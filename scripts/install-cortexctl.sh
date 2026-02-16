@@ -9,7 +9,8 @@ usage:
   scripts/install-cortexctl.sh [options]
 
 options:
-  --repo <owner/repo>      GitHub repository hosting release assets (required unless --asset-base-url is set)
+  --repo <owner/repo>      GitHub repository hosting release assets
+                           (default: $CORTEX_INSTALL_REPO or eric-tramel/cortex)
   --asset-base-url <url>   Base URL hosting cortex-bundle-<target>.tar.gz and .sha256 assets
   --version <tag>       Release tag (default: latest)
   --install-dir <path>  Destination directory for binary (default: ~/.local/bin)
@@ -19,8 +20,9 @@ options:
   -h, --help            Show help
 
 examples:
-  scripts/install-cortexctl.sh --repo eric-tramel/cortex
-  scripts/install-cortexctl.sh --repo eric-tramel/cortex --version v0.1.1
+  scripts/install-cortexctl.sh
+  scripts/install-cortexctl.sh --version v0.1.1
+  scripts/install-cortexctl.sh --repo your-org/cortex-fork --version v0.1.1
   scripts/install-cortexctl.sh --asset-base-url http://127.0.0.1:8080 --version ci-e2e
 EOF
 }
@@ -137,7 +139,7 @@ fetch_latest_tag() {
   echo "$tag"
 }
 
-repo=""
+repo="${CORTEX_INSTALL_REPO:-eric-tramel/cortex}"
 asset_base_url=""
 version="latest"
 install_dir="${HOME}/.local/bin"
@@ -194,10 +196,6 @@ if [[ -n "$asset_base_url" ]]; then
     usage
     exit 64
   fi
-elif [[ -z "$repo" ]]; then
-  echo "--repo is required unless --asset-base-url is provided"
-  usage
-  exit 64
 fi
 
 require_cmd curl
