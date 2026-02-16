@@ -3,6 +3,7 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IngestSource {
     #[serde(default)]
     pub name: String,
@@ -17,6 +18,7 @@ pub struct IngestSource {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClickHouseConfig {
     #[serde(default = "default_ch_url")]
     pub url: String,
@@ -35,6 +37,7 @@ pub struct ClickHouseConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IngestConfig {
     #[serde(default = "default_sources")]
     pub sources: Vec<IngestSource>,
@@ -59,6 +62,7 @@ pub struct IngestConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpConfig {
     #[serde(default = "default_max_results")]
     pub max_results: u16,
@@ -79,6 +83,7 @@ pub struct McpConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Bm25Config {
     #[serde(default = "default_k1")]
     pub k1: f64,
@@ -93,6 +98,7 @@ pub struct Bm25Config {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MonitorConfig {
     #[serde(default = "default_monitor_host")]
     pub host: String,
@@ -101,6 +107,7 @@ pub struct MonitorConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
     #[serde(default = "default_runtime_root")]
     pub root_dir: String,
@@ -127,6 +134,7 @@ pub struct RuntimeConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     #[serde(default)]
     pub clickhouse: ClickHouseConfig,
@@ -547,6 +555,19 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<AppConfig> {
 mod tests {
     use super::*;
 
+    fn write_temp_config(contents: &str, label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "cortex-config-{label}-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after unix epoch")
+                .as_nanos()
+        ));
+        std::fs::write(&path, contents).expect("write temp config");
+        path
+    }
+
     #[test]
     fn resolve_order_prefers_cli_then_env_then_home_then_repo() {
         let raw = Some(PathBuf::from("/tmp/cli.toml"));
@@ -628,6 +649,48 @@ mod tests {
         let err = load_config(&path).expect_err("missing config path should fail");
         assert!(
             err.to_string().contains("failed to read config"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn load_config_errors_on_unknown_top_level_section() {
+        let path = write_temp_config(
+            r#"
+[clickhouse]
+url = "http://127.0.0.1:8123"
+
+[unexpected]
+enabled = true
+"#,
+            "unknown-top-level",
+        );
+        let err = load_config(&path).expect_err("unknown top-level section should fail");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            format!("{err:#}").contains("unknown field `unexpected`"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn load_config_errors_on_unknown_ingest_source_key() {
+        let path = write_temp_config(
+            r#"
+[[ingest.sources]]
+name = "codex"
+provider = "codex"
+enabled = true
+glob = "~/.codex/sessions/**/*.jsonl"
+watch_root = "~/.codex/sessions"
+extra = "not-allowed"
+"#,
+            "unknown-source-key",
+        );
+        let err = load_config(&path).expect_err("unknown ingest source key should fail");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            format!("{err:#}").contains("unknown field `extra`"),
             "unexpected error: {err:#}"
         );
     }
