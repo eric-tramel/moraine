@@ -19,7 +19,7 @@ options:
 
 examples:
   scripts/install-cortexctl.sh --repo eric-tramel/cortex
-  scripts/install-cortexctl.sh --repo eric-tramel/cortex --version v0.1.0
+  scripts/install-cortexctl.sh --repo eric-tramel/cortex --version v0.1.1
 EOF
 }
 

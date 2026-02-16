@@ -59,7 +59,7 @@ Install paths:
 
 Tag-driven GitHub Actions release workflow:
 
-1. Push a semantic tag (example: `v0.1.0`).
+1. Push a semantic tag (example: `v0.1.1`).
 2. Workflow `.github/workflows/release-cortexctl.yml` builds:
    - `x86_64-unknown-linux-gnu`
    - `aarch64-unknown-linux-gnu`

@@ -184,7 +184,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "cortex-clickhouse"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -198,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "cortex-config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "cortex-ingest"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "cortex-config",
@@ -218,7 +218,7 @@ dependencies = [
 
 [[package]]
 name = "cortex-ingest-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -238,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "cortex-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "cortex-config",
@@ -249,7 +249,7 @@ dependencies = [
 
 [[package]]
 name = "cortex-mcp-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "cortex-clickhouse",
@@ -264,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "cortex-monitor"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "cortex-config",
@@ -274,7 +274,7 @@ dependencies = [
 
 [[package]]
 name = "cortex-monitor-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -289,7 +289,7 @@ dependencies = [
 
 [[package]]
 name = "cortexctl"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "cortex-clickhouse",
