@@ -71,7 +71,9 @@ impl ClickHouseClient {
         {
             let mut qp = url.query_pairs_mut();
             qp.append_pair("query", query);
-            qp.append_pair("database", database.unwrap_or(&self.cfg.database));
+            if let Some(database) = database {
+                qp.append_pair("database", database);
+            }
             if let Some(default_format) = default_format {
                 qp.append_pair("default_format", default_format);
             }
@@ -112,7 +114,7 @@ impl ClickHouseClient {
 
     pub async fn ping(&self) -> Result<()> {
         let response = self
-            .request_text("SELECT 1", None, None, false, None)
+            .request_text("SELECT 1", None, Some("system"), false, None)
             .await?;
         if response.trim() == "1" {
             Ok(())
@@ -123,7 +125,7 @@ impl ClickHouseClient {
 
     pub async fn version(&self) -> Result<String> {
         let rows: Vec<Value> = self
-            .query_json_data("SELECT version() AS version", None)
+            .query_json_data("SELECT version() AS version", Some("system"))
             .await?;
         let version = rows
             .first()
@@ -139,6 +141,7 @@ impl ClickHouseClient {
         query: &str,
         database: Option<&str>,
     ) -> Result<Vec<T>> {
+        let database = database.or(Some(&self.cfg.database));
         let raw = self
             .request_text(query, None, database, false, None)
             .await?;
@@ -161,6 +164,7 @@ impl ClickHouseClient {
         query: &str,
         database: Option<&str>,
     ) -> Result<Vec<T>> {
+        let database = database.or(Some(&self.cfg.database));
         let raw = self
             .request_text(query, None, database, false, Some("JSON"))
             .await?;
@@ -302,7 +306,10 @@ impl ClickHouseClient {
             escape_literal(&self.cfg.database)
         );
 
-        match self.query_json_data::<ExistsRow>(&exists_query, None).await {
+        match self
+            .query_json_data::<ExistsRow>(&exists_query, Some("system"))
+            .await
+        {
             Ok(rows) => {
                 report.database_exists = rows.first().map(|r| r.exists == 1).unwrap_or(false)
             }
@@ -367,7 +374,10 @@ impl ClickHouseClient {
             "schema_migrations",
         ];
 
-        match self.query_json_data::<TableRow>(&table_query, None).await {
+        match self
+            .query_json_data::<TableRow>(&table_query, Some("system"))
+            .await
+        {
             Ok(rows) => {
                 let existing = rows.into_iter().map(|r| r.name).collect::<HashSet<_>>();
                 report.missing_tables = required
