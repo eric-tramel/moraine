@@ -1145,28 +1145,58 @@ fn source_tree_mode_enabled() -> bool {
     env_flag_enabled("CORTEX_SOURCE_TREE_MODE")
 }
 
-fn resolve_service_binary(service: Service, paths: &RuntimePaths) -> PathBuf {
-    let Some(name) = service.binary_name() else {
-        return PathBuf::from(service.name());
+#[derive(Debug, Clone)]
+struct ServiceBinaryProbe {
+    source: &'static str,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct ServiceBinaryResolution {
+    binary_name: String,
+    resolved_path: Option<PathBuf>,
+    checked_paths: Vec<ServiceBinaryProbe>,
+}
+
+fn resolve_service_binary(service: Service, paths: &RuntimePaths) -> ServiceBinaryResolution {
+    let name = service.binary_name().unwrap_or(service.name()).to_string();
+    let mut checked_paths = Vec::new();
+
+    let mut check = |source: &'static str, path: PathBuf| {
+        if path.exists() {
+            Some(path)
+        } else {
+            checked_paths.push(ServiceBinaryProbe { source, path });
+            None
+        }
     };
 
     if let Ok(dir) = std::env::var("CORTEX_SERVICE_BIN_DIR") {
-        let path = PathBuf::from(dir).join(name);
-        if path.exists() {
-            return path;
+        if let Some(path) = check("CORTEX_SERVICE_BIN_DIR", PathBuf::from(dir).join(&name)) {
+            return ServiceBinaryResolution {
+                binary_name: name,
+                resolved_path: Some(path),
+                checked_paths,
+            };
         }
     }
 
-    let configured = paths.service_bin_dir.join(name);
-    if configured.exists() {
-        return configured;
+    if let Some(path) = check("runtime.service_bin_dir", paths.service_bin_dir.join(&name)) {
+        return ServiceBinaryResolution {
+            binary_name: name,
+            resolved_path: Some(path),
+            checked_paths,
+        };
     }
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let sibling = dir.join(name);
-            if sibling.exists() {
-                return sibling;
+            if let Some(path) = check("cortexctl sibling", dir.join(&name)) {
+                return ServiceBinaryResolution {
+                    binary_name: name,
+                    resolved_path: Some(path),
+                    checked_paths,
+                };
             }
         }
     }
@@ -1175,15 +1205,61 @@ fn resolve_service_binary(service: Service, paths: &RuntimePaths) -> PathBuf {
         if let Some(project_bin) = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(|p| p.parent())
-            .map(|p| p.join("target").join("debug").join(name))
+            .map(|p| p.join("target").join("debug").join(&name))
         {
-            if project_bin.exists() {
-                return project_bin;
+            if let Some(path) = check("source-tree mode target/debug", project_bin) {
+                return ServiceBinaryResolution {
+                    binary_name: name,
+                    resolved_path: Some(path),
+                    checked_paths,
+                };
             }
         }
     }
 
-    PathBuf::from(name)
+    ServiceBinaryResolution {
+        binary_name: name,
+        resolved_path: None,
+        checked_paths,
+    }
+}
+
+fn require_service_binary(service: Service, paths: &RuntimePaths) -> Result<PathBuf> {
+    let resolution = resolve_service_binary(service, paths);
+    if let Some(path) = resolution.resolved_path {
+        return Ok(path);
+    }
+
+    let checked = if resolution.checked_paths.is_empty() {
+        "- (no probe paths)".to_string()
+    } else {
+        resolution
+            .checked_paths
+            .iter()
+            .map(|probe| format!("- {} ({})", probe.path.display(), probe.source))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    bail!(
+        "required service binary `{}` for `{}` was not found.\nchecked:\n{}\nremediation:\n- install Cortex service binaries so `{}` exists under `runtime.service_bin_dir` (`{}`)\n- or set `CORTEX_SERVICE_BIN_DIR` to a directory containing `{}`\n- for source builds run `cargo build --workspace --locked` and set `CORTEX_SOURCE_TREE_MODE=1`\n`cortexctl` does not fall back to PATH for service binaries.",
+        resolution.binary_name,
+        service.name(),
+        checked,
+        resolution.binary_name,
+        paths.service_bin_dir.display(),
+        resolution.binary_name
+    );
+}
+
+fn preflight_required_service_binaries(services: &[Service], paths: &RuntimePaths) -> Result<()> {
+    for service in services {
+        if *service == Service::ClickHouse {
+            continue;
+        }
+        require_service_binary(*service, paths)?;
+    }
+    Ok(())
 }
 
 fn contains_flag(args: &[String], flag: &str) -> bool {
@@ -1297,7 +1373,7 @@ fn start_background_service(
         });
     }
 
-    let binary = resolve_service_binary(service, paths);
+    let binary = require_service_binary(service, paths)?;
 
     let logfile = OpenOptions::new()
         .create(true)
@@ -1337,7 +1413,7 @@ async fn run_foreground_service(
         return run_foreground_clickhouse(cfg, paths).await;
     }
 
-    let binary = resolve_service_binary(service, paths);
+    let binary = require_service_binary(service, paths)?;
     let args = service_args_with_defaults(service, cfg_path, cfg, paths, passthrough_args);
 
     let status = Command::new(binary)
@@ -1543,6 +1619,20 @@ fn collect_logs(
 
 fn current_exe_path() -> Result<PathBuf> {
     std::env::current_exe().context("failed to resolve current executable")
+}
+
+fn selected_up_services(args: &UpArgs, cfg: &AppConfig) -> Vec<Service> {
+    let mut services = Vec::new();
+    if !args.no_ingest {
+        services.push(Service::Ingest);
+    }
+    if args.monitor || cfg.runtime.start_monitor_on_up {
+        services.push(Service::Monitor);
+    }
+    if args.mcp || cfg.runtime.start_mcp_on_up {
+        services.push(Service::Mcp);
+    }
+    services
 }
 
 fn selected_boot_services(cfg: &AppConfig) -> Vec<Service> {
@@ -2606,33 +2696,17 @@ async fn main() -> Result<ExitCode> {
         CliCommand::Up(args) => {
             let (config_path, cfg) = load_cfg(cli.config.clone())?;
             let paths = runtime_paths(&cfg);
+            let services_to_start = selected_up_services(&args, &cfg);
+            preflight_required_service_binaries(&services_to_start, &paths)?;
             ensure_runtime_dirs(&paths)?;
 
             let clickhouse = start_clickhouse(&cfg, &paths).await?;
             let migrations = cmd_db_migrate(&cfg).await?;
 
             let mut started_services = Vec::new();
-            if !args.no_ingest {
+            for service in services_to_start {
                 started_services.push(start_background_service(
-                    Service::Ingest,
-                    &config_path,
-                    &cfg,
-                    &paths,
-                    &[],
-                )?);
-            }
-            if args.monitor || cfg.runtime.start_monitor_on_up {
-                started_services.push(start_background_service(
-                    Service::Monitor,
-                    &config_path,
-                    &cfg,
-                    &paths,
-                    &[],
-                )?);
-            }
-            if args.mcp || cfg.runtime.start_mcp_on_up {
-                started_services.push(start_background_service(
-                    Service::Mcp,
+                    service,
                     &config_path,
                     &cfg,
                     &paths,
@@ -2936,16 +3010,22 @@ mod tests {
 
         std::env::remove_var("CORTEX_SOURCE_TREE_MODE");
         std::env::set_var("CORTEX_SERVICE_BIN_DIR", &env_dir);
-        assert_eq!(resolve_service_binary(Service::Ingest, &paths), env_bin);
+        assert_eq!(
+            resolve_service_binary(Service::Ingest, &paths).resolved_path,
+            Some(env_bin.clone())
+        );
 
         std::env::remove_var("CORTEX_SERVICE_BIN_DIR");
-        assert_eq!(resolve_service_binary(Service::Ingest, &paths), cfg_bin);
+        assert_eq!(
+            resolve_service_binary(Service::Ingest, &paths).resolved_path,
+            Some(cfg_bin)
+        );
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn resolve_service_binary_falls_back_to_path_name() {
+    fn resolve_service_binary_reports_missing_without_path_fallback() {
         let root = temp_dir("resolver-path");
         let mut cfg = AppConfig::default();
         cfg.runtime.service_bin_dir = root.join("missing").to_string_lossy().to_string();
@@ -2954,7 +3034,33 @@ mod tests {
         std::env::remove_var("CORTEX_SERVICE_BIN_DIR");
         std::env::remove_var("CORTEX_SOURCE_TREE_MODE");
         let resolved = resolve_service_binary(Service::Mcp, &paths);
-        assert_eq!(resolved, PathBuf::from("cortex-mcp"));
+        assert_eq!(resolved.binary_name, "cortex-mcp");
+        assert!(resolved.resolved_path.is_none());
+        assert!(resolved
+            .checked_paths
+            .iter()
+            .any(|probe| probe.source == "runtime.service_bin_dir"
+                && probe.path == paths.service_bin_dir.join("cortex-mcp")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn require_service_binary_includes_remediation() {
+        let root = temp_dir("resolver-remediation");
+        let mut cfg = AppConfig::default();
+        cfg.runtime.service_bin_dir = root.join("missing").to_string_lossy().to_string();
+        let paths = runtime_paths(&cfg);
+
+        std::env::remove_var("CORTEX_SERVICE_BIN_DIR");
+        std::env::remove_var("CORTEX_SOURCE_TREE_MODE");
+        let err = require_service_binary(Service::Mcp, &paths).expect_err("missing mcp binary");
+        let message = err.to_string();
+        assert!(message.contains("required service binary `cortex-mcp`"));
+        assert!(message.contains("runtime.service_bin_dir"));
+        assert!(message.contains("CORTEX_SERVICE_BIN_DIR"));
+        assert!(message.contains("cargo build --workspace --locked"));
+        assert!(message.contains("does not fall back to PATH"));
 
         let _ = fs::remove_dir_all(root);
     }
