@@ -104,6 +104,40 @@ wait_for_clickhouse_count() {
   done
 }
 
+ensure_monitor_frontend_assets() {
+  local repo_root="$1"
+  local playwright_browsers_path="$2"
+  local monitor_web_dir="$repo_root/web/monitor"
+
+  need_cmd bun
+
+  if [[ ! -d "$monitor_web_dir" ]]; then
+    echo "missing monitor frontend directory: $monitor_web_dir" >&2
+    exit 1
+  fi
+  if [[ ! -f "$monitor_web_dir/package.json" ]]; then
+    echo "missing monitor frontend package manifest: $monitor_web_dir/package.json" >&2
+    exit 1
+  fi
+
+  if [[ ! -d "$monitor_web_dir/node_modules" ]]; then
+    echo "[e2e] installing monitor frontend dependencies"
+    (cd "$monitor_web_dir" && bun install --frozen-lockfile)
+  else
+    echo "[e2e] reusing monitor frontend dependencies"
+  fi
+
+  echo "[e2e] building monitor frontend assets"
+  (cd "$monitor_web_dir" && bun run build)
+
+  mkdir -p "$playwright_browsers_path"
+  echo "[e2e] ensuring Playwright browser is installed"
+  (
+    cd "$monitor_web_dir"
+    PLAYWRIGHT_BROWSERS_PATH="$playwright_browsers_path" bunx playwright install chromium
+  )
+}
+
 cleanup_e2e() {
   local cortexctl_bin="$1"
   local config_path="$2"
@@ -184,6 +218,7 @@ main() {
 
   local tmp_root
   tmp_root="$(mktemp -d)"
+  local playwright_browsers_path="$tmp_root/playwright-browsers"
   local fixtures_root="$tmp_root/fixtures"
   local runtime_root="$tmp_root/runtime"
   local config_path="$tmp_root/cortex-ci.toml"
@@ -278,6 +313,20 @@ EOF
     body="$(curl -fsS "http://127.0.0.1:${monitor_port}${path}")"
     printf '%s' "$body" | json_ok_true "$python_bin"
   done
+
+  echo "[e2e] validating monitor frontend with Playwright (live backend)"
+  ensure_monitor_frontend_assets "$repo_root" "$playwright_browsers_path"
+  wait_for_endpoint_ok "$python_bin" "http://127.0.0.1:${monitor_port}/api/health" 120
+  (
+    cd "$repo_root/web/monitor"
+    PLAYWRIGHT_BROWSERS_PATH="$playwright_browsers_path" \
+      MONITOR_BASE_URL="http://127.0.0.1:${monitor_port}" \
+      CORTEX_E2E_CODEX_KEYWORD="$codex_keyword" \
+      CORTEX_E2E_CLAUDE_KEYWORD="$claude_keyword" \
+      CORTEX_E2E_CODEX_TRACE_MARKER="$codex_trace_marker" \
+      CORTEX_E2E_CLAUDE_TRACE_MARKER="$claude_trace_marker" \
+      bun run test:e2e -- e2e/monitor.live.spec.ts
+  )
 
   echo "[e2e] checking MCP initialize/tools/search/open (codex)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
