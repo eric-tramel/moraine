@@ -1,10 +1,17 @@
 use anyhow::{anyhow, bail, Context, Result};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use cortex_clickhouse::{ClickHouseClient, DoctorReport};
 use cortex_config::AppConfig;
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Constraint, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Line;
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, Widget, Wrap};
 use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Output, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -30,6 +37,141 @@ const CH_URL_LINUX_AARCH64: &str = "https://github.com/ClickHouse/ClickHouse/rel
 const CH_SHA_LINUX_AARCH64: &str =
     "3d227e50109b0dab330ee2230f46d76f0360f1a61956443c37de5b7651fb488b";
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum OutputFormat {
+    Auto,
+    Rich,
+    Plain,
+    Json,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputMode {
+    Rich,
+    Plain,
+    Json,
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "cortexctl",
+    about = "Unified runtime control plane for Cortex services"
+)]
+struct Cli {
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
+    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Auto)]
+    output: OutputFormat,
+    #[arg(long, global = true, default_value_t = false)]
+    verbose: bool,
+    #[command(subcommand)]
+    command: CliCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum CliCommand {
+    Up(UpArgs),
+    Down,
+    Status,
+    Logs(LogsArgs),
+    Db(DbArgs),
+    Clickhouse(ClickhouseArgs),
+    Service(ServiceArgs),
+    Run(RunArgs),
+}
+
+#[derive(Debug, Args)]
+struct UpArgs {
+    #[arg(long)]
+    no_ingest: bool,
+    #[arg(long)]
+    monitor: bool,
+    #[arg(long)]
+    mcp: bool,
+}
+
+#[derive(Debug, Args)]
+struct LogsArgs {
+    #[arg(value_enum)]
+    service: Option<Service>,
+    #[arg(long, default_value_t = 200)]
+    lines: usize,
+}
+
+#[derive(Debug, Args)]
+struct DbArgs {
+    #[command(subcommand)]
+    command: DbCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum DbCommand {
+    Migrate,
+    Doctor,
+}
+
+#[derive(Debug, Args)]
+struct ClickhouseArgs {
+    #[command(subcommand)]
+    command: ClickhouseCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ClickhouseCommand {
+    Install(ClickhouseInstallArgs),
+    Status,
+    Uninstall,
+}
+
+#[derive(Debug, Args)]
+struct ClickhouseInstallArgs {
+    #[arg(long)]
+    force: bool,
+    #[arg(long)]
+    version: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ServiceArgs {
+    #[command(subcommand)]
+    command: ServiceCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceCommand {
+    Install(ServiceInstallArgs),
+    Uninstall(ServiceUninstallArgs),
+    Status,
+}
+
+#[derive(Debug, Args)]
+struct ServiceInstallArgs {
+    #[arg(long)]
+    enable: bool,
+    #[arg(long)]
+    start: bool,
+}
+
+#[derive(Debug, Args)]
+struct ServiceUninstallArgs {
+    #[arg(long)]
+    disable: bool,
+    #[arg(long)]
+    stop: bool,
+}
+
+#[derive(Debug, Args)]
+struct RunArgs {
+    #[arg(value_enum)]
+    service: Service,
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        num_args = 0..
+    )]
+    args: Vec<String>,
+}
+
 #[derive(Clone)]
 struct RuntimePaths {
     root: PathBuf,
@@ -42,11 +184,16 @@ struct RuntimePaths {
     managed_clickhouse_dir: PathBuf,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 enum Service {
+    #[value(name = "clickhouse")]
     ClickHouse,
+    #[value(name = "ingest")]
     Ingest,
+    #[value(name = "monitor")]
     Monitor,
+    #[value(name = "mcp")]
     Mcp,
 }
 
@@ -135,23 +282,301 @@ struct ClickHouseAsset {
     is_archive: bool,
 }
 
-fn usage() {
-    eprintln!(
-        "usage:
-  cortexctl up [--config <path>] [--no-ingest] [--monitor] [--mcp]
-  cortexctl down [--config <path>]
-  cortexctl status [--config <path>]
-  cortexctl logs [service] [--lines <n>] [--config <path>]
-  cortexctl db migrate [--config <path>]
-  cortexctl db doctor [--config <path>]
-  cortexctl clickhouse install [--version <v>] [--force] [--config <path>]
-  cortexctl clickhouse status [--config <path>]
-  cortexctl clickhouse uninstall [--config <path>]
-  cortexctl service install [--enable] [--start] [--config <path>]
-  cortexctl service uninstall [--disable] [--stop] [--config <path>]
-  cortexctl service status [--config <path>]
-  cortexctl run clickhouse|ingest|monitor|mcp [--config <path>] [args...]"
+#[derive(Debug, Clone, serde::Serialize)]
+struct ServiceRuntimeStatus {
+    service: Service,
+    pid: Option<u32>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum HeartbeatSnapshot {
+    Available {
+        latest: String,
+        queue_depth: u64,
+        files_active: u64,
+        watcher_backend: String,
+        watcher_error_count: u64,
+        watcher_reset_count: u64,
+        watcher_last_reset_unix_ms: u64,
+    },
+    Unavailable,
+    Error {
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct StatusSnapshot {
+    services: Vec<ServiceRuntimeStatus>,
+    managed_clickhouse_installed: bool,
+    managed_clickhouse_path: String,
+    managed_clickhouse_version: Option<String>,
+    clickhouse_active_source: String,
+    clickhouse_active_source_path: Option<String>,
+    managed_clickhouse_checksum: String,
+    doctor: DoctorReport,
+    heartbeat: HeartbeatSnapshot,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct MigrationOutcome {
+    applied: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ServiceLogSection {
+    service: Service,
+    path: String,
+    exists: bool,
+    lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct LogsSnapshot {
+    requested_lines: usize,
+    sections: Vec<ServiceLogSection>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ClickhouseStatusSnapshot {
+    managed_root: String,
+    clickhouse_exists: bool,
+    clickhouse_server_exists: bool,
+    clickhouse_client_exists: bool,
+    expected_version: String,
+    active_source: String,
+    active_source_path: Option<String>,
+    checksum_state: String,
+    installed_version: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ServiceInstallSnapshot {
+    platform: String,
+    install_dir: String,
+    services: Vec<Service>,
+    enable: bool,
+    start: bool,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ServiceUninstallSnapshot {
+    platform: String,
+    disable: bool,
+    stop: bool,
+    services: Vec<Service>,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ServiceStatusRow {
+    service: Service,
+    installed: Option<bool>,
+    loaded: Option<bool>,
+    enabled: Option<bool>,
+    active: Option<bool>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ServiceStatusSnapshot {
+    platform: String,
+    linger_user: Option<String>,
+    linger_state: Option<String>,
+    rows: Vec<ServiceStatusRow>,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StartState {
+    Started,
+    AlreadyRunning,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct StartOutcome {
+    service: Service,
+    state: StartState,
+    pid: u32,
+    log_path: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct UpSnapshot {
+    clickhouse: StartOutcome,
+    migrations: MigrationOutcome,
+    services: Vec<StartOutcome>,
+    status: StatusSnapshot,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct DownSnapshot {
+    stopped: Vec<Service>,
+}
+
+struct CliOutput {
+    mode: OutputMode,
+    verbose: bool,
+    unicode: bool,
+    width: u16,
+}
+
+impl CliOutput {
+    fn from_cli(cli: &Cli) -> Self {
+        let mode = match cli.output {
+            OutputFormat::Auto => {
+                if std::io::stdout().is_terminal() {
+                    OutputMode::Rich
+                } else {
+                    OutputMode::Plain
+                }
+            }
+            OutputFormat::Rich => OutputMode::Rich,
+            OutputFormat::Plain => OutputMode::Plain,
+            OutputFormat::Json => OutputMode::Json,
+        };
+        let unicode = std::env::var("LC_ALL")
+            .ok()
+            .or_else(|| std::env::var("LANG").ok())
+            .map(|v| !v.to_ascii_uppercase().contains("C"))
+            .unwrap_or(true);
+        let width = std::env::var("COLUMNS")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .map(|v| v.clamp(72, 140))
+            .unwrap_or(100);
+
+        Self {
+            mode,
+            verbose: cli.verbose,
+            unicode,
+            width,
+        }
+    }
+
+    fn is_json(&self) -> bool {
+        self.mode == OutputMode::Json
+    }
+
+    fn section(&self, title: &str, lines: &[String]) {
+        match self.mode {
+            OutputMode::Plain => {
+                println!("{title}");
+                for line in lines {
+                    println!("  {line}");
+                }
+            }
+            OutputMode::Rich => {
+                let panel = render_panel(title, lines, self.width, self.unicode);
+                println!("{panel}");
+            }
+            OutputMode::Json => {}
+        }
+    }
+
+    fn table(&self, title: &str, headers: &[&str], rows: &[Vec<String>]) {
+        match self.mode {
+            OutputMode::Plain => print_plain_table(title, headers, rows),
+            OutputMode::Rich => {
+                let table = render_table(title, headers, rows, self.width, self.unicode);
+                println!("{table}");
+            }
+            OutputMode::Json => {}
+        }
+    }
+
+    fn line(&self, text: &str) {
+        if self.mode != OutputMode::Json {
+            println!("{text}");
+        }
+    }
+}
+
+fn render_panel(title: &str, lines: &[String], width: u16, unicode: bool) -> String {
+    let area = Rect::new(0, 0, width, (lines.len().max(1) as u16).saturating_add(2));
+    let mut buffer = Buffer::empty(area);
+    let mut block = Block::default()
+        .title(Line::from(title.to_string()))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan));
+    if !unicode {
+        block = block.border_set(ratatui::symbols::border::PLAIN);
+    }
+    let paragraph = Paragraph::new(lines.join("\n"))
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .style(Style::default().fg(Color::White));
+    paragraph.render(area, &mut buffer);
+    buffer_to_string(&buffer)
+}
+
+fn render_table(
+    title: &str,
+    headers: &[&str],
+    rows: &[Vec<String>],
+    width: u16,
+    unicode: bool,
+) -> String {
+    let area = Rect::new(
+        0,
+        0,
+        width,
+        (rows.len().saturating_add(1) as u16).saturating_add(2),
     );
+    let mut buffer = Buffer::empty(area);
+    let mut block = Block::default()
+        .title(Line::from(title.to_string()))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan));
+    if !unicode {
+        block = block.border_set(ratatui::symbols::border::PLAIN);
+    }
+
+    let header = Row::new(
+        headers
+            .iter()
+            .map(|h| Cell::from((*h).to_string()).style(Style::default().fg(Color::Yellow))),
+    )
+    .style(Style::default().add_modifier(Modifier::BOLD));
+    let data_rows = rows.iter().map(|row| Row::new(row.clone()));
+    let widths = headers
+        .iter()
+        .map(|_| Constraint::Percentage((100 / headers.len().max(1)) as u16))
+        .collect::<Vec<_>>();
+    let table = Table::new(data_rows, widths).header(header).block(block);
+    table.render(area, &mut buffer);
+    buffer_to_string(&buffer)
+}
+
+fn buffer_to_string(buffer: &Buffer) -> String {
+    let mut lines = Vec::new();
+    for y in 0..buffer.area.height {
+        let mut line = String::new();
+        for x in 0..buffer.area.width {
+            line.push_str(buffer[(x, y)].symbol());
+        }
+        while line.ends_with(' ') {
+            line.pop();
+        }
+        lines.push(line);
+    }
+    while lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+fn print_plain_table(title: &str, headers: &[&str], rows: &[Vec<String>]) {
+    println!("{title}");
+    println!("{}", headers.join(" | "));
+    let divider = headers.iter().map(|_| "---").collect::<Vec<_>>().join("+");
+    println!("{divider}");
+    for row in rows {
+        println!("{}", row.join(" | "));
+    }
 }
 
 fn runtime_paths(cfg: &AppConfig) -> RuntimePaths {
@@ -648,10 +1073,14 @@ async fn wait_for_clickhouse(cfg: &AppConfig) -> Result<()> {
     }
 }
 
-async fn start_clickhouse(cfg: &AppConfig, paths: &RuntimePaths) -> Result<()> {
+async fn start_clickhouse(cfg: &AppConfig, paths: &RuntimePaths) -> Result<StartOutcome> {
     if let Some(pid) = service_running(paths, Service::ClickHouse) {
-        println!("clickhouse already running (pid {})", pid);
-        return Ok(());
+        return Ok(StartOutcome {
+            service: Service::ClickHouse,
+            state: StartState::AlreadyRunning,
+            pid,
+            log_path: Some(log_path(paths, Service::ClickHouse).display().to_string()),
+        });
     }
 
     let server_bin = resolve_clickhouse_server_command(cfg, paths).await?;
@@ -678,7 +1107,12 @@ async fn start_clickhouse(cfg: &AppConfig, paths: &RuntimePaths) -> Result<()> {
     write_pid(&pid_path(paths, Service::ClickHouse), child.id())?;
 
     wait_for_clickhouse(cfg).await?;
-    Ok(())
+    Ok(StartOutcome {
+        service: Service::ClickHouse,
+        state: StartState::Started,
+        pid: child.id(),
+        log_path: Some(log_path(paths, Service::ClickHouse).display().to_string()),
+    })
 }
 
 async fn run_foreground_clickhouse(cfg: &AppConfig, paths: &RuntimePaths) -> Result<ExitCode> {
@@ -849,14 +1283,18 @@ fn start_background_service(
     cfg: &AppConfig,
     paths: &RuntimePaths,
     extra_args: &[String],
-) -> Result<()> {
+) -> Result<StartOutcome> {
     if service == Service::ClickHouse {
         bail!("clickhouse is not managed by service launcher; use `cortexctl up`");
     }
 
     if let Some(pid) = service_running(paths, service) {
-        println!("{} already running (pid {})", service.name(), pid);
-        return Ok(());
+        return Ok(StartOutcome {
+            service,
+            state: StartState::AlreadyRunning,
+            pid,
+            log_path: Some(log_path(paths, service).display().to_string()),
+        });
     }
 
     let binary = resolve_service_binary(service, paths);
@@ -880,14 +1318,12 @@ fn start_background_service(
         .with_context(|| format!("failed to start {}", service.name()))?;
 
     write_pid(&pid_path(paths, service), child.id())?;
-    println!(
-        "{} started (pid {}) log={} ",
-        service.name(),
-        child.id(),
-        log_path(paths, service).display()
-    );
-
-    Ok(())
+    Ok(StartOutcome {
+        service,
+        state: StartState::Started,
+        pid: child.id(),
+        log_path: Some(log_path(paths, service).display().to_string()),
+    })
 }
 
 async fn run_foreground_service(
@@ -912,15 +1348,10 @@ async fn run_foreground_service(
     Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
 }
 
-async fn cmd_db_migrate(cfg: &AppConfig) -> Result<()> {
+async fn cmd_db_migrate(cfg: &AppConfig) -> Result<MigrationOutcome> {
     let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
     let applied = ch.run_migrations().await?;
-    if applied.is_empty() {
-        println!("migrations already up to date");
-    } else {
-        println!("applied migrations: {}", applied.join(", "));
-    }
-    Ok(())
+    Ok(MigrationOutcome { applied })
 }
 
 async fn cmd_db_doctor(cfg: &AppConfig) -> Result<DoctorReport> {
@@ -1009,79 +1440,50 @@ fn active_clickhouse_source(paths: &RuntimePaths) -> (&'static str, Option<PathB
     ("missing", None)
 }
 
-async fn cmd_status(paths: &RuntimePaths, cfg: &AppConfig) -> Result<()> {
-    for service in [
+async fn cmd_status(paths: &RuntimePaths, cfg: &AppConfig) -> Result<StatusSnapshot> {
+    let services = [
         Service::ClickHouse,
         Service::Ingest,
         Service::Monitor,
         Service::Mcp,
-    ] {
-        match service_running(paths, service) {
-            Some(pid) => println!("{}: running (pid {})", service.name(), pid),
-            None => println!("{}: stopped", service.name()),
-        }
-    }
-
+    ]
+    .iter()
+    .copied()
+    .map(|service| ServiceRuntimeStatus {
+        service,
+        pid: service_running(paths, service),
+    })
+    .collect::<Vec<_>>();
     let managed_server = managed_clickhouse_bin(paths, "clickhouse-server");
     let (source, source_path) = active_clickhouse_source(paths);
-    println!(
-        "managed clickhouse: {} ({})",
-        if managed_server.exists() {
-            "installed"
-        } else {
-            "missing"
-        },
-        managed_server.display()
-    );
-    if let Some(version) = managed_clickhouse_version(paths) {
-        println!("managed clickhouse version: {}", version);
-    }
-    println!(
-        "clickhouse active source: {}{}",
-        source,
-        source_path
-            .as_ref()
-            .map(|path| format!(" ({})", path.display()))
-            .unwrap_or_default()
-    );
-    println!(
-        "managed clickhouse checksum: {}",
-        managed_clickhouse_checksum_state(cfg, paths)
-    );
-
     let report = cmd_db_doctor(cfg).await?;
-    println!("clickhouse healthy: {}", report.clickhouse_healthy);
-    if let Some(version) = report.clickhouse_version {
-        println!("clickhouse version: {}", version);
-    }
-    println!("database exists: {}", report.database_exists);
-    println!(
-        "pending migrations: {}",
-        report.pending_migrations.join(",")
-    );
-    println!("missing tables: {}", report.missing_tables.join(","));
-    if !report.errors.is_empty() {
-        println!("doctor errors: {}", report.errors.join(" | "));
-    }
+    let heartbeat = match query_heartbeat(cfg).await {
+        Ok(Some(row)) => HeartbeatSnapshot::Available {
+            latest: row.latest,
+            queue_depth: row.queue_depth,
+            files_active: row.files_active,
+            watcher_backend: row.watcher_backend,
+            watcher_error_count: row.watcher_error_count,
+            watcher_reset_count: row.watcher_reset_count,
+            watcher_last_reset_unix_ms: row.watcher_last_reset_unix_ms,
+        },
+        Ok(None) => HeartbeatSnapshot::Unavailable,
+        Err(err) => HeartbeatSnapshot::Error {
+            message: err.to_string(),
+        },
+    };
 
-    match query_heartbeat(cfg).await {
-        Ok(Some(row)) => {
-            println!("ingest heartbeat latest: {}", row.latest);
-            println!("ingest queue depth: {}", row.queue_depth);
-            println!("ingest files active: {}", row.files_active);
-            println!("watcher backend: {}", row.watcher_backend);
-            println!("watcher error count: {}", row.watcher_error_count);
-            println!("watcher reset count: {}", row.watcher_reset_count);
-            println!(
-                "watcher last reset unix ms: {}",
-                row.watcher_last_reset_unix_ms
-            );
-        }
-        Ok(None) => println!("ingest heartbeat: unavailable"),
-        Err(err) => println!("ingest heartbeat error: {}", err),
-    }
-
-    Ok(())
+    Ok(StatusSnapshot {
+        services,
+        managed_clickhouse_installed: managed_server.exists(),
+        managed_clickhouse_path: managed_server.display().to_string(),
+        managed_clickhouse_version: managed_clickhouse_version(paths),
+        clickhouse_active_source: source.to_string(),
+        clickhouse_active_source_path: source_path.map(|path| path.display().to_string()),
+        managed_clickhouse_checksum: managed_clickhouse_checksum_state(cfg, paths),
+        doctor: report,
+        heartbeat,
+    })
 }
 
 fn tail_lines(path: &Path, lines: usize) -> Result<Vec<String>> {
@@ -1097,7 +1499,11 @@ fn tail_lines(path: &Path, lines: usize) -> Result<Vec<String>> {
     Ok(collected)
 }
 
-fn print_logs(paths: &RuntimePaths, service: Option<Service>, lines: usize) -> Result<()> {
+fn collect_logs(
+    paths: &RuntimePaths,
+    service: Option<Service>,
+    lines: usize,
+) -> Result<LogsSnapshot> {
     let targets = match service {
         Some(svc) => vec![svc],
         None => vec![
@@ -1108,71 +1514,31 @@ fn print_logs(paths: &RuntimePaths, service: Option<Service>, lines: usize) -> R
         ],
     };
 
+    let mut sections = Vec::new();
     for svc in targets {
         let path = log_path(paths, svc);
-        println!("== {} ({}) ==", svc.name(), path.display());
+        let path_string = path.display().to_string();
         if !path.exists() {
-            println!("<no log file>");
+            sections.push(ServiceLogSection {
+                service: svc,
+                path: path_string,
+                exists: false,
+                lines: Vec::new(),
+            });
             continue;
         }
-
-        for line in tail_lines(&path, lines)? {
-            println!("{}", line);
-        }
+        sections.push(ServiceLogSection {
+            service: svc,
+            path: path_string,
+            exists: true,
+            lines: tail_lines(&path, lines)?,
+        });
     }
 
-    Ok(())
-}
-
-fn parse_service(name: &str) -> Option<Service> {
-    match name {
-        "clickhouse" => Some(Service::ClickHouse),
-        "ingest" => Some(Service::Ingest),
-        "monitor" => Some(Service::Monitor),
-        "mcp" => Some(Service::Mcp),
-        _ => None,
-    }
-}
-
-fn parse_logs_args(args: &[String]) -> Result<(Option<Service>, usize, Option<PathBuf>)> {
-    let mut service = None;
-    let mut lines = 200usize;
-
-    let mut i = 0usize;
-    let mut raw_config = None;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--lines" => {
-                if i + 1 >= args.len() {
-                    bail!("--lines requires a number");
-                }
-                lines = args[i + 1]
-                    .parse::<usize>()
-                    .map_err(|e| anyhow!("invalid --lines value: {e}"))?;
-                i += 2;
-            }
-            "--config" => {
-                if i + 1 >= args.len() {
-                    bail!("--config requires a path");
-                }
-                raw_config = Some(PathBuf::from(args[i + 1].clone()));
-                i += 2;
-            }
-            other => {
-                if service.is_none() {
-                    service = parse_service(other);
-                    if service.is_none() {
-                        bail!("unknown service: {}", other);
-                    }
-                } else {
-                    bail!("unexpected argument: {}", other);
-                }
-                i += 1;
-            }
-        }
-    }
-
-    Ok((service, lines, raw_config))
+    Ok(LogsSnapshot {
+        requested_lines: lines,
+        sections,
+    })
 }
 
 fn current_exe_path() -> Result<PathBuf> {
@@ -1323,14 +1689,15 @@ fn install_launchd_services(
     cfg_path: &Path,
     enable: bool,
     start: bool,
-) -> Result<()> {
+) -> Result<ServiceInstallSnapshot> {
     let services = selected_boot_services(cfg);
     let agents_dir = launch_agents_dir()?;
     fs::create_dir_all(&agents_dir)?;
     let domain = format!("gui/{}", uid_string()?);
     let cortexctl_exe = current_exe_path()?;
 
-    for service in services {
+    for service in &services {
+        let service = *service;
         let plist_path = agents_dir.join(format!("{}.plist", service.launchd_label()));
         let plist = launchd_plist(service, cfg, paths, cfg_path, &cortexctl_exe);
         fs::write(&plist_path, plist)?;
@@ -1396,16 +1763,27 @@ fn install_launchd_services(
         }
     }
 
-    println!("launchd services installed in {}", agents_dir.display());
-    Ok(())
+    Ok(ServiceInstallSnapshot {
+        platform: "macos-launchd".to_string(),
+        install_dir: agents_dir.display().to_string(),
+        services,
+        enable,
+        start,
+        notes: vec![],
+    })
 }
 
-fn uninstall_launchd_services(cfg: &AppConfig, disable: bool, stop: bool) -> Result<()> {
+fn uninstall_launchd_services(
+    cfg: &AppConfig,
+    disable: bool,
+    stop: bool,
+) -> Result<ServiceUninstallSnapshot> {
     let services = selected_boot_services(cfg);
     let agents_dir = launch_agents_dir()?;
     let domain = format!("gui/{}", uid_string()?);
 
-    for service in services {
+    for service in &services {
+        let service = *service;
         if stop {
             let _ = Command::new("launchctl")
                 .arg("bootout")
@@ -1423,28 +1801,43 @@ fn uninstall_launchd_services(cfg: &AppConfig, disable: bool, stop: bool) -> Res
         let _ = fs::remove_file(plist_path);
     }
 
-    println!("launchd service entries removed");
-    Ok(())
+    Ok(ServiceUninstallSnapshot {
+        platform: "macos-launchd".to_string(),
+        disable,
+        stop,
+        services,
+        notes: vec![format!(
+            "removed launchd entries under {}",
+            agents_dir.display()
+        )],
+    })
 }
 
-fn status_launchd_services(cfg: &AppConfig) -> Result<()> {
+fn status_launchd_services(cfg: &AppConfig) -> Result<ServiceStatusSnapshot> {
     let services = selected_boot_services(cfg);
     let agents_dir = launch_agents_dir()?;
 
-    for service in services {
+    let mut rows = Vec::new();
+    for service in &services {
+        let service = *service;
         let plist_path = agents_dir.join(format!("{}.plist", service.launchd_label()));
         let installed = plist_path.exists();
         let loaded = launchctl_list_loaded(service.launchd_label());
-
-        println!(
-            "{}: installed={} loaded={}",
-            service.name(),
-            installed,
-            loaded
-        );
+        rows.push(ServiceStatusRow {
+            service,
+            installed: Some(installed),
+            loaded: Some(loaded),
+            enabled: None,
+            active: None,
+        });
     }
 
-    Ok(())
+    Ok(ServiceStatusSnapshot {
+        platform: "macos-launchd".to_string(),
+        linger_user: None,
+        linger_state: None,
+        rows,
+    })
 }
 
 fn systemd_user_dir() -> Result<PathBuf> {
@@ -1543,11 +1936,12 @@ fn loginctl_linger_state(user: &str) -> Result<Option<bool>> {
     })
 }
 
-fn ensure_systemd_linger() -> Result<()> {
+fn ensure_systemd_linger() -> Result<Vec<String>> {
     let user = current_username()?;
+    let mut notes = Vec::new();
     match loginctl_linger_state(&user)? {
         Some(true) => {
-            println!("systemd linger: enabled for user {}", user);
+            notes.push(format!("systemd linger enabled for user {user}"));
         }
         Some(false) => {
             let output = Command::new("loginctl")
@@ -1556,35 +1950,35 @@ fn ensure_systemd_linger() -> Result<()> {
                 .output();
             match output {
                 Ok(output) if output.status.success() => {
-                    println!("systemd linger: enabled for user {}", user);
+                    notes.push(format!("systemd linger enabled for user {user}"));
                 }
                 Ok(output) => {
-                    println!(
+                    notes.push(format!(
                         "warning: failed to enable systemd linger for {} ({}). Run: sudo loginctl enable-linger {}",
                         user,
                         summarize_command_output(&output),
                         user
-                    );
+                    ));
                 }
                 Err(exc) => {
-                    println!(
+                    notes.push(format!(
                         "warning: failed to run loginctl enable-linger for {} ({}). Run: sudo loginctl enable-linger {}",
                         user,
                         exc,
                         user
-                    );
+                    ));
                 }
             }
         }
         None => {
-            println!(
+            notes.push(format!(
                 "warning: unable to query systemd linger state. For pre-login service startup run: sudo loginctl enable-linger {}",
                 user
-            );
+            ));
         }
     }
 
-    Ok(())
+    Ok(notes)
 }
 
 fn systemctl_user(args: &[&str]) -> Result<()> {
@@ -1610,7 +2004,7 @@ fn install_systemd_services(
     cfg_path: &Path,
     enable: bool,
     start: bool,
-) -> Result<()> {
+) -> Result<ServiceInstallSnapshot> {
     let services = selected_boot_services(cfg);
     let unit_dir = systemd_user_dir()?;
     fs::create_dir_all(&unit_dir)?;
@@ -1621,7 +2015,7 @@ fn install_systemd_services(
         fs::write(unit_dir.join(service.systemd_unit()), unit)?;
     }
 
-    ensure_systemd_linger()?;
+    let notes = ensure_systemd_linger()?;
     systemctl_user(&["daemon-reload"])?;
 
     for service in &services {
@@ -1633,11 +2027,21 @@ fn install_systemd_services(
         }
     }
 
-    println!("systemd user services installed in {}", unit_dir.display());
-    Ok(())
+    Ok(ServiceInstallSnapshot {
+        platform: "linux-systemd-user".to_string(),
+        install_dir: unit_dir.display().to_string(),
+        services,
+        enable,
+        start,
+        notes,
+    })
 }
 
-fn uninstall_systemd_services(cfg: &AppConfig, disable: bool, stop: bool) -> Result<()> {
+fn uninstall_systemd_services(
+    cfg: &AppConfig,
+    disable: bool,
+    stop: bool,
+) -> Result<ServiceUninstallSnapshot> {
     let services = selected_boot_services(cfg);
     for service in &services {
         if stop {
@@ -1655,20 +2059,29 @@ fn uninstall_systemd_services(cfg: &AppConfig, disable: bool, stop: bool) -> Res
 
     let _ = systemctl_user(&["daemon-reload"]);
 
-    println!("systemd user services removed");
-    Ok(())
+    Ok(ServiceUninstallSnapshot {
+        platform: "linux-systemd-user".to_string(),
+        disable,
+        stop,
+        services,
+        notes: vec![format!("removed units from {}", unit_dir.display())],
+    })
 }
 
-fn status_systemd_services(cfg: &AppConfig) -> Result<()> {
+fn status_systemd_services(cfg: &AppConfig) -> Result<ServiceStatusSnapshot> {
     let services = selected_boot_services(cfg);
+    let mut linger_user = None;
+    let mut linger_state = None;
     if let Ok(user) = current_username() {
-        match loginctl_linger_state(&user) {
-            Ok(Some(enabled)) => println!("systemd linger ({}): {}", user, enabled),
-            Ok(None) => println!("systemd linger ({}): unknown", user),
-            Err(exc) => println!("systemd linger ({}): error ({})", user, exc),
-        }
+        linger_user = Some(user.clone());
+        linger_state = match loginctl_linger_state(&user) {
+            Ok(Some(enabled)) => Some(enabled.to_string()),
+            Ok(None) => Some("unknown".to_string()),
+            Err(exc) => Some(format!("error ({exc})")),
+        };
     }
 
+    let mut rows = Vec::new();
     for service in &services {
         let enabled = Command::new("systemctl")
             .arg("--user")
@@ -1690,10 +2103,21 @@ fn status_systemd_services(cfg: &AppConfig) -> Result<()> {
             .map(|s| s.success())
             .unwrap_or(false);
 
-        println!("{}: enabled={} active={}", service.name(), enabled, active);
+        rows.push(ServiceStatusRow {
+            service: *service,
+            installed: None,
+            loaded: None,
+            enabled: Some(enabled),
+            active: Some(active),
+        });
     }
 
-    Ok(())
+    Ok(ServiceStatusSnapshot {
+        platform: "linux-systemd-user".to_string(),
+        linger_user,
+        linger_state,
+        rows,
+    })
 }
 
 async fn cmd_service_install(
@@ -1702,7 +2126,7 @@ async fn cmd_service_install(
     paths: &RuntimePaths,
     enable: bool,
     start: bool,
-) -> Result<()> {
+) -> Result<ServiceInstallSnapshot> {
     ensure_runtime_dirs(paths)?;
     let _ = resolve_clickhouse_server_command(cfg, paths).await?;
 
@@ -1713,7 +2137,11 @@ async fn cmd_service_install(
     }
 }
 
-fn cmd_service_uninstall(cfg: &AppConfig, disable: bool, stop: bool) -> Result<()> {
+fn cmd_service_uninstall(
+    cfg: &AppConfig,
+    disable: bool,
+    stop: bool,
+) -> Result<ServiceUninstallSnapshot> {
     match std::env::consts::OS {
         "macos" => uninstall_launchd_services(cfg, disable, stop),
         "linux" => uninstall_systemd_services(cfg, disable, stop),
@@ -1721,7 +2149,7 @@ fn cmd_service_uninstall(cfg: &AppConfig, disable: bool, stop: bool) -> Result<(
     }
 }
 
-fn cmd_service_status(cfg: &AppConfig) -> Result<()> {
+fn cmd_service_status(cfg: &AppConfig) -> Result<ServiceStatusSnapshot> {
     match std::env::consts::OS {
         "macos" => status_launchd_services(cfg),
         "linux" => status_systemd_services(cfg),
@@ -1729,187 +2157,503 @@ fn cmd_service_status(cfg: &AppConfig) -> Result<()> {
     }
 }
 
-fn parse_service_install_flags(args: &[String]) -> Result<(bool, bool)> {
-    let mut enable = false;
-    let mut start = false;
-    let mut explicit = false;
-
-    for arg in args {
-        match arg.as_str() {
-            "--enable" => {
-                explicit = true;
-                enable = true;
-            }
-            "--start" => {
-                explicit = true;
-                start = true;
-            }
-            _ => bail!("unexpected service install arg: {}", arg),
-        }
-    }
-
-    if !explicit {
-        enable = true;
-        start = true;
-    }
-
-    Ok((enable, start))
-}
-
-fn parse_service_uninstall_flags(args: &[String]) -> Result<(bool, bool)> {
-    let mut disable = false;
-    let mut stop = false;
-    let mut explicit = false;
-
-    for arg in args {
-        match arg.as_str() {
-            "--disable" => {
-                explicit = true;
-                disable = true;
-            }
-            "--stop" => {
-                explicit = true;
-                stop = true;
-            }
-            _ => bail!("unexpected service uninstall arg: {}", arg),
-        }
-    }
-
-    if !explicit {
-        disable = true;
-        stop = true;
-    }
-
-    Ok((disable, stop))
-}
-
-fn parse_clickhouse_install_flags(
-    args: &[String],
-    default_version: &str,
-) -> Result<(bool, String)> {
-    let mut force = false;
-    let mut version = default_version.to_string();
-    let mut i = 0usize;
-
-    while i < args.len() {
-        match args[i].as_str() {
-            "--force" => {
-                force = true;
-                i += 1;
-            }
-            "--version" => {
-                if i + 1 >= args.len() {
-                    bail!("--version requires a value");
-                }
-                version = args[i + 1].clone();
-                i += 2;
-            }
-            other => bail!("unexpected clickhouse install arg: {}", other),
-        }
-    }
-
-    Ok((force, version))
-}
-
-async fn cmd_clickhouse_install(paths: &RuntimePaths, version: &str, force: bool) -> Result<()> {
+async fn cmd_clickhouse_install(
+    paths: &RuntimePaths,
+    version: &str,
+    force: bool,
+) -> Result<PathBuf> {
     ensure_runtime_dirs(paths)?;
     let installed = install_managed_clickhouse(paths, version, force).await?;
-    println!("managed clickhouse installed: {}", installed.display());
-    Ok(())
+    Ok(installed)
 }
 
-fn cmd_clickhouse_status(cfg: &AppConfig, paths: &RuntimePaths) {
+fn cmd_clickhouse_status(cfg: &AppConfig, paths: &RuntimePaths) -> ClickhouseStatusSnapshot {
     let clickhouse = managed_clickhouse_bin(paths, "clickhouse");
     let clickhouse_server = managed_clickhouse_bin(paths, "clickhouse-server");
     let clickhouse_client = managed_clickhouse_bin(paths, "clickhouse-client");
     let (active_source, active_source_path) = active_clickhouse_source(paths);
 
-    println!("managed root: {}", paths.managed_clickhouse_dir.display());
-    println!("clickhouse: {}", clickhouse.exists());
-    println!("clickhouse-server: {}", clickhouse_server.exists());
-    println!("clickhouse-client: {}", clickhouse_client.exists());
-    println!("expected version: {}", cfg.runtime.clickhouse_version);
-    println!(
-        "active source: {}{}",
-        active_source,
-        active_source_path
-            .as_ref()
-            .map(|path| format!(" ({})", path.display()))
-            .unwrap_or_default()
-    );
-    println!(
-        "checksum state: {}",
-        managed_clickhouse_checksum_state(cfg, paths)
-    );
-
-    if let Some(version) = managed_clickhouse_version(paths) {
-        println!("installed version: {}", version);
+    ClickhouseStatusSnapshot {
+        managed_root: paths.managed_clickhouse_dir.display().to_string(),
+        clickhouse_exists: clickhouse.exists(),
+        clickhouse_server_exists: clickhouse_server.exists(),
+        clickhouse_client_exists: clickhouse_client.exists(),
+        expected_version: cfg.runtime.clickhouse_version.clone(),
+        active_source: active_source.to_string(),
+        active_source_path: active_source_path.map(|path| path.display().to_string()),
+        checksum_state: managed_clickhouse_checksum_state(cfg, paths),
+        installed_version: managed_clickhouse_version(paths),
     }
 }
 
-fn cmd_clickhouse_uninstall(paths: &RuntimePaths) -> Result<()> {
+fn cmd_clickhouse_uninstall(paths: &RuntimePaths) -> Result<String> {
     if paths.managed_clickhouse_dir.exists() {
         fs::remove_dir_all(&paths.managed_clickhouse_dir).with_context(|| {
             format!("failed removing {}", paths.managed_clickhouse_dir.display())
         })?;
     }
 
-    println!(
-        "managed clickhouse removed: {}",
-        paths.managed_clickhouse_dir.display()
-    );
+    Ok(paths.managed_clickhouse_dir.display().to_string())
+}
+
+fn health_label(value: bool) -> &'static str {
+    if value {
+        "healthy"
+    } else {
+        "unhealthy"
+    }
+}
+
+fn state_label(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn format_start_state(outcome: &StartOutcome) -> String {
+    match outcome.state {
+        StartState::Started => "started".to_string(),
+        StartState::AlreadyRunning => "already running".to_string(),
+    }
+}
+
+fn render_status(output: &CliOutput, snapshot: &StatusSnapshot) -> Result<()> {
+    if output.is_json() {
+        println!("{}", serde_json::to_string_pretty(snapshot)?);
+        return Ok(());
+    }
+
+    let service_rows = snapshot
+        .services
+        .iter()
+        .map(|row| {
+            vec![
+                row.service.name().to_string(),
+                if row.pid.is_some() {
+                    "running".to_string()
+                } else {
+                    "stopped".to_string()
+                },
+                row.pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+            ]
+        })
+        .collect::<Vec<_>>();
+    output.table("Services", &["service", "state", "pid"], &service_rows);
+
+    let mut clickhouse_lines = vec![
+        format!(
+            "managed install: {}",
+            if snapshot.managed_clickhouse_installed {
+                "present"
+            } else {
+                "missing"
+            }
+        ),
+        format!("managed binary: {}", snapshot.managed_clickhouse_path),
+        format!(
+            "active source: {}{}",
+            snapshot.clickhouse_active_source,
+            snapshot
+                .clickhouse_active_source_path
+                .as_ref()
+                .map(|p| format!(" ({p})"))
+                .unwrap_or_default()
+        ),
+        format!("checksum: {}", snapshot.managed_clickhouse_checksum),
+    ];
+    if let Some(version) = &snapshot.managed_clickhouse_version {
+        clickhouse_lines.push(format!("managed version: {version}"));
+    }
+    output.section("ClickHouse Runtime", &clickhouse_lines);
+
+    let mut doctor_lines = vec![
+        format!(
+            "clickhouse: {}",
+            health_label(snapshot.doctor.clickhouse_healthy)
+        ),
+        format!(
+            "database exists: {}",
+            state_label(snapshot.doctor.database_exists)
+        ),
+        format!(
+            "pending migrations: {}",
+            if snapshot.doctor.pending_migrations.is_empty() {
+                "none".to_string()
+            } else {
+                snapshot.doctor.pending_migrations.join(", ")
+            }
+        ),
+        format!(
+            "missing tables: {}",
+            if snapshot.doctor.missing_tables.is_empty() {
+                "none".to_string()
+            } else {
+                snapshot.doctor.missing_tables.join(", ")
+            }
+        ),
+    ];
+    if let Some(version) = &snapshot.doctor.clickhouse_version {
+        doctor_lines.push(format!("server version: {version}"));
+    }
+    if output.verbose && !snapshot.doctor.errors.is_empty() {
+        doctor_lines.push(format!("errors: {}", snapshot.doctor.errors.join(" | ")));
+    }
+    output.section("Database Health", &doctor_lines);
+
+    let heartbeat_lines = match &snapshot.heartbeat {
+        HeartbeatSnapshot::Available {
+            latest,
+            queue_depth,
+            files_active,
+            watcher_backend,
+            watcher_error_count,
+            watcher_reset_count,
+            watcher_last_reset_unix_ms,
+        } => {
+            let mut lines = vec![
+                format!("latest: {latest}"),
+                format!("queue depth: {queue_depth}"),
+                format!("files active: {files_active}"),
+                format!("watcher backend: {watcher_backend}"),
+                format!("watcher errors: {watcher_error_count}"),
+                format!("watcher resets: {watcher_reset_count}"),
+            ];
+            if output.verbose {
+                lines.push(format!(
+                    "watcher last reset unix ms: {watcher_last_reset_unix_ms}"
+                ));
+            }
+            lines
+        }
+        HeartbeatSnapshot::Unavailable => vec!["heartbeat unavailable".to_string()],
+        HeartbeatSnapshot::Error { message } => vec![format!("heartbeat error: {message}")],
+    };
+    output.section("Ingest Heartbeat", &heartbeat_lines);
+    Ok(())
+}
+
+fn render_db_migrate(output: &CliOutput, outcome: &MigrationOutcome) -> Result<()> {
+    if output.is_json() {
+        println!("{}", serde_json::to_string_pretty(outcome)?);
+        return Ok(());
+    }
+    if outcome.applied.is_empty() {
+        output.section("Database Migrations", &["already up to date".to_string()]);
+        return Ok(());
+    }
+    let rows = outcome
+        .applied
+        .iter()
+        .enumerate()
+        .map(|(idx, migration)| vec![(idx + 1).to_string(), migration.to_string()])
+        .collect::<Vec<_>>();
+    output.table("Applied Migrations", &["#", "migration"], &rows);
+    Ok(())
+}
+
+fn doctor_is_healthy(report: &DoctorReport) -> bool {
+    report.clickhouse_healthy
+        && report.database_exists
+        && report.pending_migrations.is_empty()
+        && report.missing_tables.is_empty()
+        && report.errors.is_empty()
+}
+
+fn render_db_doctor(output: &CliOutput, report: &DoctorReport) -> Result<()> {
+    if output.is_json() {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+
+    let mut lines = vec![
+        format!("clickhouse: {}", health_label(report.clickhouse_healthy)),
+        format!("database: {}", report.database),
+        format!("database exists: {}", state_label(report.database_exists)),
+        format!(
+            "pending migrations: {}",
+            if report.pending_migrations.is_empty() {
+                "none".to_string()
+            } else {
+                report.pending_migrations.join(", ")
+            }
+        ),
+        format!(
+            "missing tables: {}",
+            if report.missing_tables.is_empty() {
+                "none".to_string()
+            } else {
+                report.missing_tables.join(", ")
+            }
+        ),
+    ];
+    if let Some(version) = &report.clickhouse_version {
+        lines.push(format!("clickhouse version: {version}"));
+    }
+    if output.verbose && !report.applied_migrations.is_empty() {
+        lines.push(format!(
+            "applied migrations: {}",
+            report.applied_migrations.join(", ")
+        ));
+    }
+    if !report.errors.is_empty() {
+        lines.push(format!("errors: {}", report.errors.join(" | ")));
+    }
+    output.section("DB Doctor", &lines);
+    Ok(())
+}
+
+fn render_logs(output: &CliOutput, snapshot: &LogsSnapshot) -> Result<()> {
+    if output.is_json() {
+        println!("{}", serde_json::to_string_pretty(snapshot)?);
+        return Ok(());
+    }
+    for section in &snapshot.sections {
+        let mut lines = vec![
+            format!("path: {}", section.path),
+            format!("lines requested: {}", snapshot.requested_lines),
+        ];
+        if !section.exists {
+            lines.push("log file: missing".to_string());
+            output.section(&format!("Logs: {}", section.service.name()), &lines);
+            continue;
+        }
+        lines.push(format!("lines returned: {}", section.lines.len()));
+        output.section(&format!("Logs: {}", section.service.name()), &lines);
+        for line in &section.lines {
+            output.line(line);
+        }
+    }
+    Ok(())
+}
+
+fn render_clickhouse_status(output: &CliOutput, snapshot: &ClickhouseStatusSnapshot) -> Result<()> {
+    if output.is_json() {
+        println!("{}", serde_json::to_string_pretty(snapshot)?);
+        return Ok(());
+    }
+    let mut lines = vec![
+        format!("managed root: {}", snapshot.managed_root),
+        format!(
+            "clickhouse binary: {}",
+            state_label(snapshot.clickhouse_exists)
+        ),
+        format!(
+            "clickhouse-server binary: {}",
+            state_label(snapshot.clickhouse_server_exists)
+        ),
+        format!(
+            "clickhouse-client binary: {}",
+            state_label(snapshot.clickhouse_client_exists)
+        ),
+        format!("expected version: {}", snapshot.expected_version),
+        format!(
+            "active source: {}{}",
+            snapshot.active_source,
+            snapshot
+                .active_source_path
+                .as_ref()
+                .map(|p| format!(" ({p})"))
+                .unwrap_or_default()
+        ),
+        format!("checksum state: {}", snapshot.checksum_state),
+    ];
+    if let Some(version) = &snapshot.installed_version {
+        lines.push(format!("installed version: {version}"));
+    }
+    output.section("Managed ClickHouse", &lines);
+    Ok(())
+}
+
+fn render_service_install(output: &CliOutput, snapshot: &ServiceInstallSnapshot) -> Result<()> {
+    if output.is_json() {
+        println!("{}", serde_json::to_string_pretty(snapshot)?);
+        return Ok(());
+    }
+    let mut lines = vec![
+        format!("platform: {}", snapshot.platform),
+        format!("install dir: {}", snapshot.install_dir),
+        format!(
+            "services: {}",
+            snapshot
+                .services
+                .iter()
+                .map(|svc| svc.name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        format!("enable: {}", state_label(snapshot.enable)),
+        format!("start: {}", state_label(snapshot.start)),
+    ];
+    lines.extend(snapshot.notes.iter().cloned());
+    output.section("Service Install", &lines);
+    Ok(())
+}
+
+fn render_service_uninstall(output: &CliOutput, snapshot: &ServiceUninstallSnapshot) -> Result<()> {
+    if output.is_json() {
+        println!("{}", serde_json::to_string_pretty(snapshot)?);
+        return Ok(());
+    }
+    let mut lines = vec![
+        format!("platform: {}", snapshot.platform),
+        format!("disable: {}", state_label(snapshot.disable)),
+        format!("stop: {}", state_label(snapshot.stop)),
+        format!(
+            "services: {}",
+            snapshot
+                .services
+                .iter()
+                .map(|svc| svc.name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    ];
+    lines.extend(snapshot.notes.iter().cloned());
+    output.section("Service Uninstall", &lines);
+    Ok(())
+}
+
+fn render_service_status(output: &CliOutput, snapshot: &ServiceStatusSnapshot) -> Result<()> {
+    if output.is_json() {
+        println!("{}", serde_json::to_string_pretty(snapshot)?);
+        return Ok(());
+    }
+    let mut lines = vec![format!("platform: {}", snapshot.platform)];
+    if let (Some(user), Some(state)) = (&snapshot.linger_user, &snapshot.linger_state) {
+        lines.push(format!("systemd linger ({user}): {state}"));
+    }
+    output.section("Service Manager", &lines);
+
+    let headers = if snapshot.platform.starts_with("macos") {
+        vec!["service", "installed", "loaded"]
+    } else {
+        vec!["service", "enabled", "active"]
+    };
+    let rows = snapshot
+        .rows
+        .iter()
+        .map(|row| {
+            if snapshot.platform.starts_with("macos") {
+                vec![
+                    row.service.name().to_string(),
+                    row.installed.map(state_label).unwrap_or("-").to_string(),
+                    row.loaded.map(state_label).unwrap_or("-").to_string(),
+                ]
+            } else {
+                vec![
+                    row.service.name().to_string(),
+                    row.enabled.map(state_label).unwrap_or("-").to_string(),
+                    row.active.map(state_label).unwrap_or("-").to_string(),
+                ]
+            }
+        })
+        .collect::<Vec<_>>();
+    output.table("Services", &headers, &rows);
+    Ok(())
+}
+
+fn render_up(output: &CliOutput, snapshot: &UpSnapshot) -> Result<()> {
+    if output.is_json() {
+        println!("{}", serde_json::to_string_pretty(snapshot)?);
+        return Ok(());
+    }
+    let mut rows = vec![vec![
+        snapshot.clickhouse.service.name().to_string(),
+        format_start_state(&snapshot.clickhouse),
+        snapshot.clickhouse.pid.to_string(),
+    ]];
+    rows.extend(snapshot.services.iter().map(|outcome| {
+        vec![
+            outcome.service.name().to_string(),
+            format_start_state(outcome),
+            outcome.pid.to_string(),
+        ]
+    }));
+    output.table("Startup Results", &["service", "result", "pid"], &rows);
+    render_db_migrate(output, &snapshot.migrations)?;
+    render_status(output, &snapshot.status)?;
+    Ok(())
+}
+
+fn render_down(output: &CliOutput, snapshot: &DownSnapshot) -> Result<()> {
+    if output.is_json() {
+        println!("{}", serde_json::to_string_pretty(snapshot)?);
+        return Ok(());
+    }
+    if snapshot.stopped.is_empty() {
+        output.section("Shutdown", &["no running services found".to_string()]);
+        return Ok(());
+    }
+    let rows = snapshot
+        .stopped
+        .iter()
+        .map(|service| vec![service.name().to_string(), "stopped".to_string()])
+        .collect::<Vec<_>>();
+    output.table("Shutdown", &["service", "result"], &rows);
     Ok(())
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<ExitCode> {
-    let mut args = std::env::args().skip(1).collect::<Vec<_>>();
-    if args.is_empty() {
-        usage();
-        return Ok(ExitCode::from(2));
-    }
-    if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help" | "help") {
-        usage();
-        return Ok(ExitCode::SUCCESS);
-    }
+    let cli = Cli::parse();
+    let output = CliOutput::from_cli(&cli);
 
-    let command = args.remove(0);
-
-    match command.as_str() {
-        "up" => {
-            let (raw_config, rest) = parse_config_flag(&args)?;
-            let (config_path, cfg) = load_cfg(raw_config)?;
+    match cli.command {
+        CliCommand::Up(args) => {
+            let (config_path, cfg) = load_cfg(cli.config.clone())?;
             let paths = runtime_paths(&cfg);
             ensure_runtime_dirs(&paths)?;
 
-            let no_ingest = rest.iter().any(|arg| arg == "--no-ingest");
-            let force_monitor = rest.iter().any(|arg| arg == "--monitor");
-            let force_mcp = rest.iter().any(|arg| arg == "--mcp");
+            let clickhouse = start_clickhouse(&cfg, &paths).await?;
+            let migrations = cmd_db_migrate(&cfg).await?;
 
-            start_clickhouse(&cfg, &paths).await?;
-            cmd_db_migrate(&cfg).await?;
+            let mut started_services = Vec::new();
+            if !args.no_ingest {
+                started_services.push(start_background_service(
+                    Service::Ingest,
+                    &config_path,
+                    &cfg,
+                    &paths,
+                    &[],
+                )?);
+            }
+            if args.monitor || cfg.runtime.start_monitor_on_up {
+                started_services.push(start_background_service(
+                    Service::Monitor,
+                    &config_path,
+                    &cfg,
+                    &paths,
+                    &[],
+                )?);
+            }
+            if args.mcp || cfg.runtime.start_mcp_on_up {
+                started_services.push(start_background_service(
+                    Service::Mcp,
+                    &config_path,
+                    &cfg,
+                    &paths,
+                    &[],
+                )?);
+            }
 
-            if !no_ingest {
-                start_background_service(Service::Ingest, &config_path, &cfg, &paths, &[])?;
-            }
-            if force_monitor || cfg.runtime.start_monitor_on_up {
-                start_background_service(Service::Monitor, &config_path, &cfg, &paths, &[])?;
-            }
-            if force_mcp || cfg.runtime.start_mcp_on_up {
-                start_background_service(Service::Mcp, &config_path, &cfg, &paths, &[])?;
-            }
-
-            cmd_status(&paths, &cfg).await?;
+            let status = cmd_status(&paths, &cfg).await?;
+            let snapshot = UpSnapshot {
+                clickhouse,
+                migrations,
+                services: started_services,
+                status,
+            };
+            render_up(&output, &snapshot)?;
             Ok(ExitCode::SUCCESS)
         }
-        "down" => {
-            let (raw_config, rest) = parse_config_flag(&args)?;
-            if !rest.is_empty() {
-                bail!("unexpected arguments for down: {}", rest.join(" "));
-            }
-            let (_, cfg) = load_cfg(raw_config)?;
+        CliCommand::Down => {
+            let (_, cfg) = load_cfg(cli.config.clone())?;
             let paths = runtime_paths(&cfg);
-
+            let mut stopped = Vec::new();
             for service in [
                 Service::Mcp,
                 Service::Monitor,
@@ -1917,163 +2661,133 @@ async fn main() -> Result<ExitCode> {
                 Service::ClickHouse,
             ] {
                 if stop_service(&paths, service)? {
-                    println!("stopped {}", service.name());
+                    stopped.push(service);
                 }
             }
-
+            render_down(&output, &DownSnapshot { stopped })?;
             Ok(ExitCode::SUCCESS)
         }
-        "status" => {
-            let (raw_config, rest) = parse_config_flag(&args)?;
-            if !rest.is_empty() {
-                bail!("unexpected arguments for status: {}", rest.join(" "));
-            }
-            let (_, cfg) = load_cfg(raw_config)?;
+        CliCommand::Status => {
+            let (_, cfg) = load_cfg(cli.config.clone())?;
             let paths = runtime_paths(&cfg);
-            cmd_status(&paths, &cfg).await?;
+            let snapshot = cmd_status(&paths, &cfg).await?;
+            render_status(&output, &snapshot)?;
             Ok(ExitCode::SUCCESS)
         }
-        "logs" => {
-            let (service, lines, raw_config) = parse_logs_args(&args)?;
-            let (_, cfg) = load_cfg(raw_config)?;
+        CliCommand::Logs(args) => {
+            let (_, cfg) = load_cfg(cli.config.clone())?;
             let paths = runtime_paths(&cfg);
-            print_logs(&paths, service, lines)?;
+            let snapshot = collect_logs(&paths, args.service, args.lines)?;
+            render_logs(&output, &snapshot)?;
             Ok(ExitCode::SUCCESS)
         }
-        "db" => {
-            if args.is_empty() {
-                usage();
-                return Ok(ExitCode::from(2));
-            }
-
-            let sub = args.remove(0);
-            let (raw_config, rest) = parse_config_flag(&args)?;
-            if !rest.is_empty() {
-                bail!("unexpected db args: {}", rest.join(" "));
-            }
-
-            let (_, cfg) = load_cfg(raw_config)?;
-
-            match sub.as_str() {
-                "migrate" => {
-                    cmd_db_migrate(&cfg).await?;
+        CliCommand::Db(args) => {
+            let (_, cfg) = load_cfg(cli.config.clone())?;
+            match args.command {
+                DbCommand::Migrate => {
+                    let outcome = cmd_db_migrate(&cfg).await?;
+                    render_db_migrate(&output, &outcome)?;
                     Ok(ExitCode::SUCCESS)
                 }
-                "doctor" => {
+                DbCommand::Doctor => {
                     let report = cmd_db_doctor(&cfg).await?;
-                    println!("{}", serde_json::to_string_pretty(&report)?);
-                    let healthy = report.clickhouse_healthy
-                        && report.database_exists
-                        && report.pending_migrations.is_empty()
-                        && report.missing_tables.is_empty()
-                        && report.errors.is_empty();
-
-                    if healthy {
+                    render_db_doctor(&output, &report)?;
+                    if doctor_is_healthy(&report) {
                         Ok(ExitCode::SUCCESS)
                     } else {
                         Ok(ExitCode::from(1))
                     }
                 }
-                _ => {
-                    usage();
-                    Ok(ExitCode::from(2))
-                }
             }
         }
-        "clickhouse" => {
-            if args.is_empty() {
-                usage();
-                return Ok(ExitCode::from(2));
-            }
-
-            let sub = args.remove(0);
-            let (raw_config, rest) = parse_config_flag(&args)?;
-            let (_, cfg) = load_cfg(raw_config)?;
+        CliCommand::Clickhouse(args) => {
+            let (_, cfg) = load_cfg(cli.config.clone())?;
             let paths = runtime_paths(&cfg);
-
-            match sub.as_str() {
-                "install" => {
-                    let (force, version) =
-                        parse_clickhouse_install_flags(&rest, &cfg.runtime.clickhouse_version)?;
-                    cmd_clickhouse_install(&paths, &version, force).await?;
-                    Ok(ExitCode::SUCCESS)
-                }
-                "status" => {
-                    if !rest.is_empty() {
-                        bail!("unexpected clickhouse status args: {}", rest.join(" "));
+            match args.command {
+                ClickhouseCommand::Install(install) => {
+                    let version = install
+                        .version
+                        .unwrap_or_else(|| cfg.runtime.clickhouse_version.clone());
+                    let installed = cmd_clickhouse_install(&paths, &version, install.force).await?;
+                    if output.is_json() {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "installed_path": installed.display().to_string(),
+                                "version": version,
+                                "force": install.force,
+                            }))?
+                        );
+                    } else {
+                        output.section(
+                            "Managed ClickHouse Install",
+                            &[
+                                format!("installed binary: {}", installed.display()),
+                                format!("version: {version}"),
+                                format!("force: {}", state_label(install.force)),
+                            ],
+                        );
                     }
-                    cmd_clickhouse_status(&cfg, &paths);
                     Ok(ExitCode::SUCCESS)
                 }
-                "uninstall" => {
-                    if !rest.is_empty() {
-                        bail!("unexpected clickhouse uninstall args: {}", rest.join(" "));
+                ClickhouseCommand::Status => {
+                    let snapshot = cmd_clickhouse_status(&cfg, &paths);
+                    render_clickhouse_status(&output, &snapshot)?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                ClickhouseCommand::Uninstall => {
+                    let removed = cmd_clickhouse_uninstall(&paths)?;
+                    if output.is_json() {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "removed_path": removed
+                            }))?
+                        );
+                    } else {
+                        output.section(
+                            "Managed ClickHouse Uninstall",
+                            &[format!("removed: {removed}")],
+                        );
                     }
-                    cmd_clickhouse_uninstall(&paths)?;
                     Ok(ExitCode::SUCCESS)
-                }
-                _ => {
-                    usage();
-                    Ok(ExitCode::from(2))
                 }
             }
         }
-        "service" => {
-            if args.is_empty() {
-                usage();
-                return Ok(ExitCode::from(2));
+        CliCommand::Service(args) => {
+            let (config_path, cfg) = load_cfg(cli.config.clone())?;
+            let paths = runtime_paths(&cfg);
+            match args.command {
+                ServiceCommand::Install(install) => {
+                    let explicit = install.enable || install.start;
+                    let enable = if explicit { install.enable } else { true };
+                    let start = if explicit { install.start } else { true };
+                    let snapshot =
+                        cmd_service_install(&config_path, &cfg, &paths, enable, start).await?;
+                    render_service_install(&output, &snapshot)?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                ServiceCommand::Uninstall(uninstall) => {
+                    let explicit = uninstall.disable || uninstall.stop;
+                    let disable = if explicit { uninstall.disable } else { true };
+                    let stop = if explicit { uninstall.stop } else { true };
+                    let snapshot = cmd_service_uninstall(&cfg, disable, stop)?;
+                    render_service_uninstall(&output, &snapshot)?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                ServiceCommand::Status => {
+                    let snapshot = cmd_service_status(&cfg)?;
+                    render_service_status(&output, &snapshot)?;
+                    Ok(ExitCode::SUCCESS)
+                }
             }
-
-            let sub = args.remove(0);
-            let (raw_config, rest) = parse_config_flag(&args)?;
+        }
+        CliCommand::Run(run) => {
+            let (inline_config, passthrough) = parse_config_flag(&run.args)?;
+            let raw_config = inline_config.or(cli.config.clone());
             let (config_path, cfg) = load_cfg(raw_config)?;
             let paths = runtime_paths(&cfg);
-
-            match sub.as_str() {
-                "install" => {
-                    let (enable, start) = parse_service_install_flags(&rest)?;
-                    cmd_service_install(&config_path, &cfg, &paths, enable, start).await?;
-                    Ok(ExitCode::SUCCESS)
-                }
-                "uninstall" => {
-                    let (disable, stop) = parse_service_uninstall_flags(&rest)?;
-                    cmd_service_uninstall(&cfg, disable, stop)?;
-                    Ok(ExitCode::SUCCESS)
-                }
-                "status" => {
-                    if !rest.is_empty() {
-                        bail!("unexpected service status args: {}", rest.join(" "));
-                    }
-                    cmd_service_status(&cfg)?;
-                    Ok(ExitCode::SUCCESS)
-                }
-                _ => {
-                    usage();
-                    Ok(ExitCode::from(2))
-                }
-            }
-        }
-        "run" => {
-            if args.is_empty() {
-                usage();
-                return Ok(ExitCode::from(2));
-            }
-
-            let service_name = args.remove(0);
-            let (raw_config, passthrough) = parse_config_flag(&args)?;
-            let (config_path, cfg) = load_cfg(raw_config)?;
-            let paths = runtime_paths(&cfg);
-
-            let Some(service) = parse_service(&service_name) else {
-                usage();
-                return Ok(ExitCode::from(2));
-            };
-
-            run_foreground_service(service, &config_path, &cfg, &paths, &passthrough).await
-        }
-        _ => {
-            usage();
-            Ok(ExitCode::from(2))
+            run_foreground_service(run.service, &config_path, &cfg, &paths, &passthrough).await
         }
     }
 }
@@ -2134,16 +2848,60 @@ mod tests {
     }
 
     #[test]
-    fn parse_clickhouse_install_flags_supports_version_and_force() {
-        let args = vec![
-            "--version".to_string(),
-            "v25.12.5.44-stable".to_string(),
-            "--force".to_string(),
-        ];
-        let (force, version) =
-            parse_clickhouse_install_flags(&args, DEFAULT_CLICKHOUSE_TAG).expect("parse flags");
-        assert!(force);
-        assert_eq!(version, "v25.12.5.44-stable");
+    fn clap_parses_clickhouse_install_flags() {
+        let cli = Cli::parse_from([
+            "cortexctl",
+            "clickhouse",
+            "install",
+            "--version",
+            "v25.12.5.44-stable",
+            "--force",
+        ]);
+        match cli.command {
+            CliCommand::Clickhouse(ClickhouseArgs {
+                command: ClickhouseCommand::Install(install),
+            }) => {
+                assert!(install.force);
+                assert_eq!(install.version.as_deref(), Some("v25.12.5.44-stable"));
+            }
+            _ => panic!("expected clickhouse install command"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_run_passthrough_args() {
+        let cli = Cli::parse_from([
+            "cortexctl",
+            "--output",
+            "plain",
+            "run",
+            "mcp",
+            "--",
+            "--stdio",
+            "--transport",
+            "jsonrpc",
+        ]);
+        match cli.command {
+            CliCommand::Run(run) => {
+                assert_eq!(run.service, Service::Mcp);
+                assert_eq!(
+                    run.args,
+                    vec![
+                        "--stdio".to_string(),
+                        "--transport".to_string(),
+                        "jsonrpc".to_string(),
+                    ]
+                );
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn output_mode_respects_json_flag() {
+        let cli = Cli::parse_from(["cortexctl", "--output", "json", "status"]);
+        let output = CliOutput::from_cli(&cli);
+        assert_eq!(output.mode, OutputMode::Json);
     }
 
     #[test]

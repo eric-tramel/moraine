@@ -23,6 +23,7 @@ Start the local stack and confirm it is healthy:
 ```bash
 cortexctl up
 cortexctl status
+cortexctl status --output rich --verbose
 ```
 
 Open the monitor UI:

@@ -87,6 +87,7 @@ Resolution precedence:
 ```bash
 cd ~/src/cortex
 bin/cortexctl up
+bin/cortexctl up --output rich
 ```
 
 `cortexctl up` does the following:
@@ -106,6 +107,7 @@ It auto-installs managed ClickHouse when missing and `runtime.clickhouse_auto_in
 cd ~/src/cortex
 bin/cortexctl db migrate
 bin/cortexctl db doctor
+bin/cortexctl db doctor --output json
 ```
 
 `db doctor` checks:
@@ -143,12 +145,19 @@ bin/cortexctl service uninstall
 ```bash
 cd ~/src/cortex
 bin/cortexctl status
+bin/cortexctl status --output rich --verbose
+bin/cortexctl status --output json
 bin/cortexctl logs
-bin/cortexctl logs ingest --lines 200
+bin/cortexctl logs ingest --lines 200 --output plain
 bin/cortexctl down
 ```
 
 Status includes process state, DB health/schema checks, and latest ingest heartbeat metrics.
+
+All subcommands support output control:
+
+- `--output auto|rich|plain|json` (default `auto`, rich on TTY).
+- `--verbose` for expanded diagnostics in rich/plain output.
 
 ## Legacy scripts
 
