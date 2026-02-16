@@ -458,6 +458,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             name: "005_watcher_heartbeat_metrics.sql",
             sql: include_str!("../../../sql/005_watcher_heartbeat_metrics.sql"),
         },
+        Migration {
+            version: "006",
+            name: "006_search_stats_authoritative_views.sql",
+            sql: include_str!("../../../sql/006_search_stats_authoritative_views.sql"),
+        },
     ]
 }
 
