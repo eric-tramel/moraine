@@ -82,8 +82,12 @@ Requires a Rust toolchain (`cargo`, `rustc`):
 ```bash
 git clone https://github.com/eric-tramel/cortex.git ~/src/cortex
 cd ~/src/cortex
-cargo install --path apps/cortexctl --locked
+for crate in cortexctl cortex-ingest cortex-monitor cortex-mcp; do
+  cargo install --path "apps/$crate" --locked
+done
 ```
+
+This installs all runtime binaries expected by `cortexctl up`.
 
 ## More Details
 

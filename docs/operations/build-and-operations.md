@@ -18,23 +18,27 @@ This produces binaries for:
 - `cortex-monitor`
 - `cortex-mcp`
 
-## Install `cortexctl`
+## Install Runtime Binaries From Source
 
 ### Cargo install
 
 ```bash
 git clone https://github.com/eric-tramel/cortex.git ~/src/cortex
 cd ~/src/cortex
-cargo install --path apps/cortexctl --locked
+for crate in cortexctl cortex-ingest cortex-monitor cortex-mcp; do
+  cargo install --path "apps/$crate" --locked
+done
 ```
 
 Or install directly from GitHub without cloning:
 
 ```bash
-cargo install --git https://github.com/eric-tramel/cortex.git \
-  --package cortexctl \
-  --bin cortexctl \
-  --locked
+for bin in cortexctl cortex-ingest cortex-monitor cortex-mcp; do
+  cargo install --git https://github.com/eric-tramel/cortex.git \
+    --package "$bin" \
+    --bin "$bin" \
+    --locked
+done
 ```
 
 ### Prebuilt release binary
