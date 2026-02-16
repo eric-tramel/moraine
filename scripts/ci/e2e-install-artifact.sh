@@ -87,7 +87,6 @@ main() {
   local install_script="$repo_root/scripts/install-cortexctl.sh"
   local e2e_script="$repo_root/scripts/ci/e2e-stack.sh"
   local python_bin="${PYTHON_BIN:-python3}"
-  local bun_bin=""
   local run_stamp
   run_stamp="$(date +%s)_$$_$RANDOM"
   local bundle_version="ci-e2e-${run_stamp}"
@@ -96,10 +95,6 @@ main() {
   need_cmd "$python_bin"
   need_cmd tar
   need_cmd bash
-
-  if command -v bun >/dev/null 2>&1; then
-    bun_bin="$(command -v bun)"
-  fi
 
   TMP_ROOT="$(mktemp -d)"
   local dist_dir="$TMP_ROOT/dist"
@@ -122,9 +117,6 @@ main() {
   export HOME="$isolated_home"
   mkdir -p "$HOME"
   local base_path="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-  if [[ -n "$bun_bin" ]]; then
-    base_path="$(dirname "$bun_bin"):$base_path"
-  fi
   export PATH="$base_path"
   "$install_script" \
     --asset-base-url "$asset_base_url" \
