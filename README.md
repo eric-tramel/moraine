@@ -44,7 +44,7 @@ cortexctl service status
 
 | OS | Architectures | Notes |
 | --- | --- | --- |
-| macOS | `x86_64`, `aarch64` | user `launchd` services |
+| macOS | `aarch64` | user `launchd` services |
 | Linux | `x86_64`, `aarch64` | user `systemd` services (linger recommended) |
 
 ## Alternative installs

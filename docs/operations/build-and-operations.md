@@ -63,7 +63,6 @@ Tag-driven GitHub Actions release workflow:
 2. Workflow `.github/workflows/release-cortexctl.yml` builds:
    - `x86_64-unknown-linux-gnu`
    - `aarch64-unknown-linux-gnu`
-   - `x86_64-apple-darwin`
    - `aarch64-apple-darwin`
 3. Uploads `cortex-bundle-<target>.tar.gz` plus `cortex-bundle-<target>.sha256` to the tag release.
 
