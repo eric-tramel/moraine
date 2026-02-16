@@ -330,7 +330,8 @@ EOF
     if command -v node >/dev/null 2>&1 && [[ -f "node_modules/playwright/cli.js" ]]; then
       node node_modules/playwright/cli.js test --config playwright.config.cjs e2e/monitor.live.spec.ts
     else
-      bun run test:e2e -- e2e/monitor.live.spec.ts
+      # Fall back to full suite (no file filter) to avoid Bun path-filter issues.
+      bun run test:e2e
     fi
   )
 
