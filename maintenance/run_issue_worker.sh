@@ -286,7 +286,7 @@ Execution requirements:
    git push -u origin $BRANCH_NAME
 7. Create a PR to $BASE_BRANCH with:
    - clear summary and validation steps
-   - "Fixes #$ISSUE_NUMBER" in the body
+   - "Closes #$ISSUE_NUMBER" in the body
 8. Comment on issue #$ISSUE_NUMBER with the PR URL.
 
 Output format in final response (strict, lines only):
