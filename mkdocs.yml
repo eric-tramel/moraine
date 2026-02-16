@@ -28,6 +28,7 @@ extra_css:
   - https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.11.1/build/styles/github-dark.min.css
   - stylesheets/citation-pills.css
   - stylesheets/source-links.css
+  - stylesheets/unified-trace-schema.css
 
 extra_javascript:
   - https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.11.1/build/highlight.min.js
@@ -51,6 +52,7 @@ nav:
   - Cortex Core:
       - System Architecture: core/system-architecture.md
       - Data Model: core/data-model.md
+      - Unified Trace Schema Mapping: core/unified-trace-schema.md
       - Ingestion Service: core/ingestion-service.md
   - Cortex Search:
       - Retrieval and BM25: search/indexing-and-retrieval.md

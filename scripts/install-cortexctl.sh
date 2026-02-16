@@ -3,13 +3,14 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Install Cortex binaries from GitHub Releases.
+Install Cortex binaries from release bundle artifacts.
 
 usage:
-  scripts/install-cortexctl.sh --repo <owner/repo> [options]
+  scripts/install-cortexctl.sh [options]
 
 options:
-  --repo <owner/repo>   GitHub repository hosting release assets (required)
+  --repo <owner/repo>      GitHub repository hosting release assets (required unless --asset-base-url is set)
+  --asset-base-url <url>   Base URL hosting cortex-bundle-<target>.tar.gz and .sha256 assets
   --version <tag>       Release tag (default: latest)
   --install-dir <path>  Destination directory for binary (default: ~/.local/bin)
   --lib-dir <path>      Destination root for versioned bundle (default: ~/.local/lib/cortex)
@@ -20,6 +21,7 @@ options:
 examples:
   scripts/install-cortexctl.sh --repo eric-tramel/cortex
   scripts/install-cortexctl.sh --repo eric-tramel/cortex --version v0.1.1
+  scripts/install-cortexctl.sh --asset-base-url http://127.0.0.1:8080 --version ci-e2e
 EOF
 }
 
@@ -53,7 +55,7 @@ manifest_checksum() {
   local key="$2"
   grep -E "\"${key}\"[[:space:]]*:" "$manifest" \
     | head -n 1 \
-    | sed -n 's/.*:[[:space:]]*"\([0-9a-fA-F]\+\)".*/\1/p'
+    | sed -nE 's/.*:[[:space:]]*"([0-9a-fA-F]+)".*/\1/p'
 }
 
 verify_checksum() {
@@ -119,11 +121,16 @@ detect_target_triple() {
 fetch_latest_tag() {
   local repo="$1"
   local api_url="https://api.github.com/repos/${repo}/releases/latest"
-  local tag
+  local response tag
 
-  tag="$(curl -fsSL "$api_url" | sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]\+\)".*$/\1/p' | head -n 1)"
-  if [[ -z "$tag" ]]; then
+  if ! response="$(curl -fsSL "$api_url")"; then
     echo "failed to resolve latest release tag from $api_url"
+    exit 1
+  fi
+
+  tag="$(printf '%s\n' "$response" | sed -nE 's/^[[:space:]]*"tag_name":[[:space:]]*"([^"]+)".*$/\1/p' | head -n 1)"
+  if [[ -z "$tag" ]]; then
+    echo "failed to parse latest release tag from $api_url"
     exit 1
   fi
 
@@ -131,6 +138,7 @@ fetch_latest_tag() {
 }
 
 repo=""
+asset_base_url=""
 version="latest"
 install_dir="${HOME}/.local/bin"
 lib_dir="${HOME}/.local/lib/cortex"
@@ -141,6 +149,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --repo)
       repo="${2:-}"
+      shift 2
+      ;;
+    --asset-base-url)
+      asset_base_url="${2:-}"
       shift 2
       ;;
     --version)
@@ -175,8 +187,15 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$repo" ]]; then
-  echo "--repo is required"
+if [[ -n "$asset_base_url" ]]; then
+  asset_base_url="${asset_base_url%/}"
+  if [[ "$version" == "latest" ]]; then
+    echo "--version <tag> is required when --asset-base-url is set"
+    usage
+    exit 64
+  fi
+elif [[ -z "$repo" ]]; then
+  echo "--repo is required unless --asset-base-url is provided"
   usage
   exit 64
 fi
@@ -191,8 +210,13 @@ fi
 
 asset_name="cortex-bundle-${target}.tar.gz"
 checksum_name="cortex-bundle-${target}.sha256"
-asset_url="https://github.com/${repo}/releases/download/${version}/${asset_name}"
-checksum_url="https://github.com/${repo}/releases/download/${version}/${checksum_name}"
+if [[ -n "$asset_base_url" ]]; then
+  asset_url="${asset_base_url}/${asset_name}"
+  checksum_url="${asset_base_url}/${checksum_name}"
+else
+  asset_url="https://github.com/${repo}/releases/download/${version}/${asset_name}"
+  checksum_url="https://github.com/${repo}/releases/download/${version}/${checksum_name}"
+fi
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
@@ -200,15 +224,25 @@ trap 'rm -rf "$tmp_dir"' EXIT
 echo "installing Cortex ${version} for ${target}"
 echo "downloading: ${asset_url}"
 if ! curl -fL "$asset_url" -o "$tmp_dir/$asset_name"; then
-  echo "failed to download release asset: $asset_name"
-  echo "verify that repo/tag/target exists in GitHub Releases:"
-  echo "  https://github.com/${repo}/releases/tag/${version}"
+  echo "failed to download release asset: $asset_url"
+  if [[ -n "$asset_base_url" ]]; then
+    echo "verify that the artifact is available at:"
+    echo "  $asset_url"
+  else
+    echo "verify that repo/tag/target exists in GitHub Releases:"
+    echo "  https://github.com/${repo}/releases/tag/${version}"
+  fi
   exit 1
 fi
 if ! curl -fL "$checksum_url" -o "$tmp_dir/$checksum_name"; then
-  echo "failed to download release checksum: $checksum_name"
-  echo "verify that repo/tag/target exists in GitHub Releases:"
-  echo "  https://github.com/${repo}/releases/tag/${version}"
+  echo "failed to download release checksum: $checksum_url"
+  if [[ -n "$asset_base_url" ]]; then
+    echo "verify that the checksum is available at:"
+    echo "  $checksum_url"
+  else
+    echo "verify that repo/tag/target exists in GitHub Releases:"
+    echo "  https://github.com/${repo}/releases/tag/${version}"
+  fi
   exit 1
 fi
 
@@ -223,7 +257,7 @@ if [[ ! -f "$extract_dir/manifest.json" ]]; then
   exit 1
 fi
 
-manifest_target="$(sed -n 's/^[[:space:]]*"target"[[:space:]]*:[[:space:]]*"\([^"]\+\)".*$/\1/p' "$extract_dir/manifest.json" | head -n 1)"
+manifest_target="$(sed -nE 's/^[[:space:]]*"target"[[:space:]]*:[[:space:]]*"([^"]+)".*$/\1/p' "$extract_dir/manifest.json" | head -n 1)"
 if [[ -n "$manifest_target" && "$manifest_target" != "$target" ]]; then
   echo "bundle target mismatch: expected $target, manifest has $manifest_target"
   exit 1

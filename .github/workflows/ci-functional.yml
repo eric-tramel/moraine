@@ -43,5 +43,5 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --locked
 
-      - name: Functional stack + MCP smoke
-        run: bash scripts/ci/e2e-stack.sh
+      - name: Functional install + stack + MCP smoke
+        run: bash scripts/ci/e2e-install-artifact.sh "${{ matrix.target }}"

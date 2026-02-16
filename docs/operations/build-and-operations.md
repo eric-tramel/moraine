@@ -42,6 +42,7 @@ cargo install --git https://github.com/eric-tramel/cortex.git \
 ```bash
 curl -fsSL https://raw.githubusercontent.com/eric-tramel/cortex/main/scripts/install-cortexctl.sh \
   | bash -s -- --repo eric-tramel/cortex
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
 Default binary symlink location is `~/.local/bin`. Versioned bundles are installed under `~/.local/lib/cortex/<tag>/<target>` with `~/.local/lib/cortex/current` as active symlink.
@@ -67,6 +68,8 @@ Tag-driven GitHub Actions release workflow:
 3. Uploads `cortex-bundle-<target>.tar.gz` plus `cortex-bundle-<target>.sha256` to the tag release.
 
 Each bundle includes `manifest.json` with target/version metadata, per-binary checksums, and build metadata.
+
+Multiplatform functional CI (`.github/workflows/ci-functional.yml`) also packages per-target bundles and validates `scripts/install-cortexctl.sh` by installing from a local artifact server before running the stack + MCP smoke test.
 
 ## Config model
 

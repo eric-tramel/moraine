@@ -14,6 +14,7 @@ curl -fsSL https://raw.githubusercontent.com/eric-tramel/cortex/main/scripts/ins
 Then start and check the local stack:
 
 ```bash
+export PATH="$HOME/.local/bin:$PATH"
 cortexctl up
 cortexctl status
 ```
