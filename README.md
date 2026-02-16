@@ -1,162 +1,91 @@
-# cortex
+# Cortex
 
-Cortex is a local Rust workspace for ingesting Codex/Claude session logs into ClickHouse, serving monitor APIs/UI, and exposing MCP retrieval tools.
+Cortex is a local-first system that ingests your Codex and Claude Code session logs into a local database (ClickHouse) so you can monitor them, inspect them, and use them for retrieval.
 
-## Quickstart
+What you get:
 
-Install `cortexctl` (prebuilt binary, recommended):
+- A local ingestion pipeline that watches your session logs and keeps ClickHouse up to date
+- A monitor UI to see health and browse the stored tables
+- An MCP server so agent runtimes can retrieve traces via `search` and `open`
+
+## Quickstart (5 minutes)
+
+Install `cortexctl` (prebuilt bundle, recommended):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/eric-tramel/cortex/main/scripts/install-cortexctl.sh \
   | bash
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Then start and check the local stack:
+Start the local stack and confirm it is healthy:
 
 ```bash
-export PATH="$HOME/.local/bin:$PATH"
 cortexctl up
 cortexctl status
 ```
 
-The installer sets up all Cortex binaries (`cortexctl`, `cortex-ingest`, `cortex-monitor`, `cortex-mcp`) and auto-installs a managed ClickHouse build by default.
+Open the monitor UI:
 
-Install layout:
+- `http://127.0.0.1:8080`
 
-- `~/.local/lib/cortex/<tag>/<target>/bin` (versioned bundle)
-- `~/.local/lib/cortex/current` (active symlink)
-- `~/.local/bin/cortexctl` (command symlink)
-- `~/.local/lib/cortex/clickhouse/current` (managed ClickHouse)
+To see value quickly: run a Codex or Claude Code session as you normally would, then refresh the UI (or rerun `cortexctl status`) and watch row counts and heartbeat move.
 
-Enable launch-on-boot services:
+Notes:
+
+- Cortex stores state under `~/.cortex`.
+- If ClickHouse is missing, `cortexctl up` auto-installs a managed ClickHouse build by default.
+
+## Where Data Comes From
+
+By default, Cortex watches these JSONL sources (you can change this in config):
+
+- Codex: `~/.codex/sessions/**/*.jsonl`
+- Claude Code: `~/.claude/projects/**/*.jsonl`
+
+## Use Cortex With an Agent (MCP)
+
+MCP (Model Context Protocol) is not started by default. For an ad hoc session:
 
 ```bash
-cortexctl service install
-cortexctl service status
+cortexctl run mcp
 ```
 
-## Prerequisites
+Agents typically call `search` to discover relevant events, then `open` to fetch surrounding context.
 
-- Rust toolchain (`cargo`, `rustc`) if you want to build from source.
+To start MCP automatically with `cortexctl up`, set `runtime.start_mcp_on_up=true` in `~/.cortex/config.toml`.
 
-`clickhouse-server` on `PATH` is optional. `cortexctl up` auto-installs managed ClickHouse when `runtime.clickhouse_auto_install=true` (default).
+For host integration details and the tool contract (`search`, `open`), see `docs/mcp/agent-interface.md`.
 
-## Platform support
+## Common Commands
 
-| OS | Architectures | Notes |
-| --- | --- | --- |
-| macOS | `x86_64`, `aarch64` | user `launchd` services |
-| Linux | `x86_64`, `aarch64` | user `systemd` services (linger recommended) |
+- `cortexctl status`: health + ingest heartbeat
+- `cortexctl logs`: service logs
+- `cortexctl down`: stop everything
+- `cortexctl service install`: start services on login (macOS `launchd`, Linux user `systemd`)
 
-## Alternative installs
+## Configuration (Optional)
 
-Install from source with Cargo:
+Default config lives in `config/cortex.toml`. Runtime config is resolved in this order:
+
+1. `--config <path>`
+2. `CORTEX_CONFIG` (and `CORTEX_MCP_CONFIG` for MCP)
+3. `~/.cortex/config.toml`
+
+To customize, start by copying `config/cortex.toml` to `~/.cortex/config.toml` and edit values there.
+
+## Install From Source (Optional)
+
+Requires a Rust toolchain (`cargo`, `rustc`):
 
 ```bash
-gh repo clone eric-tramel/cortex ~/src/cortex
+git clone https://github.com/eric-tramel/cortex.git ~/src/cortex
 cd ~/src/cortex
 cargo install --path apps/cortexctl --locked
 ```
 
-Install from GitHub with Cargo (no clone):
+## More Details
 
-```bash
-cargo install --git https://github.com/eric-tramel/cortex.git \
-  --package cortexctl \
-  --bin cortexctl \
-  --locked
-```
-
-## Build
-
-```bash
-cd ~/src/cortex
-cargo build --workspace
-```
-
-## Config
-
-Single config schema: `config/cortex.toml`.
-
-Config resolution order across binaries:
-
-1. `--config <path>`
-2. env override (`CORTEX_CONFIG`; MCP also checks `CORTEX_MCP_CONFIG` first)
-3. `~/.cortex/config.toml` (if present)
-4. repo default `config/cortex.toml`
-
-## Runtime management (`cortexctl`)
-
-Use `cortexctl` for local stack lifecycle.
-
-```bash
-cd ~/src/cortex
-
-# Start ClickHouse, run migrations, and start configured services
-bin/cortexctl up
-
-# Status: process state + DB health + migration/schema checks + ingest heartbeat
-bin/cortexctl status
-
-# Managed ClickHouse lifecycle
-bin/cortexctl clickhouse status
-bin/cortexctl clickhouse install --version v25.12.5.44-stable
-bin/cortexctl clickhouse install --force
-bin/cortexctl clickhouse uninstall
-
-# DB lifecycle
-bin/cortexctl db migrate
-bin/cortexctl db doctor
-
-# Foreground service entrypoints
-bin/cortexctl run ingest
-bin/cortexctl run monitor --host 127.0.0.1 --port 8090
-bin/cortexctl run mcp
-
-# Logs and shutdown
-bin/cortexctl logs
-bin/cortexctl down
-
-# Boot service management
-bin/cortexctl service install
-bin/cortexctl service status
-bin/cortexctl service uninstall
-```
-
-Linux pre-login startup note: enable linger for your user if needed.
-
-```bash
-sudo loginctl enable-linger "$USER"
-```
-
-## Compatibility notes
-
-Legacy script commands (`bin/start-clickhouse`, `bin/init-db`, `bin/start-ingestor`, `bin/status`, `bin/stop-all`, `bin/run-codex-mcp`, `bin/cortex-monitor`) are removed and now exit with migration guidance to `cortexctl`.
-
-Source-tree fallback mode is opt-in. Set `CORTEX_SOURCE_TREE_MODE=1` to allow `cortexctl run ...` to resolve `target/debug/*` binaries and repo `web/monitor/dist` assets.
-
-## Monitor Frontend (Svelte)
-
-The monitor UI source lives under `web/monitor/` and is built with Vite.
-Release bundles include prebuilt `web/monitor/dist` assets, so installed binaries (`cortexctl`, `cortex-monitor`) do not require Bun at runtime.
-The legacy `cortex-monitor/web` directory has been removed.
-
-```bash
-cd ~/src/cortex/web/monitor
-bun install
-bun run typecheck
-bun run build
-```
-
-With `CORTEX_SOURCE_TREE_MODE=1`, `cortexctl run monitor` uses `web/monitor/dist` for static assets by default.
-
-## Docs
-
-```bash
-cd ~/src/cortex
-make docs-qc
-make docs-build
-make docs-serve
-```
-
-Open `http://127.0.0.1:8000`.
+- Operations runbook: `docs/operations/build-and-operations.md`
+- Migration notes: `docs/operations/migration-guide.md`
+- System internals: `docs/core/system-architecture.md`

@@ -120,7 +120,7 @@ bin/cortexctl db doctor
 ```bash
 cd ~/src/cortex
 bin/cortexctl run ingest
-bin/cortexctl run monitor --host 127.0.0.1 --port 8090
+bin/cortexctl run monitor
 bin/cortexctl run mcp
 bin/cortexctl run clickhouse
 ```
