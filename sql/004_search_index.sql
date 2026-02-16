@@ -146,37 +146,25 @@ GROUP BY
   d.source_ref,
   d.doc_len;
 
-CREATE TABLE IF NOT EXISTS cortex.search_term_stats (
-  term String,
-  docs UInt64
-)
-ENGINE = SummingMergeTree
-ORDER BY term;
+DROP TABLE IF EXISTS cortex.search_term_stats;
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS cortex.mv_search_term_stats
-TO cortex.search_term_stats
+CREATE VIEW IF NOT EXISTS cortex.search_term_stats
 AS
 SELECT
   term,
-  toUInt64(1) AS docs
-FROM cortex.search_postings;
+  toUInt64(count()) AS docs
+FROM cortex.search_postings FINAL
+GROUP BY term;
 
-CREATE TABLE IF NOT EXISTS cortex.search_corpus_stats (
-  bucket UInt8,
-  docs UInt64,
-  total_doc_len UInt64
-)
-ENGINE = SummingMergeTree
-ORDER BY bucket;
+DROP TABLE IF EXISTS cortex.search_corpus_stats;
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS cortex.mv_search_corpus_stats
-TO cortex.search_corpus_stats
+CREATE VIEW IF NOT EXISTS cortex.search_corpus_stats
 AS
 SELECT
   toUInt8(0) AS bucket,
-  toUInt64(1) AS docs,
-  toUInt64(doc_len) AS total_doc_len
-FROM cortex.search_documents
+  toUInt64(count()) AS docs,
+  toUInt64(ifNull(sum(doc_len), 0)) AS total_doc_len
+FROM cortex.search_documents FINAL
 WHERE doc_len > 0;
 
 CREATE TABLE IF NOT EXISTS cortex.search_query_log (

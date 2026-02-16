@@ -71,8 +71,6 @@ run_sql() {
 
 echo "backfilling search index tables in $CLICKHOUSE_DB"
 
-run_sql "TRUNCATE TABLE ${CLICKHOUSE_DB}.search_term_stats"
-run_sql "TRUNCATE TABLE ${CLICKHOUSE_DB}.search_corpus_stats"
 run_sql "TRUNCATE TABLE ${CLICKHOUSE_DB}.search_postings"
 run_sql "TRUNCATE TABLE ${CLICKHOUSE_DB}.search_documents"
 
@@ -81,7 +79,9 @@ run_sql "INSERT INTO ${CLICKHOUSE_DB}.search_documents (doc_version, ingested_at
 DOCS="$(curl -fsS "$CLICKHOUSE_URL/?query=SELECT%20count()%20FROM%20${CLICKHOUSE_DB}.search_documents")"
 POSTINGS="$(curl -fsS "$CLICKHOUSE_URL/?query=SELECT%20count()%20FROM%20${CLICKHOUSE_DB}.search_postings")"
 TERMS="$(curl -fsS "$CLICKHOUSE_URL/?query=SELECT%20count()%20FROM%20${CLICKHOUSE_DB}.search_term_stats")"
+CORPUS_DOCS="$(curl -fsS "$CLICKHOUSE_URL/?query=SELECT%20sum(docs)%20FROM%20${CLICKHOUSE_DB}.search_corpus_stats")"
 
 echo "search_documents: $DOCS"
 echo "search_postings: $POSTINGS"
-echo "search_term_stats: $TERMS"
+echo "search_term_stats (terms): $TERMS"
+echo "search_corpus_stats (docs): $CORPUS_DOCS"

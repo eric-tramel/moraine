@@ -588,7 +588,7 @@ FORMAT JSONEachRow",
         }
 
         let fallback_query = format!(
-            "SELECT toUInt64(count()) AS docs, toUInt64(ifNull(sum(doc_len), 0)) AS total_doc_len FROM {} WHERE doc_len > 0 FORMAT JSONEachRow",
+            "SELECT toUInt64(count()) AS docs, toUInt64(ifNull(sum(doc_len), 0)) AS total_doc_len FROM {} FINAL WHERE doc_len > 0 FORMAT JSONEachRow",
             self.table_ref("search_documents")
         );
         let fallback: Vec<CorpusStatsRow> = self.ch.query_rows(&fallback_query, None).await?;
@@ -619,7 +619,7 @@ FORMAT JSONEachRow",
         }
 
         let fallback_query = format!(
-            "SELECT term, count() AS df FROM {postings_table} WHERE term IN {terms_array} GROUP BY term FORMAT JSONEachRow",
+            "SELECT term, count() AS df FROM {postings_table} FINAL WHERE term IN {terms_array} GROUP BY term FORMAT JSONEachRow",
         );
         let fallback_rows: Vec<DfRow> = self.ch.query_rows(&fallback_query, None).await?;
         for row in fallback_rows {
