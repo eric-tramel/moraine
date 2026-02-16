@@ -12,7 +12,7 @@ The corpus is now split by subsystem boundary: `Cortex Core` (data plane), `Cort
 
 ## Reading Path
 
-Read in this order for full context: `docs/core/system-architecture.md`, `docs/core/data-model.md`, `docs/core/ingestion-service.md`, `docs/search/indexing-and-retrieval.md`, `docs/mcp/agent-interface.md`, `docs/architecture/design-tradeoffs.md`, and `docs/operations/build-and-operations.md`. The sequence follows dependency direction from invariants to schema, runtime behavior, search structures, interface contract, then architectural and operational consequences.
+Read in this order for full context: `docs/core/system-architecture.md`, `docs/core/data-model.md`, `docs/core/unified-trace-schema.md`, `docs/core/ingestion-service.md`, `docs/search/indexing-and-retrieval.md`, `docs/mcp/agent-interface.md`, `docs/architecture/design-tradeoffs.md`, and `docs/operations/build-and-operations.md`. The sequence follows dependency direction from invariants to schema, field-level normalization mapping, runtime behavior, search structures, interface contract, then architectural and operational consequences.
 
 ## External References
 

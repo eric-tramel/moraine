@@ -1,0 +1,12 @@
+.md-typeset h2#field-mapping-table + table th:first-child,
+.md-typeset h2#field-mapping-table + table td:first-child {
+  min-width: 12rem;
+  width: 12rem;
+}
+
+.md-typeset h2#field-mapping-table + table th:first-child code,
+.md-typeset h2#field-mapping-table + table td:first-child code {
+  white-space: nowrap;
+  word-break: normal;
+  overflow-wrap: normal;
+}
