@@ -25,6 +25,16 @@ sha256_file() {
   exit 1
 }
 
+build_monitor_frontend() {
+  local monitor_dir="$PROJECT_ROOT/web/monitor"
+  echo "building monitor frontend with bun"
+  (
+    cd "$monitor_dir"
+    bun install --frozen-lockfile
+    bun run build
+  )
+}
+
 if [[ $# -lt 1 || $# -gt 2 ]]; then
   usage
   exit 64
@@ -46,12 +56,7 @@ OUTPUT_DIR="${2:-$PROJECT_ROOT/dist}"
 
 mkdir -p "$OUTPUT_DIR"
 
-echo "building monitor frontend (bun + vite)"
-(
-  cd "$PROJECT_ROOT/web/monitor"
-  bun install --frozen-lockfile
-  bun run build
-)
+build_monitor_frontend
 
 if [[ ! -d "$PROJECT_ROOT/web/monitor/dist" ]]; then
   echo "expected built frontend assets at $PROJECT_ROOT/web/monitor/dist"

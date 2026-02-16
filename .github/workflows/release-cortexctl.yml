@@ -39,6 +39,14 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Verify Bun
+        run: bun --version
+
       - name: Build release archive
         run: scripts/package-cortexctl-release.sh "${{ matrix.target }}" dist
 

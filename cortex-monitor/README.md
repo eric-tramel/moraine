@@ -29,7 +29,8 @@ Environment helpers:
 
 ## Frontend build
 
-The monitor UI source lives under `web/monitor` and is built with Bun + Vite.
+The monitor UI source lives under `web/monitor` and is built with Vite.
+Release bundles include prebuilt web assets, so running installed binaries does not require Bun.
 The `cortex-monitor/web` directory has been removed.
 
 ```bash

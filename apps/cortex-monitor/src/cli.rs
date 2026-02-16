@@ -8,7 +8,20 @@ pub struct CliArgs {
     pub static_dir: PathBuf,
 }
 
-fn default_static_dir() -> PathBuf {
+fn monitor_dir_candidates(root: &Path) -> [PathBuf; 2] {
+    [
+        root.join("web").join("monitor").join("dist"),
+        root.join("web").join("monitor"),
+    ]
+}
+
+fn find_monitor_dir(root: &Path) -> Option<PathBuf> {
+    monitor_dir_candidates(root)
+        .into_iter()
+        .find(|candidate| candidate.exists())
+}
+
+fn source_tree_static_dir() -> PathBuf {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     manifest_dir
         .parent()
@@ -17,6 +30,28 @@ fn default_static_dir() -> PathBuf {
         .join("web")
         .join("monitor")
         .join("dist")
+}
+
+fn default_static_dir() -> PathBuf {
+    if let Ok(value) = std::env::var("CORTEX_MONITOR_STATIC_DIR") {
+        let configured = PathBuf::from(value);
+        if configured.exists() {
+            return configured;
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        let exe = exe.canonicalize().unwrap_or(exe);
+        if let Some(bin_dir) = exe.parent() {
+            if let Some(bundle_root) = bin_dir.parent() {
+                if let Some(found) = find_monitor_dir(bundle_root) {
+                    return found;
+                }
+            }
+        }
+    }
+
+    source_tree_static_dir()
 }
 
 fn usage() {
@@ -69,5 +104,52 @@ pub fn parse_args() -> CliArgs {
         port,
         config_path: cortex_config::resolve_monitor_config_path(config_path),
         static_dir: static_dir.unwrap_or_else(default_static_dir),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_monitor_dir;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cortex-monitor-cli-{name}-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create temp root");
+        root
+    }
+
+    #[test]
+    fn find_monitor_dir_prefers_dist() {
+        let root = temp_root("prefers-dist");
+        let dist = root.join("web").join("monitor").join("dist");
+        let monitor = root.join("web").join("monitor");
+        fs::create_dir_all(&dist).expect("create dist");
+        fs::create_dir_all(&monitor).expect("create monitor dir");
+
+        let found = find_monitor_dir(&root);
+        assert_eq!(found, Some(dist));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn find_monitor_dir_uses_monitor_root_when_dist_missing() {
+        let root = temp_root("fallback-monitor-root");
+        let monitor = root.join("web").join("monitor");
+        fs::create_dir_all(&monitor).expect("create monitor dir");
+
+        let found = find_monitor_dir(&root);
+        assert_eq!(found, Some(monitor));
+
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }
