@@ -11,6 +11,7 @@ from pathlib import Path
 
 CITATION_RE = re.compile(r"\[src:\s*([^\]]+)\]")
 REF_RE = re.compile(r"^([^:\s]+):(?:L)?(\d+)(?:-(?:L)?(\d+))?$", re.IGNORECASE)
+WINDOWS_ABS_RE = re.compile(r"^[A-Za-z]:[\\/]|^\\\\")
 
 
 def parse_ref(chunk: str) -> tuple[str, int, int] | None:
@@ -23,6 +24,21 @@ def parse_ref(chunk: str) -> tuple[str, int, int] | None:
     if end < start:
         start, end = end, start
     return rel_path, start, end
+
+
+def sanitize_rel_path(raw_path: str) -> str | None:
+    if not raw_path or WINDOWS_ABS_RE.match(raw_path):
+        return None
+
+    normalized = raw_path.replace("\\", "/")
+    candidate = Path(normalized)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        return None
+
+    sanitized = candidate.as_posix()
+    if sanitized in {"", "."}:
+        return None
+    return sanitized
 
 
 def detect_language(rel_path: str) -> str:
@@ -68,12 +84,11 @@ def collect_references(docs_root: Path) -> dict[str, set[int]]:
 
 
 def resolve_repo_source_path(repo_root: Path, rel_path: str) -> tuple[str, Path] | None:
-    candidate = Path(rel_path)
-    if candidate.is_absolute():
-        return None
-    if ".." in candidate.parts:
+    sanitized_rel_path = sanitize_rel_path(rel_path)
+    if sanitized_rel_path is None:
         return None
 
+    candidate = Path(sanitized_rel_path)
     abs_path = (repo_root / candidate).resolve()
     try:
         normalized_rel_path = abs_path.relative_to(repo_root).as_posix()
@@ -84,7 +99,11 @@ def resolve_repo_source_path(repo_root: Path, rel_path: str) -> tuple[str, Path]
 
 
 def resolve_output_path(out_dir: Path, rel_path: str) -> Path | None:
-    dst = (out_dir / f"{rel_path}.md").resolve()
+    sanitized_rel_path = sanitize_rel_path(rel_path)
+    if sanitized_rel_path is None:
+        return None
+
+    dst = (out_dir / f"{sanitized_rel_path}.md").resolve()
     try:
         dst.relative_to(out_dir)
     except ValueError:
