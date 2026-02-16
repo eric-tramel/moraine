@@ -111,9 +111,24 @@ struct HeartbeatRow {
     latest: String,
     queue_depth: u64,
     files_active: u64,
+    #[serde(default)]
+    watcher_backend: String,
+    #[serde(default)]
+    watcher_error_count: u64,
+    #[serde(default)]
+    watcher_reset_count: u64,
+    #[serde(default)]
+    watcher_last_reset_unix_ms: u64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Deserialize)]
+struct LegacyHeartbeatRow {
+    latest: String,
+    queue_depth: u64,
+    files_active: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct ClickHouseAsset {
     url: &'static str,
     sha256: &'static str,
@@ -129,7 +144,7 @@ fn usage() {
   cortexctl logs [service] [--lines <n>] [--config <path>]
   cortexctl db migrate [--config <path>]
   cortexctl db doctor [--config <path>]
-  cortexctl clickhouse install [--force] [--config <path>]
+  cortexctl clickhouse install [--version <v>] [--force] [--config <path>]
   cortexctl clickhouse status [--config <path>]
   cortexctl clickhouse uninstall [--config <path>]
   cortexctl service install [--enable] [--start] [--config <path>]
@@ -297,6 +312,10 @@ fn managed_clickhouse_bin(paths: &RuntimePaths, binary: &str) -> PathBuf {
     paths.managed_clickhouse_dir.join("bin").join(binary)
 }
 
+fn managed_clickhouse_checksum_file(paths: &RuntimePaths) -> PathBuf {
+    paths.managed_clickhouse_dir.join("SHA256")
+}
+
 fn detect_host_target() -> Result<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
@@ -311,16 +330,16 @@ fn detect_host_target() -> Result<&'static str> {
     }
 }
 
-fn clickhouse_asset(cfg: &AppConfig) -> Result<ClickHouseAsset> {
-    if cfg.runtime.clickhouse_version != DEFAULT_CLICKHOUSE_TAG {
+fn clickhouse_asset_for_target(version: &str, target: &str) -> Result<ClickHouseAsset> {
+    if version != DEFAULT_CLICKHOUSE_TAG {
         bail!(
-            "unsupported runtime.clickhouse_version {}; this build supports {}",
-            cfg.runtime.clickhouse_version,
+            "unsupported ClickHouse version {}; this build supports {}",
+            version,
             DEFAULT_CLICKHOUSE_TAG
         );
     }
 
-    match detect_host_target()? {
+    match target {
         "x86_64-apple-darwin" => Ok(ClickHouseAsset {
             url: CH_URL_MACOS_X86_64,
             sha256: CH_SHA_MACOS_X86_64,
@@ -341,8 +360,12 @@ fn clickhouse_asset(cfg: &AppConfig) -> Result<ClickHouseAsset> {
             sha256: CH_SHA_LINUX_AARCH64,
             is_archive: true,
         }),
-        other => bail!("unsupported target: {}", other),
+        other => bail!("unsupported ClickHouse target: {}", other),
     }
+}
+
+fn clickhouse_asset_for_host(version: &str) -> Result<ClickHouseAsset> {
+    clickhouse_asset_for_target(version, detect_host_target()?)
 }
 
 async fn download_to_path(url: &str, dest: &Path) -> Result<()> {
@@ -449,11 +472,11 @@ fn ensure_symlink(target: &Path, link: &Path) -> Result<()> {
 }
 
 async fn install_managed_clickhouse(
-    cfg: &AppConfig,
     paths: &RuntimePaths,
+    version: &str,
     force: bool,
 ) -> Result<PathBuf> {
-    let asset = clickhouse_asset(cfg)?;
+    let asset = clickhouse_asset_for_host(version)?;
 
     let bin_dir = paths.managed_clickhouse_dir.join("bin");
     let clickhouse = bin_dir.join("clickhouse");
@@ -524,7 +547,11 @@ async fn install_managed_clickhouse(
 
     fs::write(
         paths.managed_clickhouse_dir.join("VERSION"),
-        format!("{}\n", cfg.runtime.clickhouse_version),
+        format!("{}\n", version),
+    )?;
+    fs::write(
+        managed_clickhouse_checksum_file(paths),
+        format!("{}\n", digest),
     )?;
 
     let _ = fs::remove_file(download);
@@ -557,7 +584,7 @@ async fn resolve_clickhouse_server_command(
     }
 
     if cfg.runtime.clickhouse_auto_install {
-        install_managed_clickhouse(cfg, paths, false).await?;
+        install_managed_clickhouse(paths, &cfg.runtime.clickhouse_version, false).await?;
         let managed = managed_clickhouse_bin(paths, "clickhouse-server");
         if managed.exists() {
             return Ok(managed);
@@ -639,7 +666,23 @@ async fn run_foreground_clickhouse(cfg: &AppConfig, paths: &RuntimePaths) -> Res
     Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
 }
 
-fn resolve_service_binary(service: Service, cfg: &AppConfig, paths: &RuntimePaths) -> PathBuf {
+fn env_flag_enabled(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn source_tree_mode_enabled() -> bool {
+    env_flag_enabled("CORTEX_SOURCE_TREE_MODE")
+}
+
+fn resolve_service_binary(service: Service, paths: &RuntimePaths) -> PathBuf {
     let Some(name) = service.binary_name() else {
         return PathBuf::from(service.name());
     };
@@ -665,17 +708,18 @@ fn resolve_service_binary(service: Service, cfg: &AppConfig, paths: &RuntimePath
         }
     }
 
-    if let Some(project_bin) = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.join("target").join("debug").join(name))
-    {
-        if project_bin.exists() {
-            return project_bin;
+    if source_tree_mode_enabled() {
+        if let Some(project_bin) = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("target").join("debug").join(name))
+        {
+            if project_bin.exists() {
+                return project_bin;
+            }
         }
     }
 
-    let _ = cfg;
     PathBuf::from(name)
 }
 
@@ -709,13 +753,15 @@ fn resolve_monitor_static_dir(paths: &RuntimePaths) -> Option<PathBuf> {
         }
     }
 
-    if let Some(dev_path) = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.join("web").join("monitor"))
-    {
-        if dev_path.exists() {
-            return Some(dev_path);
+    if source_tree_mode_enabled() {
+        if let Some(dev_path) = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("web").join("monitor"))
+        {
+            if dev_path.exists() {
+                return Some(dev_path);
+            }
         }
     }
 
@@ -773,7 +819,7 @@ fn start_background_service(
         return Ok(());
     }
 
-    let binary = resolve_service_binary(service, cfg, paths);
+    let binary = resolve_service_binary(service, paths);
 
     let logfile = OpenOptions::new()
         .create(true)
@@ -815,7 +861,7 @@ async fn run_foreground_service(
         return run_foreground_clickhouse(cfg, paths).await;
     }
 
-    let binary = resolve_service_binary(service, cfg, paths);
+    let binary = resolve_service_binary(service, paths);
     let args = service_args_with_defaults(service, cfg_path, cfg, paths, passthrough_args);
 
     let status = Command::new(binary)
@@ -846,11 +892,35 @@ async fn query_heartbeat(cfg: &AppConfig) -> Result<Option<HeartbeatRow>> {
     let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
     let db = quote_identifier(&cfg.clickhouse.database);
     let query = format!(
-        "SELECT toString(max(ts)) AS latest, toUInt64(argMax(queue_depth, ts)) AS queue_depth, toUInt64(argMax(files_active, ts)) AS files_active FROM {db}.ingest_heartbeats"
+        "SELECT \
+            toString(max(ts)) AS latest, \
+            toUInt64(argMax(queue_depth, ts)) AS queue_depth, \
+            toUInt64(argMax(files_active, ts)) AS files_active, \
+            toString(argMax(watcher_backend, ts)) AS watcher_backend, \
+            toUInt64(argMax(watcher_error_count, ts)) AS watcher_error_count, \
+            toUInt64(argMax(watcher_reset_count, ts)) AS watcher_reset_count, \
+            toUInt64(argMax(watcher_last_reset_unix_ms, ts)) AS watcher_last_reset_unix_ms \
+         FROM {db}.ingest_heartbeats"
     );
 
-    let rows: Vec<HeartbeatRow> = ch.query_json_data(&query, None).await?;
-    Ok(rows.into_iter().next())
+    match ch.query_json_data::<HeartbeatRow>(&query, None).await {
+        Ok(rows) => Ok(rows.into_iter().next()),
+        Err(_) => {
+            let legacy_query = format!(
+                "SELECT toString(max(ts)) AS latest, toUInt64(argMax(queue_depth, ts)) AS queue_depth, toUInt64(argMax(files_active, ts)) AS files_active FROM {db}.ingest_heartbeats"
+            );
+            let rows: Vec<LegacyHeartbeatRow> = ch.query_json_data(&legacy_query, None).await?;
+            Ok(rows.into_iter().next().map(|row| HeartbeatRow {
+                latest: row.latest,
+                queue_depth: row.queue_depth,
+                files_active: row.files_active,
+                watcher_backend: "unknown".to_string(),
+                watcher_error_count: 0,
+                watcher_reset_count: 0,
+                watcher_last_reset_unix_ms: 0,
+            }))
+        }
+    }
 }
 
 fn quote_identifier(value: &str) -> String {
@@ -862,6 +932,41 @@ fn managed_clickhouse_version(paths: &RuntimePaths) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+fn managed_clickhouse_checksum(paths: &RuntimePaths) -> Option<String> {
+    fs::read_to_string(managed_clickhouse_checksum_file(paths))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn managed_clickhouse_checksum_state(cfg: &AppConfig, paths: &RuntimePaths) -> String {
+    let Some(stored) = managed_clickhouse_checksum(paths) else {
+        return "unknown (missing checksum metadata)".to_string();
+    };
+
+    let expected = match clickhouse_asset_for_host(&cfg.runtime.clickhouse_version) {
+        Ok(asset) => asset.sha256,
+        Err(exc) => return format!("unknown ({})", exc),
+    };
+
+    if stored == expected {
+        "verified".to_string()
+    } else {
+        format!("mismatch (expected {}, got {})", expected, stored)
+    }
+}
+
+fn active_clickhouse_source(paths: &RuntimePaths) -> (&'static str, Option<PathBuf>) {
+    let managed = managed_clickhouse_bin(paths, "clickhouse-server");
+    if managed.exists() {
+        return ("managed", Some(managed));
+    }
+    if clickhouse_from_path_available() {
+        return ("path", Some(PathBuf::from("clickhouse-server")));
+    }
+    ("missing", None)
 }
 
 async fn cmd_status(paths: &RuntimePaths, cfg: &AppConfig) -> Result<()> {
@@ -878,6 +983,7 @@ async fn cmd_status(paths: &RuntimePaths, cfg: &AppConfig) -> Result<()> {
     }
 
     let managed_server = managed_clickhouse_bin(paths, "clickhouse-server");
+    let (source, source_path) = active_clickhouse_source(paths);
     println!(
         "managed clickhouse: {} ({})",
         if managed_server.exists() {
@@ -890,6 +996,18 @@ async fn cmd_status(paths: &RuntimePaths, cfg: &AppConfig) -> Result<()> {
     if let Some(version) = managed_clickhouse_version(paths) {
         println!("managed clickhouse version: {}", version);
     }
+    println!(
+        "clickhouse active source: {}{}",
+        source,
+        source_path
+            .as_ref()
+            .map(|path| format!(" ({})", path.display()))
+            .unwrap_or_default()
+    );
+    println!(
+        "managed clickhouse checksum: {}",
+        managed_clickhouse_checksum_state(cfg, paths)
+    );
 
     let report = cmd_db_doctor(cfg).await?;
     println!("clickhouse healthy: {}", report.clickhouse_healthy);
@@ -911,6 +1029,13 @@ async fn cmd_status(paths: &RuntimePaths, cfg: &AppConfig) -> Result<()> {
             println!("ingest heartbeat latest: {}", row.latest);
             println!("ingest queue depth: {}", row.queue_depth);
             println!("ingest files active: {}", row.files_active);
+            println!("watcher backend: {}", row.watcher_backend);
+            println!("watcher error count: {}", row.watcher_error_count);
+            println!("watcher reset count: {}", row.watcher_reset_count);
+            println!(
+                "watcher last reset unix ms: {}",
+                row.watcher_last_reset_unix_ms
+            );
         }
         Ok(None) => println!("ingest heartbeat: unavailable"),
         Err(err) => println!("ingest heartbeat error: {}", err),
@@ -1290,13 +1415,21 @@ fn systemd_user_dir() -> Result<PathBuf> {
         .join("user"))
 }
 
+fn systemd_escape(value: &str) -> String {
+    if value.contains([' ', '\t', '\n', '"', '\\']) {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        value.to_string()
+    }
+}
+
 fn systemd_unit_content(service: Service, cfg_path: &Path, cortexctl_exe: &Path) -> String {
     let exec_args = vec![
-        cortexctl_exe.to_string_lossy().to_string(),
+        systemd_escape(&cortexctl_exe.to_string_lossy()),
         "run".to_string(),
         service.name().to_string(),
         "--config".to_string(),
-        cfg_path.to_string_lossy().to_string(),
+        systemd_escape(&cfg_path.to_string_lossy()),
     ];
 
     let exec = exec_args.join(" ");
@@ -1324,6 +1457,94 @@ WantedBy=default.target
         deps = deps,
         exec = exec,
     )
+}
+
+fn current_username() -> Result<String> {
+    if let Ok(user) = std::env::var("USER") {
+        if !user.trim().is_empty() {
+            return Ok(user);
+        }
+    }
+
+    let output = Command::new("id")
+        .arg("-un")
+        .output()
+        .context("failed to resolve current user via id -un")?;
+    if !output.status.success() {
+        bail!("id -un failed");
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn loginctl_linger_state(user: &str) -> Result<Option<bool>> {
+    let output = match Command::new("loginctl")
+        .arg("show-user")
+        .arg(user)
+        .arg("--property=Linger")
+        .arg("--value")
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return Ok(None),
+    };
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let value = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .to_ascii_lowercase();
+    Ok(match value.as_str() {
+        "yes" | "true" => Some(true),
+        "no" | "false" => Some(false),
+        _ => None,
+    })
+}
+
+fn ensure_systemd_linger() -> Result<()> {
+    let user = current_username()?;
+    match loginctl_linger_state(&user)? {
+        Some(true) => {
+            println!("systemd linger: enabled for user {}", user);
+        }
+        Some(false) => {
+            let output = Command::new("loginctl")
+                .arg("enable-linger")
+                .arg(&user)
+                .output();
+            match output {
+                Ok(output) if output.status.success() => {
+                    println!("systemd linger: enabled for user {}", user);
+                }
+                Ok(output) => {
+                    println!(
+                        "warning: failed to enable systemd linger for {} ({}). Run: sudo loginctl enable-linger {}",
+                        user,
+                        summarize_command_output(&output),
+                        user
+                    );
+                }
+                Err(exc) => {
+                    println!(
+                        "warning: failed to run loginctl enable-linger for {} ({}). Run: sudo loginctl enable-linger {}",
+                        user,
+                        exc,
+                        user
+                    );
+                }
+            }
+        }
+        None => {
+            println!(
+                "warning: unable to query systemd linger state. For pre-login service startup run: sudo loginctl enable-linger {}",
+                user
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn systemctl_user(args: &[&str]) -> Result<()> {
@@ -1360,6 +1581,7 @@ fn install_systemd_services(
         fs::write(unit_dir.join(service.systemd_unit()), unit)?;
     }
 
+    ensure_systemd_linger()?;
     systemctl_user(&["daemon-reload"])?;
 
     for service in &services {
@@ -1399,6 +1621,13 @@ fn uninstall_systemd_services(cfg: &AppConfig, disable: bool, stop: bool) -> Res
 
 fn status_systemd_services(cfg: &AppConfig) -> Result<()> {
     let services = selected_boot_services(cfg);
+    if let Ok(user) = current_username() {
+        match loginctl_linger_state(&user) {
+            Ok(Some(enabled)) => println!("systemd linger ({}): {}", user, enabled),
+            Ok(None) => println!("systemd linger ({}): unknown", user),
+            Err(exc) => println!("systemd linger ({}): error ({})", user, exc),
+        }
+    }
 
     for service in &services {
         let enabled = Command::new("systemctl")
@@ -1514,25 +1743,67 @@ fn parse_service_uninstall_flags(args: &[String]) -> Result<(bool, bool)> {
     Ok((disable, stop))
 }
 
-async fn cmd_clickhouse_install(cfg: &AppConfig, paths: &RuntimePaths, force: bool) -> Result<()> {
+fn parse_clickhouse_install_flags(
+    args: &[String],
+    default_version: &str,
+) -> Result<(bool, String)> {
+    let mut force = false;
+    let mut version = default_version.to_string();
+    let mut i = 0usize;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--force" => {
+                force = true;
+                i += 1;
+            }
+            "--version" => {
+                if i + 1 >= args.len() {
+                    bail!("--version requires a value");
+                }
+                version = args[i + 1].clone();
+                i += 2;
+            }
+            other => bail!("unexpected clickhouse install arg: {}", other),
+        }
+    }
+
+    Ok((force, version))
+}
+
+async fn cmd_clickhouse_install(paths: &RuntimePaths, version: &str, force: bool) -> Result<()> {
     ensure_runtime_dirs(paths)?;
-    let installed = install_managed_clickhouse(cfg, paths, force).await?;
+    let installed = install_managed_clickhouse(paths, version, force).await?;
     println!("managed clickhouse installed: {}", installed.display());
     Ok(())
 }
 
-fn cmd_clickhouse_status(paths: &RuntimePaths) {
+fn cmd_clickhouse_status(cfg: &AppConfig, paths: &RuntimePaths) {
     let clickhouse = managed_clickhouse_bin(paths, "clickhouse");
     let clickhouse_server = managed_clickhouse_bin(paths, "clickhouse-server");
     let clickhouse_client = managed_clickhouse_bin(paths, "clickhouse-client");
+    let (active_source, active_source_path) = active_clickhouse_source(paths);
 
     println!("managed root: {}", paths.managed_clickhouse_dir.display());
     println!("clickhouse: {}", clickhouse.exists());
     println!("clickhouse-server: {}", clickhouse_server.exists());
     println!("clickhouse-client: {}", clickhouse_client.exists());
+    println!("expected version: {}", cfg.runtime.clickhouse_version);
+    println!(
+        "active source: {}{}",
+        active_source,
+        active_source_path
+            .as_ref()
+            .map(|path| format!(" ({})", path.display()))
+            .unwrap_or_default()
+    );
+    println!(
+        "checksum state: {}",
+        managed_clickhouse_checksum_state(cfg, paths)
+    );
 
     if let Some(version) = managed_clickhouse_version(paths) {
-        println!("version: {}", version);
+        println!("installed version: {}", version);
     }
 }
 
@@ -1556,6 +1827,10 @@ async fn main() -> Result<ExitCode> {
     if args.is_empty() {
         usage();
         return Ok(ExitCode::from(2));
+    }
+    if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help" | "help") {
+        usage();
+        return Ok(ExitCode::SUCCESS);
     }
 
     let command = args.remove(0);
@@ -1678,21 +1953,16 @@ async fn main() -> Result<ExitCode> {
 
             match sub.as_str() {
                 "install" => {
-                    let mut force = false;
-                    for arg in rest {
-                        match arg.as_str() {
-                            "--force" => force = true,
-                            _ => bail!("unexpected clickhouse install arg: {}", arg),
-                        }
-                    }
-                    cmd_clickhouse_install(&cfg, &paths, force).await?;
+                    let (force, version) =
+                        parse_clickhouse_install_flags(&rest, &cfg.runtime.clickhouse_version)?;
+                    cmd_clickhouse_install(&paths, &version, force).await?;
                     Ok(ExitCode::SUCCESS)
                 }
                 "status" => {
                     if !rest.is_empty() {
                         bail!("unexpected clickhouse status args: {}", rest.join(" "));
                     }
-                    cmd_clickhouse_status(&paths);
+                    cmd_clickhouse_status(&cfg, &paths);
                     Ok(ExitCode::SUCCESS)
                 }
                 "uninstall" => {
@@ -1765,5 +2035,173 @@ async fn main() -> Result<ExitCode> {
             usage();
             Ok(ExitCode::from(2))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("cortexctl-{name}-{stamp}"));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    fn write_file(path: &Path) {
+        fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        fs::write(path, b"#!/bin/sh\n").expect("write file");
+    }
+
+    #[test]
+    fn clickhouse_asset_selection_covers_target_matrix() {
+        let linux_x64 =
+            clickhouse_asset_for_target(DEFAULT_CLICKHOUSE_TAG, "x86_64-unknown-linux-gnu")
+                .expect("linux x64");
+        assert_eq!(linux_x64.url, CH_URL_LINUX_X86_64);
+        assert!(linux_x64.is_archive);
+
+        let linux_arm =
+            clickhouse_asset_for_target(DEFAULT_CLICKHOUSE_TAG, "aarch64-unknown-linux-gnu")
+                .expect("linux arm");
+        assert_eq!(linux_arm.url, CH_URL_LINUX_AARCH64);
+        assert!(linux_arm.is_archive);
+
+        let mac_x64 = clickhouse_asset_for_target(DEFAULT_CLICKHOUSE_TAG, "x86_64-apple-darwin")
+            .expect("mac x64");
+        assert_eq!(mac_x64.url, CH_URL_MACOS_X86_64);
+        assert!(!mac_x64.is_archive);
+
+        let mac_arm = clickhouse_asset_for_target(DEFAULT_CLICKHOUSE_TAG, "aarch64-apple-darwin")
+            .expect("mac arm");
+        assert_eq!(mac_arm.url, CH_URL_MACOS_AARCH64);
+        assert!(!mac_arm.is_archive);
+    }
+
+    #[test]
+    fn clickhouse_asset_rejects_unsupported_version() {
+        let err = clickhouse_asset_for_target("v0.0.0", "x86_64-unknown-linux-gnu")
+            .expect_err("unsupported version");
+        assert!(
+            err.to_string().contains("unsupported ClickHouse version"),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_clickhouse_install_flags_supports_version_and_force() {
+        let args = vec![
+            "--version".to_string(),
+            "v25.12.5.44-stable".to_string(),
+            "--force".to_string(),
+        ];
+        let (force, version) =
+            parse_clickhouse_install_flags(&args, DEFAULT_CLICKHOUSE_TAG).expect("parse flags");
+        assert!(force);
+        assert_eq!(version, "v25.12.5.44-stable");
+    }
+
+    #[test]
+    fn resolve_service_binary_prefers_env_then_config() {
+        let root = temp_dir("resolver");
+        let env_dir = root.join("env");
+        let cfg_dir = root.join("cfg");
+        let env_bin = env_dir.join("cortex-ingest");
+        let cfg_bin = cfg_dir.join("cortex-ingest");
+        write_file(&env_bin);
+        write_file(&cfg_bin);
+
+        let mut cfg = AppConfig::default();
+        cfg.runtime.service_bin_dir = cfg_dir.to_string_lossy().to_string();
+        let paths = runtime_paths(&cfg);
+
+        std::env::remove_var("CORTEX_SOURCE_TREE_MODE");
+        std::env::set_var("CORTEX_SERVICE_BIN_DIR", &env_dir);
+        assert_eq!(resolve_service_binary(Service::Ingest, &paths), env_bin);
+
+        std::env::remove_var("CORTEX_SERVICE_BIN_DIR");
+        assert_eq!(resolve_service_binary(Service::Ingest, &paths), cfg_bin);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_service_binary_falls_back_to_path_name() {
+        let root = temp_dir("resolver-path");
+        let mut cfg = AppConfig::default();
+        cfg.runtime.service_bin_dir = root.join("missing").to_string_lossy().to_string();
+        let paths = runtime_paths(&cfg);
+
+        std::env::remove_var("CORTEX_SERVICE_BIN_DIR");
+        std::env::remove_var("CORTEX_SOURCE_TREE_MODE");
+        let resolved = resolve_service_binary(Service::Mcp, &paths);
+        assert_eq!(resolved, PathBuf::from("cortex-mcp"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn systemd_unit_content_has_expected_dependencies() {
+        let cfg_path = PathBuf::from("/tmp/cortex.toml");
+        let cortexctl = PathBuf::from("/tmp/cortexctl");
+
+        let clickhouse = systemd_unit_content(Service::ClickHouse, &cfg_path, &cortexctl);
+        assert!(clickhouse
+            .contains("ExecStart=/tmp/cortexctl run clickhouse --config /tmp/cortex.toml"));
+        assert!(!clickhouse.contains("After=cortex-clickhouse.service"));
+
+        let ingest = systemd_unit_content(Service::Ingest, &cfg_path, &cortexctl);
+        assert!(ingest.contains("After=cortex-clickhouse.service"));
+        assert!(ingest.contains("Requires=cortex-clickhouse.service"));
+    }
+
+    #[test]
+    fn launchd_plist_contains_label_and_program_args() {
+        let mut cfg = AppConfig::default();
+        cfg.runtime.root_dir = "/tmp/cortex".to_string();
+        cfg.runtime.logs_dir = "/tmp/cortex/logs".to_string();
+        let paths = runtime_paths(&cfg);
+        let plist = launchd_plist(
+            Service::Monitor,
+            &cfg,
+            &paths,
+            Path::new("/tmp/cortex.toml"),
+            Path::new("/tmp/cortexctl"),
+        );
+
+        assert!(plist.contains("<string>com.eric.cortex.monitor</string>"));
+        assert!(plist.contains("<string>/tmp/cortexctl</string>"));
+        assert!(plist.contains("<string>run</string>"));
+        assert!(plist.contains("<string>monitor</string>"));
+        assert!(plist.contains("<string>--config</string>"));
+        assert!(plist.contains("<string>/tmp/cortex.toml</string>"));
+    }
+
+    #[test]
+    fn managed_checksum_state_reports_verified() {
+        let root = temp_dir("checksum");
+        let managed_dir = root.join("managed");
+        fs::create_dir_all(&managed_dir).expect("managed dir");
+
+        let mut cfg = AppConfig::default();
+        cfg.runtime.managed_clickhouse_dir = managed_dir.to_string_lossy().to_string();
+        let paths = runtime_paths(&cfg);
+
+        let expected = clickhouse_asset_for_host(&cfg.runtime.clickhouse_version)
+            .expect("host asset")
+            .sha256;
+        fs::write(
+            managed_clickhouse_checksum_file(&paths),
+            format!("{expected}\n"),
+        )
+        .expect("write checksum");
+
+        assert_eq!(managed_clickhouse_checksum_state(&cfg, &paths), "verified");
+        let _ = fs::remove_dir_all(root);
     }
 }

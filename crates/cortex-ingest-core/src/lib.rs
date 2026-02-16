@@ -22,6 +22,11 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, RwLock, Semaphore};
 use tracing::{error, info};
 
+pub(crate) const WATCHER_BACKEND_UNKNOWN: u64 = 0;
+pub(crate) const WATCHER_BACKEND_NATIVE: u64 = 1;
+pub(crate) const WATCHER_BACKEND_POLL: u64 = 2;
+pub(crate) const WATCHER_BACKEND_MIXED: u64 = 3;
+
 #[derive(Debug, Clone)]
 pub(crate) struct WorkItem {
     pub(crate) source_name: String,
@@ -51,6 +56,10 @@ pub(crate) struct Metrics {
     pub(crate) last_flush_ms: AtomicU64,
     pub(crate) flush_failures: AtomicU64,
     pub(crate) queue_depth: AtomicU64,
+    pub(crate) watcher_error_count: AtomicU64,
+    pub(crate) watcher_reset_count: AtomicU64,
+    pub(crate) watcher_last_reset_unix_ms: AtomicU64,
+    pub(crate) watcher_backend_state: AtomicU64,
     pub(crate) last_error: Mutex<String>,
 }
 
@@ -201,7 +210,8 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         metrics.clone(),
     );
 
-    let watcher_threads = spawn_watcher_threads(enabled_sources.clone(), watch_path_tx)?;
+    let watcher_threads =
+        spawn_watcher_threads(enabled_sources.clone(), watch_path_tx, metrics.clone())?;
 
     if config.ingest.backfill_on_start {
         for source in &enabled_sources {

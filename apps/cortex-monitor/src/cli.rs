@@ -18,6 +18,14 @@ fn default_static_dir() -> PathBuf {
         .join("monitor")
 }
 
+fn usage() {
+    eprintln!(
+        "usage:
+  cortex-monitor [--host <host>] [--port <port>] [--config <path>] [--static-dir <path>]
+"
+    );
+}
+
 pub fn parse_args() -> CliArgs {
     let mut host = None;
     let mut port = None;
@@ -46,6 +54,10 @@ pub fn parse_args() -> CliArgs {
                 if let Some(value) = args.next() {
                     static_dir = Some(PathBuf::from(value));
                 }
+            }
+            "-h" | "--help" | "help" => {
+                usage();
+                std::process::exit(0);
             }
             _ => {}
         }

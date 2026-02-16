@@ -20,6 +20,13 @@ cortexctl status
 
 The installer sets up all Cortex binaries (`cortexctl`, `cortex-ingest`, `cortex-monitor`, `cortex-mcp`) and auto-installs a managed ClickHouse build by default.
 
+Install layout:
+
+- `~/.local/lib/cortex/<tag>/<target>/bin` (versioned bundle)
+- `~/.local/lib/cortex/current` (active symlink)
+- `~/.local/bin/cortexctl` (command symlink)
+- `~/.local/lib/cortex/clickhouse/current` (managed ClickHouse)
+
 Enable launch-on-boot services:
 
 ```bash
@@ -29,8 +36,16 @@ cortexctl service status
 
 ## Prerequisites
 
-- `clickhouse-server` available on `PATH`.
 - Rust toolchain (`cargo`, `rustc`) if you want to build from source.
+
+`clickhouse-server` on `PATH` is optional. `cortexctl up` auto-installs managed ClickHouse when `runtime.clickhouse_auto_install=true` (default).
+
+## Platform support
+
+| OS | Architectures | Notes |
+| --- | --- | --- |
+| macOS | `x86_64`, `aarch64` | user `launchd` services |
+| Linux | `x86_64`, `aarch64` | user `systemd` services (linger recommended) |
 
 ## Alternative installs
 
@@ -84,6 +99,7 @@ bin/cortexctl status
 
 # Managed ClickHouse lifecycle
 bin/cortexctl clickhouse status
+bin/cortexctl clickhouse install --version v25.12.5.44-stable
 bin/cortexctl clickhouse install --force
 bin/cortexctl clickhouse uninstall
 
@@ -106,9 +122,17 @@ bin/cortexctl service status
 bin/cortexctl service uninstall
 ```
 
+Linux pre-login startup note: enable linger for your user if needed.
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
+
 ## Compatibility notes
 
 Legacy script commands (`bin/start-clickhouse`, `bin/init-db`, `bin/start-ingestor`, `bin/status`, `bin/stop-all`, `bin/run-codex-mcp`, `bin/cortex-monitor`) are removed and now exit with migration guidance to `cortexctl`.
+
+Source-tree fallback mode is opt-in. Set `CORTEX_SOURCE_TREE_MODE=1` to allow `cortexctl run ...` to resolve `target/debug/*` binaries and repo `web/monitor` assets.
 
 ## Docs
 

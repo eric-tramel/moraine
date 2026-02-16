@@ -1,7 +1,10 @@
 use crate::checkpoint::{checkpoint_key, merge_checkpoint};
 use crate::heartbeat::host_name;
 use crate::model::Checkpoint;
-use crate::{DispatchState, Metrics, SinkMessage};
+use crate::{
+    DispatchState, Metrics, SinkMessage, WATCHER_BACKEND_MIXED, WATCHER_BACKEND_NATIVE,
+    WATCHER_BACKEND_POLL,
+};
 use cortex_clickhouse::ClickHouseClient;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -11,6 +14,15 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
 use tracing::warn;
+
+fn watcher_backend_label(value: u64) -> &'static str {
+    match value {
+        WATCHER_BACKEND_NATIVE => "native",
+        WATCHER_BACKEND_POLL => "poll",
+        WATCHER_BACKEND_MIXED => "mixed",
+        _ => "unknown",
+    }
+}
 
 pub(crate) fn spawn_sink_task(
     config: cortex_config::AppConfig,
@@ -96,6 +108,11 @@ pub(crate) fn spawn_sink_task(
                             .expect("metrics last_error mutex poisoned")
                             .clone()
                     };
+                    let watcher_backend = watcher_backend_label(
+                        metrics
+                            .watcher_backend_state
+                            .load(Ordering::Relaxed),
+                    );
 
                     let heartbeat = json!({
                         "host": host_name(),
@@ -109,6 +126,10 @@ pub(crate) fn spawn_sink_task(
                         "flush_latency_ms": metrics.last_flush_ms.load(Ordering::Relaxed) as u32,
                         "append_to_visible_p50_ms": 0u32,
                         "append_to_visible_p95_ms": 0u32,
+                        "watcher_backend": watcher_backend,
+                        "watcher_error_count": metrics.watcher_error_count.load(Ordering::Relaxed),
+                        "watcher_reset_count": metrics.watcher_reset_count.load(Ordering::Relaxed),
+                        "watcher_last_reset_unix_ms": metrics.watcher_last_reset_unix_ms.load(Ordering::Relaxed),
                         "last_error": last_error,
                     });
 

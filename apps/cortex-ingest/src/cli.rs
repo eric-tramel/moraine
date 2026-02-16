@@ -5,15 +5,30 @@ pub struct CliArgs {
     pub config_path: PathBuf,
 }
 
+fn usage() {
+    eprintln!(
+        "usage:
+  cortex-ingest [--config <path>]
+"
+    );
+}
+
 pub fn parse_args() -> CliArgs {
     let mut args = std::env::args().skip(1);
     let mut config_path: Option<PathBuf> = None;
 
     while let Some(arg) = args.next() {
-        if arg == "--config" {
-            if let Some(value) = args.next() {
-                config_path = Some(PathBuf::from(value));
+        match arg.as_str() {
+            "--config" => {
+                if let Some(value) = args.next() {
+                    config_path = Some(PathBuf::from(value));
+                }
             }
+            "-h" | "--help" | "help" => {
+                usage();
+                std::process::exit(0);
+            }
+            _ => {}
         }
     }
 

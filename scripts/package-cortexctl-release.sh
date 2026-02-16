@@ -11,6 +11,20 @@ examples:
 EOF
 }
 
+sha256_file() {
+  local path="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$path" | awk '{print $1}'
+    return
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$path" | awk '{print $1}'
+    return
+  fi
+  echo "neither sha256sum nor shasum found; cannot compute checksum for $path" >&2
+  exit 1
+}
+
 if [[ $# -lt 1 || $# -gt 2 ]]; then
   usage
   exit 64
@@ -55,16 +69,36 @@ cp "$PROJECT_ROOT/target/$TARGET/release/cortex-monitor" "$STAGE_DIR/bin/cortex-
 cp "$PROJECT_ROOT/target/$TARGET/release/cortex-mcp" "$STAGE_DIR/bin/cortex-mcp"
 cp -R "$PROJECT_ROOT/web/monitor" "$STAGE_DIR/web/monitor"
 
+build_timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+git_commit="$(git -C "$PROJECT_ROOT" rev-parse --verify HEAD 2>/dev/null || echo "unknown")"
+rustc_version="$(rustc -V 2>/dev/null || echo "unknown")"
+checksum_cortexctl="$(sha256_file "$STAGE_DIR/bin/cortexctl")"
+checksum_ingest="$(sha256_file "$STAGE_DIR/bin/cortex-ingest")"
+checksum_monitor="$(sha256_file "$STAGE_DIR/bin/cortex-monitor")"
+checksum_mcp="$(sha256_file "$STAGE_DIR/bin/cortex-mcp")"
+
 cat > "$STAGE_DIR/manifest.json" <<EOF
 {
+  "bundle_format_version": 1,
   "target": "$TARGET",
   "version": "${GITHUB_REF_NAME:-dev}",
+  "build": {
+    "timestamp_utc": "$build_timestamp",
+    "git_commit": "$git_commit",
+    "rustc": "$rustc_version"
+  },
   "binaries": [
     "cortexctl",
     "cortex-ingest",
     "cortex-monitor",
     "cortex-mcp"
   ],
+  "checksums": {
+    "bin/cortexctl": "$checksum_cortexctl",
+    "bin/cortex-ingest": "$checksum_ingest",
+    "bin/cortex-monitor": "$checksum_monitor",
+    "bin/cortex-mcp": "$checksum_mcp"
+  },
   "web_assets": [
     "web/monitor"
   ]
@@ -72,15 +106,7 @@ cat > "$STAGE_DIR/manifest.json" <<EOF
 EOF
 
 tar -C "$STAGE_DIR" -czf "$ARCHIVE_PATH" .
-
-if command -v sha256sum >/dev/null 2>&1; then
-  sha256sum "$ARCHIVE_PATH" | awk -v archive="$ARCHIVE_NAME" '{print $1 "  " archive}' > "$CHECKSUM_PATH"
-elif command -v shasum >/dev/null 2>&1; then
-  shasum -a 256 "$ARCHIVE_PATH" | awk -v archive="$ARCHIVE_NAME" '{print $1 "  " archive}' > "$CHECKSUM_PATH"
-else
-  echo "neither sha256sum nor shasum found; cannot produce checksum file"
-  exit 1
-fi
+echo "$(sha256_file "$ARCHIVE_PATH")  $ARCHIVE_NAME" > "$CHECKSUM_PATH"
 
 echo "packaged: $ARCHIVE_PATH"
 echo "checksum: $CHECKSUM_PATH"

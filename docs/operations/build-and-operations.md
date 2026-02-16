@@ -48,6 +48,13 @@ Default binary symlink location is `~/.local/bin`. Versioned bundles are install
 
 The installer fetches a full bundle (`cortexctl`, `cortex-ingest`, `cortex-monitor`, `cortex-mcp`) and installs managed ClickHouse automatically by default.
 
+Install paths:
+
+- Bundle root: `~/.local/lib/cortex/<tag>/<target>`
+- Active symlink: `~/.local/lib/cortex/current`
+- Command symlinks: `~/.local/bin`
+- Managed ClickHouse root: `~/.local/lib/cortex/clickhouse/current`
+
 ## Publish prebuilt binaries
 
 Tag-driven GitHub Actions release workflow:
@@ -59,6 +66,8 @@ Tag-driven GitHub Actions release workflow:
    - `x86_64-apple-darwin`
    - `aarch64-apple-darwin`
 3. Uploads `cortex-bundle-<target>.tar.gz` plus `cortex-bundle-<target>.sha256` to the tag release.
+
+Each bundle includes `manifest.json` with target/version metadata, per-binary checksums, and build metadata.
 
 ## Config model
 
@@ -86,6 +95,8 @@ bin/cortexctl up
 4. Starts ingest and optional services from `runtime` config.
 
 It auto-installs managed ClickHouse when missing and `runtime.clickhouse_auto_install=true`.
+
+`cortexctl clickhouse status` reports managed install state, active binary source (`managed` vs `PATH`), installed version, and checksum state.
 
 ## DB lifecycle
 
@@ -123,6 +134,7 @@ bin/cortexctl service uninstall
 
 - macOS: installs user LaunchAgents under `~/Library/LaunchAgents`.
 - Linux: installs user systemd units under `~/.config/systemd/user`.
+- Linux linger is checked during install. If linger is unavailable, Cortex prints the exact remediation command (`sudo loginctl enable-linger <user>`).
 
 ## Status, logs, shutdown
 

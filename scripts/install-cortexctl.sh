@@ -30,6 +30,32 @@ require_cmd() {
   fi
 }
 
+checksum_of() {
+  local path="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$path" | awk '{print $1}'
+    return
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$path" | awk '{print $1}'
+    return
+  fi
+  if command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$path" | awk '{print $NF}'
+    return
+  fi
+  echo "no checksum command available for $path" >&2
+  exit 1
+}
+
+manifest_checksum() {
+  local manifest="$1"
+  local key="$2"
+  grep -E "\"${key}\"[[:space:]]*:" "$manifest" \
+    | head -n 1 \
+    | sed -n 's/.*:[[:space:]]*"\([0-9a-fA-F]\+\)".*/\1/p'
+}
+
 verify_checksum() {
   local archive="$1"
   local checksum_file="$2"
@@ -192,10 +218,31 @@ extract_dir="$tmp_dir/extracted"
 mkdir -p "$extract_dir"
 tar -xzf "$tmp_dir/$asset_name" -C "$extract_dir"
 
+if [[ ! -f "$extract_dir/manifest.json" ]]; then
+  echo "archive did not contain required manifest: manifest.json"
+  exit 1
+fi
+
+manifest_target="$(sed -n 's/^[[:space:]]*"target"[[:space:]]*:[[:space:]]*"\([^"]\+\)".*$/\1/p' "$extract_dir/manifest.json" | head -n 1)"
+if [[ -n "$manifest_target" && "$manifest_target" != "$target" ]]; then
+  echo "bundle target mismatch: expected $target, manifest has $manifest_target"
+  exit 1
+fi
+
 for bin in cortexctl cortex-ingest cortex-monitor cortex-mcp; do
   if [[ ! -f "$extract_dir/bin/$bin" ]]; then
     echo "archive did not contain required binary: bin/$bin"
     exit 1
+  fi
+  expected_sum="$(manifest_checksum "$extract_dir/manifest.json" "bin/$bin")"
+  if [[ -n "$expected_sum" ]]; then
+    actual_sum="$(checksum_of "$extract_dir/bin/$bin")"
+    if [[ "$expected_sum" != "$actual_sum" ]]; then
+      echo "manifest checksum mismatch for bin/$bin"
+      echo "expected: $expected_sum"
+      echo "actual:   $actual_sum"
+      exit 1
+    fi
   fi
 done
 
@@ -218,6 +265,13 @@ ln -sfn "$release_dir" "$current_link"
 mkdir -p "$install_dir"
 for bin in cortexctl cortex-ingest cortex-monitor cortex-mcp; do
   ln -sfn "$current_link/bin/$bin" "$install_dir/$bin"
+done
+
+for bin in cortexctl cortex-ingest cortex-monitor cortex-mcp; do
+  if ! "$current_link/bin/$bin" --help >/dev/null 2>&1; then
+    echo "installed binary failed health check (--help): $current_link/bin/$bin"
+    exit 1
+  fi
 done
 
 echo "installed bundle: $release_dir"
