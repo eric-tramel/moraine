@@ -67,8 +67,32 @@ def collect_references(docs_root: Path) -> dict[str, set[int]]:
     return refs
 
 
-def render_source_page(repo_root: Path, rel_path: str, ref_lines: set[int]) -> str:
-    abs_path = repo_root / rel_path
+def resolve_repo_source_path(repo_root: Path, rel_path: str) -> tuple[str, Path] | None:
+    candidate = Path(rel_path)
+    if candidate.is_absolute():
+        return None
+    if ".." in candidate.parts:
+        return None
+
+    abs_path = (repo_root / candidate).resolve()
+    try:
+        normalized_rel_path = abs_path.relative_to(repo_root).as_posix()
+    except ValueError:
+        return None
+
+    return normalized_rel_path, abs_path
+
+
+def resolve_output_path(out_dir: Path, rel_path: str) -> Path | None:
+    dst = (out_dir / f"{rel_path}.md").resolve()
+    try:
+        dst.relative_to(out_dir)
+    except ValueError:
+        return None
+    return dst
+
+
+def render_source_page(abs_path: Path, rel_path: str, ref_lines: set[int]) -> str:
     source_text = abs_path.read_text(encoding="utf-8", errors="replace")
     src_lines = source_text.splitlines()
 
@@ -111,15 +135,23 @@ def main() -> int:
 
     generated = 0
     skipped = 0
-    for rel_path, lines in sorted(refs.items()):
-        abs_path = repo_root / rel_path
+    for raw_rel_path, lines in sorted(refs.items()):
+        resolved = resolve_repo_source_path(repo_root, raw_rel_path)
+        if not resolved:
+            skipped += 1
+            continue
+
+        rel_path, abs_path = resolved
         if not abs_path.exists() or not abs_path.is_file():
             skipped += 1
             continue
 
-        dst = out_dir / f"{rel_path}.md"
+        dst = resolve_output_path(out_dir, rel_path)
+        if dst is None:
+            skipped += 1
+            continue
         dst.parent.mkdir(parents=True, exist_ok=True)
-        dst.write_text(render_source_page(repo_root, rel_path, lines), encoding="utf-8")
+        dst.write_text(render_source_page(abs_path, rel_path, lines), encoding="utf-8")
         generated += 1
 
     print(f"generated source pages: {generated}")
