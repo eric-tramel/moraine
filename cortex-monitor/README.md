@@ -20,12 +20,25 @@ Optional flags:
 - `--host` (default: `127.0.0.1`)
 - `--port` (default: `8080`)
 - `--config` path to `cortex.toml`-style config
-- `--static-dir` path to web assets (defaults to `cortex-monitor/web`)
+- `--static-dir` path to web assets (defaults to `web/monitor/dist`)
 
 Environment helpers:
 
 - `CORTEX_CONFIG` to point at a config file (overridden by `--config`)
 - `CORTEX_MONITOR_CARGO` to override the `cargo` binary
+
+## Frontend build
+
+The monitor UI source lives under `web/monitor` and is built with Bun + Vite.
+The `cortex-monitor/web` directory has been removed.
+
+```bash
+cd /Users/eric/src/cortex/web/monitor
+bun install
+bun run build
+```
+
+Serve custom assets by passing `--static-dir` if needed.
 
 ## API endpoints
 

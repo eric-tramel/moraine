@@ -10,91 +10,9 @@
       href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Sora:wght@400;500;600;700&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <div class="app-shell">
-      <header class="top-bar">
-        <div>
-          <h1>Cortex Monitor</h1>
-        </div>
-        <div class="top-actions">
-          <button id="themeToggle" type="button" class="button-ghost">Dark</button>
-          <button id="refreshAll" type="button">Refresh All</button>
-        </div>
-      </header>
-
-      <main class="layout">
-        <section class="panel">
-          <div class="analytics-head">
-            <h2>Live Analytics</h2>
-            <div id="analyticsRanges" class="range-group" role="group" aria-label="Analytics range">
-              <button type="button" data-range="15m">15m</button>
-              <button type="button" data-range="1h">1h</button>
-              <button type="button" data-range="6h">6h</button>
-              <button type="button" data-range="24h" class="active">24h</button>
-              <button type="button" data-range="7d">7d</button>
-              <button type="button" data-range="30d">30d</button>
-            </div>
-          </div>
-          <p id="analyticsMeta" class="muted">Loading model analytics…</p>
-          <div class="chart-grid">
-            <article class="chart-card">
-              <h3>Generation Tokens Per Model</h3>
-              <div class="chart-wrap">
-                <canvas id="tokensChart"></canvas>
-              </div>
-            </article>
-            <article class="chart-card">
-              <h3>Turns Per Model</h3>
-              <div class="chart-wrap">
-                <canvas id="turnsChart"></canvas>
-              </div>
-            </article>
-            <article class="chart-card">
-              <h3>Concurrent Sessions</h3>
-              <div class="chart-wrap">
-                <canvas id="concurrentSessionsChart"></canvas>
-              </div>
-            </article>
-          </div>
-        </section>
-
-        <section class="panel">
-          <h2>Health</h2>
-          <div id="healthCard" class="card-grid"></div>
-
-          <h2>Ingestor Heartbeat</h2>
-          <div id="ingestorCard" class="card-grid"></div>
-        </section>
-
-        <section class="panel">
-          <section class="detail">
-            <div class="detail-head">
-              <h2 id="tableTitle">Table</h2>
-              <label for="tableSelect">Table</label>
-              <select id="tableSelect"></select>
-              <label for="rowLimit">Rows</label>
-              <select id="rowLimit">
-                <option value="10">10</option>
-                <option value="25" selected>25</option>
-                <option value="50">50</option>
-                <option value="100">100</option>
-              </select>
-            </div>
-            <div id="schemaCard" class="card muted"></div>
-            <div class="table-wrap">
-              <table id="previewTable">
-                <thead id="previewHead"></thead>
-                <tbody id="previewBody"></tbody>
-              </table>
-            </div>
-          </section>
-        </section>
-      </main>
-    </div>
-
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
-    <script src="app.js"></script>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

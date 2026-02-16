@@ -35,11 +35,28 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! command -v bun >/dev/null 2>&1; then
+  echo "bun is not installed or not on PATH"
+  exit 1
+fi
+
 TARGET="$1"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUTPUT_DIR="${2:-$PROJECT_ROOT/dist}"
 
 mkdir -p "$OUTPUT_DIR"
+
+echo "building monitor frontend (bun + vite)"
+(
+  cd "$PROJECT_ROOT/web/monitor"
+  bun install --frozen-lockfile
+  bun run build
+)
+
+if [[ ! -d "$PROJECT_ROOT/web/monitor/dist" ]]; then
+  echo "expected built frontend assets at $PROJECT_ROOT/web/monitor/dist"
+  exit 1
+fi
 
 cargo build --manifest-path "$PROJECT_ROOT/Cargo.toml" --release --locked --target "$TARGET" \
   -p cortexctl \
@@ -61,13 +78,13 @@ CHECKSUM_PATH="$OUTPUT_DIR/cortex-bundle-$TARGET.sha256"
 STAGE_DIR="$(mktemp -d)"
 trap 'rm -rf "$STAGE_DIR"' EXIT
 
-mkdir -p "$STAGE_DIR/bin" "$STAGE_DIR/web"
+mkdir -p "$STAGE_DIR/bin" "$STAGE_DIR/web/monitor"
 
 cp "$PROJECT_ROOT/target/$TARGET/release/cortexctl" "$STAGE_DIR/bin/cortexctl"
 cp "$PROJECT_ROOT/target/$TARGET/release/cortex-ingest" "$STAGE_DIR/bin/cortex-ingest"
 cp "$PROJECT_ROOT/target/$TARGET/release/cortex-monitor" "$STAGE_DIR/bin/cortex-monitor"
 cp "$PROJECT_ROOT/target/$TARGET/release/cortex-mcp" "$STAGE_DIR/bin/cortex-mcp"
-cp -R "$PROJECT_ROOT/web/monitor" "$STAGE_DIR/web/monitor"
+cp -R "$PROJECT_ROOT/web/monitor/dist" "$STAGE_DIR/web/monitor/dist"
 
 build_timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 git_commit="$(git -C "$PROJECT_ROOT" rev-parse --verify HEAD 2>/dev/null || echo "unknown")"
@@ -100,7 +117,7 @@ cat > "$STAGE_DIR/manifest.json" <<EOF
     "bin/cortex-mcp": "$checksum_mcp"
   },
   "web_assets": [
-    "web/monitor"
+    "web/monitor/dist"
   ]
 }
 EOF

@@ -18,3 +18,11 @@ target/
 site/
 docs/.quality/review-report.json
 docs/_source/
+
+# Frontend workspace output
+web/monitor/node_modules/
+web/monitor/dist/
+web/monitor/.vite/
+web/monitor/.playwright/
+web/monitor/playwright-report/
+web/monitor/test-results/

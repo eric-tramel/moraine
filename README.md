@@ -132,7 +132,21 @@ sudo loginctl enable-linger "$USER"
 
 Legacy script commands (`bin/start-clickhouse`, `bin/init-db`, `bin/start-ingestor`, `bin/status`, `bin/stop-all`, `bin/run-codex-mcp`, `bin/cortex-monitor`) are removed and now exit with migration guidance to `cortexctl`.
 
-Source-tree fallback mode is opt-in. Set `CORTEX_SOURCE_TREE_MODE=1` to allow `cortexctl run ...` to resolve `target/debug/*` binaries and repo `web/monitor` assets.
+Source-tree fallback mode is opt-in. Set `CORTEX_SOURCE_TREE_MODE=1` to allow `cortexctl run ...` to resolve `target/debug/*` binaries and repo `web/monitor/dist` assets.
+
+## Monitor Frontend (Bun + Svelte)
+
+The monitor UI is a Bun-managed Svelte app under `web/monitor/`, built with Vite and served from `web/monitor/dist`.
+The legacy `cortex-monitor/web` directory has been removed.
+
+```bash
+cd ~/src/cortex/web/monitor
+bun install
+bun run typecheck
+bun run build
+```
+
+With `CORTEX_SOURCE_TREE_MODE=1`, `cortexctl run monitor` uses `web/monitor/dist` for static assets by default.
 
 ## Docs
 

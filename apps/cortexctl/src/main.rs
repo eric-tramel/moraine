@@ -756,6 +756,13 @@ fn contains_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|arg| arg == flag)
 }
 
+fn monitor_dir_candidates(root: &Path) -> [PathBuf; 2] {
+    [
+        root.join("web").join("monitor").join("dist"),
+        root.join("web").join("monitor"),
+    ]
+}
+
 fn resolve_monitor_static_dir(paths: &RuntimePaths) -> Option<PathBuf> {
     if let Ok(value) = std::env::var("CORTEX_MONITOR_STATIC_DIR") {
         let path = PathBuf::from(value);
@@ -767,18 +774,20 @@ fn resolve_monitor_static_dir(paths: &RuntimePaths) -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(bin_dir) = exe.parent() {
             if let Some(bundle_root) = bin_dir.parent() {
-                let candidate = bundle_root.join("web").join("monitor");
-                if candidate.exists() {
-                    return Some(candidate);
+                for candidate in monitor_dir_candidates(bundle_root) {
+                    if candidate.exists() {
+                        return Some(candidate);
+                    }
                 }
             }
         }
     }
 
     if let Some(bundle_root) = paths.service_bin_dir.parent() {
-        let candidate = bundle_root.join("web").join("monitor");
-        if candidate.exists() {
-            return Some(candidate);
+        for candidate in monitor_dir_candidates(bundle_root) {
+            if candidate.exists() {
+                return Some(candidate);
+            }
         }
     }
 
@@ -786,10 +795,12 @@ fn resolve_monitor_static_dir(paths: &RuntimePaths) -> Option<PathBuf> {
         if let Some(dev_path) = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(|p| p.parent())
-            .map(|p| p.join("web").join("monitor"))
+            .map(PathBuf::from)
         {
-            if dev_path.exists() {
-                return Some(dev_path);
+            for candidate in monitor_dir_candidates(&dev_path) {
+                if candidate.exists() {
+                    return Some(candidate);
+                }
             }
         }
     }

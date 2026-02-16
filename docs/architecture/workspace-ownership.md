@@ -25,7 +25,7 @@ Cortex is organized as a Rust workspace with explicit app/core boundaries.
 
 - Owns monitor CLI/runtime entrypoint.
 - Delegates query/domain behavior to `cortex-monitor-core`.
-- Serves static assets from `web/monitor`.
+- Serves static assets from `web/monitor/dist` (built from `web/monitor`).
 
 ### `crates/cortex-monitor-core`
 

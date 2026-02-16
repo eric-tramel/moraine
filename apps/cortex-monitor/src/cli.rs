@@ -16,6 +16,7 @@ fn default_static_dir() -> PathBuf {
         .expect("workspace root")
         .join("web")
         .join("monitor")
+        .join("dist")
 }
 
 fn usage() {
