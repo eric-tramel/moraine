@@ -1,8 +1,8 @@
-import { defineConfig, devices } from '@playwright/test';
+const { defineConfig, devices } = require('@playwright/test');
 
 const externalBaseUrl = process.env.MONITOR_BASE_URL;
 
-export default defineConfig({
+module.exports = defineConfig({
   testDir: './e2e',
   timeout: 30_000,
   expect: {
