@@ -8,7 +8,7 @@ Install `cortexctl` (prebuilt binary, recommended):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/eric-tramel/cortex/main/scripts/install-cortexctl.sh \
-  | bash -s -- --repo eric-tramel/cortex
+  | bash
 ```
 
 Then start and check the local stack:
