@@ -135,9 +135,10 @@ Legacy script commands (`bin/start-clickhouse`, `bin/init-db`, `bin/start-ingest
 
 Source-tree fallback mode is opt-in. Set `CORTEX_SOURCE_TREE_MODE=1` to allow `cortexctl run ...` to resolve `target/debug/*` binaries and repo `web/monitor/dist` assets.
 
-## Monitor Frontend (Bun + Svelte)
+## Monitor Frontend (Svelte)
 
-The monitor UI is a Bun-managed Svelte app under `web/monitor/`, built with Vite and served from `web/monitor/dist`.
+The monitor UI source lives under `web/monitor/` and is built with Vite.
+Release bundles include prebuilt `web/monitor/dist` assets, so installed binaries (`cortexctl`, `cortex-monitor`) do not require Bun at runtime.
 The legacy `cortex-monitor/web` directory has been removed.
 
 ```bash
