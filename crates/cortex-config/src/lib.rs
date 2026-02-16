@@ -537,10 +537,6 @@ fn normalize_config(mut cfg: AppConfig) -> AppConfig {
 }
 
 pub fn load_config(path: impl AsRef<Path>) -> Result<AppConfig> {
-    if !path.as_ref().exists() {
-        return Ok(normalize_config(AppConfig::default()));
-    }
-
     let content = std::fs::read_to_string(path.as_ref())
         .with_context(|| format!("failed to read config {}", path.as_ref().display()))?;
     let cfg: AppConfig = toml::from_str(&content).context("failed to parse TOML config")?;
@@ -627,11 +623,12 @@ mod tests {
     }
 
     #[test]
-    fn load_config_uses_defaults_when_path_missing() {
+    fn load_config_errors_when_path_missing() {
         let path = std::env::temp_dir().join("cortex-missing-config-does-not-exist.toml");
-        let cfg = load_config(&path).expect("load defaults for missing config");
-        assert_eq!(cfg.clickhouse.database, "cortex");
-        assert!(!cfg.runtime.service_bin_dir.is_empty());
-        assert!(cfg.runtime.clickhouse_auto_install);
+        let err = load_config(&path).expect_err("missing config path should fail");
+        assert!(
+            err.to_string().contains("failed to read config"),
+            "unexpected error: {err:#}"
+        );
     }
 }
