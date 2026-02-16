@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "error: run-ingestor-rust-service has been removed in the cortexctl migration." >&2
-echo "use: bin/cortexctl run ingest" >&2
-exit 64
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec "$PROJECT_ROOT/bin/cortexctl" run ingest "$@"

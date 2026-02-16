@@ -294,8 +294,10 @@ dependencies = [
  "anyhow",
  "cortex-clickhouse",
  "cortex-config",
+ "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 

@@ -1,17 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
-CLICKHOUSE_LABEL="com.eric.cortex.clickhouse"
-INGESTOR_LABEL="com.eric.cortex.ingestor"
-DOMAIN="gui/$(id -u)"
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "uninstall-launchd is macOS-only; on Linux use: bin/cortexctl service uninstall" >&2
+  exit 64
+fi
 
-launchctl bootout "$DOMAIN/$INGESTOR_LABEL" >/dev/null 2>&1 || true
-launchctl bootout "$DOMAIN/$CLICKHOUSE_LABEL" >/dev/null 2>&1 || true
-
-rm -f "$LAUNCH_AGENTS_DIR/$INGESTOR_LABEL.plist"
-rm -f "$LAUNCH_AGENTS_DIR/$CLICKHOUSE_LABEL.plist"
-
-echo "Removed launchd agents:"
-echo "- $CLICKHOUSE_LABEL"
-echo "- $INGESTOR_LABEL"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec "$PROJECT_ROOT/bin/cortexctl" service uninstall "$@"

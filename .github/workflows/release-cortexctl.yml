@@ -23,6 +23,8 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
           - os: macos-13
             target: x86_64-apple-darwin
           - os: macos-14
@@ -47,8 +49,8 @@ jobs:
         with:
           tag_name: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
           files: |
-            dist/cortexctl-${{ matrix.target }}.tar.gz
-            dist/cortexctl-${{ matrix.target }}.sha256
+            dist/cortex-bundle-${{ matrix.target }}.tar.gz
+            dist/cortex-bundle-${{ matrix.target }}.sha256
           overwrite_files: true
           generate_release_notes: true
         env:

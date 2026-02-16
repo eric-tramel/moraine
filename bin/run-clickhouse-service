@@ -2,24 +2,4 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CORTEX_HOME="${CORTEX_HOME:-$HOME/.cortex}"
-CH_ROOT="$CORTEX_HOME/clickhouse"
-
-CLICKHOUSE_SERVER_BIN="${CLICKHOUSE_SERVER_BIN:-}"
-if [[ -z "$CLICKHOUSE_SERVER_BIN" ]]; then
-  if command -v clickhouse-server >/dev/null 2>&1; then
-    CLICKHOUSE_SERVER_BIN="$(command -v clickhouse-server)"
-  elif [[ -x "$HOME/.npm-global/bin/clickhouse-server" ]]; then
-    CLICKHOUSE_SERVER_BIN="$HOME/.npm-global/bin/clickhouse-server"
-  else
-    echo "clickhouse-server is not installed or not on PATH"
-    exit 1
-  fi
-fi
-
-mkdir -p "$CH_ROOT/data" "$CH_ROOT/tmp" "$CH_ROOT/log" "$CH_ROOT/user_files" "$CH_ROOT/format_schemas"
-
-sed "s#__CORTEX_HOME__#$CORTEX_HOME#g" "$PROJECT_ROOT/config/clickhouse.xml" > "$CH_ROOT/config.xml"
-sed "s#__CORTEX_HOME__#$CORTEX_HOME#g" "$PROJECT_ROOT/config/users.xml" > "$CH_ROOT/users.xml"
-
-exec "$CLICKHOUSE_SERVER_BIN" --config-file "$CH_ROOT/config.xml"
+exec "$PROJECT_ROOT/bin/cortexctl" run clickhouse "$@"

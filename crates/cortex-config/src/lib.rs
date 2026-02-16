@@ -108,10 +108,18 @@ pub struct RuntimeConfig {
     pub logs_dir: String,
     #[serde(default = "default_runtime_pids_dir")]
     pub pids_dir: String,
+    #[serde(default = "default_service_bin_dir")]
+    pub service_bin_dir: String,
+    #[serde(default = "default_managed_clickhouse_dir")]
+    pub managed_clickhouse_dir: String,
     #[serde(default = "default_clickhouse_start_timeout_seconds")]
     pub clickhouse_start_timeout_seconds: f64,
     #[serde(default = "default_healthcheck_interval_ms")]
     pub healthcheck_interval_ms: u64,
+    #[serde(default = "default_true")]
+    pub clickhouse_auto_install: bool,
+    #[serde(default = "default_clickhouse_version")]
+    pub clickhouse_version: String,
     #[serde(default = "default_true")]
     pub start_monitor_on_up: bool,
     #[serde(default = "default_false")]
@@ -207,8 +215,12 @@ impl Default for RuntimeConfig {
             root_dir: default_runtime_root(),
             logs_dir: default_runtime_logs_dir(),
             pids_dir: default_runtime_pids_dir(),
+            service_bin_dir: default_service_bin_dir(),
+            managed_clickhouse_dir: default_managed_clickhouse_dir(),
             clickhouse_start_timeout_seconds: default_clickhouse_start_timeout_seconds(),
             healthcheck_interval_ms: default_healthcheck_interval_ms(),
+            clickhouse_auto_install: true,
+            clickhouse_version: default_clickhouse_version(),
             start_monitor_on_up: true,
             start_mcp_on_up: false,
         }
@@ -359,12 +371,24 @@ fn default_runtime_pids_dir() -> String {
     "run".to_string()
 }
 
+fn default_service_bin_dir() -> String {
+    "~/.local/lib/cortex/current/bin".to_string()
+}
+
+fn default_managed_clickhouse_dir() -> String {
+    "~/.local/lib/cortex/clickhouse/current".to_string()
+}
+
 fn default_clickhouse_start_timeout_seconds() -> f64 {
     30.0
 }
 
 fn default_healthcheck_interval_ms() -> u64 {
     500
+}
+
+fn default_clickhouse_version() -> String {
+    "v25.12.5.44-stable".to_string()
 }
 
 fn default_true() -> bool {
@@ -492,11 +516,7 @@ fn resolve_runtime_subdir(root: &str, value: &str) -> String {
     Path::new(root).join(path).to_string_lossy().to_string()
 }
 
-pub fn load_config(path: impl AsRef<Path>) -> Result<AppConfig> {
-    let content = std::fs::read_to_string(path.as_ref())
-        .with_context(|| format!("failed to read config {}", path.as_ref().display()))?;
-    let mut cfg: AppConfig = toml::from_str(&content).context("failed to parse TOML config")?;
-
+fn normalize_config(mut cfg: AppConfig) -> AppConfig {
     for source in &mut cfg.ingest.sources {
         source.glob = expand_path(&source.glob);
         source.watch_root = if source.watch_root.trim().is_empty() {
@@ -510,8 +530,21 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<AppConfig> {
     cfg.runtime.root_dir = expand_path(&cfg.runtime.root_dir);
     cfg.runtime.logs_dir = resolve_runtime_subdir(&cfg.runtime.root_dir, &cfg.runtime.logs_dir);
     cfg.runtime.pids_dir = resolve_runtime_subdir(&cfg.runtime.root_dir, &cfg.runtime.pids_dir);
+    cfg.runtime.service_bin_dir = expand_path(&cfg.runtime.service_bin_dir);
+    cfg.runtime.managed_clickhouse_dir = expand_path(&cfg.runtime.managed_clickhouse_dir);
 
-    Ok(cfg)
+    cfg
+}
+
+pub fn load_config(path: impl AsRef<Path>) -> Result<AppConfig> {
+    if !path.as_ref().exists() {
+        return Ok(normalize_config(AppConfig::default()));
+    }
+
+    let content = std::fs::read_to_string(path.as_ref())
+        .with_context(|| format!("failed to read config {}", path.as_ref().display()))?;
+    let cfg: AppConfig = toml::from_str(&content).context("failed to parse TOML config")?;
+    Ok(normalize_config(cfg))
 }
 
 #[cfg(test)]
@@ -591,5 +624,14 @@ mod tests {
         std::env::remove_var("CORTEX_MCP_CONFIG");
         std::env::remove_var("CORTEX_CONFIG");
         assert_eq!(chosen, PathBuf::from("/tmp/mcp.toml"));
+    }
+
+    #[test]
+    fn load_config_uses_defaults_when_path_missing() {
+        let path = std::env::temp_dir().join("cortex-missing-config-does-not-exist.toml");
+        let cfg = load_config(&path).expect("load defaults for missing config");
+        assert_eq!(cfg.clickhouse.database, "cortex");
+        assert!(!cfg.runtime.service_bin_dir.is_empty());
+        assert!(cfg.runtime.clickhouse_auto_install);
     }
 }

@@ -11,14 +11,21 @@ curl -fsSL https://raw.githubusercontent.com/eric-tramel/cortex/main/scripts/ins
   | bash -s -- --repo eric-tramel/cortex
 ```
 
-Then start the local stack:
+Then start and check the local stack:
 
 ```bash
 cortexctl up
 cortexctl status
 ```
 
-If `clickhouse-server` is missing, the installer prints platform-specific install guidance. `cortexctl` manages ClickHouse lifecycle but expects the ClickHouse binary to be installed.
+The installer sets up all Cortex binaries (`cortexctl`, `cortex-ingest`, `cortex-monitor`, `cortex-mcp`) and auto-installs a managed ClickHouse build by default.
+
+Enable launch-on-boot services:
+
+```bash
+cortexctl service install
+cortexctl service status
+```
 
 ## Prerequisites
 
@@ -75,6 +82,11 @@ bin/cortexctl up
 # Status: process state + DB health + migration/schema checks + ingest heartbeat
 bin/cortexctl status
 
+# Managed ClickHouse lifecycle
+bin/cortexctl clickhouse status
+bin/cortexctl clickhouse install --force
+bin/cortexctl clickhouse uninstall
+
 # DB lifecycle
 bin/cortexctl db migrate
 bin/cortexctl db doctor
@@ -87,6 +99,11 @@ bin/cortexctl run mcp
 # Logs and shutdown
 bin/cortexctl logs
 bin/cortexctl down
+
+# Boot service management
+bin/cortexctl service install
+bin/cortexctl service status
+bin/cortexctl service uninstall
 ```
 
 ## Compatibility notes
