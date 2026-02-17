@@ -4,7 +4,7 @@
 
 Moraine was built under unusually tight constraints: complete locality, near-real-time ingest visibility, multi-format trace fidelity, and lightweight retrieval for agent workflows. The important point is that these constraints conflict in practice. A design that optimizes one axis naively will usually violate another. This document records the decisions that resolved those conflicts and the conditions under which each decision should be revisited.
 
-These are architecture decisions, not implementation trivia. They explain why current code and schema look the way they do and provide a stable reference when proposing future changes. [src: config/clickhouse.xml:L17, config/moraine.toml:L11, rust/codex-mcp/src/main.rs:L264]
+These are architecture decisions, not implementation trivia. They explain why current code and schema look the way they do and provide a stable reference when proposing future changes. [src: config/clickhouse.xml:L17, config/moraine.toml:L11, crates/moraine-mcp-core/src/lib.rs:L258-L330]
 
 ## ADR-001: Local ClickHouse as the System Database
 
@@ -22,7 +22,7 @@ Revisit trigger: if operating envelope shifts to extremely constrained devices w
 
 Ingestion is implemented as a Rust async service and legacy Python ingestion paths were removed from operational flow. The reason is not language preference; it is control over concurrency, backpressure, and predictable behavior under sustained append load.
 
-The most important benefit is explicit control of pressure points. Worker concurrency is semaphore-limited, dispatch queues are bounded, sink channels are bounded, and retry behavior is explicit. In an interpreter-based ad hoc pipeline, these limits are often implicit or unevenly enforced, which leads to intermittent stalls and memory spikes at higher event rates. [src: rust/ingestor/src/ingestor.rs:L60, rust/ingestor/src/ingestor.rs:L62, rust/ingestor/src/ingestor.rs:L74]
+The most important benefit is explicit control of pressure points. Worker concurrency is semaphore-limited, dispatch queues are bounded, sink channels are bounded, and retry behavior is explicit. In an interpreter-based ad hoc pipeline, these limits are often implicit or unevenly enforced, which leads to intermittent stalls and memory spikes at higher event rates. [src: crates/moraine-ingest-core/src/lib.rs:L111-L113, crates/moraine-ingest-core/src/lib.rs:L125-L149, crates/moraine-ingest-core/src/sink.rs:L105-L117]
 
 The cost is higher implementation complexity and slower iteration for small parser tweaks. Moraine mitigates this by keeping normalization logic centralized and testable in one module while keeping service wiring explicit and compact.
 
@@ -30,7 +30,7 @@ Revisit trigger: if ingest event rate drops permanently to trivial volume and op
 
 ## ADR-003: Event Watcher Plus Reconcile Scanner
 
-The scheduling model combines OS file events with periodic full-glob reconciliation. This decision explicitly rejects a watcher-only model. Filesystem watcher streams are low-latency but not a perfect reliability substrate; dropped or coalesced events are realistic in long-running local systems. [src: rust/ingestor/src/ingestor.rs:L187, rust/ingestor/src/ingestor.rs:L284]
+The scheduling model combines OS file events with periodic full-glob reconciliation. This decision explicitly rejects a watcher-only model. Filesystem watcher streams are low-latency but not a perfect reliability substrate; dropped or coalesced events are realistic in long-running local systems. [src: crates/moraine-ingest-core/src/watch.rs:L282-L290, crates/moraine-ingest-core/src/reconcile.rs:L19-L33]
 
 In Moraine, watcher events drive fast path freshness while reconcile bounds correctness lag. Reconcile cost is small periodic filesystem scanning overhead, but it buys deterministic eventual coverage and removes dependence on watcher infallibility.
 
@@ -40,7 +40,7 @@ Revisit trigger: if platform-specific watcher reliability can be proven and veri
 
 ## ADR-004: Preserve Raw Payloads and Source Coordinates
 
-The canonical model stores both extracted fields and full payload JSON, plus complete source coordinates. This is a conscious decision to prioritize reconstruction and future parser evolution over maximal storage compactness. [src: sql/001_schema.sql:L13, sql/001_schema.sql:L42, rust/ingestor/src/normalize.rs:L157]
+The canonical model stores both extracted fields and full payload JSON, plus complete source coordinates. This is a conscious decision to prioritize reconstruction and future parser evolution over maximal storage compactness. [src: sql/001_schema.sql:L13, sql/001_schema.sql:L42, crates/moraine-ingest-core/src/normalize.rs:L430-L434, crates/moraine-ingest-core/src/normalize.rs:L502-L505]
 
 The tempting alternative is aggressive projection and early pruning: keep only normalized text and a small set of typed fields. That approach reduces storage but destroys two critical capabilities. First, it removes the ability to diagnose parser/classification mistakes against exact source payloads. Second, it makes adapting to new payload forms difficult because historical rows no longer contain recoverable context.
 
@@ -50,7 +50,7 @@ Revisit trigger: if storage growth becomes a hard operational limit, introduce r
 
 ## ADR-005: At-Least-Once Ingest with Replacing Semantics
 
-Moraine does not attempt exactly-once ingestion across file append, truncation, and rotation scenarios. Instead it implements at-least-once processing and depends on deterministic event IDs plus `ReplacingMergeTree` convergence to yield logical idempotence. [src: rust/ingestor/src/normalize.rs:L100, sql/001_schema.sql:L46]
+Moraine does not attempt exactly-once ingestion across file append, truncation, and rotation scenarios. Instead it implements at-least-once processing and depends on deterministic event IDs plus `ReplacingMergeTree` convergence to yield logical idempotence. [src: crates/moraine-ingest-core/src/dispatch.rs:L162-L169, crates/moraine-ingest-core/src/normalize.rs:L333-L349, sql/001_schema.sql:L46]
 
 This decision is driven by practical file-system reality. Exactly-once requires heavyweight coordination and durable transaction markers that are brittle in local file event environments. At-least-once with generation-aware checkpoints is simpler and robust under common failure modes.
 
@@ -60,7 +60,7 @@ Revisit trigger: if downstream consumers require strict immediate uniqueness gua
 
 ## ADR-006: Incremental Sparse Indexing in ClickHouse
 
-Sparse lexical structures are maintained continuously with materialized views and query-time BM25 scoring in MCP. This decision avoids rebuilding indexes in-process or scanning canonical event tables for each query. [src: sql/004_search_index.sql:L28, sql/004_search_index.sql:L100, rust/codex-mcp/src/main.rs:L410]
+Sparse lexical structures are maintained continuously with materialized views and query-time BM25 scoring in MCP. This decision avoids rebuilding indexes in-process or scanning canonical event tables for each query. [src: sql/004_search_index.sql:L28, sql/004_search_index.sql:L100, crates/moraine-conversations/src/clickhouse_repo.rs:L413-L509]
 
 The alternative was in-memory lexical indexing inside MCP. That would simplify SQL but couple index correctness to process lifetime and require explicit rebuild logic on startup or schema changes. It also introduces synchronization complexity if multiple MCP instances run concurrently.
 
@@ -70,7 +70,7 @@ Revisit trigger: if query latency becomes dominated by SQL overhead despite spar
 
 ## ADR-007: Retrieval Defaults Favor Signal Over Completeness
 
-MCP search defaults intentionally exclude many operational/tool lifecycle events and optionally exclude codex-mcp self-events. This decision optimizes agent answer quality by reducing lexical noise. [src: rust/codex-mcp/src/main.rs:L511, rust/codex-mcp/src/main.rs:L523, config/moraine.toml:L40-L41]
+MCP search defaults intentionally exclude many operational/tool lifecycle events and optionally exclude codex-mcp self-events. This decision optimizes agent answer quality by reducing lexical noise. [src: crates/moraine-conversations/src/clickhouse_repo.rs:L446-L460, crates/moraine-conversations/src/clickhouse_repo.rs:L1159-L1164, config/moraine.toml:L40-L41]
 
 The alternative is maximal recall: include all event classes by default and let downstream agents filter. In practice this pushes noise handling to every client and leads to repeated poor ranking behavior where high-frequency operational tokens dominate.
 
@@ -80,7 +80,7 @@ Revisit trigger: if workloads shift toward tool-trace diagnostics as the dominan
 
 ## ADR-008: Query and Hit Logging as First-Class Tables
 
-Search telemetry is persisted by default into dedicated query and hit log tables, with optional async writes. This is a strategic decision to make relevance diagnostics and performance auditing possible from day one rather than bolting instrumentation on after quality regressions appear. [src: sql/004_search_index.sql:L180, rust/codex-mcp/src/main.rs:L650, rust/codex-mcp/src/main.rs:L689]
+Search telemetry is persisted by default into dedicated query and hit log tables, with optional async writes. This is a strategic decision to make relevance diagnostics and performance auditing possible from day one rather than bolting instrumentation on after quality regressions appear. [src: sql/004_search_index.sql:L180, crates/moraine-conversations/src/clickhouse_repo.rs:L640-L734]
 
 The cost is additional write volume per query. The benefit is long-term leverage: ranking regressions, filter policy debates, and tuning decisions can be informed by observed query distributions and hit outcomes rather than anecdote.
 
