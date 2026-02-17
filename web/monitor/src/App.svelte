@@ -6,7 +6,7 @@
   import TablePanel from './lib/components/TablePanel.svelte';
   import TopBar from './lib/components/TopBar.svelte';
   import { fetchAnalytics, fetchHealth, fetchStatus, fetchTableDetail, fetchTables } from './lib/api/client';
-  import { POLL_INTERVAL_MS, ROW_LIMIT_OPTIONS } from './lib/constants';
+  import { FAST_POLL_INTERVAL_MS, ROW_LIMIT_OPTIONS, SLOW_POLL_INTERVAL_MS } from './lib/constants';
   import { analyticsRangeStore, rowLimitStore, selectedTableStore } from './lib/state/monitor';
   import { initializeTheme, themeStore, toggleTheme } from './lib/state/theme';
   import type { AnalyticsRangeKey, AnalyticsResponse, TableDetailResponse, TableSummary } from './lib/types/api';
@@ -103,13 +103,8 @@
     analyticsError = null;
   }
 
-  async function hydrate(): Promise<void> {
-    const [healthResult, statusResult, tableResult, analyticsResult] = await Promise.allSettled([
-      loadHealth(),
-      loadStatus(),
-      loadTablesAndSelection(),
-      loadAnalytics(),
-    ]);
+  async function hydrateFast(): Promise<void> {
+    const [healthResult, statusResult] = await Promise.allSettled([loadHealth(), loadStatus()]);
 
     if (healthResult.status === 'rejected') {
       healthCards = sectionErrorCards('ClickHouse', errorMessage(healthResult.reason));
@@ -118,6 +113,10 @@
     if (statusResult.status === 'rejected') {
       ingestorCards = sectionErrorCards('Ingestor', errorMessage(statusResult.reason));
     }
+  }
+
+  async function hydrateSlow(): Promise<void> {
+    const [tableResult, analyticsResult] = await Promise.allSettled([loadTablesAndSelection(), loadAnalytics()]);
 
     if (tableResult.status === 'rejected') {
       tableTitle = 'Connection issue';
@@ -129,6 +128,10 @@
     if (analyticsResult.status === 'rejected') {
       analyticsError = `Analytics unavailable: ${errorMessage(analyticsResult.reason)}`;
     }
+  }
+
+  async function hydrateAll(): Promise<void> {
+    await Promise.all([hydrateFast(), hydrateSlow()]);
   }
 
   async function handleRangeChange(event: CustomEvent<AnalyticsRangeKey>): Promise<void> {
@@ -175,20 +178,25 @@
 
   onMount(() => {
     initializeTheme();
-    void hydrate();
+    void hydrateAll();
 
-    const interval = window.setInterval(() => {
-      void hydrate();
-    }, POLL_INTERVAL_MS);
+    const fastInterval = window.setInterval(() => {
+      void hydrateFast();
+    }, FAST_POLL_INTERVAL_MS);
+
+    const slowInterval = window.setInterval(() => {
+      void hydrateSlow();
+    }, SLOW_POLL_INTERVAL_MS);
 
     return () => {
-      window.clearInterval(interval);
+      window.clearInterval(fastInterval);
+      window.clearInterval(slowInterval);
     };
   });
 </script>
 
 <div class="app-shell">
-  <TopBar theme={$themeStore} on:toggleTheme={handleThemeToggle} on:refresh={() => void hydrate()} />
+  <TopBar theme={$themeStore} on:toggleTheme={handleThemeToggle} on:refresh={() => void hydrateAll()} />
 
   <main class="layout">
     <AnalyticsPanel

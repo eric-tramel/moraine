@@ -17,6 +17,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 regex = "1.11"
 urlencoding = "2.1"
 walkdir = "2.5"
+same-file = "1.0"
 moraine-config = { path = "../moraine-config" }
 moraine-clickhouse = { path = "../moraine-clickhouse" }
 

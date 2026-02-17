@@ -17,7 +17,8 @@ export const MODEL_COLORS = [
 
 export const THEME_STORAGE_KEY = 'moraine-monitor-theme';
 
-export const POLL_INTERVAL_MS = 10_000;
+export const FAST_POLL_INTERVAL_MS = 10_000;
+export const SLOW_POLL_INTERVAL_MS = 60_000;
 
 export const DEFAULT_ANALYTICS_META = 'Loading model analytics…';
 

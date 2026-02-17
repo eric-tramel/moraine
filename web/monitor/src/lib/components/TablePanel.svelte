@@ -2,7 +2,7 @@
   import { createEventDispatcher } from 'svelte';
   import type { TableDetailResponse } from '../types/api';
   import type { TableOption } from '../types/ui';
-  import { isHttpUrl, searchQueryUrl, stringifyCellValue } from '../utils/url';
+  import { isHttpUrl, previewTableCellValue, searchQueryUrl } from '../utils/url';
 
   export let tableTitle = 'Table';
   export let tableOptions: TableOption[] = [];
@@ -15,6 +15,8 @@
 
   let selectedTableValue = '';
   let rowLimitValue = 25;
+  let expandedCells = new Set<string>();
+  let previousDetail: TableDetailResponse | null = null;
 
   const dispatch = createEventDispatcher<{
     tableChange: string;
@@ -25,6 +27,10 @@
   $: rows = detail?.rows ?? [];
   $: selectedTableValue = selectedTable || '';
   $: rowLimitValue = rowLimit;
+  $: if (detail !== previousDetail) {
+    previousDetail = detail;
+    expandedCells = new Set();
+  }
 
   function handleTableChange(): void {
     dispatch('tableChange', selectedTableValue);
@@ -36,6 +42,24 @@
 
   function valueAsString(value: unknown): string {
     return typeof value === 'string' ? value : String(value);
+  }
+
+  function cellKey(rowIndex: number, column: string): string {
+    return `${rowIndex}:${column}`;
+  }
+
+  function isCellExpanded(key: string): boolean {
+    return expandedCells.has(key);
+  }
+
+  function toggleCellExpansion(key: string): void {
+    const next = new Set(expandedCells);
+    if (next.has(key)) {
+      next.delete(key);
+    } else {
+      next.add(key);
+    }
+    expandedCells = next;
   }
 </script>
 
@@ -83,21 +107,40 @@
               <td colspan={columns.length}>No rows found for this table.</td>
             </tr>
           {:else}
-            {#each rows as row}
+            {#each rows as row, rowIndex}
               <tr>
                 {#each columns as column}
                   {@const value = row[column]}
                   <td>
                     {#if value === null || value === undefined}
                       {''}
-                    {:else if selectedTable === 'web_searches' && column === 'result_url' && isHttpUrl(value)}
-                      <a href={value} target="_blank" rel="noopener noreferrer">{value}</a>
-                    {:else if selectedTable === 'web_searches' && column === 'search_query' && valueAsString(value).trim().length > 0}
-                      <a href={searchQueryUrl(valueAsString(value))} target="_blank" rel="noopener noreferrer">
-                        {valueAsString(value)}
-                      </a>
                     {:else}
-                      {stringifyCellValue(value)}
+                      {@const preview = previewTableCellValue(value)}
+                      {@const key = cellKey(rowIndex, column)}
+                      {@const expanded = isCellExpanded(key)}
+                      {@const displayText = expanded ? preview.fullText : preview.previewText}
+                      <div class="cell-content">
+                        {#if selectedTable === 'web_searches' && column === 'result_url' && isHttpUrl(value)}
+                          <a href={value} target="_blank" rel="noopener noreferrer">{displayText}</a>
+                        {:else if selectedTable === 'web_searches' && column === 'search_query' && valueAsString(value).trim().length > 0}
+                          <a href={searchQueryUrl(valueAsString(value))} target="_blank" rel="noopener noreferrer">
+                            {displayText}
+                          </a>
+                        {:else}
+                          {displayText}
+                        {/if}
+
+                        {#if preview.isTruncated}
+                          <button
+                            type="button"
+                            class="cell-toggle"
+                            aria-expanded={expanded}
+                            on:click={() => toggleCellExpansion(key)}
+                          >
+                            {expanded ? 'Show less' : 'Show more'}
+                          </button>
+                        {/if}
+                      </div>
                     {/if}
                   </td>
                 {/each}
