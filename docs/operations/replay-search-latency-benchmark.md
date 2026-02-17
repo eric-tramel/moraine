@@ -9,8 +9,9 @@ The benchmark script is a self-declared `uv` script and replays through the loca
 The script:
 
 - selects top `N` rows from `moraine.search_query_log` by `response_ms` in a time window,
+- excludes prior benchmark replay rows (`source='benchmark-replay'`) by default,
 - runs `maturin develop` for `bindings/python/moraine_conversations` (unless skipped),
-- replays each query through `moraine_conversations.ConversationClient.search_events_json`,
+- replays each query through `moraine_conversations.ConversationClient.search_events_json` with `source='benchmark-replay'`,
 - runs warmup and measured repeats per query,
 - reports per-query and aggregate latency stats,
 - records timeout/error counts,
@@ -57,6 +58,7 @@ uv run --script scripts/bench/replay_search_latency.py \
 - `--repeats <int>`: measured runs per selected query.
 - `--timeout-seconds <int>`: timeout for each replayed search request.
 - `--skip-maturin-develop`: skip local binding rebuild before replay.
+- `--include-benchmark-replays`: include `source='benchmark-replay'` rows in selection.
 - `--output-json <path>`: write machine-readable benchmark output.
 - `--print-sql`: print generated ClickHouse selection SQL.
 - `--dry-run`: select and validate rows, but skip replay.
@@ -95,7 +97,8 @@ Exit code behavior:
 
 - No rows selected:
   - increase `--window` (for example `7d`),
-  - verify recent `search_query_log` writes are present.
+  - verify recent `search_query_log` writes are present,
+  - if you intentionally want replay-generated rows, pass `--include-benchmark-replays`.
 - Local binding build/import failure:
   - ensure `uv`, Python, Rust/Cargo, and a C toolchain are available,
   - run `uv run --script scripts/bench/replay_search_latency.py --config ...` so `maturin` is auto-installed,

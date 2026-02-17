@@ -148,6 +148,7 @@ impl ConversationClient {
         min_should_match=None,
         include_tool_events=None,
         exclude_codex_mcp=None,
+        source=None,
     ))]
     fn search_events_json(
         &self,
@@ -158,11 +159,13 @@ impl ConversationClient {
         min_should_match: Option<u16>,
         include_tool_events: Option<bool>,
         exclude_codex_mcp: Option<bool>,
+        source: Option<String>,
     ) -> PyResult<String> {
         let results = self
             .rt
             .block_on(self.repo.search_events(SearchEventsQuery {
                 query,
+                source,
                 limit,
                 session_id,
                 min_score,

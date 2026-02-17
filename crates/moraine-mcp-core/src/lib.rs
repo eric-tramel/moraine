@@ -374,6 +374,7 @@ impl AppState {
             .repo
             .search_events(SearchEventsQuery {
                 query: args.query,
+                source: Some("moraine-mcp".to_string()),
                 limit: args.limit,
                 session_id: args.session_id,
                 min_score: args.min_score,

@@ -26,6 +26,7 @@ from urllib.request import Request, urlopen
 
 WINDOW_RE = re.compile(r"^\s*(\d+)\s*([smhdw])\s*$", re.IGNORECASE)
 SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+BENCHMARK_REPLAY_SOURCE = "benchmark-replay"
 
 
 @dataclass
@@ -105,6 +106,11 @@ def parse_args() -> argparse.Namespace:
         "--skip-maturin-develop",
         action="store_true",
         help="Skip running maturin develop before replay",
+    )
+    parser.add_argument(
+        "--include-benchmark-replays",
+        action="store_true",
+        help=f"Include rows with source='{BENCHMARK_REPLAY_SOURCE}' in top-N selection",
     )
     parser.add_argument("--output-json", help="Write machine-readable results JSON to this path")
     parser.add_argument(
@@ -302,7 +308,16 @@ def parse_bool_like(value: Any, field_name: str) -> bool:
     raise ValueError(f"{field_name} expected boolean, got {type(value).__name__}")
 
 
-def build_selection_sql(database: str, interval_expr: str, top_n: int) -> str:
+def build_selection_sql(
+    database: str,
+    interval_expr: str,
+    top_n: int,
+    include_benchmark_replays: bool,
+) -> str:
+    source_filter_sql = ""
+    if not include_benchmark_replays:
+        source_filter_sql = f"  AND source != '{BENCHMARK_REPLAY_SOURCE}'\n"
+
     return (
         "SELECT\n"
         "  toString(ts) AS selected_ts,\n"
@@ -319,6 +334,7 @@ def build_selection_sql(database: str, interval_expr: str, top_n: int) -> str:
         f"FROM {database}.search_query_log\n"
         f"WHERE ts >= now() - {interval_expr}\n"
         "  AND length(trim(BOTH ' ' FROM raw_query)) > 0\n"
+        f"{source_filter_sql}"
         "ORDER BY response_ms DESC\n"
         f"LIMIT {top_n}\n"
         "FORMAT JSONEachRow"
@@ -560,6 +576,7 @@ class PackageSearchClient:
             min_should_match=int(arguments["min_should_match"]),
             include_tool_events=bool(arguments["include_tool_events"]),
             exclude_codex_mcp=bool(arguments["exclude_codex_mcp"]),
+            source=BENCHMARK_REPLAY_SOURCE,
         )
         parsed = json.loads(payload)
         if not isinstance(parsed, dict):
@@ -592,6 +609,7 @@ def print_selection_summary(
     print("Selection")
     print(f"  window: {args.window}")
     print(f"  requested_top_n: {args.top_n}")
+    print(f"  include_benchmark_replays: {args.include_benchmark_replays}")
     print(f"  selected_rows: {len(selected_rows)}")
     print(f"  replayable_rows: {len(replayable_rows)}")
     print(f"  skipped_rows: {skipped}")
@@ -677,6 +695,7 @@ def build_output_json(
                 "timeout_seconds": args.timeout_seconds,
                 "dry_run": dry_run,
                 "skip_maturin_develop": args.skip_maturin_develop,
+                "include_benchmark_replays": args.include_benchmark_replays,
             },
             "selected_count": len(selected_rows),
             "replayed_count": len(replay_results),
@@ -705,7 +724,12 @@ def main() -> int:
         print(f"fatal: {exc}", file=sys.stderr)
         return 2
 
-    selection_sql = build_selection_sql(ch_cfg.database, interval_expr, args.top_n)
+    selection_sql = build_selection_sql(
+        ch_cfg.database,
+        interval_expr,
+        args.top_n,
+        args.include_benchmark_replays,
+    )
     if args.print_sql:
         print("Selection SQL:")
         print(selection_sql)
@@ -720,7 +744,8 @@ def main() -> int:
     if not raw_rows:
         print(
             "fatal: no rows found in search_query_log for requested window; "
-            "try increasing --window or confirm telemetry is present",
+            "try increasing --window, confirm telemetry is present, or pass "
+            "--include-benchmark-replays",
             file=sys.stderr,
         )
         empty_payload = build_output_json(

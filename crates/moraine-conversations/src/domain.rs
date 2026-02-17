@@ -175,6 +175,8 @@ pub struct OpenContext {
 pub struct SearchEventsQuery {
     pub query: String,
     #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
     pub limit: Option<u16>,
     #[serde(default)]
     pub session_id: Option<String>,

@@ -640,6 +640,7 @@ FORMAT JSONEachRow",
     async fn log_search_events(
         &self,
         query_id: &str,
+        source: &str,
         raw_query: &str,
         session_hint: &str,
         terms: &[String],
@@ -668,7 +669,7 @@ FORMAT JSONEachRow",
 
         let query_row = json!({
             "query_id": query_id,
-            "source": "moraine-conversations",
+            "source": source,
             "session_hint": session_hint,
             "raw_query": raw_query,
             "normalized_terms": terms,
@@ -1133,6 +1134,12 @@ FORMAT JSONEachRow",
         if query_text.is_empty() {
             return Err(RepoError::invalid_argument("query cannot be empty"));
         }
+        let source = query
+            .source
+            .as_deref()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+            .unwrap_or("moraine-conversations");
 
         let query_id = Uuid::new_v4().to_string();
         let started = Instant::now();
@@ -1239,6 +1246,7 @@ FORMAT JSONEachRow",
 
         self.log_search_events(
             &query_id,
+            source,
             query_text,
             query.session_id.as_deref().unwrap_or(""),
             &terms,
