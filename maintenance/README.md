@@ -36,21 +36,46 @@ maintenance/run_multiagent_repo_audit.sh --dry-run
 
 ## Issue Worker Orchestrator
 
-`run_issue_worker.sh` runs one issue-focused automation cycle:
+`run_issue_worker.sh` orchestrates issue-fix workers:
 
-1. Accept a comma-separated label union (`--tag-union`).
-2. Select the highest priority matching open issue (`P0 > P1 > P2 > unlabeled`, then lowest issue number).
-3. Mark it in progress with `status/in-progress`.
-4. Create a fresh worktree/branch for that issue.
-5. Launch `codex exec` with `gpt-5.3-codex` + `xhigh` effort to fix, test, commit, push, and open a PR.
+1. Optionally filter by a comma-separated label union (`--tag-union`).
+2. Select issues by priority (`P0 > P1 > P2 > unlabeled`, then lowest issue number).
+3. Claim each selected issue with `status/in-progress`.
+4. Launch worker executions with a 20-second stagger between launches.
+5. Use `--parallel N` (default `1`) to control concurrent workers.
+6. Use `--continuous` to keep refilling worker slots until no eligible issues remain.
 
-Quick start:
+Quick start (no tag filter):
+
+```bash
+maintenance/run_issue_worker.sh
+```
+
+Quick start (with tag filter):
 
 ```bash
 maintenance/run_issue_worker.sh --tag-union "area/config,area/security"
 ```
 
-Dry run (select only, no claim or Codex launch):
+One-shot parallel batch (up to 3 workers):
+
+```bash
+maintenance/run_issue_worker.sh --parallel 3
+```
+
+Continuous pool (keep up to 3 workers active until issue queue is empty):
+
+```bash
+maintenance/run_issue_worker.sh --parallel 3 --continuous
+```
+
+Dry run (select only, no claim or Codex launch, no tag filter):
+
+```bash
+maintenance/run_issue_worker.sh --dry-run
+```
+
+Dry run (with tag filter):
 
 ```bash
 maintenance/run_issue_worker.sh --tag-union "area/config,area/security" --dry-run
