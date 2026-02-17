@@ -1,9 +1,35 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import select
 import subprocess
 from typing import Any, Dict, Optional
+
+
+def collect_stderr(
+    proc: subprocess.Popen[str], wait_seconds: float = 0.2, max_bytes: int = 8192
+) -> str:
+    if proc.stderr is None:
+        return ""
+
+    chunks: list[str] = []
+    bytes_read = 0
+    timeout = wait_seconds
+    fd = proc.stderr.fileno()
+    while bytes_read < max_bytes:
+        ready, _, _ = select.select([proc.stderr], [], [], timeout)
+        if not ready:
+            break
+
+        timeout = 0
+        chunk = os.read(fd, min(4096, max_bytes - bytes_read))
+        if not chunk:
+            break
+        chunks.append(chunk.decode("utf-8", errors="replace"))
+        bytes_read += len(chunk)
+
+    return "".join(chunks)
 
 
 def read_json_line(proc: subprocess.Popen[str], timeout_seconds: int = 20) -> Dict[str, Any]:
@@ -12,12 +38,12 @@ def read_json_line(proc: subprocess.Popen[str], timeout_seconds: int = 20) -> Di
 
     ready, _, _ = select.select([proc.stdout], [], [], timeout_seconds)
     if not ready:
-        stderr = proc.stderr.read() if proc.stderr else ""
+        stderr = collect_stderr(proc)
         raise TimeoutError(f"timed out waiting for MCP response; stderr={stderr.strip()}")
 
     line = proc.stdout.readline()
     if line == "":
-        stderr = proc.stderr.read() if proc.stderr else ""
+        stderr = collect_stderr(proc)
         raise RuntimeError(f"MCP process exited unexpectedly; stderr={stderr.strip()}")
 
     return json.loads(line)

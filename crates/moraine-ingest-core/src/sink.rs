@@ -29,6 +29,21 @@ fn saturating_u64_to_u32(value: u64) -> u32 {
     value.min(u32::MAX as u64) as u32
 }
 
+fn duration_from_config_seconds(seconds: f64, minimum_seconds: f64, field_name: &str) -> Duration {
+    if !seconds.is_finite() {
+        warn!("non-finite config value for `{field_name}` ({seconds}); using {minimum_seconds}");
+        return Duration::from_secs_f64(minimum_seconds);
+    }
+
+    let sanitized_seconds = seconds.max(minimum_seconds);
+    Duration::try_from_secs_f64(sanitized_seconds).unwrap_or_else(|_| {
+        warn!(
+            "out-of-range config value for `{field_name}` ({sanitized_seconds}); using {minimum_seconds}"
+        );
+        Duration::from_secs_f64(minimum_seconds)
+    })
+}
+
 fn append_to_visible_percentile(sorted_latencies_ms: &[u64], quantile: f64) -> u64 {
     debug_assert!(!sorted_latencies_ms.is_empty());
     let rank = ((sorted_latencies_ms.len() as f64) * quantile).ceil() as usize;
@@ -77,12 +92,21 @@ pub(crate) fn spawn_sink_task(
         let mut error_rows = Vec::<Value>::new();
         let mut checkpoint_updates = HashMap::<String, Checkpoint>::new();
 
-        let flush_interval =
-            Duration::from_secs_f64(config.ingest.flush_interval_seconds.max(0.05));
-        let heartbeat_interval =
-            Duration::from_secs_f64(config.ingest.heartbeat_interval_seconds.max(1.0));
-        let retry_backoff =
-            Duration::from_secs_f64((config.ingest.flush_interval_seconds * 2.0).max(0.25));
+        let flush_interval = duration_from_config_seconds(
+            config.ingest.flush_interval_seconds,
+            0.05,
+            "ingest.flush_interval_seconds",
+        );
+        let heartbeat_interval = duration_from_config_seconds(
+            config.ingest.heartbeat_interval_seconds,
+            1.0,
+            "ingest.heartbeat_interval_seconds",
+        );
+        let retry_backoff = duration_from_config_seconds(
+            config.ingest.flush_interval_seconds * 2.0,
+            0.25,
+            "ingest.flush_interval_seconds * 2.0",
+        );
 
         let mut flush_tick = tokio::time::interval(flush_interval);
         let mut heartbeat_tick = tokio::time::interval(heartbeat_interval);
@@ -469,5 +493,24 @@ mod tests {
 
         assert_eq!(p50, 0);
         assert_eq!(p95, 0);
+    }
+
+    #[test]
+    fn duration_from_config_seconds_clamps_to_minimum() {
+        let duration = duration_from_config_seconds(0.001, 0.05, "ingest.flush_interval_seconds");
+        assert_eq!(duration, Duration::from_millis(50));
+    }
+
+    #[test]
+    fn duration_from_config_seconds_handles_non_finite_values() {
+        let nan = duration_from_config_seconds(f64::NAN, 0.05, "ingest.flush_interval_seconds");
+        let pos_inf =
+            duration_from_config_seconds(f64::INFINITY, 0.05, "ingest.flush_interval_seconds");
+        let neg_inf =
+            duration_from_config_seconds(f64::NEG_INFINITY, 0.05, "ingest.flush_interval_seconds");
+
+        assert_eq!(nan, Duration::from_millis(50));
+        assert_eq!(pos_inf, Duration::from_millis(50));
+        assert_eq!(neg_inf, Duration::from_millis(50));
     }
 }
