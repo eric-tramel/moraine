@@ -18,6 +18,7 @@ pub struct NormalizedRecord {
     pub event_rows: Vec<Value>,
     pub link_rows: Vec<Value>,
     pub tool_rows: Vec<Value>,
+    pub error_rows: Vec<Value>,
     pub session_hint: String,
     pub model_hint: String,
 }

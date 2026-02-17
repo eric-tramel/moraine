@@ -52,6 +52,41 @@ fn unix_ms_now() -> u64 {
         .as_millis() as u64
 }
 
+struct WatchRegistration {
+    metrics: Arc<Metrics>,
+    registered: bool,
+}
+
+impl WatchRegistration {
+    fn new(metrics: Arc<Metrics>) -> Self {
+        Self {
+            metrics,
+            registered: false,
+        }
+    }
+
+    fn mark_registered(&mut self) {
+        if self.registered {
+            return;
+        }
+        self.metrics
+            .watcher_registrations
+            .fetch_add(1, Ordering::Relaxed);
+        self.registered = true;
+    }
+}
+
+impl Drop for WatchRegistration {
+    fn drop(&mut self) {
+        if !self.registered {
+            return;
+        }
+        self.metrics
+            .watcher_registrations
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 fn record_backend(metrics: &Arc<Metrics>, backend: WatcherBackend) {
     let next = backend.state();
     let mut current = metrics.watcher_backend_state.load(Ordering::Relaxed);
@@ -159,6 +194,7 @@ pub(crate) fn spawn_watcher_threads(
         let handle = std::thread::spawn(move || {
             let (event_tx, event_rx) = std::sync::mpsc::channel::<notify::Result<Event>>();
             let native_tx = event_tx.clone();
+            let mut registration = WatchRegistration::new(metrics_clone.clone());
 
             let mut watcher = match notify::recommended_watcher(move |res| {
                 let _ = native_tx.send(res);
@@ -238,6 +274,7 @@ pub(crate) fn spawn_watcher_threads(
                 );
                 return;
             }
+            registration.mark_registered();
 
             loop {
                 match event_rx.recv() {
@@ -312,11 +349,13 @@ pub(crate) fn enumerate_jsonl_files(glob_pattern: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Metrics;
     use notify::{
         event::{CreateKind, DataChange, Flag, ModifyKind, RenameMode},
         EventKind,
     };
     use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn rescan_events_require_reconcile() {
@@ -349,5 +388,19 @@ mod tests {
 
         let paths = event_jsonl_paths(&event);
         assert_eq!(paths, vec!["/tmp/a.jsonl".to_string()]);
+    }
+
+    #[test]
+    fn watcher_registration_tracks_active_watches() {
+        let metrics = Arc::new(Metrics::default());
+        assert_eq!(metrics.watcher_registrations.load(Ordering::Relaxed), 0);
+
+        {
+            let mut registration = WatchRegistration::new(metrics.clone());
+            registration.mark_registered();
+            assert_eq!(metrics.watcher_registrations.load(Ordering::Relaxed), 1);
+        }
+
+        assert_eq!(metrics.watcher_registrations.load(Ordering::Relaxed), 0);
     }
 }

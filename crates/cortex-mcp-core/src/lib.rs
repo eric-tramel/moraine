@@ -390,7 +390,7 @@ impl AppState {
         }
 
         let avgdl = (total_doc_len as f64 / docs as f64).max(1.0);
-        let df_map = self.df_map(&terms).await?;
+        let df_map = self.df_map(&terms, docs).await?;
 
         let mut idf_by_term = HashMap::<String, f64>::new();
         for term in &terms {
@@ -599,7 +599,7 @@ FORMAT JSONEachRow",
         }
     }
 
-    async fn df_map(&self, terms: &[String]) -> Result<HashMap<String, u64>> {
+    async fn df_map(&self, terms: &[String], docs: u64) -> Result<HashMap<String, u64>> {
         let terms_array = sql_array_strings(terms);
         let term_stats_table = self.table_ref("search_term_stats");
         let postings_table = self.table_ref("search_postings");
@@ -614,7 +614,7 @@ FORMAT JSONEachRow",
             map.insert(row.term, row.df);
         }
 
-        if map.len() == terms.len() {
+        if !df_map_requires_recompute(terms, &map, docs) {
             return Ok(map);
         }
 
@@ -622,6 +622,7 @@ FORMAT JSONEachRow",
             "SELECT term, count() AS df FROM {postings_table} FINAL WHERE term IN {terms_array} GROUP BY term FORMAT JSONEachRow",
         );
         let fallback_rows: Vec<DfRow> = self.ch.query_rows(&fallback_query, None).await?;
+        map.clear();
         for row in fallback_rows {
             map.insert(row.term, row.df);
         }
@@ -1074,6 +1075,16 @@ fn sql_array_f64(items: &[f64]) -> String {
     format!("[{}]", parts.join(","))
 }
 
+fn df_map_requires_recompute(terms: &[String], df_map: &HashMap<String, u64>, docs: u64) -> bool {
+    if df_map.len() != terms.len() {
+        return true;
+    }
+
+    terms
+        .iter()
+        .any(|term| df_map.get(term).copied().unwrap_or(0) > docs)
+}
+
 pub async fn run_stdio(cfg: AppConfig) -> Result<()> {
     let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
     ch.ping().await.context("clickhouse ping failed")?;
@@ -1175,5 +1186,34 @@ mod tests {
     fn table_ref_escapes_identifiers() {
         let state = test_state("db`name");
         assert_eq!(state.table_ref("table`x"), "`db``name`.`table``x`");
+    }
+
+    #[test]
+    fn df_map_recompute_when_terms_missing() {
+        let terms = vec!["hello".to_string(), "world".to_string()];
+        let mut df_map = HashMap::new();
+        df_map.insert("hello".to_string(), 2);
+
+        assert!(df_map_requires_recompute(&terms, &df_map, 10));
+    }
+
+    #[test]
+    fn df_map_recompute_when_primary_df_exceeds_docs() {
+        let terms = vec!["hello".to_string(), "world".to_string()];
+        let mut df_map = HashMap::new();
+        df_map.insert("hello".to_string(), 11);
+        df_map.insert("world".to_string(), 2);
+
+        assert!(df_map_requires_recompute(&terms, &df_map, 10));
+    }
+
+    #[test]
+    fn df_map_skip_recompute_when_primary_stats_are_consistent() {
+        let terms = vec!["hello".to_string(), "world".to_string()];
+        let mut df_map = HashMap::new();
+        df_map.insert("hello".to_string(), 4);
+        df_map.insert("world".to_string(), 2);
+
+        assert!(!df_map_requires_recompute(&terms, &df_map, 10));
     }
 }
