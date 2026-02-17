@@ -102,6 +102,24 @@ pub(crate) async fn enqueue_work(
     }
 }
 
+pub(crate) fn complete_work(key: &str, dispatch: &Arc<Mutex<DispatchState>>) -> Option<WorkItem> {
+    let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+    state.inflight.remove(key);
+
+    if state.dirty.remove(key) {
+        if state.pending.insert(key.to_string()) {
+            return state.item_by_key.get(key).cloned();
+        }
+        return None;
+    }
+
+    if !state.pending.contains(key) && !state.inflight.contains(key) && !state.dirty.contains(key) {
+        state.item_by_key.remove(key);
+    }
+
+    None
+}
+
 pub(crate) async fn process_file(
     config: &AppConfig,
     work: &WorkItem,
@@ -222,7 +240,7 @@ pub(crate) async fn process_file(
             }
         };
 
-        let normalized = normalize_record(
+        let normalized = match normalize_record(
             &parsed,
             &work.source_name,
             &work.provider,
@@ -233,7 +251,24 @@ pub(crate) async fn process_file(
             start_offset,
             &session_hint,
             &model_hint,
-        );
+        ) {
+            Ok(normalized) => normalized,
+            Err(exc) => {
+                batch.error_rows.push(json!({
+                    "source_name": work.source_name,
+                    "provider": work.provider,
+                    "source_file": source_file,
+                    "source_inode": inode,
+                    "source_generation": checkpoint.source_generation,
+                    "source_line_no": line_no,
+                    "source_offset": start_offset,
+                    "error_kind": "normalize_error",
+                    "error_text": exc.to_string(),
+                    "raw_fragment": truncate(&text, 20_000),
+                }));
+                continue;
+            }
+        };
 
         session_hint = normalized.session_hint;
         model_hint = normalized.model_hint;
@@ -241,6 +276,7 @@ pub(crate) async fn process_file(
         batch.event_rows.extend(normalized.event_rows);
         batch.link_rows.extend(normalized.link_rows);
         batch.tool_rows.extend(normalized.tool_rows);
+        batch.error_rows.extend(normalized.error_rows);
         batch.lines_processed = batch.lines_processed.saturating_add(1);
 
         if batch.row_count() >= config.ingest.batch_size {
@@ -302,4 +338,87 @@ fn truncate(input: &str, max_chars: usize) -> String {
         return input.to_string();
     }
     input.chars().take(max_chars).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::complete_work;
+    use crate::{DispatchState, WorkItem};
+    use std::sync::{Arc, Mutex};
+
+    fn sample_work(path: &str) -> WorkItem {
+        WorkItem {
+            source_name: "test-source".to_string(),
+            provider: "test-provider".to_string(),
+            path: path.to_string(),
+        }
+    }
+
+    #[test]
+    fn complete_work_prunes_idle_item() {
+        let dispatch = Arc::new(Mutex::new(DispatchState::default()));
+        let work = sample_work("/tmp/idle.jsonl");
+        let key = work.key();
+
+        {
+            let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+            state.inflight.insert(key.clone());
+            state.item_by_key.insert(key.clone(), work);
+        }
+
+        let reschedule = complete_work(&key, &dispatch);
+        assert!(reschedule.is_none());
+
+        let state = dispatch.lock().expect("dispatch mutex poisoned");
+        assert!(!state.inflight.contains(&key));
+        assert!(!state.pending.contains(&key));
+        assert!(!state.dirty.contains(&key));
+        assert!(!state.item_by_key.contains_key(&key));
+    }
+
+    #[test]
+    fn complete_work_reschedules_dirty_item() {
+        let dispatch = Arc::new(Mutex::new(DispatchState::default()));
+        let work = sample_work("/tmp/dirty.jsonl");
+        let key = work.key();
+
+        {
+            let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+            state.inflight.insert(key.clone());
+            state.dirty.insert(key.clone());
+            state.item_by_key.insert(key.clone(), work.clone());
+        }
+
+        let reschedule = complete_work(&key, &dispatch);
+        assert_eq!(
+            reschedule.as_ref().map(|item| item.path.as_str()),
+            Some(work.path.as_str())
+        );
+
+        let state = dispatch.lock().expect("dispatch mutex poisoned");
+        assert!(!state.inflight.contains(&key));
+        assert!(!state.dirty.contains(&key));
+        assert!(state.pending.contains(&key));
+        assert!(state.item_by_key.contains_key(&key));
+    }
+
+    #[test]
+    fn complete_work_keeps_item_when_still_pending() {
+        let dispatch = Arc::new(Mutex::new(DispatchState::default()));
+        let work = sample_work("/tmp/pending.jsonl");
+        let key = work.key();
+
+        {
+            let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+            state.pending.insert(key.clone());
+            state.item_by_key.insert(key.clone(), work);
+        }
+
+        let reschedule = complete_work(&key, &dispatch);
+        assert!(reschedule.is_none());
+
+        let state = dispatch.lock().expect("dispatch mutex poisoned");
+        assert!(state.pending.contains(&key));
+        assert!(state.item_by_key.contains_key(&key));
+    }
 }
