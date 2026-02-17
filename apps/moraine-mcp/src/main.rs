@@ -25,7 +25,7 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    let args = cli::parse_args();
+    let args = cli::parse_args()?;
     let cfg = moraine_config::load_config(&args.config_path)
         .with_context(|| format!("failed to load config {}", args.config_path.display()))?;
 
