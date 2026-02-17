@@ -829,17 +829,12 @@ async fn api_table_rows(
         }
     };
 
+    let preview_columns: Vec<String> = schema.iter().map(|entry| entry.name.clone()).collect();
+    let rows_query = table_preview_rows_query(database, &table, &preview_columns, limit);
+
     let rows = match state
         .clickhouse
-        .query_rows::<Value>(
-            &format!(
-                "SELECT * FROM {}.{} LIMIT {}",
-                escape_identifier(database),
-                escape_identifier(&table),
-                limit
-            ),
-            None,
-        )
+        .query_rows::<Value>(&rows_query, None)
         .await
     {
         Ok(value) => value,
@@ -966,6 +961,28 @@ fn escape_identifier(value: &str) -> String {
     format!("`{}`", value.replace('`', "``"))
 }
 
+fn table_preview_rows_query(
+    database: &str,
+    table: &str,
+    column_names: &[String],
+    limit: u32,
+) -> String {
+    let database = escape_identifier(database);
+    let table = escape_identifier(table);
+
+    if column_names.is_empty() {
+        return format!("SELECT * FROM {database}.{table} LIMIT {limit}");
+    }
+
+    let order_by = column_names
+        .iter()
+        .map(|name| escape_identifier(name))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!("SELECT * FROM {database}.{table} ORDER BY {order_by} LIMIT {limit}")
+}
+
 fn value_to_i64(value: &Value) -> Option<i64> {
     if let Some(n) = value.as_i64() {
         return Some(n);
@@ -993,6 +1010,40 @@ mod tests {
     fn escaping_helpers() {
         assert_eq!(escape_literal("a'b"), "a''b");
         assert_eq!(escape_identifier("ev`ents"), "`ev``ents`");
+    }
+
+    #[test]
+    fn table_preview_query_orders_by_schema_columns() {
+        let query = table_preview_rows_query(
+            "analytics",
+            "events",
+            &[
+                "event_ts".to_string(),
+                "session_id".to_string(),
+                "event_id".to_string(),
+            ],
+            25,
+        );
+        assert_eq!(
+            query,
+            "SELECT * FROM `analytics`.`events` ORDER BY `event_ts`, `session_id`, `event_id` LIMIT 25"
+        );
+    }
+
+    #[test]
+    fn table_preview_query_escapes_identifiers() {
+        let query = table_preview_rows_query("ana`lytics", "ev`ents", &["co`l".to_string()], 10);
+        assert_eq!(
+            query,
+            "SELECT * FROM `ana``lytics`.`ev``ents` ORDER BY `co``l` LIMIT 10"
+        );
+    }
+
+    #[test]
+    fn table_preview_query_handles_empty_schema() {
+        let columns: Vec<String> = Vec::new();
+        let query = table_preview_rows_query("analytics", "events", &columns, 5);
+        assert_eq!(query, "SELECT * FROM `analytics`.`events` LIMIT 5");
     }
 
     #[test]
