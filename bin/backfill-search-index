@@ -54,38 +54,13 @@ if [[ ! -f "$CONFIG_PATH" ]]; then
   fi
 fi
 
-toml_get() {
-  local section="$1"
-  local key="$2"
-  local file="$3"
-  awk -v section="$section" -v key="$key" '
-    BEGIN { in_section = 0 }
-
-    /^[[:space:]]*#/ { next }
-
-    $0 ~ "^[[:space:]]*\\[" section "\\][[:space:]]*$" {
-      in_section = 1
-      next
-    }
-
-    $0 ~ "^[[:space:]]*\\[[^]]+\\][[:space:]]*$" {
-      in_section = 0
-    }
-
-    in_section && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
-      value = $0
-      sub(/^[^=]*=[[:space:]]*/, "", value)
-      sub(/[[:space:]]+#.*$/, "", value)
-      gsub(/^"/, "", value)
-      gsub(/"$/, "", value)
-      print value
-      exit
-    }
-  ' "$file"
+config_get() {
+  local key="$1"
+  "$PROJECT_ROOT/bin/cortexctl" --config "$CONFIG_PATH" config get "$key"
 }
 
-CLICKHOUSE_URL="$(toml_get "clickhouse" "url" "$CONFIG_PATH")"
-CLICKHOUSE_DB="$(toml_get "clickhouse" "database" "$CONFIG_PATH")"
+CLICKHOUSE_URL="$(config_get "clickhouse.url")"
+CLICKHOUSE_DB="$(config_get "clickhouse.database")"
 CLICKHOUSE_URL="${CLICKHOUSE_URL:-http://127.0.0.1:8123}"
 CLICKHOUSE_DB="${CLICKHOUSE_DB:-cortex}"
 
