@@ -6,6 +6,8 @@ use anyhow::{Context, Result};
 use moraine_config::AppConfig;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+#[cfg(not(unix))]
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -14,8 +16,12 @@ use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
 use tracing::debug;
 
+#[cfg(not(unix))]
+use same_file::Handle;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(not(unix))]
+use std::time::UNIX_EPOCH;
 
 pub(crate) fn spawn_debounce_task(
     config: AppConfig,
@@ -137,10 +143,7 @@ pub(crate) async fn process_file(
         }
     };
 
-    #[cfg(unix)]
-    let inode = meta.ino();
-    #[cfg(not(unix))]
-    let inode = 0u64;
+    let inode = source_inode_for_file(source_file, &meta);
 
     let file_size = meta.len();
     let cp_key = checkpoint_key(&work.source_name, source_file);
@@ -333,6 +336,52 @@ pub(crate) async fn process_file(
     Ok(())
 }
 
+fn source_inode_for_file(source_file: &str, meta: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        let _ = source_file;
+        meta.ino()
+    }
+
+    #[cfg(not(unix))]
+    {
+        non_unix_source_inode(source_file, meta)
+    }
+}
+
+#[cfg(not(unix))]
+fn non_unix_source_inode(source_file: &str, meta: &std::fs::Metadata) -> u64 {
+    if let Ok(handle) = Handle::from_path(source_file) {
+        let id = hash_identity(&handle);
+        if id != 0 {
+            return id;
+        }
+    }
+
+    // Fallback when a platform file handle identity is unavailable.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source_file.hash(&mut hasher);
+    if let Ok(created_at) = meta.created() {
+        if let Ok(since_epoch) = created_at.duration_since(UNIX_EPOCH) {
+            since_epoch.as_nanos().hash(&mut hasher);
+        }
+    }
+
+    let id = hasher.finish();
+    if id == 0 {
+        1
+    } else {
+        id
+    }
+}
+
+#[cfg(not(unix))]
+fn hash_identity(value: &impl Hash) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn truncate(input: &str, max_chars: usize) -> String {
     if input.chars().count() <= max_chars {
         return input.to_string();
@@ -342,9 +391,12 @@ fn truncate(input: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::complete_work;
+    use super::{complete_work, source_inode_for_file};
     use crate::{DispatchState, WorkItem};
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn sample_work(path: &str) -> WorkItem {
         WorkItem {
@@ -352,6 +404,14 @@ mod tests {
             provider: "test-provider".to_string(),
             path: path.to_string(),
         }
+    }
+
+    fn unique_test_file(name: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("moraine-dispatch-{name}-{suffix}.jsonl"))
     }
 
     #[test]
@@ -420,5 +480,44 @@ mod tests {
         let state = dispatch.lock().expect("dispatch mutex poisoned");
         assert!(state.pending.contains(&key));
         assert!(state.item_by_key.contains_key(&key));
+    }
+
+    #[test]
+    fn source_inode_is_stable_for_same_file() {
+        let path = unique_test_file("identity-stable");
+        fs::write(&path, "{\"line\":1}\n").expect("write initial file");
+        let source_file = path.to_string_lossy().to_string();
+
+        let first_meta = fs::metadata(&path).expect("metadata for initial file");
+        let first_id = source_inode_for_file(&source_file, &first_meta);
+        assert_ne!(first_id, 0);
+
+        fs::write(&path, "{\"line\":1}\n{\"line\":2}\n").expect("append file content");
+        let second_meta = fs::metadata(&path).expect("metadata after append");
+        let second_id = source_inode_for_file(&source_file, &second_meta);
+
+        let _ = fs::remove_file(&path);
+        assert_eq!(first_id, second_id);
+    }
+
+    #[test]
+    fn source_inode_changes_when_file_is_replaced() {
+        let path = unique_test_file("identity-replaced");
+        let replacement = unique_test_file("identity-replacement");
+        fs::write(&path, "{\"line\":1}\n").expect("write original file");
+        let source_file = path.to_string_lossy().to_string();
+
+        let original_meta = fs::metadata(&path).expect("metadata for original file");
+        let original_id = source_inode_for_file(&source_file, &original_meta);
+        assert_ne!(original_id, 0);
+
+        fs::write(&replacement, "{\"line\":99}\n").expect("write replacement file");
+        fs::rename(&replacement, &path).expect("replace file via rename");
+
+        let replaced_meta = fs::metadata(&path).expect("metadata for replaced file");
+        let replaced_id = source_inode_for_file(&source_file, &replaced_meta);
+
+        let _ = fs::remove_file(&path);
+        assert_ne!(original_id, replaced_id);
     }
 }

@@ -297,6 +297,24 @@
     font-size: 0.84rem;
   }
 
+  .cell-content {
+    @apply flex flex-col gap-1;
+  }
+
+  .cell-toggle {
+    @apply border-0 bg-transparent p-0 text-left text-xs;
+    color: var(--primary);
+    cursor: pointer;
+    font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    width: fit-content;
+  }
+
+  .cell-toggle:hover {
+    opacity: 0.9;
+  }
+
   #previewTable td a {
     color: var(--primary);
     text-decoration: underline;
