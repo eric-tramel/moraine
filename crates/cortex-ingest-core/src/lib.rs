@@ -56,6 +56,7 @@ pub(crate) struct Metrics {
     pub(crate) last_flush_ms: AtomicU64,
     pub(crate) flush_failures: AtomicU64,
     pub(crate) queue_depth: AtomicU64,
+    pub(crate) watcher_registrations: AtomicU64,
     pub(crate) watcher_error_count: AtomicU64,
     pub(crate) watcher_reset_count: AtomicU64,
     pub(crate) watcher_last_reset_unix_ms: AtomicU64,

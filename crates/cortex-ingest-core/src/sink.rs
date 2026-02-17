@@ -100,7 +100,8 @@ pub(crate) fn spawn_sink_task(
                         let state = dispatch.lock().expect("dispatch mutex poisoned");
                         state.inflight.len() as u32
                     };
-                    let files_watched = checkpoints.read().await.len() as u32;
+                    let files_watched =
+                        metrics.watcher_registrations.load(Ordering::Relaxed) as u32;
                     let last_error = {
                         metrics
                             .last_error
