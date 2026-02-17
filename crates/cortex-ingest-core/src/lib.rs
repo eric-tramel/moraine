@@ -7,7 +7,7 @@ mod reconcile;
 mod sink;
 mod watch;
 
-use crate::dispatch::{enqueue_work, process_file, spawn_debounce_task};
+use crate::dispatch::{complete_work, enqueue_work, process_file, spawn_debounce_task};
 use crate::model::RowBatch;
 use crate::reconcile::spawn_reconcile_task;
 use crate::sink::spawn_sink_task;
@@ -173,16 +173,7 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
                             .expect("metrics last_error mutex poisoned") = exc.to_string();
                     }
 
-                    let mut reschedule: Option<WorkItem> = None;
-                    {
-                        let mut state = dispatch_worker.lock().expect("dispatch mutex poisoned");
-                        state.inflight.remove(&key);
-                        if state.dirty.remove(&key) {
-                            if state.pending.insert(key.clone()) {
-                                reschedule = state.item_by_key.get(&key).cloned();
-                            }
-                        }
-                    }
+                    let reschedule = complete_work(&key, &dispatch_worker);
 
                     if let Some(item) = reschedule {
                         if process_tx_worker.send(item).await.is_ok() {
