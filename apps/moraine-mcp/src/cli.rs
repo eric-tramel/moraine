@@ -56,10 +56,9 @@ mod tests {
 
     #[test]
     fn parse_args_uses_config_path_when_provided() {
-        let parsed = parse_args_from(
-            vec!["--config".to_string(), "/tmp/mcp.toml".to_string()].into_iter(),
-        )
-        .expect("valid config path should parse");
+        let parsed =
+            parse_args_from(vec!["--config".to_string(), "/tmp/mcp.toml".to_string()].into_iter())
+                .expect("valid config path should parse");
         assert_eq!(parsed.config_path, PathBuf::from("/tmp/mcp.toml"));
     }
 }
