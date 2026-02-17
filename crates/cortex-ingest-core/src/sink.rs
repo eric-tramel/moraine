@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
-use tracing::warn;
+use tracing::{info, warn};
 
 fn watcher_backend_label(value: u64) -> &'static str {
     match value {
@@ -81,11 +81,50 @@ pub(crate) fn spawn_sink_task(
             Duration::from_secs_f64(config.ingest.flush_interval_seconds.max(0.05));
         let heartbeat_interval =
             Duration::from_secs_f64(config.ingest.heartbeat_interval_seconds.max(1.0));
+        let retry_backoff =
+            Duration::from_secs_f64((config.ingest.flush_interval_seconds * 2.0).max(0.25));
 
         let mut flush_tick = tokio::time::interval(flush_interval);
         let mut heartbeat_tick = tokio::time::interval(heartbeat_interval);
+        let mut throttling_flush_retries = false;
 
         loop {
+            if throttling_flush_retries
+                && has_pending_data(
+                    &raw_rows,
+                    &event_rows,
+                    &link_rows,
+                    &tool_rows,
+                    &error_rows,
+                    &checkpoint_updates,
+                )
+            {
+                if flush_pending(
+                    &clickhouse,
+                    &checkpoints,
+                    &metrics,
+                    &mut raw_rows,
+                    &mut event_rows,
+                    &mut link_rows,
+                    &mut tool_rows,
+                    &mut error_rows,
+                    &mut checkpoint_updates,
+                )
+                .await
+                {
+                    throttling_flush_retries = false;
+                    info!("flush retry succeeded; resuming sink intake");
+                } else {
+                    tokio::select! {
+                        _ = tokio::time::sleep(retry_backoff) => {}
+                        _ = heartbeat_tick.tick() => {
+                            emit_heartbeat(&clickhouse, &metrics, &dispatch).await;
+                        }
+                    }
+                }
+                continue;
+            }
+
             tokio::select! {
                 maybe_msg = rx.recv() => {
                     match maybe_msg {
@@ -101,7 +140,7 @@ pub(crate) fn spawn_sink_task(
 
                             let total_rows = raw_rows.len() + event_rows.len() + link_rows.len() + tool_rows.len() + error_rows.len();
                             if total_rows >= config.ingest.batch_size {
-                                flush_pending(
+                                if !flush_pending(
                                     &clickhouse,
                                     &checkpoints,
                                     &metrics,
@@ -111,15 +150,23 @@ pub(crate) fn spawn_sink_task(
                                     &mut tool_rows,
                                     &mut error_rows,
                                     &mut checkpoint_updates,
-                                ).await;
+                                ).await {
+                                    if !throttling_flush_retries {
+                                        warn!(
+                                            "flush failed; pausing sink intake and retrying pending rows every {} ms",
+                                            retry_backoff.as_millis()
+                                        );
+                                    }
+                                    throttling_flush_retries = true;
+                                }
                             }
                         }
                         None => break,
                     }
                 }
                 _ = flush_tick.tick() => {
-                    if !(raw_rows.is_empty() && event_rows.is_empty() && link_rows.is_empty() && tool_rows.is_empty() && error_rows.is_empty() && checkpoint_updates.is_empty()) {
-                        flush_pending(
+                    if has_pending_data(&raw_rows, &event_rows, &link_rows, &tool_rows, &error_rows, &checkpoint_updates) {
+                        if !flush_pending(
                             &clickhouse,
                             &checkpoints,
                             &metrics,
@@ -129,62 +176,31 @@ pub(crate) fn spawn_sink_task(
                             &mut tool_rows,
                             &mut error_rows,
                             &mut checkpoint_updates,
-                        ).await;
+                        ).await {
+                            if !throttling_flush_retries {
+                                warn!(
+                                    "flush failed; pausing sink intake and retrying pending rows every {} ms",
+                                    retry_backoff.as_millis()
+                                );
+                            }
+                            throttling_flush_retries = true;
+                        }
                     }
                 }
                 _ = heartbeat_tick.tick() => {
-                    let files_active = {
-                        let state = dispatch.lock().expect("dispatch mutex poisoned");
-                        state.inflight.len() as u32
-                    };
-                    let files_watched =
-                        metrics.watcher_registrations.load(Ordering::Relaxed) as u32;
-                    let last_error = {
-                        metrics
-                            .last_error
-                            .lock()
-                            .expect("metrics last_error mutex poisoned")
-                            .clone()
-                    };
-                    let watcher_backend = watcher_backend_label(
-                        metrics
-                            .watcher_backend_state
-                            .load(Ordering::Relaxed),
-                    );
-
-                    let heartbeat = json!({
-                        "host": host_name(),
-                        "service_version": env!("CARGO_PKG_VERSION"),
-                        "queue_depth": metrics.queue_depth.load(Ordering::Relaxed),
-                        "files_active": files_active,
-                        "files_watched": files_watched,
-                        "rows_raw_written": metrics.raw_rows_written.load(Ordering::Relaxed),
-                        "rows_events_written": metrics.event_rows_written.load(Ordering::Relaxed),
-                        "rows_errors_written": metrics.err_rows_written.load(Ordering::Relaxed),
-                        "flush_latency_ms": saturating_u64_to_u32(metrics.last_flush_ms.load(Ordering::Relaxed)),
-                        "append_to_visible_p50_ms": saturating_u64_to_u32(metrics.append_to_visible_p50_ms.load(Ordering::Relaxed)),
-                        "append_to_visible_p95_ms": saturating_u64_to_u32(metrics.append_to_visible_p95_ms.load(Ordering::Relaxed)),
-                        "watcher_backend": watcher_backend,
-                        "watcher_error_count": metrics.watcher_error_count.load(Ordering::Relaxed),
-                        "watcher_reset_count": metrics.watcher_reset_count.load(Ordering::Relaxed),
-                        "watcher_last_reset_unix_ms": metrics.watcher_last_reset_unix_ms.load(Ordering::Relaxed),
-                        "last_error": last_error,
-                    });
-
-                    if let Err(exc) = clickhouse.insert_json_rows("ingest_heartbeats", &[heartbeat]).await {
-                        warn!("heartbeat insert failed: {exc}");
-                    }
+                    emit_heartbeat(&clickhouse, &metrics, &dispatch).await;
                 }
             }
         }
 
-        if !(raw_rows.is_empty()
-            && event_rows.is_empty()
-            && link_rows.is_empty()
-            && tool_rows.is_empty()
-            && error_rows.is_empty()
-            && checkpoint_updates.is_empty())
-        {
+        if has_pending_data(
+            &raw_rows,
+            &event_rows,
+            &link_rows,
+            &tool_rows,
+            &error_rows,
+            &checkpoint_updates,
+        ) {
             flush_pending(
                 &clickhouse,
                 &checkpoints,
@@ -201,6 +217,69 @@ pub(crate) fn spawn_sink_task(
     })
 }
 
+fn has_pending_data(
+    raw_rows: &[Value],
+    event_rows: &[Value],
+    link_rows: &[Value],
+    tool_rows: &[Value],
+    error_rows: &[Value],
+    checkpoint_updates: &HashMap<String, Checkpoint>,
+) -> bool {
+    !(raw_rows.is_empty()
+        && event_rows.is_empty()
+        && link_rows.is_empty()
+        && tool_rows.is_empty()
+        && error_rows.is_empty()
+        && checkpoint_updates.is_empty())
+}
+
+async fn emit_heartbeat(
+    clickhouse: &ClickHouseClient,
+    metrics: &Arc<Metrics>,
+    dispatch: &Arc<Mutex<DispatchState>>,
+) {
+    let files_active = {
+        let state = dispatch.lock().expect("dispatch mutex poisoned");
+        state.inflight.len() as u32
+    };
+    let files_watched = metrics.watcher_registrations.load(Ordering::Relaxed) as u32;
+    let last_error = {
+        metrics
+            .last_error
+            .lock()
+            .expect("metrics last_error mutex poisoned")
+            .clone()
+    };
+    let watcher_backend =
+        watcher_backend_label(metrics.watcher_backend_state.load(Ordering::Relaxed));
+
+    let heartbeat = json!({
+        "host": host_name(),
+        "service_version": env!("CARGO_PKG_VERSION"),
+        "queue_depth": metrics.queue_depth.load(Ordering::Relaxed),
+        "files_active": files_active,
+        "files_watched": files_watched,
+        "rows_raw_written": metrics.raw_rows_written.load(Ordering::Relaxed),
+        "rows_events_written": metrics.event_rows_written.load(Ordering::Relaxed),
+        "rows_errors_written": metrics.err_rows_written.load(Ordering::Relaxed),
+        "flush_latency_ms": saturating_u64_to_u32(metrics.last_flush_ms.load(Ordering::Relaxed)),
+        "append_to_visible_p50_ms": saturating_u64_to_u32(metrics.append_to_visible_p50_ms.load(Ordering::Relaxed)),
+        "append_to_visible_p95_ms": saturating_u64_to_u32(metrics.append_to_visible_p95_ms.load(Ordering::Relaxed)),
+        "watcher_backend": watcher_backend,
+        "watcher_error_count": metrics.watcher_error_count.load(Ordering::Relaxed),
+        "watcher_reset_count": metrics.watcher_reset_count.load(Ordering::Relaxed),
+        "watcher_last_reset_unix_ms": metrics.watcher_last_reset_unix_ms.load(Ordering::Relaxed),
+        "last_error": last_error,
+    });
+
+    if let Err(exc) = clickhouse
+        .insert_json_rows("ingest_heartbeats", &[heartbeat])
+        .await
+    {
+        warn!("heartbeat insert failed: {exc}");
+    }
+}
+
 async fn flush_pending(
     clickhouse: &ClickHouseClient,
     checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
@@ -211,7 +290,7 @@ async fn flush_pending(
     tool_rows: &mut Vec<Value>,
     error_rows: &mut Vec<Value>,
     checkpoint_updates: &mut HashMap<String, Checkpoint>,
-) {
+) -> bool {
     let started = Instant::now();
 
     let checkpoint_rows: Vec<Value> = checkpoint_updates
@@ -283,6 +362,7 @@ async fn flush_pending(
             tool_rows.clear();
             error_rows.clear();
             checkpoint_updates.clear();
+            true
         }
         Err(exc) => {
             metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
@@ -291,15 +371,58 @@ async fn flush_pending(
                 .lock()
                 .expect("metrics last_error mutex poisoned") = exc.to_string();
             warn!("flush failed: {exc}");
+            false
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::compute_append_to_visible_stats;
+    use super::*;
+    use crate::model::RowBatch;
     use chrono::{DateTime, Utc};
     use serde_json::json;
+    use tokio::time::timeout;
+
+    fn single_row_batch(id: u64) -> SinkMessage {
+        let mut batch = RowBatch::default();
+        batch.raw_rows.push(json!({ "id": id }));
+        SinkMessage::Batch(batch)
+    }
+
+    #[tokio::test]
+    async fn failed_flush_throttles_sink_consumption() {
+        let mut config = cortex_config::AppConfig::default();
+        config.clickhouse.url = "http://127.0.0.1:1".to_string();
+        config.clickhouse.timeout_seconds = 1.0;
+        config.ingest.batch_size = 1;
+        config.ingest.flush_interval_seconds = 0.05;
+        config.ingest.heartbeat_interval_seconds = 60.0;
+
+        let clickhouse = ClickHouseClient::new(config.clickhouse.clone())
+            .expect("clickhouse client should initialize");
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+        let dispatch = Arc::new(Mutex::new(DispatchState::default()));
+        let (tx, rx) = mpsc::channel(1);
+
+        let handle = spawn_sink_task(config, clickhouse, checkpoints, metrics, rx, dispatch);
+
+        tx.send(single_row_batch(1))
+            .await
+            .expect("first send should succeed");
+        tx.send(single_row_batch(2))
+            .await
+            .expect("second send should succeed");
+
+        let third_send = timeout(Duration::from_millis(350), tx.send(single_row_batch(3))).await;
+        assert!(
+            third_send.is_err(),
+            "third send should block while sink retries failed flushes"
+        );
+
+        handle.abort();
+    }
 
     #[test]
     fn compute_append_to_visible_stats_uses_real_record_timestamps() {
