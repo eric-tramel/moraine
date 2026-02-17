@@ -8,17 +8,17 @@ pub struct CliArgs {
     pub static_dir: PathBuf,
 }
 
-fn monitor_dir_candidates(root: &Path) -> [PathBuf; 2] {
-    [
-        root.join("web").join("monitor").join("dist"),
-        root.join("web").join("monitor"),
-    ]
+fn monitor_dist_candidate(root: &Path) -> PathBuf {
+    root.join("web").join("monitor").join("dist")
 }
 
 fn find_monitor_dir(root: &Path) -> Option<PathBuf> {
-    monitor_dir_candidates(root)
-        .into_iter()
-        .find(|candidate| candidate.exists())
+    let candidate = monitor_dist_candidate(root);
+    if candidate.exists() {
+        Some(candidate)
+    } else {
+        None
+    }
 }
 
 fn source_tree_static_dir() -> PathBuf {
@@ -142,13 +142,13 @@ mod tests {
     }
 
     #[test]
-    fn find_monitor_dir_uses_monitor_root_when_dist_missing() {
+    fn find_monitor_dir_requires_dist() {
         let root = temp_root("fallback-monitor-root");
         let monitor = root.join("web").join("monitor");
         fs::create_dir_all(&monitor).expect("create monitor dir");
 
         let found = find_monitor_dir(&root);
-        assert_eq!(found, Some(monitor));
+        assert_eq!(found, None);
 
         fs::remove_dir_all(root).expect("cleanup");
     }
