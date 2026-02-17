@@ -1,6 +1,6 @@
 use crate::config::ClickHouseConfig;
 use anyhow::Result;
-use cortex_clickhouse::ClickHouseClient as SharedClickHouseClient;
+use moraine_clickhouse::ClickHouseClient as SharedClickHouseClient;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 

@@ -1,9 +1,9 @@
-DROP VIEW IF EXISTS cortex.v_session_summary;
-DROP VIEW IF EXISTS cortex.v_turn_summary;
-DROP VIEW IF EXISTS cortex.v_conversation_trace;
-DROP VIEW IF EXISTS cortex.v_all_events;
+DROP VIEW IF EXISTS moraine.v_session_summary;
+DROP VIEW IF EXISTS moraine.v_turn_summary;
+DROP VIEW IF EXISTS moraine.v_conversation_trace;
+DROP VIEW IF EXISTS moraine.v_all_events;
 
-CREATE VIEW cortex.v_all_events AS
+CREATE VIEW moraine.v_all_events AS
 SELECT
   ingested_at,
   event_uid,
@@ -29,9 +29,9 @@ SELECT
   payload_json,
   token_usage_json,
   event_version
-FROM cortex.events;
+FROM moraine.events;
 
-CREATE VIEW cortex.v_conversation_trace AS
+CREATE VIEW moraine.v_conversation_trace AS
 SELECT
   session_id,
   session_date,
@@ -72,9 +72,9 @@ SELECT
   text_content,
   payload_json,
   token_usage_json
-FROM cortex.v_all_events;
+FROM moraine.v_all_events;
 
-CREATE VIEW cortex.v_turn_summary AS
+CREATE VIEW moraine.v_turn_summary AS
 SELECT
   session_id,
   turn_seq,
@@ -87,10 +87,10 @@ SELECT
   countIf(event_class = 'tool_call') AS tool_calls,
   countIf(event_class = 'tool_result') AS tool_results,
   countIf(event_class = 'reasoning') AS reasoning_items
-FROM cortex.v_conversation_trace
+FROM moraine.v_conversation_trace
 GROUP BY session_id, turn_seq;
 
-CREATE VIEW cortex.v_session_summary AS
+CREATE VIEW moraine.v_session_summary AS
 SELECT
   session_id,
   min(event_time) AS first_event_time,
@@ -101,5 +101,5 @@ SELECT
   countIf(event_class = 'tool_result') AS tool_results,
   countIf(actor_role = 'user' AND event_class = 'message') AS user_messages,
   countIf(actor_role = 'assistant' AND event_class = 'message') AS assistant_messages
-FROM cortex.v_conversation_trace
+FROM moraine.v_conversation_trace
 GROUP BY session_id;

@@ -2,7 +2,7 @@
 name = "codex-mcp"
 version = "0.1.0"
 edition = "2021"
-description = "High-performance MCP search/open service for Cortex ClickHouse indexes"
+description = "High-performance MCP search/open service for Moraine ClickHouse indexes"
 
 [dependencies]
 anyhow = "1.0"
@@ -15,5 +15,5 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 uuid = { version = "1.11", features = ["v4"] }
-cortex-config = { path = "../../crates/cortex-config" }
-cortex-clickhouse = { path = "../../crates/cortex-clickhouse" }
+moraine-config = { path = "../../crates/moraine-config" }
+moraine-clickhouse = { path = "../../crates/moraine-clickhouse" }

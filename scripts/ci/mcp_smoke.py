@@ -82,7 +82,7 @@ def select_hit(
 
 
 def run_smoke(
-    cortexctl: str,
+    moraine: str,
     config: str,
     query: str,
     expect_session_id: Optional[str],
@@ -90,7 +90,7 @@ def run_smoke(
     expect_open_text: Optional[str],
 ) -> None:
     proc = subprocess.Popen(
-        [cortexctl, "run", "mcp", "--config", config],
+        [moraine, "run", "mcp", "--config", config],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -226,7 +226,7 @@ def run_smoke(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cortexctl", required=True)
+    parser.add_argument("--moraine", required=True)
     parser.add_argument("--config", required=True)
     parser.add_argument("--query", required=True)
     parser.add_argument("--expect-session-id")
@@ -235,7 +235,7 @@ def main() -> int:
     args = parser.parse_args()
 
     run_smoke(
-        args.cortexctl,
+        args.moraine,
         args.config,
         args.query,
         args.expect_session_id,

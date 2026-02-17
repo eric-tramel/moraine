@@ -45,7 +45,7 @@ test('loads dashboard and handles core interactions', async ({ page }) => {
       json: {
         ok: true,
         url: 'http://127.0.0.1:8123',
-        database: 'cortex',
+        database: 'moraine',
         version: '25.1.2',
         ping_ms: 8.75,
         connections: { total: 16 },
@@ -124,7 +124,7 @@ test('loads dashboard and handles core interactions', async ({ page }) => {
 
   await page.goto('/');
 
-  await expect(page.getByRole('heading', { name: 'Cortex Monitor' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Moraine Monitor' })).toBeVisible();
   await expect(page.locator('#healthCard .card')).toHaveCount(5);
   await expect(page.locator('#ingestorCard .card').first()).toContainText('Healthy');
 

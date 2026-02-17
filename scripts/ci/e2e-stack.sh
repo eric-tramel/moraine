@@ -105,7 +105,7 @@ wait_for_clickhouse_count() {
 }
 
 cleanup_e2e() {
-  local cortexctl_bin="$1"
+  local moraine_bin="$1"
   local config_path="$2"
   local runtime_root="$3"
   local tmp_root="$4"
@@ -130,7 +130,7 @@ cleanup_e2e() {
     done
   fi
 
-  "$cortexctl_bin" down --config "$config_path" >/dev/null 2>&1 || true
+  "$moraine_bin" down --config "$config_path" >/dev/null 2>&1 || true
 
   if [[ "${E2E_SUCCESS}" -eq 1 && "${KEEP_E2E_TMP:-0}" != "1" ]]; then
     rm -rf "$tmp_root"
@@ -142,10 +142,10 @@ cleanup_e2e() {
 main() {
   local repo_root
   repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-  local cortexctl_bin="${CORTEXCTL_BIN:-$repo_root/target/debug/cortexctl}"
+  local moraine_bin="${MORAINECTL_BIN:-$repo_root/target/debug/moraine}"
   local python_bin="${PYTHON_BIN:-python3}"
   local monitor_port="${MONITOR_PORT:-}"
-  local base_keyword="${CORTEX_TEST_KEYWORD:-portable_ci_keyword}"
+  local base_keyword="${MORAINE_TEST_KEYWORD:-portable_ci_keyword}"
   base_keyword="${base_keyword//[^[:alnum:]_]/_}"
   base_keyword="$(printf '%s' "$base_keyword" | tr '[:upper:]' '[:lower:]')"
   if [[ -z "$base_keyword" ]]; then
@@ -155,7 +155,7 @@ main() {
   run_stamp="$(date +%s)_$$_$RANDOM"
   local codex_keyword="${base_keyword}_codex_${run_stamp}"
   local claude_keyword="${base_keyword}_claude_${run_stamp}"
-  local clickhouse_database="cortex"
+  local clickhouse_database="moraine"
   local codex_session_suffix
   codex_session_suffix="$(printf '%06x%06x' "$RANDOM" "$RANDOM")"
   local codex_session_id="00000000-0000-4000-8000-${codex_session_suffix}"
@@ -176,8 +176,8 @@ main() {
   clickhouse_http_port="$(pick_clickhouse_http_port "$python_bin")"
   local clickhouse_url="http://127.0.0.1:${clickhouse_http_port}"
 
-  if [[ ! -x "$cortexctl_bin" ]]; then
-    echo "missing cortexctl binary: $cortexctl_bin" >&2
+  if [[ ! -x "$moraine_bin" ]]; then
+    echo "missing moraine binary: $moraine_bin" >&2
     echo "build first: cargo build --workspace --locked" >&2
     exit 1
   fi
@@ -186,7 +186,7 @@ main() {
   tmp_root="$(mktemp -d)"
   local fixtures_root="$tmp_root/fixtures"
   local runtime_root="$tmp_root/runtime"
-  local config_path="$tmp_root/cortex-ci.toml"
+  local config_path="$tmp_root/moraine-ci.toml"
   local codex_fixture_file="$fixtures_root/codex/sessions/2026/02/16/session-${codex_session_id}.jsonl"
   local claude_fixture_file="$fixtures_root/claude/projects/e2e/session-${claude_session_id}.jsonl"
 
@@ -248,7 +248,7 @@ start_monitor_on_up = true
 start_mcp_on_up = false
 EOF
 
-  trap "cleanup_e2e \"$cortexctl_bin\" \"$config_path\" \"$runtime_root\" \"$tmp_root\"" EXIT
+  trap "cleanup_e2e \"$moraine_bin\" \"$config_path\" \"$runtime_root\" \"$tmp_root\"" EXIT
 
   echo "[e2e] run id: ${run_stamp}"
   echo "[e2e] clickhouse url: ${clickhouse_url}"
@@ -257,10 +257,10 @@ EOF
   echo "[e2e] claude fixture: ${claude_fixture_file}"
 
   echo "[e2e] installing managed ClickHouse"
-  "$cortexctl_bin" clickhouse install --config "$config_path"
+  "$moraine_bin" clickhouse install --config "$config_path"
 
   echo "[e2e] starting stack"
-  "$cortexctl_bin" up --config "$config_path"
+  "$moraine_bin" up --config "$config_path"
 
   echo "[e2e] waiting for monitor health"
   wait_for_endpoint_ok "$python_bin" "http://127.0.0.1:${monitor_port}/api/health" 120
@@ -281,7 +281,7 @@ EOF
 
   echo "[e2e] checking MCP initialize/tools/search/open (codex)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
-    --cortexctl "$cortexctl_bin" \
+    --moraine "$moraine_bin" \
     --config "$config_path" \
     --query "$codex_keyword" \
     --expect-session-id "$codex_session_id" \
@@ -290,7 +290,7 @@ EOF
 
   echo "[e2e] checking MCP initialize/tools/search/open (claude)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
-    --cortexctl "$cortexctl_bin" \
+    --moraine "$moraine_bin" \
     --config "$config_path" \
     --query "$claude_keyword" \
     --expect-session-id "$claude_session_id" \
@@ -298,7 +298,7 @@ EOF
     --expect-open-text "$claude_trace_marker"
 
   echo "[e2e] final status"
-  "$cortexctl_bin" status --config "$config_path"
+  "$moraine_bin" status --config "$config_path"
   E2E_SUCCESS=1
 }
 

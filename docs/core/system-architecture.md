@@ -2,7 +2,7 @@
 
 ## System Objective
 
-Cortex converts append-heavy JSONL streams from `~/.codex/sessions/**/*.jsonl` and `~/.claude/projects/**/*.jsonl` into a local, queryable corpus that supports both rapid operational inspection and faithful trace reconstruction. This is a single-node operational index, not a distributed analytics system: [ClickHouse](https://github.com/ClickHouse/ClickHouse) binds to loopback, state is rooted under `~/.cortex`, and lifecycle is managed through `cortexctl`.
+Moraine converts append-heavy JSONL streams from `~/.codex/sessions/**/*.jsonl` and `~/.claude/projects/**/*.jsonl` into a local, queryable corpus that supports both rapid operational inspection and faithful trace reconstruction. This is a single-node operational index, not a distributed analytics system: [ClickHouse](https://github.com/ClickHouse/ClickHouse) binds to loopback, state is rooted under `~/.moraine`, and lifecycle is managed through `moraine`.
 
 The design prioritizes low append-to-visibility latency, replay fidelity across evolving record formats, and a thin retrieval process that relies on write-time index maintenance. These priorities drive the ingestion/runtime and schema choices documented below. [src: rust/ingestor/src/ingestor.rs:L45, rust/ingestor/src/normalize.rs:L336, sql/004_search_index.sql:L28, rust/codex-mcp/src/main.rs:L337]
 
@@ -10,13 +10,13 @@ The design prioritizes low append-to-visibility latency, replay fidelity across 
 
 The system is composed of four layers with explicit ownership boundaries.
 
-The storage layer is a local ClickHouse instance configured from templated XML and started by `cortexctl up`. It owns canonical tables, reconstruction views, sparse lexical indexes, and query/hit logs; services interact through SQL only.
+The storage layer is a local ClickHouse instance configured from templated XML and started by `moraine up`. It owns canonical tables, reconstruction views, sparse lexical indexes, and query/hit logs; services interact through SQL only.
 
-The ingestion layer is Rust `cortex-ingestor`: watcher plus reconcile scheduling, normalization, batching, checkpoint persistence, and heartbeat emission. It is the only transformation boundary from raw JSON to canonical classes. [src: rust/ingestor/src/ingestor.rs:L187, rust/ingestor/src/ingestor.rs:L284, rust/ingestor/src/ingestor.rs:L390, rust/ingestor/src/normalize.rs:L336]
+The ingestion layer is Rust `moraine-ingestor`: watcher plus reconcile scheduling, normalization, batching, checkpoint persistence, and heartbeat emission. It is the only transformation boundary from raw JSON to canonical classes. [src: rust/ingestor/src/ingestor.rs:L187, rust/ingestor/src/ingestor.rs:L284, rust/ingestor/src/ingestor.rs:L390, rust/ingestor/src/normalize.rs:L336]
 
 Indexing is implemented with ClickHouse materialized views that incrementally maintain `search_documents`, `search_postings`, and stats tables as canonical rows land. This shifts cost from corpus scans to sparse term lookups. [src: sql/004_search_index.sql:L28, sql/004_search_index.sql:L100, sql/004_search_index.sql:L154, sql/004_search_index.sql:L170]
 
-The retrieval layer is `cortex-mcp`, a stdio JSON-RPC server exposing `search` and `open`. It performs BM25 scoring over prebuilt postings and returns prose or full JSON output without owning index-state lifecycle.
+The retrieval layer is `moraine-mcp`, a stdio JSON-RPC server exposing `search` and `open`. It performs BM25 scoring over prebuilt postings and returns prose or full JSON output without owning index-state lifecycle.
 
 ## End-to-End Causal Flow
 
@@ -42,7 +42,7 @@ Invariant five is retrieval-service thinness. `codex-mcp` does not own corpus st
 
 ## Failure and Recovery Model
 
-Watcher loss is treated as expected, not exceptional. The reconcile task scans the sessions glob on a fixed interval and enqueues matching files. If filesystem events are dropped, reconcile eventually repairs visibility by re-queueing files and relying on checkpoints to skip already consumed offsets. Recovery latency is bounded by reconcile interval and queue pressure. [src: rust/ingestor/src/ingestor.rs:L284, rust/ingestor/src/ingestor.rs:L296, config/cortex.toml:L19]
+Watcher loss is treated as expected, not exceptional. The reconcile task scans the sessions glob on a fixed interval and enqueues matching files. If filesystem events are dropped, reconcile eventually repairs visibility by re-queueing files and relying on checkpoints to skip already consumed offsets. Recovery latency is bounded by reconcile interval and queue pressure. [src: rust/ingestor/src/ingestor.rs:L284, rust/ingestor/src/ingestor.rs:L296, config/moraine.toml:L19]
 
 Parse errors are quarantined. A malformed JSON line yields a row in `ingest_errors` with source coordinates and truncated fragment, then ingestion continues with the next line. This keeps corruption blast radius local to one record and preserves forward progress under partially malformed logs. [src: rust/ingestor/src/ingestor.rs:L647, rust/ingestor/src/ingestor.rs:L654, sql/001_schema.sql:L80]
 
@@ -52,11 +52,11 @@ MCP failures are intentionally narrow: inputs are regex-sanitized, SQL literals 
 
 ## Performance Envelope
 
-The ingestion runtime controls throughput through four principal knobs: file-worker concurrency, inflight channel capacity, batch size, and flush interval. The defaults are not arbitrary; they reflect a bias toward sustained throughput with bounded latency (`max_file_workers=8`, `max_inflight_batches=64`, `batch_size=4000`, `flush_interval_seconds=0.5`). This setup performs well under concurrent append streams while keeping write amplification manageable. [src: config/cortex.toml:L11-L12, config/cortex.toml:L15-L16]
+The ingestion runtime controls throughput through four principal knobs: file-worker concurrency, inflight channel capacity, batch size, and flush interval. The defaults are not arbitrary; they reflect a bias toward sustained throughput with bounded latency (`max_file_workers=8`, `max_inflight_batches=64`, `batch_size=4000`, `flush_interval_seconds=0.5`). This setup performs well under concurrent append streams while keeping write amplification manageable. [src: config/moraine.toml:L11-L12, config/moraine.toml:L15-L16]
 
 Backpressure is explicit: bounded processing/sink channels, semaphore-limited workers, and heartbeat queue-depth telemetry that surfaces pressure before visible staleness. [src: rust/ingestor/src/ingestor.rs:L60, rust/ingestor/src/ingestor.rs:L62, rust/ingestor/src/ingestor.rs:L74, rust/ingestor/src/ingestor.rs:L393]
 
-Retrieval runtime cost scales primarily with query term count and posting list fanout, not total corpus size. Query tokenization caps terms (`max_query_terms`) and BM25 SQL applies `term IN [..]`, `matched_terms` thresholds, and result limits, all of which bound compute. The practical implication is that interactive latency remains predictable so long as term selectivity is reasonable and tool-event noise filters remain enabled by default. [src: rust/codex-mcp/src/main.rs:L346, rust/codex-mcp/src/main.rs:L505, rust/codex-mcp/src/main.rs:L564, config/cortex.toml:L50]
+Retrieval runtime cost scales primarily with query term count and posting list fanout, not total corpus size. Query tokenization caps terms (`max_query_terms`) and BM25 SQL applies `term IN [..]`, `matched_terms` thresholds, and result limits, all of which bound compute. The practical implication is that interactive latency remains predictable so long as term selectivity is reasonable and tool-event noise filters remain enabled by default. [src: rust/codex-mcp/src/main.rs:L346, rust/codex-mcp/src/main.rs:L505, rust/codex-mcp/src/main.rs:L564, config/moraine.toml:L50]
 
 ## Design Pressure and Rejected Alternatives
 
@@ -70,4 +70,4 @@ An exactly-once ingest guarantee was rejected because file-based append streams 
 
 Operators should treat schema and normalization as contracts. Changes to event classification, tokenization, or checkpoint semantics have cross-layer effects that can silently degrade retrieval or recovery behavior if not reviewed together.
 
-For day-to-day operation, health should be interpreted as a chain, not a single ping. A healthy chain includes ClickHouse availability, progressing `raw_events` and canonical event counts, and recent heartbeat timestamps with stable flush latency. A broken link anywhere in this chain predicts stale retrieval even when one service appears alive. Use `bin/cortexctl status` as the primary health entrypoint.
+For day-to-day operation, health should be interpreted as a chain, not a single ping. A healthy chain includes ClickHouse availability, progressing `raw_events` and canonical event counts, and recent heartbeat timestamps with stable flush latency. A broken link anywhere in this chain predicts stale retrieval even when one service appears alive. Use `bin/moraine status` as the primary health entrypoint.

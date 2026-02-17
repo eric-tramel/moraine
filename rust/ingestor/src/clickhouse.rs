@@ -1,7 +1,7 @@
 use crate::config::ClickHouseConfig;
 use crate::model::Checkpoint;
 use anyhow::Result;
-use cortex_clickhouse::ClickHouseClient as SharedClickHouseClient;
+use moraine_clickhouse::ClickHouseClient as SharedClickHouseClient;
 use serde_json::Value;
 use std::collections::HashMap;
 

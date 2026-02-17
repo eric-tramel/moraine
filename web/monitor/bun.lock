@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "cortex-monitor-web",
+      "name": "moraine-monitor-web",
       "dependencies": {
         "chart.js": "^4.5.1",
       },

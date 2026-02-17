@@ -6,5 +6,5 @@ Do not add new MCP changes here.
 
 Authoritative MCP code lives in:
 
-- `apps/cortex-mcp`
-- `crates/cortex-mcp-core`
+- `apps/moraine-mcp`
+- `crates/moraine-mcp-core`

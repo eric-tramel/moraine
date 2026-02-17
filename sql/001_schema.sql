@@ -1,6 +1,6 @@
-CREATE DATABASE IF NOT EXISTS cortex;
+CREATE DATABASE IF NOT EXISTS moraine;
 
-CREATE TABLE IF NOT EXISTS cortex.raw_events (
+CREATE TABLE IF NOT EXISTS moraine.raw_events (
   ingested_at DateTime64(3) DEFAULT now64(3),
   source_name LowCardinality(String),
   provider LowCardinality(String),
@@ -20,7 +20,7 @@ ENGINE = MergeTree
 PARTITION BY toYYYYMM(ingested_at)
 ORDER BY (source_name, source_file, source_generation, source_offset, source_line_no, event_uid);
 
-CREATE TABLE IF NOT EXISTS cortex.events (
+CREATE TABLE IF NOT EXISTS moraine.events (
   ingested_at DateTime64(3) DEFAULT now64(3),
   event_uid String,
   session_id String,
@@ -89,7 +89,7 @@ ENGINE = ReplacingMergeTree(event_version)
 PARTITION BY toYYYYMM(ingested_at)
 ORDER BY (session_id, event_ts, source_name, source_file, source_generation, source_offset, source_line_no, event_uid);
 
-CREATE TABLE IF NOT EXISTS cortex.event_links (
+CREATE TABLE IF NOT EXISTS moraine.event_links (
   ingested_at DateTime64(3) DEFAULT now64(3),
   event_uid String,
   linked_event_uid String,
@@ -109,7 +109,7 @@ ENGINE = ReplacingMergeTree(event_version)
 PARTITION BY toYYYYMM(ingested_at)
 ORDER BY (session_id, event_uid, link_type, linked_event_uid);
 
-CREATE TABLE IF NOT EXISTS cortex.tool_io (
+CREATE TABLE IF NOT EXISTS moraine.tool_io (
   ingested_at DateTime64(3) DEFAULT now64(3),
   event_uid String,
   session_id String,
@@ -135,7 +135,7 @@ ENGINE = ReplacingMergeTree(event_version)
 PARTITION BY toYYYYMM(ingested_at)
 ORDER BY (session_id, tool_call_id, event_uid);
 
-CREATE TABLE IF NOT EXISTS cortex.ingest_errors (
+CREATE TABLE IF NOT EXISTS moraine.ingest_errors (
   ingested_at DateTime64(3) DEFAULT now64(3),
   source_name LowCardinality(String),
   provider LowCardinality(String),
@@ -152,7 +152,7 @@ ENGINE = MergeTree
 PARTITION BY toYYYYMM(ingested_at)
 ORDER BY (source_name, source_file, source_generation, source_offset, source_line_no);
 
-CREATE TABLE IF NOT EXISTS cortex.ingest_checkpoints (
+CREATE TABLE IF NOT EXISTS moraine.ingest_checkpoints (
   updated_at DateTime64(3) DEFAULT now64(3),
   source_name LowCardinality(String),
   source_file String,

@@ -273,7 +273,7 @@ fn spawn_watcher_threads(
                 Ok(watcher) => watcher,
                 Err(exc) => {
                     eprintln!(
-                        "[cortex-rust] failed to create watcher for {}: {exc}",
+                        "[moraine-rust] failed to create watcher for {}: {exc}",
                         source_name
                     );
                     return;
@@ -282,7 +282,7 @@ fn spawn_watcher_threads(
 
             if let Err(exc) = watcher.watch(watch_root.as_path(), RecursiveMode::Recursive) {
                 eprintln!(
-                    "[cortex-rust] failed to watch {} ({}): {exc}",
+                    "[moraine-rust] failed to watch {} ({}): {exc}",
                     watch_root.display(),
                     source_name
                 );
@@ -301,7 +301,7 @@ fn spawn_watcher_threads(
                         }
                     }
                     Ok(Err(exc)) => {
-                        eprintln!("[cortex-rust] watcher event error ({source_name}): {exc}");
+                        eprintln!("[moraine-rust] watcher event error ({source_name}): {exc}");
                     }
                     Err(_) => break,
                 }

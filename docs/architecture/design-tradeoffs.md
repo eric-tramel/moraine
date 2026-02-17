@@ -2,9 +2,9 @@
 
 ## Decision Context
 
-Cortex was built under unusually tight constraints: complete locality, near-real-time ingest visibility, multi-format trace fidelity, and lightweight retrieval for agent workflows. The important point is that these constraints conflict in practice. A design that optimizes one axis naively will usually violate another. This document records the decisions that resolved those conflicts and the conditions under which each decision should be revisited.
+Moraine was built under unusually tight constraints: complete locality, near-real-time ingest visibility, multi-format trace fidelity, and lightweight retrieval for agent workflows. The important point is that these constraints conflict in practice. A design that optimizes one axis naively will usually violate another. This document records the decisions that resolved those conflicts and the conditions under which each decision should be revisited.
 
-These are architecture decisions, not implementation trivia. They explain why current code and schema look the way they do and provide a stable reference when proposing future changes. [src: config/clickhouse.xml:L17, config/cortex.toml:L11, rust/codex-mcp/src/main.rs:L264]
+These are architecture decisions, not implementation trivia. They explain why current code and schema look the way they do and provide a stable reference when proposing future changes. [src: config/clickhouse.xml:L17, config/moraine.toml:L11, rust/codex-mcp/src/main.rs:L264]
 
 ## ADR-001: Local ClickHouse as the System Database
 
@@ -12,9 +12,9 @@ The system chose ClickHouse as the single local database for raw ingest ledger, 
 
 The alternative was a lighter embedded database (for example SQLite-class storage) paired with application-side indexing. That would have reduced binary footprint but pushed substantial complexity into service code: manual incremental index maintenance, limited concurrency under high append rates, and weaker large-scale aggregation performance for diagnostic queries.
 
-ClickHouse provides three primitives Cortex relies on heavily: MergeTree write throughput, materialized view fanout, and SQL window/aggregation capabilities. These map directly to ingest workloads and retrieval design: the system can append aggressively, derive view-based ordering deterministically, and maintain sparse indexes incrementally in storage. [src: sql/001_schema.sql:L17, sql/002_views.sql:L73, sql/004_search_index.sql:L100]
+ClickHouse provides three primitives Moraine relies on heavily: MergeTree write throughput, materialized view fanout, and SQL window/aggregation capabilities. These map directly to ingest workloads and retrieval design: the system can append aggressively, derive view-based ordering deterministically, and maintain sparse indexes incrementally in storage. [src: sql/001_schema.sql:L17, sql/002_views.sql:L73, sql/004_search_index.sql:L100]
 
-The cost is a heavier runtime than embedded alternatives and a larger schema/engine tuning surface. The mitigation is strict locality: loopback binding, local path templating, and a single Rust lifecycle surface (`cortexctl`) that keeps runtime behavior transparent.
+The cost is a heavier runtime than embedded alternatives and a larger schema/engine tuning surface. The mitigation is strict locality: loopback binding, local path templating, and a single Rust lifecycle surface (`moraine`) that keeps runtime behavior transparent.
 
 Revisit trigger: if operating envelope shifts to extremely constrained devices where ClickHouse memory/CPU profile becomes unacceptable, revisit this decision with measured workload traces rather than intuition.
 
@@ -24,7 +24,7 @@ Ingestion is implemented as a Rust async service and legacy Python ingestion pat
 
 The most important benefit is explicit control of pressure points. Worker concurrency is semaphore-limited, dispatch queues are bounded, sink channels are bounded, and retry behavior is explicit. In an interpreter-based ad hoc pipeline, these limits are often implicit or unevenly enforced, which leads to intermittent stalls and memory spikes at higher event rates. [src: rust/ingestor/src/ingestor.rs:L60, rust/ingestor/src/ingestor.rs:L62, rust/ingestor/src/ingestor.rs:L74]
 
-The cost is higher implementation complexity and slower iteration for small parser tweaks. Cortex mitigates this by keeping normalization logic centralized and testable in one module while keeping service wiring explicit and compact.
+The cost is higher implementation complexity and slower iteration for small parser tweaks. Moraine mitigates this by keeping normalization logic centralized and testable in one module while keeping service wiring explicit and compact.
 
 Revisit trigger: if ingest event rate drops permanently to trivial volume and operational simplicity dominates throughput concerns, a simpler runtime could be reconsidered; however, this would need a concrete replacement for current checkpoint, backpressure, and watcher-reconcile behavior.
 
@@ -32,7 +32,7 @@ Revisit trigger: if ingest event rate drops permanently to trivial volume and op
 
 The scheduling model combines OS file events with periodic full-glob reconciliation. This decision explicitly rejects a watcher-only model. Filesystem watcher streams are low-latency but not a perfect reliability substrate; dropped or coalesced events are realistic in long-running local systems. [src: rust/ingestor/src/ingestor.rs:L187, rust/ingestor/src/ingestor.rs:L284]
 
-In Cortex, watcher events drive fast path freshness while reconcile bounds correctness lag. Reconcile cost is small periodic filesystem scanning overhead, but it buys deterministic eventual coverage and removes dependence on watcher infallibility.
+In Moraine, watcher events drive fast path freshness while reconcile bounds correctness lag. Reconcile cost is small periodic filesystem scanning overhead, but it buys deterministic eventual coverage and removes dependence on watcher infallibility.
 
 The alternative, watcher-only ingestion, has lower background cost but cannot guarantee eventual completeness when events are missed. For trace reconstruction workloads, silent omission is worse than slight periodic overhead.
 
@@ -44,13 +44,13 @@ The canonical model stores both extracted fields and full payload JSON, plus com
 
 The tempting alternative is aggressive projection and early pruning: keep only normalized text and a small set of typed fields. That approach reduces storage but destroys two critical capabilities. First, it removes the ability to diagnose parser/classification mistakes against exact source payloads. Second, it makes adapting to new payload forms difficult because historical rows no longer contain recoverable context.
 
-Cortex chooses storage overhead to preserve forensic depth. This is aligned with system purpose: maintainers need to reconstruct conversations and tooling behavior, not only aggregate message counts.
+Moraine chooses storage overhead to preserve forensic depth. This is aligned with system purpose: maintainers need to reconstruct conversations and tooling behavior, not only aggregate message counts.
 
 Revisit trigger: if storage growth becomes a hard operational limit, introduce retention tiers that preserve canonical windows while archiving or compressing raw payload history, rather than dropping provenance fields globally.
 
 ## ADR-005: At-Least-Once Ingest with Replacing Semantics
 
-Cortex does not attempt exactly-once ingestion across file append, truncation, and rotation scenarios. Instead it implements at-least-once processing and depends on deterministic event IDs plus `ReplacingMergeTree` convergence to yield logical idempotence. [src: rust/ingestor/src/normalize.rs:L100, sql/001_schema.sql:L46]
+Moraine does not attempt exactly-once ingestion across file append, truncation, and rotation scenarios. Instead it implements at-least-once processing and depends on deterministic event IDs plus `ReplacingMergeTree` convergence to yield logical idempotence. [src: rust/ingestor/src/normalize.rs:L100, sql/001_schema.sql:L46]
 
 This decision is driven by practical file-system reality. Exactly-once requires heavyweight coordination and durable transaction markers that are brittle in local file event environments. At-least-once with generation-aware checkpoints is simpler and robust under common failure modes.
 
@@ -70,11 +70,11 @@ Revisit trigger: if query latency becomes dominated by SQL overhead despite spar
 
 ## ADR-007: Retrieval Defaults Favor Signal Over Completeness
 
-MCP search defaults intentionally exclude many operational/tool lifecycle events and optionally exclude codex-mcp self-events. This decision optimizes agent answer quality by reducing lexical noise. [src: rust/codex-mcp/src/main.rs:L511, rust/codex-mcp/src/main.rs:L523, config/cortex.toml:L40-L41]
+MCP search defaults intentionally exclude many operational/tool lifecycle events and optionally exclude codex-mcp self-events. This decision optimizes agent answer quality by reducing lexical noise. [src: rust/codex-mcp/src/main.rs:L511, rust/codex-mcp/src/main.rs:L523, config/moraine.toml:L40-L41]
 
 The alternative is maximal recall: include all event classes by default and let downstream agents filter. In practice this pushes noise handling to every client and leads to repeated poor ranking behavior where high-frequency operational tokens dominate.
 
-Cortex defaults to conservative inclusion and makes broader retrieval opt-in via arguments. This preserves usability for common workflows while retaining flexibility for forensic modes.
+Moraine defaults to conservative inclusion and makes broader retrieval opt-in via arguments. This preserves usability for common workflows while retaining flexibility for forensic modes.
 
 Revisit trigger: if workloads shift toward tool-trace diagnostics as the dominant use case, default include policy may need to widen, but only with measured relevance impact using query/hit logs.
 
@@ -88,4 +88,4 @@ Revisit trigger: if query throughput grows enough that sync logging becomes a me
 
 ## Decision Summary
 
-Across all decisions, the consistent pattern is this: Cortex spends complexity in deterministic ingestion semantics and schema design so that retrieval remains thin and operational debugging remains tractable. The system is intentionally not minimal in table count or code paths. It is minimal in hidden behavior. That distinction should remain the bar for future changes.
+Across all decisions, the consistent pattern is this: Moraine spends complexity in deterministic ingestion semantics and schema design so that retrieval remains thin and operational debugging remains tractable. The system is intentionally not minimal in table count or code paths. It is minimal in hidden behavior. That distinction should remain the bar for future changes.

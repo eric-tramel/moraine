@@ -1,5 +1,5 @@
 [package]
-name = "cortex-ingestor"
+name = "moraine-ingestor"
 version = "0.1.0"
 edition = "2021"
 description = "Event-driven Rust ingestor for Codex sessions into ClickHouse"
@@ -20,5 +20,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 urlencoding = "2.1"
 walkdir = "2.5"
-cortex-config = { path = "../../crates/cortex-config" }
-cortex-clickhouse = { path = "../../crates/cortex-clickhouse" }
+moraine-config = { path = "../../crates/moraine-config" }
+moraine-clickhouse = { path = "../../crates/moraine-clickhouse" }

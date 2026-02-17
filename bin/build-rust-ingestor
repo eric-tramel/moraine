@@ -3,5 +3,5 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-cargo build --release --manifest-path "$PROJECT_ROOT/apps/cortex-ingest/Cargo.toml"
-echo "built: $PROJECT_ROOT/target/release/cortex-ingest"
+cargo build --release --manifest-path "$PROJECT_ROOT/apps/moraine-ingest/Cargo.toml"
+echo "built: $PROJECT_ROOT/target/release/moraine-ingest"

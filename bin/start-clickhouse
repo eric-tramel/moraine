@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "error: start-clickhouse has been removed in the cortexctl migration." >&2
-echo "use: bin/cortexctl up --no-ingest" >&2
+echo "error: start-clickhouse has been removed in the moraine migration." >&2
+echo "use: bin/moraine up --no-ingest" >&2
 exit 64

@@ -15,7 +15,7 @@ export const MODEL_COLORS = [
   '#0891b2',
 ];
 
-export const THEME_STORAGE_KEY = 'cortex-monitor-theme';
+export const THEME_STORAGE_KEY = 'moraine-monitor-theme';
 
 export const POLL_INTERVAL_MS = 10_000;
 

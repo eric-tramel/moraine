@@ -1,38 +1,38 @@
-# Migration Guide: Legacy Scripts to `cortexctl`
+# Migration Guide: Legacy Scripts to `moraine`
 
-This guide maps historical script commands to the `cortexctl` command contracts.
+This guide maps historical script commands to the `moraine` command contracts.
 
 ## Command mapping
 
-- `bin/start-clickhouse` -> `bin/cortexctl up --no-ingest`
-- `bin/init-db` -> `bin/cortexctl db migrate`
-- `bin/status` -> `bin/cortexctl status`
-- `bin/stop-all` -> `bin/cortexctl down`
-- `bin/start-ingestor` -> `bin/cortexctl up` (wrapper retired)
-- `bin/run-codex-mcp` -> `bin/cortexctl run mcp` (wrapper retired)
-- `bin/cortex-monitor` -> `bin/cortexctl run monitor` (wrapper retired)
+- `bin/start-clickhouse` -> `bin/moraine up --no-ingest`
+- `bin/init-db` -> `bin/moraine db migrate`
+- `bin/status` -> `bin/moraine status`
+- `bin/stop-all` -> `bin/moraine down`
+- `bin/start-ingestor` -> `bin/moraine up` (wrapper retired)
+- `bin/run-codex-mcp` -> `bin/moraine run mcp` (wrapper retired)
+- `bin/moraine-monitor` -> `bin/moraine run monitor` (wrapper retired)
 
-Legacy lifecycle aliases (`start-clickhouse`, `init-db`, `status`, `stop-all`) remain as fail-fast migration stubs. Service wrappers (`start-ingestor`, `run-codex-mcp`, `cortex-monitor`) are retired to keep the command surface focused on `cortexctl`.
+Legacy lifecycle aliases (`start-clickhouse`, `init-db`, `status`, `stop-all`) remain as fail-fast migration stubs. Service wrappers (`start-ingestor`, `run-codex-mcp`, `moraine-monitor`) are retired to keep the command surface focused on `moraine`.
 
 ## Runtime changes
 
-1. Runtime supervision is now in Rust (`cortexctl`), not shell scripts.
+1. Runtime supervision is now in Rust (`moraine`), not shell scripts.
 2. ClickHouse schema application is versioned and tracked via `schema_migrations`.
-3. One shared config schema is used for all services (`config/cortex.toml`).
-4. `cortexctl run ingest|monitor|mcp` resolves installed binaries first; source-tree fallback is opt-in via `CORTEX_SOURCE_TREE_MODE=1`.
+3. One shared config schema is used for all services (`config/moraine.toml`).
+4. `moraine run ingest|monitor|mcp` resolves installed binaries first; source-tree fallback is opt-in via `MORAINE_SOURCE_TREE_MODE=1`.
 
 ## Recommended workflow
 
 ```bash
-cd ~/src/cortex
+cd ~/src/moraine
 cargo build --workspace
-bin/cortexctl up
-bin/cortexctl status
+bin/moraine up
+bin/moraine status
 ```
 
 For DB checks:
 
 ```bash
-bin/cortexctl db migrate
-bin/cortexctl db doctor
+bin/moraine db migrate
+bin/moraine db doctor
 ```

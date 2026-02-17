@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG_PATH="${CORTEX_CONFIG:-$HOME/.cortex/config.toml}"
+CONFIG_PATH="${MORAINE_CONFIG:-$HOME/.moraine/config.toml}"
 WRITE_CONFIG=0
 
 usage() {
@@ -10,8 +10,8 @@ usage() {
 usage: $(basename "$0") [--config <path>] [--write-config]
 
 options:
-  --config <path>   config file path (default: CORTEX_CONFIG or ~/.cortex/config.toml)
-  --write-config    explicitly allow writing a missing config by copying config/cortex.toml
+  --config <path>   config file path (default: MORAINE_CONFIG or ~/.moraine/config.toml)
+  --write-config    explicitly allow writing a missing config by copying config/moraine.toml
 EOF
 }
 
@@ -44,19 +44,19 @@ done
 if [[ ! -f "$CONFIG_PATH" ]]; then
   if [[ "$WRITE_CONFIG" -eq 1 ]]; then
     mkdir -p "$(dirname "$CONFIG_PATH")"
-    cp "$PROJECT_ROOT/config/cortex.toml" "$CONFIG_PATH"
+    cp "$PROJECT_ROOT/config/moraine.toml" "$CONFIG_PATH"
     echo "wrote default config to $CONFIG_PATH"
   else
     echo "config not found: $CONFIG_PATH" >&2
     echo "refusing to write config without explicit opt-in" >&2
-    echo "rerun with --write-config to copy $PROJECT_ROOT/config/cortex.toml" >&2
+    echo "rerun with --write-config to copy $PROJECT_ROOT/config/moraine.toml" >&2
     exit 1
   fi
 fi
 
 config_get() {
   local key="$1"
-  "$PROJECT_ROOT/bin/cortexctl" --config "$CONFIG_PATH" config get "$key"
+  "$PROJECT_ROOT/bin/moraine" --config "$CONFIG_PATH" config get "$key"
 }
 
 CLICKHOUSE_URL="$(config_get "clickhouse.url")"
@@ -64,7 +64,7 @@ CLICKHOUSE_DB="$(config_get "clickhouse.database")"
 CLICKHOUSE_USER="$(config_get "clickhouse.username")"
 CLICKHOUSE_PASSWORD="$(config_get "clickhouse.password")"
 CLICKHOUSE_URL="${CLICKHOUSE_URL:-http://127.0.0.1:8123}"
-CLICKHOUSE_DB="${CLICKHOUSE_DB:-cortex}"
+CLICKHOUSE_DB="${CLICKHOUSE_DB:-moraine}"
 
 CURL_AUTH_ARGS=()
 if [[ -n "$CLICKHOUSE_USER" ]]; then
@@ -80,7 +80,7 @@ if ! clickhouse_curl "$CLICKHOUSE_URL/?query=SELECT%201" >/dev/null 2>&1; then
   exit 1
 fi
 
-"$PROJECT_ROOT/bin/cortexctl" db migrate --config "$CONFIG_PATH"
+"$PROJECT_ROOT/bin/moraine" db migrate --config "$CONFIG_PATH"
 
 run_sql() {
   local stmt="$1"

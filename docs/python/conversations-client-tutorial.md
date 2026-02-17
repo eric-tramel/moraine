@@ -1,38 +1,38 @@
 # Python Conversations Client Tutorial
 
-This tutorial shows how to use the `cortex-conversations` Python binding as a high-level read-only client for Cortex conversation data. The binding exports `ConversationClient` and provides three primary methods: `list_conversations_json`, `get_conversation_json`, and `search_conversations_json`. [src: bindings/python/cortex_conversations/python/cortex_conversations/__init__.py:L1-L3, bindings/python/cortex_conversations/src/lib.rs:L62-L140]
+This tutorial shows how to use the `moraine-conversations` Python binding as a high-level read-only client for Moraine conversation data. The binding exports `ConversationClient` and provides three primary methods: `list_conversations_json`, `get_conversation_json`, and `search_conversations_json`. [src: bindings/python/moraine_conversations/python/moraine_conversations/__init__.py:L1-L3, bindings/python/moraine_conversations/src/lib.rs:L62-L140]
 
 ## Prerequisites
 
-You need a running Cortex stack (or any reachable ClickHouse endpoint with the Cortex schema) and Python 3.9+. A standard local setup is to start the stack with `bin/cortexctl up`. The binding package itself is configured for Python `>=3.9` and uses `maturin` as the build backend. [src: docs/operations/build-and-operations.md:L89-L104, bindings/python/cortex_conversations/pyproject.toml:L1-L10]
+You need a running Moraine stack (or any reachable ClickHouse endpoint with the Moraine schema) and Python 3.9+. A standard local setup is to start the stack with `bin/moraine up`. The binding package itself is configured for Python `>=3.9` and uses `maturin` as the build backend. [src: docs/operations/build-and-operations.md:L89-L104, bindings/python/moraine_conversations/pyproject.toml:L1-L10]
 
 ## Install The Binding Locally
 
 From the repo root:
 
 ```bash
-cd bindings/python/cortex_conversations
+cd bindings/python/moraine_conversations
 python3 -m venv .venv
 source .venv/bin/activate
 pip install maturin
 maturin develop
 ```
 
-At that point, `import cortex_conversations` loads the compiled extension module in your virtualenv. [src: bindings/python/cortex_conversations/README.md:L5-L17, bindings/python/cortex_conversations/pyproject.toml:L20-L23]
+At that point, `import moraine_conversations` loads the compiled extension module in your virtualenv. [src: bindings/python/moraine_conversations/README.md:L5-L17, bindings/python/moraine_conversations/pyproject.toml:L20-L23]
 
 ## Create A Client
 
 ```python
-from cortex_conversations import ConversationClient
+from moraine_conversations import ConversationClient
 
 client = ConversationClient(
     url="http://127.0.0.1:8123",
-    database="cortex",
+    database="moraine",
     timeout_seconds=5.0,
 )
 ```
 
-The constructor accepts `url`, `database`, `username`, `password`, `timeout_seconds`, and `max_results`. [src: bindings/python/cortex_conversations/src/lib.rs:L18-L60]
+The constructor accepts `url`, `database`, `username`, `password`, `timeout_seconds`, and `max_results`. [src: bindings/python/moraine_conversations/src/lib.rs:L18-L60]
 
 ## List Conversations By Date And Mode
 
@@ -55,7 +55,7 @@ for convo in page["items"]:
 next_cursor = page["next_cursor"]
 ```
 
-`mode` must be one of `web_search`, `mcp_internal`, `tool_calling`, or `chat`. Results are paginated with `next_cursor`. [src: bindings/python/cortex_conversations/src/lib.rs:L62-L85, bindings/python/cortex_conversations/src/lib.rs:L148-L155]
+`mode` must be one of `web_search`, `mcp_internal`, `tool_calling`, or `chat`. Results are paginated with `next_cursor`. [src: bindings/python/moraine_conversations/src/lib.rs:L62-L85, bindings/python/moraine_conversations/src/lib.rs:L148-L155]
 
 ## Retrieve One Conversation By ID
 
@@ -70,7 +70,7 @@ else:
     print(len(conversation["turns"]))
 ```
 
-The method returns JSON for `Option<Conversation>`, so a missing session is `null` in Python after `json.loads`. [src: bindings/python/cortex_conversations/src/lib.rs:L87-L98]
+The method returns JSON for `Option<Conversation>`, so a missing session is `null` in Python after `json.loads`. [src: bindings/python/moraine_conversations/src/lib.rs:L87-L98]
 
 ## Search Conversations (Whole-Conversation Ranking)
 
@@ -95,20 +95,20 @@ for hit in results["hits"]:
     print(hit["session_id"], hit["score"], hit.get("best_event_uid"))
 ```
 
-This search is ranked at the conversation/session level, not only single events. Internally, event scores are aggregated by `session_id`, and the best event per session is carried through as `best_event_uid` plus a snippet. [src: bindings/python/cortex_conversations/src/lib.rs:L100-L140, crates/cortex-conversations/src/clickhouse_repo.rs:L592-L620]
+This search is ranked at the conversation/session level, not only single events. Internally, event scores are aggregated by `session_id`, and the best event per session is carried through as `best_event_uid` plus a snippet. [src: bindings/python/moraine_conversations/src/lib.rs:L100-L140, crates/moraine-conversations/src/clickhouse_repo.rs:L592-L620]
 
 ## Run The Python Smoke Test
 
 ```bash
-cd bindings/python/cortex_conversations
+cd bindings/python/moraine_conversations
 source .venv/bin/activate
 pip install pytest
 CARGO_HOME=/tmp/cargo-home maturin develop
 pytest -q tests/test_smoke.py
 ```
 
-The smoke test exercises list/get/search end-to-end against a mock ClickHouse HTTP endpoint. [src: bindings/python/cortex_conversations/tests/test_smoke.py:L120-L166, bindings/python/cortex_conversations/pyproject.toml:L17-L18]
+The smoke test exercises list/get/search end-to-end against a mock ClickHouse HTTP endpoint. [src: bindings/python/moraine_conversations/tests/test_smoke.py:L120-L166, bindings/python/moraine_conversations/pyproject.toml:L17-L18]
 
 ## Error Semantics
 
-Invalid mode values raise a Python `ValueError`. Backend or query failures are surfaced as Python `RuntimeError` values with the underlying error text. [src: bindings/python/cortex_conversations/src/lib.rs:L7-L8, bindings/python/cortex_conversations/src/lib.rs:L153-L160]
+Invalid mode values raise a Python `ValueError`. Backend or query failures are surfaced as Python `RuntimeError` values with the underlying error text. [src: bindings/python/moraine_conversations/src/lib.rs:L7-L8, bindings/python/moraine_conversations/src/lib.rs:L153-L160]

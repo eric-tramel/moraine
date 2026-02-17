@@ -15,7 +15,7 @@ Options:
   --shards N                  Number of review shards (default: 10)
   --review-parallel N         Max concurrent review agents (default: 5)
   --issue-parallel N          Max concurrent issue-creator agents (default: 3)
-  --run-dir PATH              Artifact directory (default: /tmp/cortex-maintenance-<timestamp>)
+  --run-dir PATH              Artifact directory (default: /tmp/moraine-maintenance-<timestamp>)
   --max-files N               Limit number of source files (default: 0 = all)
   --sandbox-mode MODE         Codex sandbox mode:
                                 bypass (default), read-only, workspace-write, danger-full-access
@@ -60,7 +60,7 @@ DEDUPE_MODEL="gpt-5.3-codex"
 ISSUE_MODEL="gpt-5.3-codex-spark"
 RELATIONSHIP_MODEL="gpt-5.3-codex"
 RELATIONSHIP_EFFORT="xhigh"
-RUN_DIR="/tmp/cortex-maintenance-$(date +'%Y%m%d-%H%M%S')"
+RUN_DIR="/tmp/moraine-maintenance-$(date +'%Y%m%d-%H%M%S')"
 MAX_FILES=0
 DRY_RUN=0
 AUTO_YES=0

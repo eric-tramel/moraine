@@ -1,18 +1,18 @@
 <clickhouse>
   <logger>
     <level>information</level>
-    <log>__CORTEX_HOME__/clickhouse/log/clickhouse-server.log</log>
-    <errorlog>__CORTEX_HOME__/clickhouse/log/clickhouse-server.err.log</errorlog>
+    <log>__MORAINE_HOME__/clickhouse/log/clickhouse-server.log</log>
+    <errorlog>__MORAINE_HOME__/clickhouse/log/clickhouse-server.err.log</errorlog>
     <size>1000M</size>
     <count>3</count>
   </logger>
 
-  <path>__CORTEX_HOME__/clickhouse/data/</path>
-  <tmp_path>__CORTEX_HOME__/clickhouse/tmp/</tmp_path>
-  <user_files_path>__CORTEX_HOME__/clickhouse/user_files/</user_files_path>
-  <format_schema_path>__CORTEX_HOME__/clickhouse/format_schemas/</format_schema_path>
-  <users_config>__CORTEX_HOME__/clickhouse/users.xml</users_config>
-  <pid>__CORTEX_HOME__/clickhouse/clickhouse.pid</pid>
+  <path>__MORAINE_HOME__/clickhouse/data/</path>
+  <tmp_path>__MORAINE_HOME__/clickhouse/tmp/</tmp_path>
+  <user_files_path>__MORAINE_HOME__/clickhouse/user_files/</user_files_path>
+  <format_schema_path>__MORAINE_HOME__/clickhouse/format_schemas/</format_schema_path>
+  <users_config>__MORAINE_HOME__/clickhouse/users.xml</users_config>
+  <pid>__MORAINE_HOME__/clickhouse/clickhouse.pid</pid>
 
   <listen_host>127.0.0.1</listen_host>
   <http_port>__CLICKHOUSE_HTTP_PORT__</http_port>

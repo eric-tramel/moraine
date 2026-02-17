@@ -1,0 +1,19 @@
+[package]
+name = "moraine-conversations-py"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "moraine_conversations_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["abi3-py39"] }
+serde_json = "1.0"
+tokio = { version = "1.40", features = ["rt-multi-thread"] }
+moraine-config = { path = "../../../crates/moraine-config" }
+moraine-clickhouse = { path = "../../../crates/moraine-clickhouse" }
+moraine-conversations = { path = "../../../crates/moraine-conversations" }
+
+[workspace]

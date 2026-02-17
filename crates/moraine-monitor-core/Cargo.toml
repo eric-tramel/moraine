@@ -1,0 +1,16 @@
+[package]
+name = "moraine-monitor-core"
+version = "0.1.1"
+edition = "2021"
+description = "Analytics and query logic for Moraine monitor service"
+
+[dependencies]
+anyhow = "1.0"
+axum = "0.7"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+mime_guess = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "fs"] }
+moraine-config = { path = "../moraine-config" }
+moraine-clickhouse = { path = "../moraine-clickhouse" }

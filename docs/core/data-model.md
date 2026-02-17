@@ -58,7 +58,7 @@ Token accounting payloads are preserved in `token_usage_json` rather than explod
 
 ## Schema Evolution Guidance
 
-Treat SQL files as contract surfaces, not migration suggestions. The bootstrap path executes all bundled migrations in order through `cortexctl db migrate`. Any breaking schema change should include compatibility reasoning for existing views and consumers, otherwise operational startup can succeed while semantic correctness regresses.
+Treat SQL files as contract surfaces, not migration suggestions. The bootstrap path executes all bundled migrations in order through `moraine db migrate`. Any breaking schema change should include compatibility reasoning for existing views and consumers, otherwise operational startup can succeed while semantic correctness regresses.
 
 When changing normalization fields that feed retrieval, evaluate the full chain: canonical columns, document projection MVs, posting generation, stats maintenance, and MCP filters. If tokenization or text projection semantics change, run `bin/backfill-search-index` to avoid mixed historical semantics across pre-change and post-change rows. [src: sql/004_search_index.sql:L28, sql/004_search_index.sql:L100, bin/backfill-search-index:L74]
 

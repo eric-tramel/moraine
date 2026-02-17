@@ -42,6 +42,13 @@
     ];
   }
 
+  function sectionErrorCards(label: string, message: string): StatCard[] {
+    return [
+      { label, value: 'Unavailable', tone: 'bad' },
+      { label: 'Error', value: message, tone: 'warn' },
+    ];
+  }
+
   function updateSchema(detail: TableDetailResponse): void {
     if (!detail.schema || detail.schema.length === 0) {
       schemaText = 'No schema metadata returned';
@@ -96,23 +103,31 @@
     analyticsError = null;
   }
 
-  function handleHydrationError(message: string): void {
-    healthCards = [];
-    ingestorCards = [];
-    tableOptions = [];
-    tableDetail = null;
-    tableTitle = 'Connection issue';
-    schemaText = message;
-    schemaMuted = false;
-    analyticsPayload = null;
-    analyticsError = `Analytics unavailable: ${message}`;
-  }
-
   async function hydrate(): Promise<void> {
-    try {
-      await Promise.all([loadHealth(), loadStatus(), loadTablesAndSelection(), loadAnalytics()]);
-    } catch (error) {
-      handleHydrationError(errorMessage(error));
+    const [healthResult, statusResult, tableResult, analyticsResult] = await Promise.allSettled([
+      loadHealth(),
+      loadStatus(),
+      loadTablesAndSelection(),
+      loadAnalytics(),
+    ]);
+
+    if (healthResult.status === 'rejected') {
+      healthCards = sectionErrorCards('ClickHouse', errorMessage(healthResult.reason));
+    }
+
+    if (statusResult.status === 'rejected') {
+      ingestorCards = sectionErrorCards('Ingestor', errorMessage(statusResult.reason));
+    }
+
+    if (tableResult.status === 'rejected') {
+      tableTitle = 'Connection issue';
+      tableDetail = null;
+      schemaText = errorMessage(tableResult.reason);
+      schemaMuted = false;
+    }
+
+    if (analyticsResult.status === 'rejected') {
+      analyticsError = `Analytics unavailable: ${errorMessage(analyticsResult.reason)}`;
     }
   }
 

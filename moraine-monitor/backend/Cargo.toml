@@ -1,0 +1,18 @@
+[package]
+name = "moraine-monitor"
+version = "0.1.0"
+edition = "2021"
+description = "Local ClickHouse dashboard for Moraine"
+
+[dependencies]
+anyhow = "1.0"
+axum = "0.7"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+mime_guess = "2.0"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "fs"] }
+moraine-config = { path = "../../crates/moraine-config" }
+moraine-clickhouse = { path = "../../crates/moraine-clickhouse" }

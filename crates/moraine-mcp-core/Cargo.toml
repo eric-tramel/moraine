@@ -1,0 +1,15 @@
+[package]
+name = "moraine-mcp-core"
+version = "0.1.1"
+edition = "2021"
+description = "MCP protocol and tool routing core for Moraine"
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.40", features = ["io-std", "io-util", "sync", "time"] }
+tracing = "0.1"
+moraine-config = { path = "../moraine-config" }
+moraine-clickhouse = { path = "../moraine-clickhouse" }
+moraine-conversations = { path = "../moraine-conversations" }

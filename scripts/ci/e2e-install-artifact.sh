@@ -83,8 +83,8 @@ main() {
   local target="$1"
   local repo_root
   repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-  local package_script="$repo_root/scripts/package-cortexctl-release.sh"
-  local install_script="$repo_root/scripts/install-cortexctl.sh"
+  local package_script="$repo_root/scripts/package-moraine-release.sh"
+  local install_script="$repo_root/scripts/install-moraine.sh"
   local e2e_script="$repo_root/scripts/ci/e2e-stack.sh"
   local python_bin="${PYTHON_BIN:-python3}"
   local run_stamp
@@ -124,15 +124,15 @@ main() {
     --skip-clickhouse
 
   export PATH="$HOME/.local/bin:$PATH"
-  local installed_cortexctl="$HOME/.local/bin/cortexctl"
-  if [[ ! -x "$installed_cortexctl" ]]; then
-    echo "missing installed cortexctl binary: $installed_cortexctl" >&2
+  local installed_moraine="$HOME/.local/bin/moraine"
+  if [[ ! -x "$installed_moraine" ]]; then
+    echo "missing installed moraine binary: $installed_moraine" >&2
     exit 1
   fi
 
-  echo "[e2e-install] running functional stack + MCP smoke with installed cortexctl"
-  unset CORTEX_SOURCE_TREE_MODE
-  CORTEXCTL_BIN="$installed_cortexctl" PYTHON_BIN="$python_bin" bash "$e2e_script"
+  echo "[e2e-install] running functional stack + MCP smoke with installed moraine"
+  unset MORAINE_SOURCE_TREE_MODE
+  MORAINECTL_BIN="$installed_moraine" PYTHON_BIN="$python_bin" bash "$e2e_script"
   E2E_INSTALL_SUCCESS=1
 }
 

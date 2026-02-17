@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CRATE_DIR="$PROJECT_ROOT/apps/moraine"
+
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "cargo is not installed or not on PATH"
+  exit 1
+fi
+
+cargo build --manifest-path "$CRATE_DIR/Cargo.toml" --release
+
+echo "built: $PROJECT_ROOT/target/release/moraine"

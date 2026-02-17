@@ -36,7 +36,7 @@ maintenance/run_multiagent_repo_audit.sh --dry-run
 - `maintenance/REPORT.md`: deduplicated findings.
 - `maintenance/ISSUES_CREATED.md`: one line per issue-creation result.
 - `maintenance/ISSUE_RELATIONSHIPS.md`: one line per relationship-linking result.
-- run artifacts in `/tmp/cortex-maintenance-<timestamp>` (or `--run-dir`).
+- run artifacts in `/tmp/moraine-maintenance-<timestamp>` (or `--run-dir`).
 
 ## Issue Worker Orchestrator
 

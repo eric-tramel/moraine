@@ -1,0 +1,11 @@
+[package]
+name = "moraine-monitor"
+version = "0.1.1"
+edition = "2021"
+description = "Moraine monitor HTTP/UI service"
+
+[dependencies]
+anyhow = "1.0"
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }
+moraine-config = { path = "../../crates/moraine-config" }
+moraine-monitor-core = { path = "../../crates/moraine-monitor-core" }

@@ -1,10 +1,10 @@
 # Unified Trace Schema Mapping
 
-This page maps raw Codex and Claude Code trace fields into the unified `cortex.events` table so you can move directly from source JSONL to canonical columns when querying ClickHouse. The table rows below follow the `cortex.events` schema order. [src: sql/001_schema.sql:L23-L77, crates/cortex-ingest-core/src/normalize.rs:L259-L379, crates/cortex-ingest-core/src/normalize.rs:L1322-L1415]
+This page maps raw Codex and Claude Code trace fields into the unified `moraine.events` table so you can move directly from source JSONL to canonical columns when querying ClickHouse. The table rows below follow the `moraine.events` schema order. [src: sql/001_schema.sql:L23-L77, crates/moraine-ingest-core/src/normalize.rs:L259-L379, crates/moraine-ingest-core/src/normalize.rs:L1322-L1415]
 
 ## Field Mapping Table
 
-| Unified field (`cortex.events`) | Codex trace mapping | Claude Code trace mapping |
+| Unified field (`moraine.events`) | Codex trace mapping | Claude Code trace mapping |
 | --- | --- | --- |
 | `ingested_at` | Not from trace. Set by ClickHouse default `now64(3)` at insert time. | Not from trace. Set by ClickHouse default `now64(3)` at insert time. |
 | `event_uid` | Derived SHA-256 from source file coordinates plus raw fingerprint and suffix (`raw`, or `compacted:{idx}` for expanded compacted items). | Derived SHA-256 from source file coordinates plus raw fingerprint and suffix (`raw`, or `claude:block:{idx}` for content blocks). |
@@ -57,4 +57,4 @@ This page maps raw Codex and Claude Code trace fields into the unified `cortex.e
 | `token_usage_json` | Compact JSON of full `payload` for `event_msg` token-count rows; otherwise empty string. | Not populated (empty string). |
 | `event_version` | Not from trace. Generated from current UNIX epoch milliseconds at normalization time. | Not from trace. Generated from current UNIX epoch milliseconds at normalization time. |
 
-Field defaults and provider-specific overrides come from `base_event_obj`, `normalize_codex_event`, `normalize_claude_event`, and `normalize_record`. [src: crates/cortex-ingest-core/src/normalize.rs:L78-L104, crates/cortex-ingest-core/src/normalize.rs:L172-L230, crates/cortex-ingest-core/src/normalize.rs:L259-L379, crates/cortex-ingest-core/src/normalize.rs:L440-L997, crates/cortex-ingest-core/src/normalize.rs:L999-L1320, crates/cortex-ingest-core/src/normalize.rs:L1322-L1415]
+Field defaults and provider-specific overrides come from `base_event_obj`, `normalize_codex_event`, `normalize_claude_event`, and `normalize_record`. [src: crates/moraine-ingest-core/src/normalize.rs:L78-L104, crates/moraine-ingest-core/src/normalize.rs:L172-L230, crates/moraine-ingest-core/src/normalize.rs:L259-L379, crates/moraine-ingest-core/src/normalize.rs:L440-L997, crates/moraine-ingest-core/src/normalize.rs:L999-L1320, crates/moraine-ingest-core/src/normalize.rs:L1322-L1415]

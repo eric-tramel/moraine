@@ -6,5 +6,5 @@ Do not add new ingest changes here.
 
 Authoritative ingest code lives in:
 
-- `apps/cortex-ingest`
-- `crates/cortex-ingest-core`
+- `apps/moraine-ingest`
+- `crates/moraine-ingest-core`

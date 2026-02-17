@@ -1,0 +1,12 @@
+[package]
+name = "moraine-mcp"
+version = "0.1.1"
+edition = "2021"
+description = "Moraine MCP stdio server"
+
+[dependencies]
+anyhow = "1.0"
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+moraine-config = { path = "../../crates/moraine-config" }
+moraine-mcp-core = { path = "../../crates/moraine-mcp-core" }

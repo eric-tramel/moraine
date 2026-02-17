@@ -1,19 +1,19 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/cortex-config",
-  "crates/cortex-clickhouse",
-  "crates/cortex-conversations",
-  "crates/cortex-ingest-core",
-  "crates/cortex-mcp-core",
-  "crates/cortex-monitor-core",
-  "apps/cortex-ingest",
-  "apps/cortex-mcp",
-  "apps/cortex-monitor",
-  "apps/cortexctl",
+  "crates/moraine-config",
+  "crates/moraine-clickhouse",
+  "crates/moraine-conversations",
+  "crates/moraine-ingest-core",
+  "crates/moraine-mcp-core",
+  "crates/moraine-monitor-core",
+  "apps/moraine-ingest",
+  "apps/moraine-mcp",
+  "apps/moraine-monitor",
+  "apps/moraine",
 ]
 
 [workspace.package]
 edition = "2021"
 license = "MIT"
-authors = ["Cortex Maintainers"]
+authors = ["Moraine Maintainers"]

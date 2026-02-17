@@ -1,4 +1,4 @@
-site_name: Cortex Documentation
+site_name: Moraine Documentation
 site_description: Local ClickHouse + Rust ingestion + BM25 indexing architecture and operations
 site_url: http://127.0.0.1:8000
 
@@ -49,14 +49,14 @@ markdown_extensions:
 
 nav:
   - Home: README.md
-  - Cortex Core:
+  - Moraine Core:
       - System Architecture: core/system-architecture.md
       - Data Model: core/data-model.md
       - Unified Trace Schema Mapping: core/unified-trace-schema.md
       - Ingestion Service: core/ingestion-service.md
-  - Cortex Search:
+  - Moraine Search:
       - Retrieval and BM25: search/indexing-and-retrieval.md
-  - Cortex MCP:
+  - Moraine MCP:
       - Agent Interface: mcp/agent-interface.md
   - Python Bindings:
       - Conversations Tutorial: python/conversations-client-tutorial.md

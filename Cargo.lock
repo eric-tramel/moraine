@@ -314,12 +314,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
-name = "cortex-clickhouse"
+name = "moraine-clickhouse"
 version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
- "cortex-config",
+ "moraine-config",
  "reqwest",
  "serde",
  "serde_json",
@@ -328,7 +328,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cortex-config"
+name = "moraine-config"
 version = "0.1.1"
 dependencies = [
  "anyhow",
@@ -337,15 +337,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "cortex-conversations"
+name = "moraine-conversations"
 version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
  "axum",
  "base64",
- "cortex-clickhouse",
- "cortex-config",
+ "moraine-clickhouse",
+ "moraine-config",
  "regex",
  "serde",
  "serde_json",
@@ -356,24 +356,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "cortex-ingest"
+name = "moraine-ingest"
 version = "0.1.1"
 dependencies = [
  "anyhow",
- "cortex-config",
- "cortex-ingest-core",
+ "moraine-config",
+ "moraine-ingest-core",
  "tokio",
  "tracing-subscriber",
 ]
 
 [[package]]
-name = "cortex-ingest-core"
+name = "moraine-ingest-core"
 version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
- "cortex-clickhouse",
- "cortex-config",
+ "moraine-clickhouse",
+ "moraine-config",
  "glob",
  "notify",
  "regex",
@@ -387,24 +387,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "cortex-mcp"
+name = "moraine-mcp"
 version = "0.1.1"
 dependencies = [
  "anyhow",
- "cortex-config",
- "cortex-mcp-core",
+ "moraine-config",
+ "moraine-mcp-core",
  "tokio",
  "tracing-subscriber",
 ]
 
 [[package]]
-name = "cortex-mcp-core"
+name = "moraine-mcp-core"
 version = "0.1.1"
 dependencies = [
  "anyhow",
- "cortex-clickhouse",
- "cortex-config",
- "cortex-conversations",
+ "moraine-clickhouse",
+ "moraine-config",
+ "moraine-conversations",
  "serde",
  "serde_json",
  "tokio",
@@ -412,24 +412,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "cortex-monitor"
+name = "moraine-monitor"
 version = "0.1.1"
 dependencies = [
  "anyhow",
- "cortex-config",
- "cortex-monitor-core",
+ "moraine-config",
+ "moraine-monitor-core",
  "tokio",
 ]
 
 [[package]]
-name = "cortex-monitor-core"
+name = "moraine-monitor-core"
 version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
  "chrono",
- "cortex-clickhouse",
- "cortex-config",
+ "moraine-clickhouse",
+ "moraine-config",
  "mime_guess",
  "serde",
  "serde_json",
@@ -437,13 +437,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "cortexctl"
+name = "moraine"
 version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
- "cortex-clickhouse",
- "cortex-config",
+ "moraine-clickhouse",
+ "moraine-config",
  "ratatui",
  "reqwest",
  "serde",

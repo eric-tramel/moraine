@@ -1,9 +1,9 @@
 import { expect, test, type Page } from '@playwright/test';
 
-const codexKeyword = process.env.CORTEX_E2E_CODEX_KEYWORD || '';
-const claudeKeyword = process.env.CORTEX_E2E_CLAUDE_KEYWORD || '';
-const codexTraceMarker = process.env.CORTEX_E2E_CODEX_TRACE_MARKER || '';
-const claudeTraceMarker = process.env.CORTEX_E2E_CLAUDE_TRACE_MARKER || '';
+const codexKeyword = process.env.MORAINE_E2E_CODEX_KEYWORD || '';
+const claudeKeyword = process.env.MORAINE_E2E_CLAUDE_KEYWORD || '';
+const codexTraceMarker = process.env.MORAINE_E2E_CODEX_TRACE_MARKER || '';
+const claudeTraceMarker = process.env.MORAINE_E2E_CLAUDE_TRACE_MARKER || '';
 
 test.skip(!process.env.MONITOR_BASE_URL, 'MONITOR_BASE_URL must be set for the live monitor e2e test');
 
@@ -124,7 +124,7 @@ test('live monitor UI reflects ingested fixture data', async ({ page }) => {
 
   await page.goto('/');
 
-  await expect(page.getByRole('heading', { name: 'Cortex Monitor' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Moraine Monitor' })).toBeVisible();
   await expect(page.locator('#healthCard .card')).toHaveCount(5);
   await expect(page.locator('#ingestorCard .card').first()).toContainText('Healthy');
 

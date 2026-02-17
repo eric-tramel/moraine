@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "error: status has been removed in the cortexctl migration." >&2
-echo "use: bin/cortexctl status" >&2
+echo "error: status has been removed in the moraine migration." >&2
+echo "use: bin/moraine status" >&2
 exit 64

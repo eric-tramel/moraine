@@ -27,13 +27,13 @@ fn parse_config_path() -> PathBuf {
 
 fn default_config_path() -> PathBuf {
     if let Some(home) = std::env::var_os("HOME") {
-        let path = PathBuf::from(home).join(".cortex").join("config.toml");
+        let path = PathBuf::from(home).join(".moraine").join("config.toml");
         if path.exists() {
             return path;
         }
     }
 
-    PathBuf::from("config/cortex.toml")
+    PathBuf::from("config/moraine.toml")
 }
 
 #[tokio::main(flavor = "multi_thread")]

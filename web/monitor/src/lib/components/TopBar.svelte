@@ -15,7 +15,7 @@
 
 <header class="top-bar">
   <div>
-    <h1>Cortex Monitor</h1>
+    <h1>Moraine Monitor</h1>
   </div>
   <div class="top-actions">
     <button

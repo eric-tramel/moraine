@@ -268,7 +268,7 @@ impl AppState {
             "tools": [
                 {
                     "name": "search",
-                    "description": "BM25 lexical search over Cortex indexed conversation events.",
+                    "description": "BM25 lexical search over Moraine indexed conversation events.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -563,8 +563,8 @@ SELECT
     )
   ) AS score,
   uniqExact(p.term) AS matched_terms
-FROM cortex.search_postings AS p
-ANY INNER JOIN cortex.search_documents AS d ON d.event_uid = p.doc_id
+FROM moraine.search_postings AS p
+ANY INNER JOIN moraine.search_documents AS d ON d.event_uid = p.doc_id
 WHERE {where_sql}
 GROUP BY p.doc_id
 HAVING matched_terms >= {min_should_match} AND score >= {min_score:.6}
@@ -576,7 +576,7 @@ FORMAT JSONEachRow",
     }
 
     async fn corpus_stats(&self) -> Result<(u64, u64)> {
-        let from_stats_query = "SELECT toUInt64(ifNull(sum(docs), 0)) AS docs, toUInt64(ifNull(sum(total_doc_len), 0)) AS total_doc_len FROM cortex.search_corpus_stats FORMAT JSONEachRow";
+        let from_stats_query = "SELECT toUInt64(ifNull(sum(docs), 0)) AS docs, toUInt64(ifNull(sum(total_doc_len), 0)) AS total_doc_len FROM moraine.search_corpus_stats FORMAT JSONEachRow";
         let from_stats: Vec<CorpusStatsRow> = self.ch.query_json_rows(from_stats_query).await?;
 
         if let Some(row) = from_stats.first() {
@@ -585,7 +585,7 @@ FORMAT JSONEachRow",
             }
         }
 
-        let fallback_query = "SELECT toUInt64(count()) AS docs, toUInt64(ifNull(sum(doc_len), 0)) AS total_doc_len FROM cortex.search_documents WHERE doc_len > 0 FORMAT JSONEachRow";
+        let fallback_query = "SELECT toUInt64(count()) AS docs, toUInt64(ifNull(sum(doc_len), 0)) AS total_doc_len FROM moraine.search_documents WHERE doc_len > 0 FORMAT JSONEachRow";
         let fallback: Vec<CorpusStatsRow> = self.ch.query_json_rows(fallback_query).await?;
         if let Some(row) = fallback.first() {
             Ok((row.docs, row.total_doc_len))
@@ -597,7 +597,7 @@ FORMAT JSONEachRow",
     async fn df_map(&self, terms: &[String]) -> Result<HashMap<String, u64>> {
         let terms_array = sql_array_strings(terms);
         let primary_query = format!(
-            "SELECT term, toUInt64(sum(docs)) AS df FROM cortex.search_term_stats WHERE term IN {} GROUP BY term FORMAT JSONEachRow",
+            "SELECT term, toUInt64(sum(docs)) AS df FROM moraine.search_term_stats WHERE term IN {} GROUP BY term FORMAT JSONEachRow",
             terms_array
         );
 
@@ -613,7 +613,7 @@ FORMAT JSONEachRow",
         }
 
         let fallback_query = format!(
-            "SELECT term, count() AS df FROM cortex.search_postings WHERE term IN {} GROUP BY term FORMAT JSONEachRow",
+            "SELECT term, count() AS df FROM moraine.search_postings WHERE term IN {} GROUP BY term FORMAT JSONEachRow",
             terms_array
         );
         let fallback_rows: Vec<DfRow> = self.ch.query_json_rows(&fallback_query).await?;
@@ -734,7 +734,7 @@ FORMAT JSONEachRow",
         let after = args.after.unwrap_or(self.cfg.mcp.default_context_after);
 
         let target_query = format!(
-            "SELECT session_id, event_order, turn_seq FROM cortex.v_conversation_trace WHERE event_uid = {} ORDER BY event_order DESC LIMIT 1 FORMAT JSONEachRow",
+            "SELECT session_id, event_order, turn_seq FROM moraine.v_conversation_trace WHERE event_uid = {} ORDER BY event_order DESC LIMIT 1 FORMAT JSONEachRow",
             sql_quote(event_uid)
         );
 
@@ -751,7 +751,7 @@ FORMAT JSONEachRow",
         let upper = target.event_order + after as u64;
 
         let context_query = format!(
-            "SELECT session_id, event_uid, event_order, turn_seq, toString(event_time) AS event_time, actor_role, event_class, payload_type, call_id, name, phase, item_id, text_content, payload_json, token_usage_json, source_ref FROM cortex.v_conversation_trace WHERE session_id = {} AND event_order BETWEEN {} AND {} ORDER BY event_order FORMAT JSONEachRow",
+            "SELECT session_id, event_uid, event_order, turn_seq, toString(event_time) AS event_time, actor_role, event_class, payload_type, call_id, name, phase, item_id, text_content, payload_json, token_usage_json, source_ref FROM moraine.v_conversation_trace WHERE session_id = {} AND event_order BETWEEN {} AND {} ORDER BY event_order FORMAT JSONEachRow",
             sql_quote(&target.session_id),
             lower,
             upper

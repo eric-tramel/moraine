@@ -1,6 +1,6 @@
-# Cortex
+# Moraine
 
-Cortex is a local-first system that ingests your Codex and Claude Code session logs into a local database (ClickHouse) so you can monitor them, inspect them, and use them for retrieval.
+Moraine is a local-first system that ingests your Codex and Claude Code session logs into a local database (ClickHouse) so you can monitor them, inspect them, and use them for retrieval.
 
 What you get:
 
@@ -10,10 +10,10 @@ What you get:
 
 ## Quickstart (5 minutes)
 
-Install `cortexctl` (prebuilt bundle, recommended):
+Install `moraine` (prebuilt bundle, recommended):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/eric-tramel/cortex/main/scripts/install-cortexctl.sh \
+curl -fsSL https://raw.githubusercontent.com/eric-tramel/moraine/main/scripts/install-moraine.sh \
   | bash
 export PATH="$HOME/.local/bin:$PATH"
 ```
@@ -21,73 +21,72 @@ export PATH="$HOME/.local/bin:$PATH"
 Start the local stack and confirm it is healthy:
 
 ```bash
-cortexctl up
-cortexctl status
-cortexctl status --output rich --verbose
+moraine up
+moraine status
+moraine status --output rich --verbose
 ```
 
 Open the monitor UI:
 
 - `http://127.0.0.1:8080`
 
-To see value quickly: run a Codex or Claude Code session as you normally would, then refresh the UI (or rerun `cortexctl status`) and watch row counts and heartbeat move.
+To see value quickly: run a Codex or Claude Code session as you normally would, then refresh the UI (or rerun `moraine status`) and watch row counts and heartbeat move.
 
 Notes:
 
-- Cortex stores state under `~/.cortex`.
-- If ClickHouse is missing, `cortexctl up` auto-installs a managed ClickHouse build by default.
+- Moraine stores state under `~/.moraine`.
+- If ClickHouse is missing, `moraine up` auto-installs a managed ClickHouse build by default.
 
 ## Where Data Comes From
 
-By default, Cortex watches these JSONL sources (you can change this in config):
+By default, Moraine watches these JSONL sources (you can change this in config):
 
 - Codex: `~/.codex/sessions/**/*.jsonl`
 - Claude Code: `~/.claude/projects/**/*.jsonl`
 
-## Use Cortex With an Agent (MCP)
+## Use Moraine With an Agent (MCP)
 
 MCP (Model Context Protocol) is not started by default. For an ad hoc session:
 
 ```bash
-cortexctl run mcp
+moraine run mcp
 ```
 
 Agents typically call `search` to discover relevant events, then `open` to fetch surrounding context.
 
-To start MCP automatically with `cortexctl up`, set `runtime.start_mcp_on_up=true` in `~/.cortex/config.toml`.
+To start MCP automatically with `moraine up`, set `runtime.start_mcp_on_up=true` in `~/.moraine/config.toml`.
 
 For host integration details and the tool contract (`search`, `open`), see `docs/mcp/agent-interface.md`.
 
 ## Common Commands
 
-- `cortexctl status`: health + ingest heartbeat
-- `cortexctl logs`: service logs
-- `cortexctl down`: stop everything
-- `cortexctl service install`: start services on login (macOS `launchd`, Linux user `systemd`)
+- `moraine status`: health + ingest heartbeat
+- `moraine logs`: service logs
+- `moraine down`: stop everything
 
 ## Configuration (Optional)
 
-Default config lives in `config/cortex.toml`. Runtime config is resolved in this order:
+Default config lives in `config/moraine.toml`. Runtime config is resolved in this order:
 
 1. `--config <path>`
-2. `CORTEX_CONFIG` (and `CORTEX_MCP_CONFIG` for MCP)
-3. `~/.cortex/config.toml`
+2. `MORAINE_CONFIG` (and `MORAINE_MCP_CONFIG` for MCP)
+3. `~/.moraine/config.toml`
 
-To customize, start by copying `config/cortex.toml` to `~/.cortex/config.toml` and edit values there.
+To customize, start by copying `config/moraine.toml` to `~/.moraine/config.toml` and edit values there.
 
 ## Install From Source (Optional)
 
 Requires a Rust toolchain (`cargo`, `rustc`):
 
 ```bash
-git clone https://github.com/eric-tramel/cortex.git ~/src/cortex
-cd ~/src/cortex
-for crate in cortexctl cortex-ingest cortex-monitor cortex-mcp; do
+git clone https://github.com/eric-tramel/moraine.git ~/src/moraine
+cd ~/src/moraine
+for crate in moraine moraine-ingest moraine-monitor moraine-mcp; do
   cargo install --path "apps/$crate" --locked
 done
 ```
 
-This installs all runtime binaries expected by `cortexctl up`.
+This installs all runtime binaries expected by `moraine up`.
 
 ## More Details
 
@@ -99,4 +98,4 @@ This installs all runtime binaries expected by `cortexctl up`.
 
 Runtime development is authoritative in `apps/*` and `crates/*`.
 
-Legacy reference-only trees still exist under `rust/*` and `cortex-monitor/backend`; do not add new runtime logic there.
+Legacy reference-only trees still exist under `rust/*` and `moraine-monitor/backend`; do not add new runtime logic there.

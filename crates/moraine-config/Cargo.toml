@@ -1,0 +1,10 @@
+[package]
+name = "moraine-config"
+version = "0.1.1"
+edition = "2021"
+description = "Shared Moraine configuration schema and loaders"
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"

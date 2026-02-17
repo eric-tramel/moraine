@@ -1,4 +1,4 @@
-CREATE TABLE IF NOT EXISTS cortex.ingest_heartbeats (
+CREATE TABLE IF NOT EXISTS moraine.ingest_heartbeats (
   ts DateTime64(3) DEFAULT now64(3),
   host String,
   service_version String,

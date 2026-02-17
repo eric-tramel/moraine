@@ -347,7 +347,7 @@ run_issue_cycle() {
 
   LOG_CONTEXT="launch-$launch_id"
   RUN_ID="${ORCH_RUN_ID}-l${launch_id}"
-  RUN_DIR="$(mktemp -d "/tmp/cortex-issue-worker-${RUN_ID}.XXXXXX")"
+  RUN_DIR="$(mktemp -d "/tmp/moraine-issue-worker-${RUN_ID}.XXXXXX")"
   trap worker_cleanup EXIT
 
   CLAIMED=0
@@ -587,7 +587,7 @@ run_dry_run_selection() {
   local dry_run_dir
   local select_status=0
   dry_run_id="${ORCH_RUN_ID}-dryrun"
-  dry_run_dir="$(mktemp -d "/tmp/cortex-issue-worker-${dry_run_id}.XXXXXX")"
+  dry_run_dir="$(mktemp -d "/tmp/moraine-issue-worker-${dry_run_id}.XXXXXX")"
 
   select_issue_candidate "$dry_run_dir" || select_status=$?
   if [ "$select_status" -ne 0 ]; then
@@ -868,7 +868,7 @@ REPO_NAME="${REPO#*/}"
 [ -n "$REPO_NAME" ] || die "Unable to parse repository name from '$REPO'."
 [ "$REPO_OWNER" != "$REPO_NAME" ] || die "Expected owner/name format for repo, got '$REPO'."
 ORCH_RUN_ID="$(date -u +'%Y%m%dT%H%M%SZ')-$$"
-ORCH_RUN_DIR="$(mktemp -d "/tmp/cortex-issue-worker-orch-${ORCH_RUN_ID}.XXXXXX")"
+ORCH_RUN_DIR="$(mktemp -d "/tmp/moraine-issue-worker-orch-${ORCH_RUN_ID}.XXXXXX")"
 trap main_cleanup EXIT
 
 prepare_tag_filter

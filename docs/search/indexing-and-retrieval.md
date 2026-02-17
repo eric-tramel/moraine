@@ -2,7 +2,7 @@
 
 ## Retrieval Objective
 
-Cortex retrieval is designed around one principle: ranking should be cheap at query time because expensive corpus transformation has already been paid incrementally at ingest time. This is the operational equivalent of [BM25S](https://bm25s.github.io/) thinking, but implemented with [ClickHouse](https://github.com/ClickHouse/ClickHouse) tables and materialized views instead of in-memory sparse matrices. The consequence is a thin MCP process that computes scores and formats responses while delegating index freshness and persistence to the database layer. [src: sql/004_search_index.sql:L28, sql/004_search_index.sql:L100, rust/codex-mcp/src/main.rs:L337]
+Moraine retrieval is designed around one principle: ranking should be cheap at query time because expensive corpus transformation has already been paid incrementally at ingest time. This is the operational equivalent of [BM25S](https://bm25s.github.io/) thinking, but implemented with [ClickHouse](https://github.com/ClickHouse/ClickHouse) tables and materialized views instead of in-memory sparse matrices. The consequence is a thin MCP process that computes scores and formats responses while delegating index freshness and persistence to the database layer. [src: sql/004_search_index.sql:L28, sql/004_search_index.sql:L100, rust/codex-mcp/src/main.rs:L337]
 
 The retrieval stack has three cooperating stages. Stage one is document projection from canonical events into `search_documents`. Stage two is sparse postings and corpus statistics maintenance. Stage three is query-time BM25 scoring with runtime filters in `codex-mcp`. Understanding this separation is essential for debugging: if search quality degrades, determine whether the issue is in projection, indexing, or ranking policy before tuning constants. [src: sql/004_search_index.sql:L1, sql/004_search_index.sql:L82, rust/codex-mcp/src/main.rs:L482]
 
@@ -36,7 +36,7 @@ Because ranking is executed over postings constrained by query terms, dominant c
 
 By default, retrieval excludes several operationally noisy payloads and prefers semantically meaningful event classes (`message`, `reasoning`, `event_msg`). When `include_tool_events` is false, additional payload-type exclusions remove lifecycle chatter such as `task_started` and `turn_aborted`. This default policy is tuned for agent consumption quality rather than maximal recall of low-signal events. [src: rust/codex-mcp/src/main.rs:L513, rust/codex-mcp/src/main.rs:L515, rust/codex-mcp/src/main.rs:L517]
 
-A second policy filter optionally excludes codex-mcp self-reference. It removes rows whose payload mentions `codex-mcp` and rows with tool names `search` or `open`. This prevents retrieval loops where prior search/open traces dominate subsequent search results. The filter can be disabled when self-observation is intentionally desired. [src: rust/codex-mcp/src/main.rs:L523, rust/codex-mcp/src/main.rs:L525, config/cortex.toml:L41]
+A second policy filter optionally excludes codex-mcp self-reference. It removes rows whose payload mentions `codex-mcp` and rows with tool names `search` or `open`. This prevents retrieval loops where prior search/open traces dominate subsequent search results. The filter can be disabled when self-observation is intentionally desired. [src: rust/codex-mcp/src/main.rs:L523, rust/codex-mcp/src/main.rs:L525, config/moraine.toml:L41]
 
 Session scoping is supported through exact `session_id` filtering in postings query conditions. In scoped mode, ranking is still BM25-based but corpus statistics remain global in current implementation. That means scores are comparable within scoped results for ranking order, but absolute values should not be interpreted as session-local calibrated relevance probabilities. [src: rust/codex-mcp/src/main.rs:L507, rust/codex-mcp/src/main.rs:L572]
 
@@ -60,11 +60,11 @@ Each search writes a `search_query_log` row with normalized terms, filter settin
 
 ## Performance and Quality Tuning
 
-High-impact knobs are `k1`, `b`, `min_should_match`, result limit, and inclusion filters. Raising `min_should_match` increases precision by requiring broader term overlap; lowering it increases recall for short queries or sparse terms. `k1` and `b` should be tuned against corpus characteristics, but defaults (`1.2`, `0.75`) are reasonable starting points for mixed conversational and tool text. [src: config/cortex.toml:L46-47, config/cortex.toml:L49]
+High-impact knobs are `k1`, `b`, `min_should_match`, result limit, and inclusion filters. Raising `min_should_match` increases precision by requiring broader term overlap; lowering it increases recall for short queries or sparse terms. `k1` and `b` should be tuned against corpus characteristics, but defaults (`1.2`, `0.75`) are reasonable starting points for mixed conversational and tool text. [src: config/moraine.toml:L46-47, config/moraine.toml:L49]
 
 If ranking quality looks noisy, first inspect corpus inputs, not formula constants. Common root causes are weak `text_content` extraction, inclusion of operational chatter, or stale/misaligned index tables after schema changes. Constants cannot recover information that never entered `search_documents` correctly. [src: sql/004_search_index.sql:L53, rust/ingestor/src/normalize.rs:L651, bin/backfill-search-index:L72]
 
-If latency regresses, inspect posting fanout and query term shape. Extremely broad terms and long query token lists increase candidate set size. The max-query-terms cap provides a hard guardrail; if you raise it, do so with observed workload data and not by default. [src: rust/codex-mcp/src/main.rs:L346, rust/codex-mcp/src/main.rs:L1016, config/cortex.toml:L50]
+If latency regresses, inspect posting fanout and query term shape. Extremely broad terms and long query token lists increase candidate set size. The max-query-terms cap provides a hard guardrail; if you raise it, do so with observed workload data and not by default. [src: rust/codex-mcp/src/main.rs:L346, rust/codex-mcp/src/main.rs:L1016, config/moraine.toml:L50]
 
 ## Known Limits
 

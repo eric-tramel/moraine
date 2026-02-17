@@ -6,7 +6,7 @@ describe('buildHealthCards', () => {
     const cards = buildHealthCards({
       ok: true,
       url: 'http://localhost:8123',
-      database: 'cortex',
+      database: 'moraine',
       version: '25.1.1',
       ping_ms: 12.345,
       connections: { total: 42 },

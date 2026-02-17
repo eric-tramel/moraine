@@ -6,5 +6,5 @@ Do not add new runtime logic under `rust/*`.
 
 Use these authoritative workspace paths instead:
 
-- Ingest: `apps/cortex-ingest` and `crates/cortex-ingest-core`
-- MCP: `apps/cortex-mcp` and `crates/cortex-mcp-core`
+- Ingest: `apps/moraine-ingest` and `crates/moraine-ingest-core`
+- MCP: `apps/moraine-mcp` and `crates/moraine-mcp-core`
