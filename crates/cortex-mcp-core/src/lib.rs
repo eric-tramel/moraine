@@ -2,8 +2,8 @@ use anyhow::{anyhow, Context, Result};
 use cortex_clickhouse::ClickHouseClient;
 use cortex_config::AppConfig;
 use cortex_conversations::{
-    ClickHouseConversationRepository, ConversationRepository, OpenEventRequest, RepoConfig,
-    SearchEventsQuery,
+    ClickHouseConversationRepository, ConversationMode, ConversationRepository,
+    ConversationSearchQuery, OpenEventRequest, RepoConfig, SearchEventsQuery,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -51,6 +51,29 @@ struct SearchArgs {
     min_score: Option<f64>,
     #[serde(default)]
     min_should_match: Option<u16>,
+    #[serde(default)]
+    include_tool_events: Option<bool>,
+    #[serde(default)]
+    exclude_codex_mcp: Option<bool>,
+    #[serde(default)]
+    verbosity: Option<Verbosity>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchConversationsArgs {
+    query: String,
+    #[serde(default)]
+    limit: Option<u16>,
+    #[serde(default)]
+    min_score: Option<f64>,
+    #[serde(default)]
+    min_should_match: Option<u16>,
+    #[serde(default)]
+    from_unix_ms: Option<i64>,
+    #[serde(default)]
+    to_unix_ms: Option<i64>,
+    #[serde(default)]
+    mode: Option<ConversationMode>,
     #[serde(default)]
     include_tool_events: Option<bool>,
     #[serde(default)]
@@ -144,6 +167,44 @@ struct OpenProseEvent {
     payload_type: String,
     #[serde(default)]
     text_content: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ConversationSearchProsePayload {
+    #[serde(default)]
+    query_id: String,
+    #[serde(default)]
+    query: String,
+    #[serde(default)]
+    stats: ConversationSearchProseStats,
+    #[serde(default)]
+    hits: Vec<ConversationSearchProseHit>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ConversationSearchProseStats {
+    #[serde(default)]
+    took_ms: u64,
+    #[serde(default)]
+    result_count: u64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ConversationSearchProseHit {
+    #[serde(default)]
+    rank: u64,
+    #[serde(default)]
+    session_id: String,
+    #[serde(default)]
+    score: f64,
+    #[serde(default)]
+    matched_terms: u16,
+    #[serde(default)]
+    event_count_considered: u32,
+    #[serde(default)]
+    best_event_uid: Option<String>,
+    #[serde(default)]
+    snippet: Option<String>,
 }
 
 #[derive(Clone)]
@@ -243,6 +304,33 @@ impl AppState {
                         },
                         "required": ["event_uid"]
                     }
+                },
+                {
+                    "name": "search_conversations",
+                    "description": "BM25 lexical search across whole conversations.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string" },
+                            "limit": { "type": "integer", "minimum": 1, "maximum": self.cfg.mcp.max_results },
+                            "min_score": { "type": "number" },
+                            "min_should_match": { "type": "integer", "minimum": 1 },
+                            "from_unix_ms": { "type": "integer" },
+                            "to_unix_ms": { "type": "integer" },
+                            "mode": {
+                                "type": "string",
+                                "enum": ["web_search", "mcp_internal", "tool_calling", "chat"]
+                            },
+                            "include_tool_events": { "type": "boolean" },
+                            "exclude_codex_mcp": { "type": "boolean" },
+                            "verbosity": {
+                                "type": "string",
+                                "enum": ["prose", "full"],
+                                "default": "prose"
+                            }
+                        },
+                        "required": ["query"]
+                    }
                 }
             ]
         })
@@ -268,6 +356,20 @@ impl AppState {
                 match verbosity {
                     Verbosity::Full => Ok(tool_ok_full(payload)),
                     Verbosity::Prose => Ok(tool_ok_prose(format_open_prose(&payload)?)),
+                }
+            }
+            "search_conversations" => {
+                let args: SearchConversationsArgs = serde_json::from_value(params.arguments)
+                    .context(
+                        "search_conversations expects a JSON object with at least {\"query\": ...}",
+                    )?;
+                let verbosity = args.verbosity.unwrap_or_default();
+                let payload = self.search_conversations(args).await?;
+                match verbosity {
+                    Verbosity::Full => Ok(tool_ok_full(payload)),
+                    Verbosity::Prose => {
+                        Ok(tool_ok_prose(format_conversation_search_prose(&payload)?))
+                    }
                 }
             }
             other => Err(anyhow!("unknown tool: {other}")),
@@ -312,6 +414,26 @@ impl AppState {
         }
 
         serde_json::to_value(result).context("failed to encode open result payload")
+    }
+
+    async fn search_conversations(&self, args: SearchConversationsArgs) -> Result<Value> {
+        let result = self
+            .repo
+            .search_conversations(ConversationSearchQuery {
+                query: args.query,
+                limit: args.limit,
+                min_score: args.min_score,
+                min_should_match: args.min_should_match,
+                from_unix_ms: args.from_unix_ms,
+                to_unix_ms: args.to_unix_ms,
+                mode: args.mode,
+                include_tool_events: args.include_tool_events,
+                exclude_codex_mcp: args.exclude_codex_mcp,
+            })
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?;
+
+        serde_json::to_value(result).context("failed to encode search_conversations result payload")
     }
 }
 
@@ -473,6 +595,48 @@ fn format_open_prose(payload: &Value) -> Result<String> {
     Ok(out.trim_end().to_string())
 }
 
+fn format_conversation_search_prose(payload: &Value) -> Result<String> {
+    let parsed: ConversationSearchProsePayload = serde_json::from_value(payload.clone())
+        .context("failed to parse search_conversations payload")?;
+
+    let mut out = String::new();
+    out.push_str(&format!("Conversation Search: \"{}\"\n", parsed.query));
+    out.push_str(&format!("Query ID: {}\n", parsed.query_id));
+    out.push_str(&format!(
+        "Hits: {} ({} ms)\n",
+        parsed.stats.result_count, parsed.stats.took_ms
+    ));
+
+    if parsed.hits.is_empty() {
+        out.push_str("\nNo hits.");
+        return Ok(out);
+    }
+
+    for hit in &parsed.hits {
+        out.push_str(&format!(
+            "\n{}) session={} score={:.4} matched_terms={} events={}\n",
+            hit.rank, hit.session_id, hit.score, hit.matched_terms, hit.event_count_considered
+        ));
+
+        if let Some(best_event_uid) = hit.best_event_uid.as_deref() {
+            out.push_str(&format!("   best_event_uid: {}\n", best_event_uid));
+            out.push_str(&format!(
+                "   next: open(event_uid=\"{}\")\n",
+                best_event_uid
+            ));
+        }
+
+        if let Some(snippet) = hit.snippet.as_deref() {
+            let compact = compact_text_line(snippet, 220);
+            if !compact.is_empty() {
+                out.push_str(&format!("   snippet: {}\n", compact));
+            }
+        }
+    }
+
+    Ok(out.trim_end().to_string())
+}
+
 fn append_open_event_line(out: &mut String, event: &OpenProseEvent) {
     let kind = display_kind(&event.event_class, &event.payload_type);
     out.push_str(&format!(
@@ -580,5 +744,22 @@ mod tests {
         let text = "one two three four five";
         let compact = compact_text_line(text, 10);
         assert!(compact.ends_with("..."));
+    }
+
+    #[test]
+    fn format_conversation_search_handles_empty_hits() {
+        let payload = json!({
+            "query_id": "q1",
+            "query": "hello world",
+            "stats": {
+                "took_ms": 2,
+                "result_count": 0
+            },
+            "hits": []
+        });
+
+        let text = format_conversation_search_prose(&payload).expect("format");
+        assert!(text.contains("Conversation Search"));
+        assert!(text.contains("No hits"));
     }
 }

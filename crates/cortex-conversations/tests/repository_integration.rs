@@ -1,0 +1,299 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use axum::{
+    extract::{Query, State},
+    http::{HeaderMap, StatusCode},
+    routing::get,
+    Router,
+};
+use cortex_clickhouse::ClickHouseClient;
+use cortex_config::ClickHouseConfig;
+use cortex_conversations::{
+    ClickHouseConversationRepository, ConversationListFilter, ConversationMode,
+    ConversationRepository, ConversationSearchQuery, PageRequest, RepoConfig,
+};
+use serde_json::json;
+
+#[derive(Default)]
+struct MockState {
+    queries: Mutex<Vec<String>>,
+}
+
+fn test_clickhouse_config(url: String) -> ClickHouseConfig {
+    ClickHouseConfig {
+        url,
+        database: "cortex".to_string(),
+        username: "default".to_string(),
+        password: String::new(),
+        timeout_seconds: 5.0,
+        async_insert: true,
+        wait_for_async_insert: true,
+    }
+}
+
+fn json_data(rows: serde_json::Value) -> String {
+    json!({ "data": rows }).to_string()
+}
+
+async fn spawn_mock_server() -> (String, Arc<MockState>) {
+    async fn handler(
+        State(state): State<Arc<MockState>>,
+        Query(params): Query<HashMap<String, String>>,
+        headers: HeaderMap,
+    ) -> (StatusCode, String) {
+        if headers.get("content-length").is_none() {
+            return (
+                StatusCode::LENGTH_REQUIRED,
+                "missing content-length".to_string(),
+            );
+        }
+
+        let query = params.get("query").cloned().unwrap_or_default();
+        state
+            .queries
+            .lock()
+            .expect("query lock")
+            .push(query.clone());
+
+        if query.contains("FROM `cortex`.`v_session_summary` AS s") {
+            if query.contains("s.session_id < 'sess_b'") {
+                return (
+                    StatusCode::OK,
+                    json_data(json!([
+                        {
+                            "session_id": "sess_a",
+                            "first_event_time": "2026-01-01 10:00:00",
+                            "first_event_unix_ms": 1767261600000_i64,
+                            "last_event_time": "2026-01-01 10:10:00",
+                            "last_event_unix_ms": 1767262200000_i64,
+                            "total_turns": 2,
+                            "total_events": 20,
+                            "user_messages": 4,
+                            "assistant_messages": 4,
+                            "tool_calls": 2,
+                            "tool_results": 2,
+                            "mode": "web_search"
+                        }
+                    ])),
+                );
+            }
+
+            return (
+                StatusCode::OK,
+                json_data(json!([
+                    {
+                        "session_id": "sess_c",
+                        "first_event_time": "2026-01-03 10:00:00",
+                        "first_event_unix_ms": 1767434400000_i64,
+                        "last_event_time": "2026-01-03 10:10:00",
+                        "last_event_unix_ms": 1767435000000_i64,
+                        "total_turns": 3,
+                        "total_events": 30,
+                        "user_messages": 6,
+                        "assistant_messages": 6,
+                        "tool_calls": 3,
+                        "tool_results": 3,
+                        "mode": "web_search"
+                    },
+                    {
+                        "session_id": "sess_b",
+                        "first_event_time": "2026-01-02 10:00:00",
+                        "first_event_unix_ms": 1767348000000_i64,
+                        "last_event_time": "2026-01-02 10:10:00",
+                        "last_event_unix_ms": 1767348600000_i64,
+                        "total_turns": 2,
+                        "total_events": 22,
+                        "user_messages": 4,
+                        "assistant_messages": 4,
+                        "tool_calls": 2,
+                        "tool_results": 2,
+                        "mode": "web_search"
+                    },
+                    {
+                        "session_id": "sess_a",
+                        "first_event_time": "2026-01-01 10:00:00",
+                        "first_event_unix_ms": 1767261600000_i64,
+                        "last_event_time": "2026-01-01 10:10:00",
+                        "last_event_unix_ms": 1767262200000_i64,
+                        "total_turns": 2,
+                        "total_events": 20,
+                        "user_messages": 4,
+                        "assistant_messages": 4,
+                        "tool_calls": 2,
+                        "tool_results": 2,
+                        "mode": "web_search"
+                    }
+                ])),
+            );
+        }
+
+        if query.contains("FROM `cortex`.`search_corpus_stats`") {
+            return (
+                StatusCode::OK,
+                json_data(json!([
+                    {
+                        "docs": 100_u64,
+                        "total_doc_len": 5000_u64
+                    }
+                ])),
+            );
+        }
+
+        if query.contains("FROM `cortex`.`search_term_stats`") {
+            return (
+                StatusCode::OK,
+                json_data(json!([
+                    { "term": "hello", "df": 20_u64 },
+                    { "term": "world", "df": 10_u64 }
+                ])),
+            );
+        }
+
+        if query.contains("GROUP BY e.session_id") {
+            return (
+                StatusCode::OK,
+                json_data(json!([
+                    {
+                        "session_id": "sess_c",
+                        "score": 12.5,
+                        "matched_terms": 2_u16,
+                        "event_count_considered": 3_u32,
+                        "best_event_uid": "evt-c-42",
+                        "snippet": "best match from session c"
+                    },
+                    {
+                        "session_id": "sess_a",
+                        "score": 7.0,
+                        "matched_terms": 1_u16,
+                        "event_count_considered": 2_u32,
+                        "best_event_uid": "evt-a-11",
+                        "snippet": "weaker match from session a"
+                    }
+                ])),
+            );
+        }
+
+        (StatusCode::OK, json_data(json!([])))
+    }
+
+    let state = Arc::new(MockState::default());
+    let app = Router::new()
+        .route("/", get(handler).post(handler))
+        .with_state(state.clone());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test listener");
+    let addr = listener.local_addr().expect("listener addr");
+
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (format!("http://{}", addr), state)
+}
+
+async fn build_repo() -> (ClickHouseConversationRepository, Arc<MockState>) {
+    let (base_url, state) = spawn_mock_server().await;
+    let client =
+        ClickHouseClient::new(test_clickhouse_config(base_url)).expect("valid clickhouse client");
+
+    let repo = ClickHouseConversationRepository::new(
+        client,
+        RepoConfig {
+            max_results: 100,
+            ..RepoConfig::default()
+        },
+    );
+
+    (repo, state)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_conversations_applies_filters_and_cursor_pagination() {
+    let (repo, state) = build_repo().await;
+
+    let filter = ConversationListFilter {
+        from_unix_ms: Some(1767261600000_i64),
+        to_unix_ms: Some(1767500000000_i64),
+        mode: Some(ConversationMode::WebSearch),
+    };
+
+    let first = repo
+        .list_conversations(
+            filter.clone(),
+            PageRequest {
+                limit: 2,
+                cursor: None,
+            },
+        )
+        .await
+        .expect("first page");
+
+    assert_eq!(first.items.len(), 2);
+    assert_eq!(first.items[0].session_id, "sess_c");
+    assert_eq!(first.items[1].session_id, "sess_b");
+    assert!(first.next_cursor.is_some());
+
+    let second = repo
+        .list_conversations(
+            filter,
+            PageRequest {
+                limit: 2,
+                cursor: first.next_cursor,
+            },
+        )
+        .await
+        .expect("second page");
+
+    assert_eq!(second.items.len(), 1);
+    assert_eq!(second.items[0].session_id, "sess_a");
+    assert!(second.next_cursor.is_none());
+
+    let queries = state.queries.lock().expect("queries lock").clone();
+    let list_query = queries
+        .iter()
+        .find(|q| q.contains("FROM `cortex`.`v_session_summary` AS s"))
+        .expect("list query should be captured");
+
+    assert!(list_query.contains("ifNull(m.mode, 'chat') = 'web_search'"));
+    assert!(list_query.contains("toUnixTimestamp64Milli(s.last_event_time) >= 1767261600000"));
+    assert!(list_query.contains("toUnixTimestamp64Milli(s.last_event_time) < 1767500000000"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_conversations_returns_ranked_session_hits_and_expected_sql_shape() {
+    let (repo, state) = build_repo().await;
+
+    let result = repo
+        .search_conversations(ConversationSearchQuery {
+            query: "hello world".to_string(),
+            limit: Some(10),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            from_unix_ms: Some(1767261600000_i64),
+            to_unix_ms: Some(1767500000000_i64),
+            mode: Some(ConversationMode::Chat),
+            include_tool_events: Some(true),
+            exclude_codex_mcp: Some(false),
+        })
+        .await
+        .expect("search conversations");
+
+    assert_eq!(result.hits.len(), 2);
+    assert_eq!(result.hits[0].session_id, "sess_c");
+    assert_eq!(result.hits[0].best_event_uid.as_deref(), Some("evt-c-42"));
+    assert_eq!(result.hits[1].session_id, "sess_a");
+
+    let queries = state.queries.lock().expect("queries lock").clone();
+    let agg_query = queries
+        .iter()
+        .find(|q| q.contains("GROUP BY e.session_id"))
+        .expect("aggregated conversation query should be captured");
+
+    assert!(agg_query.contains("argMax(e.event_uid, e.event_score)"));
+    assert!(agg_query.contains("ifNull(m.mode, 'chat') = 'chat'"));
+    assert!(agg_query.contains("toUnixTimestamp64Milli(d.ingested_at) >= 1767261600000"));
+    assert!(agg_query.contains("toUnixTimestamp64Milli(d.ingested_at) < 1767500000000"));
+}

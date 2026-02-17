@@ -16,3 +16,8 @@ tokio = { version = "1.40", features = ["rt", "sync"] }
 tracing = "0.1"
 uuid = { version = "1.11", features = ["v4"] }
 cortex-clickhouse = { path = "../cortex-clickhouse" }
+
+[dev-dependencies]
+axum = "0.7"
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "net"] }
+cortex-config = { path = "../cortex-config" }
