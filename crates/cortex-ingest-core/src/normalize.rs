@@ -1423,7 +1423,7 @@ pub fn normalize_record(
     if event_ts_parse_failed {
         error_rows.push(json!({
             "source_name": source_name,
-            "provider": provider,
+            "provider": provider_name,
             "source_file": source_file,
             "source_inode": source_inode,
             "source_generation": source_generation,
@@ -1787,7 +1787,8 @@ mod tests {
             99,
             "",
             "",
-        );
+        )
+        .expect("codex event with invalid timestamp should normalize");
 
         let event_row = out.event_rows[0].as_object().unwrap();
         assert_eq!(
@@ -1835,7 +1836,8 @@ mod tests {
             144,
             "",
             "",
-        );
+        )
+        .expect("codex event should normalize while preserving session date from path");
 
         let event_row = out.event_rows[0].as_object().unwrap();
         assert_eq!(
