@@ -19,3 +19,7 @@ urlencoding = "2.1"
 walkdir = "2.5"
 moraine-config = { path = "../moraine-config" }
 moraine-clickhouse = { path = "../moraine-clickhouse" }
+
+[dev-dependencies]
+axum = "0.7"
+tokio = { version = "1.40", features = ["net"] }
