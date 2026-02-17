@@ -1032,12 +1032,7 @@ mod tests {
 
     #[test]
     fn table_preview_query_escapes_identifiers() {
-        let query = table_preview_rows_query(
-            "ana`lytics",
-            "ev`ents",
-            &["co`l".to_string()],
-            10,
-        );
+        let query = table_preview_rows_query("ana`lytics", "ev`ents", &["co`l".to_string()], 10);
         assert_eq!(
             query,
             "SELECT * FROM `ana``lytics`.`ev``ents` ORDER BY `co``l` LIMIT 10"
