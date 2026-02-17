@@ -297,6 +297,15 @@ EOF
     --expect-source-file "$claude_fixture_file" \
     --expect-open-text "$claude_trace_marker"
 
+  if [[ "${RUN_REPLAY_BENCH_SMOKE:-0}" == "1" ]]; then
+    echo "[e2e] checking replay benchmark script (dry-run)"
+    "$python_bin" "$repo_root/scripts/bench/replay_search_latency.py" \
+      --config "$config_path" \
+      --window 24h \
+      --top-n 2 \
+      --dry-run
+  fi
+
   echo "[e2e] final status"
   "$moraine_bin" status --config "$config_path"
   E2E_SUCCESS=1

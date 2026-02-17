@@ -131,6 +131,17 @@ bin/moraine run mcp
 bin/moraine run clickhouse
 ```
 
+## Replay latency benchmark
+
+Use the replay benchmark to measure current MCP `search` latency against recent worst-case telemetry:
+
+```bash
+python3 scripts/bench/replay_search_latency.py --config config/moraine.toml
+```
+
+For workload inspection only, run with `--dry-run`.
+Detailed options, output fields, and troubleshooting are in `operations/replay-search-latency-benchmark.md`.
+
 ## Status, logs, shutdown
 
 ```bash
@@ -159,7 +170,11 @@ Legacy lifecycle aliases remain as fail-fast migration stubs with a `moraine` re
 - `bin/status`
 - `bin/stop-all`
 
-Legacy service wrapper scripts are retired; run services directly with `bin/moraine run ingest|monitor|mcp`.
+Legacy wrappers remain only as fail-fast stubs:
+
+- `bin/start-ingestor` -> `bin/moraine up`
+- `bin/run-codex-mcp` -> `bin/moraine run mcp`
+- `bin/moraine-monitor` -> `bin/moraine run monitor`
 
 ## Failure triage
 

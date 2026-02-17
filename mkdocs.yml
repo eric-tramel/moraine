@@ -65,4 +65,5 @@ nav:
       - Workspace Ownership: architecture/workspace-ownership.md
   - Operations:
       - Build and Operations: operations/build-and-operations.md
+      - Replay Search Latency Benchmark: operations/replay-search-latency-benchmark.md
       - Migration Guide: operations/migration-guide.md
