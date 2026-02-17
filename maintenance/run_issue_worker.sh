@@ -78,6 +78,103 @@ count_commits() {
   printf '0'
 }
 
+extract_codex_field() {
+  local field="$1"
+  local file="$2"
+
+  [ -f "$file" ] || return 1
+  awk -v key="$field" 'index($0, key ": ") == 1 { print substr($0, length(key) + 3); exit }' "$file"
+}
+
+normalize_optional_value() {
+  local value
+  local lower
+
+  value="$(trim "${1:-}")"
+  lower="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
+
+  case "$lower" in
+    ""|"none"|"null"|"n/a"|"na")
+      printf ''
+      ;;
+    *)
+      printf '%s' "$value"
+      ;;
+  esac
+}
+
+resolve_pr_info_json() {
+  local branch_name="$1"
+  local attempts="${2:-5}"
+  local delay_seconds="${3:-2}"
+  local attempt=1
+  local info_json='[]'
+  local pr_url=""
+
+  while [ "$attempt" -le "$attempts" ]; do
+    info_json="$(gh pr list --repo "$REPO" --head "$branch_name" --state open --json url,headRefOid --limit 1 2>/dev/null || printf '[]')"
+    pr_url="$(jq -r '.[0].url // empty' <<< "$info_json")"
+    if [ -n "$pr_url" ]; then
+      printf '%s' "$info_json"
+      return 0
+    fi
+    if [ "$attempt" -lt "$attempts" ]; then
+      sleep "$delay_seconds"
+    fi
+    attempt=$((attempt + 1))
+  done
+
+  printf '%s' "$info_json"
+  return 1
+}
+
+infer_worker_status_from_log() {
+  local worker_log="$1"
+
+  if [ ! -f "$worker_log" ]; then
+    return 1
+  fi
+
+  if rg -Fq "Completed successfully." "$worker_log"; then
+    printf '0'
+    return 0
+  fi
+  if rg -Fq "No eligible issues found for filter" "$worker_log"; then
+    printf '%s' "$NO_ISSUES_EXIT_CODE"
+    return 0
+  fi
+  if rg -Fq "ERROR:" "$worker_log"; then
+    printf '1'
+    return 0
+  fi
+
+  return 1
+}
+
+remove_active_worker_at_index() {
+  local index="$1"
+  local nounset_was_set=0
+
+  case $- in
+    *u*)
+      nounset_was_set=1
+      set +u
+      ;;
+  esac
+
+  unset "ACTIVE_PIDS[$index]"
+  unset "ACTIVE_IDS[$index]"
+  unset "ACTIVE_LOGS[$index]"
+
+  ACTIVE_PIDS=("${ACTIVE_PIDS[@]}")
+  ACTIVE_IDS=("${ACTIVE_IDS[@]}")
+  ACTIVE_LOGS=("${ACTIVE_LOGS[@]}")
+
+  if [ "$nounset_was_set" -eq 1 ]; then
+    set -u
+  fi
+}
+
 worker_cleanup() {
   if [ -n "${RUN_DIR:-}" ] && [ -d "$RUN_DIR" ]; then
     rm -rf "$RUN_DIR"
@@ -421,29 +518,52 @@ PROMPT
     log "Warning: failed to refresh origin/$BRANCH_NAME before commit_check."
   fi
 
-  PR_INFO_JSON="$(gh pr list --repo "$REPO" --head "$BRANCH_NAME" --state open --json url,headRefOid --limit 1)"
+  FINAL_PR_URL="$(normalize_optional_value "$(extract_codex_field "PR_URL" "$RUN_DIR/final.md" 2>/dev/null || true)")"
+  FINAL_COMMIT_SHA="$(normalize_optional_value "$(extract_codex_field "COMMIT_SHA" "$RUN_DIR/final.md" 2>/dev/null || true)")"
+
+  PR_INFO_JSON="$(resolve_pr_info_json "$BRANCH_NAME" 5 2 || true)"
   PR_URL="$(jq -r '.[0].url // empty' <<< "$PR_INFO_JSON")"
   PR_HEAD_SHA="$(jq -r '.[0].headRefOid // empty' <<< "$PR_INFO_JSON")"
+  if [ -z "$PR_URL" ] && [ -n "$FINAL_PR_URL" ]; then
+    PR_URL="$FINAL_PR_URL"
+    log "PR discovery fallback: using PR URL from Codex final output: $PR_URL"
+  fi
   if [ -z "$PR_URL" ]; then
-    fail_run "pr_check" "No open PR found for branch '$BRANCH_NAME'."
+    fail_run "pr_check" "No open PR found for branch '$BRANCH_NAME' (and no PR_URL in final output)."
+  fi
+
+  PR_COMMIT_COUNT=""
+  if PR_VIEW_JSON="$(gh pr view --repo "$REPO" "$PR_URL" --json headRefOid,commits 2>/dev/null)"; then
+    PR_VIEW_HEAD_SHA="$(jq -r '.headRefOid // empty' <<< "$PR_VIEW_JSON" 2>/dev/null || true)"
+    PR_VIEW_COMMIT_COUNT="$(jq -r '.commits | length' <<< "$PR_VIEW_JSON" 2>/dev/null || true)"
+    if [ -n "$PR_VIEW_HEAD_SHA" ]; then
+      PR_HEAD_SHA="$PR_VIEW_HEAD_SHA"
+    fi
+    if [[ "$PR_VIEW_COMMIT_COUNT" =~ ^[0-9]+$ ]]; then
+      PR_COMMIT_COUNT="$PR_VIEW_COMMIT_COUNT"
+    fi
   fi
 
   LOCAL_AHEAD_COUNT="$(count_commits "$WORKTREE_PATH" "origin/$BASE_BRANCH..HEAD")"
   REMOTE_AHEAD_COUNT="$(count_commits "$WORKTREE_PATH" "origin/$BASE_BRANCH..origin/$BRANCH_NAME")"
-  PR_HEAD_IS_COMMIT=0
-  if [ -n "$PR_HEAD_SHA" ] && git -C "$WORKTREE_PATH" cat-file -e "${PR_HEAD_SHA}^{commit}" >/dev/null 2>&1; then
-    PR_HEAD_IS_COMMIT=1
+  PR_HEAD_IS_VALID=0
+  if [[ "$PR_HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+    PR_HEAD_IS_VALID=1
+  fi
+  FINAL_COMMIT_IS_VALID=0
+  if [[ "$FINAL_COMMIT_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+    FINAL_COMMIT_IS_VALID=1
   fi
 
-  if [ "${LOCAL_AHEAD_COUNT:-0}" -lt 1 ] && \
-     [ "${REMOTE_AHEAD_COUNT:-0}" -lt 1 ] && \
-     [ "$PR_HEAD_IS_COMMIT" -ne 1 ]; then
-    fail_run "commit_check" "No commit evidence found (local ahead: ${LOCAL_AHEAD_COUNT:-0}, remote ahead: ${REMOTE_AHEAD_COUNT:-0}, pr head sha: ${PR_HEAD_SHA:-none})."
-  fi
-  if [ "${LOCAL_AHEAD_COUNT:-0}" -lt 1 ] && \
-     [ "${REMOTE_AHEAD_COUNT:-0}" -lt 1 ] && \
-     [ "$PR_HEAD_IS_COMMIT" -eq 1 ]; then
-    log "Commit check fallback: ahead counts were zero, but PR head commit $PR_HEAD_SHA exists."
+  if [ -n "$PR_COMMIT_COUNT" ] && [ "$PR_COMMIT_COUNT" -gt 0 ]; then
+    log "Commit check: PR reports $PR_COMMIT_COUNT commit(s)."
+  elif [ "${LOCAL_AHEAD_COUNT:-0}" -lt 1 ] && \
+       [ "${REMOTE_AHEAD_COUNT:-0}" -lt 1 ] && \
+       [ "$PR_HEAD_IS_VALID" -ne 1 ] && \
+       [ "$FINAL_COMMIT_IS_VALID" -ne 1 ]; then
+    fail_run "commit_check" "No commit evidence found (local ahead: ${LOCAL_AHEAD_COUNT:-0}, remote ahead: ${REMOTE_AHEAD_COUNT:-0}, pr head sha: ${PR_HEAD_SHA:-none}, final commit sha: ${FINAL_COMMIT_SHA:-none}, pr commit count: ${PR_COMMIT_COUNT:-unknown})."
+  else
+    log "Commit check fallback: using alternate evidence (local ahead: ${LOCAL_AHEAD_COUNT:-0}, remote ahead: ${REMOTE_AHEAD_COUNT:-0}, pr head sha: ${PR_HEAD_SHA:-none}, final commit sha: ${FINAL_COMMIT_SHA:-none}, pr commit count: ${PR_COMMIT_COUNT:-unknown})."
   fi
 
   SUCCESS_COMMENT="$(cat <<COMMENT
@@ -518,18 +638,24 @@ maybe_wait_for_stagger() {
 launch_worker() {
   local launch_id="$1"
   local worker_log="$ORCH_RUN_DIR/launch-${launch_id}.log"
+  local pid=""
 
   maybe_wait_for_stagger
   (
     run_issue_cycle "$launch_id"
   ) > "$worker_log" 2>&1 &
+  pid="$!"
 
-  ACTIVE_PIDS+=("$!")
+  if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
+    die "Failed to capture PID for worker $launch_id."
+  fi
+
+  ACTIVE_PIDS+=("$pid")
   ACTIVE_IDS+=("$launch_id")
   ACTIVE_LOGS+=("$worker_log")
   TOTAL_LAUNCHED=$((TOTAL_LAUNCHED + 1))
   LAST_LAUNCH_EPOCH="$(date +%s)"
-  log "Launched worker $launch_id (pid ${ACTIVE_PIDS[$((${#ACTIVE_PIDS[@]} - 1))]})."
+  log "Launched worker $launch_id (pid $pid)."
 }
 
 handle_worker_completion() {
@@ -565,30 +691,53 @@ reap_finished_workers() {
   local i=0
 
   while [ "$i" -lt "${#ACTIVE_PIDS[@]}" ]; do
-    local pid="${ACTIVE_PIDS[$i]}"
+    local pid="${ACTIVE_PIDS[$i]-}"
+    local launch_id="${ACTIVE_IDS[$i]-unknown-$i}"
+    local worker_log="${ACTIVE_LOGS[$i]-}"
+    local status=0
+    local inferred_status=""
+
+    if [ -z "$worker_log" ]; then
+      worker_log="$ORCH_RUN_DIR/launch-${launch_id}.log"
+    fi
+    if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
+      log "Warning: worker $launch_id has invalid tracked PID '${pid:-<empty>}' (index $i)."
+      status=1
+      if inferred_status="$(infer_worker_status_from_log "$worker_log")"; then
+        status="$inferred_status"
+        log "Using inferred status $status for worker $launch_id from log."
+      fi
+      COMPLETED_TOTAL=$((COMPLETED_TOTAL + 1))
+      handle_worker_completion "$launch_id" "$status" "$worker_log"
+      remove_active_worker_at_index "$i"
+      finished=1
+      continue
+    fi
+
     if kill -0 "$pid" >/dev/null 2>&1; then
       i=$((i + 1))
       continue
     fi
 
-    local status=0
-    if wait "$pid"; then
+    if wait "$pid" >/dev/null 2>&1; then
       status=0
     else
       status=$?
     fi
+    if [ "$status" -eq 127 ]; then
+      if inferred_status="$(infer_worker_status_from_log "$worker_log")"; then
+        status="$inferred_status"
+        log "Warning: wait lost PID $pid for worker $launch_id; inferred status $status from log."
+      else
+        status=1
+        log "Warning: wait lost PID $pid for worker $launch_id with no inferable status; treating as failure."
+      fi
+    fi
 
-    local launch_id="${ACTIVE_IDS[$i]}"
-    local worker_log="${ACTIVE_LOGS[$i]}"
     COMPLETED_TOTAL=$((COMPLETED_TOTAL + 1))
     handle_worker_completion "$launch_id" "$status" "$worker_log"
 
-    unset 'ACTIVE_PIDS[$i]'
-    unset 'ACTIVE_IDS[$i]'
-    unset 'ACTIVE_LOGS[$i]'
-    ACTIVE_PIDS=("${ACTIVE_PIDS[@]}")
-    ACTIVE_IDS=("${ACTIVE_IDS[@]}")
-    ACTIVE_LOGS=("${ACTIVE_LOGS[@]}")
+    remove_active_worker_at_index "$i"
     finished=1
   done
 
