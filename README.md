@@ -94,3 +94,9 @@ This installs all runtime binaries expected by `cortexctl up`.
 - Operations runbook: `docs/operations/build-and-operations.md`
 - Migration notes: `docs/operations/migration-guide.md`
 - System internals: `docs/core/system-architecture.md`
+
+## Source Layout Note
+
+Runtime development is authoritative in `apps/*` and `crates/*`.
+
+Legacy reference-only trees still exist under `rust/*` and `cortex-monitor/backend`; do not add new runtime logic there.

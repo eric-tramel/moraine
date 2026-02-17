@@ -8,6 +8,12 @@ Cortex is organized as a Rust workspace with explicit app/core boundaries.
 - Core crates (`crates/*-core`) hold service domain logic.
 - Shared infra crates (`cortex-config`, `cortex-clickhouse`) hold cross-cutting concerns.
 
+Legacy source trees remain in-repo only as historical reference snapshots and are non-authoritative:
+
+- `rust/ingestor` -> `apps/cortex-ingest` + `crates/cortex-ingest-core`
+- `rust/codex-mcp` -> `apps/cortex-mcp` + `crates/cortex-mcp-core`
+- `cortex-monitor/backend` -> `apps/cortex-monitor` + `crates/cortex-monitor-core`
+
 ## Ownership map
 
 ### `apps/cortex-ingest`
@@ -64,3 +70,4 @@ Cortex is organized as a Rust workspace with explicit app/core boundaries.
 2. Core crates may depend on shared crates but not on app crates.
 3. Shared crates must not depend on service-specific core crates.
 4. Changes to shared config or ClickHouse APIs should be made once in shared crates and consumed by all services.
+5. Do not add new runtime logic under `rust/*` or `cortex-monitor/backend`; treat those paths as legacy reference-only trees.

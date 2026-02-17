@@ -2,6 +2,8 @@
 
 Local UI to inspect the `cortex` ClickHouse database, now backed by a Rust server.
 
+Note: `cortex-monitor/backend` is a legacy reference-only tree. Authoritative monitor runtime code is in `apps/cortex-monitor` and `crates/cortex-monitor-core`.
+
 ## Run
 
 ```bash
