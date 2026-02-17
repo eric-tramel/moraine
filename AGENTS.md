@@ -7,7 +7,7 @@ This repository is a Rust workspace for local Cortex services and shared librari
 - `crates/`: shared libraries (config, ClickHouse client, ingest/monitor/MCP core logic).
 - `sql/`: ordered schema and migration SQL (`001_...sql`, `002_...sql`, etc.).
 - `config/`: default runtime/config templates (`cortex.toml`, ClickHouse XML).
-- `scripts/`: CI helpers, packaging, docs quality tooling.
+- `scripts/`: CI helpers, packaging, docs tooling.
 - `docs/`: MkDocs source; generated site output goes to `site/`.
 - `web/monitor/`: static monitor UI assets served by monitor service.
 
@@ -19,7 +19,7 @@ Prefer adding new runtime logic under `apps/` + `crates/` (not legacy `rust/` or
 - `cargo fmt --all -- --check`: enforce formatting (matches CI).
 - `bash scripts/ci/e2e-stack.sh`: run functional stack + MCP smoke test.
 - `bin/cortexctl up` / `bin/cortexctl status` / `bin/cortexctl down`: local stack lifecycle.
-- `make docs-qc` / `make docs-build` / `make docs-serve`: docs quality checks and MkDocs build/serve.
+- `make docs-build` / `make docs-serve`: MkDocs build/serve.
 
 ## Coding Style & Naming Conventions
 Use Rust 2021 idioms and keep code `rustfmt`-clean.

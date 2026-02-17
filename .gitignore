@@ -17,7 +17,6 @@ target/
 # Build and generated output
 *.log
 site/
-docs/.quality/review-report.json
 docs/_source/
 
 # Frontend workspace output
