@@ -12,7 +12,7 @@ The system is composed of four layers with explicit ownership boundaries.
 
 The storage layer is a local ClickHouse instance configured from templated XML and started by `moraine up`. It owns canonical tables, reconstruction views, sparse lexical indexes, and query/hit logs; services interact through SQL only.
 
-The ingestion layer is Rust `moraine-ingestor`: watcher plus reconcile scheduling, normalization, batching, checkpoint persistence, and heartbeat emission. It is the only transformation boundary from raw JSON to canonical classes. [src: rust/ingestor/src/ingestor.rs:L187, rust/ingestor/src/ingestor.rs:L284, rust/ingestor/src/ingestor.rs:L390, rust/ingestor/src/normalize.rs:L336]
+The ingestion layer is Rust `moraine-ingest`: watcher plus reconcile scheduling, normalization, batching, checkpoint persistence, and heartbeat emission. It is the only transformation boundary from raw JSON to canonical classes. [src: rust/ingestor/src/ingestor.rs:L187, rust/ingestor/src/ingestor.rs:L284, rust/ingestor/src/ingestor.rs:L390, rust/ingestor/src/normalize.rs:L336]
 
 Indexing is implemented with ClickHouse materialized views that incrementally maintain `search_documents`, `search_postings`, and stats tables as canonical rows land. This shifts cost from corpus scans to sparse term lookups. [src: sql/004_search_index.sql:L28, sql/004_search_index.sql:L100, sql/004_search_index.sql:L154, sql/004_search_index.sql:L170]
 

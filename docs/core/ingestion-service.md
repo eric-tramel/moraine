@@ -2,7 +2,7 @@
 
 ## Runtime Responsibility
 
-`moraine-ingestor` is the sole writer that transforms JSONL lines from configured Codex and Claude trace sources into canonical event rows. It owns file-change detection, append-safe consumption, schema-aware normalization, and batched persistence with checkpoint advancement. Although retrieval runs elsewhere, this service defines the invariants retrieval depends on: stable event identity and source provenance. [src: rust/ingestor/src/main.rs:L7, rust/ingestor/src/ingestor.rs:L45, rust/ingestor/src/normalize.rs:L336, config/moraine.toml:L21-L33]
+`moraine-ingest` is the sole writer that transforms JSONL lines from configured Codex and Claude trace sources into canonical event rows. It owns file-change detection, append-safe consumption, schema-aware normalization, and batched persistence with checkpoint advancement. Although retrieval runs elsewhere, this service defines the invariants retrieval depends on: stable event identity and source provenance. [src: rust/ingestor/src/main.rs:L7, rust/ingestor/src/ingestor.rs:L45, rust/ingestor/src/normalize.rs:L336, config/moraine.toml:L21-L33]
 
 The process is started with a multi-thread Tokio runtime and a TOML config. At startup it pings ClickHouse, loads checkpoint state from `ingest_checkpoints`, instantiates channels and concurrency guards, and then starts watcher, debounce, reconcile, worker, sink, and heartbeat loops. The startup sequence intentionally front-loads dependency failure: if ClickHouse is unreachable, ingestion does not enter a partially alive state. [src: rust/ingestor/src/main.rs:L28, rust/ingestor/src/ingestor.rs:L47, rust/ingestor/src/ingestor.rs:L49, rust/ingestor/src/ingestor.rs:L145]
 
