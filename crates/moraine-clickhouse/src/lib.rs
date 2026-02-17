@@ -103,7 +103,12 @@ impl ClickHouseClient {
 
         let response = req.send().await.context("clickhouse request failed")?;
         let status = response.status();
-        let text = response.text().await.unwrap_or_default();
+        let text = response.text().await.with_context(|| {
+            format!(
+                "failed to read clickhouse response body (status {})",
+                status
+            )
+        })?;
 
         if !status.is_success() {
             return Err(anyhow!("clickhouse returned {}: {}", status, text));
@@ -627,6 +632,34 @@ mod tests {
         format!("http://{}", addr)
     }
 
+    fn spawn_truncated_body_server() -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind raw listener");
+        let addr = listener.local_addr().expect("raw listener addr");
+
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request);
+
+                let response = concat!(
+                    "HTTP/1.1 200 OK\r\n",
+                    "Content-Type: text/plain; charset=utf-8\r\n",
+                    "Content-Length: 20\r\n",
+                    "Connection: close\r\n",
+                    "\r\n",
+                    "short",
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        format!("http://{}", addr)
+    }
+
     #[test]
     fn sql_split_handles_multiple_statements() {
         let sql = "CREATE TABLE a (x String);\nINSERT INTO a VALUES ('a;b');\n";
@@ -682,5 +715,19 @@ mod tests {
         assert!(msg.contains("clickhouse returned"));
         assert!(msg.contains("500"));
         assert!(msg.contains("boom"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn request_text_propagates_response_body_read_errors() {
+        let base_url = spawn_truncated_body_server();
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+
+        let err = client
+            .request_text("SELECT 1", None, None, false, None)
+            .await
+            .expect_err("expected response body read failure");
+
+        let msg = err.to_string();
+        assert!(msg.contains("failed to read clickhouse response body"));
     }
 }
