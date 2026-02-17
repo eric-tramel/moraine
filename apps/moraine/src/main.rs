@@ -279,6 +279,7 @@ enum HeartbeatSnapshot {
 #[derive(Debug, Clone, serde::Serialize)]
 struct StatusSnapshot {
     services: Vec<ServiceRuntimeStatus>,
+    monitor_url: Option<String>,
     managed_clickhouse_installed: bool,
     managed_clickhouse_path: String,
     managed_clickhouse_version: Option<String>,
@@ -1457,12 +1458,32 @@ fn active_clickhouse_source(paths: &RuntimePaths) -> (&'static str, Option<PathB
     ("missing", None)
 }
 
-fn clickhouse_runtime_running(services: &[ServiceRuntimeStatus]) -> bool {
+fn service_runtime_running(services: &[ServiceRuntimeStatus], service: Service) -> bool {
     services
         .iter()
-        .find(|row| row.service == Service::ClickHouse)
+        .find(|row| row.service == service)
         .and_then(|row| row.pid)
         .is_some()
+}
+
+fn clickhouse_runtime_running(services: &[ServiceRuntimeStatus]) -> bool {
+    service_runtime_running(services, Service::ClickHouse)
+}
+
+fn monitor_runtime_running(services: &[ServiceRuntimeStatus]) -> bool {
+    service_runtime_running(services, Service::Monitor)
+}
+
+fn format_http_url(host: &str, port: u16) -> String {
+    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+        format!("http://[{host}]:{port}")
+    } else {
+        format!("http://{host}:{port}")
+    }
+}
+
+fn monitor_runtime_url(cfg: &AppConfig) -> String {
+    format_http_url(&cfg.monitor.host, cfg.monitor.port)
 }
 
 fn build_status_notes(
@@ -1507,6 +1528,7 @@ async fn cmd_status(paths: &RuntimePaths, cfg: &AppConfig) -> Result<StatusSnaps
     let report = cmd_db_doctor(cfg).await?;
     let clickhouse_health_url = cfg.clickhouse.url.clone();
     let status_notes = build_status_notes(&services, &report, &clickhouse_health_url);
+    let monitor_url = monitor_runtime_running(&services).then(|| monitor_runtime_url(cfg));
     let heartbeat = match query_heartbeat(cfg).await {
         Ok(Some(row)) => HeartbeatSnapshot::Available {
             latest: row.latest,
@@ -1525,6 +1547,7 @@ async fn cmd_status(paths: &RuntimePaths, cfg: &AppConfig) -> Result<StatusSnaps
 
     Ok(StatusSnapshot {
         services,
+        monitor_url,
         managed_clickhouse_installed: managed_server.exists(),
         managed_clickhouse_path: managed_server.display().to_string(),
         managed_clickhouse_version: managed_clickhouse_version(paths),
@@ -1704,6 +1727,9 @@ fn render_status(output: &CliOutput, snapshot: &StatusSnapshot) -> Result<()> {
         })
         .collect::<Vec<_>>();
     output.table("Services", &["service", "state", "pid"], &service_rows);
+    if let Some(monitor_url) = &snapshot.monitor_url {
+        output.section("Monitor Runtime", &[format!("monitor url: {monitor_url}")]);
+    }
 
     let mut clickhouse_lines = vec![
         format!(
@@ -2347,6 +2373,43 @@ mod tests {
         cfg.clickhouse.url = "not-a-url".to_string();
         let err = clickhouse_ports_from_url(&cfg).expect_err("invalid url");
         assert!(err.to_string().contains("invalid clickhouse.url"));
+    }
+
+    #[test]
+    fn monitor_runtime_url_uses_configured_bind() {
+        let mut cfg = AppConfig::default();
+        cfg.monitor.host = "127.0.0.1".to_string();
+        cfg.monitor.port = 18080;
+        assert_eq!(monitor_runtime_url(&cfg), "http://127.0.0.1:18080");
+    }
+
+    #[test]
+    fn monitor_runtime_url_wraps_ipv6_host() {
+        let mut cfg = AppConfig::default();
+        cfg.monitor.host = "::1".to_string();
+        cfg.monitor.port = 18080;
+        assert_eq!(monitor_runtime_url(&cfg), "http://[::1]:18080");
+    }
+
+    #[test]
+    fn monitor_runtime_running_checks_monitor_pid() {
+        let services = vec![
+            ServiceRuntimeStatus {
+                service: Service::ClickHouse,
+                pid: Some(100),
+            },
+            ServiceRuntimeStatus {
+                service: Service::Monitor,
+                pid: Some(200),
+            },
+        ];
+        assert!(monitor_runtime_running(&services));
+
+        let stopped_monitor = vec![ServiceRuntimeStatus {
+            service: Service::Monitor,
+            pid: None,
+        }];
+        assert!(!monitor_runtime_running(&stopped_monitor));
     }
 
     #[test]
