@@ -6,14 +6,38 @@ CARGO_BIN="${MORAINE_CTL_CARGO:-cargo}"
 CRATE_MANIFEST="$PROJECT_ROOT/apps/moraine/Cargo.toml"
 BIN_PATH="$PROJECT_ROOT/target/debug/moraine"
 
-build_if_missing() {
-  local package_name="$1"
-  local manifest_path="$2"
-  local bin_path="$PROJECT_ROOT/target/debug/$package_name"
+build_binary() {
+  local manifest_path="$1"
+  "$CARGO_BIN" build --manifest-path "$manifest_path"
+}
 
-  if [[ ! -x "$bin_path" ]]; then
-    "$CARGO_BIN" build --manifest-path "$manifest_path"
+monitor_frontend_needs_build() {
+  local dist_index="$PROJECT_ROOT/web/monitor/dist/index.html"
+  if [[ ! -f "$dist_index" ]]; then
+    return 0
   fi
+
+  local watch_paths=(
+    "$PROJECT_ROOT/web/monitor/src"
+    "$PROJECT_ROOT/web/monitor/index.html"
+    "$PROJECT_ROOT/web/monitor/package.json"
+    "$PROJECT_ROOT/web/monitor/tsconfig.app.json"
+    "$PROJECT_ROOT/web/monitor/tsconfig.node.json"
+    "$PROJECT_ROOT/web/monitor/vite.config.ts"
+  )
+
+  local path
+  for path in "${watch_paths[@]}"; do
+    if [[ -d "$path" ]]; then
+      if find "$path" -type f -newer "$dist_index" -print -quit | grep -q .; then
+        return 0
+      fi
+    elif [[ -f "$path" && "$path" -nt "$dist_index" ]]; then
+      return 0
+    fi
+  done
+
+  return 1
 }
 
 has_flag() {
@@ -29,7 +53,7 @@ has_flag() {
 
 ensure_monitor_frontend() {
   local dist_dir="$PROJECT_ROOT/web/monitor/dist"
-  if [[ -f "$dist_dir/index.html" ]]; then
+  if ! monitor_frontend_needs_build; then
     return 0
   fi
 
@@ -108,8 +132,11 @@ if [[ "${MORAINE_CTL_USE_CARGO_RUN:-0}" == "1" ]]; then
   exec "$CARGO_BIN" run --manifest-path "$CRATE_MANIFEST" -- "$@"
 fi
 
-if [[ ! -x "$BIN_PATH" || "${MORAINE_CTL_FORCE_BUILD:-0}" == "1" ]]; then
+if [[ "${MORAINE_CTL_SKIP_BUILD:-0}" != "1" ]]; then
   "$CARGO_BIN" build --manifest-path "$CRATE_MANIFEST"
+elif [[ ! -x "$BIN_PATH" ]]; then
+  echo "error: $BIN_PATH not found and build is disabled (set MORAINE_CTL_SKIP_BUILD=0)." >&2
+  exit 1
 fi
 
 # Running through the source-tree wrapper should "just work" for sibling binaries.
@@ -121,16 +148,16 @@ if [[ "$command_name" == "run" ]]; then
   service_name="$(run_service_arg "$@" || true)"
   case "$service_name" in
     ingest)
-      build_if_missing "moraine-ingest" "$PROJECT_ROOT/apps/moraine-ingest/Cargo.toml"
+      build_binary "$PROJECT_ROOT/apps/moraine-ingest/Cargo.toml"
       ;;
     monitor)
       if ! has_flag "--static-dir" "$@"; then
         ensure_monitor_frontend
       fi
-      build_if_missing "moraine-monitor" "$PROJECT_ROOT/apps/moraine-monitor/Cargo.toml"
+      build_binary "$PROJECT_ROOT/apps/moraine-monitor/Cargo.toml"
       ;;
     mcp)
-      build_if_missing "moraine-mcp" "$PROJECT_ROOT/apps/moraine-mcp/Cargo.toml"
+      build_binary "$PROJECT_ROOT/apps/moraine-mcp/Cargo.toml"
       ;;
   esac
 fi

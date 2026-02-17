@@ -77,7 +77,7 @@
   $: {
     if (payload?.ok) {
       chartView = buildAnalyticsView(payload);
-      metaText = chartView.metaText;
+      metaText = errorMessage ? `${chartView.metaText} | ${errorMessage}` : chartView.metaText;
     } else {
       chartView = null;
       metaText = errorMessage || DEFAULT_ANALYTICS_META;

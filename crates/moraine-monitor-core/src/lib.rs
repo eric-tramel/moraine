@@ -10,6 +10,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -73,7 +74,15 @@ pub async fn run_server(
     println!("moraine-monitor running at http://{}", bind);
     println!("serving UI from {}", state.static_dir.display());
 
-    let listener = tokio::net::TcpListener::bind(bind).await?;
+    let listener = tokio::net::TcpListener::bind(bind).await.map_err(|error| {
+        if error.kind() == ErrorKind::AddrInUse {
+            anyhow!(
+                "failed to bind {bind}: address already in use. another monitor may already be running (including legacy cortex-monitor). stop it or rerun with `moraine run monitor -- --port <free-port>`"
+            )
+        } else {
+            anyhow!("failed to bind {bind}: {error}")
+        }
+    })?;
     axum::serve(listener, app).await?;
     Ok(())
 }
