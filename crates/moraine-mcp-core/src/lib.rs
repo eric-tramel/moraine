@@ -11,17 +11,12 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, warn};
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Verbosity {
+    #[default]
     Prose,
     Full,
-}
-
-impl Default for Verbosity {
-    fn default() -> Self {
-        Self::Prose
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -238,9 +233,7 @@ impl AppState {
             "notifications/initialized" | "initialized" => None,
             "tools/list" => id.map(|msg_id| rpc_ok(msg_id, self.tools_list_result())),
             "tools/call" => {
-                let Some(msg_id) = id else {
-                    return None;
-                };
+                let msg_id = id?;
 
                 let parsed: Result<ToolCallParams> =
                     serde_json::from_value(req.params).context("invalid tools/call params payload");

@@ -133,7 +133,7 @@ pub struct RuntimeConfig {
     pub start_mcp_on_up: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     #[serde(default)]
@@ -231,19 +231,6 @@ impl Default for RuntimeConfig {
             clickhouse_version: default_clickhouse_version(),
             start_monitor_on_up: true,
             start_mcp_on_up: false,
-        }
-    }
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            clickhouse: ClickHouseConfig::default(),
-            ingest: IngestConfig::default(),
-            mcp: McpConfig::default(),
-            bm25: Bm25Config::default(),
-            monitor: MonitorConfig::default(),
-            runtime: RuntimeConfig::default(),
         }
     }
 }

@@ -16,6 +16,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
@@ -25,6 +27,9 @@ jobs:
 
       - name: Format check
         run: cargo fmt --all -- --check
+
+      - name: Clippy strict (baseline)
+        run: bash scripts/ci/clippy-strict-baseline.sh
 
       - name: Build workspace
         run: cargo build --workspace --locked
