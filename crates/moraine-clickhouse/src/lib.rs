@@ -529,9 +529,21 @@ fn split_sql_statements(sql: &str) -> Vec<String> {
             continue;
         }
 
-        for ch in line.chars() {
-            if ch == '\'' && prev != '\\' {
-                in_single_quote = !in_single_quote;
+        let chars: Vec<char> = line.chars().collect();
+        let mut idx = 0;
+        while idx < chars.len() {
+            let ch = chars[idx];
+            if ch == '\'' {
+                if in_single_quote && idx + 1 < chars.len() && chars[idx + 1] == '\'' {
+                    current.push(ch);
+                    current.push(chars[idx + 1]);
+                    prev = chars[idx + 1];
+                    idx += 2;
+                    continue;
+                }
+                if prev != '\\' {
+                    in_single_quote = !in_single_quote;
+                }
             }
 
             if ch == ';' && !in_single_quote {
@@ -541,11 +553,13 @@ fn split_sql_statements(sql: &str) -> Vec<String> {
                 }
                 current.clear();
                 prev = '\0';
+                idx += 1;
                 continue;
             }
 
             current.push(ch);
             prev = ch;
+            idx += 1;
         }
 
         current.push('\n');
@@ -667,6 +681,27 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert!(out[0].starts_with("CREATE TABLE"));
         assert!(out[1].contains("'a;b'"));
+    }
+
+    #[test]
+    fn sql_split_handles_sql_standard_escaped_quotes() {
+        let sql = "INSERT INTO a VALUES ('it''s;fine');\nSELECT 1;\n";
+        let out = split_sql_statements(sql);
+        assert_eq!(out.len(), 2);
+        assert!(out[0].contains("'it''s;fine'"));
+    }
+
+    #[test]
+    fn sql_split_handles_escaped_quote_after_backslash() {
+        let sql = "INSERT INTO a VALUES ('path\\'';still-string');\nSELECT 1;\n";
+        let out = split_sql_statements(sql);
+        assert_eq!(
+            out,
+            vec![
+                "INSERT INTO a VALUES ('path\\'';still-string')".to_string(),
+                "SELECT 1".to_string()
+            ]
+        );
     }
 
     #[test]

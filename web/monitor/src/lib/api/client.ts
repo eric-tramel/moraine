@@ -18,13 +18,23 @@ async function requestJson<T>(path: string): Promise<T> {
     },
   });
 
-  const data = (await response.json()) as T & ErrorPayload;
-
   if (!response.ok) {
-    throw new Error(data.error || `request failed (${response.status})`);
+    let errorMessage: string | undefined;
+    const contentType = response.headers.get('content-type') ?? '';
+
+    if (contentType.includes('application/json')) {
+      try {
+        const data = (await response.json()) as ErrorPayload;
+        errorMessage = data.error;
+      } catch {
+        errorMessage = undefined;
+      }
+    }
+
+    throw new Error(errorMessage || `request failed (${response.status})`);
   }
 
-  return data;
+  return (await response.json()) as T;
 }
 
 export function fetchHealth(): Promise<HealthResponse> {
