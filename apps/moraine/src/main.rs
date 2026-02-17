@@ -1297,11 +1297,8 @@ fn contains_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|arg| arg == flag)
 }
 
-fn monitor_dir_candidates(root: &Path) -> [PathBuf; 2] {
-    [
-        root.join("web").join("monitor").join("dist"),
-        root.join("web").join("monitor"),
-    ]
+fn monitor_dist_candidate(root: &Path) -> PathBuf {
+    root.join("web").join("monitor").join("dist")
 }
 
 fn resolve_monitor_static_dir(paths: &RuntimePaths) -> Option<PathBuf> {
@@ -1315,20 +1312,18 @@ fn resolve_monitor_static_dir(paths: &RuntimePaths) -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(bin_dir) = exe.parent() {
             if let Some(bundle_root) = bin_dir.parent() {
-                for candidate in monitor_dir_candidates(bundle_root) {
-                    if candidate.exists() {
-                        return Some(candidate);
-                    }
+                let candidate = monitor_dist_candidate(bundle_root);
+                if candidate.exists() {
+                    return Some(candidate);
                 }
             }
         }
     }
 
     if let Some(bundle_root) = paths.service_bin_dir.parent() {
-        for candidate in monitor_dir_candidates(bundle_root) {
-            if candidate.exists() {
-                return Some(candidate);
-            }
+        let candidate = monitor_dist_candidate(bundle_root);
+        if candidate.exists() {
+            return Some(candidate);
         }
     }
 
@@ -1338,10 +1333,9 @@ fn resolve_monitor_static_dir(paths: &RuntimePaths) -> Option<PathBuf> {
             .and_then(|p| p.parent())
             .map(PathBuf::from)
         {
-            for candidate in monitor_dir_candidates(&dev_path) {
-                if candidate.exists() {
-                    return Some(candidate);
-                }
+            let candidate = monitor_dist_candidate(&dev_path);
+            if candidate.exists() {
+                return Some(candidate);
             }
         }
     }

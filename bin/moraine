@@ -16,6 +16,37 @@ build_if_missing() {
   fi
 }
 
+has_flag() {
+  local flag="$1"
+  shift
+  for arg in "$@"; do
+    if [[ "$arg" == "$flag" || "$arg" == "$flag="* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+ensure_monitor_frontend() {
+  local dist_dir="$PROJECT_ROOT/web/monitor/dist"
+  if [[ -f "$dist_dir/index.html" ]]; then
+    return 0
+  fi
+
+  if ! command -v bun >/dev/null 2>&1; then
+    echo "error: monitor frontend build output not found at $dist_dir" >&2
+    echo "install bun and build frontend assets:" >&2
+    echo "  (cd \"$PROJECT_ROOT/web/monitor\" && bun install --frozen-lockfile && bun run build)" >&2
+    exit 1
+  fi
+
+  (
+    cd "$PROJECT_ROOT/web/monitor"
+    bun install --frozen-lockfile
+    bun run build
+  )
+}
+
 first_non_flag_arg() {
   local skip_next=0
   for arg in "$@"; do
@@ -93,6 +124,9 @@ if [[ "$command_name" == "run" ]]; then
       build_if_missing "moraine-ingest" "$PROJECT_ROOT/apps/moraine-ingest/Cargo.toml"
       ;;
     monitor)
+      if ! has_flag "--static-dir" "$@"; then
+        ensure_monitor_frontend
+      fi
       build_if_missing "moraine-monitor" "$PROJECT_ROOT/apps/moraine-monitor/Cargo.toml"
       ;;
     mcp)
