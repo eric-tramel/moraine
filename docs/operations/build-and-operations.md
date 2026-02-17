@@ -159,11 +159,7 @@ Legacy lifecycle aliases remain as fail-fast migration stubs with a `moraine` re
 - `bin/status`
 - `bin/stop-all`
 
-Legacy wrappers remain only as fail-fast stubs:
-
-- `bin/start-ingestor` -> `bin/moraine up`
-- `bin/run-codex-mcp` -> `bin/moraine run mcp`
-- `bin/moraine-monitor` -> `bin/moraine run monitor`
+Legacy service wrapper scripts are retired; run services directly with `bin/moraine run ingest|monitor|mcp`.
 
 ## Failure triage
 
