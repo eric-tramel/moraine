@@ -58,6 +58,8 @@ nav:
       - Retrieval and BM25: search/indexing-and-retrieval.md
   - Cortex MCP:
       - Agent Interface: mcp/agent-interface.md
+  - Python Bindings:
+      - Conversations Tutorial: python/conversations-client-tutorial.md
   - Architecture:
       - Design Tradeoffs: architecture/design-tradeoffs.md
       - Workspace Ownership: architecture/workspace-ownership.md
