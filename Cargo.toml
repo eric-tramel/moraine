@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/cortex-config",
   "crates/cortex-clickhouse",
+  "crates/cortex-conversations",
   "crates/cortex-ingest-core",
   "crates/cortex-mcp-core",
   "crates/cortex-monitor-core",
