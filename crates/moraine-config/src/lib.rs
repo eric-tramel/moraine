@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -417,25 +417,40 @@ pub fn expand_path(path: &str) -> String {
 }
 
 pub fn watch_root_from_glob(glob_pattern: &str) -> String {
-    if let Some(idx) = glob_pattern.find("/**") {
-        return glob_pattern[..idx].to_string();
+    fn component_contains_glob(component: Component<'_>) -> bool {
+        match component {
+            Component::Normal(part) => {
+                let value = part.to_string_lossy();
+                value.contains('*')
+                    || value.contains('?')
+                    || value.contains('[')
+                    || value.contains(']')
+                    || value.contains('{')
+                    || value.contains('}')
+            }
+            _ => false,
+        }
     }
 
-    if let Some(idx) = glob_pattern.find('*') {
-        let prefix = glob_pattern[..idx].trim_end_matches('/');
-        if !prefix.is_empty() {
-            return prefix.to_string();
+    let path = Path::new(glob_pattern);
+    let mut root = PathBuf::new();
+
+    for component in path.components() {
+        if component_contains_glob(component) {
+            return if root.as_os_str().is_empty() {
+                ".".to_string()
+            } else {
+                root.to_string_lossy().to_string()
+            };
         }
-        let path = Path::new(prefix);
-        if let Some(parent) = path.parent() {
-            return parent.to_string_lossy().to_string();
-        }
+
+        root.push(component.as_os_str());
     }
 
-    Path::new(glob_pattern)
-        .parent()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| glob_pattern.to_string())
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.to_string_lossy().to_string())
+        .unwrap_or_else(|| ".".to_string())
 }
 
 fn home_config_path() -> Option<PathBuf> {
@@ -598,6 +613,11 @@ mod tests {
     fn watch_root_extracts_prefix() {
         assert_eq!(watch_root_from_glob("/tmp/a/**/*.jsonl"), "/tmp/a");
         assert_eq!(watch_root_from_glob("/tmp/a/*.jsonl"), "/tmp/a");
+        assert_eq!(watch_root_from_glob("logs/*.jsonl"), "logs");
+        assert_eq!(watch_root_from_glob("logs/session-*.jsonl"), "logs");
+        assert_eq!(watch_root_from_glob("*.jsonl"), ".");
+        assert_eq!(watch_root_from_glob("*/*.jsonl"), ".");
+        assert_eq!(watch_root_from_glob("/**/*.jsonl"), "/");
     }
 
     #[test]
