@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS cortex.event_links (
   ingested_at DateTime64(3) DEFAULT now64(3),
   event_uid String,
   linked_event_uid String,
+  linked_external_id String,
   link_type LowCardinality(String),
   session_id String,
   provider LowCardinality(String),

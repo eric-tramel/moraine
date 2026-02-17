@@ -1,4 +1,5 @@
 use crate::model::NormalizedRecord;
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde_json::{json, Map, Value};
@@ -8,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const TEXT_LIMIT: usize = 200_000;
 const PREVIEW_LIMIT: usize = 320;
+const UNPARSEABLE_EVENT_TS: &str = "1970-01-01 00:00:00.000";
 
 fn session_id_re() -> &'static Regex {
     static SESSION_ID_RE: OnceLock<Regex> = OnceLock::new();
@@ -72,6 +74,32 @@ fn to_u8_bool(value: Option<&Value>) -> u8 {
             }
         }
         _ => 0,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Provider {
+    Codex,
+    Claude,
+}
+
+impl Provider {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "codex" => Ok(Self::Codex),
+            "claude" => Ok(Self::Claude),
+            _ => Err(anyhow!(
+                "unsupported provider `{}`; expected one of: codex, claude",
+                raw.trim()
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
     }
 }
 
@@ -186,22 +214,27 @@ pub fn infer_session_date_from_file(source_file: &str, record_ts: &str) -> Strin
         return format!("{}-{}-{}", &cap[1], &cap[2], &cap[3]);
     }
 
-    parse_event_ts(record_ts)
-        .split(' ')
-        .next()
-        .unwrap_or("1970-01-01")
-        .to_string()
+    parse_record_ts(record_ts)
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "1970-01-01".to_string())
 }
 
-fn parse_event_ts(record_ts: &str) -> String {
-    if let Ok(dt) = DateTime::parse_from_rfc3339(record_ts) {
-        return dt
-            .with_timezone(&Utc)
-            .format("%Y-%m-%d %H:%M:%S%.3f")
-            .to_string();
+fn parse_record_ts(record_ts: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(record_ts)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn format_event_ts(dt: &DateTime<Utc>) -> String {
+    dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+}
+
+fn parse_event_ts(record_ts: &str) -> (String, bool) {
+    if let Some(dt) = parse_record_ts(record_ts) {
+        return (format_event_ts(&dt), false);
     }
 
-    Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+    (UNPARSEABLE_EVENT_TS.to_string(), true)
 }
 
 fn event_uid(
@@ -383,12 +416,14 @@ fn build_link_row(
     ctx: &RecordContext<'_>,
     event_uid: &str,
     linked_event_uid: &str,
+    linked_external_id: &str,
     link_type: &str,
     metadata_json: &str,
 ) -> Value {
     json!({
         "event_uid": event_uid,
         "linked_event_uid": linked_event_uid,
+        "linked_external_id": linked_external_id,
         "link_type": link_type,
         "session_id": ctx.session_id,
         "provider": ctx.provider,
@@ -396,6 +431,40 @@ fn build_link_row(
         "metadata_json": metadata_json,
         "event_version": event_version(),
     })
+}
+
+fn build_event_link_row(
+    ctx: &RecordContext<'_>,
+    event_uid: &str,
+    linked_event_uid: &str,
+    link_type: &str,
+    metadata_json: &str,
+) -> Value {
+    build_link_row(
+        ctx,
+        event_uid,
+        linked_event_uid,
+        "",
+        link_type,
+        metadata_json,
+    )
+}
+
+fn build_external_link_row(
+    ctx: &RecordContext<'_>,
+    event_uid: &str,
+    linked_external_id: &str,
+    link_type: &str,
+    metadata_json: &str,
+) -> Value {
+    build_link_row(
+        ctx,
+        event_uid,
+        "",
+        linked_external_id,
+        link_type,
+        metadata_json,
+    )
 }
 
 fn build_tool_row(
@@ -454,7 +523,13 @@ fn normalize_codex_event(
 
     let push_parent_link = |links: &mut Vec<Value>, uid: &str, parent: &str| {
         if !parent.is_empty() {
-            links.push(build_link_row(ctx, uid, parent, "parent_event", "{}"));
+            links.push(build_external_link_row(
+                ctx,
+                uid,
+                parent,
+                "parent_event",
+                "{}",
+            ));
         }
     };
 
@@ -854,7 +929,7 @@ fn normalize_codex_event(
                     row.insert("origin_event_id".to_string(), json!(base_uid));
                     events.push(Value::Object(row));
 
-                    links.push(build_link_row(
+                    links.push(build_event_link_row(
                         ctx,
                         &item_uid,
                         base_uid,
@@ -1199,7 +1274,7 @@ fn normalize_claude_event(
                     events.push(Value::Object(row));
 
                     if !parent_uuid.is_empty() {
-                        links.push(build_link_row(
+                        links.push(build_external_link_row(
                             ctx,
                             &block_uid,
                             &parent_uuid,
@@ -1229,7 +1304,7 @@ fn normalize_claude_event(
                 stamp_common(&mut row);
                 events.push(Value::Object(row));
                 if !parent_uuid.is_empty() {
-                    links.push(build_link_row(
+                    links.push(build_external_link_row(
                         ctx,
                         base_uid,
                         &parent_uuid,
@@ -1284,7 +1359,7 @@ fn normalize_claude_event(
         events.push(Value::Object(row));
 
         if !parent_uuid.is_empty() {
-            links.push(build_link_row(
+            links.push(build_external_link_row(
                 ctx,
                 base_uid,
                 &parent_uuid,
@@ -1298,14 +1373,20 @@ fn normalize_claude_event(
         let tool_use_id = to_str(record.get("toolUseID"));
         if !tool_use_id.is_empty() {
             if let Some(uid) = events[0].get("event_uid").and_then(|v| v.as_str()) {
-                links.push(build_link_row(ctx, uid, &tool_use_id, "tool_use_id", "{}"));
+                links.push(build_external_link_row(
+                    ctx,
+                    uid,
+                    &tool_use_id,
+                    "tool_use_id",
+                    "{}",
+                ));
             }
         }
 
         let source_tool_assistant = to_str(record.get("sourceToolAssistantUUID"));
         if !source_tool_assistant.is_empty() {
             if let Some(uid) = events[0].get("event_uid").and_then(|v| v.as_str()) {
-                links.push(build_link_row(
+                links.push(build_external_link_row(
                     ctx,
                     uid,
                     &source_tool_assistant,
@@ -1330,12 +1411,14 @@ pub fn normalize_record(
     source_offset: u64,
     session_hint: &str,
     model_hint: &str,
-) -> NormalizedRecord {
+) -> Result<NormalizedRecord> {
+    let provider = Provider::parse(provider)?;
+    let provider_name = provider.as_str();
     let record_ts = to_str(record.get("timestamp"));
-    let event_ts = parse_event_ts(&record_ts);
+    let (event_ts, event_ts_parse_failed) = parse_event_ts(&record_ts);
     let top_type = to_str(record.get("type"));
 
-    let mut session_id = if provider == "claude" {
+    let mut session_id = if provider == Provider::Claude {
         to_str(record.get("sessionId"))
     } else {
         String::new()
@@ -1348,7 +1431,7 @@ pub fn normalize_record(
         };
     }
 
-    if provider == "codex" && top_type == "session_meta" {
+    if provider == Provider::Codex && top_type == "session_meta" {
         let payload = record.get("payload").cloned().unwrap_or(Value::Null);
         let payload_id = to_str(payload.get("id"));
         if !payload_id.is_empty() {
@@ -1370,7 +1453,7 @@ pub fn normalize_record(
 
     let raw_row = json!({
         "source_name": source_name,
-        "provider": provider,
+        "provider": provider_name,
         "source_file": source_file,
         "source_inode": source_inode,
         "source_generation": source_generation,
@@ -1384,9 +1467,28 @@ pub fn normalize_record(
         "event_uid": base_uid,
     });
 
+    let mut error_rows = Vec::<Value>::new();
+    if event_ts_parse_failed {
+        error_rows.push(json!({
+            "source_name": source_name,
+            "provider": provider_name,
+            "source_file": source_file,
+            "source_inode": source_inode,
+            "source_generation": source_generation,
+            "source_line_no": source_line_no,
+            "source_offset": source_offset,
+            "error_kind": "timestamp_parse_error",
+            "error_text": format!(
+                "timestamp is missing or not RFC3339; used {} UTC fallback",
+                UNPARSEABLE_EVENT_TS
+            ),
+            "raw_fragment": truncate_chars(&record_ts, 20_000),
+        }));
+    }
+
     let ctx = RecordContext {
         source_name,
-        provider,
+        provider: provider_name,
         session_id: &session_id,
         session_date: &session_date,
         source_file,
@@ -1398,27 +1500,29 @@ pub fn normalize_record(
         event_ts: &event_ts,
     };
 
-    let (event_rows, link_rows, tool_rows) = if provider == "claude" {
+    let (event_rows, link_rows, tool_rows) = if provider == Provider::Claude {
         normalize_claude_event(record, &ctx, &top_type, &base_uid)
     } else {
         normalize_codex_event(record, &ctx, &top_type, &base_uid, model_hint)
     };
-    let model_hint = resolve_model_hint(&event_rows, provider, model_hint);
+    let model_hint = resolve_model_hint(&event_rows, provider_name, model_hint);
 
-    NormalizedRecord {
+    Ok(NormalizedRecord {
         raw_row,
         event_rows,
         link_rows,
         tool_rows,
+        error_rows,
         session_hint: session_id,
         model_hint,
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::normalize_record;
     use serde_json::json;
+    use std::collections::HashMap;
 
     #[test]
     fn codex_tool_call_normalization() {
@@ -1444,10 +1548,12 @@ mod tests {
             1024,
             "",
             "",
-        );
+        )
+        .expect("codex tool call should normalize");
 
         assert_eq!(out.event_rows.len(), 1);
         assert_eq!(out.tool_rows.len(), 1);
+        assert!(out.error_rows.is_empty());
         let row = out.event_rows[0].as_object().unwrap();
         assert_eq!(
             row.get("event_kind").unwrap().as_str().unwrap(),
@@ -1478,7 +1584,8 @@ mod tests {
             1,
             "",
             "",
-        );
+        )
+        .expect("codex turn context should normalize");
 
         let row = out.event_rows[0].as_object().unwrap();
         assert_eq!(
@@ -1529,7 +1636,8 @@ mod tests {
             2,
             "",
             "",
-        );
+        )
+        .expect("codex token count should normalize");
 
         let row = out.event_rows[0].as_object().unwrap();
         assert_eq!(
@@ -1588,7 +1696,8 @@ mod tests {
             4,
             "",
             "",
-        );
+        )
+        .expect("codex token count alias should normalize");
 
         let row = out.event_rows[0].as_object().unwrap();
         assert_eq!(
@@ -1622,7 +1731,8 @@ mod tests {
             3,
             "",
             "",
-        );
+        )
+        .expect("codex custom tool call should normalize");
 
         assert_eq!(out.event_rows.len(), 1);
         assert_eq!(out.tool_rows.len(), 1);
@@ -1687,7 +1797,8 @@ mod tests {
             100,
             "",
             "",
-        );
+        )
+        .expect("claude event should normalize");
 
         assert_eq!(out.event_rows.len(), 2);
         assert_eq!(out.tool_rows.len(), 1);
@@ -1698,5 +1809,275 @@ mod tests {
             "tool_call"
         );
         assert_eq!(first.get("provider").unwrap().as_str().unwrap(), "claude");
+        assert!(out.error_rows.is_empty());
+    }
+
+    #[test]
+    fn invalid_timestamp_uses_epoch_and_emits_timestamp_parse_error() {
+        let record = json!({
+            "timestamp": "not-a-timestamp",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "call_id": "call_bad_ts",
+                "name": "Read",
+                "arguments": "{}"
+            }
+        });
+
+        let out = normalize_record(
+            &record,
+            "codex",
+            "codex",
+            "/Users/eric/.codex/sessions/session-019c5f6a-49bd-7920-ac67-1dd8e33b0e95.jsonl",
+            9,
+            2,
+            7,
+            99,
+            "",
+            "",
+        )
+        .expect("codex event with invalid timestamp should normalize");
+
+        let event_row = out.event_rows[0].as_object().unwrap();
+        assert_eq!(
+            event_row.get("event_ts").unwrap().as_str().unwrap(),
+            "1970-01-01 00:00:00.000"
+        );
+        assert_eq!(
+            event_row.get("session_date").unwrap().as_str().unwrap(),
+            "1970-01-01"
+        );
+
+        assert_eq!(out.error_rows.len(), 1);
+        let error = out.error_rows[0].as_object().unwrap();
+        assert_eq!(
+            error.get("error_kind").unwrap().as_str().unwrap(),
+            "timestamp_parse_error"
+        );
+        assert_eq!(
+            error.get("raw_fragment").unwrap().as_str().unwrap(),
+            "not-a-timestamp"
+        );
+    }
+
+    #[test]
+    fn invalid_timestamp_preserves_session_date_from_source_path() {
+        let record = json!({
+            "timestamp": "still-not-a-timestamp",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "call_id": "call_bad_ts",
+                "name": "Read",
+                "arguments": "{}"
+            }
+        });
+
+        let out = normalize_record(
+            &record,
+            "codex",
+            "codex",
+            "/Users/eric/.codex/sessions/2026/02/16/session-019c5f6a-49bd-7920-ac67-1dd8e33b0e95.jsonl",
+            11,
+            4,
+            12,
+            144,
+            "",
+            "",
+        )
+        .expect("codex event should normalize while preserving session date from path");
+
+        let event_row = out.event_rows[0].as_object().unwrap();
+        assert_eq!(
+            event_row.get("event_ts").unwrap().as_str().unwrap(),
+            "1970-01-01 00:00:00.000"
+        );
+        assert_eq!(
+            event_row.get("session_date").unwrap().as_str().unwrap(),
+            "2026-02-16"
+        );
+        assert_eq!(out.error_rows.len(), 1);
+    }
+
+    #[test]
+    fn unknown_provider_is_rejected() {
+        let record = json!({
+            "timestamp": "2026-02-15T03:50:42.191Z",
+            "type": "turn_context",
+        });
+
+        let err = normalize_record(
+            &record,
+            "unknown",
+            "unknown",
+            "/tmp/sessions/session-1.jsonl",
+            1,
+            1,
+            1,
+            1,
+            "",
+            "",
+        )
+        .expect_err("unknown provider should be rejected");
+
+        assert!(
+            err.to_string().contains("unsupported provider"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn claude_links_split_event_uids_from_external_ids() {
+        let record = json!({
+            "type": "assistant",
+            "sessionId": "7c666c01-d38e-4658-8650-854ffb5b626e",
+            "uuid": "assistant-2",
+            "parentUuid": "user-parent-2",
+            "toolUseID": "toolu_42",
+            "sourceToolAssistantUUID": "assistant-root-1",
+            "requestId": "req-2",
+            "timestamp": "2026-01-19T15:59:41.421Z",
+            "message": {
+                "role": "assistant",
+                "content": "done"
+            }
+        });
+
+        let out = normalize_record(
+            &record,
+            "claude",
+            "claude",
+            "/Users/eric/.claude/projects/p1/s1.jsonl",
+            55,
+            2,
+            11,
+            101,
+            "",
+            "",
+        )
+        .expect("claude assistant record should normalize");
+
+        assert_eq!(out.link_rows.len(), 3);
+
+        let by_type = out
+            .link_rows
+            .iter()
+            .map(|row| {
+                let obj = row.as_object().expect("link row object");
+                let link_type = obj
+                    .get("link_type")
+                    .and_then(|v| v.as_str())
+                    .expect("link_type")
+                    .to_string();
+                (link_type, obj.clone())
+            })
+            .collect::<HashMap<_, _>>();
+
+        let parent = by_type.get("parent_uuid").expect("parent_uuid link");
+        assert_eq!(
+            parent
+                .get("linked_external_id")
+                .and_then(|v| v.as_str())
+                .unwrap(),
+            "user-parent-2"
+        );
+        assert_eq!(
+            parent
+                .get("linked_event_uid")
+                .and_then(|v| v.as_str())
+                .unwrap(),
+            ""
+        );
+
+        let tool_use = by_type.get("tool_use_id").expect("tool_use_id link");
+        assert_eq!(
+            tool_use
+                .get("linked_external_id")
+                .and_then(|v| v.as_str())
+                .unwrap(),
+            "toolu_42"
+        );
+        assert_eq!(
+            tool_use
+                .get("linked_event_uid")
+                .and_then(|v| v.as_str())
+                .unwrap(),
+            ""
+        );
+
+        let source_tool = by_type
+            .get("source_tool_assistant")
+            .expect("source_tool_assistant link");
+        assert_eq!(
+            source_tool
+                .get("linked_external_id")
+                .and_then(|v| v.as_str())
+                .unwrap(),
+            "assistant-root-1"
+        );
+        assert_eq!(
+            source_tool
+                .get("linked_event_uid")
+                .and_then(|v| v.as_str())
+                .unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn codex_compacted_parent_link_uses_event_uid_target() {
+        let record = json!({
+            "timestamp": "2026-02-15T03:50:50.838Z",
+            "type": "compacted",
+            "payload": {
+                "replacement_history": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "hello"}
+                        ]
+                    }
+                ]
+            }
+        });
+
+        let out = normalize_record(
+            &record,
+            "codex",
+            "codex",
+            "/Users/eric/.codex/sessions/2026/02/15/session-019c5f6a-49bd-7920-ac67-1dd8e33b0e95.jsonl",
+            1,
+            1,
+            12,
+            12,
+            "",
+            "",
+        )
+        .expect("compacted record should normalize");
+
+        let compacted_uid = out.event_rows[0]
+            .get("event_uid")
+            .and_then(|v| v.as_str())
+            .expect("compacted event uid");
+        let link = out.link_rows[0].as_object().expect("compacted link");
+
+        assert_eq!(
+            link.get("link_type").and_then(|v| v.as_str()).unwrap(),
+            "compacted_parent"
+        );
+        assert_eq!(
+            link.get("linked_event_uid")
+                .and_then(|v| v.as_str())
+                .unwrap(),
+            compacted_uid
+        );
+        assert_eq!(
+            link.get("linked_external_id")
+                .and_then(|v| v.as_str())
+                .unwrap(),
+            ""
+        );
     }
 }

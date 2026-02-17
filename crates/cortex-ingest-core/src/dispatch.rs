@@ -222,7 +222,7 @@ pub(crate) async fn process_file(
             }
         };
 
-        let normalized = normalize_record(
+        let normalized = match normalize_record(
             &parsed,
             &work.source_name,
             &work.provider,
@@ -233,7 +233,24 @@ pub(crate) async fn process_file(
             start_offset,
             &session_hint,
             &model_hint,
-        );
+        ) {
+            Ok(normalized) => normalized,
+            Err(exc) => {
+                batch.error_rows.push(json!({
+                    "source_name": work.source_name,
+                    "provider": work.provider,
+                    "source_file": source_file,
+                    "source_inode": inode,
+                    "source_generation": checkpoint.source_generation,
+                    "source_line_no": line_no,
+                    "source_offset": start_offset,
+                    "error_kind": "normalize_error",
+                    "error_text": exc.to_string(),
+                    "raw_fragment": truncate(&text, 20_000),
+                }));
+                continue;
+            }
+        };
 
         session_hint = normalized.session_hint;
         model_hint = normalized.model_hint;
@@ -241,6 +258,7 @@ pub(crate) async fn process_file(
         batch.event_rows.extend(normalized.event_rows);
         batch.link_rows.extend(normalized.link_rows);
         batch.tool_rows.extend(normalized.tool_rows);
+        batch.error_rows.extend(normalized.error_rows);
         batch.lines_processed = batch.lines_processed.saturating_add(1);
 
         if batch.row_count() >= config.ingest.batch_size {

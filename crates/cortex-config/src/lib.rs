@@ -524,8 +524,22 @@ fn resolve_runtime_subdir(root: &str, value: &str) -> String {
     Path::new(root).join(path).to_string_lossy().to_string()
 }
 
-fn normalize_config(mut cfg: AppConfig) -> AppConfig {
-    for source in &mut cfg.ingest.sources {
+fn normalize_provider(provider: &str, source_idx: usize, source_name: &str) -> Result<String> {
+    let normalized = provider.trim().to_ascii_lowercase();
+    if normalized == "codex" || normalized == "claude" {
+        return Ok(normalized);
+    }
+
+    Err(anyhow::anyhow!(
+        "invalid ingest.sources[{source_idx}].provider `{}` for source `{}`; expected one of: codex, claude",
+        provider.trim(),
+        source_name
+    ))
+}
+
+fn normalize_config(mut cfg: AppConfig) -> Result<AppConfig> {
+    for (source_idx, source) in cfg.ingest.sources.iter_mut().enumerate() {
+        source.provider = normalize_provider(&source.provider, source_idx, &source.name)?;
         source.glob = expand_path(&source.glob);
         source.watch_root = if source.watch_root.trim().is_empty() {
             watch_root_from_glob(&source.glob)
@@ -541,14 +555,14 @@ fn normalize_config(mut cfg: AppConfig) -> AppConfig {
     cfg.runtime.service_bin_dir = expand_path(&cfg.runtime.service_bin_dir);
     cfg.runtime.managed_clickhouse_dir = expand_path(&cfg.runtime.managed_clickhouse_dir);
 
-    cfg
+    Ok(cfg)
 }
 
 pub fn load_config(path: impl AsRef<Path>) -> Result<AppConfig> {
     let content = std::fs::read_to_string(path.as_ref())
         .with_context(|| format!("failed to read config {}", path.as_ref().display()))?;
     let cfg: AppConfig = toml::from_str(&content).context("failed to parse TOML config")?;
-    Ok(normalize_config(cfg))
+    normalize_config(cfg)
 }
 
 #[cfg(test)]
@@ -691,6 +705,27 @@ extra = "not-allowed"
         std::fs::remove_file(&path).ok();
         assert!(
             format!("{err:#}").contains("unknown field `extra`"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn load_config_errors_on_unknown_ingest_provider() {
+        let path = write_temp_config(
+            r#"
+[[ingest.sources]]
+name = "custom"
+provider = "openai"
+enabled = true
+glob = "~/.custom/sessions/**/*.jsonl"
+watch_root = "~/.custom/sessions"
+"#,
+            "unknown-provider",
+        );
+        let err = load_config(&path).expect_err("unknown ingest provider should fail");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            format!("{err:#}").contains("expected one of: codex, claude"),
             "unexpected error: {err:#}"
         );
     }
