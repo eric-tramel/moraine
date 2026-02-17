@@ -20,3 +20,7 @@ walkdir = "2.5"
 same-file = "1.0"
 moraine-config = { path = "../moraine-config" }
 moraine-clickhouse = { path = "../moraine-clickhouse" }
+
+[dev-dependencies]
+axum = "0.7"
+tokio = { version = "1.40", features = ["net"] }

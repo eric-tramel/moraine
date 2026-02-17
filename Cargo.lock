@@ -371,6 +371,7 @@ name = "moraine-ingest-core"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "axum",
  "chrono",
  "moraine-clickhouse",
  "moraine-config",
