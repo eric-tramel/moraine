@@ -333,6 +333,8 @@ struct StatusSnapshot {
     clickhouse_active_source: String,
     clickhouse_active_source_path: Option<String>,
     managed_clickhouse_checksum: String,
+    clickhouse_health_url: String,
+    status_notes: Vec<String>,
     doctor: DoctorReport,
     heartbeat: HeartbeatSnapshot,
 }
@@ -652,6 +654,8 @@ fn is_pid_running(pid: u32) -> bool {
     Command::new("kill")
         .arg("-0")
         .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
@@ -687,7 +691,11 @@ fn stop_service(paths: &RuntimePaths, service: Service) -> Result<bool> {
         return Ok(false);
     }
 
-    let _ = Command::new("kill").arg(pid.to_string()).status();
+    let _ = Command::new("kill")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 
     for _ in 0..20 {
         if !is_pid_running(pid) {
@@ -697,7 +705,12 @@ fn stop_service(paths: &RuntimePaths, service: Service) -> Result<bool> {
         std::thread::sleep(Duration::from_millis(200));
     }
 
-    let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+    let _ = Command::new("kill")
+        .arg("-9")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
     let _ = fs::remove_file(path);
     Ok(true)
 }
@@ -1534,6 +1547,37 @@ fn active_clickhouse_source(paths: &RuntimePaths) -> (&'static str, Option<PathB
     ("missing", None)
 }
 
+fn clickhouse_runtime_running(services: &[ServiceRuntimeStatus]) -> bool {
+    services
+        .iter()
+        .find(|row| row.service == Service::ClickHouse)
+        .and_then(|row| row.pid)
+        .is_some()
+}
+
+fn build_status_notes(
+    services: &[ServiceRuntimeStatus],
+    report: &DoctorReport,
+    clickhouse_url: &str,
+) -> Vec<String> {
+    let clickhouse_running = clickhouse_runtime_running(services);
+    let mut notes = Vec::new();
+
+    if report.clickhouse_healthy && !clickhouse_running {
+        notes.push(format!(
+            "database health checks query clickhouse.url ({clickhouse_url}); endpoint is healthy while managed clickhouse runtime is stopped"
+        ));
+    }
+
+    if !report.clickhouse_healthy && clickhouse_running {
+        notes.push(format!(
+            "managed clickhouse runtime is running, but health checks against clickhouse.url ({clickhouse_url}) are failing"
+        ));
+    }
+
+    notes
+}
+
 async fn cmd_status(paths: &RuntimePaths, cfg: &AppConfig) -> Result<StatusSnapshot> {
     let services = [
         Service::ClickHouse,
@@ -1551,6 +1595,8 @@ async fn cmd_status(paths: &RuntimePaths, cfg: &AppConfig) -> Result<StatusSnaps
     let managed_server = managed_clickhouse_bin(paths, "clickhouse-server");
     let (source, source_path) = active_clickhouse_source(paths);
     let report = cmd_db_doctor(cfg).await?;
+    let clickhouse_health_url = cfg.clickhouse.url.clone();
+    let status_notes = build_status_notes(&services, &report, &clickhouse_health_url);
     let heartbeat = match query_heartbeat(cfg).await {
         Ok(Some(row)) => HeartbeatSnapshot::Available {
             latest: row.latest,
@@ -1575,6 +1621,8 @@ async fn cmd_status(paths: &RuntimePaths, cfg: &AppConfig) -> Result<StatusSnaps
         clickhouse_active_source: source.to_string(),
         clickhouse_active_source_path: source_path.map(|path| path.display().to_string()),
         managed_clickhouse_checksum: managed_clickhouse_checksum_state(cfg, paths),
+        clickhouse_health_url,
+        status_notes,
         doctor: report,
         heartbeat,
     })
@@ -2394,6 +2442,7 @@ fn render_status(output: &CliOutput, snapshot: &StatusSnapshot) -> Result<()> {
             "clickhouse: {}",
             health_label(snapshot.doctor.clickhouse_healthy)
         ),
+        format!("health target: {}", snapshot.clickhouse_health_url),
         format!(
             "database exists: {}",
             state_label(snapshot.doctor.database_exists)
@@ -2422,6 +2471,9 @@ fn render_status(output: &CliOutput, snapshot: &StatusSnapshot) -> Result<()> {
         doctor_lines.push(format!("errors: {}", snapshot.doctor.errors.join(" | ")));
     }
     output.section("Database Health", &doctor_lines);
+    if !snapshot.status_notes.is_empty() {
+        output.section("Status Notes", &snapshot.status_notes);
+    }
 
     let heartbeat_lines = match &snapshot.heartbeat {
         HeartbeatSnapshot::Available {
@@ -2934,6 +2986,19 @@ mod tests {
         fs::write(path, b"#!/bin/sh\n").expect("write file");
     }
 
+    fn test_doctor_report(clickhouse_healthy: bool) -> DoctorReport {
+        DoctorReport {
+            clickhouse_healthy,
+            clickhouse_version: None,
+            database: "cortex".to_string(),
+            database_exists: true,
+            applied_migrations: Vec::new(),
+            pending_migrations: Vec::new(),
+            missing_tables: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+
     #[test]
     fn clickhouse_asset_selection_covers_target_matrix() {
         let linux_x64 =
@@ -2968,6 +3033,35 @@ mod tests {
             "{}",
             err
         );
+    }
+
+    #[test]
+    fn build_status_notes_flags_healthy_external_clickhouse() {
+        let services = vec![ServiceRuntimeStatus {
+            service: Service::ClickHouse,
+            pid: None,
+        }];
+        let report = test_doctor_report(true);
+        let notes = build_status_notes(&services, &report, "http://127.0.0.1:8123");
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].contains("endpoint is healthy while managed clickhouse runtime is stopped")
+        );
+        assert!(notes[0].contains("http://127.0.0.1:8123"));
+    }
+
+    #[test]
+    fn build_status_notes_flags_unhealthy_managed_clickhouse() {
+        let services = vec![ServiceRuntimeStatus {
+            service: Service::ClickHouse,
+            pid: Some(4242),
+        }];
+        let report = test_doctor_report(false);
+        let notes = build_status_notes(&services, &report, "http://127.0.0.1:8123");
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("managed clickhouse runtime is running"));
+        assert!(notes[0].contains("are failing"));
+        assert!(notes[0].contains("http://127.0.0.1:8123"));
     }
 
     #[test]

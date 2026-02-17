@@ -61,10 +61,21 @@ config_get() {
 
 CLICKHOUSE_URL="$(config_get "clickhouse.url")"
 CLICKHOUSE_DB="$(config_get "clickhouse.database")"
+CLICKHOUSE_USER="$(config_get "clickhouse.username")"
+CLICKHOUSE_PASSWORD="$(config_get "clickhouse.password")"
 CLICKHOUSE_URL="${CLICKHOUSE_URL:-http://127.0.0.1:8123}"
 CLICKHOUSE_DB="${CLICKHOUSE_DB:-cortex}"
 
-if ! curl -fsS "$CLICKHOUSE_URL/?query=SELECT%201" >/dev/null 2>&1; then
+CURL_AUTH_ARGS=()
+if [[ -n "$CLICKHOUSE_USER" ]]; then
+  CURL_AUTH_ARGS+=(--user "${CLICKHOUSE_USER}:${CLICKHOUSE_PASSWORD}")
+fi
+
+clickhouse_curl() {
+  curl -fsS "${CURL_AUTH_ARGS[@]}" "$@"
+}
+
+if ! clickhouse_curl "$CLICKHOUSE_URL/?query=SELECT%201" >/dev/null 2>&1; then
   echo "clickhouse is unavailable at $CLICKHOUSE_URL" >&2
   exit 1
 fi
@@ -73,7 +84,7 @@ fi
 
 run_sql() {
   local stmt="$1"
-  curl -fsS --data-binary "$stmt" "$CLICKHOUSE_URL/?database=$CLICKHOUSE_DB" >/dev/null
+  clickhouse_curl --data-binary "$stmt" "$CLICKHOUSE_URL/?database=$CLICKHOUSE_DB" >/dev/null
 }
 
 echo "backfilling search index tables in $CLICKHOUSE_DB"
@@ -83,10 +94,10 @@ run_sql "TRUNCATE TABLE ${CLICKHOUSE_DB}.search_documents"
 
 run_sql "INSERT INTO ${CLICKHOUSE_DB}.search_documents (doc_version, ingested_at, event_uid, compacted_parent_uid, session_id, session_date, source_name, provider, source_file, source_generation, source_line_no, source_offset, source_ref, record_ts, event_class, payload_type, actor_role, name, phase, text_content, payload_json, token_usage_json) SELECT event_version, ingested_at, event_uid, origin_event_id, session_id, session_date, source_name, provider, source_file, source_generation, source_line_no, source_offset, source_ref, record_ts, event_kind, payload_type, actor_kind, tool_name, if(tool_phase != '', tool_phase, op_status), text_content, payload_json, token_usage_json FROM ${CLICKHOUSE_DB}.events WHERE lengthUTF8(replaceRegexpAll(text_content, '\\\\s+', '')) > 0"
 
-DOCS="$(curl -fsS "$CLICKHOUSE_URL/?query=SELECT%20count()%20FROM%20${CLICKHOUSE_DB}.search_documents")"
-POSTINGS="$(curl -fsS "$CLICKHOUSE_URL/?query=SELECT%20count()%20FROM%20${CLICKHOUSE_DB}.search_postings")"
-TERMS="$(curl -fsS "$CLICKHOUSE_URL/?query=SELECT%20count()%20FROM%20${CLICKHOUSE_DB}.search_term_stats")"
-CORPUS_DOCS="$(curl -fsS "$CLICKHOUSE_URL/?query=SELECT%20sum(docs)%20FROM%20${CLICKHOUSE_DB}.search_corpus_stats")"
+DOCS="$(clickhouse_curl "$CLICKHOUSE_URL/?query=SELECT%20count()%20FROM%20${CLICKHOUSE_DB}.search_documents")"
+POSTINGS="$(clickhouse_curl "$CLICKHOUSE_URL/?query=SELECT%20count()%20FROM%20${CLICKHOUSE_DB}.search_postings")"
+TERMS="$(clickhouse_curl "$CLICKHOUSE_URL/?query=SELECT%20count()%20FROM%20${CLICKHOUSE_DB}.search_term_stats")"
+CORPUS_DOCS="$(clickhouse_curl "$CLICKHOUSE_URL/?query=SELECT%20sum(docs)%20FROM%20${CLICKHOUSE_DB}.search_corpus_stats")"
 
 echo "search_documents: $DOCS"
 echo "search_postings: $POSTINGS"
