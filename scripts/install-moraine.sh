@@ -91,7 +91,8 @@ verify_checksum() {
     return
   fi
 
-  echo "warning: no sha256sum/shasum/openssl found; skipping checksum verification" >&2
+  echo "unable to verify checksum for $archive: no sha256sum/shasum/openssl found" >&2
+  exit 1
 }
 
 detect_target_triple() {
