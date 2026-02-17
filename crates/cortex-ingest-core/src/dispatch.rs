@@ -241,6 +241,7 @@ pub(crate) async fn process_file(
         batch.event_rows.extend(normalized.event_rows);
         batch.link_rows.extend(normalized.link_rows);
         batch.tool_rows.extend(normalized.tool_rows);
+        batch.error_rows.extend(normalized.error_rows);
         batch.lines_processed = batch.lines_processed.saturating_add(1);
 
         if batch.row_count() >= config.ingest.batch_size {

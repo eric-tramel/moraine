@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const TEXT_LIMIT: usize = 200_000;
 const PREVIEW_LIMIT: usize = 320;
+const UNPARSEABLE_EVENT_TS: &str = "1970-01-01 00:00:00.000";
 
 fn session_id_re() -> &'static Regex {
     static SESSION_ID_RE: OnceLock<Regex> = OnceLock::new();
@@ -186,22 +187,27 @@ pub fn infer_session_date_from_file(source_file: &str, record_ts: &str) -> Strin
         return format!("{}-{}-{}", &cap[1], &cap[2], &cap[3]);
     }
 
-    parse_event_ts(record_ts)
-        .split(' ')
-        .next()
-        .unwrap_or("1970-01-01")
-        .to_string()
+    parse_record_ts(record_ts)
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "1970-01-01".to_string())
 }
 
-fn parse_event_ts(record_ts: &str) -> String {
-    if let Ok(dt) = DateTime::parse_from_rfc3339(record_ts) {
-        return dt
-            .with_timezone(&Utc)
-            .format("%Y-%m-%d %H:%M:%S%.3f")
-            .to_string();
+fn parse_record_ts(record_ts: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(record_ts)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn format_event_ts(dt: &DateTime<Utc>) -> String {
+    dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+}
+
+fn parse_event_ts(record_ts: &str) -> (String, bool) {
+    if let Some(dt) = parse_record_ts(record_ts) {
+        return (format_event_ts(&dt), false);
     }
 
-    Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+    (UNPARSEABLE_EVENT_TS.to_string(), true)
 }
 
 fn event_uid(
@@ -1332,7 +1338,7 @@ pub fn normalize_record(
     model_hint: &str,
 ) -> NormalizedRecord {
     let record_ts = to_str(record.get("timestamp"));
-    let event_ts = parse_event_ts(&record_ts);
+    let (event_ts, event_ts_parse_failed) = parse_event_ts(&record_ts);
     let top_type = to_str(record.get("type"));
 
     let mut session_id = if provider == "claude" {
@@ -1384,6 +1390,25 @@ pub fn normalize_record(
         "event_uid": base_uid,
     });
 
+    let mut error_rows = Vec::<Value>::new();
+    if event_ts_parse_failed {
+        error_rows.push(json!({
+            "source_name": source_name,
+            "provider": provider,
+            "source_file": source_file,
+            "source_inode": source_inode,
+            "source_generation": source_generation,
+            "source_line_no": source_line_no,
+            "source_offset": source_offset,
+            "error_kind": "timestamp_parse_error",
+            "error_text": format!(
+                "timestamp is missing or not RFC3339; used {} UTC fallback",
+                UNPARSEABLE_EVENT_TS
+            ),
+            "raw_fragment": truncate_chars(&record_ts, 20_000),
+        }));
+    }
+
     let ctx = RecordContext {
         source_name,
         provider,
@@ -1410,6 +1435,7 @@ pub fn normalize_record(
         event_rows,
         link_rows,
         tool_rows,
+        error_rows,
         session_hint: session_id,
         model_hint,
     }
@@ -1448,6 +1474,7 @@ mod tests {
 
         assert_eq!(out.event_rows.len(), 1);
         assert_eq!(out.tool_rows.len(), 1);
+        assert!(out.error_rows.is_empty());
         let row = out.event_rows[0].as_object().unwrap();
         assert_eq!(
             row.get("event_kind").unwrap().as_str().unwrap(),
@@ -1698,5 +1725,92 @@ mod tests {
             "tool_call"
         );
         assert_eq!(first.get("provider").unwrap().as_str().unwrap(), "claude");
+        assert!(out.error_rows.is_empty());
+    }
+
+    #[test]
+    fn invalid_timestamp_uses_epoch_and_emits_timestamp_parse_error() {
+        let record = json!({
+            "timestamp": "not-a-timestamp",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "call_id": "call_bad_ts",
+                "name": "Read",
+                "arguments": "{}"
+            }
+        });
+
+        let out = normalize_record(
+            &record,
+            "codex",
+            "codex",
+            "/Users/eric/.codex/sessions/session-019c5f6a-49bd-7920-ac67-1dd8e33b0e95.jsonl",
+            9,
+            2,
+            7,
+            99,
+            "",
+            "",
+        );
+
+        let event_row = out.event_rows[0].as_object().unwrap();
+        assert_eq!(
+            event_row.get("event_ts").unwrap().as_str().unwrap(),
+            "1970-01-01 00:00:00.000"
+        );
+        assert_eq!(
+            event_row.get("session_date").unwrap().as_str().unwrap(),
+            "1970-01-01"
+        );
+
+        assert_eq!(out.error_rows.len(), 1);
+        let error = out.error_rows[0].as_object().unwrap();
+        assert_eq!(
+            error.get("error_kind").unwrap().as_str().unwrap(),
+            "timestamp_parse_error"
+        );
+        assert_eq!(
+            error.get("raw_fragment").unwrap().as_str().unwrap(),
+            "not-a-timestamp"
+        );
+    }
+
+    #[test]
+    fn invalid_timestamp_preserves_session_date_from_source_path() {
+        let record = json!({
+            "timestamp": "still-not-a-timestamp",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "call_id": "call_bad_ts",
+                "name": "Read",
+                "arguments": "{}"
+            }
+        });
+
+        let out = normalize_record(
+            &record,
+            "codex",
+            "codex",
+            "/Users/eric/.codex/sessions/2026/02/16/session-019c5f6a-49bd-7920-ac67-1dd8e33b0e95.jsonl",
+            11,
+            4,
+            12,
+            144,
+            "",
+            "",
+        );
+
+        let event_row = out.event_rows[0].as_object().unwrap();
+        assert_eq!(
+            event_row.get("event_ts").unwrap().as_str().unwrap(),
+            "1970-01-01 00:00:00.000"
+        );
+        assert_eq!(
+            event_row.get("session_date").unwrap().as_str().unwrap(),
+            "2026-02-16"
+        );
+        assert_eq!(out.error_rows.len(), 1);
     }
 }
