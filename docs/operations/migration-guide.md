@@ -8,11 +8,8 @@ This guide maps historical script commands to the `moraine` command contracts.
 - `bin/init-db` -> `bin/moraine db migrate`
 - `bin/status` -> `bin/moraine status`
 - `bin/stop-all` -> `bin/moraine down`
-- `bin/start-ingestor` -> `bin/moraine up` (wrapper retired)
-- `bin/run-codex-mcp` -> `bin/moraine run mcp` (wrapper retired)
-- `bin/moraine-monitor` -> `bin/moraine run monitor` (wrapper retired)
 
-Legacy lifecycle aliases (`start-clickhouse`, `init-db`, `status`, `stop-all`) remain as fail-fast migration stubs. Service wrappers (`start-ingestor`, `run-codex-mcp`, `moraine-monitor`) are retired to keep the command surface focused on `moraine`.
+Legacy lifecycle aliases (`start-clickhouse`, `init-db`, `status`, `stop-all`) remain as fail-fast migration stubs. Service wrapper scripts are retired; use `bin/moraine run ingest|monitor|mcp` directly.
 
 ## Runtime changes
 
