@@ -165,15 +165,18 @@ All subcommands support output control:
 
 ## Legacy scripts
 
-Legacy shell entrypoints are removed and now fail fast with a `cortexctl` replacement hint:
+Legacy lifecycle aliases remain as fail-fast migration stubs with a `cortexctl` replacement hint:
 
 - `bin/start-clickhouse`
 - `bin/init-db`
-- `bin/start-ingestor`
 - `bin/status`
 - `bin/stop-all`
-- `bin/run-codex-mcp`
-- `bin/cortex-monitor`
+
+Legacy service wrappers are retired (no longer shipped):
+
+- `bin/start-ingestor` -> `bin/cortexctl up`
+- `bin/run-codex-mcp` -> `bin/cortexctl run mcp`
+- `bin/cortex-monitor` -> `bin/cortexctl run monitor`
 
 ## Failure triage
 

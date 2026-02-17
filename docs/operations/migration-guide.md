@@ -1,18 +1,18 @@
 # Migration Guide: Legacy Scripts to `cortexctl`
 
-This guide maps removed script commands to the new `cortexctl` command contracts.
+This guide maps historical script commands to the `cortexctl` command contracts.
 
 ## Command mapping
 
 - `bin/start-clickhouse` -> `bin/cortexctl up --no-ingest`
 - `bin/init-db` -> `bin/cortexctl db migrate`
-- `bin/start-ingestor` -> `bin/cortexctl up`
 - `bin/status` -> `bin/cortexctl status`
 - `bin/stop-all` -> `bin/cortexctl down`
-- `bin/run-codex-mcp` -> `bin/cortexctl run mcp`
-- `bin/cortex-monitor` -> `bin/cortexctl run monitor`
+- `bin/start-ingestor` -> `bin/cortexctl up` (wrapper retired)
+- `bin/run-codex-mcp` -> `bin/cortexctl run mcp` (wrapper retired)
+- `bin/cortex-monitor` -> `bin/cortexctl run monitor` (wrapper retired)
 
-Each removed script now exits with a migration message instead of invoking legacy behavior.
+Legacy lifecycle aliases (`start-clickhouse`, `init-db`, `status`, `stop-all`) remain as fail-fast migration stubs. Service wrappers (`start-ingestor`, `run-codex-mcp`, `cortex-monitor`) are retired to keep the command surface focused on `cortexctl`.
 
 ## Runtime changes
 

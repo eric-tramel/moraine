@@ -1,6 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-echo "error: run-codex-mcp has been removed in the cortexctl migration." >&2
-echo "use: bin/cortexctl run mcp" >&2
-exit 64

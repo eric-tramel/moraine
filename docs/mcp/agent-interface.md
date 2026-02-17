@@ -163,18 +163,20 @@ For deterministic behavior across environments, pin config in `config/cortex.tom
 
 Reference excerpt:
 
-```bash
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG_PATH="${CORTEX_MCP_CONFIG:-$PROJECT_ROOT/config/codex-mcp.toml}"
-BINARY_PATH="$PROJECT_ROOT/rust/codex-mcp/target/release/codex-mcp"
-
-if [[ ! -f "$CONFIG_PATH" ]]; then
-  CONFIG_PATH="$PROJECT_ROOT/config/ingestor.toml"
-fi
-
-exec "$BINARY_PATH" --config "$CONFIG_PATH" "$@"
+```rust
+#[derive(Debug, Args)]
+struct RunArgs {
+    #[arg(value_enum)]
+    service: Service,
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        num_args = 0..
+    )]
+    args: Vec<String>,
+}
 ```
 
-[src: bin/run-codex-mcp:L4-L10, bin/run-codex-mcp:L18]
+[src: apps/cortexctl/src/main.rs:L164-L173]
 
 In practice, the interface should be treated as a strict retrieval edge service: keep it stateless, keep calls bounded, and let ClickHouse remain the durable truth for both content and retrieval telemetry.

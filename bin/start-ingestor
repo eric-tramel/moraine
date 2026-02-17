@@ -1,6 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-echo "error: start-ingestor has been removed in the cortexctl migration." >&2
-echo "use: bin/cortexctl up" >&2
-exit 64

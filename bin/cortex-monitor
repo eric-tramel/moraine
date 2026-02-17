@@ -1,6 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-echo "error: cortex-monitor has been removed in the cortexctl migration." >&2
-echo "use: bin/cortexctl run monitor" >&2
-exit 64
