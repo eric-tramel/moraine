@@ -463,6 +463,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             name: "006_search_stats_authoritative_views.sql",
             sql: include_str!("../../../sql/006_search_stats_authoritative_views.sql"),
         },
+        Migration {
+            version: "007",
+            name: "007_event_links_external_id.sql",
+            sql: include_str!("../../../sql/007_event_links_external_id.sql"),
+        },
     ]
 }
 

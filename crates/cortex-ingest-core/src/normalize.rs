@@ -383,12 +383,14 @@ fn build_link_row(
     ctx: &RecordContext<'_>,
     event_uid: &str,
     linked_event_uid: &str,
+    linked_external_id: &str,
     link_type: &str,
     metadata_json: &str,
 ) -> Value {
     json!({
         "event_uid": event_uid,
         "linked_event_uid": linked_event_uid,
+        "linked_external_id": linked_external_id,
         "link_type": link_type,
         "session_id": ctx.session_id,
         "provider": ctx.provider,
@@ -396,6 +398,40 @@ fn build_link_row(
         "metadata_json": metadata_json,
         "event_version": event_version(),
     })
+}
+
+fn build_event_link_row(
+    ctx: &RecordContext<'_>,
+    event_uid: &str,
+    linked_event_uid: &str,
+    link_type: &str,
+    metadata_json: &str,
+) -> Value {
+    build_link_row(
+        ctx,
+        event_uid,
+        linked_event_uid,
+        "",
+        link_type,
+        metadata_json,
+    )
+}
+
+fn build_external_link_row(
+    ctx: &RecordContext<'_>,
+    event_uid: &str,
+    linked_external_id: &str,
+    link_type: &str,
+    metadata_json: &str,
+) -> Value {
+    build_link_row(
+        ctx,
+        event_uid,
+        "",
+        linked_external_id,
+        link_type,
+        metadata_json,
+    )
 }
 
 fn build_tool_row(
@@ -454,7 +490,13 @@ fn normalize_codex_event(
 
     let push_parent_link = |links: &mut Vec<Value>, uid: &str, parent: &str| {
         if !parent.is_empty() {
-            links.push(build_link_row(ctx, uid, parent, "parent_event", "{}"));
+            links.push(build_external_link_row(
+                ctx,
+                uid,
+                parent,
+                "parent_event",
+                "{}",
+            ));
         }
     };
 
@@ -854,7 +896,7 @@ fn normalize_codex_event(
                     row.insert("origin_event_id".to_string(), json!(base_uid));
                     events.push(Value::Object(row));
 
-                    links.push(build_link_row(
+                    links.push(build_event_link_row(
                         ctx,
                         &item_uid,
                         base_uid,
@@ -1199,7 +1241,7 @@ fn normalize_claude_event(
                     events.push(Value::Object(row));
 
                     if !parent_uuid.is_empty() {
-                        links.push(build_link_row(
+                        links.push(build_external_link_row(
                             ctx,
                             &block_uid,
                             &parent_uuid,
@@ -1229,7 +1271,7 @@ fn normalize_claude_event(
                 stamp_common(&mut row);
                 events.push(Value::Object(row));
                 if !parent_uuid.is_empty() {
-                    links.push(build_link_row(
+                    links.push(build_external_link_row(
                         ctx,
                         base_uid,
                         &parent_uuid,
@@ -1284,7 +1326,7 @@ fn normalize_claude_event(
         events.push(Value::Object(row));
 
         if !parent_uuid.is_empty() {
-            links.push(build_link_row(
+            links.push(build_external_link_row(
                 ctx,
                 base_uid,
                 &parent_uuid,
@@ -1298,14 +1340,20 @@ fn normalize_claude_event(
         let tool_use_id = to_str(record.get("toolUseID"));
         if !tool_use_id.is_empty() {
             if let Some(uid) = events[0].get("event_uid").and_then(|v| v.as_str()) {
-                links.push(build_link_row(ctx, uid, &tool_use_id, "tool_use_id", "{}"));
+                links.push(build_external_link_row(
+                    ctx,
+                    uid,
+                    &tool_use_id,
+                    "tool_use_id",
+                    "{}",
+                ));
             }
         }
 
         let source_tool_assistant = to_str(record.get("sourceToolAssistantUUID"));
         if !source_tool_assistant.is_empty() {
             if let Some(uid) = events[0].get("event_uid").and_then(|v| v.as_str()) {
-                links.push(build_link_row(
+                links.push(build_external_link_row(
                     ctx,
                     uid,
                     &source_tool_assistant,
@@ -1419,6 +1467,7 @@ pub fn normalize_record(
 mod tests {
     use super::normalize_record;
     use serde_json::json;
+    use std::collections::HashMap;
 
     #[test]
     fn codex_tool_call_normalization() {
@@ -1698,5 +1747,157 @@ mod tests {
             "tool_call"
         );
         assert_eq!(first.get("provider").unwrap().as_str().unwrap(), "claude");
+    }
+
+    #[test]
+    fn claude_links_split_event_uids_from_external_ids() {
+        let record = json!({
+            "type": "assistant",
+            "sessionId": "7c666c01-d38e-4658-8650-854ffb5b626e",
+            "uuid": "assistant-2",
+            "parentUuid": "user-parent-2",
+            "toolUseID": "toolu_42",
+            "sourceToolAssistantUUID": "assistant-root-1",
+            "requestId": "req-2",
+            "timestamp": "2026-01-19T15:59:41.421Z",
+            "message": {
+                "role": "assistant",
+                "content": "done"
+            }
+        });
+
+        let out = normalize_record(
+            &record,
+            "claude",
+            "claude",
+            "/Users/eric/.claude/projects/p1/s1.jsonl",
+            55,
+            2,
+            11,
+            101,
+            "",
+            "",
+        );
+
+        assert_eq!(out.link_rows.len(), 3);
+
+        let by_type = out
+            .link_rows
+            .iter()
+            .map(|row| {
+                let obj = row.as_object().expect("link row object");
+                let link_type = obj
+                    .get("link_type")
+                    .and_then(|v| v.as_str())
+                    .expect("link_type")
+                    .to_string();
+                (link_type, obj.clone())
+            })
+            .collect::<HashMap<_, _>>();
+
+        let parent = by_type.get("parent_uuid").expect("parent_uuid link");
+        assert_eq!(
+            parent
+                .get("linked_external_id")
+                .and_then(|v| v.as_str())
+                .unwrap(),
+            "user-parent-2"
+        );
+        assert_eq!(
+            parent
+                .get("linked_event_uid")
+                .and_then(|v| v.as_str())
+                .unwrap(),
+            ""
+        );
+
+        let tool_use = by_type.get("tool_use_id").expect("tool_use_id link");
+        assert_eq!(
+            tool_use
+                .get("linked_external_id")
+                .and_then(|v| v.as_str())
+                .unwrap(),
+            "toolu_42"
+        );
+        assert_eq!(
+            tool_use
+                .get("linked_event_uid")
+                .and_then(|v| v.as_str())
+                .unwrap(),
+            ""
+        );
+
+        let source_tool = by_type
+            .get("source_tool_assistant")
+            .expect("source_tool_assistant link");
+        assert_eq!(
+            source_tool
+                .get("linked_external_id")
+                .and_then(|v| v.as_str())
+                .unwrap(),
+            "assistant-root-1"
+        );
+        assert_eq!(
+            source_tool
+                .get("linked_event_uid")
+                .and_then(|v| v.as_str())
+                .unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn codex_compacted_parent_link_uses_event_uid_target() {
+        let record = json!({
+            "timestamp": "2026-02-15T03:50:50.838Z",
+            "type": "compacted",
+            "payload": {
+                "replacement_history": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "hello"}
+                        ]
+                    }
+                ]
+            }
+        });
+
+        let out = normalize_record(
+            &record,
+            "codex",
+            "codex",
+            "/Users/eric/.codex/sessions/2026/02/15/session-019c5f6a-49bd-7920-ac67-1dd8e33b0e95.jsonl",
+            1,
+            1,
+            12,
+            12,
+            "",
+            "",
+        );
+
+        let compacted_uid = out.event_rows[0]
+            .get("event_uid")
+            .and_then(|v| v.as_str())
+            .expect("compacted event uid");
+        let link = out.link_rows[0].as_object().expect("compacted link");
+
+        assert_eq!(
+            link.get("link_type").and_then(|v| v.as_str()).unwrap(),
+            "compacted_parent"
+        );
+        assert_eq!(
+            link.get("linked_event_uid")
+                .and_then(|v| v.as_str())
+                .unwrap(),
+            compacted_uid
+        );
+        assert_eq!(
+            link.get("linked_external_id")
+                .and_then(|v| v.as_str())
+                .unwrap(),
+            ""
+        );
     }
 }
