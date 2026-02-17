@@ -333,36 +333,11 @@ async fn flush_pending(
         .collect();
 
     let flush_result = async {
-        clickhouse.insert_json_rows("raw_events", raw_rows).await?;
-        clickhouse.insert_json_rows("events", event_rows).await?;
-        clickhouse
-            .insert_json_rows("event_links", link_rows)
-            .await?;
-        clickhouse.insert_json_rows("tool_io", tool_rows).await?;
-        clickhouse
-            .insert_json_rows("ingest_errors", error_rows)
-            .await?;
-        clickhouse
-            .insert_json_rows("ingest_checkpoints", &checkpoint_rows)
-            .await?;
-        anyhow::Result::<()>::Ok(())
-    }
-    .await;
-
-    match flush_result {
-        Ok(()) => {
+        if !raw_rows.is_empty() {
+            clickhouse.insert_json_rows("raw_events", raw_rows).await?;
             metrics
                 .raw_rows_written
                 .fetch_add(raw_rows.len() as u64, Ordering::Relaxed);
-            metrics
-                .event_rows_written
-                .fetch_add(event_rows.len() as u64, Ordering::Relaxed);
-            metrics
-                .err_rows_written
-                .fetch_add(error_rows.len() as u64, Ordering::Relaxed);
-            metrics
-                .last_flush_ms
-                .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
             if let Some((p50_ms, p95_ms)) = compute_append_to_visible_stats(raw_rows, Utc::now()) {
                 metrics
                     .append_to_visible_p50_ms
@@ -371,6 +346,43 @@ async fn flush_pending(
                     .append_to_visible_p95_ms
                     .store(p95_ms as u64, Ordering::Relaxed);
             }
+            raw_rows.clear();
+        }
+
+        if !event_rows.is_empty() {
+            clickhouse.insert_json_rows("events", event_rows).await?;
+            metrics
+                .event_rows_written
+                .fetch_add(event_rows.len() as u64, Ordering::Relaxed);
+            event_rows.clear();
+        }
+
+        if !link_rows.is_empty() {
+            clickhouse
+                .insert_json_rows("event_links", link_rows)
+                .await?;
+            link_rows.clear();
+        }
+
+        if !tool_rows.is_empty() {
+            clickhouse.insert_json_rows("tool_io", tool_rows).await?;
+            tool_rows.clear();
+        }
+
+        if !error_rows.is_empty() {
+            clickhouse
+                .insert_json_rows("ingest_errors", error_rows)
+                .await?;
+            metrics
+                .err_rows_written
+                .fetch_add(error_rows.len() as u64, Ordering::Relaxed);
+            error_rows.clear();
+        }
+
+        if !checkpoint_rows.is_empty() {
+            clickhouse
+                .insert_json_rows("ingest_checkpoints", &checkpoint_rows)
+                .await?;
 
             {
                 let mut state = checkpoints.write().await;
@@ -379,15 +391,18 @@ async fn flush_pending(
                     state.insert(key, cp.clone());
                 }
             }
-
-            raw_rows.clear();
-            event_rows.clear();
-            link_rows.clear();
-            tool_rows.clear();
-            error_rows.clear();
             checkpoint_updates.clear();
-            true
         }
+
+        metrics
+            .last_flush_ms
+            .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        anyhow::Result::<()>::Ok(())
+    }
+    .await;
+
+    match flush_result {
+        Ok(()) => true,
         Err(exc) => {
             metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
             *metrics
@@ -404,9 +419,135 @@ async fn flush_pending(
 mod tests {
     use super::*;
     use crate::model::RowBatch;
+    use axum::{
+        extract::{Query, State},
+        http::StatusCode,
+        routing::post,
+        Router,
+    };
     use chrono::{DateTime, Utc};
     use serde_json::json;
     use tokio::time::timeout;
+
+    #[derive(Clone, Default)]
+    struct MockClickHouseState {
+        calls_by_table: Arc<Mutex<HashMap<String, usize>>>,
+        fail_once_by_table: Arc<Mutex<HashMap<String, usize>>>,
+    }
+
+    impl MockClickHouseState {
+        fn with_single_failure(table: &str) -> Self {
+            let state = Self::default();
+            state
+                .fail_once_by_table
+                .lock()
+                .expect("mock fail_once mutex poisoned")
+                .insert(table.to_string(), 1);
+            state
+        }
+
+        fn call_count(&self, table: &str) -> usize {
+            *self
+                .calls_by_table
+                .lock()
+                .expect("mock calls mutex poisoned")
+                .get(table)
+                .unwrap_or(&0)
+        }
+    }
+
+    fn inserted_table_name(query: &str) -> Option<&'static str> {
+        if query.contains("`raw_events`") {
+            Some("raw_events")
+        } else if query.contains("`event_links`") {
+            Some("event_links")
+        } else if query.contains("`tool_io`") {
+            Some("tool_io")
+        } else if query.contains("`ingest_errors`") {
+            Some("ingest_errors")
+        } else if query.contains("`ingest_checkpoints`") {
+            Some("ingest_checkpoints")
+        } else if query.contains("`events`") {
+            Some("events")
+        } else {
+            None
+        }
+    }
+
+    async fn mock_clickhouse_handler(
+        State(state): State<MockClickHouseState>,
+        Query(params): Query<HashMap<String, String>>,
+    ) -> (StatusCode, String) {
+        let query = params.get("query").cloned().unwrap_or_default();
+        let Some(table) = inserted_table_name(&query) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("unexpected query payload: {query}"),
+            );
+        };
+
+        {
+            let mut calls = state
+                .calls_by_table
+                .lock()
+                .expect("mock calls mutex poisoned");
+            *calls.entry(table.to_string()).or_insert(0) += 1;
+        }
+
+        let mut fail_once = state
+            .fail_once_by_table
+            .lock()
+            .expect("mock fail_once mutex poisoned");
+        if let Some(remaining) = fail_once.get_mut(table) {
+            if *remaining > 0 {
+                *remaining -= 1;
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("intentional failure for {table}"),
+                );
+            }
+        }
+
+        (StatusCode::OK, String::new())
+    }
+
+    async fn spawn_mock_clickhouse(
+        fail_once_table: &str,
+    ) -> (ClickHouseClient, MockClickHouseState) {
+        let state = MockClickHouseState::with_single_failure(fail_once_table);
+        let app = Router::new()
+            .route("/", post(mock_clickhouse_handler))
+            .with_state(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock clickhouse listener");
+        let addr = listener.local_addr().expect("mock listener addr");
+
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut config = moraine_config::AppConfig::default();
+        config.clickhouse.url = format!("http://{}", addr);
+        config.clickhouse.timeout_seconds = 1.0;
+        let clickhouse = ClickHouseClient::new(config.clickhouse)
+            .expect("mock clickhouse client should initialize");
+
+        (clickhouse, state)
+    }
+
+    fn sample_checkpoint() -> Checkpoint {
+        Checkpoint {
+            source_name: "source-a".to_string(),
+            source_file: "/tmp/source-a.jsonl".to_string(),
+            source_inode: 42,
+            source_generation: 1,
+            last_offset: 100,
+            last_line_no: 3,
+            status: "active".to_string(),
+        }
+    }
 
     fn single_row_batch(id: u64) -> SinkMessage {
         let mut batch = RowBatch::default();
@@ -446,6 +587,91 @@ mod tests {
         );
 
         handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flush_pending_retries_only_unfinished_tables() {
+        let (clickhouse, mock_state) = spawn_mock_clickhouse("events").await;
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+
+        let mut raw_rows = vec![json!({
+            "record_ts": "2026-02-17T00:00:01.000Z",
+            "event_uid": "evt-1"
+        })];
+        let mut event_rows = vec![json!({"event_uid": "evt-1"})];
+        let mut link_rows = Vec::<Value>::new();
+        let mut tool_rows = Vec::<Value>::new();
+        let mut error_rows = Vec::<Value>::new();
+        let mut checkpoint_updates = HashMap::new();
+        let checkpoint = sample_checkpoint();
+        checkpoint_updates.insert(
+            checkpoint_key(&checkpoint.source_name, &checkpoint.source_file),
+            checkpoint.clone(),
+        );
+
+        let first_attempt = flush_pending(
+            &clickhouse,
+            &checkpoints,
+            &metrics,
+            &mut raw_rows,
+            &mut event_rows,
+            &mut link_rows,
+            &mut tool_rows,
+            &mut error_rows,
+            &mut checkpoint_updates,
+        )
+        .await;
+        assert!(!first_attempt, "first flush should fail at events stage");
+
+        assert!(raw_rows.is_empty(), "raw rows should not be retried");
+        assert_eq!(
+            event_rows.len(),
+            1,
+            "event rows remain pending after failure"
+        );
+        assert_eq!(
+            checkpoint_updates.len(),
+            1,
+            "checkpoint update must remain pending until checkpoint flush succeeds"
+        );
+        assert_eq!(metrics.raw_rows_written.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.event_rows_written.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.flush_failures.load(Ordering::Relaxed), 1);
+
+        let second_attempt = flush_pending(
+            &clickhouse,
+            &checkpoints,
+            &metrics,
+            &mut raw_rows,
+            &mut event_rows,
+            &mut link_rows,
+            &mut tool_rows,
+            &mut error_rows,
+            &mut checkpoint_updates,
+        )
+        .await;
+        assert!(
+            second_attempt,
+            "second flush should complete remaining stages"
+        );
+
+        assert!(event_rows.is_empty());
+        assert!(checkpoint_updates.is_empty());
+        assert_eq!(metrics.raw_rows_written.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.event_rows_written.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.flush_failures.load(Ordering::Relaxed), 1);
+
+        assert_eq!(mock_state.call_count("raw_events"), 1);
+        assert_eq!(mock_state.call_count("events"), 2);
+        assert_eq!(mock_state.call_count("ingest_checkpoints"), 1);
+
+        let state = checkpoints.read().await;
+        let checkpoint_key_value = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
+        assert!(
+            state.contains_key(&checkpoint_key_value),
+            "checkpoint cache should advance after checkpoint stage succeeds"
+        );
     }
 
     #[test]
