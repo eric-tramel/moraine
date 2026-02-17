@@ -85,6 +85,42 @@ def _rows_for_query(query: str) -> list[dict]:
             },
         ]
 
+    if "any(p.source_name) AS source_name" in query:
+        return [
+            {
+                "event_uid": "evt-c-42",
+                "session_id": "sess_c",
+                "source_name": "codex",
+                "provider": "codex",
+                "event_class": "message",
+                "payload_type": "text",
+                "actor_role": "assistant",
+                "name": "",
+                "phase": "",
+                "source_ref": "/tmp/sess_c.jsonl:1:42",
+                "doc_len": 19,
+                "text_preview": "best event in session c",
+                "score": 12.5,
+                "matched_terms": 2,
+            },
+            {
+                "event_uid": "evt-a-11",
+                "session_id": "sess_a",
+                "source_name": "codex",
+                "provider": "codex",
+                "event_class": "message",
+                "payload_type": "text",
+                "actor_role": "assistant",
+                "name": "",
+                "phase": "",
+                "source_ref": "/tmp/sess_a.jsonl:1:11",
+                "doc_len": 13,
+                "text_preview": "weaker event in session a",
+                "score": 7.0,
+                "matched_terms": 1,
+            },
+        ]
+
     return []
 
 
@@ -161,6 +197,20 @@ def test_conversation_client_smoke() -> None:
         )
         assert len(search["hits"]) == 2
         assert search["hits"][0]["session_id"] == "sess_c"
+
+        event_search = json.loads(
+            client.search_events_json(
+                query="hello world",
+                limit=10,
+                session_id="sess_c",
+                min_score=0.0,
+                min_should_match=1,
+                include_tool_events=True,
+                exclude_codex_mcp=False,
+            )
+        )
+        assert len(event_search["hits"]) == 2
+        assert event_search["hits"][0]["event_uid"] == "evt-c-42"
     finally:
         proc.terminate()
         proc.join(timeout=5)

@@ -314,147 +314,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
-name = "moraine-clickhouse"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "axum",
- "moraine-config",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "url",
-]
-
-[[package]]
-name = "moraine-config"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "serde",
- "toml",
-]
-
-[[package]]
-name = "moraine-conversations"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "base64",
- "moraine-clickhouse",
- "moraine-config",
- "regex",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "moraine-ingest"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "moraine-config",
- "moraine-ingest-core",
- "tokio",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "moraine-ingest-core"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "moraine-clickhouse",
- "moraine-config",
- "glob",
- "notify",
- "regex",
- "same-file",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tracing",
- "urlencoding",
- "walkdir",
-]
-
-[[package]]
-name = "moraine-mcp"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "moraine-config",
- "moraine-mcp-core",
- "tokio",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "moraine-mcp-core"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "moraine-clickhouse",
- "moraine-config",
- "moraine-conversations",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "moraine-monitor"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "moraine-config",
- "moraine-monitor-core",
- "tokio",
-]
-
-[[package]]
-name = "moraine-monitor-core"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "moraine-clickhouse",
- "moraine-config",
- "mime_guess",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "moraine"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "clap",
- "moraine-clickhouse",
- "moraine-config",
- "ratatui",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
-]
-
-[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1181,6 +1040,147 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "moraine"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "moraine-clickhouse",
+ "moraine-config",
+ "ratatui",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
+name = "moraine-clickhouse"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "axum",
+ "moraine-config",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "moraine-config"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "serde",
+ "toml",
+]
+
+[[package]]
+name = "moraine-conversations"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64",
+ "moraine-clickhouse",
+ "moraine-config",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "moraine-ingest"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "moraine-config",
+ "moraine-ingest-core",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "moraine-ingest-core"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "glob",
+ "moraine-clickhouse",
+ "moraine-config",
+ "notify",
+ "regex",
+ "same-file",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "urlencoding",
+ "walkdir",
+]
+
+[[package]]
+name = "moraine-mcp"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "moraine-config",
+ "moraine-mcp-core",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "moraine-mcp-core"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "moraine-clickhouse",
+ "moraine-config",
+ "moraine-conversations",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "moraine-monitor"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "moraine-config",
+ "moraine-monitor-core",
+ "tokio",
+]
+
+[[package]]
+name = "moraine-monitor-core"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "mime_guess",
+ "moraine-clickhouse",
+ "moraine-config",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

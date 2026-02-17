@@ -3,6 +3,7 @@ use moraine_config::ClickHouseConfig;
 use moraine_conversations::{
     ClickHouseConversationRepository, ConversationDetailOptions, ConversationListFilter,
     ConversationMode, ConversationRepository, ConversationSearchQuery, PageRequest, RepoConfig,
+    SearchEventsQuery,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -131,6 +132,41 @@ impl ConversationClient {
                 from_unix_ms,
                 to_unix_ms,
                 mode: parsed_mode,
+                include_tool_events,
+                exclude_codex_mcp,
+            }))
+            .map_err(py_runtime_err)?;
+
+        serde_json::to_string(&results).map_err(py_runtime_err)
+    }
+
+    #[pyo3(signature = (
+        query,
+        limit=None,
+        session_id=None,
+        min_score=None,
+        min_should_match=None,
+        include_tool_events=None,
+        exclude_codex_mcp=None,
+    ))]
+    fn search_events_json(
+        &self,
+        query: String,
+        limit: Option<u16>,
+        session_id: Option<String>,
+        min_score: Option<f64>,
+        min_should_match: Option<u16>,
+        include_tool_events: Option<bool>,
+        exclude_codex_mcp: Option<bool>,
+    ) -> PyResult<String> {
+        let results = self
+            .rt
+            .block_on(self.repo.search_events(SearchEventsQuery {
+                query,
+                limit,
+                session_id,
+                min_score,
+                min_should_match,
                 include_tool_events,
                 exclude_codex_mcp,
             }))

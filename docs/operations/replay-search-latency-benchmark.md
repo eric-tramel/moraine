@@ -2,12 +2,15 @@
 
 ## Purpose
 
-Use `scripts/bench/replay_search_latency.py` to replay real, high-latency MCP `search` requests from telemetry and measure current lookup latency against that baseline.
+Use `scripts/bench/replay_search_latency.py` to replay real, high-latency search requests from telemetry and measure current lookup latency against that baseline.
+
+The benchmark script is a self-declared `uv` script and replays through the local maturin-built `moraine-conversations` Python package (`ConversationClient.search_events_json`) so the run exercises the in-repo search implementation directly.
 
 The script:
 
 - selects top `N` rows from `moraine.search_query_log` by `response_ms` in a time window,
-- replays each query through MCP `tools/call` `search`,
+- runs `maturin develop` for `bindings/python/moraine_conversations` (unless skipped),
+- replays each query through `moraine_conversations.ConversationClient.search_events_json`,
 - runs warmup and measured repeats per query,
 - reports per-query and aggregate latency stats,
 - records timeout/error counts,
@@ -18,14 +21,14 @@ The script:
 Default benchmark (top 20 in last 24h):
 
 ```bash
-python3 scripts/bench/replay_search_latency.py \
+uv run --script scripts/bench/replay_search_latency.py \
   --config config/moraine.toml
 ```
 
 Custom window/sample and JSON output:
 
 ```bash
-python3 scripts/bench/replay_search_latency.py \
+uv run --script scripts/bench/replay_search_latency.py \
   --config config/moraine.toml \
   --window 7d \
   --top-n 40 \
@@ -38,7 +41,7 @@ python3 scripts/bench/replay_search_latency.py \
 Inspect selected workload without replay:
 
 ```bash
-python3 scripts/bench/replay_search_latency.py \
+uv run --script scripts/bench/replay_search_latency.py \
   --config config/moraine.toml \
   --window 24h \
   --top-n 20 \
@@ -47,15 +50,16 @@ python3 scripts/bench/replay_search_latency.py \
 
 ## CLI Flags
 
-- `--config <path>`: Moraine config file used for ClickHouse + MCP.
+- `--config <path>`: Moraine config file used for ClickHouse connectivity.
 - `--window <duration>`: telemetry lookback window. Supported suffixes: `s`, `m`, `h`, `d`, `w`.
 - `--top-n <int>`: number of highest-latency rows to select.
 - `--warmup <int>`: warmup runs per selected query.
 - `--repeats <int>`: measured runs per selected query.
-- `--timeout-seconds <int>`: timeout for each MCP request.
+- `--timeout-seconds <int>`: timeout for each replayed search request.
+- `--skip-maturin-develop`: skip local binding rebuild before replay.
 - `--output-json <path>`: write machine-readable benchmark output.
 - `--print-sql`: print generated ClickHouse selection SQL.
-- `--dry-run`: select and validate rows, but skip MCP replay.
+- `--dry-run`: select and validate rows, but skip replay.
 
 Defaults:
 
@@ -92,13 +96,14 @@ Exit code behavior:
 - No rows selected:
   - increase `--window` (for example `7d`),
   - verify recent `search_query_log` writes are present.
-- MCP startup failure:
-  - confirm `morainectl` or `moraine` is installed or set `MORAINECTL_BIN`,
-  - verify config path and `moraine run mcp --config <path>` works manually.
+- Local binding build/import failure:
+  - ensure `uv`, Python, Rust/Cargo, and a C toolchain are available,
+  - run `uv run --script scripts/bench/replay_search_latency.py --config ...` so `maturin` is auto-installed,
+  - if iterating rapidly and the package is already built in the environment, use `--skip-maturin-develop`.
 - Replay timeouts:
   - raise `--timeout-seconds`,
   - reduce `--top-n`/`--repeats` for quicker local checks,
-  - inspect ClickHouse and MCP logs for transient slowness.
+  - inspect ClickHouse logs for transient slowness.
 - Invalid selected rows:
   - run `--dry-run` to inspect skip reasons,
   - confirm telemetry fields (`result_limit`, `min_should_match`, flags) are valid.

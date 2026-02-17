@@ -1,13 +1,17 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = [
+#   "maturin>=1.6,<2",
+# ]
+# ///
 from __future__ import annotations
 
 import argparse
 import base64
 import json
 import math
-import os
 import re
-import select
 import shutil
 import subprocess
 import sys
@@ -80,8 +84,8 @@ def parse_window_interval(value: str) -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Replay top-N slow search requests from moraine.search_query_log via MCP "
-            "search and report observed latency."
+            "Replay top-N slow search requests from moraine.search_query_log via the "
+            "local moraine_conversations Python package and report observed latency."
         )
     )
     parser.add_argument("--config", required=True, help="Path to moraine.toml")
@@ -92,7 +96,15 @@ def parse_args() -> argparse.Namespace:
         "--repeats", type=positive_int, default=5, help="Measured replay runs per query"
     )
     parser.add_argument(
-        "--timeout-seconds", type=positive_int, default=20, help="Timeout per MCP request"
+        "--timeout-seconds",
+        type=positive_int,
+        default=20,
+        help="Timeout per search request (seconds)",
+    )
+    parser.add_argument(
+        "--skip-maturin-develop",
+        action="store_true",
+        help="Skip running maturin develop before replay",
     )
     parser.add_argument("--output-json", help="Write machine-readable results JSON to this path")
     parser.add_argument(
@@ -405,7 +417,6 @@ def normalize_rows(raw_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
                 "min_score": min_score,
                 "include_tool_events": include_tool_events,
                 "exclude_codex_mcp": exclude_codex_mcp,
-                "verbosity": "full",
             }
             if session_hint:
                 arguments["session_id"] = session_hint
@@ -469,168 +480,102 @@ def summarize_values(values: list[float], include_p99: bool) -> Optional[dict[st
     return stats
 
 
-def collect_stderr(
-    proc: subprocess.Popen[str], wait_seconds: float = 0.2, max_bytes: int = 8192
-) -> str:
-    if proc.stderr is None:
-        return ""
+def ensure_local_python_binding(repo_root: Path) -> None:
+    manifest_path = repo_root / "bindings" / "python" / "moraine_conversations" / "Cargo.toml"
+    if not manifest_path.exists():
+        raise RuntimeError(f"python binding manifest not found: {manifest_path}")
 
-    chunks: list[str] = []
-    bytes_read = 0
-    timeout = wait_seconds
-    fd = proc.stderr.fileno()
-    while bytes_read < max_bytes:
-        ready, _, _ = select.select([proc.stderr], [], [], timeout)
-        if not ready:
-            break
-        timeout = 0
-        chunk = os.read(fd, min(4096, max_bytes - bytes_read))
-        if not chunk:
-            break
-        chunks.append(chunk.decode("utf-8", errors="replace"))
-        bytes_read += len(chunk)
-
-    return "".join(chunks)
-
-
-class McpClient:
-    def __init__(self, command: list[str], default_timeout_seconds: int):
-        self.command = command
-        self.default_timeout_seconds = default_timeout_seconds
-        self.next_id = 1
-        self.proc = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
+    maturin_bin = shutil.which("maturin")
+    if not maturin_bin:
+        raise RuntimeError(
+            "maturin was not found in PATH; run this script via `uv run --script` so "
+            "its self-declared dependencies are installed"
         )
-        self._initialize()
 
-    def close(self) -> None:
-        if self.proc.stdin:
-            self.proc.stdin.close()
-        self.proc.terminate()
-        try:
-            self.proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-            self.proc.wait(timeout=5)
-
-    def _read_json_line(self, timeout_seconds: float) -> dict[str, Any]:
-        if self.proc.stdout is None:
-            raise RuntimeError("MCP stdout pipe is unavailable")
-
-        ready, _, _ = select.select([self.proc.stdout], [], [], timeout_seconds)
-        if not ready:
-            stderr = collect_stderr(self.proc)
-            raise TimeoutError(f"timed out waiting for MCP response; stderr={stderr.strip()}")
-
-        line = self.proc.stdout.readline()
-        if line == "":
-            stderr = collect_stderr(self.proc)
-            raise RuntimeError(f"MCP process exited unexpectedly; stderr={stderr.strip()}")
-
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"invalid JSON-RPC line from MCP: {line.strip()}") from exc
-        if not isinstance(payload, dict):
-            raise RuntimeError(f"invalid JSON-RPC payload type: {type(payload).__name__}")
-        return payload
-
-    def _request(
-        self, method: str, params: dict[str, Any], timeout_seconds: Optional[int] = None
-    ) -> dict[str, Any]:
-        if self.proc.stdin is None:
-            raise RuntimeError("MCP stdin pipe is unavailable")
-
-        request_id = self.next_id
-        self.next_id += 1
-
-        payload = {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": method,
-            "params": params,
-        }
-        self.proc.stdin.write(json.dumps(payload) + "\n")
-        self.proc.stdin.flush()
-
-        deadline = time.monotonic() + float(timeout_seconds or self.default_timeout_seconds)
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                stderr = collect_stderr(self.proc)
-                raise TimeoutError(
-                    f"timed out waiting for method={method} response id={request_id}; "
-                    f"stderr={stderr.strip()}"
-                )
-            response = self._read_json_line(remaining)
-            if response.get("id") != request_id:
-                continue
-            if "error" in response:
-                raise RuntimeError(f"rpc error for {method}: {response['error']}")
-            result = response.get("result")
-            if not isinstance(result, dict):
-                raise RuntimeError(f"rpc response for {method} missing result object")
-            return result
-
-    def _notify(self, method: str, params: dict[str, Any]) -> None:
-        if self.proc.stdin is None:
-            raise RuntimeError("MCP stdin pipe is unavailable")
-        payload = {
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-        }
-        self.proc.stdin.write(json.dumps(payload) + "\n")
-        self.proc.stdin.flush()
-
-    def _initialize(self) -> None:
-        init_result = self._request("initialize", {})
-        if "protocolVersion" not in init_result:
-            raise RuntimeError("initialize response missing protocolVersion")
-
-        self._notify("notifications/initialized", {})
-
-        tools_result = self._request("tools/list", {})
-        tools = tools_result.get("tools")
-        if not isinstance(tools, list):
-            raise RuntimeError("tools/list missing tools array")
-        tool_names = {tool.get("name") for tool in tools if isinstance(tool, dict)}
-        if "search" not in tool_names:
-            raise RuntimeError(f"tools/list did not include search tool: {sorted(tool_names)}")
-
-    def search(self, arguments: dict[str, Any], timeout_seconds: int) -> dict[str, Any]:
-        result = self._request(
-            "tools/call",
-            {"name": "search", "arguments": arguments},
-            timeout_seconds=timeout_seconds,
-        )
-        if result.get("isError"):
-            raise RuntimeError(f"search tool call returned isError=true: {result}")
-        return result
-
-
-def resolve_moraine_bin(repo_root: Path) -> str:
-    from_env = os.environ.get("MORAINECTL_BIN")
-    if from_env:
-        return from_env
-
-    for cmd in ("morainectl", "moraine"):
-        path = shutil.which(cmd)
-        if path:
-            return path
-
-    local_wrapper = repo_root / "bin" / "moraine"
-    if local_wrapper.exists() and os.access(local_wrapper, os.X_OK):
-        return str(local_wrapper)
-
-    raise RuntimeError(
-        "unable to resolve moraine binary; set MORAINECTL_BIN, or install morainectl/moraine"
+    result = subprocess.run(
+        [
+            maturin_bin,
+            "develop",
+            "--manifest-path",
+            str(manifest_path),
+            "--locked",
+        ],
+        cwd=repo_root,
+        check=False,
+        capture_output=True,
+        text=True,
     )
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        stdout = (result.stdout or "").strip()
+        detail = stderr or stdout or f"exit code {result.returncode}"
+        raise RuntimeError(f"maturin develop failed: {detail}")
+
+
+def ensure_binding_python_source_on_syspath(repo_root: Path) -> None:
+    python_source = repo_root / "bindings" / "python" / "moraine_conversations" / "python"
+    if not python_source.is_dir():
+        raise RuntimeError(f"python binding source directory not found: {python_source}")
+
+    python_source_str = str(python_source)
+    if python_source_str not in sys.path:
+        # maturin develop uses a .pth for editable installs, but this process does
+        # not restart; add the source path explicitly so import works immediately.
+        sys.path.insert(0, python_source_str)
+
+
+def load_conversation_client_class() -> Any:
+    try:
+        from moraine_conversations import ConversationClient
+    except Exception as exc:  # pragma: no cover - exercised in runtime usage
+        raise RuntimeError(
+            "failed to import moraine_conversations after local build; "
+            "check maturin output and Rust toolchain setup"
+        ) from exc
+    return ConversationClient
+
+
+class PackageSearchClient:
+    def __init__(
+        self,
+        conversation_client_cls: Any,
+        clickhouse: ClickHouseSettings,
+        timeout_seconds: int,
+    ) -> None:
+        self.client = conversation_client_cls(
+            url=clickhouse.url,
+            database=clickhouse.database,
+            username=clickhouse.username,
+            password=clickhouse.password,
+            timeout_seconds=float(timeout_seconds),
+            max_results=65535,
+        )
+
+    def search(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        payload = self.client.search_events_json(
+            query=str(arguments["query"]),
+            limit=int(arguments["limit"]),
+            session_id=arguments.get("session_id"),
+            min_score=float(arguments["min_score"]),
+            min_should_match=int(arguments["min_should_match"]),
+            include_tool_events=bool(arguments["include_tool_events"]),
+            exclude_codex_mcp=bool(arguments["exclude_codex_mcp"]),
+        )
+        parsed = json.loads(payload)
+        if not isinstance(parsed, dict):
+            raise RuntimeError(
+                f"search_events_json returned non-object payload: {type(parsed).__name__}"
+            )
+        return parsed
+
+
+def classify_failure(exc: Exception) -> str:
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    lowered = str(exc).lower()
+    if "timeout" in lowered or "timed out" in lowered:
+        return "timeout"
+    return "error"
 
 
 def print_selection_summary(
@@ -731,6 +676,7 @@ def build_output_json(
                 "repeats": args.repeats,
                 "timeout_seconds": args.timeout_seconds,
                 "dry_run": dry_run,
+                "skip_maturin_develop": args.skip_maturin_develop,
             },
             "selected_count": len(selected_rows),
             "replayed_count": len(replay_results),
@@ -826,110 +772,98 @@ def main() -> int:
             write_output_json(Path(args.output_json).expanduser(), payload)
         return 2
 
+    if args.skip_maturin_develop:
+        print("Skipping maturin develop (per --skip-maturin-develop)")
+    else:
+        print("Building local moraine_conversations binding via maturin develop...")
+        try:
+            ensure_local_python_binding(repo_root)
+        except Exception as exc:
+            print(f"fatal: failed to build local python binding: {exc}", file=sys.stderr)
+            return 2
+
     try:
-        moraine_bin = resolve_moraine_bin(repo_root)
+        ensure_binding_python_source_on_syspath(repo_root)
+        conversation_client_cls = load_conversation_client_class()
+        client = PackageSearchClient(
+            conversation_client_cls=conversation_client_cls,
+            clickhouse=ch_cfg,
+            timeout_seconds=args.timeout_seconds,
+        )
     except Exception as exc:
-        print(f"fatal: {exc}", file=sys.stderr)
+        print(f"fatal: failed to initialize local search client: {exc}", file=sys.stderr)
         return 2
 
-    command = [moraine_bin, "run", "mcp", "--config", str(config_path)]
     replay_results: list[dict[str, Any]] = []
     all_samples: list[float] = []
     failures = {"timeouts": 0, "errors": 0}
 
-    try:
-        client = McpClient(command, default_timeout_seconds=args.timeout_seconds)
-    except Exception as exc:
-        print(f"fatal: failed to start MCP subprocess: {exc}", file=sys.stderr)
-        return 2
+    for spec in replayable_rows:
+        warmup_samples: list[float] = []
+        measured_samples: list[float] = []
+        query_failures: list[dict[str, Any]] = []
 
-    try:
-        for spec in replayable_rows:
-            warmup_samples: list[float] = []
-            measured_samples: list[float] = []
-            query_failures: list[dict[str, Any]] = []
+        for idx in range(args.warmup):
+            try:
+                start_ns = time.perf_counter_ns()
+                client.search(spec.arguments)
+                elapsed_ms = (time.perf_counter_ns() - start_ns) / 1_000_000.0
+                warmup_samples.append(elapsed_ms)
+            except Exception as exc:
+                failure_type = classify_failure(exc)
+                failures["timeouts" if failure_type == "timeout" else "errors"] += 1
+                query_failures.append(
+                    {
+                        "type": failure_type,
+                        "phase": "warmup",
+                        "iteration": idx + 1,
+                        "message": str(exc),
+                    }
+                )
 
-            for idx in range(args.warmup):
-                try:
-                    start_ns = time.perf_counter_ns()
-                    client.search(spec.arguments, timeout_seconds=args.timeout_seconds)
-                    elapsed_ms = (time.perf_counter_ns() - start_ns) / 1_000_000.0
-                    warmup_samples.append(elapsed_ms)
-                except TimeoutError as exc:
-                    failures["timeouts"] += 1
-                    query_failures.append(
-                        {
-                            "type": "timeout",
-                            "phase": "warmup",
-                            "iteration": idx + 1,
-                            "message": str(exc),
-                        }
-                    )
-                except Exception as exc:
-                    failures["errors"] += 1
-                    query_failures.append(
-                        {
-                            "type": "error",
-                            "phase": "warmup",
-                            "iteration": idx + 1,
-                            "message": str(exc),
-                        }
-                    )
+        for idx in range(args.repeats):
+            try:
+                start_ns = time.perf_counter_ns()
+                client.search(spec.arguments)
+                elapsed_ms = (time.perf_counter_ns() - start_ns) / 1_000_000.0
+                measured_samples.append(elapsed_ms)
+            except Exception as exc:
+                failure_type = classify_failure(exc)
+                failures["timeouts" if failure_type == "timeout" else "errors"] += 1
+                query_failures.append(
+                    {
+                        "type": failure_type,
+                        "phase": "measured",
+                        "iteration": idx + 1,
+                        "message": str(exc),
+                    }
+                )
 
-            for idx in range(args.repeats):
-                try:
-                    start_ns = time.perf_counter_ns()
-                    client.search(spec.arguments, timeout_seconds=args.timeout_seconds)
-                    elapsed_ms = (time.perf_counter_ns() - start_ns) / 1_000_000.0
-                    measured_samples.append(elapsed_ms)
-                except TimeoutError as exc:
-                    failures["timeouts"] += 1
-                    query_failures.append(
-                        {
-                            "type": "timeout",
-                            "phase": "measured",
-                            "iteration": idx + 1,
-                            "message": str(exc),
-                        }
-                    )
-                except Exception as exc:
-                    failures["errors"] += 1
-                    query_failures.append(
-                        {
-                            "type": "error",
-                            "phase": "measured",
-                            "iteration": idx + 1,
-                            "message": str(exc),
-                        }
-                    )
+        stats_ms = summarize_values(measured_samples, include_p99=False)
+        delta_p50_ms = None
+        if stats_ms is not None:
+            delta_p50_ms = stats_ms["p50"] - spec.baseline_response_ms
+            all_samples.extend(measured_samples)
 
-            stats_ms = summarize_values(measured_samples, include_p99=False)
-            delta_p50_ms = None
-            if stats_ms is not None:
-                delta_p50_ms = stats_ms["p50"] - spec.baseline_response_ms
-                all_samples.extend(measured_samples)
-
-            replay_results.append(
-                {
-                    "rank": spec.rank,
-                    "ts": spec.ts,
-                    "query_id": spec.query_id,
-                    "source": spec.source,
-                    "session_hint": spec.session_hint,
-                    "baseline_response_ms": spec.baseline_response_ms,
-                    "query": spec.raw_query,
-                    "arguments": spec.arguments,
-                    "warmup_samples_ms": warmup_samples,
-                    "measured_samples_ms": measured_samples,
-                    "stats_ms": stats_ms,
-                    "delta_p50_ms": delta_p50_ms,
-                    "success_count": len(measured_samples),
-                    "failure_count": len(query_failures),
-                    "failures": query_failures,
-                }
-            )
-    finally:
-        client.close()
+        replay_results.append(
+            {
+                "rank": spec.rank,
+                "ts": spec.ts,
+                "query_id": spec.query_id,
+                "source": spec.source,
+                "session_hint": spec.session_hint,
+                "baseline_response_ms": spec.baseline_response_ms,
+                "query": spec.raw_query,
+                "arguments": spec.arguments,
+                "warmup_samples_ms": warmup_samples,
+                "measured_samples_ms": measured_samples,
+                "stats_ms": stats_ms,
+                "delta_p50_ms": delta_p50_ms,
+                "success_count": len(measured_samples),
+                "failure_count": len(query_failures),
+                "failures": query_failures,
+            }
+        )
 
     print_replay_table(replay_results)
 
