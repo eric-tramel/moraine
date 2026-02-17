@@ -4,7 +4,7 @@
 
 Cortex was built under unusually tight constraints: complete locality, near-real-time ingest visibility, multi-format trace fidelity, and lightweight retrieval for agent workflows. The important point is that these constraints conflict in practice. A design that optimizes one axis naively will usually violate another. This document records the decisions that resolved those conflicts and the conditions under which each decision should be revisited.
 
-These are architecture decisions, not implementation trivia. They explain why current code and schema look the way they do and provide a stable reference when proposing future changes. [src: config/clickhouse.xml:L17, config/ingestor.toml:L11, rust/codex-mcp/src/main.rs:L264]
+These are architecture decisions, not implementation trivia. They explain why current code and schema look the way they do and provide a stable reference when proposing future changes. [src: config/clickhouse.xml:L17, config/cortex.toml:L11, rust/codex-mcp/src/main.rs:L264]
 
 ## ADR-001: Local ClickHouse as the System Database
 
@@ -70,7 +70,7 @@ Revisit trigger: if query latency becomes dominated by SQL overhead despite spar
 
 ## ADR-007: Retrieval Defaults Favor Signal Over Completeness
 
-MCP search defaults intentionally exclude many operational/tool lifecycle events and optionally exclude codex-mcp self-events. This decision optimizes agent answer quality by reducing lexical noise. [src: rust/codex-mcp/src/main.rs:L511, rust/codex-mcp/src/main.rs:L523, config/codex-mcp.toml:L15]
+MCP search defaults intentionally exclude many operational/tool lifecycle events and optionally exclude codex-mcp self-events. This decision optimizes agent answer quality by reducing lexical noise. [src: rust/codex-mcp/src/main.rs:L511, rust/codex-mcp/src/main.rs:L523, config/cortex.toml:L40-L41]
 
 The alternative is maximal recall: include all event classes by default and let downstream agents filter. In practice this pushes noise handling to every client and leads to repeated poor ranking behavior where high-frequency operational tokens dominate.
 

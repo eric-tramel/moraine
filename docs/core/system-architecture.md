@@ -42,7 +42,7 @@ Invariant five is retrieval-service thinness. `codex-mcp` does not own corpus st
 
 ## Failure and Recovery Model
 
-Watcher loss is treated as expected, not exceptional. The reconcile task scans the sessions glob on a fixed interval and enqueues matching files. If filesystem events are dropped, reconcile eventually repairs visibility by re-queueing files and relying on checkpoints to skip already consumed offsets. Recovery latency is bounded by reconcile interval and queue pressure. [src: rust/ingestor/src/ingestor.rs:L284, rust/ingestor/src/ingestor.rs:L296, config/ingestor.toml:L19]
+Watcher loss is treated as expected, not exceptional. The reconcile task scans the sessions glob on a fixed interval and enqueues matching files. If filesystem events are dropped, reconcile eventually repairs visibility by re-queueing files and relying on checkpoints to skip already consumed offsets. Recovery latency is bounded by reconcile interval and queue pressure. [src: rust/ingestor/src/ingestor.rs:L284, rust/ingestor/src/ingestor.rs:L296, config/cortex.toml:L19]
 
 Parse errors are quarantined. A malformed JSON line yields a row in `ingest_errors` with source coordinates and truncated fragment, then ingestion continues with the next line. This keeps corruption blast radius local to one record and preserves forward progress under partially malformed logs. [src: rust/ingestor/src/ingestor.rs:L647, rust/ingestor/src/ingestor.rs:L654, sql/001_schema.sql:L80]
 
@@ -52,11 +52,11 @@ MCP failures are intentionally narrow: inputs are regex-sanitized, SQL literals 
 
 ## Performance Envelope
 
-The ingestion runtime controls throughput through four principal knobs: file-worker concurrency, inflight channel capacity, batch size, and flush interval. The defaults are not arbitrary; they reflect a bias toward sustained throughput with bounded latency (`max_file_workers=8`, `max_inflight_batches=64`, `batch_size=4000`, `flush_interval_seconds=0.5`). This setup performs well under concurrent append streams while keeping write amplification manageable. [src: config/ingestor.toml:L12-13, config/ingestor.toml:L16-17]
+The ingestion runtime controls throughput through four principal knobs: file-worker concurrency, inflight channel capacity, batch size, and flush interval. The defaults are not arbitrary; they reflect a bias toward sustained throughput with bounded latency (`max_file_workers=8`, `max_inflight_batches=64`, `batch_size=4000`, `flush_interval_seconds=0.5`). This setup performs well under concurrent append streams while keeping write amplification manageable. [src: config/cortex.toml:L11-L12, config/cortex.toml:L15-L16]
 
 Backpressure is explicit: bounded processing/sink channels, semaphore-limited workers, and heartbeat queue-depth telemetry that surfaces pressure before visible staleness. [src: rust/ingestor/src/ingestor.rs:L60, rust/ingestor/src/ingestor.rs:L62, rust/ingestor/src/ingestor.rs:L74, rust/ingestor/src/ingestor.rs:L393]
 
-Retrieval runtime cost scales primarily with query term count and posting list fanout, not total corpus size. Query tokenization caps terms (`max_query_terms`) and BM25 SQL applies `term IN [..]`, `matched_terms` thresholds, and result limits, all of which bound compute. The practical implication is that interactive latency remains predictable so long as term selectivity is reasonable and tool-event noise filters remain enabled by default. [src: rust/codex-mcp/src/main.rs:L346, rust/codex-mcp/src/main.rs:L505, rust/codex-mcp/src/main.rs:L564, config/codex-mcp.toml:L25]
+Retrieval runtime cost scales primarily with query term count and posting list fanout, not total corpus size. Query tokenization caps terms (`max_query_terms`) and BM25 SQL applies `term IN [..]`, `matched_terms` thresholds, and result limits, all of which bound compute. The practical implication is that interactive latency remains predictable so long as term selectivity is reasonable and tool-event noise filters remain enabled by default. [src: rust/codex-mcp/src/main.rs:L346, rust/codex-mcp/src/main.rs:L505, rust/codex-mcp/src/main.rs:L564, config/cortex.toml:L50]
 
 ## Design Pressure and Rejected Alternatives
 

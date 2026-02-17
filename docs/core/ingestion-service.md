@@ -2,7 +2,7 @@
 
 ## Runtime Responsibility
 
-`cortex-ingestor` is the sole writer that transforms JSONL lines from configured Codex and Claude trace sources into canonical event rows. It owns file-change detection, append-safe consumption, schema-aware normalization, and batched persistence with checkpoint advancement. Although retrieval runs elsewhere, this service defines the invariants retrieval depends on: stable event identity and source provenance. [src: rust/ingestor/src/main.rs:L7, rust/ingestor/src/ingestor.rs:L45, rust/ingestor/src/normalize.rs:L336, config/ingestor.toml:L21-L33]
+`cortex-ingestor` is the sole writer that transforms JSONL lines from configured Codex and Claude trace sources into canonical event rows. It owns file-change detection, append-safe consumption, schema-aware normalization, and batched persistence with checkpoint advancement. Although retrieval runs elsewhere, this service defines the invariants retrieval depends on: stable event identity and source provenance. [src: rust/ingestor/src/main.rs:L7, rust/ingestor/src/ingestor.rs:L45, rust/ingestor/src/normalize.rs:L336, config/cortex.toml:L21-L33]
 
 The process is started with a multi-thread Tokio runtime and a TOML config. At startup it pings ClickHouse, loads checkpoint state from `ingest_checkpoints`, instantiates channels and concurrency guards, and then starts watcher, debounce, reconcile, worker, sink, and heartbeat loops. The startup sequence intentionally front-loads dependency failure: if ClickHouse is unreachable, ingestion does not enter a partially alive state. [src: rust/ingestor/src/main.rs:L28, rust/ingestor/src/ingestor.rs:L47, rust/ingestor/src/ingestor.rs:L49, rust/ingestor/src/ingestor.rs:L145]
 
@@ -48,9 +48,9 @@ On successful flush, counters and checkpoint cache advance. On failure, buffers 
 
 Backpressure emerges naturally from bounded channels and semaphore limits. If workers produce faster than sink can flush, sink channel saturation slows worker sends. If enqueue rate exceeds worker drain rate, `queue_depth` rises and can be observed in heartbeat rows. This architecture avoids runaway memory on the happy path while providing clear observability when the system nears capacity. [src: rust/ingestor/src/ingestor.rs:L62, rust/ingestor/src/ingestor.rs:L74, rust/ingestor/src/ingestor.rs:L393, rust/ingestor/src/ingestor.rs:L545]
 
-Debounce interval tuning materially changes behavior under churn. Very low debounce values reduce trigger latency but increase duplicate scheduling pressure; higher values coalesce better but delay visibility. The default of 50 ms is a compromise oriented toward fast local append workloads. Reconcile interval similarly trades CPU scan cost for missed-event recovery delay; default is 30 s. [src: config/ingestor.toml:L18-19, rust/ingestor/src/ingestor.rs:L238]
+Debounce interval tuning materially changes behavior under churn. Very low debounce values reduce trigger latency but increase duplicate scheduling pressure; higher values coalesce better but delay visibility. The default of 50 ms is a compromise oriented toward fast local append workloads. Reconcile interval similarly trades CPU scan cost for missed-event recovery delay; default is 30 s. [src: config/cortex.toml:L18-19, rust/ingestor/src/ingestor.rs:L238]
 
-Batch size and flush interval jointly define visibility cadence and insert efficiency. Larger batches and longer flush intervals reduce insert overhead and improve throughput; smaller values improve freshness at higher request rates and write amplification. The sink’s timer-based flush means low-traffic files still become visible promptly without waiting for high batch thresholds. [src: config/ingestor.toml:L12-13, rust/ingestor/src/ingestor.rs:L326, rust/ingestor/src/ingestor.rs:L362]
+Batch size and flush interval jointly define visibility cadence and insert efficiency. Larger batches and longer flush intervals reduce insert overhead and improve throughput; smaller values improve freshness at higher request rates and write amplification. The sink’s timer-based flush means low-traffic files still become visible promptly without waiting for high batch thresholds. [src: config/cortex.toml:L12-13, rust/ingestor/src/ingestor.rs:L326, rust/ingestor/src/ingestor.rs:L362]
 
 ## Failure Modes and Recovery Behavior
 
@@ -64,7 +64,7 @@ During prolonged ClickHouse outages, in-memory buffers can grow because failed f
 
 ## Tuning and Extension Guidance
 
-When tuning throughput, change one parameter class at a time and observe heartbeats and lag indicators. Typical order is: increase `max_file_workers`, then `batch_size`, then adjust `flush_interval_seconds`, then revisit `max_inflight_batches`. Simultaneous broad changes make causal attribution impossible under bursty append traffic. [src: config/ingestor.toml:L12, config/ingestor.toml:L17, sql/003_ingest_heartbeats.sql:L5]
+When tuning throughput, change one parameter class at a time and observe heartbeats and lag indicators. Typical order is: increase `max_file_workers`, then `batch_size`, then adjust `flush_interval_seconds`, then revisit `max_inflight_batches`. Simultaneous broad changes make causal attribution impossible under bursty append traffic. [src: config/cortex.toml:L11-L12, config/cortex.toml:L15-L16, sql/003_ingest_heartbeats.sql:L5]
 
 When adding new event payload shapes, extend `normalize_record` rather than branching downstream SQL to interpret raw payload blobs. Canonical field population is the contract boundary; if it weakens, retrieval and analytics logic accumulate format-specific conditionals and eventually diverge. Every new branch should preserve source coordinates, deterministic UID behavior, and payload JSON preservation semantics. [src: rust/ingestor/src/normalize.rs:L157, rust/ingestor/src/normalize.rs:L177, rust/ingestor/src/normalize.rs:L336]
 

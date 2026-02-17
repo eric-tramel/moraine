@@ -33,12 +33,7 @@ fn default_config_path() -> PathBuf {
         }
     }
 
-    let repo_default = PathBuf::from("config/cortex.toml");
-    if repo_default.exists() {
-        return repo_default;
-    }
-
-    PathBuf::from("config/ingestor.toml")
+    PathBuf::from("config/cortex.toml")
 }
 
 #[tokio::main(flavor = "multi_thread")]
