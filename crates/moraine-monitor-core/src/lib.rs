@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::time::Instant;
@@ -50,6 +50,8 @@ pub async fn run_server(
     port: u16,
     static_dir: PathBuf,
 ) -> Result<()> {
+    validate_static_dir(&static_dir)?;
+
     let clickhouse = ClickHouseClient::new(cfg.clickhouse)?;
 
     let state = AppState {
@@ -84,6 +86,32 @@ pub async fn run_server(
         }
     })?;
     axum::serve(listener, app).await?;
+    Ok(())
+}
+
+fn validate_static_dir(static_dir: &FsPath) -> Result<()> {
+    let metadata = std::fs::metadata(static_dir).map_err(|error| {
+        anyhow!(
+            "monitor static directory `{}` is unavailable: {error}. if running from source, build UI assets with `(cd web/monitor && bun install --frozen-lockfile && bun run build)`; otherwise ensure packaged `web/monitor/dist` assets are installed or pass `--static-dir <path>`",
+            static_dir.display()
+        )
+    })?;
+
+    if !metadata.is_dir() {
+        return Err(anyhow!(
+            "monitor static directory `{}` is not a directory; pass `--static-dir <path>` pointing to a built monitor dist directory",
+            static_dir.display()
+        ));
+    }
+
+    let index_path = static_dir.join("index.html");
+    if !index_path.is_file() {
+        return Err(anyhow!(
+            "monitor static directory `{}` does not contain `index.html`; build monitor assets or pass `--static-dir <path>`",
+            static_dir.display()
+        ));
+    }
+
     Ok(())
 }
 
@@ -1006,6 +1034,20 @@ fn value_to_i64(value: &Value) -> Option<i64> {
 mod tests {
     use super::*;
     use anyhow::anyhow;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(suffix: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "moraine-monitor-core-{suffix}-{}-{stamp}",
+            std::process::id()
+        ))
+    }
 
     #[test]
     fn identifier_safety_helper() {
@@ -1072,5 +1114,47 @@ mod tests {
         assert_eq!(payload["version"], json!("24.8"));
         assert_eq!(payload["ping_ms"], json!(8.25));
         assert_eq!(payload["error"], json!("ping failed"));
+    }
+
+    #[test]
+    fn validate_static_dir_accepts_built_directory() {
+        let root = temp_path("static-valid");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(root.join("index.html"), "<!doctype html>").expect("write index");
+
+        validate_static_dir(&root).expect("valid static dir");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn validate_static_dir_rejects_missing_directory() {
+        let missing = temp_path("static-missing");
+        let err = validate_static_dir(&missing).expect_err("missing static dir should fail");
+        assert!(err.to_string().contains("is unavailable"));
+    }
+
+    #[test]
+    fn validate_static_dir_rejects_non_directory() {
+        let root = temp_path("static-file");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join("dist");
+        fs::write(&path, "not a dir").expect("write file");
+
+        let err = validate_static_dir(&path).expect_err("file should fail");
+        assert!(err.to_string().contains("is not a directory"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn validate_static_dir_requires_index_html() {
+        let root = temp_path("static-no-index");
+        fs::create_dir_all(&root).expect("create root");
+
+        let err = validate_static_dir(&root).expect_err("missing index should fail");
+        assert!(err.to_string().contains("does not contain `index.html`"));
+
+        let _ = fs::remove_dir_all(root);
     }
 }

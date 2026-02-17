@@ -10,6 +10,51 @@ need_cmd() {
   fi
 }
 
+monitor_frontend_needs_build() {
+  local repo_root="$1"
+  local dist_index="$repo_root/web/monitor/dist/index.html"
+  if [[ ! -f "$dist_index" ]]; then
+    return 0
+  fi
+
+  local watch_paths=(
+    "$repo_root/web/monitor/src"
+    "$repo_root/web/monitor/index.html"
+    "$repo_root/web/monitor/package.json"
+    "$repo_root/web/monitor/tsconfig.app.json"
+    "$repo_root/web/monitor/tsconfig.node.json"
+    "$repo_root/web/monitor/vite.config.ts"
+  )
+
+  local path
+  for path in "${watch_paths[@]}"; do
+    if [[ -d "$path" ]]; then
+      if find "$path" -type f -newer "$dist_index" -print -quit | grep -q .; then
+        return 0
+      fi
+    elif [[ -f "$path" && "$path" -nt "$dist_index" ]]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+ensure_monitor_frontend() {
+  local repo_root="$1"
+  local dist_dir="$repo_root/web/monitor/dist"
+  if ! monitor_frontend_needs_build "$repo_root"; then
+    return 0
+  fi
+
+  need_cmd bun
+  (
+    cd "$repo_root/web/monitor"
+    bun install --frozen-lockfile
+    bun run build
+  )
+}
+
 pick_open_port() {
   local python_bin="$1"
   "$python_bin" -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
@@ -258,6 +303,9 @@ EOF
 
   echo "[e2e] installing managed ClickHouse"
   "$moraine_bin" clickhouse install --config "$config_path"
+
+  echo "[e2e] ensuring monitor frontend assets"
+  ensure_monitor_frontend "$repo_root"
 
   echo "[e2e] starting stack"
   "$moraine_bin" up --config "$config_path"

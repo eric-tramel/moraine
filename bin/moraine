@@ -51,6 +51,105 @@ has_flag() {
   return 1
 }
 
+resolve_config_path() {
+  local config_path=""
+  local skip_next=0
+  local arg
+  for arg in "$@"; do
+    if [[ "$skip_next" == "1" ]]; then
+      config_path="$arg"
+      skip_next=0
+      continue
+    fi
+    case "$arg" in
+      --config)
+        skip_next=1
+        ;;
+      --config=*)
+        config_path="${arg#--config=}"
+        ;;
+    esac
+  done
+
+  if [[ -n "$config_path" ]]; then
+    printf '%s\n' "$config_path"
+    return 0
+  fi
+
+  if [[ -n "${MORAINE_CONFIG:-}" ]]; then
+    printf '%s\n' "$MORAINE_CONFIG"
+    return 0
+  fi
+
+  local home_cfg=""
+  if [[ -n "${HOME:-}" ]]; then
+    home_cfg="${HOME}/.moraine/config.toml"
+    if [[ -f "$home_cfg" ]]; then
+      printf '%s\n' "$home_cfg"
+      return 0
+    fi
+  fi
+
+  if [[ -f "$PROJECT_ROOT/config/moraine.toml" ]]; then
+    printf '%s\n' "$PROJECT_ROOT/config/moraine.toml"
+    return 0
+  fi
+
+  if [[ -n "$home_cfg" ]]; then
+    printf '%s\n' "$home_cfg"
+  else
+    printf '%s\n' "$PROJECT_ROOT/config/moraine.toml"
+  fi
+}
+
+monitor_enabled_for_up() {
+  if has_flag "--monitor" "$@"; then
+    return 0
+  fi
+
+  local cfg_path
+  cfg_path="$(resolve_config_path "$@")"
+  if [[ ! -f "$cfg_path" ]]; then
+    # Runtime default in moraine-config is start_monitor_on_up=true.
+    return 0
+  fi
+
+  local value=""
+  value="$(
+    awk '
+      BEGIN { in_runtime = 0 }
+      /^[[:space:]]*\[/ {
+        in_runtime = ($0 ~ /^[[:space:]]*\[runtime\][[:space:]]*$/)
+        next
+      }
+      in_runtime && /^[[:space:]]*start_monitor_on_up[[:space:]]*=/ {
+        line = $0
+        sub(/^[^=]*=[[:space:]]*/, "", line)
+        sub(/[[:space:]]*(#.*)?$/, "", line)
+        gsub(/"/, "", line)
+        print tolower(line)
+        exit
+      }
+    ' "$cfg_path"
+  )"
+
+  if [[ -z "$value" ]]; then
+    return 0
+  fi
+
+  case "$value" in
+    1|true|yes|on)
+      return 0
+      ;;
+    0|false|no|off)
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
 ensure_monitor_frontend() {
   local dist_dir="$PROJECT_ROOT/web/monitor/dist"
   if ! monitor_frontend_needs_build; then
@@ -144,6 +243,12 @@ fi
 export MORAINE_SOURCE_TREE_MODE
 
 command_name="$(first_non_flag_arg "$@" || true)"
+if [[ "$command_name" == "up" ]]; then
+  if monitor_enabled_for_up "$@"; then
+    ensure_monitor_frontend
+  fi
+fi
+
 if [[ "$command_name" == "run" ]]; then
   service_name="$(run_service_arg "$@" || true)"
   case "$service_name" in
