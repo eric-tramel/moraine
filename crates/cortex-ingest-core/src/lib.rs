@@ -54,6 +54,8 @@ pub(crate) struct Metrics {
     pub(crate) event_rows_written: AtomicU64,
     pub(crate) err_rows_written: AtomicU64,
     pub(crate) last_flush_ms: AtomicU64,
+    pub(crate) append_to_visible_p50_ms: AtomicU64,
+    pub(crate) append_to_visible_p95_ms: AtomicU64,
     pub(crate) flush_failures: AtomicU64,
     pub(crate) queue_depth: AtomicU64,
     pub(crate) watcher_registrations: AtomicU64,
