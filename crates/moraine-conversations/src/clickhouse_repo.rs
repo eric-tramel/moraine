@@ -39,7 +39,6 @@ const TERM_DF_CACHE_TTL: Duration = Duration::from_secs(300);
 const SEARCH_SCHEMA_CACHE_TTL: Duration = Duration::from_secs(60);
 const SEARCH_RESULT_CACHE_TTL: Duration = Duration::from_secs(15);
 const SEARCH_RESULT_CACHE_MAX_ENTRIES: usize = 256;
-const SEARCH_INDEX_WATERMARK_CACHE_TTL: Duration = Duration::from_millis(250);
 const TERM_POSTINGS_CACHE_TTL: Duration = Duration::from_secs(15);
 const TERM_POSTINGS_CACHE_MAX_ENTRIES: usize = 2048;
 const TERM_POSTINGS_CACHE_MAX_ROWS_PER_TERM: usize = 131_072;
@@ -128,7 +127,8 @@ struct SearchRow {
 #[derive(Debug, Clone, Deserialize)]
 struct CachedPostingRow {
     event_uid: String,
-    tf_norm: f64,
+    doc_len: u32,
+    tf: u16,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -169,6 +169,11 @@ struct DfRow {
 }
 
 #[derive(Debug, Deserialize)]
+struct HotQueryRow {
+    raw_query: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ConversationSearchRow {
     session_id: String,
     score: f64,
@@ -181,37 +186,6 @@ struct ConversationSearchRow {
 #[derive(Debug, Deserialize)]
 struct ColumnExistsRow {
     exists: u8,
-}
-
-#[derive(Debug, Deserialize)]
-struct SearchIndexWatermarkRow {
-    docs_max_block: u64,
-    posts_max_block: u64,
-    docs_rows: u64,
-    posts_rows: u64,
-}
-
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
-struct SearchIndexWatermark {
-    docs_max_block: u64,
-    posts_max_block: u64,
-    docs_rows: u64,
-    posts_rows: u64,
-}
-
-impl SearchIndexWatermark {
-    fn from_rows(rows: &[SearchIndexWatermarkRow]) -> Self {
-        if let Some(row) = rows.first() {
-            Self {
-                docs_max_block: row.docs_max_block,
-                posts_max_block: row.posts_max_block,
-                docs_rows: row.docs_rows,
-                posts_rows: row.posts_rows,
-            }
-        } else {
-            Self::default()
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -232,7 +206,6 @@ struct SearchStatsCache {
     corpus_stats: Option<CorpusStatsCacheEntry>,
     term_df_by_term: HashMap<String, TermDfCacheEntry>,
     has_codex_flag_column: Option<(bool, Instant)>,
-    search_index_watermark: Option<(SearchIndexWatermark, Instant)>,
 }
 
 #[derive(Debug, Clone)]
@@ -243,15 +216,12 @@ struct SearchEventsCacheEntry {
 
 #[derive(Debug, Clone)]
 struct TermPostingsCacheEntry {
-    watermark: SearchIndexWatermark,
-    avgdl_bits: u64,
     rows: Arc<[CachedPostingRow]>,
     fetched_at: Instant,
 }
 
 #[derive(Debug, Clone)]
 struct SearchDocExtraCacheEntry {
-    watermark: SearchIndexWatermark,
     session_id: String,
     source_name: String,
     provider: String,
@@ -290,6 +260,52 @@ impl ClickHouseConversationRepository {
         &self.cfg
     }
 
+    pub async fn prewarm_mcp_search_state(&self) -> RepoResult<()> {
+        const PREWARM_QUERY_LIMIT: u16 = 10;
+        const PREWARM_HOT_QUERY_COUNT: usize = 6;
+        const PREWARM_FALLBACK_QUERIES: [&str; 5] = [
+            "the",
+            "error",
+            "test",
+            "file directory path config",
+            "function code implementation",
+        ];
+
+        let mut queries = self
+            .load_hot_queries_for_prewarm(PREWARM_HOT_QUERY_COUNT)
+            .await?;
+        for fallback in PREWARM_FALLBACK_QUERIES {
+            if !queries.iter().any(|existing| existing == fallback) {
+                queries.push(fallback.to_string());
+            }
+        }
+
+        for query in queries {
+            if query.trim().is_empty() {
+                continue;
+            }
+            if let Err(err) = self
+                .search_events(SearchEventsQuery {
+                    query,
+                    source: Some(BENCHMARK_REPLAY_SOURCE.to_string()),
+                    limit: Some(PREWARM_QUERY_LIMIT),
+                    session_id: None,
+                    min_score: None,
+                    min_should_match: None,
+                    include_tool_events: None,
+                    exclude_codex_mcp: None,
+                    disable_cache: Some(false),
+                    search_strategy: Some(SearchEventsStrategy::Optimized),
+                })
+                .await
+            {
+                warn!("mcp prewarm query failed: {}", err);
+            }
+        }
+
+        Ok(())
+    }
+
     fn table_ref(&self, table: &str) -> String {
         format!(
             "{}.{}",
@@ -304,9 +320,6 @@ impl ClickHouseConversationRepository {
 
     fn search_events_cache_key(
         terms: &[String],
-        docs: u64,
-        total_doc_len: u64,
-        index_watermark: SearchIndexWatermark,
         search_strategy: SearchEventsStrategy,
         include_tool_events: bool,
         exclude_codex_mcp: bool,
@@ -318,11 +331,7 @@ impl ClickHouseConversationRepository {
         let mut cache_terms = terms.to_vec();
         cache_terms.sort_unstable();
         format!(
-            "docs={docs};total_doc_len={total_doc_len};idx_wm={}:{}:{}:{};strategy={};incl_tools={include_tool_events};excl_codex={exclude_codex_mcp};session={};msm={min_should_match};min_score={min_score:.12};limit={limit};terms={}",
-            index_watermark.docs_max_block,
-            index_watermark.posts_max_block,
-            index_watermark.docs_rows,
-            index_watermark.posts_rows,
+            "strategy={};incl_tools={include_tool_events};excl_codex={exclude_codex_mcp};session={};msm={min_should_match};min_score={min_score:.12};limit={limit};terms={}",
             search_strategy.as_str(),
             session_id.unwrap_or(""),
             cache_terms.join(",")
@@ -649,6 +658,30 @@ FORMAT JSONEachRow",
         }
     }
 
+    async fn load_hot_queries_for_prewarm(&self, limit: usize) -> RepoResult<Vec<String>> {
+        let query = format!(
+            "SELECT raw_query
+FROM (
+  SELECT
+    raw_query,
+    count() AS query_count,
+    avg(response_ms) AS avg_response_ms
+  FROM {}
+  WHERE source = 'moraine-mcp'
+    AND ts >= now() - INTERVAL 7 DAY
+    AND lengthUTF8(trim(BOTH ' ' FROM raw_query)) > 0
+  GROUP BY raw_query
+  ORDER BY query_count DESC, avg_response_ms DESC
+  LIMIT {}
+)
+FORMAT JSONEachRow",
+            self.table_ref("search_query_log"),
+            limit
+        );
+        let rows: Vec<HotQueryRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
+        Ok(rows.into_iter().map(|row| row.raw_query).collect())
+    }
+
     async fn df_map(&self, terms: &[String]) -> RepoResult<HashMap<String, u64>> {
         let now = Instant::now();
         let postings_table = self.table_ref("search_postings");
@@ -949,42 +982,6 @@ FORMAT JSONEachRow",
         Ok(exists)
     }
 
-    async fn fetch_search_index_watermark(&self) -> RepoResult<SearchIndexWatermark> {
-        let query = format!(
-            "SELECT
-  toUInt64(ifNull(maxIf(max_block_number, table = 'search_documents'), 0)) AS docs_max_block,
-  toUInt64(ifNull(maxIf(max_block_number, table = 'search_postings'), 0)) AS posts_max_block,
-  toUInt64(ifNull(sumIf(rows, table = 'search_documents'), 0)) AS docs_rows,
-  toUInt64(ifNull(sumIf(rows, table = 'search_postings'), 0)) AS posts_rows
-FROM system.parts
-WHERE database = {}
-  AND table IN ('search_documents', 'search_postings')
-  AND active
-FORMAT JSONEachRow",
-            sql_quote(&self.ch.config().database)
-        );
-        let rows: Vec<SearchIndexWatermarkRow> =
-            self.map_backend(self.ch.query_rows(&query, Some("system")).await)?;
-        Ok(SearchIndexWatermark::from_rows(&rows))
-    }
-
-    async fn search_index_watermark(&self) -> RepoResult<SearchIndexWatermark> {
-        let now = Instant::now();
-        {
-            let cache = self.stats_cache.read().await;
-            if let Some((value, fetched_at)) = &cache.search_index_watermark {
-                if now.duration_since(*fetched_at) <= SEARCH_INDEX_WATERMARK_CACHE_TTL {
-                    return Ok(*value);
-                }
-            }
-        }
-
-        let watermark = self.fetch_search_index_watermark().await?;
-        let mut cache = self.stats_cache.write().await;
-        cache.search_index_watermark = Some((watermark, now));
-        Ok(watermark)
-    }
-
     fn passes_search_doc_filters(
         row: &SearchDocExtraCacheEntry,
         include_tool_events: bool,
@@ -1053,11 +1050,8 @@ FORMAT JSONEachRow",
     async fn load_term_postings_for_terms(
         &self,
         terms: &[String],
-        watermark: SearchIndexWatermark,
-        avgdl: f64,
     ) -> RepoResult<HashMap<String, Arc<[CachedPostingRow]>>> {
         let now = Instant::now();
-        let avgdl_bits = avgdl.to_bits();
         let mut by_term = HashMap::<String, Arc<[CachedPostingRow]>>::new();
         let mut missing_terms = Vec::<String>::new();
 
@@ -1065,10 +1059,7 @@ FORMAT JSONEachRow",
             let cache = self.term_postings_cache.read().await;
             for term in terms {
                 if let Some(entry) = cache.get(term) {
-                    if entry.watermark == watermark
-                        && entry.avgdl_bits == avgdl_bits
-                        && now.duration_since(entry.fetched_at) <= TERM_POSTINGS_CACHE_TTL
-                    {
+                    if now.duration_since(entry.fetched_at) <= TERM_POSTINGS_CACHE_TTL {
                         by_term.insert(term.clone(), Arc::clone(&entry.rows));
                         continue;
                     }
@@ -1093,14 +1084,12 @@ FORMAT JSONEachRow",
 
             let fetched_rows: Vec<FetchedPostingRow> =
                 self.map_backend(self.ch.query_rows(&query, None).await)?;
-            let k1 = self.cfg.bm25_k1.max(0.01);
-            let b = self.cfg.bm25_b.clamp(0.0, 1.0);
             let mut grouped = HashMap::<String, Vec<CachedPostingRow>>::new();
             for row in fetched_rows {
-                let tf_norm = Self::bm25_term_score(row.tf, row.doc_len, avgdl, k1, b);
                 grouped.entry(row.term).or_default().push(CachedPostingRow {
                     event_uid: row.event_uid,
-                    tf_norm,
+                    doc_len: row.doc_len,
+                    tf: row.tf,
                 });
             }
 
@@ -1114,8 +1103,6 @@ FORMAT JSONEachRow",
                     cache.insert(
                         term,
                         TermPostingsCacheEntry {
-                            watermark,
-                            avgdl_bits,
                             rows,
                             fetched_at: now,
                         },
@@ -1152,7 +1139,6 @@ FORMAT JSONEachRow",
     async fn load_search_doc_extras(
         &self,
         event_uids: &[String],
-        watermark: SearchIndexWatermark,
         use_document_codex_flag: bool,
     ) -> RepoResult<HashMap<String, SearchDocExtraCacheEntry>> {
         let now = Instant::now();
@@ -1163,9 +1149,7 @@ FORMAT JSONEachRow",
             let cache = self.search_doc_extra_cache.read().await;
             for uid in event_uids {
                 if let Some(entry) = cache.get(uid) {
-                    if entry.watermark == watermark
-                        && now.duration_since(entry.fetched_at) <= SEARCH_DOC_EXTRA_CACHE_TTL
-                    {
+                    if now.duration_since(entry.fetched_at) <= SEARCH_DOC_EXTRA_CACHE_TTL {
                         by_uid.insert(uid.clone(), entry.clone());
                         continue;
                     }
@@ -1184,7 +1168,6 @@ FORMAT JSONEachRow",
 
             for row in fetched_rows {
                 let entry = SearchDocExtraCacheEntry {
-                    watermark,
                     session_id: row.session_id,
                     source_name: row.source_name,
                     provider: row.provider,
@@ -1371,12 +1354,11 @@ FORMAT JSONEachRow",
             matched_terms: u64,
         }
 
-        let watermark = self.search_index_watermark().await?;
-        let postings_by_term = self
-            .load_term_postings_for_terms(terms, watermark, avgdl)
-            .await?;
+        let postings_by_term = self.load_term_postings_for_terms(terms).await?;
         let use_document_codex_flag = self.search_documents_has_codex_flag().await?;
         let df_map = self.df_map(terms).await?;
+        let k1 = self.cfg.bm25_k1.max(0.01);
+        let b = self.cfg.bm25_b.clamp(0.0, 1.0);
         let mut idf_by_term = HashMap::<&str, f64>::new();
         for term in terms {
             let df = *df_map.get(term).unwrap_or(&0);
@@ -1403,7 +1385,7 @@ FORMAT JSONEachRow",
                             matched_mask: 0,
                         });
 
-                    entry.score += idf * row.tf_norm;
+                    entry.score += idf * Self::bm25_term_score(row.tf, row.doc_len, avgdl, k1, b);
                     entry.matched_mask |= 1u64 << idx;
                 }
             }
@@ -1451,7 +1433,7 @@ FORMAT JSONEachRow",
                 .map(|row| row.row.event_uid.clone())
                 .collect();
             let doc_extras = self
-                .load_search_doc_extras(&event_uids, watermark, use_document_codex_flag)
+                .load_search_doc_extras(&event_uids, use_document_codex_flag)
                 .await?;
 
             for row in &fast_candidates[offset..end] {
@@ -2223,12 +2205,8 @@ FORMAT JSONEachRow",
                 .await?;
             rows_to_hits(rows)
         } else {
-            let index_watermark = self.search_index_watermark().await?;
             let cache_key = Self::search_events_cache_key(
                 &terms,
-                docs,
-                total_doc_len,
-                index_watermark,
                 effective_strategy,
                 include_tool_events,
                 exclude_codex_mcp,
@@ -2494,7 +2472,6 @@ mod tests {
 
     fn sample_search_doc() -> SearchDocExtraCacheEntry {
         SearchDocExtraCacheEntry {
-            watermark: SearchIndexWatermark::default(),
             session_id: "session-1".to_string(),
             source_name: "source".to_string(),
             provider: "provider".to_string(),

@@ -7,7 +7,10 @@ use moraine_conversations::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, warn};
 
@@ -206,6 +209,7 @@ struct ConversationSearchProseHit {
 struct AppState {
     cfg: AppConfig,
     repo: ClickHouseConversationRepository,
+    prewarm_started: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -214,6 +218,21 @@ impl AppState {
 
         match req.method.as_str() {
             "initialize" => {
+                if self
+                    .prewarm_started
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    let repo = self.repo.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) = repo.prewarm_mcp_search_state().await {
+                            warn!("mcp prewarm failed: {}", err);
+                        } else {
+                            debug!("mcp prewarm completed");
+                        }
+                    });
+                }
+
                 let result = json!({
                     "protocolVersion": self.cfg.mcp.protocol_version,
                     "capabilities": {
@@ -691,7 +710,11 @@ pub async fn run_stdio(cfg: AppConfig) -> Result<()> {
     };
 
     let repo = ClickHouseConversationRepository::new(ch, repo_cfg);
-    let state = Arc::new(AppState { cfg, repo });
+    let state = Arc::new(AppState {
+        cfg,
+        repo,
+        prewarm_started: Arc::new(AtomicBool::new(false)),
+    });
 
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
