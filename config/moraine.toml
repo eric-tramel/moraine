@@ -39,7 +39,7 @@ default_context_before = 3
 default_context_after = 3
 default_include_tool_events = false
 default_exclude_codex_mcp = true
-async_log_writes = false
+async_log_writes = true
 protocol_version = "2024-11-05"
 
 [bm25]

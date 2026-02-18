@@ -330,7 +330,7 @@ impl Default for RepoConfig {
             default_context_after: 6,
             default_include_tool_events: false,
             default_exclude_codex_mcp: true,
-            async_log_writes: false,
+            async_log_writes: true,
             bm25_k1: 1.2,
             bm25_b: 0.75,
             bm25_default_min_score: 0.0,

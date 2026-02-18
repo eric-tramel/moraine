@@ -190,7 +190,7 @@ impl Default for McpConfig {
             default_context_after: default_context_after(),
             default_include_tool_events: false,
             default_exclude_codex_mcp: true,
-            async_log_writes: false,
+            async_log_writes: true,
             protocol_version: default_protocol_version(),
         }
     }
