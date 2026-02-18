@@ -32,8 +32,18 @@ fn test_clickhouse_config(url: String) -> ClickHouseConfig {
     }
 }
 
-fn json_data(rows: serde_json::Value) -> String {
-    json!({ "data": rows }).to_string()
+fn json_each_row(rows: serde_json::Value) -> String {
+    match rows {
+        serde_json::Value::Array(items) => {
+            let mut out = String::new();
+            for item in items {
+                out.push_str(&item.to_string());
+                out.push('\n');
+            }
+            out
+        }
+        value => format!("{value}\n"),
+    }
 }
 
 async fn spawn_mock_server() -> (String, Arc<MockState>) {
@@ -60,7 +70,7 @@ async fn spawn_mock_server() -> (String, Arc<MockState>) {
             if query.contains("s.session_id < 'sess_b'") {
                 return (
                     StatusCode::OK,
-                    json_data(json!([
+                    json_each_row(json!([
                         {
                             "session_id": "sess_a",
                             "first_event_time": "2026-01-01 10:00:00",
@@ -81,7 +91,7 @@ async fn spawn_mock_server() -> (String, Arc<MockState>) {
 
             return (
                 StatusCode::OK,
-                json_data(json!([
+                json_each_row(json!([
                     {
                         "session_id": "sess_c",
                         "first_event_time": "2026-01-03 10:00:00",
@@ -131,7 +141,7 @@ async fn spawn_mock_server() -> (String, Arc<MockState>) {
         if query.contains("FROM `moraine`.`search_corpus_stats`") {
             return (
                 StatusCode::OK,
-                json_data(json!([
+                json_each_row(json!([
                     {
                         "docs": 100_u64,
                         "total_doc_len": 5000_u64
@@ -143,7 +153,7 @@ async fn spawn_mock_server() -> (String, Arc<MockState>) {
         if query.contains("FROM `moraine`.`search_term_stats`") {
             return (
                 StatusCode::OK,
-                json_data(json!([
+                json_each_row(json!([
                     { "term": "hello", "df": 20_u64 },
                     { "term": "world", "df": 10_u64 }
                 ])),
@@ -153,7 +163,7 @@ async fn spawn_mock_server() -> (String, Arc<MockState>) {
         if query.contains("GROUP BY e.session_id") {
             return (
                 StatusCode::OK,
-                json_data(json!([
+                json_each_row(json!([
                     {
                         "session_id": "sess_c",
                         "score": 12.5,
@@ -174,7 +184,7 @@ async fn spawn_mock_server() -> (String, Arc<MockState>) {
             );
         }
 
-        (StatusCode::OK, json_data(json!([])))
+        (StatusCode::OK, json_each_row(json!([])))
     }
 
     let state = Arc::new(MockState::default());

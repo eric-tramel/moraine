@@ -188,6 +188,27 @@ pub struct SearchEventsQuery {
     pub include_tool_events: Option<bool>,
     #[serde(default)]
     pub exclude_codex_mcp: Option<bool>,
+    #[serde(default)]
+    pub disable_cache: Option<bool>,
+    #[serde(default)]
+    pub search_strategy: Option<SearchEventsStrategy>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchEventsStrategy {
+    #[default]
+    Optimized,
+    OracleExact,
+}
+
+impl SearchEventsStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Optimized => "optimized",
+            Self::OracleExact => "oracle_exact",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

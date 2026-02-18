@@ -5,6 +5,7 @@ edition = "2021"
 description = "High-level read/query APIs for Moraine conversations"
 
 [dependencies]
+ahash = "0.8"
 anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"

@@ -3,6 +3,19 @@
 version = 4
 
 [[package]]
+name = "ahash"
+version = "0.8.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
+dependencies = [
+ "cfg-if",
+ "getrandom 0.3.4",
+ "once_cell",
+ "version_check",
+ "zerocopy",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -85,56 +98,6 @@ name = "cfg_aliases"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
-
-[[package]]
-name = "moraine-clickhouse"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "moraine-config",
- "reqwest",
- "serde",
- "serde_json",
- "url",
-]
-
-[[package]]
-name = "moraine-config"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "serde",
- "toml",
-]
-
-[[package]]
-name = "moraine-conversations"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64",
- "moraine-clickhouse",
- "regex",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "moraine-conversations-py"
-version = "0.1.0"
-dependencies = [
- "moraine-clickhouse",
- "moraine-config",
- "moraine-conversations",
- "pyo3",
- "serde_json",
- "tokio",
-]
 
 [[package]]
 name = "displaydoc"
@@ -583,6 +546,57 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "moraine-clickhouse"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "moraine-config",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "url",
+]
+
+[[package]]
+name = "moraine-config"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "serde",
+ "toml",
+]
+
+[[package]]
+name = "moraine-conversations"
+version = "0.1.1"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "moraine-clickhouse",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "moraine-conversations-py"
+version = "0.1.0"
+dependencies = [
+ "moraine-clickhouse",
+ "moraine-config",
+ "moraine-conversations",
+ "pyo3",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1339,6 +1353,12 @@ dependencies = [
  "js-sys",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "version_check"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "want"

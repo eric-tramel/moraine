@@ -3,6 +3,8 @@ import multiprocessing as mp
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+import pytest
+
 from moraine_conversations import ConversationClient
 
 
@@ -207,10 +209,14 @@ def test_conversation_client_smoke() -> None:
                 min_should_match=1,
                 include_tool_events=True,
                 exclude_codex_mcp=False,
+                search_strategy="optimized",
             )
         )
         assert len(event_search["hits"]) == 2
         assert event_search["hits"][0]["event_uid"] == "evt-c-42"
+
+        with pytest.raises(ValueError):
+            client.search_events_json(query="hello world", search_strategy="not_a_strategy")
     finally:
         proc.terminate()
         proc.join(timeout=5)

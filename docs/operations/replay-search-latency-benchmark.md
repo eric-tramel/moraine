@@ -14,6 +14,7 @@ The script:
 - replays each query through `moraine_conversations.ConversationClient.search_events_json` with `source='benchmark-replay'`,
 - runs warmup and measured repeats per query,
 - reports per-query and aggregate latency stats,
+- compares optimized replay results against an `oracle_exact` SQL strategy to detect ranking regressions,
 - records timeout/error counts,
 - optionally writes a JSON artifact.
 
@@ -49,6 +50,14 @@ uv run --script scripts/bench/replay_search_latency.py \
   --dry-run
 ```
 
+Run latency-only replay without oracle quality gates:
+
+```bash
+uv run --script scripts/bench/replay_search_latency.py \
+  --config config/moraine.toml \
+  --no-oracle-quality-check
+```
+
 ## CLI Flags
 
 - `--config <path>`: Moraine config file used for ClickHouse connectivity.
@@ -59,6 +68,16 @@ uv run --script scripts/bench/replay_search_latency.py \
 - `--timeout-seconds <int>`: timeout for each replayed search request.
 - `--skip-maturin-develop`: skip local binding rebuild before replay.
 - `--include-benchmark-replays`: include `source='benchmark-replay'` rows in selection.
+- `--query-variant-mode <none|subset_scramble>`: query variant expansion mode before replay.
+- `--max-query-terms <int>`: max normalized terms used for variant generation.
+- `--use-search-cache`: allow `moraine-conversations` search result cache during replay (default no-cache).
+- `--parse-json-response`: parse replay response JSON in the benchmark process during measured runs.
+- `--oracle-quality-check` / `--no-oracle-quality-check`: enable or disable oracle quality validation (default enabled).
+- `--oracle-k <int>`: top-K for oracle quality metrics; `0` uses each query's replay `limit`.
+- `--oracle-recall-at-k-threshold <0..1>`: Recall@K quality gate (default `1.0`).
+- `--oracle-ndcg-at-k-threshold <0..1>`: NDCG@K quality gate (default `0.99`).
+- `--oracle-min-stability-recall <0..1>`: minimum oracle-vs-oracle Recall@K stability for strict gating (default `0.95`).
+- `--oracle-min-stability-ndcg <0..1>`: minimum oracle-vs-oracle NDCG@K stability for strict gating (default `0.98`).
 - `--output-json <path>`: write machine-readable benchmark output.
 - `--print-sql`: print generated ClickHouse selection SQL.
 - `--dry-run`: select and validate rows, but skip replay.
@@ -78,6 +97,8 @@ Console output includes:
 - selection metadata and selected time range,
 - per-query table with baseline vs replay (`p50`, `p95`, `min`, `max`, `delta_p50`),
 - aggregate summary (`min`, `p50`, `p95`, `p99`, `max`, `avg`),
+- oracle quality summary (Recall@K, NDCG@K, pass/regression/error counts),
+- oracle stability summary (`unstable_case_count`) to isolate high-ingest drift windows,
 - timeout/error totals.
 
 JSON output includes:
@@ -86,12 +107,13 @@ JSON output includes:
 - `selected_queries` (baseline rows + replay eligibility),
 - `replay_results` (samples, per-query stats, failures),
 - `aggregate` (overall stats + counts),
+- `aggregate.quality` (oracle thresholds and quality summary stats),
 - `failures` (timeout/error totals).
 
 Exit code behavior:
 
 - `0`: all replay attempts succeeded.
-- non-zero: fatal setup error, empty selection window, or replay timeout/error failures.
+- non-zero: fatal setup error, empty selection window, replay timeout/error failures, or oracle quality regressions/errors.
 
 ## Troubleshooting
 
@@ -107,6 +129,10 @@ Exit code behavior:
   - raise `--timeout-seconds`,
   - reduce `--top-n`/`--repeats` for quicker local checks,
   - inspect ClickHouse logs for transient slowness.
+- Oracle quality regressions:
+  - inspect per-query `oracle_quality` output for missing/unexpected top-K event IDs,
+  - verify whether the rank divergence is expected for intentional retrieval changes,
+  - only relax quality thresholds after explicit search-quality validation.
 - Invalid selected rows:
   - run `--dry-run` to inspect skip reasons,
   - confirm telemetry fields (`result_limit`, `min_should_match`, flags) are valid.

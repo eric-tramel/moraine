@@ -183,6 +183,10 @@ impl ClickHouseClient {
         query: &str,
         database: Option<&str>,
     ) -> Result<Vec<T>> {
+        if has_explicit_json_each_row_format(query) {
+            return self.query_json_each_row(query, database).await;
+        }
+
         match self.query_json_data(query, database).await {
             Ok(rows) => Ok(rows),
             Err(_) => self.query_json_each_row(query, database).await,
@@ -478,6 +482,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             name: "008_categorical_domain_contracts.sql",
             sql: include_str!("../../../sql/008_categorical_domain_contracts.sql"),
         },
+        Migration {
+            version: "009",
+            name: "009_search_documents_codex_flag.sql",
+            sql: include_str!("../../../sql/009_search_documents_codex_flag.sql"),
+        },
     ]
 }
 
@@ -579,6 +588,15 @@ fn escape_identifier(identifier: &str) -> String {
 
 fn escape_literal(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+fn has_explicit_json_each_row_format(query: &str) -> bool {
+    let compact = query
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    compact.contains(" format jsoneachrow")
 }
 
 #[cfg(test)]
@@ -716,6 +734,18 @@ mod tests {
     fn identifier_validation_rejects_invalid() {
         assert!(validate_identifier("moraine_01").is_ok());
         assert!(validate_identifier("moraine-db").is_err());
+    }
+
+    #[test]
+    fn format_detection_handles_case_and_whitespace() {
+        assert!(has_explicit_json_each_row_format(
+            "SELECT 1\nFORMAT JSONEachRow"
+        ));
+        assert!(has_explicit_json_each_row_format(
+            "SELECT 1 format jsoneachrow"
+        ));
+        assert!(!has_explicit_json_each_row_format("SELECT 1"));
+        assert!(!has_explicit_json_each_row_format("SELECT 1 FORMAT JSON"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
