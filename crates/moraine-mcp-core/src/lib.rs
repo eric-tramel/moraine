@@ -223,6 +223,12 @@ impl AppState {
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
                 {
+                    if let Err(err) = self.repo.prewarm_mcp_search_state_quick().await {
+                        warn!("mcp quick prewarm failed: {}", err);
+                    } else {
+                        debug!("mcp quick prewarm completed");
+                    }
+
                     let repo = self.repo.clone();
                     tokio::spawn(async move {
                         if let Err(err) = repo.prewarm_mcp_search_state().await {
@@ -692,7 +698,6 @@ fn compact_text_line(text: &str, max_chars: usize) -> String {
 
 pub async fn run_stdio(cfg: AppConfig) -> Result<()> {
     let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
-    ch.ping().await.context("clickhouse ping failed")?;
 
     let repo_cfg = RepoConfig {
         max_results: cfg.mcp.max_results,

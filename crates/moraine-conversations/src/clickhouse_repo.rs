@@ -260,6 +260,64 @@ impl ClickHouseConversationRepository {
         &self.cfg
     }
 
+    async fn run_mcp_search_prewarm_queries(
+        &self,
+        queries: impl IntoIterator<Item = String>,
+        limit: u16,
+    ) {
+        for query in queries {
+            if query.trim().is_empty() {
+                continue;
+            }
+            if let Err(err) = self
+                .search_events(SearchEventsQuery {
+                    query,
+                    source: Some(BENCHMARK_REPLAY_SOURCE.to_string()),
+                    limit: Some(limit),
+                    session_id: None,
+                    min_score: None,
+                    min_should_match: None,
+                    include_tool_events: None,
+                    exclude_codex_mcp: None,
+                    disable_cache: Some(false),
+                    search_strategy: Some(SearchEventsStrategy::Optimized),
+                })
+                .await
+            {
+                warn!("mcp prewarm query failed: {}", err);
+            }
+        }
+    }
+
+    pub async fn prewarm_mcp_search_state_quick(&self) -> RepoResult<()> {
+        // Keep synchronous initialize prewarm deterministic and bounded.
+        // Variable hot-query prewarm stays in the async background path.
+        const PREWARM_QUERY: &str = "the";
+        const PREWARM_LIMITS: [u16; 2] = [1, 25];
+
+        for limit in PREWARM_LIMITS {
+            if let Err(err) = self
+                .search_events(SearchEventsQuery {
+                    query: PREWARM_QUERY.to_string(),
+                    source: Some(BENCHMARK_REPLAY_SOURCE.to_string()),
+                    limit: Some(limit),
+                    session_id: None,
+                    min_score: None,
+                    min_should_match: None,
+                    include_tool_events: None,
+                    exclude_codex_mcp: None,
+                    disable_cache: Some(false),
+                    search_strategy: Some(SearchEventsStrategy::Optimized),
+                })
+                .await
+            {
+                warn!("mcp quick prewarm query failed: {}", err);
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn prewarm_mcp_search_state(&self) -> RepoResult<()> {
         const PREWARM_QUERY_LIMIT: u16 = 10;
         const PREWARM_HOT_QUERY_COUNT: usize = 6;
@@ -280,28 +338,8 @@ impl ClickHouseConversationRepository {
             }
         }
 
-        for query in queries {
-            if query.trim().is_empty() {
-                continue;
-            }
-            if let Err(err) = self
-                .search_events(SearchEventsQuery {
-                    query,
-                    source: Some(BENCHMARK_REPLAY_SOURCE.to_string()),
-                    limit: Some(PREWARM_QUERY_LIMIT),
-                    session_id: None,
-                    min_score: None,
-                    min_should_match: None,
-                    include_tool_events: None,
-                    exclude_codex_mcp: None,
-                    disable_cache: Some(false),
-                    search_strategy: Some(SearchEventsStrategy::Optimized),
-                })
-                .await
-            {
-                warn!("mcp prewarm query failed: {}", err);
-            }
-        }
+        self.run_mcp_search_prewarm_queries(queries, PREWARM_QUERY_LIMIT)
+            .await;
 
         Ok(())
     }
