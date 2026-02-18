@@ -199,6 +199,14 @@ def parse_args() -> argparse.Namespace:
         help="Allow moraine-conversations search result cache during replay (default: disabled)",
     )
     parser.add_argument(
+        "--request-source",
+        default=BENCHMARK_REPLAY_SOURCE,
+        help=(
+            "Source value sent to search_events_json. "
+            f"Default is '{BENCHMARK_REPLAY_SOURCE}' to avoid replay logging feedback."
+        ),
+    )
+    parser.add_argument(
         "--parse-json-response",
         action="store_true",
         help=(
@@ -1078,6 +1086,7 @@ class PackageSearchClient:
         timeout_seconds: int,
         disable_cache: bool,
         parse_json_response: bool,
+        request_source: str,
     ) -> None:
         self.client = conversation_client_cls(
             url=clickhouse.url,
@@ -1089,6 +1098,7 @@ class PackageSearchClient:
         )
         self.disable_cache = disable_cache
         self.parse_json_response = parse_json_response
+        self.request_source = request_source
 
     def search_payload(
         self,
@@ -1109,7 +1119,7 @@ class PackageSearchClient:
             include_tool_events=bool(arguments["include_tool_events"]),
             exclude_codex_mcp=bool(arguments["exclude_codex_mcp"]),
             disable_cache=disable_cache,
-            source=BENCHMARK_REPLAY_SOURCE,
+            source=self.request_source,
             search_strategy=search_strategy,
         )
 
@@ -1153,6 +1163,7 @@ def print_selection_summary(
     print(f"  max_query_terms: {args.max_query_terms}")
     print(f"  expanded_replay_cases: {len(expanded_replay_rows)}")
     print(f"  use_search_cache: {args.use_search_cache}")
+    print(f"  request_source: {args.request_source}")
     print(f"  parse_json_response: {args.parse_json_response}")
     print(f"  oracle_quality_check: {args.oracle_quality_check}")
     if args.oracle_quality_check:
@@ -1329,6 +1340,7 @@ def build_output_json(
                 "query_variant_mode": args.query_variant_mode,
                 "max_query_terms": args.max_query_terms,
                 "use_search_cache": args.use_search_cache,
+                "request_source": args.request_source,
                 "parse_json_response": args.parse_json_response,
                 "oracle_quality_check": args.oracle_quality_check,
                 "oracle_k": args.oracle_k,
@@ -1476,6 +1488,7 @@ def main() -> int:
             timeout_seconds=args.timeout_seconds,
             disable_cache=not args.use_search_cache,
             parse_json_response=args.parse_json_response,
+            request_source=args.request_source,
         )
     except Exception as exc:
         print(f"fatal: failed to initialize local search client: {exc}", file=sys.stderr)
