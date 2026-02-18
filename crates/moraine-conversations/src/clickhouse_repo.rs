@@ -42,11 +42,10 @@ const SEARCH_RESULT_CACHE_MAX_ENTRIES: usize = 256;
 const SEARCH_INDEX_WATERMARK_CACHE_TTL: Duration = Duration::from_millis(250);
 const TERM_POSTINGS_CACHE_TTL: Duration = Duration::from_secs(15);
 const TERM_POSTINGS_CACHE_MAX_ENTRIES: usize = 2048;
+const TERM_POSTINGS_CACHE_MAX_ROWS_PER_TERM: usize = 131_072;
+const TERM_POSTINGS_CACHE_MAX_ROWS_TOTAL: usize = 262_144;
 const SEARCH_DOC_EXTRA_CACHE_TTL: Duration = Duration::from_secs(15);
 const SEARCH_DOC_EXTRA_CACHE_MAX_ENTRIES: usize = 65536;
-const SEARCH_FAST_CANDIDATE_MULTIPLIER: usize = 1;
-const SEARCH_FAST_CANDIDATE_MIN_EXTRA: usize = 0;
-const SEARCH_FAST_CANDIDATE_LIMIT_CAP: usize = 256;
 
 #[derive(Debug, Clone, Deserialize)]
 struct ConversationSummaryRow {
@@ -128,17 +127,16 @@ struct SearchRow {
 
 #[derive(Debug, Clone, Deserialize)]
 struct CachedPostingRow {
+    event_uid: String,
+    tf_norm: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FetchedPostingRow {
     term: String,
     event_uid: String,
-    session_id: String,
-    is_message_like: u8,
-    is_token_count: u8,
-    is_excluded_payload: u8,
-    is_search_or_open: u8,
     doc_len: u32,
     tf: u16,
-    #[serde(default)]
-    tf_norm: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -719,20 +717,61 @@ FORMAT JSONEachRow",
             .map(|t| *idf_by_term.get(t).unwrap_or(&0.0))
             .collect();
         let idf_array_sql = sql_array_f64(&idf_vals);
+        let documents_join_sql = if use_document_codex_flag {
+            format!(
+                "(SELECT
+  event_uid,
+  any(session_id) AS session_id,
+  any(source_name) AS source_name,
+  any(provider) AS provider,
+  any(event_class) AS event_class,
+  any(payload_type) AS payload_type,
+  any(actor_role) AS actor_role,
+  any(name) AS name,
+  any(phase) AS phase,
+  any(source_ref) AS source_ref,
+  any(doc_len) AS doc_len,
+  any(text_content) AS text_content,
+  any(payload_json) AS payload_json,
+  toUInt8(any(has_codex_mcp)) AS has_codex_mcp
+FROM {documents_table}
+GROUP BY event_uid)"
+            )
+        } else {
+            format!(
+                "(SELECT
+  event_uid,
+  any(session_id) AS session_id,
+  any(source_name) AS source_name,
+  any(provider) AS provider,
+  any(event_class) AS event_class,
+  any(payload_type) AS payload_type,
+  any(actor_role) AS actor_role,
+  any(name) AS name,
+  any(phase) AS phase,
+  any(source_ref) AS source_ref,
+  any(doc_len) AS doc_len,
+  any(text_content) AS text_content,
+  any(payload_json) AS payload_json,
+  toUInt8(0) AS has_codex_mcp
+FROM {documents_table}
+GROUP BY event_uid)"
+            )
+        };
 
         let mut where_clauses = vec![format!("p.term IN {}", terms_array_sql)];
 
         if let Some(sid) = session_id {
-            where_clauses.push(format!("p.session_id = {}", sql_quote(sid)));
+            where_clauses.push(format!("d.session_id = {}", sql_quote(sid)));
         }
 
         if include_tool_events {
-            where_clauses.push("p.payload_type != 'token_count'".to_string());
+            where_clauses.push("d.payload_type != 'token_count'".to_string());
         } else {
             where_clauses
-                .push("p.event_class IN ('message', 'reasoning', 'event_msg')".to_string());
+                .push("d.event_class IN ('message', 'reasoning', 'event_msg')".to_string());
             where_clauses.push(
-                "p.payload_type NOT IN ('token_count', 'task_started', 'task_complete', 'turn_aborted', 'item_completed')"
+                "d.payload_type NOT IN ('token_count', 'task_started', 'task_complete', 'turn_aborted', 'item_completed')"
                     .to_string(),
             );
         }
@@ -761,16 +800,16 @@ FORMAT JSONEachRow",
   {idf_array_sql} AS q_idf
 SELECT
   p.doc_id AS event_uid,
-  any(p.session_id) AS session_id,
-  any(p.source_name) AS source_name,
-  any(p.provider) AS provider,
-  any(p.event_class) AS event_class,
-  any(p.payload_type) AS payload_type,
-  any(p.actor_role) AS actor_role,
-  any(p.name) AS name,
-  any(p.phase) AS phase,
-  any(p.source_ref) AS source_ref,
-  any(p.doc_len) AS doc_len,
+  any(d.session_id) AS session_id,
+  any(d.source_name) AS source_name,
+  any(d.provider) AS provider,
+  any(d.event_class) AS event_class,
+  any(d.payload_type) AS payload_type,
+  any(d.actor_role) AS actor_role,
+  any(d.name) AS name,
+  any(d.phase) AS phase,
+  any(d.source_ref) AS source_ref,
+  any(d.doc_len) AS doc_len,
   leftUTF8(any(d.text_content), {preview}) AS text_preview,
   sum(
     transform(p.term, q_terms, q_idf, 0.0)
@@ -783,7 +822,7 @@ SELECT
   ) AS score,
   uniqExact(p.term) AS matched_terms
 FROM {postings_table} AS p
-ANY INNER JOIN {documents_table} AS d ON d.event_uid = p.doc_id
+INNER JOIN {documents_join_sql} AS d ON d.event_uid = p.doc_id
 WHERE {where_sql}
 GROUP BY p.doc_id
 HAVING matched_terms >= {min_should_match} AND score >= {min_score:.6}
@@ -792,16 +831,8 @@ LIMIT {limit}
 FORMAT JSONEachRow",
             preview = self.cfg.preview_chars,
             postings_table = postings_table,
-            documents_table = documents_table,
+            documents_join_sql = documents_join_sql,
         ))
-    }
-
-    fn fast_search_candidate_limit(limit: u16) -> u16 {
-        let limit_usize = limit as usize;
-        let expanded = (limit_usize * SEARCH_FAST_CANDIDATE_MULTIPLIER)
-            .max(limit_usize + SEARCH_FAST_CANDIDATE_MIN_EXTRA)
-            .min(SEARCH_FAST_CANDIDATE_LIMIT_CAP);
-        expanded as u16
     }
 
     fn build_search_events_hydrate_sql(
@@ -817,9 +848,52 @@ FORMAT JSONEachRow",
         let documents_table = self.table_ref("search_documents");
         let event_uids_array = sql_array_strings(event_uids);
         let codex_expr = if use_document_codex_flag {
-            "toUInt8(d.has_codex_mcp)"
+            "d.has_codex_mcp"
         } else {
             "toUInt8(positionCaseInsensitiveUTF8(d.payload_json, 'codex-mcp') > 0)"
+        };
+        let documents_source_sql = if use_document_codex_flag {
+            format!(
+                "(SELECT
+  event_uid,
+  any(session_id) AS session_id,
+  any(source_name) AS source_name,
+  any(provider) AS provider,
+  any(event_class) AS event_class,
+  any(payload_type) AS payload_type,
+  any(actor_role) AS actor_role,
+  any(name) AS name,
+  any(phase) AS phase,
+  any(source_ref) AS source_ref,
+  any(doc_len) AS doc_len,
+  any(text_content) AS text_content,
+  any(payload_json) AS payload_json,
+  toUInt8(any(has_codex_mcp)) AS has_codex_mcp
+FROM {documents_table}
+WHERE event_uid IN {event_uids_array}
+GROUP BY event_uid)"
+            )
+        } else {
+            format!(
+                "(SELECT
+  event_uid,
+  any(session_id) AS session_id,
+  any(source_name) AS source_name,
+  any(provider) AS provider,
+  any(event_class) AS event_class,
+  any(payload_type) AS payload_type,
+  any(actor_role) AS actor_role,
+  any(name) AS name,
+  any(phase) AS phase,
+  any(source_ref) AS source_ref,
+  any(doc_len) AS doc_len,
+  any(text_content) AS text_content,
+  any(payload_json) AS payload_json,
+  toUInt8(0) AS has_codex_mcp
+FROM {documents_table}
+WHERE event_uid IN {event_uids_array}
+GROUP BY event_uid)"
+            )
         };
 
         Ok(format!(
@@ -837,13 +911,11 @@ FORMAT JSONEachRow",
   d.doc_len AS doc_len,
   leftUTF8(d.text_content, {preview}) AS text_preview,
   {codex_expr} AS has_codex_mcp
-FROM {documents_table} AS d
-PREWHERE d.event_uid IN {event_uids_array}
+FROM {documents_source_sql} AS d
 FORMAT JSONEachRow",
             preview = self.cfg.preview_chars,
             codex_expr = codex_expr,
-            documents_table = documents_table,
-            event_uids_array = event_uids_array,
+            documents_source_sql = documents_source_sql,
         ))
     }
 
@@ -896,40 +968,6 @@ FORMAT JSONEachRow",
         Ok(SearchIndexWatermark::from_rows(&rows))
     }
 
-    fn refresh_search_index_watermark_async(&self) {
-        let ch = self.ch.clone();
-        let cache = self.stats_cache.clone();
-        let database = self.ch.config().database.clone();
-        tokio::spawn(async move {
-            let query = format!(
-                "SELECT
-  toUInt64(ifNull(maxIf(max_block_number, table = 'search_documents'), 0)) AS docs_max_block,
-  toUInt64(ifNull(maxIf(max_block_number, table = 'search_postings'), 0)) AS posts_max_block,
-  toUInt64(ifNull(sumIf(rows, table = 'search_documents'), 0)) AS docs_rows,
-  toUInt64(ifNull(sumIf(rows, table = 'search_postings'), 0)) AS posts_rows
-FROM system.parts
-WHERE database = {}
-  AND table IN ('search_documents', 'search_postings')
-  AND active
-FORMAT JSONEachRow",
-                sql_quote(&database)
-            );
-
-            let rows: AnyResult<Vec<SearchIndexWatermarkRow>> =
-                ch.query_rows(&query, Some("system")).await;
-            match rows {
-                Ok(rows) => {
-                    let mut cache = cache.write().await;
-                    cache.search_index_watermark =
-                        Some((SearchIndexWatermark::from_rows(&rows), Instant::now()));
-                }
-                Err(err) => {
-                    warn!("failed to refresh search index watermark: {}", err);
-                }
-            }
-        });
-    }
-
     async fn search_index_watermark(&self) -> RepoResult<SearchIndexWatermark> {
         let now = Instant::now();
         {
@@ -941,27 +979,14 @@ FORMAT JSONEachRow",
             }
         }
 
-        {
-            let mut cache = self.stats_cache.write().await;
-            if let Some((value, fetched_at)) = &mut cache.search_index_watermark {
-                if now.duration_since(*fetched_at) > SEARCH_INDEX_WATERMARK_CACHE_TTL {
-                    let stale = *value;
-                    *fetched_at = now;
-                    drop(cache);
-                    self.refresh_search_index_watermark_async();
-                    return Ok(stale);
-                }
-            }
-        }
-
         let watermark = self.fetch_search_index_watermark().await?;
         let mut cache = self.stats_cache.write().await;
         cache.search_index_watermark = Some((watermark, now));
         Ok(watermark)
     }
 
-    fn passes_search_event_filters(
-        row: &CachedPostingRow,
+    fn passes_search_doc_filters(
+        row: &SearchDocExtraCacheEntry,
         include_tool_events: bool,
         exclude_codex_mcp: bool,
         session_id: Option<&str>,
@@ -973,20 +998,33 @@ FORMAT JSONEachRow",
         }
 
         if include_tool_events {
-            if row.is_token_count != 0 {
+            if row.payload_type == "token_count" {
                 return false;
             }
         } else {
-            if row.is_message_like == 0 {
+            if row.event_class != "message"
+                && row.event_class != "reasoning"
+                && row.event_class != "event_msg"
+            {
                 return false;
             }
-            if row.is_excluded_payload != 0 {
+            if row.payload_type == "token_count"
+                || row.payload_type == "task_started"
+                || row.payload_type == "task_complete"
+                || row.payload_type == "turn_aborted"
+                || row.payload_type == "item_completed"
+            {
                 return false;
             }
         }
 
-        if exclude_codex_mcp && row.is_search_or_open != 0 {
-            return false;
+        if exclude_codex_mcp {
+            if row.has_codex_mcp != 0 {
+                return false;
+            }
+            if row.name.eq_ignore_ascii_case("search") || row.name.eq_ignore_ascii_case("open") {
+                return false;
+            }
         }
 
         true
@@ -1046,11 +1084,6 @@ FORMAT JSONEachRow",
                 "SELECT
   term,
   doc_id AS event_uid,
-  session_id,
-  toUInt8(event_class IN ('message', 'reasoning', 'event_msg')) AS is_message_like,
-  toUInt8(payload_type = 'token_count') AS is_token_count,
-  toUInt8(payload_type IN ('token_count', 'task_started', 'task_complete', 'turn_aborted', 'item_completed')) AS is_excluded_payload,
-  toUInt8(lowerUTF8(name) IN ('search', 'open')) AS is_search_or_open,
   doc_len,
   tf
 FROM {postings_table}
@@ -1058,16 +1091,17 @@ WHERE term IN {terms_array}
 FORMAT JSONEachRow",
             );
 
-            let mut fetched_rows: Vec<CachedPostingRow> =
+            let fetched_rows: Vec<FetchedPostingRow> =
                 self.map_backend(self.ch.query_rows(&query, None).await)?;
             let k1 = self.cfg.bm25_k1.max(0.01);
             let b = self.cfg.bm25_b.clamp(0.0, 1.0);
-            for row in &mut fetched_rows {
-                row.tf_norm = Self::bm25_term_score(row.tf, row.doc_len, avgdl, k1, b);
-            }
             let mut grouped = HashMap::<String, Vec<CachedPostingRow>>::new();
             for row in fetched_rows {
-                grouped.entry(row.term.clone()).or_default().push(row);
+                let tf_norm = Self::bm25_term_score(row.tf, row.doc_len, avgdl, k1, b);
+                grouped.entry(row.term).or_default().push(CachedPostingRow {
+                    event_uid: row.event_uid,
+                    tf_norm,
+                });
             }
 
             let mut cache = self.term_postings_cache.write().await;
@@ -1076,24 +1110,31 @@ FORMAT JSONEachRow",
                 let rows_vec = grouped.remove(&term).unwrap_or_default();
                 let rows: Arc<[CachedPostingRow]> = Arc::from(rows_vec.into_boxed_slice());
                 by_term.insert(term.clone(), Arc::clone(&rows));
-                cache.insert(
-                    term,
-                    TermPostingsCacheEntry {
-                        watermark,
-                        avgdl_bits,
-                        rows,
-                        fetched_at: now,
-                    },
-                );
+                if rows.len() <= TERM_POSTINGS_CACHE_MAX_ROWS_PER_TERM {
+                    cache.insert(
+                        term,
+                        TermPostingsCacheEntry {
+                            watermark,
+                            avgdl_bits,
+                            rows,
+                            fetched_at: now,
+                        },
+                    );
+                }
             }
 
-            while cache.len() > TERM_POSTINGS_CACHE_MAX_ENTRIES {
+            let mut cached_rows_total = cache.values().map(|entry| entry.rows.len()).sum::<usize>();
+            while cache.len() > TERM_POSTINGS_CACHE_MAX_ENTRIES
+                || cached_rows_total > TERM_POSTINGS_CACHE_MAX_ROWS_TOTAL
+            {
                 if let Some(oldest_key) = cache
                     .iter()
                     .min_by_key(|(_, entry)| entry.fetched_at)
                     .map(|(k, _)| k.clone())
                 {
-                    cache.remove(&oldest_key);
+                    if let Some(evicted) = cache.remove(&oldest_key) {
+                        cached_rows_total = cached_rows_total.saturating_sub(evicted.rows.len());
+                    }
                 } else {
                     break;
                 }
@@ -1190,8 +1231,7 @@ FORMAT JSONEachRow",
         min_score: f64,
         limit: u16,
     ) -> RepoResult<Vec<SearchRow>> {
-        let initial_candidate_limit = Self::fast_search_candidate_limit(limit);
-        let (initial_rows, initial_candidate_count) = self
+        let (rows, _candidate_count) = self
             .search_events_rows_fast_pass(
                 terms,
                 docs,
@@ -1202,40 +1242,13 @@ FORMAT JSONEachRow",
                 min_should_match,
                 min_score,
                 limit,
-                initial_candidate_limit,
+                usize::MAX,
             )
             .await?;
-        if initial_candidate_count < initial_candidate_limit as usize {
-            return Ok(initial_rows);
+        if !rows.is_empty() {
+            return Ok(rows);
         }
 
-        let expanded_candidate_limit = SEARCH_FAST_CANDIDATE_LIMIT_CAP as u16;
-        if expanded_candidate_limit > initial_candidate_limit {
-            let (expanded_rows, expanded_candidate_count) = self
-                .search_events_rows_fast_pass(
-                    terms,
-                    docs,
-                    avgdl,
-                    include_tool_events,
-                    exclude_codex_mcp,
-                    session_id,
-                    min_should_match,
-                    min_score,
-                    limit,
-                    expanded_candidate_limit,
-                )
-                .await?;
-
-            // Only accept fast-pass results when we considered the full candidate set.
-            // If candidate count reaches the cap, ranking may be truncated; preserve
-            // exact behavior by falling back to the full SQL path.
-            if expanded_candidate_count < expanded_candidate_limit as usize {
-                return Ok(expanded_rows);
-            }
-        }
-
-        // Fast candidates were exhausted before we could satisfy the requested limit.
-        // Fall back to the original SQL shape to preserve exact behavior.
         self.search_events_rows_exact_sql(
             terms,
             docs,
@@ -1349,7 +1362,7 @@ FORMAT JSONEachRow",
         min_should_match: u16,
         min_score: f64,
         limit: u16,
-        candidate_limit: u16,
+        candidate_limit: usize,
     ) -> RepoResult<(Vec<SearchRow>, usize)> {
         #[derive(Clone, Copy)]
         struct CandidateRef<'a> {
@@ -1362,6 +1375,7 @@ FORMAT JSONEachRow",
         let postings_by_term = self
             .load_term_postings_for_terms(terms, watermark, avgdl)
             .await?;
+        let use_document_codex_flag = self.search_documents_has_codex_flag().await?;
         let df_map = self.df_map(terms).await?;
         let mut idf_by_term = HashMap::<&str, f64>::new();
         for term in terms {
@@ -1369,88 +1383,43 @@ FORMAT JSONEachRow",
             idf_by_term.insert(term.as_str(), Self::bm25_idf(docs, df));
         }
 
-        let mut fast_candidates = Vec::<CandidateRef<'_>>::new();
-        if terms.len() == 1 {
-            if min_should_match > 1 {
-                return Ok((Vec::new(), 0));
+        let mut accum_by_uid = HashMap::<&str, SearchScoreAccum<'_>>::new();
+        for (idx, term) in terms.iter().enumerate() {
+            if idx >= 64 {
+                break;
             }
-
-            let term = &terms[0];
             let idf = *idf_by_term.get(term.as_str()).unwrap_or(&0.0);
             if idf <= 0.0 {
-                return Ok((Vec::new(), 0));
+                continue;
             }
 
             if let Some(rows) = postings_by_term.get(term) {
                 for row in rows.iter() {
-                    if !Self::passes_search_event_filters(
-                        row,
-                        include_tool_events,
-                        exclude_codex_mcp,
-                        session_id,
-                    ) {
-                        continue;
-                    }
-
-                    let score = idf * row.tf_norm;
-                    if score < min_score {
-                        continue;
-                    }
-                    fast_candidates.push(CandidateRef {
-                        row,
-                        score,
-                        matched_terms: 1,
-                    });
-                }
-            }
-        } else {
-            let mut accum_by_uid = HashMap::<&str, SearchScoreAccum<'_>>::new();
-            for (idx, term) in terms.iter().enumerate() {
-                if idx >= 64 {
-                    break;
-                }
-                let idf = *idf_by_term.get(term.as_str()).unwrap_or(&0.0);
-                if idf <= 0.0 {
-                    continue;
-                }
-
-                if let Some(rows) = postings_by_term.get(term) {
-                    for row in rows.iter() {
-                        if !Self::passes_search_event_filters(
+                    let entry = accum_by_uid
+                        .entry(row.event_uid.as_str())
+                        .or_insert_with(|| SearchScoreAccum {
                             row,
-                            include_tool_events,
-                            exclude_codex_mcp,
-                            session_id,
-                        ) {
-                            continue;
-                        }
+                            score: 0.0,
+                            matched_mask: 0,
+                        });
 
-                        let entry =
-                            accum_by_uid
-                                .entry(row.event_uid.as_str())
-                                .or_insert_with(|| SearchScoreAccum {
-                                    row,
-                                    score: 0.0,
-                                    matched_mask: 0,
-                                });
-
-                        entry.score += idf * row.tf_norm;
-                        entry.matched_mask |= 1u64 << idx;
-                    }
+                    entry.score += idf * row.tf_norm;
+                    entry.matched_mask |= 1u64 << idx;
                 }
             }
+        }
 
-            for acc in accum_by_uid.values() {
-                let matched_terms = acc.matched_mask.count_ones() as u64;
-                if matched_terms < min_should_match as u64 || acc.score < min_score {
-                    continue;
-                }
-                fast_candidates.push(CandidateRef {
-                    row: acc.row,
-                    score: acc.score,
-                    matched_terms,
-                });
+        let mut fast_candidates = Vec::<CandidateRef<'_>>::new();
+        for acc in accum_by_uid.values() {
+            let matched_terms = acc.matched_mask.count_ones() as u64;
+            if matched_terms < min_should_match as u64 || acc.score < min_score {
+                continue;
             }
+            fast_candidates.push(CandidateRef {
+                row: acc.row,
+                score: acc.score,
+                matched_terms,
+            });
         }
 
         if fast_candidates.is_empty() {
@@ -1458,14 +1427,13 @@ FORMAT JSONEachRow",
         }
 
         let candidate_count = fast_candidates.len();
-        let keep = candidate_limit as usize;
-        if fast_candidates.len() > keep {
-            fast_candidates.select_nth_unstable_by(keep, |a, b| {
+        if candidate_limit < fast_candidates.len() {
+            fast_candidates.select_nth_unstable_by(candidate_limit, |a, b| {
                 b.score
                     .total_cmp(&a.score)
                     .then_with(|| a.row.event_uid.cmp(&b.row.event_uid))
             });
-            fast_candidates.truncate(keep);
+            fast_candidates.truncate(candidate_limit);
         }
         fast_candidates.sort_by(|a, b| {
             b.score
@@ -1473,44 +1441,54 @@ FORMAT JSONEachRow",
                 .then_with(|| a.row.event_uid.cmp(&b.row.event_uid))
         });
 
-        let event_uids: Vec<String> = fast_candidates
-            .iter()
-            .map(|row| row.row.event_uid.clone())
-            .collect();
-        let use_document_codex_flag = self.search_documents_has_codex_flag().await?;
-        let doc_extras = self
-            .load_search_doc_extras(&event_uids, watermark, use_document_codex_flag)
-            .await?;
-
         let mut fast_rows = Vec::<SearchRow>::new();
-        for row in fast_candidates {
-            let Some(extra) = doc_extras.get(row.row.event_uid.as_str()) else {
-                continue;
-            };
-            if exclude_codex_mcp && extra.has_codex_mcp != 0 {
-                continue;
-            }
+        let hydrate_chunk_size = (limit as usize).saturating_mul(8).max(128);
+        let mut offset = 0usize;
+        while offset < fast_candidates.len() && fast_rows.len() < limit as usize {
+            let end = (offset + hydrate_chunk_size).min(fast_candidates.len());
+            let event_uids: Vec<String> = fast_candidates[offset..end]
+                .iter()
+                .map(|row| row.row.event_uid.clone())
+                .collect();
+            let doc_extras = self
+                .load_search_doc_extras(&event_uids, watermark, use_document_codex_flag)
+                .await?;
 
-            fast_rows.push(SearchRow {
-                event_uid: row.row.event_uid.clone(),
-                session_id: extra.session_id.clone(),
-                source_name: extra.source_name.clone(),
-                provider: extra.provider.clone(),
-                event_class: extra.event_class.clone(),
-                payload_type: extra.payload_type.clone(),
-                actor_role: extra.actor_role.clone(),
-                name: extra.name.clone(),
-                phase: extra.phase.clone(),
-                source_ref: extra.source_ref.clone(),
-                doc_len: extra.doc_len,
-                text_preview: extra.text_preview.clone(),
-                score: row.score,
-                matched_terms: row.matched_terms,
-            });
+            for row in &fast_candidates[offset..end] {
+                let Some(extra) = doc_extras.get(row.row.event_uid.as_str()) else {
+                    continue;
+                };
+                if !Self::passes_search_doc_filters(
+                    extra,
+                    include_tool_events,
+                    exclude_codex_mcp,
+                    session_id,
+                ) {
+                    continue;
+                }
 
-            if fast_rows.len() >= limit as usize {
-                break;
+                fast_rows.push(SearchRow {
+                    event_uid: row.row.event_uid.clone(),
+                    session_id: extra.session_id.clone(),
+                    source_name: extra.source_name.clone(),
+                    provider: extra.provider.clone(),
+                    event_class: extra.event_class.clone(),
+                    payload_type: extra.payload_type.clone(),
+                    actor_role: extra.actor_role.clone(),
+                    name: extra.name.clone(),
+                    phase: extra.phase.clone(),
+                    source_ref: extra.source_ref.clone(),
+                    doc_len: extra.doc_len,
+                    text_preview: extra.text_preview.clone(),
+                    score: row.score,
+                    matched_terms: row.matched_terms,
+                });
+
+                if fast_rows.len() >= limit as usize {
+                    break;
+                }
             }
+            offset = end;
         }
 
         Ok((fast_rows, candidate_count))
@@ -2181,12 +2159,7 @@ FORMAT JSONEachRow",
             .exclude_codex_mcp
             .unwrap_or(self.cfg.default_exclude_codex_mcp);
         let disable_cache = query.disable_cache.unwrap_or(false);
-        let search_strategy = query.search_strategy.unwrap_or_default();
-        let effective_strategy = if disable_cache {
-            SearchEventsStrategy::OracleExact
-        } else {
-            search_strategy
-        };
+        let effective_strategy = query.search_strategy.unwrap_or_default();
 
         if let Some(session_id) = query.session_id.as_deref() {
             Self::validate_session_id(session_id)?;
@@ -2519,6 +2492,25 @@ fn sql_array_f64(items: &[f64]) -> String {
 mod tests {
     use super::*;
 
+    fn sample_search_doc() -> SearchDocExtraCacheEntry {
+        SearchDocExtraCacheEntry {
+            watermark: SearchIndexWatermark::default(),
+            session_id: "session-1".to_string(),
+            source_name: "source".to_string(),
+            provider: "provider".to_string(),
+            event_class: "message".to_string(),
+            payload_type: "message".to_string(),
+            actor_role: "assistant".to_string(),
+            name: "tool".to_string(),
+            phase: "".to_string(),
+            source_ref: "source-ref".to_string(),
+            doc_len: 42,
+            text_preview: "preview".to_string(),
+            has_codex_mcp: 0,
+            fetched_at: Instant::now(),
+        }
+    }
+
     #[test]
     fn tokenize_query_enforces_limits_and_counts() {
         let terms = tokenize_query("Hello hello world tool_use", 3);
@@ -2540,5 +2532,23 @@ mod tests {
         let out = sql_array_strings(&values);
         assert!(out.contains("'a'"));
         assert!(out.contains("'b''c'"));
+    }
+
+    #[test]
+    fn search_doc_filters_exclude_codex_by_flag() {
+        let mut row = sample_search_doc();
+        row.has_codex_mcp = 1;
+        assert!(!ClickHouseConversationRepository::passes_search_doc_filters(
+            &row, false, true, None
+        ));
+    }
+
+    #[test]
+    fn search_doc_filters_exclude_codex_by_tool_name() {
+        let mut row = sample_search_doc();
+        row.name = "search".to_string();
+        assert!(!ClickHouseConversationRepository::passes_search_doc_filters(
+            &row, false, true, None
+        ));
     }
 }
