@@ -307,3 +307,62 @@ async fn search_conversations_returns_ranked_session_hits_and_expected_sql_shape
     assert!(agg_query.contains("toUnixTimestamp64Milli(d.ingested_at) >= 1767261600000"));
     assert!(agg_query.contains("toUnixTimestamp64Milli(d.ingested_at) < 1767500000000"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_conversations_without_mode_filter_skips_mode_join() {
+    let (repo, state) = build_repo().await;
+
+    let _ = repo
+        .search_conversations(ConversationSearchQuery {
+            query: "hello world".to_string(),
+            limit: Some(10),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            from_unix_ms: Some(1767261600000_i64),
+            to_unix_ms: Some(1767500000000_i64),
+            mode: None,
+            include_tool_events: Some(true),
+            exclude_codex_mcp: Some(false),
+        })
+        .await
+        .expect("search conversations");
+
+    let queries = state.queries.lock().expect("queries lock").clone();
+    let agg_query = queries
+        .iter()
+        .find(|q| q.contains("GROUP BY e.session_id"))
+        .expect("aggregated conversation query should be captured");
+
+    assert!(!agg_query.contains("ANY LEFT JOIN ("));
+    assert!(!agg_query.contains("ifNull(m.mode"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_conversations_without_time_window_uses_postings_only_fast_path() {
+    let (repo, state) = build_repo().await;
+
+    let _ = repo
+        .search_conversations(ConversationSearchQuery {
+            query: "hello world".to_string(),
+            limit: Some(10),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            from_unix_ms: None,
+            to_unix_ms: None,
+            mode: None,
+            include_tool_events: Some(true),
+            exclude_codex_mcp: Some(false),
+        })
+        .await
+        .expect("search conversations");
+
+    let queries = state.queries.lock().expect("queries lock").clone();
+    let agg_query = queries
+        .iter()
+        .find(|q| q.contains("GROUP BY e.session_id"))
+        .expect("aggregated conversation query should be captured");
+
+    assert!(agg_query.contains("PREWHERE"));
+    assert!(agg_query.contains("bitCount(groupBitOr(e.term_mask))"));
+    assert!(!agg_query.contains("JOIN `moraine`.`search_documents` AS d"));
+}
