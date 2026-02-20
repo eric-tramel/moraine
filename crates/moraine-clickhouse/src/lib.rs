@@ -375,6 +375,7 @@ impl ClickHouseClient {
             "ingest_heartbeats",
             "search_documents",
             "search_postings",
+            "search_conversation_terms",
             "search_term_stats",
             "search_corpus_stats",
             "search_query_log",
@@ -486,6 +487,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             version: "009",
             name: "009_search_documents_codex_flag.sql",
             sql: include_str!("../../../sql/009_search_documents_codex_flag.sql"),
+        },
+        Migration {
+            version: "010",
+            name: "010_search_conversation_terms.sql",
+            sql: include_str!("../../../sql/010_search_conversation_terms.sql"),
         },
     ]
 }

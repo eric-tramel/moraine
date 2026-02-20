@@ -160,6 +160,24 @@ async fn spawn_mock_server() -> (String, Arc<MockState>) {
             );
         }
 
+        if query.contains("FROM `moraine`.`search_conversation_terms` AS ct") {
+            return (
+                StatusCode::OK,
+                json_each_row(json!([
+                    {
+                        "session_id": "sess_c",
+                        "score": 8.0,
+                        "matched_terms": 2_u16
+                    },
+                    {
+                        "session_id": "sess_a",
+                        "score": 5.0,
+                        "matched_terms": 1_u16
+                    }
+                ])),
+            );
+        }
+
         if query.contains("GROUP BY e.session_id") {
             return (
                 StatusCode::OK,
@@ -303,6 +321,7 @@ async fn search_conversations_returns_ranked_session_hits_and_expected_sql_shape
         .expect("aggregated conversation query should be captured");
 
     assert!(agg_query.contains("argMax(e.event_uid, e.event_score)"));
+    assert!(agg_query.contains("p.session_id IN ['sess_c','sess_a']"));
     assert!(agg_query.contains("ifNull(m.mode, 'chat') = 'chat'"));
     assert!(agg_query.contains("toUnixTimestamp64Milli(d.ingested_at) >= 1767261600000"));
     assert!(agg_query.contains("toUnixTimestamp64Milli(d.ingested_at) < 1767500000000"));
