@@ -367,7 +367,7 @@ fn default_runtime_pids_dir() -> String {
 }
 
 fn default_service_bin_dir() -> String {
-    "~/.local/lib/moraine/current/bin".to_string()
+    "~/.local/bin".to_string()
 }
 
 fn default_managed_clickhouse_dir() -> String {

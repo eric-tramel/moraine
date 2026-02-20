@@ -84,7 +84,7 @@ main() {
   local repo_root
   repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
   local package_script="$repo_root/scripts/package-moraine-release.sh"
-  local install_script="$repo_root/scripts/install-moraine.sh"
+  local install_script="$repo_root/scripts/install.sh"
   local e2e_script="$repo_root/scripts/ci/e2e-stack.sh"
   local python_bin="${PYTHON_BIN:-python3}"
   local run_stamp
@@ -118,10 +118,11 @@ main() {
   mkdir -p "$HOME"
   local base_path="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
   export PATH="$base_path"
-  "$install_script" \
-    --asset-base-url "$asset_base_url" \
-    --version "$bundle_version" \
-    --skip-clickhouse
+  MORAINE_INSTALL_ASSET_BASE_URL="$asset_base_url" \
+    MORAINE_INSTALL_VERSION="$bundle_version" \
+    MORAINE_INSTALL_SKIP_CLICKHOUSE=1 \
+    MORAINE_INSTALL_DIR="$HOME/.local/bin" \
+    bash "$install_script"
 
   export PATH="$HOME/.local/bin:$PATH"
   local installed_moraine="$HOME/.local/bin/moraine"
