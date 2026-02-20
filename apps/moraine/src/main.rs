@@ -806,6 +806,51 @@ fn sha256_hex(path: &Path) -> Result<String> {
     Ok(digest.iter().map(|b| format!("{:02x}", b)).collect())
 }
 
+fn path_ends_with_components(path: &Path, suffix: &[&str]) -> bool {
+    let mut components = path.components().rev();
+    for expected in suffix.iter().rev() {
+        match components
+            .next()
+            .and_then(|component| component.as_os_str().to_str())
+        {
+            Some(component) if component == *expected => {}
+            _ => return false,
+        }
+    }
+
+    true
+}
+
+fn find_file_ending_with(root: &Path, suffix: &[&str]) -> Result<Option<PathBuf>> {
+    let mut stack = vec![root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+
+            if path_ends_with_components(&path, suffix) {
+                return Ok(Some(path));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 fn find_file_named(root: &Path, name: &str) -> Result<Option<PathBuf>> {
     let mut stack = vec![root.to_path_buf()];
 
@@ -931,7 +976,8 @@ async fn install_managed_clickhouse(
             bail!("failed to extract ClickHouse archive");
         }
 
-        find_file_named(&extract_dir, "clickhouse")?
+        find_file_ending_with(&extract_dir, &["usr", "bin", "clickhouse"])?
+            .or(find_file_named(&extract_dir, "clickhouse")?)
             .ok_or_else(|| anyhow!("extracted ClickHouse archive missing clickhouse binary"))?
     } else {
         download.clone()
@@ -2237,6 +2283,21 @@ mod tests {
             "{}",
             err
         );
+    }
+
+    #[test]
+    fn find_file_ending_with_prefers_usr_bin_clickhouse() {
+        let root = temp_dir("find-file-ending-with");
+        let completion = root.join("pkg/usr/share/bash-completion/completions/clickhouse");
+        let binary = root.join("pkg/usr/bin/clickhouse");
+        write_file(&completion);
+        write_file(&binary);
+
+        let resolved = find_file_ending_with(&root, &["usr", "bin", "clickhouse"])
+            .expect("resolve clickhouse path")
+            .expect("clickhouse path");
+
+        assert_eq!(resolved, binary);
     }
 
     #[test]
