@@ -16,6 +16,9 @@ Specifically, Morine provides:
 - **Continually Optimized Search Tooling**: improvements to realtime search performance are an ongoing effort in the project, and we're aiming to drive down real-time search latency as much as can.
 - **Fully local**: nothing leaves your machine, unless you want it to (and set up a remote db instance).
 
+<img width="1784" height="1167" alt="image" src="https://github.com/user-attachments/assets/150a0ed5-1daf-4eb5-b60e-d3ee2221b22f" />
+
+
 ## Quickstart
 
 Install `moraine` (prebuilt bundle) to `~/.local/bin`. 
