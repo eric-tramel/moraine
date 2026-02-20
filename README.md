@@ -1,13 +1,21 @@
-# Moraine
+
+![Moraine Banner](https://github.com/user-attachments/assets/50e1e16f-f859-4b2c-83da-8ee06c2d0509)
 
 [![Docs](https://github.com/eric-tramel/moraine/actions/workflows/docs-deploy.yml/badge.svg)](https://eric-tramel.github.io/moraine/)
 
-Moraine indexes your Claude Code and Codex session logs into a local ClickHouse database — giving your agents searchable long-term memory and giving you a unified record of everything they've done.
+Moraine indexes all of your Claude Code and Codex traces in realtime into a searchable, unfied database.
 
-- **Agent memory via MCP**: agents search and retrieve context from past conversations using `search` and `open` tools
+🤖 **Your Agents Get**: a searchable long-term memory.
+🌝 **You Get**: a unified record of everything they've done across providers. Tools, Tokens, and Talk.
+
+Specifically, Morine provides:
+
+- **The Dataplane to Your Agentic Era**: the database is yours, take inspiration from our tooling and schema definitions and build your own apps ontop of moraine's DB.
+- **Agent memory via MCP**: agents search and retrieve context from past conversations
 - **Unified trace database**: every conversation turn, tool call, and token count in one place — query it however you want
 - **Monitor UI**: browse sessions, check ingestion health, inspect what your agents have been doing
-- **Fully local**: nothing leaves your machine
+- **Continually Optimized Search Tooling**: improvements to realtime search performance are an ongoing effort in the project, and we're aiming to drive down real-time search latency as much as can.
+- **Fully local**: nothing leaves your machine, unless you want it to (and set up a remote db instance).
 
 ## Quickstart
 
