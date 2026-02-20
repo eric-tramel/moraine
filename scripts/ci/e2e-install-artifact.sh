@@ -130,6 +130,12 @@ main() {
     echo "missing installed moraine binary: $installed_moraine" >&2
     exit 1
   fi
+  local installed_config="$HOME/.moraine/config.toml"
+  if [[ ! -f "$installed_config" ]]; then
+    echo "missing installed config bootstrap: $installed_config" >&2
+    exit 1
+  fi
+  "$installed_moraine" config get clickhouse.url --config "$installed_config" >/dev/null
 
   echo "[e2e-install] running functional stack + MCP smoke with installed moraine"
   unset MORAINE_SOURCE_TREE_MODE

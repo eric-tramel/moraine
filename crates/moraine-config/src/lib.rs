@@ -675,6 +675,21 @@ mod tests {
     }
 
     #[test]
+    fn load_config_accepts_minimal_comment_only_file() {
+        let path = write_temp_config(
+            r#"
+# Moraine default config.
+# Values omitted here are filled by built-in defaults.
+"#,
+            "minimal-comment-only",
+        );
+        let cfg = load_config(&path).expect("minimal config should load with defaults");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(cfg.clickhouse.url, "http://127.0.0.1:8123");
+        assert!(!cfg.ingest.sources.is_empty());
+    }
+
+    #[test]
     fn load_config_errors_on_unknown_top_level_section() {
         let path = write_temp_config(
             r#"
