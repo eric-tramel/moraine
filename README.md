@@ -18,48 +18,33 @@ Specifically, Morine provides:
 
 ## Quickstart
 
-Install `moraine` (prebuilt bundle):
+Install `moraine` (prebuilt bundle) to `~/.local/bin`. 
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/eric-tramel/moraine/main/scripts/install.sh \
   | sh
-export PATH="$HOME/.local/bin:$PATH"
 ```
 
-The installer is environment-configured (not flag-configured). Common overrides:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/eric-tramel/moraine/main/scripts/install.sh \
-  | MORAINE_INSTALL_VERSION=v0.1.1 sh
-
-curl -fsSL https://raw.githubusercontent.com/eric-tramel/moraine/main/scripts/install.sh \
-  | MORAINE_INSTALL_DIR="$HOME/bin" MORAINE_INSTALL_SKIP_CLICKHOUSE=1 sh
-```
+Afterwards, just make sure to have `~/.local/bin` on your path (e.g. in your `.zshrc`, `.bashrc`, etc.).
 
 Start the stack and confirm it is healthy:
 
 ```bash
+which moraine
 moraine up
 moraine status
 ```
 
 Open the monitor UI at `http://127.0.0.1:8080`.
 
-Run a Claude Code or Codex session as you normally would, then check `moraine status` again — you'll see row counts and the ingest heartbeat move as your sessions are indexed.
+Run a Claude Code or Codex session as you normally would, you'll see row counts and the ingest heartbeat move as your sessions are indexed.
 
 Use `moraine status --output rich --verbose` for a detailed breakdown.
 
 ## Connect an Agent (MCP)
 
-This is where Moraine pays off: your agents can search past sessions to find relevant context.
-
-Start the MCP server:
-
-```bash
-moraine run mcp
-```
-
-Or start it automatically with `moraine up` by setting `runtime.start_mcp_on_up = true` in `~/.moraine/config.toml`.
+While Moraine can be used for many purposes, a direct one is the search tooling we've built into a custom
+BM25 search MCP, which will allow your agents to self-review past conversations **across agent harnesses**.
 
 To wire it into Claude Code, add this to your `.mcp.json`:
 
@@ -74,10 +59,11 @@ To wire it into Claude Code, add this to your `.mcp.json`:
 }
 ```
 
-The MCP server exposes two tools:
+Or add to Codex:
 
-- **`search`** — BM25 lexical search across indexed conversation events. Returns ranked hits with snippets.
-- **`open`** — fetch an event with surrounding context. Use this after `search` to reconstruct the conversation around a hit.
+```
+codex mcp add conversation-search -- moraine run mcp
+```
 
 For the full tool contract and integration guidance, see `docs/mcp/agent-interface.md`.
 
