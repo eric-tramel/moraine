@@ -1742,6 +1742,22 @@ fn state_label(value: bool) -> &'static str {
     }
 }
 
+fn stoplight(running: bool) -> &'static str {
+    if running {
+        "\u{1F7E2}" // 🟢
+    } else {
+        "\u{1F534}" // 🔴
+    }
+}
+
+fn service_endpoint(service: Service, snapshot: &StatusSnapshot) -> Option<String> {
+    match service {
+        Service::ClickHouse => Some(snapshot.clickhouse_health_url.clone()),
+        Service::Monitor => snapshot.monitor_url.clone(),
+        _ => None,
+    }
+}
+
 fn format_start_state(outcome: &StartOutcome) -> String {
     match outcome.state {
         StartState::Started => "started".to_string(),
@@ -1755,93 +1771,79 @@ fn render_status(output: &CliOutput, snapshot: &StatusSnapshot) -> Result<()> {
         return Ok(());
     }
 
-    let service_rows = snapshot
+    // -- Services with stoplight indicators and endpoints --
+    let service_rows: Vec<Vec<String>> = snapshot
         .services
         .iter()
         .map(|row| {
-            vec![
-                row.service.name().to_string(),
-                if row.pid.is_some() {
+            let running = row.pid.is_some();
+            let mut cols = vec![
+                format!("{} {}", stoplight(running), row.service.name()),
+                if running {
                     "running".to_string()
                 } else {
                     "stopped".to_string()
                 },
-                row.pid
-                    .map(|pid| pid.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-            ]
+                service_endpoint(row.service, snapshot).unwrap_or_default(),
+            ];
+            if output.verbose {
+                cols.push(
+                    row.pid
+                        .map(|pid| pid.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+            }
+            cols
         })
-        .collect::<Vec<_>>();
-    output.table("Services", &["service", "state", "pid"], &service_rows);
-    if let Some(monitor_url) = &snapshot.monitor_url {
-        output.section("Monitor Runtime", &[format!("monitor url: {monitor_url}")]);
+        .collect();
+
+    if output.verbose {
+        output.table("Services", &["", "state", "endpoint", "pid"], &service_rows);
+    } else {
+        output.table("Services", &["", "state", "endpoint"], &service_rows);
     }
 
-    let mut clickhouse_lines = vec![
-        format!(
-            "managed install: {}",
-            if snapshot.managed_clickhouse_installed {
-                "present"
-            } else {
-                "missing"
-            }
-        ),
-        format!("managed binary: {}", snapshot.managed_clickhouse_path),
-        format!(
-            "active source: {}{}",
-            snapshot.clickhouse_active_source,
-            snapshot
-                .clickhouse_active_source_path
-                .as_ref()
-                .map(|p| format!(" ({p})"))
-                .unwrap_or_default()
-        ),
-        format!("checksum: {}", snapshot.managed_clickhouse_checksum),
-    ];
-    if let Some(version) = &snapshot.managed_clickhouse_version {
-        clickhouse_lines.push(format!("managed version: {version}"));
-    }
-    output.section("ClickHouse Runtime", &clickhouse_lines);
-
-    let mut doctor_lines = vec![
-        format!(
-            "clickhouse: {}",
-            health_label(snapshot.doctor.clickhouse_healthy)
-        ),
-        format!("health target: {}", snapshot.clickhouse_health_url),
-        format!(
-            "database exists: {}",
-            state_label(snapshot.doctor.database_exists)
-        ),
-        format!(
-            "pending migrations: {}",
-            if snapshot.doctor.pending_migrations.is_empty() {
-                "none".to_string()
-            } else {
-                snapshot.doctor.pending_migrations.join(", ")
-            }
-        ),
-        format!(
-            "missing tables: {}",
-            if snapshot.doctor.missing_tables.is_empty() {
-                "none".to_string()
-            } else {
-                snapshot.doctor.missing_tables.join(", ")
-            }
-        ),
-    ];
+    // -- Database Health (concise) --
+    let db_healthy = snapshot.doctor.clickhouse_healthy && snapshot.doctor.database_exists;
+    let mut doctor_lines = vec![format!(
+        "{} {}",
+        stoplight(db_healthy),
+        if db_healthy {
+            "database healthy".to_string()
+        } else {
+            format!(
+                "clickhouse {} / db {}",
+                health_label(snapshot.doctor.clickhouse_healthy),
+                if snapshot.doctor.database_exists {
+                    "exists"
+                } else {
+                    "missing"
+                }
+            )
+        }
+    )];
     if let Some(version) = &snapshot.doctor.clickhouse_version {
-        doctor_lines.push(format!("server version: {version}"));
+        doctor_lines[0].push_str(&format!("  (v{version})"));
+    }
+    if !snapshot.doctor.pending_migrations.is_empty() {
+        doctor_lines.push(format!(
+            "  pending migrations: {}",
+            snapshot.doctor.pending_migrations.join(", ")
+        ));
+    }
+    if !snapshot.doctor.missing_tables.is_empty() {
+        doctor_lines.push(format!(
+            "  missing tables: {}",
+            snapshot.doctor.missing_tables.join(", ")
+        ));
     }
     if output.verbose && !snapshot.doctor.errors.is_empty() {
-        doctor_lines.push(format!("errors: {}", snapshot.doctor.errors.join(" | ")));
+        doctor_lines.push(format!("  errors: {}", snapshot.doctor.errors.join(" | ")));
     }
-    output.section("Database Health", &doctor_lines);
-    if !snapshot.status_notes.is_empty() {
-        output.section("Status Notes", &snapshot.status_notes);
-    }
+    output.section("Database", &doctor_lines);
 
-    let heartbeat_lines = match &snapshot.heartbeat {
+    // -- Ingest activity (only show when there is something to report) --
+    match &snapshot.heartbeat {
         HeartbeatSnapshot::Available {
             latest,
             queue_depth,
@@ -1852,24 +1854,66 @@ fn render_status(output: &CliOutput, snapshot: &StatusSnapshot) -> Result<()> {
             watcher_last_reset_unix_ms,
         } => {
             let mut lines = vec![
-                format!("latest: {latest}"),
-                format!("queue depth: {queue_depth}"),
-                format!("files active: {files_active}"),
-                format!("watcher backend: {watcher_backend}"),
-                format!("watcher errors: {watcher_error_count}"),
-                format!("watcher resets: {watcher_reset_count}"),
+                format!("last event: {latest}"),
+                format!("queue: {queue_depth}  |  active files: {files_active}"),
             ];
+            if *watcher_error_count > 0 || *watcher_reset_count > 0 {
+                lines.push(format!(
+                    "watcher: {watcher_backend}  (errors: {watcher_error_count}, resets: {watcher_reset_count})"
+                ));
+            } else if output.verbose {
+                lines.push(format!("watcher: {watcher_backend}"));
+            }
             if output.verbose {
                 lines.push(format!(
                     "watcher last reset unix ms: {watcher_last_reset_unix_ms}"
                 ));
             }
-            lines
+            output.section("Ingest", &lines);
         }
-        HeartbeatSnapshot::Unavailable => vec!["heartbeat unavailable".to_string()],
-        HeartbeatSnapshot::Error { message } => vec![format!("heartbeat error: {message}")],
-    };
-    output.section("Ingest Heartbeat", &heartbeat_lines);
+        HeartbeatSnapshot::Unavailable => {
+            if output.verbose {
+                output.section("Ingest", &["no heartbeat data".to_string()]);
+            }
+        }
+        HeartbeatSnapshot::Error { message } => {
+            output.section("Ingest", &[format!("heartbeat error: {message}")]);
+        }
+    }
+
+    // -- ClickHouse runtime details (verbose only) --
+    if output.verbose {
+        let mut ch_lines = vec![
+            format!(
+                "managed install: {}",
+                if snapshot.managed_clickhouse_installed {
+                    "present"
+                } else {
+                    "missing"
+                }
+            ),
+            format!("binary: {}", snapshot.managed_clickhouse_path),
+            format!(
+                "source: {}{}",
+                snapshot.clickhouse_active_source,
+                snapshot
+                    .clickhouse_active_source_path
+                    .as_ref()
+                    .map(|p| format!(" ({p})"))
+                    .unwrap_or_default()
+            ),
+            format!("checksum: {}", snapshot.managed_clickhouse_checksum),
+        ];
+        if let Some(version) = &snapshot.managed_clickhouse_version {
+            ch_lines.push(format!("managed version: {version}"));
+        }
+        output.section("ClickHouse Runtime", &ch_lines);
+    }
+
+    // -- Status notes (warnings) --
+    if !snapshot.status_notes.is_empty() {
+        output.section("Warnings", &snapshot.status_notes);
+    }
     Ok(())
 }
 
