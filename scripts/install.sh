@@ -405,6 +405,18 @@ for bin in $bins; do
   chmod +x "$install_dir/$bin"
 done
 
+monitor_dist_source="$extract_dir/web/monitor/dist"
+if [ ! -d "$monitor_dist_source" ]; then
+  echo "archive did not contain required monitor assets: web/monitor/dist"
+  exit 1
+fi
+
+install_root="$(dirname "$install_dir")"
+monitor_dist_dir="$install_root/web/monitor/dist"
+mkdir -p "$(dirname "$monitor_dist_dir")"
+rm -rf "$monitor_dist_dir"
+cp -R "$monitor_dist_source" "$monitor_dist_dir"
+
 for bin in $bins; do
   if ! "$install_dir/$bin" --help >/dev/null 2>&1; then
     echo "installed binary failed health check (--help): $install_dir/$bin"
@@ -425,6 +437,7 @@ write_install_receipt \
   "$checksum_url"
 
 echo "installed binaries to: $install_dir"
+echo "installed monitor assets to: $monitor_dist_dir"
 echo "wrote install receipt: $receipt_path"
 
 if ! bootstrap_runtime_config "$runtime_config_path" "$extract_dir/config/moraine.toml"; then

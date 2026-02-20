@@ -130,6 +130,11 @@ main() {
     echo "missing installed moraine binary: $installed_moraine" >&2
     exit 1
   fi
+  local installed_monitor_index="$HOME/.local/web/monitor/dist/index.html"
+  if [[ ! -f "$installed_monitor_index" ]]; then
+    echo "missing installed monitor assets: $installed_monitor_index" >&2
+    exit 1
+  fi
   local installed_config="$HOME/.moraine/config.toml"
   if [[ ! -f "$installed_config" ]]; then
     echo "missing installed config bootstrap: $installed_config" >&2
