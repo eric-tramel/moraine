@@ -17,6 +17,8 @@ curl -fsSL https://raw.githubusercontent.com/eric-tramel/moraine/main/scripts/in
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
+For installer version/path/ClickHouse override options, see `docs/operations/build-and-operations.md`.
+
 Start the stack and confirm it is healthy:
 
 ```bash

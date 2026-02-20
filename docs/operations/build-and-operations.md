@@ -53,6 +53,16 @@ Default binary symlink location is `~/.local/bin`. Versioned bundles are install
 
 The installer fetches a full bundle (`moraine`, `moraine-ingest`, `moraine-monitor`, `moraine-mcp`) and installs managed ClickHouse automatically by default.
 
+The installer is environment-configured (not flag-configured). Common overrides:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/eric-tramel/moraine/main/scripts/install-moraine.sh \
+  | MORAINE_INSTALL_VERSION=v0.1.1 sh
+
+curl -fsSL https://raw.githubusercontent.com/eric-tramel/moraine/main/scripts/install-moraine.sh \
+  | MORAINE_INSTALL_DIR="$HOME/bin" MORAINE_INSTALL_SKIP_CLICKHOUSE=1 sh
+```
+
 Install paths:
 
 - Bundle root: `~/.local/lib/moraine/<tag>/<target>`
