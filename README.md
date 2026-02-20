@@ -1,4 +1,5 @@
-# Moraine
+
+![Moraine Banner](https://github.com/user-attachments/assets/50e1e16f-f859-4b2c-83da-8ee06c2d0509)
 
 [![Docs](https://github.com/eric-tramel/moraine/actions/workflows/docs-deploy.yml/badge.svg)](https://eric-tramel.github.io/moraine/)
 
