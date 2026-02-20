@@ -1,5 +1,5 @@
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ahash::AHashMap as HashMap;
 use anyhow::Result as AnyResult;
@@ -45,6 +45,11 @@ const TERM_POSTINGS_CACHE_MAX_ROWS_PER_TERM: usize = 131_072;
 const TERM_POSTINGS_CACHE_MAX_ROWS_TOTAL: usize = 262_144;
 const SEARCH_DOC_EXTRA_CACHE_TTL: Duration = Duration::from_secs(15);
 const SEARCH_DOC_EXTRA_CACHE_MAX_ENTRIES: usize = 65536;
+const CONVERSATION_CANDIDATE_MIN: usize = 512;
+const CONVERSATION_CANDIDATE_MULTIPLIER: usize = 80;
+const CONVERSATION_CANDIDATE_MAX: usize = 20_000;
+const CONVERSATION_RECENT_WINDOW_MS: i64 = 45_000;
+const CONVERSATION_RECENT_CANDIDATE_LIMIT: usize = 1024;
 
 #[derive(Debug, Clone, Deserialize)]
 struct ConversationSummaryRow {
@@ -180,7 +185,27 @@ struct ConversationSearchRow {
     matched_terms: u16,
     event_count_considered: u32,
     best_event_uid: String,
+    #[serde(default)]
     snippet: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConversationSnippetRow {
+    event_uid: String,
+    snippet: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConversationCandidateRow {
+    session_id: String,
+    score: f64,
+    matched_terms: u16,
+}
+
+#[derive(Debug, Default)]
+struct ConversationCandidateSet {
+    rows: Vec<ConversationCandidateRow>,
+    truncated: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -883,7 +908,7 @@ SELECT
   any(d.doc_len) AS doc_len,
   leftUTF8(any(d.text_content), {preview}) AS text_preview,
   sum(
-    transform(p.term, q_terms, q_idf, 0.0)
+    transform(toString(p.term), q_terms, q_idf, 0.0)
     *
     (
       (toFloat64(p.tf) * (k1 + 1.0))
@@ -1514,6 +1539,360 @@ FORMAT JSONEachRow",
         Ok((fast_rows, candidate_count))
     }
 
+    fn conversation_candidate_limit(limit: u16) -> usize {
+        (limit as usize)
+            .saturating_mul(CONVERSATION_CANDIDATE_MULTIPLIER)
+            .clamp(CONVERSATION_CANDIDATE_MIN, CONVERSATION_CANDIDATE_MAX)
+    }
+
+    fn now_unix_ms() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or_default()
+    }
+
+    fn build_conversation_postings_filter_sql(
+        &self,
+        terms: &[String],
+        include_tool_events: bool,
+        exclude_codex_mcp: bool,
+        from_unix_ms: Option<i64>,
+        to_unix_ms: Option<i64>,
+        recent_from_unix_ms: Option<i64>,
+        candidate_session_ids: Option<&[String]>,
+    ) -> (String, String, String) {
+        let terms_array_sql = sql_array_strings(terms);
+        let mut postings_filters = vec![format!("p.term IN {}", terms_array_sql)];
+        let mut document_filters = Vec::new();
+
+        if let Some(from_unix_ms) = from_unix_ms {
+            document_filters.push(format!(
+                "toUnixTimestamp64Milli(d.ingested_at) >= {from_unix_ms}"
+            ));
+        }
+        if let Some(to_unix_ms) = to_unix_ms {
+            document_filters.push(format!(
+                "toUnixTimestamp64Milli(d.ingested_at) < {to_unix_ms}"
+            ));
+        }
+        if let Some(recent_from_unix_ms) = recent_from_unix_ms {
+            document_filters.push(format!(
+                "toUnixTimestamp64Milli(d.ingested_at) >= {recent_from_unix_ms}"
+            ));
+        }
+
+        if include_tool_events {
+            postings_filters.push("p.payload_type != 'token_count'".to_string());
+        } else {
+            postings_filters
+                .push("p.event_class IN ('message', 'reasoning', 'event_msg')".to_string());
+            postings_filters.push(
+                "p.payload_type NOT IN ('token_count', 'task_started', 'task_complete', 'turn_aborted', 'item_completed')"
+                    .to_string(),
+            );
+        }
+
+        if exclude_codex_mcp {
+            postings_filters.push("p.source_name != 'codex-mcp'".to_string());
+            postings_filters.push("lowerUTF8(p.name) NOT IN ('search', 'open')".to_string());
+        }
+
+        if let Some(candidate_session_ids) = candidate_session_ids {
+            if !candidate_session_ids.is_empty() {
+                postings_filters.push(format!(
+                    "p.session_id IN {}",
+                    sql_array_strings(candidate_session_ids)
+                ));
+            }
+        }
+
+        let prewhere_sql = postings_filters.join("\n      AND ");
+        let where_sql = if document_filters.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", document_filters.join("\n      AND "))
+        };
+        let docs_join_sql = if document_filters.is_empty() {
+            String::new()
+        } else {
+            let documents_table = self.table_ref("search_documents");
+            format!("ANY INNER JOIN {documents_table} AS d ON d.event_uid = p.doc_id")
+        };
+        (docs_join_sql, prewhere_sql, where_sql)
+    }
+
+    fn build_search_conversation_candidates_sql(
+        &self,
+        terms: &[String],
+        idf_by_term: &HashMap<String, f64>,
+        include_tool_events: bool,
+        exclude_codex_mcp: bool,
+        min_should_match: u16,
+        limit: usize,
+        from_unix_ms: Option<i64>,
+        to_unix_ms: Option<i64>,
+        mode: Option<ConversationMode>,
+    ) -> RepoResult<String> {
+        if terms.is_empty() {
+            return Err(RepoError::invalid_argument(
+                "cannot build candidate query with empty terms",
+            ));
+        }
+
+        let postings_table = self.table_ref("search_postings");
+        let conversation_terms_table = self.table_ref("search_conversation_terms");
+        let terms_array_sql = sql_array_strings(terms);
+        let idf_vals: Vec<f64> = terms
+            .iter()
+            .map(|t| *idf_by_term.get(t).unwrap_or(&0.0))
+            .collect();
+        let idf_array_sql = sql_array_f64(&idf_vals);
+        let (docs_join_sql, prewhere_sql, where_sql) = self.build_conversation_postings_filter_sql(
+            terms,
+            include_tool_events,
+            exclude_codex_mcp,
+            from_unix_ms,
+            to_unix_ms,
+            None,
+            None,
+        );
+
+        let (mode_join_sql, mode_filter_sql) = if let Some(selected_mode) = mode {
+            let mode_subquery = self.mode_subquery();
+            let mode_filter_sql = Self::mode_filter_clause(Some(selected_mode))
+                .map(|clause| format!("AND {clause}"))
+                .unwrap_or_default();
+            (
+                format!("ANY LEFT JOIN ({mode_subquery}) AS m ON m.session_id = c.session_id"),
+                mode_filter_sql,
+            )
+        } else {
+            (String::new(), String::new())
+        };
+
+        Ok(format!(
+            "WITH
+  {terms_array_sql} AS q_terms,
+  {idf_array_sql} AS q_idf
+SELECT
+  c.session_id,
+  c.score,
+  toUInt16(c.matched_terms) AS matched_terms
+FROM (
+  SELECT
+    ct.session_id,
+    sum(transform(ct.term, q_terms, q_idf, 0.0) * log1p(toFloat64(ct.tf_sum))) AS score,
+    toUInt16(countDistinct(ct.term)) AS matched_terms
+  FROM {conversation_terms_table} AS ct
+  ANY INNER JOIN (
+    SELECT DISTINCT p.session_id
+    FROM {postings_table} AS p
+    {docs_join_sql}
+    PREWHERE {prewhere_sql}
+    {where_sql}
+  ) AS eligible ON eligible.session_id = ct.session_id
+  WHERE ct.term IN {terms_array_sql}
+  GROUP BY ct.session_id
+) AS c
+{mode_join_sql}
+WHERE c.matched_terms >= {min_should_match}
+  {mode_filter_sql}
+ORDER BY c.score DESC, c.session_id ASC
+LIMIT {limit}
+FORMAT JSONEachRow",
+            conversation_terms_table = conversation_terms_table,
+            postings_table = postings_table,
+            docs_join_sql = docs_join_sql,
+            prewhere_sql = prewhere_sql,
+            where_sql = where_sql,
+            mode_join_sql = mode_join_sql,
+            mode_filter_sql = mode_filter_sql,
+            min_should_match = min_should_match,
+            limit = limit,
+        ))
+    }
+
+    fn build_search_conversation_recent_candidates_sql(
+        &self,
+        terms: &[String],
+        idf_by_term: &HashMap<String, f64>,
+        include_tool_events: bool,
+        exclude_codex_mcp: bool,
+        min_should_match: u16,
+        limit: usize,
+        from_unix_ms: Option<i64>,
+        to_unix_ms: Option<i64>,
+        mode: Option<ConversationMode>,
+    ) -> RepoResult<String> {
+        if terms.is_empty() {
+            return Err(RepoError::invalid_argument(
+                "cannot build recent candidate query with empty terms",
+            ));
+        }
+
+        let postings_table = self.table_ref("search_postings");
+        let terms_array_sql = sql_array_strings(terms);
+        let idf_vals: Vec<f64> = terms
+            .iter()
+            .map(|t| *idf_by_term.get(t).unwrap_or(&0.0))
+            .collect();
+        let idf_array_sql = sql_array_f64(&idf_vals);
+        let now_unix_ms = Self::now_unix_ms();
+        let recent_floor = now_unix_ms.saturating_sub(CONVERSATION_RECENT_WINDOW_MS);
+        let recent_from_unix_ms = match from_unix_ms {
+            Some(from) => from.max(recent_floor),
+            None => recent_floor,
+        };
+        let (docs_join_sql, prewhere_sql, where_sql) = self.build_conversation_postings_filter_sql(
+            terms,
+            include_tool_events,
+            exclude_codex_mcp,
+            from_unix_ms,
+            to_unix_ms,
+            Some(recent_from_unix_ms),
+            None,
+        );
+
+        let (mode_join_sql, mode_filter_sql) = if let Some(selected_mode) = mode {
+            let mode_subquery = self.mode_subquery();
+            let mode_filter_sql = Self::mode_filter_clause(Some(selected_mode))
+                .map(|clause| format!("AND {clause}"))
+                .unwrap_or_default();
+            (
+                format!("ANY LEFT JOIN ({mode_subquery}) AS m ON m.session_id = c.session_id"),
+                mode_filter_sql,
+            )
+        } else {
+            (String::new(), String::new())
+        };
+
+        Ok(format!(
+            "WITH
+  {terms_array_sql} AS q_terms,
+  {idf_array_sql} AS q_idf
+SELECT
+  c.session_id,
+  c.score,
+  toUInt16(c.matched_terms) AS matched_terms
+FROM (
+  SELECT
+    p.session_id AS session_id,
+    sum(transform(toString(p.term), q_terms, q_idf, 0.0) * log1p(toFloat64(p.tf))) AS score,
+    toUInt16(countDistinct(p.term)) AS matched_terms
+  FROM {postings_table} AS p
+  {docs_join_sql}
+  PREWHERE {prewhere_sql}
+  {where_sql}
+  GROUP BY p.session_id
+) AS c
+{mode_join_sql}
+WHERE c.matched_terms >= {min_should_match}
+  {mode_filter_sql}
+ORDER BY c.score DESC, c.session_id ASC
+LIMIT {limit}
+FORMAT JSONEachRow",
+            postings_table = postings_table,
+            docs_join_sql = docs_join_sql,
+            prewhere_sql = prewhere_sql,
+            where_sql = where_sql,
+            mode_join_sql = mode_join_sql,
+            mode_filter_sql = mode_filter_sql,
+            min_should_match = min_should_match,
+            limit = limit,
+        ))
+    }
+
+    async fn fetch_conversation_candidates(
+        &self,
+        terms: &[String],
+        idf_by_term: &HashMap<String, f64>,
+        include_tool_events: bool,
+        exclude_codex_mcp: bool,
+        min_should_match: u16,
+        limit: u16,
+        from_unix_ms: Option<i64>,
+        to_unix_ms: Option<i64>,
+        mode: Option<ConversationMode>,
+    ) -> RepoResult<ConversationCandidateSet> {
+        let candidate_limit = Self::conversation_candidate_limit(limit);
+        let persistent_sql = self.build_search_conversation_candidates_sql(
+            terms,
+            idf_by_term,
+            include_tool_events,
+            exclude_codex_mcp,
+            min_should_match,
+            candidate_limit,
+            from_unix_ms,
+            to_unix_ms,
+            mode,
+        )?;
+        let mut persistent_rows: Vec<ConversationCandidateRow> =
+            self.map_backend(self.ch.query_rows(&persistent_sql, None).await)?;
+        let truncated = persistent_rows.len() >= candidate_limit;
+        if truncated {
+            return Ok(ConversationCandidateSet {
+                rows: persistent_rows,
+                truncated: true,
+            });
+        }
+
+        let recent_sql = self.build_search_conversation_recent_candidates_sql(
+            terms,
+            idf_by_term,
+            include_tool_events,
+            exclude_codex_mcp,
+            min_should_match,
+            CONVERSATION_RECENT_CANDIDATE_LIMIT,
+            from_unix_ms,
+            to_unix_ms,
+            mode,
+        )?;
+        let recent_rows: Vec<ConversationCandidateRow> =
+            self.map_backend(self.ch.query_rows(&recent_sql, None).await)?;
+
+        let mut by_session = HashMap::<String, (f64, u16)>::new();
+        for row in persistent_rows.drain(..) {
+            by_session.insert(row.session_id, (row.score, row.matched_terms));
+        }
+        for row in recent_rows {
+            let entry = by_session
+                .entry(row.session_id)
+                .or_insert((row.score, row.matched_terms));
+            if row.score > entry.0 {
+                entry.0 = row.score;
+            }
+            if row.matched_terms > entry.1 {
+                entry.1 = row.matched_terms;
+            }
+        }
+
+        let mut rows = by_session
+            .into_iter()
+            .map(
+                |(session_id, (score, matched_terms))| ConversationCandidateRow {
+                    session_id,
+                    score,
+                    matched_terms,
+                },
+            )
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
+        let max_rows = candidate_limit.saturating_add(CONVERSATION_RECENT_CANDIDATE_LIMIT);
+        if rows.len() > max_rows {
+            rows.truncate(max_rows);
+        }
+
+        Ok(ConversationCandidateSet {
+            rows,
+            truncated: false,
+        })
+    }
+
     fn build_search_conversations_sql(
         &self,
         terms: &[String],
@@ -1527,6 +1906,7 @@ FORMAT JSONEachRow",
         from_unix_ms: Option<i64>,
         to_unix_ms: Option<i64>,
         mode: Option<ConversationMode>,
+        candidate_session_ids: Option<&[String]>,
     ) -> RepoResult<String> {
         if terms.is_empty() {
             return Err(RepoError::invalid_argument(
@@ -1535,50 +1915,54 @@ FORMAT JSONEachRow",
         }
 
         let postings_table = self.table_ref("search_postings");
-        let documents_table = self.table_ref("search_documents");
         let terms_array_sql = sql_array_strings(terms);
         let idf_vals: Vec<f64> = terms
             .iter()
             .map(|t| *idf_by_term.get(t).unwrap_or(&0.0))
             .collect();
         let idf_array_sql = sql_array_f64(&idf_vals);
-
-        let mut event_where = vec![format!("p.term IN {}", terms_array_sql)];
-        if let Some(from_unix_ms) = from_unix_ms {
-            event_where.push(format!(
-                "toUnixTimestamp64Milli(d.ingested_at) >= {from_unix_ms}"
-            ));
-        }
-        if let Some(to_unix_ms) = to_unix_ms {
-            event_where.push(format!(
-                "toUnixTimestamp64Milli(d.ingested_at) < {to_unix_ms}"
-            ));
-        }
-
-        if include_tool_events {
-            event_where.push("p.payload_type != 'token_count'".to_string());
+        let (docs_join_sql, prewhere_sql, where_sql) = self.build_conversation_postings_filter_sql(
+            terms,
+            include_tool_events,
+            exclude_codex_mcp,
+            from_unix_ms,
+            to_unix_ms,
+            None,
+            candidate_session_ids,
+        );
+        let (mode_join_sql, mode_filter_sql) = if let Some(selected_mode) = mode {
+            let mode_subquery = self.mode_subquery();
+            let mode_filter_sql = Self::mode_filter_clause(Some(selected_mode))
+                .map(|clause| format!("AND {clause}"))
+                .unwrap_or_default();
+            (
+                format!("ANY LEFT JOIN ({mode_subquery}) AS m ON m.session_id = c.session_id"),
+                mode_filter_sql,
+            )
         } else {
-            event_where.push("p.event_class IN ('message', 'reasoning', 'event_msg')".to_string());
-            event_where.push(
-                "p.payload_type NOT IN ('token_count', 'task_started', 'task_complete', 'turn_aborted', 'item_completed')"
-                    .to_string(),
-            );
-        }
-
-        if exclude_codex_mcp {
-            event_where
-                .push("positionCaseInsensitiveUTF8(d.payload_json, 'codex-mcp') = 0".to_string());
-            event_where.push("lowerUTF8(d.name) NOT IN ('search', 'open')".to_string());
-        }
-
-        let event_where_sql = event_where.join("\n      AND ");
-        let mode_subquery = self.mode_subquery();
-        let mode_filter_sql = Self::mode_filter_clause(mode)
-            .map(|clause| format!("AND {clause}"))
-            .unwrap_or_default();
+            (String::new(), String::new())
+        };
 
         let k1 = self.cfg.bm25_k1.max(0.01);
         let b = self.cfg.bm25_b.clamp(0.0, 1.0);
+        let use_term_bitmask = terms.len() <= 63;
+        let term_bits_with_sql = if use_term_bitmask {
+            ",\n  arrayMap(idx -> toUInt64(bitShiftLeft(toUInt64(1), idx - 1)), arrayEnumerate(q_terms)) AS q_bits"
+                .to_string()
+        } else {
+            String::new()
+        };
+        let outer_matched_terms_sql = if use_term_bitmask {
+            "bitCount(groupBitOr(e.term_mask))".to_string()
+        } else {
+            "length(arrayDistinct(arrayFlatten(groupArray(e.matched_terms_arr))))".to_string()
+        };
+        let inner_matched_terms_sql = if use_term_bitmask {
+            "groupBitOr(transform(toString(p.term), q_terms, q_bits, toUInt64(0))) AS term_mask,"
+                .to_string()
+        } else {
+            "groupUniqArray(toString(p.term)) AS matched_terms_arr,".to_string()
+        };
 
         Ok(format!(
             "WITH
@@ -1586,30 +1970,27 @@ FORMAT JSONEachRow",
   {b:.6} AS b,
   greatest({avgdl:.6}, 1.0) AS avgdl,
   {terms_array_sql} AS q_terms,
-  {idf_array_sql} AS q_idf
+  {idf_array_sql} AS q_idf{term_bits_with_sql}
 SELECT
   c.session_id,
   c.score,
   toUInt16(c.matched_terms) AS matched_terms,
   toUInt32(c.event_count_considered) AS event_count_considered,
-  c.best_event_uid,
-  c.snippet
+  c.best_event_uid
 FROM (
   SELECT
     e.session_id AS session_id,
     sum(e.event_score) AS score,
-    length(arrayDistinct(arrayFlatten(groupArray(e.matched_terms_arr)))) AS matched_terms,
+    {outer_matched_terms_sql} AS matched_terms,
     count() AS event_count_considered,
-    argMax(e.event_uid, e.event_score) AS best_event_uid,
-    argMax(e.text_preview, e.event_score) AS snippet
+    argMax(e.event_uid, e.event_score) AS best_event_uid
   FROM (
     SELECT
       p.doc_id AS event_uid,
       any(p.session_id) AS session_id,
-      groupUniqArray(p.term) AS matched_terms_arr,
-      leftUTF8(any(d.text_content), {preview}) AS text_preview,
+      {inner_matched_terms_sql}
       sum(
-        transform(p.term, q_terms, q_idf, 0.0)
+        transform(toString(p.term), q_terms, q_idf, 0.0)
         *
         (
           (toFloat64(p.tf) * (k1 + 1.0))
@@ -1618,29 +1999,64 @@ FROM (
         )
       ) AS event_score
     FROM {postings_table} AS p
-    ANY INNER JOIN {documents_table} AS d ON d.event_uid = p.doc_id
-    WHERE {event_where_sql}
+    {docs_join_sql}
+    PREWHERE {prewhere_sql}
+    {where_sql}
     GROUP BY p.doc_id
   ) AS e
   GROUP BY e.session_id
 ) AS c
-ANY LEFT JOIN ({mode_subquery}) AS m ON m.session_id = c.session_id
+{mode_join_sql}
 WHERE c.matched_terms >= {min_should_match}
   AND c.score >= {min_score:.6}
   {mode_filter_sql}
 ORDER BY c.score DESC, c.session_id ASC
 LIMIT {limit}
 FORMAT JSONEachRow",
-            preview = self.cfg.preview_chars,
             postings_table = postings_table,
-            documents_table = documents_table,
-            event_where_sql = event_where_sql,
-            mode_subquery = mode_subquery,
+            docs_join_sql = docs_join_sql,
+            prewhere_sql = prewhere_sql,
+            where_sql = where_sql,
+            outer_matched_terms_sql = outer_matched_terms_sql,
+            inner_matched_terms_sql = inner_matched_terms_sql,
+            term_bits_with_sql = term_bits_with_sql,
+            mode_join_sql = mode_join_sql,
             mode_filter_sql = mode_filter_sql,
             min_should_match = min_should_match,
             min_score = min_score,
             limit = limit,
         ))
+    }
+
+    async fn fetch_conversation_snippets(
+        &self,
+        event_uids: &[String],
+    ) -> RepoResult<HashMap<String, String>> {
+        if event_uids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let documents_table = self.table_ref("search_documents");
+        let event_uids_sql = sql_array_strings(event_uids);
+        let sql = format!(
+            "SELECT
+  event_uid,
+  leftUTF8(any(text_content), {preview}) AS snippet
+FROM {documents_table}
+WHERE event_uid IN {event_uids_sql}
+GROUP BY event_uid
+FORMAT JSONEachRow",
+            preview = self.cfg.preview_chars,
+            documents_table = documents_table,
+            event_uids_sql = event_uids_sql,
+        );
+        let rows: Vec<ConversationSnippetRow> =
+            self.map_backend(self.ch.query_rows(&sql, None).await)?;
+        let mut by_uid = HashMap::new();
+        for row in rows {
+            by_uid.insert(row.event_uid, row.snippet);
+        }
+        Ok(by_uid)
     }
 
     async fn log_search_events(
@@ -2384,6 +2800,42 @@ FORMAT JSONEachRow",
             idf_by_term.insert(term.clone(), idf.max(0.0));
         }
 
+        let candidate_set = match self
+            .fetch_conversation_candidates(
+                &terms,
+                &idf_by_term,
+                include_tool_events,
+                exclude_codex_mcp,
+                min_should_match,
+                limit,
+                query.from_unix_ms,
+                query.to_unix_ms,
+                query.mode,
+            )
+            .await
+        {
+            Ok(set) => set,
+            Err(err) => {
+                warn!("search_conversations candidate stage failed; falling back to exact path: {err}");
+                ConversationCandidateSet::default()
+            }
+        };
+        let candidate_limit = Self::conversation_candidate_limit(limit);
+        let candidate_session_ids = if candidate_set.truncated
+            || candidate_set.rows.is_empty()
+            || candidate_set.rows.len() >= candidate_limit
+        {
+            None
+        } else {
+            Some(
+                candidate_set
+                    .rows
+                    .into_iter()
+                    .map(|row| row.session_id)
+                    .collect::<Vec<_>>(),
+            )
+        };
+
         let sql = self.build_search_conversations_sql(
             &terms,
             &idf_by_term,
@@ -2396,30 +2848,49 @@ FORMAT JSONEachRow",
             query.from_unix_ms,
             query.to_unix_ms,
             query.mode,
+            candidate_session_ids.as_deref(),
         )?;
 
         let rows: Vec<ConversationSearchRow> =
             self.map_backend(self.ch.query_rows(&sql, None).await)?;
+        let best_event_uids = rows
+            .iter()
+            .filter_map(|row| {
+                if row.best_event_uid.is_empty() {
+                    None
+                } else {
+                    Some(row.best_event_uid.clone())
+                }
+            })
+            .collect::<Vec<_>>();
+        let snippet_by_event_uid = self.fetch_conversation_snippets(&best_event_uids).await?;
 
         let hits = rows
             .into_iter()
             .enumerate()
-            .map(|(idx, row)| ConversationSearchHit {
-                rank: idx + 1,
-                session_id: row.session_id,
-                score: row.score,
-                matched_terms: row.matched_terms,
-                event_count_considered: row.event_count_considered,
-                best_event_uid: if row.best_event_uid.is_empty() {
+            .map(|(idx, row)| {
+                let best_event_uid = if row.best_event_uid.is_empty() {
                     None
                 } else {
                     Some(row.best_event_uid)
-                },
-                snippet: if row.snippet.is_empty() {
-                    None
-                } else {
-                    Some(row.snippet)
-                },
+                };
+                let snippet = best_event_uid
+                    .as_ref()
+                    .and_then(|event_uid| snippet_by_event_uid.get(event_uid).cloned())
+                    .or(if row.snippet.is_empty() {
+                        None
+                    } else {
+                        Some(row.snippet)
+                    });
+                ConversationSearchHit {
+                    rank: idx + 1,
+                    session_id: row.session_id,
+                    score: row.score,
+                    matched_terms: row.matched_terms,
+                    event_count_considered: row.event_count_considered,
+                    best_event_uid,
+                    snippet,
+                }
             })
             .collect::<Vec<_>>();
 
