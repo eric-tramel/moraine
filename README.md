@@ -17,6 +17,16 @@ curl -fsSL https://raw.githubusercontent.com/eric-tramel/moraine/main/scripts/in
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
+The installer is environment-configured (not flag-configured). Common overrides:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/eric-tramel/moraine/main/scripts/install.sh \
+  | MORAINE_INSTALL_VERSION=v0.1.1 bash
+
+curl -fsSL https://raw.githubusercontent.com/eric-tramel/moraine/main/scripts/install.sh \
+  | MORAINE_INSTALL_DIR="$HOME/bin" MORAINE_INSTALL_SKIP_CLICKHOUSE=1 bash
+```
+
 Start the stack and confirm it is healthy:
 
 ```bash

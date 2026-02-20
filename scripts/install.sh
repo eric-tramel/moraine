@@ -2,29 +2,36 @@
 set -euo pipefail
 
 usage() {
-  cat <<'EOF'
+  cat <<'USAGE'
 Install Moraine binaries from release bundle artifacts.
 
 usage:
-  scripts/install.sh [options]
+  scripts/install.sh [--help]
 
-options:
-  --repo <owner/repo>      GitHub repository hosting release assets
-                           (default: $MORAINE_INSTALL_REPO or eric-tramel/moraine)
-  --asset-base-url <url>   Base URL hosting moraine-bundle-<target>.tar.gz and .sha256 assets
-  --version <tag>       Release tag (default: latest)
-  --install-dir <path>  Destination directory for binary (default: ~/.local/bin)
-  --lib-dir <path>      Destination root for versioned bundle (default: ~/.local/lib/moraine)
-  --skip-clickhouse     Do not auto-install managed ClickHouse
-  --force               Replace existing binary without prompting
-  -h, --help            Show help
+configuration (environment variables):
+  MORAINE_INSTALL_REPO             GitHub repository hosting release assets
+                                   (default: eric-tramel/moraine)
+  MORAINE_INSTALL_VERSION          Release tag to install (default: latest)
+  MORAINE_INSTALL_ASSET_BASE_URL   Base URL hosting moraine-bundle-<target>.tar.gz and .sha256
+                                   (requires MORAINE_INSTALL_VERSION to be set to a tag)
+  MORAINE_INSTALL_SKIP_CLICKHOUSE  Skip managed ClickHouse install when set to 1/true/yes/on
+
+  MORAINE_INSTALL_DIR              Explicit install bin directory (highest precedence)
+  XDG_BIN_HOME                     Install bin directory when MORAINE_INSTALL_DIR is unset
+  XDG_DATA_HOME                    Fallback install location is "$(dirname XDG_DATA_HOME)/bin"
+  HOME                             Final fallback install dir: ~/.local/bin
+  XDG_CONFIG_HOME                  Receipt root (default: ~/.config)
+
+install directory precedence:
+  MORAINE_INSTALL_DIR > XDG_BIN_HOME > $(dirname XDG_DATA_HOME)/bin > ~/.local/bin
 
 examples:
   scripts/install.sh
-  scripts/install.sh --version v0.1.1
-  scripts/install.sh --repo your-org/moraine-fork --version v0.1.1
-  scripts/install.sh --asset-base-url http://127.0.0.1:8080 --version ci-e2e
-EOF
+  MORAINE_INSTALL_VERSION=v0.1.1 scripts/install.sh
+  MORAINE_INSTALL_ASSET_BASE_URL=http://127.0.0.1:8080 \
+    MORAINE_INSTALL_VERSION=ci-e2e scripts/install.sh
+  MORAINE_INSTALL_DIR="$HOME/bin" MORAINE_INSTALL_SKIP_CLICKHOUSE=1 scripts/install.sh
+USAGE
 }
 
 require_cmd() {
@@ -32,6 +39,42 @@ require_cmd() {
     echo "required command not found: $1"
     exit 1
   fi
+}
+
+is_truthy() {
+  case "${1:-}" in
+    1|true|TRUE|True|yes|YES|Yes|on|ON|On)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+resolve_install_dir() {
+  if [[ -n "${MORAINE_INSTALL_DIR:-}" ]]; then
+    printf '%s\n' "$MORAINE_INSTALL_DIR"
+    return
+  fi
+
+  if [[ -n "${XDG_BIN_HOME:-}" ]]; then
+    printf '%s\n' "$XDG_BIN_HOME"
+    return
+  fi
+
+  if [[ -n "${XDG_DATA_HOME:-}" ]]; then
+    printf '%s/bin\n' "$(dirname "$XDG_DATA_HOME")"
+    return
+  fi
+
+  printf '%s/.local/bin\n' "$HOME"
+}
+
+resolve_receipt_path() {
+  local config_home
+  config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+  printf '%s/moraine/install-receipt.json\n' "$config_home"
 }
 
 checksum_of() {
@@ -140,60 +183,78 @@ fetch_latest_tag() {
   echo "$tag"
 }
 
-repo="${MORAINE_INSTALL_REPO:-eric-tramel/moraine}"
-asset_base_url=""
-version="latest"
-install_dir="${HOME}/.local/bin"
-lib_dir="${HOME}/.local/lib/moraine"
-skip_clickhouse=0
-force=0
+json_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\t'/\\t}"
+  printf '%s' "$value"
+}
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --repo)
-      repo="${2:-}"
-      shift 2
-      ;;
-    --asset-base-url)
-      asset_base_url="${2:-}"
-      shift 2
-      ;;
-    --version)
-      version="${2:-}"
-      shift 2
-      ;;
-    --install-dir)
-      install_dir="${2:-}"
-      shift 2
-      ;;
-    --lib-dir)
-      lib_dir="${2:-}"
-      shift 2
-      ;;
-    --skip-clickhouse)
-      skip_clickhouse=1
-      shift
-      ;;
-    --force)
-      force=1
-      shift
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    *)
-      echo "unknown argument: $1"
-      usage
-      exit 64
-      ;;
-  esac
-done
+write_install_receipt() {
+  local receipt_path="$1"
+  local installed_at_utc="$2"
+  local repo="$3"
+  local requested_version="$4"
+  local resolved_version="$5"
+  local target="$6"
+  local install_dir="$7"
+  local asset_url="$8"
+  local checksum_url="$9"
+
+  mkdir -p "$(dirname "$receipt_path")"
+
+  cat >"$receipt_path" <<RECEIPT
+{
+  "schema_version": 1,
+  "installed_at_utc": "$(json_escape "$installed_at_utc")",
+  "repo": "$(json_escape "$repo")",
+  "requested_version": "$(json_escape "$requested_version")",
+  "resolved_version": "$(json_escape "$resolved_version")",
+  "target": "$(json_escape "$target")",
+  "install_dir": "$(json_escape "$install_dir")",
+  "asset_url": "$(json_escape "$asset_url")",
+  "checksum_url": "$(json_escape "$checksum_url")",
+  "binaries": [
+    "moraine",
+    "moraine-ingest",
+    "moraine-monitor",
+    "moraine-mcp"
+  ]
+}
+RECEIPT
+}
+
+if [[ $# -gt 0 ]]; then
+  if [[ $# -eq 1 && ( "$1" == "-h" || "$1" == "--help" ) ]]; then
+    usage
+    exit 0
+  fi
+
+  echo "unknown argument(s): $*" >&2
+  echo "install.sh is configured via environment variables; run with --help for details" >&2
+  exit 64
+fi
+
+repo="${MORAINE_INSTALL_REPO:-eric-tramel/moraine}"
+asset_base_url="${MORAINE_INSTALL_ASSET_BASE_URL:-}"
+requested_version="${MORAINE_INSTALL_VERSION:-latest}"
+version="$requested_version"
+install_dir="$(resolve_install_dir)"
+receipt_path="$(resolve_receipt_path)"
+skip_clickhouse=0
+bins=(moraine moraine-ingest moraine-monitor moraine-mcp)
+
+if is_truthy "${MORAINE_INSTALL_SKIP_CLICKHOUSE:-}"; then
+  skip_clickhouse=1
+fi
 
 if [[ -n "$asset_base_url" ]]; then
   asset_base_url="${asset_base_url%/}"
   if [[ "$version" == "latest" ]]; then
-    echo "--version <tag> is required when --asset-base-url is set"
+    echo "MORAINE_INSTALL_VERSION <tag> is required when MORAINE_INSTALL_ASSET_BASE_URL is set"
     usage
     exit 64
   fi
@@ -262,7 +323,7 @@ if [[ -n "$manifest_target" && "$manifest_target" != "$target" ]]; then
   exit 1
 fi
 
-for bin in moraine moraine-ingest moraine-monitor moraine-mcp; do
+for bin in "${bins[@]}"; do
   if [[ ! -f "$extract_dir/bin/$bin" ]]; then
     echo "archive did not contain required binary: bin/$bin"
     exit 1
@@ -279,37 +340,33 @@ for bin in moraine moraine-ingest moraine-monitor moraine-mcp; do
   fi
 done
 
-release_dir="$lib_dir/$version/$target"
-current_link="$lib_dir/current"
-
-if [[ -e "$release_dir" && "$force" -ne 1 ]]; then
-  echo "destination already exists: $release_dir"
-  echo "re-run with --force to replace it"
-  exit 1
-fi
-
-rm -rf "$release_dir"
-mkdir -p "$release_dir"
-cp -R "$extract_dir"/. "$release_dir/"
-
-mkdir -p "$lib_dir"
-ln -sfn "$release_dir" "$current_link"
-
 mkdir -p "$install_dir"
-for bin in moraine moraine-ingest moraine-monitor moraine-mcp; do
-  ln -sfn "$current_link/bin/$bin" "$install_dir/$bin"
+for bin in "${bins[@]}"; do
+  cp "$extract_dir/bin/$bin" "$install_dir/$bin"
+  chmod +x "$install_dir/$bin"
 done
 
-for bin in moraine moraine-ingest moraine-monitor moraine-mcp; do
-  if ! "$current_link/bin/$bin" --help >/dev/null 2>&1; then
-    echo "installed binary failed health check (--help): $current_link/bin/$bin"
+for bin in "${bins[@]}"; do
+  if ! "$install_dir/$bin" --help >/dev/null 2>&1; then
+    echo "installed binary failed health check (--help): $install_dir/$bin"
     exit 1
   fi
 done
 
-echo "installed bundle: $release_dir"
-echo "active bundle: $current_link"
-echo "linked binaries in: $install_dir"
+installed_at_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+write_install_receipt \
+  "$receipt_path" \
+  "$installed_at_utc" \
+  "$repo" \
+  "$requested_version" \
+  "$version" \
+  "$target" \
+  "$install_dir" \
+  "$asset_url" \
+  "$checksum_url"
+
+echo "installed binaries to: $install_dir"
+echo "wrote install receipt: $receipt_path"
 
 if [[ ":$PATH:" != *":$install_dir:"* ]]; then
   echo
@@ -321,7 +378,7 @@ fi
 if [[ "$skip_clickhouse" -ne 1 ]]; then
   echo
   echo "installing managed ClickHouse..."
-  if ! "$current_link/bin/moraine" clickhouse install; then
+  if ! "$install_dir/moraine" clickhouse install; then
     echo "warning: managed ClickHouse install failed."
     echo "you can retry with:"
     echo "  moraine clickhouse install"

@@ -118,10 +118,11 @@ main() {
   mkdir -p "$HOME"
   local base_path="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
   export PATH="$base_path"
-  "$install_script" \
-    --asset-base-url "$asset_base_url" \
-    --version "$bundle_version" \
-    --skip-clickhouse
+  MORAINE_INSTALL_ASSET_BASE_URL="$asset_base_url" \
+    MORAINE_INSTALL_VERSION="$bundle_version" \
+    MORAINE_INSTALL_SKIP_CLICKHOUSE=1 \
+    MORAINE_INSTALL_DIR="$HOME/.local/bin" \
+    bash "$install_script"
 
   export PATH="$HOME/.local/bin:$PATH"
   local installed_moraine="$HOME/.local/bin/moraine"

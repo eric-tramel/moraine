@@ -49,16 +49,23 @@ curl -fsSL https://raw.githubusercontent.com/eric-tramel/moraine/main/scripts/in
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Default binary symlink location is `~/.local/bin`. Versioned bundles are installed under `~/.local/lib/moraine/<tag>/<target>` with `~/.local/lib/moraine/current` as active symlink.
+The installer fetches a full bundle (`moraine`, `moraine-ingest`, `moraine-monitor`, `moraine-mcp`) and overwrites binaries in place in a single bin directory.
 
-The installer fetches a full bundle (`moraine`, `moraine-ingest`, `moraine-monitor`, `moraine-mcp`) and installs managed ClickHouse automatically by default.
+Install directory precedence:
 
-Install paths:
+1. `MORAINE_INSTALL_DIR`
+2. `XDG_BIN_HOME`
+3. `$(dirname "$XDG_DATA_HOME")/bin`
+4. `~/.local/bin`
 
-- Bundle root: `~/.local/lib/moraine/<tag>/<target>`
-- Active symlink: `~/.local/lib/moraine/current`
-- Command symlinks: `~/.local/bin`
-- Managed ClickHouse root: `~/.local/lib/moraine/clickhouse/current`
+The installer writes a receipt at `${XDG_CONFIG_HOME:-~/.config}/moraine/install-receipt.json`.
+
+Installer environment configuration:
+
+- `MORAINE_INSTALL_REPO` (default `eric-tramel/moraine`)
+- `MORAINE_INSTALL_VERSION` (default `latest`)
+- `MORAINE_INSTALL_ASSET_BASE_URL` (requires `MORAINE_INSTALL_VERSION` to be a non-`latest` tag)
+- `MORAINE_INSTALL_SKIP_CLICKHOUSE` (`1|true|yes|on` skips managed ClickHouse install)
 
 ## Publish prebuilt binaries
 
