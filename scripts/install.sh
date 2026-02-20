@@ -76,6 +76,56 @@ resolve_receipt_path() {
   printf '%s/moraine/install-receipt.json\n' "$config_home"
 }
 
+resolve_runtime_config_path() {
+  if [ -n "${MORAINE_CONFIG:-}" ]; then
+    printf '%s\n' "$MORAINE_CONFIG"
+    return
+  fi
+
+  printf '%s/.moraine/config.toml\n' "${HOME:?HOME is not set}"
+}
+
+write_minimal_default_config() {
+  path="$1"
+
+  cat >"$path" <<'CONFIG'
+# Moraine default config.
+# Values omitted here are filled by built-in defaults.
+CONFIG
+}
+
+bootstrap_runtime_config() {
+  config_path="$1"
+  template_path="$2"
+
+  if [ -f "$config_path" ]; then
+    return 0
+  fi
+
+  config_dir="$(dirname "$config_path")"
+  if ! mkdir -p "$config_dir"; then
+    echo "warning: failed to create config directory: $config_dir"
+    return 1
+  fi
+
+  if [ -f "$template_path" ]; then
+    if ! cp "$template_path" "$config_path"; then
+      echo "warning: failed to write config from bundle template: $config_path"
+      return 1
+    fi
+    echo "wrote default config: $config_path"
+    return 0
+  fi
+
+  if ! write_minimal_default_config "$config_path"; then
+    echo "warning: failed to write minimal config: $config_path"
+    return 1
+  fi
+
+  echo "wrote minimal default config: $config_path"
+  return 0
+}
+
 checksum_of() {
   path="$1"
   if command -v sha256sum >/dev/null 2>&1; then
@@ -239,6 +289,7 @@ requested_version="${MORAINE_INSTALL_VERSION:-latest}"
 version="$requested_version"
 install_dir="$(resolve_install_dir)"
 receipt_path="$(resolve_receipt_path)"
+runtime_config_path="$(resolve_runtime_config_path)"
 skip_clickhouse=0
 bins="moraine moraine-ingest moraine-monitor moraine-mcp"
 
@@ -335,6 +386,19 @@ for bin in $bins; do
   fi
 done
 
+if [ -f "$extract_dir/config/moraine.toml" ]; then
+  expected_sum="$(manifest_checksum "$extract_dir/manifest.json" "config/moraine.toml")"
+  if [ -n "$expected_sum" ]; then
+    actual_sum="$(checksum_of "$extract_dir/config/moraine.toml")"
+    if [ "$expected_sum" != "$actual_sum" ]; then
+      echo "manifest checksum mismatch for config/moraine.toml"
+      echo "expected: $expected_sum"
+      echo "actual:   $actual_sum"
+      exit 1
+    fi
+  fi
+fi
+
 mkdir -p "$install_dir"
 for bin in $bins; do
   cp "$extract_dir/bin/$bin" "$install_dir/$bin"
@@ -363,6 +427,10 @@ write_install_receipt \
 echo "installed binaries to: $install_dir"
 echo "wrote install receipt: $receipt_path"
 
+if ! bootstrap_runtime_config "$runtime_config_path" "$extract_dir/config/moraine.toml"; then
+  echo "warning: unable to bootstrap config at $runtime_config_path"
+fi
+
 case ":${PATH:-}:" in
   *":$install_dir:"*)
     ;;
@@ -377,10 +445,10 @@ esac
 if [ "$skip_clickhouse" -ne 1 ]; then
   echo
   echo "installing managed ClickHouse..."
-  if ! "$install_dir/moraine" clickhouse install; then
+  if ! "$install_dir/moraine" clickhouse install --config "$runtime_config_path"; then
     echo "warning: managed ClickHouse install failed."
     echo "you can retry with:"
-    echo "  moraine clickhouse install"
+    echo "  moraine clickhouse install --config \"$runtime_config_path\""
   fi
 fi
 

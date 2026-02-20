@@ -83,12 +83,13 @@ CHECKSUM_PATH="$OUTPUT_DIR/moraine-bundle-$TARGET.sha256"
 STAGE_DIR="$(mktemp -d)"
 trap 'rm -rf "$STAGE_DIR"' EXIT
 
-mkdir -p "$STAGE_DIR/bin" "$STAGE_DIR/web/monitor"
+mkdir -p "$STAGE_DIR/bin" "$STAGE_DIR/config" "$STAGE_DIR/web/monitor"
 
 cp "$PROJECT_ROOT/target/$TARGET/release/moraine" "$STAGE_DIR/bin/moraine"
 cp "$PROJECT_ROOT/target/$TARGET/release/moraine-ingest" "$STAGE_DIR/bin/moraine-ingest"
 cp "$PROJECT_ROOT/target/$TARGET/release/moraine-monitor" "$STAGE_DIR/bin/moraine-monitor"
 cp "$PROJECT_ROOT/target/$TARGET/release/moraine-mcp" "$STAGE_DIR/bin/moraine-mcp"
+cp "$PROJECT_ROOT/config/moraine.toml" "$STAGE_DIR/config/moraine.toml"
 cp -R "$PROJECT_ROOT/web/monitor/dist" "$STAGE_DIR/web/monitor/dist"
 
 build_timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
@@ -98,6 +99,7 @@ checksum_moraine="$(sha256_file "$STAGE_DIR/bin/moraine")"
 checksum_ingest="$(sha256_file "$STAGE_DIR/bin/moraine-ingest")"
 checksum_monitor="$(sha256_file "$STAGE_DIR/bin/moraine-monitor")"
 checksum_mcp="$(sha256_file "$STAGE_DIR/bin/moraine-mcp")"
+checksum_config="$(sha256_file "$STAGE_DIR/config/moraine.toml")"
 
 cat > "$STAGE_DIR/manifest.json" <<EOF
 {
@@ -119,7 +121,8 @@ cat > "$STAGE_DIR/manifest.json" <<EOF
     "bin/moraine": "$checksum_moraine",
     "bin/moraine-ingest": "$checksum_ingest",
     "bin/moraine-monitor": "$checksum_monitor",
-    "bin/moraine-mcp": "$checksum_mcp"
+    "bin/moraine-mcp": "$checksum_mcp",
+    "config/moraine.toml": "$checksum_config"
   },
   "web_assets": [
     "web/monitor/dist"
