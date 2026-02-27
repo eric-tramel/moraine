@@ -2,8 +2,9 @@ use anyhow::{anyhow, Context, Result};
 use moraine_clickhouse::ClickHouseClient;
 use moraine_config::AppConfig;
 use moraine_conversations::{
-    ClickHouseConversationRepository, ConversationMode, ConversationRepository,
-    ConversationSearchQuery, OpenEventRequest, RepoConfig, SearchEventsQuery,
+    ClickHouseConversationRepository, ConversationListFilter, ConversationMode,
+    ConversationRepository, ConversationSearchQuery, OpenEventRequest, PageRequest, RepoConfig,
+    SearchEventsQuery,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -76,6 +77,22 @@ struct SearchConversationsArgs {
     include_tool_events: Option<bool>,
     #[serde(default)]
     exclude_codex_mcp: Option<bool>,
+    #[serde(default)]
+    verbosity: Option<Verbosity>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ListSessionsArgs {
+    #[serde(default)]
+    limit: Option<u16>,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    from_unix_ms: Option<i64>,
+    #[serde(default)]
+    to_unix_ms: Option<i64>,
+    #[serde(default)]
+    mode: Option<ConversationMode>,
     #[serde(default)]
     verbosity: Option<Verbosity>,
 }
@@ -203,6 +220,32 @@ struct ConversationSearchProseHit {
     best_event_uid: Option<String>,
     #[serde(default)]
     snippet: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SessionListProsePayload {
+    #[serde(default)]
+    sessions: Vec<SessionListProseSession>,
+    #[serde(default)]
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SessionListProseSession {
+    #[serde(default)]
+    session_id: String,
+    #[serde(default)]
+    start_time: String,
+    #[serde(default)]
+    start_unix_ms: i64,
+    #[serde(default)]
+    end_time: String,
+    #[serde(default)]
+    end_unix_ms: i64,
+    #[serde(default)]
+    event_count: u64,
+    #[serde(default)]
+    harness_type: String,
 }
 
 #[derive(Clone)]
@@ -349,6 +392,28 @@ impl AppState {
                         },
                         "required": ["query"]
                     }
+                },
+                {
+                    "name": "list_sessions",
+                    "description": "List session metadata in a time window without requiring a search query.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "limit": { "type": "integer", "minimum": 1, "maximum": self.cfg.mcp.max_results },
+                            "cursor": { "type": "string" },
+                            "from_unix_ms": { "type": "integer" },
+                            "to_unix_ms": { "type": "integer" },
+                            "mode": {
+                                "type": "string",
+                                "enum": ["web_search", "mcp_internal", "tool_calling", "chat"]
+                            },
+                            "verbosity": {
+                                "type": "string",
+                                "enum": ["prose", "full"],
+                                "default": "prose"
+                            }
+                        }
+                    }
                 }
             ]
         })
@@ -388,6 +453,20 @@ impl AppState {
                     Verbosity::Prose => {
                         Ok(tool_ok_prose(format_conversation_search_prose(&payload)?))
                     }
+                }
+            }
+            "list_sessions" => {
+                let args: ListSessionsArgs = if params.arguments.is_null() {
+                    ListSessionsArgs::default()
+                } else {
+                    serde_json::from_value(params.arguments)
+                        .context("list_sessions expects a JSON object with optional filters")?
+                };
+                let verbosity = args.verbosity.unwrap_or_default();
+                let payload = self.list_sessions(args).await?;
+                match verbosity {
+                    Verbosity::Full => Ok(tool_ok_full(payload)),
+                    Verbosity::Prose => Ok(tool_ok_prose(format_session_list_prose(&payload)?)),
                 }
             }
             other => Err(anyhow!("unknown tool: {other}")),
@@ -455,6 +534,62 @@ impl AppState {
             .map_err(|err| anyhow!(err.to_string()))?;
 
         serde_json::to_value(result).context("failed to encode search_conversations result payload")
+    }
+
+    async fn list_sessions(&self, args: ListSessionsArgs) -> Result<Value> {
+        let ListSessionsArgs {
+            limit,
+            cursor,
+            from_unix_ms,
+            to_unix_ms,
+            mode,
+            verbosity: _,
+        } = args;
+
+        let page = self
+            .repo
+            .list_conversations(
+                ConversationListFilter {
+                    from_unix_ms,
+                    to_unix_ms,
+                    mode,
+                },
+                PageRequest {
+                    limit: limit.unwrap_or(self.cfg.mcp.max_results),
+                    cursor,
+                },
+            )
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?;
+
+        let sessions = page
+            .items
+            .into_iter()
+            .map(|summary| {
+                json!({
+                    "session_id": summary.session_id,
+                    "start_time": summary.first_event_time,
+                    "start_unix_ms": summary.first_event_unix_ms,
+                    "end_time": summary.last_event_time,
+                    "end_unix_ms": summary.last_event_unix_ms,
+                    "event_count": summary.total_events,
+                    "turn_count": summary.total_turns,
+                    "user_messages": summary.user_messages,
+                    "assistant_messages": summary.assistant_messages,
+                    "tool_calls": summary.tool_calls,
+                    "tool_results": summary.tool_results,
+                    "harness_type": summary.mode.as_str(),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Ok(json!({
+            "from_unix_ms": from_unix_ms,
+            "to_unix_ms": to_unix_ms,
+            "mode": mode.map(ConversationMode::as_str),
+            "sessions": sessions,
+            "next_cursor": page.next_cursor,
+        }))
     }
 }
 
@@ -658,6 +793,50 @@ fn format_conversation_search_prose(payload: &Value) -> Result<String> {
     Ok(out.trim_end().to_string())
 }
 
+fn format_session_list_prose(payload: &Value) -> Result<String> {
+    let parsed: SessionListProsePayload =
+        serde_json::from_value(payload.clone()).context("failed to parse list_sessions payload")?;
+
+    let mut out = String::new();
+    out.push_str("Session List\n");
+    out.push_str(&format!("Sessions: {}\n", parsed.sessions.len()));
+
+    if parsed.sessions.is_empty() {
+        out.push_str("\nNo sessions.");
+        return Ok(out);
+    }
+
+    for (idx, session) in parsed.sessions.iter().enumerate() {
+        let harness = if session.harness_type.is_empty() {
+            "chat"
+        } else {
+            session.harness_type.as_str()
+        };
+
+        out.push_str(&format!(
+            "\n{}) session={} harness={} events={}\n",
+            idx + 1,
+            session.session_id,
+            harness,
+            session.event_count
+        ));
+        out.push_str(&format!(
+            "   start: {} (unix_ms={})\n",
+            session.start_time, session.start_unix_ms
+        ));
+        out.push_str(&format!(
+            "   end: {} (unix_ms={})\n",
+            session.end_time, session.end_unix_ms
+        ));
+    }
+
+    if let Some(cursor) = parsed.next_cursor.as_deref() {
+        out.push_str(&format!("\nnext_cursor: {}", cursor));
+    }
+
+    Ok(out.trim_end().to_string())
+}
+
 fn append_open_event_line(out: &mut String, event: &OpenProseEvent) {
     let kind = display_kind(&event.event_class, &event.payload_type);
     out.push_str(&format!(
@@ -785,5 +964,40 @@ mod tests {
         let text = format_conversation_search_prose(&payload).expect("format");
         assert!(text.contains("Conversation Search"));
         assert!(text.contains("No hits"));
+    }
+
+    #[test]
+    fn format_session_list_handles_empty_result() {
+        let payload = json!({
+            "sessions": [],
+            "next_cursor": null
+        });
+
+        let text = format_session_list_prose(&payload).expect("format");
+        assert!(text.contains("Session List"));
+        assert!(text.contains("No sessions"));
+    }
+
+    #[test]
+    fn format_session_list_includes_next_cursor_and_times() {
+        let payload = json!({
+            "sessions": [
+                {
+                    "session_id": "sess-1",
+                    "start_time": "2026-01-02 12:00:00",
+                    "start_unix_ms": 1767355200000_i64,
+                    "end_time": "2026-01-02 12:05:00",
+                    "end_unix_ms": 1767355500000_i64,
+                    "event_count": 22_u64,
+                    "harness_type": "web_search"
+                }
+            ],
+            "next_cursor": "cursor-token"
+        });
+
+        let text = format_session_list_prose(&payload).expect("format");
+        assert!(text.contains("session=sess-1"));
+        assert!(text.contains("harness=web_search"));
+        assert!(text.contains("next_cursor: cursor-token"));
     }
 }
