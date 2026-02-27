@@ -528,6 +528,22 @@ GROUP BY session_id"
         Ok(())
     }
 
+    fn is_low_information_system_event(actor_role: &str, payload_type: &str) -> bool {
+        actor_role.eq_ignore_ascii_case("system")
+            && matches!(
+                payload_type.to_ascii_lowercase().as_str(),
+                "progress" | "file_history_snapshot" | "system"
+            )
+    }
+
+    fn open_context_filter_clause(include_system_events: bool) -> &'static str {
+        if include_system_events {
+            ""
+        } else {
+            " AND NOT (lowerUTF8(actor_role) = 'system' AND lowerUTF8(payload_type) IN ('progress', 'file_history_snapshot', 'system'))"
+        }
+    }
+
     fn map_conversation_row(row: ConversationSummaryRow) -> ConversationSummary {
         ConversationSummary {
             session_id: row.session_id,
@@ -2541,6 +2557,8 @@ FORMAT JSONEachRow",
 
         let before = req.before.unwrap_or(self.cfg.default_context_before);
         let after = req.after.unwrap_or(self.cfg.default_context_after);
+        let include_system_events = req.include_system_events.unwrap_or(false);
+        let context_filter = Self::open_context_filter_clause(include_system_events);
         let trace_table = self.table_ref("v_conversation_trace");
 
         let target_query = format!(
@@ -2563,10 +2581,7 @@ FORMAT JSONEachRow",
             });
         };
 
-        let lower = target.event_order.saturating_sub(before as u64).max(1);
-        let upper = target.event_order + after as u64;
-
-        let context_query = format!(
+        let target_row_query = format!(
             "SELECT
   session_id,
   event_uid,
@@ -2585,17 +2600,102 @@ FORMAT JSONEachRow",
   payload_json,
   token_usage_json
 FROM {trace_table}
-WHERE session_id = {} AND event_order BETWEEN {} AND {}
+WHERE session_id = {} AND event_order = {} AND event_uid = {}
 ORDER BY event_order ASC
 FORMAT JSONEachRow",
             sql_quote(&target.session_id),
-            lower,
-            upper
+            target.event_order,
+            sql_quote(event_uid),
         );
 
-        let mut rows: Vec<TraceEventRow> =
-            self.map_backend(self.ch.query_rows(&context_query, None).await)?;
-        rows.sort_by_key(|row| row.event_order);
+        let mut before_rows: Vec<TraceEventRow> = if before == 0 {
+            Vec::new()
+        } else {
+            let before_query = format!(
+                "SELECT
+  session_id,
+  event_uid,
+  toUInt64(event_order) AS event_order,
+  toUInt32(turn_seq) AS turn_seq,
+  toString(event_time) AS event_time,
+  actor_role,
+  event_class,
+  payload_type,
+  call_id,
+  name,
+  phase,
+  item_id,
+  source_ref,
+  text_content,
+  payload_json,
+  token_usage_json
+FROM {trace_table}
+WHERE session_id = {} AND event_order < {}{}
+ORDER BY event_order DESC
+LIMIT {}
+FORMAT JSONEachRow",
+                sql_quote(&target.session_id),
+                target.event_order,
+                context_filter,
+                before,
+            );
+
+            self.map_backend(self.ch.query_rows(&before_query, None).await)?
+        };
+        if !include_system_events {
+            before_rows.retain(|row| {
+                !Self::is_low_information_system_event(&row.actor_role, &row.payload_type)
+            });
+        }
+        before_rows.reverse();
+
+        let target_rows: Vec<TraceEventRow> =
+            self.map_backend(self.ch.query_rows(&target_row_query, None).await)?;
+
+        let mut after_rows: Vec<TraceEventRow> = if after == 0 {
+            Vec::new()
+        } else {
+            let after_query = format!(
+                "SELECT
+  session_id,
+  event_uid,
+  toUInt64(event_order) AS event_order,
+  toUInt32(turn_seq) AS turn_seq,
+  toString(event_time) AS event_time,
+  actor_role,
+  event_class,
+  payload_type,
+  call_id,
+  name,
+  phase,
+  item_id,
+  source_ref,
+  text_content,
+  payload_json,
+  token_usage_json
+FROM {trace_table}
+WHERE session_id = {} AND event_order > {}{}
+ORDER BY event_order ASC
+LIMIT {}
+FORMAT JSONEachRow",
+                sql_quote(&target.session_id),
+                target.event_order,
+                context_filter,
+                after,
+            );
+
+            self.map_backend(self.ch.query_rows(&after_query, None).await)?
+        };
+        if !include_system_events {
+            after_rows.retain(|row| {
+                !Self::is_low_information_system_event(&row.actor_role, &row.payload_type)
+            });
+        }
+
+        let mut rows = Vec::with_capacity(before_rows.len() + target_rows.len() + after_rows.len());
+        rows.extend(before_rows);
+        rows.extend(target_rows);
+        rows.extend(after_rows);
 
         let events: Vec<OpenEvent> = rows
             .into_iter()
@@ -3259,5 +3359,45 @@ mod tests {
 
         let deduped = ClickHouseConversationRepository::dedupe_search_rows(rows, 5);
         assert_eq!(deduped.len(), 2);
+    }
+
+    #[test]
+    fn low_information_system_event_classifier_targets_open_noise() {
+        assert!(
+            ClickHouseConversationRepository::is_low_information_system_event("system", "progress")
+        );
+        assert!(
+            ClickHouseConversationRepository::is_low_information_system_event(
+                "SYSTEM",
+                "file_history_snapshot"
+            )
+        );
+        assert!(
+            ClickHouseConversationRepository::is_low_information_system_event("system", "system")
+        );
+        assert!(
+            !ClickHouseConversationRepository::is_low_information_system_event(
+                "assistant",
+                "progress"
+            )
+        );
+        assert!(
+            !ClickHouseConversationRepository::is_low_information_system_event(
+                "system",
+                "reasoning"
+            )
+        );
+    }
+
+    #[test]
+    fn open_context_filter_clause_respects_include_system_events_flag() {
+        assert_eq!(
+            ClickHouseConversationRepository::open_context_filter_clause(true),
+            ""
+        );
+        let filtered_clause = ClickHouseConversationRepository::open_context_filter_clause(false);
+        assert!(filtered_clause.contains("progress"));
+        assert!(filtered_clause.contains("file_history_snapshot"));
+        assert!(filtered_clause.contains("lowerUTF8(actor_role) = 'system'"));
     }
 }
