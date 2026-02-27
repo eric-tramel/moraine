@@ -88,6 +88,8 @@ struct OpenArgs {
     #[serde(default)]
     after: Option<u16>,
     #[serde(default)]
+    include_system_events: Option<bool>,
+    #[serde(default)]
     verbosity: Option<Verbosity>,
 }
 
@@ -314,6 +316,7 @@ impl AppState {
                             "event_uid": { "type": "string" },
                             "before": { "type": "integer", "minimum": 0 },
                             "after": { "type": "integer", "minimum": 0 },
+                            "include_system_events": { "type": "boolean", "default": false },
                             "verbosity": {
                                 "type": "string",
                                 "enum": ["prose", "full"],
@@ -422,6 +425,7 @@ impl AppState {
                 event_uid: args.event_uid,
                 before: args.before,
                 after: args.after,
+                include_system_events: args.include_system_events,
             })
             .await
             .map_err(|err| anyhow!(err.to_string()))?;
