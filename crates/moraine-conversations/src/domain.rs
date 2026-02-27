@@ -217,6 +217,9 @@ pub struct SearchEventsStats {
     pub avgdl: f64,
     pub took_ms: u32,
     pub result_count: usize,
+    pub requested_limit: u16,
+    pub effective_limit: u16,
+    pub limit_capped: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -274,6 +277,9 @@ pub struct ConversationSearchStats {
     pub avgdl: f64,
     pub took_ms: u32,
     pub result_count: usize,
+    pub requested_limit: u16,
+    pub effective_limit: u16,
+    pub limit_capped: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -310,6 +316,8 @@ pub struct OpenEventRequest {
     pub before: Option<u16>,
     #[serde(default)]
     pub after: Option<u16>,
+    #[serde(default)]
+    pub include_system_events: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
