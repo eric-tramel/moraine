@@ -37,5 +37,28 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --locked
 
+      - name: Detect E2E-relevant changes
+        id: e2e_changes
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            e2e:
+              - '.github/workflows/ci-pr-fast.yml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'apps/**'
+              - 'bin/**'
+              - 'config/**'
+              - 'crates/**'
+              - 'scripts/**'
+              - 'sql/**'
+              - 'web/**'
+
       - name: Functional stack + MCP smoke (Linux)
+        if: github.event_name != 'pull_request' || steps.e2e_changes.outputs.e2e == 'true'
         run: bash scripts/ci/e2e-stack.sh
+
+      - name: Skip E2E for docs-only changes
+        if: github.event_name == 'pull_request' && steps.e2e_changes.outputs.e2e != 'true'
+        run: echo "Skipping E2E: no E2E-relevant file changes detected."
