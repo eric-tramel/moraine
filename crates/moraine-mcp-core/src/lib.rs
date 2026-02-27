@@ -3,7 +3,7 @@ use moraine_clickhouse::ClickHouseClient;
 use moraine_config::AppConfig;
 use moraine_conversations::{
     ClickHouseConversationRepository, ConversationMode, ConversationRepository,
-    ConversationSearchQuery, OpenEventRequest, RepoConfig, SearchEventsQuery,
+    ConversationSearchQuery, OpenEventRequest, RepoConfig, SearchEventKind, SearchEventsQuery,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -51,10 +51,28 @@ struct SearchArgs {
     min_should_match: Option<u16>,
     #[serde(default)]
     include_tool_events: Option<bool>,
+    #[serde(default, alias = "event_kinds", alias = "kind", alias = "kinds")]
+    event_kind: Option<SearchEventKindsArg>,
     #[serde(default)]
     exclude_codex_mcp: Option<bool>,
     #[serde(default)]
     verbosity: Option<Verbosity>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum SearchEventKindsArg {
+    One(SearchEventKind),
+    Many(Vec<SearchEventKind>),
+}
+
+impl SearchEventKindsArg {
+    fn into_vec(self) -> Vec<SearchEventKind> {
+        match self {
+            Self::One(kind) => vec![kind],
+            Self::Many(kinds) => kinds,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -295,6 +313,21 @@ impl AppState {
                             "min_score": { "type": "number" },
                             "min_should_match": { "type": "integer", "minimum": 1 },
                             "include_tool_events": { "type": "boolean" },
+                            "event_kind": {
+                                "oneOf": [
+                                    {
+                                        "type": "string",
+                                        "enum": ["message", "reasoning", "tool_call", "tool_result"]
+                                    },
+                                    {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "string",
+                                            "enum": ["message", "reasoning", "tool_call", "tool_result"]
+                                        }
+                                    }
+                                ]
+                            },
                             "exclude_codex_mcp": { "type": "boolean" },
                             "verbosity": {
                                 "type": "string",
@@ -405,6 +438,7 @@ impl AppState {
                 min_score: args.min_score,
                 min_should_match: args.min_should_match,
                 include_tool_events: args.include_tool_events,
+                event_kinds: args.event_kind.map(SearchEventKindsArg::into_vec),
                 exclude_codex_mcp: args.exclude_codex_mcp,
                 disable_cache: None,
                 search_strategy: None,
@@ -785,5 +819,32 @@ mod tests {
         let text = format_conversation_search_prose(&payload).expect("format");
         assert!(text.contains("Conversation Search"));
         assert!(text.contains("No hits"));
+    }
+
+    #[test]
+    fn search_args_accept_single_event_kind_and_alias() {
+        let args: SearchArgs = serde_json::from_value(json!({
+            "query": "error",
+            "kind": "reasoning"
+        }))
+        .expect("parse search args");
+
+        let parsed = args.event_kind.expect("event kind should parse").into_vec();
+        assert_eq!(parsed, vec![SearchEventKind::Reasoning]);
+    }
+
+    #[test]
+    fn search_args_accept_event_kind_list() {
+        let args: SearchArgs = serde_json::from_value(json!({
+            "query": "error",
+            "event_kind": ["message", "tool_result"]
+        }))
+        .expect("parse search args");
+
+        let parsed = args.event_kind.expect("event kind should parse").into_vec();
+        assert_eq!(
+            parsed,
+            vec![SearchEventKind::Message, SearchEventKind::ToolResult]
+        );
     }
 }

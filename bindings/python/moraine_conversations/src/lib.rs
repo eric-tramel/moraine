@@ -176,6 +176,7 @@ impl ConversationClient {
                 min_score,
                 min_should_match,
                 include_tool_events,
+                event_kinds: None,
                 exclude_codex_mcp,
                 disable_cache,
                 search_strategy: parsed_search_strategy,

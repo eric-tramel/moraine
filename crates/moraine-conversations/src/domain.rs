@@ -187,6 +187,8 @@ pub struct SearchEventsQuery {
     #[serde(default)]
     pub include_tool_events: Option<bool>,
     #[serde(default)]
+    pub event_kinds: Option<Vec<SearchEventKind>>,
+    #[serde(default)]
     pub exclude_codex_mcp: Option<bool>,
     #[serde(default)]
     pub disable_cache: Option<bool>,
@@ -207,6 +209,26 @@ impl SearchEventsStrategy {
         match self {
             Self::Optimized => "optimized",
             Self::OracleExact => "oracle_exact",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchEventKind {
+    Message,
+    Reasoning,
+    ToolCall,
+    ToolResult,
+}
+
+impl SearchEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Message => "message",
+            Self::Reasoning => "reasoning",
+            Self::ToolCall => "tool_call",
+            Self::ToolResult => "tool_result",
         }
     }
 }
