@@ -1413,6 +1413,88 @@ FORMAT JSONEachRow",
         }
     }
 
+    fn dedupe_fetch_limit(limit: u16) -> u16 {
+        limit.saturating_mul(3).max(limit)
+    }
+
+    fn is_message_search_row(row: &SearchRow) -> bool {
+        row.event_class == "message" && row.payload_type == "message"
+    }
+
+    fn is_event_msg_search_row(row: &SearchRow) -> bool {
+        row.event_class == "event_msg"
+            && (row.payload_type == "agent_message"
+                || row.payload_type == "user_message"
+                || row.payload_type == "event_msg")
+    }
+
+    fn compact_preview_for_dedup(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn search_rows_are_mirrors(a: &SearchRow, b: &SearchRow) -> bool {
+        let same_kind_pair = (Self::is_message_search_row(a) && Self::is_event_msg_search_row(b))
+            || (Self::is_event_msg_search_row(a) && Self::is_message_search_row(b));
+        if !same_kind_pair {
+            return false;
+        }
+
+        if a.session_id != b.session_id
+            || a.actor_role != b.actor_role
+            || a.matched_terms != b.matched_terms
+        {
+            return false;
+        }
+
+        if (a.score - b.score).abs() > 1e-9 {
+            return false;
+        }
+
+        Self::compact_preview_for_dedup(&a.text_preview)
+            == Self::compact_preview_for_dedup(&b.text_preview)
+    }
+
+    fn search_row_kind_priority(row: &SearchRow) -> u8 {
+        if Self::is_message_search_row(row) {
+            0
+        } else if Self::is_event_msg_search_row(row) {
+            1
+        } else {
+            2
+        }
+    }
+
+    fn should_replace_mirror(existing: &SearchRow, candidate: &SearchRow) -> bool {
+        let existing_priority = Self::search_row_kind_priority(existing);
+        let candidate_priority = Self::search_row_kind_priority(candidate);
+        candidate_priority < existing_priority
+            || (candidate_priority == existing_priority && candidate.event_uid < existing.event_uid)
+    }
+
+    fn dedupe_search_rows(rows: Vec<SearchRow>, limit: u16) -> Vec<SearchRow> {
+        let target = limit as usize;
+        let mut deduped = Vec::<SearchRow>::with_capacity(rows.len().min(target));
+
+        for row in rows {
+            if let Some(existing_idx) = deduped
+                .iter()
+                .position(|existing| Self::search_rows_are_mirrors(existing, &row))
+            {
+                if Self::should_replace_mirror(&deduped[existing_idx], &row) {
+                    deduped[existing_idx] = row;
+                }
+                continue;
+            }
+
+            deduped.push(row);
+            if deduped.len() >= target {
+                break;
+            }
+        }
+
+        deduped
+    }
+
     async fn search_events_rows_fast_pass(
         &self,
         terms: &[String],
@@ -2719,6 +2801,7 @@ FORMAT JSONEachRow",
         }
 
         let avgdl = (total_doc_len as f64 / docs as f64).max(1.0);
+        let fetch_limit = Self::dedupe_fetch_limit(limit);
         let rows_to_hits = |rows: Vec<SearchRow>| -> Vec<SearchEventHit> {
             rows.into_iter()
                 .enumerate()
@@ -2754,10 +2837,10 @@ FORMAT JSONEachRow",
                     session_id,
                     min_should_match,
                     min_score,
-                    limit,
+                    fetch_limit,
                 )
                 .await?;
-            rows_to_hits(rows)
+            rows_to_hits(Self::dedupe_search_rows(rows, limit))
         } else {
             let cache_key = Self::search_events_cache_key(
                 &terms,
@@ -2784,10 +2867,10 @@ FORMAT JSONEachRow",
                         session_id,
                         min_should_match,
                         min_score,
-                        limit,
+                        fetch_limit,
                     )
                     .await?;
-                let fresh_hits = rows_to_hits(fresh_rows);
+                let fresh_hits = rows_to_hits(Self::dedupe_search_rows(fresh_rows, limit));
                 self.search_events_cache_put(cache_key, &fresh_hits).await;
                 fresh_hits
             }
@@ -3097,6 +3180,34 @@ mod tests {
         }
     }
 
+    fn sample_search_row(
+        event_uid: &str,
+        session_id: &str,
+        event_class: &str,
+        payload_type: &str,
+        actor_role: &str,
+        text_preview: &str,
+        score: f64,
+        matched_terms: u64,
+    ) -> SearchRow {
+        SearchRow {
+            event_uid: event_uid.to_string(),
+            session_id: session_id.to_string(),
+            source_name: "source".to_string(),
+            provider: "provider".to_string(),
+            event_class: event_class.to_string(),
+            payload_type: payload_type.to_string(),
+            actor_role: actor_role.to_string(),
+            name: String::new(),
+            phase: String::new(),
+            source_ref: "source-ref".to_string(),
+            doc_len: 42,
+            text_preview: text_preview.to_string(),
+            score,
+            matched_terms,
+        }
+    }
+
     #[test]
     fn tokenize_query_enforces_limits_and_counts() {
         let terms = tokenize_query("Hello hello world tool_use", 3);
@@ -3136,6 +3247,118 @@ mod tests {
         assert!(
             !ClickHouseConversationRepository::passes_search_doc_filters(&row, false, true, None)
         );
+    }
+
+    #[test]
+    fn dedupe_search_rows_prefers_message_over_event_msg_mirror() {
+        let rows = vec![
+            sample_search_row(
+                "uid-event-msg",
+                "sess-a",
+                "event_msg",
+                "agent_message",
+                "assistant",
+                "Short answer: no",
+                18.26,
+                3,
+            ),
+            sample_search_row(
+                "uid-message",
+                "sess-a",
+                "message",
+                "message",
+                "assistant",
+                "Short  answer:\nno",
+                18.26,
+                3,
+            ),
+        ];
+
+        let deduped = ClickHouseConversationRepository::dedupe_search_rows(rows, 5);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].event_uid, "uid-message");
+        assert_eq!(deduped[0].event_class, "message");
+    }
+
+    #[test]
+    fn dedupe_search_rows_fills_limit_after_collapsing_mirrors() {
+        let rows = vec![
+            sample_search_row(
+                "uid-event-msg",
+                "sess-a",
+                "event_msg",
+                "agent_message",
+                "assistant",
+                "same answer",
+                18.26,
+                3,
+            ),
+            sample_search_row(
+                "uid-message",
+                "sess-a",
+                "message",
+                "message",
+                "assistant",
+                "same answer",
+                18.26,
+                3,
+            ),
+            sample_search_row(
+                "uid-2",
+                "sess-b",
+                "message",
+                "message",
+                "assistant",
+                "different answer 2",
+                17.00,
+                2,
+            ),
+            sample_search_row(
+                "uid-3",
+                "sess-c",
+                "message",
+                "message",
+                "assistant",
+                "different answer 3",
+                16.00,
+                2,
+            ),
+        ];
+
+        let deduped = ClickHouseConversationRepository::dedupe_search_rows(rows, 3);
+        assert_eq!(deduped.len(), 3);
+        assert_eq!(deduped[0].event_uid, "uid-message");
+        assert_eq!(deduped[1].event_uid, "uid-2");
+        assert_eq!(deduped[2].event_uid, "uid-3");
+    }
+
+    #[test]
+    fn dedupe_search_rows_does_not_collapse_same_kind_hits() {
+        let rows = vec![
+            sample_search_row(
+                "uid-1",
+                "sess-a",
+                "message",
+                "message",
+                "assistant",
+                "same text",
+                10.0,
+                2,
+            ),
+            sample_search_row(
+                "uid-2",
+                "sess-a",
+                "message",
+                "message",
+                "assistant",
+                "same text",
+                10.0,
+                2,
+            ),
+        ];
+
+        let deduped = ClickHouseConversationRepository::dedupe_search_rows(rows, 5);
+        assert_eq!(deduped.len(), 2);
     }
 
     #[test]
