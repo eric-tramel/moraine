@@ -196,6 +196,13 @@ struct ConversationSnippetRow {
 }
 
 #[derive(Debug, Deserialize)]
+struct SessionTimeBoundsRow {
+    session_id: String,
+    first_event_time: String,
+    last_event_time: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ConversationCandidateRow {
     session_id: String,
     score: f64,
@@ -206,6 +213,12 @@ struct ConversationCandidateRow {
 struct ConversationCandidateSet {
     rows: Vec<ConversationCandidateRow>,
     truncated: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SessionTimeBounds {
+    first_event_time: String,
+    last_event_time: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2059,6 +2072,100 @@ FORMAT JSONEachRow",
         Ok(by_uid)
     }
 
+    async fn load_session_time_bounds(
+        &self,
+        session_ids: &[String],
+    ) -> RepoResult<HashMap<String, SessionTimeBounds>> {
+        let mut unique_session_ids = session_ids.to_vec();
+        unique_session_ids.sort_unstable();
+        unique_session_ids.dedup();
+        if unique_session_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let session_summary_table = self.table_ref("v_session_summary");
+        let session_ids_sql = sql_array_strings(&unique_session_ids);
+        let sql = format!(
+            "SELECT
+  s.session_id AS session_id,
+  toString(s.first_event_time) AS first_event_time,
+  toString(s.last_event_time) AS last_event_time
+FROM {session_summary_table} AS s
+WHERE s.session_id IN {session_ids_sql}
+FORMAT JSONEachRow",
+            session_summary_table = session_summary_table,
+            session_ids_sql = session_ids_sql,
+        );
+
+        let rows: Vec<SessionTimeBoundsRow> =
+            match self.map_backend(self.ch.query_rows(&sql, None).await) {
+                Ok(rows) => rows,
+                Err(err) => {
+                    warn!("failed to load session time bounds: {}", err);
+                    return Ok(HashMap::new());
+                }
+            };
+        let mut bounds_by_session = HashMap::new();
+        for row in rows {
+            bounds_by_session.insert(
+                row.session_id,
+                SessionTimeBounds {
+                    first_event_time: row.first_event_time,
+                    last_event_time: row.last_event_time,
+                },
+            );
+        }
+        Ok(bounds_by_session)
+    }
+
+    async fn map_search_rows_to_hits(
+        &self,
+        rows: Vec<SearchRow>,
+    ) -> RepoResult<Vec<SearchEventHit>> {
+        let session_ids = rows
+            .iter()
+            .map(|row| row.session_id.clone())
+            .collect::<Vec<_>>();
+        let session_time_bounds = self.load_session_time_bounds(&session_ids).await?;
+
+        Ok(rows
+            .into_iter()
+            .enumerate()
+            .map(|(idx, row)| {
+                let session_id = row.session_id;
+                let (first_event_time, last_event_time) = session_time_bounds
+                    .get(session_id.as_str())
+                    .map(|bounds| {
+                        (
+                            bounds.first_event_time.clone(),
+                            bounds.last_event_time.clone(),
+                        )
+                    })
+                    .unwrap_or_default();
+
+                SearchEventHit {
+                    rank: idx + 1,
+                    event_uid: row.event_uid,
+                    session_id,
+                    first_event_time,
+                    last_event_time,
+                    source_name: row.source_name,
+                    provider: row.provider,
+                    score: row.score,
+                    matched_terms: row.matched_terms,
+                    doc_len: row.doc_len,
+                    event_class: row.event_class,
+                    payload_type: row.payload_type,
+                    actor_role: row.actor_role,
+                    name: row.name,
+                    phase: row.phase,
+                    source_ref: row.source_ref,
+                    text_preview: row.text_preview,
+                }
+            })
+            .collect())
+    }
+
     async fn log_search_events(
         &self,
         query_id: &str,
@@ -2619,28 +2726,6 @@ FORMAT JSONEachRow",
         }
 
         let avgdl = (total_doc_len as f64 / docs as f64).max(1.0);
-        let rows_to_hits = |rows: Vec<SearchRow>| -> Vec<SearchEventHit> {
-            rows.into_iter()
-                .enumerate()
-                .map(|(idx, row)| SearchEventHit {
-                    rank: idx + 1,
-                    event_uid: row.event_uid,
-                    session_id: row.session_id,
-                    source_name: row.source_name,
-                    provider: row.provider,
-                    score: row.score,
-                    matched_terms: row.matched_terms,
-                    doc_len: row.doc_len,
-                    event_class: row.event_class,
-                    payload_type: row.payload_type,
-                    actor_role: row.actor_role,
-                    name: row.name,
-                    phase: row.phase,
-                    source_ref: row.source_ref,
-                    text_preview: row.text_preview,
-                })
-                .collect()
-        };
 
         let hits = if disable_cache {
             let rows = self
@@ -2657,7 +2742,7 @@ FORMAT JSONEachRow",
                     limit,
                 )
                 .await?;
-            rows_to_hits(rows)
+            self.map_search_rows_to_hits(rows).await?
         } else {
             let cache_key = Self::search_events_cache_key(
                 &terms,
@@ -2687,7 +2772,7 @@ FORMAT JSONEachRow",
                         limit,
                     )
                     .await?;
-                let fresh_hits = rows_to_hits(fresh_rows);
+                let fresh_hits = self.map_search_rows_to_hits(fresh_rows).await?;
                 self.search_events_cache_put(cache_key, &fresh_hits).await;
                 fresh_hits
             }
@@ -2853,6 +2938,11 @@ FORMAT JSONEachRow",
 
         let rows: Vec<ConversationSearchRow> =
             self.map_backend(self.ch.query_rows(&sql, None).await)?;
+        let session_ids = rows
+            .iter()
+            .map(|row| row.session_id.clone())
+            .collect::<Vec<_>>();
+        let session_time_bounds = self.load_session_time_bounds(&session_ids).await?;
         let best_event_uids = rows
             .iter()
             .filter_map(|row| {
@@ -2869,6 +2959,16 @@ FORMAT JSONEachRow",
             .into_iter()
             .enumerate()
             .map(|(idx, row)| {
+                let session_id = row.session_id;
+                let (first_event_time, last_event_time) = session_time_bounds
+                    .get(session_id.as_str())
+                    .map(|bounds| {
+                        (
+                            bounds.first_event_time.clone(),
+                            bounds.last_event_time.clone(),
+                        )
+                    })
+                    .unwrap_or_default();
                 let best_event_uid = if row.best_event_uid.is_empty() {
                     None
                 } else {
@@ -2884,7 +2984,9 @@ FORMAT JSONEachRow",
                     });
                 ConversationSearchHit {
                     rank: idx + 1,
-                    session_id: row.session_id,
+                    session_id,
+                    first_event_time,
+                    last_event_time,
                     score: row.score,
                     matched_terms: row.matched_terms,
                     event_count_considered: row.event_count_considered,

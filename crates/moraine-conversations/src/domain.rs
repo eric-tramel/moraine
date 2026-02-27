@@ -224,6 +224,8 @@ pub struct SearchEventHit {
     pub rank: usize,
     pub event_uid: String,
     pub session_id: String,
+    pub first_event_time: String,
+    pub last_event_time: String,
     pub source_name: String,
     pub provider: String,
     pub score: f64,
@@ -280,6 +282,8 @@ pub struct ConversationSearchStats {
 pub struct ConversationSearchHit {
     pub rank: usize,
     pub session_id: String,
+    pub first_event_time: String,
+    pub last_event_time: String,
     pub score: f64,
     pub matched_terms: u16,
     pub event_count_considered: u32,
