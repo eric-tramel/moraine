@@ -66,7 +66,9 @@ async fn spawn_mock_server() -> (String, Arc<MockState>) {
             .expect("query lock")
             .push(query.clone());
 
-        if query.contains("FROM `moraine`.`v_session_summary` AS s") {
+        if query.contains("FROM `moraine`.`v_session_summary` AS s")
+            && query.contains("ORDER BY s.last_event_time DESC")
+        {
             if query.contains("s.session_id < 'sess_b'") {
                 return (
                     StatusCode::OK,
@@ -184,6 +186,11 @@ async fn spawn_mock_server() -> (String, Arc<MockState>) {
                 json_each_row(json!([
                     {
                         "session_id": "sess_c",
+                        "first_event_time": "2026-01-03 10:00:00",
+                        "first_event_unix_ms": 1767434400000_i64,
+                        "last_event_time": "2026-01-03 10:10:00",
+                        "last_event_unix_ms": 1767435000000_i64,
+                        "provider": "codex",
                         "score": 12.5,
                         "matched_terms": 2_u16,
                         "event_count_considered": 3_u32,
@@ -192,11 +199,38 @@ async fn spawn_mock_server() -> (String, Arc<MockState>) {
                     },
                     {
                         "session_id": "sess_a",
+                        "first_event_time": "2026-01-01 10:00:00",
+                        "first_event_unix_ms": 1767261600000_i64,
+                        "last_event_time": "2026-01-01 10:10:00",
+                        "last_event_unix_ms": 1767262200000_i64,
+                        "provider": "codex",
                         "score": 7.0,
                         "matched_terms": 1_u16,
                         "event_count_considered": 2_u32,
                         "best_event_uid": "evt-a-11",
                         "snippet": "weaker match from session a"
+                    }
+                ])),
+            );
+        }
+
+        if query.contains("WHERE event_kind = 'session_meta'")
+            && query.contains("GROUP BY session_id")
+        {
+            return (
+                StatusCode::OK,
+                json_each_row(json!([
+                    {
+                        "session_id": "sess_c",
+                        "provider": "codex",
+                        "session_slug": "project-c",
+                        "session_summary": "Session C summary"
+                    },
+                    {
+                        "session_id": "sess_a",
+                        "provider": "codex",
+                        "session_slug": "",
+                        "session_summary": ""
                     }
                 ])),
             );
@@ -311,8 +345,31 @@ async fn search_conversations_returns_ranked_session_hits_and_expected_sql_shape
 
     assert_eq!(result.hits.len(), 2);
     assert_eq!(result.hits[0].session_id, "sess_c");
+    assert_eq!(
+        result.hits[0].first_event_time.as_deref(),
+        Some("2026-01-03 10:00:00")
+    );
+    assert_eq!(result.hits[0].first_event_unix_ms, Some(1767434400000_i64));
+    assert_eq!(
+        result.hits[0].last_event_time.as_deref(),
+        Some("2026-01-03 10:10:00")
+    );
+    assert_eq!(result.hits[0].last_event_unix_ms, Some(1767435000000_i64));
+    assert_eq!(result.hits[0].provider.as_deref(), Some("codex"));
+    assert_eq!(result.hits[0].session_slug.as_deref(), Some("project-c"));
+    assert_eq!(
+        result.hits[0].session_summary.as_deref(),
+        Some("Session C summary")
+    );
     assert_eq!(result.hits[0].best_event_uid.as_deref(), Some("evt-c-42"));
     assert_eq!(result.hits[1].session_id, "sess_a");
+    assert_eq!(
+        result.hits[1].first_event_time.as_deref(),
+        Some("2026-01-01 10:00:00")
+    );
+    assert_eq!(result.hits[1].provider.as_deref(), Some("codex"));
+    assert_eq!(result.hits[1].session_slug, None);
+    assert_eq!(result.hits[1].session_summary, None);
 
     let queries = state.queries.lock().expect("queries lock").clone();
     let agg_query = queries
@@ -321,6 +378,7 @@ async fn search_conversations_returns_ranked_session_hits_and_expected_sql_shape
         .expect("aggregated conversation query should be captured");
 
     assert!(agg_query.contains("argMax(e.event_uid, e.event_score)"));
+    assert!(agg_query.contains("ANY LEFT JOIN `moraine`.`v_session_summary` AS s"));
     assert!(agg_query.contains("p.session_id IN ['sess_c','sess_a']"));
     assert!(agg_query.contains("ifNull(m.mode, 'chat') = 'chat'"));
     assert!(agg_query.contains("toUnixTimestamp64Milli(d.ingested_at) >= 1767261600000"));

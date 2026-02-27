@@ -194,6 +194,20 @@ struct ConversationSearchProseHit {
     #[serde(default)]
     session_id: String,
     #[serde(default)]
+    first_event_time: Option<String>,
+    #[serde(default)]
+    first_event_unix_ms: Option<i64>,
+    #[serde(default)]
+    last_event_time: Option<String>,
+    #[serde(default)]
+    last_event_unix_ms: Option<i64>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    session_slug: Option<String>,
+    #[serde(default)]
+    session_summary: Option<String>,
+    #[serde(default)]
     score: f64,
     #[serde(default)]
     matched_terms: u16,
@@ -638,6 +652,31 @@ fn format_conversation_search_prose(payload: &Value) -> Result<String> {
             "\n{}) session={} score={:.4} matched_terms={} events={}\n",
             hit.rank, hit.session_id, hit.score, hit.matched_terms, hit.event_count_considered
         ));
+        if let Some(provider) = hit.provider.as_deref() {
+            out.push_str(&format!("   provider: {}\n", provider));
+        }
+        if let (Some(first), Some(last)) = (
+            hit.first_event_time.as_deref(),
+            hit.last_event_time.as_deref(),
+        ) {
+            out.push_str(&format!("   first_last: {} -> {}\n", first, last));
+        } else if let (Some(first_ms), Some(last_ms)) =
+            (hit.first_event_unix_ms, hit.last_event_unix_ms)
+        {
+            out.push_str(&format!(
+                "   first_last_unix_ms: {} -> {}\n",
+                first_ms, last_ms
+            ));
+        }
+        if let Some(session_slug) = hit.session_slug.as_deref() {
+            out.push_str(&format!("   session_slug: {}\n", session_slug));
+        }
+        if let Some(session_summary) = hit.session_summary.as_deref() {
+            let compact = compact_text_line(session_summary, 220);
+            if !compact.is_empty() {
+                out.push_str(&format!("   session_summary: {}\n", compact));
+            }
+        }
 
         if let Some(best_event_uid) = hit.best_event_uid.as_deref() {
             out.push_str(&format!("   best_event_uid: {}\n", best_event_uid));
@@ -785,5 +824,41 @@ mod tests {
         let text = format_conversation_search_prose(&payload).expect("format");
         assert!(text.contains("Conversation Search"));
         assert!(text.contains("No hits"));
+    }
+
+    #[test]
+    fn format_conversation_search_includes_session_metadata() {
+        let payload = json!({
+            "query_id": "q1",
+            "query": "hello world",
+            "stats": {
+                "took_ms": 2,
+                "result_count": 1
+            },
+            "hits": [
+                {
+                    "rank": 1,
+                    "session_id": "sess_c",
+                    "first_event_time": "2026-01-03 10:00:00",
+                    "first_event_unix_ms": 1767434400000_i64,
+                    "last_event_time": "2026-01-03 10:10:00",
+                    "last_event_unix_ms": 1767435000000_i64,
+                    "provider": "codex",
+                    "session_slug": "project-c",
+                    "session_summary": "Session C summary",
+                    "score": 12.5,
+                    "matched_terms": 2,
+                    "event_count_considered": 3,
+                    "best_event_uid": "evt-c-42",
+                    "snippet": "best match from session c"
+                }
+            ]
+        });
+
+        let text = format_conversation_search_prose(&payload).expect("format");
+        assert!(text.contains("provider: codex"));
+        assert!(text.contains("first_last: 2026-01-03 10:00:00 -> 2026-01-03 10:10:00"));
+        assert!(text.contains("session_slug: project-c"));
+        assert!(text.contains("session_summary: Session C summary"));
     }
 }

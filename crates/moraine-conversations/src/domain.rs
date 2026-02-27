@@ -280,6 +280,13 @@ pub struct ConversationSearchStats {
 pub struct ConversationSearchHit {
     pub rank: usize,
     pub session_id: String,
+    pub first_event_time: Option<String>,
+    pub first_event_unix_ms: Option<i64>,
+    pub last_event_time: Option<String>,
+    pub last_event_unix_ms: Option<i64>,
+    pub provider: Option<String>,
+    pub session_slug: Option<String>,
+    pub session_summary: Option<String>,
     pub score: f64,
     pub matched_terms: u16,
     pub event_count_considered: u32,

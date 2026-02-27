@@ -181,12 +181,33 @@ struct HotQueryRow {
 #[derive(Debug, Deserialize)]
 struct ConversationSearchRow {
     session_id: String,
+    #[serde(default)]
+    first_event_time: String,
+    #[serde(default)]
+    first_event_unix_ms: i64,
+    #[serde(default)]
+    last_event_time: String,
+    #[serde(default)]
+    last_event_unix_ms: i64,
+    #[serde(default)]
+    provider: String,
     score: f64,
     matched_terms: u16,
     event_count_considered: u32,
     best_event_uid: String,
     #[serde(default)]
     snippet: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConversationSessionMetadataRow {
+    session_id: String,
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    session_slug: String,
+    #[serde(default)]
+    session_summary: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1915,6 +1936,7 @@ FORMAT JSONEachRow",
         }
 
         let postings_table = self.table_ref("search_postings");
+        let session_summary_table = self.table_ref("v_session_summary");
         let terms_array_sql = sql_array_strings(terms);
         let idf_vals: Vec<f64> = terms
             .iter()
@@ -1973,6 +1995,19 @@ FORMAT JSONEachRow",
   {idf_array_sql} AS q_idf{term_bits_with_sql}
 SELECT
   c.session_id,
+  if(s.session_id = '', '', toString(s.first_event_time)) AS first_event_time,
+  if(
+    s.session_id = '',
+    toInt64(0),
+    toInt64(toUnixTimestamp64Milli(s.first_event_time))
+  ) AS first_event_unix_ms,
+  if(s.session_id = '', '', toString(s.last_event_time)) AS last_event_time,
+  if(
+    s.session_id = '',
+    toInt64(0),
+    toInt64(toUnixTimestamp64Milli(s.last_event_time))
+  ) AS last_event_unix_ms,
+  c.provider,
   c.score,
   toUInt16(c.matched_terms) AS matched_terms,
   toUInt32(c.event_count_considered) AS event_count_considered,
@@ -1983,11 +2018,13 @@ FROM (
     sum(e.event_score) AS score,
     {outer_matched_terms_sql} AS matched_terms,
     count() AS event_count_considered,
+    argMax(e.provider, e.event_score) AS provider,
     argMax(e.event_uid, e.event_score) AS best_event_uid
   FROM (
     SELECT
       p.doc_id AS event_uid,
       any(p.session_id) AS session_id,
+      any(p.provider) AS provider,
       {inner_matched_terms_sql}
       sum(
         transform(toString(p.term), q_terms, q_idf, 0.0)
@@ -2006,6 +2043,7 @@ FROM (
   ) AS e
   GROUP BY e.session_id
 ) AS c
+ANY LEFT JOIN {session_summary_table} AS s ON s.session_id = c.session_id
 {mode_join_sql}
 WHERE c.matched_terms >= {min_should_match}
   AND c.score >= {min_score:.6}
@@ -2020,6 +2058,7 @@ FORMAT JSONEachRow",
             outer_matched_terms_sql = outer_matched_terms_sql,
             inner_matched_terms_sql = inner_matched_terms_sql,
             term_bits_with_sql = term_bits_with_sql,
+            session_summary_table = session_summary_table,
             mode_join_sql = mode_join_sql,
             mode_filter_sql = mode_filter_sql,
             min_should_match = min_should_match,
@@ -2057,6 +2096,50 @@ FORMAT JSONEachRow",
             by_uid.insert(row.event_uid, row.snippet);
         }
         Ok(by_uid)
+    }
+
+    async fn fetch_conversation_session_metadata(
+        &self,
+        session_ids: &[String],
+    ) -> RepoResult<HashMap<String, ConversationSessionMetadataRow>> {
+        if session_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let events_table = self.table_ref("events");
+        let session_ids_sql = sql_array_strings(session_ids);
+        let sql = format!(
+            "SELECT
+  session_id,
+  argMax(provider, event_ts) AS provider,
+  ifNull(argMax(nullIf(JSONExtractString(payload_json, 'slug'), ''), event_ts), '') AS session_slug,
+  ifNull(
+    argMax(
+      coalesce(
+        nullIf(JSONExtractString(payload_json, 'summary'), ''),
+        nullIf(JSONExtractString(payload_json, 'title'), ''),
+        nullIf(JSONExtractString(payload_json, 'name'), '')
+      ),
+      event_ts
+    ),
+    ''
+  ) AS session_summary
+FROM {events_table}
+WHERE event_kind = 'session_meta'
+  AND session_id IN {session_ids_sql}
+GROUP BY session_id
+FORMAT JSONEachRow",
+            events_table = events_table,
+            session_ids_sql = session_ids_sql,
+        );
+
+        let rows: Vec<ConversationSessionMetadataRow> =
+            self.map_backend(self.ch.query_rows(&sql, None).await)?;
+        let mut by_session = HashMap::new();
+        for row in rows {
+            by_session.insert(row.session_id.clone(), row);
+        }
+        Ok(by_session)
     }
 
     async fn log_search_events(
@@ -2864,30 +2947,66 @@ FORMAT JSONEachRow",
             })
             .collect::<Vec<_>>();
         let snippet_by_event_uid = self.fetch_conversation_snippets(&best_event_uids).await?;
+        let session_ids = rows
+            .iter()
+            .map(|row| row.session_id.clone())
+            .collect::<Vec<_>>();
+        let session_metadata_by_session_id = self
+            .fetch_conversation_session_metadata(&session_ids)
+            .await?;
 
         let hits = rows
             .into_iter()
             .enumerate()
             .map(|(idx, row)| {
-                let best_event_uid = if row.best_event_uid.is_empty() {
+                let ConversationSearchRow {
+                    session_id,
+                    first_event_time,
+                    first_event_unix_ms,
+                    last_event_time,
+                    last_event_unix_ms,
+                    provider: row_provider,
+                    score,
+                    matched_terms,
+                    event_count_considered,
+                    best_event_uid: row_best_event_uid,
+                    snippet: row_snippet,
+                } = row;
+                let session_metadata = session_metadata_by_session_id.get(&session_id);
+
+                let best_event_uid = if row_best_event_uid.is_empty() {
                     None
                 } else {
-                    Some(row.best_event_uid)
+                    Some(row_best_event_uid)
                 };
                 let snippet = best_event_uid
                     .as_ref()
                     .and_then(|event_uid| snippet_by_event_uid.get(event_uid).cloned())
-                    .or(if row.snippet.is_empty() {
-                        None
-                    } else {
-                        Some(row.snippet)
-                    });
+                    .or((!row_snippet.is_empty()).then_some(row_snippet));
+                let has_first_event_time = !first_event_time.is_empty();
+                let has_last_event_time = !last_event_time.is_empty();
+                let provider = session_metadata
+                    .and_then(|meta| (!meta.provider.is_empty()).then(|| meta.provider.clone()))
+                    .or((!row_provider.is_empty()).then_some(row_provider));
+                let session_slug = session_metadata.and_then(|meta| {
+                    (!meta.session_slug.is_empty()).then(|| meta.session_slug.clone())
+                });
+                let session_summary = session_metadata.and_then(|meta| {
+                    (!meta.session_summary.is_empty()).then(|| meta.session_summary.clone())
+                });
                 ConversationSearchHit {
                     rank: idx + 1,
-                    session_id: row.session_id,
-                    score: row.score,
-                    matched_terms: row.matched_terms,
-                    event_count_considered: row.event_count_considered,
+                    session_id,
+                    first_event_time: has_first_event_time.then_some(first_event_time),
+                    first_event_unix_ms: has_first_event_time.then_some(first_event_unix_ms),
+                    last_event_time: has_last_event_time.then_some(last_event_time),
+                    last_event_unix_ms: has_last_event_time.then_some(last_event_unix_ms),
+                    provider,
+                    session_slug,
+                    session_summary,
+                    score,
+                    matched_terms,
+                    event_count_considered,
                     best_event_uid,
                     snippet,
                 }
