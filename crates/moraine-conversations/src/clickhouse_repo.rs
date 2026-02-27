@@ -181,12 +181,33 @@ struct HotQueryRow {
 #[derive(Debug, Deserialize)]
 struct ConversationSearchRow {
     session_id: String,
+    #[serde(default)]
+    first_event_time: String,
+    #[serde(default)]
+    first_event_unix_ms: i64,
+    #[serde(default)]
+    last_event_time: String,
+    #[serde(default)]
+    last_event_unix_ms: i64,
+    #[serde(default)]
+    provider: String,
     score: f64,
     matched_terms: u16,
     event_count_considered: u32,
     best_event_uid: String,
     #[serde(default)]
     snippet: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConversationSessionMetadataRow {
+    session_id: String,
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    session_slug: String,
+    #[serde(default)]
+    session_summary: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -526,6 +547,22 @@ GROUP BY session_id"
             ));
         }
         Ok(())
+    }
+
+    fn is_low_information_system_event(actor_role: &str, payload_type: &str) -> bool {
+        actor_role.eq_ignore_ascii_case("system")
+            && matches!(
+                payload_type.to_ascii_lowercase().as_str(),
+                "progress" | "file_history_snapshot" | "system"
+            )
+    }
+
+    fn open_context_filter_clause(include_system_events: bool) -> &'static str {
+        if include_system_events {
+            ""
+        } else {
+            " AND NOT (lowerUTF8(actor_role) = 'system' AND lowerUTF8(payload_type) IN ('progress', 'file_history_snapshot', 'system'))"
+        }
     }
 
     fn map_conversation_row(row: ConversationSummaryRow) -> ConversationSummary {
@@ -1397,6 +1434,88 @@ FORMAT JSONEachRow",
         }
     }
 
+    fn dedupe_fetch_limit(limit: u16) -> u16 {
+        limit.saturating_mul(3).max(limit)
+    }
+
+    fn is_message_search_row(row: &SearchRow) -> bool {
+        row.event_class == "message" && row.payload_type == "message"
+    }
+
+    fn is_event_msg_search_row(row: &SearchRow) -> bool {
+        row.event_class == "event_msg"
+            && (row.payload_type == "agent_message"
+                || row.payload_type == "user_message"
+                || row.payload_type == "event_msg")
+    }
+
+    fn compact_preview_for_dedup(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn search_rows_are_mirrors(a: &SearchRow, b: &SearchRow) -> bool {
+        let same_kind_pair = (Self::is_message_search_row(a) && Self::is_event_msg_search_row(b))
+            || (Self::is_event_msg_search_row(a) && Self::is_message_search_row(b));
+        if !same_kind_pair {
+            return false;
+        }
+
+        if a.session_id != b.session_id
+            || a.actor_role != b.actor_role
+            || a.matched_terms != b.matched_terms
+        {
+            return false;
+        }
+
+        if (a.score - b.score).abs() > 1e-9 {
+            return false;
+        }
+
+        Self::compact_preview_for_dedup(&a.text_preview)
+            == Self::compact_preview_for_dedup(&b.text_preview)
+    }
+
+    fn search_row_kind_priority(row: &SearchRow) -> u8 {
+        if Self::is_message_search_row(row) {
+            0
+        } else if Self::is_event_msg_search_row(row) {
+            1
+        } else {
+            2
+        }
+    }
+
+    fn should_replace_mirror(existing: &SearchRow, candidate: &SearchRow) -> bool {
+        let existing_priority = Self::search_row_kind_priority(existing);
+        let candidate_priority = Self::search_row_kind_priority(candidate);
+        candidate_priority < existing_priority
+            || (candidate_priority == existing_priority && candidate.event_uid < existing.event_uid)
+    }
+
+    fn dedupe_search_rows(rows: Vec<SearchRow>, limit: u16) -> Vec<SearchRow> {
+        let target = limit as usize;
+        let mut deduped = Vec::<SearchRow>::with_capacity(rows.len().min(target));
+
+        for row in rows {
+            if let Some(existing_idx) = deduped
+                .iter()
+                .position(|existing| Self::search_rows_are_mirrors(existing, &row))
+            {
+                if Self::should_replace_mirror(&deduped[existing_idx], &row) {
+                    deduped[existing_idx] = row;
+                }
+                continue;
+            }
+
+            deduped.push(row);
+            if deduped.len() >= target {
+                break;
+            }
+        }
+
+        deduped
+    }
+
     async fn search_events_rows_fast_pass(
         &self,
         terms: &[String],
@@ -1915,6 +2034,7 @@ FORMAT JSONEachRow",
         }
 
         let postings_table = self.table_ref("search_postings");
+        let session_summary_table = self.table_ref("v_session_summary");
         let terms_array_sql = sql_array_strings(terms);
         let idf_vals: Vec<f64> = terms
             .iter()
@@ -1973,6 +2093,19 @@ FORMAT JSONEachRow",
   {idf_array_sql} AS q_idf{term_bits_with_sql}
 SELECT
   c.session_id,
+  if(s.session_id = '', '', toString(s.first_event_time)) AS first_event_time,
+  if(
+    s.session_id = '',
+    toInt64(0),
+    toInt64(toUnixTimestamp64Milli(s.first_event_time))
+  ) AS first_event_unix_ms,
+  if(s.session_id = '', '', toString(s.last_event_time)) AS last_event_time,
+  if(
+    s.session_id = '',
+    toInt64(0),
+    toInt64(toUnixTimestamp64Milli(s.last_event_time))
+  ) AS last_event_unix_ms,
+  c.provider,
   c.score,
   toUInt16(c.matched_terms) AS matched_terms,
   toUInt32(c.event_count_considered) AS event_count_considered,
@@ -1983,11 +2116,13 @@ FROM (
     sum(e.event_score) AS score,
     {outer_matched_terms_sql} AS matched_terms,
     count() AS event_count_considered,
+    argMax(e.provider, e.event_score) AS provider,
     argMax(e.event_uid, e.event_score) AS best_event_uid
   FROM (
     SELECT
       p.doc_id AS event_uid,
       any(p.session_id) AS session_id,
+      any(p.provider) AS provider,
       {inner_matched_terms_sql}
       sum(
         transform(toString(p.term), q_terms, q_idf, 0.0)
@@ -2006,6 +2141,7 @@ FROM (
   ) AS e
   GROUP BY e.session_id
 ) AS c
+ANY LEFT JOIN {session_summary_table} AS s ON s.session_id = c.session_id
 {mode_join_sql}
 WHERE c.matched_terms >= {min_should_match}
   AND c.score >= {min_score:.6}
@@ -2020,6 +2156,7 @@ FORMAT JSONEachRow",
             outer_matched_terms_sql = outer_matched_terms_sql,
             inner_matched_terms_sql = inner_matched_terms_sql,
             term_bits_with_sql = term_bits_with_sql,
+            session_summary_table = session_summary_table,
             mode_join_sql = mode_join_sql,
             mode_filter_sql = mode_filter_sql,
             min_should_match = min_should_match,
@@ -2057,6 +2194,50 @@ FORMAT JSONEachRow",
             by_uid.insert(row.event_uid, row.snippet);
         }
         Ok(by_uid)
+    }
+
+    async fn fetch_conversation_session_metadata(
+        &self,
+        session_ids: &[String],
+    ) -> RepoResult<HashMap<String, ConversationSessionMetadataRow>> {
+        if session_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let events_table = self.table_ref("events");
+        let session_ids_sql = sql_array_strings(session_ids);
+        let sql = format!(
+            "SELECT
+  session_id,
+  argMax(provider, event_ts) AS provider,
+  ifNull(argMax(nullIf(JSONExtractString(payload_json, 'slug'), ''), event_ts), '') AS session_slug,
+  ifNull(
+    argMax(
+      coalesce(
+        nullIf(JSONExtractString(payload_json, 'summary'), ''),
+        nullIf(JSONExtractString(payload_json, 'title'), ''),
+        nullIf(JSONExtractString(payload_json, 'name'), '')
+      ),
+      event_ts
+    ),
+    ''
+  ) AS session_summary
+FROM {events_table}
+WHERE event_kind = 'session_meta'
+  AND session_id IN {session_ids_sql}
+GROUP BY session_id
+FORMAT JSONEachRow",
+            events_table = events_table,
+            session_ids_sql = session_ids_sql,
+        );
+
+        let rows: Vec<ConversationSessionMetadataRow> =
+            self.map_backend(self.ch.query_rows(&sql, None).await)?;
+        let mut by_session = HashMap::new();
+        for row in rows {
+            by_session.insert(row.session_id.clone(), row);
+        }
+        Ok(by_session)
     }
 
     async fn log_search_events(
@@ -2459,6 +2640,8 @@ FORMAT JSONEachRow",
 
         let before = req.before.unwrap_or(self.cfg.default_context_before);
         let after = req.after.unwrap_or(self.cfg.default_context_after);
+        let include_system_events = req.include_system_events.unwrap_or(false);
+        let context_filter = Self::open_context_filter_clause(include_system_events);
         let trace_table = self.table_ref("v_conversation_trace");
 
         let target_query = format!(
@@ -2481,10 +2664,7 @@ FORMAT JSONEachRow",
             });
         };
 
-        let lower = target.event_order.saturating_sub(before as u64).max(1);
-        let upper = target.event_order + after as u64;
-
-        let context_query = format!(
+        let target_row_query = format!(
             "SELECT
   session_id,
   event_uid,
@@ -2503,17 +2683,102 @@ FORMAT JSONEachRow",
   payload_json,
   token_usage_json
 FROM {trace_table}
-WHERE session_id = {} AND event_order BETWEEN {} AND {}
+WHERE session_id = {} AND event_order = {} AND event_uid = {}
 ORDER BY event_order ASC
 FORMAT JSONEachRow",
             sql_quote(&target.session_id),
-            lower,
-            upper
+            target.event_order,
+            sql_quote(event_uid),
         );
 
-        let mut rows: Vec<TraceEventRow> =
-            self.map_backend(self.ch.query_rows(&context_query, None).await)?;
-        rows.sort_by_key(|row| row.event_order);
+        let mut before_rows: Vec<TraceEventRow> = if before == 0 {
+            Vec::new()
+        } else {
+            let before_query = format!(
+                "SELECT
+  session_id,
+  event_uid,
+  toUInt64(event_order) AS event_order,
+  toUInt32(turn_seq) AS turn_seq,
+  toString(event_time) AS event_time,
+  actor_role,
+  event_class,
+  payload_type,
+  call_id,
+  name,
+  phase,
+  item_id,
+  source_ref,
+  text_content,
+  payload_json,
+  token_usage_json
+FROM {trace_table}
+WHERE session_id = {} AND event_order < {}{}
+ORDER BY event_order DESC
+LIMIT {}
+FORMAT JSONEachRow",
+                sql_quote(&target.session_id),
+                target.event_order,
+                context_filter,
+                before,
+            );
+
+            self.map_backend(self.ch.query_rows(&before_query, None).await)?
+        };
+        if !include_system_events {
+            before_rows.retain(|row| {
+                !Self::is_low_information_system_event(&row.actor_role, &row.payload_type)
+            });
+        }
+        before_rows.reverse();
+
+        let target_rows: Vec<TraceEventRow> =
+            self.map_backend(self.ch.query_rows(&target_row_query, None).await)?;
+
+        let mut after_rows: Vec<TraceEventRow> = if after == 0 {
+            Vec::new()
+        } else {
+            let after_query = format!(
+                "SELECT
+  session_id,
+  event_uid,
+  toUInt64(event_order) AS event_order,
+  toUInt32(turn_seq) AS turn_seq,
+  toString(event_time) AS event_time,
+  actor_role,
+  event_class,
+  payload_type,
+  call_id,
+  name,
+  phase,
+  item_id,
+  source_ref,
+  text_content,
+  payload_json,
+  token_usage_json
+FROM {trace_table}
+WHERE session_id = {} AND event_order > {}{}
+ORDER BY event_order ASC
+LIMIT {}
+FORMAT JSONEachRow",
+                sql_quote(&target.session_id),
+                target.event_order,
+                context_filter,
+                after,
+            );
+
+            self.map_backend(self.ch.query_rows(&after_query, None).await)?
+        };
+        if !include_system_events {
+            after_rows.retain(|row| {
+                !Self::is_low_information_system_event(&row.actor_role, &row.payload_type)
+            });
+        }
+
+        let mut rows = Vec::with_capacity(before_rows.len() + target_rows.len() + after_rows.len());
+        rows.extend(before_rows);
+        rows.extend(target_rows);
+        rows.extend(after_rows);
 
         let events: Vec<OpenEvent> = rows
             .into_iter()
@@ -2575,11 +2840,9 @@ FORMAT JSONEachRow",
         }
         let terms: Vec<String> = terms_with_qf.iter().map(|(term, _)| term.clone()).collect();
 
-        let limit = query
-            .limit
-            .unwrap_or(self.cfg.max_results)
-            .max(1)
-            .min(self.cfg.max_results);
+        let requested_limit = query.limit.unwrap_or(self.cfg.max_results).max(1);
+        let limit = requested_limit.min(self.cfg.max_results);
+        let limit_capped = requested_limit > limit;
 
         let min_should_match = query
             .min_should_match
@@ -2613,12 +2876,16 @@ FORMAT JSONEachRow",
                     avgdl: 0.0,
                     took_ms: started.elapsed().as_millis() as u32,
                     result_count: 0,
+                    requested_limit,
+                    effective_limit: limit,
+                    limit_capped,
                 },
                 hits: Vec::new(),
             });
         }
 
         let avgdl = (total_doc_len as f64 / docs as f64).max(1.0);
+        let fetch_limit = Self::dedupe_fetch_limit(limit);
         let rows_to_hits = |rows: Vec<SearchRow>| -> Vec<SearchEventHit> {
             rows.into_iter()
                 .enumerate()
@@ -2654,10 +2921,10 @@ FORMAT JSONEachRow",
                     session_id,
                     min_should_match,
                     min_score,
-                    limit,
+                    fetch_limit,
                 )
                 .await?;
-            rows_to_hits(rows)
+            rows_to_hits(Self::dedupe_search_rows(rows, limit))
         } else {
             let cache_key = Self::search_events_cache_key(
                 &terms,
@@ -2684,10 +2951,10 @@ FORMAT JSONEachRow",
                         session_id,
                         min_should_match,
                         min_score,
-                        limit,
+                        fetch_limit,
                     )
                     .await?;
-                let fresh_hits = rows_to_hits(fresh_rows);
+                let fresh_hits = rows_to_hits(Self::dedupe_search_rows(fresh_rows, limit));
                 self.search_events_cache_put(cache_key, &fresh_hits).await;
                 fresh_hits
             }
@@ -2724,6 +2991,9 @@ FORMAT JSONEachRow",
                 avgdl,
                 took_ms,
                 result_count: hits.len(),
+                requested_limit,
+                effective_limit: limit,
+                limit_capped,
             },
             hits,
         })
@@ -2749,11 +3019,9 @@ FORMAT JSONEachRow",
         }
         let terms: Vec<String> = terms_with_qf.iter().map(|(term, _)| term.clone()).collect();
 
-        let limit = query
-            .limit
-            .unwrap_or(self.cfg.max_results)
-            .max(1)
-            .min(self.cfg.max_results);
+        let requested_limit = query.limit.unwrap_or(self.cfg.max_results).max(1);
+        let limit = requested_limit.min(self.cfg.max_results);
+        let limit_capped = requested_limit > limit;
 
         let min_should_match = query
             .min_should_match
@@ -2780,6 +3048,9 @@ FORMAT JSONEachRow",
                     avgdl: 0.0,
                     took_ms: started.elapsed().as_millis() as u32,
                     result_count: 0,
+                    requested_limit,
+                    effective_limit: limit,
+                    limit_capped,
                 },
                 hits: Vec::new(),
             });
@@ -2864,30 +3135,66 @@ FORMAT JSONEachRow",
             })
             .collect::<Vec<_>>();
         let snippet_by_event_uid = self.fetch_conversation_snippets(&best_event_uids).await?;
+        let session_ids = rows
+            .iter()
+            .map(|row| row.session_id.clone())
+            .collect::<Vec<_>>();
+        let session_metadata_by_session_id = self
+            .fetch_conversation_session_metadata(&session_ids)
+            .await?;
 
         let hits = rows
             .into_iter()
             .enumerate()
             .map(|(idx, row)| {
-                let best_event_uid = if row.best_event_uid.is_empty() {
+                let ConversationSearchRow {
+                    session_id,
+                    first_event_time,
+                    first_event_unix_ms,
+                    last_event_time,
+                    last_event_unix_ms,
+                    provider: row_provider,
+                    score,
+                    matched_terms,
+                    event_count_considered,
+                    best_event_uid: row_best_event_uid,
+                    snippet: row_snippet,
+                } = row;
+                let session_metadata = session_metadata_by_session_id.get(&session_id);
+
+                let best_event_uid = if row_best_event_uid.is_empty() {
                     None
                 } else {
-                    Some(row.best_event_uid)
+                    Some(row_best_event_uid)
                 };
                 let snippet = best_event_uid
                     .as_ref()
                     .and_then(|event_uid| snippet_by_event_uid.get(event_uid).cloned())
-                    .or(if row.snippet.is_empty() {
-                        None
-                    } else {
-                        Some(row.snippet)
-                    });
+                    .or((!row_snippet.is_empty()).then_some(row_snippet));
+                let has_first_event_time = !first_event_time.is_empty();
+                let has_last_event_time = !last_event_time.is_empty();
+                let provider = session_metadata
+                    .and_then(|meta| (!meta.provider.is_empty()).then(|| meta.provider.clone()))
+                    .or((!row_provider.is_empty()).then_some(row_provider));
+                let session_slug = session_metadata.and_then(|meta| {
+                    (!meta.session_slug.is_empty()).then(|| meta.session_slug.clone())
+                });
+                let session_summary = session_metadata.and_then(|meta| {
+                    (!meta.session_summary.is_empty()).then(|| meta.session_summary.clone())
+                });
                 ConversationSearchHit {
                     rank: idx + 1,
-                    session_id: row.session_id,
-                    score: row.score,
-                    matched_terms: row.matched_terms,
-                    event_count_considered: row.event_count_considered,
+                    session_id,
+                    first_event_time: has_first_event_time.then_some(first_event_time),
+                    first_event_unix_ms: has_first_event_time.then_some(first_event_unix_ms),
+                    last_event_time: has_last_event_time.then_some(last_event_time),
+                    last_event_unix_ms: has_last_event_time.then_some(last_event_unix_ms),
+                    provider,
+                    session_slug,
+                    session_summary,
+                    score,
+                    matched_terms,
+                    event_count_considered,
                     best_event_uid,
                     snippet,
                 }
@@ -2903,6 +3210,9 @@ FORMAT JSONEachRow",
                 avgdl,
                 took_ms: started.elapsed().as_millis() as u32,
                 result_count: hits.len(),
+                requested_limit,
+                effective_limit: limit,
+                limit_capped,
             },
             hits,
         })
@@ -2997,6 +3307,34 @@ mod tests {
         }
     }
 
+    fn sample_search_row(
+        event_uid: &str,
+        session_id: &str,
+        event_class: &str,
+        payload_type: &str,
+        actor_role: &str,
+        text_preview: &str,
+        score: f64,
+        matched_terms: u64,
+    ) -> SearchRow {
+        SearchRow {
+            event_uid: event_uid.to_string(),
+            session_id: session_id.to_string(),
+            source_name: "source".to_string(),
+            provider: "provider".to_string(),
+            event_class: event_class.to_string(),
+            payload_type: payload_type.to_string(),
+            actor_role: actor_role.to_string(),
+            name: String::new(),
+            phase: String::new(),
+            source_ref: "source-ref".to_string(),
+            doc_len: 42,
+            text_preview: text_preview.to_string(),
+            score,
+            matched_terms,
+        }
+    }
+
     #[test]
     fn tokenize_query_enforces_limits_and_counts() {
         let terms = tokenize_query("Hello hello world tool_use", 3);
@@ -3036,5 +3374,157 @@ mod tests {
         assert!(
             !ClickHouseConversationRepository::passes_search_doc_filters(&row, false, true, None)
         );
+    }
+
+    #[test]
+    fn dedupe_search_rows_prefers_message_over_event_msg_mirror() {
+        let rows = vec![
+            sample_search_row(
+                "uid-event-msg",
+                "sess-a",
+                "event_msg",
+                "agent_message",
+                "assistant",
+                "Short answer: no",
+                18.26,
+                3,
+            ),
+            sample_search_row(
+                "uid-message",
+                "sess-a",
+                "message",
+                "message",
+                "assistant",
+                "Short  answer:\nno",
+                18.26,
+                3,
+            ),
+        ];
+
+        let deduped = ClickHouseConversationRepository::dedupe_search_rows(rows, 5);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].event_uid, "uid-message");
+        assert_eq!(deduped[0].event_class, "message");
+    }
+
+    #[test]
+    fn dedupe_search_rows_fills_limit_after_collapsing_mirrors() {
+        let rows = vec![
+            sample_search_row(
+                "uid-event-msg",
+                "sess-a",
+                "event_msg",
+                "agent_message",
+                "assistant",
+                "same answer",
+                18.26,
+                3,
+            ),
+            sample_search_row(
+                "uid-message",
+                "sess-a",
+                "message",
+                "message",
+                "assistant",
+                "same answer",
+                18.26,
+                3,
+            ),
+            sample_search_row(
+                "uid-2",
+                "sess-b",
+                "message",
+                "message",
+                "assistant",
+                "different answer 2",
+                17.00,
+                2,
+            ),
+            sample_search_row(
+                "uid-3",
+                "sess-c",
+                "message",
+                "message",
+                "assistant",
+                "different answer 3",
+                16.00,
+                2,
+            ),
+        ];
+
+        let deduped = ClickHouseConversationRepository::dedupe_search_rows(rows, 3);
+        assert_eq!(deduped.len(), 3);
+        assert_eq!(deduped[0].event_uid, "uid-message");
+        assert_eq!(deduped[1].event_uid, "uid-2");
+        assert_eq!(deduped[2].event_uid, "uid-3");
+    }
+
+    #[test]
+    fn dedupe_search_rows_does_not_collapse_same_kind_hits() {
+        let rows = vec![
+            sample_search_row(
+                "uid-1",
+                "sess-a",
+                "message",
+                "message",
+                "assistant",
+                "same text",
+                10.0,
+                2,
+            ),
+            sample_search_row(
+                "uid-2",
+                "sess-a",
+                "message",
+                "message",
+                "assistant",
+                "same text",
+                10.0,
+                2,
+            ),
+        ];
+
+        let deduped = ClickHouseConversationRepository::dedupe_search_rows(rows, 5);
+        assert_eq!(deduped.len(), 2);
+    }
+
+    #[test]
+    fn low_information_system_event_classifier_targets_open_noise() {
+        assert!(
+            ClickHouseConversationRepository::is_low_information_system_event("system", "progress")
+        );
+        assert!(
+            ClickHouseConversationRepository::is_low_information_system_event(
+                "SYSTEM",
+                "file_history_snapshot"
+            )
+        );
+        assert!(
+            ClickHouseConversationRepository::is_low_information_system_event("system", "system")
+        );
+        assert!(
+            !ClickHouseConversationRepository::is_low_information_system_event(
+                "assistant",
+                "progress"
+            )
+        );
+        assert!(
+            !ClickHouseConversationRepository::is_low_information_system_event(
+                "system",
+                "reasoning"
+            )
+        );
+    }
+
+    #[test]
+    fn open_context_filter_clause_respects_include_system_events_flag() {
+        assert_eq!(
+            ClickHouseConversationRepository::open_context_filter_clause(true),
+            ""
+        );
+        let filtered_clause = ClickHouseConversationRepository::open_context_filter_clause(false);
+        assert!(filtered_clause.contains("progress"));
+        assert!(filtered_clause.contains("file_history_snapshot"));
+        assert!(filtered_clause.contains("lowerUTF8(actor_role) = 'system'"));
     }
 }
