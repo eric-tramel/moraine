@@ -309,6 +309,8 @@ pub struct OpenEventRequest {
     pub before: Option<u16>,
     #[serde(default)]
     pub after: Option<u16>,
+    #[serde(default)]
+    pub include_system_events: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
