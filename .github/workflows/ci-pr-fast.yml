@@ -61,4 +61,5 @@ jobs:
 
       - name: Skip E2E for docs-only changes
         if: github.event_name == 'pull_request' && steps.e2e_changes.outputs.e2e != 'true'
-        run: echo "Skipping E2E: no E2E-relevant file changes detected."
+        run: |
+          echo "Skipping E2E: no E2E-relevant file changes detected."
