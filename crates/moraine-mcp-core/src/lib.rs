@@ -15,6 +15,8 @@ use std::sync::{
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, warn};
 
+const TOOL_LIMIT_MIN: u16 = 1;
+
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Verbosity {
@@ -338,6 +340,7 @@ impl AppState {
     }
 
     fn tools_list_result(&self) -> Value {
+        let (limit_min, limit_max) = tool_limit_bounds(self.cfg.mcp.max_results);
         json!({
             "tools": [
                 {
@@ -347,7 +350,7 @@ impl AppState {
                         "type": "object",
                         "properties": {
                             "query": { "type": "string" },
-                            "limit": { "type": "integer", "minimum": 1, "maximum": self.cfg.mcp.max_results },
+                            "limit": { "type": "integer", "minimum": limit_min, "maximum": limit_max },
                             "session_id": { "type": "string" },
                             "min_score": { "type": "number" },
                             "min_should_match": { "type": "integer", "minimum": 1 },
@@ -388,7 +391,7 @@ impl AppState {
                         "type": "object",
                         "properties": {
                             "query": { "type": "string" },
-                            "limit": { "type": "integer", "minimum": 1, "maximum": self.cfg.mcp.max_results },
+                            "limit": { "type": "integer", "minimum": limit_min, "maximum": limit_max },
                             "min_score": { "type": "number" },
                             "min_should_match": { "type": "integer", "minimum": 1 },
                             "from_unix_ms": { "type": "integer" },
@@ -437,8 +440,9 @@ impl AppState {
     async fn call_tool(&self, params: ToolCallParams) -> Result<Value> {
         match params.name.as_str() {
             "search" => {
-                let args: SearchArgs = serde_json::from_value(params.arguments)
+                let mut args: SearchArgs = serde_json::from_value(params.arguments)
                     .context("search expects a JSON object with at least {\"query\": ...}")?;
+                args.limit = validate_tool_limit("search", args.limit, self.cfg.mcp.max_results)?;
                 let verbosity = args.verbosity.unwrap_or_default();
                 let payload = self.search(args).await?;
                 match verbosity {
@@ -457,10 +461,15 @@ impl AppState {
                 }
             }
             "search_conversations" => {
-                let args: SearchConversationsArgs = serde_json::from_value(params.arguments)
+                let mut args: SearchConversationsArgs = serde_json::from_value(params.arguments)
                     .context(
                         "search_conversations expects a JSON object with at least {\"query\": ...}",
                     )?;
+                args.limit = validate_tool_limit(
+                    "search_conversations",
+                    args.limit,
+                    self.cfg.mcp.max_results,
+                )?;
                 let verbosity = args.verbosity.unwrap_or_default();
                 let payload = self.search_conversations(args).await?;
                 match verbosity {
@@ -606,6 +615,24 @@ impl AppState {
             "sessions": sessions,
             "next_cursor": page.next_cursor,
         }))
+    }
+}
+
+fn tool_limit_bounds(max_results: u16) -> (u16, u16) {
+    (TOOL_LIMIT_MIN, max_results.max(TOOL_LIMIT_MIN))
+}
+
+fn validate_tool_limit(
+    tool_name: &str,
+    limit: Option<u16>,
+    max_results: u16,
+) -> Result<Option<u16>> {
+    let (min, max) = tool_limit_bounds(max_results);
+    match limit {
+        Some(value) if !(min..=max).contains(&value) => Err(anyhow!(
+            "{tool_name} limit must be between {min} and {max} (received {value})"
+        )),
+        _ => Ok(limit),
     }
 }
 
@@ -1010,6 +1037,36 @@ mod tests {
         let text = format_conversation_search_prose(&payload).expect("format");
         assert!(text.contains("Conversation Search"));
         assert!(text.contains("No hits"));
+    }
+
+    #[test]
+    fn tool_limit_bounds_use_shared_min_and_effective_max() {
+        assert_eq!(tool_limit_bounds(25), (1, 25));
+        assert_eq!(tool_limit_bounds(0), (1, 1));
+    }
+
+    #[test]
+    fn validate_tool_limit_enforces_bounds() {
+        assert_eq!(
+            validate_tool_limit("search", None, 25).expect("missing limit accepted"),
+            None
+        );
+        assert_eq!(
+            validate_tool_limit("search", Some(25), 25).expect("max bound accepted"),
+            Some(25)
+        );
+
+        let zero_err = validate_tool_limit("search", Some(0), 25).expect_err("zero must fail");
+        assert_eq!(
+            zero_err.to_string(),
+            "search limit must be between 1 and 25 (received 0)"
+        );
+
+        let high_err = validate_tool_limit("search", Some(26), 25).expect_err("above max fails");
+        assert_eq!(
+            high_err.to_string(),
+            "search limit must be between 1 and 25 (received 26)"
+        );
     }
 
     #[test]
