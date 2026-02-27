@@ -99,6 +99,7 @@ Main outputs:
 2. Validate readiness (draft status, optional approval, required checks, mergeability).
 3. Merge ready PRs sequentially.
 4. For behind/conflicting PRs, launch a Codex repair session in a fresh worktree to integrate latest base branch and push the updated head branch.
+5. Stop after the first repair attempt by default so one run does not trigger a full repair cascade.
 
 Quick start (queue label `merge-queue`):
 
@@ -126,6 +127,7 @@ Common options:
 - `--merge-method METHOD`: `squash|merge|rebase`.
 - `--require-approval`: require `reviewDecision=APPROVED` before merge.
 - `--no-repair`: disable Codex-based repair for behind/conflicting PRs.
+- `--continue-after-repair`: process additional PRs after a repair attempt (default is to stop after the first repair to avoid repair cascades).
 - `--repair-gate CMD`: validation command run after repair (default `cargo test --workspace --locked`).
 - `--cleanup-worktrees`: remove successful repair worktrees at the end.
 

@@ -25,6 +25,8 @@ Options:
   --allow-admin-merge       Pass --admin to gh pr merge
   --delete-branch           Delete head branch after successful merge
   --no-repair               Disable Codex repair runs for blocked PRs
+  --continue-after-repair   Continue processing more PRs after a repair attempt
+                            (default: stop after first repair attempt)
   --model MODEL             Codex repair model (default: gpt-5.3-codex)
   --effort LEVEL            Codex repair effort (default: high)
   --repair-gate CMD         Command to validate repaired branch
@@ -341,6 +343,7 @@ REQUIRE_APPROVAL=0
 ALLOW_ADMIN_MERGE=0
 DELETE_BRANCH=0
 ENABLE_REPAIR=1
+STOP_AFTER_REPAIR=1
 MODEL="gpt-5.3-codex"
 EFFORT="high"
 REPAIR_GATE="cargo test --workspace --locked"
@@ -374,6 +377,8 @@ while [ "$#" -gt 0 ]; do
       DELETE_BRANCH=1; shift ;;
     --no-repair)
       ENABLE_REPAIR=0; shift ;;
+    --continue-after-repair)
+      STOP_AFTER_REPAIR=0; shift ;;
     --model)
       MODEL="${2:-}"; shift 2 ;;
     --effort)
@@ -443,6 +448,11 @@ REPORT_FILE="$RUN_DIR/report.md"
     echo "- Queue label: (none, all open PRs)"
   fi
   echo "- Dry run: $DRY_RUN"
+  if [ "$STOP_AFTER_REPAIR" -eq 1 ]; then
+    echo "- Stop after repair: yes"
+  else
+    echo "- Stop after repair: no"
+  fi
   echo "- Started: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
   echo
 } > "$REPORT_FILE"
@@ -478,6 +488,7 @@ MERGED_COUNT=0
 REPAIRED_COUNT=0
 SKIPPED_COUNT=0
 FAILED_COUNT=0
+HALT_REASON=""
 
 while IFS= read -r pr_number; do
   if [ "$MAX_MERGES" -gt 0 ] && [ "$MERGED_COUNT" -ge "$MAX_MERGES" ]; then
@@ -562,24 +573,41 @@ while IFS= read -r pr_number; do
     if [ "$ENABLE_REPAIR" -eq 0 ]; then
       SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
       append_report "- #$pr_number [SKIP] $pr_url - needs repair (mergeable=$pr_mergeable state=$pr_merge_state)"
-      continue
+      HALT_REASON="queue blocked at PR #$pr_number (needs repair; repair disabled)"
+      log "Stopping: $HALT_REASON"
+      break
     fi
 
     if [ "$DRY_RUN" -eq 1 ]; then
       REPAIRED_COUNT=$((REPAIRED_COUNT + 1))
       append_report "- #$pr_number [DRY-RUN-REPAIR] $pr_url - would run Codex repair (mergeable=$pr_mergeable state=$pr_merge_state)"
+      if [ "$STOP_AFTER_REPAIR" -eq 1 ]; then
+        HALT_REASON="stopped after first repair attempt in dry-run mode at PR #$pr_number"
+        log "Stopping: $HALT_REASON"
+        break
+      fi
       continue
     fi
 
     repair_status=0
     if run_codex_repair "$pr_number" "$pr_title" "$pr_url" "$pr_head_ref" "$pr_head_sha" "$pr_cross_repo"; then
       REPAIRED_COUNT=$((REPAIRED_COUNT + 1))
+      if [ "$STOP_AFTER_REPAIR" -eq 1 ]; then
+        HALT_REASON="stopped after repairing PR #$pr_number; rerun after checks complete to merge"
+        log "Stopping: $HALT_REASON"
+        break
+      fi
     else
       repair_status=$?
       if [ "$repair_status" -eq 2 ]; then
         SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
       else
         FAILED_COUNT=$((FAILED_COUNT + 1))
+        if [ "$STOP_AFTER_REPAIR" -eq 1 ]; then
+          HALT_REASON="stopped after repair failure on PR #$pr_number"
+          log "Stopping: $HALT_REASON"
+          break
+        fi
       fi
     fi
     continue
@@ -629,6 +657,9 @@ done < <(jq -r '.[].number' "$RUN_DIR/candidates.json")
   echo "- repaired: $REPAIRED_COUNT"
   echo "- skipped: $SKIPPED_COUNT"
   echo "- failed: $FAILED_COUNT"
+  if [ -n "$HALT_REASON" ]; then
+    echo "- halted: $HALT_REASON"
+  fi
   echo
   echo "- Finished: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 } >> "$REPORT_FILE"
