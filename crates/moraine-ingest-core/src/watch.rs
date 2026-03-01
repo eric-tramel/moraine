@@ -158,13 +158,30 @@ fn queue_rescan(
     metrics: &Arc<Metrics>,
 ) {
     record_rescan(metrics);
-    if let Ok(paths) = enumerate_jsonl_files(glob_pattern) {
-        for path in paths {
-            let _ = tx.send(WorkItem {
-                source_name: source_name.to_string(),
-                provider: provider.to_string(),
-                path,
-            });
+    match enumerate_jsonl_files(glob_pattern) {
+        Ok(paths) => {
+            for path in paths {
+                let _ = tx.send(WorkItem {
+                    source_name: source_name.to_string(),
+                    provider: provider.to_string(),
+                    path,
+                });
+            }
+        }
+        Err(exc) => {
+            warn!(
+                source = source_name,
+                provider,
+                glob_pattern,
+                error = %exc,
+                "watcher rescan failed to enumerate jsonl files"
+            );
+            record_watcher_error(
+                metrics,
+                &format!(
+                    "rescan enumerate failed for source={source_name} provider={provider} glob={glob_pattern}: {exc}"
+                ),
+            );
         }
     }
 }
@@ -356,6 +373,7 @@ mod tests {
     };
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
+    use tokio::sync::mpsc;
 
     #[test]
     fn rescan_events_require_reconcile() {
@@ -402,5 +420,27 @@ mod tests {
         }
 
         assert_eq!(metrics.watcher_registrations.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn queue_rescan_records_enumeration_errors() {
+        let metrics = Arc::new(Metrics::default());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        queue_rescan("[", "source-alpha", "provider-alpha", &tx, &metrics);
+
+        assert!(rx.try_recv().is_err());
+        assert_eq!(metrics.watcher_reset_count.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.watcher_error_count.load(Ordering::Relaxed), 1);
+
+        let last_error = metrics
+            .last_error
+            .lock()
+            .expect("metrics last_error mutex poisoned")
+            .clone();
+        assert!(last_error.contains("rescan enumerate failed"));
+        assert!(last_error.contains("source=source-alpha"));
+        assert!(last_error.contains("provider=provider-alpha"));
+        assert!(last_error.contains("glob=["));
     }
 }

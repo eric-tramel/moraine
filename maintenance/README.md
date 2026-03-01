@@ -90,3 +90,48 @@ Main outputs:
 - No run artifacts are retained.
 - The script uses a temporary run directory under `/tmp` and removes it on exit.
 - Durable state is kept in GitHub issue/PR updates only.
+
+## Merge Train Orchestrator
+
+`run_merge_train.sh` orchestrates a manual merge train for pull requests:
+
+1. Select queued PRs on a base branch (`main` by default).
+2. Validate readiness (draft status, optional approval, required checks, mergeability).
+3. Merge ready PRs sequentially.
+4. For behind/conflicting PRs, launch a Codex repair session in a fresh worktree to integrate latest base branch and push the updated head branch.
+5. Stop after the first repair attempt by default so one run does not trigger a full repair cascade.
+
+Quick start (queue label `merge-queue`):
+
+```bash
+maintenance/run_merge_train.sh --yes
+```
+
+Dry run:
+
+```bash
+maintenance/run_merge_train.sh --dry-run
+```
+
+Process all open PRs for `main` (no queue label filter):
+
+```bash
+maintenance/run_merge_train.sh --all-open --yes
+```
+
+Common options:
+
+- `--queue-label LABEL`: queue selector label (default `merge-queue`).
+- `--all-open`: ignore queue label and consider all open PRs for the base branch.
+- `--max-merges N`: cap merges performed in one run.
+- `--merge-method METHOD`: `squash|merge|rebase`.
+- `--require-approval`: require `reviewDecision=APPROVED` before merge.
+- `--no-repair`: disable Codex-based repair for behind/conflicting PRs.
+- `--continue-after-repair`: process additional PRs after a repair attempt (default is to stop after the first repair to avoid repair cascades).
+- `--repair-gate CMD`: validation command run after repair (default `cargo test --workspace --locked`).
+- `--cleanup-worktrees`: remove successful repair worktrees at the end.
+
+Main outputs:
+
+- `maintenance/MERGE_TRAIN_REPORT.md`: run summary with per-PR actions.
+- Run logs/artifacts in `/tmp/moraine-merge-train-<timestamp>` (or `--run-dir`).

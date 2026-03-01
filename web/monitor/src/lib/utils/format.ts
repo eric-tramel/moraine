@@ -40,11 +40,18 @@ export function formatCompactNumber(value: number): string {
 }
 
 export function buildBucketAxis(range: AnalyticsRange): number[] {
-  const bucketSeconds = Number(range.bucket_seconds || 3600);
-  const fromUnix = Number(range.from_unix || 0);
-  const toUnix = Number(range.to_unix || 0);
+  const bucketSeconds = range.bucket_seconds == null ? 3600 : Number(range.bucket_seconds);
+  const fromUnix = range.from_unix == null ? Number.NaN : Number(range.from_unix);
+  const toUnix = range.to_unix == null ? Number.NaN : Number(range.to_unix);
 
-  if (!fromUnix || !toUnix || bucketSeconds <= 0) return [];
+  if (
+    !Number.isFinite(fromUnix) ||
+    !Number.isFinite(toUnix) ||
+    !Number.isFinite(bucketSeconds) ||
+    bucketSeconds <= 0
+  ) {
+    return [];
+  }
 
   const start = Math.floor(fromUnix / bucketSeconds) * bucketSeconds;
   const end = Math.floor(toUnix / bucketSeconds) * bucketSeconds;
