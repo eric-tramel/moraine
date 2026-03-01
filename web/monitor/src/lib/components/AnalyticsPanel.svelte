@@ -28,6 +28,15 @@
   let metaText = DEFAULT_ANALYTICS_META;
   let chartView = payload?.ok ? buildAnalyticsView(payload) : null;
 
+  function resetCharts(): void {
+    destroyChart(tokensChart);
+    destroyChart(turnsChart);
+    destroyChart(concurrentChart);
+    tokensChart = null;
+    turnsChart = null;
+    concurrentChart = null;
+  }
+
   function renderCharts(): void {
     if (!chartView || !tokensCanvas || !turnsCanvas || !concurrentCanvas) {
       return;
@@ -79,6 +88,7 @@
       chartView = buildAnalyticsView(payload);
       metaText = errorMessage ? `${chartView.metaText} | ${errorMessage}` : chartView.metaText;
     } else {
+      resetCharts();
       chartView = null;
       metaText = errorMessage || DEFAULT_ANALYTICS_META;
     }
@@ -90,9 +100,7 @@
   }
 
   onDestroy(() => {
-    destroyChart(tokensChart);
-    destroyChart(turnsChart);
-    destroyChart(concurrentChart);
+    resetCharts();
   });
 </script>
 

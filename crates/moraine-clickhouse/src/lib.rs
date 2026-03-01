@@ -502,7 +502,11 @@ fn truncate_for_error(statement: &str) -> String {
     if compact.len() <= LIMIT {
         compact
     } else {
-        format!("{}...", &compact[..LIMIT])
+        let mut boundary = LIMIT;
+        while !compact.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        format!("{}...", &compact[..boundary])
     }
 }
 
@@ -752,6 +756,13 @@ mod tests {
         ));
         assert!(!has_explicit_json_each_row_format("SELECT 1"));
         assert!(!has_explicit_json_each_row_format("SELECT 1 FORMAT JSON"));
+    }
+
+    #[test]
+    fn truncate_for_error_handles_multibyte_utf8_boundaries() {
+        let statement = format!("{}é{}", "a".repeat(239), "b".repeat(10));
+        let truncated = truncate_for_error(&statement);
+        assert_eq!(truncated, format!("{}...", "a".repeat(239)));
     }
 
     #[tokio::test(flavor = "multi_thread")]
