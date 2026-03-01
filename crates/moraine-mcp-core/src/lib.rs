@@ -153,6 +153,10 @@ struct SearchProseHit {
     #[serde(default)]
     session_id: String,
     #[serde(default)]
+    first_event_time: String,
+    #[serde(default)]
+    last_event_time: String,
+    #[serde(default)]
     score: f64,
     #[serde(default)]
     event_class: String,
@@ -743,10 +747,21 @@ fn format_search_prose(payload: &Value) -> Result<String> {
 
     for hit in &parsed.hits {
         let kind = display_kind(&hit.event_class, &hit.payload_type);
+        let recency = if hit.last_event_time.is_empty() {
+            String::new()
+        } else {
+            format!(" last_event_time={}", hit.last_event_time)
+        };
         out.push_str(&format!(
-            "\n{}) session={} score={:.4} kind={} role={}\n",
-            hit.rank, hit.session_id, hit.score, kind, hit.actor_role
+            "\n{}) session={} score={:.4} kind={} role={}{}\n",
+            hit.rank, hit.session_id, hit.score, kind, hit.actor_role, recency
         ));
+        if !hit.first_event_time.is_empty() && !hit.last_event_time.is_empty() {
+            out.push_str(&format!(
+                "   session_window: {} -> {}\n",
+                hit.first_event_time, hit.last_event_time
+            ));
+        }
 
         let snippet = compact_text_line(&hit.text_preview, 220);
         if !snippet.is_empty() {
@@ -1249,6 +1264,36 @@ mod tests {
         assert!(text.contains("first_last: 2026-01-03 10:00:00 -> 2026-01-03 10:10:00"));
         assert!(text.contains("session_slug: project-c"));
         assert!(text.contains("session_summary: Session C summary"));
+    }
+
+    #[test]
+    fn format_search_prose_includes_session_recency() {
+        let payload = json!({
+            "query_id": "q2",
+            "query": "design decision",
+            "stats": {
+                "took_ms": 3,
+                "result_count": 1
+            },
+            "hits": [
+                {
+                    "rank": 1,
+                    "event_uid": "evt-1",
+                    "session_id": "sess-a",
+                    "first_event_time": "2026-01-01 00:00:00",
+                    "last_event_time": "2026-01-02 00:00:00",
+                    "score": 4.2,
+                    "event_class": "message",
+                    "payload_type": "text",
+                    "actor_role": "assistant",
+                    "text_preview": "decision details"
+                }
+            ]
+        });
+
+        let text = format_search_prose(&payload).expect("format");
+        assert!(text.contains("last_event_time=2026-01-02 00:00:00"));
+        assert!(text.contains("session_window: 2026-01-01 00:00:00 -> 2026-01-02 00:00:00"));
     }
 
     #[test]

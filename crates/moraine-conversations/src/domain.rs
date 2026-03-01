@@ -227,6 +227,8 @@ pub struct SearchEventHit {
     pub rank: usize,
     pub event_uid: String,
     pub session_id: String,
+    pub first_event_time: String,
+    pub last_event_time: String,
     pub source_name: String,
     pub provider: String,
     pub score: f64,
