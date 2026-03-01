@@ -32,7 +32,9 @@ fn parse_args_impl(mut args: impl Iterator<Item = String>) -> Result<ParseOutcom
             "-h" | "--help" | "help" => {
                 return Ok(ParseOutcome::Help);
             }
-            _ => {}
+            _ => {
+                return Err(format!("unrecognized argument: {arg}"));
+            }
         }
     }
 
@@ -80,5 +82,23 @@ mod tests {
         };
 
         assert_eq!(args.config_path, PathBuf::from("custom.toml"));
+    }
+
+    #[test]
+    fn parse_args_rejects_unknown_flag() {
+        let result = parse_args_impl(vec!["--cnfig".to_string()].into_iter());
+        assert!(matches!(
+            result,
+            Err(error) if error == "unrecognized argument: --cnfig"
+        ));
+    }
+
+    #[test]
+    fn parse_args_rejects_unknown_positional() {
+        let result = parse_args_impl(vec!["custom.toml".to_string()].into_iter());
+        assert!(matches!(
+            result,
+            Err(error) if error == "unrecognized argument: custom.toml"
+        ));
     }
 }

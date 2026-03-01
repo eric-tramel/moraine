@@ -11,7 +11,7 @@ use moraine_clickhouse::ClickHouseClient;
 use moraine_config::ClickHouseConfig;
 use moraine_conversations::{
     ClickHouseConversationRepository, ConversationListFilter, ConversationMode,
-    ConversationRepository, ConversationSearchQuery, PageRequest, RepoConfig,
+    ConversationRepository, ConversationSearchQuery, PageRequest, RepoConfig, SearchEventsQuery,
 };
 use serde_json::json;
 
@@ -66,7 +66,9 @@ async fn spawn_mock_server() -> (String, Arc<MockState>) {
             .expect("query lock")
             .push(query.clone());
 
-        if query.contains("FROM `moraine`.`v_session_summary` AS s") {
+        if query.contains("FROM `moraine`.`v_session_summary` AS s")
+            && query.contains("ORDER BY s.last_event_time DESC")
+        {
             if query.contains("s.session_id < 'sess_b'") {
                 return (
                     StatusCode::OK,
@@ -138,6 +140,28 @@ async fn spawn_mock_server() -> (String, Arc<MockState>) {
             );
         }
 
+        if query.contains("FROM `moraine`.`v_session_summary` AS s")
+            && query.contains("WHERE s.session_id IN")
+            && query.contains("toString(s.first_event_time) AS first_event_time")
+            && query.contains("toString(s.last_event_time) AS last_event_time")
+        {
+            return (
+                StatusCode::OK,
+                json_each_row(json!([
+                    {
+                        "session_id": "sess_c",
+                        "first_event_time": "2026-01-03 10:00:00",
+                        "last_event_time": "2026-01-03 10:10:00"
+                    },
+                    {
+                        "session_id": "sess_a",
+                        "first_event_time": "2026-01-01 10:00:00",
+                        "last_event_time": "2026-01-01 10:10:00"
+                    }
+                ])),
+            );
+        }
+
         if query.contains("FROM `moraine`.`search_corpus_stats`") {
             return (
                 StatusCode::OK,
@@ -184,6 +208,11 @@ async fn spawn_mock_server() -> (String, Arc<MockState>) {
                 json_each_row(json!([
                     {
                         "session_id": "sess_c",
+                        "first_event_time": "2026-01-03 10:00:00",
+                        "first_event_unix_ms": 1767434400000_i64,
+                        "last_event_time": "2026-01-03 10:10:00",
+                        "last_event_unix_ms": 1767435000000_i64,
+                        "provider": "codex",
                         "score": 12.5,
                         "matched_terms": 2_u16,
                         "event_count_considered": 3_u32,
@@ -192,11 +221,80 @@ async fn spawn_mock_server() -> (String, Arc<MockState>) {
                     },
                     {
                         "session_id": "sess_a",
+                        "first_event_time": "2026-01-01 10:00:00",
+                        "first_event_unix_ms": 1767261600000_i64,
+                        "last_event_time": "2026-01-01 10:10:00",
+                        "last_event_unix_ms": 1767262200000_i64,
+                        "provider": "codex",
                         "score": 7.0,
                         "matched_terms": 1_u16,
                         "event_count_considered": 2_u32,
                         "best_event_uid": "evt-a-11",
                         "snippet": "weaker match from session a"
+                    }
+                ])),
+            );
+        }
+
+        if query.contains("GROUP BY p.doc_id")
+            && query.contains("ORDER BY score DESC, event_uid ASC")
+        {
+            return (
+                StatusCode::OK,
+                json_each_row(json!([
+                    {
+                        "event_uid": "evt-c-42",
+                        "session_id": "sess_c",
+                        "source_name": "codex",
+                        "provider": "codex",
+                        "event_class": "message",
+                        "payload_type": "text",
+                        "actor_role": "assistant",
+                        "name": "",
+                        "phase": "",
+                        "source_ref": "/tmp/sess_c.jsonl:1:42",
+                        "doc_len": 19,
+                        "text_preview": "best event in session c",
+                        "score": 12.5,
+                        "matched_terms": 2_u64
+                    },
+                    {
+                        "event_uid": "evt-a-11",
+                        "session_id": "sess_a",
+                        "source_name": "codex",
+                        "provider": "codex",
+                        "event_class": "message",
+                        "payload_type": "text",
+                        "actor_role": "assistant",
+                        "name": "",
+                        "phase": "",
+                        "source_ref": "/tmp/sess_a.jsonl:1:11",
+                        "doc_len": 13,
+                        "text_preview": "weaker event in session a",
+                        "score": 7.0,
+                        "matched_terms": 1_u64
+                    }
+                ])),
+            );
+        }
+
+        if query.contains("WHERE event_kind = 'session_meta'")
+            && query.contains("GROUP BY session_id")
+        {
+            return (
+                StatusCode::OK,
+                json_each_row(json!([
+                    {
+                        "session_id": "sess_c",
+                        "provider": "codex",
+                        "session_slug": "project-c",
+                        "session_summary": "Session C summary"
+                    },
+                    {
+                        "session_id": "sess_a",
+                        "provider": "codex",
+                        "session_slug": "",
+                        "session_summary": ""
                     }
                 ])),
             );
@@ -222,7 +320,9 @@ async fn spawn_mock_server() -> (String, Arc<MockState>) {
     (format!("http://{}", addr), state)
 }
 
-async fn build_repo() -> (ClickHouseConversationRepository, Arc<MockState>) {
+async fn build_repo_with_max_results(
+    max_results: u16,
+) -> (ClickHouseConversationRepository, Arc<MockState>) {
     let (base_url, state) = spawn_mock_server().await;
     let client =
         ClickHouseClient::new(test_clickhouse_config(base_url)).expect("valid clickhouse client");
@@ -230,12 +330,16 @@ async fn build_repo() -> (ClickHouseConversationRepository, Arc<MockState>) {
     let repo = ClickHouseConversationRepository::new(
         client,
         RepoConfig {
-            max_results: 100,
+            max_results,
             ..RepoConfig::default()
         },
     );
 
     (repo, state)
+}
+
+async fn build_repo() -> (ClickHouseConversationRepository, Arc<MockState>) {
+    build_repo_with_max_results(100).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -311,8 +415,34 @@ async fn search_conversations_returns_ranked_session_hits_and_expected_sql_shape
 
     assert_eq!(result.hits.len(), 2);
     assert_eq!(result.hits[0].session_id, "sess_c");
+    assert_eq!(
+        result.hits[0].first_event_time.as_deref(),
+        Some("2026-01-03 10:00:00")
+    );
+    assert_eq!(result.hits[0].first_event_unix_ms, Some(1767434400000_i64));
+    assert_eq!(
+        result.hits[0].last_event_time.as_deref(),
+        Some("2026-01-03 10:10:00")
+    );
+    assert_eq!(result.hits[0].last_event_unix_ms, Some(1767435000000_i64));
+    assert_eq!(result.hits[0].provider.as_deref(), Some("codex"));
+    assert_eq!(result.hits[0].session_slug.as_deref(), Some("project-c"));
+    assert_eq!(
+        result.hits[0].session_summary.as_deref(),
+        Some("Session C summary")
+    );
     assert_eq!(result.hits[0].best_event_uid.as_deref(), Some("evt-c-42"));
     assert_eq!(result.hits[1].session_id, "sess_a");
+    assert_eq!(
+        result.hits[1].first_event_time.as_deref(),
+        Some("2026-01-01 10:00:00")
+    );
+    assert_eq!(result.hits[1].provider.as_deref(), Some("codex"));
+    assert_eq!(result.hits[1].session_slug, None);
+    assert_eq!(result.hits[1].session_summary, None);
+    assert_eq!(result.stats.requested_limit, 10);
+    assert_eq!(result.stats.effective_limit, 10);
+    assert!(!result.stats.limit_capped);
 
     let queries = state.queries.lock().expect("queries lock").clone();
     let agg_query = queries
@@ -321,10 +451,35 @@ async fn search_conversations_returns_ranked_session_hits_and_expected_sql_shape
         .expect("aggregated conversation query should be captured");
 
     assert!(agg_query.contains("argMax(e.event_uid, e.event_score)"));
+    assert!(agg_query.contains("ANY LEFT JOIN `moraine`.`v_session_summary` AS s"));
     assert!(agg_query.contains("p.session_id IN ['sess_c','sess_a']"));
     assert!(agg_query.contains("ifNull(m.mode, 'chat') = 'chat'"));
     assert!(agg_query.contains("toUnixTimestamp64Milli(d.ingested_at) >= 1767261600000"));
     assert!(agg_query.contains("toUnixTimestamp64Milli(d.ingested_at) < 1767500000000"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_conversations_reports_capped_limit_metadata() {
+    let (repo, _state) = build_repo_with_max_results(25).await;
+
+    let result = repo
+        .search_conversations(ConversationSearchQuery {
+            query: "hello world".to_string(),
+            limit: Some(100),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            from_unix_ms: None,
+            to_unix_ms: None,
+            mode: None,
+            include_tool_events: Some(true),
+            exclude_codex_mcp: Some(false),
+        })
+        .await
+        .expect("search conversations");
+
+    assert_eq!(result.stats.requested_limit, 100);
+    assert_eq!(result.stats.effective_limit, 25);
+    assert!(result.stats.limit_capped);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -384,4 +539,33 @@ async fn search_conversations_without_time_window_uses_postings_only_fast_path()
     assert!(agg_query.contains("PREWHERE"));
     assert!(agg_query.contains("bitCount(groupBitOr(e.term_mask))"));
     assert!(!agg_query.contains("JOIN `moraine`.`search_documents` AS d"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_events_includes_session_time_bounds() {
+    let (repo, _state) = build_repo().await;
+
+    let result = repo
+        .search_events(SearchEventsQuery {
+            query: "hello world".to_string(),
+            source: Some("integration-test".to_string()),
+            limit: Some(10),
+            session_id: None,
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            include_tool_events: Some(true),
+            exclude_codex_mcp: Some(false),
+            disable_cache: Some(true),
+            search_strategy: None,
+        })
+        .await
+        .expect("search events");
+
+    assert_eq!(result.hits.len(), 2);
+    assert_eq!(result.hits[0].session_id, "sess_c");
+    assert_eq!(result.hits[0].first_event_time, "2026-01-03 10:00:00");
+    assert_eq!(result.hits[0].last_event_time, "2026-01-03 10:10:00");
+    assert_eq!(result.hits[1].session_id, "sess_a");
+    assert_eq!(result.hits[1].first_event_time, "2026-01-01 10:00:00");
+    assert_eq!(result.hits[1].last_event_time, "2026-01-01 10:10:00");
 }

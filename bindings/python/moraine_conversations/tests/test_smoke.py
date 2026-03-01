@@ -87,7 +87,7 @@ def _rows_for_query(query: str) -> list[dict]:
             },
         ]
 
-    if "any(p.source_name) AS source_name" in query:
+    if "GROUP BY p.doc_id" in query and "ORDER BY score DESC, event_uid ASC" in query:
         return [
             {
                 "event_uid": "evt-c-42",
