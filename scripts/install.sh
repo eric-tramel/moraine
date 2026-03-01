@@ -235,7 +235,42 @@ fetch_latest_tag() {
 }
 
 json_escape() {
-  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+  value="$1"
+  escaped=""
+
+  for byte in $(printf '%s' "$value" | LC_ALL=C od -An -tu1 -v); do
+    case "$byte" in
+      34)
+        escaped="${escaped}\\\""
+        ;;
+      92)
+        escaped="${escaped}\\\\"
+        ;;
+      8)
+        escaped="${escaped}\\b"
+        ;;
+      9)
+        escaped="${escaped}\\t"
+        ;;
+      10)
+        escaped="${escaped}\\n"
+        ;;
+      12)
+        escaped="${escaped}\\f"
+        ;;
+      13)
+        escaped="${escaped}\\r"
+        ;;
+      [0-7]|1[0-9]|2[0-9]|3[01])
+        escaped="${escaped}\\u00$(printf '%02x' "$byte")"
+        ;;
+      *)
+        escaped="${escaped}$(printf "\\$(printf '%03o' "$byte")")"
+        ;;
+    esac
+  done
+
+  printf '%s' "$escaped"
 }
 
 write_install_receipt() {

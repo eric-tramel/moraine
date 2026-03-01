@@ -55,7 +55,7 @@ for convo in page["items"]:
 next_cursor = page["next_cursor"]
 ```
 
-`mode` must be one of `web_search`, `mcp_internal`, `tool_calling`, or `chat`. Results are paginated with `next_cursor`. [src: bindings/python/moraine_conversations/src/lib.rs:L62-L85, bindings/python/moraine_conversations/src/lib.rs:L148-L155]
+`mode` must be one of `web_search`, `mcp_internal`, `tool_calling`, or `chat`. Modes are computed per session (exactly one mode per session), using first-match precedence over any matching event: `web_search` > `mcp_internal` > `tool_calling` > `chat`. In concrete terms: `web_search` covers web search events (`web_search_call`, `search_results_received`, or `tool_use` with `WebSearch`/`WebFetch`), `mcp_internal` covers Codex MCP internal search/open activity, `tool_calling` covers remaining tool activity (`tool_call`, `tool_result`, `tool_use`), and `chat` means none of those signals were present. Results are paginated with `next_cursor`. [src: bindings/python/moraine_conversations/src/lib.rs:L62-L85, bindings/python/moraine_conversations/src/lib.rs:L148-L155, crates/moraine-conversations/src/clickhouse_repo.rs:L451-L471]
 
 ## Retrieve One Conversation By ID
 

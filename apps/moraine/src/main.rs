@@ -553,8 +553,34 @@ fn pid_path(paths: &RuntimePaths, service: Service) -> PathBuf {
     paths.pids_dir.join(service.pid_file())
 }
 
+fn clickhouse_internal_log_path(paths: &RuntimePaths) -> PathBuf {
+    paths
+        .clickhouse_root
+        .join("log")
+        .join("clickhouse-server.log")
+}
+
+fn legacy_clickhouse_pipe_log_path(paths: &RuntimePaths) -> PathBuf {
+    paths.logs_dir.join(Service::ClickHouse.log_file())
+}
+
+fn cleanup_legacy_clickhouse_pipe_log(paths: &RuntimePaths) {
+    let legacy_log = legacy_clickhouse_pipe_log_path(paths);
+    let should_remove = fs::metadata(&legacy_log)
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false);
+    if should_remove {
+        let _ = fs::remove_file(legacy_log);
+    }
+}
+
 fn log_path(paths: &RuntimePaths, service: Service) -> PathBuf {
-    paths.logs_dir.join(service.log_file())
+    match service {
+        Service::ClickHouse => clickhouse_internal_log_path(paths),
+        Service::Ingest | Service::Monitor | Service::Mcp => {
+            paths.logs_dir.join(service.log_file())
+        }
+    }
 }
 
 fn read_pid(path: &Path) -> Option<u32> {
@@ -1077,24 +1103,17 @@ async fn start_clickhouse(cfg: &AppConfig, paths: &RuntimePaths) -> Result<Start
         });
     }
 
+    cleanup_legacy_clickhouse_pipe_log(paths);
+
     let server_bin = resolve_clickhouse_server_command(cfg, paths).await?;
 
     materialize_clickhouse_config(cfg, paths)?;
 
-    let logfile = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path(paths, Service::ClickHouse))
-        .context("failed to open clickhouse log file")?;
-    let logfile_err = logfile
-        .try_clone()
-        .context("failed to clone clickhouse log file")?;
-
     let child = Command::new(&server_bin)
         .arg("--config-file")
         .arg(&paths.clickhouse_config)
-        .stdout(Stdio::from(logfile))
-        .stderr(Stdio::from(logfile_err))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("failed to start {}", server_bin.display()))?;
 
@@ -2403,6 +2422,49 @@ mod tests {
             "{}",
             err
         );
+    }
+
+    #[test]
+    fn clickhouse_logs_use_internal_rotating_path() {
+        let root = temp_dir("clickhouse-log-path");
+        let logs_dir = root.join("logs");
+
+        let mut cfg = AppConfig::default();
+        cfg.runtime.root_dir = root.to_string_lossy().to_string();
+        cfg.runtime.logs_dir = logs_dir.to_string_lossy().to_string();
+        let paths = runtime_paths(&cfg);
+
+        assert_eq!(
+            log_path(&paths, Service::ClickHouse),
+            root.join("clickhouse/log/clickhouse-server.log")
+        );
+        assert_eq!(
+            log_path(&paths, Service::Ingest),
+            logs_dir.join("ingest.log")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cleanup_legacy_clickhouse_pipe_log_removes_legacy_file() {
+        let root = temp_dir("legacy-clickhouse-log");
+        let logs_dir = root.join("logs");
+        fs::create_dir_all(&logs_dir).expect("create logs dir");
+
+        let mut cfg = AppConfig::default();
+        cfg.runtime.root_dir = root.to_string_lossy().to_string();
+        cfg.runtime.logs_dir = logs_dir.to_string_lossy().to_string();
+        let paths = runtime_paths(&cfg);
+
+        let legacy_log = legacy_clickhouse_pipe_log_path(&paths);
+        fs::write(&legacy_log, b"legacy clickhouse stdout").expect("write legacy log");
+        assert!(legacy_log.exists());
+
+        cleanup_legacy_clickhouse_pipe_log(&paths);
+        assert!(!legacy_log.exists());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

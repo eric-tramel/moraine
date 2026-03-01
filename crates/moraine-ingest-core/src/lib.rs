@@ -7,6 +7,7 @@ mod reconcile;
 mod sink;
 mod watch;
 
+use crate::checkpoint::checkpoint_key;
 use crate::dispatch::{complete_work, enqueue_work, process_file, spawn_debounce_task};
 use crate::model::RowBatch;
 use crate::reconcile::spawn_reconcile_task;
@@ -284,8 +285,9 @@ async fn load_checkpoints(
     let mut map = HashMap::<String, model::Checkpoint>::new();
 
     for row in rows {
+        let key = checkpoint_key(&row.source_name, &row.source_file);
         map.insert(
-            format!("{}\n{}", row.source_name, row.source_file),
+            key,
             model::Checkpoint {
                 source_name: row.source_name,
                 source_file: row.source_file,
