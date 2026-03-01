@@ -162,6 +162,8 @@ bin/moraine down
 ```
 
 Status includes process state, DB health/schema checks, and latest ingest heartbeat metrics.
+`bin/moraine logs clickhouse` reads ClickHouse's internal rotating log at
+`~/.moraine/clickhouse/log/clickhouse-server.log`.
 
 All subcommands support output control:
 
