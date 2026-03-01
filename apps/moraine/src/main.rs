@@ -11,7 +11,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1627,8 +1627,55 @@ async fn cmd_status(paths: &RuntimePaths, cfg: &AppConfig) -> Result<StatusSnaps
 }
 
 fn tail_lines(path: &Path, lines: usize) -> Result<Vec<String>> {
-    let content = fs::read_to_string(path)
+    const TAIL_READ_CHUNK_BYTES: usize = 8 * 1024;
+
+    if lines == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut file = fs::File::open(path)
         .with_context(|| format!("failed to read log file {}", path.display()))?;
+    let mut position = file
+        .metadata()
+        .with_context(|| format!("failed to read log file {}", path.display()))?
+        .len();
+
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
+    let mut scratch = vec![0_u8; TAIL_READ_CHUNK_BYTES];
+    let mut newline_count = 0usize;
+    while position > 0 {
+        let read_len = (position as usize).min(TAIL_READ_CHUNK_BYTES);
+        position -= read_len as u64;
+        file.seek(SeekFrom::Start(position))
+            .with_context(|| format!("failed to read log file {}", path.display()))?;
+        file.read_exact(&mut scratch[..read_len])
+            .with_context(|| format!("failed to read log file {}", path.display()))?;
+        newline_count += scratch[..read_len]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count();
+        chunks.push(scratch[..read_len].to_vec());
+        if newline_count > lines {
+            break;
+        }
+    }
+
+    let total_len = chunks.iter().map(Vec::len).sum();
+    let mut bytes = Vec::with_capacity(total_len);
+    for chunk in chunks.iter().rev() {
+        bytes.extend_from_slice(chunk);
+    }
+
+    let start = if position > 0 {
+        bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(bytes.len(), |idx| idx + 1)
+    } else {
+        0
+    };
+    let content = std::str::from_utf8(&bytes[start..])
+        .with_context(|| format!("failed to decode log file {} as utf-8", path.display()))?;
     let mut collected = content
         .lines()
         .rev()
@@ -2310,6 +2357,35 @@ mod tests {
             missing_tables: Vec::new(),
             errors: Vec::new(),
         }
+    }
+
+    #[test]
+    fn tail_lines_returns_last_n_without_trailing_newline() {
+        let root = temp_dir("tail-lines-basic");
+        let path = root.join("test.log");
+        fs::write(&path, "one\ntwo\nthree").expect("write log");
+
+        let lines = tail_lines(&path, 2).expect("tail lines");
+        assert_eq!(lines, vec!["two".to_string(), "three".to_string()]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tail_lines_handles_utf8_chunk_boundary() {
+        let root = temp_dir("tail-lines-utf8");
+        let path = root.join("test.log");
+        let prefix = "é".repeat(4500);
+        let content = format!("{prefix}\nmiddle\ntail\n");
+        fs::write(&path, content).expect("write log");
+
+        let one = tail_lines(&path, 1).expect("tail one line");
+        assert_eq!(one, vec!["tail".to_string()]);
+
+        let two = tail_lines(&path, 2).expect("tail two lines");
+        assert_eq!(two, vec!["middle".to_string(), "tail".to_string()]);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
