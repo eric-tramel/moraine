@@ -55,7 +55,8 @@ enum OutputMode {
 #[derive(Debug, Parser)]
 #[command(
     name = "moraine",
-    about = "Unified runtime control plane for Moraine services"
+    about = "Unified runtime control plane for Moraine services",
+    version = env!("CARGO_PKG_VERSION")
 )]
 struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
@@ -78,6 +79,7 @@ enum CliCommand {
     Clickhouse(ClickhouseArgs),
     Config(ConfigArgs),
     Run(RunArgs),
+    Update(UpdateArgs),
 }
 
 #[derive(Debug, Args)]
@@ -158,6 +160,16 @@ struct RunArgs {
         num_args = 0..
     )]
     args: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct UpdateArgs {
+    /// Check for updates without installing
+    #[arg(long)]
+    check: bool,
+    /// Target version tag (e.g. v0.4.0)
+    #[arg(long, value_name = "TAG")]
+    version: Option<String>,
 }
 
 #[derive(Clone)]
@@ -350,6 +362,53 @@ struct UpSnapshot {
 #[derive(Debug, Clone, serde::Serialize)]
 struct DownSnapshot {
     stopped: Vec<Service>,
+}
+
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+struct InstallReceipt {
+    #[serde(default)]
+    schema_version: u32,
+    #[serde(default)]
+    repo: String,
+    #[serde(default)]
+    resolved_version: String,
+    #[serde(default)]
+    target: String,
+    #[serde(default)]
+    install_dir: String,
+    #[serde(default)]
+    binaries: Vec<String>,
+    #[serde(default)]
+    installed_at_utc: String,
+    #[serde(default)]
+    requested_version: String,
+    #[serde(default)]
+    asset_url: String,
+    #[serde(default)]
+    checksum_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum UpdateOutcome {
+    AlreadyUpToDate {
+        current: String,
+        latest: String,
+    },
+    UpdateAvailable {
+        current: String,
+        target: String,
+        latest: String,
+    },
+    Updated {
+        previous: String,
+        installed: String,
+    },
 }
 
 struct CliOutput {
@@ -2156,6 +2215,369 @@ fn render_down(output: &CliOutput, snapshot: &DownSnapshot) -> Result<()> {
     Ok(())
 }
 
+fn parse_version_tag(tag: &str) -> Result<(u64, u64, u64)> {
+    let stripped = tag.strip_prefix('v').unwrap_or(tag);
+    let parts: Vec<&str> = stripped.split('.').collect();
+    if parts.len() != 3 {
+        bail!("invalid version tag '{}': expected vMAJOR.MINOR.PATCH", tag);
+    }
+    let major = parts[0]
+        .parse::<u64>()
+        .with_context(|| format!("invalid major version in '{}'", tag))?;
+    let minor = parts[1]
+        .parse::<u64>()
+        .with_context(|| format!("invalid minor version in '{}'", tag))?;
+    let patch = parts[2]
+        .parse::<u64>()
+        .with_context(|| format!("invalid patch version in '{}'", tag))?;
+    Ok((major, minor, patch))
+}
+
+fn normalize_version_tag(tag: &str) -> String {
+    if tag.starts_with('v') {
+        tag.to_string()
+    } else {
+        format!("v{}", tag)
+    }
+}
+
+fn receipt_path() -> Result<PathBuf> {
+    let config_home = std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{}/.config", home)
+    });
+    Ok(PathBuf::from(config_home).join("moraine/install-receipt.json"))
+}
+
+fn load_install_receipt() -> Result<InstallReceipt> {
+    let path = receipt_path()?;
+    let text = fs::read_to_string(&path).with_context(|| {
+        format!(
+            "install receipt not found at {}\n\
+             this command requires a prior install via install.sh\n\
+             dev/cargo builds do not create an install receipt",
+            path.display()
+        )
+    })?;
+    serde_json::from_str(&text)
+        .with_context(|| format!("failed to parse install receipt at {}", path.display()))
+}
+
+async fn fetch_latest_release(repo: &str) -> Result<GitHubRelease> {
+    let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
+    let client = Client::builder().user_agent("moraine-updater").build()?;
+    let resp = client
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .with_context(|| format!("failed to fetch latest release from {}", url))?
+        .error_for_status()
+        .with_context(|| format!("GitHub API error fetching {}", url))?;
+    resp.json::<GitHubRelease>()
+        .await
+        .context("failed to parse GitHub release response")
+}
+
+async fn cmd_update(args: &UpdateArgs) -> Result<UpdateOutcome> {
+    let receipt = load_install_receipt()?;
+    let current_tag = normalize_version_tag(&receipt.resolved_version);
+    let current_ver = parse_version_tag(&current_tag)?;
+
+    let latest_release = fetch_latest_release(&receipt.repo).await?;
+    let latest_tag = normalize_version_tag(&latest_release.tag_name);
+    let latest_ver = parse_version_tag(&latest_tag)?;
+
+    let (target_tag, target_ver) = if let Some(ref requested) = args.version {
+        let tag = normalize_version_tag(requested);
+        let ver = parse_version_tag(&tag)?;
+        if ver > latest_ver {
+            bail!(
+                "requested version {} is newer than latest release {}",
+                tag,
+                latest_tag
+            );
+        }
+        (tag, ver)
+    } else {
+        (latest_tag.clone(), latest_ver)
+    };
+
+    if target_ver == current_ver {
+        return Ok(UpdateOutcome::AlreadyUpToDate {
+            current: current_tag,
+            latest: latest_tag,
+        });
+    }
+
+    if target_ver < current_ver {
+        bail!(
+            "target version {} is older than current version {} (downgrades not supported)",
+            target_tag,
+            current_tag
+        );
+    }
+
+    if args.check {
+        return Ok(UpdateOutcome::UpdateAvailable {
+            current: current_tag,
+            target: target_tag,
+            latest: latest_tag,
+        });
+    }
+
+    // --- download, verify, install ---
+
+    let target_triple = &receipt.target;
+    let asset_name = format!("moraine-bundle-{}.tar.gz", target_triple);
+    let checksum_name = format!("moraine-bundle-{}.sha256", target_triple);
+    let asset_url = format!(
+        "https://github.com/{}/releases/download/{}/{}",
+        receipt.repo, target_tag, asset_name
+    );
+    let checksum_url = format!(
+        "https://github.com/{}/releases/download/{}/{}",
+        receipt.repo, target_tag, checksum_name
+    );
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "moraine-update-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    ));
+    fs::create_dir_all(&tmp_dir)?;
+
+    let _cleanup = TempDirGuard(tmp_dir.clone());
+
+    let archive_path = tmp_dir.join(&asset_name);
+    let checksum_path = tmp_dir.join(&checksum_name);
+
+    download_to_path(&asset_url, &archive_path).await?;
+    download_to_path(&checksum_url, &checksum_path).await?;
+
+    // Verify bundle checksum
+    let checksum_content = fs::read_to_string(&checksum_path)?;
+    let expected_hash = checksum_content
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| anyhow!("empty checksum file"))?;
+    let actual_hash = sha256_hex(&archive_path)?;
+    if actual_hash != expected_hash {
+        bail!(
+            "bundle checksum mismatch: expected {}, got {}",
+            expected_hash,
+            actual_hash
+        );
+    }
+
+    // Extract
+    let extract_dir = tmp_dir.join("extracted");
+    fs::create_dir_all(&extract_dir)?;
+    let tar_status = Command::new("tar")
+        .env("LC_ALL", "C")
+        .arg("-xzf")
+        .arg(&archive_path)
+        .arg("-C")
+        .arg(&extract_dir)
+        .status()
+        .context("failed to run tar")?;
+    if !tar_status.success() {
+        bail!("failed to extract update bundle");
+    }
+
+    // Validate manifest
+    let manifest_path = extract_dir.join("manifest.json");
+    if !manifest_path.exists() {
+        bail!("update bundle missing manifest.json");
+    }
+    let manifest: serde_json::Value = serde_json::from_str(&fs::read_to_string(&manifest_path)?)?;
+
+    if let Some(manifest_target) = manifest.get("target").and_then(|v| v.as_str()) {
+        if manifest_target != target_triple {
+            bail!(
+                "bundle target mismatch: expected {}, manifest has {}",
+                target_triple,
+                manifest_target
+            );
+        }
+    }
+
+    let bins = &receipt.binaries;
+    let manifest_checksums = manifest
+        .get("checksums")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+
+    for bin in bins {
+        let bin_path = extract_dir.join("bin").join(bin);
+        if !bin_path.exists() {
+            bail!("update bundle missing binary: bin/{}", bin);
+        }
+        let manifest_key = format!("bin/{}", bin);
+        if let Some(expected) = manifest_checksums
+            .get(&manifest_key)
+            .and_then(|v| v.as_str())
+        {
+            let actual = sha256_hex(&bin_path)?;
+            if actual != expected {
+                bail!(
+                    "manifest checksum mismatch for {}: expected {}, got {}",
+                    manifest_key,
+                    expected,
+                    actual
+                );
+            }
+        }
+    }
+
+    // Replace binaries atomically
+    let install_dir = PathBuf::from(&receipt.install_dir);
+    for bin in bins {
+        let src = extract_dir.join("bin").join(bin);
+        let tmp_dest = install_dir.join(format!(".{}.update.tmp", bin));
+        let final_dest = install_dir.join(bin);
+
+        fs::copy(&src, &tmp_dest)
+            .with_context(|| format!("failed to stage {} to {}", bin, tmp_dest.display()))?;
+        make_executable(&tmp_dest)?;
+        fs::rename(&tmp_dest, &final_dest)
+            .with_context(|| format!("failed to atomically replace {}", final_dest.display()))?;
+    }
+
+    // Replace web assets
+    let install_root = install_dir
+        .parent()
+        .ok_or_else(|| anyhow!("install_dir has no parent"))?;
+    let monitor_dist_source = extract_dir.join("web/monitor/dist");
+    if monitor_dist_source.exists() {
+        let monitor_dist_dest = install_root.join("web/monitor/dist");
+        if let Some(parent) = monitor_dist_dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let _ = fs::remove_dir_all(&monitor_dist_dest);
+        let cp_status = Command::new("cp")
+            .arg("-R")
+            .arg(&monitor_dist_source)
+            .arg(&monitor_dist_dest)
+            .status()
+            .context("failed to copy monitor assets")?;
+        if !cp_status.success() {
+            bail!("failed to replace monitor web assets");
+        }
+    }
+
+    // Health check: run --help on each binary
+    for bin in bins {
+        let bin_path = install_dir.join(bin);
+        let help_status = Command::new(&bin_path)
+            .arg("--help")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .with_context(|| format!("health check failed for {}", bin_path.display()))?;
+        if !help_status.success() {
+            bail!(
+                "installed binary failed health check (--help): {}",
+                bin_path.display()
+            );
+        }
+    }
+
+    // Update install receipt
+    let now_utc = {
+        let d = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let secs = d.as_secs();
+        let days = secs / 86400;
+        let time_secs = secs % 86400;
+        let hours = time_secs / 3600;
+        let minutes = (time_secs % 3600) / 60;
+        let seconds = time_secs % 60;
+
+        // Compute year/month/day from days since epoch (1970-01-01)
+        let (year, month, day) = civil_from_days(days as i64);
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            year, month, day, hours, minutes, seconds
+        )
+    };
+
+    let updated_receipt = InstallReceipt {
+        schema_version: receipt.schema_version,
+        repo: receipt.repo.clone(),
+        resolved_version: target_tag.clone(),
+        target: receipt.target.clone(),
+        install_dir: receipt.install_dir.clone(),
+        binaries: receipt.binaries.clone(),
+        installed_at_utc: now_utc,
+        requested_version: args.version.clone().unwrap_or_else(|| "latest".to_string()),
+        asset_url,
+        checksum_url,
+    };
+
+    let receipt_file = receipt_path()?;
+    if let Some(parent) = receipt_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(
+        &receipt_file,
+        serde_json::to_string_pretty(&updated_receipt)?,
+    )?;
+
+    // Best-effort service warning
+    if let Ok((_, cfg)) = load_cfg(None) {
+        let paths = runtime_paths(&cfg);
+        let running: Vec<_> = [
+            Service::ClickHouse,
+            Service::Ingest,
+            Service::Monitor,
+            Service::Mcp,
+        ]
+        .iter()
+        .filter(|s| service_running(&paths, **s).is_some())
+        .map(|s| s.name())
+        .collect();
+        if !running.is_empty() {
+            eprintln!(
+                "note: running services detected ({}); restart with: moraine down && moraine up",
+                running.join(", ")
+            );
+        }
+    }
+
+    Ok(UpdateOutcome::Updated {
+        previous: current_tag,
+        installed: target_tag,
+    })
+}
+
+/// Convert days since Unix epoch to (year, month, day).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    // Algorithm from Howard Hinnant's chrono-compatible date library
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+struct TempDirGuard(PathBuf);
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
@@ -2323,6 +2745,53 @@ async fn main() -> Result<ExitCode> {
             let (config_path, cfg) = load_cfg(raw_config)?;
             let paths = runtime_paths(&cfg);
             run_foreground_service(run.service, &config_path, &cfg, &paths, &passthrough).await
+        }
+        CliCommand::Update(args) => {
+            let outcome = cmd_update(&args).await?;
+            if output.is_json() {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                match &outcome {
+                    UpdateOutcome::AlreadyUpToDate { current, latest } => {
+                        output.section(
+                            "Update",
+                            &[
+                                format!("current version: {}", current),
+                                format!("latest version:  {}", latest),
+                                "already up to date".to_string(),
+                            ],
+                        );
+                    }
+                    UpdateOutcome::UpdateAvailable {
+                        current,
+                        target,
+                        latest,
+                    } => {
+                        output.section(
+                            "Update Available",
+                            &[
+                                format!("current version: {}", current),
+                                format!("target version:  {}", target),
+                                format!("latest version:  {}", latest),
+                                "run `moraine update` to install".to_string(),
+                            ],
+                        );
+                    }
+                    UpdateOutcome::Updated {
+                        previous,
+                        installed,
+                    } => {
+                        output.section(
+                            "Updated",
+                            &[
+                                format!("previous version: {}", previous),
+                                format!("installed version: {}", installed),
+                            ],
+                        );
+                    }
+                }
+            }
+            Ok(ExitCode::SUCCESS)
         }
     }
 }
@@ -2791,5 +3260,129 @@ mod tests {
 
         assert_eq!(managed_clickhouse_checksum_state(&cfg, &paths), "verified");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn clap_parses_update_check() {
+        let cli = Cli::parse_from(["moraine", "update", "--check"]);
+        match cli.command {
+            CliCommand::Update(args) => {
+                assert!(args.check);
+                assert!(args.version.is_none());
+            }
+            _ => panic!("expected update command"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_update_with_version() {
+        let cli = Cli::parse_from(["moraine", "update", "--version", "v0.4.0"]);
+        match cli.command {
+            CliCommand::Update(args) => {
+                assert!(!args.check);
+                assert_eq!(args.version.as_deref(), Some("v0.4.0"));
+            }
+            _ => panic!("expected update command"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_update_bare() {
+        let cli = Cli::parse_from(["moraine", "update"]);
+        match cli.command {
+            CliCommand::Update(args) => {
+                assert!(!args.check);
+                assert!(args.version.is_none());
+            }
+            _ => panic!("expected update command"),
+        }
+    }
+
+    #[test]
+    fn install_receipt_serde_roundtrip() {
+        let receipt = InstallReceipt {
+            schema_version: 1,
+            repo: "eric-tramel/moraine".to_string(),
+            resolved_version: "v0.3.0".to_string(),
+            target: "aarch64-apple-darwin".to_string(),
+            install_dir: "/home/user/.local/bin".to_string(),
+            binaries: vec![
+                "moraine".to_string(),
+                "moraine-ingest".to_string(),
+                "moraine-monitor".to_string(),
+                "moraine-mcp".to_string(),
+            ],
+            installed_at_utc: "2025-01-01T00:00:00Z".to_string(),
+            requested_version: "latest".to_string(),
+            asset_url: "https://example.com/bundle.tar.gz".to_string(),
+            checksum_url: "https://example.com/bundle.sha256".to_string(),
+        };
+
+        let json = serde_json::to_string_pretty(&receipt).expect("serialize");
+        let parsed: InstallReceipt = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(parsed.schema_version, 1);
+        assert_eq!(parsed.repo, "eric-tramel/moraine");
+        assert_eq!(parsed.resolved_version, "v0.3.0");
+        assert_eq!(parsed.target, "aarch64-apple-darwin");
+        assert_eq!(parsed.binaries.len(), 4);
+    }
+
+    #[test]
+    fn install_receipt_deserializes_from_install_sh_format() {
+        let json = r#"{
+  "schema_version": 1,
+  "installed_at_utc": "2025-06-01T12:00:00Z",
+  "repo": "eric-tramel/moraine",
+  "requested_version": "latest",
+  "resolved_version": "v0.3.0",
+  "target": "aarch64-apple-darwin",
+  "install_dir": "/Users/test/.local/bin",
+  "asset_url": "https://github.com/eric-tramel/moraine/releases/download/v0.3.0/moraine-bundle-aarch64-apple-darwin.tar.gz",
+  "checksum_url": "https://github.com/eric-tramel/moraine/releases/download/v0.3.0/moraine-bundle-aarch64-apple-darwin.sha256",
+  "binaries": [
+    "moraine",
+    "moraine-ingest",
+    "moraine-monitor",
+    "moraine-mcp"
+  ]
+}"#;
+        let receipt: InstallReceipt = serde_json::from_str(json).expect("parse install.sh receipt");
+        assert_eq!(receipt.schema_version, 1);
+        assert_eq!(receipt.resolved_version, "v0.3.0");
+        assert_eq!(receipt.install_dir, "/Users/test/.local/bin");
+        assert_eq!(receipt.binaries.len(), 4);
+    }
+
+    #[test]
+    fn version_tag_normalization() {
+        assert_eq!(normalize_version_tag("v0.3.0"), "v0.3.0");
+        assert_eq!(normalize_version_tag("0.3.0"), "v0.3.0");
+        assert_eq!(normalize_version_tag("v1.0.0"), "v1.0.0");
+    }
+
+    #[test]
+    fn parse_version_tag_valid() {
+        assert_eq!(parse_version_tag("v0.3.0").unwrap(), (0, 3, 0));
+        assert_eq!(parse_version_tag("v1.2.3").unwrap(), (1, 2, 3));
+        assert_eq!(parse_version_tag("0.3.0").unwrap(), (0, 3, 0));
+    }
+
+    #[test]
+    fn parse_version_tag_invalid() {
+        assert!(parse_version_tag("v0.3").is_err());
+        assert!(parse_version_tag("not-a-version").is_err());
+        assert!(parse_version_tag("v0.3.0.1").is_err());
+    }
+
+    #[test]
+    fn civil_from_days_epoch() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+    }
+
+    #[test]
+    fn civil_from_days_known_date() {
+        // 2025-01-01 is day 20089
+        assert_eq!(civil_from_days(20089), (2025, 1, 1));
     }
 }

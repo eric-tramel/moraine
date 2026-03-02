@@ -435,9 +435,21 @@ if [ -f "$extract_dir/config/moraine.toml" ]; then
 fi
 
 mkdir -p "$install_dir"
+
+# Clean up stale temp files from a prior interrupted install
 for bin in $bins; do
-  cp "$extract_dir/bin/$bin" "$install_dir/$bin"
-  chmod +x "$install_dir/$bin"
+  rm -f "$install_dir/.$bin.install.tmp"
+done
+
+# Phase 1: stage all binaries as temp files (same filesystem for mv guarantee)
+for bin in $bins; do
+  cp "$extract_dir/bin/$bin" "$install_dir/.$bin.install.tmp"
+  chmod +x "$install_dir/.$bin.install.tmp"
+done
+
+# Phase 2: atomic rename (mv on same fs is rename(2) — no ETXTBSY, no corrupt binaries)
+for bin in $bins; do
+  mv -f "$install_dir/.$bin.install.tmp" "$install_dir/$bin"
 done
 
 monitor_dist_source="$extract_dir/web/monitor/dist"
@@ -449,8 +461,10 @@ fi
 install_root="$(dirname "$install_dir")"
 monitor_dist_dir="$install_root/web/monitor/dist"
 mkdir -p "$(dirname "$monitor_dist_dir")"
+rm -rf "${monitor_dist_dir}.install.tmp"
+cp -R "$monitor_dist_source" "${monitor_dist_dir}.install.tmp"
 rm -rf "$monitor_dist_dir"
-cp -R "$monitor_dist_source" "$monitor_dist_dir"
+mv -f "${monitor_dist_dir}.install.tmp" "$monitor_dist_dir"
 
 for bin in $bins; do
   if ! "$install_dir/$bin" --help >/dev/null 2>&1; then
