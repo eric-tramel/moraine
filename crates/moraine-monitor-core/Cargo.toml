@@ -1,6 +1,6 @@
 [package]
 name = "moraine-monitor-core"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "Analytics and query logic for Moraine monitor service"
 
