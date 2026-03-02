@@ -1613,13 +1613,11 @@ FORMAT JSONEachRow",
     }
 
     fn search_rows_are_mirrors(a: &SearchRow, b: &SearchRow) -> bool {
-        let is_message_pair = (Self::is_message_search_row(a)
-            && Self::is_event_msg_search_row(b))
+        let is_message_pair = (Self::is_message_search_row(a) && Self::is_event_msg_search_row(b))
             || (Self::is_event_msg_search_row(a) && Self::is_message_search_row(b));
         let is_reasoning_pair = (Self::is_reasoning_search_row(a)
             && Self::is_event_msg_reasoning_search_row(b))
-            || (Self::is_event_msg_reasoning_search_row(a)
-                && Self::is_reasoning_search_row(b));
+            || (Self::is_event_msg_reasoning_search_row(a) && Self::is_reasoning_search_row(b));
         let same_kind_pair = is_message_pair || is_reasoning_pair;
         if !same_kind_pair {
             return false;
@@ -1643,8 +1641,7 @@ FORMAT JSONEachRow",
     fn search_row_kind_priority(row: &SearchRow) -> u8 {
         if Self::is_message_search_row(row) || Self::is_reasoning_search_row(row) {
             0
-        } else if Self::is_event_msg_search_row(row)
-            || Self::is_event_msg_reasoning_search_row(row)
+        } else if Self::is_event_msg_search_row(row) || Self::is_event_msg_reasoning_search_row(row)
         {
             1
         } else {
@@ -3104,7 +3101,9 @@ FORMAT JSONEachRow",
 
         let terms_with_qf = tokenize_query(query_text, self.cfg.bm25_max_query_terms);
         if terms_with_qf.is_empty() {
-            return Err(RepoError::invalid_argument("query has no searchable terms (tokens shorter than 2 characters are excluded)"));
+            return Err(RepoError::invalid_argument(
+                "query has no searchable terms (tokens shorter than 2 characters are excluded)",
+            ));
         }
         let terms: Vec<String> = terms_with_qf.iter().map(|(term, _)| term.clone()).collect();
 
@@ -3268,7 +3267,9 @@ FORMAT JSONEachRow",
 
         let terms_with_qf = tokenize_query(query_text, self.cfg.bm25_max_query_terms);
         if terms_with_qf.is_empty() {
-            return Err(RepoError::invalid_argument("query has no searchable terms (tokens shorter than 2 characters are excluded)"));
+            return Err(RepoError::invalid_argument(
+                "query has no searchable terms (tokens shorter than 2 characters are excluded)",
+            ));
         }
         let terms: Vec<String> = terms_with_qf.iter().map(|(term, _)| term.clone()).collect();
 
