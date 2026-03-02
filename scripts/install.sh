@@ -27,7 +27,7 @@ install directory precedence:
 
 examples:
   scripts/install.sh
-  MORAINE_INSTALL_VERSION=v0.2.1 scripts/install.sh
+  MORAINE_INSTALL_VERSION=v0.3.0 scripts/install.sh
   MORAINE_INSTALL_ASSET_BASE_URL=http://127.0.0.1:8080 \
     MORAINE_INSTALL_VERSION=ci-e2e scripts/install.sh
   MORAINE_INSTALL_DIR="$HOME/bin" MORAINE_INSTALL_SKIP_CLICKHOUSE=1 scripts/install.sh

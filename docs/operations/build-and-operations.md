@@ -71,7 +71,7 @@ Installer environment configuration:
 
 Tag-driven GitHub Actions release workflow:
 
-1. Push a semantic tag (example: `v0.2.1`).
+1. Push a semantic tag (example: `v0.3.0`).
 2. Workflow `.github/workflows/release-moraine.yml` builds:
    - `x86_64-unknown-linux-gnu`
    - `aarch64-unknown-linux-gnu`
