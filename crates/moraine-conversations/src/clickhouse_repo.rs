@@ -1948,8 +1948,8 @@ FORMAT JSONEachRow",
   {terms_array_sql} AS q_terms,
   {idf_array_sql} AS q_idf
 SELECT
-  c.session_id,
-  c.score,
+  c.session_id AS session_id,
+  c.score AS score,
   toUInt16(c.matched_terms) AS matched_terms
 FROM (
   SELECT
@@ -2044,8 +2044,8 @@ FORMAT JSONEachRow",
   {terms_array_sql} AS q_terms,
   {idf_array_sql} AS q_idf
 SELECT
-  c.session_id,
-  c.score,
+  c.session_id AS session_id,
+  c.score AS score,
   toUInt16(c.matched_terms) AS matched_terms
 FROM (
   SELECT
@@ -2245,7 +2245,7 @@ FORMAT JSONEachRow",
   {terms_array_sql} AS q_terms,
   {idf_array_sql} AS q_idf{term_bits_with_sql}
 SELECT
-  c.session_id,
+  c.session_id AS session_id,
   if(s.session_id = '', '', toString(s.first_event_time)) AS first_event_time,
   if(
     s.session_id = '',
@@ -2258,11 +2258,11 @@ SELECT
     toInt64(0),
     toInt64(toUnixTimestamp64Milli(s.last_event_time))
   ) AS last_event_unix_ms,
-  c.provider,
-  c.score,
+  c.provider AS provider,
+  c.score AS score,
   toUInt16(c.matched_terms) AS matched_terms,
   toUInt32(c.event_count_considered) AS event_count_considered,
-  c.best_event_uid
+  c.best_event_uid AS best_event_uid
 FROM (
   SELECT
     e.session_id AS session_id,
