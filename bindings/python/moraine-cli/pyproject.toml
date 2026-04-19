@@ -3,7 +3,7 @@ requires = ["hatchling>=1.21"]
 build-backend = "hatchling.build"
 
 [project]
-name = "moraine"
+name = "moraine-cli"
 dynamic = ["version"]
 description = "Moraine — unified trace indexer and MCP server for Claude Code / Codex"
 readme = "README.md"
