@@ -82,6 +82,99 @@ fn compose_hermes_model(model: &str, base_url: &str) -> String {
     }
 }
 
+/// Per-session cursor used to derive model-side latency for Claude Code
+/// assistant turns. We stamp `latency_ms` on the first assistant event of a
+/// record when the immediately preceding event in the same session was a
+/// tool_result — that interval is bounded on both ends by machine events
+/// (tool harness → model provider → next assistant block), so it cleanly
+/// represents server-side processing with no human-in-the-loop noise.
+#[derive(Clone, Copy)]
+struct SessionCursor {
+    prev_event_ts_ms: i64,
+    prev_was_tool_result: bool,
+}
+
+fn parse_event_ts_ms(event_ts: &str) -> Option<i64> {
+    chrono::NaiveDateTime::parse_from_str(event_ts, "%Y-%m-%d %H:%M:%S%.3f")
+        .ok()
+        .map(|dt| dt.and_utc().timestamp_millis())
+}
+
+/// Post-process event rows from a single Claude Code record:
+///   * if the session's prior event was a `tool_result`, stamp `latency_ms`
+///     on the first assistant-actor event in this record (= wall-clock time
+///     the model provider spent between `tool_result received` and
+///     `first block of assistant response produced`);
+///   * advance the per-session cursor for the next record.
+///
+/// No-op for non-claude harnesses or empty row sets. The stamped value is
+/// clamped to u32 (>49 days saturates).
+fn enrich_claude_model_latency(
+    harness: &str,
+    event_rows: &mut [Value],
+    cursors: &mut HashMap<String, SessionCursor>,
+) {
+    if harness != "claude-code" || event_rows.is_empty() {
+        return;
+    }
+
+    let session_id = event_rows[0]
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if session_id.is_empty() {
+        return;
+    }
+
+    let ts_ms = match event_rows[0]
+        .get("event_ts")
+        .and_then(|v| v.as_str())
+        .and_then(parse_event_ts_ms)
+    {
+        Some(ms) => ms,
+        None => return,
+    };
+
+    let any_tool_result = event_rows
+        .iter()
+        .any(|r| r.get("event_kind").and_then(|v| v.as_str()) == Some("tool_result"));
+
+    if let Some(cursor) = cursors.get(&session_id) {
+        if cursor.prev_was_tool_result && ts_ms > cursor.prev_event_ts_ms {
+            if let Some(idx) = event_rows
+                .iter()
+                .position(|r| r.get("actor_kind").and_then(|v| v.as_str()) == Some("assistant"))
+            {
+                let delta = (ts_ms - cursor.prev_event_ts_ms).max(0) as u64;
+                let capped = delta.min(u32::MAX as u64) as u32;
+                if let Some(obj) = event_rows[idx].as_object_mut() {
+                    obj.insert("latency_ms".to_string(), json!(capped));
+                }
+            }
+        }
+    }
+
+    // Only advance the cursor from events that participate in the turn
+    // sequence (user/assistant/tool). System/progress rows are out-of-band
+    // and must not reset the tool_result → assistant chain.
+    let touches_turn = event_rows.iter().any(|r| {
+        matches!(
+            r.get("actor_kind").and_then(|v| v.as_str()),
+            Some("user") | Some("assistant") | Some("tool")
+        )
+    });
+    if touches_turn {
+        cursors.insert(
+            session_id,
+            SessionCursor {
+                prev_event_ts_ms: ts_ms,
+                prev_was_tool_result: any_tool_result,
+            },
+        );
+    }
+}
+
 pub(crate) fn spawn_debounce_task(
     config: AppConfig,
     mut rx: mpsc::UnboundedReceiver<WorkItem>,
@@ -283,6 +376,7 @@ pub(crate) async fn process_file(
     let mut line_no = checkpoint.last_line_no;
     let mut session_hint = String::new();
     let mut model_hint = String::new();
+    let mut session_cursors: HashMap<String, SessionCursor> = HashMap::new();
 
     let mut batch = RowBatch::default();
 
@@ -343,7 +437,7 @@ pub(crate) async fn process_file(
             }
         };
 
-        let normalized = match normalize_record(
+        let mut normalized = match normalize_record(
             &parsed,
             &work.source_name,
             &work.harness,
@@ -372,6 +466,12 @@ pub(crate) async fn process_file(
                 continue;
             }
         };
+
+        enrich_claude_model_latency(
+            &work.harness,
+            &mut normalized.event_rows,
+            &mut session_cursors,
+        );
 
         session_hint = normalized.session_hint;
         model_hint = normalized.model_hint;
@@ -816,13 +916,14 @@ fn truncate(input: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        complete_work, compose_hermes_model, infer_vendor_from_base_url, path_matches_extension,
-        process_session_json_file, run_work_item, source_inode_for_file, work_extension,
+        complete_work, compose_hermes_model, enrich_claude_model_latency,
+        infer_vendor_from_base_url, path_matches_extension, process_session_json_file,
+        run_work_item, source_inode_for_file, work_extension, SessionCursor,
         SESSION_JSON_GENERATION, SESSION_JSON_INODE,
     };
     use crate::model::Checkpoint;
     use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
@@ -1298,5 +1399,184 @@ mod tests {
         );
 
         let _ = fs::remove_file(&path);
+    }
+
+    fn event_row(session_id: &str, event_ts: &str, event_kind: &str, actor_kind: &str) -> Value {
+        json!({
+            "session_id": session_id,
+            "event_ts": event_ts,
+            "event_kind": event_kind,
+            "actor_kind": actor_kind,
+            "latency_ms": 0u32,
+        })
+    }
+
+    fn latency_of(row: &Value) -> u64 {
+        row.get("latency_ms").and_then(|v| v.as_u64()).unwrap_or(0)
+    }
+
+    #[test]
+    fn latency_enrichment_stamps_assistant_after_tool_result() {
+        let mut cursors: HashMap<String, SessionCursor> = HashMap::new();
+        let session = "s1";
+
+        // 1) tool_result at T0.
+        let mut rows = vec![event_row(
+            session,
+            "2026-04-19 12:00:00.000",
+            "tool_result",
+            "tool",
+        )];
+        enrich_claude_model_latency("claude-code", &mut rows, &mut cursors);
+        assert_eq!(latency_of(&rows[0]), 0, "tool_result itself is untouched");
+
+        // 2) assistant turn 4.25s later: thinking + tool_use, same event_ts.
+        let mut rows = vec![
+            event_row(session, "2026-04-19 12:00:04.250", "reasoning", "assistant"),
+            event_row(session, "2026-04-19 12:00:04.250", "tool_call", "assistant"),
+        ];
+        enrich_claude_model_latency("claude-code", &mut rows, &mut cursors);
+        assert_eq!(
+            latency_of(&rows[0]),
+            4250,
+            "first assistant block carries the model latency"
+        );
+        assert_eq!(
+            latency_of(&rows[1]),
+            0,
+            "subsequent blocks in the same turn are not double-stamped"
+        );
+    }
+
+    #[test]
+    fn latency_enrichment_skips_fresh_user_prompt() {
+        let mut cursors: HashMap<String, SessionCursor> = HashMap::new();
+        let session = "s2";
+
+        // User typed a prompt.
+        let mut rows = vec![event_row(
+            session,
+            "2026-04-19 12:00:00.000",
+            "message",
+            "user",
+        )];
+        enrich_claude_model_latency("claude-code", &mut rows, &mut cursors);
+
+        // Assistant replies 10s later — gap is human typing + model time.
+        let mut rows = vec![event_row(
+            session,
+            "2026-04-19 12:00:10.000",
+            "message",
+            "assistant",
+        )];
+        enrich_claude_model_latency("claude-code", &mut rows, &mut cursors);
+
+        assert_eq!(
+            latency_of(&rows[0]),
+            0,
+            "assistant after fresh user prompt must not be stamped (ambiguous wait)"
+        );
+    }
+
+    #[test]
+    fn latency_enrichment_resets_after_user_breaks_chain() {
+        let mut cursors: HashMap<String, SessionCursor> = HashMap::new();
+        let session = "s3";
+
+        // tool_result → user prompt → assistant: chain broken by user.
+        let mut rows = vec![event_row(
+            session,
+            "2026-04-19 12:00:00.000",
+            "tool_result",
+            "tool",
+        )];
+        enrich_claude_model_latency("claude-code", &mut rows, &mut cursors);
+
+        let mut rows = vec![event_row(
+            session,
+            "2026-04-19 12:00:05.000",
+            "message",
+            "user",
+        )];
+        enrich_claude_model_latency("claude-code", &mut rows, &mut cursors);
+
+        let mut rows = vec![event_row(
+            session,
+            "2026-04-19 12:00:07.000",
+            "message",
+            "assistant",
+        )];
+        enrich_claude_model_latency("claude-code", &mut rows, &mut cursors);
+
+        assert_eq!(
+            latency_of(&rows[0]),
+            0,
+            "intervening user prompt breaks the tool_result → assistant chain"
+        );
+    }
+
+    #[test]
+    fn latency_enrichment_skips_non_claude_harness() {
+        let mut cursors: HashMap<String, SessionCursor> = HashMap::new();
+        let session = "s4";
+
+        // Seed cursor as if a tool_result happened.
+        cursors.insert(
+            session.to_string(),
+            SessionCursor {
+                prev_event_ts_ms: 1_000,
+                prev_was_tool_result: true,
+            },
+        );
+
+        let mut rows = vec![event_row(
+            session,
+            "2026-04-19 12:00:10.000",
+            "message",
+            "assistant",
+        )];
+        enrich_claude_model_latency("codex", &mut rows, &mut cursors);
+        assert_eq!(latency_of(&rows[0]), 0, "non-claude harness is a no-op");
+    }
+
+    #[test]
+    fn latency_enrichment_ignores_system_events_when_advancing_cursor() {
+        // A progress/system event between tool_result and assistant must
+        // NOT reset the cursor — otherwise we'd lose valid latency data.
+        let mut cursors: HashMap<String, SessionCursor> = HashMap::new();
+        let session = "s5";
+
+        // 1) tool_result
+        let mut rows = vec![event_row(
+            session,
+            "2026-04-19 12:00:00.000",
+            "tool_result",
+            "tool",
+        )];
+        enrich_claude_model_latency("claude-code", &mut rows, &mut cursors);
+
+        // 2) out-of-band system event (no turn actor)
+        let mut rows = vec![event_row(
+            session,
+            "2026-04-19 12:00:00.500",
+            "system",
+            "system",
+        )];
+        enrich_claude_model_latency("claude-code", &mut rows, &mut cursors);
+
+        // 3) assistant response 3s after the tool_result
+        let mut rows = vec![event_row(
+            session,
+            "2026-04-19 12:00:03.000",
+            "message",
+            "assistant",
+        )];
+        enrich_claude_model_latency("claude-code", &mut rows, &mut cursors);
+
+        assert_eq!(
+            latency_of(&rows[0]),
+            3000,
+            "system event should not reset the tool_result → assistant chain"
+        );
     }
 }
