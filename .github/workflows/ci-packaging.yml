@@ -23,6 +23,9 @@ jobs:
       DRYRUN_TARGET: x86_64-unknown-linux-gnu
       DRYRUN_VERSION: 0.0.0.dev0
       DRYRUN_WHEEL_PLATFORM: manylinux_2_17_x86_64
+      # PEP 427 normalization: `moraine-cli` → `moraine_cli` in wheel +
+      # sdist filenames. See scripts/build-python-wheels.py.
+      DRYRUN_DIST_NAME: moraine_cli
 
     steps:
       - name: Checkout
@@ -86,13 +89,13 @@ jobs:
 
       - name: Assert wheel layout
         if: github.event_name != 'pull_request' || steps.filter.outputs.packaging == 'true'
-        run: bash scripts/ci/assert-wheel-layout.sh "dist/wheels/moraine-$DRYRUN_VERSION-py3-none-$DRYRUN_WHEEL_PLATFORM.whl"
+        run: bash scripts/ci/assert-wheel-layout.sh "dist/wheels/$DRYRUN_DIST_NAME-$DRYRUN_VERSION-py3-none-$DRYRUN_WHEEL_PLATFORM.whl"
 
       - name: Install wheel + exec moraine --help (console script)
         if: github.event_name != 'pull_request' || steps.filter.outputs.packaging == 'true'
         run: |
           python3 -m venv /tmp/wheel-venv
-          /tmp/wheel-venv/bin/pip install --quiet "dist/wheels/moraine-$DRYRUN_VERSION-py3-none-$DRYRUN_WHEEL_PLATFORM.whl"
+          /tmp/wheel-venv/bin/pip install --quiet "dist/wheels/$DRYRUN_DIST_NAME-$DRYRUN_VERSION-py3-none-$DRYRUN_WHEEL_PLATFORM.whl"
           /tmp/wheel-venv/bin/moraine --help
           /tmp/wheel-venv/bin/moraine-ingest --help
           /tmp/wheel-venv/bin/moraine-monitor --help
@@ -100,7 +103,7 @@ jobs:
 
       - name: Assert sdist refuses to build
         if: github.event_name != 'pull_request' || steps.filter.outputs.packaging == 'true'
-        run: bash scripts/ci/assert-sdist-refuses.sh "dist/wheels/moraine-$DRYRUN_VERSION.tar.gz"
+        run: bash scripts/ci/assert-sdist-refuses.sh "dist/wheels/$DRYRUN_DIST_NAME-$DRYRUN_VERSION.tar.gz"
 
       - name: Upload dry-run wheel (artifact)
         if: github.event_name != 'pull_request' || steps.filter.outputs.packaging == 'true'

@@ -61,11 +61,11 @@ require_member "moraine_cli/_binaries/moraine-mcp"
 require_member "moraine_cli/_data/config/moraine.toml"
 require_member "moraine_cli/_data/web/monitor/dist/index.html"
 require_member "moraine_cli/_data/manifest.json"
-require_prefix "moraine-"         # dist-info directory
+require_prefix "moraine_cli-"     # dist-info directory (PEP 427 normalizes moraine-cli → moraine_cli)
 require_prefix "moraine_cli/_data/web/monitor/dist/"
 
 # dist-info files
-dist_info="$(printf '%s\n' "$members" | grep -E '^moraine-.*\.dist-info/' | head -1 | awk -F/ '{print $1}')"
+dist_info="$(printf '%s\n' "$members" | grep -E '^moraine_cli-.*\.dist-info/' | head -1 | awk -F/ '{print $1}')"
 if [[ -z "$dist_info" ]]; then
   echo "wheel has no <name>.dist-info/ directory" >&2
   exit 1
