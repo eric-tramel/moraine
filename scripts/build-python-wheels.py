@@ -175,10 +175,30 @@ def _iter_files(root: Path):
             yield entry
 
 
+_PEP440_PRE_MAP = (
+    ("rc", "rc"),
+    ("beta", "b"),
+    ("alpha", "a"),
+)
+
+
 def _normalize_version(version: str) -> str:
-    # Allow the caller to pass a git tag like "v0.4.1"; strip the leading v.
+    """Normalize a git tag to a PEP 440 version.
+
+    - Strips a leading `v` (so `v0.4.1` → `0.4.1`).
+    - Maps dashed pre-release segments to their PEP 440 canonical form
+      (`0.3.1-rc.1` → `0.3.1rc1`, `0.4.0-beta.2` → `0.4.0b2`).
+    - Leaves `.devN` / `.postN` segments untouched — those are already
+      PEP 440 compliant in git tags.
+
+    The release workflow pre-normalizes before calling this script, but
+    dev-time invocations (smoke tests, ad-hoc rebuilds) often pass a raw
+    git tag; keeping the normalization here means both paths work.
+    """
     if version.startswith("v") and re.match(r"^v\d", version):
-        return version[1:]
+        version = version[1:]
+    for prefix, canonical in _PEP440_PRE_MAP:
+        version = re.sub(rf"-{prefix}\.?(\d+)", rf"{canonical}\1", version)
     return version
 
 

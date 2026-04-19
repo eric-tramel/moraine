@@ -114,9 +114,20 @@ Description-Content-Type: text/markdown
 """
 
 
+_PEP440_PRE_MAP = (
+    ("rc", "rc"),
+    ("beta", "b"),
+    ("alpha", "a"),
+)
+
+
 def _normalize_version(version: str) -> str:
+    # Mirrors scripts/build-python-wheels.py._normalize_version so the
+    # sdist and wheels in the same release share a normalized version.
     if version.startswith("v") and re.match(r"^v\d", version):
-        return version[1:]
+        version = version[1:]
+    for prefix, canonical in _PEP440_PRE_MAP:
+        version = re.sub(rf"-{prefix}\.?(\d+)", rf"{canonical}\1", version)
     return version
 
 

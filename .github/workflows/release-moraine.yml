@@ -10,6 +10,15 @@ on:
         description: "Tag to release (for example v0.4.1)"
         required: true
         type: string
+      target:
+        description: "PyPI publish target — tag-triggered runs always skip. Choose explicitly on manual dispatches."
+        required: false
+        type: choice
+        default: skip
+        options:
+          - skip
+          - test-pypi
+          - pypi
 
 jobs:
   release:
@@ -61,3 +70,100 @@ jobs:
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-pypi:
+    name: publish-pypi
+    needs: release
+    # Tag-triggered runs always skip. Only manual dispatches with an
+    # explicit test-pypi / pypi target publish. See RFC #219 and
+    # docs/operations/pypi-release.md for the rehearsal procedure.
+    if: github.event_name == 'workflow_dispatch' && (github.event.inputs.target == 'test-pypi' || github.event.inputs.target == 'pypi')
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # OIDC for PyPI/TestPyPI trusted publishing
+      contents: read  # for gh release download
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Resolve tag and PEP 440 version
+        id: meta
+        env:
+          TAG: ${{ github.event.inputs.tag }}
+        # The wheel builder's --version must be PEP 440 compliant so
+        # twine / pypi accept the upload. Git tags use dash-separated
+        # pre-release segments (v0.3.1-rc.1); translate them to the
+        # canonical form here rather than in every call site.
+        run: |
+          python3 - <<'PY' >>"$GITHUB_OUTPUT"
+          import os, re
+          tag = os.environ["TAG"]
+          version = tag[1:] if re.match(r"^v\d", tag) else tag
+          # e.g. 0.3.1-rc.1 -> 0.3.1rc1, 0.4.0-beta.2 -> 0.4.0b2
+          for pre, canon in (("rc", "rc"), ("beta", "b"), ("alpha", "a")):
+              version = re.sub(rf"-{pre}\.?(\d+)", rf"{canon}\1", version)
+          # .dev / .post kept as-is; stdlib re is fine for these cases.
+          print(f"tag={tag}")
+          print(f"version={version}")
+          PY
+
+      - name: Download bundle artifacts from GH Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dist
+          gh release download "${{ steps.meta.outputs.tag }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'moraine-bundle-*.tar.gz' \
+            --dir dist/
+
+      - name: Build wheels + stub sdist
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          mkdir -p dist/wheels
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin; do
+            python3 scripts/build-python-wheels.py \
+              --target "$target" \
+              --bundle "dist/moraine-bundle-$target.tar.gz" \
+              --out-dir dist/wheels \
+              --version "$VERSION"
+          done
+          python3 scripts/build-python-sdist.py \
+            --out-dir dist/wheels \
+            --version "$VERSION"
+          ls -la dist/wheels
+
+      - name: Publish to TestPyPI
+        if: github.event.inputs.target == 'test-pypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/wheels/
+          repository-url: https://test.pypi.org/legacy/
+          # skip-existing avoids a hard failure on rehearsal tag rebuilds
+          # where the same version has already been pushed.
+          skip-existing: true
+          verbose: true
+
+      - name: Publish to PyPI
+        if: github.event.inputs.target == 'pypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/wheels/
+          skip-existing: false
+          verbose: true
+
+      - name: Upload built wheels as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: moraine-pypi-artifacts-${{ steps.meta.outputs.version }}
+          path: dist/wheels/*
+          retention-days: 30
