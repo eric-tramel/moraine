@@ -39,34 +39,6 @@ export interface StatusResponse {
   error?: string;
 }
 
-export interface TableSummary {
-  name: string;
-  engine: string;
-  is_temporary: number;
-  rows: number;
-}
-
-export interface TablesResponse {
-  ok: boolean;
-  tables: TableSummary[];
-  error?: string;
-}
-
-export interface TableColumn {
-  name: string;
-  type: string;
-  default_expression: string;
-}
-
-export interface TableDetailResponse {
-  ok: boolean;
-  table: string;
-  limit: number;
-  schema: TableColumn[];
-  rows: Array<Record<string, unknown>>;
-  error?: string;
-}
-
 export interface AnalyticsRange {
   key: AnalyticsRangeKey;
   label: string;

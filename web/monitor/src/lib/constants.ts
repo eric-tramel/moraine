@@ -21,5 +21,3 @@ export const FAST_POLL_INTERVAL_MS = 10_000;
 export const SLOW_POLL_INTERVAL_MS = 60_000;
 
 export const DEFAULT_ANALYTICS_META = 'Loading model analytics…';
-
-export const ROW_LIMIT_OPTIONS = [10, 25, 50, 100];

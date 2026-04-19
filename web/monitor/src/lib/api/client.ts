@@ -1,11 +1,4 @@
-import type {
-  AnalyticsRangeKey,
-  AnalyticsResponse,
-  HealthResponse,
-  StatusResponse,
-  TableDetailResponse,
-  TablesResponse,
-} from '../types/api';
+import type { AnalyticsRangeKey, AnalyticsResponse, HealthResponse, StatusResponse } from '../types/api';
 
 interface ErrorPayload {
   error?: string;
@@ -45,18 +38,6 @@ export function fetchStatus(): Promise<StatusResponse> {
   return requestJson<StatusResponse>('/api/status');
 }
 
-export function fetchTables(): Promise<TablesResponse> {
-  return requestJson<TablesResponse>('/api/tables');
-}
-
 export function fetchAnalytics(range: AnalyticsRangeKey): Promise<AnalyticsResponse> {
   return requestJson<AnalyticsResponse>(`/api/analytics?range=${encodeURIComponent(range)}`);
-}
-
-export function fetchTableDetail(name: string, limit: number): Promise<TableDetailResponse> {
-  if (name === 'web_searches') {
-    return requestJson<TableDetailResponse>(`/api/web-searches?limit=${limit}`);
-  }
-
-  return requestJson<TableDetailResponse>(`/api/tables/${encodeURIComponent(name)}?limit=${limit}`);
 }
