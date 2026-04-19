@@ -768,32 +768,91 @@ mod tests {
         assert!(!has_explicit_json_each_row_format("SELECT 1 FORMAT JSON"));
     }
 
+    fn is_migration_filename(name: &str) -> bool {
+        // Matches ^\d{3}_.+\.sql$
+        let Some(stem) = name.strip_suffix(".sql") else {
+            return false;
+        };
+        if stem.len() < 5 {
+            return false;
+        }
+        let (prefix, rest) = stem.split_at(3);
+        prefix.chars().all(|c| c.is_ascii_digit()) && rest.starts_with('_') && rest.len() > 1
+    }
+
     #[test]
-    fn bundled_migrations_registers_all_sql_files() {
-        let migrations = bundled_migrations();
-        assert_eq!(
-            migrations.len(),
-            12,
-            "expected 12 bundled migrations, got {}",
-            migrations.len()
+    fn bundled_migrations_matches_sql_directory() {
+        use std::path::PathBuf;
+
+        let sql_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("sql");
+
+        let mut discovered: Vec<String> = std::fs::read_dir(&sql_dir)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", sql_dir.display()))
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                if !entry.file_type().ok()?.is_file() {
+                    return None;
+                }
+                let name = entry.file_name().to_str()?.to_string();
+                is_migration_filename(&name).then_some(name)
+            })
+            .collect();
+        discovered.sort();
+
+        assert!(
+            !discovered.is_empty(),
+            "no migration files found under {}",
+            sql_dir.display()
         );
 
-        let last = migrations.last().expect("migrations non-empty");
-        assert_eq!(last.version, "012");
-        assert!(
-            last.name.contains("012"),
-            "expected migration name to contain '012', got {}",
-            last.name
+        let migrations = bundled_migrations();
+        let bundled_names: Vec<String> = migrations.iter().map(|m| m.name.to_string()).collect();
+
+        assert_eq!(
+            bundled_names, discovered,
+            "bundled_migrations() is out of sync with sql/*.sql — \
+             new migration files must be registered with a matching include_str! entry"
         );
-        assert!(
-            last.name.contains("add_inference_provider"),
-            "expected migration name to contain 'add_inference_provider', got {}",
-            last.name
+
+        // bundled_migrations() must be sorted ascending by version.
+        let versions: Vec<&str> = migrations.iter().map(|m| m.version).collect();
+        let mut sorted = versions.clone();
+        sorted.sort();
+        assert_eq!(
+            versions, sorted,
+            "bundled_migrations() must be ordered ascending by version"
         );
-        assert!(
-            !last.sql.is_empty(),
-            "expected migration 012 sql to be bundled via include_str!"
-        );
+
+        // Each entry's version must match its filename's numeric prefix.
+        for m in &migrations {
+            assert!(
+                m.name.starts_with(&format!("{}_", m.version)),
+                "migration name {} does not begin with {}_ prefix",
+                m.name,
+                m.version
+            );
+            assert!(
+                !m.sql.is_empty(),
+                "migration {} has empty bundled sql — include_str! target may be missing",
+                m.name
+            );
+        }
+    }
+
+    #[test]
+    fn migration_filename_matcher_rejects_non_conforming_names() {
+        assert!(is_migration_filename("001_schema.sql"));
+        assert!(is_migration_filename("012_add_inference_provider.sql"));
+        assert!(!is_migration_filename("001_schema.txt"));
+        assert!(!is_migration_filename("schema.sql"));
+        assert!(!is_migration_filename("01_schema.sql"));
+        assert!(!is_migration_filename("0001_schema.sql"));
+        assert!(!is_migration_filename("001schema.sql"));
+        assert!(!is_migration_filename("001_.sql"));
+        assert!(!is_migration_filename("README.md"));
     }
 
     #[test]
