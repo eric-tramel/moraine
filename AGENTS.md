@@ -84,6 +84,10 @@ which sandbox is yours.
 | `moraine-sandbox list` | One-line-per-sandbox table. |
 | `moraine-sandbox down <id>` / `down --all` | Stop, remove the container + all named volumes + the `/tmp/moraine-sandbox-<id>/` config dir. |
 
+### Agent-driven MCP smoke test
+
+For a higher-level sanity check than `cargo test` can give, use `scripts/dev/sandbox/agent-smoke-e2e` (self-documented; run with `--help`). It boots a fresh sandbox, runs the `/agent-smoke-e2e` skill (see `.claude/skills/agent-smoke-e2e/SKILL.md`) against Opus/Sonnet/Haiku in sequence, and aggregates a PASS/FAIL matrix across every `moraine-mcp` tool. Use it before cutting a release, or when you've touched anything in `moraine-mcp-core` / the MCP tool surface. Requires `ANTHROPIC_API_KEY` in the environment.
+
 ### Isolation worktrees (spawned via the Agent SDK's `isolation: "worktree"`)
 
 If you were spawned into a temporary worktree (e.g. `/Users/.../.claude/worktrees/agent-<id>/`), its branch may be **`main`**, not the branch the parent session is working on. The Agent SDK currently branches isolation worktrees from the repo root's `HEAD`, not the calling process's current branch.
