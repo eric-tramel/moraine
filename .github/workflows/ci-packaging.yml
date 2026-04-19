@@ -1,0 +1,111 @@
+name: ci-packaging
+
+# Dry-run the PyPI wheel build on PRs that touch packaging paths. Guards
+# the scripts introduced by #223 against regressions. See RFC #219 and
+# issue #224.
+#
+# Runs on every PR (so branch protection can list it as a required
+# check) but only does the expensive Rust + wheel build when packaging
+# paths changed. The filter is evaluated inside the job via
+# dorny/paths-filter@v3, mirroring the pattern used by ci-pr-fast.yml.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  packaging-dryrun:
+    name: packaging-dryrun
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      DRYRUN_TARGET: x86_64-unknown-linux-gnu
+      DRYRUN_VERSION: 0.0.0.dev0
+      DRYRUN_WHEEL_PLATFORM: manylinux_2_17_x86_64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect packaging-path changes
+        id: filter
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            packaging:
+              - '.github/workflows/ci-packaging.yml'
+              - 'bindings/python/moraine-cli/**'
+              - 'scripts/build-python-wheels.py'
+              - 'scripts/build-python-sdist.py'
+              - 'scripts/package-moraine-release.sh'
+
+      - name: Skip when no packaging changes
+        if: github.event_name == 'pull_request' && steps.filter.outputs.packaging != 'true'
+        run: echo "No packaging-path changes detected; skipping dry-run wheel build."
+
+      - name: Install Rust toolchain
+        if: github.event_name != 'pull_request' || steps.filter.outputs.packaging == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.DRYRUN_TARGET }}
+
+      - name: Install Bun
+        if: github.event_name != 'pull_request' || steps.filter.outputs.packaging == 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Setup Python
+        if: github.event_name != 'pull_request' || steps.filter.outputs.packaging == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache Rust artifacts
+        if: github.event_name != 'pull_request' || steps.filter.outputs.packaging == 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build host bundle
+        if: github.event_name != 'pull_request' || steps.filter.outputs.packaging == 'true'
+        run: scripts/package-moraine-release.sh "$DRYRUN_TARGET" dist
+
+      - name: Build Python wheel + stub sdist
+        if: github.event_name != 'pull_request' || steps.filter.outputs.packaging == 'true'
+        run: |
+          mkdir -p dist/wheels
+          python3 scripts/build-python-wheels.py \
+            --target "$DRYRUN_TARGET" \
+            --bundle "dist/moraine-bundle-$DRYRUN_TARGET.tar.gz" \
+            --out-dir dist/wheels \
+            --version "$DRYRUN_VERSION"
+          python3 scripts/build-python-sdist.py \
+            --out-dir dist/wheels \
+            --version "$DRYRUN_VERSION"
+
+      - name: Assert wheel layout
+        if: github.event_name != 'pull_request' || steps.filter.outputs.packaging == 'true'
+        run: bash scripts/ci/assert-wheel-layout.sh "dist/wheels/moraine-$DRYRUN_VERSION-py3-none-$DRYRUN_WHEEL_PLATFORM.whl"
+
+      - name: Install wheel + exec moraine --help (console script)
+        if: github.event_name != 'pull_request' || steps.filter.outputs.packaging == 'true'
+        run: |
+          python3 -m venv /tmp/wheel-venv
+          /tmp/wheel-venv/bin/pip install --quiet "dist/wheels/moraine-$DRYRUN_VERSION-py3-none-$DRYRUN_WHEEL_PLATFORM.whl"
+          /tmp/wheel-venv/bin/moraine --help
+          /tmp/wheel-venv/bin/moraine-ingest --help
+          /tmp/wheel-venv/bin/moraine-monitor --help
+          /tmp/wheel-venv/bin/moraine-mcp --help
+
+      - name: Assert sdist refuses to build
+        if: github.event_name != 'pull_request' || steps.filter.outputs.packaging == 'true'
+        run: bash scripts/ci/assert-sdist-refuses.sh "dist/wheels/moraine-$DRYRUN_VERSION.tar.gz"
+
+      - name: Upload dry-run wheel (artifact)
+        if: github.event_name != 'pull_request' || steps.filter.outputs.packaging == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: moraine-dryrun-wheel
+          path: dist/wheels/*
+          retention-days: 7
