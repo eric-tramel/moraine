@@ -1128,44 +1128,44 @@ FORMAT JSONEachRow",
         let documents_join_sql = if use_document_codex_flag {
             format!(
                 "(SELECT
-  event_uid,
-  any(session_id) AS session_id,
-  any(source_name) AS source_name,
-  any(harness) AS harness,
-  any(inference_provider) AS inference_provider,
-  any(event_class) AS event_class,
-  any(payload_type) AS payload_type,
-  any(actor_role) AS actor_role,
-  any(name) AS name,
-  any(phase) AS phase,
-  any(source_ref) AS source_ref,
-  any(doc_len) AS doc_len,
-  any(text_content) AS text_content,
-  any(payload_json) AS payload_json,
-  toUInt8(any(has_codex_mcp)) AS has_codex_mcp
-FROM {documents_table}
-GROUP BY event_uid)"
+  t.event_uid AS event_uid,
+  any(t.session_id) AS session_id,
+  any(t.source_name) AS source_name,
+  any(t.harness) AS harness,
+  any(t.inference_provider) AS inference_provider,
+  any(t.event_class) AS event_class,
+  any(t.payload_type) AS payload_type,
+  any(t.actor_role) AS actor_role,
+  any(t.name) AS name,
+  any(t.phase) AS phase,
+  any(t.source_ref) AS source_ref,
+  any(t.doc_len) AS doc_len,
+  any(t.text_content) AS text_content,
+  any(t.payload_json) AS payload_json,
+  toUInt8(any(t.has_codex_mcp)) AS has_codex_mcp
+FROM {documents_table} AS t
+GROUP BY t.event_uid)"
             )
         } else {
             format!(
                 "(SELECT
-  event_uid,
-  any(session_id) AS session_id,
-  any(source_name) AS source_name,
-  any(harness) AS harness,
-  any(inference_provider) AS inference_provider,
-  any(event_class) AS event_class,
-  any(payload_type) AS payload_type,
-  any(actor_role) AS actor_role,
-  any(name) AS name,
-  any(phase) AS phase,
-  any(source_ref) AS source_ref,
-  any(doc_len) AS doc_len,
-  any(text_content) AS text_content,
-  any(payload_json) AS payload_json,
+  t.event_uid AS event_uid,
+  any(t.session_id) AS session_id,
+  any(t.source_name) AS source_name,
+  any(t.harness) AS harness,
+  any(t.inference_provider) AS inference_provider,
+  any(t.event_class) AS event_class,
+  any(t.payload_type) AS payload_type,
+  any(t.actor_role) AS actor_role,
+  any(t.name) AS name,
+  any(t.phase) AS phase,
+  any(t.source_ref) AS source_ref,
+  any(t.doc_len) AS doc_len,
+  any(t.text_content) AS text_content,
+  any(t.payload_json) AS payload_json,
   toUInt8(0) AS has_codex_mcp
-FROM {documents_table}
-GROUP BY event_uid)"
+FROM {documents_table} AS t
+GROUP BY t.event_uid)"
             )
         };
 
@@ -1280,46 +1280,46 @@ FORMAT JSONEachRow",
         let documents_source_sql = if use_document_codex_flag {
             format!(
                 "(SELECT
-  event_uid,
-  any(session_id) AS session_id,
-  any(source_name) AS source_name,
-  any(harness) AS harness,
-  any(inference_provider) AS inference_provider,
-  any(event_class) AS event_class,
-  any(payload_type) AS payload_type,
-  any(actor_role) AS actor_role,
-  any(name) AS name,
-  any(phase) AS phase,
-  any(source_ref) AS source_ref,
-  any(doc_len) AS doc_len,
-  any(text_content) AS text_content,
-  any(payload_json) AS payload_json,
-  toUInt8(any(has_codex_mcp)) AS has_codex_mcp
-FROM {documents_table}
-WHERE event_uid IN {event_uids_array}
-GROUP BY event_uid)"
+  t.event_uid AS event_uid,
+  any(t.session_id) AS session_id,
+  any(t.source_name) AS source_name,
+  any(t.harness) AS harness,
+  any(t.inference_provider) AS inference_provider,
+  any(t.event_class) AS event_class,
+  any(t.payload_type) AS payload_type,
+  any(t.actor_role) AS actor_role,
+  any(t.name) AS name,
+  any(t.phase) AS phase,
+  any(t.source_ref) AS source_ref,
+  any(t.doc_len) AS doc_len,
+  any(t.text_content) AS text_content,
+  any(t.payload_json) AS payload_json,
+  toUInt8(any(t.has_codex_mcp)) AS has_codex_mcp
+FROM {documents_table} AS t
+WHERE t.event_uid IN {event_uids_array}
+GROUP BY t.event_uid)"
             )
         } else {
             format!(
                 "(SELECT
-  event_uid,
-  any(session_id) AS session_id,
-  any(source_name) AS source_name,
-  any(harness) AS harness,
-  any(inference_provider) AS inference_provider,
-  any(event_class) AS event_class,
-  any(payload_type) AS payload_type,
-  any(actor_role) AS actor_role,
-  any(name) AS name,
-  any(phase) AS phase,
-  any(source_ref) AS source_ref,
-  any(doc_len) AS doc_len,
-  any(text_content) AS text_content,
-  any(payload_json) AS payload_json,
+  t.event_uid AS event_uid,
+  any(t.session_id) AS session_id,
+  any(t.source_name) AS source_name,
+  any(t.harness) AS harness,
+  any(t.inference_provider) AS inference_provider,
+  any(t.event_class) AS event_class,
+  any(t.payload_type) AS payload_type,
+  any(t.actor_role) AS actor_role,
+  any(t.name) AS name,
+  any(t.phase) AS phase,
+  any(t.source_ref) AS source_ref,
+  any(t.doc_len) AS doc_len,
+  any(t.text_content) AS text_content,
+  any(t.payload_json) AS payload_json,
   toUInt8(0) AS has_codex_mcp
-FROM {documents_table}
-WHERE event_uid IN {event_uids_array}
-GROUP BY event_uid)"
+FROM {documents_table} AS t
+WHERE t.event_uid IN {event_uids_array}
+GROUP BY t.event_uid)"
             )
         };
 
@@ -2520,14 +2520,22 @@ FORMAT JSONEachRow",
         let sql = format!(
             "SELECT
   event_uid,
-  leftUTF8(any(text_content), {preview}) AS snippet,
-  leftUTF8(any(text_content), {text_content_limit}) AS text_content,
-  leftUTF8(any(payload_json), {payload_json_limit}) AS payload_json,
-  any(event_class) AS event_class,
-  any(actor_role) AS actor_role
-FROM {documents_table}
-WHERE event_uid IN {event_uids_sql}
-GROUP BY event_uid
+  leftUTF8(text_content_raw, {preview}) AS snippet,
+  leftUTF8(text_content_raw, {text_content_limit}) AS text_content,
+  leftUTF8(payload_json_raw, {payload_json_limit}) AS payload_json,
+  event_class_raw AS event_class,
+  actor_role_raw AS actor_role
+FROM (
+  SELECT
+    event_uid,
+    any(text_content) AS text_content_raw,
+    any(payload_json) AS payload_json_raw,
+    any(event_class) AS event_class_raw,
+    any(actor_role) AS actor_role_raw
+  FROM {documents_table}
+  WHERE event_uid IN {event_uids_sql}
+  GROUP BY event_uid
+)
 FORMAT JSONEachRow",
             preview = self.cfg.preview_chars,
             text_content_limit = text_content_limit,

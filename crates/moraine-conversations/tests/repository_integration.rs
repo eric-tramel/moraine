@@ -690,6 +690,24 @@ async fn build_repo() -> (ClickHouseConversationRepository, Arc<MockState>) {
     build_repo_with_max_results(100).await
 }
 
+/// Regression helper for issue #253: ClickHouse 25.12's new analyzer treats
+/// `any(column) AS column` as a nested aggregate because the inner `column`
+/// binds to the alias expression. Returns true if the SQL contains that
+/// buggy self-alias pattern for the given column (with word-boundary checks
+/// on either side, so `t.column` prefixes and `column_raw` suffixes don't
+/// trigger false positives).
+fn sql_self_aliases_aggregate(sql: &str, column: &str) -> bool {
+    let needle = format!("any({column}) AS {column}");
+    sql.match_indices(&needle).any(|(idx, _)| {
+        let head = sql[..idx].chars().next_back();
+        let tail = sql[idx + needle.len()..].chars().next();
+        let head_word =
+            matches!(head, Some(ch) if ch.is_ascii_alphanumeric() || ch == '_' || ch == '.');
+        let tail_word = matches!(tail, Some(ch) if ch.is_ascii_alphanumeric() || ch == '_');
+        !head_word && !tail_word
+    })
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn list_conversations_applies_filters_and_cursor_pagination() {
     let (repo, state) = build_repo().await;
@@ -1060,6 +1078,47 @@ async fn search_conversations_falls_back_to_row_snippet_for_text_preview() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn search_conversations_snippet_query_avoids_self_aliased_aggregates() {
+    let (repo, state) = build_repo().await;
+
+    let _ = repo
+        .search_conversations(ConversationSearchQuery {
+            query: "hello world".to_string(),
+            limit: Some(10),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            from_unix_ms: Some(1767261600000_i64),
+            to_unix_ms: Some(1767500000000_i64),
+            mode: Some(ConversationMode::Chat),
+            include_tool_events: Some(true),
+            exclude_codex_mcp: Some(false),
+        })
+        .await
+        .expect("search conversations");
+
+    let queries = state.queries.lock().expect("queries lock").clone();
+    let snippet_query = queries
+        .iter()
+        .find(|q| {
+            q.contains("WHERE event_uid IN")
+                && q.contains("GROUP BY event_uid")
+                && q.contains("AS text_content")
+        })
+        .expect("snippet hydration query should be captured");
+
+    // Regression for issue #253: aliasing `any(text_content) AS text_content`
+    // in the same SELECT makes the ClickHouse 25.12 analyzer resolve
+    // `text_content` to the alias expression, producing nested aggregates
+    // (ILLEGAL_AGGREGATION). Keep aggregate and output alias names disjoint.
+    for column in ["text_content", "payload_json", "event_class", "actor_role"] {
+        assert!(
+            !sql_self_aliases_aggregate(snippet_query, column),
+            "snippet query must not self-alias `any({column}) AS {column}`: {snippet_query}",
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn search_conversations_without_mode_filter_skips_mode_join() {
     let (repo, state) = build_repo().await;
 
@@ -1154,6 +1213,66 @@ async fn search_events_includes_session_time_bounds() {
     assert_eq!(result.hits[1].session_id, "sess_a");
     assert_eq!(result.hits[1].first_event_time, "2026-01-01 10:00:00");
     assert_eq!(result.hits[1].last_event_time, "2026-01-01 10:10:00");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_events_documents_subquery_avoids_self_aliased_aggregates() {
+    let (repo, state) = build_repo().await;
+
+    let _ = repo
+        .search_events(SearchEventsQuery {
+            query: "hello world".to_string(),
+            source: Some("integration-test".to_string()),
+            limit: Some(10),
+            session_id: None,
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            include_tool_events: Some(true),
+            event_kinds: None,
+            exclude_codex_mcp: Some(false),
+            disable_cache: Some(true),
+            search_strategy: None,
+        })
+        .await
+        .expect("search events");
+
+    let queries = state.queries.lock().expect("queries lock").clone();
+    // Defensive coverage for the same class of bug as issue #253: the
+    // `documents_join_sql` and `documents_source_sql` inner subqueries used
+    // to self-alias aggregates (`any(text_content) AS text_content`), which
+    // ClickHouse 25.12's analyzer rejects as nested aggregates. They now
+    // qualify inner column references via an `AS t` table alias.
+    let documents_subqueries: Vec<&String> = queries
+        .iter()
+        .filter(|q| q.contains("GROUP BY p.doc_id") || q.contains("FROM (SELECT\n  t.event_uid"))
+        .collect();
+    assert!(
+        !documents_subqueries.is_empty(),
+        "expected at least one search_events query to be captured; got {queries:?}",
+    );
+    for query in documents_subqueries {
+        for column in [
+            "session_id",
+            "source_name",
+            "harness",
+            "inference_provider",
+            "event_class",
+            "payload_type",
+            "actor_role",
+            "name",
+            "phase",
+            "source_ref",
+            "doc_len",
+            "text_content",
+            "payload_json",
+            "has_codex_mcp",
+        ] {
+            assert!(
+                !sql_self_aliases_aggregate(query, column),
+                "search_events query must not self-alias `any({column}) AS {column}`: {query}",
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
