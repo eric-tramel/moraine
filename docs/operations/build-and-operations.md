@@ -83,7 +83,7 @@ To upgrade a curl-installed instance, re-run the installer.
 
 Tag-driven GitHub Actions release workflow:
 
-1. Push a semantic tag (example: `v0.4.2`).
+1. Push a semantic tag (example: `v0.4.3`).
 2. Workflow `.github/workflows/release-moraine.yml` builds:
    - `x86_64-unknown-linux-gnu`
    - `aarch64-unknown-linux-gnu`
