@@ -916,10 +916,10 @@ FORMAT JSONEachRow",
     async fn load_session_metadata(&self, session_id: &str) -> RepoResult<Option<SessionMetadata>> {
         let session_summary = self.table_ref("v_session_summary");
         let mode_subquery = self.mode_subquery();
-        let events_table = self.table_ref("events");
+        let trace_table = self.table_ref("v_conversation_trace");
         let query = format!(
             "SELECT
-  s.session_id,
+  s.session_id AS session_id,
   toString(s.first_event_time) AS first_event_time,
   toInt64(toUnixTimestamp64Milli(s.first_event_time)) AS first_event_unix_ms,
   toString(s.last_event_time) AS last_event_time,
@@ -939,10 +939,10 @@ LEFT JOIN ({mode_subquery}) AS m ON m.session_id = s.session_id
 LEFT JOIN (
   SELECT
     session_id,
-    argMin(event_uid, tuple(event_ts, event_order, event_uid)) AS first_event_uid,
-    argMax(event_uid, tuple(event_ts, event_order, event_uid)) AS last_event_uid,
-    argMax(actor_role, tuple(event_ts, event_order, event_uid)) AS last_actor_role
-  FROM {events_table}
+    argMin(event_uid, tuple(event_time, event_order, event_uid)) AS first_event_uid,
+    argMax(event_uid, tuple(event_time, event_order, event_uid)) AS last_event_uid,
+    argMax(actor_role, tuple(event_time, event_order, event_uid)) AS last_actor_role
+  FROM {trace_table}
   WHERE session_id = {session_id_sql}
   GROUP BY session_id
 ) AS e ON e.session_id = s.session_id
@@ -951,7 +951,7 @@ LIMIT 1
 FORMAT JSONEachRow",
             session_summary = session_summary,
             mode_subquery = mode_subquery,
-            events_table = events_table,
+            trace_table = trace_table,
             session_id_sql = sql_quote(session_id),
         );
 

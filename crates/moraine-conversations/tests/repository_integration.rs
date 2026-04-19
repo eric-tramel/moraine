@@ -149,8 +149,9 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
         }
 
         if query.contains("FROM `moraine`.`v_session_summary` AS s")
-            && query.contains("argMin(event_uid, tuple(event_ts, event_order, event_uid))")
-            && query.contains("argMax(actor_role, tuple(event_ts, event_order, event_uid))")
+            && query.contains("argMin(event_uid, tuple(event_time, event_order, event_uid))")
+            && query.contains("argMax(actor_role, tuple(event_time, event_order, event_uid))")
+            && query.contains("FROM `moraine`.`v_conversation_trace`")
             && query.contains("WHERE s.session_id =")
         {
             if query.contains("WHERE s.session_id = 'sess-missing'") {
@@ -887,10 +888,29 @@ async fn get_session_metadata_returns_stable_summary_fields() {
     let queries = state.queries.lock().expect("queries lock").clone();
     let metadata_query = queries
         .iter()
-        .find(|q| q.contains("argMin(event_uid, tuple(event_ts, event_order, event_uid))"))
+        .find(|q| q.contains("argMin(event_uid, tuple(event_time, event_order, event_uid))"))
         .expect("session metadata query should be captured");
-    assert!(metadata_query.contains("argMax(actor_role, tuple(event_ts, event_order, event_uid))"));
+    assert!(
+        metadata_query.contains("argMax(actor_role, tuple(event_time, event_order, event_uid))")
+    );
     assert!(metadata_query.contains("WHERE s.session_id = 'sess_c'"));
+    // Regression: event_order exists only in v_conversation_trace, never in
+    // moraine.events. The mode subquery legitimately reads from events, so
+    // scope this check to the argMin/argMax subquery by asserting the
+    // v_conversation_trace table is immediately above the event_uid argMin.
+    let metadata_subquery_slice = metadata_query
+        .split_once("argMin(event_uid, tuple(event_time")
+        .and_then(|(head, _)| head.rsplit_once("SELECT"))
+        .map(|(_, tail)| tail)
+        .expect("metadata subquery head should be present");
+    assert!(
+        !metadata_subquery_slice.contains("FROM `moraine`.`events`"),
+        "argMin/argMax subquery must read from v_conversation_trace, not events: {metadata_query}",
+    );
+    assert!(
+        metadata_query.contains("FROM `moraine`.`v_conversation_trace`"),
+        "metadata subquery must read event_order from v_conversation_trace: {metadata_query}",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
