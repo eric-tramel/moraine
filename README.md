@@ -25,7 +25,15 @@ Specifically, Morine provides:
 
 ## Quickstart
 
-Install `moraine` (prebuilt bundle) to `~/.local/bin`. 
+Install `moraine` with [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv tool install moraine-cli
+```
+
+Upgrades come from your package manager: `uv tool upgrade moraine-cli`.
+
+Prefer a prebuilt bundle? Use the fallback installer to drop the binaries into `~/.local/bin`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/eric-tramel/moraine/main/scripts/install.sh \
