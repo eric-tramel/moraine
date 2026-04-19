@@ -1104,7 +1104,7 @@ async fn resolve_clickhouse_server_command(
     let should_install = if cfg.runtime.clickhouse_auto_install {
         eprintln!(
             "managed ClickHouse not found; auto-installing {version}.\n\
-             one-time download + extract (~10-30 s on a typical connection).\n\
+             one-time ~175 MiB download + extract (progress shown below).\n\
              set runtime.clickhouse_auto_install = false in your config to disable.",
         );
         true
