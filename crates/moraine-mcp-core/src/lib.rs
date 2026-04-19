@@ -695,7 +695,7 @@ impl AppState {
                 },
                 {
                     "name": "open",
-                    "description": "Open by `event_uid` with surrounding context, or open a session transcript by `session_id`.",
+                    "description": "Open by `event_uid` with surrounding context, or open a session transcript by `session_id`. Callers must supply exactly one of `event_uid` or `session_id`.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -731,11 +731,7 @@ impl AppState {
                                 "enum": ["prose", "full"],
                                 "default": "prose"
                             }
-                        },
-                        "oneOf": [
-                            { "required": ["event_uid"] },
-                            { "required": ["session_id"] }
-                        ]
+                        }
                     }
                 },
                 {
