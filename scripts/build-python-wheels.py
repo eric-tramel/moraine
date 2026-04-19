@@ -84,7 +84,7 @@ WHEEL_DISTRIBUTION_NAME = re.sub(r"[^A-Za-z0-9.]+", "_", PACKAGE_NAME)
 # exec shim (__init__.py, py.typed, _version.py) into the wheel.
 REPO_PACKAGE_ROOT = Path(__file__).resolve().parent.parent / "bindings/python/moraine-cli"
 
-DESCRIPTION = "Moraine \u2014 unified trace indexer and MCP server for Claude Code / Codex"
+DESCRIPTION = "Unified realtime agent trace database & search MCP"
 
 
 # ----------------------------------------------------------------------------
@@ -221,13 +221,13 @@ def _render_metadata(version: str, readme: str) -> str:
         f"Summary: {DESCRIPTION}",
         "Home-page: https://github.com/eric-tramel/moraine",
         "Author: Moraine Maintainers",
-        "License: MIT",
+        "License: Apache-2.0",
         "Project-URL: Homepage, https://github.com/eric-tramel/moraine",
         "Project-URL: Issues, https://github.com/eric-tramel/moraine/issues",
         "Project-URL: Repository, https://github.com/eric-tramel/moraine",
         "Keywords: moraine,claude-code,codex,mcp,telemetry,observability",
         "Classifier: Development Status :: 4 - Beta",
-        "Classifier: License :: OSI Approved :: MIT License",
+        "Classifier: License :: OSI Approved :: Apache Software License",
         "Classifier: Operating System :: MacOS",
         "Classifier: Operating System :: POSIX :: Linux",
         "Classifier: Programming Language :: Python :: 3",

@@ -33,7 +33,7 @@ import time
 from pathlib import Path
 
 PACKAGE_NAME = "moraine-cli"
-DESCRIPTION = "Moraine \u2014 unified trace indexer and MCP server for Claude Code / Codex"
+DESCRIPTION = "Unified realtime agent trace database & search MCP"
 
 # Sdist filenames follow the same PEP 427-style escaping modern build
 # tools use — replace runs of non-alphanumeric chars with underscores so
@@ -59,7 +59,7 @@ name = "{name}"
 version = "{version}"
 description = "{description}"
 readme = "README.md"
-license = {{ text = "MIT" }}
+license = {{ text = "Apache-2.0" }}
 requires-python = ">=3.9"
 """
 
@@ -113,7 +113,7 @@ Metadata-Version: 2.1
 Name: {name}
 Version: {version}
 Summary: {description}
-License: MIT
+License: Apache-2.0
 Requires-Python: >=3.9
 Description-Content-Type: text/markdown
 
