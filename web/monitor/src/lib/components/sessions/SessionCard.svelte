@@ -30,7 +30,7 @@
 >
   <div class="mv-card-head">
     <div class="mv-card-title-row">
-      <StatusDot status={session.status} endedAt={session.endedAt} />
+      <StatusDot endedAt={session.endedAt} />
       <span class="mv-card-title">{session.title}</span>
     </div>
     <span class="mv-card-time">{fmtRelative(session.endedAt)}</span>

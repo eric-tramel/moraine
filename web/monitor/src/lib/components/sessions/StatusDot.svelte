@@ -1,11 +1,10 @@
 <script lang="ts">
   import { isSessionActive } from '../../utils/sessionFormat';
-  import type { SessionStatus } from '../../types/sessions';
+  import { nowStore } from '../../state/clock';
 
-  export let status: SessionStatus;
   export let endedAt: number;
 
-  $: active = isSessionActive(status, endedAt);
+  $: active = isSessionActive(endedAt, $nowStore);
   $: label = active ? 'active' : 'idle';
 </script>
 

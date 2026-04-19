@@ -9,7 +9,7 @@ Moraine indexes all of your agent harness traces (Claude Code, Codex, Hermes Age
 
 🌝 **You Get**: a unified record of everything they've done across providers. Tools, Tokens, and Talk.
 
-Specifically, Morine provides:
+Specifically, Moraine provides:
 
 - **The Dataplane to Your Agentic Era**: the database is yours, take inspiration from our tooling and schema definitions and build your own apps ontop of moraine's DB.
 - **Agent memory via MCP**: agents search and retrieve context from past conversations
@@ -64,8 +64,7 @@ Use `moraine status --output rich --verbose` for a detailed breakdown.
 
 ## Connect an Agent (MCP)
 
-While Moraine can be used for many purposes, a direct one is the search tooling we've built into a custom
-BM25 search MCP, which will allow your agents to self-review past conversations **across agent harnesses**.
+While Moraine can be used for many purposes, a direct one is the MCP server we've built for agent self-retrieval **across agent harnesses**. It exposes five tools: `search` (BM25 over indexed events), `search_conversations` (session-scoped), `list_sessions`, `get_session`, and `open` (fetch an event and its surrounding window).
 
 To wire it into Claude Code, add this to your `.mcp.json`:
 
@@ -101,7 +100,7 @@ clickhouse client -d moraine
 ```sql
 -- sessions and their row counts
 SELECT session_id, count(*) as events
-FROM conversation_events
+FROM moraine.events
 GROUP BY session_id
 ORDER BY events DESC
 LIMIT 10;
@@ -110,14 +109,14 @@ LIMIT 10;
 SELECT session_id,
        sum(input_tokens) as input,
        sum(output_tokens) as output
-FROM conversation_events
+FROM moraine.events
 WHERE input_tokens > 0
 GROUP BY session_id
 ORDER BY output DESC
 LIMIT 10;
 ```
 
-See `sql/` for the full schema and view definitions.
+The primary table is `moraine.events`; `moraine.raw_events` holds the untransformed source rows. Convenience views include `v_conversation_trace`, `v_turn_summary`, and `v_session_summary`. See `sql/` for the full schema and view definitions.
 
 ## Watched Sources
 
@@ -127,6 +126,8 @@ By default, Moraine watches:
 |---|---|
 | Codex | `~/.codex/sessions/**/*.jsonl` |
 | Claude Code | `~/.claude/projects/**/*.jsonl` |
+| Hermes (live sessions) | `~/.hermes/sessions/session_*.json` |
+| Hermes (trajectories) | user-defined, opt-in |
 
 Configurable in `~/.moraine/config.toml` under `[[ingest.sources]]`.
 

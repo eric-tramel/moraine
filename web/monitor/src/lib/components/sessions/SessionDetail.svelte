@@ -39,7 +39,7 @@
 <div class="mv-detail mv-detail-{layout}">
   <div class="mv-detail-head">
     <div class="mv-detail-titlerow">
-      <StatusDot status={session.status} endedAt={session.endedAt} />
+      <StatusDot endedAt={session.endedAt} />
       <h3 class="mv-detail-title">{session.title}</h3>
       <div class="mv-viz-toggle" role="group" aria-label="Detail view">
         <button

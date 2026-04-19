@@ -61,6 +61,8 @@ export function summarizeArgs(args: Record<string, unknown> | undefined | null):
     .join(', ');
 }
 
-export function isSessionActive(status: string, endedAt: number, now: number = Date.now()): boolean {
-  return status === 'active' || now - endedAt < 60_000;
+export const ACTIVE_WINDOW_MS = 60_000;
+
+export function isSessionActive(endedAt: number, now: number = Date.now()): boolean {
+  return now - endedAt < ACTIVE_WINDOW_MS;
 }
