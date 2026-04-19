@@ -66,6 +66,7 @@ pub async fn run_server(
         .route("/api/tables", get(api_tables))
         .route("/api/web-searches", get(api_web_searches))
         .route("/api/tables/:table", get(api_table_rows))
+        .route("/api/sessions", get(api_sessions))
         .fallback(get(static_fallback))
         .with_state(state.clone());
 
@@ -658,6 +659,470 @@ async fn api_analytics(
         }),
         StatusCode::OK,
     )
+}
+
+#[derive(Deserialize)]
+struct SessionsQuery {
+    limit: Option<u32>,
+    since: Option<String>,
+}
+
+async fn api_sessions(
+    Query(params): Query<SessionsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let limit = params.limit.unwrap_or(50).clamp(1, 200);
+    let since = params.since.as_deref().unwrap_or("30d");
+
+    let since_seconds: u64 = match since {
+        "1h" => 60 * 60,
+        "6h" => 6 * 60 * 60,
+        "24h" => 24 * 60 * 60,
+        "7d" => 7 * 24 * 60 * 60,
+        "30d" => 30 * 24 * 60 * 60,
+        "90d" => 90 * 24 * 60 * 60,
+        "all" => 0,
+        _ => 30 * 24 * 60 * 60,
+    };
+
+    match build_sessions_payload(&state, limit, since_seconds).await {
+        Ok(payload) => json_response(payload, StatusCode::OK),
+        Err(error) => json_response(
+            json!({"ok": false, "error": format!("sessions query failed: {error}")}),
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct SessionSummaryRow {
+    session_id: String,
+    harness: String,
+    source_name: String,
+    started_at_ms: i64,
+    ended_at_ms: i64,
+    models_blob: String,
+    trace_id: String,
+    first_user_text: String,
+}
+
+#[derive(serde::Deserialize)]
+struct SessionEventRow {
+    session_id: String,
+    event_ts_ms: i64,
+    event_kind: String,
+    actor_kind: String,
+    payload_type: String,
+    tool_name: String,
+    tool_call_id: String,
+    tool_error: u8,
+    latency_ms: u32,
+    model: String,
+    input_tokens: u32,
+    output_tokens: u32,
+    cache_read_tokens: u32,
+    cache_write_tokens: u32,
+    text_preview: String,
+    text_content: String,
+    tool_args_json: String,
+}
+
+async fn build_sessions_payload(state: &AppState, limit: u32, since_seconds: u64) -> Result<Value> {
+    let database = &state.clickhouse.config().database;
+    let events_table = format!(
+        "{}.{}",
+        escape_identifier(database),
+        escape_identifier("events")
+    );
+
+    let recency_filter = if since_seconds == 0 {
+        String::new()
+    } else {
+        format!(" AND event_ts >= now() - INTERVAL {} SECOND", since_seconds)
+    };
+
+    let summary_query = format!(
+        "SELECT \
+            session_id, \
+            any(harness) AS harness, \
+            any(source_name) AS source_name, \
+            toInt64(toUnixTimestamp64Milli(min(event_ts))) AS started_at_ms, \
+            toInt64(toUnixTimestamp64Milli(max(event_ts))) AS ended_at_ms, \
+            arrayStringConcat( \
+                arrayFilter(m -> length(m) > 0, \
+                    groupUniqArray(lowerUTF8(trim(BOTH ' ' FROM model)))), \
+                '\u{1f}' \
+            ) AS models_blob, \
+            any(if(length(trim(BOTH ' ' FROM trace_id)) > 0, trace_id, '')) AS trace_id, \
+            argMin( \
+                if(length(text_content) > 0, substring(text_content, 1, 400), substring(text_preview, 1, 400)), \
+                if(event_kind = 'message' AND actor_kind = 'user', event_ts, toDateTime64('2099-01-01', 3)) \
+            ) AS first_user_text \
+         FROM {events_table} \
+         WHERE length(trim(BOTH ' ' FROM session_id)) > 0{recency_filter} \
+         GROUP BY session_id \
+         ORDER BY ended_at_ms DESC \
+         LIMIT {limit}"
+    );
+
+    let summary_rows = state
+        .clickhouse
+        .query_rows::<SessionSummaryRow>(&summary_query, None)
+        .await?;
+
+    if summary_rows.is_empty() {
+        return Ok(json!({"ok": true, "sessions": []}));
+    }
+
+    let session_ids: Vec<String> = summary_rows.iter().map(|r| r.session_id.clone()).collect();
+    let id_list = session_ids
+        .iter()
+        .map(|id| format!("'{}'", escape_literal(id)))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let events_query = format!(
+        "SELECT \
+            session_id, \
+            toInt64(toUnixTimestamp64Milli(event_ts)) AS event_ts_ms, \
+            event_kind, \
+            actor_kind, \
+            payload_type, \
+            tool_name, \
+            tool_call_id, \
+            tool_error, \
+            latency_ms, \
+            model, \
+            input_tokens, \
+            output_tokens, \
+            cache_read_tokens, \
+            cache_write_tokens, \
+            substring(text_preview, 1, 2000) AS text_preview, \
+            substring(text_content, 1, 2000) AS text_content, \
+            if(event_kind = 'tool_call', substring(JSONExtractRaw(payload_json, 'input'), 1, 2000), '') AS tool_args_json \
+         FROM {events_table} \
+         WHERE session_id IN ({id_list}) \
+         ORDER BY session_id, event_ts, source_file, source_generation, source_offset, source_line_no"
+    );
+
+    let event_rows = state
+        .clickhouse
+        .query_rows::<SessionEventRow>(&events_query, None)
+        .await?;
+
+    let mut events_by_session: HashMap<String, Vec<SessionEventRow>> = HashMap::new();
+    for row in event_rows {
+        events_by_session
+            .entry(row.session_id.clone())
+            .or_default()
+            .push(row);
+    }
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    let sessions: Vec<Value> = summary_rows
+        .into_iter()
+        .map(|summary| {
+            let events = events_by_session
+                .remove(&summary.session_id)
+                .unwrap_or_default();
+            build_session_json(summary, events, now_ms)
+        })
+        .collect();
+
+    Ok(json!({"ok": true, "sessions": sessions}))
+}
+
+fn build_session_json(
+    summary: SessionSummaryRow,
+    events: Vec<SessionEventRow>,
+    now_ms: i64,
+) -> Value {
+    let duration_ms = (summary.ended_at_ms - summary.started_at_ms).max(0);
+
+    let status = if now_ms - summary.ended_at_ms < 60_000 {
+        "active"
+    } else {
+        "completed"
+    };
+
+    let models: Vec<String> = if summary.models_blob.is_empty() {
+        Vec::new()
+    } else {
+        summary
+            .models_blob
+            .split('\u{1f}')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect()
+    };
+
+    let title = derive_title(&summary.first_user_text);
+
+    let turns = build_turns(&events);
+    let total_tokens: u64 = turns
+        .iter()
+        .map(|t| t.get("totalTokens").and_then(|v| v.as_u64()).unwrap_or(0))
+        .sum();
+    let total_tool_calls: u64 = turns
+        .iter()
+        .map(|t| t.get("toolCalls").and_then(|v| v.as_u64()).unwrap_or(0))
+        .sum();
+
+    let harness = harness_descriptor(&summary.harness, &summary.source_name);
+
+    json!({
+        "id": summary.session_id,
+        "title": title,
+        "harness": harness,
+        "startedAt": summary.started_at_ms,
+        "endedAt": summary.ended_at_ms,
+        "durationMs": duration_ms,
+        "status": status,
+        "models": models,
+        "turns": turns,
+        "totalTokens": total_tokens,
+        "totalToolCalls": total_tool_calls,
+        "tags": Vec::<String>::new(),
+        "traceId": summary.trace_id,
+    })
+}
+
+fn derive_title(first_user_text: &str) -> String {
+    let trimmed = first_user_text.trim();
+    if trimmed.is_empty() {
+        return "(untitled session)".to_string();
+    }
+
+    let first_line = trimmed.lines().next().unwrap_or(trimmed);
+    let clean = first_line.trim();
+    let max_chars = 120;
+    let char_count = clean.chars().count();
+    if char_count <= max_chars {
+        clean.to_string()
+    } else {
+        let truncated: String = clean.chars().take(max_chars).collect();
+        format!("{truncated}\u{2026}")
+    }
+}
+
+fn harness_descriptor(harness_id: &str, source_name: &str) -> Value {
+    let id = if harness_id.trim().is_empty() {
+        source_name.trim()
+    } else {
+        harness_id.trim()
+    };
+    let id = if id.is_empty() { "unknown" } else { id };
+    let label = id.to_string();
+    let short: String = id
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .take(2)
+        .filter_map(|part| part.chars().next())
+        .collect::<String>()
+        .to_uppercase();
+    let short = if short.is_empty() {
+        id.chars().take(2).collect::<String>().to_uppercase()
+    } else {
+        short
+    };
+
+    let hue = hue_for_label(id);
+
+    json!({
+        "id": id,
+        "label": label,
+        "short": short,
+        "hue": hue,
+    })
+}
+
+fn hue_for_label(label: &str) -> u32 {
+    match label {
+        "claude-code" => 25,
+        "codex" => 150,
+        "hermes" => 265,
+        "cursor" => 200,
+        "aider" => 340,
+        "continue" => 100,
+        "cli" => 60,
+        _ => {
+            let mut hash: u32 = 0;
+            for byte in label.bytes() {
+                hash = hash.wrapping_mul(31).wrapping_add(byte as u32);
+            }
+            hash % 360
+        }
+    }
+}
+
+fn build_turns(events: &[SessionEventRow]) -> Vec<Value> {
+    struct TurnBuilder {
+        idx: u32,
+        model: String,
+        started_at: i64,
+        ended_at: i64,
+        steps: Vec<Value>,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        tool_calls: u64,
+    }
+
+    if events.is_empty() {
+        return Vec::new();
+    }
+
+    let mut turns: Vec<TurnBuilder> = Vec::new();
+    let mut current: Option<TurnBuilder> = None;
+    let mut open_tool_calls: HashMap<String, usize> = HashMap::new();
+
+    for event in events {
+        let starts_new_turn = event.event_kind == "message" && event.actor_kind == "user";
+
+        if starts_new_turn {
+            if let Some(finished) = current.take() {
+                turns.push(finished);
+            }
+            current = Some(TurnBuilder {
+                idx: turns.len() as u32,
+                model: String::new(),
+                started_at: event.event_ts_ms,
+                ended_at: event.event_ts_ms,
+                steps: Vec::new(),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+            });
+            open_tool_calls.clear();
+        }
+
+        let turn = match current.as_mut() {
+            Some(t) => t,
+            None => continue,
+        };
+
+        turn.ended_at = turn.ended_at.max(event.event_ts_ms);
+        turn.prompt_tokens += (event.input_tokens + event.cache_read_tokens) as u64;
+        turn.completion_tokens += (event.output_tokens + event.cache_write_tokens) as u64;
+        if !event.model.trim().is_empty() && turn.model.is_empty() {
+            turn.model = event.model.trim().to_string();
+        }
+
+        match (
+            event.event_kind.as_str(),
+            event.actor_kind.as_str(),
+            event.payload_type.as_str(),
+        ) {
+            ("message", "user", _) => {
+                turn.steps.push(json!({
+                    "kind": "user",
+                    "at": event.event_ts_ms,
+                    "text": preferred_text(event),
+                }));
+            }
+            ("message", "assistant", _) | (_, "assistant", "text") => {
+                turn.steps.push(json!({
+                    "kind": "assistant",
+                    "at": event.event_ts_ms,
+                    "text": preferred_text(event),
+                    "tokens": event.output_tokens,
+                }));
+            }
+            ("reasoning", _, _) | (_, _, "thinking") => {
+                let text = preferred_text(event);
+                if !text.is_empty() {
+                    turn.steps.push(json!({
+                        "kind": "thinking",
+                        "at": event.event_ts_ms,
+                        "text": text,
+                    }));
+                }
+            }
+            ("tool_call", _, _) | (_, _, "tool_use") => {
+                turn.tool_calls += 1;
+                let step_index = turn.steps.len();
+                if !event.tool_call_id.is_empty() {
+                    open_tool_calls.insert(event.tool_call_id.clone(), step_index);
+                }
+                let args = if event.tool_args_json.trim().is_empty() {
+                    Value::Object(Default::default())
+                } else {
+                    serde_json::from_str::<Value>(&event.tool_args_json)
+                        .unwrap_or_else(|_| Value::Object(Default::default()))
+                };
+                turn.steps.push(json!({
+                    "kind": "tool_call",
+                    "at": event.event_ts_ms,
+                    "tool": if event.tool_name.is_empty() { "tool".to_string() } else { event.tool_name.clone() },
+                    "args": args,
+                    "latencyMs": event.latency_ms,
+                    "result": "",
+                    "resultAt": event.event_ts_ms,
+                    "status": if event.tool_error != 0 { "error" } else { "ok" },
+                    "callId": event.tool_call_id,
+                }));
+            }
+            ("tool_result", _, _) | (_, "tool", "tool_result") => {
+                let result_text = preferred_text(event);
+                if let Some(&step_index) = open_tool_calls.get(&event.tool_call_id) {
+                    if let Some(step) = turn.steps.get_mut(step_index) {
+                        if let Some(obj) = step.as_object_mut() {
+                            let call_at = obj
+                                .get("at")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(event.event_ts_ms);
+                            obj.insert("resultAt".into(), json!(event.event_ts_ms));
+                            obj.insert(
+                                "latencyMs".into(),
+                                json!((event.event_ts_ms - call_at).max(0) as u32),
+                            );
+                            obj.insert("result".into(), json!(result_text));
+                            if event.tool_error != 0 {
+                                obj.insert("status".into(), json!("error"));
+                            }
+                        }
+                    }
+                    open_tool_calls.remove(&event.tool_call_id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(finished) = current.take() {
+        turns.push(finished);
+    }
+
+    turns
+        .into_iter()
+        .map(|builder| {
+            let duration = (builder.ended_at - builder.started_at).max(0);
+            let total = builder.prompt_tokens + builder.completion_tokens;
+            json!({
+                "idx": builder.idx,
+                "model": builder.model,
+                "startedAt": builder.started_at,
+                "endedAt": builder.ended_at,
+                "durationMs": duration,
+                "promptTokens": builder.prompt_tokens,
+                "completionTokens": builder.completion_tokens,
+                "totalTokens": total,
+                "toolCalls": builder.tool_calls,
+                "steps": builder.steps,
+            })
+        })
+        .collect()
+}
+
+fn preferred_text(event: &SessionEventRow) -> String {
+    if !event.text_content.trim().is_empty() {
+        event.text_content.trim().to_string()
+    } else {
+        event.text_preview.trim().to_string()
+    }
 }
 
 async fn query_table_summaries(state: &AppState) -> Result<Vec<TableSummary>> {

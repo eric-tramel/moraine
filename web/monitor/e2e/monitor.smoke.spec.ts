@@ -71,46 +71,8 @@ test('loads dashboard and handles core interactions', async ({ page }) => {
     });
   });
 
-  await page.route('**/api/tables', async (route) => {
-    await route.fulfill({
-      json: {
-        ok: true,
-        tables: [
-          { name: 'events', engine: 'MergeTree', is_temporary: 0, rows: 1234 },
-          { name: 'ingest_heartbeats', engine: 'MergeTree', is_temporary: 0, rows: 15 },
-        ],
-      },
-    });
-  });
-
-  await page.route('**/api/tables/events?limit=*', async (route) => {
-    await route.fulfill({
-      json: {
-        ok: true,
-        table: 'events',
-        limit: 25,
-        schema: [
-          { name: 'event_ts', type: 'DateTime', default_expression: '' },
-          { name: 'model', type: 'String', default_expression: '' },
-        ],
-        rows: [{ event_ts: '2026-02-16 01:02:03', model: 'gpt-5.3-codex-xhigh' }],
-      },
-    });
-  });
-
-  await page.route('**/api/web-searches?limit=*', async (route) => {
-    await route.fulfill({
-      json: {
-        ok: true,
-        table: 'web_searches',
-        limit: 25,
-        schema: [
-          { name: 'search_query', type: 'String', default_expression: '' },
-          { name: 'result_url', type: 'String', default_expression: '' },
-        ],
-        rows: [{ search_query: 'bun typescript vite', result_url: 'https://example.com' }],
-      },
-    });
+  await page.route('**/api/sessions', async (route) => {
+    await route.fulfill({ status: 404, body: 'not found' });
   });
 
   await page.route('**/api/analytics?range=*', async (route) => {
@@ -125,21 +87,49 @@ test('loads dashboard and handles core interactions', async ({ page }) => {
   await page.goto('/');
 
   await expect(page.getByRole('heading', { name: 'Moraine Monitor' })).toBeVisible();
-  await expect(page.locator('#healthCard .card')).toHaveCount(5);
-  await expect(page.locator('#ingestorCard .card').first()).toContainText('Healthy');
 
-  await page.selectOption('#tableSelect', 'web_searches');
-  await expect(page.locator('#tableTitle')).toContainText('Table: web_searches');
-  await expect(page.locator('#previewBody')).toContainText('bun typescript vite');
+  await expect(page.locator('#healthGroup')).toContainText('ClickHouse');
+  await expect(page.locator('#healthGroup')).toContainText('127.0.0.1:8123');
+  await expect(page.locator('#healthGroup')).toContainText('moraine');
+  await expect(page.locator('#ingestorGroup')).toContainText('healthy');
 
-  await page.selectOption('#rowLimit', '50');
-  await expect(page.locator('#rowLimit')).toHaveValue('50');
-
-  await page.getByRole('button', { name: '7d' }).click();
+  await page.locator('#analyticsRanges').getByRole('button', { name: '7d' }).click();
   await expect(page.locator('#analyticsMeta')).toContainText('Last 7d');
 
+  // Sessions panel (mock fallback) renders cards
+  await expect(page.locator('#sessionsPanel')).toBeVisible();
+  await expect(page.locator('.mv-card').first()).toBeVisible();
+
+  // Clicking a card opens the side panel with detail (transcript is default)
+  await page.locator('.mv-card').first().click();
+  await expect(page.locator('.mv-sidepanel')).toBeVisible();
+  await expect(page.locator('.mv-nodes')).toBeVisible();
+
+  // Toggle to flamegraph view
+  await page.locator('.mv-viz-toggle button', { hasText: 'flamegraph' }).click();
+  await expect(page.locator('.mv-turnblock').first()).toBeVisible();
+
+  // Back to transcript
+  await page.locator('.mv-viz-toggle button', { hasText: 'transcript' }).click();
+  await expect(page.locator('.mv-nodes')).toBeVisible();
+
+  await page.locator('.mv-sidepanel .mv-iconbtn').click();
+  await expect(page.locator('.mv-sidepanel')).toHaveCount(0);
+
+  // Filter bar: searching narrows results
+  const counter = page.locator('.mv-filter-count');
+  const totalText = (await counter.textContent()) ?? '';
+  const totalMatch = totalText.match(/\d+\s*\/\s*(\d+)/);
+  expect(totalMatch).not.toBeNull();
+
+  await page.locator('.mv-search-input').fill('nothing-should-match-xyz');
+  await expect(page.locator('.mv-empty')).toContainText('No sessions match');
+  await page.locator('.mv-search-clear').click();
+
+  // Theme segmented switch
   const htmlThemeBefore = await page.locator('html').getAttribute('data-theme');
-  await page.locator('#themeToggle').click();
+  const otherTheme = htmlThemeBefore === 'dark' ? 'light' : 'dark';
+  await page.locator(otherTheme === 'dark' ? '#themeDark' : '#themeLight').click();
   const htmlThemeAfter = await page.locator('html').getAttribute('data-theme');
-  expect(htmlThemeAfter).not.toBe(htmlThemeBefore);
+  expect(htmlThemeAfter).toBe(otherTheme);
 });
