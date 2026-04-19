@@ -11,7 +11,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-usage: scripts/ci/assert-sdist-refuses.sh <path/to/moraine-X.Y.Z.tar.gz>
+usage: scripts/ci/assert-sdist-refuses.sh <path/to/moraine_cli-X.Y.Z.tar.gz>
 EOF
 }
 
@@ -33,9 +33,9 @@ trap 'rm -rf "$venv_dir" "$log"' EXIT
 python3 -m venv "$venv_dir"
 "$venv_dir/bin/pip" install --quiet --upgrade pip >/dev/null
 
-# Must fail. `--no-binary moraine` forces pip to build from the sdist
-# rather than picking up a cached wheel.
-if "$venv_dir/bin/pip" install --no-binary moraine "$sdist" >"$log" 2>&1; then
+# Must fail. `--no-binary moraine-cli` forces pip to build from the
+# sdist rather than picking up a cached wheel.
+if "$venv_dir/bin/pip" install --no-binary moraine-cli "$sdist" >"$log" 2>&1; then
   echo "ERROR: sdist install should have failed but succeeded" >&2
   cat "$log" >&2
   exit 1

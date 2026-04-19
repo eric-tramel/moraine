@@ -32,8 +32,15 @@ import tarfile
 import time
 from pathlib import Path
 
-PACKAGE_NAME = "moraine"
+PACKAGE_NAME = "moraine-cli"
 DESCRIPTION = "Moraine \u2014 unified trace indexer and MCP server for Claude Code / Codex"
+
+# Sdist filenames follow the same PEP 427-style escaping modern build
+# tools use — replace runs of non-alphanumeric chars with underscores so
+# the archive name parses as {distribution}-{version}.tar.gz without
+# ambiguity (`moraine-cli-0.4.1` otherwise reads as distribution
+# `moraine` + version `cli-0.4.1`).
+SDIST_DISTRIBUTION_NAME = re.sub(r"[^A-Za-z0-9.]+", "_", PACKAGE_NAME)
 
 REFUSAL_MESSAGE = (
     "moraine ships as prebuilt binary wheels only. Install via a "
@@ -144,7 +151,7 @@ def build_sdist(*, version: str, out_dir: Path) -> Path:
     version = _normalize_version(version)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    sdist_root = f"{PACKAGE_NAME}-{version}"
+    sdist_root = f"{SDIST_DISTRIBUTION_NAME}-{version}"
     sdist_name = f"{sdist_root}.tar.gz"
     sdist_path = out_dir / sdist_name
     if sdist_path.exists():
