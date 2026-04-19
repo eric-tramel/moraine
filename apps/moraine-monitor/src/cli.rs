@@ -32,12 +32,27 @@ fn source_tree_static_dir() -> PathBuf {
         .join("dist")
 }
 
-fn default_static_dir() -> PathBuf {
-    if let Ok(value) = std::env::var("MORAINE_MONITOR_STATIC_DIR") {
-        let configured = PathBuf::from(value);
-        if configured.exists() {
-            return configured;
+const MONITOR_DIST_ENV_KEYS: &[&str] = &["MORAINE_MONITOR_DIST", "MORAINE_MONITOR_STATIC_DIR"];
+
+fn env_override_static_dir_with_keys(keys: &[&str]) -> Option<PathBuf> {
+    for key in keys {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let configured = PathBuf::from(trimmed);
+            if configured.exists() {
+                return Some(configured);
+            }
         }
+    }
+    None
+}
+
+fn default_static_dir() -> PathBuf {
+    if let Some(configured) = env_override_static_dir_with_keys(MONITOR_DIST_ENV_KEYS) {
+        return configured;
     }
 
     if let Ok(exe) = std::env::current_exe() {
@@ -109,7 +124,7 @@ pub fn parse_args() -> CliArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::find_monitor_dir;
+    use super::{env_override_static_dir_with_keys, find_monitor_dir};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -151,5 +166,40 @@ mod tests {
         assert_eq!(found, None);
 
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn env_override_returns_path_when_set_and_exists() {
+        let root = temp_root("env-override-primary");
+        let env_key = "MORAINE_MONITOR_DIST_TEST_PRIMARY";
+        std::env::set_var(env_key, root.to_string_lossy().to_string());
+
+        let found = env_override_static_dir_with_keys(&[env_key]);
+
+        std::env::remove_var(env_key);
+        fs::remove_dir_all(&root).ok();
+        assert_eq!(found, Some(root));
+    }
+
+    #[test]
+    fn env_override_none_when_unset() {
+        let found = env_override_static_dir_with_keys(&["MORAINE_MONITOR_DIST_TEST_UNSET_KEY"]);
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn env_override_skips_missing_path_and_falls_through_to_alias() {
+        let root = temp_root("env-override-alias");
+        let primary = "MORAINE_MONITOR_DIST_TEST_ALIAS_PRIMARY";
+        let alias = "MORAINE_MONITOR_DIST_TEST_ALIAS_SECONDARY";
+        std::env::set_var(primary, "/tmp/moraine-monitor-dist-definitely-missing");
+        std::env::set_var(alias, root.to_string_lossy().to_string());
+
+        let found = env_override_static_dir_with_keys(&[primary, alias]);
+
+        std::env::remove_var(primary);
+        std::env::remove_var(alias);
+        fs::remove_dir_all(&root).ok();
+        assert_eq!(found, Some(root));
     }
 }

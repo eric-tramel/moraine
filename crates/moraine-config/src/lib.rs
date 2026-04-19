@@ -513,10 +513,13 @@ fn repo_default_config_path() -> PathBuf {
     PathBuf::from("config/moraine.toml")
 }
 
+const DEFAULT_CONFIG_ENV_KEYS: &[&str] = &["MORAINE_DEFAULT_CONFIG"];
+
 fn resolve_config_path_with_overrides(
     raw_path: Option<PathBuf>,
     env_keys: &[&str],
     home_path: Option<PathBuf>,
+    default_env_keys: &[&str],
     repo_default: PathBuf,
 ) -> PathBuf {
     if let Some(path) = raw_path {
@@ -538,6 +541,19 @@ fn resolve_config_path_with_overrides(
         }
     }
 
+    for key in default_env_keys {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let candidate = PathBuf::from(trimmed);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+
     if repo_default.exists() {
         return repo_default;
     }
@@ -550,6 +566,7 @@ pub fn resolve_config_path(raw_path: Option<PathBuf>) -> PathBuf {
         raw_path,
         &["MORAINE_CONFIG"],
         home_config_path(),
+        DEFAULT_CONFIG_ENV_KEYS,
         repo_default_config_path(),
     )
 }
@@ -559,6 +576,7 @@ pub fn resolve_mcp_config_path(raw_path: Option<PathBuf>) -> PathBuf {
         raw_path,
         &["MORAINE_MCP_CONFIG", "MORAINE_CONFIG"],
         home_config_path(),
+        DEFAULT_CONFIG_ENV_KEYS,
         repo_default_config_path(),
     )
 }
@@ -568,6 +586,7 @@ pub fn resolve_monitor_config_path(raw_path: Option<PathBuf>) -> PathBuf {
         raw_path,
         &["MORAINE_MONITOR_CONFIG", "MORAINE_CONFIG"],
         home_config_path(),
+        DEFAULT_CONFIG_ENV_KEYS,
         repo_default_config_path(),
     )
 }
@@ -577,6 +596,7 @@ pub fn resolve_ingest_config_path(raw_path: Option<PathBuf>) -> PathBuf {
         raw_path,
         &["MORAINE_INGEST_CONFIG", "MORAINE_CONFIG"],
         home_config_path(),
+        DEFAULT_CONFIG_ENV_KEYS,
         repo_default_config_path(),
     )
 }
@@ -663,6 +683,7 @@ mod tests {
             raw,
             &["MORAINE_CONFIG"],
             Some(PathBuf::from("/tmp/home.toml")),
+            &[],
             PathBuf::from("/tmp/repo.toml"),
         );
         assert_eq!(chosen, PathBuf::from("/tmp/cli.toml"));
@@ -701,6 +722,7 @@ mod tests {
             None,
             &[env_key],
             Some(PathBuf::from("/tmp/from-home.toml")),
+            &[],
             PathBuf::from("/tmp/from-repo.toml"),
         );
 
@@ -717,11 +739,103 @@ mod tests {
             None,
             &["MORAINE_CONFIG_TEST_DOES_NOT_EXIST"],
             Some(PathBuf::from("/tmp/definitely-missing-home.toml")),
+            &[],
             repo_default.clone(),
         );
 
         std::fs::remove_file(&repo_default).ok();
         assert_eq!(chosen, repo_default);
+    }
+
+    #[test]
+    fn default_env_used_when_home_missing_and_path_exists() {
+        let default_path = std::env::temp_dir().join(format!(
+            "moraine-default-config-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::write(&default_path, "x=1").expect("write default");
+        let env_key = "MORAINE_DEFAULT_CONFIG_TEST_EXISTS";
+        std::env::set_var(env_key, default_path.to_string_lossy().to_string());
+
+        let chosen = resolve_config_path_with_overrides(
+            None,
+            &["MORAINE_CONFIG_TEST_DOES_NOT_EXIST"],
+            Some(PathBuf::from("/tmp/definitely-missing-home.toml")),
+            &[env_key],
+            PathBuf::from("/tmp/definitely-missing-repo-default.toml"),
+        );
+
+        std::env::remove_var(env_key);
+        std::fs::remove_file(&default_path).ok();
+        assert_eq!(chosen, default_path);
+    }
+
+    #[test]
+    fn default_env_skipped_when_path_missing() {
+        let repo_default = std::env::temp_dir().join(format!(
+            "moraine-default-repo-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::write(&repo_default, "x=1").expect("write repo default");
+        let env_key = "MORAINE_DEFAULT_CONFIG_TEST_MISSING";
+        std::env::set_var(env_key, "/tmp/definitely-missing-default.toml");
+
+        let chosen = resolve_config_path_with_overrides(
+            None,
+            &["MORAINE_CONFIG_TEST_DOES_NOT_EXIST"],
+            Some(PathBuf::from("/tmp/definitely-missing-home.toml")),
+            &[env_key],
+            repo_default.clone(),
+        );
+
+        std::env::remove_var(env_key);
+        std::fs::remove_file(&repo_default).ok();
+        assert_eq!(chosen, repo_default);
+    }
+
+    #[test]
+    fn default_env_does_not_override_home_when_home_exists() {
+        let home_path = std::env::temp_dir().join(format!(
+            "moraine-default-home-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let default_path = std::env::temp_dir().join(format!(
+            "moraine-default-lower-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::write(&home_path, "x=1").expect("write home");
+        std::fs::write(&default_path, "x=1").expect("write default");
+        let env_key = "MORAINE_DEFAULT_CONFIG_TEST_NOT_HIGHER";
+        std::env::set_var(env_key, default_path.to_string_lossy().to_string());
+
+        let chosen = resolve_config_path_with_overrides(
+            None,
+            &["MORAINE_CONFIG_TEST_DOES_NOT_EXIST"],
+            Some(home_path.clone()),
+            &[env_key],
+            PathBuf::from("/tmp/definitely-missing-repo-default.toml"),
+        );
+
+        std::env::remove_var(env_key);
+        std::fs::remove_file(&home_path).ok();
+        std::fs::remove_file(&default_path).ok();
+        assert_eq!(chosen, home_path);
     }
 
     #[test]

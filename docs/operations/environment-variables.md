@@ -12,9 +12,11 @@ These variables affect runtime behavior of `moraine`, `moraine-ingest`, `moraine
 | `MORAINE_MCP_CONFIG` | MCP service | MCP config override. Falls back to `MORAINE_CONFIG` if unset. |
 | `MORAINE_MONITOR_CONFIG` | Monitor service | Monitor config override. Falls back to `MORAINE_CONFIG` if unset. |
 | `MORAINE_INGEST_CONFIG` | Ingest service | Ingest config override. Falls back to `MORAINE_CONFIG` if unset. |
+| `MORAINE_DEFAULT_CONFIG` | All services | Lowest-precedence fallback config path, consulted below `~/.moraine/config.toml` and above the compiled-in default. Only honored when the referenced file exists. Intended for package-manager distributions (e.g. the `uv tool install moraine` wheel) that ship a bundled default. |
 | `MORAINE_SERVICE_BIN_DIR` | `moraine` process manager | Overrides the directory probed for service binaries (`moraine-ingest`, `moraine-monitor`, `moraine-mcp`). |
 | `MORAINE_SOURCE_TREE_MODE` | `moraine` process manager | When truthy (`1`, `true`, `yes`, `on`), allows source-tree fallback probes (for example `target/debug/*`) when service binaries are not found in installed locations. |
-| `MORAINE_MONITOR_STATIC_DIR` | Monitor static asset resolution | Overrides monitor static asset directory when the given path exists. |
+| `MORAINE_MONITOR_DIST` | Monitor static asset resolution | Overrides the monitor static asset directory (normally `web/monitor/dist`) when the given path exists. Canonical name used by the `uv tool install moraine` wheel shim. Takes precedence over `MORAINE_MONITOR_STATIC_DIR`. |
+| `MORAINE_MONITOR_STATIC_DIR` | Monitor static asset resolution | Legacy alias for `MORAINE_MONITOR_DIST`. Honored when set and the path exists; prefer `MORAINE_MONITOR_DIST` in new configurations. |
 
 ## Installer (`scripts/install.sh`)
 

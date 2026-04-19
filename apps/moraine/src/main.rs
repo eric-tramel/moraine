@@ -1342,11 +1342,19 @@ fn monitor_dist_candidate(root: &Path) -> PathBuf {
     root.join("web").join("monitor").join("dist")
 }
 
+const MONITOR_DIST_ENV_KEYS: &[&str] = &["MORAINE_MONITOR_DIST", "MORAINE_MONITOR_STATIC_DIR"];
+
 fn resolve_monitor_static_dir(paths: &RuntimePaths) -> Option<PathBuf> {
-    if let Ok(value) = std::env::var("MORAINE_MONITOR_STATIC_DIR") {
-        let path = PathBuf::from(value);
-        if path.exists() {
-            return Some(path);
+    for key in MONITOR_DIST_ENV_KEYS {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let path = PathBuf::from(trimmed);
+            if path.exists() {
+                return Some(path);
+            }
         }
     }
 

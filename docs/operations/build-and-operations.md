@@ -89,9 +89,12 @@ Use one shared config schema at `config/moraine.toml`.
 Resolution precedence:
 
 1. `--config <path>`
-2. env override (`MORAINE_CONFIG`, plus `MORAINE_MCP_CONFIG` for MCP)
+2. env override (`MORAINE_CONFIG`, plus `MORAINE_MCP_CONFIG` for MCP, `MORAINE_MONITOR_CONFIG` for monitor, `MORAINE_INGEST_CONFIG` for ingest)
 3. `~/.moraine/config.toml` (if present)
-4. repo default `config/moraine.toml`
+4. `MORAINE_DEFAULT_CONFIG` fallback (if set and the referenced file exists) — packaging hook used by the `uv tool install moraine` wheel to point at its bundled default
+5. repo default `config/moraine.toml`
+
+The monitor binary resolves its static asset directory (`web/monitor/dist`) in this order: `--static-dir`, then `MORAINE_MONITOR_DIST` (canonical) or `MORAINE_MONITOR_STATIC_DIR` (legacy alias), then install-dir relative, then source-tree fallback. The `uv tool install moraine` wheel sets `MORAINE_MONITOR_DIST` in its exec shim so the bundled bytes are used without relying on path conventions.
 
 ## Start stack
 
