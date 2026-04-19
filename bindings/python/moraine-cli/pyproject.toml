@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "moraine"
+dynamic = ["version"]
+description = "Moraine — unified trace indexer and MCP server for Claude Code / Codex"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [{ name = "Moraine Maintainers" }]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+  "Topic :: Software Development :: Libraries",
+]
+keywords = ["moraine", "claude-code", "codex", "mcp", "telemetry", "observability"]
+
+[project.scripts]
+moraine = "moraine_cli:_moraine_main"
+moraine-ingest = "moraine_cli:_moraine_ingest_main"
+moraine-monitor = "moraine_cli:_moraine_monitor_main"
+moraine-mcp = "moraine_cli:_moraine_mcp_main"
+
+[project.urls]
+Homepage = "https://github.com/eric-tramel/moraine"
+Issues = "https://github.com/eric-tramel/moraine/issues"
+Repository = "https://github.com/eric-tramel/moraine"
+
+# Hatchling is used only for the sdist + wheel *metadata* plumbing required by
+# pyproject.toml. Actual platform wheels are assembled by
+# scripts/build-python-wheels.py out of moraine-bundle-<target>.tar.gz
+# artifacts — see RFC #219 and issue #223. `pip install moraine --no-binary`
+# is explicitly rejected via scripts/build-python-sdist.py.
+[tool.hatch.version]
+path = "moraine_cli/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["moraine_cli"]
