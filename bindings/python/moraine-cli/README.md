@@ -1,13 +1,20 @@
-# moraine (PyPI distribution)
+# moraine-cli (PyPI distribution)
 
 This directory packages the Moraine CLI binaries as platform-tagged Python
 wheels so they can be installed with:
 
 ```bash
-uv tool install moraine
+uv tool install moraine-cli
 # or
-uvx moraine --help
+uvx --from moraine-cli moraine --help
 ```
+
+The PyPI distribution name is `moraine-cli` because the shorter
+`moraine` is already taken on PyPI by an unrelated InSAR postprocessing
+tool. The command-line entry points installed by the wheel are the
+original short names — `moraine`, `moraine-ingest`, `moraine-monitor`,
+`moraine-mcp` — so after `uv tool install moraine-cli` you still run
+`moraine up` the same as before.
 
 The wheel contains **prebuilt binaries** — the exec-shim package
 (`moraine_cli/__init__.py`) calls `os.execvpe` into the bundled
@@ -40,7 +47,7 @@ frontend — way out of scope for `pip install`. The sdist is a stub that
 raises a clear error:
 
 ```
-$ pip install moraine --no-binary moraine
+$ pip install moraine-cli --no-binary moraine-cli
 ERROR: moraine ships as prebuilt binary wheels only. Install via a
        platform with a published wheel, or build from source with:
        https://github.com/eric-tramel/moraine#install-from-source

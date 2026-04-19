@@ -66,8 +66,14 @@ BUNDLE_BINARIES = ("moraine", "moraine-ingest", "moraine-monitor", "moraine-mcp"
 BUNDLE_CONFIG = "config/moraine.toml"
 BUNDLE_MONITOR_DIST = "web/monitor/dist"
 
-PACKAGE_NAME = "moraine"  # PyPI distribution name
+PACKAGE_NAME = "moraine-cli"  # PyPI distribution name
 IMPORT_NAME = "moraine_cli"  # package name inside the wheel
+
+# PEP 427 §5: each component of the wheel filename is escaped by
+# replacing runs of non-alphanumeric characters with a single
+# underscore. The .dist-info directory uses the same normalization.
+# The Name: field in METADATA keeps the original hyphenated form.
+WHEEL_DISTRIBUTION_NAME = re.sub(r"[^A-Za-z0-9.]+", "_", PACKAGE_NAME)
 
 # Path inside the repo for the in-tree package skeleton. Used to copy the
 # exec shim (__init__.py, py.typed, _version.py) into the wheel.
@@ -175,10 +181,30 @@ def _iter_files(root: Path):
             yield entry
 
 
+_PEP440_PRE_MAP = (
+    ("rc", "rc"),
+    ("beta", "b"),
+    ("alpha", "a"),
+)
+
+
 def _normalize_version(version: str) -> str:
-    # Allow the caller to pass a git tag like "v0.4.1"; strip the leading v.
+    """Normalize a git tag to a PEP 440 version.
+
+    - Strips a leading `v` (so `v0.4.1` → `0.4.1`).
+    - Maps dashed pre-release segments to their PEP 440 canonical form
+      (`0.3.1-rc.1` → `0.3.1rc1`, `0.4.0-beta.2` → `0.4.0b2`).
+    - Leaves `.devN` / `.postN` segments untouched — those are already
+      PEP 440 compliant in git tags.
+
+    The release workflow pre-normalizes before calling this script, but
+    dev-time invocations (smoke tests, ad-hoc rebuilds) often pass a raw
+    git tag; keeping the normalization here means both paths work.
+    """
     if version.startswith("v") and re.match(r"^v\d", version):
-        return version[1:]
+        version = version[1:]
+    for prefix, canonical in _PEP440_PRE_MAP:
+        version = re.sub(rf"-{prefix}\.?(\d+)", rf"{canonical}\1", version)
     return version
 
 
@@ -293,13 +319,13 @@ def build_wheel(
         records: list[WheelRecordEntry] = []
 
         wheel_name = (
-            f"{PACKAGE_NAME}-{version}-{PYTHON_TAG}-{ABI_TAG}-{platform_tag}.whl"
+            f"{WHEEL_DISTRIBUTION_NAME}-{version}-{PYTHON_TAG}-{ABI_TAG}-{platform_tag}.whl"
         )
         wheel_path = out_dir / wheel_name
         if wheel_path.exists():
             wheel_path.unlink()
 
-        dist_info = f"{PACKAGE_NAME}-{version}.dist-info"
+        dist_info = f"{WHEEL_DISTRIBUTION_NAME}-{version}.dist-info"
         record_arcname = f"{dist_info}/RECORD"
 
         with zipfile.ZipFile(wheel_path, "w") as zf:
