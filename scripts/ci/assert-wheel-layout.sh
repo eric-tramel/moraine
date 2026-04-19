@@ -96,4 +96,52 @@ if missing:
     sys.exit(1)
 PY
 
+# GLIBC floor check for manylinux wheels. Parse the glibc version from
+# the wheel's platform tag (e.g. `manylinux_2_28_x86_64` → 2.28), extract
+# each bundled binary into a temp dir, and run `readelf -V` to confirm
+# no GLIBC_X.Y symbol exceeds the advertised floor. This regression is
+# what shipped in v0.4.2rc1 (#246): ubuntu-24.04 runner leaked GLIBC_2.39
+# symbols into wheels tagged manylinux_2_17. The check is skipped for
+# non-manylinux wheels (macosx, etc.) and when readelf is unavailable.
+wheel_basename="$(basename "$wheel")"
+if [[ "$wheel_basename" =~ manylinux_([0-9]+)_([0-9]+)_ ]]; then
+  floor_major="${BASH_REMATCH[1]}"
+  floor_minor="${BASH_REMATCH[2]}"
+  if ! command -v readelf >/dev/null 2>&1; then
+    echo "readelf not found; skipping glibc floor check on manylinux wheel" >&2
+  else
+    echo "checking bundled binaries honour GLIBC_<=${floor_major}.${floor_minor} floor"
+    tmpdir="$(mktemp -d)"
+    trap 'rm -rf "$tmpdir"' EXIT
+    python3 -m zipfile -e "$wheel" "$tmpdir" >/dev/null
+    violations=()
+    for bin in "$tmpdir"/moraine_cli/_binaries/*; do
+      [[ -f "$bin" ]] || continue
+      # readelf -V lists versioned symbol needs; extract the highest
+      # GLIBC_X.Y entry for this binary.
+      max="$(readelf -V "$bin" 2>/dev/null \
+        | grep -oE 'GLIBC_[0-9]+\.[0-9]+' \
+        | sort -u \
+        | awk -F'[_.]' '{print $2"."$3}' \
+        | sort -t. -k1,1n -k2,2n \
+        | tail -1)"
+      if [[ -z "$max" ]]; then
+        continue  # static or no glibc deps
+      fi
+      bin_major="${max%%.*}"
+      bin_minor="${max##*.}"
+      if (( bin_major > floor_major )) \
+         || (( bin_major == floor_major && bin_minor > floor_minor )); then
+        violations+=("$(basename "$bin"): requires GLIBC_${max}, wheel tag allows <= ${floor_major}.${floor_minor}")
+      fi
+    done
+    if (( ${#violations[@]} > 0 )); then
+      echo "wheel's platform tag is a lie — bundled binaries need a newer glibc than the tag advertises:" >&2
+      printf '  %s\n' "${violations[@]}" >&2
+      echo "(see issue #246; fix by wrapping cargo in a manylinux build container)" >&2
+      exit 1
+    fi
+  fi
+fi
+
 echo "wheel layout OK: $wheel"

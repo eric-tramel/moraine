@@ -63,11 +63,61 @@ if [[ ! -d "$PROJECT_ROOT/web/monitor/dist" ]]; then
   exit 1
 fi
 
-cargo build --manifest-path "$PROJECT_ROOT/Cargo.toml" --release --locked --target "$TARGET" \
-  -p moraine \
-  -p moraine-ingest \
-  -p moraine-monitor \
-  -p moraine-mcp
+cargo_build_native() {
+  cargo build --manifest-path "$PROJECT_ROOT/Cargo.toml" --release --locked --target "$TARGET" \
+    -p moraine \
+    -p moraine-ingest \
+    -p moraine-monitor \
+    -p moraine-mcp
+}
+
+# `MORAINE_CARGO_CONTAINER`: optional Docker image that wraps the Rust
+# build so the resulting binaries link against the container's glibc
+# floor, not the host's. Used by the linux release legs to honour the
+# wheel's `manylinux_2_28_*` platform tag — ubuntu-24.04 runners ship
+# glibc 2.39, which leaked into v0.4.2rc1 and broke every non-latest
+# linux distro (see issue #246). Unset by default so host builds and
+# the macOS release leg are unchanged.
+cargo_build_in_container() {
+  local image="$1"
+  echo "cargo build for $TARGET inside container image: $image"
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "MORAINE_CARGO_CONTAINER is set but docker is not on PATH" >&2
+    exit 1
+  fi
+
+  # `HOME=/workspace/.cargo-container-home` keeps rustup's on-disk state
+  # inside the mounted worktree so it survives across invocations (cache
+  # the stable toolchain + target) and is owned by the host user. Cargo
+  # target dir is the project's default `target/<target>/`, unchanged.
+  docker run --rm \
+    -v "$PROJECT_ROOT:/workspace" \
+    -w /workspace \
+    --user "$(id -u):$(id -g)" \
+    -e HOME=/workspace/.cargo-container-home \
+    -e CARGO_TERM_COLOR=never \
+    "$image" bash -c '
+      set -euo pipefail
+      export RUSTUP_HOME="$HOME/rustup"
+      export CARGO_HOME="$HOME/cargo"
+      mkdir -p "$RUSTUP_HOME" "$CARGO_HOME"
+      if [[ ! -x "$CARGO_HOME/bin/cargo" ]]; then
+        echo "installing rustup + stable toolchain inside container..."
+        curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | \
+          sh -s -- --default-toolchain stable --profile minimal -y
+      fi
+      export PATH="$CARGO_HOME/bin:$PATH"
+      rustup target add "'"$TARGET"'"
+      cargo build --manifest-path /workspace/Cargo.toml --release --locked --target "'"$TARGET"'" \
+        -p moraine -p moraine-ingest -p moraine-monitor -p moraine-mcp
+    '
+}
+
+if [[ -n "${MORAINE_CARGO_CONTAINER:-}" ]]; then
+  cargo_build_in_container "$MORAINE_CARGO_CONTAINER"
+else
+  cargo_build_native
+fi
 
 for bin in moraine moraine-ingest moraine-monitor moraine-mcp; do
   if [[ ! -x "$PROJECT_ROOT/target/$TARGET/release/$bin" ]]; then

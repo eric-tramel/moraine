@@ -32,10 +32,17 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            # pypa manylinux_2_28 image: AlmaLinux 8, glibc 2.28 floor.
+            # Honours the wheel's `manylinux_2_28_x86_64` tag so the
+            # resulting binary runs on RHEL 9 / Ubuntu 20.04+ / Debian 12+
+            # / AL2023 — see issue #246.
+            cargo_container: quay.io/pypa/manylinux_2_28_x86_64
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            cargo_container: quay.io/pypa/manylinux_2_28_aarch64
           - os: macos-14
             target: aarch64-apple-darwin
+            cargo_container: ""
 
     steps:
       - name: Checkout
@@ -57,6 +64,12 @@ jobs:
         run: bun --version
 
       - name: Build release archive
+        env:
+          # Linux legs wrap cargo in the pypa manylinux container so the
+          # binaries link against glibc 2.28, not the ubuntu-24.04 runner's
+          # glibc 2.39 (issue #246). macOS sets this empty; the script
+          # falls back to a native host build.
+          MORAINE_CARGO_CONTAINER: ${{ matrix.cargo_container }}
         run: scripts/package-moraine-release.sh "${{ matrix.target }}" dist
 
       - name: Upload assets to release

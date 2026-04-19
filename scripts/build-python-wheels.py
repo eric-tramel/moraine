@@ -52,9 +52,14 @@ from pathlib import Path
 # builder self-contained. Everything the builder needs to know about target
 # triples + wheel layout sits in this file.
 
+# manylinux_2_28 — AlmaLinux 8 / glibc 2.28 floor. The release matrix
+# builds the linux binaries inside quay.io/pypa/manylinux_2_28_<arch>
+# so the tag is truthful. See issue #246 for the history (v0.4.2rc1
+# shipped manylinux_2_17 wheels containing GLIBC_2.39 symbols and
+# broke every distro older than Ubuntu 24.04).
 TARGET_TO_WHEEL_PLATFORM = {
-    "x86_64-unknown-linux-gnu": "manylinux_2_17_x86_64",
-    "aarch64-unknown-linux-gnu": "manylinux_2_17_aarch64",
+    "x86_64-unknown-linux-gnu": "manylinux_2_28_x86_64",
+    "aarch64-unknown-linux-gnu": "manylinux_2_28_aarch64",
     "aarch64-apple-darwin": "macosx_11_0_arm64",
     "x86_64-apple-darwin": "macosx_11_0_x86_64",
 }

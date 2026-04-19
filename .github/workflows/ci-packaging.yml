@@ -22,7 +22,12 @@ jobs:
     env:
       DRYRUN_TARGET: x86_64-unknown-linux-gnu
       DRYRUN_VERSION: 0.0.0.dev0
-      DRYRUN_WHEEL_PLATFORM: manylinux_2_17_x86_64
+      # manylinux_2_28 — AlmaLinux 8 / glibc 2.28 floor. See issue #246
+      # for why this is NOT manylinux_2_17 even though the build runner
+      # itself is Ubuntu 24.04. The cargo step wraps inside the pypa
+      # manylinux image so the resulting binary honours the tag.
+      DRYRUN_WHEEL_PLATFORM: manylinux_2_28_x86_64
+      DRYRUN_CARGO_CONTAINER: quay.io/pypa/manylinux_2_28_x86_64
       # PEP 427 normalization: `moraine-cli` → `moraine_cli` in wheel +
       # sdist filenames. See scripts/build-python-wheels.py.
       DRYRUN_DIST_NAME: moraine_cli
@@ -72,6 +77,8 @@ jobs:
 
       - name: Build host bundle
         if: github.event_name != 'pull_request' || steps.filter.outputs.packaging == 'true'
+        env:
+          MORAINE_CARGO_CONTAINER: ${{ env.DRYRUN_CARGO_CONTAINER }}
         run: scripts/package-moraine-release.sh "$DRYRUN_TARGET" dist
 
       - name: Build Python wheel + stub sdist
@@ -104,6 +111,30 @@ jobs:
       - name: Assert sdist refuses to build
         if: github.event_name != 'pull_request' || steps.filter.outputs.packaging == 'true'
         run: bash scripts/ci/assert-sdist-refuses.sh "dist/wheels/$DRYRUN_DIST_NAME-$DRYRUN_VERSION.tar.gz"
+
+      - name: Verify wheel runs on debian:bookworm (glibc 2.36 regression guard for #246)
+        if: github.event_name != 'pull_request' || steps.filter.outputs.packaging == 'true'
+        run: |
+          # bookworm is where the v0.4.2rc1 glibc regression was caught.
+          # If a future runner bump leaks symbols past the manylinux_2_28
+          # floor, this step fails before we publish. Uses the host's
+          # pre-built wheel; container only installs uv + runs --help.
+          wheel_name="$DRYRUN_DIST_NAME-$DRYRUN_VERSION-py3-none-$DRYRUN_WHEEL_PLATFORM.whl"
+          docker run --rm \
+            -v "$PWD/dist/wheels:/wheels:ro" \
+            -e WHEEL_NAME="$wheel_name" \
+            debian:bookworm-slim bash -c '
+              set -euxo pipefail
+              apt-get update -qq
+              apt-get install -y --no-install-recommends curl ca-certificates >/dev/null
+              curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/root/.local/bin sh >/dev/null
+              export PATH="/root/.local/bin:$PATH"
+              uv tool install --reinstall --prerelease=allow "/wheels/$WHEEL_NAME"
+              for bin in moraine moraine-ingest moraine-monitor moraine-mcp; do
+                "$HOME/.local/bin/$bin" --help >/dev/null
+                echo "  ok: $bin --help"
+              done
+            '
 
       - name: Upload dry-run wheel (artifact)
         if: github.event_name != 'pull_request' || steps.filter.outputs.packaging == 'true'
