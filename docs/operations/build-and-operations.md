@@ -18,9 +18,19 @@ This produces binaries for:
 - `moraine-monitor`
 - `moraine-mcp`
 
-## Install Runtime Binaries From Source
+## Install Runtime Binaries
 
-### Cargo install
+### uv tool install (recommended)
+
+```bash
+uv tool install moraine-cli
+```
+
+To upgrade: `uv tool upgrade moraine-cli`. To uninstall: `uv tool uninstall moraine-cli`.
+
+The PyPI distribution is named `moraine-cli`; the installed entrypoint is `moraine`.
+
+### Cargo install from source
 
 ```bash
 git clone https://github.com/eric-tramel/moraine.git ~/src/moraine
@@ -41,7 +51,9 @@ for bin in moraine moraine-ingest moraine-monitor moraine-mcp; do
 done
 ```
 
-### Prebuilt release binary
+Upgrade via `cargo install --force --locked moraine` (and equivalents for the sibling binaries).
+
+### Prebuilt release bundle (fallback)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/eric-tramel/moraine/main/scripts/install.sh \
@@ -58,14 +70,14 @@ Install directory precedence:
 3. `$(dirname "$XDG_DATA_HOME")/bin`
 4. `~/.local/bin`
 
-The installer writes a receipt at `${XDG_CONFIG_HOME:-~/.config}/moraine/install-receipt.json`.
-
 Installer environment configuration:
 
 - `MORAINE_INSTALL_REPO` (default `eric-tramel/moraine`)
 - `MORAINE_INSTALL_VERSION` (default `latest`)
 - `MORAINE_INSTALL_ASSET_BASE_URL` (requires `MORAINE_INSTALL_VERSION` to be a non-`latest` tag)
 - `MORAINE_INSTALL_SKIP_CLICKHOUSE` (`1|true|yes|on` skips managed ClickHouse install)
+
+To upgrade a curl-installed instance, re-run the installer.
 
 ## Publish prebuilt binaries
 
@@ -91,10 +103,10 @@ Resolution precedence:
 1. `--config <path>`
 2. env override (`MORAINE_CONFIG`, plus `MORAINE_MCP_CONFIG` for MCP, `MORAINE_MONITOR_CONFIG` for monitor, `MORAINE_INGEST_CONFIG` for ingest)
 3. `~/.moraine/config.toml` (if present)
-4. `MORAINE_DEFAULT_CONFIG` fallback (if set and the referenced file exists) — packaging hook used by the `uv tool install moraine` wheel to point at its bundled default
+4. `MORAINE_DEFAULT_CONFIG` fallback (if set and the referenced file exists) — packaging hook used by the `uv tool install moraine-cli` wheel to point at its bundled default
 5. repo default `config/moraine.toml`
 
-The monitor binary resolves its static asset directory (`web/monitor/dist`) in this order: `--static-dir`, then `MORAINE_MONITOR_DIST` (canonical) or `MORAINE_MONITOR_STATIC_DIR` (legacy alias), then install-dir relative, then source-tree fallback. The `uv tool install moraine` wheel sets `MORAINE_MONITOR_DIST` in its exec shim so the bundled bytes are used without relying on path conventions.
+The monitor binary resolves its static asset directory (`web/monitor/dist`) in this order: `--static-dir`, then `MORAINE_MONITOR_DIST` (canonical) or `MORAINE_MONITOR_STATIC_DIR` (legacy alias), then install-dir relative, then source-tree fallback. The `uv tool install moraine-cli` wheel sets `MORAINE_MONITOR_DIST` in its exec shim so the bundled bytes are used without relying on path conventions.
 
 ## Start stack
 

@@ -20,7 +20,6 @@ configuration (environment variables):
   XDG_BIN_HOME                     Install bin directory when MORAINE_INSTALL_DIR is unset
   XDG_DATA_HOME                    Fallback install location is "$(dirname XDG_DATA_HOME)/bin"
   HOME                             Final fallback install dir: ~/.local/bin
-  XDG_CONFIG_HOME                  Receipt root (default: ~/.config)
 
 install directory precedence:
   MORAINE_INSTALL_DIR > XDG_BIN_HOME > $(dirname XDG_DATA_HOME)/bin > ~/.local/bin
@@ -69,11 +68,6 @@ resolve_install_dir() {
   fi
 
   printf '%s/.local/bin\n' "${HOME:?HOME is not set}"
-}
-
-resolve_receipt_path() {
-  config_home="${XDG_CONFIG_HOME:-${HOME:?HOME is not set}/.config}"
-  printf '%s/moraine/install-receipt.json\n' "$config_home"
 }
 
 resolve_runtime_config_path() {
@@ -234,79 +228,6 @@ fetch_latest_tag() {
   printf '%s\n' "$tag"
 }
 
-json_escape() {
-  value="$1"
-  escaped=""
-
-  for byte in $(printf '%s' "$value" | LC_ALL=C od -An -tu1 -v); do
-    case "$byte" in
-      34)
-        escaped="${escaped}\\\""
-        ;;
-      92)
-        escaped="${escaped}\\\\"
-        ;;
-      8)
-        escaped="${escaped}\\b"
-        ;;
-      9)
-        escaped="${escaped}\\t"
-        ;;
-      10)
-        escaped="${escaped}\\n"
-        ;;
-      12)
-        escaped="${escaped}\\f"
-        ;;
-      13)
-        escaped="${escaped}\\r"
-        ;;
-      [0-7]|1[0-9]|2[0-9]|3[01])
-        escaped="${escaped}\\u00$(printf '%02x' "$byte")"
-        ;;
-      *)
-        escaped="${escaped}$(printf "\\$(printf '%03o' "$byte")")"
-        ;;
-    esac
-  done
-
-  printf '%s' "$escaped"
-}
-
-write_install_receipt() {
-  receipt_path="$1"
-  installed_at_utc="$2"
-  repo="$3"
-  requested_version="$4"
-  resolved_version="$5"
-  target="$6"
-  install_dir="$7"
-  asset_url="$8"
-  checksum_url="$9"
-
-  mkdir -p "$(dirname "$receipt_path")"
-
-  cat >"$receipt_path" <<RECEIPT
-{
-  "schema_version": 1,
-  "installed_at_utc": "$(json_escape "$installed_at_utc")",
-  "repo": "$(json_escape "$repo")",
-  "requested_version": "$(json_escape "$requested_version")",
-  "resolved_version": "$(json_escape "$resolved_version")",
-  "target": "$(json_escape "$target")",
-  "install_dir": "$(json_escape "$install_dir")",
-  "asset_url": "$(json_escape "$asset_url")",
-  "checksum_url": "$(json_escape "$checksum_url")",
-  "binaries": [
-    "moraine",
-    "moraine-ingest",
-    "moraine-monitor",
-    "moraine-mcp"
-  ]
-}
-RECEIPT
-}
-
 if [ "$#" -gt 0 ]; then
   if [ "$#" -eq 1 ] && { [ "$1" = "-h" ] || [ "$1" = "--help" ]; }; then
     usage
@@ -320,10 +241,8 @@ fi
 
 repo="${MORAINE_INSTALL_REPO:-eric-tramel/moraine}"
 asset_base_url="${MORAINE_INSTALL_ASSET_BASE_URL:-}"
-requested_version="${MORAINE_INSTALL_VERSION:-latest}"
-version="$requested_version"
+version="${MORAINE_INSTALL_VERSION:-latest}"
 install_dir="$(resolve_install_dir)"
-receipt_path="$(resolve_receipt_path)"
 runtime_config_path="$(resolve_runtime_config_path)"
 skip_clickhouse=0
 bins="moraine moraine-ingest moraine-monitor moraine-mcp"
@@ -473,21 +392,8 @@ for bin in $bins; do
   fi
 done
 
-installed_at_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-write_install_receipt \
-  "$receipt_path" \
-  "$installed_at_utc" \
-  "$repo" \
-  "$requested_version" \
-  "$version" \
-  "$target" \
-  "$install_dir" \
-  "$asset_url" \
-  "$checksum_url"
-
 echo "installed binaries to: $install_dir"
 echo "installed monitor assets to: $monitor_dist_dir"
-echo "wrote install receipt: $receipt_path"
 
 if ! bootstrap_runtime_config "$runtime_config_path" "$extract_dir/config/moraine.toml"; then
   echo "warning: unable to bootstrap config at $runtime_config_path"

@@ -2,6 +2,16 @@
 
 This guide maps historical script commands to the `moraine` command contracts.
 
+## Updating an existing install
+
+`moraine update` has been removed. Updates are now handled by your package manager:
+
+- `uv tool install moraine-cli` (recommended) — installs, and `uv tool upgrade moraine-cli` keeps it current. The PyPI distribution is named `moraine-cli`; the installed entrypoint is `moraine`.
+- `cargo install --force --locked moraine` — for source installs.
+- Re-run `scripts/install.sh` — for existing curl-based installs. The installer will overwrite the binaries in place.
+
+Installs from prior versions leave a stale `${XDG_CONFIG_HOME:-~/.config}/moraine/install-receipt.json` file; it is no longer read or written and can be deleted at will.
+
 ## Command mapping
 
 - `bin/start-clickhouse` -> `bin/moraine up --no-ingest`
