@@ -54,6 +54,18 @@ RUN apt-get update \
         build-essential \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Node.js (for the Claude Code CLI used by the agent-smoke-e2e driver).
+# NodeSource's setup script is the upstream-recommended path and pins us to a
+# current LTS line. We install npm with it so `npm install -g @anthropic-ai/claude-code`
+# just works for the smoke-test flow; non-smoke sandbox users pay ~50 MB once,
+# which is cheap compared to the rust toolchain that dominates image size.
+ARG NODE_MAJOR=20
+RUN curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install -g @anthropic-ai/claude-code \
+    && claude --version
+
 # Install sccache. Binary targets linux-musl for static linkage so it runs
 # regardless of glibc version. When the host (macOS) and the container (linux)
 # both point RUSTC_WRAPPER=sccache at a shared disk cache, their entries are

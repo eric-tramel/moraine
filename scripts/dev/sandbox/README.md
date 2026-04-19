@@ -60,10 +60,47 @@ supported runtime for end users. Production install remains `install.sh` /
 PyPI — see issue #219. If you find yourself reaching for this to run
 moraine "for real", stop; use `install.sh` instead.
 
+## Agent-driven smoke test (`agent-smoke-e2e`)
+
+`scripts/dev/sandbox/agent-smoke-e2e` boots a fresh sandbox, runs the Claude
+Code CLI inside the container (headless, `--dangerously-skip-permissions`),
+and drives the `/agent-smoke-e2e` skill at
+[`.claude/skills/agent-smoke-e2e/SKILL.md`](../../../.claude/skills/agent-smoke-e2e/SKILL.md).
+The skill exercises every `moraine-mcp` tool (`search`, `open`,
+`search_conversations`, `list_sessions`, `get_session`,
+`get_session_events`) and emits a pass/fail matrix.
+
+The driver runs the skill **three times** — once each against Opus 4.7,
+Sonnet 4.6, and Haiku 4.5 — sharing a single sandbox boot. Each model gets
+a fresh `moraine-mcp` subprocess (claude spins one up per invocation), so
+runs are independent from the server's perspective. The driver aggregates
+the three verdicts; exit 0 requires all three to PASS. Override the model
+set with `MORAINE_SMOKE_MODELS="id1 id2 ..."` for ad-hoc runs.
+
+```bash
+# One-shot: boot, run opus/sonnet/haiku in sequence, report, tear down.
+export ANTHROPIC_API_KEY=sk-ant-...
+scripts/dev/sandbox/agent-smoke-e2e
+
+# Only one model, e.g. during a regression bisect:
+MORAINE_SMOKE_MODELS="claude-sonnet-4-6" scripts/dev/sandbox/agent-smoke-e2e
+```
+
+Complements `scripts/ci/mcp_smoke.py` (raw JSON-RPC) by driving the MCP
+tools through an actual agent — catches regressions in tool discovery,
+argument validation, and LLM-shaped payloads that the raw protocol smoke
+doesn't exercise.
+
+`ANTHROPIC_API_KEY` is required. On macOS, `claude login` stores creds in
+Keychain and they're unreachable from the Linux container — so exporting an
+API key is the supported path for this smoke test.
+
 ## See also
 
 - `docs/development/sandbox.md` — the long-form guide: flags, build
   strategies, mounts, config generation, caveats, troubleshooting.
 - `scripts/ci/e2e-stack.sh` — the non-interactive CI gate with synthetic
   fixtures. Complementary to this sandbox, not replaced by it.
+- `scripts/ci/mcp_smoke.py` — raw JSON-RPC smoke against `moraine-mcp`.
+  `agent-smoke-e2e` is the agent-level companion.
 - RFC: `gh issue view 232`.

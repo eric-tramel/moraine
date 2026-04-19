@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+# Moraine dev sandbox — agent-driven MCP smoke test.
+#
+# End-to-end exercise of the built moraine-mcp binary through a real Claude
+# Code agent session. Complements scripts/ci/mcp_smoke.py (raw JSON-RPC) by
+# driving the tools the way an actual agent would: through MCP tool discovery,
+# with real LLM-shaped payloads, and through a full sandbox boot/build cycle.
+#
+# Flow:
+#   1. Boot a fresh moraine sandbox (--mount-host-sessions so there's real
+#      data to search over; the skill is tolerant of empty stacks too).
+#   2. For each model in {opus, sonnet, haiku}, exec `claude` inside the
+#      sandbox with:
+#        * --dangerously-skip-permissions  (auto-approve all tool calls)
+#        * --model <model-id>              (the row under test)
+#        * --mcp-config pointing at /opt/moraine/bin/moraine-mcp
+#        * a prompt that invokes the /agent-smoke-e2e skill from /repo
+#   3. Capture stdout per run, match the trailing `overall: PASS|FAIL` line.
+#   4. Tear the sandbox down (always, even on failure — leftover sandboxes
+#      are load-bearing leaks per RFC #232).
+#   5. Exit 0 only if all three model runs PASSed.
+#
+# The sandbox boots once and is shared across all three runs — boot/build is
+# the expensive part, so repeating it per model would be wasteful. Each run
+# gets its own fresh MCP server subprocess (claude starts a new one per
+# invocation) so runs are independent from the server's point of view.
+#
+# Credentials: passes ANTHROPIC_API_KEY through from the host environment.
+# On macOS the normal `claude login` flow stores creds in Keychain, which
+# isn't reachable from a Linux container — so for this smoke test, callers
+# must have ANTHROPIC_API_KEY exported. The script errors early if not.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SANDBOX_CLI="${SCRIPT_DIR}/moraine-sandbox"
+PROJECT_PREFIX="moraine-sandbox-"
+
+# Model ids under test. Keep in sync with the knowledge cutoff guidance in
+# the global CLAUDE.md: Opus 4.7, Sonnet 4.6, Haiku 4.5 are the current
+# family. Override via MORAINE_SMOKE_MODELS (space-separated ids) for ad-hoc
+# runs against other models without editing the script.
+DEFAULT_MODELS=(
+    "claude-opus-4-7"
+    "claude-sonnet-4-6"
+    "claude-haiku-4-5"
+)
+
+log()  { printf '[smoke-e2e] %s\n' "$*" >&2; }
+warn() { printf '[smoke-e2e] WARN: %s\n' "$*" >&2; }
+die()  { printf '[smoke-e2e] ERROR: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    cat >&2 <<EOF
+Usage: agent-smoke-e2e [--id <id>] [--keep] [--rebuild] [--no-host-sessions]
+
+Runs the /agent-smoke-e2e skill against the in-sandbox moraine-mcp once per
+model in {opus-4.7, sonnet-4.6, haiku-4.5} and aggregates verdicts.
+
+  --id <id>           Reuse an existing sandbox id instead of booting a new
+                      one. When set, the script never tears down on exit.
+  --keep              Leave the sandbox running after the runs (no teardown).
+  --rebuild           Forward --rebuild to moraine-sandbox up (forces a cold
+                      cargo build of the workspace inside the container).
+  --no-host-sessions  Boot without mounting host session archives. The test
+                      still passes — the skill tolerates empty stacks — but
+                      exercises less of the data path.
+
+Environment:
+  ANTHROPIC_API_KEY       Required. Passed through to the in-container CLI.
+  MORAINE_SMOKE_MODELS    Optional. Space-separated model ids to run against
+                          instead of the default opus/sonnet/haiku trio.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Flags
+# ---------------------------------------------------------------------------
+
+given_id=""
+keep=0
+rebuild=0
+mount_host_sessions=1
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --id)               given_id="${2:-}"; [[ -n "$given_id" ]] || die "--id requires a value"; shift 2 ;;
+        --keep)             keep=1; shift ;;
+        --rebuild)          rebuild=1; shift ;;
+        --no-host-sessions) mount_host_sessions=0; shift ;;
+        -h|--help)          usage; exit 0 ;;
+        *)                  usage; die "unknown flag: $1" ;;
+    esac
+done
+
+# Resolve model list: env override (space-separated) wins, else defaults.
+models=()
+if [[ -n "${MORAINE_SMOKE_MODELS:-}" ]]; then
+    # shellcheck disable=SC2206
+    models=(${MORAINE_SMOKE_MODELS})
+else
+    models=("${DEFAULT_MODELS[@]}")
+fi
+[[ "${#models[@]}" -gt 0 ]] || die "no models configured — set MORAINE_SMOKE_MODELS or restore defaults"
+
+# ---------------------------------------------------------------------------
+# Pre-flight
+# ---------------------------------------------------------------------------
+
+command -v docker >/dev/null 2>&1 || die "docker is required"
+[[ -x "$SANDBOX_CLI" ]] || die "moraine-sandbox CLI not found at $SANDBOX_CLI"
+
+if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+    die "ANTHROPIC_API_KEY is not set; the in-container claude CLI needs it to authenticate"
+fi
+
+# ---------------------------------------------------------------------------
+# Boot sandbox (or adopt an existing one)
+# ---------------------------------------------------------------------------
+
+owned_sandbox=0
+if [[ -n "$given_id" ]]; then
+    id="$given_id"
+    log "reusing sandbox ${id}"
+else
+    up_args=(--quiet)
+    (( mount_host_sessions )) && up_args+=(--mount-host-sessions)
+    (( rebuild ))             && up_args+=(--rebuild)
+    log "booting sandbox (moraine-sandbox up ${up_args[*]})"
+    id="$("$SANDBOX_CLI" up "${up_args[@]}")"
+    owned_sandbox=1
+    log "booted ${id}"
+fi
+
+project="${PROJECT_PREFIX}${id}"
+
+# Unified trap. tmp_files is a cumulative list of every tmp file we've
+# created across model runs, cleaned up together on exit so we never leak a
+# scratch file regardless of where failure strikes.
+tmp_files=()
+cleanup() {
+    local rc=$?
+    if [[ "${#tmp_files[@]}" -gt 0 ]]; then
+        rm -f "${tmp_files[@]}"
+    fi
+    if (( owned_sandbox )) && (( ! keep )); then
+        log "tearing down ${id}"
+        "$SANDBOX_CLI" down "$id" || warn "teardown returned non-zero (state may be partial)"
+    elif (( keep )); then
+        log "leaving ${id} up (--keep)"
+    fi
+    exit "$rc"
+}
+trap cleanup EXIT INT TERM
+
+# ---------------------------------------------------------------------------
+# Shared run configuration
+# ---------------------------------------------------------------------------
+
+# Inline MCP config so we don't depend on /repo/.mcp.json's host-relative
+# path (./target/debug/moraine-mcp won't exist in the read-only /repo
+# mount). The in-container binary lives at /opt/moraine/bin/moraine-mcp and
+# needs --config pointing at the generated sandbox config.
+mcp_config=$(cat <<'JSON'
+{
+  "mcpServers": {
+    "moraine": {
+      "command": "/opt/moraine/bin/moraine-mcp",
+      "args": ["--config", "/sandbox/moraine.toml"]
+    }
+  }
+}
+JSON
+)
+
+prompt='Run the agent-smoke-e2e skill. Follow it verbatim and emit the final PASS/FAIL block as specified, then stop.'
+
+# ---------------------------------------------------------------------------
+# Run the skill once per model
+# ---------------------------------------------------------------------------
+
+# Parallel arrays: verdicts[i] ∈ {PASS,FAIL,?}, rcs[i] = claude exit code.
+verdicts=()
+rcs=()
+
+for model in "${models[@]}"; do
+    log "=== run: model=${model} ==="
+
+    tmp_out="$(mktemp)"
+    tmp_err="$(mktemp)"
+    tmp_files+=("$tmp_out" "$tmp_err")
+
+    # Use `docker exec` (not `docker compose exec`) so we don't need to
+    # re-seed the compose-file env vars (SANDBOX_REPO_ROOT etc.) that
+    # `docker compose` parses even for exec. The moraine container's name
+    # matches the compose project name, which is what we want.
+    set +e
+    docker exec \
+        -i \
+        -u moraine \
+        -w /repo \
+        -e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}" \
+        -e "HOME=/home/moraine" \
+        "$project" \
+        claude \
+            --dangerously-skip-permissions \
+            --model "$model" \
+            --mcp-config "$mcp_config" \
+            -p "$prompt" \
+        >"$tmp_out" 2>"$tmp_err"
+    claude_rc=$?
+    set -e
+    rcs+=("$claude_rc")
+
+    log "claude (${model}) exited with code ${claude_rc}"
+
+    printf '\n----- claude stdout (%s) -----\n' "$model" >&2
+    cat "$tmp_out" >&2
+    printf '\n----- claude stderr (%s) -----\n' "$model" >&2
+    cat "$tmp_err" >&2
+    printf '\n--------------------------------\n' >&2
+
+    # Match the `overall:` line emitted by the skill. Search stdout first,
+    # fall back to stderr in case claude routed the final block there.
+    # Last match wins so we don't trip on earlier plan text.
+    verdict="$(grep -E '^overall:[[:space:]]+(PASS|FAIL)$' "$tmp_out" "$tmp_err" 2>/dev/null | tail -n1 | awk '{print $NF}')"
+    if [[ -z "$verdict" ]]; then
+        warn "${model}: no 'overall: PASS|FAIL' line found — skill did not complete cleanly"
+        verdict="?"
+    fi
+    verdicts+=("$verdict")
+    log "${model}: ${verdict}"
+done
+
+# ---------------------------------------------------------------------------
+# Aggregate + report
+# ---------------------------------------------------------------------------
+
+overall="PASS"
+summary=""
+for i in "${!models[@]}"; do
+    model="${models[$i]}"
+    verdict="${verdicts[$i]}"
+    rc="${rcs[$i]}"
+    printf -v row '  %-24s %s  (claude exit=%s)\n' "$model" "$verdict" "$rc"
+    summary+="$row"
+    if [[ "$verdict" != "PASS" ]]; then
+        overall="FAIL"
+    fi
+done
+
+printf '\n==== agent-smoke-e2e summary ====\n' >&2
+printf '%b' "$summary" >&2
+printf '  overall:                  %s\n' "$overall" >&2
+printf '=================================\n' >&2
+
+if [[ "$overall" == "PASS" ]]; then
+    exit 0
+fi
+exit 1
