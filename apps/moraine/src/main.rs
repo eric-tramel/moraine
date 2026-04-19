@@ -11,7 +11,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
-use std::io::{IsTerminal, Read, Seek, SeekFrom};
+use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -797,9 +797,9 @@ fn clickhouse_asset_for_host(version: &str) -> Result<ClickHouseAsset> {
     clickhouse_asset_for_target(version, detect_host_target()?)
 }
 
-async fn download_to_path(url: &str, dest: &Path) -> Result<()> {
+async fn download_to_path(url: &str, dest: &Path, label: &str) -> Result<()> {
     let client = Client::new();
-    let response = client
+    let mut response = client
         .get(url)
         .send()
         .await
@@ -807,12 +807,54 @@ async fn download_to_path(url: &str, dest: &Path) -> Result<()> {
         .error_for_status()
         .with_context(|| format!("download failed for {}", url))?;
 
-    let bytes = response
-        .bytes()
-        .await
-        .with_context(|| format!("failed reading response body for {}", url))?;
+    let total = response.content_length();
+    let show_progress = std::io::stderr().is_terminal();
 
-    fs::write(dest, &bytes).with_context(|| format!("failed writing {}", dest.display()))
+    let mut file = std::fs::File::create(dest)
+        .with_context(|| format!("failed writing {}", dest.display()))?;
+    let mut downloaded: u64 = 0;
+    let mut last_render = Instant::now();
+
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("failed reading response body for {}", url))?
+    {
+        file.write_all(&chunk)
+            .with_context(|| format!("failed writing {}", dest.display()))?;
+        downloaded += chunk.len() as u64;
+
+        if show_progress && last_render.elapsed() >= Duration::from_millis(150) {
+            render_download_progress(label, downloaded, total, false);
+            last_render = Instant::now();
+        }
+    }
+
+    if show_progress {
+        render_download_progress(label, downloaded, total, true);
+    }
+
+    Ok(())
+}
+
+fn render_download_progress(label: &str, done: u64, total: Option<u64>, done_flag: bool) {
+    const MIB: f64 = 1024.0 * 1024.0;
+    let done_mb = done as f64 / MIB;
+    match total {
+        Some(t) if t > 0 => {
+            let total_mb = t as f64 / MIB;
+            let pct = ((done as f64 / t as f64) * 100.0).min(100.0);
+            eprint!("\r  {label}: {done_mb:>6.1} / {total_mb:>6.1} MiB  ({pct:>5.1}%)");
+        }
+        _ => {
+            eprint!("\r  {label}: {done_mb:>6.1} MiB");
+        }
+    }
+    if done_flag {
+        eprintln!();
+    } else {
+        std::io::stderr().flush().ok();
+    }
 }
 
 fn sha256_hex(path: &Path) -> Result<String> {
@@ -977,7 +1019,7 @@ async fn install_managed_clickhouse(
         .join("tmp")
         .join(format!("clickhouse-extract-{}", stamp));
 
-    download_to_path(asset.url, &download).await?;
+    download_to_path(asset.url, &download, &format!("ClickHouse {version}")).await?;
 
     let digest = sha256_hex(&download)?;
     if digest != asset.sha256 {
@@ -1058,8 +1100,20 @@ async fn resolve_clickhouse_server_command(
         return Ok(PathBuf::from("clickhouse-server"));
     }
 
-    if cfg.runtime.clickhouse_auto_install {
-        install_managed_clickhouse(paths, &cfg.runtime.clickhouse_version, false).await?;
+    let version = &cfg.runtime.clickhouse_version;
+    let should_install = if cfg.runtime.clickhouse_auto_install {
+        eprintln!(
+            "managed ClickHouse not found; auto-installing {version}.\n\
+             one-time download + extract (~10-30 s on a typical connection).\n\
+             set runtime.clickhouse_auto_install = false in your config to disable.",
+        );
+        true
+    } else {
+        prompt_install_clickhouse(version)?
+    };
+
+    if should_install {
+        install_managed_clickhouse(paths, version, false).await?;
         let managed = managed_clickhouse_bin(paths, "clickhouse-server");
         if managed.exists() {
             return Ok(managed);
@@ -1070,6 +1124,35 @@ async fn resolve_clickhouse_server_command(
         "clickhouse-server is not installed or not on PATH (managed install dir: {})",
         paths.managed_clickhouse_dir.display()
     )
+}
+
+fn prompt_install_clickhouse(version: &str) -> Result<bool> {
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() || !std::io::stderr().is_terminal() {
+        bail!(
+            "managed ClickHouse is not installed and runtime.clickhouse_auto_install = false.\n\
+             cannot prompt in non-interactive mode.\n\
+             remediation:\n\
+             - run `moraine clickhouse install` explicitly, or\n\
+             - set runtime.clickhouse_auto_install = true in your config"
+        );
+    }
+
+    loop {
+        eprint!("managed ClickHouse {version} is not installed. install now? [Y/n] ");
+        std::io::stderr().flush().ok();
+
+        let mut input = String::new();
+        stdin
+            .read_line(&mut input)
+            .context("failed to read confirmation from stdin")?;
+
+        match input.trim().to_ascii_lowercase().as_str() {
+            "" | "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => eprintln!("please answer 'y' or 'n'."),
+        }
+    }
 }
 
 async fn wait_for_clickhouse(cfg: &AppConfig) -> Result<()> {
