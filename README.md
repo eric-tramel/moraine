@@ -2,9 +2,11 @@
 
 [![Docs](https://github.com/eric-tramel/moraine/actions/workflows/docs-deploy.yml/badge.svg)](https://eric-tramel.github.io/moraine/)
 
-Moraine indexes all of your Claude Code and Codex traces in realtime into a searchable, unfied database.
+Moraine indexes all of your agent harness traces (Claude Code, Codex, Hermes Agent, ...) in realtime into a searchable, unfied database.
 
 🤖 **Your Agents Get**: a searchable long-term memory.
+
+
 🌝 **You Get**: a unified record of everything they've done across providers. Tools, Tokens, and Talk.
 
 Specifically, Morine provides:
@@ -16,7 +18,11 @@ Specifically, Morine provides:
 - **Continually Optimized Search Tooling**: improvements to realtime search performance are an ongoing effort in the project, and we're aiming to drive down real-time search latency as much as can.
 - **Fully local**: nothing leaves your machine, unless you want it to (and set up a remote db instance).
 
-<img width="1784" height="1167" alt="image" src="https://github.com/user-attachments/assets/150a0ed5-1daf-4eb5-b60e-d3ee2221b22f" />
+<img width="1635" height="1170" alt="image" src="https://github.com/user-attachments/assets/b1e67007-aa73-4c31-80b9-79c0d4fb91da" />
+
+<img width="1635" height="1170" alt="image" src="https://github.com/user-attachments/assets/f7ec8582-8d3c-4745-bdbe-a2fe71df6004" />
+
+
 
 
 | :warning: WARNING           |
