@@ -5,14 +5,14 @@ build-backend = "hatchling.build"
 [project]
 name = "moraine-cli"
 dynamic = ["version"]
-description = "Moraine — unified trace indexer and MCP server for Claude Code / Codex"
+description = "Unified realtime agent trace database & search MCP"
 readme = "README.md"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 requires-python = ">=3.9"
 authors = [{ name = "Moraine Maintainers" }]
 classifiers = [
   "Development Status :: 4 - Beta",
-  "License :: OSI Approved :: MIT License",
+  "License :: OSI Approved :: Apache Software License",
   "Operating System :: MacOS",
   "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
