@@ -63,8 +63,11 @@ nav:
   - Architecture:
       - Design Tradeoffs: architecture/design-tradeoffs.md
       - Workspace Ownership: architecture/workspace-ownership.md
+  - Development:
+      - Dev Sandbox: development/sandbox.md
   - Operations:
       - Build and Operations: operations/build-and-operations.md
       - Environment Variables: operations/environment-variables.md
       - Replay Search Latency Benchmark: operations/replay-search-latency-benchmark.md
       - Migration Guide: operations/migration-guide.md
+      - PyPI Release: operations/pypi-release.md
