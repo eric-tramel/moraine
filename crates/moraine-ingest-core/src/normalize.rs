@@ -2778,7 +2778,10 @@ fn normalize_kimi_cli_wire_event(
                 "",
                 &payload_json,
             );
-            row.insert("input_tokens".to_string(), json!(input_other));
+            row.insert(
+                "input_tokens".to_string(),
+                json!(input_other + input_cache_read + input_cache_creation),
+            );
             row.insert("output_tokens".to_string(), json!(output));
             row.insert("cache_read_tokens".to_string(), json!(input_cache_read));
             row.insert(
