@@ -110,8 +110,19 @@ fn kimi_wire_fixture_maps_messages_tools_and_tokens() {
         usage.get("payload_type").and_then(Value::as_str),
         Some("token_count")
     );
-    assert_eq!(usage.get("input_tokens").and_then(Value::as_u64), Some(10));
+    // input_tokens = input_other + input_cache_read + input_cache_creation
+    // (10 + 2 + 1). cache reads/writes are a subset of total input, not
+    // additional on top — see issue #272.
+    assert_eq!(usage.get("input_tokens").and_then(Value::as_u64), Some(13));
     assert_eq!(usage.get("output_tokens").and_then(Value::as_u64), Some(5));
+    assert_eq!(
+        usage.get("cache_read_tokens").and_then(Value::as_u64),
+        Some(2)
+    );
+    assert_eq!(
+        usage.get("cache_write_tokens").and_then(Value::as_u64),
+        Some(1)
+    );
 }
 
 #[test]
