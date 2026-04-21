@@ -123,6 +123,19 @@ fn kimi_wire_fixture_maps_messages_tools_and_tokens() {
         usage.get("cache_write_tokens").and_then(Value::as_u64),
         Some(1)
     );
+
+    // Every emitted Kimi event row should carry the harness-slug placeholder
+    // model ("kimi-cli") so they are visible in tokens-by-model analytics —
+    // the wire schema does not expose the underlying model name.
+    for record in &rows {
+        for event in &record.event_rows {
+            assert_eq!(
+                event.get("model").and_then(Value::as_str),
+                Some("kimi-cli"),
+                "every kimi event should carry a placeholder model"
+            );
+        }
+    }
 }
 
 #[test]
