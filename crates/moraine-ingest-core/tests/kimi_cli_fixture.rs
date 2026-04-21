@@ -115,6 +115,31 @@ fn kimi_wire_fixture_maps_messages_tools_and_tokens() {
 }
 
 #[test]
+fn kimi_subagent_event_emits_raw_row_but_no_normalized_event() {
+    // SubagentEvent envelopes on the parent wire duplicate events that are
+    // already captured via the sub-agent's own wire.jsonl. They must not
+    // produce a normalized event row (which would double-count every
+    // sub-agent event as `progress` on the parent, see #271), but the raw
+    // row is preserved so the byte-level trace remains intact.
+    let rows = normalize_lines("wire.jsonl");
+    let subagent_row = rows
+        .iter()
+        .find(|row| {
+            row.raw_row
+                .get("top_type")
+                .and_then(Value::as_str)
+                .map(|k| k == "SubagentEvent")
+                .unwrap_or(false)
+        })
+        .expect("fixture contains a SubagentEvent record");
+
+    assert!(!subagent_row.raw_row.is_null());
+    assert!(subagent_row.event_rows.is_empty());
+    assert!(subagent_row.tool_rows.is_empty());
+    assert!(subagent_row.error_rows.is_empty());
+}
+
+#[test]
 fn kimi_events_do_not_reuse_raw_record_uid() {
     let rows = normalize_lines("wire.jsonl");
     let mut event_uids = HashSet::new();

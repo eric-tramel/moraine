@@ -2808,9 +2808,18 @@ fn normalize_kimi_cli_wire_event(
             };
             push_progress("wire:hook", "event_msg", text, "event_msg");
         }
+        "SubagentEvent" => {
+            // Kimi writes every sub-agent event twice: once as a SubagentEvent
+            // envelope on the parent wire, and once as the real event inside
+            // `<session>/subagents/<agent_id>/wire.jsonl`. Emitting a normalized
+            // row here would double-count every sub-agent event as `progress`
+            // on the parent session (see #271). Skip the normalized row; the
+            // raw_events row is still written from the enclosing dispatcher,
+            // so the byte-level trace is preserved.
+        }
         "MCPLoadingBegin" | "MCPLoadingEnd" | "MCPStatusSnapshot" | "BtwBegin" | "BtwEnd"
-        | "SubagentEvent" | "Notification" | "PlanDisplay" | "ApprovalRequest"
-        | "ApprovalResponse" | "QuestionRequest" | "QuestionResponse" => {
+        | "Notification" | "PlanDisplay" | "ApprovalRequest" | "ApprovalResponse"
+        | "QuestionRequest" | "QuestionResponse" => {
             push_progress(
                 &format!("wire:{msg_type}"),
                 "progress",
