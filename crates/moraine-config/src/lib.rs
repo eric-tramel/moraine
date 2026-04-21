@@ -16,9 +16,9 @@ pub struct IngestSource {
     #[serde(default)]
     pub watch_root: String,
     /// On-disk trace format: `"jsonl"` (append-only newline-delimited records,
-    /// the default used by Codex, Claude Code, and Hermes ShareGPT dumps) or
-    /// `"session_json"` (single-file-per-session JSON rewritten in place via
-    /// atomic rename — used by live Hermes agent sessions). Empty means
+    /// the default used by Codex, Claude Code, Kimi CLI, and Hermes ShareGPT
+    /// dumps) or `"session_json"` (single-file-per-session JSON rewritten in
+    /// place via atomic rename — used by live Hermes agent sessions). Empty means
     /// "infer": hermes + `*.json` glob → `session_json`, otherwise `jsonl`.
     #[serde(default)]
     pub format: String,
@@ -286,6 +286,14 @@ fn default_sources() -> Vec<IngestSource> {
             enabled: true,
             glob: "~/.hermes/sessions/session_*.json".to_string(),
             watch_root: "~/.hermes/sessions".to_string(),
+            format: String::new(),
+        },
+        IngestSource {
+            name: "kimi-cli".to_string(),
+            harness: "kimi-cli".to_string(),
+            enabled: true,
+            glob: "~/.kimi/sessions/**/wire.jsonl".to_string(),
+            watch_root: "~/.kimi/sessions".to_string(),
             format: String::new(),
         },
     ]
@@ -613,12 +621,16 @@ fn resolve_runtime_subdir(root: &str, value: &str) -> String {
 
 fn normalize_harness(harness: &str, source_idx: usize, source_name: &str) -> Result<String> {
     let normalized = harness.trim().to_ascii_lowercase();
-    if normalized == "codex" || normalized == "claude-code" || normalized == "hermes" {
+    if normalized == "codex"
+        || normalized == "claude-code"
+        || normalized == "hermes"
+        || normalized == "kimi-cli"
+    {
         return Ok(normalized);
     }
 
     Err(anyhow::anyhow!(
-        "invalid ingest.sources[{source_idx}].harness `{}` for source `{}`; expected one of: codex, claude-code, hermes",
+        "invalid ingest.sources[{source_idx}].harness `{}` for source `{}`; expected one of: codex, claude-code, hermes, kimi-cli",
         harness.trim(),
         source_name
     ))
@@ -933,7 +945,7 @@ watch_root = "~/.custom/sessions"
         let err = load_config(&path).expect_err("unknown ingest harness should fail");
         std::fs::remove_file(&path).ok();
         assert!(
-            format!("{err:#}").contains("expected one of: codex, claude-code, hermes"),
+            format!("{err:#}").contains("expected one of: codex, claude-code, hermes, kimi-cli"),
             "unexpected error: {err:#}"
         );
     }
@@ -954,7 +966,7 @@ watch_root = "~/.claude/projects"
         let err = load_config(&path).expect_err("legacy `claude` harness value should fail");
         std::fs::remove_file(&path).ok();
         assert!(
-            format!("{err:#}").contains("expected one of: codex, claude-code, hermes"),
+            format!("{err:#}").contains("expected one of: codex, claude-code, hermes, kimi-cli"),
             "unexpected error: {err:#}"
         );
     }
@@ -1007,5 +1019,30 @@ watch_root = "~/trajectories"
         assert_eq!(source.name, "hermes");
         assert!(source.glob.ends_with("/trajectories/**/*.jsonl"));
         assert!(source.watch_root.ends_with("/trajectories"));
+    }
+
+    #[test]
+    fn load_config_accepts_kimi_cli_harness_value() {
+        let path = write_temp_config(
+            r#"
+[[ingest.sources]]
+name = "kimi-cli"
+harness = "kimi-cli"
+enabled = true
+glob = "~/.kimi/sessions/**/wire.jsonl"
+watch_root = "~/.kimi/sessions"
+"#,
+            "kimi-cli-harness",
+        );
+        let cfg = load_config(&path).expect("kimi-cli harness should be accepted");
+        std::fs::remove_file(&path).ok();
+        let source = cfg
+            .ingest
+            .sources
+            .iter()
+            .find(|source| source.harness == "kimi-cli")
+            .expect("kimi-cli source");
+        assert_eq!(source.format, SOURCE_FORMAT_JSONL);
+        assert_eq!(source.tracked_extension(), "jsonl");
     }
 }

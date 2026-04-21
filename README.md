@@ -2,7 +2,7 @@
 
 [![Docs](https://github.com/eric-tramel/moraine/actions/workflows/docs-deploy.yml/badge.svg)](https://eric-tramel.github.io/moraine/)
 
-Moraine indexes all of your agent harness traces (Claude Code, Codex, Hermes Agent, ...) in realtime into a searchable, unfied database.
+Moraine indexes all of your agent harness traces (Claude Code, Codex, Kimi CLI, Hermes Agent, ...) in realtime into a searchable, unified database.
 
 🤖 **Your Agents Get**: a searchable long-term memory.
 
@@ -58,7 +58,7 @@ moraine status
 
 Open the monitor UI at `http://127.0.0.1:8080`.
 
-Run a Claude Code or Codex session as you normally would, you'll see row counts and the ingest heartbeat move as your sessions are indexed.
+Run an agent session as you normally would, you'll see row counts and the ingest heartbeat move as your sessions are indexed.
 
 Use `moraine status --output rich --verbose` for a detailed breakdown.
 
@@ -126,6 +126,7 @@ By default, Moraine watches:
 |---|---|
 | Codex | `~/.codex/sessions/**/*.jsonl` |
 | Claude Code | `~/.claude/projects/**/*.jsonl` |
+| Kimi CLI | `~/.kimi/sessions/**/wire.jsonl` |
 | Hermes (live sessions) | `~/.hermes/sessions/session_*.json` |
 | Hermes (trajectories) | user-defined, opt-in |
 

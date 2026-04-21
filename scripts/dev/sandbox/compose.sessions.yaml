@@ -12,6 +12,8 @@
 #                                 (live per-session JSON files the Hermes CLI
 #                                 rewrites in place; exercises the
 #                                 format = "session_json" path)
+#   SANDBOX_KIMI_SESSIONS_DIR     host ~/.kimi/sessions, read-only
+#                                 (wire.jsonl files written by the Kimi CLI)
 
 services:
   moraine:
@@ -19,3 +21,4 @@ services:
       - "${SANDBOX_CODEX_SESSIONS_DIR}:/host/codex/sessions:ro"
       - "${SANDBOX_CLAUDE_PROJECTS_DIR}:/host/claude/projects:ro"
       - "${SANDBOX_HERMES_SESSIONS_DIR}:/host/hermes/sessions:ro"
+      - "${SANDBOX_KIMI_SESSIONS_DIR}:/host/kimi/sessions:ro"

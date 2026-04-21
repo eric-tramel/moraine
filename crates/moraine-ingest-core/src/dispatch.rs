@@ -475,7 +475,14 @@ pub(crate) async fn process_file(
 
         session_hint = normalized.session_hint;
         model_hint = normalized.model_hint;
-        batch.raw_rows.push(normalized.raw_row);
+        // A null `raw_row` means the normalizer deliberately skipped the
+        // record (e.g. the Kimi wire metadata header). Advance the line
+        // counter and checkpoint, but emit nothing downstream — passing a
+        // `Value::Null` through to ClickHouse breaks the whole JSONEachRow
+        // batch with "expected '{' before: 'null'".
+        if !normalized.raw_row.is_null() {
+            batch.raw_rows.push(normalized.raw_row);
+        }
         batch.event_rows.extend(normalized.event_rows);
         batch.link_rows.extend(normalized.link_rows);
         batch.tool_rows.extend(normalized.tool_rows);
@@ -672,7 +679,13 @@ async fn process_session_json_file(
             Ok(normalized) => {
                 session_hint = normalized.session_hint;
                 model_hint = normalized.model_hint;
-                batch.raw_rows.push(normalized.raw_row);
+                // A null `raw_row` is the normalizer's "skip this record"
+                // signal (e.g. Kimi wire metadata header). Still count the
+                // line for checkpointing, but don't emit a null row — it
+                // would poison the JSONEachRow batch at flush time.
+                if !normalized.raw_row.is_null() {
+                    batch.raw_rows.push(normalized.raw_row);
+                }
                 batch.event_rows.extend(normalized.event_rows);
                 batch.link_rows.extend(normalized.link_rows);
                 batch.tool_rows.extend(normalized.tool_rows);

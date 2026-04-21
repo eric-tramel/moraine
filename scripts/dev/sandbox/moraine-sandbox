@@ -36,12 +36,14 @@ PROJECT_PREFIX="moraine-sandbox-"
 : "${SANDBOX_CODEX_SESSIONS_DIR:=/dev/null}"
 : "${SANDBOX_CLAUDE_PROJECTS_DIR:=/dev/null}"
 : "${SANDBOX_HERMES_SESSIONS_DIR:=/dev/null}"
+: "${SANDBOX_KIMI_SESSIONS_DIR:=/dev/null}"
 : "${SANDBOX_MONITOR_HOST_PORT:=0}"
 : "${SANDBOX_CLICKHOUSE_HTTP_HOST_PORT:=0}"
 : "${SANDBOX_CLICKHOUSE_TCP_HOST_PORT:=0}"
 : "${SANDBOX_CLICKHOUSE_IMAGE:=clickhouse/clickhouse-server:latest}"
 export SANDBOX_REPO_ROOT SANDBOX_BIN_DIR SANDBOX_WEB_DIR SANDBOX_CONFIG_DIR
 export SANDBOX_CODEX_SESSIONS_DIR SANDBOX_CLAUDE_PROJECTS_DIR SANDBOX_HERMES_SESSIONS_DIR
+export SANDBOX_KIMI_SESSIONS_DIR
 export SANDBOX_MONITOR_HOST_PORT SANDBOX_CLICKHOUSE_HTTP_HOST_PORT SANDBOX_CLICKHOUSE_TCP_HOST_PORT
 export SANDBOX_CLICKHOUSE_IMAGE
 
@@ -270,13 +272,14 @@ ensure_compose_env() {
     : "${SANDBOX_CODEX_SESSIONS_DIR:=/tmp}"
     : "${SANDBOX_CLAUDE_PROJECTS_DIR:=/tmp}"
     : "${SANDBOX_HERMES_SESSIONS_DIR:=/tmp}"
+    : "${SANDBOX_KIMI_SESSIONS_DIR:=/tmp}"
     : "${SANDBOX_SCCACHE_HOST_DIR:=/tmp}"
     : "${SANDBOX_REBUILD:=0}"
     export SANDBOX_CLICKHOUSE_IMAGE SANDBOX_CLICKHOUSE_HTTP_HOST_PORT \
         SANDBOX_CLICKHOUSE_TCP_HOST_PORT SANDBOX_MONITOR_HOST_PORT \
         SANDBOX_REPO_ROOT SANDBOX_WEB_DIR SANDBOX_CONFIG_DIR \
         SANDBOX_ENTRYPOINT SANDBOX_CODEX_SESSIONS_DIR SANDBOX_CLAUDE_PROJECTS_DIR \
-        SANDBOX_HERMES_SESSIONS_DIR \
+        SANDBOX_HERMES_SESSIONS_DIR SANDBOX_KIMI_SESSIONS_DIR \
         SANDBOX_SCCACHE_HOST_DIR SANDBOX_REBUILD
 }
 
@@ -344,7 +347,8 @@ for proj in data:
 #   $4 codex_sessions_dir (host) — may be ""
 #   $5 claude_projects_dir (host) — may be ""
 #   $6 hermes_sessions_dir (host) — may be ""
-#   $7 clickhouse_version
+#   $7 kimi_sessions_dir (host) — may be ""
+#   $8 clickhouse_version
 generate_moraine_toml() {
     local config_dir="$1"
     local id="$2"
@@ -352,13 +356,15 @@ generate_moraine_toml() {
     local codex_dir="$4"
     local claude_dir="$5"
     local hermes_dir="$6"
-    local ch_version="$7"
+    local kimi_dir="$7"
+    local ch_version="$8"
 
     mkdir -p "$config_dir"
 
     local codex_src_block=""
     local claude_src_block=""
     local hermes_src_block=""
+    local kimi_src_block=""
 
     if [[ "$mount_sessions" == "1" ]]; then
         if [[ -n "$codex_dir" && -d "$codex_dir" ]]; then
@@ -376,15 +382,22 @@ generate_moraine_toml() {
         else
             warn "host hermes sessions dir not found (${hermes_dir}); skipping that source"
         fi
+        if [[ -n "$kimi_dir" && -d "$kimi_dir" ]]; then
+            kimi_src_block=$'[[ingest.sources]]\nname = "host-kimi"\nharness = "kimi-cli"\nenabled = true\nglob = "/host/kimi/sessions/**/wire.jsonl"\nwatch_root = "/host/kimi/sessions"\n'
+        else
+            warn "host kimi sessions dir not found (${kimi_dir}); skipping that source"
+        fi
     else
         # Fixture-based sources. Create empty dirs under config dir that will
         # be mounted at /sandbox inside the container.
         mkdir -p "${config_dir}/fixtures/codex/sessions"
         mkdir -p "${config_dir}/fixtures/claude/projects"
         mkdir -p "${config_dir}/fixtures/hermes/sessions"
+        mkdir -p "${config_dir}/fixtures/kimi/sessions"
         codex_src_block=$'[[ingest.sources]]\nname = "fixture-codex"\nharness = "codex"\nenabled = true\nglob = "/sandbox/fixtures/codex/sessions/**/*.jsonl"\nwatch_root = "/sandbox/fixtures/codex/sessions"\n'
         claude_src_block=$'[[ingest.sources]]\nname = "fixture-claude"\nharness = "claude-code"\nenabled = true\nglob = "/sandbox/fixtures/claude/projects/**/*.jsonl"\nwatch_root = "/sandbox/fixtures/claude/projects"\n'
         hermes_src_block=$'[[ingest.sources]]\nname = "fixture-hermes"\nharness = "hermes"\nenabled = true\nglob = "/sandbox/fixtures/hermes/sessions/session_*.json"\nwatch_root = "/sandbox/fixtures/hermes/sessions"\nformat = "session_json"\n'
+        kimi_src_block=$'[[ingest.sources]]\nname = "fixture-kimi"\nharness = "kimi-cli"\nenabled = true\nglob = "/sandbox/fixtures/kimi/sessions/**/wire.jsonl"\nwatch_root = "/sandbox/fixtures/kimi/sessions"\n'
     fi
 
     local toml_path="${config_dir}/moraine.toml"
@@ -406,6 +419,7 @@ state_dir = "/home/moraine/.moraine/ingestor"
 ${codex_src_block}
 ${claude_src_block}
 ${hermes_src_block}
+${kimi_src_block}
 [monitor]
 host = "0.0.0.0"
 port = 8080
@@ -567,10 +581,12 @@ cmd_up() {
     [[ -z "$claude_dir" || "$claude_dir" == "/dev/null" ]] && claude_dir="${HOME}/.claude/projects"
     local hermes_dir="$SANDBOX_HERMES_SESSIONS_DIR"
     [[ -z "$hermes_dir" || "$hermes_dir" == "/dev/null" ]] && hermes_dir="${HOME}/.hermes/sessions"
+    local kimi_dir="$SANDBOX_KIMI_SESSIONS_DIR"
+    [[ -z "$kimi_dir" || "$kimi_dir" == "/dev/null" ]] && kimi_dir="${HOME}/.kimi/sessions"
     local ch_version
     ch_version="$(clickhouse_version_from_default_config)"
     generate_moraine_toml "$config_dir" "$id" "$mount_sessions" \
-        "$codex_dir" "$claude_dir" "$hermes_dir" "$ch_version"
+        "$codex_dir" "$claude_dir" "$hermes_dir" "$kimi_dir" "$ch_version"
     local config_path="${config_dir}/moraine.toml"
 
     # Translate moraine's clickhouse_version (e.g. "v25.12.5.44-stable") to
@@ -612,6 +628,11 @@ cmd_up() {
             export SANDBOX_HERMES_SESSIONS_DIR="$hermes_dir"
         else
             export SANDBOX_HERMES_SESSIONS_DIR="/dev/null"
+        fi
+        if [[ -d "$kimi_dir" ]]; then
+            export SANDBOX_KIMI_SESSIONS_DIR="$kimi_dir"
+        else
+            export SANDBOX_KIMI_SESSIONS_DIR="/dev/null"
         fi
     fi
 
@@ -876,6 +897,9 @@ ENVIRONMENT:
                                 session_*.json rewritten in place — the
                                 sandbox ingests them via the session_json
                                 format path.
+    SANDBOX_KIMI_SESSIONS_DIR   override host kimi-cli sessions dir (default
+                                ~/.kimi/sessions). Ingests wire.jsonl files
+                                written by the Kimi CLI.
 EOF
 }
 

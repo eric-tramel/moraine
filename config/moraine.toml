@@ -32,6 +32,14 @@ enabled = true
 glob = "~/.claude/projects/**/*.jsonl"
 watch_root = "~/.claude/projects"
 
+[[ingest.sources]]
+name = "kimi-cli"
+harness = "kimi-cli"
+enabled = true
+glob = "~/.kimi/sessions/**/wire.jsonl"
+watch_root = "~/.kimi/sessions"
+format = "jsonl"
+
 # Hermes Agent LIVE sessions: one JSON file per conversation under
 # ~/.hermes/sessions/ that the agent rewrites in place every turn.
 # `format = "session_json"` opts into the rewrite-aware processor that emits

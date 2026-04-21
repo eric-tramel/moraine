@@ -1,6 +1,6 @@
 # Moraine Documentation
 
-Moraine is a local indexing and retrieval system built to ingest Codex JSONL session streams and Claude code-trace JSONL streams with low latency, keep full reconstruction fidelity, and serve lexical retrieval without rebuilding global indexes for every query. The system is deliberately opinionated: everything runs on one machine, all state is under `~/.moraine`, and all critical surfaces are SQL tables, Rust services, and deterministic shell entrypoints.
+Moraine is a local indexing and retrieval system built to ingest Codex, Claude Code, Kimi CLI, and Hermes traces with low latency, keep full reconstruction fidelity, and serve lexical retrieval without rebuilding global indexes for every query. The system is deliberately opinionated: everything runs on one machine, all state is under `~/.moraine`, and all critical surfaces are SQL tables, Rust services, and deterministic shell entrypoints.
 
 The practical consequence is that this documentation is not a user tutorial; it is a maintainer corpus. Each document is written to answer a specific class of engineering question: what the system guarantees, where it can fail, how failure is recovered, how freshness is preserved, and where performance is spent.
 

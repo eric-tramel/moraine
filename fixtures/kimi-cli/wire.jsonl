@@ -1,0 +1,8 @@
+{"type":"metadata","protocol_version":"1.9"}
+{"timestamp":1775953944.549974,"message":{"type":"TurnBegin","payload":{"user_input":"Please inspect the sample project."}}}
+{"timestamp":1775953944.550842,"message":{"type":"StepBegin","payload":{"n":1}}}
+{"timestamp":1775953945.100000,"message":{"type":"ContentPart","payload":{"type":"think","think":"Need to inspect files first."}}}
+{"timestamp":1775953946.200000,"message":{"type":"ContentPart","payload":{"type":"text","text":"I will read the manifest."}}}
+{"timestamp":1775953947.300000,"message":{"type":"ToolCall","payload":{"type":"function","id":"tool_abc","function":{"name":"ReadFile","arguments":"{\"path\":\"manifest.json\"}"},"extras":null}}}
+{"timestamp":1775953948.400000,"message":{"type":"ToolResult","payload":{"tool_call_id":"tool_abc","return_value":{"is_error":false,"output":"{\"ok\":true}","message":"Read file","display":[],"extras":null}}}}
+{"timestamp":1775953949.500000,"message":{"type":"StatusUpdate","payload":{"context_usage":0.1,"context_tokens":100,"max_context_tokens":1000,"token_usage":{"input_other":10,"output":5,"input_cache_read":2,"input_cache_creation":1},"message_id":"chatcmpl_test","plan_mode":false,"mcp_status":null}}}

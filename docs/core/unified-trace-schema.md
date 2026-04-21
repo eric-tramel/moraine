@@ -1,6 +1,6 @@
 # Unified Trace Schema Mapping
 
-This page maps raw Codex and Claude Code trace fields into the unified `moraine.events` table so you can move directly from source JSONL to canonical columns when querying ClickHouse. Hermes Agent trajectories now normalize into the same table as well; because Hermes uses ShareGPT-compatible JSONL with one whole rollout per line, its mapping is summarized after the provider comparison table. The table rows below follow the `moraine.events` schema order. [src: sql/001_schema.sql:L23-L77, crates/moraine-ingest-core/src/normalize.rs:L259-L379, crates/moraine-ingest-core/src/normalize.rs:L1322-L1415]
+This page maps raw trace fields into the unified `moraine.events` table so you can move directly from source data to canonical columns when querying ClickHouse. Codex, Claude Code, Kimi CLI, and Hermes normalize into the same table, with format-specific notes after the provider comparison table. The table rows below follow the `moraine.events` schema order. [src: sql/001_schema.sql:L23-L77, crates/moraine-ingest-core/src/normalize.rs]
 
 ## Field Mapping Table
 
@@ -87,3 +87,9 @@ Live Hermes CLI / gateway sessions land at `~/.hermes/sessions/session_<ts>_<id>
   - `role == "tool"` → one `event_kind=tool_result` row correlated to the originating call via `tool_call_id`, plus a matching `tool_io` response row.
   - `role == "system"` → one `event_kind=system` row.
 - All rows emitted from one message share `turn_index = message_index + 1`, giving each conversation turn a monotonically increasing sequence for `v_conversation_trace`. Within a single message, sub-events are time-offset by microsecond so the reasoning row sorts before the tool_call row that follows it.
+
+## Kimi CLI Mapping
+
+Kimi CLI uses `~/.kimi/sessions/**/wire.jsonl`. Wire records with `message.type=TurnBegin` or `SteerInput` become `message` / `user_message` rows. `ContentPart` with `type=text` becomes an assistant message, while `type=think` becomes a `reasoning` / `thinking` row. `ToolCall` and `ToolResult` map to `tool_call` and `tool_result` plus `tool_io` rows keyed by the Kimi tool call id. `StatusUpdate.token_usage` maps input, output, and cache token counters. Session ids are derived from the parent session directory and namespaced as `kimi-cli:<session-id>`. The leading `{"type":"metadata","protocol_version":...}` header line is skipped during normalization — it's a per-file protocol marker, not a session event.
+
+The sibling `context.jsonl` file is not ingested: it's a materialized-turn view that Kimi writes from the same wire events, so anything in it is already captured via `wire.jsonl` (except the system prompt, which Moraine does not persist today).
