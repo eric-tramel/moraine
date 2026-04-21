@@ -2840,6 +2840,20 @@ fn normalize_kimi_cli_wire_event(
         }
     }
 
+    // Why: the Kimi wire schema (MoonshotAI/kimi-cli wire/types.py) has no
+    // record that carries the active model name, and neither do the sibling
+    // context.jsonl / state.json files. Without a placeholder, every Kimi
+    // event has an empty `model` and the monitor's tokens-by-model analytics
+    // (which filters out empty-model rows) never shows them. Stamping the
+    // harness slug here guarantees a single "kimi-cli" series so Kimi usage
+    // is at least visible cross-harness, even though we can't distinguish
+    // between configured Kimi models.
+    for row in events.iter_mut() {
+        if let Some(obj) = row.as_object_mut() {
+            obj.insert("model".to_string(), json!("kimi-cli"));
+        }
+    }
+
     (events, links, tools)
 }
 
@@ -3978,6 +3992,80 @@ mod tests {
             tool_response.get("output_text").and_then(Value::as_str),
             Some("{\"forecast\":\"rain\"}")
         );
+    }
+
+    #[test]
+    fn kimi_cli_status_update_stamps_placeholder_model() {
+        let record = json!({
+            "timestamp": 1776735761.27701_f64,
+            "message": {
+                "type": "StatusUpdate",
+                "payload": {
+                    "message_id": "msg_abc",
+                    "context_usage": 0.42,
+                    "token_usage": {
+                        "input_other": 1234,
+                        "input_cache_read": 56,
+                        "input_cache_creation": 78,
+                        "output": 90
+                    }
+                }
+            }
+        });
+
+        let out = normalize_record(
+            &record,
+            "kimi-cli",
+            "kimi-cli",
+            "/Users/eric/.kimi/sessions/work-abc/sess-xyz/wire.jsonl",
+            1,
+            1,
+            5,
+            500,
+            "",
+            "",
+        )
+        .expect("kimi status update should normalize");
+
+        assert_eq!(out.event_rows.len(), 1);
+        let row = out.event_rows[0].as_object().unwrap();
+        assert_eq!(row.get("model").and_then(Value::as_str), Some("kimi-cli"));
+        // input_tokens sums input_other + input_cache_read + input_cache_creation
+        // (1234 + 56 + 78), per #275.
+        assert_eq!(row.get("input_tokens").and_then(Value::as_u64), Some(1368));
+        assert_eq!(row.get("output_tokens").and_then(Value::as_u64), Some(90));
+        assert_eq!(out.model_hint, "kimi-cli");
+    }
+
+    #[test]
+    fn kimi_cli_content_part_stamps_placeholder_model() {
+        let record = json!({
+            "timestamp": 1776735761.27701_f64,
+            "message": {
+                "type": "ContentPart",
+                "payload": {
+                    "type": "text",
+                    "text": "hello there"
+                }
+            }
+        });
+
+        let out = normalize_record(
+            &record,
+            "kimi-cli",
+            "kimi-cli",
+            "/Users/eric/.kimi/sessions/work-abc/sess-xyz/wire.jsonl",
+            1,
+            1,
+            6,
+            600,
+            "",
+            "",
+        )
+        .expect("kimi content part should normalize");
+
+        let row = out.event_rows[0].as_object().unwrap();
+        assert_eq!(row.get("model").and_then(Value::as_str), Some("kimi-cli"));
     }
 
     #[test]
