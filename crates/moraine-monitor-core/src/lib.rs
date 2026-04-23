@@ -432,6 +432,24 @@ fn resolve_analytics_range(value: Option<&str>) -> AnalyticsRange {
     }
 }
 
+fn analytics_window_query(table: &str, window_filter: &str, window_seconds: u32) -> String {
+    format!(
+        "SELECT \
+           toUInt64(anchor_unix) AS now_unix, \
+           toUInt64(greatest(anchor_unix - toInt64({window_seconds}), toInt64(0))) AS from_unix \
+         FROM ( \
+           SELECT \
+             if( \
+               count() = 0, \
+               toInt64(toUnixTimestamp(now())), \
+               toInt64(intDiv(toUnixTimestamp64Milli(max(event_ts)), 1000)) \
+             ) AS anchor_unix \
+           FROM {table} \
+           WHERE {window_filter} \
+         )",
+    )
+}
+
 async fn api_analytics(
     Query(params): Query<AnalyticsQuery>,
     State(state): State<AppState>,
@@ -615,12 +633,7 @@ async fn api_analytics(
         from_unix: u64,
     }
 
-    let window_query = format!(
-        "SELECT toUInt64(toUnixTimestamp(max(event_ts))) AS now_unix, toUInt64(toUnixTimestamp(max(event_ts) - INTERVAL {} SECOND)) AS from_unix FROM {} WHERE {}",
-        range.window_seconds,
-        table,
-        window_filter,
-    );
+    let window_query = analytics_window_query(&table, &window_filter, range.window_seconds);
 
     let (now_unix, from_unix) = match state
         .clickhouse
@@ -1560,6 +1573,20 @@ mod tests {
         let columns: Vec<String> = Vec::new();
         let query = table_preview_rows_query("analytics", "events", &columns, 5);
         assert_eq!(query, "SELECT * FROM `analytics`.`events` LIMIT 5");
+    }
+
+    #[test]
+    fn analytics_window_query_guards_empty_recent_window() {
+        let query = analytics_window_query(
+            "`moraine`.`events`",
+            "event_ts >= now() - INTERVAL 86400 SECOND",
+            86_400,
+        );
+
+        assert!(query.contains("count() = 0"));
+        assert!(query.contains("toUnixTimestamp64Milli(max(event_ts))"));
+        assert!(query.contains("greatest(anchor_unix - toInt64(86400), toInt64(0))"));
+        assert!(!query.contains("max(event_ts) - INTERVAL"));
     }
 
     #[test]
