@@ -27,6 +27,7 @@ export interface AssistantStep {
   at: number;
   text: string;
   tokens?: number;
+  durationMs?: number;
 }
 
 export interface ThinkingStep {
