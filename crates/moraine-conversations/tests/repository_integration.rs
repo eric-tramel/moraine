@@ -14,6 +14,7 @@ use moraine_conversations::{
     ClickHouseConversationRepository, ConversationListFilter, ConversationListSort,
     ConversationMode, ConversationRepository, ConversationSearchQuery, PageRequest, RepoConfig,
     RepoError, SearchEventKind, SearchEventsQuery, SessionEventsDirection, SessionEventsQuery,
+    SessionMetadataSearchQuery,
 };
 use serde_json::json;
 
@@ -114,7 +115,9 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
                         "assistant_messages": 6,
                         "tool_calls": 3,
                         "tool_results": 3,
-                        "mode": "web_search"
+                        "mode": "web_search",
+                        "session_slug": "project-c",
+                        "session_summary": "Session C summary"
                     },
                     {
                         "session_id": "sess_b",
@@ -343,7 +346,9 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
             );
         }
 
-        if query.contains("GROUP BY e.session_id") {
+        if query.contains("GROUP BY e.session_id")
+            && query.contains("FROM `moraine`.`search_postings` AS p")
+        {
             return (
                 StatusCode::OK,
                 json_each_row(json!([
@@ -468,6 +473,41 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
                         "harness": "codex",
                         "session_slug": "",
                         "session_summary": ""
+                    }
+                ])),
+            );
+        }
+
+        if query.contains("WITH\n  ['rare','summary'] AS q_terms")
+            && query.contains("FROM `moraine`.`events` AS e")
+            && query.contains("WHERE e.event_kind = 'session_meta'")
+            && query.contains("AS meta_event_uid")
+            && query.contains("AS matched_terms")
+        {
+            return (
+                StatusCode::OK,
+                json_each_row(json!([
+                    {
+                        "session_id": "sess_meta_summary",
+                        "first_event_time": "2026-01-05 10:00:00",
+                        "first_event_unix_ms": 1767607200000_i64,
+                        "last_event_time": "2026-01-05 10:15:00",
+                        "last_event_unix_ms": 1767608100000_i64,
+                        "total_turns": 4_u32,
+                        "total_events": 18_u64,
+                        "user_messages": 5_u64,
+                        "assistant_messages": 5_u64,
+                        "tool_calls": 1_u64,
+                        "tool_results": 1_u64,
+                        "mode": "chat",
+                        "harness": "codex",
+                        "inference_provider": "openai",
+                        "session_slug": "rare-summary-session",
+                        "session_summary": "Rare summary-only session about metadata discovery.",
+                        "meta_event_uid": "meta-rare-1",
+                        "score": 5.0,
+                        "matched_terms": 2_u16,
+                        "metadata_text": "{\"summary\":\"Rare summary-only session about metadata discovery.\"}"
                     }
                 ])),
             );
@@ -734,6 +774,11 @@ async fn list_conversations_applies_filters_and_cursor_pagination() {
     assert_eq!(first.items.len(), 2);
     assert_eq!(first.items[0].session_id, "sess_c");
     assert_eq!(first.items[1].session_id, "sess_b");
+    assert_eq!(first.items[0].session_slug.as_deref(), Some("project-c"));
+    assert_eq!(
+        first.items[0].session_summary.as_deref(),
+        Some("Session C summary")
+    );
     assert!(first.next_cursor.is_some());
 
     let second = repo
@@ -754,10 +799,16 @@ async fn list_conversations_applies_filters_and_cursor_pagination() {
     let queries = state.queries.lock().expect("queries lock").clone();
     let list_query = queries
         .iter()
-        .find(|q| q.contains("FROM `moraine`.`v_session_summary` AS s"))
+        .find(|q| {
+            q.contains("FROM `moraine`.`v_session_summary` AS s")
+                && q.contains("ORDER BY s.last_event_time")
+        })
         .expect("list query should be captured");
 
     assert!(list_query.contains("ifNull(m.mode, 'chat') = 'web_search'"));
+    assert!(list_query.contains("JSONExtractString(payload_json, 'summary')"));
+    assert!(list_query.contains("s.session_id AS session_id"));
+    assert!(list_query.contains("AS session_slug"));
     assert!(list_query.contains("toUnixTimestamp64Milli(s.last_event_time) >= 1767261600000"));
     assert!(list_query.contains("toUnixTimestamp64Milli(s.last_event_time) < 1767500000000"));
     assert!(list_query.contains("ORDER BY s.last_event_time DESC, s.session_id DESC"));
@@ -954,6 +1005,106 @@ async fn get_session_metadata_keeps_empty_boundary_fields_when_summary_exists() 
     assert!(metadata.first_event_uid.is_empty());
     assert!(metadata.last_event_uid.is_empty());
     assert!(metadata.last_actor_role.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_session_metadata_returns_summary_only_matches() {
+    let (repo, _state) = build_repo().await;
+
+    let result = repo
+        .search_session_metadata(SessionMetadataSearchQuery {
+            query: "rare summary".to_string(),
+            limit: Some(10),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            from_unix_ms: None,
+            to_unix_ms: None,
+            mode: None,
+            session_id: None,
+        })
+        .await
+        .expect("search session metadata");
+
+    assert_eq!(result.query, "rare summary");
+    assert_eq!(result.terms, vec!["rare", "summary"]);
+    assert_eq!(result.stats.requested_limit, 10);
+    assert_eq!(result.stats.effective_limit, 10);
+    assert!(!result.stats.limit_capped);
+    assert_eq!(result.stats.result_count, 1);
+
+    let hit = &result.hits[0];
+    assert_eq!(hit.rank, 1);
+    assert_eq!(hit.session_id, "sess_meta_summary");
+    assert_eq!(hit.first_event_time.as_deref(), Some("2026-01-05 10:00:00"));
+    assert_eq!(hit.first_event_unix_ms, Some(1767607200000_i64));
+    assert_eq!(hit.last_event_time.as_deref(), Some("2026-01-05 10:15:00"));
+    assert_eq!(hit.last_event_unix_ms, Some(1767608100000_i64));
+    assert_eq!(hit.total_turns, Some(4));
+    assert_eq!(hit.total_events, Some(18));
+    assert_eq!(hit.user_messages, Some(5));
+    assert_eq!(hit.assistant_messages, Some(5));
+    assert_eq!(hit.tool_calls, Some(1));
+    assert_eq!(hit.tool_results, Some(1));
+    assert_eq!(hit.mode, Some(ConversationMode::Chat));
+    assert_eq!(hit.harness.as_deref(), Some("codex"));
+    assert_eq!(hit.inference_provider.as_deref(), Some("openai"));
+    assert_eq!(hit.session_slug.as_deref(), Some("rare-summary-session"));
+    assert_eq!(
+        hit.session_summary.as_deref(),
+        Some("Rare summary-only session about metadata discovery.")
+    );
+    assert_eq!(hit.meta_event_uid.as_deref(), Some("meta-rare-1"));
+    assert_eq!(hit.score, 5.0);
+    assert_eq!(hit.matched_terms, 2);
+    assert_eq!(
+        hit.snippet.as_deref(),
+        Some("Rare summary-only session about metadata discovery.")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_session_metadata_applies_time_mode_filters_and_caps_limit() {
+    let (repo, state) = build_repo_with_max_results(5).await;
+
+    let result = repo
+        .search_session_metadata(SessionMetadataSearchQuery {
+            query: "rare summary".to_string(),
+            limit: Some(25),
+            min_score: Some(1.5),
+            min_should_match: Some(2),
+            from_unix_ms: Some(1767600000000_i64),
+            to_unix_ms: Some(1767610000000_i64),
+            mode: Some(ConversationMode::Chat),
+            session_id: Some("sess_meta_summary".to_string()),
+        })
+        .await
+        .expect("search session metadata");
+
+    assert_eq!(result.stats.requested_limit, 25);
+    assert_eq!(result.stats.effective_limit, 5);
+    assert!(result.stats.limit_capped);
+
+    let queries = state.queries.lock().expect("queries lock").clone();
+    let metadata_search_query = queries
+        .iter()
+        .find(|q| {
+            q.contains("FROM `moraine`.`events` AS e")
+                && q.contains("WHERE e.event_kind = 'session_meta'")
+                && q.contains("AS meta_event_uid")
+        })
+        .expect("session metadata search query should be captured");
+
+    assert!(metadata_search_query.contains("meta.matched_terms >= 2"));
+    assert!(metadata_search_query.contains("meta.score >= 1.500000"));
+    assert!(!metadata_search_query.contains("search_postings"));
+    assert!(metadata_search_query
+        .contains("toUnixTimestamp64Milli(s.last_event_time) >= 1767600000000"));
+    assert!(
+        metadata_search_query.contains("toUnixTimestamp64Milli(s.last_event_time) < 1767610000000")
+    );
+    assert!(metadata_search_query.contains("ifNull(m.mode, 'chat') = 'chat'"));
+    assert!(metadata_search_query.contains("meta.session_id = 'sess_meta_summary'"));
+    assert!(metadata_search_query.contains("LIMIT 5"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

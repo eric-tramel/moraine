@@ -21,8 +21,9 @@ use crate::domain::{
     ConversationSearchResults, ConversationSearchStats, ConversationSummary, OpenContext,
     OpenEvent, OpenEventRequest, Page, PageRequest, RepoConfig, SearchEventHit, SearchEventKind,
     SearchEventsQuery, SearchEventsResult, SearchEventsStats, SearchEventsStrategy,
-    SessionEventsDirection, SessionEventsQuery, SessionMetadata, TraceEvent, Turn, TurnListFilter,
-    TurnSummary,
+    SessionEventsDirection, SessionEventsQuery, SessionMetadata, SessionMetadataSearchHit,
+    SessionMetadataSearchQuery, SessionMetadataSearchResults, SessionMetadataSearchStats,
+    TraceEvent, Turn, TurnListFilter, TurnSummary,
 };
 use crate::error::{RepoError, RepoResult};
 use crate::repo::ConversationRepository;
@@ -69,6 +70,10 @@ struct ConversationSummaryRow {
     tool_calls: u64,
     tool_results: u64,
     mode: String,
+    #[serde(default)]
+    session_slug: String,
+    #[serde(default)]
+    session_summary: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -91,6 +96,49 @@ struct SessionMetadataRow {
     last_event_uid: String,
     #[serde(default)]
     last_actor_role: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SessionMetadataSearchRow {
+    session_id: String,
+    #[serde(default)]
+    first_event_time: String,
+    #[serde(default)]
+    first_event_unix_ms: i64,
+    #[serde(default)]
+    last_event_time: String,
+    #[serde(default)]
+    last_event_unix_ms: i64,
+    #[serde(default)]
+    total_turns: u32,
+    #[serde(default)]
+    total_events: u64,
+    #[serde(default)]
+    user_messages: u64,
+    #[serde(default)]
+    assistant_messages: u64,
+    #[serde(default)]
+    tool_calls: u64,
+    #[serde(default)]
+    tool_results: u64,
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    harness: String,
+    #[serde(default)]
+    inference_provider: String,
+    #[serde(default)]
+    session_slug: String,
+    #[serde(default)]
+    session_summary: String,
+    #[serde(default)]
+    meta_event_uid: String,
+    #[serde(default)]
+    score: f64,
+    #[serde(default)]
+    matched_terms: u16,
+    #[serde(default)]
+    metadata_text: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -377,6 +425,77 @@ impl ClickHouseConversationRepository {
 
     pub fn config(&self) -> &RepoConfig {
         &self.cfg
+    }
+
+    pub async fn search_session_metadata(
+        &self,
+        query: SessionMetadataSearchQuery,
+    ) -> RepoResult<SessionMetadataSearchResults> {
+        let query_text = query.query.trim();
+        if query_text.is_empty() {
+            return Err(RepoError::invalid_argument("query cannot be empty"));
+        }
+
+        Self::validate_time_bounds(query.from_unix_ms, query.to_unix_ms)?;
+        if let Some(session_id) = query.session_id.as_deref() {
+            Self::validate_session_id(session_id)?;
+        }
+
+        let query_id = Uuid::new_v4().to_string();
+        let started = Instant::now();
+
+        let terms_with_qf = tokenize_query(query_text, self.cfg.bm25_max_query_terms);
+        if terms_with_qf.is_empty() {
+            return Err(RepoError::invalid_argument(
+                "query has no searchable terms (tokens shorter than 2 characters are excluded)",
+            ));
+        }
+        let terms: Vec<String> = terms_with_qf.iter().map(|(term, _)| term.clone()).collect();
+
+        let requested_limit = query.limit.unwrap_or(self.cfg.max_results).max(1);
+        let limit = requested_limit.min(self.cfg.max_results);
+        let limit_capped = requested_limit > limit;
+
+        let min_should_match = query
+            .min_should_match
+            .unwrap_or(self.cfg.bm25_default_min_should_match)
+            .max(1)
+            .min(terms.len() as u16);
+        let min_score = query.min_score.unwrap_or(0.0);
+
+        let sql = self.build_search_session_metadata_sql(
+            &terms,
+            min_should_match,
+            min_score,
+            limit,
+            query.from_unix_ms,
+            query.to_unix_ms,
+            query.mode,
+            query.session_id.as_deref(),
+        )?;
+
+        let rows: Vec<SessionMetadataSearchRow> =
+            self.map_backend(self.ch.query_rows(&sql, None).await)?;
+        let hits = rows
+            .into_iter()
+            .enumerate()
+            .map(|(idx, row)| self.map_session_metadata_search_row(idx + 1, row, &terms))
+            .collect::<Vec<_>>();
+        let took_ms = started.elapsed().as_millis() as u32;
+
+        Ok(SessionMetadataSearchResults {
+            query_id,
+            query: query_text.to_string(),
+            terms,
+            stats: SessionMetadataSearchStats {
+                requested_limit,
+                effective_limit: limit,
+                limit_capped,
+                result_count: hits.len(),
+                took_ms,
+            },
+            hits,
+        })
     }
 
     async fn run_mcp_search_prewarm_queries(
@@ -786,6 +905,8 @@ GROUP BY session_id"
             tool_calls: row.tool_calls,
             tool_results: row.tool_results,
             mode: Self::parse_mode(&row.mode),
+            session_slug: non_empty_string(row.session_slug),
+            session_summary: non_empty_string(row.session_summary),
         }
     }
 
@@ -806,6 +927,45 @@ GROUP BY session_id"
             first_event_uid: row.first_event_uid,
             last_event_uid: row.last_event_uid,
             last_actor_role: row.last_actor_role,
+        }
+    }
+
+    fn map_session_metadata_search_row(
+        &self,
+        rank: usize,
+        row: SessionMetadataSearchRow,
+        terms: &[String],
+    ) -> SessionMetadataSearchHit {
+        let has_session_summary = !row.first_event_time.is_empty();
+        let snippet = evidence_snippet(
+            &row.session_summary,
+            &row.metadata_text,
+            terms,
+            self.cfg.preview_chars,
+        );
+
+        SessionMetadataSearchHit {
+            rank,
+            session_id: row.session_id,
+            first_event_time: has_session_summary.then_some(row.first_event_time),
+            first_event_unix_ms: has_session_summary.then_some(row.first_event_unix_ms),
+            last_event_time: has_session_summary.then_some(row.last_event_time),
+            last_event_unix_ms: has_session_summary.then_some(row.last_event_unix_ms),
+            total_turns: has_session_summary.then_some(row.total_turns),
+            total_events: has_session_summary.then_some(row.total_events),
+            user_messages: has_session_summary.then_some(row.user_messages),
+            assistant_messages: has_session_summary.then_some(row.assistant_messages),
+            tool_calls: has_session_summary.then_some(row.tool_calls),
+            tool_results: has_session_summary.then_some(row.tool_results),
+            mode: (!row.mode.is_empty()).then(|| Self::parse_mode(&row.mode)),
+            harness: non_empty_string(row.harness),
+            inference_provider: non_empty_string(row.inference_provider),
+            session_slug: non_empty_string(row.session_slug),
+            session_summary: non_empty_string(row.session_summary),
+            meta_event_uid: non_empty_string(row.meta_event_uid),
+            score: row.score,
+            matched_terms: row.matched_terms,
+            snippet,
         }
     }
 
@@ -852,6 +1012,153 @@ GROUP BY session_id"
         mode.map(|m| format!("ifNull(m.mode, 'chat') = {}", sql_quote(m.as_str())))
     }
 
+    fn build_search_session_metadata_sql(
+        &self,
+        terms: &[String],
+        min_should_match: u16,
+        min_score: f64,
+        limit: u16,
+        from_unix_ms: Option<i64>,
+        to_unix_ms: Option<i64>,
+        mode: Option<ConversationMode>,
+        session_id: Option<&str>,
+    ) -> RepoResult<String> {
+        if terms.is_empty() {
+            return Err(RepoError::invalid_argument(
+                "cannot build session metadata search query with empty terms",
+            ));
+        }
+
+        let events_table = self.table_ref("events");
+        let session_summary_table = self.table_ref("v_session_summary");
+        let mode_subquery = self.mode_subquery();
+        let terms_array_sql = sql_array_strings(terms);
+
+        let mut where_clauses = vec![
+            format!("meta.matched_terms >= {min_should_match}"),
+            format!("meta.score >= {min_score:.6}"),
+        ];
+        if let Some(from_unix_ms) = from_unix_ms {
+            where_clauses.push(format!(
+                "toUnixTimestamp64Milli(s.last_event_time) >= {from_unix_ms}"
+            ));
+        }
+        if let Some(to_unix_ms) = to_unix_ms {
+            where_clauses.push(format!(
+                "toUnixTimestamp64Milli(s.last_event_time) < {to_unix_ms}"
+            ));
+        }
+        if let Some(mode_clause) = Self::mode_filter_clause(mode) {
+            where_clauses.push(mode_clause);
+        }
+        if let Some(session_id) = session_id {
+            where_clauses.push(format!("meta.session_id = {}", sql_quote(session_id)));
+        }
+        let where_sql = where_clauses.join("\n  AND ");
+
+        Ok(format!(
+            "WITH
+  {terms_array_sql} AS q_terms
+SELECT
+  meta.session_id AS session_id,
+  if(s.session_id = '', '', toString(s.first_event_time)) AS first_event_time,
+  if(
+    s.session_id = '',
+    toInt64(0),
+    toInt64(toUnixTimestamp64Milli(s.first_event_time))
+  ) AS first_event_unix_ms,
+  if(s.session_id = '', '', toString(s.last_event_time)) AS last_event_time,
+  if(
+    s.session_id = '',
+    toInt64(0),
+    toInt64(toUnixTimestamp64Milli(s.last_event_time))
+  ) AS last_event_unix_ms,
+  if(s.session_id = '', toUInt32(0), toUInt32(s.total_turns)) AS total_turns,
+  if(s.session_id = '', toUInt64(0), toUInt64(s.total_events)) AS total_events,
+  if(s.session_id = '', toUInt64(0), toUInt64(s.user_messages)) AS user_messages,
+  if(s.session_id = '', toUInt64(0), toUInt64(s.assistant_messages)) AS assistant_messages,
+  if(s.session_id = '', toUInt64(0), toUInt64(s.tool_calls)) AS tool_calls,
+  if(s.session_id = '', toUInt64(0), toUInt64(s.tool_results)) AS tool_results,
+  ifNull(m.mode, 'chat') AS mode,
+  meta.harness AS harness,
+  meta.inference_provider AS inference_provider,
+  meta.session_slug AS session_slug,
+  meta.session_summary AS session_summary,
+  meta.meta_event_uid AS meta_event_uid,
+  meta.score AS score,
+  meta.matched_terms AS matched_terms,
+  leftUTF8(meta.metadata_text, {metadata_limit}) AS metadata_text
+FROM (
+  SELECT
+    searchable.session_id AS session_id,
+    searchable.meta_event_uid AS meta_event_uid,
+    searchable.harness AS harness,
+    searchable.inference_provider AS inference_provider,
+    searchable.session_slug AS session_slug,
+    searchable.session_summary AS session_summary,
+    searchable.metadata_text AS metadata_text,
+    toUInt16(arraySum(arrayMap(
+      term -> if(positionCaseInsensitiveUTF8(searchable.search_text, term) > 0, 1, 0),
+      q_terms
+    ))) AS matched_terms,
+    arraySum(arrayMap(
+      term ->
+        if(positionCaseInsensitiveUTF8(searchable.session_summary, term) > 0, 2.0, 0.0)
+        + if(positionCaseInsensitiveUTF8(searchable.session_slug, term) > 0, 1.5, 0.0)
+        + if(positionCaseInsensitiveUTF8(searchable.metadata_text, term) > 0, 1.0, 0.0),
+      q_terms
+    )) AS score
+  FROM (
+    SELECT
+      base.session_id AS session_id,
+      base.meta_event_uid AS meta_event_uid,
+      base.harness AS harness,
+      base.inference_provider AS inference_provider,
+      base.session_slug AS session_slug,
+      base.session_summary AS session_summary,
+      base.metadata_text AS metadata_text,
+      concat(base.session_summary, '\n', base.session_slug, '\n', base.metadata_text) AS search_text
+    FROM (
+      SELECT
+        e.session_id AS session_id,
+        argMax(e.event_uid, tuple(e.event_ts, e.event_uid)) AS meta_event_uid,
+        argMax(e.harness, tuple(e.event_ts, e.event_uid)) AS harness,
+        argMax(e.inference_provider, tuple(e.event_ts, e.event_uid)) AS inference_provider,
+        ifNull(argMax(nullIf(JSONExtractString(e.payload_json, 'slug'), ''), tuple(e.event_ts, e.event_uid)), '') AS session_slug,
+        ifNull(
+          argMax(
+            coalesce(
+              nullIf(JSONExtractString(e.payload_json, 'summary'), ''),
+              nullIf(JSONExtractString(e.payload_json, 'title'), ''),
+              nullIf(JSONExtractString(e.payload_json, 'name'), '')
+            ),
+            tuple(e.event_ts, e.event_uid)
+          ),
+          ''
+        ) AS session_summary,
+        argMax(e.payload_json, tuple(e.event_ts, e.event_uid)) AS metadata_text
+      FROM {events_table} AS e
+      WHERE e.event_kind = 'session_meta'
+      GROUP BY e.session_id
+    ) AS base
+  ) AS searchable
+) AS meta
+LEFT JOIN {session_summary_table} AS s ON s.session_id = meta.session_id
+ANY LEFT JOIN ({mode_subquery}) AS m ON m.session_id = meta.session_id
+WHERE {where_sql}
+ORDER BY meta.score DESC, meta.session_id ASC
+LIMIT {limit}
+FORMAT JSONEachRow",
+            terms_array_sql = terms_array_sql,
+            events_table = events_table,
+            session_summary_table = session_summary_table,
+            mode_subquery = mode_subquery,
+            where_sql = where_sql,
+            limit = limit,
+            metadata_limit = usize::from(self.cfg.preview_chars).saturating_mul(8),
+        ))
+    }
+
     async fn load_turns_for_session(&self, session_id: &str) -> RepoResult<Vec<TurnSummary>> {
         let turn_summary = self.table_ref("v_turn_summary");
         let query = format!(
@@ -888,7 +1195,7 @@ FORMAT JSONEachRow",
         let mode_subquery = self.mode_subquery();
         let query = format!(
             "SELECT
-  s.session_id,
+  s.session_id AS session_id,
   toString(s.first_event_time) AS first_event_time,
   toInt64(toUnixTimestamp64Milli(s.first_event_time)) AS first_event_unix_ms,
   toString(s.last_event_time) AS last_event_time,
@@ -2841,6 +3148,7 @@ impl ConversationRepository for ClickHouseConversationRepository {
         };
 
         let session_summary = self.table_ref("v_session_summary");
+        let events_table = self.table_ref("events");
         let mode_subquery = self.mode_subquery();
 
         let mut where_clauses = vec!["1 = 1".to_string()];
@@ -2880,7 +3188,7 @@ impl ConversationRepository for ClickHouseConversationRepository {
 
         let query = format!(
             "SELECT
-  s.session_id,
+  s.session_id AS session_id,
   toString(s.first_event_time) AS first_event_time,
   toInt64(toUnixTimestamp64Milli(s.first_event_time)) AS first_event_unix_ms,
   toString(s.last_event_time) AS last_event_time,
@@ -2891,14 +3199,36 @@ impl ConversationRepository for ClickHouseConversationRepository {
   toUInt64(s.assistant_messages) AS assistant_messages,
   toUInt64(s.tool_calls) AS tool_calls,
   toUInt64(s.tool_results) AS tool_results,
-  ifNull(m.mode, 'chat') AS mode
+  ifNull(m.mode, 'chat') AS mode,
+  ifNull(meta.session_slug, '') AS session_slug,
+  ifNull(meta.session_summary, '') AS session_summary
 FROM {session_summary} AS s
 LEFT JOIN ({mode_subquery}) AS m ON m.session_id = s.session_id
+LEFT JOIN (
+  SELECT
+    session_id,
+    ifNull(argMax(nullIf(JSONExtractString(payload_json, 'slug'), ''), tuple(event_ts, event_uid)), '') AS session_slug,
+    ifNull(
+      argMax(
+        coalesce(
+          nullIf(JSONExtractString(payload_json, 'summary'), ''),
+          nullIf(JSONExtractString(payload_json, 'title'), ''),
+          nullIf(JSONExtractString(payload_json, 'name'), '')
+        ),
+        tuple(event_ts, event_uid)
+      ),
+      ''
+    ) AS session_summary
+  FROM {events_table}
+  WHERE event_kind = 'session_meta'
+  GROUP BY session_id
+) AS meta ON meta.session_id = s.session_id
 WHERE {where_sql}
 ORDER BY s.last_event_time {order_dir}, s.session_id {order_dir}
 LIMIT {limit_plus}
 FORMAT JSONEachRow",
             session_summary = session_summary,
+            events_table = events_table,
             mode_subquery = mode_subquery,
             where_sql = where_sql,
             order_dir = order_dir,
@@ -3894,6 +4224,71 @@ fn is_safe_filter_value(value: &str) -> bool {
     safe_value_re().is_match(value)
 }
 
+fn non_empty_string(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
+}
+
+fn compact_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn first_term_match_index(value: &str, terms: &[String]) -> Option<usize> {
+    let lower = value.to_ascii_lowercase();
+    terms.iter().filter_map(|term| lower.find(term)).min()
+}
+
+fn snippet_around_match(value: &str, match_idx: Option<usize>, max_chars: usize) -> String {
+    let compact = compact_whitespace(value);
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+
+    let byte_idx = match_idx
+        .and_then(|idx| value.get(..idx))
+        .map(compact_whitespace)
+        .map(|prefix| prefix.chars().count())
+        .unwrap_or(0);
+    let context_before = max_chars / 3;
+    let start = byte_idx.saturating_sub(context_before);
+    let mut snippet = compact
+        .chars()
+        .skip(start)
+        .take(max_chars)
+        .collect::<String>();
+    if start > 0 {
+        snippet.insert_str(0, "...");
+    }
+    if compact.chars().count() > start + max_chars {
+        snippet.push_str("...");
+    }
+    snippet
+}
+
+fn evidence_snippet(
+    session_summary: &str,
+    metadata_text: &str,
+    terms: &[String],
+    preview_chars: u16,
+) -> Option<String> {
+    let summary_match = first_term_match_index(session_summary, terms);
+    let metadata_match = first_term_match_index(metadata_text, terms);
+    let (source, match_idx) = if summary_match.is_some() {
+        (session_summary, summary_match)
+    } else if metadata_match.is_some() {
+        (metadata_text, metadata_match)
+    } else if !session_summary.is_empty() {
+        (session_summary, None)
+    } else {
+        (metadata_text, None)
+    };
+    if source.is_empty() {
+        return None;
+    }
+
+    let snippet = snippet_around_match(source, match_idx, usize::from(preview_chars).max(1));
+    (!snippet.is_empty()).then_some(snippet)
+}
+
 fn sql_quote(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
 }
@@ -3992,6 +4387,21 @@ mod tests {
         let out = sql_array_strings(&values);
         assert!(out.contains("'a'"));
         assert!(out.contains("'b''c'"));
+    }
+
+    #[test]
+    fn evidence_snippet_prefers_matching_metadata_over_nonmatching_summary() {
+        let terms = vec!["quartz".to_string()];
+        let snippet = evidence_snippet(
+            "General session summary.",
+            "{\"metadata\":{\"codename\":\"quartz\"}}",
+            &terms,
+            80,
+        );
+        assert_eq!(
+            snippet.as_deref(),
+            Some("{\"metadata\":{\"codename\":\"quartz\"}}")
+        );
     }
 
     #[test]
