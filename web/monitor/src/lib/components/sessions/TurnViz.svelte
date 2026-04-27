@@ -20,11 +20,45 @@
     return 'text' in step && typeof step.text === 'string';
   }
 
+  function stepDurationMs(step: Step): number | undefined {
+    if ('durationMs' in step && typeof step.durationMs === 'number' && step.durationMs > 0) {
+      return step.durationMs;
+    }
+    return undefined;
+  }
+
+  function traceRange(step: Step): { start: number; end: number } {
+    if (step.kind === 'tool_call') {
+      return { start: step.at, end: Math.max(step.at, step.resultAt) };
+    }
+
+    const durationMs = stepDurationMs(step);
+    if (durationMs) {
+      return { start: step.at - durationMs, end: step.at };
+    }
+
+    return { start: step.at, end: step.at + 600 };
+  }
+
+  function traceTooltip(step: Step): string {
+    if (step.kind === 'tool_call') {
+      return `${step.tool} tool call · ${fmtDuration(step.latencyMs)}`;
+    }
+
+    const durationMs = stepDurationMs(step);
+    if (durationMs) {
+      return `${step.kind} · model latency ${fmtDuration(durationMs)}`;
+    }
+
+    return step.kind;
+  }
+
   $: traceBounds = computeTraceBounds(turn);
 
   function computeTraceBounds(t: Turn): { start: number; span: number } {
-    const start = t.startedAt;
-    const ends = t.steps.map((s) => (s.kind === 'tool_call' ? s.resultAt : s.at));
+    const ranges = t.steps.map(traceRange);
+    const start = Math.min(t.startedAt, ...ranges.map((r) => r.start));
+    const ends = ranges.map((r) => r.end);
     const end = Math.max(t.endedAt, ...ends);
     return { start, span: Math.max(1, end - start) };
   }
@@ -96,8 +130,10 @@
     </div>
     {#each steps as step, i (keyFor(step, i))}
       {@const key = keyFor(step, i)}
-      {@const at = step.at}
-      {@const endAt = step.kind === 'tool_call' ? step.resultAt : step.at + 600}
+      {@const durationMs = stepDurationMs(step)}
+      {@const range = traceRange(step)}
+      {@const at = range.start}
+      {@const endAt = range.end}
       {@const leftPct = ((at - traceBounds.start) / traceBounds.span) * 100}
       {@const widthPct = Math.max(1, ((endAt - at) / traceBounds.span) * 100)}
       {@const expanded = expandedTools.has(key)}
@@ -107,14 +143,17 @@
         <div class="mv-tr-track">
           <button
             type="button"
-            class="mv-tr-bar mv-tr-bar-{step.kind}"
+            class="mv-tr-bar mv-tr-bar-{step.kind} {durationMs ? 'mv-tr-bar-duration' : ''}"
             class:is-error={step.kind === 'tool_call' && step.status === 'error'}
+            title={traceTooltip(step)}
             style="left: {leftPct}%; width: {widthPct}%"
             on:click={() => step.kind === 'tool_call' && dispatch('toggleTool', key)}
           >
             <span class="mv-tr-bar-text mono">
               {#if step.kind === 'tool_call'}
                 {step.tool} · {step.latencyMs}ms
+              {:else if durationMs}
+                {step.kind} · {fmtDuration(durationMs)}
               {:else if step.kind === 'assistant' && step.tokens}
                 {step.kind} · {step.tokens} tok
               {:else}

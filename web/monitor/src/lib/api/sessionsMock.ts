@@ -158,6 +158,7 @@ function makeGenerator(seed: number) {
 
     const assistantChunks = randInt(1, toolCount > 0 ? 3 : 2);
     let cursor = startedAt + randInt(200, 1800);
+    let pendingAssistantDurationMs: number | undefined;
 
     for (let i = 0; i < assistantChunks; i++) {
       steps.push({
@@ -165,7 +166,9 @@ function makeGenerator(seed: number) {
         at: cursor,
         text: ASSISTANT_TEXTS[randInt(0, ASSISTANT_TEXTS.length - 1)],
         tokens: randInt(60, 820),
+        durationMs: pendingAssistantDurationMs,
       });
+      pendingAssistantDurationMs = undefined;
       cursor += randInt(300, 4500);
 
       if (i < toolCount) {
@@ -175,7 +178,8 @@ function makeGenerator(seed: number) {
         const callAt = cursor;
         cursor += randInt(200, 6500);
         const resultAt = cursor;
-        cursor += randInt(100, 2200);
+        pendingAssistantDurationMs = randInt(100, 2200);
+        cursor += pendingAssistantDurationMs;
         const toolCall: ToolCallStep = {
           kind: 'tool_call',
           at: callAt,

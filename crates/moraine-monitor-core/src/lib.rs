@@ -1128,14 +1128,20 @@ fn build_turns(events: &[SessionEventRow]) -> Vec<Value> {
                 }));
             }
             ("message", "assistant", _) | (_, "assistant", "text") => {
-                turn.steps.push(json!({
+                let mut step = json!({
                     "kind": "assistant",
                     "at": event.event_ts_ms,
                     "text": preferred_text(event),
                     "tokens": event_output_tokens(event),
                     "endpointKind": event.endpoint_kind,
                     "nativeTokenUnits": nonzero_native_units(event),
-                }));
+                });
+                if event.latency_ms > 0 {
+                    if let Some(obj) = step.as_object_mut() {
+                        obj.insert("durationMs".into(), json!(event.latency_ms));
+                    }
+                }
+                turn.steps.push(step);
             }
             ("reasoning", _, _) | (_, _, "thinking") => {
                 let text = preferred_text(event);
@@ -1620,12 +1626,71 @@ mod tests {
         ))
     }
 
+    fn session_event(
+        event_kind: &str,
+        actor_kind: &str,
+        payload_type: &str,
+        at: i64,
+    ) -> SessionEventRow {
+        SessionEventRow {
+            session_id: "session-1".to_string(),
+            event_ts_ms: at,
+            event_kind: event_kind.to_string(),
+            actor_kind: actor_kind.to_string(),
+            payload_type: payload_type.to_string(),
+            tool_name: String::new(),
+            tool_call_id: String::new(),
+            tool_error: 0,
+            latency_ms: 0,
+            model: String::new(),
+            endpoint_kind: String::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            token_usage_buckets: HashMap::new(),
+            token_usage_native_units: HashMap::new(),
+            text_preview: String::new(),
+            text_content: String::new(),
+            tool_args_json: String::new(),
+        }
+    }
+
     #[test]
     fn identifier_safety_helper() {
         assert!(is_safe_identifier("events"));
         assert!(is_safe_identifier("_tmp_1"));
         assert!(!is_safe_identifier("1events"));
         assert!(!is_safe_identifier("events;drop"));
+    }
+
+    #[test]
+    fn build_turns_emits_assistant_latency_duration() {
+        let mut user = session_event("message", "user", "text", 1_000);
+        user.text_content = "run the tool".to_string();
+        let mut assistant = session_event("message", "assistant", "text", 5_500);
+        assistant.text_content = "done".to_string();
+        assistant.output_tokens = 42;
+        assistant.latency_ms = 4_500;
+
+        let turns = build_turns(&[user, assistant]);
+        let steps = turns[0]["steps"].as_array().expect("steps");
+
+        assert_eq!(steps[1]["durationMs"], json!(4_500));
+        assert_eq!(steps[1]["tokens"], json!(42));
+    }
+
+    #[test]
+    fn build_turns_omits_zero_assistant_latency_duration() {
+        let mut user = session_event("message", "user", "text", 1_000);
+        user.text_content = "fresh prompt".to_string();
+        let mut assistant = session_event("message", "assistant", "text", 1_600);
+        assistant.text_content = "first reply".to_string();
+
+        let turns = build_turns(&[user, assistant]);
+        let steps = turns[0]["steps"].as_array().expect("steps");
+
+        assert!(steps[1].get("durationMs").is_none());
     }
 
     #[test]
