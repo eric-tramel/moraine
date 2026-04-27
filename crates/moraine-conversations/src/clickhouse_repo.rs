@@ -1195,7 +1195,7 @@ FORMAT JSONEachRow",
         let mode_subquery = self.mode_subquery();
         let query = format!(
             "SELECT
-  s.session_id,
+  s.session_id AS session_id,
   toString(s.first_event_time) AS first_event_time,
   toInt64(toUnixTimestamp64Milli(s.first_event_time)) AS first_event_unix_ms,
   toString(s.last_event_time) AS last_event_time,
@@ -3188,7 +3188,7 @@ impl ConversationRepository for ClickHouseConversationRepository {
 
         let query = format!(
             "SELECT
-  s.session_id,
+  s.session_id AS session_id,
   toString(s.first_event_time) AS first_event_time,
   toInt64(toUnixTimestamp64Milli(s.first_event_time)) AS first_event_unix_ms,
   toString(s.last_event_time) AS last_event_time,

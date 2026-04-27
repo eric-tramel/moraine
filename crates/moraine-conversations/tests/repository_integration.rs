@@ -799,11 +799,15 @@ async fn list_conversations_applies_filters_and_cursor_pagination() {
     let queries = state.queries.lock().expect("queries lock").clone();
     let list_query = queries
         .iter()
-        .find(|q| q.contains("FROM `moraine`.`v_session_summary` AS s"))
+        .find(|q| {
+            q.contains("FROM `moraine`.`v_session_summary` AS s")
+                && q.contains("ORDER BY s.last_event_time")
+        })
         .expect("list query should be captured");
 
     assert!(list_query.contains("ifNull(m.mode, 'chat') = 'web_search'"));
     assert!(list_query.contains("JSONExtractString(payload_json, 'summary')"));
+    assert!(list_query.contains("s.session_id AS session_id"));
     assert!(list_query.contains("AS session_slug"));
     assert!(list_query.contains("toUnixTimestamp64Milli(s.last_event_time) >= 1767261600000"));
     assert!(list_query.contains("toUnixTimestamp64Milli(s.last_event_time) < 1767500000000"));
