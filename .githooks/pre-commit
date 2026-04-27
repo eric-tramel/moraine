@@ -28,10 +28,10 @@ if [[ -z "$staged_rust" ]]; then
   exit 0
 fi
 
-echo "[pre-commit] cargo fmt --all -- --check"
-cargo fmt --all -- --check
+echo "[pre-commit] make fmt"
+make fmt
 
 echo "[pre-commit] clippy (strict baseline, matches CI)"
-bash scripts/ci/clippy-strict-baseline.sh
+make clippy
 
 echo "[pre-commit] ok"
