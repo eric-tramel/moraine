@@ -56,7 +56,7 @@ To reconstruct a full conversation deterministically, query `v_conversation_trac
 
 Tool call lineage is represented through `call_id` in `v_all_events` (mapped from `events.tool_call_id`) and event class pairings such as `tool_call` and `tool_result`. Compacted lineage is represented through `compacted_parent_uid` (mapped from `events.origin_event_id`) and optional `event_links` rows with `link_type='compacted_parent'`. Together, these fields support both conversational and execution-trace reconstruction without a separate expansion table. [src: sql/001_schema.sql:L47, sql/001_schema.sql:L49, sql/001_schema.sql:L103, sql/002_views.sql:L10, sql/002_views.sql:L25]
 
-Token accounting payloads are preserved in `token_usage_json` rather than exploded into rigid columns. When token-level analytics are needed, parse JSON at query time into derived metrics. This keeps ingestion and schema evolution decoupled from provider-specific token metadata changes. [src: sql/001_schema.sql:L43, rust/ingestor/src/normalize.rs:L624]
+Token accounting uses a hybrid contract. `token_usage_json` preserves the raw provider payload for forensic review, while `endpoint_kind`, `token_usage_buckets`, and `token_usage_native_units` expose queryable canonical accounting for modality, cache, reasoning, provider-side tool use, and embedding-style usage. The legacy scalar counters remain for compatibility, but dashboards and MCP responses should read the canonical maps. [src: sql/001_schema.sql, docs/architecture/token-accounting.md]
 
 ## Schema Evolution Guidance
 

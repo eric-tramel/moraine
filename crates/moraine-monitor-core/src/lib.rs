@@ -458,6 +458,8 @@ async fn api_analytics(
     struct TokenRow {
         bucket_unix: u64,
         model: String,
+        endpoint_kind: String,
+        bucket: String,
         tokens: u64,
     }
 
@@ -487,8 +489,8 @@ async fn api_analytics(
         "event_ts >= now() - INTERVAL {} SECOND AND length(trim(BOTH ' ' FROM model)) > 0 AND lowerUTF8(trim(BOTH ' ' FROM model)) != '<synthetic>'",
         range.window_seconds
     );
-    let generation_latest_filter = format!(
-        "event_ts_latest >= now() - INTERVAL {} SECOND AND length(trim(BOTH ' ' FROM model_latest)) > 0 AND lowerUTF8(trim(BOTH ' ' FROM model_latest)) != '<synthetic>' AND output_tokens_latest > 0",
+    let token_latest_filter = format!(
+        "event_ts_latest >= now() - INTERVAL {} SECOND AND length(trim(BOTH ' ' FROM model_latest)) > 0 AND lowerUTF8(trim(BOTH ' ' FROM model_latest)) != '<synthetic>' AND arraySum(mapValues(token_usage_buckets_latest)) > 0",
         range.window_seconds
     );
     let turn_filter = format!(
@@ -496,62 +498,70 @@ async fn api_analytics(
         window_filter
     );
     let concurrent_filter = format!(
-        "event_ts >= now() - INTERVAL {} SECOND AND length(trim(BOTH ' ' FROM session_id)) > 0 AND (input_tokens > 0 OR output_tokens > 0 OR cache_read_tokens > 0 OR cache_write_tokens > 0)",
+        "event_ts >= now() - INTERVAL {} SECOND AND length(trim(BOTH ' ' FROM session_id)) > 0 AND arraySum(mapValues(token_usage_buckets)) > 0",
         range.window_seconds
     );
 
     let token_query = format!(
-        "SELECT bucket_unix, model, toUInt64(sum(tokens)) AS tokens \
+        "SELECT bucket_unix, model, endpoint_kind, bucket, toUInt64(sum(tokens)) AS tokens \
          FROM ( \
-           SELECT bucket_unix, model, toUInt64(max(output_tokens_latest)) AS tokens \
+           SELECT bucket_unix, model, endpoint_kind, bucket, toUInt64(max(tokens_latest)) AS tokens \
            FROM ( \
              SELECT \
                toUInt64(toUnixTimestamp(toStartOfInterval(event_ts_latest, INTERVAL {bucket_seconds} SECOND))) AS bucket_unix, \
                {model_expr_latest} AS model, \
+               endpoint_kind_latest AS endpoint_kind, \
                harness_latest, \
                session_id_latest, \
                request_id_latest, \
-               output_tokens_latest \
+               bucket, \
+               toUInt64(tokens_latest) AS tokens_latest \
              FROM ( \
                SELECT \
                  event_uid, \
                  argMax(event_ts, event_version) AS event_ts_latest, \
                  argMax(model, event_version) AS model_latest, \
+                 argMax(endpoint_kind, event_version) AS endpoint_kind_latest, \
                  argMax(harness, event_version) AS harness_latest, \
                  argMax(session_id, event_version) AS session_id_latest, \
                  argMax(request_id, event_version) AS request_id_latest, \
-                 argMax(output_tokens, event_version) AS output_tokens_latest \
+                 argMax(token_usage_buckets, event_version) AS token_usage_buckets_latest \
                FROM {table} \
                GROUP BY event_uid \
-             ) WHERE {generation_latest_filter} \
+             ) ARRAY JOIN mapKeys(token_usage_buckets_latest) AS bucket, mapValues(token_usage_buckets_latest) AS tokens_latest \
+             WHERE {token_latest_filter} AND tokens_latest > 0 \
            ) \
            WHERE harness_latest = 'claude-code' AND length(trim(BOTH ' ' FROM request_id_latest)) > 0 \
-           GROUP BY bucket_unix, model, session_id_latest, request_id_latest \
+           GROUP BY bucket_unix, model, endpoint_kind, session_id_latest, request_id_latest, bucket \
            UNION ALL \
            SELECT \
              toUInt64(toUnixTimestamp(toStartOfInterval(event_ts_latest, INTERVAL {bucket_seconds} SECOND))) AS bucket_unix, \
              {model_expr_latest} AS model, \
-             toUInt64(output_tokens_latest) AS tokens \
+             endpoint_kind_latest AS endpoint_kind, \
+             bucket, \
+             toUInt64(tokens_latest) AS tokens \
            FROM ( \
              SELECT \
                event_uid, \
                argMax(event_ts, event_version) AS event_ts_latest, \
                argMax(model, event_version) AS model_latest, \
+               argMax(endpoint_kind, event_version) AS endpoint_kind_latest, \
                argMax(harness, event_version) AS harness_latest, \
                argMax(session_id, event_version) AS session_id_latest, \
                argMax(request_id, event_version) AS request_id_latest, \
-               argMax(output_tokens, event_version) AS output_tokens_latest \
+               argMax(token_usage_buckets, event_version) AS token_usage_buckets_latest \
              FROM {table} \
              GROUP BY event_uid \
-           ) WHERE {generation_latest_filter} \
+           ) ARRAY JOIN mapKeys(token_usage_buckets_latest) AS bucket, mapValues(token_usage_buckets_latest) AS tokens_latest \
+           WHERE {token_latest_filter} AND tokens_latest > 0 \
            AND NOT (harness_latest = 'claude-code' AND length(trim(BOTH ' ' FROM request_id_latest)) > 0) \
          ) \
-         GROUP BY bucket_unix, model \
-         ORDER BY bucket_unix ASC, model ASC",
+         GROUP BY bucket_unix, model, endpoint_kind, bucket \
+         ORDER BY bucket_unix ASC, model ASC, endpoint_kind ASC, bucket ASC",
         bucket_seconds = range.bucket_seconds,
         model_expr_latest = model_expr_latest,
         table = table,
-        generation_latest_filter = generation_latest_filter,
+        token_latest_filter = token_latest_filter,
     );
 
     let turns_query = format!(
@@ -731,10 +741,15 @@ struct SessionEventRow {
     tool_error: u8,
     latency_ms: u32,
     model: String,
+    endpoint_kind: String,
     input_tokens: u32,
     output_tokens: u32,
     cache_read_tokens: u32,
     cache_write_tokens: u32,
+    #[serde(default)]
+    token_usage_buckets: HashMap<String, u64>,
+    #[serde(default)]
+    token_usage_native_units: HashMap<String, f64>,
     text_preview: String,
     text_content: String,
     tool_args_json: String,
@@ -806,10 +821,13 @@ async fn build_sessions_payload(state: &AppState, limit: u32, since_seconds: u64
             tool_error, \
             latency_ms, \
             model, \
+            endpoint_kind, \
             input_tokens, \
             output_tokens, \
             cache_read_tokens, \
             cache_write_tokens, \
+            token_usage_buckets, \
+            token_usage_native_units, \
             substring(text_preview, 1, 2000) AS text_preview, \
             substring(text_content, 1, 2000) AS text_content, \
             if(event_kind = 'tool_call', substring(JSONExtractRaw(payload_json, 'input'), 1, 2000), '') AS tool_args_json \
@@ -972,6 +990,77 @@ fn hue_for_label(label: &str) -> u32 {
     }
 }
 
+fn token_bucket(event: &SessionEventRow, bucket: &str) -> u64 {
+    event.token_usage_buckets.get(bucket).copied().unwrap_or(0)
+}
+
+fn sum_token_buckets(event: &SessionEventRow, buckets: &[&str]) -> u64 {
+    buckets
+        .iter()
+        .map(|bucket| token_bucket(event, bucket))
+        .sum()
+}
+
+fn event_token_total(event: &SessionEventRow) -> u64 {
+    let canonical_total: u64 = event.token_usage_buckets.values().copied().sum();
+    if canonical_total > 0 {
+        canonical_total
+    } else {
+        (event.input_tokens
+            + event.output_tokens
+            + event.cache_read_tokens
+            + event.cache_write_tokens) as u64
+    }
+}
+
+fn event_prompt_tokens(event: &SessionEventRow) -> u64 {
+    let canonical_prompt = sum_token_buckets(
+        event,
+        &[
+            "input_text",
+            "input_cache_read",
+            "input_cache_write",
+            "input_image",
+            "input_audio",
+            "embedding_input_text",
+            "embedding_input_image",
+        ],
+    );
+    if canonical_prompt > 0 {
+        canonical_prompt
+    } else {
+        (event.input_tokens + event.cache_read_tokens + event.cache_write_tokens) as u64
+    }
+}
+
+fn event_output_tokens(event: &SessionEventRow) -> u64 {
+    let canonical_output = sum_token_buckets(
+        event,
+        &[
+            "output_text",
+            "output_image",
+            "output_audio",
+            "reasoning",
+            "server_tool_use",
+        ],
+    );
+    if canonical_output > 0 {
+        canonical_output
+    } else {
+        event.output_tokens as u64
+    }
+}
+
+fn nonzero_native_units(event: &SessionEventRow) -> Value {
+    let units = event
+        .token_usage_native_units
+        .iter()
+        .filter(|(_, value)| **value > 0.0)
+        .map(|(key, value)| (key.clone(), json!(value)))
+        .collect::<serde_json::Map<_, _>>();
+    Value::Object(units)
+}
+
 fn build_turns(events: &[SessionEventRow]) -> Vec<Value> {
     struct TurnBuilder {
         idx: u32,
@@ -1018,8 +1107,10 @@ fn build_turns(events: &[SessionEventRow]) -> Vec<Value> {
         };
 
         turn.ended_at = turn.ended_at.max(event.event_ts_ms);
-        turn.prompt_tokens += (event.input_tokens + event.cache_read_tokens) as u64;
-        turn.completion_tokens += (event.output_tokens + event.cache_write_tokens) as u64;
+        let event_prompt = event_prompt_tokens(event);
+        let event_total = event_token_total(event);
+        turn.prompt_tokens += event_prompt;
+        turn.completion_tokens += event_total.saturating_sub(event_prompt);
         if !event.model.trim().is_empty() && turn.model.is_empty() {
             turn.model = event.model.trim().to_string();
         }
@@ -1041,7 +1132,9 @@ fn build_turns(events: &[SessionEventRow]) -> Vec<Value> {
                     "kind": "assistant",
                     "at": event.event_ts_ms,
                     "text": preferred_text(event),
-                    "tokens": event.output_tokens,
+                    "tokens": event_output_tokens(event),
+                    "endpointKind": event.endpoint_kind,
+                    "nativeTokenUnits": nonzero_native_units(event),
                 }));
             }
             ("reasoning", _, _) | (_, _, "thinking") => {

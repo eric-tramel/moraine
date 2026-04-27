@@ -40,7 +40,7 @@ Hermes **live sessions** use a different on-disk format and a different processo
 
 Kimi CLI support uses `~/.kimi/sessions/**/wire.jsonl`. The wire log carries UNIX-second timestamps and typed envelopes such as `TurnBegin`, `ContentPart`, `ToolCall`, `ToolResult`, and `StatusUpdate`; Moraine maps those to user/assistant messages, reasoning rows, tool I/O, progress rows, and token-count events. The leading `{"type":"metadata",...}` header is a per-file protocol marker and is skipped during normalization — it's the only wire record without a timestamp, and `wire.jsonl` is the sole Kimi source Moraine consumes (the sibling `context.jsonl` is a redundant materialized-turn view with no information not already in wire).
 
-Token accounting is preserved rather than normalized into fixed numeric columns. For `event_msg` payloads with `token_count` type, the service stores a compact JSON blob in `token_usage_json`. This keeps ingestion schema-forward compatible with evolving token metadata while allowing downstream extraction in SQL when needed. [src: rust/ingestor/src/normalize.rs:L624, sql/001_schema.sql:L43]
+Token accounting is both preserved and normalized. For provider usage payloads, the service stores compact raw details in `token_usage_json` and also fills `endpoint_kind`, `token_usage_buckets`, and `token_usage_native_units`. The canonical bucket map uses additive semantics so cache, modality, reasoning, provider-side tool, and embedding usage can be aggregated without parsing provider JSON or double-counting cache tokens. [src: crates/moraine-ingest-core/src/normalize.rs, sql/001_schema.sql]
 
 ## Sink, Flush, and Durability Semantics
 

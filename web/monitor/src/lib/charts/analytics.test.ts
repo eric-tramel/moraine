@@ -17,9 +17,27 @@ describe('buildAnalyticsView', () => {
       range: baseRange,
       series: {
         tokens: [
-          { bucket_unix: 1_700_000_000, model: 'gpt-5.3-codex-xhigh', tokens: 1200 },
-          { bucket_unix: 1_700_003_600, model: 'gpt-5.3-codex-xhigh', tokens: 800 },
-          { bucket_unix: 1_700_000_000, model: 'haiku', tokens: 100 },
+          {
+            bucket_unix: 1_700_000_000,
+            model: 'gpt-5.3-codex-xhigh',
+            endpoint_kind: 'generation',
+            bucket: 'input_text',
+            tokens: 1200,
+          },
+          {
+            bucket_unix: 1_700_003_600,
+            model: 'gpt-5.3-codex-xhigh',
+            endpoint_kind: 'generation',
+            bucket: 'input_text',
+            tokens: 800,
+          },
+          {
+            bucket_unix: 1_700_000_000,
+            model: 'haiku',
+            endpoint_kind: 'generation',
+            bucket: 'output_text',
+            tokens: 100,
+          },
         ],
         turns: [
           { bucket_unix: 1_700_000_000, model: 'gpt-5.3-codex-xhigh', turns: 12 },
@@ -34,6 +52,7 @@ describe('buildAnalyticsView', () => {
 
     expect(view.labels.length).toBeGreaterThan(0);
     expect(view.tokenDatasets).toHaveLength(2);
+    expect(view.tokenDatasets[0].label).toContain('generation');
     expect(view.turnDatasets).toHaveLength(2);
     expect(view.concurrentDatasets).toHaveLength(1);
     expect(view.metaText).toContain('Last 24h');

@@ -28,6 +28,9 @@ SELECT
   text_content,
   payload_json,
   token_usage_json,
+  endpoint_kind,
+  token_usage_buckets,
+  token_usage_native_units,
   event_version
 FROM moraine.events;
 
@@ -71,7 +74,10 @@ SELECT
   item_id,
   text_content,
   payload_json,
-  token_usage_json
+  token_usage_json,
+  endpoint_kind,
+  token_usage_buckets,
+  token_usage_native_units
 FROM moraine.v_all_events;
 
 CREATE VIEW moraine.v_turn_summary AS

@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS moraine.events (
   coord_group_label String,
   is_substream UInt8,
   model LowCardinality(String),
+  endpoint_kind LowCardinality(String) DEFAULT 'generation',
   input_tokens UInt32,
   output_tokens UInt32,
   cache_read_tokens UInt32,
@@ -72,7 +73,34 @@ CREATE TABLE IF NOT EXISTS moraine.events (
   text_preview String,
   payload_json String,
   token_usage_json String,
+  token_usage_buckets Map(String, UInt64) DEFAULT map(
+    'input_text', toUInt64(input_tokens),
+    'output_text', toUInt64(output_tokens),
+    'input_cache_read', toUInt64(cache_read_tokens),
+    'input_cache_write', toUInt64(cache_write_tokens),
+    'input_image', toUInt64(0),
+    'output_image', toUInt64(0),
+    'input_audio', toUInt64(0),
+    'output_audio', toUInt64(0),
+    'reasoning', toUInt64(0),
+    'server_tool_use', toUInt64(0),
+    'embedding_input_text', toUInt64(0),
+    'embedding_input_image', toUInt64(0),
+    'other', toUInt64(0)
+  ),
+  token_usage_native_units Map(String, Float64) DEFAULT map(
+    'input_image_pixels', toFloat64(0),
+    'output_image_pixels', toFloat64(0),
+    'input_audio_seconds', toFloat64(0),
+    'output_audio_seconds', toFloat64(0),
+    'input_images', toFloat64(0),
+    'output_images', toFloat64(0)
+  ),
   event_version UInt64,
+  CONSTRAINT events_endpoint_kind_domain CHECK endpoint_kind IN (
+    'generation', 'embedding', 'rerank', 'moderation', 'image_generation',
+    'audio_generation', 'other'
+  ),
   CONSTRAINT events_event_kind_domain CHECK event_kind IN (
     'session_meta', 'turn_context', 'message', 'tool_call', 'tool_result', 'reasoning',
     'event_msg', 'compacted_raw', 'progress', 'system', 'summary', 'queue_operation',
