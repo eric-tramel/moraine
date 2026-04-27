@@ -1,182 +1,131 @@
-# Moraine MCP Interface
+# Moraine MCP Agent Interface
 
-## Service Contract
+## Contract
 
-`moraine-mcp` is a local, stateless [Model Context Protocol](https://modelcontextprotocol.io/) server that sits on top of ClickHouse-backed Moraine tables and exposes exactly two retrieval primitives to agent runtimes: lexical discovery (`search`) and trace reconstruction (`open`). It does not own ingestion, index construction, or background maintenance. Its contract boundary is intentionally narrow: accept JSON-RPC tool calls over stdio, execute bounded SQL reads against precomputed search structures and trace views, and return either agent-readable prose or full structured JSON. This keeps latency predictable, process startup cheap, and failure domains small enough that host runtimes can restart the process without any reindex step.
+Issue #290 narrows the agent-facing MCP surface to three session-first tools:
 
-Configuration confirms this posture. ClickHouse endpoint, protocol version, result limits, context defaults, and BM25 parameters are loaded from TOML with concrete defaults, and startup fails fast on parse or ping failure. The service therefore has no hidden mutable state that can drift from corpus truth: either it can reach ClickHouse and answer from current tables, or it fails immediately and visibly. [src: crates/moraine-config/src/lib.rs:L66-L98, crates/moraine-config/src/lib.rs:L563-L566, crates/moraine-mcp-core/src/lib.rs:L671-L673, config/moraine.toml:L1-L50]
+- `search_session_data`: answer questions about prior session content.
+- `open_session`: expand one known session when search snippets are not enough.
+- `list_sessions`: browse session metadata without searching content.
 
-## JSON-RPC Session Lifecycle
+The boundary is intentionally small. Agents should search sessions first, open only targeted sessions, and use metadata listing only for time/mode browsing. The MCP server remains a stateless stdio JSON-RPC process over ClickHouse-backed conversation tables; ingestion, schema maintenance, and index construction stay outside this service. The Rust MCP tool list publishes these three tools first, with explicit `inputSchema`, `outputSchema`, and read-only annotations, while lower-level compatibility tools remain available but de-emphasized. [src: crates/moraine-mcp-core/src/lib.rs:L827-L1180]
 
-The runtime is a long-lived async loop over newline-delimited JSON-RPC messages on stdin/stdout. Each non-empty line is parsed as `RpcRequest`; malformed lines are logged and skipped rather than terminating the server process. Supported base methods are `initialize`, `ping`, `tools/list`, and `tools/call`; unknown methods produce `-32601` responses when an `id` is present. Notifications such as `notifications/initialized` are accepted and ignored, which keeps compatibility with hosts that send startup chatter not requiring responses. [src: crates/moraine-mcp-core/src/lib.rs:L23-L29, crates/moraine-mcp-core/src/lib.rs:L215-L255, crates/moraine-mcp-core/src/lib.rs:L697-L710]
+## Tool Boundaries
 
-Initialization returns protocol and capability metadata sourced from runtime config and Cargo package version. Tool invocation is routed through typed argument decoding, and decode errors are surfaced as parameter errors (`-32602`) instead of ad hoc text. This separation between transport-level errors and tool-level errors is important for agent frameworks because they can decide whether to retry, revise arguments, or terminate based on standard JSON-RPC semantics. [src: crates/moraine-mcp-core/src/lib.rs:L216-L230, crates/moraine-mcp-core/src/lib.rs:L238-L250, crates/moraine-mcp-core/src/lib.rs:L332-L369]
+### `search_session_data`
 
-Reference excerpt:
+Primary entry point for content questions. Use it for decisions, fixes, errors, logs, codenames, config values, file paths, migrations, status codes, and "what did we decide?" prompts.
 
-```rust
-match req.method.as_str() {
-    "initialize" => { /* protocol + capabilities */ }
-    "ping" => id.map(|msg_id| rpc_ok(msg_id, json!({}))),
-    "tools/list" => id.map(|msg_id| rpc_ok(msg_id, self.tools_list_result())),
-    "tools/call" => { /* typed decode + call_tool */ }
-    _ => id.map(|msg_id| rpc_err(msg_id, -32601, &format!("method not found: {}", req.method))),
-}
-```
+Important arguments:
 
-[src: crates/moraine-mcp-core/src/lib.rs:L215-L255]
+- `query` is natural language plus any exact tokens from the user request.
+- `limit` defaults to `5`, caps at `20`, and is also bounded by the configured MCP maximum.
+- `matching_events_limit` defaults to `5` and caps at `8`; raise it only for multi-evidence questions.
+- `event_scope` defaults to `auto`; `auto` searches compact user-facing content but includes raw tool output for raw/error/log/stack/status/tool-output queries.
+- `recency_policy` defaults to `auto`; `auto` prefers current, final, latest, corrected evidence and down-ranks stale, draft, provisional, superseded, or deprecated material unless the user asks for history.
+- `from_unix_ms`, `to_unix_ms`, `mode`, and `session_id` narrow the search by time window, computed session mode, or one known session.
+- `include_context` defaults to `false`; set it only when snippets need nearby turns.
 
-## Tool Definitions and Input Schemas
+Default behavior returns session-ranked evidence, not event-ranked transcript dumps. The implementation combines conversation search, session-metadata search, per-session matching event snippets, summary evidence, optional bounded context, and recency adjustments. Internal MCP traces are suppressed by default so the model sees remembered work, not retrieval plumbing. [src: crates/moraine-mcp-core/src/lib.rs:L1593-L1920]
 
-`tools/list` publishes two tools with explicit JSON Schema fragments: `search` and `open`. `search` requires `query`, supports optional bounds such as `limit`, `min_score`, `min_should_match`, filtering options (`session_id`, `include_tool_events`, `exclude_codex_mcp`), and `verbosity`. `open` requires `event_uid`, supports context window controls (`before`, `after`), and the same `verbosity` selector. The published schemas are the authoritative wire contract for hosts; any client-side wrappers should derive from this payload rather than duplicating assumptions in separate code paths. [src: crates/moraine-mcp-core/src/lib.rs:L258-L299]
+### `open_session`
 
-The design intentionally keeps tool inventory minimal. Higher-level retrieval workflows are expected to be composed in the host runtime by calling `search`, selecting a candidate UID, and then calling `open` for surrounding evidence. This composition pattern is reflected directly in the prose formatter, which includes a suggested `open(event_uid=...)` continuation for each hit. [src: crates/moraine-mcp-core/src/lib.rs:L258-L299, crates/moraine-mcp-core/src/lib.rs:L507-L521]
+Expansion tool after `search_session_data` returns a `session_id`. Use it for transcript context, surrounding turns, or additional evidence when search snippets are insufficient. Do not call it just because search returned a hit with enough evidence to answer.
 
-Reference excerpt:
+Important arguments:
 
-```rust
+- `session_id` is required.
+- `query` optionally requests query-relevant windows first.
+- `around_event_uid` optionally requests bounded before/after context around one evidence event.
+- `event_scope` controls transcript breadth. `auto` uses query cues for tool-output windows, `messages` restricts chronological pages to messages/reasoning, and `all` broadens to normal event kinds.
+- `limit` defaults to `20` and caps at `50`; `cursor` paginates chronological pages.
+- `before` and `after` default to `3` and cap at `10` for event-centered windows.
+- `include_payload_json` should be explicit when exact raw payload JSON is needed.
+- `include_system_events` defaults to `false`.
+
+Without `query` or `around_event_uid`, `open_session` returns a chronological page with metadata and a cursor. With `query`, it searches within the session and returns relevant windows first. With `around_event_uid`, it returns bounded before/after context and verifies the event belongs to the requested session. [src: crates/moraine-mcp-core/src/lib.rs:L1921-L2119]
+
+### `list_sessions`
+
+Metadata-only browsing. Use it for newest/latest sessions by time, date windows, mode filters, pagination, and session inventory. Do not use it to answer questions about what happened inside a session.
+
+Important arguments:
+
+- `limit` defaults to the configured MCP maximum when omitted and is validated against server bounds.
+- `from_unix_ms` and `to_unix_ms` filter by session end time; `from_unix_ms` must be less than `to_unix_ms`.
+- `mode` filters the computed session mode: `web_search`, `mcp_internal`, `tool_calling`, or `chat`.
+- `sort` defaults to `desc`, so the newest session end time comes first.
+- `cursor` continues a deterministic page for the same filter and sort.
+
+Responses include compact rows: `session_id`, mode, start/end times, event and turn counts, `session_slug`, `session_summary`, and a next-call hint to `open_session`. [src: crates/moraine-mcp-core/src/lib.rs:L2121-L2186]
+
+## Response Shape
+
+Default tool results should be answer-first hybrid:
+
+- `content[0].text` gives a short answer or salience summary the model can use immediately.
+- `structuredContent` carries compact parseable evidence with stable IDs.
+- `isError=false` marks successful tool results.
+- `isError=true` returns a concise text error; transport and parameter errors still use JSON-RPC error envelopes where appropriate.
+
+`search_session_data` structured results should include `query`, requested and effective `event_scope`, `recency_policy`, `recency_applied`, `hits`, and per-hit `rank`, `session_id`, `score`, time bounds, `session_summary`, compact `evidence`, optional `context`, and a next-call hint such as `open_session(session_id="...")`. Evidence entries should carry stable `event_uid`, `event_order`, kind/role, snippet text, and raw output snippets only when the effective scope includes them.
+
+`open_session` structured results should include `found`, `session_id`, session metadata, effective scope, page/window metadata, `events`, and `next_cursor` when more transcript data exists.
+
+`list_sessions` structured results should include the effective filters, `sort`, `sessions`, and `next_cursor`.
+
+The published MCP metadata includes `outputSchema` for these structured payloads. For the three agent-facing tools, default `verbosity=prose` returns hybrid text plus `structuredContent`; `verbosity=full` returns pretty JSON text plus the same structured payload. Legacy tools may still use prose-only default responses. [src: crates/moraine-mcp-core/src/lib.rs:L886-L966, crates/moraine-mcp-core/src/lib.rs:L1146-L1178, crates/moraine-mcp-core/src/lib.rs:L1248-L1330]
+
+Example:
+
+```json
 {
-    "name": "search",
-    "description": "BM25 lexical search over Moraine indexed conversation events.",
-    "inputSchema": {
-        "type": "object",
-        "properties": {
-            "query": { "type": "string" },
-            "limit": { "type": "integer", "minimum": 1, "maximum": self.cfg.mcp.max_results },
-            "verbosity": { "type": "string", "enum": ["prose", "full"], "default": "prose" }
-        },
-        "required": ["query"]
+  "content": [
+    {
+      "type": "text",
+      "text": "Top session s-20260424-iris-final records the final Iris batch policy: IRIS_BATCH_SIZE=96 and IRIS_FLUSH_MS=250."
     }
+  ],
+  "structuredContent": {
+    "query": "Iris batch size current setting",
+    "event_scope": "auto",
+    "recency_policy": "auto",
+    "hits": [
+      {
+        "rank": 1,
+        "session_id": "s-20260424-iris-final",
+        "score": 11.94,
+        "last_event_time": "2026-04-24 14:34:00",
+        "session_summary": "Iris final current batch policy changed to IRIS_BATCH_SIZE=96 with IRIS_FLUSH_MS=250.",
+        "evidence": [
+          {
+            "event_uid": "evt-iris-final-03",
+            "event_order": 3,
+            "kind": "message/message",
+            "snippet": "Final current Iris batch size policy: set IRIS_BATCH_SIZE=96 and IRIS_FLUSH_MS=250."
+          }
+        ],
+        "next": "open_session(session_id=\"s-20260424-iris-final\")"
+      }
+    ]
+  },
+  "isError": false
 }
 ```
 
-[src: crates/moraine-mcp-core/src/lib.rs:L262-L281]
+## Recency And Raw Output
 
-## Search Tool Execution Semantics
+Recency is semantic, not just timestamp sorting. When the query asks for current, latest, final, corrected, or active state, the search contract should prefer evidence that marks a final/corrected state and demote stale drafts, provisional notes, deprecated values, and superseded answers. When the user asks for history, old or superseded evidence can rank normally.
 
-`search` begins by normalizing and validating request fields: query trimming, empty-query rejection, term tokenization with hard cap (`max_query_terms`), bounded `limit`, bounded `min_should_match`, optional session safety checks, and default filter controls from config. Query IDs are generated per call, and elapsed time is tracked from pre-tokenization to final payload assembly. These steps are not incidental bookkeeping; they are the service’s first-stage admission control and protect ClickHouse from pathological or malformed query shapes generated by upstream agents. [src: crates/moraine-conversations/src/clickhouse_repo.rs:L1131-L1168, crates/moraine-conversations/src/clickhouse_repo.rs:L1407-L1435, config/moraine.toml:L35-L50]
+Raw output is automatic under `event_scope=auto`. Queries containing cues such as raw, exact error, logs, stack trace, traceback, status, command output, HTTP status, panic, exception, or tool result should include the relevant tool/result payload snippets without requiring the agent to set a broader scope manually. Outside those cases, default snippets should stay compact and user-facing.
 
-Ranking is BM25-like and implemented by combining in-process IDF preparation with SQL-side term scoring over `search_postings`. Corpus totals and term frequencies are sourced from stats tables when available and transparently fall back to base-table aggregation when stats are missing, so bootstrap and partial-repair states still return results. SQL generation constrains candidate rows via `p.term IN [...]`, optional session filters, event-class/payload filters, and optional codex-mcp self-exclusion, then computes score per document with configured `k1` and `b`. The result set is ordered by score and truncated by the requested limit. [src: crates/moraine-conversations/src/clickhouse_repo.rs:L381-L410, crates/moraine-conversations/src/clickhouse_repo.rs:L413-L509, crates/moraine-conversations/src/clickhouse_repo.rs:L1186-L1214]
+## Legacy And De-Emphasized Tools
 
-Operationally, this means retrieval latency is tied to postings fanout and term selectivity rather than corpus-wide scans. The MCP process performs no full-table tokenization, no corpus rebuild, and no local index persistence; it simply compiles a bounded query against continuously maintained search tables. [src: crates/moraine-conversations/src/clickhouse_repo.rs:L413-L509, sql/004_search_index.sql:L82-L133, sql/004_search_index.sql:L147-L170]
+The current server still publishes broader implementation tools: `search`, `open`, `search_conversations`, `get_session`, and `get_session_events`. For issue #290, agents should treat them as legacy, compatibility, or internal-building-block surfaces.
 
-Reference excerpt:
+- `search` is event-ranked and useful for low-level debugging, but it is too narrow as the default agent retrieval tool.
+- `search_conversations` is the implementation basis for `search_session_data`, but the agent-facing name and result contract should be clearer and answer-first.
+- `open` is overloaded between event windows and session opening; `open_session` should make the session expansion path explicit.
+- `get_session` and `get_session_events` are lower-level metadata/event APIs. Prefer `open_session` unless a caller truly needs raw paginated event rows.
 
-```rust
-let query = args.query.trim();
-if query.is_empty() {
-    return Err(anyhow!("query cannot be empty"));
-}
-let terms_with_qf = tokenize_query(query, self.cfg.bm25.max_query_terms);
-let min_should_match = args
-    .min_should_match
-    .unwrap_or(self.cfg.bm25.default_min_should_match)
-    .max(1)
-    .min(terms.len() as u16);
-let query_sql = self.build_search_sql(/* terms, filters, bounds */)?;
-let mut rows: Vec<SearchRow> = self.ch.query_json_rows(&query_sql).await?;
-rows.sort_by(|a, b| b.score.total_cmp(&a.score));
-```
-
-[src: crates/moraine-conversations/src/clickhouse_repo.rs:L1132-L1158, crates/moraine-conversations/src/clickhouse_repo.rs:L1201-L1214]
-
-## Open Tool Execution Semantics
-
-`open` provides deterministic context reconstruction around one event UID. The implementation first validates `event_uid`, resolves target `(session_id, event_order, turn_seq)` from `v_conversation_trace`, then loads an ordered event window bounded by `before` and `after` offsets. If no target row exists, the response is a successful `found=false` payload rather than an exception, so hosts can branch on result state without treating misses as transport failures. [src: crates/moraine-conversations/src/clickhouse_repo.rs:L1031-L1053, crates/moraine-conversations/src/clickhouse_repo.rs:L1062-L1128]
-
-Window rows include compact context fields and full payload/token JSON, preserving both quick readability and deep inspection paths. Ordering is normalized in memory before emission, and prose formatting then partitions rows into before/target/after blocks with stable event order, which is useful for agents that need immediate narrative context instead of raw arrays. [src: crates/moraine-conversations/src/clickhouse_repo.rs:L1065-L1116, crates/moraine-mcp-core/src/lib.rs:L526-L589]
-
-The main architectural implication is that `open` depends on data-plane ordering contracts, not on search-rank ordering. Its fidelity therefore inherits from `v_conversation_trace` and source provenance in core tables, allowing a consistent answer to “what happened around this event” even when lexical ranking and trace chronology diverge. [src: sql/002_views.sql:L61-L80, sql/001_schema.sql:L27-L31]
-
-Reference excerpt:
-
-```rust
-let target_query = format!(
-    "SELECT session_id, event_order, turn_seq
-     FROM moraine.v_conversation_trace
-     WHERE event_uid = {}
-     ORDER BY event_order DESC LIMIT 1 FORMAT JSONEachRow",
-    sql_quote(event_uid)
-);
-let targets: Vec<OpenTargetRow> = self.ch.query_json_rows(&target_query).await?;
-let Some(target) = targets.first() else {
-    return Ok(json!({ "found": false, "event_uid": event_uid, "events": [] }));
-};
-```
-
-[src: crates/moraine-conversations/src/clickhouse_repo.rs:L1042-L1050]
-
-## Response Shapes and Verbosity
-
-The tool envelope is explicitly dual-mode. In `full` mode, responses include both `content` text and `structuredContent` carrying the entire JSON payload. In default `prose` mode, responses return a concise text form intended for direct LLM consumption with minimal parsing burden. Error envelopes set `isError=true` and provide a single text payload. This makes downstream handling straightforward for both strict schema consumers and text-first agents. [src: crates/moraine-mcp-core/src/lib.rs:L452-L488]
-
-Prose search output includes query metadata, hit count/latency, ranked hit summaries, snippet lines, and the next-step affordance to call `open`. Prose open output includes session and turn metadata, context-window settings, and ordered event blocks. Hosts that want deterministic machine transforms should request `full`; hosts optimizing for immediate model reasoning can stay on default `prose`. [src: crates/moraine-mcp-core/src/lib.rs:L490-L523, crates/moraine-mcp-core/src/lib.rs:L526-L589]
-
-Reference excerpt:
-
-```rust
-fn tool_ok_full(payload: Value) -> Value {
-    json!({
-        "content": [{ "type": "text", "text": serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string()) }],
-        "structuredContent": payload,
-        "isError": false
-    })
-}
-
-fn tool_ok_prose(text: String) -> Value {
-    json!({ "content": [{ "type": "text", "text": text }], "isError": false })
-}
-```
-
-[src: crates/moraine-mcp-core/src/lib.rs:L452-L476]
-
-## Safety and Failure Semantics
-
-Input safety controls are strict but lightweight. Session and event filter values are validated with a safe-character regex before interpolation, SQL string literals are escaped, and unsupported characters produce deterministic request errors. Query tokenizer bounds prevent unbounded term lists, and limit clamps prevent oversized result sets even if hosts send extreme values. [src: crates/moraine-conversations/src/clickhouse_repo.rs:L214-L229, crates/moraine-conversations/src/clickhouse_repo.rs:L1146-L1164, crates/moraine-conversations/src/clickhouse_repo.rs:L1401-L1443]
-
-Failure handling favors continuity. Parse failures of incoming request lines are logged and ignored; transport loop continues. Search/open execution errors are converted into tool error payloads instead of process termination. Telemetry writes to `search_query_log` and `search_hit_log` are best-effort in both sync and async modes: failures are warned but do not poison the user-facing response path. This behavior is deliberate because retrieval correctness should not hinge on observability table availability. [src: crates/moraine-mcp-core/src/lib.rs:L243-L247, crates/moraine-mcp-core/src/lib.rs:L705-L710, crates/moraine-conversations/src/clickhouse_repo.rs:L640-L734, sql/004_search_index.sql:L180-L219]
-
-Client-side ClickHouse access is centralized in a small wrapper (`query_rows`, `insert_json_rows`, ping), with timeout and optional HTTP basic auth from config. This keeps surface area narrow and makes failure modes auditable to a small set of request paths. [src: crates/moraine-clickhouse/src/lib.rs:L43-L56, crates/moraine-clickhouse/src/lib.rs:L100-L129, crates/moraine-clickhouse/src/lib.rs:L181-L212]
-
-Reference excerpt:
-
-```rust
-fn safe_value_re() -> &'static Regex {
-    static SAFE_RE: OnceLock<Regex> = OnceLock::new();
-    SAFE_RE.get_or_init(|| Regex::new(r"^[A-Za-z0-9._:@/-]{1,256}$").expect("valid safe-value regex"))
-}
-
-fn sql_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
-}
-```
-
-[src: crates/moraine-conversations/src/clickhouse_repo.rs:L1401-L1405, crates/moraine-conversations/src/clickhouse_repo.rs:L1441-L1443]
-
-## Integration Guidance for Agents
-
-Integrate `moraine-mcp` as a colocated subprocess started by the host agent runtime. The recommended operational path is `bin/moraine run mcp --config <path>`, which keeps one command surface across local environments.
-
-For host policy, default to `verbosity=prose` for first-pass retrieval, then issue targeted `verbosity=full` calls when the agent needs exact JSON fields (`payload_json`, `token_usage_json`, or source coordinates). Keep `exclude_codex_mcp=true` unless debugging MCP internals, and avoid raising `max_query_terms` without workload evidence because fanout cost rises rapidly on broad lexical tokens. [src: config/moraine.toml:L40-L50, crates/moraine-conversations/src/clickhouse_repo.rs:L1162-L1164, crates/moraine-conversations/src/clickhouse_repo.rs:L1407-L1424]
-
-For deterministic behavior across environments, pin config in `config/moraine.toml` and keep MCP policy in the `[mcp]` section. This avoids drift between service-specific config files.
-
-Reference excerpt:
-
-```rust
-#[derive(Debug, Args)]
-struct RunArgs {
-    #[arg(value_enum)]
-    service: Service,
-    #[arg(
-        trailing_var_arg = true,
-        allow_hyphen_values = true,
-        num_args = 0..
-    )]
-    args: Vec<String>,
-}
-```
-
-[src: apps/moraine/src/main.rs:L164-L173]
-
-In practice, the interface should be treated as a strict retrieval edge service: keep it stateless, keep calls bounded, and let ClickHouse remain the durable truth for both content and retrieval telemetry.
+Keep full transcript context opt-in. The successful default path for most content questions is one `search_session_data` call with enough evidence to answer, followed by `open_session` only when snippets are insufficient.

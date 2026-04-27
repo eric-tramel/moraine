@@ -1,15 +1,19 @@
+#![recursion_limit = "256"]
+
 use anyhow::{anyhow, Context, Result};
 use moraine_clickhouse::ClickHouseClient;
 use moraine_config::AppConfig;
 use moraine_conversations::{
     is_user_facing_content_event, ClickHouseConversationRepository, ConversationDetailOptions,
     ConversationListFilter, ConversationListSort, ConversationMode, ConversationRepository,
-    ConversationSearchQuery, ConversationSearchResults, OpenEventRequest, PageRequest, RepoConfig,
-    RepoError, SearchEventKind, SearchEventsQuery, SearchEventsResult, SessionEventsDirection,
-    SessionEventsQuery, TurnListFilter,
+    ConversationSearchQuery, ConversationSearchResults, OpenEvent, OpenEventRequest, PageRequest,
+    RepoConfig, RepoError, SearchEventHit, SearchEventKind, SearchEventsQuery, SearchEventsResult,
+    SessionEventsDirection, SessionEventsQuery, SessionMetadataSearchHit,
+    SessionMetadataSearchQuery, TraceEvent, TurnListFilter,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -18,6 +22,16 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, warn};
 
 const TOOL_LIMIT_MIN: u16 = 1;
+const SESSION_SEARCH_DEFAULT_LIMIT: u16 = 5;
+const SESSION_SEARCH_MAX_LIMIT: u16 = 20;
+const SESSION_SEARCH_DEFAULT_MATCHING_EVENTS_LIMIT: u16 = 5;
+const SESSION_SEARCH_MAX_MATCHING_EVENTS_LIMIT: u16 = 8;
+const SESSION_SEARCH_CONTEXT_BEFORE: u16 = 2;
+const SESSION_SEARCH_CONTEXT_AFTER: u16 = 2;
+const OPEN_SESSION_DEFAULT_LIMIT: u16 = 20;
+const OPEN_SESSION_MAX_LIMIT: u16 = 50;
+const OPEN_SESSION_DEFAULT_CONTEXT: u16 = 3;
+const OPEN_SESSION_MAX_CONTEXT: u16 = 10;
 
 const CONVERSATION_MODE_CLASSIFICATION_SEMANTICS: &str =
     "Sessions are classified into exactly one mode by first match on any event in the session: web_search > mcp_internal > tool_calling > chat.";
@@ -113,6 +127,79 @@ struct SearchConversationsArgs {
     verbosity: Option<Verbosity>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SessionSearchEventScope {
+    #[default]
+    Auto,
+    Messages,
+    All,
+}
+
+impl SessionSearchEventScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Messages => "messages",
+            Self::All => "all",
+        }
+    }
+
+    fn includes_tool_events(self, query: &str) -> bool {
+        match self {
+            Self::Auto => query_suggests_tool_events(query),
+            Self::Messages => false,
+            Self::All => true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RecencyPolicy {
+    #[default]
+    Auto,
+    Off,
+}
+
+impl RecencyPolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Off => "off",
+        }
+    }
+
+    fn is_active_for_query(self, query: &str) -> bool {
+        matches!(self, Self::Auto) && query_suggests_recency(query)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchSessionDataArgs {
+    query: String,
+    #[serde(default)]
+    limit: Option<u16>,
+    #[serde(default)]
+    matching_events_limit: Option<u16>,
+    #[serde(default)]
+    event_scope: Option<SessionSearchEventScope>,
+    #[serde(default)]
+    recency_policy: Option<RecencyPolicy>,
+    #[serde(default)]
+    from_unix_ms: Option<i64>,
+    #[serde(default)]
+    to_unix_ms: Option<i64>,
+    #[serde(default)]
+    mode: Option<ConversationMode>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    include_context: Option<bool>,
+    #[serde(default)]
+    verbosity: Option<Verbosity>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct ListSessionsArgs {
     #[serde(default)]
@@ -134,6 +221,31 @@ struct ListSessionsArgs {
 #[derive(Debug, Deserialize)]
 struct GetSessionArgs {
     session_id: String,
+    #[serde(default)]
+    verbosity: Option<Verbosity>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenSessionArgs {
+    session_id: String,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    around_event_uid: Option<String>,
+    #[serde(default)]
+    limit: Option<u16>,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    before: Option<u16>,
+    #[serde(default)]
+    after: Option<u16>,
+    #[serde(default)]
+    event_scope: Option<SessionSearchEventScope>,
+    #[serde(default)]
+    include_payload_json: Option<bool>,
+    #[serde(default)]
+    include_system_events: Option<bool>,
     #[serde(default)]
     verbosity: Option<Verbosity>,
 }
@@ -517,7 +629,13 @@ struct SessionListProseSession {
     #[serde(default)]
     event_count: u64,
     #[serde(default)]
+    turn_count: u32,
+    #[serde(default)]
     mode: String,
+    #[serde(default)]
+    session_summary: Option<String>,
+    #[serde(default)]
+    next: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -570,6 +688,68 @@ struct GetSessionProseError {
     code: String,
     #[serde(default)]
     message: String,
+}
+
+#[derive(Debug, Clone)]
+struct SessionSearchEvidence {
+    event_uid: String,
+    event_order: Option<u64>,
+    turn_seq: Option<u32>,
+    event_time: Option<String>,
+    kind: String,
+    role: String,
+    snippet: String,
+}
+
+#[derive(Debug, Clone)]
+struct SessionSearchCandidate {
+    session_id: String,
+    first_event_time: Option<String>,
+    first_event_unix_ms: Option<i64>,
+    last_event_time: Option<String>,
+    last_event_unix_ms: Option<i64>,
+    mode: Option<String>,
+    event_count: Option<u64>,
+    turn_count: Option<u32>,
+    harness: Option<String>,
+    inference_provider: Option<String>,
+    session_slug: Option<String>,
+    session_summary: Option<String>,
+    score: f64,
+    matched_terms: u16,
+    event_count_considered: u32,
+    best_event_uid: Option<String>,
+    summary_event_uid: Option<String>,
+    summary_snippet: Option<String>,
+    evidence: Vec<SessionSearchEvidence>,
+    context: Vec<Value>,
+}
+
+impl SessionSearchCandidate {
+    fn new(session_id: String) -> Self {
+        Self {
+            session_id,
+            first_event_time: None,
+            first_event_unix_ms: None,
+            last_event_time: None,
+            last_event_unix_ms: None,
+            mode: None,
+            event_count: None,
+            turn_count: None,
+            harness: None,
+            inference_provider: None,
+            session_slug: None,
+            session_summary: None,
+            score: 0.0,
+            matched_terms: 0,
+            event_count_considered: 0,
+            best_event_uid: None,
+            summary_event_uid: None,
+            summary_snippet: None,
+            evidence: Vec::new(),
+            context: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -652,8 +832,179 @@ impl AppState {
         json!({
             "tools": [
                 {
+                    "name": "search_session_data",
+                    "description": "Search prior Moraine sessions for decisions, fixes, errors, logs, codenames, config values, and files. Returns compact session-ranked evidence from summaries and events. Defaults include raw tool output for error/log queries and prefer current, final, corrected, or latest evidence when asked. Use list_sessions only for metadata browsing; use open_session only when snippets are insufficient.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Natural-language search terms. Include exact names, errors, paths, status codes, codenames, config keys, or migration names from the user request."
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "minimum": limit_min,
+                                "maximum": limit_max.min(SESSION_SEARCH_MAX_LIMIT),
+                                "default": SESSION_SEARCH_DEFAULT_LIMIT
+                            },
+                            "matching_events_limit": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": SESSION_SEARCH_MAX_MATCHING_EVENTS_LIMIT,
+                                "default": SESSION_SEARCH_DEFAULT_MATCHING_EVENTS_LIMIT,
+                                "description": "Maximum matching event snippets per session. Raise only for multi-evidence questions."
+                            },
+                            "event_scope": {
+                                "type": "string",
+                                "enum": ["auto", "messages", "all"],
+                                "default": "auto",
+                                "description": "Use auto unless the user explicitly wants only messages or all events. Auto includes tool output for raw/error/log/stack/status queries."
+                            },
+                            "recency_policy": {
+                                "type": "string",
+                                "enum": ["auto", "off"],
+                                "default": "auto",
+                                "description": "Auto prefers current/final/latest/corrected evidence and down-ranks stale, draft, provisional, or deprecated notes when the query asks for that."
+                            },
+                            "from_unix_ms": { "type": "integer" },
+                            "to_unix_ms": { "type": "integer" },
+                            "mode": {
+                                "type": "string",
+                                "enum": ["web_search", "mcp_internal", "tool_calling", "chat"],
+                                "description": SEARCH_CONVERSATIONS_MODE_DOC
+                            },
+                            "session_id": {
+                                "type": "string",
+                                "description": "Optional session id to restrict evidence to one known session."
+                            },
+                            "include_context": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "Opt in to bounded surrounding turns for top evidence. Defaults to compact snippets only."
+                            },
+                            "verbosity": {
+                                "type": "string",
+                                "enum": ["prose", "full"],
+                                "default": "prose"
+                            }
+                        },
+                        "required": ["query"]
+                    },
+                    "outputSchema": {
+                        "type": "object",
+                        "required": ["query", "event_scope", "recency_policy", "hits"],
+                        "properties": {
+                            "query": { "type": "string" },
+                            "event_scope": { "type": "string" },
+                            "effective_event_scope": { "type": "string" },
+                            "recency_policy": { "type": "string" },
+                            "recency_applied": { "type": "boolean" },
+                            "hits": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "required": ["rank", "session_id", "score", "evidence", "next"],
+                                    "properties": {
+                                        "rank": { "type": "integer" },
+                                        "session_id": { "type": "string" },
+                                        "score": { "type": "number" },
+                                        "last_event_time": { "type": ["string", "null"] },
+                                        "session_summary": { "type": ["string", "null"] },
+                                        "evidence": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "required": ["event_uid", "kind", "snippet"],
+                                                "properties": {
+                                                    "event_uid": { "type": "string" },
+                                                    "event_order": { "type": ["integer", "null"] },
+                                                    "turn_seq": { "type": ["integer", "null"] },
+                                                    "kind": { "type": "string" },
+                                                    "role": { "type": "string" },
+                                                    "snippet": { "type": "string" }
+                                                }
+                                            }
+                                        },
+                                        "next": { "type": "string" }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "annotations": {
+                        "readOnlyHint": true
+                    }
+                },
+                {
+                    "name": "open_session",
+                    "description": "Open one prior session after search_session_data returns a session_id. Use for transcript context, surrounding turns, or additional evidence when search snippets are insufficient. With query, return query-relevant windows first; without query, return a chronological page.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "session_id": { "type": "string" },
+                            "query": {
+                                "type": "string",
+                                "description": "Optional query for relevant windows before chronological paging."
+                            },
+                            "around_event_uid": {
+                                "type": "string",
+                                "description": "Optional event uid from search evidence; returns bounded before/after context around it."
+                            },
+                            "limit": { "type": "integer", "minimum": limit_min, "maximum": limit_max.min(OPEN_SESSION_MAX_LIMIT), "default": OPEN_SESSION_DEFAULT_LIMIT },
+                            "cursor": { "type": "string" },
+                            "before": { "type": "integer", "minimum": 0, "maximum": OPEN_SESSION_MAX_CONTEXT, "default": OPEN_SESSION_DEFAULT_CONTEXT },
+                            "after": { "type": "integer", "minimum": 0, "maximum": OPEN_SESSION_MAX_CONTEXT, "default": OPEN_SESSION_DEFAULT_CONTEXT },
+                            "event_scope": {
+                                "type": "string",
+                                "enum": ["auto", "messages", "all"],
+                                "default": "auto"
+                            },
+                            "include_payload_json": { "type": "boolean", "default": false },
+                            "include_system_events": { "type": "boolean", "default": false },
+                            "verbosity": {
+                                "type": "string",
+                                "enum": ["prose", "full"],
+                                "default": "prose"
+                            }
+                        },
+                        "required": ["session_id"]
+                    },
+                    "outputSchema": {
+                        "type": "object",
+                        "required": ["found", "session_id", "events"],
+                        "properties": {
+                            "found": { "type": "boolean" },
+                            "session_id": { "type": "string" },
+                            "query": { "type": ["string", "null"] },
+                            "around_event_uid": { "type": ["string", "null"] },
+                            "summary": { "type": ["object", "null"] },
+                            "events": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "event_uid": { "type": "string" },
+                                        "event_order": { "type": "integer" },
+                                        "turn_seq": { "type": "integer" },
+                                        "event_time": { "type": "string" },
+                                        "actor_role": { "type": "string" },
+                                        "kind": { "type": "string" },
+                                        "text": { "type": "string" }
+                                    }
+                                }
+                            },
+                            "next_cursor": { "type": ["string", "null"] }
+                        }
+                    },
+                    "annotations": {
+                        "readOnlyHint": true
+                    }
+                },
+                {
                     "name": "search",
-                    "description": "BM25 lexical search over Moraine indexed conversation events. Bag-of-words ranking: no phrase matching, no stemming. Word order does not matter.",
+                    "description": "Legacy event-level BM25 search over Moraine indexed conversation events. Prefer search_session_data for agent questions about prior session content.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -695,7 +1046,7 @@ impl AppState {
                 },
                 {
                     "name": "open",
-                    "description": "Open by `event_uid` with surrounding context, or open a session transcript by `session_id`. Callers must supply exactly one of `event_uid` or `session_id`.",
+                    "description": "Legacy open tool. Prefer open_session for session expansion. Opens by `event_uid` with surrounding context, or by `session_id`; callers must supply exactly one of `event_uid` or `session_id`.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -732,12 +1083,15 @@ impl AppState {
                                 "default": "prose"
                             }
                         }
+                    },
+                    "annotations": {
+                        "readOnlyHint": true
                     }
                 },
                 {
                     "name": "search_conversations",
                     "description": format!(
-                        "BM25 lexical search across whole conversations. {CONVERSATION_MODE_CLASSIFICATION_SEMANTICS} {SEARCH_CONVERSATIONS_MODE_DOC}"
+                        "Legacy session-level BM25 search across whole conversations. Prefer search_session_data for agent-facing retrieval. {CONVERSATION_MODE_CLASSIFICATION_SEMANTICS} {SEARCH_CONVERSATIONS_MODE_DOC}"
                     ),
                     "inputSchema": {
                         "type": "object",
@@ -771,7 +1125,7 @@ impl AppState {
                 },
                 {
                     "name": "list_sessions",
-                    "description": "List session metadata in a time window without requiring a search query.",
+                    "description": "List session metadata without searching content. Use for newest/latest session by time, date windows, mode filters, and browsing session summaries. Do not use for questions about what happened inside a session.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -796,6 +1150,37 @@ impl AppState {
                                 "default": "prose"
                             }
                         }
+                    },
+                    "outputSchema": {
+                        "type": "object",
+                        "required": ["sessions"],
+                        "properties": {
+                            "from_unix_ms": { "type": ["integer", "null"] },
+                            "to_unix_ms": { "type": ["integer", "null"] },
+                            "mode": { "type": ["string", "null"] },
+                            "sort": { "type": "string" },
+                            "sessions": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "required": ["session_id", "mode", "next"],
+                                    "properties": {
+                                        "session_id": { "type": "string" },
+                                        "mode": { "type": "string" },
+                                        "start_time": { "type": "string" },
+                                        "end_time": { "type": "string" },
+                                        "event_count": { "type": "integer" },
+                                        "turn_count": { "type": "integer" },
+                                        "session_summary": { "type": ["string", "null"] },
+                                        "next": { "type": "string" }
+                                    }
+                                }
+                            },
+                            "next_cursor": { "type": ["string", "null"] }
+                        }
+                    },
+                    "annotations": {
+                        "readOnlyHint": true
                     }
                 },
                 {
@@ -858,6 +1243,44 @@ impl AppState {
 
     async fn call_tool(&self, params: ToolCallParams) -> Result<Value> {
         match params.name.as_str() {
+            "search_session_data" => {
+                let mut args: SearchSessionDataArgs = serde_json::from_value(params.arguments)
+                    .context(
+                        "search_session_data expects a JSON object with at least {\"query\": ...}",
+                    )?;
+                let max_limit = self.cfg.mcp.max_results.min(SESSION_SEARCH_MAX_LIMIT);
+                args.limit = validate_tool_limit("search_session_data", args.limit, max_limit)?;
+                args.matching_events_limit = validate_tool_limit(
+                    "search_session_data matching_events_limit",
+                    args.matching_events_limit,
+                    SESSION_SEARCH_MAX_MATCHING_EVENTS_LIMIT,
+                )?;
+                let verbosity = args.verbosity.unwrap_or_default();
+                let payload = self.search_session_data(args).await?;
+                match verbosity {
+                    Verbosity::Full => Ok(tool_ok_full(payload)),
+                    Verbosity::Prose => Ok(tool_ok_hybrid(
+                        format_search_session_data_text(&payload)?,
+                        payload,
+                    )),
+                }
+            }
+            "open_session" => {
+                let mut args: OpenSessionArgs = serde_json::from_value(params.arguments)
+                    .context("open_session expects {\"session_id\": ...}")?;
+                let max_limit = self.cfg.mcp.max_results.min(OPEN_SESSION_MAX_LIMIT);
+                args.limit = validate_tool_limit("open_session", args.limit, max_limit)?;
+                validate_context_window("open_session before", args.before)?;
+                validate_context_window("open_session after", args.after)?;
+                let verbosity = args.verbosity.unwrap_or_default();
+                let payload = self.open_session(args).await?;
+                match verbosity {
+                    Verbosity::Full => Ok(tool_ok_full(payload)),
+                    Verbosity::Prose => {
+                        Ok(tool_ok_hybrid(format_open_session_text(&payload)?, payload))
+                    }
+                }
+            }
             "search" => {
                 let mut args: SearchArgs = serde_json::from_value(params.arguments)
                     .context("search expects a JSON object with at least {\"query\": ...}")?;
@@ -913,7 +1336,10 @@ impl AppState {
                 let payload = self.list_sessions(args).await?;
                 match verbosity {
                     Verbosity::Full => Ok(tool_ok_full(payload)),
-                    Verbosity::Prose => Ok(tool_ok_prose(format_session_list_prose(&payload)?)),
+                    Verbosity::Prose => Ok(tool_ok_hybrid(
+                        format_session_list_prose(&payload)?,
+                        payload,
+                    )),
                 }
             }
             "get_session" => {
@@ -1177,6 +1603,603 @@ impl AppState {
         serde_json::to_value(result).context("failed to encode search_conversations result payload")
     }
 
+    async fn search_session_data(&self, args: SearchSessionDataArgs) -> Result<Value> {
+        let query = args.query.trim().to_string();
+        if query.is_empty() {
+            return Err(anyhow!("query cannot be empty"));
+        }
+
+        let requested_scope = args.event_scope.unwrap_or_default();
+        let effective_include_tool_events = requested_scope.includes_tool_events(&query);
+        let effective_scope = if effective_include_tool_events {
+            "all"
+        } else {
+            "messages"
+        };
+        let recency_policy = args.recency_policy.unwrap_or_default();
+        let recency_applied = recency_policy.is_active_for_query(&query);
+        let limit = args.limit.unwrap_or(SESSION_SEARCH_DEFAULT_LIMIT);
+        let matching_events_limit = args
+            .matching_events_limit
+            .unwrap_or(SESSION_SEARCH_DEFAULT_MATCHING_EVENTS_LIMIT);
+        let include_context = args.include_context.unwrap_or(false);
+        let session_filter = args
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+
+        let search_limit = limit
+            .saturating_mul(4)
+            .max(limit)
+            .min(self.cfg.mcp.max_results.max(TOOL_LIMIT_MIN));
+
+        let conversation_results = self
+            .repo
+            .search_conversations(ConversationSearchQuery {
+                query: query.clone(),
+                limit: Some(search_limit),
+                min_score: None,
+                min_should_match: None,
+                from_unix_ms: args.from_unix_ms,
+                to_unix_ms: args.to_unix_ms,
+                mode: args.mode,
+                include_tool_events: Some(effective_include_tool_events),
+                exclude_codex_mcp: Some(true),
+            })
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?;
+
+        let metadata_results = self
+            .repo
+            .search_session_metadata(SessionMetadataSearchQuery {
+                query: query.clone(),
+                limit: Some(search_limit),
+                min_score: None,
+                min_should_match: None,
+                from_unix_ms: args.from_unix_ms,
+                to_unix_ms: args.to_unix_ms,
+                mode: args.mode,
+                session_id: session_filter.clone(),
+            })
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?;
+
+        let mut candidates = HashMap::<String, SessionSearchCandidate>::new();
+        for hit in conversation_results.hits {
+            if session_filter
+                .as_deref()
+                .is_some_and(|sid| sid != hit.session_id)
+            {
+                continue;
+            }
+            let candidate = candidates
+                .entry(hit.session_id.clone())
+                .or_insert_with(|| SessionSearchCandidate::new(hit.session_id.clone()));
+            candidate.first_event_time = hit
+                .first_event_time
+                .clone()
+                .or(candidate.first_event_time.take());
+            candidate.first_event_unix_ms =
+                hit.first_event_unix_ms.or(candidate.first_event_unix_ms);
+            candidate.last_event_time = hit
+                .last_event_time
+                .clone()
+                .or(candidate.last_event_time.take());
+            candidate.last_event_unix_ms = hit.last_event_unix_ms.or(candidate.last_event_unix_ms);
+            candidate.harness = hit.harness.clone().or(candidate.harness.take());
+            candidate.inference_provider = hit
+                .inference_provider
+                .clone()
+                .or(candidate.inference_provider.take());
+            candidate.session_slug = hit.session_slug.clone().or(candidate.session_slug.take());
+            candidate.session_summary = hit
+                .session_summary
+                .clone()
+                .or(candidate.session_summary.take());
+            candidate.score += hit.score;
+            candidate.matched_terms = candidate.matched_terms.max(hit.matched_terms);
+            candidate.event_count_considered = candidate
+                .event_count_considered
+                .saturating_add(hit.event_count_considered);
+            candidate.best_event_uid = hit
+                .best_event_uid
+                .clone()
+                .or(candidate.best_event_uid.take());
+        }
+
+        for hit in metadata_results.hits {
+            if session_filter
+                .as_deref()
+                .is_some_and(|sid| sid != hit.session_id)
+            {
+                continue;
+            }
+            self.merge_metadata_search_hit(&mut candidates, hit);
+        }
+
+        if let Some(session_id) = session_filter.as_deref() {
+            if !candidates.contains_key(session_id) {
+                let direct_events = self
+                    .repo
+                    .search_events(SearchEventsQuery {
+                        query: query.clone(),
+                        source: Some("moraine-mcp".to_string()),
+                        limit: Some(matching_events_limit),
+                        session_id: Some(session_id.to_string()),
+                        min_score: None,
+                        min_should_match: None,
+                        include_tool_events: Some(effective_include_tool_events),
+                        event_kinds: None,
+                        exclude_codex_mcp: Some(true),
+                        disable_cache: None,
+                        search_strategy: None,
+                    })
+                    .await
+                    .map_err(|err| anyhow!(err.to_string()))?;
+
+                if !direct_events.hits.is_empty() {
+                    let candidate = candidates
+                        .entry(session_id.to_string())
+                        .or_insert_with(|| SessionSearchCandidate::new(session_id.to_string()));
+                    for hit in direct_events.hits {
+                        candidate.score += hit.score;
+                        candidate.matched_terms =
+                            candidate.matched_terms.max(hit.matched_terms as u16);
+                        candidate.event_count_considered =
+                            candidate.event_count_considered.saturating_add(1);
+                        if candidate.best_event_uid.is_none() {
+                            candidate.best_event_uid = Some(hit.event_uid);
+                        }
+                        if candidate.first_event_time.is_none() && !hit.first_event_time.is_empty()
+                        {
+                            candidate.first_event_time = Some(hit.first_event_time);
+                        }
+                        if candidate.last_event_time.is_none() && !hit.last_event_time.is_empty() {
+                            candidate.last_event_time = Some(hit.last_event_time);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut candidates = candidates.into_values().collect::<Vec<_>>();
+        for candidate in &mut candidates {
+            let event_results = self
+                .repo
+                .search_events(SearchEventsQuery {
+                    query: query.clone(),
+                    source: Some("moraine-mcp".to_string()),
+                    limit: Some(matching_events_limit),
+                    session_id: Some(candidate.session_id.clone()),
+                    min_score: None,
+                    min_should_match: None,
+                    include_tool_events: Some(effective_include_tool_events),
+                    event_kinds: None,
+                    exclude_codex_mcp: Some(true),
+                    disable_cache: None,
+                    search_strategy: None,
+                })
+                .await
+                .map_err(|err| anyhow!(err.to_string()))?;
+
+            for event_hit in event_results.hits {
+                candidate
+                    .evidence
+                    .push(self.search_event_evidence(&event_hit).await?);
+            }
+
+            self.add_summary_evidence(candidate);
+
+            if include_context {
+                if let Some(event_uid) = candidate
+                    .evidence
+                    .iter()
+                    .find(|event| !event.event_uid.is_empty())
+                    .map(|event| event.event_uid.clone())
+                {
+                    candidate.context = self
+                        .context_events_for_uid(
+                            &event_uid,
+                            SESSION_SEARCH_CONTEXT_BEFORE,
+                            SESSION_SEARCH_CONTEXT_AFTER,
+                            false,
+                            false,
+                        )
+                        .await?;
+                }
+            }
+        }
+
+        apply_recency_adjustments(&mut candidates, recency_applied);
+        candidates.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| b.last_event_unix_ms.cmp(&a.last_event_unix_ms))
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
+        candidates.truncate(limit as usize);
+
+        let hits = candidates
+            .into_iter()
+            .enumerate()
+            .map(|(idx, candidate)| self.session_search_candidate_to_json(idx + 1, candidate))
+            .collect::<Vec<_>>();
+
+        Ok(json!({
+            "query": query,
+            "event_scope": requested_scope.as_str(),
+            "effective_event_scope": effective_scope,
+            "recency_policy": recency_policy.as_str(),
+            "recency_applied": recency_applied,
+            "matching_events_limit": matching_events_limit,
+            "include_context": include_context,
+            "stats": {
+                "result_count": hits.len(),
+                "requested_limit": limit,
+                "effective_limit": limit,
+                "conversation_query_id": conversation_results.query_id,
+                "metadata_query_id": metadata_results.query_id,
+            },
+            "hits": hits,
+        }))
+    }
+
+    fn merge_metadata_search_hit(
+        &self,
+        candidates: &mut HashMap<String, SessionSearchCandidate>,
+        hit: SessionMetadataSearchHit,
+    ) {
+        let candidate = candidates
+            .entry(hit.session_id.clone())
+            .or_insert_with(|| SessionSearchCandidate::new(hit.session_id.clone()));
+        candidate.first_event_time = hit.first_event_time.or(candidate.first_event_time.take());
+        candidate.first_event_unix_ms = hit.first_event_unix_ms.or(candidate.first_event_unix_ms);
+        candidate.last_event_time = hit.last_event_time.or(candidate.last_event_time.take());
+        candidate.last_event_unix_ms = hit.last_event_unix_ms.or(candidate.last_event_unix_ms);
+        candidate.mode = hit
+            .mode
+            .map(|mode| mode.as_str().to_string())
+            .or(candidate.mode.take());
+        candidate.event_count = hit.total_events.or(candidate.event_count);
+        candidate.turn_count = hit.total_turns.or(candidate.turn_count);
+        candidate.harness = hit.harness.or(candidate.harness.take());
+        candidate.inference_provider = hit
+            .inference_provider
+            .or(candidate.inference_provider.take());
+        candidate.session_slug = hit.session_slug.or(candidate.session_slug.take());
+        candidate.session_summary = hit.session_summary.or(candidate.session_summary.take());
+        candidate.score += hit.score * 1.25;
+        candidate.matched_terms = candidate.matched_terms.max(hit.matched_terms);
+        candidate.summary_event_uid = hit.meta_event_uid.or(candidate.summary_event_uid.take());
+        candidate.summary_snippet = hit.snippet.or(candidate.summary_snippet.take());
+    }
+
+    async fn search_event_evidence(&self, hit: &SearchEventHit) -> Result<SessionSearchEvidence> {
+        let mut event_order = None;
+        let mut turn_seq = None;
+        let mut event_time = None;
+        if let Ok(context) = self
+            .repo
+            .open_event(OpenEventRequest {
+                event_uid: hit.event_uid.clone(),
+                before: Some(0),
+                after: Some(0),
+                include_system_events: Some(true),
+            })
+            .await
+        {
+            if let Some(event) = context
+                .events
+                .iter()
+                .find(|event| event.event_uid == hit.event_uid)
+            {
+                event_order = Some(event.event_order);
+                turn_seq = Some(event.turn_seq);
+                event_time = Some(event.event_time.clone());
+            }
+        }
+
+        Ok(SessionSearchEvidence {
+            event_uid: hit.event_uid.clone(),
+            event_order,
+            turn_seq,
+            event_time,
+            kind: display_kind(&hit.event_class, &hit.payload_type),
+            role: hit.actor_role.clone(),
+            snippet: compact_text_line(
+                hit.text_content
+                    .as_deref()
+                    .unwrap_or(hit.text_preview.as_str()),
+                320,
+            ),
+        })
+    }
+
+    fn add_summary_evidence(&self, candidate: &mut SessionSearchCandidate) {
+        let Some(snippet) = candidate
+            .summary_snippet
+            .as_deref()
+            .or(candidate.session_summary.as_deref())
+            .map(|value| compact_text_line(value, 320))
+            .filter(|value| !value.is_empty())
+        else {
+            return;
+        };
+
+        if candidate.evidence.iter().any(|event| {
+            event.snippet == snippet
+                || candidate.summary_event_uid.as_deref() == Some(event.event_uid.as_str())
+        }) {
+            return;
+        }
+
+        candidate.evidence.push(SessionSearchEvidence {
+            event_uid: candidate
+                .summary_event_uid
+                .clone()
+                .unwrap_or_else(|| candidate.session_id.clone()),
+            event_order: None,
+            turn_seq: None,
+            event_time: candidate.last_event_time.clone(),
+            kind: "session_meta/session_meta".to_string(),
+            role: "system".to_string(),
+            snippet,
+        });
+    }
+
+    fn session_search_candidate_to_json(
+        &self,
+        rank: usize,
+        candidate: SessionSearchCandidate,
+    ) -> Value {
+        let evidence = candidate
+            .evidence
+            .into_iter()
+            .map(|event| {
+                json!({
+                    "event_uid": event.event_uid,
+                    "event_order": event.event_order,
+                    "turn_seq": event.turn_seq,
+                    "event_time": event.event_time,
+                    "kind": event.kind,
+                    "role": event.role,
+                    "snippet": event.snippet,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        json!({
+            "rank": rank,
+            "session_id": candidate.session_id,
+            "score": round_score(candidate.score),
+            "first_event_time": candidate.first_event_time,
+            "first_event_unix_ms": candidate.first_event_unix_ms,
+            "last_event_time": candidate.last_event_time,
+            "last_event_unix_ms": candidate.last_event_unix_ms,
+            "mode": candidate.mode,
+            "event_count": candidate.event_count,
+            "turn_count": candidate.turn_count,
+            "harness": candidate.harness,
+            "inference_provider": candidate.inference_provider,
+            "session_slug": candidate.session_slug,
+            "session_summary": candidate.session_summary,
+            "matched_terms": candidate.matched_terms,
+            "event_count_considered": candidate.event_count_considered,
+            "best_event_uid": candidate.best_event_uid,
+            "evidence": evidence,
+            "context": candidate.context,
+            "next": format!("open_session(session_id=\"{}\")", candidate.session_id),
+        })
+    }
+
+    async fn open_session(&self, args: OpenSessionArgs) -> Result<Value> {
+        let session_id = args.session_id.trim().to_string();
+        if session_id.is_empty() {
+            return Err(anyhow!("session_id cannot be empty"));
+        }
+
+        let query = args
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let around_event_uid = args
+            .around_event_uid
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let limit = args.limit.unwrap_or(OPEN_SESSION_DEFAULT_LIMIT);
+        let before = args.before.unwrap_or(OPEN_SESSION_DEFAULT_CONTEXT);
+        let after = args.after.unwrap_or(OPEN_SESSION_DEFAULT_CONTEXT);
+        let include_payload_json = args.include_payload_json.unwrap_or(false);
+        let include_system_events = args.include_system_events.unwrap_or(false);
+        let event_scope = args.event_scope.unwrap_or_default();
+
+        let metadata = self
+            .repo
+            .get_session_metadata(&session_id)
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let Some(metadata) = metadata else {
+            return Ok(json!({
+                "open_mode": "session",
+                "found": false,
+                "session_id": session_id,
+                "query": query,
+                "around_event_uid": around_event_uid,
+                "events": [],
+                "next_cursor": Value::Null,
+            }));
+        };
+
+        let (events, next_cursor) = if let Some(event_uid) = around_event_uid.as_deref() {
+            let context = self
+                .repo
+                .open_event(OpenEventRequest {
+                    event_uid: event_uid.to_string(),
+                    before: Some(before),
+                    after: Some(after),
+                    include_system_events: Some(include_system_events),
+                })
+                .await
+                .map_err(|err| anyhow!(err.to_string()))?;
+            if context.found && context.session_id != session_id {
+                return Err(anyhow!(
+                    "around_event_uid belongs to session_id {} not {}",
+                    context.session_id,
+                    session_id
+                ));
+            }
+            (
+                context
+                    .events
+                    .into_iter()
+                    .map(|event| open_event_to_json(event, include_payload_json))
+                    .collect::<Vec<_>>(),
+                None,
+            )
+        } else if let Some(query) = query.as_deref() {
+            let include_tool_events = event_scope.includes_tool_events(query);
+            let search_results = self
+                .repo
+                .search_events(SearchEventsQuery {
+                    query: query.to_string(),
+                    source: Some("moraine-mcp".to_string()),
+                    limit: Some(limit),
+                    session_id: Some(session_id.clone()),
+                    min_score: None,
+                    min_should_match: None,
+                    include_tool_events: Some(include_tool_events),
+                    event_kinds: None,
+                    exclude_codex_mcp: Some(true),
+                    disable_cache: None,
+                    search_strategy: None,
+                })
+                .await
+                .map_err(|err| anyhow!(err.to_string()))?;
+
+            let mut by_uid = HashMap::<String, Value>::new();
+            for hit in search_results.hits {
+                let context = self
+                    .repo
+                    .open_event(OpenEventRequest {
+                        event_uid: hit.event_uid,
+                        before: Some(before),
+                        after: Some(after),
+                        include_system_events: Some(include_system_events),
+                    })
+                    .await
+                    .map_err(|err| anyhow!(err.to_string()))?;
+                for event in context.events {
+                    by_uid
+                        .entry(event.event_uid.clone())
+                        .or_insert_with(|| open_event_to_json(event, include_payload_json));
+                }
+                if by_uid.len() >= limit as usize {
+                    break;
+                }
+            }
+            let mut events = by_uid.into_values().collect::<Vec<_>>();
+            events.sort_by_key(|event| {
+                event
+                    .get("event_order")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default()
+            });
+            events.truncate(limit as usize);
+            (events, None)
+        } else {
+            let event_kinds = if matches!(event_scope, SessionSearchEventScope::Messages) {
+                Some(vec![SearchEventKind::Message, SearchEventKind::Reasoning])
+            } else {
+                None
+            };
+            let page = self
+                .repo
+                .list_session_events(
+                    SessionEventsQuery {
+                        session_id: session_id.clone(),
+                        direction: SessionEventsDirection::Forward,
+                        event_kinds,
+                    },
+                    PageRequest {
+                        limit,
+                        cursor: args.cursor,
+                    },
+                )
+                .await
+                .map_err(|err| anyhow!(err.to_string()))?;
+            let events = page
+                .items
+                .into_iter()
+                .filter(|event| {
+                    include_system_events
+                        || !is_low_information_system_event(&event.actor_role, &event.payload_type)
+                })
+                .map(|event| trace_event_to_json(event, include_payload_json))
+                .collect::<Vec<_>>();
+            (events, page.next_cursor)
+        };
+
+        Ok(json!({
+            "open_mode": "session",
+            "found": true,
+            "session_id": session_id,
+            "query": query,
+            "around_event_uid": around_event_uid,
+            "event_scope": event_scope.as_str(),
+            "include_payload_json": include_payload_json,
+            "include_system_events": include_system_events,
+            "limit": limit,
+            "before": before,
+            "after": after,
+            "summary": {
+                "start_time": metadata.first_event_time,
+                "start_unix_ms": metadata.first_event_unix_ms,
+                "end_time": metadata.last_event_time,
+                "end_unix_ms": metadata.last_event_unix_ms,
+                "event_count": metadata.total_events,
+                "turn_count": metadata.total_turns,
+                "mode": metadata.mode.as_str(),
+                "first_event_uid": metadata.first_event_uid,
+                "last_event_uid": metadata.last_event_uid,
+                "last_actor_role": metadata.last_actor_role,
+            },
+            "events": events,
+            "next_cursor": next_cursor,
+        }))
+    }
+
+    async fn context_events_for_uid(
+        &self,
+        event_uid: &str,
+        before: u16,
+        after: u16,
+        include_payload_json: bool,
+        include_system_events: bool,
+    ) -> Result<Vec<Value>> {
+        let context = self
+            .repo
+            .open_event(OpenEventRequest {
+                event_uid: event_uid.to_string(),
+                before: Some(before),
+                after: Some(after),
+                include_system_events: Some(include_system_events),
+            })
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?;
+
+        Ok(context
+            .events
+            .into_iter()
+            .map(|event| open_event_to_json(event, include_payload_json))
+            .collect())
+    }
+
     async fn list_sessions(&self, args: ListSessionsArgs) -> Result<Value> {
         let ListSessionsArgs {
             limit,
@@ -1223,6 +2246,9 @@ impl AppState {
                     "tool_calls": summary.tool_calls,
                     "tool_results": summary.tool_results,
                     "mode": summary.mode.as_str(),
+                    "session_slug": summary.session_slug,
+                    "session_summary": summary.session_summary,
+                    "next": format!("open_session(session_id=\"{}\")", summary.session_id),
                 })
             })
             .collect::<Vec<_>>();
@@ -1401,6 +2427,177 @@ fn validate_tool_limit(
     }
 }
 
+fn validate_context_window(name: &str, value: Option<u16>) -> Result<()> {
+    if let Some(value) = value {
+        if value > OPEN_SESSION_MAX_CONTEXT {
+            return Err(anyhow!(
+                "{name} must be between 0 and {OPEN_SESSION_MAX_CONTEXT} (received {value})"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn query_tokens(query: &str) -> Vec<String> {
+    query
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .filter_map(|token| {
+            let token = token.trim().to_ascii_lowercase();
+            (token.len() >= 2 && token.len() <= 64).then_some(token)
+        })
+        .collect()
+}
+
+fn query_suggests_tool_events(query: &str) -> bool {
+    let tokens = query_tokens(query);
+    tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "raw"
+                | "tool"
+                | "output"
+                | "stderr"
+                | "stdout"
+                | "http"
+                | "status"
+                | "error"
+                | "errors"
+                | "failed"
+                | "failure"
+                | "exception"
+                | "stack"
+                | "trace"
+                | "traceback"
+                | "panic"
+                | "log"
+                | "logs"
+                | "cargo"
+                | "pytest"
+                | "curl"
+                | "body"
+                | "field"
+                | "rows"
+                | "inserted"
+                | "exit"
+        )
+    })
+}
+
+fn query_suggests_recency(query: &str) -> bool {
+    let tokens = query_tokens(query);
+    let has_not = tokens.iter().any(|token| token == "not");
+    let has_strong_current = tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "latest" | "current" | "correct" | "corrected"
+        )
+    });
+    if has_not && !has_strong_current {
+        return false;
+    }
+
+    tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "latest"
+                | "current"
+                | "final"
+                | "correct"
+                | "corrected"
+                | "settled"
+                | "superseded"
+                | "replace"
+                | "replaced"
+                | "new"
+                | "newer"
+                | "now"
+                | "deprecated"
+                | "provisional"
+        )
+    })
+}
+
+fn apply_recency_adjustments(candidates: &mut [SessionSearchCandidate], active: bool) {
+    if !active || candidates.is_empty() {
+        return;
+    }
+
+    let min_time = candidates
+        .iter()
+        .filter_map(|candidate| candidate.last_event_unix_ms)
+        .min();
+    let max_time = candidates
+        .iter()
+        .filter_map(|candidate| candidate.last_event_unix_ms)
+        .max();
+    let (min_time, max_time) = match (min_time, max_time) {
+        (Some(min_time), Some(max_time)) if max_time > min_time => (min_time, max_time),
+        _ => (0, 0),
+    };
+
+    for candidate in candidates {
+        if max_time > min_time {
+            if let Some(last) = candidate.last_event_unix_ms {
+                let recency = (last - min_time) as f64 / (max_time - min_time) as f64;
+                candidate.score += 3.0 * recency;
+            }
+        }
+
+        let text = candidate_rank_text(candidate);
+        if contains_any_rank_token(
+            &text,
+            &[
+                "final",
+                "current",
+                "correct",
+                "corrected",
+                "settled",
+                "latest",
+            ],
+        ) {
+            candidate.score += 2.0;
+        }
+        if contains_any_rank_token(
+            &text,
+            &[
+                "temporary",
+                "provisional",
+                "stale",
+                "draft",
+                "dry",
+                "dry_run",
+            ],
+        ) {
+            candidate.score -= 8.0;
+        }
+        if contains_any_rank_token(&text, &["deprecated", "superseded"]) {
+            candidate.score -= 2.0;
+        }
+    }
+}
+
+fn candidate_rank_text(candidate: &SessionSearchCandidate) -> String {
+    let mut chunks = Vec::<String>::new();
+    if let Some(summary) = candidate.session_summary.as_deref() {
+        chunks.push(summary.to_string());
+    }
+    for evidence in &candidate.evidence {
+        chunks.push(evidence.snippet.clone());
+    }
+    chunks.join(" ").to_ascii_lowercase()
+}
+
+fn contains_any_rank_token(text: &str, needles: &[&str]) -> bool {
+    let tokens = query_tokens(text);
+    tokens
+        .iter()
+        .any(|token| needles.iter().any(|needle| token == needle))
+}
+
+fn round_score(score: f64) -> f64 {
+    (score * 10_000.0).round() / 10_000.0
+}
+
 fn apply_search_content_policy(result: &mut SearchEventsResult, include_payload_json: bool) {
     for hit in &mut result.hits {
         if !is_user_facing_content_event(&hit.event_class, &hit.actor_role) {
@@ -1424,6 +2621,57 @@ fn apply_conversation_search_content_policy(
             hit.payload_json = None;
         }
     }
+}
+
+fn open_event_to_json(event: OpenEvent, include_payload_json: bool) -> Value {
+    let kind = display_kind(&event.event_class, &event.payload_type);
+    let text = compact_text_line(&event.text_content, 600);
+    let mut payload = json!({
+        "event_uid": event.event_uid,
+        "event_order": event.event_order,
+        "turn_seq": event.turn_seq,
+        "event_time": event.event_time,
+        "actor_role": event.actor_role,
+        "event_class": event.event_class,
+        "payload_type": event.payload_type,
+        "kind": kind,
+        "call_id": event.call_id,
+        "name": event.name,
+        "phase": event.phase,
+        "item_id": event.item_id,
+        "source_ref": event.source_ref,
+        "text": text,
+        "is_target": event.is_target,
+    });
+    if include_payload_json {
+        payload["payload_json"] = Value::String(event.payload_json);
+    }
+    payload
+}
+
+fn trace_event_to_json(event: TraceEvent, include_payload_json: bool) -> Value {
+    let kind = display_kind(&event.event_class, &event.payload_type);
+    let text = compact_text_line(&event.text_content, 600);
+    let mut payload = json!({
+        "event_uid": event.event_uid,
+        "event_order": event.event_order,
+        "turn_seq": event.turn_seq,
+        "event_time": event.event_time,
+        "actor_role": event.actor_role,
+        "event_class": event.event_class,
+        "payload_type": event.payload_type,
+        "kind": kind,
+        "call_id": event.call_id,
+        "name": event.name,
+        "phase": event.phase,
+        "item_id": event.item_id,
+        "source_ref": event.source_ref,
+        "text": text,
+    });
+    if include_payload_json {
+        payload["payload_json"] = Value::String(event.payload_json);
+    }
+    payload
 }
 
 fn rpc_ok(id: Value, result: Value) -> Value {
@@ -1459,6 +2707,19 @@ fn tool_ok_full(payload: Value) -> Value {
     })
 }
 
+fn tool_ok_hybrid(text: String, payload: Value) -> Value {
+    json!({
+        "content": [
+            {
+                "type": "text",
+                "text": text
+            }
+        ],
+        "structuredContent": payload,
+        "isError": false
+    })
+}
+
 fn tool_ok_prose(text: String) -> Value {
     json!({
         "content": [
@@ -1481,6 +2742,101 @@ fn tool_error_result(message: String) -> Value {
         ],
         "isError": true
     })
+}
+
+fn format_search_session_data_text(payload: &Value) -> Result<String> {
+    let query = payload.get("query").and_then(Value::as_str).unwrap_or("");
+    let hits = payload
+        .get("hits")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if hits.is_empty() {
+        return Ok(format!("No matching sessions found for \"{query}\"."));
+    }
+
+    let top = &hits[0];
+    let session_id = top
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or("(unknown)");
+    let last_event_time = top
+        .get("last_event_time")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let summary = top
+        .get("session_summary")
+        .and_then(Value::as_str)
+        .map(|value| compact_text_line(value, 220))
+        .unwrap_or_default();
+    let evidence = top
+        .get("evidence")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .take(3)
+                .filter_map(|item| item.get("snippet").and_then(Value::as_str))
+                .map(|snippet| compact_text_line(snippet, 180))
+                .filter(|snippet| !snippet.is_empty())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+        .unwrap_or_default();
+
+    let mut out = format!("Top session {session_id}");
+    if !last_event_time.is_empty() {
+        out.push_str(&format!(" ending {last_event_time}"));
+    }
+    if !summary.is_empty() {
+        out.push_str(&format!(": {summary}"));
+    }
+    if !evidence.is_empty() {
+        out.push_str(&format!(" Evidence: {evidence}"));
+    }
+    if hits.len() > 1 {
+        out.push_str(&format!(" ({} sessions returned)", hits.len()));
+    }
+    Ok(out)
+}
+
+fn format_open_session_text(payload: &Value) -> Result<String> {
+    let session_id = payload
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or("(unknown)");
+    if payload.get("found").and_then(Value::as_bool) == Some(false) {
+        return Ok(format!("Session {session_id} was not found."));
+    }
+
+    let events = payload
+        .get("events")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let summary = payload
+        .get("summary")
+        .and_then(|summary| summary.get("end_time"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let snippets = events
+        .iter()
+        .take(4)
+        .filter_map(|event| event.get("text").and_then(Value::as_str))
+        .map(|text| compact_text_line(text, 180))
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    let mut out = format!("Opened session {session_id}");
+    if !summary.is_empty() {
+        out.push_str(&format!(" ending {summary}"));
+    }
+    out.push_str(&format!(" with {} events", events.len()));
+    if !snippets.is_empty() {
+        out.push_str(&format!(". Evidence: {snippets}"));
+    }
+    Ok(out)
 }
 
 fn format_search_prose(payload: &Value) -> Result<String> {
@@ -1831,10 +3187,11 @@ fn format_session_list_prose(payload: &Value) -> Result<String> {
         };
 
         out.push_str(&format!(
-            "\n{}) session={} mode={} events={}\n",
+            "\n{}) session={} mode={} turns={} events={}\n",
             idx + 1,
             session.session_id,
             mode,
+            session.turn_count,
             session.event_count
         ));
         out.push_str(&format!(
@@ -1845,6 +3202,15 @@ fn format_session_list_prose(payload: &Value) -> Result<String> {
             "   end: {} (unix_ms={})\n",
             session.end_time, session.end_unix_ms
         ));
+        if let Some(summary) = session.session_summary.as_deref() {
+            let compact = compact_text_line(summary, 220);
+            if !compact.is_empty() {
+                out.push_str(&format!("   session_summary: {}\n", compact));
+            }
+        }
+        if !session.next.is_empty() {
+            out.push_str(&format!("   next: {}\n", session.next));
+        }
     }
 
     if let Some(cursor) = parsed.next_cursor.as_deref() {
@@ -2079,11 +3445,142 @@ pub async fn run_stdio(cfg: AppConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use moraine_clickhouse::ClickHouseClient;
+
+    fn test_state() -> AppState {
+        let cfg = AppConfig::default();
+        let ch = ClickHouseClient::new(cfg.clickhouse.clone()).expect("clickhouse client");
+        let repo = ClickHouseConversationRepository::new(ch, RepoConfig::default());
+        AppState {
+            cfg,
+            repo,
+            prewarm_started: Arc::new(AtomicBool::new(false)),
+        }
+    }
 
     #[test]
     fn display_kind_compacts_payload_type_when_redundant() {
         assert_eq!(display_kind("message", "message"), "message");
         assert_eq!(display_kind("", "unknown"), "event");
+    }
+
+    #[test]
+    fn tools_list_publishes_session_first_surface_with_output_schemas() {
+        let state = test_state();
+        let payload = state.tools_list_result();
+        let tools = payload["tools"].as_array().expect("tools array");
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names[0], "search_session_data");
+        assert_eq!(names[1], "open_session");
+        assert!(names.contains(&"list_sessions"));
+
+        for tool_name in ["search_session_data", "open_session", "list_sessions"] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool["name"].as_str() == Some(tool_name))
+                .expect("tool exists");
+            assert!(
+                tool.get("outputSchema").is_some(),
+                "{tool_name} has outputSchema"
+            );
+            assert_eq!(tool["annotations"]["readOnlyHint"], json!(true));
+        }
+
+        let search = tools
+            .iter()
+            .find(|tool| tool["name"].as_str() == Some("search_session_data"))
+            .expect("search_session_data exists");
+        assert_eq!(
+            search["inputSchema"]["properties"]["event_scope"]["default"],
+            json!("auto")
+        );
+        assert_eq!(
+            search["inputSchema"]["properties"]["recency_policy"]["default"],
+            json!("auto")
+        );
+    }
+
+    #[test]
+    fn hybrid_tool_result_includes_text_and_structured_content_by_default_shape() {
+        let payload = json!({
+            "query": "Iris batch size current setting",
+            "hits": [
+                {
+                    "session_id": "s-20260424-iris-final",
+                    "last_event_time": "2026-04-24 14:34:00",
+                    "session_summary": "Iris final current batch policy changed to IRIS_BATCH_SIZE=96.",
+                    "evidence": [
+                        {
+                            "snippet": "Final current Iris batch size policy: set IRIS_BATCH_SIZE=96."
+                        }
+                    ]
+                }
+            ]
+        });
+        let text = format_search_session_data_text(&payload).expect("format");
+        let result = tool_ok_hybrid(text, payload.clone());
+
+        assert_eq!(result["isError"], json!(false));
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .expect("text")
+            .contains("Top session s-20260424-iris-final"));
+        assert_eq!(result["structuredContent"], payload);
+    }
+
+    #[test]
+    fn event_scope_auto_detects_raw_error_and_log_queries() {
+        assert!(query_suggests_tool_events(
+            "Where did the Juno stack trace panic happen?"
+        ));
+        assert!(query_suggests_tool_events("exact raw pytest error"));
+        assert!(query_suggests_tool_events("HTTP 422 status body from curl"));
+        assert!(!query_suggests_tool_events(
+            "Iris batch size current setting"
+        ));
+    }
+
+    #[test]
+    fn recency_policy_auto_detects_current_queries_but_not_not_final_history() {
+        assert!(query_suggests_recency(
+            "What is the current Iris batch size setting?"
+        ));
+        assert!(query_suggests_recency(
+            "correct current Mirage endpoint not provisional"
+        ));
+        assert!(!query_suggests_recency(
+            "Which Apollo value should not be treated as final?"
+        ));
+    }
+
+    #[test]
+    fn recency_adjustments_promote_final_over_stale_draft() {
+        let mut candidates = vec![
+            SessionSearchCandidate {
+                session_id: "old".to_string(),
+                last_event_unix_ms: Some(1000),
+                session_summary: Some("Temporary stale dry-run batch size setting".to_string()),
+                score: 10.0,
+                ..SessionSearchCandidate::new("old".to_string())
+            },
+            SessionSearchCandidate {
+                session_id: "final".to_string(),
+                last_event_unix_ms: Some(2000),
+                session_summary: Some("Final current batch size policy".to_string()),
+                score: 9.0,
+                ..SessionSearchCandidate::new("final".to_string())
+            },
+        ];
+
+        apply_recency_adjustments(&mut candidates, true);
+        candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
+
+        assert_eq!(candidates[0].session_id, "final");
+        assert!(candidates[0].score > candidates[1].score);
     }
 
     #[test]
