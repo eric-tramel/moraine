@@ -1228,6 +1228,12 @@
   color: white;
 }
 
+.mv-tr-bar-duration {
+  background: color-mix(in oklab, var(--primary) 60%, var(--good));
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, #fff 28%, transparent);
+  color: white;
+}
+
 .mv-tr-bar-tool_call {
   background: var(--warn);
   color: #fff;
@@ -1241,7 +1247,7 @@
 .mv-tr-bar-text {
   font-size: 0.6875rem;
   font-weight: 600;
-  letter-spacing: 0.01em;
+  letter-spacing: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
