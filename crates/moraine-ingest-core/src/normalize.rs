@@ -244,6 +244,11 @@ fn update_u8_field(row: &mut Value, key: &str, value: u8) {
     }
 }
 
+fn mark_reasoning_metadata(row: &mut Map<String, Value>) {
+    row.insert("has_reasoning".to_string(), json!(1u8));
+    row.insert("content_types".to_string(), json!(["reasoning"]));
+}
+
 pub fn infer_session_id_from_file(source_file: &str) -> String {
     let stem = std::path::Path::new(source_file)
         .file_stem()
@@ -995,7 +1000,7 @@ fn normalize_hermes_trajectory(
                                 ctx,
                                 &segment_uid,
                                 "reasoning",
-                                "thinking",
+                                "reasoning",
                                 "assistant",
                                 &thinking,
                                 &compact_json(&json!({
@@ -1005,8 +1010,7 @@ fn normalize_hermes_trajectory(
                                 })),
                             ));
                             if let Some(obj) = row.as_object_mut() {
-                                obj.insert("content_types".to_string(), json!(["thinking"]));
-                                obj.insert("has_reasoning".to_string(), json!(1u8));
+                                mark_reasoning_metadata(obj);
                                 obj.insert("turn_index".to_string(), json!(current_turn_for_item));
                             }
                             update_string_field(&mut row, "model", &model);
@@ -1424,7 +1428,7 @@ fn normalize_hermes_session_message(
                     ctx,
                     &next_uid("reasoning"),
                     "reasoning",
-                    "thinking",
+                    "reasoning",
                     "assistant",
                     &reasoning_text,
                     &compact_json(&json!({
@@ -1436,8 +1440,7 @@ fn normalize_hermes_session_message(
                     update_string_field(&mut row, "model", &model);
                 }
                 if let Some(obj) = row.as_object_mut() {
-                    obj.insert("content_types".to_string(), json!(["thinking"]));
-                    obj.insert("has_reasoning".to_string(), json!(1u8));
+                    mark_reasoning_metadata(obj);
                     obj.insert("turn_index".to_string(), json!(turn_index));
                 }
                 hermes_stamp_time(&mut row, &hermes_event_dt(base_dt, sub_event_index));
@@ -1860,7 +1863,7 @@ fn normalize_codex_event(
                         &extract_message_text(&summary),
                         &payload_json,
                     );
-                    row.insert("has_reasoning".to_string(), json!(1u8));
+                    mark_reasoning_metadata(&mut row);
                     row.insert("item_id".to_string(), json!(to_str(payload_obj.get("id"))));
                     events.push(Value::Object(row));
                 }
@@ -1968,7 +1971,7 @@ fn normalize_codex_event(
                     json!(compact_json(&payload)),
                 );
             } else if payload_type == "agent_reasoning" {
-                row.insert("has_reasoning".to_string(), json!(1u8));
+                mark_reasoning_metadata(&mut row);
             }
             events.push(Value::Object(row));
         }
@@ -2045,6 +2048,9 @@ fn normalize_codex_event(
                         &text,
                         &compact_json(item),
                     );
+                    if kind == "reasoning" {
+                        mark_reasoning_metadata(&mut row);
+                    }
                     row.insert("origin_event_id".to_string(), json!(base_uid));
                     events.push(Value::Object(row));
 
@@ -2138,7 +2144,7 @@ fn normalize_codex_event(
                     &extract_message_text(&summary),
                     &compact_json(record),
                 );
-                row.insert("has_reasoning".to_string(), json!(1u8));
+                mark_reasoning_metadata(&mut row);
                 Value::Object(row)
             };
 
@@ -2283,13 +2289,12 @@ fn normalize_claude_event(
                                 ctx,
                                 &block_uid,
                                 "reasoning",
-                                "thinking",
+                                "reasoning",
                                 "assistant",
                                 &extract_message_text(item),
                                 &compact_json(item),
                             );
-                            r.insert("has_reasoning".to_string(), json!(1u8));
-                            r.insert("content_types".to_string(), json!(["thinking"]));
+                            mark_reasoning_metadata(&mut r);
                             r
                         }
                         "tool_use" => {
@@ -2622,13 +2627,12 @@ fn normalize_kimi_cli_wire_event(
                         ctx,
                         &uid,
                         "reasoning",
-                        "thinking",
+                        "reasoning",
                         "assistant",
                         &text,
                         &payload_json,
                     );
-                    row.insert("has_reasoning".to_string(), json!(1u8));
-                    row.insert("content_types".to_string(), json!(["thinking"]));
+                    mark_reasoning_metadata(&mut row);
                     events.push(Value::Object(row));
                 }
                 _ => {
@@ -3054,6 +3058,20 @@ mod tests {
     use serde_json::{json, Value};
     use std::collections::HashMap;
 
+    fn assert_canonical_reasoning_metadata(row: &Value) {
+        let expected_content_types = json!(["reasoning"]);
+        assert_eq!(
+            row.get("event_kind").and_then(Value::as_str),
+            Some("reasoning")
+        );
+        assert_eq!(
+            row.get("payload_type").and_then(Value::as_str),
+            Some("reasoning")
+        );
+        assert_eq!(row.get("content_types"), Some(&expected_content_types));
+        assert_eq!(row.get("has_reasoning").and_then(Value::as_u64), Some(1));
+    }
+
     #[test]
     fn codex_tool_call_normalization() {
         let record = json!({
@@ -3283,6 +3301,66 @@ mod tests {
     }
 
     #[test]
+    fn codex_reasoning_branches_use_canonical_metadata() {
+        let records = [
+            json!({
+                "timestamp": "2026-02-15T03:50:50.838Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": "think through the request"}]
+                }
+            }),
+            json!({
+                "timestamp": "2026-02-15T03:50:51.838Z",
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "top-level reasoning"}]
+            }),
+            json!({
+                "timestamp": "2026-02-15T03:50:52.838Z",
+                "type": "compacted",
+                "payload": {
+                    "replacement_history": [
+                        {
+                            "type": "reasoning",
+                            "summary": [{"type": "summary_text", "text": "compacted reasoning"}]
+                        }
+                    ]
+                }
+            }),
+        ];
+
+        for (idx, record) in records.iter().enumerate() {
+            let out = normalize_record(
+                record,
+                "codex",
+                "codex",
+                "/Users/eric/.codex/sessions/2026/02/15/session-019c5f6a-49bd-7920-ac67-1dd8e33b0e95.jsonl",
+                1,
+                1,
+                idx as u64 + 20,
+                idx as u64 + 20,
+                "",
+                "",
+            )
+            .expect("codex reasoning record should normalize");
+
+            assert!(
+                out.error_rows.is_empty(),
+                "unexpected errors for case {idx}: {:?}",
+                out.error_rows
+            );
+            let reasoning = out
+                .event_rows
+                .iter()
+                .find(|row| row.get("event_kind").and_then(Value::as_str) == Some("reasoning"))
+                .expect("reasoning row");
+            assert_canonical_reasoning_metadata(reasoning);
+        }
+    }
+
+    #[test]
     fn claude_tool_use_and_result_blocks() {
         let record = json!({
             "type": "assistant",
@@ -3347,6 +3425,46 @@ mod tests {
             "anthropic"
         );
         assert!(out.error_rows.is_empty());
+    }
+
+    #[test]
+    fn claude_reasoning_block_uses_canonical_metadata() {
+        let record = json!({
+            "type": "assistant",
+            "sessionId": "7c666c01-d38e-4658-8650-854ffb5b626e",
+            "uuid": "assistant-2",
+            "parentUuid": "user-1",
+            "requestId": "req-2",
+            "timestamp": "2026-01-19T15:58:41.421Z",
+            "message": {
+                "model": "claude-opus-4-5-20251101",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "I should answer directly."
+                    }
+                ]
+            }
+        });
+
+        let out = normalize_record(
+            &record,
+            "claude",
+            "claude-code",
+            "/Users/eric/.claude/projects/p1/s1.jsonl",
+            55,
+            2,
+            12,
+            120,
+            "",
+            "",
+        )
+        .expect("claude reasoning event should normalize");
+
+        assert_eq!(out.event_rows.len(), 1);
+        assert!(out.error_rows.is_empty());
+        assert_canonical_reasoning_metadata(&out.event_rows[0]);
     }
 
     #[test]
@@ -3908,14 +4026,7 @@ mod tests {
             .iter()
             .find(|row| row.get("event_kind") == Some(&json!("reasoning")))
             .expect("reasoning row");
-        assert_eq!(
-            reasoning.get("payload_type").and_then(Value::as_str),
-            Some("thinking")
-        );
-        assert_eq!(
-            reasoning.get("has_reasoning").and_then(Value::as_u64),
-            Some(1)
-        );
+        assert_canonical_reasoning_metadata(reasoning);
 
         let tool_call = out
             .event_rows

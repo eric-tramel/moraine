@@ -139,7 +139,7 @@ fn hermes_fixture_round_trips_vendor_model_split_and_tool_io() {
         "model must be the verbatim right-hand side of vendor/model split",
     );
 
-    // Reasoning (from <think>) is normalized with payload_type=thinking.
+    // Reasoning (from <think>) uses the canonical reasoning metadata shape.
     let reasoning = rec
         .event_rows
         .iter()
@@ -147,7 +147,15 @@ fn hermes_fixture_round_trips_vendor_model_split_and_tool_io() {
         .expect("reasoning row");
     assert_eq!(
         reasoning.get("payload_type").and_then(Value::as_str),
-        Some("thinking"),
+        Some("reasoning"),
+    );
+    assert_eq!(
+        reasoning.get("content_types"),
+        Some(&serde_json::json!(["reasoning"])),
+    );
+    assert_eq!(
+        reasoning.get("has_reasoning").and_then(Value::as_u64),
+        Some(1),
     );
 
     // tool_call event carries the tool_call_id and name from the embedded JSON.

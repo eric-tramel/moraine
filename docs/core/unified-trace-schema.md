@@ -50,7 +50,7 @@ This page maps raw trace fields into the unified `moraine.events` table so you c
 | `latency_ms` | Not populated (defaults to `0`). | Top-level `durationMs` for non-assistant/user rows. |
 | `retry_count` | Not populated (defaults to `0`). | Top-level `retryAttempt` for non-assistant/user rows. |
 | `service_tier` | `payload.rate_limits.plan_type` for token-count rows; otherwise empty. | `message.usage.service_tier`. |
-| `content_types` | From `payload.content[].type` (message branches) when present; otherwise empty array. | For blocks: explicit single-type arrays (`thinking`, `tool_use`, `tool_result`, or block type). For non-block message rows: extracted from `message.content[].type`. |
+| `content_types` | From `payload.content[].type` (message branches) when present; explicit `["reasoning"]` for reasoning rows; otherwise empty array. | For blocks: explicit single-type arrays (`reasoning` for thinking blocks, `tool_use`, `tool_result`, or block type). For non-block message rows: extracted from `message.content[].type`. |
 | `has_reasoning` | Set to `1` for explicit reasoning branches (`response_item.reasoning`, top-level `reasoning`, and `event_msg` with `agent_reasoning`); otherwise `0`. | Set to `1` for `thinking` blocks; otherwise `0`. |
 | `text_content` | Derived via recursive text extraction over relevant payload branches (message content, tool input/output, summaries, etc.), truncated to limit. | Derived via recursive text extraction over content blocks or full record payload, truncated to limit. |
 | `text_preview` | Derived from `text_content` and truncated to preview length. | Derived from `text_content` and truncated to preview length. |
@@ -59,6 +59,12 @@ This page maps raw trace fields into the unified `moraine.events` table so you c
 | `event_version` | Not from trace. Generated from current UNIX epoch milliseconds at normalization time. | Not from trace. Generated from current UNIX epoch milliseconds at normalization time. |
 
 Field defaults and provider-specific overrides come from `base_event_obj`, `normalize_codex_event`, `normalize_claude_event`, and `normalize_record`. [src: crates/moraine-ingest-core/src/normalize.rs:L78-L104, crates/moraine-ingest-core/src/normalize.rs:L172-L230, crates/moraine-ingest-core/src/normalize.rs:L259-L379, crates/moraine-ingest-core/src/normalize.rs:L440-L997, crates/moraine-ingest-core/src/normalize.rs:L999-L1320, crates/moraine-ingest-core/src/normalize.rs:L1322-L1415]
+
+## Reasoning Metadata Backfill
+
+Current normalizers use `event_kind=reasoning`, `payload_type=reasoning`, `content_types=["reasoning"]`, and `has_reasoning=1` for reasoning rows across Codex, Claude Code, Hermes, and Kimi CLI. Existing ClickHouse deployments may still contain historical Claude / Hermes / Kimi rows with `payload_type=thinking` or `content_types=["thinking"]`, plus older Codex reasoning rows with empty `content_types`. Migration `sql/013_canonical_reasoning_metadata.sql` mutates those historical rows in `moraine.events` and updates the search projections that copied the old `payload_type` value.
+
+If operators rebuild search tables manually after this migration, run `bin/backfill-search-index` only after the ClickHouse mutations have completed so `search_documents` and `search_postings` are regenerated from canonical event rows.
 
 ## Hermes ShareGPT Mapping
 
@@ -69,7 +75,7 @@ Hermes Agent trajectories are stored as ShareGPT-compatible JSONL where one line
 - Hermes encodes the LLM vendor in the record's `model` field as `vendor/model` (e.g. `anthropic/claude-sonnet-4.6`). The normalizer splits on the first `/`: the left side becomes `inference_provider` on every emitted row, and the right side is stored verbatim as `model`. Values with no slash keep `inference_provider` empty and store the whole string as `model`.
 - `conversations[].from == "system"` becomes `event_kind=system`, `actor_kind=system`.
 - `conversations[].from == "human"` becomes `event_kind=message`, `actor_kind=user`.
-- `conversations[].from == "gpt"` is segmented: plain text becomes `message`, `<think>...</think>` becomes `reasoning` with `payload_type=thinking`, and `<tool_call>...</tool_call>` becomes `tool_call` with `payload_type=tool_use`.
+- `conversations[].from == "gpt"` is segmented: plain text becomes `message`, `<think>...</think>` becomes `reasoning` with `payload_type=reasoning` and `content_types=["reasoning"]`, and `<tool_call>...</tool_call>` becomes `tool_call` with `payload_type=tool_use`.
 - `conversations[].from == "tool"` is segmented on `<tool_response>...</tool_response>` and normalized into `tool_result` rows plus `tool_io` response rows.
 - When Hermes emits only one top-level timestamp for the entire rollout, Moraine preserves event order by assigning microsecond offsets per generated canonical event. This keeps `v_conversation_trace` chronological within the rollout while preserving the original raw JSON in `raw_events`.
 
@@ -83,13 +89,13 @@ Live Hermes CLI / gateway sessions land at `~/.hermes/sessions/session_<ts>_<id>
 - The first time a session file is seen, the processor emits one `event_kind=session_meta` row carrying `model`, `platform`, `system_prompt`, and `tools[]`. Subsequent re-reads of the same file do not re-emit the meta row unless the processor's checkpoint has been reset.
 - OpenAI chat-completions messages map one-for-one:
   - `role == "user"` → one `event_kind=message` row with `actor_kind=user`.
-  - `role == "assistant"` → optional `event_kind=reasoning` (when `reasoning` is non-empty, `payload_type=thinking`, `has_reasoning=1`) followed by optional `event_kind=message` (when `content` is non-empty, `payload_type=agent_message`, `op_status=<finish_reason>`) followed by one `event_kind=tool_call` per entry in `tool_calls[]` (function name from `function.name`, arguments parsed from `function.arguments`, `tool_call_id` from `id`).
+  - `role == "assistant"` → optional `event_kind=reasoning` (when `reasoning` is non-empty, `payload_type=reasoning`, `content_types=["reasoning"]`, `has_reasoning=1`) followed by optional `event_kind=message` (when `content` is non-empty, `payload_type=agent_message`, `op_status=<finish_reason>`) followed by one `event_kind=tool_call` per entry in `tool_calls[]` (function name from `function.name`, arguments parsed from `function.arguments`, `tool_call_id` from `id`).
   - `role == "tool"` → one `event_kind=tool_result` row correlated to the originating call via `tool_call_id`, plus a matching `tool_io` response row.
   - `role == "system"` → one `event_kind=system` row.
 - All rows emitted from one message share `turn_index = message_index + 1`, giving each conversation turn a monotonically increasing sequence for `v_conversation_trace`. Within a single message, sub-events are time-offset by microsecond so the reasoning row sorts before the tool_call row that follows it.
 
 ## Kimi CLI Mapping
 
-Kimi CLI uses `~/.kimi/sessions/**/wire.jsonl`. Wire records with `message.type=TurnBegin` or `SteerInput` become `message` / `user_message` rows. `ContentPart` with `type=text` becomes an assistant message, while `type=think` becomes a `reasoning` / `thinking` row. `ToolCall` and `ToolResult` map to `tool_call` and `tool_result` plus `tool_io` rows keyed by the Kimi tool call id. `StatusUpdate.token_usage` maps input, output, and cache token counters. Session ids are derived from the parent session directory and namespaced as `kimi-cli:<session-id>`. The leading `{"type":"metadata","protocol_version":...}` header line is skipped during normalization — it's a per-file protocol marker, not a session event.
+Kimi CLI uses `~/.kimi/sessions/**/wire.jsonl`. Wire records with `message.type=TurnBegin` or `SteerInput` become `message` / `user_message` rows. `ContentPart` with `type=text` becomes an assistant message, while `type=think` becomes a canonical `reasoning` / `reasoning` row with `content_types=["reasoning"]`. `ToolCall` and `ToolResult` map to `tool_call` and `tool_result` plus `tool_io` rows keyed by the Kimi tool call id. `StatusUpdate.token_usage` maps input, output, and cache token counters. Session ids are derived from the parent session directory and namespaced as `kimi-cli:<session-id>`. The leading `{"type":"metadata","protocol_version":...}` header line is skipped during normalization — it's a per-file protocol marker, not a session event.
 
 The sibling `context.jsonl` file is not ingested: it's a materialized-turn view that Kimi writes from the same wire events, so anything in it is already captured via `wire.jsonl` (except the system prompt, which Moraine does not persist today).

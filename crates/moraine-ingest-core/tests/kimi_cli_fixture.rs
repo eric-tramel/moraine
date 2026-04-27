@@ -83,6 +83,14 @@ fn kimi_wire_fixture_maps_messages_tools_and_tokens() {
         Some("reasoning")
     );
     assert_eq!(
+        reasoning.get("payload_type").and_then(Value::as_str),
+        Some("reasoning")
+    );
+    assert_eq!(
+        reasoning.get("content_types"),
+        Some(&serde_json::json!(["reasoning"]))
+    );
+    assert_eq!(
         reasoning.get("has_reasoning").and_then(Value::as_u64),
         Some(1)
     );
