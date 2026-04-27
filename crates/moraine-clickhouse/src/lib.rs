@@ -503,6 +503,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             name: "012_add_inference_provider_and_rename_claude.sql",
             sql: include_str!("../../../sql/012_add_inference_provider_and_rename_claude.sql"),
         },
+        Migration {
+            version: "013",
+            name: "013_canonical_reasoning_metadata.sql",
+            sql: include_str!("../../../sql/013_canonical_reasoning_metadata.sql"),
+        },
     ]
 }
 

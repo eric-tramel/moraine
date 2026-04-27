@@ -210,6 +210,16 @@ fn session_messages_map_openai_chat_roles_to_trace_events() {
     );
     assert_eq!(
         assistant_msg.event_rows[0]
+            .get("payload_type")
+            .and_then(Value::as_str),
+        Some("reasoning"),
+    );
+    assert_eq!(
+        assistant_msg.event_rows[0].get("content_types"),
+        Some(&json!(["reasoning"])),
+    );
+    assert_eq!(
+        assistant_msg.event_rows[0]
             .get("has_reasoning")
             .and_then(Value::as_u64),
         Some(1),
