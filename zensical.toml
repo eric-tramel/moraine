@@ -1,0 +1,42 @@
+[project]
+site_name = "Moraine"
+site_description = "Install, run, and configure the local Moraine agent trace stack."
+site_url = "https://eric-tramel.github.io/moraine/"
+docs_dir = "docs"
+site_dir = "site"
+use_directory_urls = false
+copyright = "Apache-2.0"
+extra_css = ["stylesheets/site.css"]
+repo_url = "https://github.com/eric-tramel/moraine"
+repo_name = "eric-tramel/moraine"
+nav = [
+  { "Introduction" = "index.md" },
+  { "Quickstart and Installation" = "quickstart.md" },
+  { "Configuration" = "configuration.md" },
+]
+
+[project.theme]
+features = [
+  "navigation.sections",
+  "navigation.expand",
+  "navigation.path",
+  "toc.follow",
+  "content.code.copy",
+]
+
+[project.theme.icon]
+repo = "fontawesome/brands/github"
+
+[[project.theme.palette]]
+scheme = "default"
+primary = "blue grey"
+accent = "cyan"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+scheme = "slate"
+primary = "blue grey"
+accent = "cyan"
+toggle.icon = "lucide/moon"
+toggle.name = "Switch to light mode"

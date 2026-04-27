@@ -1,0 +1,12 @@
+@media screen and (min-width: 60em) {
+  .md-header__inner.md-grid {
+    max-width: none;
+    width: 100%;
+    padding-inline-start: max(0.8rem, calc((100vw - 61rem) / 2 + 0.8rem));
+    padding-inline-end: 0.8rem;
+  }
+
+  .md-header__option {
+    margin-left: auto;
+  }
+}

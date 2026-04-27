@@ -36,7 +36,7 @@ For changes that touch ingest, MCP, monitor, or ClickHouse schema, run them insi
 
 ## Dev sandbox (required for QA of ingest/monitor/MCP/schema)
 
-The sandbox is a long-lived linux container that mounts your current worktree at `/repo` read-only, `cargo build`s the workspace on first boot (wrapped by sccache sharing the host's cache), then runs the moraine stack against a sibling-compose ClickHouse. Iterate inside via `moraine-sandbox shell` — cargo / rustc / rustup / sccache are all on `PATH`, and `CARGO_TARGET_DIR` is volume-backed so subsequent builds are incremental. See [docs/development/sandbox.md](docs/development/sandbox.md) for the full reference.
+The sandbox is a long-lived linux container that mounts your current worktree at `/repo` read-only, `cargo build`s the workspace on first boot (wrapped by sccache sharing the host's cache), then runs the moraine stack against a sibling-compose ClickHouse. Iterate inside via `moraine-sandbox shell` — cargo / rustc / rustup / sccache are all on `PATH`, and `CARGO_TARGET_DIR` is volume-backed so subsequent builds are incremental. See [scripts/dev/sandbox/README.md](scripts/dev/sandbox/README.md) for the full reference.
 
 ### Typical agent flow
 
