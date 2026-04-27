@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -178,6 +179,9 @@ pub struct TraceEvent {
     pub text_content: String,
     pub payload_json: String,
     pub token_usage_json: String,
+    pub endpoint_kind: String,
+    pub token_usage_buckets: BTreeMap<String, u64>,
+    pub token_usage_native_units: BTreeMap<String, f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,6 +203,9 @@ pub struct OpenEvent {
     pub text_content: String,
     pub payload_json: String,
     pub token_usage_json: String,
+    pub endpoint_kind: String,
+    pub token_usage_buckets: BTreeMap<String, u64>,
+    pub token_usage_native_units: BTreeMap<String, f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

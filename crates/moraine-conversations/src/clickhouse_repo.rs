@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -176,6 +177,12 @@ struct TraceEventRow {
     text_content: String,
     payload_json: String,
     token_usage_json: String,
+    #[serde(default)]
+    endpoint_kind: String,
+    #[serde(default)]
+    token_usage_buckets: BTreeMap<String, u64>,
+    #[serde(default)]
+    token_usage_native_units: BTreeMap<String, f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1005,6 +1012,9 @@ GROUP BY session_id"
             text_content: row.text_content,
             payload_json: row.payload_json,
             token_usage_json: row.token_usage_json,
+            endpoint_kind: row.endpoint_kind,
+            token_usage_buckets: row.token_usage_buckets,
+            token_usage_native_units: row.token_usage_native_units,
         }
     }
 
@@ -3435,7 +3445,10 @@ FORMAT JSONEachRow",
   source_ref,
   text_content,
   payload_json,
-  token_usage_json
+  token_usage_json,
+  endpoint_kind,
+  token_usage_buckets,
+  token_usage_native_units
 FROM {trace_table}
 WHERE session_id = {} AND turn_seq = {}
 ORDER BY event_order ASC
@@ -3504,7 +3517,10 @@ FORMAT JSONEachRow",
   source_ref,
   text_content,
   payload_json,
-  token_usage_json
+  token_usage_json,
+  endpoint_kind,
+  token_usage_buckets,
+  token_usage_native_units
 FROM {trace_table}
 WHERE session_id = {} AND event_order = {} AND event_uid = {}
 ORDER BY event_order ASC
@@ -3534,7 +3550,10 @@ FORMAT JSONEachRow",
   source_ref,
   text_content,
   payload_json,
-  token_usage_json
+  token_usage_json,
+  endpoint_kind,
+  token_usage_buckets,
+  token_usage_native_units
 FROM {trace_table}
 WHERE session_id = {} AND event_order < {}{}
 ORDER BY event_order DESC
@@ -3578,7 +3597,10 @@ FORMAT JSONEachRow",
   source_ref,
   text_content,
   payload_json,
-  token_usage_json
+  token_usage_json,
+  endpoint_kind,
+  token_usage_buckets,
+  token_usage_native_units
 FROM {trace_table}
 WHERE session_id = {} AND event_order > {}{}
 ORDER BY event_order ASC
@@ -3623,6 +3645,9 @@ FORMAT JSONEachRow",
                 text_content: row.text_content,
                 payload_json: row.payload_json,
                 token_usage_json: row.token_usage_json,
+                endpoint_kind: row.endpoint_kind,
+                token_usage_buckets: row.token_usage_buckets,
+                token_usage_native_units: row.token_usage_native_units,
             })
             .collect();
 
@@ -3726,7 +3751,10 @@ FORMAT JSONEachRow",
   source_ref,
   text_content,
   payload_json,
-  token_usage_json
+  token_usage_json,
+  endpoint_kind,
+  token_usage_buckets,
+  token_usage_native_units
 FROM {trace_table}
 WHERE {where_sql}
 ORDER BY {order_by_sql}

@@ -62,6 +62,7 @@ nav:
       - Conversations Tutorial: python/conversations-client-tutorial.md
   - Architecture:
       - Design Tradeoffs: architecture/design-tradeoffs.md
+      - Harmonized Token Accounting: architecture/token-accounting.md
       - Workspace Ownership: architecture/workspace-ownership.md
   - Development:
       - Dev Sandbox: development/sandbox.md

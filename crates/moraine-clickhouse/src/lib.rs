@@ -508,6 +508,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             name: "013_canonical_reasoning_metadata.sql",
             sql: include_str!("../../../sql/013_canonical_reasoning_metadata.sql"),
         },
+        Migration {
+            version: "014",
+            name: "014_harmonized_token_accounting.sql",
+            sql: include_str!("../../../sql/014_harmonized_token_accounting.sql"),
+        },
     ]
 }
 

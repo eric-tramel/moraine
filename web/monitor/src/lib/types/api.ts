@@ -51,6 +51,8 @@ export interface AnalyticsRange {
 export interface TokenPoint {
   bucket_unix: number;
   model: string;
+  endpoint_kind?: string;
+  bucket?: string;
   tokens: number;
 }
 

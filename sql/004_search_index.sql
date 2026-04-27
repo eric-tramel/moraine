@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS moraine.search_documents (
   source_name LowCardinality(String) DEFAULT '',
   harness LowCardinality(String) DEFAULT '',
   inference_provider LowCardinality(String) DEFAULT '',
+  endpoint_kind LowCardinality(String) DEFAULT 'generation',
   source_file String,
   source_generation UInt32,
   source_line_no UInt64,
@@ -29,6 +30,29 @@ CREATE TABLE IF NOT EXISTS moraine.search_documents (
   text_content String,
   payload_json String,
   token_usage_json String,
+  token_usage_buckets Map(String, UInt64) DEFAULT map(
+    'input_text', toUInt64(0),
+    'output_text', toUInt64(0),
+    'input_cache_read', toUInt64(0),
+    'input_cache_write', toUInt64(0),
+    'input_image', toUInt64(0),
+    'output_image', toUInt64(0),
+    'input_audio', toUInt64(0),
+    'output_audio', toUInt64(0),
+    'reasoning', toUInt64(0),
+    'server_tool_use', toUInt64(0),
+    'embedding_input_text', toUInt64(0),
+    'embedding_input_image', toUInt64(0),
+    'other', toUInt64(0)
+  ),
+  token_usage_native_units Map(String, Float64) DEFAULT map(
+    'input_image_pixels', toFloat64(0),
+    'output_image_pixels', toFloat64(0),
+    'input_audio_seconds', toFloat64(0),
+    'output_audio_seconds', toFloat64(0),
+    'input_images', toFloat64(0),
+    'output_images', toFloat64(0)
+  ),
   doc_len UInt32 MATERIALIZED toUInt32(length(extractAll(lowerUTF8(text_content), '[a-z0-9_]+')))
 )
 ENGINE = ReplacingMergeTree(doc_version)
@@ -41,6 +65,33 @@ ALTER TABLE moraine.search_documents
   ADD COLUMN IF NOT EXISTS harness LowCardinality(String) DEFAULT '' AFTER source_name;
 ALTER TABLE moraine.search_documents
   ADD COLUMN IF NOT EXISTS inference_provider LowCardinality(String) DEFAULT '' AFTER harness;
+ALTER TABLE moraine.search_documents
+  ADD COLUMN IF NOT EXISTS endpoint_kind LowCardinality(String) DEFAULT 'generation' AFTER inference_provider;
+ALTER TABLE moraine.search_documents
+  ADD COLUMN IF NOT EXISTS token_usage_buckets Map(String, UInt64) DEFAULT map(
+    'input_text', toUInt64(0),
+    'output_text', toUInt64(0),
+    'input_cache_read', toUInt64(0),
+    'input_cache_write', toUInt64(0),
+    'input_image', toUInt64(0),
+    'output_image', toUInt64(0),
+    'input_audio', toUInt64(0),
+    'output_audio', toUInt64(0),
+    'reasoning', toUInt64(0),
+    'server_tool_use', toUInt64(0),
+    'embedding_input_text', toUInt64(0),
+    'embedding_input_image', toUInt64(0),
+    'other', toUInt64(0)
+  ) AFTER token_usage_json;
+ALTER TABLE moraine.search_documents
+  ADD COLUMN IF NOT EXISTS token_usage_native_units Map(String, Float64) DEFAULT map(
+    'input_image_pixels', toFloat64(0),
+    'output_image_pixels', toFloat64(0),
+    'input_audio_seconds', toFloat64(0),
+    'output_audio_seconds', toFloat64(0),
+    'input_images', toFloat64(0),
+    'output_images', toFloat64(0)
+  ) AFTER token_usage_buckets;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS moraine.mv_search_documents_from_events
 TO moraine.search_documents
@@ -55,6 +106,7 @@ SELECT
   source_name,
   harness,
   inference_provider,
+  endpoint_kind,
   source_file,
   source_generation,
   source_line_no,
@@ -68,7 +120,9 @@ SELECT
   if(tool_phase != '', tool_phase, op_status) AS phase,
   text_content,
   payload_json,
-  token_usage_json
+  token_usage_json,
+  token_usage_buckets,
+  token_usage_native_units
 FROM moraine.events
 WHERE lengthUTF8(replaceRegexpAll(text_content, '\\s+', '')) > 0;
 

@@ -2349,6 +2349,9 @@ impl AppState {
                     "text_content": event.text_content,
                     "payload_json": event.payload_json,
                     "token_usage_json": event.token_usage_json,
+                    "endpoint_kind": event.endpoint_kind,
+                    "token_usage_buckets": event.token_usage_buckets,
+                    "token_usage_native_units": event.token_usage_native_units,
                 })
             })
             .collect::<Vec<_>>();
@@ -2642,6 +2645,9 @@ fn open_event_to_json(event: OpenEvent, include_payload_json: bool) -> Value {
         "source_ref": event.source_ref,
         "text": text,
         "is_target": event.is_target,
+        "endpoint_kind": event.endpoint_kind,
+        "token_usage_buckets": event.token_usage_buckets,
+        "token_usage_native_units": event.token_usage_native_units,
     });
     if include_payload_json {
         payload["payload_json"] = Value::String(event.payload_json);
@@ -2667,6 +2673,9 @@ fn trace_event_to_json(event: TraceEvent, include_payload_json: bool) -> Value {
         "item_id": event.item_id,
         "source_ref": event.source_ref,
         "text": text,
+        "endpoint_kind": event.endpoint_kind,
+        "token_usage_buckets": event.token_usage_buckets,
+        "token_usage_native_units": event.token_usage_native_units,
     });
     if include_payload_json {
         payload["payload_json"] = Value::String(event.payload_json);

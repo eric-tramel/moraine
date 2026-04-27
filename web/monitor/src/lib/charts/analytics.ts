@@ -18,46 +18,68 @@ export interface AnalyticsChartView {
   maxTicks: number;
 }
 
-function mapModelPoints<T extends TokenPoint | TurnPoint>(
+function tokenSeriesLabel(point: TokenPoint): string {
+  const model = point.model || 'unknown';
+  const endpoint = point.endpoint_kind || 'generation';
+  const bucket = point.bucket || 'tokens';
+  return `${model} · ${endpoint} · ${bucket}`;
+}
+
+function mapSeriesPoints<T extends TokenPoint | TurnPoint>(
   points: T[],
   valueKey: 'tokens' | 'turns',
+  labelForPoint: (point: T) => string,
 ): Map<string, Map<number, number>> {
-  const modelMap = new Map<string, Map<number, number>>();
+  const seriesMap = new Map<string, Map<number, number>>();
 
   for (const point of points) {
-    const model = point.model || 'unknown';
+    const label = labelForPoint(point);
     const bucket = Number(point.bucket_unix);
     const value =
       valueKey === 'tokens'
         ? Number((point as TokenPoint).tokens || 0)
         : Number((point as TurnPoint).turns || 0);
 
-    if (!modelMap.has(model)) {
-      modelMap.set(model, new Map<number, number>());
+    if (!seriesMap.has(label)) {
+      seriesMap.set(label, new Map<number, number>());
     }
 
-    modelMap.get(model)!.set(bucket, value);
+    seriesMap.get(label)!.set(bucket, value);
   }
 
-  return modelMap;
+  return seriesMap;
 }
 
-function collectTopModels(tokens: TokenPoint[], turns: TurnPoint[]): string[] {
+function collectTopTokenSeries(tokens: TokenPoint[]): string[] {
   const totals = new Map<string, number>();
 
   for (const point of tokens) {
+    const label = tokenSeriesLabel(point);
+    totals.set(label, (totals.get(label) || 0) + Number(point.tokens || 0));
+  }
+
+  return [...totals.entries()]
+    .sort((left, right) => right[1] - left[1])
+    .map(([label]) => label)
+    .slice(0, 8);
+}
+
+function collectTopModels(tokens: TokenPoint[], turns: TurnPoint[]): string[] {
+  const models = new Map<string, number>();
+
+  for (const point of tokens) {
     const model = point.model || 'unknown';
-    totals.set(model, (totals.get(model) || 0) + Number(point.tokens || 0));
+    models.set(model, (models.get(model) || 0) + Number(point.tokens || 0));
   }
 
   for (const point of turns) {
     const model = point.model || 'unknown';
-    if (!totals.has(model)) {
-      totals.set(model, 0);
+    if (!models.has(model)) {
+      models.set(model, 0);
     }
   }
 
-  return [...totals.entries()]
+  return [...models.entries()]
     .sort((left, right) => right[1] - left[1])
     .map(([model]) => model)
     .slice(0, 8);
@@ -83,18 +105,19 @@ export function buildAnalyticsView(data: AnalyticsResponse): AnalyticsChartView 
   const turnPoints = data.series?.turns || [];
   const concurrentPoints = data.series?.concurrent_sessions || [];
 
-  const tokenMap = mapModelPoints(tokenPoints, 'tokens');
-  const turnMap = mapModelPoints(turnPoints, 'turns');
+  const tokenMap = mapSeriesPoints<TokenPoint>(tokenPoints, 'tokens', tokenSeriesLabel);
+  const turnMap = mapSeriesPoints<TurnPoint>(turnPoints, 'turns', (point) => point.model || 'unknown');
   const concurrentMap = mapConcurrent(concurrentPoints);
+  const tokenSeries = collectTopTokenSeries(tokenPoints);
   const models = collectTopModels(tokenPoints, turnPoints);
 
   const labels = bucketAxis.map((bucket) => formatBucketLabel(bucket, range.key));
 
-  const tokenDatasets = models.map((model, index) => {
+  const tokenDatasets = tokenSeries.map((series, index) => {
     const color = MODEL_COLORS[index % MODEL_COLORS.length];
     return {
-      label: model,
-      data: bucketAxis.map((bucket) => tokenMap.get(model)?.get(bucket) ?? 0),
+      label: series,
+      data: bucketAxis.map((bucket) => tokenMap.get(series)?.get(bucket) ?? 0),
       borderColor: color,
       backgroundColor: `${color}26`,
       borderWidth: 1,

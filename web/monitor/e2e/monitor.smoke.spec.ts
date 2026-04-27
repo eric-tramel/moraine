@@ -24,8 +24,20 @@ function analyticsFixture(range: string) {
     },
     series: {
       tokens: [
-        { bucket_unix: 1_700_000_000, model: 'gpt-5.3-codex-xhigh', tokens: 1200 },
-        { bucket_unix: 1_700_003_600, model: 'gpt-5.3-codex-xhigh', tokens: 900 },
+        {
+          bucket_unix: 1_700_000_000,
+          model: 'gpt-5.3-codex-xhigh',
+          endpoint_kind: 'generation',
+          bucket: 'input_text',
+          tokens: 1200,
+        },
+        {
+          bucket_unix: 1_700_003_600,
+          model: 'gpt-5.3-codex-xhigh',
+          endpoint_kind: 'generation',
+          bucket: 'output_text',
+          tokens: 900,
+        },
       ],
       turns: [
         { bucket_unix: 1_700_000_000, model: 'gpt-5.3-codex-xhigh', turns: 9 },
