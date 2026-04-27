@@ -1,173 +1,65 @@
-![Moraine Banner](https://github.com/user-attachments/assets/efa723e6-bcc9-4402-bbdf-083297f7e1e2)
+# Moraine
 
 [![Docs](https://github.com/eric-tramel/moraine/actions/workflows/docs-deploy.yml/badge.svg)](https://eric-tramel.github.io/moraine/)
 
-Moraine indexes all of your agent harness traces (Claude Code, Codex, Kimi CLI, Hermes Agent, ...) in realtime into a searchable, unified database.
+Moraine is a local trace stack for agent work. It indexes sessions from agent
+harnesses such as Codex, Claude Code, Kimi CLI, and Hermes into ClickHouse,
+serves a monitor UI, and exposes MCP retrieval over the indexed history.
 
-🤖 **Your Agents Get**: a searchable long-term memory.
+Moraine is under active development. Config keys, schemas, and MCP tools can
+change across minor releases.
 
+## Documentation
 
-🌝 **You Get**: a unified record of everything they've done across providers. Tools, Tokens, and Talk.
+- [Introduction](docs/index.md)
+- [Quickstart and Installation](docs/quickstart.md)
+- [Configuration](docs/configuration.md)
 
-Specifically, Moraine provides:
+Build the documentation site with:
 
-- **The Dataplane to Your Agentic Era**: the database is yours, take inspiration from our tooling and schema definitions and build your own apps ontop of moraine's DB.
-- **Agent memory via MCP**: agents search and retrieve context from past conversations
-- **Unified trace database**: every conversation turn, tool call, and token count in one place — query it however you want
-- **Monitor UI**: browse sessions, check ingestion health, inspect what your agents have been doing
-- **Continually Optimized Search Tooling**: improvements to realtime search performance are an ongoing effort in the project, and we're aiming to drive down real-time search latency as much as can.
-- **Fully local**: nothing leaves your machine, unless you want it to (and set up a remote db instance).
+```bash
+make docs-build
+```
 
-<img width="1635" height="1170" alt="image" src="https://github.com/user-attachments/assets/b1e67007-aa73-4c31-80b9-79c0d4fb91da" />
+Serve it locally with:
 
-<img width="1635" height="1170" alt="image" src="https://github.com/user-attachments/assets/f7ec8582-8d3c-4745-bdbe-a2fe71df6004" />
-
-
-
-
-| :warning: WARNING           |
-|:----------------------------|
-| Moraine is under active development, so features or schemas may change or move around whenever Y changes in vX.Y.Z. |
+```bash
+make docs-serve
+```
 
 ## Quickstart
 
-Install `moraine` with [uv](https://docs.astral.sh/uv/):
+Install from PyPI with `uv`:
 
 ```bash
 uv tool install moraine-cli
 ```
 
-Upgrades come from your package manager: `uv tool upgrade moraine-cli`.
-
-Prefer a prebuilt bundle? Use the fallback installer to drop the binaries into `~/.local/bin`:
+Or install the latest release bundle:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/eric-tramel/moraine/main/scripts/install.sh \
-  | sh
+curl -fsSL https://raw.githubusercontent.com/eric-tramel/moraine/main/scripts/install.sh | sh
 ```
 
-Afterwards, just make sure to have `~/.local/bin` on your path (e.g. in your `.zshrc`, `.bashrc`, etc.).
-
-Start the stack and confirm it is healthy:
+Start the local stack:
 
 ```bash
-which moraine
 moraine up
 moraine status
 ```
 
-Open the monitor UI at `http://127.0.0.1:8080`.
+The monitor UI runs at `http://127.0.0.1:8080` by default.
 
-Run an agent session as you normally would, you'll see row counts and the ingest heartbeat move as your sessions are indexed.
-
-Use `moraine status --output rich --verbose` for a detailed breakdown.
-
-## Connect an Agent (MCP)
-
-While Moraine can be used for many purposes, a direct one is the MCP server we've built for agent self-retrieval **across agent harnesses**. It exposes five tools: `search` (BM25 over indexed events), `search_conversations` (session-scoped), `list_sessions`, `get_session`, and `open` (fetch an event and its surrounding window).
-
-To wire it into Claude Code, add this to your `.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "moraine": {
-      "command": "moraine",
-      "args": ["run", "mcp"]
-    }
-  }
-}
-```
-
-Or add to Codex:
-
-```
-codex mcp add conversation-search -- moraine run mcp
-```
-
-For the full tool contract and integration guidance, see `docs/mcp/agent-interface.md`.
-
-## Query the Database Directly
-
-Moraine's ClickHouse tables are yours to query. The MCP search path is optimized for fast agent retrieval, but the underlying database holds the complete trace of every session — conversation turns, tool calls, token usage, timestamps, and more.
-
-Connect to ClickHouse and explore:
+## Development
 
 ```bash
-clickhouse client -d moraine
+cargo build --workspace --locked
+cargo test --workspace --locked
+cargo fmt --all -- --check
 ```
 
-```sql
--- sessions and their row counts
-SELECT session_id, count(*) as events
-FROM moraine.events
-GROUP BY session_id
-ORDER BY events DESC
-LIMIT 10;
-
--- token usage across sessions
-SELECT session_id,
-       sum(input_tokens) as input,
-       sum(output_tokens) as output
-FROM moraine.events
-WHERE input_tokens > 0
-GROUP BY session_id
-ORDER BY output DESC
-LIMIT 10;
-```
-
-The primary table is `moraine.events`; `moraine.raw_events` holds the untransformed source rows. Convenience views include `v_conversation_trace`, `v_turn_summary`, and `v_session_summary`. See `sql/` for the full schema and view definitions.
-
-## Watched Sources
-
-By default, Moraine watches:
-
-| Source | Path |
-|---|---|
-| Codex | `~/.codex/sessions/**/*.jsonl` |
-| Claude Code | `~/.claude/projects/**/*.jsonl` |
-| Kimi CLI | `~/.kimi/sessions/**/wire.jsonl` |
-| Hermes (live sessions) | `~/.hermes/sessions/session_*.json` |
-| Hermes (trajectories) | user-defined, opt-in |
-
-Configurable in `~/.moraine/config.toml` under `[[ingest.sources]]`.
-
-## Common Commands
-
-| Command | What it does |
-|---|---|
-| `moraine up` | Start all services (ClickHouse, ingestor, monitor) |
-| `moraine status` | Health check + ingest heartbeat |
-| `moraine logs` | View service logs |
-| `moraine down` | Stop everything |
-
-## Configuration
-
-Default config lives in `config/moraine.toml`. Runtime config is resolved in order:
-
-1. `--config <path>` flag
-2. `MORAINE_CONFIG` env var (and `MORAINE_MCP_CONFIG` for MCP)
-3. `~/.moraine/config.toml`
-
-To customize, copy `config/moraine.toml` to `~/.moraine/config.toml` and edit.
-
-Moraine stores all runtime state under `~/.moraine`. If ClickHouse is not already installed, `moraine up` auto-installs a managed build.
-
-## Install From Source
-
-Requires a Rust toolchain (`cargo`, `rustc`):
+The repository-managed pre-commit hook can be installed with:
 
 ```bash
-git clone https://github.com/eric-tramel/moraine.git ~/src/moraine
-cd ~/src/moraine
-for crate in moraine moraine-ingest moraine-monitor moraine-mcp; do
-  cargo install --path "apps/$crate" --locked
-done
+make hooks-install
 ```
-
-## Further Reading
-
-- Operations runbook: `docs/operations/build-and-operations.md`
-- Migration notes: `docs/operations/migration-guide.md`
-- System internals: `docs/core/system-architecture.md`
-- MCP tool contract: `docs/mcp/agent-interface.md`

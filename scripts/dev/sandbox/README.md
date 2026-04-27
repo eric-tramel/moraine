@@ -97,8 +97,6 @@ API key is the supported path for this smoke test.
 
 ## See also
 
-- `docs/development/sandbox.md` — the long-form guide: flags, build
-  strategies, mounts, config generation, caveats, troubleshooting.
 - `scripts/ci/e2e-stack.sh` — the non-interactive CI gate with synthetic
   fixtures. Complementary to this sandbox, not replaced by it.
 - `scripts/ci/mcp_smoke.py` — raw JSON-RPC smoke against `moraine-mcp`.
