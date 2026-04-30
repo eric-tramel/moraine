@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import base64
 import json
 import os
 import select
@@ -75,36 +76,196 @@ def assert_tool_success(result: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
-def select_hit(
-    hits: list[Any],
-    expect_session_id: Optional[str],
-    expect_source_file: Optional[str],
+def call_tool(
+    proc: subprocess.Popen[str],
+    expected_id: int,
+    name: str,
+    arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
-    for hit in hits:
-        if not isinstance(hit, dict):
-            continue
-        if expect_session_id is not None and hit.get("session_id") != expect_session_id:
-            continue
-        if expect_source_file is not None:
-            source_ref = hit.get("source_ref")
-            if not isinstance(source_ref, str) or expect_source_file not in source_ref:
-                continue
-        return hit
-
-    debug_hits = [
+    response = send_request(
+        proc,
         {
-            "event_uid": hit.get("event_uid"),
-            "session_id": hit.get("session_id"),
-            "source_ref": hit.get("source_ref"),
-        }
-        for hit in hits
-        if isinstance(hit, dict)
-    ][:5]
-    raise AssertionError(
-        "search did not return a hit matching expected filters: "
-        f"session_id={expect_session_id}, source_file={expect_source_file}, "
-        f"hits={debug_hits}"
+            "jsonrpc": "2.0",
+            "id": expected_id,
+            "method": "tools/call",
+            "params": {
+                "name": name,
+                "arguments": arguments,
+            },
+        },
     )
+    return assert_tool_success(assert_rpc_ok(response, expected_id))
+
+
+def assert_structured_content(result: Dict[str, Any], tool_name: str) -> Dict[str, Any]:
+    payload = result.get("structuredContent")
+    if not isinstance(payload, dict):
+        raise AssertionError(f"{tool_name} structuredContent missing")
+    if payload.get("tool") != tool_name:
+        raise AssertionError(
+            f"{tool_name} structuredContent has wrong tool: {payload.get('tool')}"
+        )
+    if "error" in payload:
+        raise AssertionError(f"{tool_name} returned error envelope: {payload['error']}")
+    if not isinstance(payload.get("data"), dict):
+        raise AssertionError(f"{tool_name} structuredContent missing data object")
+    return payload
+
+
+def encode_mcp_component(raw: str) -> str:
+    encoded = base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+    return encoded.rstrip("=")
+
+
+def expected_mcp_session_id(raw_session_id: Optional[str]) -> Optional[str]:
+    if raw_session_id is None:
+        return None
+    return f"session:{encode_mcp_component(raw_session_id)}"
+
+
+def nested_string(value: Dict[str, Any], *path: str) -> Optional[str]:
+    current: Any = value
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current if isinstance(current, str) else None
+
+
+def collect_strings(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        strings: list[str] = []
+        for child in value.values():
+            strings.extend(collect_strings(child))
+        return strings
+    if isinstance(value, list):
+        strings = []
+        for child in value:
+            strings.extend(collect_strings(child))
+        return strings
+    return []
+
+
+def contains_text(value: Any, needle: str) -> bool:
+    return any(needle in text for text in collect_strings(value))
+
+
+def assert_tools_surface(tool_names_ordered: list[str]) -> None:
+    if tool_names_ordered != ["search_sessions", "open"]:
+        raise AssertionError(
+            "tools/list must publish the two-tool search surface exactly: "
+            f"{tool_names_ordered}"
+        )
+
+
+def select_search_sessions_result(
+    results: list[Any],
+    expect_session_id: Optional[str],
+    expect_open_text: Optional[str],
+) -> Dict[str, Any]:
+    expected_session = expected_mcp_session_id(expect_session_id)
+    candidates: list[Dict[str, Any]] = []
+
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        session_id = nested_string(result, "session", "id")
+        open_session_id = nested_string(result, "open", "session_id")
+        if expected_session is not None and expected_session not in {
+            session_id,
+            open_session_id,
+        }:
+            continue
+        candidates.append(result)
+
+    if not candidates:
+        debug_hits = [
+            {
+                "id": hit.get("id"),
+                "session_id": nested_string(hit, "session", "id"),
+                "open_session_id": nested_string(hit, "open", "session_id"),
+                "snippet": nested_string(hit, "snippet", "text"),
+            }
+            for hit in results
+            if isinstance(hit, dict)
+        ][:5]
+        raise AssertionError(
+            "search_sessions did not return a hit matching expected filters: "
+            f"session_id={expect_session_id}, hits={debug_hits}"
+        )
+
+    if expect_open_text is not None:
+        for result in candidates:
+            if contains_text(result, expect_open_text):
+                return result
+
+    return candidates[0]
+
+
+def open_ids_from_search_result(result: Dict[str, Any]) -> list[str]:
+    handles = result.get("open")
+    if not isinstance(handles, dict):
+        raise AssertionError(f"search_sessions result missing open handles: {result}")
+
+    open_ids: list[str] = []
+    for key in ["event_id", "turn_id", "session_id"]:
+        open_id = handles.get(key)
+        if not isinstance(open_id, str) or not open_id:
+            raise AssertionError(f"search_sessions result missing {key}: {result}")
+        open_ids.append(open_id)
+    return list(dict.fromkeys(open_ids))
+
+
+def open_payload_session_id(payload: Dict[str, Any]) -> Optional[str]:
+    kind = nested_string(payload, "data", "kind")
+    if kind == "event":
+        return nested_string(payload, "data", "event", "session_id")
+    if kind == "turn":
+        return nested_string(payload, "data", "turn", "session_id")
+    if kind == "session":
+        return nested_string(payload, "data", "session", "id")
+    return None
+
+
+def assert_open_search_ids(
+    proc: subprocess.Popen[str],
+    next_id: int,
+    open_ids: list[str],
+    expect_session_id: Optional[str],
+    expect_open_text: Optional[str],
+) -> int:
+    expected_session = expected_mcp_session_id(expect_session_id)
+    opened_payloads: list[Dict[str, Any]] = []
+
+    for open_id in open_ids:
+        open_result = call_tool(proc, next_id, "open", {"id": open_id})
+        next_id += 1
+        open_payload = assert_structured_content(open_result, "open")
+        if nested_string(open_payload, "request", "id") != open_id:
+            raise AssertionError(
+                f"open request id mismatch: got={nested_string(open_payload, 'request', 'id')} "
+                f"want={open_id}"
+            )
+        open_session_id = open_payload_session_id(open_payload)
+        if expected_session is not None and open_session_id != expected_session:
+            raise AssertionError(
+                "open session mismatch: "
+                f"got={open_session_id} want={expected_session}"
+            )
+        opened_payloads.append(open_payload)
+
+    if expect_open_text is not None and not any(
+        contains_text(payload, expect_open_text) for payload in opened_payloads
+    ):
+        opened_ids = [nested_string(payload, "request", "id") for payload in opened_payloads]
+        raise AssertionError(
+            f"open responses for search_sessions IDs did not include expected text marker: "
+            f"{expect_open_text}; opened={opened_ids}"
+        )
+
+    return next_id
 
 
 def run_smoke(
@@ -152,93 +313,47 @@ def run_smoke(
         if not isinstance(tools, list):
             raise AssertionError("tools/list missing tools array")
 
-        tool_names = {tool.get("name") for tool in tools if isinstance(tool, dict)}
-        if "search" not in tool_names or "open" not in tool_names:
-            raise AssertionError(f"tools/list did not include search/open: {tool_names}")
+        tool_names_ordered = [
+            tool.get("name")
+            for tool in tools
+            if isinstance(tool, dict) and isinstance(tool.get("name"), str)
+        ]
+        if len(tool_names_ordered) != len(tools) or len(tool_names_ordered) != len(
+            set(tool_names_ordered)
+        ):
+            raise AssertionError(f"tools/list returned duplicate or invalid tool names: {tools}")
+        assert_tools_surface(tool_names_ordered)
 
-        search_resp = send_request(
+        next_id = 3
+        search_result = call_tool(
             proc,
+            next_id,
+            "search_sessions",
             {
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "tools/call",
-                "params": {
-                    "name": "search",
-                    "arguments": {
-                        "query": query,
-                        "verbosity": "full",
-                        "limit": 20,
-                        "exclude_codex_mcp": False,
-                    },
-                },
+                "query": query,
+                "n_hits": 20,
             },
         )
-        search_result = assert_tool_success(assert_rpc_ok(search_resp, 3))
-        search_payload = search_result.get("structuredContent")
-        if not isinstance(search_payload, dict):
-            raise AssertionError("search structuredContent missing")
+        next_id += 1
+        search_payload = assert_structured_content(search_result, "search_sessions")
 
-        hits = search_payload.get("hits")
-        if not isinstance(hits, list) or not hits:
-            raise AssertionError(f"search returned no hits for query={query}")
+        results = search_payload["data"].get("results")
+        if not isinstance(results, list) or not results:
+            raise AssertionError(f"search_sessions returned no results for query={query}")
 
-        selected_hit = select_hit(hits, expect_session_id, expect_source_file)
-        event_uid = selected_hit.get("event_uid")
-        if not isinstance(event_uid, str) or not event_uid:
-            raise AssertionError("selected search hit missing event_uid")
-
-        open_resp = send_request(
-            proc,
-            {
-                "jsonrpc": "2.0",
-                "id": 4,
-                "method": "tools/call",
-                "params": {
-                    "name": "open",
-                    "arguments": {
-                        "event_uid": event_uid,
-                        "verbosity": "full",
-                    },
-                },
-            },
+        selected_result = select_search_sessions_result(
+            results,
+            expect_session_id,
+            expect_open_text,
         )
-        open_result = assert_tool_success(assert_rpc_ok(open_resp, 4))
-        open_payload = open_result.get("structuredContent")
-        if not isinstance(open_payload, dict):
-            raise AssertionError("open structuredContent missing")
-        if open_payload.get("found") is not True:
-            raise AssertionError(f"open did not find event_uid={event_uid}: {open_payload}")
-        if expect_session_id is not None and open_payload.get("session_id") != expect_session_id:
-            raise AssertionError(
-                f"open session mismatch: got={open_payload.get('session_id')} want={expect_session_id}"
-            )
+        next_id = assert_open_search_ids(
+            proc,
+            next_id,
+            open_ids_from_search_result(selected_result),
+            expect_session_id,
+            expect_open_text,
+        )
 
-        events = open_payload.get("events")
-        if not isinstance(events, list) or not events:
-            raise AssertionError("open returned no context events")
-
-        if not any(
-            isinstance(event, dict) and event.get("event_uid") == event_uid for event in events
-        ):
-            raise AssertionError("open response did not include requested event_uid")
-        if expect_source_file is not None and not any(
-            isinstance(event, dict)
-            and isinstance(event.get("source_ref"), str)
-            and expect_source_file in event.get("source_ref", "")
-            for event in events
-        ):
-            raise AssertionError(
-                f"open response did not include expected source file: {expect_source_file}"
-            )
-        if expect_open_text is not None and not any(
-            isinstance(event, dict)
-            and isinstance(event.get("text_content"), str)
-            and expect_open_text in event.get("text_content", "")
-            for event in events
-        ):
-            raise AssertionError(
-                f"open response did not include expected text marker: {expect_open_text}"
-            )
     finally:
         if proc.stdin:
             proc.stdin.close()

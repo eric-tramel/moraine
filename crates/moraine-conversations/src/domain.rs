@@ -162,6 +162,102 @@ pub struct Turn {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpEventRef {
+    pub session_id: String,
+    pub event_uid: String,
+    pub event_order: u64,
+    pub turn_seq: u32,
+    pub event_time: String,
+    pub event_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpTurnRef {
+    pub session_id: String,
+    pub turn_seq: u32,
+    pub turn_id: String,
+    pub started_at: String,
+    pub ended_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpEventSummary {
+    pub session_id: String,
+    pub event_uid: String,
+    pub event_order: u64,
+    pub turn_seq: u32,
+    pub event_time: String,
+    pub actor_role: String,
+    pub event_class: String,
+    pub payload_type: String,
+    pub event_type: String,
+    pub call_id: String,
+    pub name: String,
+    pub phase: String,
+    pub text_preview: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpTurnCompact {
+    pub metadata: TurnSummary,
+    pub user_input_summary: Option<String>,
+    pub final_response_summary: Option<String>,
+    pub user_input_event: Option<McpEventRef>,
+    pub final_response_event: Option<McpEventRef>,
+    pub tools_called: Vec<String>,
+    pub normalized_event_types: Vec<String>,
+    pub completed: bool,
+    pub terminal_event_uid: Option<String>,
+    pub first_event: Option<McpEventRef>,
+    pub last_event: Option<McpEventRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpSessionOpen {
+    pub metadata: SessionMetadata,
+    pub title: Option<String>,
+    pub source: Option<String>,
+    pub harness: Option<String>,
+    pub inference_provider: Option<String>,
+    pub session_slug: Option<String>,
+    pub session_summary: Option<String>,
+    pub turns: Vec<McpTurnCompact>,
+    pub completed: bool,
+    pub terminal_event_uid: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpTurnOpen {
+    pub metadata: TurnSummary,
+    pub events: Vec<McpEventSummary>,
+    pub user_input_summary: Option<String>,
+    pub final_response_summary: Option<String>,
+    pub tools_called: Vec<String>,
+    pub normalized_event_types: Vec<String>,
+    pub completed: bool,
+    pub terminal_event_uid: Option<String>,
+    pub previous_turn: Option<McpTurnRef>,
+    pub next_turn: Option<McpTurnRef>,
+    pub first_event: Option<McpEventRef>,
+    pub last_event: Option<McpEventRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpEventOpen {
+    pub event: TraceEvent,
+    pub event_type: String,
+    pub event_ordinal: u32,
+    pub turn_completed: bool,
+    pub turn_terminal_event_uid: Option<String>,
+    pub parent_session: SessionMetadata,
+    pub parent_turn: TurnSummary,
+    pub previous_event: Option<McpEventRef>,
+    pub next_event: Option<McpEventRef>,
+    pub previous_turn: Option<McpTurnRef>,
+    pub next_turn: Option<McpTurnRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceEvent {
     pub session_id: String,
     pub event_uid: String,
@@ -284,6 +380,68 @@ impl SearchEventKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpEventType {
+    UserInput,
+    AssistantResponse,
+    Reasoning,
+    ToolCall,
+    ToolResponse,
+    Compaction,
+    System,
+    Runtime,
+    Unknown,
+}
+
+impl McpEventType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UserInput => "user_input",
+            Self::AssistantResponse => "assistant_response",
+            Self::Reasoning => "reasoning",
+            Self::ToolCall => "tool_call",
+            Self::ToolResponse => "tool_response",
+            Self::Compaction => "compaction",
+            Self::System => "system",
+            Self::Runtime => "runtime",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_normalized(value: &str) -> Self {
+        match value {
+            "user_input" => Self::UserInput,
+            "assistant_response" => Self::AssistantResponse,
+            "reasoning" => Self::Reasoning,
+            "tool_call" => Self::ToolCall,
+            "tool_response" => Self::ToolResponse,
+            "compaction" => Self::Compaction,
+            "system" => Self::System,
+            "runtime" => Self::Runtime,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn search_order(self) -> u8 {
+        match self {
+            Self::UserInput => 0,
+            Self::AssistantResponse => 1,
+            Self::Reasoning => 2,
+            Self::ToolCall => 3,
+            Self::ToolResponse => 4,
+            Self::Compaction => 5,
+            Self::System => 6,
+            Self::Runtime => 7,
+            Self::Unknown => 8,
+        }
+    }
+
+    pub fn default_search_types() -> Vec<Self> {
+        vec![Self::UserInput, Self::AssistantResponse, Self::ToolResponse]
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionEventsDirection {
@@ -360,6 +518,87 @@ pub struct SearchEventsResult {
     pub terms: Vec<String>,
     pub stats: SearchEventsStats,
     pub hits: Vec<SearchEventHit>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SearchMcpEventsQuery {
+    pub query: String,
+    #[serde(default)]
+    pub n_hits: Option<u16>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub turn_seq: Option<u32>,
+    #[serde(default)]
+    pub event_types: Option<Vec<McpEventType>>,
+    #[serde(default)]
+    pub min_score: Option<f64>,
+    #[serde(default)]
+    pub min_should_match: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchMcpEventsStats {
+    pub docs: u64,
+    pub avgdl: f64,
+    pub took_ms: u32,
+    pub result_count: usize,
+    pub requested_n_hits: u16,
+    pub effective_n_hits: u16,
+    pub limit_capped: bool,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchMcpEventHit {
+    pub rank: usize,
+    pub event_uid: String,
+    pub session_id: String,
+    pub event_type: McpEventType,
+    pub event_time: String,
+    pub event_unix_ms: i64,
+    pub turn_seq: u32,
+    pub turn_ordinal: u32,
+    pub event_order: u64,
+    pub event_ordinal: u32,
+    pub turn_event_count: u64,
+    pub session_started_at: Option<String>,
+    pub session_updated_at: Option<String>,
+    pub session_title: Option<String>,
+    pub session_slug: Option<String>,
+    pub session_summary: Option<String>,
+    pub source_name: Option<String>,
+    pub harness: Option<String>,
+    pub inference_provider: Option<String>,
+    pub event_class: String,
+    pub payload_type: String,
+    pub actor_role: String,
+    pub tool_name: Option<String>,
+    pub tool_phase: Option<String>,
+    pub call_id: Option<String>,
+    pub item_id: Option<String>,
+    pub model: Option<String>,
+    pub endpoint_kind: Option<String>,
+    pub source_ref: Option<String>,
+    pub snippet: String,
+    pub snippet_truncated: bool,
+    pub text_content: Option<String>,
+    pub payload_json: Option<String>,
+    pub score: f64,
+    pub raw_score: f64,
+    pub matched_terms: u64,
+    pub doc_len: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchMcpEventsResult {
+    pub query_id: String,
+    pub query: String,
+    pub terms: Vec<String>,
+    pub event_types: Vec<McpEventType>,
+    pub truncated: bool,
+    pub stats: SearchMcpEventsStats,
+    pub hits: Vec<SearchMcpEventHit>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

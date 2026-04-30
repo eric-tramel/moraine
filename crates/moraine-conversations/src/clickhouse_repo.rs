@@ -19,12 +19,14 @@ use crate::cursor::{
 use crate::domain::{
     is_user_facing_content_event, Conversation, ConversationDetailOptions, ConversationListFilter,
     ConversationListSort, ConversationMode, ConversationSearchHit, ConversationSearchQuery,
-    ConversationSearchResults, ConversationSearchStats, ConversationSummary, OpenContext,
-    OpenEvent, OpenEventRequest, Page, PageRequest, RepoConfig, SearchEventHit, SearchEventKind,
-    SearchEventsQuery, SearchEventsResult, SearchEventsStats, SearchEventsStrategy,
-    SessionEventsDirection, SessionEventsQuery, SessionMetadata, SessionMetadataSearchHit,
-    SessionMetadataSearchQuery, SessionMetadataSearchResults, SessionMetadataSearchStats,
-    TraceEvent, Turn, TurnListFilter, TurnSummary,
+    ConversationSearchResults, ConversationSearchStats, ConversationSummary, McpEventOpen,
+    McpEventRef, McpEventSummary, McpEventType, McpSessionOpen, McpTurnCompact, McpTurnOpen,
+    McpTurnRef, OpenContext, OpenEvent, OpenEventRequest, Page, PageRequest, RepoConfig,
+    SearchEventHit, SearchEventKind, SearchEventsQuery, SearchEventsResult, SearchEventsStats,
+    SearchEventsStrategy, SearchMcpEventHit, SearchMcpEventsQuery, SearchMcpEventsResult,
+    SearchMcpEventsStats, SessionEventsDirection, SessionEventsQuery, SessionMetadata,
+    SessionMetadataSearchHit, SessionMetadataSearchQuery, SessionMetadataSearchResults,
+    SessionMetadataSearchStats, TraceEvent, Turn, TurnListFilter, TurnSummary,
 };
 use crate::error::{RepoError, RepoResult};
 use crate::repo::ConversationRepository;
@@ -169,13 +171,21 @@ struct TraceEventRow {
     actor_role: String,
     event_class: String,
     payload_type: String,
+    #[serde(default)]
     call_id: String,
+    #[serde(default)]
     name: String,
+    #[serde(default)]
     phase: String,
+    #[serde(default)]
     item_id: String,
+    #[serde(default)]
     source_ref: String,
+    #[serde(default)]
     text_content: String,
+    #[serde(default)]
     payload_json: String,
+    #[serde(default)]
     token_usage_json: String,
     #[serde(default)]
     endpoint_kind: String,
@@ -186,10 +196,74 @@ struct TraceEventRow {
 }
 
 #[derive(Debug, Deserialize)]
+struct EventSessionRow {
+    session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionEventSourceRow {
+    session_id: String,
+    event_uid: String,
+    event_time: String,
+    event_unix_ms: i64,
+    source_name: String,
+    turn_index: u32,
+    actor_role: String,
+    event_class: String,
+    payload_type: String,
+    #[serde(default)]
+    call_id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    phase: String,
+    #[serde(default)]
+    item_id: String,
+    #[serde(default)]
+    source_ref: String,
+    #[serde(default)]
+    text_content: String,
+    #[serde(default)]
+    payload_json: String,
+    #[serde(default)]
+    token_usage_json: String,
+    #[serde(default)]
+    endpoint_kind: String,
+    #[serde(default)]
+    token_usage_buckets: BTreeMap<String, u64>,
+    #[serde(default)]
+    token_usage_native_units: BTreeMap<String, f64>,
+}
+
+#[derive(Debug, Clone)]
+struct IndexedTraceEvent {
+    event: TraceEvent,
+    event_unix_ms: i64,
+    turn_id: String,
+    source_name: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct OpenTargetRow {
     session_id: String,
     event_order: u64,
     turn_seq: u32,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct McpSessionInfoRow {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    harness: String,
+    #[serde(default)]
+    inference_provider: String,
+    #[serde(default)]
+    session_slug: String,
+    #[serde(default)]
+    session_summary: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -216,6 +290,55 @@ struct SearchRow {
     payload_json: String,
     score: f64,
     matched_terms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SearchMcpEventRow {
+    event_uid: String,
+    session_id: String,
+    source_name: String,
+    harness: String,
+    #[serde(default)]
+    inference_provider: String,
+    #[serde(default)]
+    endpoint_kind: String,
+    event_class: String,
+    payload_type: String,
+    actor_role: String,
+    name: String,
+    phase: String,
+    source_ref: String,
+    doc_len: u32,
+    text_preview: String,
+    #[serde(default)]
+    text_content: String,
+    #[serde(default)]
+    payload_json: String,
+    #[serde(default)]
+    mcp_event_type: String,
+    raw_score: f64,
+    matched_terms: u64,
+    event_time: String,
+    event_unix_ms: i64,
+    event_order: u64,
+    turn_seq: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SearchMcpEventEnrichmentRow {
+    event_uid: String,
+    event_time: String,
+    event_unix_ms: i64,
+    event_order: u64,
+    turn_seq: u32,
+    event_ordinal: u32,
+    turn_event_count: u64,
+    #[serde(default)]
+    call_id: String,
+    #[serde(default)]
+    item_id: String,
+    #[serde(default)]
+    model: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -814,6 +937,330 @@ GROUP BY session_id"
         Ok(Some(kinds))
     }
 
+    fn normalize_mcp_event_types(
+        event_types: Option<Vec<McpEventType>>,
+    ) -> RepoResult<Vec<McpEventType>> {
+        let mut event_types = event_types.unwrap_or_else(McpEventType::default_search_types);
+        if event_types.is_empty() {
+            return Err(RepoError::invalid_argument(
+                "event_types filter cannot be an empty list",
+            ));
+        }
+
+        event_types.sort_by_key(|event_type| event_type.search_order());
+        event_types.dedup();
+        Ok(event_types)
+    }
+
+    fn is_mcp_system_event(event_class: &str, payload_type: &str, actor_role: &str) -> bool {
+        actor_role.eq_ignore_ascii_case("system")
+            || matches!(event_class, "system" | "progress" | "file_history_snapshot")
+            || matches!(
+                payload_type,
+                "system" | "progress" | "file-history-snapshot" | "file_history_snapshot"
+            )
+    }
+
+    fn is_mcp_runtime_event(event_class: &str, payload_type: &str) -> bool {
+        event_class == "queue_operation"
+            || matches!(
+                payload_type,
+                "task_started"
+                    | "task_complete"
+                    | "turn_aborted"
+                    | "item_completed"
+                    | "queue-operation"
+            )
+    }
+
+    fn is_mcp_message_event(event_class: &str, payload_type: &str) -> bool {
+        event_class == "message"
+            || (event_class == "event_msg"
+                && matches!(
+                    payload_type,
+                    "user_message" | "agent_message" | "message" | "text" | "event_msg"
+                ))
+    }
+
+    fn is_mcp_reasoning_event(event_class: &str, payload_type: &str) -> bool {
+        event_class == "reasoning"
+            || matches!(payload_type, "agent_reasoning" | "reasoning" | "thinking")
+    }
+
+    fn is_mcp_tool_call_event(event_class: &str, payload_type: &str) -> bool {
+        event_class == "tool_call"
+            || matches!(
+                payload_type,
+                "tool_use" | "function_call" | "custom_tool_call" | "web_search_call"
+            )
+    }
+
+    fn is_mcp_tool_response_event(event_class: &str, payload_type: &str) -> bool {
+        event_class == "tool_result"
+            || matches!(
+                payload_type,
+                "tool_result"
+                    | "function_call_output"
+                    | "custom_tool_call_output"
+                    | "search_results_received"
+            )
+    }
+
+    fn is_mcp_compaction_event(event_class: &str, payload_type: &str) -> bool {
+        matches!(event_class, "compacted_raw" | "summary")
+            || matches!(payload_type, "compacted" | "summary")
+    }
+
+    fn mcp_event_type_for(event_class: &str, payload_type: &str, actor_role: &str) -> McpEventType {
+        let is_system_actor = actor_role.eq_ignore_ascii_case("system");
+        if actor_role.eq_ignore_ascii_case("user")
+            && Self::is_mcp_message_event(event_class, payload_type)
+        {
+            McpEventType::UserInput
+        } else if actor_role.eq_ignore_ascii_case("assistant")
+            && Self::is_mcp_message_event(event_class, payload_type)
+        {
+            McpEventType::AssistantResponse
+        } else if !is_system_actor && Self::is_mcp_reasoning_event(event_class, payload_type) {
+            McpEventType::Reasoning
+        } else if !is_system_actor && Self::is_mcp_tool_call_event(event_class, payload_type) {
+            McpEventType::ToolCall
+        } else if !is_system_actor && Self::is_mcp_tool_response_event(event_class, payload_type) {
+            McpEventType::ToolResponse
+        } else if Self::is_mcp_compaction_event(event_class, payload_type) {
+            McpEventType::Compaction
+        } else if Self::is_mcp_runtime_event(event_class, payload_type) {
+            McpEventType::Runtime
+        } else if Self::is_mcp_system_event(event_class, payload_type, actor_role) {
+            McpEventType::System
+        } else {
+            McpEventType::Unknown
+        }
+    }
+
+    fn mcp_message_event_clause(event_class_expr: &str, payload_type_expr: &str) -> String {
+        format!(
+            "({event_class_expr} = 'message' OR ({event_class_expr} = 'event_msg' AND {payload_type_expr} IN ('user_message', 'agent_message', 'message', 'text', 'event_msg')))"
+        )
+    }
+
+    fn mcp_reasoning_event_clause(event_class_expr: &str, payload_type_expr: &str) -> String {
+        format!(
+            "({event_class_expr} = 'reasoning' OR {payload_type_expr} IN ('agent_reasoning', 'reasoning', 'thinking'))"
+        )
+    }
+
+    fn mcp_tool_call_event_clause(event_class_expr: &str, payload_type_expr: &str) -> String {
+        format!(
+            "({event_class_expr} = 'tool_call' OR {payload_type_expr} IN ('tool_use', 'function_call', 'custom_tool_call', 'web_search_call'))"
+        )
+    }
+
+    fn mcp_tool_response_event_clause(event_class_expr: &str, payload_type_expr: &str) -> String {
+        format!(
+            "({event_class_expr} = 'tool_result' OR {payload_type_expr} IN ('tool_result', 'function_call_output', 'custom_tool_call_output', 'search_results_received'))"
+        )
+    }
+
+    fn mcp_compaction_event_clause(event_class_expr: &str, payload_type_expr: &str) -> String {
+        format!(
+            "({event_class_expr} IN ('compacted_raw', 'summary') OR {payload_type_expr} IN ('compacted', 'summary'))"
+        )
+    }
+
+    fn mcp_runtime_event_clause(event_class_expr: &str, payload_type_expr: &str) -> String {
+        format!(
+            "({event_class_expr} = 'queue_operation' OR {payload_type_expr} IN ('task_started', 'task_complete', 'turn_aborted', 'item_completed', 'queue-operation'))"
+        )
+    }
+
+    fn mcp_system_event_clause(
+        event_class_expr: &str,
+        payload_type_expr: &str,
+        actor_role_expr: &str,
+    ) -> String {
+        format!(
+            "(lowerUTF8({actor_role_expr}) = 'system' OR {event_class_expr} IN ('system', 'progress', 'file_history_snapshot') OR {payload_type_expr} IN ('system', 'progress', 'file-history-snapshot', 'file_history_snapshot'))"
+        )
+    }
+
+    fn single_mcp_event_type_clause(
+        event_class_expr: &str,
+        payload_type_expr: &str,
+        actor_role_expr: &str,
+        event_type: McpEventType,
+    ) -> String {
+        let non_system_actor = format!("lowerUTF8({actor_role_expr}) != 'system'");
+        match event_type {
+            McpEventType::UserInput => format!(
+                "(lowerUTF8({actor_role_expr}) = 'user' AND {})",
+                Self::mcp_message_event_clause(event_class_expr, payload_type_expr)
+            ),
+            McpEventType::AssistantResponse => format!(
+                "(lowerUTF8({actor_role_expr}) = 'assistant' AND {})",
+                Self::mcp_message_event_clause(event_class_expr, payload_type_expr)
+            ),
+            McpEventType::Reasoning => format!(
+                "({non_system_actor} AND {})",
+                Self::mcp_reasoning_event_clause(event_class_expr, payload_type_expr)
+            ),
+            McpEventType::ToolCall => format!(
+                "({non_system_actor} AND {})",
+                Self::mcp_tool_call_event_clause(event_class_expr, payload_type_expr)
+            ),
+            McpEventType::ToolResponse => format!(
+                "({non_system_actor} AND {})",
+                Self::mcp_tool_response_event_clause(event_class_expr, payload_type_expr)
+            ),
+            McpEventType::Compaction => {
+                Self::mcp_compaction_event_clause(event_class_expr, payload_type_expr)
+            }
+            McpEventType::System => {
+                Self::mcp_system_event_clause(event_class_expr, payload_type_expr, actor_role_expr)
+            }
+            McpEventType::Runtime => {
+                Self::mcp_runtime_event_clause(event_class_expr, payload_type_expr)
+            }
+            McpEventType::Unknown => {
+                let known = [
+                    McpEventType::UserInput,
+                    McpEventType::AssistantResponse,
+                    McpEventType::Reasoning,
+                    McpEventType::ToolCall,
+                    McpEventType::ToolResponse,
+                    McpEventType::Compaction,
+                    McpEventType::System,
+                    McpEventType::Runtime,
+                ]
+                .into_iter()
+                .map(|known_type| {
+                    Self::single_mcp_event_type_clause(
+                        event_class_expr,
+                        payload_type_expr,
+                        actor_role_expr,
+                        known_type,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" OR ");
+                format!("NOT ({known})")
+            }
+        }
+    }
+
+    fn mcp_event_type_filter_clause(
+        event_class_expr: &str,
+        payload_type_expr: &str,
+        actor_role_expr: &str,
+        event_types: &[McpEventType],
+    ) -> String {
+        let clauses = event_types
+            .iter()
+            .map(|event_type| {
+                Self::single_mcp_event_type_clause(
+                    event_class_expr,
+                    payload_type_expr,
+                    actor_role_expr,
+                    *event_type,
+                )
+            })
+            .collect::<Vec<_>>();
+        if clauses.len() == 1 {
+            clauses[0].clone()
+        } else {
+            format!("({})", clauses.join(" OR "))
+        }
+    }
+
+    fn mcp_event_type_sql_expr(
+        event_class_expr: &str,
+        payload_type_expr: &str,
+        actor_role_expr: &str,
+    ) -> String {
+        let clauses = [
+            (
+                McpEventType::UserInput,
+                Self::single_mcp_event_type_clause(
+                    event_class_expr,
+                    payload_type_expr,
+                    actor_role_expr,
+                    McpEventType::UserInput,
+                ),
+            ),
+            (
+                McpEventType::AssistantResponse,
+                Self::single_mcp_event_type_clause(
+                    event_class_expr,
+                    payload_type_expr,
+                    actor_role_expr,
+                    McpEventType::AssistantResponse,
+                ),
+            ),
+            (
+                McpEventType::Reasoning,
+                Self::single_mcp_event_type_clause(
+                    event_class_expr,
+                    payload_type_expr,
+                    actor_role_expr,
+                    McpEventType::Reasoning,
+                ),
+            ),
+            (
+                McpEventType::ToolCall,
+                Self::single_mcp_event_type_clause(
+                    event_class_expr,
+                    payload_type_expr,
+                    actor_role_expr,
+                    McpEventType::ToolCall,
+                ),
+            ),
+            (
+                McpEventType::ToolResponse,
+                Self::single_mcp_event_type_clause(
+                    event_class_expr,
+                    payload_type_expr,
+                    actor_role_expr,
+                    McpEventType::ToolResponse,
+                ),
+            ),
+            (
+                McpEventType::Compaction,
+                Self::single_mcp_event_type_clause(
+                    event_class_expr,
+                    payload_type_expr,
+                    actor_role_expr,
+                    McpEventType::Compaction,
+                ),
+            ),
+            (
+                McpEventType::Runtime,
+                Self::single_mcp_event_type_clause(
+                    event_class_expr,
+                    payload_type_expr,
+                    actor_role_expr,
+                    McpEventType::Runtime,
+                ),
+            ),
+            (
+                McpEventType::System,
+                Self::single_mcp_event_type_clause(
+                    event_class_expr,
+                    payload_type_expr,
+                    actor_role_expr,
+                    McpEventType::System,
+                ),
+            ),
+        ];
+
+        let mut parts = Vec::new();
+        for (event_type, clause) in clauses {
+            parts.push(clause);
+            parts.push(sql_quote(event_type.as_str()));
+        }
+        parts.push(sql_quote(McpEventType::Unknown.as_str()));
+        format!("multiIf({})", parts.join(", "))
+    }
+
     fn matches_event_kind(event_class: &str, payload_type: &str, kind: SearchEventKind) -> bool {
         match kind {
             SearchEventKind::Message => {
@@ -1033,6 +1480,51 @@ GROUP BY session_id"
         }
     }
 
+    fn map_indexed_session_events(rows: Vec<SessionEventSourceRow>) -> Vec<IndexedTraceEvent> {
+        let mut fallback_turn_seq = 0u32;
+        rows.into_iter()
+            .enumerate()
+            .map(|(idx, row)| {
+                if row.actor_role == "user" && row.event_class == "message" {
+                    fallback_turn_seq = fallback_turn_seq.saturating_add(1);
+                }
+                let turn_seq = if row.turn_index > 0 {
+                    row.turn_index
+                } else {
+                    fallback_turn_seq.max(1)
+                };
+                let turn_id = row.turn_index.to_string();
+                let event = TraceEvent {
+                    session_id: row.session_id,
+                    event_uid: row.event_uid,
+                    event_order: (idx + 1) as u64,
+                    turn_seq,
+                    event_time: row.event_time,
+                    actor_role: row.actor_role,
+                    event_class: row.event_class,
+                    payload_type: row.payload_type,
+                    call_id: row.call_id,
+                    name: row.name,
+                    phase: row.phase,
+                    item_id: row.item_id,
+                    source_ref: row.source_ref,
+                    text_content: row.text_content,
+                    payload_json: row.payload_json,
+                    token_usage_json: row.token_usage_json,
+                    endpoint_kind: row.endpoint_kind,
+                    token_usage_buckets: row.token_usage_buckets,
+                    token_usage_native_units: row.token_usage_native_units,
+                };
+                IndexedTraceEvent {
+                    event,
+                    event_unix_ms: row.event_unix_ms,
+                    turn_id,
+                    source_name: row.source_name,
+                }
+            })
+            .collect()
+    }
+
     fn mode_filter_clause(mode: Option<ConversationMode>) -> Option<String> {
         mode.map(|m| format!("ifNull(m.mode, 'chat') = {}", sql_quote(m.as_str())))
     }
@@ -1192,9 +1684,9 @@ FORMAT JSONEachRow",
   toUInt32(turn_seq) AS turn_seq,
   ifNull(turn_id, '') AS turn_id,
   toString(started_at) AS started_at,
-  toInt64(toUnixTimestamp64Milli(started_at)) AS started_at_unix_ms,
+  toInt64(toUnixTimestamp64Milli(parseDateTime64BestEffort(toString(started_at), 3))) AS started_at_unix_ms,
   toString(ended_at) AS ended_at,
-  toInt64(toUnixTimestamp64Milli(ended_at)) AS ended_at_unix_ms,
+  toInt64(toUnixTimestamp64Milli(parseDateTime64BestEffort(toString(ended_at), 3))) AS ended_at_unix_ms,
   toUInt64(total_events) AS total_events,
   toUInt64(user_messages) AS user_messages,
   toUInt64(assistant_messages) AS assistant_messages,
@@ -1290,6 +1782,570 @@ FORMAT JSONEachRow",
         let rows: Vec<SessionMetadataRow> =
             self.map_backend(self.ch.query_rows(&query, None).await)?;
         Ok(rows.into_iter().next().map(Self::map_session_metadata_row))
+    }
+
+    async fn load_mcp_session_info(&self, session_id: &str) -> RepoResult<McpSessionInfoRow> {
+        let events_table = self.table_ref("events");
+        let query = format!(
+            "SELECT
+  ifNull(
+    argMaxIf(nullIf(JSONExtractString(payload_json, 'title'), ''), tuple(event_ts, event_uid), event_kind = 'session_meta'),
+    ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'name'), ''), tuple(event_ts, event_uid), event_kind = 'session_meta'), '')
+  ) AS title,
+  ifNull(
+    argMaxIf(nullIf(JSONExtractString(payload_json, 'source'), ''), tuple(event_ts, event_uid), event_kind = 'session_meta'),
+    ifNull(argMax(nullIf(source_name, ''), tuple(event_ts, event_uid)), '')
+  ) AS source,
+  ifNull(argMax(nullIf(harness, ''), tuple(event_ts, event_uid)), '') AS harness,
+  ifNull(argMax(nullIf(inference_provider, ''), tuple(event_ts, event_uid)), '') AS inference_provider,
+  ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'slug'), ''), tuple(event_ts, event_uid), event_kind = 'session_meta'), '') AS session_slug,
+  ifNull(
+    argMaxIf(nullIf(JSONExtractString(payload_json, 'summary'), ''), tuple(event_ts, event_uid), event_kind = 'session_meta'),
+    ifNull(
+      argMaxIf(nullIf(JSONExtractString(payload_json, 'title'), ''), tuple(event_ts, event_uid), event_kind = 'session_meta'),
+      ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'name'), ''), tuple(event_ts, event_uid), event_kind = 'session_meta'), '')
+    )
+  ) AS session_summary
+FROM {events_table}
+WHERE session_id = {}
+GROUP BY session_id
+LIMIT 1
+FORMAT JSONEachRow",
+            sql_quote(session_id),
+        );
+
+        let rows: Vec<McpSessionInfoRow> =
+            self.map_backend(self.ch.query_rows(&query, None).await)?;
+        Ok(rows.into_iter().next().unwrap_or_default())
+    }
+
+    async fn load_turn_summary(
+        &self,
+        session_id: &str,
+        turn_seq: u32,
+    ) -> RepoResult<Option<TurnSummary>> {
+        let turn_summary = self.table_ref("v_turn_summary");
+        let query = format!(
+            "SELECT
+  session_id,
+  toUInt32(turn_seq) AS turn_seq,
+  ifNull(turn_id, '') AS turn_id,
+  toString(started_at) AS started_at,
+  toInt64(toUnixTimestamp64Milli(parseDateTime64BestEffort(toString(started_at), 3))) AS started_at_unix_ms,
+  toString(ended_at) AS ended_at,
+  toInt64(toUnixTimestamp64Milli(parseDateTime64BestEffort(toString(ended_at), 3))) AS ended_at_unix_ms,
+  toUInt64(total_events) AS total_events,
+  toUInt64(user_messages) AS user_messages,
+  toUInt64(assistant_messages) AS assistant_messages,
+  toUInt64(tool_calls) AS tool_calls,
+  toUInt64(tool_results) AS tool_results,
+  toUInt64(reasoning_items) AS reasoning_items
+FROM {turn_summary}
+WHERE session_id = {} AND turn_seq = {}
+LIMIT 1
+FORMAT JSONEachRow",
+            sql_quote(session_id),
+            turn_seq,
+        );
+
+        let rows: Vec<TurnSummaryRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
+        Ok(rows.into_iter().next().map(Self::map_turn_row))
+    }
+
+    async fn load_event_by_uid(&self, event_uid: &str) -> RepoResult<Option<TraceEvent>> {
+        let trace_table = self.table_ref("v_conversation_trace");
+        let query = format!(
+            "SELECT
+  session_id,
+  event_uid,
+  toUInt64(event_order) AS event_order,
+  toUInt32(turn_seq) AS turn_seq,
+  toString(event_time) AS event_time,
+  actor_role,
+  event_class,
+  payload_type,
+  call_id,
+  name,
+  phase,
+  item_id,
+  source_ref,
+  text_content,
+  payload_json,
+  token_usage_json,
+  endpoint_kind,
+  token_usage_buckets,
+  token_usage_native_units
+FROM {trace_table}
+WHERE event_uid = {}
+ORDER BY event_order DESC
+LIMIT 1
+FORMAT JSONEachRow",
+            sql_quote(event_uid),
+        );
+
+        let rows: Vec<TraceEventRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
+        Ok(rows.into_iter().next().map(Self::map_trace_event))
+    }
+
+    async fn load_event_session_id(&self, event_uid: &str) -> RepoResult<Option<String>> {
+        let documents_table = self.table_ref("search_documents");
+        let docs_query = format!(
+            "SELECT
+  argMax(session_id, doc_version) AS session_id
+FROM {documents_table}
+WHERE event_uid = {}
+GROUP BY event_uid
+LIMIT 1
+FORMAT JSONEachRow",
+            sql_quote(event_uid),
+        );
+        let rows: Vec<EventSessionRow> =
+            self.map_backend(self.ch.query_rows(&docs_query, None).await)?;
+        if let Some(row) = rows.into_iter().next() {
+            if !row.session_id.is_empty() {
+                return Ok(Some(row.session_id));
+            }
+        }
+
+        let events_table = self.table_ref("events");
+        let events_query = format!(
+            "SELECT
+  argMax(session_id, event_version) AS session_id
+FROM {events_table}
+WHERE event_uid = {}
+GROUP BY event_uid
+LIMIT 1
+FORMAT JSONEachRow",
+            sql_quote(event_uid),
+        );
+        let rows: Vec<EventSessionRow> =
+            self.map_backend(self.ch.query_rows(&events_query, None).await)?;
+        Ok(rows
+            .into_iter()
+            .next()
+            .map(|row| row.session_id)
+            .filter(|session_id| !session_id.is_empty()))
+    }
+
+    async fn load_indexed_session_events_from_events(
+        &self,
+        session_id: &str,
+        target_full_event_uid: Option<&str>,
+    ) -> RepoResult<Vec<IndexedTraceEvent>> {
+        let events_table = self.table_ref("events");
+        let text_limit = usize::from(self.cfg.preview_chars).max(4);
+        let payload_limit = text_limit.saturating_mul(2);
+        let text_preview_expr = truncated_utf8_sql("text_content", text_limit);
+        let payload_preview_expr = truncated_utf8_sql("payload_json", payload_limit);
+        let (text_expr, payload_expr) = if let Some(event_uid) = target_full_event_uid {
+            let event_uid_sql = sql_quote(event_uid);
+            (
+                format!("if(event_uid = {event_uid_sql}, text_content, {text_preview_expr})"),
+                format!("if(event_uid = {event_uid_sql}, payload_json, {payload_preview_expr})"),
+            )
+        } else {
+            (text_preview_expr, payload_preview_expr)
+        };
+        let query = format!(
+            "WITH ifNull(parseDateTime64BestEffortOrNull(record_ts), ingested_at) AS resolved_event_time
+SELECT
+  session_id,
+  event_uid,
+  toString(resolved_event_time) AS event_time,
+  toInt64(toUnixTimestamp64Milli(resolved_event_time)) AS event_unix_ms,
+  source_name,
+  toUInt32(turn_index) AS turn_index,
+  actor_kind AS actor_role,
+  event_kind AS event_class,
+  payload_type,
+  tool_call_id AS call_id,
+  tool_name AS name,
+  if(tool_phase != '', tool_phase, op_status) AS phase,
+  item_id,
+  source_ref,
+  {text_expr} AS text_content,
+  {payload_expr} AS payload_json,
+  token_usage_json,
+  endpoint_kind,
+  token_usage_buckets,
+  token_usage_native_units
+FROM {events_table}
+WHERE session_id = {}
+ORDER BY resolved_event_time, source_file, source_generation, source_offset, source_line_no, event_uid
+FORMAT JSONEachRow",
+            sql_quote(session_id),
+        );
+
+        let rows: Vec<SessionEventSourceRow> =
+            self.map_backend(self.ch.query_rows(&query, None).await)?;
+        Ok(Self::map_indexed_session_events(rows))
+    }
+
+    async fn load_events_for_turn(
+        &self,
+        session_id: &str,
+        turn_seq: u32,
+    ) -> RepoResult<Vec<TraceEvent>> {
+        let trace_table = self.table_ref("v_conversation_trace");
+        let query = format!(
+            "SELECT
+  session_id,
+  event_uid,
+  toUInt64(event_order) AS event_order,
+  toUInt32(turn_seq) AS turn_seq,
+  toString(event_time) AS event_time,
+  actor_role,
+  event_class,
+  payload_type,
+  call_id,
+  name,
+  phase,
+  item_id,
+  source_ref,
+  text_content,
+  payload_json,
+  token_usage_json,
+  endpoint_kind,
+  token_usage_buckets,
+  token_usage_native_units
+FROM {trace_table}
+WHERE session_id = {} AND turn_seq = {}
+ORDER BY event_order ASC
+FORMAT JSONEachRow",
+            sql_quote(session_id),
+            turn_seq,
+        );
+
+        let rows: Vec<TraceEventRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
+        Ok(rows.into_iter().map(Self::map_trace_event).collect())
+    }
+
+    fn mcp_event_ref(event: &TraceEvent) -> McpEventRef {
+        McpEventRef {
+            session_id: event.session_id.clone(),
+            event_uid: event.event_uid.clone(),
+            event_order: event.event_order,
+            turn_seq: event.turn_seq,
+            event_time: event.event_time.clone(),
+            event_type: Self::normalized_event_type(
+                &event.event_class,
+                &event.payload_type,
+                &event.actor_role,
+            ),
+        }
+    }
+
+    fn mcp_turn_ref_from_summary(summary: &TurnSummary) -> McpTurnRef {
+        McpTurnRef {
+            session_id: summary.session_id.clone(),
+            turn_seq: summary.turn_seq,
+            turn_id: summary.turn_id.clone(),
+            started_at: summary.started_at.clone(),
+            ended_at: summary.ended_at.clone(),
+        }
+    }
+
+    fn summarize_indexed_turn(
+        session_id: &str,
+        turn_seq: u32,
+        events: &[IndexedTraceEvent],
+    ) -> Option<TurnSummary> {
+        let turn_events = events
+            .iter()
+            .filter(|event| event.event.turn_seq == turn_seq)
+            .collect::<Vec<_>>();
+        Self::summarize_indexed_turn_slice(session_id, turn_seq, &turn_events)
+    }
+
+    fn summarize_indexed_turns(events: &[IndexedTraceEvent]) -> Vec<TurnSummary> {
+        let Some(first) = events.first() else {
+            return Vec::new();
+        };
+        let session_id = first.event.session_id.as_str();
+        let mut events_by_turn = BTreeMap::<u32, Vec<&IndexedTraceEvent>>::new();
+        for event in events {
+            events_by_turn
+                .entry(event.event.turn_seq)
+                .or_default()
+                .push(event);
+        }
+        events_by_turn
+            .into_iter()
+            .filter_map(|(turn_seq, turn_events)| {
+                Self::summarize_indexed_turn_slice(session_id, turn_seq, &turn_events)
+            })
+            .collect()
+    }
+
+    fn summarize_indexed_turn_slice(
+        session_id: &str,
+        turn_seq: u32,
+        events: &[&IndexedTraceEvent],
+    ) -> Option<TurnSummary> {
+        let first = events.first()?;
+        let last = events.last()?;
+        let turn_id = events
+            .iter()
+            .find_map(|event| (!event.turn_id.is_empty()).then(|| event.turn_id.clone()))
+            .unwrap_or_default();
+        let user_messages = events
+            .iter()
+            .filter(|event| {
+                event.event.actor_role == "user" && event.event.event_class == "message"
+            })
+            .count() as u64;
+        let assistant_messages = events
+            .iter()
+            .filter(|event| {
+                event.event.actor_role == "assistant" && event.event.event_class == "message"
+            })
+            .count() as u64;
+        let tool_calls = events
+            .iter()
+            .filter(|event| event.event.event_class == "tool_call")
+            .count() as u64;
+        let tool_results = events
+            .iter()
+            .filter(|event| event.event.event_class == "tool_result")
+            .count() as u64;
+        let reasoning_items = events
+            .iter()
+            .filter(|event| event.event.event_class == "reasoning")
+            .count() as u64;
+
+        Some(TurnSummary {
+            session_id: session_id.to_string(),
+            turn_seq,
+            turn_id,
+            started_at: first.event.event_time.clone(),
+            started_at_unix_ms: first.event_unix_ms,
+            ended_at: last.event.event_time.clone(),
+            ended_at_unix_ms: last.event_unix_ms,
+            total_events: events.len() as u64,
+            user_messages,
+            assistant_messages,
+            tool_calls,
+            tool_results,
+            reasoning_items,
+        })
+    }
+
+    fn session_metadata_from_indexed_events(
+        events: &[IndexedTraceEvent],
+    ) -> Option<SessionMetadata> {
+        let first = events.first()?;
+        let last = events.last()?;
+        let total_turns = events
+            .iter()
+            .map(|event| event.event.turn_seq)
+            .max()
+            .unwrap_or(0);
+        let tool_calls = events
+            .iter()
+            .filter(|event| event.event.event_class == "tool_call")
+            .count() as u64;
+        let tool_results = events
+            .iter()
+            .filter(|event| event.event.event_class == "tool_result")
+            .count() as u64;
+        let user_messages = events
+            .iter()
+            .filter(|event| {
+                event.event.actor_role == "user" && event.event.event_class == "message"
+            })
+            .count() as u64;
+        let assistant_messages = events
+            .iter()
+            .filter(|event| {
+                event.event.actor_role == "assistant" && event.event.event_class == "message"
+            })
+            .count() as u64;
+
+        Some(SessionMetadata {
+            session_id: first.event.session_id.clone(),
+            first_event_time: first.event.event_time.clone(),
+            first_event_unix_ms: first.event_unix_ms,
+            last_event_time: last.event.event_time.clone(),
+            last_event_unix_ms: last.event_unix_ms,
+            total_turns,
+            total_events: events.len() as u64,
+            user_messages,
+            assistant_messages,
+            tool_calls,
+            tool_results,
+            mode: Self::mode_from_indexed_events(events),
+            first_event_uid: first.event.event_uid.clone(),
+            last_event_uid: last.event.event_uid.clone(),
+            last_actor_role: last.event.actor_role.clone(),
+        })
+    }
+
+    fn mode_from_indexed_events(events: &[IndexedTraceEvent]) -> ConversationMode {
+        if events.iter().any(|event| {
+            event.event.payload_type == "web_search_call"
+                || event.event.payload_type == "search_results_received"
+                || (event.event.payload_type == "tool_use"
+                    && matches!(event.event.name.as_str(), "WebSearch" | "WebFetch"))
+        }) {
+            return ConversationMode::WebSearch;
+        }
+        if events.iter().any(|event| {
+            event.source_name == "codex-mcp"
+                || event.event.name.eq_ignore_ascii_case("search")
+                || event.event.name.eq_ignore_ascii_case("open")
+        }) {
+            return ConversationMode::McpInternal;
+        }
+        if events.iter().any(|event| {
+            event.event.event_class == "tool_call"
+                || event.event.event_class == "tool_result"
+                || event.event.payload_type == "tool_use"
+        }) {
+            return ConversationMode::ToolCalling;
+        }
+        ConversationMode::Chat
+    }
+
+    fn mcp_event_summary(&self, event: &TraceEvent) -> McpEventSummary {
+        McpEventSummary {
+            session_id: event.session_id.clone(),
+            event_uid: event.event_uid.clone(),
+            event_order: event.event_order,
+            turn_seq: event.turn_seq,
+            event_time: event.event_time.clone(),
+            actor_role: event.actor_role.clone(),
+            event_class: event.event_class.clone(),
+            payload_type: event.payload_type.clone(),
+            event_type: Self::normalized_event_type(
+                &event.event_class,
+                &event.payload_type,
+                &event.actor_role,
+            ),
+            call_id: event.call_id.clone(),
+            name: event.name.clone(),
+            phase: event.phase.clone(),
+            text_preview: Self::compact_event_text(event, self.cfg.preview_chars),
+        }
+    }
+
+    fn compact_event_text(event: &TraceEvent, preview_chars: u16) -> Option<String> {
+        let source = if event.text_content.trim().is_empty() {
+            event.payload_json.as_str()
+        } else {
+            event.text_content.as_str()
+        };
+        let compact = compact_text_line(source, usize::from(preview_chars).max(1));
+        (!compact.is_empty()).then_some(compact)
+    }
+
+    fn mcp_turn_compact(&self, summary: TurnSummary, events: &[TraceEvent]) -> McpTurnCompact {
+        let user_input_event = events.iter().find(|event| {
+            event.actor_role.eq_ignore_ascii_case("user")
+                && Self::matches_event_kind(
+                    &event.event_class,
+                    &event.payload_type,
+                    SearchEventKind::Message,
+                )
+        });
+        let user_input_summary = user_input_event
+            .and_then(|event| Self::compact_event_text(event, self.cfg.preview_chars));
+
+        let final_response_event = events.iter().rev().find(|event| {
+            event.actor_role.eq_ignore_ascii_case("assistant")
+                && Self::matches_event_kind(
+                    &event.event_class,
+                    &event.payload_type,
+                    SearchEventKind::Message,
+                )
+        });
+        let final_response_summary = final_response_event
+            .and_then(|event| Self::compact_event_text(event, self.cfg.preview_chars));
+
+        let mut tools_called = Vec::<String>::new();
+        let mut normalized_event_types = Vec::<String>::new();
+        for event in events {
+            let event_type = Self::normalized_event_type(
+                &event.event_class,
+                &event.payload_type,
+                &event.actor_role,
+            );
+            push_first_seen(&mut normalized_event_types, event_type.clone());
+            if event_type == McpEventType::ToolCall.as_str() {
+                let tool_name = if event.name.trim().is_empty() {
+                    event.call_id.trim()
+                } else {
+                    event.name.trim()
+                };
+                if !tool_name.is_empty() {
+                    push_first_seen(&mut tools_called, tool_name.to_string());
+                }
+            }
+        }
+
+        let terminal_event = events.iter().rev().find_map(|event| {
+            Self::turn_terminal_completed(event).map(|completed| (event, completed))
+        });
+        let completed = terminal_event
+            .map(|(_, completed)| completed)
+            .unwrap_or(false);
+        let terminal_event_uid = terminal_event.map(|(event, _)| event.event_uid.clone());
+
+        McpTurnCompact {
+            metadata: summary,
+            user_input_summary,
+            final_response_summary,
+            user_input_event: user_input_event.map(Self::mcp_event_ref),
+            final_response_event: final_response_event.map(Self::mcp_event_ref),
+            tools_called,
+            normalized_event_types,
+            completed,
+            terminal_event_uid,
+            first_event: events.first().map(Self::mcp_event_ref),
+            last_event: events.last().map(Self::mcp_event_ref),
+        }
+    }
+
+    fn mcp_turn_open(
+        &self,
+        summary: TurnSummary,
+        events: Vec<TraceEvent>,
+        previous_turn: Option<McpTurnRef>,
+        next_turn: Option<McpTurnRef>,
+    ) -> McpTurnOpen {
+        let compact = self.mcp_turn_compact(summary, &events);
+        let events = events
+            .iter()
+            .map(|event| self.mcp_event_summary(event))
+            .collect();
+
+        McpTurnOpen {
+            metadata: compact.metadata,
+            events,
+            user_input_summary: compact.user_input_summary,
+            final_response_summary: compact.final_response_summary,
+            tools_called: compact.tools_called,
+            normalized_event_types: compact.normalized_event_types,
+            completed: compact.completed,
+            terminal_event_uid: compact.terminal_event_uid,
+            previous_turn,
+            next_turn,
+            first_event: compact.first_event,
+            last_event: compact.last_event,
+        }
+    }
+
+    fn normalized_event_type(event_class: &str, payload_type: &str, actor_role: &str) -> String {
+        Self::mcp_event_type_for(event_class, payload_type, actor_role)
+            .as_str()
+            .to_string()
+    }
+
+    fn turn_terminal_completed(event: &TraceEvent) -> Option<bool> {
+        match event.payload_type.as_str() {
+            "task_complete" => Some(true),
+            "turn_aborted" => Some(false),
+            _ => None,
+        }
     }
 
     async fn corpus_stats(&self) -> RepoResult<(u64, u64)> {
@@ -1599,6 +2655,146 @@ FORMAT JSONEachRow",
             payload_json_limit = payload_json_limit,
             postings_table = postings_table,
             documents_join_sql = documents_join_sql,
+        ))
+    }
+
+    fn build_search_mcp_events_sql(
+        &self,
+        terms: &[String],
+        idf_by_term: &HashMap<String, f64>,
+        avgdl: f64,
+        event_types: &[McpEventType],
+        session_id: Option<&str>,
+        turn_seq: Option<u32>,
+        min_should_match: u16,
+        min_score: f64,
+        limit: u16,
+    ) -> RepoResult<String> {
+        if terms.is_empty() {
+            return Err(RepoError::invalid_argument(
+                "cannot build search query with empty terms",
+            ));
+        }
+        if event_types.is_empty() {
+            return Err(RepoError::invalid_argument(
+                "event_types filter cannot be an empty list",
+            ));
+        }
+
+        let postings_table = self.table_ref("search_postings");
+        let documents_table = self.table_ref("search_documents");
+        let trace_table = self.table_ref("v_conversation_trace");
+        let terms_array_sql = sql_array_strings(terms);
+        let idf_vals: Vec<f64> = terms
+            .iter()
+            .map(|t| *idf_by_term.get(t).unwrap_or(&0.0))
+            .collect();
+        let idf_array_sql = sql_array_f64(&idf_vals);
+        let documents_join_sql = format!(
+            "(SELECT
+  t.event_uid AS event_uid,
+  any(t.session_id) AS session_id,
+  any(t.source_name) AS source_name,
+  any(t.harness) AS harness,
+  any(t.inference_provider) AS inference_provider,
+  any(t.endpoint_kind) AS endpoint_kind,
+  any(t.event_class) AS event_class,
+  any(t.payload_type) AS payload_type,
+  any(t.actor_role) AS actor_role,
+  any(t.name) AS name,
+  any(t.phase) AS phase,
+  any(t.source_ref) AS source_ref,
+  any(t.doc_len) AS doc_len,
+  any(t.text_content) AS text_content,
+  any(t.payload_json) AS payload_json
+FROM {documents_table} AS t
+GROUP BY t.event_uid)"
+        );
+
+        let mut where_clauses = vec![format!("p.term IN {}", terms_array_sql)];
+        if let Some(turn_seq) = turn_seq {
+            let Some(session_id) = session_id else {
+                return Err(RepoError::invalid_argument(
+                    "turn-scoped search requires session_id",
+                ));
+            };
+            where_clauses.push(format!(
+                "tr.session_id = {} AND tr.turn_seq = {}",
+                sql_quote(session_id),
+                turn_seq
+            ));
+        } else if let Some(session_id) = session_id {
+            where_clauses.push(format!("d.session_id = {}", sql_quote(session_id)));
+        }
+        where_clauses.push(Self::mcp_event_type_filter_clause(
+            "d.event_class",
+            "d.payload_type",
+            "d.actor_role",
+            event_types,
+        ));
+
+        let where_sql = where_clauses.join("\n  AND ");
+        let mcp_event_type_expr =
+            Self::mcp_event_type_sql_expr("d.event_class", "d.payload_type", "d.actor_role");
+        let k1 = self.cfg.bm25_k1.max(0.01);
+        let b = self.cfg.bm25_b.clamp(0.0, 1.0);
+        let text_content_limit = usize::from(self.cfg.preview_chars).saturating_mul(4);
+        let payload_json_limit = usize::from(self.cfg.preview_chars).saturating_mul(8);
+
+        Ok(format!(
+            "WITH
+  {k1:.6} AS k1,
+  {b:.6} AS b,
+  greatest({avgdl:.6}, 1.0) AS avgdl,
+  {terms_array_sql} AS q_terms,
+  {idf_array_sql} AS q_idf
+SELECT
+  p.doc_id AS event_uid,
+  any(d.session_id) AS session_id,
+  any(d.source_name) AS source_name,
+  any(d.harness) AS harness,
+  any(d.inference_provider) AS inference_provider,
+  any(d.endpoint_kind) AS endpoint_kind,
+  any(d.event_class) AS event_class,
+  any(d.payload_type) AS payload_type,
+  any(d.actor_role) AS actor_role,
+  any(d.name) AS name,
+  any(d.phase) AS phase,
+  any(d.source_ref) AS source_ref,
+  any(d.doc_len) AS doc_len,
+  leftUTF8(any(d.text_content), {preview}) AS text_preview,
+  leftUTF8(any(d.text_content), {text_content_limit}) AS text_content,
+  leftUTF8(any(d.payload_json), {payload_json_limit}) AS payload_json,
+  any({mcp_event_type_expr}) AS mcp_event_type,
+  sum(
+    transform(toString(p.term), q_terms, q_idf, 0.0)
+    *
+    (
+      (toFloat64(p.tf) * (k1 + 1.0))
+      /
+      (toFloat64(p.tf) + k1 * (1.0 - b + b * (toFloat64(p.doc_len) / avgdl)))
+    )
+  ) AS raw_score,
+  uniqExact(p.term) AS matched_terms,
+  toString(any(tr.event_time)) AS event_time,
+  toInt64(toUnixTimestamp64Milli(any(tr.event_time))) AS event_unix_ms,
+  toUInt64(any(tr.event_order)) AS event_order,
+  toUInt32(any(tr.turn_seq)) AS turn_seq
+FROM {postings_table} AS p
+INNER JOIN {documents_join_sql} AS d ON d.event_uid = p.doc_id
+ANY INNER JOIN {trace_table} AS tr ON tr.event_uid = p.doc_id
+WHERE {where_sql}
+GROUP BY p.doc_id
+HAVING matched_terms >= {min_should_match} AND raw_score >= {min_score:.6}
+ORDER BY raw_score DESC, event_unix_ms DESC, event_uid ASC
+LIMIT {limit}
+FORMAT JSONEachRow",
+            preview = self.cfg.preview_chars,
+            text_content_limit = text_content_limit,
+            payload_json_limit = payload_json_limit,
+            postings_table = postings_table,
+            documents_join_sql = documents_join_sql,
+            trace_table = trace_table,
         ))
     }
 
@@ -2113,6 +3309,227 @@ FORMAT JSONEachRow",
                 .await
             }
         }
+    }
+
+    async fn search_mcp_event_rows(
+        &self,
+        terms: &[String],
+        docs: u64,
+        avgdl: f64,
+        event_types: &[McpEventType],
+        session_id: Option<&str>,
+        turn_seq: Option<u32>,
+        min_should_match: u16,
+        min_score: f64,
+        limit: u16,
+    ) -> RepoResult<Vec<SearchMcpEventRow>> {
+        if turn_seq.is_none() {
+            let fast_rows = self
+                .search_mcp_event_rows_fast_pass(
+                    terms,
+                    docs,
+                    avgdl,
+                    event_types,
+                    session_id,
+                    min_should_match,
+                    min_score,
+                    limit,
+                )
+                .await?;
+            if !fast_rows.is_empty() {
+                return Ok(fast_rows);
+            }
+        }
+
+        let df_map = self.df_map(terms).await?;
+        let mut idf_by_term = HashMap::<String, f64>::new();
+        for term in terms {
+            let df = *df_map.get(term).unwrap_or(&0);
+            idf_by_term.insert(term.clone(), Self::bm25_idf(docs, df));
+        }
+
+        let sql = self.build_search_mcp_events_sql(
+            terms,
+            &idf_by_term,
+            avgdl,
+            event_types,
+            session_id,
+            turn_seq,
+            min_should_match,
+            min_score,
+            limit,
+        )?;
+        let mut rows: Vec<SearchMcpEventRow> =
+            self.map_backend(self.ch.query_rows(&sql, None).await)?;
+        Self::sort_search_mcp_event_rows(&mut rows);
+        Ok(rows)
+    }
+
+    async fn search_mcp_event_rows_fast_pass(
+        &self,
+        terms: &[String],
+        docs: u64,
+        avgdl: f64,
+        event_types: &[McpEventType],
+        session_id: Option<&str>,
+        min_should_match: u16,
+        min_score: f64,
+        limit: u16,
+    ) -> RepoResult<Vec<SearchMcpEventRow>> {
+        #[derive(Clone, Copy)]
+        struct CandidateRef<'a> {
+            row: &'a CachedPostingRow,
+            score: f64,
+            matched_terms: u64,
+        }
+
+        let postings_by_term = self.load_term_postings_for_terms(terms).await?;
+        let use_document_codex_flag = self.search_documents_has_codex_flag().await?;
+        let df_map = self.df_map(terms).await?;
+        let k1 = self.cfg.bm25_k1.max(0.01);
+        let b = self.cfg.bm25_b.clamp(0.0, 1.0);
+        let mut idf_by_term = HashMap::<&str, f64>::new();
+        for term in terms {
+            let df = *df_map.get(term).unwrap_or(&0);
+            idf_by_term.insert(term.as_str(), Self::bm25_idf(docs, df));
+        }
+
+        let mut accum_by_uid = HashMap::<&str, SearchScoreAccum<'_>>::new();
+        for (idx, term) in terms.iter().enumerate() {
+            if idx >= 64 {
+                break;
+            }
+            let idf = *idf_by_term.get(term.as_str()).unwrap_or(&0.0);
+            if idf <= 0.0 {
+                continue;
+            }
+
+            if let Some(rows) = postings_by_term.get(term) {
+                for row in rows.iter() {
+                    let entry = accum_by_uid
+                        .entry(row.event_uid.as_str())
+                        .or_insert_with(|| SearchScoreAccum {
+                            row,
+                            score: 0.0,
+                            matched_mask: 0,
+                        });
+
+                    entry.score += idf * Self::bm25_term_score(row.tf, row.doc_len, avgdl, k1, b);
+                    entry.matched_mask |= 1u64 << idx;
+                }
+            }
+        }
+
+        let mut candidates = Vec::<CandidateRef<'_>>::new();
+        for acc in accum_by_uid.values() {
+            let matched_terms = acc.matched_mask.count_ones() as u64;
+            if matched_terms < min_should_match as u64 || acc.score < min_score {
+                continue;
+            }
+            candidates.push(CandidateRef {
+                row: acc.row,
+                score: acc.score,
+                matched_terms,
+            });
+        }
+
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        candidates.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.row.event_uid.cmp(&b.row.event_uid))
+        });
+
+        let mut rows = Vec::<SearchMcpEventRow>::new();
+        let target_rows = (limit as usize)
+            .saturating_mul(8)
+            .max((limit as usize).saturating_add(32))
+            .min(256);
+        let hydrate_chunk_size = target_rows.max(128);
+        let mut offset = 0usize;
+        while offset < candidates.len() && rows.len() < target_rows {
+            let end = (offset + hydrate_chunk_size).min(candidates.len());
+            let event_uids: Vec<String> = candidates[offset..end]
+                .iter()
+                .map(|candidate| candidate.row.event_uid.clone())
+                .collect();
+            let doc_extras = self
+                .load_search_doc_extras(&event_uids, use_document_codex_flag)
+                .await?;
+
+            for candidate in &candidates[offset..end] {
+                let Some(extra) = doc_extras.get(candidate.row.event_uid.as_str()) else {
+                    continue;
+                };
+                if session_id.is_some_and(|session_id| extra.session_id != session_id) {
+                    continue;
+                }
+                let event_type = Self::mcp_event_type_for(
+                    &extra.event_class,
+                    &extra.payload_type,
+                    &extra.actor_role,
+                );
+                if !event_types.contains(&event_type) {
+                    continue;
+                }
+
+                rows.push(SearchMcpEventRow {
+                    event_uid: candidate.row.event_uid.clone(),
+                    session_id: extra.session_id.clone(),
+                    source_name: extra.source_name.clone(),
+                    harness: extra.harness.clone(),
+                    inference_provider: extra.inference_provider.clone(),
+                    endpoint_kind: String::new(),
+                    event_class: extra.event_class.clone(),
+                    payload_type: extra.payload_type.clone(),
+                    actor_role: extra.actor_role.clone(),
+                    name: extra.name.clone(),
+                    phase: extra.phase.clone(),
+                    source_ref: extra.source_ref.clone(),
+                    doc_len: extra.doc_len,
+                    text_preview: extra.text_preview.clone(),
+                    text_content: extra.text_content.clone(),
+                    payload_json: extra.payload_json.clone(),
+                    mcp_event_type: event_type.as_str().to_string(),
+                    raw_score: candidate.score,
+                    matched_terms: candidate.matched_terms,
+                    event_time: String::new(),
+                    event_unix_ms: 0,
+                    event_order: 0,
+                    turn_seq: 0,
+                });
+
+                if rows.len() >= target_rows {
+                    break;
+                }
+            }
+            offset = end;
+        }
+
+        let event_enrichment_by_uid = self.load_mcp_event_enrichment(&rows).await?;
+        for row in rows.iter_mut() {
+            if let Some(enrichment) = event_enrichment_by_uid.get(row.event_uid.as_str()) {
+                row.event_time = enrichment.event_time.clone();
+                row.event_unix_ms = enrichment.event_unix_ms;
+                row.event_order = enrichment.event_order;
+                row.turn_seq = enrichment.turn_seq;
+            }
+        }
+        Self::sort_search_mcp_event_rows(&mut rows);
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    fn sort_search_mcp_event_rows(rows: &mut [SearchMcpEventRow]) {
+        rows.sort_by(|a, b| {
+            b.raw_score
+                .total_cmp(&a.raw_score)
+                .then_with(|| b.event_unix_ms.cmp(&a.event_unix_ms))
+                .then_with(|| a.event_uid.cmp(&b.event_uid))
+        });
     }
 
     fn dedupe_fetch_limit(limit: u16) -> u16 {
@@ -3028,6 +4445,199 @@ FORMAT JSONEachRow",
             .collect())
     }
 
+    async fn load_mcp_event_enrichment(
+        &self,
+        rows: &[SearchMcpEventRow],
+    ) -> RepoResult<HashMap<String, SearchMcpEventEnrichmentRow>> {
+        if rows.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut event_uids = rows
+            .iter()
+            .map(|row| row.event_uid.clone())
+            .collect::<Vec<_>>();
+        event_uids.sort_unstable();
+        event_uids.dedup();
+
+        let mut session_ids = rows
+            .iter()
+            .map(|row| row.session_id.clone())
+            .collect::<Vec<_>>();
+        session_ids.sort_unstable();
+        session_ids.dedup();
+
+        let trace_table = self.table_ref("v_conversation_trace");
+        let events_table = self.table_ref("events");
+        let event_uids_sql = sql_array_strings(&event_uids);
+        let session_ids_sql = sql_array_strings(&session_ids);
+        let sql = format!(
+            "SELECT
+  tr.event_uid AS event_uid,
+  toString(tr.event_time) AS event_time,
+  toInt64(toUnixTimestamp64Milli(tr.event_time)) AS event_unix_ms,
+  toUInt64(tr.event_order) AS event_order,
+  toUInt32(tr.turn_seq) AS turn_seq,
+  toUInt32(tr.event_ordinal) AS event_ordinal,
+  toUInt64(tr.turn_event_count) AS turn_event_count,
+  tr.call_id AS call_id,
+  tr.item_id AS item_id,
+  ifNull(e.model, '') AS model
+FROM (
+  SELECT
+    event_uid,
+    session_id,
+    event_time,
+    event_order,
+    turn_seq,
+    call_id,
+    item_id,
+    row_number() OVER (
+      PARTITION BY session_id, turn_seq
+      ORDER BY event_order ASC, event_uid ASC
+    ) AS event_ordinal,
+    count() OVER (PARTITION BY session_id, turn_seq) AS turn_event_count
+  FROM {trace_table}
+  WHERE session_id IN {session_ids_sql}
+) AS tr
+ANY LEFT JOIN (
+  SELECT
+    event_uid,
+    argMax(model, event_version) AS model
+  FROM {events_table}
+  WHERE event_uid IN {event_uids_sql}
+  GROUP BY event_uid
+) AS e ON e.event_uid = tr.event_uid
+WHERE tr.event_uid IN {event_uids_sql}
+FORMAT JSONEachRow",
+            trace_table = trace_table,
+            events_table = events_table,
+            session_ids_sql = session_ids_sql,
+            event_uids_sql = event_uids_sql,
+        );
+
+        let rows: Vec<SearchMcpEventEnrichmentRow> =
+            self.map_backend(self.ch.query_rows(&sql, None).await)?;
+        let mut by_uid = HashMap::new();
+        for row in rows {
+            by_uid.insert(row.event_uid.clone(), row);
+        }
+        Ok(by_uid)
+    }
+
+    async fn map_search_mcp_rows_to_hits(
+        &self,
+        rows: Vec<SearchMcpEventRow>,
+    ) -> RepoResult<Vec<SearchMcpEventHit>> {
+        let session_ids = rows
+            .iter()
+            .map(|row| row.session_id.clone())
+            .collect::<Vec<_>>();
+        let session_time_bounds = self.load_session_time_bounds(&session_ids).await?;
+        let session_metadata_by_session_id = self
+            .fetch_conversation_session_metadata(&session_ids)
+            .await?;
+        let event_enrichment_by_uid = self.load_mcp_event_enrichment(&rows).await?;
+        let max_raw_score = rows.iter().map(|row| row.raw_score).fold(0.0_f64, f64::max);
+
+        Ok(rows
+            .into_iter()
+            .enumerate()
+            .map(|(idx, row)| {
+                let session_id = row.session_id;
+                let enrichment = event_enrichment_by_uid.get(row.event_uid.as_str());
+                let event_type = if row.mcp_event_type.is_empty() {
+                    Self::mcp_event_type_for(&row.event_class, &row.payload_type, &row.actor_role)
+                } else {
+                    McpEventType::from_normalized(&row.mcp_event_type)
+                };
+                let session_metadata = session_metadata_by_session_id.get(&session_id);
+                let session_slug = session_metadata.and_then(|meta| {
+                    (!meta.session_slug.is_empty()).then(|| meta.session_slug.clone())
+                });
+                let session_summary = session_metadata.and_then(|meta| {
+                    (!meta.session_summary.is_empty()).then(|| meta.session_summary.clone())
+                });
+                let session_title = session_summary.clone().or_else(|| session_slug.clone());
+                let (session_started_at, session_updated_at) = session_time_bounds
+                    .get(session_id.as_str())
+                    .map(|bounds| {
+                        (
+                            non_empty_string(bounds.first_event_time.clone()),
+                            non_empty_string(bounds.last_event_time.clone()),
+                        )
+                    })
+                    .unwrap_or_default();
+                let text_content_len = row.text_content.chars().count();
+                let snippet_len = row.text_preview.chars().count();
+                let snippet = if row.text_preview.is_empty() {
+                    row.text_content.clone()
+                } else {
+                    row.text_preview.clone()
+                };
+                let score = if max_raw_score > 0.0 {
+                    (row.raw_score / max_raw_score).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+
+                SearchMcpEventHit {
+                    rank: idx + 1,
+                    event_uid: row.event_uid,
+                    session_id,
+                    event_type,
+                    event_time: enrichment
+                        .map(|value| value.event_time.clone())
+                        .unwrap_or(row.event_time),
+                    event_unix_ms: enrichment
+                        .map(|value| value.event_unix_ms)
+                        .unwrap_or(row.event_unix_ms),
+                    turn_seq: enrichment
+                        .map(|value| value.turn_seq)
+                        .unwrap_or(row.turn_seq),
+                    turn_ordinal: enrichment
+                        .map(|value| value.turn_seq)
+                        .unwrap_or(row.turn_seq),
+                    event_order: enrichment
+                        .map(|value| value.event_order)
+                        .unwrap_or(row.event_order),
+                    event_ordinal: enrichment
+                        .map(|value| value.event_ordinal)
+                        .unwrap_or_default(),
+                    turn_event_count: enrichment
+                        .map(|value| value.turn_event_count)
+                        .unwrap_or_default(),
+                    session_started_at,
+                    session_updated_at,
+                    session_title,
+                    session_slug,
+                    session_summary,
+                    source_name: non_empty_string(row.source_name),
+                    harness: non_empty_string(row.harness),
+                    inference_provider: non_empty_string(row.inference_provider),
+                    event_class: row.event_class,
+                    payload_type: row.payload_type,
+                    actor_role: row.actor_role,
+                    tool_name: non_empty_string(row.name),
+                    tool_phase: non_empty_string(row.phase),
+                    call_id: enrichment.and_then(|value| non_empty_string(value.call_id.clone())),
+                    item_id: enrichment.and_then(|value| non_empty_string(value.item_id.clone())),
+                    model: enrichment.and_then(|value| non_empty_string(value.model.clone())),
+                    endpoint_kind: non_empty_string(row.endpoint_kind),
+                    source_ref: non_empty_string(row.source_ref),
+                    snippet,
+                    snippet_truncated: text_content_len > snippet_len && snippet_len > 0,
+                    text_content: non_empty_string(row.text_content),
+                    payload_json: non_empty_string(row.payload_json),
+                    score,
+                    raw_score: row.raw_score,
+                    matched_terms: row.matched_terms,
+                    doc_len: row.doc_len,
+                }
+            })
+            .collect())
+    }
+
     async fn fetch_conversation_session_metadata(
         &self,
         session_ids: &[String],
@@ -3351,6 +4961,55 @@ FORMAT JSONEachRow",
         self.load_session_metadata(session_id).await
     }
 
+    async fn get_mcp_session(&self, session_id: &str) -> RepoResult<Option<McpSessionOpen>> {
+        Self::validate_session_id(session_id)?;
+
+        let events = self
+            .load_indexed_session_events_from_events(session_id, None)
+            .await?;
+        let Some(metadata) = Self::session_metadata_from_indexed_events(&events) else {
+            return Ok(None);
+        };
+
+        let session_info = self.load_mcp_session_info(session_id).await?;
+        let turn_summaries = Self::summarize_indexed_turns(&events);
+        let mut events_by_turn = BTreeMap::<u32, Vec<TraceEvent>>::new();
+        for event in events {
+            events_by_turn
+                .entry(event.event.turn_seq)
+                .or_default()
+                .push(event.event);
+        }
+
+        let turns = turn_summaries
+            .into_iter()
+            .map(|summary| {
+                let events = events_by_turn
+                    .get(&summary.turn_seq)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                self.mcp_turn_compact(summary, events)
+            })
+            .collect::<Vec<_>>();
+
+        let completed = turns.last().map(|turn| turn.completed).unwrap_or(false);
+        let terminal_event_uid = turns
+            .last()
+            .and_then(|turn| turn.terminal_event_uid.clone());
+        Ok(Some(McpSessionOpen {
+            metadata,
+            title: non_empty_string(session_info.title),
+            source: non_empty_string(session_info.source),
+            harness: non_empty_string(session_info.harness),
+            inference_provider: non_empty_string(session_info.inference_provider),
+            session_slug: non_empty_string(session_info.session_slug),
+            session_summary: non_empty_string(session_info.session_summary),
+            completed,
+            terminal_event_uid,
+            turns,
+        }))
+    }
+
     async fn list_turns(
         &self,
         session_id: &str,
@@ -3400,9 +5059,9 @@ FORMAT JSONEachRow",
   toUInt32(turn_seq) AS turn_seq,
   ifNull(turn_id, '') AS turn_id,
   toString(started_at) AS started_at,
-  toInt64(toUnixTimestamp64Milli(started_at)) AS started_at_unix_ms,
+  toInt64(toUnixTimestamp64Milli(parseDateTime64BestEffort(toString(started_at), 3))) AS started_at_unix_ms,
   toString(ended_at) AS ended_at,
-  toInt64(toUnixTimestamp64Milli(ended_at)) AS ended_at_unix_ms,
+  toInt64(toUnixTimestamp64Milli(parseDateTime64BestEffort(toString(ended_at), 3))) AS ended_at_unix_ms,
   toUInt64(total_events) AS total_events,
   toUInt64(user_messages) AS user_messages,
   toUInt64(assistant_messages) AS assistant_messages,
@@ -3447,74 +5106,50 @@ FORMAT JSONEachRow",
     async fn get_turn(&self, session_id: &str, turn_seq: u32) -> RepoResult<Option<Turn>> {
         Self::validate_session_id(session_id)?;
 
-        let turn_summary = self.table_ref("v_turn_summary");
-        let summary_query = format!(
-            "SELECT
-  session_id,
-  toUInt32(turn_seq) AS turn_seq,
-  ifNull(turn_id, '') AS turn_id,
-  toString(started_at) AS started_at,
-  toInt64(toUnixTimestamp64Milli(started_at)) AS started_at_unix_ms,
-  toString(ended_at) AS ended_at,
-  toInt64(toUnixTimestamp64Milli(ended_at)) AS ended_at_unix_ms,
-  toUInt64(total_events) AS total_events,
-  toUInt64(user_messages) AS user_messages,
-  toUInt64(assistant_messages) AS assistant_messages,
-  toUInt64(tool_calls) AS tool_calls,
-  toUInt64(tool_results) AS tool_results,
-  toUInt64(reasoning_items) AS reasoning_items
-FROM {turn_summary}
-WHERE session_id = {} AND turn_seq = {}
-LIMIT 1
-FORMAT JSONEachRow",
-            sql_quote(session_id),
-            turn_seq,
-        );
-
-        let rows: Vec<TurnSummaryRow> =
-            self.map_backend(self.ch.query_rows(&summary_query, None).await)?;
-        let Some(summary_row) = rows.into_iter().next() else {
+        let Some(summary) = self.load_turn_summary(session_id, turn_seq).await? else {
             return Ok(None);
         };
+        let events = self.load_events_for_turn(session_id, turn_seq).await?;
 
-        let trace_table = self.table_ref("v_conversation_trace");
-        let events_query = format!(
-            "SELECT
-  session_id,
-  event_uid,
-  toUInt64(event_order) AS event_order,
-  toUInt32(turn_seq) AS turn_seq,
-  toString(event_time) AS event_time,
-  actor_role,
-  event_class,
-  payload_type,
-  call_id,
-  name,
-  phase,
-  item_id,
-  source_ref,
-  text_content,
-  payload_json,
-  token_usage_json,
-  endpoint_kind,
-  token_usage_buckets,
-  token_usage_native_units
-FROM {trace_table}
-WHERE session_id = {} AND turn_seq = {}
-ORDER BY event_order ASC
-FORMAT JSONEachRow",
-            sql_quote(session_id),
-            turn_seq,
-        );
+        Ok(Some(Turn { summary, events }))
+    }
 
-        let event_rows: Vec<TraceEventRow> =
-            self.map_backend(self.ch.query_rows(&events_query, None).await)?;
-        let events = event_rows.into_iter().map(Self::map_trace_event).collect();
+    async fn get_mcp_turn(
+        &self,
+        session_id: &str,
+        turn_seq: u32,
+    ) -> RepoResult<Option<McpTurnOpen>> {
+        Self::validate_session_id(session_id)?;
 
-        Ok(Some(Turn {
-            summary: Self::map_turn_row(summary_row),
+        let indexed_events = self
+            .load_indexed_session_events_from_events(session_id, None)
+            .await?;
+        let Some(summary) = Self::summarize_indexed_turn(session_id, turn_seq, &indexed_events)
+        else {
+            return Ok(None);
+        };
+        let turn_summaries = Self::summarize_indexed_turns(&indexed_events);
+        let previous_turn = turn_summaries
+            .iter()
+            .rev()
+            .find(|summary| summary.turn_seq < turn_seq)
+            .map(Self::mcp_turn_ref_from_summary);
+        let next_turn = turn_summaries
+            .iter()
+            .find(|summary| summary.turn_seq > turn_seq)
+            .map(Self::mcp_turn_ref_from_summary);
+        let events = indexed_events
+            .into_iter()
+            .filter(|event| event.event.turn_seq == turn_seq)
+            .map(|event| event.event)
+            .collect::<Vec<_>>();
+
+        Ok(Some(self.mcp_turn_open(
+            summary,
             events,
-        }))
+            previous_turn,
+            next_turn,
+        )))
     }
 
     async fn open_event(&self, req: OpenEventRequest) -> RepoResult<OpenContext> {
@@ -3711,6 +5346,87 @@ FORMAT JSONEachRow",
             after,
             events,
         })
+    }
+
+    async fn get_mcp_event(&self, event_uid: &str) -> RepoResult<Option<McpEventOpen>> {
+        let event_uid = event_uid.trim();
+        if event_uid.is_empty() {
+            return Err(RepoError::invalid_argument("event_uid cannot be empty"));
+        }
+        Self::validate_event_uid(event_uid)?;
+
+        let session_id = if let Some(session_id) = self.load_event_session_id(event_uid).await? {
+            session_id
+        } else if let Some(event) = self.load_event_by_uid(event_uid).await? {
+            event.session_id
+        } else {
+            return Ok(None);
+        };
+
+        let indexed_events = self
+            .load_indexed_session_events_from_events(&session_id, Some(event_uid))
+            .await?;
+        let Some(target_index) = indexed_events
+            .iter()
+            .position(|event| event.event.event_uid == event_uid)
+        else {
+            return Ok(None);
+        };
+        let event = indexed_events[target_index].event.clone();
+        let Some(parent_session) = Self::session_metadata_from_indexed_events(&indexed_events)
+        else {
+            return Ok(None);
+        };
+        let Some(parent_turn) =
+            Self::summarize_indexed_turn(&session_id, event.turn_seq, &indexed_events)
+        else {
+            return Ok(None);
+        };
+        let turn_summaries = Self::summarize_indexed_turns(&indexed_events);
+        let previous_turn = turn_summaries
+            .iter()
+            .rev()
+            .find(|summary| summary.turn_seq < event.turn_seq)
+            .map(Self::mcp_turn_ref_from_summary);
+        let next_turn = turn_summaries
+            .iter()
+            .find(|summary| summary.turn_seq > event.turn_seq)
+            .map(Self::mcp_turn_ref_from_summary);
+        let previous_event = target_index
+            .checked_sub(1)
+            .map(|index| Self::mcp_event_ref(&indexed_events[index].event));
+        let next_event = indexed_events
+            .get(target_index + 1)
+            .map(|event| Self::mcp_event_ref(&event.event));
+        let turn_events = indexed_events
+            .iter()
+            .filter(|indexed| indexed.event.turn_seq == event.turn_seq)
+            .map(|indexed| indexed.event.clone())
+            .collect::<Vec<_>>();
+        let event_ordinal = turn_events
+            .iter()
+            .position(|turn_event| turn_event.event_uid == event_uid)
+            .map(|index| (index + 1) as u32)
+            .unwrap_or(1);
+        let turn_compact = self.mcp_turn_compact(parent_turn.clone(), &turn_events);
+
+        Ok(Some(McpEventOpen {
+            event_type: Self::normalized_event_type(
+                &event.event_class,
+                &event.payload_type,
+                &event.actor_role,
+            ),
+            event,
+            event_ordinal,
+            turn_completed: turn_compact.completed,
+            turn_terminal_event_uid: turn_compact.terminal_event_uid,
+            parent_session,
+            parent_turn,
+            previous_event,
+            next_event,
+            previous_turn,
+            next_turn,
+        }))
     }
 
     async fn list_session_events(
@@ -4036,6 +5752,118 @@ FORMAT JSONEachRow",
         })
     }
 
+    async fn search_mcp_events(
+        &self,
+        query: SearchMcpEventsQuery,
+    ) -> RepoResult<SearchMcpEventsResult> {
+        let query_text = query.query.trim();
+        if query_text.is_empty() {
+            return Err(RepoError::invalid_argument("query cannot be empty"));
+        }
+
+        if let Some(session_id) = query.session_id.as_deref() {
+            Self::validate_session_id(session_id)?;
+        }
+        if let Some(turn_seq) = query.turn_seq {
+            if turn_seq == 0 {
+                return Err(RepoError::invalid_argument(
+                    "turn_seq must be greater than zero",
+                ));
+            }
+            if query.session_id.is_none() {
+                return Err(RepoError::invalid_argument(
+                    "turn-scoped search requires session_id",
+                ));
+            }
+        }
+
+        let query_id = Uuid::new_v4().to_string();
+        let started = Instant::now();
+
+        let terms_with_qf = tokenize_query(query_text, self.cfg.bm25_max_query_terms);
+        if terms_with_qf.is_empty() {
+            return Err(RepoError::invalid_argument(
+                "query has no searchable terms (tokens shorter than 2 characters are excluded)",
+            ));
+        }
+        let terms: Vec<String> = terms_with_qf.iter().map(|(term, _)| term.clone()).collect();
+        let event_types = Self::normalize_mcp_event_types(query.event_types)?;
+
+        let requested_n_hits = query.n_hits.unwrap_or(10).max(1);
+        let effective_n_hits = requested_n_hits.min(self.cfg.max_results);
+        let limit_capped = requested_n_hits > effective_n_hits;
+        let fetch_limit = effective_n_hits.saturating_add(1);
+
+        let min_should_match = query
+            .min_should_match
+            .unwrap_or(self.cfg.bm25_default_min_should_match)
+            .max(1)
+            .min(terms.len() as u16);
+        let min_score = query.min_score.unwrap_or(self.cfg.bm25_default_min_score);
+
+        let (docs, total_doc_len) = self.corpus_stats().await?;
+        if docs == 0 {
+            return Ok(SearchMcpEventsResult {
+                query_id,
+                query: query_text.to_string(),
+                terms,
+                event_types,
+                truncated: false,
+                stats: SearchMcpEventsStats {
+                    docs: 0,
+                    avgdl: 0.0,
+                    took_ms: started.elapsed().as_millis() as u32,
+                    result_count: 0,
+                    requested_n_hits,
+                    effective_n_hits,
+                    limit_capped,
+                    truncated: false,
+                },
+                hits: Vec::new(),
+            });
+        }
+
+        let avgdl = (total_doc_len as f64 / docs as f64).max(1.0);
+        let mut rows = self
+            .search_mcp_event_rows(
+                &terms,
+                docs,
+                avgdl,
+                &event_types,
+                query.session_id.as_deref(),
+                query.turn_seq,
+                min_should_match,
+                min_score,
+                fetch_limit,
+            )
+            .await?;
+        let truncated = rows.len() > effective_n_hits as usize;
+        if truncated {
+            rows.truncate(effective_n_hits as usize);
+        }
+        let hits = self.map_search_mcp_rows_to_hits(rows).await?;
+        let took_ms = started.elapsed().as_millis() as u32;
+
+        Ok(SearchMcpEventsResult {
+            query_id,
+            query: query_text.to_string(),
+            terms,
+            event_types,
+            truncated,
+            stats: SearchMcpEventsStats {
+                docs,
+                avgdl,
+                took_ms,
+                result_count: hits.len(),
+                requested_n_hits,
+                effective_n_hits,
+                limit_capped,
+                truncated,
+            },
+            hits,
+        })
+    }
+
     async fn search_conversations(
         &self,
         query: ConversationSearchQuery,
@@ -4328,8 +6156,25 @@ fn non_empty_string(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+fn push_first_seen(items: &mut Vec<String>, value: String) {
+    if !items.iter().any(|item| item == &value) {
+        items.push(value);
+    }
+}
+
 fn compact_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn compact_text_line(text: &str, max_chars: usize) -> String {
+    let compact = compact_whitespace(text);
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+
+    let mut trimmed: String = compact.chars().take(max_chars.saturating_sub(3)).collect();
+    trimmed.push_str("...");
+    trimmed
 }
 
 fn first_term_match_index(value: &str, terms: &[String]) -> Option<usize> {
@@ -4395,6 +6240,14 @@ fn sql_quote(value: &str) -> String {
 
 fn sql_identifier(value: &str) -> String {
     format!("`{}`", value.replace('`', "``"))
+}
+
+fn truncated_utf8_sql(column: &str, max_chars: usize) -> String {
+    let max_chars = max_chars.max(4);
+    let prefix_chars = max_chars.saturating_sub(3);
+    format!(
+        "if(lengthUTF8({column}) > {max_chars}, concat(leftUTF8({column}, {prefix_chars}), '...'), {column})"
+    )
 }
 
 fn sql_array_strings(items: &[String]) -> String {
@@ -4468,6 +6321,38 @@ mod tests {
         }
     }
 
+    fn sample_mcp_search_row(
+        event_uid: &str,
+        raw_score: f64,
+        event_unix_ms: i64,
+    ) -> SearchMcpEventRow {
+        SearchMcpEventRow {
+            event_uid: event_uid.to_string(),
+            session_id: "session-1".to_string(),
+            source_name: "source".to_string(),
+            harness: "harness".to_string(),
+            inference_provider: "inference-provider".to_string(),
+            endpoint_kind: "generation".to_string(),
+            event_class: "message".to_string(),
+            payload_type: "message".to_string(),
+            actor_role: "assistant".to_string(),
+            name: String::new(),
+            phase: String::new(),
+            source_ref: "source-ref".to_string(),
+            doc_len: 42,
+            text_preview: "preview".to_string(),
+            text_content: "preview".to_string(),
+            payload_json: "{}".to_string(),
+            mcp_event_type: "assistant_response".to_string(),
+            raw_score,
+            matched_terms: 1,
+            event_time: String::new(),
+            event_unix_ms,
+            event_order: 0,
+            turn_seq: 0,
+        }
+    }
+
     #[test]
     fn tokenize_query_enforces_limits_and_counts() {
         let terms = tokenize_query("Hello hello world tool_use", 3);
@@ -4504,6 +6389,24 @@ mod tests {
             snippet.as_deref(),
             Some("{\"metadata\":{\"codename\":\"quartz\"}}")
         );
+    }
+
+    #[test]
+    fn sort_mcp_search_rows_uses_timestamp_before_event_uid_tiebreaker() {
+        let mut rows = vec![
+            sample_mcp_search_row("evt-a", 4.0, 100),
+            sample_mcp_search_row("evt-b", 4.0, 300),
+            sample_mcp_search_row("evt-c", 5.0, 50),
+            sample_mcp_search_row("evt-d", 4.0, 300),
+        ];
+
+        ClickHouseConversationRepository::sort_search_mcp_event_rows(&mut rows);
+
+        let ids = rows
+            .iter()
+            .map(|row| row.event_uid.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["evt-c", "evt-b", "evt-d", "evt-a"]);
     }
 
     #[test]

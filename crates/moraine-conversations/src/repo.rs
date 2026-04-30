@@ -2,9 +2,10 @@ use async_trait::async_trait;
 
 use crate::domain::{
     Conversation, ConversationDetailOptions, ConversationListFilter, ConversationSearchQuery,
-    ConversationSearchResults, OpenContext, OpenEventRequest, Page, PageRequest, SearchEventsQuery,
-    SearchEventsResult, SessionEventsQuery, SessionMetadata, TraceEvent, Turn, TurnListFilter,
-    TurnSummary,
+    ConversationSearchResults, McpEventOpen, McpSessionOpen, McpTurnOpen, OpenContext,
+    OpenEventRequest, Page, PageRequest, SearchEventsQuery, SearchEventsResult,
+    SearchMcpEventsQuery, SearchMcpEventsResult, SessionEventsQuery, SessionMetadata, TraceEvent,
+    Turn, TurnListFilter, TurnSummary,
 };
 use crate::error::RepoResult;
 
@@ -24,6 +25,8 @@ pub trait ConversationRepository: Send + Sync {
 
     async fn get_session_metadata(&self, session_id: &str) -> RepoResult<Option<SessionMetadata>>;
 
+    async fn get_mcp_session(&self, session_id: &str) -> RepoResult<Option<McpSessionOpen>>;
+
     async fn list_turns(
         &self,
         session_id: &str,
@@ -33,7 +36,15 @@ pub trait ConversationRepository: Send + Sync {
 
     async fn get_turn(&self, session_id: &str, turn_seq: u32) -> RepoResult<Option<Turn>>;
 
+    async fn get_mcp_turn(
+        &self,
+        session_id: &str,
+        turn_seq: u32,
+    ) -> RepoResult<Option<McpTurnOpen>>;
+
     async fn open_event(&self, req: OpenEventRequest) -> RepoResult<OpenContext>;
+
+    async fn get_mcp_event(&self, event_uid: &str) -> RepoResult<Option<McpEventOpen>>;
 
     async fn list_session_events(
         &self,
@@ -42,6 +53,11 @@ pub trait ConversationRepository: Send + Sync {
     ) -> RepoResult<Page<TraceEvent>>;
 
     async fn search_events(&self, query: SearchEventsQuery) -> RepoResult<SearchEventsResult>;
+
+    async fn search_mcp_events(
+        &self,
+        query: SearchMcpEventsQuery,
+    ) -> RepoResult<SearchMcpEventsResult>;
 
     async fn search_conversations(
         &self,
