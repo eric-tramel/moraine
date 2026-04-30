@@ -12,9 +12,9 @@ use moraine_clickhouse::ClickHouseClient;
 use moraine_config::ClickHouseConfig;
 use moraine_conversations::{
     ClickHouseConversationRepository, ConversationListFilter, ConversationListSort,
-    ConversationMode, ConversationRepository, ConversationSearchQuery, PageRequest, RepoConfig,
-    RepoError, SearchEventKind, SearchEventsQuery, SessionEventsDirection, SessionEventsQuery,
-    SessionMetadataSearchQuery,
+    ConversationMode, ConversationRepository, ConversationSearchQuery, McpEventType, PageRequest,
+    RepoConfig, RepoError, SearchEventKind, SearchEventsQuery, SearchMcpEventsQuery,
+    SessionEventsDirection, SessionEventsQuery, SessionMetadataSearchQuery,
 };
 use serde_json::json;
 
@@ -328,6 +328,171 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
             );
         }
 
+        if query.contains("AS mcp_event_type")
+            && query.contains("AS raw_score")
+            && query.contains("FROM `moraine`.`search_postings` AS p")
+        {
+            let assistant_row = json!({
+                "event_uid": "evt-c-42",
+                "session_id": "sess_c",
+                "source_name": "codex",
+                "harness": "codex",
+                "inference_provider": "openai",
+                "endpoint_kind": "generation",
+                "event_class": "message",
+                "payload_type": "text",
+                "actor_role": "assistant",
+                "name": "",
+                "phase": "",
+                "source_ref": "/tmp/sess_c.jsonl:1:42",
+                "doc_len": 19_u32,
+                "text_preview": "best assistant event in session c",
+                "text_content": "best assistant event in session c with extra context",
+                "payload_json": "{\"type\":\"message\",\"topic\":\"session-c\"}",
+                "mcp_event_type": "assistant_response",
+                "raw_score": 12.5,
+                "matched_terms": 2_u64,
+                "event_time": "2026-01-03 10:02:00",
+                "event_unix_ms": 1767434520000_i64,
+                "event_order": 42_u64,
+                "turn_seq": 2_u32
+            });
+            let user_row = json!({
+                "event_uid": "evt-c-user",
+                "session_id": "sess_c",
+                "source_name": "codex",
+                "harness": "codex",
+                "inference_provider": "openai",
+                "endpoint_kind": "generation",
+                "event_class": "message",
+                "payload_type": "text",
+                "actor_role": "user",
+                "name": "",
+                "phase": "",
+                "source_ref": "/tmp/sess_c.jsonl:1:41",
+                "doc_len": 15_u32,
+                "text_preview": "user asked about hello world",
+                "text_content": "user asked about hello world in a prompt",
+                "payload_json": "{\"type\":\"message\",\"role\":\"user\"}",
+                "mcp_event_type": "user_input",
+                "raw_score": 11.0,
+                "matched_terms": 2_u64,
+                "event_time": "2026-01-03 10:01:00",
+                "event_unix_ms": 1767434460000_i64,
+                "event_order": 41_u64,
+                "turn_seq": 2_u32
+            });
+            let tool_row = json!({
+                "event_uid": "evt-c-tool",
+                "session_id": "sess_c",
+                "source_name": "codex",
+                "harness": "codex",
+                "inference_provider": "openai",
+                "endpoint_kind": "generation",
+                "event_class": "tool_result",
+                "payload_type": "tool_result",
+                "actor_role": "tool",
+                "name": "bash",
+                "phase": "completed",
+                "source_ref": "/tmp/sess_c.jsonl:1:40",
+                "doc_len": 21_u32,
+                "text_preview": "cargo test failure output",
+                "text_content": "cargo test failure output with stack details",
+                "payload_json": "{\"tool\":\"bash\",\"status\":\"failed\"}",
+                "mcp_event_type": "tool_response",
+                "raw_score": 13.0,
+                "matched_terms": 2_u64,
+                "event_time": "2026-01-03 10:00:30",
+                "event_unix_ms": 1767434430000_i64,
+                "event_order": 40_u64,
+                "turn_seq": 2_u32
+            });
+            let session_a_row = json!({
+                "event_uid": "evt-a-11",
+                "session_id": "sess_a",
+                "source_name": "codex",
+                "harness": "codex",
+                "inference_provider": "openai",
+                "endpoint_kind": "generation",
+                "event_class": "message",
+                "payload_type": "text",
+                "actor_role": "assistant",
+                "name": "",
+                "phase": "",
+                "source_ref": "/tmp/sess_a.jsonl:1:11",
+                "doc_len": 13_u32,
+                "text_preview": "weaker assistant event in session a",
+                "text_content": "weaker assistant event in session a with extra context",
+                "payload_json": "{\"type\":\"message\",\"topic\":\"session-a\"}",
+                "mcp_event_type": "assistant_response",
+                "raw_score": 7.0,
+                "matched_terms": 1_u64,
+                "event_time": "2026-01-01 10:02:00",
+                "event_unix_ms": 1767261720000_i64,
+                "event_order": 11_u64,
+                "turn_seq": 1_u32
+            });
+            let session_b_row = json!({
+                "event_uid": "evt-b-9",
+                "session_id": "sess_b",
+                "source_name": "codex",
+                "harness": "codex",
+                "inference_provider": "openai",
+                "endpoint_kind": "generation",
+                "event_class": "message",
+                "payload_type": "text",
+                "actor_role": "assistant",
+                "name": "",
+                "phase": "",
+                "source_ref": "/tmp/sess_b.jsonl:1:9",
+                "doc_len": 9_u32,
+                "text_preview": "third assistant event",
+                "text_content": "third assistant event with extra context",
+                "payload_json": "{\"type\":\"message\",\"topic\":\"session-b\"}",
+                "mcp_event_type": "assistant_response",
+                "raw_score": 6.0,
+                "matched_terms": 1_u64,
+                "event_time": "2026-01-02 10:02:00",
+                "event_unix_ms": 1767348120000_i64,
+                "event_order": 9_u64,
+                "turn_seq": 1_u32
+            });
+
+            let filter_clause = query
+                .split_once("WHERE ")
+                .and_then(|(_, tail)| tail.split_once("GROUP BY p.doc_id"))
+                .map(|(filter, _)| filter)
+                .unwrap_or(query.as_str());
+
+            if query.contains("tr.session_id = 'sess_c' AND tr.turn_seq = 2") {
+                return (StatusCode::OK, json_each_row(json!([tool_row])));
+            }
+            if query.contains("d.session_id = 'sess_a'") {
+                return (StatusCode::OK, json_each_row(json!([session_a_row])));
+            }
+            if filter_clause.contains("lowerUTF8(d.actor_role) = 'user'")
+                && !filter_clause.contains("lowerUTF8(d.actor_role) = 'assistant'")
+            {
+                return (StatusCode::OK, json_each_row(json!([user_row])));
+            }
+            if filter_clause.contains("lowerUTF8(d.actor_role) = 'assistant'")
+                && !filter_clause.contains("lowerUTF8(d.actor_role) = 'user'")
+            {
+                return (StatusCode::OK, json_each_row(json!([assistant_row])));
+            }
+            if query.contains("LIMIT 3") {
+                return (
+                    StatusCode::OK,
+                    json_each_row(json!([assistant_row, session_a_row, session_b_row])),
+                );
+            }
+
+            return (
+                StatusCode::OK,
+                json_each_row(json!([assistant_row, session_a_row])),
+            );
+        }
+
         if query.contains("FROM `moraine`.`search_conversation_terms` AS ct") {
             return (
                 StatusCode::OK,
@@ -508,6 +673,77 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
                         "score": 5.0,
                         "matched_terms": 2_u16,
                         "metadata_text": "{\"summary\":\"Rare summary-only session about metadata discovery.\"}"
+                    }
+                ])),
+            );
+        }
+
+        if query.contains("row_number() OVER")
+            && query.contains("PARTITION BY session_id, turn_seq")
+            && query.contains("WHERE tr.event_uid IN")
+        {
+            return (
+                StatusCode::OK,
+                json_each_row(json!([
+                    {
+                        "event_uid": "evt-c-tool",
+                        "event_time": "2026-01-03 10:00:30",
+                        "event_unix_ms": 1767434430000_i64,
+                        "event_order": 40_u64,
+                        "turn_seq": 2_u32,
+                        "event_ordinal": 1_u32,
+                        "turn_event_count": 3_u64,
+                        "call_id": "call-bash-1",
+                        "item_id": "item-tool",
+                        "model": "gpt-5.3-codex"
+                    },
+                    {
+                        "event_uid": "evt-c-user",
+                        "event_time": "2026-01-03 10:01:00",
+                        "event_unix_ms": 1767434460000_i64,
+                        "event_order": 41_u64,
+                        "turn_seq": 2_u32,
+                        "event_ordinal": 2_u32,
+                        "turn_event_count": 3_u64,
+                        "call_id": "",
+                        "item_id": "item-user",
+                        "model": "gpt-5.3-codex"
+                    },
+                    {
+                        "event_uid": "evt-c-42",
+                        "event_time": "2026-01-03 10:02:00",
+                        "event_unix_ms": 1767434520000_i64,
+                        "event_order": 42_u64,
+                        "turn_seq": 2_u32,
+                        "event_ordinal": 3_u32,
+                        "turn_event_count": 3_u64,
+                        "call_id": "",
+                        "item_id": "item-assistant",
+                        "model": "gpt-5.3-codex"
+                    },
+                    {
+                        "event_uid": "evt-a-11",
+                        "event_time": "2026-01-01 10:02:00",
+                        "event_unix_ms": 1767261720000_i64,
+                        "event_order": 11_u64,
+                        "turn_seq": 1_u32,
+                        "event_ordinal": 1_u32,
+                        "turn_event_count": 1_u64,
+                        "call_id": "",
+                        "item_id": "item-a",
+                        "model": "gpt-5.3-codex"
+                    },
+                    {
+                        "event_uid": "evt-b-9",
+                        "event_time": "2026-01-02 10:02:00",
+                        "event_unix_ms": 1767348120000_i64,
+                        "event_order": 9_u64,
+                        "turn_seq": 1_u32,
+                        "event_ordinal": 1_u32,
+                        "turn_event_count": 1_u64,
+                        "call_id": "",
+                        "item_id": "item-b",
+                        "model": "gpt-5.3-codex"
                     }
                 ])),
             );
@@ -1444,6 +1680,224 @@ async fn search_events_documents_subquery_avoids_self_aliased_aggregates() {
             );
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_mcp_events_supports_global_search_with_enriched_hits() {
+    let (repo, _state) = build_repo().await;
+
+    let result = repo
+        .search_mcp_events(SearchMcpEventsQuery {
+            query: "hello world".to_string(),
+            n_hits: Some(10),
+            event_types: Some(vec![
+                McpEventType::ToolResponse,
+                McpEventType::UserInput,
+                McpEventType::AssistantResponse,
+            ]),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            ..SearchMcpEventsQuery::default()
+        })
+        .await
+        .expect("search mcp events");
+
+    assert_eq!(result.hits.len(), 2);
+    assert!(!result.truncated);
+    assert_eq!(
+        result.event_types,
+        vec![
+            McpEventType::UserInput,
+            McpEventType::AssistantResponse,
+            McpEventType::ToolResponse
+        ]
+    );
+    assert_eq!(result.hits[0].event_uid, "evt-c-42");
+    assert_eq!(result.hits[0].event_type, McpEventType::AssistantResponse);
+    assert_eq!(result.hits[0].session_id, "sess_c");
+    assert_eq!(
+        result.hits[0].session_title.as_deref(),
+        Some("Session C summary")
+    );
+    assert_eq!(result.hits[0].source_name.as_deref(), Some("codex"));
+    assert_eq!(result.hits[0].event_time, "2026-01-03 10:02:00");
+    assert_eq!(result.hits[0].event_order, 42);
+    assert_eq!(result.hits[0].raw_score, 12.5);
+    assert_eq!(result.hits[0].model.as_deref(), Some("gpt-5.3-codex"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_mcp_events_supports_session_scoped_search() {
+    let (repo, state) = build_repo().await;
+
+    let result = repo
+        .search_mcp_events(SearchMcpEventsQuery {
+            query: "hello world".to_string(),
+            n_hits: Some(5),
+            session_id: Some("sess_a".to_string()),
+            event_types: Some(vec![McpEventType::AssistantResponse]),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            ..SearchMcpEventsQuery::default()
+        })
+        .await
+        .expect("session-scoped mcp event search");
+
+    assert_eq!(result.hits.len(), 1);
+    assert_eq!(result.hits[0].session_id, "sess_a");
+    assert_eq!(result.hits[0].event_uid, "evt-a-11");
+
+    let queries = state.queries.lock().expect("queries lock").clone();
+    let search_query = queries
+        .iter()
+        .find(|q| q.contains("AS mcp_event_type") && q.contains("d.session_id = 'sess_a'"))
+        .expect("session-scoped search query should be captured");
+    assert!(search_query.contains("d.session_id = 'sess_a'"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_mcp_events_supports_turn_scoped_search() {
+    let (repo, state) = build_repo().await;
+
+    let result = repo
+        .search_mcp_events(SearchMcpEventsQuery {
+            query: "cargo failure".to_string(),
+            n_hits: Some(5),
+            session_id: Some("sess_c".to_string()),
+            turn_seq: Some(2),
+            event_types: Some(vec![McpEventType::ToolResponse]),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+        })
+        .await
+        .expect("turn-scoped mcp event search");
+
+    assert_eq!(result.hits.len(), 1);
+    assert_eq!(result.hits[0].event_uid, "evt-c-tool");
+    assert_eq!(result.hits[0].event_type, McpEventType::ToolResponse);
+    assert_eq!(result.hits[0].turn_seq, 2);
+    assert_eq!(result.hits[0].event_ordinal, 1);
+    assert_eq!(result.hits[0].turn_event_count, 3);
+    assert_eq!(result.hits[0].tool_name.as_deref(), Some("bash"));
+    assert_eq!(result.hits[0].call_id.as_deref(), Some("call-bash-1"));
+
+    let queries = state.queries.lock().expect("queries lock").clone();
+    let search_query = queries
+        .iter()
+        .find(|q| {
+            q.contains("AS mcp_event_type")
+                && q.contains("tr.session_id = 'sess_c' AND tr.turn_seq = 2")
+        })
+        .expect("turn-scoped search query should be captured");
+    assert!(search_query.contains("tr.session_id = 'sess_c' AND tr.turn_seq = 2"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_mcp_events_event_type_filter_distinguishes_user_and_assistant_messages() {
+    let (repo, state) = build_repo().await;
+
+    let user_result = repo
+        .search_mcp_events(SearchMcpEventsQuery {
+            query: "hello world".to_string(),
+            n_hits: Some(5),
+            event_types: Some(vec![McpEventType::UserInput]),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            ..SearchMcpEventsQuery::default()
+        })
+        .await
+        .expect("user input search");
+    let assistant_result = repo
+        .search_mcp_events(SearchMcpEventsQuery {
+            query: "hello world".to_string(),
+            n_hits: Some(5),
+            event_types: Some(vec![McpEventType::AssistantResponse]),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            ..SearchMcpEventsQuery::default()
+        })
+        .await
+        .expect("assistant response search");
+
+    assert_eq!(user_result.hits.len(), 1);
+    assert_eq!(user_result.hits[0].event_uid, "evt-c-user");
+    assert_eq!(user_result.hits[0].event_type, McpEventType::UserInput);
+    assert_eq!(user_result.hits[0].actor_role, "user");
+    assert_eq!(assistant_result.hits.len(), 1);
+    assert_eq!(assistant_result.hits[0].event_uid, "evt-c-42");
+    assert_eq!(
+        assistant_result.hits[0].event_type,
+        McpEventType::AssistantResponse
+    );
+    assert_eq!(assistant_result.hits[0].actor_role, "assistant");
+
+    let queries = state.queries.lock().expect("queries lock").clone();
+    assert!(queries.iter().any(|q| {
+        q.contains("AS mcp_event_type") && q.contains("lowerUTF8(d.actor_role) = 'user'")
+    }));
+    assert!(queries.iter().any(|q| {
+        q.contains("AS mcp_event_type") && q.contains("lowerUTF8(d.actor_role) = 'assistant'")
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_mcp_events_fetches_limit_plus_one_for_truncation() {
+    let (repo, state) = build_repo().await;
+
+    let result = repo
+        .search_mcp_events(SearchMcpEventsQuery {
+            query: "hello world".to_string(),
+            n_hits: Some(2),
+            event_types: Some(vec![
+                McpEventType::UserInput,
+                McpEventType::AssistantResponse,
+                McpEventType::ToolResponse,
+            ]),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            ..SearchMcpEventsQuery::default()
+        })
+        .await
+        .expect("truncated mcp event search");
+
+    assert_eq!(result.hits.len(), 2);
+    assert!(result.truncated);
+    assert!(result.stats.truncated);
+    assert_eq!(result.stats.effective_n_hits, 2);
+
+    let queries = state.queries.lock().expect("queries lock").clone();
+    let search_query = queries
+        .iter()
+        .find(|q| q.contains("AS mcp_event_type") && q.contains("LIMIT 3"))
+        .expect("search query should fetch limit plus one");
+    assert!(search_query.contains("LIMIT 3"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_mcp_events_reports_event_ordinal_within_turn() {
+    let (repo, _state) = build_repo().await;
+
+    let result = repo
+        .search_mcp_events(SearchMcpEventsQuery {
+            query: "hello world".to_string(),
+            n_hits: Some(5),
+            event_types: Some(vec![McpEventType::AssistantResponse]),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            ..SearchMcpEventsQuery::default()
+        })
+        .await
+        .expect("mcp event search");
+
+    let hit = result
+        .hits
+        .iter()
+        .find(|hit| hit.event_uid == "evt-c-42")
+        .expect("assistant event hit");
+    assert_eq!(hit.turn_seq, 2);
+    assert_eq!(hit.event_order, 42);
+    assert_eq!(hit.event_ordinal, 3);
+    assert_eq!(hit.turn_event_count, 3);
 }
 
 #[tokio::test(flavor = "multi_thread")]

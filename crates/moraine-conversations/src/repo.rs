@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use crate::domain::{
     Conversation, ConversationDetailOptions, ConversationListFilter, ConversationSearchQuery,
     ConversationSearchResults, OpenContext, OpenEventRequest, Page, PageRequest, SearchEventsQuery,
-    SearchEventsResult, SessionEventsQuery, SessionMetadata, TraceEvent, Turn, TurnListFilter,
-    TurnSummary,
+    SearchEventsResult, SearchMcpEventsQuery, SearchMcpEventsResult, SessionEventsQuery,
+    SessionMetadata, TraceEvent, Turn, TurnListFilter, TurnSummary,
 };
 use crate::error::RepoResult;
 
@@ -42,6 +42,11 @@ pub trait ConversationRepository: Send + Sync {
     ) -> RepoResult<Page<TraceEvent>>;
 
     async fn search_events(&self, query: SearchEventsQuery) -> RepoResult<SearchEventsResult>;
+
+    async fn search_mcp_events(
+        &self,
+        query: SearchMcpEventsQuery,
+    ) -> RepoResult<SearchMcpEventsResult>;
 
     async fn search_conversations(
         &self,
