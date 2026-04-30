@@ -1,6 +1,8 @@
 #![recursion_limit = "256"]
 
 pub mod contract;
+mod open_v1;
+mod search_sessions_v1;
 
 use anyhow::{anyhow, Context, Result};
 use moraine_clickhouse::ClickHouseClient;
