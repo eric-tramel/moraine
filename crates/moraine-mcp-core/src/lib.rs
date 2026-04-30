@@ -1,5 +1,7 @@
 #![recursion_limit = "256"]
 
+pub mod contract;
+
 use anyhow::{anyhow, Context, Result};
 use moraine_clickhouse::ClickHouseClient;
 use moraine_config::AppConfig;
