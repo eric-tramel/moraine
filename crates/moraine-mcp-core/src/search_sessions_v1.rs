@@ -512,7 +512,7 @@ fn internal_id_error(error: ContractError) -> ContractError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::{McpEventType, SearchSessionsArgs};
+    use crate::contract::{McpEventType, OpenV1Args, SearchSessionsArgs};
 
     #[test]
     fn parses_and_canonicalizes_search_sessions_args() {
@@ -649,6 +649,64 @@ mod tests {
         assert_eq!(shaped["session"]["completed"], true);
         assert!(shaped.get("text_content").is_none());
         assert!(shaped.get("payload_json").is_none());
+    }
+
+    #[test]
+    fn shaped_search_open_ids_are_valid_open_args() {
+        let hit = SearchMcpEventHit {
+            rank: 1,
+            event_uid: "evt-open".to_string(),
+            session_id: "sess-open".to_string(),
+            event_type: RepoMcpEventType::AssistantResponse,
+            event_time: "2026-04-29 18:42:31.125".to_string(),
+            event_unix_ms: 1_777_487_751_125,
+            turn_seq: 3,
+            turn_ordinal: 3,
+            event_order: 7,
+            event_ordinal: 2,
+            turn_event_count: 2,
+            session_started_at: None,
+            session_updated_at: None,
+            session_title: None,
+            session_slug: None,
+            session_summary: None,
+            source_name: None,
+            harness: None,
+            inference_provider: None,
+            event_class: "message".to_string(),
+            payload_type: "message".to_string(),
+            actor_role: "assistant".to_string(),
+            tool_name: None,
+            tool_phase: None,
+            call_id: None,
+            item_id: None,
+            model: None,
+            endpoint_kind: None,
+            source_ref: None,
+            snippet: "assistant answer".to_string(),
+            snippet_truncated: false,
+            text_content: None,
+            payload_json: None,
+            score: 0.9,
+            raw_score: 10.0,
+            matched_terms: 1,
+            doc_len: 12,
+        };
+        let shaped = search_hit_json(&hit, &SearchLookupCache::default()).expect("shape hit");
+
+        for field in ["event_id", "turn_id", "session_id"] {
+            let open_id = shaped["open"][field]
+                .as_str()
+                .expect("search result includes open id")
+                .to_string();
+            let canonical = OpenV1Args {
+                id: Some(open_id.clone()),
+            }
+            .validate()
+            .expect("open accepts search result id");
+
+            assert_eq!(canonical.id.to_string(), open_id);
+        }
     }
 
     #[test]
