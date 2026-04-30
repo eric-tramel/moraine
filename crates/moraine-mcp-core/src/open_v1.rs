@@ -103,38 +103,17 @@ impl AppState {
                 }
             }
             McpId::Event(id) => match self.repo.get_mcp_event(id.raw_event_uid()).await {
-                Ok(Some(event)) => {
-                    let turn_state = match self
-                        .repo
-                        .get_mcp_turn(&event.event.session_id, event.event.turn_seq)
-                        .await
-                    {
-                        Ok(turn_state) => turn_state,
-                        Err(err) => {
-                            return repo_error_tool_response(
-                                request,
-                                err,
-                                started_at,
-                                sla_target_ms,
-                            );
-                        }
-                    };
-                    match open_event_data(&event, turn_state.as_ref()) {
-                        Ok((data, warnings)) => success_tool_response(
-                            request,
-                            data,
-                            warnings,
-                            started_at,
-                            sla_target_ms,
-                        ),
-                        Err(err) => internal_error_tool_response(
-                            request,
-                            format!("failed to shape event open response: {err:#}"),
-                            started_at,
-                            sla_target_ms,
-                        ),
+                Ok(Some(event)) => match open_event_data(&event, None) {
+                    Ok((data, warnings)) => {
+                        success_tool_response(request, data, warnings, started_at, sla_target_ms)
                     }
-                }
+                    Err(err) => internal_error_tool_response(
+                        request,
+                        format!("failed to shape event open response: {err:#}"),
+                        started_at,
+                        sla_target_ms,
+                    ),
+                },
                 Ok(None) => not_found_tool_response(
                     request,
                     McpEntityKind::Event,

@@ -63,17 +63,6 @@ impl AppState {
             }
         };
 
-        if let Err(error) = self
-            .populate_search_hit_contexts(&search_result.hits, &mut cache)
-            .await
-        {
-            return encode_search_sessions_error(
-                canonical_request,
-                repo_error_to_contract_error(error),
-                perf.finish(),
-            );
-        }
-
         let performance = perf.finish();
         let warnings = search_warnings(&search_result);
         let data = match search_sessions_data_json(&args, &search_result, &cache) {
@@ -141,26 +130,6 @@ impl AppState {
             }
             Some(McpId::Event(_)) => unreachable!("contract validation rejects event scope"),
         }
-    }
-
-    async fn populate_search_hit_contexts(
-        &self,
-        hits: &[SearchMcpEventHit],
-        cache: &mut SearchLookupCache,
-    ) -> Result<(), RepoError> {
-        for hit in hits {
-            let _ = load_session_metadata(self, cache, &hit.session_id).await?;
-            let _ = load_turn_open(self, cache, &hit.session_id, hit.turn_seq).await?;
-
-            if let Some(metadata) = cache.sessions.get(&hit.session_id) {
-                let latest_turn_seq = metadata.total_turns;
-                if latest_turn_seq > 0 {
-                    let _ = load_turn_open(self, cache, &hit.session_id, latest_turn_seq).await?;
-                }
-            }
-        }
-
-        Ok(())
     }
 }
 
@@ -288,14 +257,17 @@ fn search_hit_json(
     });
     let (snippet, snippet_truncated) = compact_snippet(&hit.snippet, hit.snippet_truncated);
 
-    let turn_completed = turn.map(|turn| turn.completed).unwrap_or(false);
+    let terminal_from_payload = is_terminal_payload_type(&hit.payload_type);
+    let turn_completed = turn
+        .map(|turn| turn.completed)
+        .unwrap_or(terminal_from_payload);
     let turn_event_count = turn
         .map(|turn| turn.metadata.total_events)
         .unwrap_or(hit.turn_event_count);
     let event_terminal = turn
         .and_then(|turn| turn.terminal_event_uid.as_deref())
         .map(|terminal_event_uid| terminal_event_uid == hit.event_uid)
-        .unwrap_or(false);
+        .unwrap_or(terminal_from_payload);
     let session_completed = latest_turn
         .map(|turn| turn.completed)
         .or_else(|| {
@@ -388,6 +360,10 @@ fn score_unit(score: f64) -> f64 {
     } else {
         0.0
     }
+}
+
+fn is_terminal_payload_type(payload_type: &str) -> bool {
+    matches!(payload_type, "task_complete" | "turn_aborted")
 }
 
 fn search_warnings(result: &SearchMcpEventsResult) -> Vec<String> {
