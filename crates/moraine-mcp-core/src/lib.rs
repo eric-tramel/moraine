@@ -833,7 +833,7 @@ impl AppState {
 
     fn tools_list_result(&self) -> Value {
         let (limit_min, limit_max) = tool_limit_bounds(self.cfg.mcp.max_results);
-        json!({
+        let mut payload = json!({
             "tools": [
                 {
                     "name": "search_sessions",
@@ -1335,7 +1335,18 @@ impl AppState {
                     }
                 }
             ]
-        })
+        });
+
+        if let Some(tools) = payload.get_mut("tools").and_then(Value::as_array_mut) {
+            tools.retain(|tool| {
+                matches!(
+                    tool.get("name").and_then(Value::as_str),
+                    Some("search_sessions" | "open")
+                )
+            });
+        }
+
+        payload
     }
 
     async fn call_tool(&self, params: ToolCallParams) -> Result<Value> {
@@ -3575,7 +3586,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_publishes_session_first_surface_with_output_schemas() {
+    fn tools_list_publishes_two_tool_search_surface_with_output_schemas() {
         let state = test_state();
         let payload = state.tools_list_result();
         let tools = payload["tools"].as_array().expect("tools array");
@@ -3584,19 +3595,30 @@ mod tests {
             .filter_map(|tool| tool["name"].as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(names[0], "search_sessions");
-        assert_eq!(names[1], "open");
-        assert_eq!(names[2], "search_session_data");
-        assert_eq!(names[3], "open_session");
-        assert!(names.contains(&"list_sessions"));
+        assert_eq!(names, ["search_sessions", "open"]);
+        assert_eq!(
+            names.iter().filter(|name| **name == "open").count(),
+            1,
+            "tools/list must not publish duplicate open tools"
+        );
 
-        for tool_name in [
-            "search_sessions",
-            "open",
+        for legacy_tool_name in [
             "search_session_data",
             "open_session",
+            "search",
+            "open_legacy",
+            "search_conversations",
             "list_sessions",
+            "get_session",
+            "get_session_events",
         ] {
+            assert!(
+                !names.contains(&legacy_tool_name),
+                "{legacy_tool_name} is compatibility-only and should not be advertised"
+            );
+        }
+
+        for tool_name in ["search_sessions", "open"] {
             let tool = tools
                 .iter()
                 .find(|tool| tool["name"].as_str() == Some(tool_name))
@@ -3622,15 +3644,15 @@ mod tests {
 
         let search = tools
             .iter()
-            .find(|tool| tool["name"].as_str() == Some("search_session_data"))
-            .expect("search_session_data exists");
+            .find(|tool| tool["name"].as_str() == Some("search_sessions"))
+            .expect("search_sessions exists");
         assert_eq!(
-            search["inputSchema"]["properties"]["event_scope"]["default"],
-            json!("auto")
+            search["inputSchema"]["properties"]["event_types"]["description"],
+            json!("Optional normalized event type filter. Defaults to user_input, assistant_response, and tool_response.")
         );
         assert_eq!(
-            search["inputSchema"]["properties"]["recency_policy"]["default"],
-            json!("auto")
+            search["inputSchema"]["properties"]["n_hits"]["default"],
+            json!(crate::contract::SEARCH_SESSIONS_DEFAULT_N_HITS)
         );
     }
 
