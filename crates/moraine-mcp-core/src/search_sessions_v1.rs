@@ -440,7 +440,7 @@ fn tool_error_hybrid(text: String, payload: Value) -> Value {
             }
         ],
         "structuredContent": payload,
-        "isError": true
+        "isError": false
     })
 }
 

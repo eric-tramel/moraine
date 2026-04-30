@@ -250,7 +250,7 @@ fn error_tool_response(
     let performance = Performance::from_elapsed(started_at.elapsed(), sla_target_ms);
     let envelope = ToolErrorEnvelope::error(OPEN_TOOL, request, error, performance);
     let payload = serde_json::to_value(envelope).context("failed to encode open error envelope")?;
-    Ok(tool_result(open_result_text(&payload), payload, true))
+    Ok(tool_result(open_result_text(&payload), payload, false))
 }
 
 fn tool_result(text: String, payload: Value, is_error: bool) -> Value {
@@ -958,7 +958,7 @@ mod tests {
         )
         .expect("error response");
 
-        assert_eq!(result["isError"], true);
+        assert_eq!(result["isError"], false);
         assert_eq!(
             result["structuredContent"]["schema_version"],
             "moraine.mcp.error.v1"

@@ -157,6 +157,9 @@ Field rules:
 ### Error Envelope
 
 Rejected requests and failed lookups must return a machine-readable error.
+These are in-band tool results, not MCP/JSON-RPC transport failures; the MCP
+tool result wrapper should therefore be returned cleanly with the error object
+in `structuredContent`.
 
 ```json
 {

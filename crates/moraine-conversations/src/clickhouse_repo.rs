@@ -3316,12 +3316,7 @@ FORMAT JSONEachRow",
         )?;
         let mut rows: Vec<SearchMcpEventRow> =
             self.map_backend(self.ch.query_rows(&sql, None).await)?;
-        rows.sort_by(|a, b| {
-            b.raw_score
-                .total_cmp(&a.raw_score)
-                .then_with(|| b.event_unix_ms.cmp(&a.event_unix_ms))
-                .then_with(|| a.event_uid.cmp(&b.event_uid))
-        });
+        Self::sort_search_mcp_event_rows(&mut rows);
         Ok(rows)
     }
 
@@ -3404,9 +3399,13 @@ FORMAT JSONEachRow",
         });
 
         let mut rows = Vec::<SearchMcpEventRow>::new();
-        let hydrate_chunk_size = (limit as usize).saturating_mul(8).max(128);
+        let target_rows = (limit as usize)
+            .saturating_mul(8)
+            .max((limit as usize).saturating_add(32))
+            .min(256);
+        let hydrate_chunk_size = target_rows.max(128);
         let mut offset = 0usize;
-        while offset < candidates.len() && rows.len() < limit as usize {
+        while offset < candidates.len() && rows.len() < target_rows {
             let end = (offset + hydrate_chunk_size).min(candidates.len());
             let event_uids: Vec<String> = candidates[offset..end]
                 .iter()
@@ -3458,14 +3457,34 @@ FORMAT JSONEachRow",
                     turn_seq: 0,
                 });
 
-                if rows.len() >= limit as usize {
+                if rows.len() >= target_rows {
                     break;
                 }
             }
             offset = end;
         }
 
+        let event_enrichment_by_uid = self.load_mcp_event_enrichment(&rows).await?;
+        for row in rows.iter_mut() {
+            if let Some(enrichment) = event_enrichment_by_uid.get(row.event_uid.as_str()) {
+                row.event_time = enrichment.event_time.clone();
+                row.event_unix_ms = enrichment.event_unix_ms;
+                row.event_order = enrichment.event_order;
+                row.turn_seq = enrichment.turn_seq;
+            }
+        }
+        Self::sort_search_mcp_event_rows(&mut rows);
+        rows.truncate(limit as usize);
         Ok(rows)
+    }
+
+    fn sort_search_mcp_event_rows(rows: &mut [SearchMcpEventRow]) {
+        rows.sort_by(|a, b| {
+            b.raw_score
+                .total_cmp(&a.raw_score)
+                .then_with(|| b.event_unix_ms.cmp(&a.event_unix_ms))
+                .then_with(|| a.event_uid.cmp(&b.event_uid))
+        });
     }
 
     fn dedupe_fetch_limit(limit: u16) -> u16 {
@@ -6228,6 +6247,38 @@ mod tests {
         }
     }
 
+    fn sample_mcp_search_row(
+        event_uid: &str,
+        raw_score: f64,
+        event_unix_ms: i64,
+    ) -> SearchMcpEventRow {
+        SearchMcpEventRow {
+            event_uid: event_uid.to_string(),
+            session_id: "session-1".to_string(),
+            source_name: "source".to_string(),
+            harness: "harness".to_string(),
+            inference_provider: "inference-provider".to_string(),
+            endpoint_kind: "generation".to_string(),
+            event_class: "message".to_string(),
+            payload_type: "message".to_string(),
+            actor_role: "assistant".to_string(),
+            name: String::new(),
+            phase: String::new(),
+            source_ref: "source-ref".to_string(),
+            doc_len: 42,
+            text_preview: "preview".to_string(),
+            text_content: "preview".to_string(),
+            payload_json: "{}".to_string(),
+            mcp_event_type: "assistant_response".to_string(),
+            raw_score,
+            matched_terms: 1,
+            event_time: String::new(),
+            event_unix_ms,
+            event_order: 0,
+            turn_seq: 0,
+        }
+    }
+
     #[test]
     fn tokenize_query_enforces_limits_and_counts() {
         let terms = tokenize_query("Hello hello world tool_use", 3);
@@ -6264,6 +6315,24 @@ mod tests {
             snippet.as_deref(),
             Some("{\"metadata\":{\"codename\":\"quartz\"}}")
         );
+    }
+
+    #[test]
+    fn sort_mcp_search_rows_uses_timestamp_before_event_uid_tiebreaker() {
+        let mut rows = vec![
+            sample_mcp_search_row("evt-a", 4.0, 100),
+            sample_mcp_search_row("evt-b", 4.0, 300),
+            sample_mcp_search_row("evt-c", 5.0, 50),
+            sample_mcp_search_row("evt-d", 4.0, 300),
+        ];
+
+        ClickHouseConversationRepository::sort_search_mcp_event_rows(&mut rows);
+
+        let ids = rows
+            .iter()
+            .map(|row| row.event_uid.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["evt-c", "evt-b", "evt-d", "evt-a"]);
     }
 
     #[test]
