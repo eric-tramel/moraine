@@ -10,6 +10,7 @@ import select
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlencode
@@ -37,7 +38,7 @@ def non_negative_int(value: str) -> int:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Measure the Moraine MCP v1 search_sessions/open interface over JSON-RPC stdio. "
+            "Measure the Moraine MCP v1 search_sessions/open/list_sessions interface over JSON-RPC stdio. "
             "The tool calls are read-only; corpus and query selection use ClickHouse SELECTs only."
         )
     )
@@ -86,6 +87,25 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         help="Optional search_sessions event_types entry. May be repeated.",
+    )
+    parser.add_argument(
+        "--skip-list-sessions",
+        action="store_true",
+        help="Do not benchmark list_sessions.",
+    )
+    parser.add_argument(
+        "--list-start-datetime",
+        help="Explicit list_sessions start_datetime. Defaults to the corpus minimum session start.",
+    )
+    parser.add_argument(
+        "--list-end-datetime",
+        help="Explicit list_sessions end_datetime. Defaults to the corpus maximum session update plus 1 ms.",
+    )
+    parser.add_argument("--list-limit", type=positive_int, default=20)
+    parser.add_argument(
+        "--list-mode",
+        choices=["web_search", "mcp_internal", "tool_calling", "chat"],
+        help="Optional list_sessions mode filter.",
     )
     parser.add_argument(
         "--min-docs",
@@ -235,6 +255,40 @@ SELECT metric, value FROM (
     return {
         str(row["metric"]): int(row["value"])
         for row in clickhouse_select_json_each_row(ch_cfg, sql)
+    }
+
+
+def format_utc_rfc3339_ms(unix_ms: int) -> str:
+    return (
+        datetime.fromtimestamp(unix_ms / 1000, tz=timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def corpus_session_window(ch_cfg: dict[str, Any]) -> Optional[dict[str, Any]]:
+    database = ch_cfg["database"]
+    sql = f"""
+SELECT
+  count() AS sessions,
+  toInt64(toUnixTimestamp64Milli(min(first_event_time))) AS start_unix_ms,
+  toInt64(toUnixTimestamp64Milli(max(last_event_time))) AS end_unix_ms
+FROM {database}.v_session_summary
+FORMAT JSONEachRow
+""".strip()
+    rows = clickhouse_select_json_each_row(ch_cfg, sql)
+    if not rows:
+        return None
+    row = rows[0]
+    sessions = int(row.get("sessions", 0))
+    if sessions <= 0:
+        return None
+    start_unix_ms = int(row["start_unix_ms"])
+    end_unix_ms = int(row["end_unix_ms"]) + 1
+    return {
+        "sessions": sessions,
+        "start_datetime": format_utc_rfc3339_ms(start_unix_ms),
+        "end_datetime": format_utc_rfc3339_ms(end_unix_ms),
     }
 
 
@@ -390,6 +444,8 @@ def measured_tool_call(
         raise RuntimeError(f"{name} response missing structuredContent")
     if bool(result.get("isError")):
         raise RuntimeError(f"{name} returned isError=true: {structured}")
+    if "error" in structured:
+        raise RuntimeError(f"{name} returned error envelope: {structured['error']}")
     performance = structured.get("performance")
     if not isinstance(performance, dict):
         raise RuntimeError(f"{name} response missing performance object")
@@ -486,6 +542,20 @@ def first_hit_open_ids(search_payload: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def first_list_session_open_id(list_payload: dict[str, Any]) -> Optional[str]:
+    sessions = list_payload.get("data", {}).get("sessions", [])
+    if not isinstance(sessions, list) or not sessions:
+        return None
+    first = sessions[0]
+    if not isinstance(first, dict):
+        return None
+    open_block = first.get("open")
+    if not isinstance(open_block, dict):
+        return None
+    value = open_block.get("session_id")
+    return value if isinstance(value, str) and value else None
+
+
 def unique_queries(args: argparse.Namespace, log_rows: list[dict[str, Any]]) -> list[str]:
     queries: list[str] = []
     seen: set[str] = set()
@@ -505,6 +575,7 @@ def main() -> int:
     try:
         ch_cfg = read_clickhouse_config(config)
         counts = corpus_counts(ch_cfg)
+        session_window = corpus_session_window(ch_cfg) if not args.skip_list_sessions else None
         log_rows = select_log_queries(ch_cfg, args.window, args.top_n_log_queries)
         queries = unique_queries(args, log_rows)
     except Exception as exc:
@@ -522,13 +593,48 @@ def main() -> int:
         )
         return 2
 
-    if not queries:
-        print("fatal: no queries supplied or selected", file=sys.stderr)
+    list_sessions_args: Optional[dict[str, Any]] = None
+    if not args.skip_list_sessions:
+        if bool(args.list_start_datetime) != bool(args.list_end_datetime):
+            print(
+                "fatal: --list-start-datetime and --list-end-datetime must be provided together",
+                file=sys.stderr,
+            )
+            return 2
+        if args.list_start_datetime and args.list_end_datetime:
+            list_sessions_args = {
+                "start_datetime": args.list_start_datetime,
+                "end_datetime": args.list_end_datetime,
+                "limit": args.list_limit,
+            }
+        elif session_window is not None:
+            list_sessions_args = {
+                "start_datetime": session_window["start_datetime"],
+                "end_datetime": session_window["end_datetime"],
+                "limit": args.list_limit,
+            }
+        else:
+            print("warning: no session window available; skipping list_sessions benchmark")
+        if list_sessions_args is not None and args.list_mode:
+            list_sessions_args["mode"] = args.list_mode
+
+    if list_sessions_args is not None:
+        print("list_sessions")
+        mode_suffix = f" mode={args.list_mode}" if args.list_mode else ""
+        print(
+            "  "
+            f"{list_sessions_args['start_datetime']} -> {list_sessions_args['end_datetime']} "
+            f"limit={list_sessions_args['limit']}{mode_suffix}"
+        )
+
+    if not queries and list_sessions_args is None:
+        print("fatal: no queries supplied or selected and no list_sessions window", file=sys.stderr)
         return 2
 
-    print("Queries")
-    for idx, query in enumerate(queries, start=1):
-        print(f"  {idx}. {query}")
+    if queries:
+        print("Queries")
+        for idx, query in enumerate(queries, start=1):
+            print(f"  {idx}. {query}")
 
     if args.dry_run:
         return 0
@@ -557,7 +663,10 @@ def main() -> int:
             for tool in tools_result.get("tools", [])
             if isinstance(tool, dict)
         }
-        missing_tools = {"search_sessions", "open"} - tool_names
+        expected_tools = {"search_sessions", "open"}
+        if list_sessions_args is not None:
+            expected_tools.add("list_sessions")
+        missing_tools = expected_tools - tool_names
         if missing_tools:
             raise RuntimeError(f"tools/list missing expected tools: {sorted(missing_tools)}")
 
@@ -609,6 +718,28 @@ def main() -> int:
                     if measured:
                         failures.append(f"query={query!r} run={run_idx}: {exc}")
 
+        if list_sessions_args is not None:
+            total_runs = args.warmup + args.repeats
+            for run_idx in range(total_runs):
+                measured = run_idx >= args.warmup
+                try:
+                    request_id, list_sample = measured_tool_call(
+                        proc,
+                        request_id,
+                        args.timeout_seconds,
+                        "list_sessions",
+                        dict(list_sessions_args),
+                    )
+                    if first_list_session_open_id(list_sample["structured"]) is None and measured:
+                        failures.append("list_sessions returned no open.session_id")
+                    if measured:
+                        sample = dict(list_sample)
+                        sample.pop("structured", None)
+                        samples.append(sample)
+                except Exception as exc:
+                    if measured:
+                        failures.append(f"list_sessions run={run_idx}: {exc}")
+
     except Exception as exc:
         failures.append(str(exc))
     finally:
@@ -642,6 +773,7 @@ def main() -> int:
             "repeats": args.repeats,
             "n_hits": args.n_hits,
             "open_kinds": open_kinds,
+            "list_sessions_args": list_sessions_args,
             "min_docs": args.min_docs,
             "moraine_bin": args.moraine_bin,
             "service_bin_dir": service_bin_dir,

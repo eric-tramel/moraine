@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 pub mod contract;
+mod list_sessions_v1;
 mod open_v1;
 mod search_sessions_v1;
 
@@ -173,7 +174,7 @@ impl AppState {
                 },
                 {
                     "name": contract::OPEN_TOOL,
-                    "description": "Open a Moraine MCP ID returned by search_sessions or open. Accepts session, turn, and event IDs.",
+                    "description": "Open a Moraine MCP ID returned by search_sessions, list_sessions, or open. Accepts session, turn, and event IDs.",
                     "inputSchema": {
                         "type": "object",
                         "additionalProperties": false,
@@ -203,6 +204,64 @@ impl AppState {
                     "annotations": {
                         "readOnlyHint": true
                     }
+                },
+                {
+                    "name": contract::LIST_SESSIONS_TOOL,
+                    "description": "List Moraine sessions that overlap a start/end datetime range. Returns typed session IDs, compact metadata, pagination, and open handles. Use this for metadata browsing by time; use search_sessions for content search and open to inspect a selected session.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "start_datetime": {
+                                "type": "string",
+                                "description": "Inclusive lower bound for session activity. Must be RFC 3339 / ISO 8601 with an explicit timezone, for example 2026-04-30T09:00:00-04:00 or 2026-04-30T13:00:00Z."
+                            },
+                            "end_datetime": {
+                                "type": "string",
+                                "description": "Exclusive upper bound for session activity. Must be RFC 3339 / ISO 8601 with an explicit timezone and later than start_datetime."
+                            },
+                            "limit": {
+                                "type": ["integer", "null"],
+                                "minimum": contract::LIST_SESSIONS_MIN_LIMIT,
+                                "maximum": self.cfg.mcp.max_results.max(contract::LIST_SESSIONS_MIN_LIMIT),
+                                "default": contract::LIST_SESSIONS_DEFAULT_LIMIT.min(self.cfg.mcp.max_results.max(contract::LIST_SESSIONS_MIN_LIMIT))
+                            },
+                            "cursor": {
+                                "type": ["string", "null"],
+                                "description": "Opaque cursor from a previous list_sessions response with the same filter and sort values."
+                            },
+                            "mode": {
+                                "type": ["string", "null"],
+                                "enum": ["web_search", "mcp_internal", "tool_calling", "chat", null],
+                                "description": "Optional session mode filter."
+                            },
+                            "sort": {
+                                "type": ["string", "null"],
+                                "enum": ["desc", "asc", null],
+                                "default": "desc",
+                                "description": "Sort order by session updated_at and session ID."
+                            }
+                        },
+                        "required": ["start_datetime", "end_datetime"]
+                    },
+                    "outputSchema": {
+                        "type": "object",
+                        "required": ["schema_version", "tool", "request", "data", "warnings", "performance"],
+                        "properties": {
+                            "schema_version": { "type": "string" },
+                            "tool": { "const": contract::LIST_SESSIONS_TOOL },
+                            "request": { "type": "object" },
+                            "data": {
+                                "type": "object",
+                                "required": ["result_count", "limit", "truncated", "sessions", "next_cursor"]
+                            },
+                            "warnings": { "type": "array" },
+                            "performance": { "type": "object" }
+                        }
+                    },
+                    "annotations": {
+                        "readOnlyHint": true
+                    }
                 }
             ]
         })
@@ -211,6 +270,7 @@ impl AppState {
     async fn call_tool(&self, params: ToolCallParams) -> Result<Value> {
         match params.name.as_str() {
             contract::SEARCH_SESSIONS_TOOL => self.search_sessions_v1(params.arguments).await,
+            contract::LIST_SESSIONS_TOOL => self.list_sessions_v1(params.arguments).await,
             contract::OPEN_TOOL => self.open_v1(params.arguments).await,
             other => Err(anyhow!("unknown tool: {other}")),
         }
@@ -334,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_publishes_two_tool_search_surface_with_output_schemas() {
+    fn tools_list_publishes_mcp_search_surface_with_output_schemas() {
         let state = test_state();
         let payload = state.tools_list_result();
         let tools = payload["tools"].as_array().expect("tools array");
@@ -343,9 +403,9 @@ mod tests {
             .filter_map(|tool| tool["name"].as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(names, ["search_sessions", "open"]);
+        assert_eq!(names, ["search_sessions", "open", "list_sessions"]);
 
-        for tool_name in ["search_sessions", "open"] {
+        for tool_name in ["search_sessions", "open", "list_sessions"] {
             let tool = tools
                 .iter()
                 .find(|tool| tool["name"].as_str() == Some(tool_name))
@@ -386,6 +446,33 @@ mod tests {
                 .get("evidence_policy")
                 .is_none(),
             "search_sessions should not advertise legacy evidence policy controls"
+        );
+
+        let list_sessions = tools
+            .iter()
+            .find(|tool| tool["name"].as_str() == Some("list_sessions"))
+            .expect("list_sessions exists");
+        assert_eq!(
+            list_sessions["inputSchema"]["required"],
+            json!(["start_datetime", "end_datetime"])
+        );
+        assert_eq!(
+            list_sessions["inputSchema"]["additionalProperties"],
+            json!(false)
+        );
+        assert_eq!(
+            list_sessions["inputSchema"]["properties"]["sort"]["default"],
+            json!("desc")
+        );
+        assert_eq!(
+            list_sessions["outputSchema"]["properties"]["data"]["required"],
+            json!([
+                "result_count",
+                "limit",
+                "truncated",
+                "sessions",
+                "next_cursor"
+            ])
         );
     }
 }

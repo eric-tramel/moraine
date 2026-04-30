@@ -1,10 +1,10 @@
 # MCP Search Interface Specification
 
-This document specifies the desired behavior for Moraine's two primary MCP
-retrieval tools:
+This document specifies the desired behavior for Moraine's MCP retrieval tools:
 
 - `search_sessions`
 - `open`
+- `list_sessions`
 
 The scope of this document is the external interface contract: accepted inputs,
 output shapes, response behavior, errors, performance targets, and success
@@ -62,9 +62,9 @@ event:evt_01J9Q3Q2C4TD9K7F8M1N5R6P2A
 ```
 
 Implementations must return stable IDs for the lifetime of the indexed session
-data. An ID returned by `search_sessions` or `open` must be accepted by `open`
-unless the underlying session data has been deleted or the index has been
-rebuilt with incompatible IDs.
+data. An ID returned by `search_sessions`, `list_sessions`, or `open` must be
+accepted by `open` unless the underlying session data has been deleted or the
+index has been rebuilt with incompatible IDs.
 
 ### Time Format
 
@@ -732,6 +732,88 @@ Unsupported event type:
 }
 ```
 
+## Tool: `list_sessions`
+
+### Purpose
+
+`list_sessions` lists sessions that overlap a caller-supplied datetime range.
+Use it for metadata browsing by time; use `search_sessions` for content search
+and `open` to inspect a selected session.
+
+### Request Schema
+
+```json
+{
+  "start_datetime": "2026-04-30T09:00:00-04:00",
+  "end_datetime": "2026-04-30T13:00:00-04:00",
+  "limit": 20,
+  "cursor": null,
+  "mode": null,
+  "sort": "desc"
+}
+```
+
+Rules:
+
+- `start_datetime` is inclusive and `end_datetime` is exclusive.
+- Datetimes must be RFC 3339 / ISO 8601 strings with an explicit timezone
+  offset or `Z`.
+- Sessions match when `updated_at >= start_datetime` and
+  `started_at < end_datetime`.
+- `mode`, when present, is one of `web_search`, `mcp_internal`,
+  `tool_calling`, or `chat`.
+- `sort` is `desc` or `asc`, ordered by session `updated_at` and session ID.
+
+### Response Shape
+
+Successful responses use `moraine.mcp.list_sessions.v1` and return compact
+session metadata only:
+
+```json
+{
+  "schema_version": "moraine.mcp.list_sessions.v1",
+  "tool": "list_sessions",
+  "request": {},
+  "data": {
+    "result_count": 1,
+    "limit": 20,
+    "truncated": false,
+    "sessions": [
+      {
+        "rank": 1,
+        "id": "session:c2Vzcy0x",
+        "session": {
+          "id": "session:c2Vzcy0x",
+          "title": "Build failure triage",
+          "source": "codex",
+          "started_at": "2026-04-30T13:00:00.000Z",
+          "updated_at": "2026-04-30T13:10:00.000Z",
+          "completed": true,
+          "turn_count": 3,
+          "event_count": 17,
+          "mode": "tool_calling",
+          "session_slug": "build-failure",
+          "session_summary": "Build failure triage."
+        },
+        "open": {
+          "session_id": "session:c2Vzcy0x"
+        }
+      }
+    ],
+    "next_cursor": null
+  },
+  "warnings": [],
+  "performance": {
+    "elapsed_ms": 42,
+    "sla_target_ms": 300,
+    "met_sla": true
+  }
+}
+```
+
+`list_sessions` must not return event snippets, transcript text, or event
+payloads. To inspect a listed session, pass `open.session_id` to `open`.
+
 ## Tool: `open`
 
 ### Purpose
@@ -761,7 +843,8 @@ open({
 
 - Required.
 - Must be a string.
-- Must be a valid Moraine MCP ID returned by `search_sessions` or `open`.
+- Must be a valid Moraine MCP ID returned by `search_sessions`,
+  `list_sessions`, or `open`.
 - May refer to a session, turn, or event.
 
 Invalid inputs:
@@ -1560,6 +1643,22 @@ Missing object:
 | `n_hits > 50` | Return `invalid_request`. |
 | non-integer `n_hits` | Return `invalid_request`. |
 
+### `list_sessions`
+
+| Input combination | Expected behavior |
+|---|---|
+| `start_datetime` + `end_datetime` | List sessions overlapping the datetime range with defaults. |
+| range + `limit` | Return at most `limit` sessions. |
+| range + `cursor` | Return the next deterministic page for the same filter and sort. |
+| range + `mode` | Return only sessions with that mode. |
+| range + `sort=asc` | Return oldest matching sessions first by `updated_at`, then ID. |
+| missing datetime | Return `invalid_request`. |
+| datetime without timezone | Return `invalid_request`. |
+| `end_datetime <= start_datetime` | Return `invalid_request`. |
+| unknown field | Return `invalid_request`. |
+| invalid `mode` or `sort` | Return `invalid_request`. |
+| cursor with changed filter or sort | Return `invalid_request`. |
+
 ### `open`
 
 | Input combination | Expected behavior |
@@ -1582,6 +1681,7 @@ Required traversal paths:
 - Search hit to event: `search_sessions(...).data.results[].open.event_id`
 - Search hit to turn: `search_sessions(...).data.results[].open.turn_id`
 - Search hit to session: `search_sessions(...).data.results[].open.session_id`
+- Listed session to session: `list_sessions(...).data.sessions[].open.session_id`
 - Event to parent turn: `open(event).data.traversal.turn_id`
 - Event to parent session: `open(event).data.traversal.session_id`
 - Event to adjacent event: `open(event).data.traversal.previous_event_id` and
@@ -1640,6 +1740,24 @@ Deadline:
 - `search_sessions` should return a response or `deadline_exceeded` within
   5 seconds for warm-path requests up to 1M searchable documents.
 
+### `list_sessions` Targets
+
+For metadata-only requests with `limit <= 50`:
+
+| Scenario | P50 | P95 | P99 | Deadline |
+|---|---:|---:|---:|---:|
+| Typical window, <= 5k matching sessions | <= 50 ms | <= 300 ms | <= 750 ms | 2 s |
+| Broad window, <= 100k matching sessions | <= 200 ms | <= 1000 ms | <= 2000 ms | 3 s |
+| Single-mode filtered window, <= 100k matching sessions | <= 250 ms | <= 1200 ms | <= 2500 ms | 3 s |
+
+`list_sessions` should use session metadata or summary tables, avoid event text
+search, always enforce `limit`, and return a normal response or
+`deadline_exceeded` by the applicable deadline.
+
+The response `performance.sla_target_ms` advertises the applicable target:
+300 ms for typical metadata browse requests, 1000 ms for broad unfiltered
+windows, and 1200 ms for broad single-mode filtered windows.
+
 ### `open` Targets
 
 | Request | P50 | P95 | P99 |
@@ -1679,11 +1797,26 @@ An implementation is successful when:
 - Empty result sets return success with `results: []`.
 - Performance meets the `search_sessions` SLA for the target corpus sizes.
 
+### `list_sessions`
+
+An implementation is successful when:
+
+- Valid requests return sessions overlapping the requested datetime range.
+- Boundary behavior is inclusive at `start_datetime` and exclusive at
+  `end_datetime`.
+- Results are sorted deterministically and cursor-paginated.
+- Each session includes a typed session ID accepted by `open`.
+- The response contains compact metadata and no event snippets, event payloads,
+  or transcript text.
+- Invalid ranges, unknown fields, bad cursors, invalid modes, and invalid sort
+  values produce the specified errors.
+- Performance meets the `list_sessions` SLA for target corpus sizes.
+
 ### `open`
 
 An implementation is successful when:
 
-- `open` accepts every ID returned by `search_sessions`.
+- `open` accepts every ID returned by `search_sessions` and `list_sessions`.
 - Session IDs return session metadata and all known turn summaries.
 - Turn IDs return turn metadata, compact summaries, all known event summaries,
   and traversal references.
@@ -1707,7 +1840,8 @@ workflow:
 4. Call `open` on the parent session ID to inspect the broader session.
 5. Traverse adjacent events or turns using IDs returned by `open`.
 
-This workflow should not require any additional MCP tools.
+For time-window discovery, the agent can call `list_sessions`, select a
+returned `open.session_id`, and then call `open`.
 
 ## Explicit Non-Goals
 

@@ -66,8 +66,8 @@ moraine "for real", stop; use `install.sh` instead.
 Code CLI inside the container (headless, `--dangerously-skip-permissions`),
 and drives the `/agent-smoke-e2e` skill at
 [`.claude/skills/agent-smoke-e2e/SKILL.md`](../../../.claude/skills/agent-smoke-e2e/SKILL.md).
-The skill exercises the public two-tool retrieval workflow
-(`search_sessions` and `open`) and emits a pass/fail matrix.
+The skill exercises the public retrieval workflow (`search_sessions`, `open`,
+and `list_sessions`) and emits a pass/fail matrix.
 
 The driver runs the skill **three times** — once each against Opus 4.7,
 Sonnet 4.6, and Haiku 4.5 — sharing a single sandbox boot. Each model gets

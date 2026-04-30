@@ -15,6 +15,15 @@ pub struct ConversationCursor {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpSessionListCursor {
+    pub last_event_unix_ms: i64,
+    pub session_id: String,
+    pub filter_sig: String,
+    #[serde(default)]
+    pub sort: ConversationListSort,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnCursor {
     pub last_turn_seq: u32,
     pub session_id: String,

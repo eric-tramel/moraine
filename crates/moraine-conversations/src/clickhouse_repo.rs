@@ -14,19 +14,21 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::cursor::{
-    decode_cursor, encode_cursor, ConversationCursor, SessionEventCursor, TurnCursor,
+    decode_cursor, encode_cursor, ConversationCursor, McpSessionListCursor, SessionEventCursor,
+    TurnCursor,
 };
 use crate::domain::{
     is_user_facing_content_event, Conversation, ConversationDetailOptions, ConversationListFilter,
     ConversationListSort, ConversationMode, ConversationSearchHit, ConversationSearchQuery,
     ConversationSearchResults, ConversationSearchStats, ConversationSummary, McpEventOpen,
-    McpEventRef, McpEventSummary, McpEventType, McpSessionOpen, McpTurnCompact, McpTurnOpen,
-    McpTurnRef, OpenContext, OpenEvent, OpenEventRequest, Page, PageRequest, RepoConfig,
-    SearchEventHit, SearchEventKind, SearchEventsQuery, SearchEventsResult, SearchEventsStats,
-    SearchEventsStrategy, SearchMcpEventHit, SearchMcpEventsQuery, SearchMcpEventsResult,
-    SearchMcpEventsStats, SessionEventsDirection, SessionEventsQuery, SessionMetadata,
-    SessionMetadataSearchHit, SessionMetadataSearchQuery, SessionMetadataSearchResults,
-    SessionMetadataSearchStats, TraceEvent, Turn, TurnListFilter, TurnSummary,
+    McpEventRef, McpEventSummary, McpEventType, McpSessionListFilter, McpSessionListItem,
+    McpSessionOpen, McpTurnCompact, McpTurnOpen, McpTurnRef, OpenContext, OpenEvent,
+    OpenEventRequest, Page, PageRequest, RepoConfig, SearchEventHit, SearchEventKind,
+    SearchEventsQuery, SearchEventsResult, SearchEventsStats, SearchEventsStrategy,
+    SearchMcpEventHit, SearchMcpEventsQuery, SearchMcpEventsResult, SearchMcpEventsStats,
+    SessionEventsDirection, SessionEventsQuery, SessionMetadata, SessionMetadataSearchHit,
+    SessionMetadataSearchQuery, SessionMetadataSearchResults, SessionMetadataSearchStats,
+    TraceEvent, Turn, TurnListFilter, TurnSummary,
 };
 use crate::error::{RepoError, RepoResult};
 use crate::repo::ConversationRepository;
@@ -99,6 +101,27 @@ struct SessionMetadataRow {
     last_event_uid: String,
     #[serde(default)]
     last_actor_role: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct McpSessionListRow {
+    session_id: String,
+    first_event_time: String,
+    first_event_unix_ms: i64,
+    last_event_time: String,
+    last_event_unix_ms: i64,
+    total_turns: u32,
+    total_events: u64,
+    mode: String,
+    completed: u8,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    session_slug: String,
+    #[serde(default)]
+    session_summary: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -830,7 +853,7 @@ impl ClickHouseConversationRepository {
       OR (payload_type = 'tool_use' AND tool_name IN ('WebSearch', 'WebFetch'))
     ) > 0,
     'web_search',
-    countIf(source_name = 'codex-mcp' OR lowerUTF8(tool_name) IN ('search', 'open')) > 0,
+    countIf(source_name = 'codex-mcp' OR lowerUTF8(tool_name) IN ('search', 'open', 'list_sessions')) > 0,
     'mcp_internal',
     countIf(event_kind IN ('tool_call', 'tool_result') OR payload_type = 'tool_use') > 0,
     'tool_calling',
@@ -855,6 +878,19 @@ GROUP BY session_id"
             "from={:?};to={:?};mode={};sort={}",
             filter.from_unix_ms,
             filter.to_unix_ms,
+            filter
+                .mode
+                .map(ConversationMode::as_str)
+                .unwrap_or("__none__"),
+            filter.sort.as_str(),
+        )
+    }
+
+    fn mcp_session_list_filter_sig(filter: &McpSessionListFilter) -> String {
+        format!(
+            "start={};end={};mode={};sort={}",
+            filter.start_unix_ms,
+            filter.end_unix_ms,
             filter
                 .mode
                 .map(ConversationMode::as_str)
@@ -897,6 +933,15 @@ GROUP BY session_id"
                     "from_unix_ms must be strictly less than to_unix_ms",
                 ));
             }
+        }
+        Ok(())
+    }
+
+    fn validate_required_time_bounds(start_unix_ms: i64, end_unix_ms: i64) -> RepoResult<()> {
+        if start_unix_ms >= end_unix_ms {
+            return Err(RepoError::invalid_argument(
+                "start_unix_ms must be strictly less than end_unix_ms",
+            ));
         }
         Ok(())
     }
@@ -1374,6 +1419,24 @@ GROUP BY session_id"
             tool_calls: row.tool_calls,
             tool_results: row.tool_results,
             mode: Self::parse_mode(&row.mode),
+            session_slug: non_empty_string(row.session_slug),
+            session_summary: non_empty_string(row.session_summary),
+        }
+    }
+
+    fn map_mcp_session_list_row(row: McpSessionListRow) -> McpSessionListItem {
+        McpSessionListItem {
+            session_id: row.session_id,
+            first_event_time: row.first_event_time,
+            first_event_unix_ms: row.first_event_unix_ms,
+            last_event_time: row.last_event_time,
+            last_event_unix_ms: row.last_event_unix_ms,
+            total_turns: row.total_turns,
+            total_events: row.total_events,
+            mode: Self::parse_mode(&row.mode),
+            completed: row.completed != 0,
+            title: non_empty_string(row.title),
+            source: non_empty_string(row.source),
             session_slug: non_empty_string(row.session_slug),
             session_summary: non_empty_string(row.session_summary),
         }
@@ -2193,6 +2256,7 @@ FORMAT JSONEachRow",
             event.source_name == "codex-mcp"
                 || event.event.name.eq_ignore_ascii_case("search")
                 || event.event.name.eq_ignore_ascii_case("open")
+                || event.event.name.eq_ignore_ascii_case("list_sessions")
         }) {
             return ConversationMode::McpInternal;
         }
@@ -2599,7 +2663,8 @@ GROUP BY t.event_uid)"
                     "positionCaseInsensitiveUTF8(d.payload_json, 'codex-mcp') = 0".to_string(),
                 );
             }
-            where_clauses.push("lowerUTF8(d.name) NOT IN ('search', 'open')".to_string());
+            where_clauses
+                .push("lowerUTF8(d.name) NOT IN ('search', 'open', 'list_sessions')".to_string());
         }
 
         let where_sql = where_clauses.join("\n  AND ");
@@ -2976,7 +3041,10 @@ FORMAT JSONEachRow",
             if row.has_codex_mcp != 0 {
                 return false;
             }
-            if row.name.eq_ignore_ascii_case("search") || row.name.eq_ignore_ascii_case("open") {
+            if row.name.eq_ignore_ascii_case("search")
+                || row.name.eq_ignore_ascii_case("open")
+                || row.name.eq_ignore_ascii_case("list_sessions")
+            {
                 return false;
             }
         }
@@ -3833,7 +3901,8 @@ FORMAT JSONEachRow",
 
         if exclude_codex_mcp {
             postings_filters.push("p.source_name != 'codex-mcp'".to_string());
-            postings_filters.push("lowerUTF8(p.name) NOT IN ('search', 'open')".to_string());
+            postings_filters
+                .push("lowerUTF8(p.name) NOT IN ('search', 'open', 'list_sessions')".to_string());
         }
 
         if let Some(candidate_session_ids) = candidate_session_ids {
@@ -4918,6 +4987,185 @@ FORMAT JSONEachRow",
         let next_cursor = if rows.len() > limit as usize {
             if let Some(last) = items.last() {
                 Some(encode_cursor(&ConversationCursor {
+                    last_event_unix_ms: last.last_event_unix_ms,
+                    session_id: last.session_id.clone(),
+                    filter_sig,
+                    sort,
+                })?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        Ok(Page {
+            items: std::mem::take(&mut items),
+            next_cursor,
+        })
+    }
+
+    async fn list_mcp_sessions(
+        &self,
+        filter: McpSessionListFilter,
+        page: PageRequest,
+    ) -> RepoResult<Page<McpSessionListItem>> {
+        Self::validate_required_time_bounds(filter.start_unix_ms, filter.end_unix_ms)?;
+
+        let limit = page.normalized_limit(self.cfg.max_results);
+        let filter_sig = Self::mcp_session_list_filter_sig(&filter);
+        let sort = filter.sort;
+
+        let cursor = if let Some(token) = page.cursor.as_deref() {
+            let cursor: McpSessionListCursor = decode_cursor(token)?;
+            if cursor.filter_sig != filter_sig {
+                return Err(RepoError::invalid_cursor(
+                    "cursor does not match current list_sessions filter",
+                ));
+            }
+            if cursor.sort != sort {
+                return Err(RepoError::invalid_cursor(
+                    "cursor sort does not match requested sort order",
+                ));
+            }
+            Some(cursor)
+        } else {
+            None
+        };
+
+        let session_summary = self.table_ref("v_session_summary");
+        let events_table = self.table_ref("events");
+        let mode_subquery = self.mode_subquery();
+
+        let mut where_clauses = vec![
+            format!(
+                "toUnixTimestamp64Milli(s.last_event_time) >= {}",
+                filter.start_unix_ms
+            ),
+            format!(
+                "toUnixTimestamp64Milli(s.first_event_time) < {}",
+                filter.end_unix_ms
+            ),
+        ];
+        if let Some(mode_clause) = Self::mode_filter_clause(filter.mode) {
+            where_clauses.push(mode_clause);
+        }
+
+        if let Some(cursor) = &cursor {
+            let (time_cmp, session_cmp) = match sort {
+                ConversationListSort::Desc => ("<", "<"),
+                ConversationListSort::Asc => (">", ">"),
+            };
+            where_clauses.push(format!(
+                "(toUnixTimestamp64Milli(s.last_event_time) {time_cmp} {} OR (toUnixTimestamp64Milli(s.last_event_time) = {} AND s.session_id {session_cmp} {}))",
+                cursor.last_event_unix_ms,
+                cursor.last_event_unix_ms,
+                sql_quote(&cursor.session_id)
+            ));
+        }
+
+        let where_sql = where_clauses.join("\n  AND ");
+        let order_dir = match sort {
+            ConversationListSort::Desc => "DESC",
+            ConversationListSort::Asc => "ASC",
+        };
+
+        let query = format!(
+            "SELECT
+  s.session_id AS session_id,
+  toString(s.first_event_time) AS first_event_time,
+  toInt64(toUnixTimestamp64Milli(s.first_event_time)) AS first_event_unix_ms,
+  toString(s.last_event_time) AS last_event_time,
+  toInt64(toUnixTimestamp64Milli(s.last_event_time)) AS last_event_unix_ms,
+  toUInt32(s.total_turns) AS total_turns,
+  toUInt64(s.total_events) AS total_events,
+  ifNull(m.mode, 'chat') AS mode,
+  toUInt8(
+    ifNull(status.latest_terminal_turn_seq, toUInt32(0)) = toUInt32(s.total_turns)
+    AND ifNull(status.latest_terminal_payload_type, '') = 'task_complete'
+  ) AS completed,
+  ifNull(meta.title, '') AS title,
+  ifNull(meta.source, '') AS source,
+  ifNull(meta.session_slug, '') AS session_slug,
+  ifNull(meta.session_summary, '') AS session_summary
+FROM {session_summary} AS s
+LEFT JOIN ({mode_subquery}) AS m ON m.session_id = s.session_id
+LEFT JOIN (
+  SELECT
+    session_id,
+    maxIf(toUInt32(turn_index), payload_type IN ('task_complete', 'turn_aborted')) AS latest_terminal_turn_seq,
+    ifNull(
+      argMaxIf(payload_type, tuple(event_ts, event_uid), payload_type IN ('task_complete', 'turn_aborted')),
+      ''
+    ) AS latest_terminal_payload_type
+  FROM {events_table}
+  GROUP BY session_id
+) AS status ON status.session_id = s.session_id
+LEFT JOIN (
+  SELECT
+    session_id,
+    ifNull(
+      argMax(
+        coalesce(
+          nullIf(JSONExtractString(payload_json, 'title'), ''),
+          nullIf(JSONExtractString(payload_json, 'name'), ''),
+          nullIf(JSONExtractString(payload_json, 'summary'), '')
+        ),
+        tuple(event_ts, event_uid)
+      ),
+      ''
+    ) AS title,
+    ifNull(
+      argMax(
+        coalesce(
+          nullIf(JSONExtractString(payload_json, 'source'), ''),
+          nullIf(source_name, '')
+        ),
+        tuple(event_ts, event_uid)
+      ),
+      ''
+    ) AS source,
+    ifNull(argMax(nullIf(JSONExtractString(payload_json, 'slug'), ''), tuple(event_ts, event_uid)), '') AS session_slug,
+    ifNull(
+      argMax(
+        coalesce(
+          nullIf(JSONExtractString(payload_json, 'summary'), ''),
+          nullIf(JSONExtractString(payload_json, 'title'), ''),
+          nullIf(JSONExtractString(payload_json, 'name'), '')
+        ),
+        tuple(event_ts, event_uid)
+      ),
+      ''
+    ) AS session_summary
+  FROM {events_table}
+  WHERE event_kind = 'session_meta'
+  GROUP BY session_id
+) AS meta ON meta.session_id = s.session_id
+WHERE {where_sql}
+ORDER BY s.last_event_time {order_dir}, s.session_id {order_dir}
+LIMIT {limit_plus}
+FORMAT JSONEachRow",
+            session_summary = session_summary,
+            events_table = events_table,
+            mode_subquery = mode_subquery,
+            where_sql = where_sql,
+            order_dir = order_dir,
+            limit_plus = (limit as usize) + 1,
+        );
+
+        let rows: Vec<McpSessionListRow> =
+            self.map_backend(self.ch.query_rows(&query, None).await)?;
+
+        let mut items: Vec<McpSessionListItem> = rows
+            .iter()
+            .take(limit as usize)
+            .cloned()
+            .map(Self::map_mcp_session_list_row)
+            .collect();
+
+        let next_cursor = if rows.len() > limit as usize {
+            if let Some(last) = items.last() {
+                Some(encode_cursor(&McpSessionListCursor {
                     last_event_unix_ms: last.last_event_unix_ms,
                     session_id: last.session_id.clone(),
                     filter_sig,
