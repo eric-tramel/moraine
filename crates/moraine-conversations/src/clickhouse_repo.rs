@@ -181,13 +181,21 @@ struct TraceEventRow {
     actor_role: String,
     event_class: String,
     payload_type: String,
+    #[serde(default)]
     call_id: String,
+    #[serde(default)]
     name: String,
+    #[serde(default)]
     phase: String,
+    #[serde(default)]
     item_id: String,
+    #[serde(default)]
     source_ref: String,
+    #[serde(default)]
     text_content: String,
+    #[serde(default)]
     payload_json: String,
+    #[serde(default)]
     token_usage_json: String,
     #[serde(default)]
     endpoint_kind: String,
@@ -1832,8 +1840,14 @@ FORMAT JSONEachRow",
         Ok(rows.into_iter().map(Self::map_trace_event).collect())
     }
 
-    async fn load_events_for_session(&self, session_id: &str) -> RepoResult<Vec<TraceEvent>> {
+    async fn load_compact_events_for_turn(
+        &self,
+        session_id: &str,
+        turn_seq: u32,
+    ) -> RepoResult<Vec<TraceEvent>> {
         let trace_table = self.table_ref("v_conversation_trace");
+        let text_limit = usize::from(self.cfg.preview_chars).max(4);
+        let payload_limit = text_limit.saturating_mul(2);
         let query = format!(
             "SELECT
   session_id,
@@ -1849,17 +1863,53 @@ FORMAT JSONEachRow",
   phase,
   item_id,
   source_ref,
-  text_content,
-  payload_json,
-  token_usage_json,
-  endpoint_kind,
-  token_usage_buckets,
-  token_usage_native_units
+  {text_preview_expr} AS text_content,
+  {payload_preview_expr} AS payload_json
+FROM {trace_table}
+WHERE session_id = {} AND turn_seq = {}
+ORDER BY event_order ASC
+FORMAT JSONEachRow",
+            sql_quote(session_id),
+            turn_seq,
+            text_preview_expr = truncated_utf8_sql("text_content", text_limit),
+            payload_preview_expr = truncated_utf8_sql("payload_json", payload_limit),
+        );
+
+        let rows: Vec<TraceEventRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
+        Ok(rows.into_iter().map(Self::map_trace_event).collect())
+    }
+
+    async fn load_compact_events_for_session(
+        &self,
+        session_id: &str,
+    ) -> RepoResult<Vec<TraceEvent>> {
+        let trace_table = self.table_ref("v_conversation_trace");
+        let text_limit = usize::from(self.cfg.preview_chars).max(4);
+        let payload_limit = text_limit.saturating_mul(2);
+        let query = format!(
+            "SELECT
+  session_id,
+  event_uid,
+  toUInt64(event_order) AS event_order,
+  toUInt32(turn_seq) AS turn_seq,
+  toString(event_time) AS event_time,
+  actor_role,
+  event_class,
+  payload_type,
+  call_id,
+  name,
+  phase,
+  item_id,
+  source_ref,
+  {text_preview_expr} AS text_content,
+  {payload_preview_expr} AS payload_json
 FROM {trace_table}
 WHERE session_id = {}
 ORDER BY event_order ASC
 FORMAT JSONEachRow",
             sql_quote(session_id),
+            text_preview_expr = truncated_utf8_sql("text_content", text_limit),
+            payload_preview_expr = truncated_utf8_sql("payload_json", payload_limit),
         );
 
         let rows: Vec<TraceEventRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
@@ -4536,7 +4586,7 @@ FORMAT JSONEachRow",
         let (session_info, turn_summaries, events) = tokio::try_join!(
             self.load_mcp_session_info(session_id),
             self.load_turns_for_session(session_id),
-            self.load_events_for_session(session_id),
+            self.load_compact_events_for_session(session_id),
         )?;
         let mut events_by_turn = BTreeMap::<u32, Vec<TraceEvent>>::new();
         for event in events {
@@ -4690,7 +4740,7 @@ FORMAT JSONEachRow",
             return Ok(None);
         };
         let (events, previous_turn, next_turn) = tokio::try_join!(
-            self.load_events_for_turn(session_id, turn_seq),
+            self.load_compact_events_for_turn(session_id, turn_seq),
             self.load_adjacent_turn_ref(session_id, turn_seq, true),
             self.load_adjacent_turn_ref(session_id, turn_seq, false),
         )?;
@@ -5740,6 +5790,14 @@ fn sql_quote(value: &str) -> String {
 
 fn sql_identifier(value: &str) -> String {
     format!("`{}`", value.replace('`', "``"))
+}
+
+fn truncated_utf8_sql(column: &str, max_chars: usize) -> String {
+    let max_chars = max_chars.max(4);
+    let prefix_chars = max_chars.saturating_sub(3);
+    format!(
+        "if(lengthUTF8({column}) > {max_chars}, concat(leftUTF8({column}, {prefix_chars}), '...'), {column})"
+    )
 }
 
 fn sql_array_strings(items: &[String]) -> String {
