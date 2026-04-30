@@ -1117,6 +1117,18 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
         }
 
         if query.contains("FROM `moraine`.`v_conversation_trace`")
+            && query.contains("WHERE event_uid = 'evt-open-full'")
+            && query.contains("ORDER BY event_order DESC")
+        {
+            return (
+                StatusCode::OK,
+                json_each_row(json!([
+                    trace_event_row("sess-event", "evt-open-full", 2, 1, "assistant", "message", "text", "This is the full available event content that must not be clipped by the repository open model.", "{\"text\":\"This is the full payload JSON value that must also remain intact\",\"nested\":{\"answer\":42}}", "", "")
+                ])),
+            );
+        }
+
+        if query.contains("FROM `moraine`.`v_conversation_trace`")
             && query.contains("WHERE session_id = 'sess-event' AND event_order = 2")
             && query.contains("event_uid = 'evt-open-full'")
         {

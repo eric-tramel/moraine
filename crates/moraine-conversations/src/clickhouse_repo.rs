@@ -1736,6 +1736,41 @@ FORMAT JSONEachRow",
         Ok(rows.into_iter().next().map(Self::map_turn_row))
     }
 
+    async fn load_event_by_uid(&self, event_uid: &str) -> RepoResult<Option<TraceEvent>> {
+        let trace_table = self.table_ref("v_conversation_trace");
+        let query = format!(
+            "SELECT
+  session_id,
+  event_uid,
+  toUInt64(event_order) AS event_order,
+  toUInt32(turn_seq) AS turn_seq,
+  toString(event_time) AS event_time,
+  actor_role,
+  event_class,
+  payload_type,
+  call_id,
+  name,
+  phase,
+  item_id,
+  source_ref,
+  text_content,
+  payload_json,
+  token_usage_json,
+  endpoint_kind,
+  token_usage_buckets,
+  token_usage_native_units
+FROM {trace_table}
+WHERE event_uid = {}
+ORDER BY event_order DESC
+LIMIT 1
+FORMAT JSONEachRow",
+            sql_quote(event_uid),
+        );
+
+        let rows: Vec<TraceEventRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
+        Ok(rows.into_iter().next().map(Self::map_trace_event))
+    }
+
     async fn load_events_for_turn(
         &self,
         session_id: &str,
@@ -2080,30 +2115,6 @@ FORMAT JSONEachRow",
             "task_complete" => Some(true),
             "turn_aborted" => Some(false),
             _ => None,
-        }
-    }
-
-    fn trace_event_from_open_event(event: OpenEvent) -> TraceEvent {
-        TraceEvent {
-            session_id: event.session_id,
-            event_uid: event.event_uid,
-            event_order: event.event_order,
-            turn_seq: event.turn_seq,
-            event_time: event.event_time,
-            actor_role: event.actor_role,
-            event_class: event.event_class,
-            payload_type: event.payload_type,
-            call_id: event.call_id,
-            name: event.name,
-            phase: event.phase,
-            item_id: event.item_id,
-            source_ref: event.source_ref,
-            text_content: event.text_content,
-            payload_json: event.payload_json,
-            token_usage_json: event.token_usage_json,
-            endpoint_kind: event.endpoint_kind,
-            token_usage_buckets: event.token_usage_buckets,
-            token_usage_native_units: event.token_usage_native_units,
         }
     }
 
@@ -4512,9 +4523,11 @@ FORMAT JSONEachRow",
             return Ok(None);
         };
 
-        let session_info = self.load_mcp_session_info(session_id).await?;
-        let turn_summaries = self.load_turns_for_session(session_id).await?;
-        let events = self.load_events_for_session(session_id).await?;
+        let (session_info, turn_summaries, events) = tokio::try_join!(
+            self.load_mcp_session_info(session_id),
+            self.load_turns_for_session(session_id),
+            self.load_events_for_session(session_id),
+        )?;
         let mut events_by_turn = BTreeMap::<u32, Vec<TraceEvent>>::new();
         for event in events {
             events_by_turn
@@ -4666,13 +4679,11 @@ FORMAT JSONEachRow",
         let Some(summary) = self.load_turn_summary(session_id, turn_seq).await? else {
             return Ok(None);
         };
-        let events = self.load_events_for_turn(session_id, turn_seq).await?;
-        let previous_turn = self
-            .load_adjacent_turn_ref(session_id, turn_seq, true)
-            .await?;
-        let next_turn = self
-            .load_adjacent_turn_ref(session_id, turn_seq, false)
-            .await?;
+        let (events, previous_turn, next_turn) = tokio::try_join!(
+            self.load_events_for_turn(session_id, turn_seq),
+            self.load_adjacent_turn_ref(session_id, turn_seq, true),
+            self.load_adjacent_turn_ref(session_id, turn_seq, false),
+        )?;
 
         Ok(Some(self.mcp_turn_open(
             summary,
@@ -4885,50 +4896,34 @@ FORMAT JSONEachRow",
         }
         Self::validate_event_uid(event_uid)?;
 
-        let context = self
-            .open_event(OpenEventRequest {
-                event_uid: event_uid.to_string(),
-                before: Some(0),
-                after: Some(0),
-                include_system_events: Some(true),
-            })
-            .await?;
-        if !context.found {
-            return Ok(None);
-        }
-
-        let Some(open_event) = context.events.into_iter().find(|event| event.is_target) else {
+        let Some(event) = self.load_event_by_uid(event_uid).await? else {
             return Ok(None);
         };
-        let event = Self::trace_event_from_open_event(open_event);
-
-        let Some(parent_session) = self.load_session_metadata(&event.session_id).await? else {
-            return Ok(None);
-        };
-        let Some(parent_turn) = self
-            .load_turn_summary(&event.session_id, event.turn_seq)
-            .await?
-        else {
-            return Ok(None);
-        };
-
-        let previous_event = self
-            .load_adjacent_event_ref(&event.session_id, event.event_order, &event.event_uid, true)
-            .await?;
-        let next_event = self
-            .load_adjacent_event_ref(
+        let (parent_session, parent_turn, previous_event, next_event, previous_turn, next_turn) = tokio::try_join!(
+            self.load_session_metadata(&event.session_id),
+            self.load_turn_summary(&event.session_id, event.turn_seq),
+            self.load_adjacent_event_ref(
+                &event.session_id,
+                event.event_order,
+                &event.event_uid,
+                true,
+            ),
+            self.load_adjacent_event_ref(
                 &event.session_id,
                 event.event_order,
                 &event.event_uid,
                 false,
-            )
-            .await?;
-        let previous_turn = self
-            .load_adjacent_turn_ref(&event.session_id, event.turn_seq, true)
-            .await?;
-        let next_turn = self
-            .load_adjacent_turn_ref(&event.session_id, event.turn_seq, false)
-            .await?;
+            ),
+            self.load_adjacent_turn_ref(&event.session_id, event.turn_seq, true),
+            self.load_adjacent_turn_ref(&event.session_id, event.turn_seq, false),
+        )?;
+
+        let Some(parent_session) = parent_session else {
+            return Ok(None);
+        };
+        let Some(parent_turn) = parent_turn else {
+            return Ok(None);
+        };
 
         Ok(Some(McpEventOpen {
             event_type: Self::normalized_event_type(
