@@ -33,3 +33,12 @@ local stack.
 
 Read [Configuration](configuration.md) when you need to change watched sources,
 ports, ClickHouse settings, MCP defaults, or runtime paths.
+
+Read [MCP Search Interface Plan](mcp-search-interface-plan.md) for the proposed
+two-tool search and traversal model.
+
+Read [MCP Search Interface Specification](mcp-search-interface-spec.md) for the
+concrete `search_sessions` and `open` tool contracts.
+
+Read [MCP Search Interface Implementation Plan](mcp-search-implementation-plan.md)
+for the current-codebase implementation sequence.

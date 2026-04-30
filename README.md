@@ -14,6 +14,9 @@ change across minor releases.
 - [Introduction](docs/index.md)
 - [Quickstart and Installation](docs/quickstart.md)
 - [Configuration](docs/configuration.md)
+- [MCP Search Interface Plan](docs/mcp-search-interface-plan.md)
+- [MCP Search Interface Specification](docs/mcp-search-interface-spec.md)
+- [MCP Search Interface Implementation Plan](docs/mcp-search-implementation-plan.md)
 
 Build the documentation site with:
 
