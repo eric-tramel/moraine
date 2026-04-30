@@ -55,6 +55,66 @@ fn json_each_row(rows: serde_json::Value) -> String {
     }
 }
 
+fn turn_summary_row(
+    session_id: &str,
+    turn_seq: u32,
+    total_events: u64,
+    user_messages: u64,
+    assistant_messages: u64,
+    tool_calls: u64,
+    tool_results: u64,
+    reasoning_items: u64,
+) -> serde_json::Value {
+    json!({
+        "session_id": session_id,
+        "turn_seq": turn_seq,
+        "turn_id": turn_seq.to_string(),
+        "started_at": format!("2026-02-01 10:{:02}:00", turn_seq),
+        "started_at_unix_ms": 1769940000000_i64 + i64::from(turn_seq) * 60_000,
+        "ended_at": format!("2026-02-01 10:{:02}:30", turn_seq),
+        "ended_at_unix_ms": 1769940030000_i64 + i64::from(turn_seq) * 60_000,
+        "total_events": total_events,
+        "user_messages": user_messages,
+        "assistant_messages": assistant_messages,
+        "tool_calls": tool_calls,
+        "tool_results": tool_results,
+        "reasoning_items": reasoning_items,
+    })
+}
+
+fn trace_event_row(
+    session_id: &str,
+    event_uid: &str,
+    event_order: u64,
+    turn_seq: u32,
+    actor_role: &str,
+    event_class: &str,
+    payload_type: &str,
+    text_content: &str,
+    payload_json: &str,
+    name: &str,
+    call_id: &str,
+) -> serde_json::Value {
+    json!({
+        "session_id": session_id,
+        "event_uid": event_uid,
+        "event_order": event_order,
+        "turn_seq": turn_seq,
+        "event_time": format!("2026-02-01 10:00:{:02}", event_order),
+        "actor_role": actor_role,
+        "event_class": event_class,
+        "payload_type": payload_type,
+        "call_id": call_id,
+        "name": name,
+        "phase": "",
+        "item_id": format!("item-{event_uid}"),
+        "source_ref": format!("/tmp/{session_id}.jsonl:1:{event_order}"),
+        "text_content": text_content,
+        "payload_json": payload_json,
+        "token_usage_json": "{}"
+    })
+}
+
 async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
     async fn handler(
         State(state): State<Arc<MockState>>,
@@ -186,6 +246,56 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
                 );
             }
 
+            if query.contains("WHERE s.session_id = 'sess-open'") {
+                return (
+                    StatusCode::OK,
+                    json_each_row(json!([
+                        {
+                            "session_id": "sess-open",
+                            "first_event_time": "2026-02-01 10:01:00",
+                            "first_event_unix_ms": 1769940060000_i64,
+                            "last_event_time": "2026-02-01 10:02:30",
+                            "last_event_unix_ms": 1769940150000_i64,
+                            "total_turns": 2_u32,
+                            "total_events": 8_u64,
+                            "user_messages": 2_u64,
+                            "assistant_messages": 2_u64,
+                            "tool_calls": 1_u64,
+                            "tool_results": 1_u64,
+                            "mode": "tool_calling",
+                            "first_event_uid": "evt-open-1",
+                            "last_event_uid": "evt-open-8",
+                            "last_actor_role": "system"
+                        }
+                    ])),
+                );
+            }
+
+            if query.contains("WHERE s.session_id = 'sess-event'") {
+                return (
+                    StatusCode::OK,
+                    json_each_row(json!([
+                        {
+                            "session_id": "sess-event",
+                            "first_event_time": "2026-02-01 10:00:01",
+                            "first_event_unix_ms": 1769940001000_i64,
+                            "last_event_time": "2026-02-01 10:00:04",
+                            "last_event_unix_ms": 1769940004000_i64,
+                            "total_turns": 2_u32,
+                            "total_events": 4_u64,
+                            "user_messages": 1_u64,
+                            "assistant_messages": 1_u64,
+                            "tool_calls": 0_u64,
+                            "tool_results": 0_u64,
+                            "mode": "chat",
+                            "first_event_uid": "evt-event-1",
+                            "last_event_uid": "evt-event-4",
+                            "last_actor_role": "assistant"
+                        }
+                    ])),
+                );
+            }
+
             return (
                 StatusCode::OK,
                 json_each_row(json!([
@@ -205,6 +315,26 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
                         "first_event_uid": "evt-c-1",
                         "last_event_uid": "evt-c-42",
                         "last_actor_role": "assistant"
+                    }
+                ])),
+            );
+        }
+
+        if query.contains("FROM `moraine`.`events`")
+            && query.contains("WHERE session_id = 'sess-open'")
+            && query.contains("AS title")
+            && query.contains("AS session_summary")
+        {
+            return (
+                StatusCode::OK,
+                json_each_row(json!([
+                    {
+                        "title": "Open model session",
+                        "source": "codex-source",
+                        "harness": "codex",
+                        "inference_provider": "openai",
+                        "session_slug": "open-model-session",
+                        "session_summary": "Session summary from metadata"
                     }
                 ])),
             );
@@ -510,6 +640,325 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
                         "metadata_text": "{\"summary\":\"Rare summary-only session about metadata discovery.\"}"
                     }
                 ])),
+            );
+        }
+
+        if query.contains("SELECT session_id, event_order, turn_seq")
+            && query.contains("WHERE event_uid = 'evt-open-full'")
+        {
+            return (
+                StatusCode::OK,
+                json_each_row(json!([
+                    {
+                        "session_id": "sess-event",
+                        "event_order": 2_u64,
+                        "turn_seq": 1_u32
+                    }
+                ])),
+            );
+        }
+
+        if query.contains("FROM `moraine`.`v_turn_summary`")
+            && query.contains("WHERE session_id = 'sess-open'")
+            && query.contains("ORDER BY turn_seq ASC")
+        {
+            return (
+                StatusCode::OK,
+                json_each_row(json!([
+                    turn_summary_row("sess-open", 1, 5, 1, 1, 1, 1, 0),
+                    turn_summary_row("sess-open", 2, 3, 1, 1, 0, 0, 0)
+                ])),
+            );
+        }
+
+        if query.contains("FROM `moraine`.`v_conversation_trace`")
+            && query.contains("WHERE session_id = 'sess-open'")
+            && query.contains("ORDER BY event_order ASC")
+            && !query.contains("turn_seq =")
+        {
+            return (
+                StatusCode::OK,
+                json_each_row(json!([
+                    trace_event_row(
+                        "sess-open",
+                        "evt-open-1",
+                        1,
+                        1,
+                        "user",
+                        "message",
+                        "text",
+                        "How should repository open models work?",
+                        "{\"text\":\"How should repository open models work?\"}",
+                        "",
+                        ""
+                    ),
+                    trace_event_row(
+                        "sess-open",
+                        "evt-open-2",
+                        2,
+                        1,
+                        "assistant",
+                        "tool_call",
+                        "function_call",
+                        "",
+                        "{\"name\":\"search_repo\"}",
+                        "search_repo",
+                        "call-search"
+                    ),
+                    trace_event_row(
+                        "sess-open",
+                        "evt-open-3",
+                        3,
+                        1,
+                        "tool",
+                        "tool_result",
+                        "function_call_output",
+                        "repo results",
+                        "{\"result\":\"repo results\"}",
+                        "search_repo",
+                        "call-search"
+                    ),
+                    trace_event_row(
+                        "sess-open",
+                        "evt-open-4",
+                        4,
+                        1,
+                        "assistant",
+                        "message",
+                        "text",
+                        "First answer with repository context.",
+                        "{\"text\":\"First answer with repository context.\"}",
+                        "",
+                        ""
+                    ),
+                    trace_event_row(
+                        "sess-open",
+                        "evt-open-5",
+                        5,
+                        1,
+                        "system",
+                        "event_msg",
+                        "task_complete",
+                        "",
+                        "{\"status\":\"complete\"}",
+                        "",
+                        ""
+                    ),
+                    trace_event_row(
+                        "sess-open",
+                        "evt-open-6",
+                        6,
+                        2,
+                        "user",
+                        "message",
+                        "text",
+                        "Confirm the final shape.",
+                        "{\"text\":\"Confirm the final shape.\"}",
+                        "",
+                        ""
+                    ),
+                    trace_event_row(
+                        "sess-open",
+                        "evt-open-7",
+                        7,
+                        2,
+                        "assistant",
+                        "message",
+                        "text",
+                        "Final response summary text.",
+                        "{\"text\":\"Final response summary text.\"}",
+                        "",
+                        ""
+                    ),
+                    trace_event_row(
+                        "sess-open",
+                        "evt-open-8",
+                        8,
+                        2,
+                        "system",
+                        "event_msg",
+                        "task_complete",
+                        "",
+                        "{\"status\":\"complete\"}",
+                        "",
+                        ""
+                    )
+                ])),
+            );
+        }
+
+        if query.contains("FROM `moraine`.`v_turn_summary`")
+            && query.contains("WHERE session_id = 'sess-incomplete' AND turn_seq = 2")
+            && query.contains("LIMIT 1")
+        {
+            return (
+                StatusCode::OK,
+                json_each_row(json!([turn_summary_row(
+                    "sess-incomplete",
+                    2,
+                    3,
+                    1,
+                    0,
+                    1,
+                    1,
+                    0
+                )])),
+            );
+        }
+
+        if query.contains("FROM `moraine`.`v_conversation_trace`")
+            && query.contains("WHERE session_id = 'sess-incomplete' AND turn_seq = 2")
+            && query.contains("ORDER BY event_order ASC")
+        {
+            return (
+                StatusCode::OK,
+                json_each_row(json!([
+                    trace_event_row(
+                        "sess-incomplete",
+                        "evt-inc-2",
+                        2,
+                        2,
+                        "user",
+                        "message",
+                        "text",
+                        "Run the incomplete workflow.",
+                        "{\"text\":\"Run the incomplete workflow.\"}",
+                        "",
+                        ""
+                    ),
+                    trace_event_row(
+                        "sess-incomplete",
+                        "evt-inc-3",
+                        3,
+                        2,
+                        "assistant",
+                        "tool_call",
+                        "function_call",
+                        "",
+                        "{\"name\":\"inspect\"}",
+                        "inspect",
+                        "call-inspect"
+                    ),
+                    trace_event_row(
+                        "sess-incomplete",
+                        "evt-inc-4",
+                        4,
+                        2,
+                        "tool",
+                        "tool_result",
+                        "function_call_output",
+                        "inspection output",
+                        "{\"ok\":true}",
+                        "inspect",
+                        "call-inspect"
+                    )
+                ])),
+            );
+        }
+
+        if query.contains("FROM `moraine`.`v_turn_summary`")
+            && query.contains("WHERE session_id = 'sess-incomplete' AND turn_seq < 2")
+        {
+            return (
+                StatusCode::OK,
+                json_each_row(json!([turn_summary_row(
+                    "sess-incomplete",
+                    1,
+                    2,
+                    1,
+                    1,
+                    0,
+                    0,
+                    0
+                )])),
+            );
+        }
+
+        if query.contains("FROM `moraine`.`v_turn_summary`")
+            && query.contains("WHERE session_id = 'sess-incomplete' AND turn_seq > 2")
+        {
+            return (StatusCode::OK, json_each_row(json!([])));
+        }
+
+        if query.contains("FROM `moraine`.`v_conversation_trace`")
+            && query.contains("WHERE session_id = 'sess-event' AND event_order = 2")
+            && query.contains("event_uid = 'evt-open-full'")
+        {
+            return (
+                StatusCode::OK,
+                json_each_row(json!([
+                    trace_event_row("sess-event", "evt-open-full", 2, 1, "assistant", "message", "text", "This is the full available event content that must not be clipped by the repository open model.", "{\"text\":\"This is the full payload JSON value that must also remain intact\",\"nested\":{\"answer\":42}}", "", "")
+                ])),
+            );
+        }
+
+        if query.contains("FROM `moraine`.`v_turn_summary`")
+            && query.contains("WHERE session_id = 'sess-event' AND turn_seq = 1")
+        {
+            return (
+                StatusCode::OK,
+                json_each_row(json!([turn_summary_row("sess-event", 1, 3, 1, 1, 0, 0, 0)])),
+            );
+        }
+
+        if query.contains("FROM `moraine`.`v_conversation_trace`")
+            && query.contains("WHERE session_id = 'sess-event'")
+            && query
+                .contains("event_order < 2 OR (event_order = 2 AND event_uid < 'evt-open-full')")
+        {
+            return (
+                StatusCode::OK,
+                json_each_row(json!([trace_event_row(
+                    "sess-event",
+                    "evt-event-1",
+                    1,
+                    1,
+                    "user",
+                    "message",
+                    "text",
+                    "question before full event",
+                    "{\"text\":\"question before full event\"}",
+                    "",
+                    ""
+                )])),
+            );
+        }
+
+        if query.contains("FROM `moraine`.`v_conversation_trace`")
+            && query.contains("WHERE session_id = 'sess-event'")
+            && query
+                .contains("event_order > 2 OR (event_order = 2 AND event_uid > 'evt-open-full')")
+        {
+            return (
+                StatusCode::OK,
+                json_each_row(json!([trace_event_row(
+                    "sess-event",
+                    "evt-event-3",
+                    3,
+                    1,
+                    "system",
+                    "event_msg",
+                    "task_complete",
+                    "",
+                    "{\"status\":\"complete\"}",
+                    "",
+                    ""
+                )])),
+            );
+        }
+
+        if query.contains("FROM `moraine`.`v_turn_summary`")
+            && query.contains("WHERE session_id = 'sess-event' AND turn_seq < 1")
+        {
+            return (StatusCode::OK, json_each_row(json!([])));
+        }
+
+        if query.contains("FROM `moraine`.`v_turn_summary`")
+            && query.contains("WHERE session_id = 'sess-event' AND turn_seq > 1")
+        {
+            return (
+                StatusCode::OK,
+                json_each_row(json!([turn_summary_row("sess-event", 2, 1, 0, 1, 0, 0, 0)])),
             );
         }
 
@@ -1005,6 +1454,162 @@ async fn get_session_metadata_keeps_empty_boundary_fields_when_summary_exists() 
     assert!(metadata.first_event_uid.is_empty());
     assert!(metadata.last_event_uid.is_empty());
     assert!(metadata.last_actor_role.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_mcp_session_includes_turn_summaries_and_latest_completion() {
+    let (repo, state) = build_repo().await;
+
+    let session = repo
+        .get_mcp_session("sess-open")
+        .await
+        .expect("mcp session open succeeds")
+        .expect("mcp session exists");
+
+    assert_eq!(session.metadata.session_id, "sess-open");
+    assert_eq!(session.metadata.mode, ConversationMode::ToolCalling);
+    assert_eq!(session.title.as_deref(), Some("Open model session"));
+    assert_eq!(session.source.as_deref(), Some("codex-source"));
+    assert_eq!(session.session_slug.as_deref(), Some("open-model-session"));
+    assert_eq!(session.turns.len(), 2);
+    assert!(session.completed);
+    assert_eq!(session.terminal_event_uid.as_deref(), Some("evt-open-8"));
+
+    let first_turn = &session.turns[0];
+    assert_eq!(first_turn.metadata.turn_seq, 1);
+    assert!(first_turn.completed);
+    assert_eq!(first_turn.terminal_event_uid.as_deref(), Some("evt-open-5"));
+    assert_eq!(
+        first_turn.user_input_summary.as_deref(),
+        Some("How should repository open models work?")
+    );
+    assert_eq!(
+        first_turn.final_response_summary.as_deref(),
+        Some("First answer with repository context.")
+    );
+    assert_eq!(first_turn.tools_called, vec!["search_repo"]);
+    assert_eq!(
+        first_turn.normalized_event_types,
+        vec!["message", "tool_call", "tool_result", "task_complete"]
+    );
+    assert_eq!(
+        first_turn
+            .first_event
+            .as_ref()
+            .map(|event| event.event_uid.as_str()),
+        Some("evt-open-1")
+    );
+    assert_eq!(
+        first_turn
+            .last_event
+            .as_ref()
+            .map(|event| event.event_uid.as_str()),
+        Some("evt-open-5")
+    );
+
+    let queries = state.queries.lock().expect("queries lock").clone();
+    assert!(queries.iter().any(|query| {
+        query.contains("FROM `moraine`.`v_turn_summary`")
+            && query.contains("WHERE session_id = 'sess-open'")
+    }));
+    assert!(queries.iter().any(|query| {
+        query.contains("FROM `moraine`.`v_conversation_trace`")
+            && query.contains("WHERE session_id = 'sess-open'")
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_mcp_turn_returns_compact_events_and_incomplete_state() {
+    let (repo, _state) = build_repo().await;
+
+    let turn = repo
+        .get_mcp_turn("sess-incomplete", 2)
+        .await
+        .expect("mcp turn open succeeds")
+        .expect("mcp turn exists");
+
+    assert_eq!(turn.metadata.session_id, "sess-incomplete");
+    assert_eq!(turn.metadata.turn_seq, 2);
+    assert_eq!(turn.events.len(), 3);
+    assert_eq!(turn.events[0].event_uid, "evt-inc-2");
+    assert_eq!(turn.events[0].event_type, "message");
+    assert_eq!(
+        turn.events[0].text_preview.as_deref(),
+        Some("Run the incomplete workflow.")
+    );
+    assert_eq!(turn.events[1].event_type, "tool_call");
+    assert_eq!(turn.events[2].event_type, "tool_result");
+    assert_eq!(
+        turn.user_input_summary.as_deref(),
+        Some("Run the incomplete workflow.")
+    );
+    assert!(turn.final_response_summary.is_none());
+    assert_eq!(turn.tools_called, vec!["inspect"]);
+    assert_eq!(
+        turn.normalized_event_types,
+        vec!["message", "tool_call", "tool_result"]
+    );
+    assert!(!turn.completed);
+    assert!(turn.terminal_event_uid.is_none());
+    assert_eq!(
+        turn.previous_turn.as_ref().map(|turn| turn.turn_seq),
+        Some(1)
+    );
+    assert!(turn.next_turn.is_none());
+    assert_eq!(
+        turn.first_event
+            .as_ref()
+            .map(|event| event.event_uid.as_str()),
+        Some("evt-inc-2")
+    );
+    assert_eq!(
+        turn.last_event
+            .as_ref()
+            .map(|event| event.event_uid.as_str()),
+        Some("evt-inc-4")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_mcp_event_returns_full_content_and_navigation_refs() {
+    let (repo, _state) = build_repo().await;
+
+    let event = repo
+        .get_mcp_event("evt-open-full")
+        .await
+        .expect("mcp event open succeeds")
+        .expect("mcp event exists");
+
+    assert_eq!(event.event.event_uid, "evt-open-full");
+    assert_eq!(event.event_type, "message");
+    assert_eq!(event.event.session_id, "sess-event");
+    assert_eq!(event.event.turn_seq, 1);
+    assert_eq!(
+        event.event.text_content,
+        "This is the full available event content that must not be clipped by the repository open model."
+    );
+    assert_eq!(
+        event.event.payload_json,
+        "{\"text\":\"This is the full payload JSON value that must also remain intact\",\"nested\":{\"answer\":42}}"
+    );
+    assert_eq!(event.parent_session.session_id, "sess-event");
+    assert_eq!(event.parent_turn.turn_seq, 1);
+    assert_eq!(
+        event
+            .previous_event
+            .as_ref()
+            .map(|event| event.event_uid.as_str()),
+        Some("evt-event-1")
+    );
+    assert_eq!(
+        event
+            .next_event
+            .as_ref()
+            .map(|event| event.event_uid.as_str()),
+        Some("evt-event-3")
+    );
+    assert!(event.previous_turn.is_none());
+    assert_eq!(event.next_turn.as_ref().map(|turn| turn.turn_seq), Some(2));
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -162,6 +162,97 @@ pub struct Turn {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpEventRef {
+    pub session_id: String,
+    pub event_uid: String,
+    pub event_order: u64,
+    pub turn_seq: u32,
+    pub event_time: String,
+    pub event_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpTurnRef {
+    pub session_id: String,
+    pub turn_seq: u32,
+    pub turn_id: String,
+    pub started_at: String,
+    pub ended_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpEventSummary {
+    pub session_id: String,
+    pub event_uid: String,
+    pub event_order: u64,
+    pub turn_seq: u32,
+    pub event_time: String,
+    pub actor_role: String,
+    pub event_class: String,
+    pub payload_type: String,
+    pub event_type: String,
+    pub call_id: String,
+    pub name: String,
+    pub phase: String,
+    pub text_preview: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpTurnCompact {
+    pub metadata: TurnSummary,
+    pub user_input_summary: Option<String>,
+    pub final_response_summary: Option<String>,
+    pub tools_called: Vec<String>,
+    pub normalized_event_types: Vec<String>,
+    pub completed: bool,
+    pub terminal_event_uid: Option<String>,
+    pub first_event: Option<McpEventRef>,
+    pub last_event: Option<McpEventRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpSessionOpen {
+    pub metadata: SessionMetadata,
+    pub title: Option<String>,
+    pub source: Option<String>,
+    pub harness: Option<String>,
+    pub inference_provider: Option<String>,
+    pub session_slug: Option<String>,
+    pub session_summary: Option<String>,
+    pub turns: Vec<McpTurnCompact>,
+    pub completed: bool,
+    pub terminal_event_uid: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpTurnOpen {
+    pub metadata: TurnSummary,
+    pub events: Vec<McpEventSummary>,
+    pub user_input_summary: Option<String>,
+    pub final_response_summary: Option<String>,
+    pub tools_called: Vec<String>,
+    pub normalized_event_types: Vec<String>,
+    pub completed: bool,
+    pub terminal_event_uid: Option<String>,
+    pub previous_turn: Option<McpTurnRef>,
+    pub next_turn: Option<McpTurnRef>,
+    pub first_event: Option<McpEventRef>,
+    pub last_event: Option<McpEventRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpEventOpen {
+    pub event: TraceEvent,
+    pub event_type: String,
+    pub parent_session: SessionMetadata,
+    pub parent_turn: TurnSummary,
+    pub previous_event: Option<McpEventRef>,
+    pub next_event: Option<McpEventRef>,
+    pub previous_turn: Option<McpTurnRef>,
+    pub next_turn: Option<McpTurnRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceEvent {
     pub session_id: String,
     pub event_uid: String,
