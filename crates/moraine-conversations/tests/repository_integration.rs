@@ -417,10 +417,10 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
             );
         }
 
-        if query.contains("FROM `moraine`.`v_session_summary` AS s")
-            && query.contains("WHERE s.session_id IN")
-            && query.contains("toString(s.first_event_time) AS first_event_time")
-            && query.contains("toString(s.last_event_time) AS last_event_time")
+        if query.contains("FROM `moraine`.`events`")
+            && query.contains("WHERE session_id IN")
+            && query.contains("toString(min(event_ts)) AS first_event_time")
+            && query.contains("toString(max(event_ts)) AS last_event_time")
         {
             return (
                 StatusCode::OK,
@@ -2342,6 +2342,7 @@ async fn search_events_includes_session_time_bounds() {
             source: Some("integration-test".to_string()),
             limit: Some(10),
             session_id: None,
+            session_ids: None,
             min_score: Some(0.0),
             min_should_match: Some(1),
             include_tool_events: Some(true),
@@ -2380,6 +2381,7 @@ async fn search_events_documents_subquery_avoids_self_aliased_aggregates() {
             source: Some("integration-test".to_string()),
             limit: Some(10),
             session_id: None,
+            session_ids: None,
             min_score: Some(0.0),
             min_should_match: Some(1),
             include_tool_events: Some(true),

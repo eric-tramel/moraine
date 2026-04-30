@@ -182,6 +182,23 @@ impl RecencyPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum EvidencePolicy {
+    #[default]
+    Fast,
+    Complete,
+}
+
+impl EvidencePolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Complete => "complete",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct SearchSessionDataArgs {
     query: String,
@@ -193,6 +210,8 @@ struct SearchSessionDataArgs {
     event_scope: Option<SessionSearchEventScope>,
     #[serde(default)]
     recency_policy: Option<RecencyPolicy>,
+    #[serde(default)]
+    evidence_policy: Option<EvidencePolicy>,
     #[serde(default)]
     from_unix_ms: Option<i64>,
     #[serde(default)]
@@ -967,6 +986,12 @@ impl AppState {
                                 "default": "auto",
                                 "description": "Auto prefers current/final/latest/corrected evidence and down-ranks stale, draft, provisional, or deprecated notes when the query asks for that."
                             },
+                            "evidence_policy": {
+                                "type": "string",
+                                "enum": ["fast", "complete"],
+                                "default": "fast",
+                                "description": "Use fast for lowest latency. Use complete only when every returned session needs up to matching_events_limit per-session event evidence hits."
+                            },
                             "from_unix_ms": { "type": "integer" },
                             "to_unix_ms": { "type": "integer" },
                             "mode": {
@@ -1000,6 +1025,7 @@ impl AppState {
                             "effective_event_scope": { "type": "string" },
                             "recency_policy": { "type": "string" },
                             "recency_applied": { "type": "boolean" },
+                            "evidence_policy": { "type": "string" },
                             "hits": {
                                 "type": "array",
                                 "items": {
@@ -1369,6 +1395,7 @@ impl AppState {
                 source: Some("moraine-mcp".to_string()),
                 limit: args.limit,
                 session_id: args.session_id,
+                session_ids: None,
                 min_score: args.min_score,
                 min_should_match: args.min_should_match,
                 include_tool_events: args.include_tool_events,
@@ -1607,6 +1634,7 @@ impl AppState {
         };
         let recency_policy = args.recency_policy.unwrap_or_default();
         let recency_applied = recency_policy.is_active_for_query(&query);
+        let evidence_policy = args.evidence_policy.unwrap_or_default();
         let limit = args.limit.unwrap_or(SESSION_SEARCH_DEFAULT_LIMIT);
         let matching_events_limit = args
             .matching_events_limit
@@ -1717,6 +1745,7 @@ impl AppState {
                         source: Some("moraine-mcp".to_string()),
                         limit: Some(matching_events_limit),
                         session_id: Some(session_id.to_string()),
+                        session_ids: None,
                         min_score: None,
                         min_should_match: None,
                         include_tool_events: Some(effective_include_tool_events),
@@ -1754,14 +1783,25 @@ impl AppState {
         }
 
         let mut candidates = candidates.into_values().collect::<Vec<_>>();
-        for candidate in &mut candidates {
+        rank_session_search_candidates(&mut candidates, recency_applied, limit);
+        let candidate_session_ids = candidates
+            .iter()
+            .map(|candidate| candidate.session_id.clone())
+            .collect::<Vec<_>>();
+        let evidence_search_limit = matching_events_limit
+            .saturating_mul(candidate_session_ids.len() as u16)
+            .max(matching_events_limit)
+            .min(self.cfg.mcp.max_results.max(TOOL_LIMIT_MIN));
+        let mut evidence_by_session = HashMap::<String, Vec<SessionSearchEvidence>>::new();
+        if !candidate_session_ids.is_empty() {
             let event_results = self
                 .repo
                 .search_events(SearchEventsQuery {
                     query: query.clone(),
                     source: Some("moraine-mcp".to_string()),
-                    limit: Some(matching_events_limit),
-                    session_id: Some(candidate.session_id.clone()),
+                    limit: Some(evidence_search_limit),
+                    session_id: None,
+                    session_ids: Some(candidate_session_ids.clone()),
                     min_score: None,
                     min_should_match: None,
                     include_tool_events: Some(effective_include_tool_events),
@@ -1774,9 +1814,64 @@ impl AppState {
                 .map_err(|err| anyhow!(err.to_string()))?;
 
             for event_hit in event_results.hits {
-                candidate
-                    .evidence
-                    .push(self.search_event_evidence(&event_hit).await?);
+                let evidence = evidence_by_session
+                    .entry(event_hit.session_id.clone())
+                    .or_default();
+                if evidence.len() < matching_events_limit as usize {
+                    evidence.push(search_event_evidence(&event_hit));
+                }
+            }
+
+            if evidence_policy == EvidencePolicy::Complete {
+                let underfilled_session_ids = underfilled_evidence_sessions(
+                    &candidate_session_ids,
+                    &evidence_by_session,
+                    matching_events_limit,
+                );
+                let mut tasks = Vec::with_capacity(underfilled_session_ids.len());
+                for session_id in underfilled_session_ids {
+                    let repo = self.repo.clone();
+                    let query = query.clone();
+                    tasks.push(tokio::spawn(async move {
+                        let event_results = repo
+                            .search_events(SearchEventsQuery {
+                                query,
+                                source: Some("moraine-mcp".to_string()),
+                                limit: Some(matching_events_limit),
+                                session_id: Some(session_id.clone()),
+                                session_ids: None,
+                                min_score: None,
+                                min_should_match: None,
+                                include_tool_events: Some(effective_include_tool_events),
+                                event_kinds: None,
+                                exclude_codex_mcp: Some(true),
+                                disable_cache: None,
+                                search_strategy: None,
+                            })
+                            .await
+                            .map_err(|err| anyhow!(err.to_string()))?;
+
+                        let evidence = event_results
+                            .hits
+                            .iter()
+                            .map(search_event_evidence)
+                            .collect::<Vec<_>>();
+                        Ok::<_, anyhow::Error>((session_id, evidence))
+                    }));
+                }
+
+                for task in tasks {
+                    let (session_id, evidence) = task
+                        .await
+                        .context("failed to join supplemental evidence search")??;
+                    evidence_by_session.insert(session_id, evidence);
+                }
+            }
+        }
+
+        for candidate in &mut candidates {
+            if let Some(evidence) = evidence_by_session.remove(&candidate.session_id) {
+                candidate.evidence.extend(evidence);
             }
 
             self.add_summary_evidence(candidate);
@@ -1801,15 +1896,6 @@ impl AppState {
             }
         }
 
-        apply_recency_adjustments(&mut candidates, recency_applied);
-        candidates.sort_by(|a, b| {
-            b.score
-                .total_cmp(&a.score)
-                .then_with(|| b.last_event_unix_ms.cmp(&a.last_event_unix_ms))
-                .then_with(|| a.session_id.cmp(&b.session_id))
-        });
-        candidates.truncate(limit as usize);
-
         let hits = candidates
             .into_iter()
             .enumerate()
@@ -1822,6 +1908,7 @@ impl AppState {
             "effective_event_scope": effective_scope,
             "recency_policy": recency_policy.as_str(),
             "recency_applied": recency_applied,
+            "evidence_policy": evidence_policy.as_str(),
             "matching_events_limit": matching_events_limit,
             "include_context": include_context,
             "stats": {
@@ -1863,47 +1950,6 @@ impl AppState {
         candidate.matched_terms = candidate.matched_terms.max(hit.matched_terms);
         candidate.summary_event_uid = hit.meta_event_uid.or(candidate.summary_event_uid.take());
         candidate.summary_snippet = hit.snippet.or(candidate.summary_snippet.take());
-    }
-
-    async fn search_event_evidence(&self, hit: &SearchEventHit) -> Result<SessionSearchEvidence> {
-        let mut event_order = None;
-        let mut turn_seq = None;
-        let mut event_time = None;
-        if let Ok(context) = self
-            .repo
-            .open_event(OpenEventRequest {
-                event_uid: hit.event_uid.clone(),
-                before: Some(0),
-                after: Some(0),
-                include_system_events: Some(true),
-            })
-            .await
-        {
-            if let Some(event) = context
-                .events
-                .iter()
-                .find(|event| event.event_uid == hit.event_uid)
-            {
-                event_order = Some(event.event_order);
-                turn_seq = Some(event.turn_seq);
-                event_time = Some(event.event_time.clone());
-            }
-        }
-
-        Ok(SessionSearchEvidence {
-            event_uid: hit.event_uid.clone(),
-            event_order,
-            turn_seq,
-            event_time,
-            kind: display_kind(&hit.event_class, &hit.payload_type),
-            role: hit.actor_role.clone(),
-            snippet: compact_text_line(
-                hit.text_content
-                    .as_deref()
-                    .unwrap_or(hit.text_preview.as_str()),
-                320,
-            ),
-        })
     }
 
     fn add_summary_evidence(&self, candidate: &mut SessionSearchCandidate) {
@@ -2060,6 +2106,7 @@ impl AppState {
                     source: Some("moraine-mcp".to_string()),
                     limit: Some(limit),
                     session_id: Some(session_id.clone()),
+                    session_ids: None,
                     min_score: None,
                     min_should_match: None,
                     include_tool_events: Some(include_tool_events),
@@ -2566,6 +2613,56 @@ fn apply_recency_adjustments(candidates: &mut [SessionSearchCandidate], active: 
             candidate.score -= 2.0;
         }
     }
+}
+
+fn rank_session_search_candidates(
+    candidates: &mut Vec<SessionSearchCandidate>,
+    recency_active: bool,
+    limit: u16,
+) {
+    apply_recency_adjustments(candidates, recency_active);
+    candidates.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| b.last_event_unix_ms.cmp(&a.last_event_unix_ms))
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+    candidates.truncate(limit as usize);
+}
+
+fn search_event_evidence(hit: &SearchEventHit) -> SessionSearchEvidence {
+    SessionSearchEvidence {
+        event_uid: hit.event_uid.clone(),
+        event_order: None,
+        turn_seq: None,
+        event_time: hit.event_time.clone(),
+        kind: display_kind(&hit.event_class, &hit.payload_type),
+        role: hit.actor_role.clone(),
+        snippet: compact_text_line(
+            hit.text_content
+                .as_deref()
+                .unwrap_or(hit.text_preview.as_str()),
+            320,
+        ),
+    }
+}
+
+fn underfilled_evidence_sessions(
+    candidate_session_ids: &[String],
+    evidence_by_session: &HashMap<String, Vec<SessionSearchEvidence>>,
+    matching_events_limit: u16,
+) -> Vec<String> {
+    let target = matching_events_limit as usize;
+    candidate_session_ids
+        .iter()
+        .filter(|session_id| {
+            evidence_by_session
+                .get(*session_id)
+                .map(|evidence| evidence.len() < target)
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect()
 }
 
 fn candidate_rank_text(candidate: &SessionSearchCandidate) -> String {
@@ -3531,6 +3628,34 @@ mod tests {
             search["inputSchema"]["properties"]["n_hits"]["default"],
             json!(crate::contract::SEARCH_SESSIONS_DEFAULT_N_HITS)
         );
+        assert_eq!(
+            search["inputSchema"]["properties"]["evidence_policy"]["default"],
+            json!("fast")
+        );
+    }
+
+    #[test]
+    fn search_session_data_args_default_to_fast_evidence_policy() {
+        let args: SearchSessionDataArgs = serde_json::from_value(json!({
+            "query": "moraine search latency"
+        }))
+        .expect("parse search session args");
+
+        assert_eq!(
+            args.evidence_policy.unwrap_or_default(),
+            EvidencePolicy::Fast
+        );
+
+        let complete_args: SearchSessionDataArgs = serde_json::from_value(json!({
+            "query": "moraine search latency",
+            "evidence_policy": "complete"
+        }))
+        .expect("parse complete evidence policy");
+
+        assert_eq!(
+            complete_args.evidence_policy.unwrap_or_default(),
+            EvidencePolicy::Complete
+        );
     }
 
     #[test]
@@ -3610,6 +3735,130 @@ mod tests {
 
         assert_eq!(candidates[0].session_id, "final");
         assert!(candidates[0].score > candidates[1].score);
+    }
+
+    #[test]
+    fn rank_session_search_candidates_truncates_before_evidence_enrichment() {
+        let mut candidates = vec![
+            SessionSearchCandidate {
+                session_id: "low".to_string(),
+                score: 1.0,
+                last_event_unix_ms: Some(3000),
+                ..SessionSearchCandidate::new("low".to_string())
+            },
+            SessionSearchCandidate {
+                session_id: "high".to_string(),
+                score: 10.0,
+                last_event_unix_ms: Some(1000),
+                ..SessionSearchCandidate::new("high".to_string())
+            },
+            SessionSearchCandidate {
+                session_id: "tie-newer".to_string(),
+                score: 10.0,
+                last_event_unix_ms: Some(2000),
+                ..SessionSearchCandidate::new("tie-newer".to_string())
+            },
+        ];
+
+        rank_session_search_candidates(&mut candidates, false, 2);
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tie-newer", "high"]
+        );
+    }
+
+    #[test]
+    fn search_event_evidence_uses_search_hit_without_trace_lookup() {
+        let hit = SearchEventHit {
+            rank: 1,
+            event_uid: "evt-1".to_string(),
+            session_id: "sess-1".to_string(),
+            event_time: Some("2026-04-27T12:00:00.000Z".to_string()),
+            first_event_time: String::new(),
+            last_event_time: String::new(),
+            source_name: "codex".to_string(),
+            harness: "codex".to_string(),
+            inference_provider: "openai".to_string(),
+            score: 1.0,
+            matched_terms: 1,
+            doc_len: 10,
+            event_class: "message".to_string(),
+            payload_type: "text".to_string(),
+            actor_role: "assistant".to_string(),
+            name: String::new(),
+            phase: String::new(),
+            source_ref: String::new(),
+            text_preview: "preview only".to_string(),
+            text_content: Some("full evidence text".to_string()),
+            payload_json: None,
+        };
+
+        let evidence = search_event_evidence(&hit);
+
+        assert_eq!(evidence.event_uid, "evt-1");
+        assert_eq!(evidence.kind, "message (text)");
+        assert_eq!(evidence.role, "assistant");
+        assert_eq!(evidence.event_order, None);
+        assert_eq!(evidence.turn_seq, None);
+        assert_eq!(
+            evidence.event_time.as_deref(),
+            Some("2026-04-27T12:00:00.000Z")
+        );
+        assert_eq!(evidence.snippet, "full evidence text");
+    }
+
+    #[test]
+    fn underfilled_evidence_sessions_preserves_per_session_coverage() {
+        let candidate_session_ids = vec![
+            "filled".to_string(),
+            "partial".to_string(),
+            "empty".to_string(),
+        ];
+        let mut evidence_by_session = HashMap::new();
+        evidence_by_session.insert(
+            "filled".to_string(),
+            vec![
+                SessionSearchEvidence {
+                    event_uid: "filled-1".to_string(),
+                    event_order: None,
+                    turn_seq: None,
+                    event_time: None,
+                    kind: "message".to_string(),
+                    role: "assistant".to_string(),
+                    snippet: "one".to_string(),
+                },
+                SessionSearchEvidence {
+                    event_uid: "filled-2".to_string(),
+                    event_order: None,
+                    turn_seq: None,
+                    event_time: None,
+                    kind: "message".to_string(),
+                    role: "assistant".to_string(),
+                    snippet: "two".to_string(),
+                },
+            ],
+        );
+        evidence_by_session.insert(
+            "partial".to_string(),
+            vec![SessionSearchEvidence {
+                event_uid: "partial-1".to_string(),
+                event_order: None,
+                turn_seq: None,
+                event_time: None,
+                kind: "message".to_string(),
+                role: "assistant".to_string(),
+                snippet: "one".to_string(),
+            }],
+        );
+
+        assert_eq!(
+            underfilled_evidence_sessions(&candidate_session_ids, &evidence_by_session, 2),
+            vec!["partial".to_string(), "empty".to_string()]
+        );
     }
 
     #[test]
@@ -3706,6 +3955,7 @@ mod tests {
                     rank: 1,
                     event_uid: "evt-1".to_string(),
                     session_id: "sess-1".to_string(),
+                    event_time: None,
                     first_event_time: String::new(),
                     last_event_time: String::new(),
                     source_name: "src".to_string(),
@@ -3728,6 +3978,7 @@ mod tests {
                     rank: 2,
                     event_uid: "evt-2".to_string(),
                     session_id: "sess-1".to_string(),
+                    event_time: None,
                     first_event_time: String::new(),
                     last_event_time: String::new(),
                     source_name: "src".to_string(),
@@ -3750,6 +4001,7 @@ mod tests {
                     rank: 3,
                     event_uid: "evt-3".to_string(),
                     session_id: "sess-1".to_string(),
+                    event_time: None,
                     first_event_time: String::new(),
                     last_event_time: String::new(),
                     source_name: "src".to_string(),

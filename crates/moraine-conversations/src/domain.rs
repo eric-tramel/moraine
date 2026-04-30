@@ -326,6 +326,8 @@ pub struct SearchEventsQuery {
     #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]
+    pub session_ids: Option<Vec<String>>,
+    #[serde(default)]
     pub min_score: Option<f64>,
     #[serde(default)]
     pub min_should_match: Option<u16>,
@@ -488,6 +490,8 @@ pub struct SearchEventHit {
     pub rank: usize,
     pub event_uid: String,
     pub session_id: String,
+    #[serde(default)]
+    pub event_time: Option<String>,
     pub first_event_time: String,
     pub last_event_time: String,
     pub source_name: String,

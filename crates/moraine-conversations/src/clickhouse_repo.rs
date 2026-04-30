@@ -270,6 +270,8 @@ struct McpSessionInfoRow {
 struct SearchRow {
     event_uid: String,
     session_id: String,
+    #[serde(default)]
+    event_time: String,
     source_name: String,
     harness: String,
     #[serde(default)]
@@ -358,6 +360,8 @@ struct FetchedPostingRow {
 struct SearchDocExtraRow {
     event_uid: String,
     session_id: String,
+    #[serde(default)]
+    event_time: String,
     source_name: String,
     harness: String,
     #[serde(default)]
@@ -517,6 +521,7 @@ struct TermPostingsCacheEntry {
 #[derive(Debug, Clone)]
 struct SearchDocExtraCacheEntry {
     session_id: String,
+    event_time: String,
     source_name: String,
     harness: String,
     inference_provider: String,
@@ -643,6 +648,7 @@ impl ClickHouseConversationRepository {
                     source: Some(BENCHMARK_REPLAY_SOURCE.to_string()),
                     limit: Some(limit),
                     session_id: None,
+                    session_ids: None,
                     min_score: None,
                     min_should_match: None,
                     include_tool_events: None,
@@ -671,6 +677,7 @@ impl ClickHouseConversationRepository {
                     source: Some(BENCHMARK_REPLAY_SOURCE.to_string()),
                     limit: Some(limit),
                     session_id: None,
+                    session_ids: None,
                     min_score: None,
                     min_should_match: None,
                     include_tool_events: None,
@@ -733,6 +740,7 @@ impl ClickHouseConversationRepository {
         event_kinds: Option<&[SearchEventKind]>,
         exclude_codex_mcp: bool,
         session_id: Option<&str>,
+        session_ids: Option<&[String]>,
         min_should_match: u16,
         min_score: f64,
         limit: u16,
@@ -748,8 +756,15 @@ impl ClickHouseConversationRepository {
                     .join(",")
             })
             .unwrap_or_default();
+        let session_ids_sig = session_ids
+            .map(|ids| {
+                let mut ids = ids.to_vec();
+                ids.sort_unstable();
+                ids.join(",")
+            })
+            .unwrap_or_default();
         format!(
-            "strategy={};incl_tools={include_tool_events};event_kinds={event_kind_sig};excl_codex={exclude_codex_mcp};session={};msm={min_should_match};min_score={min_score:.12};limit={limit};terms={}",
+            "strategy={};incl_tools={include_tool_events};event_kinds={event_kind_sig};excl_codex={exclude_codex_mcp};session={};sessions={session_ids_sig};msm={min_should_match};min_score={min_score:.12};limit={limit};terms={}",
             search_strategy.as_str(),
             session_id.unwrap_or(""),
             cache_terms.join(",")
@@ -2480,6 +2495,7 @@ FORMAT JSONEachRow",
         exclude_codex_mcp: bool,
         use_document_codex_flag: bool,
         session_id: Option<&str>,
+        session_ids: Option<&[String]>,
         min_should_match: u16,
         min_score: f64,
         limit: u16,
@@ -2503,6 +2519,7 @@ FORMAT JSONEachRow",
                 "(SELECT
   t.event_uid AS event_uid,
   any(t.session_id) AS session_id,
+  any(t.record_ts) AS event_time,
   any(t.source_name) AS source_name,
   any(t.harness) AS harness,
   any(t.inference_provider) AS inference_provider,
@@ -2524,6 +2541,7 @@ GROUP BY t.event_uid)"
                 "(SELECT
   t.event_uid AS event_uid,
   any(t.session_id) AS session_id,
+  any(t.record_ts) AS event_time,
   any(t.source_name) AS source_name,
   any(t.harness) AS harness,
   any(t.inference_provider) AS inference_provider,
@@ -2546,6 +2564,14 @@ GROUP BY t.event_uid)"
 
         if let Some(sid) = session_id {
             where_clauses.push(format!("d.session_id = {}", sql_quote(sid)));
+        }
+        if let Some(session_ids) = session_ids {
+            if !session_ids.is_empty() {
+                where_clauses.push(format!(
+                    "d.session_id IN {}",
+                    sql_array_strings(session_ids)
+                ));
+            }
         }
 
         if let Some(event_kinds) = event_kinds {
@@ -2592,6 +2618,7 @@ GROUP BY t.event_uid)"
 SELECT
   p.doc_id AS event_uid,
   any(d.session_id) AS session_id,
+  any(d.event_time) AS event_time,
   any(d.source_name) AS source_name,
   any(d.harness) AS harness,
   any(d.inference_provider) AS inference_provider,
@@ -2795,6 +2822,7 @@ FORMAT JSONEachRow",
                 "(SELECT
   t.event_uid AS event_uid,
   any(t.session_id) AS session_id,
+  any(t.record_ts) AS event_time,
   any(t.source_name) AS source_name,
   any(t.harness) AS harness,
   any(t.inference_provider) AS inference_provider,
@@ -2817,6 +2845,7 @@ GROUP BY t.event_uid)"
                 "(SELECT
   t.event_uid AS event_uid,
   any(t.session_id) AS session_id,
+  any(t.record_ts) AS event_time,
   any(t.source_name) AS source_name,
   any(t.harness) AS harness,
   any(t.inference_provider) AS inference_provider,
@@ -2840,6 +2869,7 @@ GROUP BY t.event_uid)"
             "SELECT
   d.event_uid AS event_uid,
   d.session_id AS session_id,
+  d.event_time AS event_time,
   d.source_name AS source_name,
   d.harness AS harness,
   d.inference_provider AS inference_provider,
@@ -2900,9 +2930,15 @@ FORMAT JSONEachRow",
         event_kinds: Option<&[SearchEventKind]>,
         exclude_codex_mcp: bool,
         session_id: Option<&str>,
+        session_ids: Option<&[String]>,
     ) -> bool {
         if let Some(sid) = session_id {
             if row.session_id != sid {
+                return false;
+            }
+        }
+        if let Some(session_ids) = session_ids {
+            if !session_ids.iter().any(|sid| sid == &row.session_id) {
                 return false;
             }
         }
@@ -3090,6 +3126,7 @@ FORMAT JSONEachRow",
             for row in fetched_rows {
                 let entry = SearchDocExtraCacheEntry {
                     session_id: row.session_id,
+                    event_time: row.event_time,
                     source_name: row.source_name,
                     harness: row.harness,
                     inference_provider: row.inference_provider,
@@ -3135,6 +3172,7 @@ FORMAT JSONEachRow",
         event_kinds: Option<&[SearchEventKind]>,
         exclude_codex_mcp: bool,
         session_id: Option<&str>,
+        session_ids: Option<&[String]>,
         min_should_match: u16,
         min_score: f64,
         limit: u16,
@@ -3148,6 +3186,7 @@ FORMAT JSONEachRow",
                 event_kinds,
                 exclude_codex_mcp,
                 session_id,
+                session_ids,
                 min_should_match,
                 min_score,
                 limit,
@@ -3166,6 +3205,7 @@ FORMAT JSONEachRow",
             event_kinds,
             exclude_codex_mcp,
             session_id,
+            session_ids,
             min_should_match,
             min_score,
             limit,
@@ -3182,6 +3222,7 @@ FORMAT JSONEachRow",
         event_kinds: Option<&[SearchEventKind]>,
         exclude_codex_mcp: bool,
         session_id: Option<&str>,
+        session_ids: Option<&[String]>,
         min_should_match: u16,
         min_score: f64,
         limit: u16,
@@ -3203,6 +3244,7 @@ FORMAT JSONEachRow",
             exclude_codex_mcp,
             use_document_codex_flag,
             session_id,
+            session_ids,
             min_should_match,
             min_score,
             limit,
@@ -3228,6 +3270,7 @@ FORMAT JSONEachRow",
         event_kinds: Option<&[SearchEventKind]>,
         exclude_codex_mcp: bool,
         session_id: Option<&str>,
+        session_ids: Option<&[String]>,
         min_should_match: u16,
         min_score: f64,
         limit: u16,
@@ -3242,6 +3285,7 @@ FORMAT JSONEachRow",
                     event_kinds,
                     exclude_codex_mcp,
                     session_id,
+                    session_ids,
                     min_should_match,
                     min_score,
                     limit,
@@ -3257,6 +3301,7 @@ FORMAT JSONEachRow",
                     event_kinds,
                     exclude_codex_mcp,
                     session_id,
+                    session_ids,
                     min_should_match,
                     min_score,
                     limit,
@@ -3591,6 +3636,7 @@ FORMAT JSONEachRow",
         event_kinds: Option<&[SearchEventKind]>,
         exclude_codex_mcp: bool,
         session_id: Option<&str>,
+        session_ids: Option<&[String]>,
         min_should_match: u16,
         min_score: f64,
         limit: u16,
@@ -3695,6 +3741,7 @@ FORMAT JSONEachRow",
                     event_kinds,
                     exclude_codex_mcp,
                     session_id,
+                    session_ids,
                 ) {
                     continue;
                 }
@@ -3702,6 +3749,7 @@ FORMAT JSONEachRow",
                 fast_rows.push(SearchRow {
                     event_uid: row.row.event_uid.clone(),
                     session_id: extra.session_id.clone(),
+                    event_time: extra.event_time.clone(),
                     source_name: extra.source_name.clone(),
                     harness: extra.harness.clone(),
                     inference_provider: extra.inference_provider.clone(),
@@ -4309,17 +4357,18 @@ FORMAT JSONEachRow",
             return Ok(HashMap::new());
         }
 
-        let session_summary_table = self.table_ref("v_session_summary");
+        let events_table = self.table_ref("events");
         let session_ids_sql = sql_array_strings(&unique_session_ids);
         let sql = format!(
             "SELECT
-  s.session_id AS session_id,
-  toString(s.first_event_time) AS first_event_time,
-  toString(s.last_event_time) AS last_event_time
-FROM {session_summary_table} AS s
-WHERE s.session_id IN {session_ids_sql}
+  session_id,
+  toString(min(event_ts)) AS first_event_time,
+  toString(max(event_ts)) AS last_event_time
+FROM {events_table}
+WHERE session_id IN {session_ids_sql}
+GROUP BY session_id
 FORMAT JSONEachRow",
-            session_summary_table = session_summary_table,
+            events_table = events_table,
             session_ids_sql = session_ids_sql,
         );
 
@@ -4373,6 +4422,7 @@ FORMAT JSONEachRow",
                     rank: idx + 1,
                     event_uid: row.event_uid,
                     session_id,
+                    event_time: (!row.event_time.is_empty()).then_some(row.event_time),
                     first_event_time,
                     last_event_time,
                     source_name: row.source_name,
@@ -5557,10 +5607,29 @@ FORMAT JSONEachRow",
         let disable_cache = query.disable_cache.unwrap_or(false);
         let effective_strategy = query.search_strategy.unwrap_or_default();
 
-        if let Some(session_id) = query.session_id.as_deref() {
+        let session_id = query.session_id.clone();
+        if let Some(session_id) = session_id.as_deref() {
             Self::validate_session_id(session_id)?;
         }
-        let session_id = query.session_id.as_deref();
+        let mut session_ids = query
+            .session_ids
+            .unwrap_or_default()
+            .into_iter()
+            .map(|session_id| session_id.trim().to_string())
+            .filter(|session_id| !session_id.is_empty())
+            .collect::<Vec<_>>();
+        session_ids.sort_unstable();
+        session_ids.dedup();
+        for session_id in &session_ids {
+            Self::validate_session_id(session_id)?;
+        }
+        let session_id = session_id.as_deref();
+        let session_ids = (!session_ids.is_empty()).then_some(session_ids);
+        let session_ids_ref = session_ids.as_deref();
+        let session_hint = session_id
+            .map(ToOwned::to_owned)
+            .or_else(|| session_ids_ref.map(|ids| ids.join(",")))
+            .unwrap_or_default();
 
         let (docs, total_doc_len) = self.corpus_stats().await?;
         if docs == 0 {
@@ -5595,6 +5664,7 @@ FORMAT JSONEachRow",
                     event_kinds.as_deref(),
                     exclude_codex_mcp,
                     session_id,
+                    session_ids_ref,
                     min_should_match,
                     min_score,
                     fetch_limit,
@@ -5610,6 +5680,7 @@ FORMAT JSONEachRow",
                 event_kinds.as_deref(),
                 exclude_codex_mcp,
                 session_id,
+                session_ids_ref,
                 min_should_match,
                 min_score,
                 limit,
@@ -5628,6 +5699,7 @@ FORMAT JSONEachRow",
                         event_kinds.as_deref(),
                         exclude_codex_mcp,
                         session_id,
+                        session_ids_ref,
                         min_should_match,
                         min_score,
                         fetch_limit,
@@ -5647,7 +5719,7 @@ FORMAT JSONEachRow",
                 &query_id,
                 source,
                 query_text,
-                session_id.unwrap_or(""),
+                &session_hint,
                 &terms,
                 limit,
                 min_should_match,
@@ -6198,6 +6270,7 @@ mod tests {
     fn sample_search_doc() -> SearchDocExtraCacheEntry {
         SearchDocExtraCacheEntry {
             session_id: "session-1".to_string(),
+            event_time: "2026-04-27T12:00:00.000Z".to_string(),
             source_name: "source".to_string(),
             harness: "harness".to_string(),
             inference_provider: "inference-provider".to_string(),
@@ -6229,6 +6302,7 @@ mod tests {
         SearchRow {
             event_uid: event_uid.to_string(),
             session_id: session_id.to_string(),
+            event_time: "2026-04-27T12:00:00.000Z".to_string(),
             source_name: "source".to_string(),
             harness: "harness".to_string(),
             inference_provider: "inference-provider".to_string(),
@@ -6341,7 +6415,7 @@ mod tests {
         row.has_codex_mcp = 1;
         assert!(
             !ClickHouseConversationRepository::passes_search_doc_filters(
-                &row, false, None, true, None
+                &row, false, None, true, None, None
             )
         );
     }
@@ -6352,7 +6426,7 @@ mod tests {
         row.name = "search".to_string();
         assert!(
             !ClickHouseConversationRepository::passes_search_doc_filters(
-                &row, false, None, true, None
+                &row, false, None, true, None, None
             )
         );
     }
@@ -6368,6 +6442,7 @@ mod tests {
             false,
             Some(&[SearchEventKind::ToolResult]),
             false,
+            None,
             None
         ));
         assert!(
@@ -6376,6 +6451,7 @@ mod tests {
                 true,
                 Some(&[SearchEventKind::Message]),
                 false,
+                None,
                 None
             )
         );
@@ -6392,6 +6468,7 @@ mod tests {
             true,
             Some(&[SearchEventKind::Reasoning]),
             false,
+            None,
             None
         ));
         assert!(
@@ -6400,6 +6477,7 @@ mod tests {
                 true,
                 Some(&[SearchEventKind::Message]),
                 false,
+                None,
                 None
             )
         );
