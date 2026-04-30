@@ -162,6 +162,16 @@ struct TurnSummaryRow {
 }
 
 #[derive(Debug, Deserialize)]
+struct TurnRefRow {
+    session_id: String,
+    turn_seq: u32,
+    #[serde(default)]
+    turn_id: String,
+    started_at: String,
+    ended_at: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct TraceEventRow {
     session_id: String,
     event_uid: String,
@@ -185,6 +195,18 @@ struct TraceEventRow {
     token_usage_buckets: BTreeMap<String, u64>,
     #[serde(default)]
     token_usage_native_units: BTreeMap<String, f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EventRefRow {
+    session_id: String,
+    event_uid: String,
+    event_order: u64,
+    turn_seq: u32,
+    event_time: String,
+    actor_role: String,
+    event_class: String,
+    payload_type: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1862,15 +1884,7 @@ FORMAT JSONEachRow",
   toUInt32(turn_seq) AS turn_seq,
   ifNull(turn_id, '') AS turn_id,
   toString(started_at) AS started_at,
-  toInt64(toUnixTimestamp64Milli(parseDateTime64BestEffort(toString(started_at), 3))) AS started_at_unix_ms,
-  toString(ended_at) AS ended_at,
-  toInt64(toUnixTimestamp64Milli(parseDateTime64BestEffort(toString(ended_at), 3))) AS ended_at_unix_ms,
-  toUInt64(total_events) AS total_events,
-  toUInt64(user_messages) AS user_messages,
-  toUInt64(assistant_messages) AS assistant_messages,
-  toUInt64(tool_calls) AS tool_calls,
-  toUInt64(tool_results) AS tool_results,
-  toUInt64(reasoning_items) AS reasoning_items
+  toString(ended_at) AS ended_at
 FROM {turn_summary}
 WHERE session_id = {} AND turn_seq {cmp} {}
 ORDER BY turn_seq {order_dir}
@@ -1880,12 +1894,8 @@ FORMAT JSONEachRow",
             turn_seq,
         );
 
-        let rows: Vec<TurnSummaryRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
-        Ok(rows
-            .into_iter()
-            .next()
-            .map(Self::map_turn_row)
-            .map(|summary| Self::mcp_turn_ref(&summary)))
+        let rows: Vec<TurnRefRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
+        Ok(rows.into_iter().next().map(Self::mcp_turn_ref_row))
     }
 
     async fn load_adjacent_event_ref(
@@ -1922,18 +1932,7 @@ FORMAT JSONEachRow",
   toString(event_time) AS event_time,
   actor_role,
   event_class,
-  payload_type,
-  call_id,
-  name,
-  phase,
-  item_id,
-  source_ref,
-  text_content,
-  payload_json,
-  token_usage_json,
-  endpoint_kind,
-  token_usage_buckets,
-  token_usage_native_units
+  payload_type
 FROM {trace_table}
 WHERE session_id = {} AND {predicate}
 ORDER BY {order_by}
@@ -1942,21 +1941,17 @@ FORMAT JSONEachRow",
             sql_quote(session_id),
         );
 
-        let rows: Vec<TraceEventRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
-        Ok(rows
-            .into_iter()
-            .next()
-            .map(Self::map_trace_event)
-            .map(|event| Self::mcp_event_ref(&event)))
+        let rows: Vec<EventRefRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
+        Ok(rows.into_iter().next().map(Self::mcp_event_ref_row))
     }
 
-    fn mcp_turn_ref(summary: &TurnSummary) -> McpTurnRef {
+    fn mcp_turn_ref_row(row: TurnRefRow) -> McpTurnRef {
         McpTurnRef {
-            session_id: summary.session_id.clone(),
-            turn_seq: summary.turn_seq,
-            turn_id: summary.turn_id.clone(),
-            started_at: summary.started_at.clone(),
-            ended_at: summary.ended_at.clone(),
+            session_id: row.session_id,
+            turn_seq: row.turn_seq,
+            turn_id: row.turn_id,
+            started_at: row.started_at,
+            ended_at: row.ended_at,
         }
     }
 
@@ -1971,6 +1966,21 @@ FORMAT JSONEachRow",
                 &event.event_class,
                 &event.payload_type,
                 &event.actor_role,
+            ),
+        }
+    }
+
+    fn mcp_event_ref_row(row: EventRefRow) -> McpEventRef {
+        McpEventRef {
+            session_id: row.session_id,
+            event_uid: row.event_uid,
+            event_order: row.event_order,
+            turn_seq: row.turn_seq,
+            event_time: row.event_time,
+            event_type: Self::normalized_event_type(
+                &row.event_class,
+                &row.payload_type,
+                &row.actor_role,
             ),
         }
     }
