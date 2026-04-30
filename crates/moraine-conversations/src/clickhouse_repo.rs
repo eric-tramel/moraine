@@ -1932,7 +1932,11 @@ FORMAT JSONEachRow",
             event_order: event.event_order,
             turn_seq: event.turn_seq,
             event_time: event.event_time.clone(),
-            event_type: Self::normalized_event_type(&event.event_class, &event.payload_type),
+            event_type: Self::normalized_event_type(
+                &event.event_class,
+                &event.payload_type,
+                &event.actor_role,
+            ),
         }
     }
 
@@ -1946,7 +1950,11 @@ FORMAT JSONEachRow",
             actor_role: event.actor_role.clone(),
             event_class: event.event_class.clone(),
             payload_type: event.payload_type.clone(),
-            event_type: Self::normalized_event_type(&event.event_class, &event.payload_type),
+            event_type: Self::normalized_event_type(
+                &event.event_class,
+                &event.payload_type,
+                &event.actor_role,
+            ),
             call_id: event.call_id.clone(),
             name: event.name.clone(),
             phase: event.phase.clone(),
@@ -1993,9 +2001,13 @@ FORMAT JSONEachRow",
         let mut tools_called = Vec::<String>::new();
         let mut normalized_event_types = Vec::<String>::new();
         for event in events {
-            let event_type = Self::normalized_event_type(&event.event_class, &event.payload_type);
+            let event_type = Self::normalized_event_type(
+                &event.event_class,
+                &event.payload_type,
+                &event.actor_role,
+            );
             push_first_seen(&mut normalized_event_types, event_type.clone());
-            if event_type == SearchEventKind::ToolCall.as_str() {
+            if event_type == McpEventType::ToolCall.as_str() {
                 let tool_name = if event.name.trim().is_empty() {
                     event.call_id.trim()
                 } else {
@@ -2057,25 +2069,10 @@ FORMAT JSONEachRow",
         }
     }
 
-    fn normalized_event_type(event_class: &str, payload_type: &str) -> String {
-        for kind in [
-            SearchEventKind::Message,
-            SearchEventKind::Reasoning,
-            SearchEventKind::ToolCall,
-            SearchEventKind::ToolResult,
-        ] {
-            if Self::matches_event_kind(event_class, payload_type, kind) {
-                return kind.as_str().to_string();
-            }
-        }
-
-        if !payload_type.is_empty() && payload_type != "unknown" {
-            payload_type.to_string()
-        } else if !event_class.is_empty() {
-            event_class.to_string()
-        } else {
-            "event".to_string()
-        }
+    fn normalized_event_type(event_class: &str, payload_type: &str, actor_role: &str) -> String {
+        Self::mcp_event_type_for(event_class, payload_type, actor_role)
+            .as_str()
+            .to_string()
     }
 
     fn turn_terminal_completed(event: &TraceEvent) -> Option<bool> {
@@ -4934,7 +4931,11 @@ FORMAT JSONEachRow",
             .await?;
 
         Ok(Some(McpEventOpen {
-            event_type: Self::normalized_event_type(&event.event_class, &event.payload_type),
+            event_type: Self::normalized_event_type(
+                &event.event_class,
+                &event.payload_type,
+                &event.actor_role,
+            ),
             event,
             parent_session,
             parent_turn,

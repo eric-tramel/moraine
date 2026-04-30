@@ -836,6 +836,99 @@ impl AppState {
         json!({
             "tools": [
                 {
+                    "name": "search_sessions",
+                    "description": "Search Moraine session history and return compact event-ranked handles. Use open with the returned event_id, turn_id, or session_id to expand results.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Natural-language search query."
+                            },
+                            "within_id": {
+                                "type": ["string", "null"],
+                                "description": "Optional session:... or turn:... ID to constrain search scope."
+                            },
+                            "event_types": {
+                                "type": ["array", "null"],
+                                "items": {
+                                    "type": "string",
+                                    "enum": [
+                                        "user_input",
+                                        "assistant_response",
+                                        "reasoning",
+                                        "tool_call",
+                                        "tool_response",
+                                        "compaction",
+                                        "system",
+                                        "runtime"
+                                    ]
+                                },
+                                "description": "Optional normalized event type filter. Defaults to user_input, assistant_response, and tool_response."
+                            },
+                            "n_hits": {
+                                "type": ["integer", "null"],
+                                "minimum": crate::contract::SEARCH_SESSIONS_MIN_N_HITS,
+                                "maximum": crate::contract::SEARCH_SESSIONS_MAX_N_HITS,
+                                "default": crate::contract::SEARCH_SESSIONS_DEFAULT_N_HITS
+                            }
+                        },
+                        "required": ["query"]
+                    },
+                    "outputSchema": {
+                        "type": "object",
+                        "required": ["schema_version", "tool", "request", "data", "warnings", "performance"],
+                        "properties": {
+                            "schema_version": { "type": "string" },
+                            "tool": { "const": "search_sessions" },
+                            "request": { "type": "object" },
+                            "data": {
+                                "type": "object",
+                                "required": ["result_count", "limit", "truncated", "results"]
+                            },
+                            "warnings": { "type": "array" },
+                            "performance": { "type": "object" }
+                        }
+                    },
+                    "annotations": {
+                        "readOnlyHint": true
+                    }
+                },
+                {
+                    "name": "open",
+                    "description": "Open a Moraine MCP ID returned by search_sessions or open. Accepts session, turn, and event IDs.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "id": {
+                                "type": "string",
+                                "description": "A session:..., turn:..., or event:... Moraine MCP ID."
+                            }
+                        },
+                        "required": ["id"]
+                    },
+                    "outputSchema": {
+                        "type": "object",
+                        "required": ["schema_version", "tool", "request", "data", "warnings", "performance"],
+                        "properties": {
+                            "schema_version": { "type": "string" },
+                            "tool": { "const": "open" },
+                            "request": { "type": "object" },
+                            "data": {
+                                "type": "object",
+                                "required": ["kind"]
+                            },
+                            "warnings": { "type": "array" },
+                            "performance": { "type": "object" }
+                        }
+                    },
+                    "annotations": {
+                        "readOnlyHint": true
+                    }
+                },
+                {
                     "name": "search_session_data",
                     "description": "Search prior Moraine sessions for decisions, fixes, errors, logs, codenames, config values, and files. Returns compact session-ranked evidence from summaries and events. Defaults include raw tool output for error/log queries and prefer current, final, corrected, or latest evidence when asked. Use list_sessions only for metadata browsing; use open_session only when snippets are insufficient.",
                     "inputSchema": {
@@ -1049,8 +1142,8 @@ impl AppState {
                     }
                 },
                 {
-                    "name": "open",
-                    "description": "Legacy open tool. Prefer open_session for session expansion. Opens by `event_uid` with surrounding context, or by `session_id`; callers must supply exactly one of `event_uid` or `session_id`.",
+                    "name": "open_legacy",
+                    "description": "Compatibility-only legacy open path. Prefer open with a typed Moraine MCP ID. Opens by `event_uid` with surrounding context, or by `session_id`; callers must supply exactly one of `event_uid` or `session_id`.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -1247,6 +1340,8 @@ impl AppState {
 
     async fn call_tool(&self, params: ToolCallParams) -> Result<Value> {
         match params.name.as_str() {
+            "search_sessions" => self.search_sessions_v1(params.arguments).await,
+            "open" => self.open_v1(params.arguments).await,
             "search_session_data" => {
                 let mut args: SearchSessionDataArgs = serde_json::from_value(params.arguments)
                     .context(
@@ -1296,10 +1391,12 @@ impl AppState {
                     Verbosity::Prose => Ok(tool_ok_prose(format_search_prose(&payload)?)),
                 }
             }
-            "open" => {
-                let mut args: OpenArgs = serde_json::from_value(params.arguments)
-                    .context("open expects one of {\"event_uid\": ...} or {\"session_id\": ...}")?;
-                args.limit = validate_tool_limit("open", args.limit, self.cfg.mcp.max_results)?;
+            "open_legacy" => {
+                let mut args: OpenArgs = serde_json::from_value(params.arguments).context(
+                    "open_legacy expects one of {\"event_uid\": ...} or {\"session_id\": ...}",
+                )?;
+                args.limit =
+                    validate_tool_limit("open_legacy", args.limit, self.cfg.mcp.max_results)?;
                 let verbosity = args.verbosity.unwrap_or_default();
                 let payload = self.open(args).await?;
                 match verbosity {
@@ -3487,11 +3584,19 @@ mod tests {
             .filter_map(|tool| tool["name"].as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(names[0], "search_session_data");
-        assert_eq!(names[1], "open_session");
+        assert_eq!(names[0], "search_sessions");
+        assert_eq!(names[1], "open");
+        assert_eq!(names[2], "search_session_data");
+        assert_eq!(names[3], "open_session");
         assert!(names.contains(&"list_sessions"));
 
-        for tool_name in ["search_session_data", "open_session", "list_sessions"] {
+        for tool_name in [
+            "search_sessions",
+            "open",
+            "search_session_data",
+            "open_session",
+            "list_sessions",
+        ] {
             let tool = tools
                 .iter()
                 .find(|tool| tool["name"].as_str() == Some(tool_name))
@@ -3502,6 +3607,18 @@ mod tests {
             );
             assert_eq!(tool["annotations"]["readOnlyHint"], json!(true));
         }
+
+        let open = tools
+            .iter()
+            .find(|tool| tool["name"].as_str() == Some("open"))
+            .expect("open exists");
+        assert_eq!(
+            open["inputSchema"]["properties"]
+                .as_object()
+                .map(|props| props.len()),
+            Some(1)
+        );
+        assert!(open["inputSchema"]["properties"].get("id").is_some());
 
         let search = tools
             .iter()

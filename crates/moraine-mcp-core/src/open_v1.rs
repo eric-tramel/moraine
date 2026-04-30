@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::contract::{
     ContractError, McpEntityKind, McpEventId, McpId, McpSessionId, McpTurnId, OpenV1Args,
     Performance, ToolEnvelope, ToolError, ToolErrorCode, ToolErrorEnvelope, OPEN_TOOL,

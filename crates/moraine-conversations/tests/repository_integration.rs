@@ -1726,7 +1726,13 @@ async fn get_mcp_session_includes_turn_summaries_and_latest_completion() {
     assert_eq!(first_turn.tools_called, vec!["search_repo"]);
     assert_eq!(
         first_turn.normalized_event_types,
-        vec!["message", "tool_call", "tool_result", "task_complete"]
+        vec![
+            "user_input",
+            "tool_call",
+            "tool_response",
+            "assistant_response",
+            "runtime"
+        ]
     );
     assert_eq!(
         first_turn
@@ -1768,13 +1774,13 @@ async fn get_mcp_turn_returns_compact_events_and_incomplete_state() {
     assert_eq!(turn.metadata.turn_seq, 2);
     assert_eq!(turn.events.len(), 3);
     assert_eq!(turn.events[0].event_uid, "evt-inc-2");
-    assert_eq!(turn.events[0].event_type, "message");
+    assert_eq!(turn.events[0].event_type, "user_input");
     assert_eq!(
         turn.events[0].text_preview.as_deref(),
         Some("Run the incomplete workflow.")
     );
     assert_eq!(turn.events[1].event_type, "tool_call");
-    assert_eq!(turn.events[2].event_type, "tool_result");
+    assert_eq!(turn.events[2].event_type, "tool_response");
     assert_eq!(
         turn.user_input_summary.as_deref(),
         Some("Run the incomplete workflow.")
@@ -1783,7 +1789,7 @@ async fn get_mcp_turn_returns_compact_events_and_incomplete_state() {
     assert_eq!(turn.tools_called, vec!["inspect"]);
     assert_eq!(
         turn.normalized_event_types,
-        vec!["message", "tool_call", "tool_result"]
+        vec!["user_input", "tool_call", "tool_response"]
     );
     assert!(!turn.completed);
     assert!(turn.terminal_event_uid.is_none());
@@ -1817,7 +1823,7 @@ async fn get_mcp_event_returns_full_content_and_navigation_refs() {
         .expect("mcp event exists");
 
     assert_eq!(event.event.event_uid, "evt-open-full");
-    assert_eq!(event.event_type, "message");
+    assert_eq!(event.event_type, "assistant_response");
     assert_eq!(event.event.session_id, "sess-event");
     assert_eq!(event.event.turn_seq, 1);
     assert_eq!(

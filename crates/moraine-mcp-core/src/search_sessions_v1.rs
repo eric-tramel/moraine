@@ -1,5 +1,3 @@
-#![allow(dead_code)] // Wired into the tool router by the integration slice.
-
 use super::{tool_ok_hybrid, AppState};
 use crate::contract::{
     format_rfc3339_utc_millis, CanonicalSearchSessionsArgs, ContractError, McpEventId, McpId,
