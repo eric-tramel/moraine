@@ -2,10 +2,10 @@ use async_trait::async_trait;
 
 use crate::domain::{
     Conversation, ConversationDetailOptions, ConversationListFilter, ConversationSearchQuery,
-    ConversationSearchResults, McpEventOpen, McpSessionOpen, McpTurnOpen, OpenContext,
-    OpenEventRequest, Page, PageRequest, SearchEventsQuery, SearchEventsResult,
-    SearchMcpEventsQuery, SearchMcpEventsResult, SessionEventsQuery, SessionMetadata, TraceEvent,
-    Turn, TurnListFilter, TurnSummary,
+    ConversationSearchResults, McpEventOpen, McpSessionListFilter, McpSessionListItem,
+    McpSessionOpen, McpTurnOpen, OpenContext, OpenEventRequest, Page, PageRequest,
+    SearchEventsQuery, SearchEventsResult, SearchMcpEventsQuery, SearchMcpEventsResult,
+    SessionEventsQuery, SessionMetadata, TraceEvent, Turn, TurnListFilter, TurnSummary,
 };
 use crate::error::RepoResult;
 
@@ -26,6 +26,12 @@ pub trait ConversationRepository: Send + Sync {
     async fn get_session_metadata(&self, session_id: &str) -> RepoResult<Option<SessionMetadata>>;
 
     async fn get_mcp_session(&self, session_id: &str) -> RepoResult<Option<McpSessionOpen>>;
+
+    async fn list_mcp_sessions(
+        &self,
+        filter: McpSessionListFilter,
+        page: PageRequest,
+    ) -> RepoResult<Page<McpSessionListItem>>;
 
     async fn list_turns(
         &self,

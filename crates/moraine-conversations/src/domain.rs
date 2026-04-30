@@ -50,6 +50,16 @@ pub struct ConversationListFilter {
     pub sort: ConversationListSort,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpSessionListFilter {
+    pub start_unix_ms: i64,
+    pub end_unix_ms: i64,
+    #[serde(default)]
+    pub mode: Option<ConversationMode>,
+    #[serde(default)]
+    pub sort: ConversationListSort,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TurnListFilter {
     #[serde(default)]
@@ -224,6 +234,27 @@ pub struct McpSessionOpen {
     pub turns: Vec<McpTurnCompact>,
     pub completed: bool,
     pub terminal_event_uid: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpSessionListItem {
+    pub session_id: String,
+    pub first_event_time: String,
+    pub first_event_unix_ms: i64,
+    pub last_event_time: String,
+    pub last_event_unix_ms: i64,
+    pub total_turns: u32,
+    pub total_events: u64,
+    pub mode: ConversationMode,
+    pub completed: bool,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub session_slug: Option<String>,
+    #[serde(default)]
+    pub session_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -12,9 +12,9 @@ use moraine_clickhouse::ClickHouseClient;
 use moraine_config::ClickHouseConfig;
 use moraine_conversations::{
     ClickHouseConversationRepository, ConversationListFilter, ConversationListSort,
-    ConversationMode, ConversationRepository, ConversationSearchQuery, McpEventType, PageRequest,
-    RepoConfig, RepoError, SearchEventKind, SearchEventsQuery, SearchMcpEventsQuery,
-    SessionEventsDirection, SessionEventsQuery, SessionMetadataSearchQuery,
+    ConversationMode, ConversationRepository, ConversationSearchQuery, McpEventType,
+    McpSessionListFilter, PageRequest, RepoConfig, RepoError, SearchEventKind, SearchEventsQuery,
+    SearchMcpEventsQuery, SessionEventsDirection, SessionEventsQuery, SessionMetadataSearchQuery,
 };
 use serde_json::json;
 
@@ -137,6 +137,85 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
             .lock()
             .expect("query lock")
             .push(query.clone());
+
+        if query.contains("FROM `moraine`.`v_session_summary` AS s")
+            && query.contains("AS completed")
+            && query.contains("latest_terminal_payload_type")
+        {
+            if query.contains("s.session_id < 'sess_b'") {
+                return (
+                    StatusCode::OK,
+                    json_each_row(json!([
+                        {
+                            "session_id": "sess_a",
+                            "first_event_time": "2026-01-01 10:00:00",
+                            "first_event_unix_ms": 1767261600000_i64,
+                            "last_event_time": "2026-01-01 10:10:00",
+                            "last_event_unix_ms": 1767262200000_i64,
+                            "total_turns": 2,
+                            "total_events": 20,
+                            "mode": "web_search",
+                            "completed": 0_u8,
+                            "title": "",
+                            "source": "codex",
+                            "session_slug": "",
+                            "session_summary": ""
+                        }
+                    ])),
+                );
+            }
+
+            return (
+                StatusCode::OK,
+                json_each_row(json!([
+                    {
+                        "session_id": "sess_c",
+                        "first_event_time": "2026-01-03 10:00:00",
+                        "first_event_unix_ms": 1767434400000_i64,
+                        "last_event_time": "2026-01-03 10:10:00",
+                        "last_event_unix_ms": 1767435000000_i64,
+                        "total_turns": 3,
+                        "total_events": 30,
+                        "mode": "web_search",
+                        "completed": 1_u8,
+                        "title": "Session C title",
+                        "source": "codex",
+                        "session_slug": "project-c",
+                        "session_summary": "Session C summary"
+                    },
+                    {
+                        "session_id": "sess_b",
+                        "first_event_time": "2026-01-02 10:00:00",
+                        "first_event_unix_ms": 1767348000000_i64,
+                        "last_event_time": "2026-01-02 10:10:00",
+                        "last_event_unix_ms": 1767348600000_i64,
+                        "total_turns": 2,
+                        "total_events": 22,
+                        "mode": "web_search",
+                        "completed": 1_u8,
+                        "title": "Session B title",
+                        "source": "codex",
+                        "session_slug": "project-b",
+                        "session_summary": "Session B summary"
+                    },
+                    {
+                        "session_id": "sess_a",
+                        "first_event_time": "2026-01-01 10:00:00",
+                        "first_event_unix_ms": 1767261600000_i64,
+                        "last_event_time": "2026-01-01 10:10:00",
+                        "last_event_unix_ms": 1767262200000_i64,
+                        "total_turns": 2,
+                        "total_events": 20,
+                        "mode": "web_search",
+                        "completed": 0_u8,
+                        "title": "",
+                        "source": "codex",
+                        "session_slug": "",
+                        "session_summary": ""
+                    }
+                ])),
+            );
+        }
 
         if query.contains("FROM `moraine`.`v_session_summary` AS s")
             && query.contains("ORDER BY s.last_event_time DESC")
@@ -1736,6 +1815,108 @@ async fn list_conversations_rejects_cursor_when_sort_changes() {
     assert_eq!(
         err.to_string(),
         "invalid cursor: cursor does not match current conversation filter"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_mcp_sessions_uses_overlap_filter_and_cursor_pagination() {
+    let (repo, state) = build_repo().await;
+
+    let filter = McpSessionListFilter {
+        start_unix_ms: 1767261600000_i64,
+        end_unix_ms: 1767500000000_i64,
+        mode: Some(ConversationMode::WebSearch),
+        sort: ConversationListSort::Desc,
+    };
+
+    let first = repo
+        .list_mcp_sessions(
+            filter.clone(),
+            PageRequest {
+                limit: 2,
+                cursor: None,
+            },
+        )
+        .await
+        .expect("first page");
+
+    assert_eq!(first.items.len(), 2);
+    assert_eq!(first.items[0].session_id, "sess_c");
+    assert_eq!(first.items[0].title.as_deref(), Some("Session C title"));
+    assert_eq!(first.items[0].source.as_deref(), Some("codex"));
+    assert!(first.items[0].completed);
+    assert_eq!(first.items[1].session_id, "sess_b");
+    assert!(first.next_cursor.is_some());
+
+    let second = repo
+        .list_mcp_sessions(
+            filter,
+            PageRequest {
+                limit: 2,
+                cursor: first.next_cursor,
+            },
+        )
+        .await
+        .expect("second page");
+
+    assert_eq!(second.items.len(), 1);
+    assert_eq!(second.items[0].session_id, "sess_a");
+    assert!(!second.items[0].completed);
+    assert!(second.next_cursor.is_none());
+
+    let queries = state.queries.lock().expect("queries lock").clone();
+    let list_query = queries
+        .iter()
+        .find(|q| q.contains("AS completed") && q.contains("latest_terminal_payload_type"))
+        .expect("list_sessions query should be captured");
+
+    assert!(list_query.contains("toUnixTimestamp64Milli(s.last_event_time) >= 1767261600000"));
+    assert!(list_query.contains("toUnixTimestamp64Milli(s.first_event_time) < 1767500000000"));
+    assert!(list_query.contains("ifNull(m.mode, 'chat') = 'web_search'"));
+    assert!(list_query.contains("ORDER BY s.last_event_time DESC, s.session_id DESC"));
+    assert!(list_query.contains("payload_type IN ('task_complete', 'turn_aborted')"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_mcp_sessions_rejects_cursor_filter_mismatch() {
+    let (repo, _state) = build_repo().await;
+
+    let base_filter = McpSessionListFilter {
+        start_unix_ms: 1767261600000_i64,
+        end_unix_ms: 1767500000000_i64,
+        mode: Some(ConversationMode::WebSearch),
+        sort: ConversationListSort::Desc,
+    };
+
+    let first = repo
+        .list_mcp_sessions(
+            base_filter.clone(),
+            PageRequest {
+                limit: 1,
+                cursor: None,
+            },
+        )
+        .await
+        .expect("first page");
+    let cursor = first.next_cursor.expect("next cursor");
+
+    let err = repo
+        .list_mcp_sessions(
+            McpSessionListFilter {
+                mode: Some(ConversationMode::Chat),
+                ..base_filter
+            },
+            PageRequest {
+                limit: 1,
+                cursor: Some(cursor),
+            },
+        )
+        .await
+        .expect_err("filter mismatch should fail");
+
+    assert_eq!(
+        err.to_string(),
+        "invalid cursor: cursor does not match current list_sessions filter"
     );
 }
 

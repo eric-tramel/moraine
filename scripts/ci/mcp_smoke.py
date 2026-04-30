@@ -153,9 +153,9 @@ def contains_text(value: Any, needle: str) -> bool:
 
 
 def assert_tools_surface(tool_names_ordered: list[str]) -> None:
-    if tool_names_ordered != ["search_sessions", "open"]:
+    if tool_names_ordered != ["search_sessions", "open", "list_sessions"]:
         raise AssertionError(
-            "tools/list must publish the two-tool search surface exactly: "
+            "tools/list must publish the MCP search surface exactly: "
             f"{tool_names_ordered}"
         )
 
@@ -216,6 +216,47 @@ def open_ids_from_search_result(result: Dict[str, Any]) -> list[str]:
             raise AssertionError(f"search_sessions result missing {key}: {result}")
         open_ids.append(open_id)
     return list(dict.fromkeys(open_ids))
+
+
+def select_list_sessions_result(
+    sessions: list[Any],
+    expect_session_id: Optional[str],
+) -> Dict[str, Any]:
+    expected_session = expected_mcp_session_id(expect_session_id)
+
+    for result in sessions:
+        if not isinstance(result, dict):
+            continue
+        session_id = nested_string(result, "session", "id")
+        open_session_id = nested_string(result, "open", "session_id")
+        if expected_session is None or expected_session in {session_id, open_session_id}:
+            return result
+
+    debug_sessions = [
+        {
+            "id": session.get("id"),
+            "session_id": nested_string(session, "session", "id"),
+            "open_session_id": nested_string(session, "open", "session_id"),
+            "updated_at": nested_string(session, "session", "updated_at"),
+        }
+        for session in sessions
+        if isinstance(session, dict)
+    ][:5]
+    raise AssertionError(
+        "list_sessions did not return a session matching expected filters: "
+        f"session_id={expect_session_id}, sessions={debug_sessions}"
+    )
+
+
+def open_id_from_list_sessions_result(result: Dict[str, Any]) -> str:
+    open_id = nested_string(result, "open", "session_id")
+    session_id = nested_string(result, "session", "id")
+    if not open_id or open_id != session_id:
+        raise AssertionError(f"list_sessions result missing matching open.session_id: {result}")
+    for forbidden in ["snippet", "payload_json", "events", "text_content"]:
+        if forbidden in result:
+            raise AssertionError(f"list_sessions returned non-metadata field {forbidden}: {result}")
+    return open_id
 
 
 def open_payload_session_id(payload: Dict[str, Any]) -> Optional[str]:
@@ -350,6 +391,31 @@ def run_smoke(
             proc,
             next_id,
             open_ids_from_search_result(selected_result),
+            expect_session_id,
+            expect_open_text,
+        )
+
+        list_result = call_tool(
+            proc,
+            next_id,
+            "list_sessions",
+            {
+                "start_datetime": "2026-02-16T11:59:00Z",
+                "end_datetime": "2026-02-16T12:01:00Z",
+                "limit": 20,
+            },
+        )
+        next_id += 1
+        list_payload = assert_structured_content(list_result, "list_sessions")
+        sessions = list_payload["data"].get("sessions")
+        if not isinstance(sessions, list) or not sessions:
+            raise AssertionError("list_sessions returned no sessions for e2e fixture window")
+
+        selected_session = select_list_sessions_result(sessions, expect_session_id)
+        next_id = assert_open_search_ids(
+            proc,
+            next_id,
+            [open_id_from_list_sessions_result(selected_session)],
             expect_session_id,
             expect_open_text,
         )

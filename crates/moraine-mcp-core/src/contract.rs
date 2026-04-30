@@ -1,3 +1,4 @@
+use chrono::DateTime;
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{json, Value};
 use std::fmt;
@@ -12,8 +13,10 @@ const BASE64_URL_ALPHABET: &[u8; 64] =
 
 pub const SEARCH_SESSIONS_TOOL: &str = "search_sessions";
 pub const OPEN_TOOL: &str = "open";
+pub const LIST_SESSIONS_TOOL: &str = "list_sessions";
 pub const SEARCH_SESSIONS_SCHEMA_VERSION: &str = "moraine.mcp.search_sessions.v1";
 pub const OPEN_SCHEMA_VERSION: &str = "moraine.mcp.open.v1";
+pub const LIST_SESSIONS_SCHEMA_VERSION: &str = "moraine.mcp.list_sessions.v1";
 pub const ERROR_SCHEMA_VERSION: &str = "moraine.mcp.error.v1";
 pub const SEARCH_SESSIONS_DEFAULT_N_HITS: u16 = 10;
 pub const SEARCH_SESSIONS_MIN_N_HITS: u16 = 1;
@@ -21,6 +24,12 @@ pub const SEARCH_SESSIONS_MAX_N_HITS: u16 = 50;
 pub const SEARCH_SESSIONS_MAX_QUERY_CHARS: usize = 4096;
 pub const SEARCH_SESSIONS_SLA_TARGET_MS: u64 = 750;
 pub const OPEN_SLA_TARGET_MS: u64 = 500;
+pub const LIST_SESSIONS_DEFAULT_LIMIT: u16 = 20;
+pub const LIST_SESSIONS_MIN_LIMIT: u16 = 1;
+pub const LIST_SESSIONS_DEFAULT_SLA_TARGET_MS: u64 = 300;
+pub const LIST_SESSIONS_BROAD_SLA_TARGET_MS: u64 = 1_000;
+pub const LIST_SESSIONS_FILTERED_BROAD_SLA_TARGET_MS: u64 = 1_200;
+pub const LIST_SESSIONS_DEADLINE_MS: u64 = 3_000;
 
 pub type ContractResult<T> = Result<T, ContractError>;
 
@@ -555,6 +564,136 @@ pub struct CanonicalSearchSessionsArgs {
     pub n_hits: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListSessionsMode {
+    WebSearch,
+    McpInternal,
+    ToolCalling,
+    Chat,
+}
+
+impl ListSessionsMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WebSearch => "web_search",
+            Self::McpInternal => "mcp_internal",
+            Self::ToolCalling => "tool_calling",
+            Self::Chat => "chat",
+        }
+    }
+}
+
+impl fmt::Display for ListSessionsMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ListSessionsSort {
+    Asc,
+    #[default]
+    Desc,
+}
+
+impl ListSessionsSort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Asc => "asc",
+            Self::Desc => "desc",
+        }
+    }
+}
+
+impl fmt::Display for ListSessionsSort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListSessionsArgs {
+    #[serde(default)]
+    pub start_datetime: Option<String>,
+    #[serde(default)]
+    pub end_datetime: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u16>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub mode: Option<ListSessionsMode>,
+    #[serde(default)]
+    pub sort: Option<ListSessionsSort>,
+}
+
+impl ListSessionsArgs {
+    pub fn validate(self, max_results: u16) -> ContractResult<CanonicalListSessionsArgs> {
+        let max_limit = max_results.max(LIST_SESSIONS_MIN_LIMIT);
+        let limit = self
+            .limit
+            .unwrap_or(LIST_SESSIONS_DEFAULT_LIMIT.min(max_limit));
+        if !(LIST_SESSIONS_MIN_LIMIT..=max_limit).contains(&limit) {
+            return Err(invalid_request_with_field(
+                "limit",
+                format!("limit must be between 1 and {max_limit}"),
+            ));
+        }
+
+        let Some(start_datetime) = self.start_datetime else {
+            return Err(list_sessions_datetime_required_error());
+        };
+        let Some(end_datetime) = self.end_datetime else {
+            return Err(list_sessions_datetime_required_error());
+        };
+
+        let start_datetime = start_datetime.trim().to_string();
+        let end_datetime = end_datetime.trim().to_string();
+        let start_unix_ms = parse_explicit_timezone_datetime("start_datetime", &start_datetime)?;
+        let end_unix_ms = parse_explicit_timezone_datetime("end_datetime", &end_datetime)?;
+        if end_unix_ms <= start_unix_ms {
+            return Err(invalid_request_with_field(
+                "end_datetime",
+                "end_datetime must be later than start_datetime",
+            ));
+        }
+
+        let cursor = self.cursor.map(|cursor| cursor.trim().to_string());
+        if matches!(cursor.as_deref(), Some("")) {
+            return Err(invalid_request_with_field(
+                "cursor",
+                "cursor must be a non-empty string when provided",
+            ));
+        }
+
+        Ok(CanonicalListSessionsArgs {
+            start_datetime,
+            end_datetime,
+            start_unix_ms,
+            end_unix_ms,
+            limit,
+            cursor,
+            mode: self.mode,
+            sort: self.sort.unwrap_or_default(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalListSessionsArgs {
+    pub start_datetime: String,
+    pub end_datetime: String,
+    pub start_unix_ms: i64,
+    pub end_unix_ms: i64,
+    pub limit: u16,
+    pub cursor: Option<String>,
+    pub mode: Option<ListSessionsMode>,
+    pub sort: ListSessionsSort,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct OpenV1Args {
     #[serde(default)]
@@ -714,6 +853,13 @@ impl PerformanceBuilder {
     pub fn finish(&self) -> Performance {
         Performance::from_elapsed(self.started_at.elapsed(), self.sla_target_ms)
     }
+
+    pub fn with_sla_target(&self, sla_target_ms: u64) -> Self {
+        Self {
+            started_at: self.started_at,
+            sla_target_ms,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -843,6 +989,62 @@ fn unsupported_event_type(raw: &str, supported: Vec<&'static str>) -> ContractEr
         "field": "event_types",
         "supported": supported
     }))
+}
+
+fn list_sessions_datetime_required_error() -> ContractError {
+    ContractError::new(
+        ToolErrorCode::InvalidRequest,
+        "list_sessions requires start_datetime and end_datetime with explicit timezones",
+    )
+    .with_details(json!({
+        "example": {
+            "start_datetime": "2026-04-30T09:00:00-04:00",
+            "end_datetime": "2026-04-30T13:00:00-04:00"
+        }
+    }))
+}
+
+fn parse_explicit_timezone_datetime(field: &'static str, input: &str) -> ContractResult<i64> {
+    if input.is_empty() {
+        return Err(invalid_request_with_field(
+            field,
+            format!("{field} must be a non-empty RFC 3339 datetime"),
+        ));
+    }
+    if !has_explicit_timezone(input) {
+        return Err(invalid_request_with_field(
+            field,
+            format!("{field} must include an explicit timezone offset or Z"),
+        ));
+    }
+
+    DateTime::parse_from_rfc3339(input)
+        .map(|datetime| datetime.timestamp_millis())
+        .map_err(|error| {
+            invalid_request_with_field(
+                field,
+                format!("{field} must be a valid RFC 3339 datetime: {error}"),
+            )
+        })
+}
+
+fn has_explicit_timezone(input: &str) -> bool {
+    let input = input.trim();
+    if input.ends_with('Z') || input.ends_with('z') {
+        return true;
+    }
+
+    let bytes = input.as_bytes();
+    if bytes.len() < 6 {
+        return false;
+    }
+    let offset = &bytes[bytes.len() - 6..];
+    matches!(offset[0], b'+' | b'-')
+        && offset[1].is_ascii_digit()
+        && offset[2].is_ascii_digit()
+        && offset[3] == b':'
+        && offset[4].is_ascii_digit()
+        && offset[5].is_ascii_digit()
 }
 
 fn searchable_event_type_index(event_type: McpEventType) -> Option<usize> {
