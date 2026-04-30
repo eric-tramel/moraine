@@ -1,4 +1,7 @@
 #![recursion_limit = "256"]
+// Legacy retrieval helpers remain in this crate while the public MCP surface
+// migrates to search_sessions/open. They are no longer advertised or routed.
+#![allow(dead_code)]
 
 pub mod contract;
 mod open_v1;
@@ -1353,132 +1356,6 @@ impl AppState {
         match params.name.as_str() {
             "search_sessions" => self.search_sessions_v1(params.arguments).await,
             "open" => self.open_v1(params.arguments).await,
-            "search_session_data" => {
-                let mut args: SearchSessionDataArgs = serde_json::from_value(params.arguments)
-                    .context(
-                        "search_session_data expects a JSON object with at least {\"query\": ...}",
-                    )?;
-                let max_limit = self.cfg.mcp.max_results.min(SESSION_SEARCH_MAX_LIMIT);
-                args.limit = validate_tool_limit("search_session_data", args.limit, max_limit)?;
-                args.matching_events_limit = validate_tool_limit(
-                    "search_session_data matching_events_limit",
-                    args.matching_events_limit,
-                    SESSION_SEARCH_MAX_MATCHING_EVENTS_LIMIT,
-                )?;
-                let verbosity = args.verbosity.unwrap_or_default();
-                let payload = self.search_session_data(args).await?;
-                match verbosity {
-                    Verbosity::Full => Ok(tool_ok_full(payload)),
-                    Verbosity::Prose => Ok(tool_ok_hybrid(
-                        format_search_session_data_text(&payload)?,
-                        payload,
-                    )),
-                }
-            }
-            "open_session" => {
-                let mut args: OpenSessionArgs = serde_json::from_value(params.arguments)
-                    .context("open_session expects {\"session_id\": ...}")?;
-                let max_limit = self.cfg.mcp.max_results.min(OPEN_SESSION_MAX_LIMIT);
-                args.limit = validate_tool_limit("open_session", args.limit, max_limit)?;
-                validate_context_window("open_session before", args.before)?;
-                validate_context_window("open_session after", args.after)?;
-                let verbosity = args.verbosity.unwrap_or_default();
-                let payload = self.open_session(args).await?;
-                match verbosity {
-                    Verbosity::Full => Ok(tool_ok_full(payload)),
-                    Verbosity::Prose => {
-                        Ok(tool_ok_hybrid(format_open_session_text(&payload)?, payload))
-                    }
-                }
-            }
-            "search" => {
-                let mut args: SearchArgs = serde_json::from_value(params.arguments)
-                    .context("search expects a JSON object with at least {\"query\": ...}")?;
-                args.limit = validate_tool_limit("search", args.limit, self.cfg.mcp.max_results)?;
-                let verbosity = args.verbosity.unwrap_or_default();
-                let payload = self.search(args).await?;
-                match verbosity {
-                    Verbosity::Full => Ok(tool_ok_full(payload)),
-                    Verbosity::Prose => Ok(tool_ok_prose(format_search_prose(&payload)?)),
-                }
-            }
-            "open_legacy" => {
-                let mut args: OpenArgs = serde_json::from_value(params.arguments).context(
-                    "open_legacy expects one of {\"event_uid\": ...} or {\"session_id\": ...}",
-                )?;
-                args.limit =
-                    validate_tool_limit("open_legacy", args.limit, self.cfg.mcp.max_results)?;
-                let verbosity = args.verbosity.unwrap_or_default();
-                let payload = self.open(args).await?;
-                match verbosity {
-                    Verbosity::Full => Ok(tool_ok_full(payload)),
-                    Verbosity::Prose => Ok(tool_ok_prose(format_open_prose(&payload)?)),
-                }
-            }
-            "search_conversations" => {
-                let mut args: SearchConversationsArgs = serde_json::from_value(params.arguments)
-                    .context(
-                        "search_conversations expects a JSON object with at least {\"query\": ...}",
-                    )?;
-                args.limit = validate_tool_limit(
-                    "search_conversations",
-                    args.limit,
-                    self.cfg.mcp.max_results,
-                )?;
-                let verbosity = args.verbosity.unwrap_or_default();
-                let mode = args.mode;
-                let payload = self.search_conversations(args).await?;
-                match verbosity {
-                    Verbosity::Full => Ok(tool_ok_full(payload)),
-                    Verbosity::Prose => Ok(tool_ok_prose(format_conversation_search_prose(
-                        &payload, mode,
-                    )?)),
-                }
-            }
-            "list_sessions" => {
-                let mut args: ListSessionsArgs = if params.arguments.is_null() {
-                    ListSessionsArgs::default()
-                } else {
-                    serde_json::from_value(params.arguments)
-                        .context("list_sessions expects a JSON object with optional filters")?
-                };
-                args.limit =
-                    validate_tool_limit("list_sessions", args.limit, self.cfg.mcp.max_results)?;
-                let verbosity = args.verbosity.unwrap_or_default();
-                let payload = self.list_sessions(args).await?;
-                match verbosity {
-                    Verbosity::Full => Ok(tool_ok_full(payload)),
-                    Verbosity::Prose => Ok(tool_ok_hybrid(
-                        format_session_list_prose(&payload)?,
-                        payload,
-                    )),
-                }
-            }
-            "get_session" => {
-                let args: GetSessionArgs = serde_json::from_value(params.arguments)
-                    .context("get_session expects {\"session_id\": ...}")?;
-                let verbosity = args.verbosity.unwrap_or_default();
-                let payload = self.get_session(args).await?;
-                match verbosity {
-                    Verbosity::Full => Ok(tool_ok_full(payload)),
-                    Verbosity::Prose => Ok(tool_ok_prose(format_get_session_prose(&payload)?)),
-                }
-            }
-            "get_session_events" => {
-                let mut args: GetSessionEventsArgs = serde_json::from_value(params.arguments)
-                    .context("get_session_events expects {\"session_id\": ...}")?;
-                args.limit = validate_tool_limit(
-                    "get_session_events",
-                    args.limit,
-                    self.cfg.mcp.max_results,
-                )?;
-                let verbosity = args.verbosity.unwrap_or_default();
-                let payload = self.get_session_events(args).await?;
-                match verbosity {
-                    Verbosity::Full => Ok(tool_ok_full(payload)),
-                    Verbosity::Prose => Ok(tool_ok_prose(format_session_events_prose(&payload)?)),
-                }
-            }
             other => Err(anyhow!("unknown tool: {other}")),
         }
     }

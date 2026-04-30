@@ -353,7 +353,7 @@ EOF
     printf '%s' "$body" | json_ok_true "$python_bin"
   done
 
-  echo "[e2e] checking MCP initialize/tools/search/open (codex)"
+  echo "[e2e] checking MCP initialize/tools/search_sessions/open (codex)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
     --moraine "$moraine_bin" \
     --config "$config_path" \
@@ -362,7 +362,7 @@ EOF
     --expect-source-file "$codex_fixture_file" \
     --expect-open-text "$codex_trace_marker"
 
-  echo "[e2e] checking MCP initialize/tools/search/open (claude)"
+  echo "[e2e] checking MCP initialize/tools/search_sessions/open (claude)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
     --moraine "$moraine_bin" \
     --config "$config_path" \
@@ -373,8 +373,8 @@ EOF
 
   # Hermes synthesizes its own `hermes:<uid>` session id, so we do not pin
   # --expect-session-id; source file + trace marker are enough to prove the
-  # row round-tripped from fixture through ingest to MCP search/open.
-  echo "[e2e] checking MCP initialize/tools/search/open (hermes)"
+  # row round-tripped from fixture through ingest to MCP search_sessions/open.
+  echo "[e2e] checking MCP initialize/tools/search_sessions/open (hermes)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
     --moraine "$moraine_bin" \
     --config "$config_path" \
