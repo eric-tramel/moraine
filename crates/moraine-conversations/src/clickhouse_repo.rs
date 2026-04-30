@@ -3123,6 +3123,24 @@ FORMAT JSONEachRow",
         min_score: f64,
         limit: u16,
     ) -> RepoResult<Vec<SearchMcpEventRow>> {
+        if turn_seq.is_none() {
+            let fast_rows = self
+                .search_mcp_event_rows_fast_pass(
+                    terms,
+                    docs,
+                    avgdl,
+                    event_types,
+                    session_id,
+                    min_should_match,
+                    min_score,
+                    limit,
+                )
+                .await?;
+            if !fast_rows.is_empty() {
+                return Ok(fast_rows);
+            }
+        }
+
         let df_map = self.df_map(terms).await?;
         let mut idf_by_term = HashMap::<String, f64>::new();
         for term in terms {
@@ -3149,6 +3167,149 @@ FORMAT JSONEachRow",
                 .then_with(|| b.event_unix_ms.cmp(&a.event_unix_ms))
                 .then_with(|| a.event_uid.cmp(&b.event_uid))
         });
+        Ok(rows)
+    }
+
+    async fn search_mcp_event_rows_fast_pass(
+        &self,
+        terms: &[String],
+        docs: u64,
+        avgdl: f64,
+        event_types: &[McpEventType],
+        session_id: Option<&str>,
+        min_should_match: u16,
+        min_score: f64,
+        limit: u16,
+    ) -> RepoResult<Vec<SearchMcpEventRow>> {
+        #[derive(Clone, Copy)]
+        struct CandidateRef<'a> {
+            row: &'a CachedPostingRow,
+            score: f64,
+            matched_terms: u64,
+        }
+
+        let postings_by_term = self.load_term_postings_for_terms(terms).await?;
+        let use_document_codex_flag = self.search_documents_has_codex_flag().await?;
+        let df_map = self.df_map(terms).await?;
+        let k1 = self.cfg.bm25_k1.max(0.01);
+        let b = self.cfg.bm25_b.clamp(0.0, 1.0);
+        let mut idf_by_term = HashMap::<&str, f64>::new();
+        for term in terms {
+            let df = *df_map.get(term).unwrap_or(&0);
+            idf_by_term.insert(term.as_str(), Self::bm25_idf(docs, df));
+        }
+
+        let mut accum_by_uid = HashMap::<&str, SearchScoreAccum<'_>>::new();
+        for (idx, term) in terms.iter().enumerate() {
+            if idx >= 64 {
+                break;
+            }
+            let idf = *idf_by_term.get(term.as_str()).unwrap_or(&0.0);
+            if idf <= 0.0 {
+                continue;
+            }
+
+            if let Some(rows) = postings_by_term.get(term) {
+                for row in rows.iter() {
+                    let entry = accum_by_uid
+                        .entry(row.event_uid.as_str())
+                        .or_insert_with(|| SearchScoreAccum {
+                            row,
+                            score: 0.0,
+                            matched_mask: 0,
+                        });
+
+                    entry.score += idf * Self::bm25_term_score(row.tf, row.doc_len, avgdl, k1, b);
+                    entry.matched_mask |= 1u64 << idx;
+                }
+            }
+        }
+
+        let mut candidates = Vec::<CandidateRef<'_>>::new();
+        for acc in accum_by_uid.values() {
+            let matched_terms = acc.matched_mask.count_ones() as u64;
+            if matched_terms < min_should_match as u64 || acc.score < min_score {
+                continue;
+            }
+            candidates.push(CandidateRef {
+                row: acc.row,
+                score: acc.score,
+                matched_terms,
+            });
+        }
+
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        candidates.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.row.event_uid.cmp(&b.row.event_uid))
+        });
+
+        let mut rows = Vec::<SearchMcpEventRow>::new();
+        let hydrate_chunk_size = (limit as usize).saturating_mul(8).max(128);
+        let mut offset = 0usize;
+        while offset < candidates.len() && rows.len() < limit as usize {
+            let end = (offset + hydrate_chunk_size).min(candidates.len());
+            let event_uids: Vec<String> = candidates[offset..end]
+                .iter()
+                .map(|candidate| candidate.row.event_uid.clone())
+                .collect();
+            let doc_extras = self
+                .load_search_doc_extras(&event_uids, use_document_codex_flag)
+                .await?;
+
+            for candidate in &candidates[offset..end] {
+                let Some(extra) = doc_extras.get(candidate.row.event_uid.as_str()) else {
+                    continue;
+                };
+                if session_id.is_some_and(|session_id| extra.session_id != session_id) {
+                    continue;
+                }
+                let event_type = Self::mcp_event_type_for(
+                    &extra.event_class,
+                    &extra.payload_type,
+                    &extra.actor_role,
+                );
+                if !event_types.contains(&event_type) {
+                    continue;
+                }
+
+                rows.push(SearchMcpEventRow {
+                    event_uid: candidate.row.event_uid.clone(),
+                    session_id: extra.session_id.clone(),
+                    source_name: extra.source_name.clone(),
+                    harness: extra.harness.clone(),
+                    inference_provider: extra.inference_provider.clone(),
+                    endpoint_kind: String::new(),
+                    event_class: extra.event_class.clone(),
+                    payload_type: extra.payload_type.clone(),
+                    actor_role: extra.actor_role.clone(),
+                    name: extra.name.clone(),
+                    phase: extra.phase.clone(),
+                    source_ref: extra.source_ref.clone(),
+                    doc_len: extra.doc_len,
+                    text_preview: extra.text_preview.clone(),
+                    text_content: extra.text_content.clone(),
+                    payload_json: extra.payload_json.clone(),
+                    mcp_event_type: event_type.as_str().to_string(),
+                    raw_score: candidate.score,
+                    matched_terms: candidate.matched_terms,
+                    event_time: String::new(),
+                    event_unix_ms: 0,
+                    event_order: 0,
+                    turn_seq: 0,
+                });
+
+                if rows.len() >= limit as usize {
+                    break;
+                }
+            }
+            offset = end;
+        }
+
         Ok(rows)
     }
 
