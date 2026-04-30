@@ -11,7 +11,7 @@ on:
         required: true
         type: string
       target:
-        description: "PyPI publish target — tag-triggered runs always skip. Choose explicitly on manual dispatches."
+        description: "PyPI publish target for manual dispatches; tag-triggered runs publish to PyPI automatically."
         required: false
         type: choice
         default: skip
@@ -87,10 +87,10 @@ jobs:
   publish-pypi:
     name: publish-pypi
     needs: release
-    # Tag-triggered runs always skip. Only manual dispatches with an
-    # explicit test-pypi / pypi target publish. See RFC #219 and
-    # docs/operations/pypi-release.md for the rehearsal procedure.
-    if: github.event_name == 'workflow_dispatch' && (github.event.inputs.target == 'test-pypi' || github.event.inputs.target == 'pypi')
+    # Tag-triggered runs publish to PyPI after release assets are uploaded.
+    # Manual dispatches keep the explicit test-pypi / pypi switch for
+    # rehearsals and re-runs. See RFC #219 and docs/operations/pypi-release.md.
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (github.event.inputs.target == 'test-pypi' || github.event.inputs.target == 'pypi'))
     runs-on: ubuntu-latest
     permissions:
       id-token: write # OIDC for PyPI/TestPyPI trusted publishing
@@ -100,7 +100,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -110,7 +110,7 @@ jobs:
       - name: Resolve tag and PEP 440 version
         id: meta
         env:
-          TAG: ${{ github.event.inputs.tag }}
+          TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
         # The wheel builder's --version must be PEP 440 compliant so
         # twine / pypi accept the upload. Git tags use dash-separated
         # pre-release segments (v0.3.1-rc.1); translate them to the
@@ -167,7 +167,7 @@ jobs:
           verbose: true
 
       - name: Publish to PyPI
-        if: github.event.inputs.target == 'pypi'
+        if: github.event_name == 'push' || github.event.inputs.target == 'pypi'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/wheels/
