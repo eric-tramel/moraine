@@ -3628,9 +3628,11 @@ mod tests {
             search["inputSchema"]["properties"]["n_hits"]["default"],
             json!(crate::contract::SEARCH_SESSIONS_DEFAULT_N_HITS)
         );
-        assert_eq!(
-            search["inputSchema"]["properties"]["evidence_policy"]["default"],
-            json!("fast")
+        assert!(
+            search["inputSchema"]["properties"]
+                .get("evidence_policy")
+                .is_none(),
+            "search_sessions should not advertise legacy evidence policy controls"
         );
     }
 
