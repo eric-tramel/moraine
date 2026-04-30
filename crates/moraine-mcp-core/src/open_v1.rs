@@ -331,14 +331,14 @@ fn open_session_data(session: &McpSessionOpen) -> Result<(Value, Vec<String>)> {
 fn open_session_turn_summary(turn: &McpTurnCompact) -> Result<Value> {
     let turn_id = encode_turn_id(&turn.metadata.session_id, turn.metadata.turn_seq)?;
     let terminal_event_id = encode_optional_event_id(turn.terminal_event_uid.as_deref())?;
-    let first_event_id = encode_event_ref_id(turn.first_event.as_ref())?;
-    let last_event_id = encode_event_ref_id(turn.last_event.as_ref())?;
+    let user_input_event_id = encode_event_ref_id(turn.user_input_event.as_ref())?;
+    let final_response_event_id = encode_event_ref_id(turn.final_response_event.as_ref())?;
     let user_input = compact_text_content(
-        first_event_id.as_deref(),
+        user_input_event_id.as_deref(),
         turn.user_input_summary.as_deref(),
     );
     let final_response = compact_text_content(
-        terminal_event_id.as_deref().or(last_event_id.as_deref()),
+        final_response_event_id.as_deref(),
         turn.final_response_summary.as_deref(),
     );
 
@@ -400,11 +400,7 @@ fn open_turn_data(turn: &McpTurnOpen) -> Result<(Value, Vec<String>)> {
             open_turn_event_summary(event, index + 1, turn.terminal_event_uid.as_deref())
         })
         .collect::<Result<Vec<_>>>()?;
-    let warnings = if turn.events.is_empty() {
-        Vec::new()
-    } else {
-        vec!["event timestamps are preserved from repository strings because unix millis are not available on turn event summaries".to_string()]
-    };
+    let warnings = Vec::new();
 
     let data = json!({
         "kind": "turn",
@@ -459,7 +455,7 @@ fn open_turn_event_summary(
         "id": id,
         "ordinal": ordinal,
         "type": event.event_type,
-        "timestamp": event.event_time,
+        "timestamp": format_repository_timestamp(&event.event_time),
         "terminal": terminal_event_uid == Some(event.event_uid.as_str()),
         "tool_name": tool_name,
         "model": null,
@@ -479,10 +475,16 @@ fn open_event_data(
     let terminal = turn_state
         .and_then(|turn| turn.terminal_event_uid.as_deref())
         .map(|terminal_event_uid| terminal_event_uid == trace.event_uid)
+        .or_else(|| {
+            event
+                .turn_terminal_event_uid
+                .as_deref()
+                .map(|terminal_event_uid| terminal_event_uid == trace.event_uid)
+        })
         .unwrap_or_else(|| is_terminal_payload(&trace.payload_type));
     let turn_completed = turn_state
         .map(|turn| turn.completed)
-        .unwrap_or_else(|| is_terminal_payload(&trace.payload_type));
+        .unwrap_or(event.turn_completed);
     let payload = parse_payload_json(&trace.payload_json);
     let model = payload
         .as_ref()
@@ -504,9 +506,9 @@ fn open_event_data(
             "id": event_id,
             "session_id": session_id,
             "turn_id": turn_id,
-            "ordinal": trace.event_order,
+            "ordinal": event.event_ordinal,
             "type": event.event_type,
-            "timestamp": trace.event_time,
+            "timestamp": format_repository_timestamp(&trace.event_time),
             "terminal": terminal,
             "model": model,
             "originating_model": originating_model,
@@ -529,10 +531,7 @@ fn open_event_data(
         }
     });
 
-    Ok((
-        data,
-        vec!["event timestamp is preserved from repository strings because unix millis are not available on event open models".to_string()],
-    ))
+    Ok((data, Vec::new()))
 }
 
 fn session_summary(metadata: &SessionMetadata) -> Result<Value> {
@@ -702,6 +701,34 @@ fn format_unix_ms(unix_ms: i64) -> String {
     crate::contract::format_rfc3339_utc_millis(unix_ms)
 }
 
+fn format_repository_timestamp(timestamp: &str) -> String {
+    let trimmed = timestamp.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.contains('T') && trimmed.ends_with('Z') {
+        return trimmed.to_string();
+    }
+
+    let Some((date, time)) = trimmed.split_once(' ') else {
+        return trimmed.to_string();
+    };
+    let (clock, fraction) = time.split_once('.').unwrap_or((time, ""));
+    if date.len() != 10 || clock.len() != 8 {
+        return trimmed.to_string();
+    }
+    let millis = if fraction.is_empty() {
+        "000".to_string()
+    } else {
+        let mut millis = fraction.chars().take(3).collect::<String>();
+        while millis.len() < 3 {
+            millis.push('0');
+        }
+        millis
+    };
+    format!("{date}T{clock}.{millis}Z")
+}
+
 fn encode_session_id(raw_session_id: &str) -> Result<String> {
     Ok(McpSessionId::from_raw_session_id(raw_session_id)
         .context("invalid repository session id")?
@@ -779,6 +806,8 @@ mod tests {
                 metadata: turn_summary(),
                 user_input_summary: Some("Please check the failing monitor startup.".to_string()),
                 final_response_summary: Some("Fixed the startup guard.".to_string()),
+                user_input_event: Some(event_ref("event-user", 1)),
+                final_response_event: Some(event_ref("event-final", 3)),
                 tools_called: vec!["exec_command".to_string()],
                 normalized_event_types: vec![
                     "user_input".to_string(),
@@ -808,6 +837,14 @@ mod tests {
             encode_event_id("event-final").unwrap()
         );
         assert!(data["turns"][0].get("payload_json").is_none());
+        assert_eq!(
+            data["turns"][0]["user_input"]["event_id"],
+            encode_event_id("event-user").unwrap()
+        );
+        assert_eq!(
+            data["turns"][0]["final_response"]["event_id"],
+            encode_event_id("event-final").unwrap()
+        );
     }
 
     #[test]
@@ -850,7 +887,7 @@ mod tests {
             data["traversal"]["next_turn_id"],
             encode_turn_id("session-a", 2).unwrap()
         );
-        assert_eq!(warnings.len(), 1);
+        assert!(warnings.is_empty());
     }
 
     #[test]
@@ -880,6 +917,9 @@ mod tests {
                 token_usage_native_units: BTreeMap::new(),
             },
             event_type: "tool_call".to_string(),
+            event_ordinal: 2,
+            turn_completed: true,
+            turn_terminal_event_uid: Some("event-final".to_string()),
             parent_session: session_metadata(),
             parent_turn: turn_summary(),
             previous_event: Some(event_ref("event-user", 1)),
@@ -891,6 +931,8 @@ mod tests {
         let (data, warnings) = open_event_data(&event, None).expect("event data");
         assert_eq!(data["kind"], "event");
         assert_eq!(data["event"]["tool_name"], "exec_command");
+        assert_eq!(data["event"]["ordinal"], 2);
+        assert_eq!(data["event"]["timestamp"], "2026-04-29T12:00:01.123Z");
         assert_eq!(data["event"]["model"], "gpt-5");
         assert_eq!(data["content"]["format"], "tool_call");
         assert_eq!(data["content"]["arguments"]["cmd"], "cargo test");
@@ -899,7 +941,7 @@ mod tests {
             data["traversal"]["previous_event_id"],
             encode_event_id("event-user").unwrap()
         );
-        assert_eq!(warnings.len(), 1);
+        assert!(warnings.is_empty());
     }
 
     #[test]

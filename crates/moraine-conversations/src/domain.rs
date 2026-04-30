@@ -202,6 +202,8 @@ pub struct McpTurnCompact {
     pub metadata: TurnSummary,
     pub user_input_summary: Option<String>,
     pub final_response_summary: Option<String>,
+    pub user_input_event: Option<McpEventRef>,
+    pub final_response_event: Option<McpEventRef>,
     pub tools_called: Vec<String>,
     pub normalized_event_types: Vec<String>,
     pub completed: bool,
@@ -244,6 +246,9 @@ pub struct McpTurnOpen {
 pub struct McpEventOpen {
     pub event: TraceEvent,
     pub event_type: String,
+    pub event_ordinal: u32,
+    pub turn_completed: bool,
+    pub turn_terminal_event_uid: Option<String>,
     pub parent_session: SessionMetadata,
     pub parent_turn: TurnSummary,
     pub previous_event: Option<McpEventRef>,

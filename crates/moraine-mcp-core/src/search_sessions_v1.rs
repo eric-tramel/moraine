@@ -304,10 +304,18 @@ fn search_hit_json(
             "source": hit.source_name.as_deref().or(hit.harness.as_deref()),
             "started_at": metadata
                 .map(|metadata| format_rfc3339_utc_millis(metadata.first_event_unix_ms))
-                .or_else(|| hit.session_started_at.clone()),
+                .or_else(|| {
+                    hit.session_started_at
+                        .as_deref()
+                        .map(format_repository_timestamp)
+                }),
             "updated_at": metadata
                 .map(|metadata| format_rfc3339_utc_millis(metadata.last_event_unix_ms))
-                .or_else(|| hit.session_updated_at.clone()),
+                .or_else(|| {
+                    hit.session_updated_at
+                        .as_deref()
+                        .map(format_repository_timestamp)
+                }),
             "completed": session_completed,
         },
         "snippet": {
@@ -364,6 +372,34 @@ fn score_unit(score: f64) -> f64 {
 
 fn is_terminal_payload_type(payload_type: &str) -> bool {
     matches!(payload_type, "task_complete" | "turn_aborted")
+}
+
+fn format_repository_timestamp(timestamp: &str) -> String {
+    let trimmed = timestamp.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.contains('T') && trimmed.ends_with('Z') {
+        return trimmed.to_string();
+    }
+
+    let Some((date, time)) = trimmed.split_once(' ') else {
+        return trimmed.to_string();
+    };
+    let (clock, fraction) = time.split_once('.').unwrap_or((time, ""));
+    if date.len() != 10 || clock.len() != 8 {
+        return trimmed.to_string();
+    }
+    let millis = if fraction.is_empty() {
+        "000".to_string()
+    } else {
+        let mut millis = fraction.chars().take(3).collect::<String>();
+        while millis.len() < 3 {
+            millis.push('0');
+        }
+        millis
+    };
+    format!("{date}T{clock}.{millis}Z")
 }
 
 fn search_warnings(result: &SearchMcpEventsResult) -> Vec<String> {
