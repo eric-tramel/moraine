@@ -19,12 +19,13 @@ use crate::cursor::{
 use crate::domain::{
     is_user_facing_content_event, Conversation, ConversationDetailOptions, ConversationListFilter,
     ConversationListSort, ConversationMode, ConversationSearchHit, ConversationSearchQuery,
-    ConversationSearchResults, ConversationSearchStats, ConversationSummary, OpenContext,
-    OpenEvent, OpenEventRequest, Page, PageRequest, RepoConfig, SearchEventHit, SearchEventKind,
-    SearchEventsQuery, SearchEventsResult, SearchEventsStats, SearchEventsStrategy,
-    SessionEventsDirection, SessionEventsQuery, SessionMetadata, SessionMetadataSearchHit,
-    SessionMetadataSearchQuery, SessionMetadataSearchResults, SessionMetadataSearchStats,
-    TraceEvent, Turn, TurnListFilter, TurnSummary,
+    ConversationSearchResults, ConversationSearchStats, ConversationSummary, McpEventOpen,
+    McpEventRef, McpEventSummary, McpSessionOpen, McpTurnCompact, McpTurnOpen, McpTurnRef,
+    OpenContext, OpenEvent, OpenEventRequest, Page, PageRequest, RepoConfig, SearchEventHit,
+    SearchEventKind, SearchEventsQuery, SearchEventsResult, SearchEventsStats,
+    SearchEventsStrategy, SessionEventsDirection, SessionEventsQuery, SessionMetadata,
+    SessionMetadataSearchHit, SessionMetadataSearchQuery, SessionMetadataSearchResults,
+    SessionMetadataSearchStats, TraceEvent, Turn, TurnListFilter, TurnSummary,
 };
 use crate::error::{RepoError, RepoResult};
 use crate::repo::ConversationRepository;
@@ -190,6 +191,22 @@ struct OpenTargetRow {
     session_id: String,
     event_order: u64,
     turn_seq: u32,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct McpSessionInfoRow {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    harness: String,
+    #[serde(default)]
+    inference_provider: String,
+    #[serde(default)]
+    session_slug: String,
+    #[serde(default)]
+    session_summary: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1275,6 +1292,448 @@ FORMAT JSONEachRow",
         let rows: Vec<SessionMetadataRow> =
             self.map_backend(self.ch.query_rows(&query, None).await)?;
         Ok(rows.into_iter().next().map(Self::map_session_metadata_row))
+    }
+
+    async fn load_mcp_session_info(&self, session_id: &str) -> RepoResult<McpSessionInfoRow> {
+        let events_table = self.table_ref("events");
+        let query = format!(
+            "SELECT
+  ifNull(
+    argMaxIf(nullIf(JSONExtractString(payload_json, 'title'), ''), tuple(event_ts, event_uid), event_kind = 'session_meta'),
+    ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'name'), ''), tuple(event_ts, event_uid), event_kind = 'session_meta'), '')
+  ) AS title,
+  ifNull(
+    argMaxIf(nullIf(JSONExtractString(payload_json, 'source'), ''), tuple(event_ts, event_uid), event_kind = 'session_meta'),
+    ifNull(argMax(nullIf(source_name, ''), tuple(event_ts, event_uid)), '')
+  ) AS source,
+  ifNull(argMax(nullIf(harness, ''), tuple(event_ts, event_uid)), '') AS harness,
+  ifNull(argMax(nullIf(inference_provider, ''), tuple(event_ts, event_uid)), '') AS inference_provider,
+  ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'slug'), ''), tuple(event_ts, event_uid), event_kind = 'session_meta'), '') AS session_slug,
+  ifNull(
+    argMaxIf(nullIf(JSONExtractString(payload_json, 'summary'), ''), tuple(event_ts, event_uid), event_kind = 'session_meta'),
+    ifNull(
+      argMaxIf(nullIf(JSONExtractString(payload_json, 'title'), ''), tuple(event_ts, event_uid), event_kind = 'session_meta'),
+      ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'name'), ''), tuple(event_ts, event_uid), event_kind = 'session_meta'), '')
+    )
+  ) AS session_summary
+FROM {events_table}
+WHERE session_id = {}
+GROUP BY session_id
+LIMIT 1
+FORMAT JSONEachRow",
+            sql_quote(session_id),
+        );
+
+        let rows: Vec<McpSessionInfoRow> =
+            self.map_backend(self.ch.query_rows(&query, None).await)?;
+        Ok(rows.into_iter().next().unwrap_or_default())
+    }
+
+    async fn load_turn_summary(
+        &self,
+        session_id: &str,
+        turn_seq: u32,
+    ) -> RepoResult<Option<TurnSummary>> {
+        let turn_summary = self.table_ref("v_turn_summary");
+        let query = format!(
+            "SELECT
+  session_id,
+  toUInt32(turn_seq) AS turn_seq,
+  ifNull(turn_id, '') AS turn_id,
+  toString(started_at) AS started_at,
+  toInt64(toUnixTimestamp64Milli(started_at)) AS started_at_unix_ms,
+  toString(ended_at) AS ended_at,
+  toInt64(toUnixTimestamp64Milli(ended_at)) AS ended_at_unix_ms,
+  toUInt64(total_events) AS total_events,
+  toUInt64(user_messages) AS user_messages,
+  toUInt64(assistant_messages) AS assistant_messages,
+  toUInt64(tool_calls) AS tool_calls,
+  toUInt64(tool_results) AS tool_results,
+  toUInt64(reasoning_items) AS reasoning_items
+FROM {turn_summary}
+WHERE session_id = {} AND turn_seq = {}
+LIMIT 1
+FORMAT JSONEachRow",
+            sql_quote(session_id),
+            turn_seq,
+        );
+
+        let rows: Vec<TurnSummaryRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
+        Ok(rows.into_iter().next().map(Self::map_turn_row))
+    }
+
+    async fn load_events_for_turn(
+        &self,
+        session_id: &str,
+        turn_seq: u32,
+    ) -> RepoResult<Vec<TraceEvent>> {
+        let trace_table = self.table_ref("v_conversation_trace");
+        let query = format!(
+            "SELECT
+  session_id,
+  event_uid,
+  toUInt64(event_order) AS event_order,
+  toUInt32(turn_seq) AS turn_seq,
+  toString(event_time) AS event_time,
+  actor_role,
+  event_class,
+  payload_type,
+  call_id,
+  name,
+  phase,
+  item_id,
+  source_ref,
+  text_content,
+  payload_json,
+  token_usage_json,
+  endpoint_kind,
+  token_usage_buckets,
+  token_usage_native_units
+FROM {trace_table}
+WHERE session_id = {} AND turn_seq = {}
+ORDER BY event_order ASC
+FORMAT JSONEachRow",
+            sql_quote(session_id),
+            turn_seq,
+        );
+
+        let rows: Vec<TraceEventRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
+        Ok(rows.into_iter().map(Self::map_trace_event).collect())
+    }
+
+    async fn load_events_for_session(&self, session_id: &str) -> RepoResult<Vec<TraceEvent>> {
+        let trace_table = self.table_ref("v_conversation_trace");
+        let query = format!(
+            "SELECT
+  session_id,
+  event_uid,
+  toUInt64(event_order) AS event_order,
+  toUInt32(turn_seq) AS turn_seq,
+  toString(event_time) AS event_time,
+  actor_role,
+  event_class,
+  payload_type,
+  call_id,
+  name,
+  phase,
+  item_id,
+  source_ref,
+  text_content,
+  payload_json,
+  token_usage_json,
+  endpoint_kind,
+  token_usage_buckets,
+  token_usage_native_units
+FROM {trace_table}
+WHERE session_id = {}
+ORDER BY event_order ASC
+FORMAT JSONEachRow",
+            sql_quote(session_id),
+        );
+
+        let rows: Vec<TraceEventRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
+        Ok(rows.into_iter().map(Self::map_trace_event).collect())
+    }
+
+    async fn load_adjacent_turn_ref(
+        &self,
+        session_id: &str,
+        turn_seq: u32,
+        previous: bool,
+    ) -> RepoResult<Option<McpTurnRef>> {
+        let turn_summary = self.table_ref("v_turn_summary");
+        let (cmp, order_dir) = if previous {
+            ("<", "DESC")
+        } else {
+            (">", "ASC")
+        };
+        let query = format!(
+            "SELECT
+  session_id,
+  toUInt32(turn_seq) AS turn_seq,
+  ifNull(turn_id, '') AS turn_id,
+  toString(started_at) AS started_at,
+  toInt64(toUnixTimestamp64Milli(started_at)) AS started_at_unix_ms,
+  toString(ended_at) AS ended_at,
+  toInt64(toUnixTimestamp64Milli(ended_at)) AS ended_at_unix_ms,
+  toUInt64(total_events) AS total_events,
+  toUInt64(user_messages) AS user_messages,
+  toUInt64(assistant_messages) AS assistant_messages,
+  toUInt64(tool_calls) AS tool_calls,
+  toUInt64(tool_results) AS tool_results,
+  toUInt64(reasoning_items) AS reasoning_items
+FROM {turn_summary}
+WHERE session_id = {} AND turn_seq {cmp} {}
+ORDER BY turn_seq {order_dir}
+LIMIT 1
+FORMAT JSONEachRow",
+            sql_quote(session_id),
+            turn_seq,
+        );
+
+        let rows: Vec<TurnSummaryRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
+        Ok(rows
+            .into_iter()
+            .next()
+            .map(Self::map_turn_row)
+            .map(|summary| Self::mcp_turn_ref(&summary)))
+    }
+
+    async fn load_adjacent_event_ref(
+        &self,
+        session_id: &str,
+        event_order: u64,
+        event_uid: &str,
+        previous: bool,
+    ) -> RepoResult<Option<McpEventRef>> {
+        let trace_table = self.table_ref("v_conversation_trace");
+        let (predicate, order_by) = if previous {
+            (
+                format!(
+                    "(event_order < {event_order} OR (event_order = {event_order} AND event_uid < {}))",
+                    sql_quote(event_uid)
+                ),
+                "event_order DESC, event_uid DESC",
+            )
+        } else {
+            (
+                format!(
+                    "(event_order > {event_order} OR (event_order = {event_order} AND event_uid > {}))",
+                    sql_quote(event_uid)
+                ),
+                "event_order ASC, event_uid ASC",
+            )
+        };
+        let query = format!(
+            "SELECT
+  session_id,
+  event_uid,
+  toUInt64(event_order) AS event_order,
+  toUInt32(turn_seq) AS turn_seq,
+  toString(event_time) AS event_time,
+  actor_role,
+  event_class,
+  payload_type,
+  call_id,
+  name,
+  phase,
+  item_id,
+  source_ref,
+  text_content,
+  payload_json,
+  token_usage_json,
+  endpoint_kind,
+  token_usage_buckets,
+  token_usage_native_units
+FROM {trace_table}
+WHERE session_id = {} AND {predicate}
+ORDER BY {order_by}
+LIMIT 1
+FORMAT JSONEachRow",
+            sql_quote(session_id),
+        );
+
+        let rows: Vec<TraceEventRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
+        Ok(rows
+            .into_iter()
+            .next()
+            .map(Self::map_trace_event)
+            .map(|event| Self::mcp_event_ref(&event)))
+    }
+
+    fn mcp_turn_ref(summary: &TurnSummary) -> McpTurnRef {
+        McpTurnRef {
+            session_id: summary.session_id.clone(),
+            turn_seq: summary.turn_seq,
+            turn_id: summary.turn_id.clone(),
+            started_at: summary.started_at.clone(),
+            ended_at: summary.ended_at.clone(),
+        }
+    }
+
+    fn mcp_event_ref(event: &TraceEvent) -> McpEventRef {
+        McpEventRef {
+            session_id: event.session_id.clone(),
+            event_uid: event.event_uid.clone(),
+            event_order: event.event_order,
+            turn_seq: event.turn_seq,
+            event_time: event.event_time.clone(),
+            event_type: Self::normalized_event_type(&event.event_class, &event.payload_type),
+        }
+    }
+
+    fn mcp_event_summary(&self, event: &TraceEvent) -> McpEventSummary {
+        McpEventSummary {
+            session_id: event.session_id.clone(),
+            event_uid: event.event_uid.clone(),
+            event_order: event.event_order,
+            turn_seq: event.turn_seq,
+            event_time: event.event_time.clone(),
+            actor_role: event.actor_role.clone(),
+            event_class: event.event_class.clone(),
+            payload_type: event.payload_type.clone(),
+            event_type: Self::normalized_event_type(&event.event_class, &event.payload_type),
+            call_id: event.call_id.clone(),
+            name: event.name.clone(),
+            phase: event.phase.clone(),
+            text_preview: Self::compact_event_text(event, self.cfg.preview_chars),
+        }
+    }
+
+    fn compact_event_text(event: &TraceEvent, preview_chars: u16) -> Option<String> {
+        let source = if event.text_content.trim().is_empty() {
+            event.payload_json.as_str()
+        } else {
+            event.text_content.as_str()
+        };
+        let compact = compact_text_line(source, usize::from(preview_chars).max(1));
+        (!compact.is_empty()).then_some(compact)
+    }
+
+    fn mcp_turn_compact(&self, summary: TurnSummary, events: &[TraceEvent]) -> McpTurnCompact {
+        let user_input_summary = events
+            .iter()
+            .find(|event| {
+                event.actor_role.eq_ignore_ascii_case("user")
+                    && Self::matches_event_kind(
+                        &event.event_class,
+                        &event.payload_type,
+                        SearchEventKind::Message,
+                    )
+            })
+            .and_then(|event| Self::compact_event_text(event, self.cfg.preview_chars));
+
+        let final_response_summary = events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.actor_role.eq_ignore_ascii_case("assistant")
+                    && Self::matches_event_kind(
+                        &event.event_class,
+                        &event.payload_type,
+                        SearchEventKind::Message,
+                    )
+            })
+            .and_then(|event| Self::compact_event_text(event, self.cfg.preview_chars));
+
+        let mut tools_called = Vec::<String>::new();
+        let mut normalized_event_types = Vec::<String>::new();
+        for event in events {
+            let event_type = Self::normalized_event_type(&event.event_class, &event.payload_type);
+            push_first_seen(&mut normalized_event_types, event_type.clone());
+            if event_type == SearchEventKind::ToolCall.as_str() {
+                let tool_name = if event.name.trim().is_empty() {
+                    event.call_id.trim()
+                } else {
+                    event.name.trim()
+                };
+                if !tool_name.is_empty() {
+                    push_first_seen(&mut tools_called, tool_name.to_string());
+                }
+            }
+        }
+
+        let terminal_event = events.iter().rev().find_map(|event| {
+            Self::turn_terminal_completed(event).map(|completed| (event, completed))
+        });
+        let completed = terminal_event
+            .map(|(_, completed)| completed)
+            .unwrap_or(false);
+        let terminal_event_uid = terminal_event.map(|(event, _)| event.event_uid.clone());
+
+        McpTurnCompact {
+            metadata: summary,
+            user_input_summary,
+            final_response_summary,
+            tools_called,
+            normalized_event_types,
+            completed,
+            terminal_event_uid,
+            first_event: events.first().map(Self::mcp_event_ref),
+            last_event: events.last().map(Self::mcp_event_ref),
+        }
+    }
+
+    fn mcp_turn_open(
+        &self,
+        summary: TurnSummary,
+        events: Vec<TraceEvent>,
+        previous_turn: Option<McpTurnRef>,
+        next_turn: Option<McpTurnRef>,
+    ) -> McpTurnOpen {
+        let compact = self.mcp_turn_compact(summary, &events);
+        let events = events
+            .iter()
+            .map(|event| self.mcp_event_summary(event))
+            .collect();
+
+        McpTurnOpen {
+            metadata: compact.metadata,
+            events,
+            user_input_summary: compact.user_input_summary,
+            final_response_summary: compact.final_response_summary,
+            tools_called: compact.tools_called,
+            normalized_event_types: compact.normalized_event_types,
+            completed: compact.completed,
+            terminal_event_uid: compact.terminal_event_uid,
+            previous_turn,
+            next_turn,
+            first_event: compact.first_event,
+            last_event: compact.last_event,
+        }
+    }
+
+    fn normalized_event_type(event_class: &str, payload_type: &str) -> String {
+        for kind in [
+            SearchEventKind::Message,
+            SearchEventKind::Reasoning,
+            SearchEventKind::ToolCall,
+            SearchEventKind::ToolResult,
+        ] {
+            if Self::matches_event_kind(event_class, payload_type, kind) {
+                return kind.as_str().to_string();
+            }
+        }
+
+        if !payload_type.is_empty() && payload_type != "unknown" {
+            payload_type.to_string()
+        } else if !event_class.is_empty() {
+            event_class.to_string()
+        } else {
+            "event".to_string()
+        }
+    }
+
+    fn turn_terminal_completed(event: &TraceEvent) -> Option<bool> {
+        match event.payload_type.as_str() {
+            "task_complete" => Some(true),
+            "turn_aborted" => Some(false),
+            _ => None,
+        }
+    }
+
+    fn trace_event_from_open_event(event: OpenEvent) -> TraceEvent {
+        TraceEvent {
+            session_id: event.session_id,
+            event_uid: event.event_uid,
+            event_order: event.event_order,
+            turn_seq: event.turn_seq,
+            event_time: event.event_time,
+            actor_role: event.actor_role,
+            event_class: event.event_class,
+            payload_type: event.payload_type,
+            call_id: event.call_id,
+            name: event.name,
+            phase: event.phase,
+            item_id: event.item_id,
+            source_ref: event.source_ref,
+            text_content: event.text_content,
+            payload_json: event.payload_json,
+            token_usage_json: event.token_usage_json,
+            endpoint_kind: event.endpoint_kind,
+            token_usage_buckets: event.token_usage_buckets,
+            token_usage_native_units: event.token_usage_native_units,
+        }
     }
 
     async fn corpus_stats(&self) -> RepoResult<(u64, u64)> {
@@ -3301,6 +3760,53 @@ FORMAT JSONEachRow",
         self.load_session_metadata(session_id).await
     }
 
+    async fn get_mcp_session(&self, session_id: &str) -> RepoResult<Option<McpSessionOpen>> {
+        Self::validate_session_id(session_id)?;
+
+        let Some(metadata) = self.load_session_metadata(session_id).await? else {
+            return Ok(None);
+        };
+
+        let session_info = self.load_mcp_session_info(session_id).await?;
+        let turn_summaries = self.load_turns_for_session(session_id).await?;
+        let events = self.load_events_for_session(session_id).await?;
+        let mut events_by_turn = BTreeMap::<u32, Vec<TraceEvent>>::new();
+        for event in events {
+            events_by_turn
+                .entry(event.turn_seq)
+                .or_default()
+                .push(event);
+        }
+
+        let turns = turn_summaries
+            .into_iter()
+            .map(|summary| {
+                let events = events_by_turn
+                    .get(&summary.turn_seq)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                self.mcp_turn_compact(summary, events)
+            })
+            .collect::<Vec<_>>();
+
+        let completed = turns.last().map(|turn| turn.completed).unwrap_or(false);
+        let terminal_event_uid = turns
+            .last()
+            .and_then(|turn| turn.terminal_event_uid.clone());
+        Ok(Some(McpSessionOpen {
+            metadata,
+            title: non_empty_string(session_info.title),
+            source: non_empty_string(session_info.source),
+            harness: non_empty_string(session_info.harness),
+            inference_provider: non_empty_string(session_info.inference_provider),
+            session_slug: non_empty_string(session_info.session_slug),
+            session_summary: non_empty_string(session_info.session_summary),
+            completed,
+            terminal_event_uid,
+            turns,
+        }))
+    }
+
     async fn list_turns(
         &self,
         session_id: &str,
@@ -3397,74 +3903,38 @@ FORMAT JSONEachRow",
     async fn get_turn(&self, session_id: &str, turn_seq: u32) -> RepoResult<Option<Turn>> {
         Self::validate_session_id(session_id)?;
 
-        let turn_summary = self.table_ref("v_turn_summary");
-        let summary_query = format!(
-            "SELECT
-  session_id,
-  toUInt32(turn_seq) AS turn_seq,
-  ifNull(turn_id, '') AS turn_id,
-  toString(started_at) AS started_at,
-  toInt64(toUnixTimestamp64Milli(started_at)) AS started_at_unix_ms,
-  toString(ended_at) AS ended_at,
-  toInt64(toUnixTimestamp64Milli(ended_at)) AS ended_at_unix_ms,
-  toUInt64(total_events) AS total_events,
-  toUInt64(user_messages) AS user_messages,
-  toUInt64(assistant_messages) AS assistant_messages,
-  toUInt64(tool_calls) AS tool_calls,
-  toUInt64(tool_results) AS tool_results,
-  toUInt64(reasoning_items) AS reasoning_items
-FROM {turn_summary}
-WHERE session_id = {} AND turn_seq = {}
-LIMIT 1
-FORMAT JSONEachRow",
-            sql_quote(session_id),
-            turn_seq,
-        );
-
-        let rows: Vec<TurnSummaryRow> =
-            self.map_backend(self.ch.query_rows(&summary_query, None).await)?;
-        let Some(summary_row) = rows.into_iter().next() else {
+        let Some(summary) = self.load_turn_summary(session_id, turn_seq).await? else {
             return Ok(None);
         };
+        let events = self.load_events_for_turn(session_id, turn_seq).await?;
 
-        let trace_table = self.table_ref("v_conversation_trace");
-        let events_query = format!(
-            "SELECT
-  session_id,
-  event_uid,
-  toUInt64(event_order) AS event_order,
-  toUInt32(turn_seq) AS turn_seq,
-  toString(event_time) AS event_time,
-  actor_role,
-  event_class,
-  payload_type,
-  call_id,
-  name,
-  phase,
-  item_id,
-  source_ref,
-  text_content,
-  payload_json,
-  token_usage_json,
-  endpoint_kind,
-  token_usage_buckets,
-  token_usage_native_units
-FROM {trace_table}
-WHERE session_id = {} AND turn_seq = {}
-ORDER BY event_order ASC
-FORMAT JSONEachRow",
-            sql_quote(session_id),
-            turn_seq,
-        );
+        Ok(Some(Turn { summary, events }))
+    }
 
-        let event_rows: Vec<TraceEventRow> =
-            self.map_backend(self.ch.query_rows(&events_query, None).await)?;
-        let events = event_rows.into_iter().map(Self::map_trace_event).collect();
+    async fn get_mcp_turn(
+        &self,
+        session_id: &str,
+        turn_seq: u32,
+    ) -> RepoResult<Option<McpTurnOpen>> {
+        Self::validate_session_id(session_id)?;
 
-        Ok(Some(Turn {
-            summary: Self::map_turn_row(summary_row),
+        let Some(summary) = self.load_turn_summary(session_id, turn_seq).await? else {
+            return Ok(None);
+        };
+        let events = self.load_events_for_turn(session_id, turn_seq).await?;
+        let previous_turn = self
+            .load_adjacent_turn_ref(session_id, turn_seq, true)
+            .await?;
+        let next_turn = self
+            .load_adjacent_turn_ref(session_id, turn_seq, false)
+            .await?;
+
+        Ok(Some(self.mcp_turn_open(
+            summary,
             events,
-        }))
+            previous_turn,
+            next_turn,
+        )))
     }
 
     async fn open_event(&self, req: OpenEventRequest) -> RepoResult<OpenContext> {
@@ -3661,6 +4131,70 @@ FORMAT JSONEachRow",
             after,
             events,
         })
+    }
+
+    async fn get_mcp_event(&self, event_uid: &str) -> RepoResult<Option<McpEventOpen>> {
+        let event_uid = event_uid.trim();
+        if event_uid.is_empty() {
+            return Err(RepoError::invalid_argument("event_uid cannot be empty"));
+        }
+        Self::validate_event_uid(event_uid)?;
+
+        let context = self
+            .open_event(OpenEventRequest {
+                event_uid: event_uid.to_string(),
+                before: Some(0),
+                after: Some(0),
+                include_system_events: Some(true),
+            })
+            .await?;
+        if !context.found {
+            return Ok(None);
+        }
+
+        let Some(open_event) = context.events.into_iter().find(|event| event.is_target) else {
+            return Ok(None);
+        };
+        let event = Self::trace_event_from_open_event(open_event);
+
+        let Some(parent_session) = self.load_session_metadata(&event.session_id).await? else {
+            return Ok(None);
+        };
+        let Some(parent_turn) = self
+            .load_turn_summary(&event.session_id, event.turn_seq)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let previous_event = self
+            .load_adjacent_event_ref(&event.session_id, event.event_order, &event.event_uid, true)
+            .await?;
+        let next_event = self
+            .load_adjacent_event_ref(
+                &event.session_id,
+                event.event_order,
+                &event.event_uid,
+                false,
+            )
+            .await?;
+        let previous_turn = self
+            .load_adjacent_turn_ref(&event.session_id, event.turn_seq, true)
+            .await?;
+        let next_turn = self
+            .load_adjacent_turn_ref(&event.session_id, event.turn_seq, false)
+            .await?;
+
+        Ok(Some(McpEventOpen {
+            event_type: Self::normalized_event_type(&event.event_class, &event.payload_type),
+            event,
+            parent_session,
+            parent_turn,
+            previous_event,
+            next_event,
+            previous_turn,
+            next_turn,
+        }))
     }
 
     async fn list_session_events(
@@ -4256,8 +4790,25 @@ fn non_empty_string(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+fn push_first_seen(items: &mut Vec<String>, value: String) {
+    if !items.iter().any(|item| item == &value) {
+        items.push(value);
+    }
+}
+
 fn compact_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn compact_text_line(text: &str, max_chars: usize) -> String {
+    let compact = compact_whitespace(text);
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+
+    let mut trimmed: String = compact.chars().take(max_chars.saturating_sub(3)).collect();
+    trimmed.push_str("...");
+    trimmed
 }
 
 fn first_term_match_index(value: &str, terms: &[String]) -> Option<usize> {
