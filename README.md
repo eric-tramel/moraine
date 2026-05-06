@@ -23,22 +23,10 @@ change across minor releases.
 
 ## Documentation
 
-- [Introduction](docs/index.md)
-- [Quickstart and Installation](docs/quickstart.md)
-- [Configuration](docs/configuration.md)
-- [MCP Search Interface Specification](docs/mcp-search-interface-spec.md)
-
-Build the documentation site with:
-
-```bash
-make docs-build
-```
-
-Serve it locally with:
-
-```bash
-make docs-serve
-```
+- [Introduction](https://eric-tramel.github.io/moraine/)
+- [Quickstart and Installation](https://eric-tramel.github.io/moraine/quickstart.html)
+- [Configuration](https://eric-tramel.github.io/moraine/configuration.html)
+- [MCP Search Interface Specification](https://eric-tramel.github.io/moraine/mcp-search-interface-spec.html)
 
 ## Quickstart
 
