@@ -5,6 +5,7 @@ pub mod model;
 pub mod normalize;
 mod reconcile;
 mod sink;
+mod sources;
 mod watch;
 
 use crate::checkpoint::checkpoint_key;
