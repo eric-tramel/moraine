@@ -1,5 +1,8 @@
 use super::shared::*;
-use super::{IngestSource, NormalizedPartials, SourceMetadata, SourceRecordContext};
+use super::{
+    emitter::{EventBuilder, SourceEmitter},
+    IngestSource, NormalizedPartials, SourceMetadata, SourceRecordContext,
+};
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Map, Value};
 use std::collections::VecDeque;
@@ -60,9 +63,9 @@ impl IngestSource for Hermes {
                 base_uid,
                 &metadata.model_hint_fallback,
             ),
-            _ => normalize_hermes_trajectory(record, ctx, base_uid, &metadata.model_hint_fallback),
+            _ => normalize_hermes_trajectory(record, ctx, base_uid, &metadata.model_hint_fallback)
+                .into(),
         }
-        .into()
     }
 }
 
@@ -589,26 +592,52 @@ fn normalize_hermes_session_meta(
     record: &Value,
     ctx: &RecordContext<'_>,
     base_uid: &str,
-) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
-    let events = Vec::<Value>::new();
-    let links = Vec::<Value>::new();
-    let tools = Vec::<Value>::new();
-
-    let mut events = events;
+) -> NormalizedPartials {
+    let mut emitter = SourceEmitter::new(ctx);
     let base_dt = parse_record_ts(ctx.record_ts);
     let platform = to_str(record.get("platform"));
     let base_url = to_str(record.get("base_url"));
     let model_raw = to_str(record.get("model"));
     let (_vendor, model) = split_hermes_vendor_model(&model_raw);
+    let _ = base_uid;
 
+    let payload = build_hermes_session_meta_payload(record, &model, &base_url, &platform);
+    let payload_json = compact_json(&payload);
+    let uid = emitter.uid(&payload_json, "session_meta");
+    let mut event = hermes_session_event_defaults(
+        emitter.event(
+            &uid,
+            "session_meta",
+            "session_meta",
+            "system",
+            "",
+            &payload_json,
+        ),
+        &model,
+    );
+    event = stamp_hermes_session_event_time(event, base_dt, 0);
+    if !platform.is_empty() {
+        event = event.agent_label(platform);
+    }
+    emitter.push_event(event);
+
+    emitter.finish()
+}
+
+fn build_hermes_session_meta_payload(
+    record: &Value,
+    model: &str,
+    base_url: &str,
+    platform: &str,
+) -> Value {
     let mut meta_payload = Map::<String, Value>::new();
     meta_payload.insert(
         "session_id".to_string(),
         Value::String(to_str(record.get("session_id"))),
     );
-    meta_payload.insert("model".to_string(), Value::String(model.clone()));
-    meta_payload.insert("base_url".to_string(), Value::String(base_url.clone()));
-    meta_payload.insert("platform".to_string(), Value::String(platform.clone()));
+    meta_payload.insert("model".to_string(), Value::String(model.to_string()));
+    meta_payload.insert("base_url".to_string(), Value::String(base_url.to_string()));
+    meta_payload.insert("platform".to_string(), Value::String(platform.to_string()));
     meta_payload.insert(
         "session_start".to_string(),
         Value::String(to_str(record.get("session_start"))),
@@ -627,37 +656,31 @@ fn normalize_hermes_session_meta(
         meta_payload.insert("message_count".to_string(), message_count.clone());
     }
 
-    let payload_json = compact_json(&Value::Object(meta_payload));
+    Value::Object(meta_payload)
+}
 
-    let uid = event_uid(
-        ctx.source_file,
-        ctx.source_generation,
-        ctx.source_line_no,
-        ctx.source_offset,
-        &payload_json,
-        "session_meta",
-    );
-    let _ = base_uid;
+struct HermesSessionMessageContext<'a> {
+    message: &'a Value,
+    message_index: u64,
+    turn_index: u32,
+    role: String,
+    content_value: Value,
+    compact_message: String,
+    model: &'a str,
+    base_dt: Option<DateTime<Utc>>,
+}
 
-    let mut row = Value::Object(base_event_obj(
-        ctx,
-        &uid,
-        "session_meta",
-        "session_meta",
-        "system",
-        "",
-        &payload_json,
-    ));
-    if !model.is_empty() {
-        update_string_field(&mut row, "model", &model);
+impl HermesSessionMessageContext<'_> {
+    fn uid(&self, emitter: &SourceEmitter<'_>, suffix: &str) -> String {
+        emitter.uid(
+            &self.compact_message,
+            &format!("hermes_session:{}:{suffix}", self.message_index),
+        )
     }
-    if !platform.is_empty() {
-        update_string_field(&mut row, "agent_label", &platform);
-    }
-    hermes_stamp_time(&mut row, &hermes_event_dt(base_dt, 0));
-    events.push(row);
 
-    (events, links, tools)
+    fn payload_json(&self) -> &str {
+        &self.compact_message
+    }
 }
 
 /// Normalize a synthetic `session_message` record: one OpenAI chat-completions
@@ -665,286 +688,334 @@ fn normalize_hermes_session_meta(
 /// plus optional tool_calls / reasoning / tool_call_id). Tool call / result
 /// correlation travels through `tool_call_id` on each emitted row — the
 /// OpenAI schema carries it on both sides, so no in-record tracking is needed.
-#[allow(unused_assignments)]
 fn normalize_hermes_session_message(
     record: &Value,
     ctx: &RecordContext<'_>,
     base_uid: &str,
     model: &str,
-) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
-    let mut events = Vec::<Value>::new();
-    let links = Vec::<Value>::new();
-    let mut tools = Vec::<Value>::new();
+) -> NormalizedPartials {
+    let mut emitter = SourceEmitter::new(ctx);
     let base_dt = parse_record_ts(ctx.record_ts);
-    let model = model.to_string();
     let _ = base_uid;
 
     let message = match record.get("message") {
         Some(Value::Object(_)) => record.get("message").unwrap(),
-        _ => return (events, links, tools),
+        _ => return emitter.finish(),
     };
 
     let message_index = record
         .get("message_index")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let role = to_str(message.get("role"));
     // For turn_index we use a 1-based message index: plenty for ordering, and
     // ClickHouse schema uses UInt32.
     let turn_index: u32 = ((message_index + 1).min(u32::MAX as u64)) as u32;
-
-    let compact_message = compact_json(message);
-    let next_uid = |suffix: &str| {
-        event_uid(
-            ctx.source_file,
-            ctx.source_generation,
-            ctx.source_line_no,
-            ctx.source_offset,
-            &compact_message,
-            &format!("hermes_session:{message_index}:{suffix}"),
-        )
+    let message_ctx = HermesSessionMessageContext {
+        message,
+        message_index,
+        turn_index,
+        role: to_str(message.get("role")),
+        content_value: message.get("content").cloned().unwrap_or(Value::Null),
+        compact_message: compact_json(message),
+        model,
+        base_dt,
     };
 
-    let content_value = message.get("content").cloned().unwrap_or(Value::Null);
+    normalize_hermes_session_message_role(&message_ctx, &mut emitter);
 
+    emitter.finish()
+}
+
+fn normalize_hermes_session_message_role(
+    message_ctx: &HermesSessionMessageContext<'_>,
+    emitter: &mut SourceEmitter<'_>,
+) {
     let mut sub_event_index = 0usize;
-
-    match role.as_str() {
-        "user" => {
-            let text = extract_message_text(&content_value);
-            let mut row = Value::Object(base_event_obj(
-                ctx,
-                &next_uid("user"),
-                "message",
-                "user_message",
-                "user",
-                &text,
-                &compact_json(message),
-            ));
-            if !model.is_empty() {
-                update_string_field(&mut row, "model", &model);
-            }
-            if let Some(obj) = row.as_object_mut() {
-                obj.insert(
-                    "content_types".to_string(),
-                    json!(extract_content_types(&content_value)),
-                );
-                obj.insert("turn_index".to_string(), json!(turn_index));
-            }
-            hermes_stamp_time(&mut row, &hermes_event_dt(base_dt, sub_event_index));
-            events.push(row);
-            sub_event_index += 1;
-        }
+    match message_ctx.role.as_str() {
+        "user" => emit_hermes_session_user_message(message_ctx, emitter, &mut sub_event_index),
         "assistant" => {
             // Emit reasoning first if present — matches the wall-clock order of
             // thinking → text → tool_calls in a single assistant turn.
-            let reasoning = message.get("reasoning").cloned().unwrap_or(Value::Null);
-            let reasoning_text = match &reasoning {
-                Value::Null => String::new(),
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            if !reasoning_text.trim().is_empty() {
-                let mut row = Value::Object(base_event_obj(
-                    ctx,
-                    &next_uid("reasoning"),
-                    "reasoning",
-                    "reasoning",
-                    "assistant",
-                    &reasoning_text,
-                    &compact_json(&json!({
-                        "role": "assistant",
-                        "reasoning": reasoning,
-                    })),
-                ));
-                if !model.is_empty() {
-                    update_string_field(&mut row, "model", &model);
-                }
-                if let Some(obj) = row.as_object_mut() {
-                    mark_reasoning_metadata(obj);
-                    obj.insert("turn_index".to_string(), json!(turn_index));
-                }
-                hermes_stamp_time(&mut row, &hermes_event_dt(base_dt, sub_event_index));
-                events.push(row);
-                sub_event_index += 1;
-            }
-
-            let text = extract_message_text(&content_value);
-            if !text.trim().is_empty() {
-                let mut row = Value::Object(base_event_obj(
-                    ctx,
-                    &next_uid("assistant"),
-                    "message",
-                    "agent_message",
-                    "assistant",
-                    &text,
-                    &compact_json(&json!({
-                        "role": "assistant",
-                        "content": content_value,
-                    })),
-                ));
-                if !model.is_empty() {
-                    update_string_field(&mut row, "model", &model);
-                }
-                if let Some(obj) = row.as_object_mut() {
-                    obj.insert(
-                        "content_types".to_string(),
-                        json!(extract_content_types(&content_value)),
-                    );
-                    obj.insert("turn_index".to_string(), json!(turn_index));
-                }
-                let finish_reason = to_str(message.get("finish_reason"));
-                if !finish_reason.is_empty() {
-                    update_string_field(&mut row, "op_status", &finish_reason);
-                }
-                hermes_stamp_time(&mut row, &hermes_event_dt(base_dt, sub_event_index));
-                events.push(row);
-                sub_event_index += 1;
-            }
-
-            if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+            emit_hermes_session_assistant_reasoning(message_ctx, emitter, &mut sub_event_index);
+            emit_hermes_session_assistant_text(message_ctx, emitter, &mut sub_event_index);
+            if let Some(tool_calls) = message_ctx
+                .message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+            {
                 for (call_idx, call) in tool_calls.iter().enumerate() {
-                    let tool_call_id = to_str(call.get("id"));
-                    let function = call.get("function").cloned().unwrap_or(Value::Null);
-                    let tool_name = to_str(function.get("name"));
-                    let arguments_raw = to_str(function.get("arguments"));
-                    let arguments = parse_json_string(&arguments_raw).unwrap_or_else(|| {
-                        if arguments_raw.is_empty() {
-                            Value::Object(Map::new())
-                        } else {
-                            json!({ "raw": arguments_raw })
-                        }
-                    });
-                    let input_json = compact_json(&arguments);
-                    let input_text = {
-                        let extracted = extract_message_text(&arguments);
-                        if extracted.is_empty() {
-                            input_json.clone()
-                        } else {
-                            extracted
-                        }
-                    };
-
-                    let uid = next_uid(&format!("tool_call:{call_idx}"));
-                    let mut row = Value::Object(base_event_obj(
-                        ctx,
-                        &uid,
-                        "tool_call",
-                        "tool_use",
-                        "assistant",
-                        &input_text,
-                        &compact_json(call),
-                    ));
-                    if !model.is_empty() {
-                        update_string_field(&mut row, "model", &model);
-                    }
-                    update_string_field(&mut row, "tool_call_id", &tool_call_id);
-                    update_string_field(&mut row, "tool_name", &tool_name);
-                    if let Some(obj) = row.as_object_mut() {
-                        obj.insert("content_types".to_string(), json!(["tool_use"]));
-                        obj.insert("turn_index".to_string(), json!(turn_index));
-                    }
-                    hermes_stamp_time(&mut row, &hermes_event_dt(base_dt, sub_event_index));
-                    events.push(row);
-                    sub_event_index += 1;
-
-                    tools.push(build_tool_row(
-                        ctx,
-                        &uid,
-                        &tool_call_id,
-                        "",
-                        &tool_name,
-                        "request",
-                        0,
-                        &input_json,
-                        "",
-                        "",
-                    ));
+                    emit_hermes_session_tool_call(
+                        message_ctx,
+                        emitter,
+                        &mut sub_event_index,
+                        call_idx,
+                        call,
+                    );
                 }
             }
         }
-        "tool" => {
-            let tool_call_id = to_str(message.get("tool_call_id"));
-            let tool_name = to_str(message.get("name"));
-            let text = extract_message_text(&content_value);
-            let output_json = compact_json(&content_value);
+        "tool" => emit_hermes_session_tool_result(message_ctx, emitter, &mut sub_event_index),
+        "system" => emit_hermes_session_system_message(message_ctx, emitter, &mut sub_event_index),
+        _ => emit_hermes_session_unknown_message(message_ctx, emitter, &mut sub_event_index),
+    }
+}
 
-            let uid = next_uid("tool_result");
-            let mut row = Value::Object(base_event_obj(
-                ctx,
-                &uid,
-                "tool_result",
-                "tool_result",
-                "tool",
-                &text,
-                &compact_json(message),
-            ));
-            if !model.is_empty() {
-                update_string_field(&mut row, "model", &model);
-            }
-            update_string_field(&mut row, "tool_call_id", &tool_call_id);
-            update_string_field(&mut row, "tool_name", &tool_name);
-            if let Some(obj) = row.as_object_mut() {
-                obj.insert("content_types".to_string(), json!(["tool_result"]));
-                obj.insert("turn_index".to_string(), json!(turn_index));
-            }
-            hermes_stamp_time(&mut row, &hermes_event_dt(base_dt, sub_event_index));
-            events.push(row);
-            sub_event_index += 1;
+fn emit_hermes_session_user_message(
+    message_ctx: &HermesSessionMessageContext<'_>,
+    emitter: &mut SourceEmitter<'_>,
+    sub_event_index: &mut usize,
+) {
+    let text = extract_message_text(&message_ctx.content_value);
+    let uid = message_ctx.uid(emitter, "user");
+    let event = hermes_session_event_defaults(
+        emitter.event(
+            &uid,
+            "message",
+            "user_message",
+            "user",
+            &text,
+            message_ctx.payload_json(),
+        ),
+        message_ctx.model,
+    )
+    .content_types(extract_content_types(&message_ctx.content_value))
+    .turn_index(message_ctx.turn_index);
+    push_hermes_session_event(emitter, event, message_ctx.base_dt, sub_event_index);
+}
 
-            tools.push(build_tool_row(
-                ctx,
-                &uid,
-                &tool_call_id,
-                "",
-                &tool_name,
-                "response",
-                0,
-                "",
-                &output_json,
-                &text,
-            ));
-        }
-        "system" => {
-            let text = extract_message_text(&content_value);
-            let mut row = Value::Object(base_event_obj(
-                ctx,
-                &next_uid("system"),
-                "system",
-                "system",
-                "system",
-                &text,
-                &compact_json(message),
-            ));
-            if !model.is_empty() {
-                update_string_field(&mut row, "model", &model);
-            }
-            if let Some(obj) = row.as_object_mut() {
-                obj.insert("turn_index".to_string(), json!(turn_index));
-            }
-            hermes_stamp_time(&mut row, &hermes_event_dt(base_dt, sub_event_index));
-            events.push(row);
-            sub_event_index += 1;
-        }
-        _ => {
-            let text = extract_message_text(&content_value);
-            let mut row = Value::Object(base_event_obj(
-                ctx,
-                &next_uid("unknown"),
-                "unknown",
-                "unknown",
-                "system",
-                &text,
-                &compact_json(message),
-            ));
-            if !model.is_empty() {
-                update_string_field(&mut row, "model", &model);
-            }
-            hermes_stamp_time(&mut row, &hermes_event_dt(base_dt, sub_event_index));
-            events.push(row);
-            sub_event_index += 1;
-        }
+fn emit_hermes_session_assistant_reasoning(
+    message_ctx: &HermesSessionMessageContext<'_>,
+    emitter: &mut SourceEmitter<'_>,
+    sub_event_index: &mut usize,
+) {
+    let reasoning = message_ctx
+        .message
+        .get("reasoning")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let reasoning_text = match &reasoning {
+        Value::Null => String::new(),
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    if reasoning_text.trim().is_empty() {
+        return;
     }
 
-    (events, links, tools)
+    let uid = message_ctx.uid(emitter, "reasoning");
+    let payload = json!({
+        "role": "assistant",
+        "reasoning": reasoning,
+    });
+    let event = hermes_session_event_defaults(
+        emitter.event_for_json(
+            &uid,
+            "reasoning",
+            "reasoning",
+            "assistant",
+            &reasoning_text,
+            &payload,
+        ),
+        message_ctx.model,
+    )
+    .has_reasoning(true)
+    .content_types(["reasoning"])
+    .turn_index(message_ctx.turn_index);
+    push_hermes_session_event(emitter, event, message_ctx.base_dt, sub_event_index);
+}
+
+fn emit_hermes_session_assistant_text(
+    message_ctx: &HermesSessionMessageContext<'_>,
+    emitter: &mut SourceEmitter<'_>,
+    sub_event_index: &mut usize,
+) {
+    let text = extract_message_text(&message_ctx.content_value);
+    if text.trim().is_empty() {
+        return;
+    }
+
+    let uid = message_ctx.uid(emitter, "assistant");
+    let payload = json!({
+        "role": "assistant",
+        "content": message_ctx.content_value,
+    });
+    let mut event = hermes_session_event_defaults(
+        emitter.event_for_json(
+            &uid,
+            "message",
+            "agent_message",
+            "assistant",
+            &text,
+            &payload,
+        ),
+        message_ctx.model,
+    )
+    .content_types(extract_content_types(&message_ctx.content_value))
+    .turn_index(message_ctx.turn_index);
+    let finish_reason = to_str(message_ctx.message.get("finish_reason"));
+    if !finish_reason.is_empty() {
+        event = event.op_status(finish_reason);
+    }
+    push_hermes_session_event(emitter, event, message_ctx.base_dt, sub_event_index);
+}
+
+fn emit_hermes_session_tool_call(
+    message_ctx: &HermesSessionMessageContext<'_>,
+    emitter: &mut SourceEmitter<'_>,
+    sub_event_index: &mut usize,
+    call_idx: usize,
+    call: &Value,
+) {
+    let tool_call_id = to_str(call.get("id"));
+    let function = call.get("function").cloned().unwrap_or(Value::Null);
+    let tool_name = to_str(function.get("name"));
+    let arguments_raw = to_str(function.get("arguments"));
+    let arguments = parse_json_string(&arguments_raw).unwrap_or_else(|| {
+        if arguments_raw.is_empty() {
+            Value::Object(Map::new())
+        } else {
+            json!({ "raw": arguments_raw })
+        }
+    });
+    let input_json = compact_json(&arguments);
+    let input_text = {
+        let extracted = extract_message_text(&arguments);
+        if extracted.is_empty() {
+            input_json.clone()
+        } else {
+            extracted
+        }
+    };
+
+    let uid = message_ctx.uid(emitter, &format!("tool_call:{call_idx}"));
+    let event = hermes_session_event_defaults(
+        emitter.event_for_json(
+            &uid,
+            "tool_call",
+            "tool_use",
+            "assistant",
+            &input_text,
+            call,
+        ),
+        message_ctx.model,
+    )
+    .tool_call_id(tool_call_id.clone())
+    .tool_name(tool_name.clone())
+    .content_types(["tool_use"])
+    .turn_index(message_ctx.turn_index);
+    push_hermes_session_event(emitter, event, message_ctx.base_dt, sub_event_index);
+    emitter.push_tool_request(&uid, &tool_call_id, "", &tool_name, &input_json);
+}
+
+fn emit_hermes_session_tool_result(
+    message_ctx: &HermesSessionMessageContext<'_>,
+    emitter: &mut SourceEmitter<'_>,
+    sub_event_index: &mut usize,
+) {
+    let tool_call_id = to_str(message_ctx.message.get("tool_call_id"));
+    let tool_name = to_str(message_ctx.message.get("name"));
+    let text = extract_message_text(&message_ctx.content_value);
+    let output_json = compact_json(&message_ctx.content_value);
+
+    let uid = message_ctx.uid(emitter, "tool_result");
+    let event = hermes_session_event_defaults(
+        emitter.event(
+            &uid,
+            "tool_result",
+            "tool_result",
+            "tool",
+            &text,
+            message_ctx.payload_json(),
+        ),
+        message_ctx.model,
+    )
+    .tool_call_id(tool_call_id.clone())
+    .tool_name(tool_name.clone())
+    .content_types(["tool_result"])
+    .turn_index(message_ctx.turn_index);
+    push_hermes_session_event(emitter, event, message_ctx.base_dt, sub_event_index);
+    emitter.push_tool_response(
+        &uid,
+        &tool_call_id,
+        "",
+        &tool_name,
+        0,
+        "",
+        &output_json,
+        &text,
+    );
+}
+
+fn emit_hermes_session_system_message(
+    message_ctx: &HermesSessionMessageContext<'_>,
+    emitter: &mut SourceEmitter<'_>,
+    sub_event_index: &mut usize,
+) {
+    let text = extract_message_text(&message_ctx.content_value);
+    let uid = message_ctx.uid(emitter, "system");
+    let event = hermes_session_event_defaults(
+        emitter.event(
+            &uid,
+            "system",
+            "system",
+            "system",
+            &text,
+            message_ctx.payload_json(),
+        ),
+        message_ctx.model,
+    )
+    .turn_index(message_ctx.turn_index);
+    push_hermes_session_event(emitter, event, message_ctx.base_dt, sub_event_index);
+}
+
+fn emit_hermes_session_unknown_message(
+    message_ctx: &HermesSessionMessageContext<'_>,
+    emitter: &mut SourceEmitter<'_>,
+    sub_event_index: &mut usize,
+) {
+    let text = extract_message_text(&message_ctx.content_value);
+    let uid = message_ctx.uid(emitter, "unknown");
+    let event = hermes_session_event_defaults(
+        emitter.event(
+            &uid,
+            "unknown",
+            "unknown",
+            "system",
+            &text,
+            message_ctx.payload_json(),
+        ),
+        message_ctx.model,
+    );
+    push_hermes_session_event(emitter, event, message_ctx.base_dt, sub_event_index);
+}
+
+fn hermes_session_event_defaults(event: EventBuilder, model: &str) -> EventBuilder {
+    let event = event.token_accounting(TokenAccounting::new(TokenEndpointKind::Generation));
+    if model.is_empty() {
+        event
+    } else {
+        event.model(model)
+    }
+}
+
+fn stamp_hermes_session_event_time(
+    event: EventBuilder,
+    base_dt: Option<DateTime<Utc>>,
+    sub_event_index: usize,
+) -> EventBuilder {
+    let dt = hermes_event_dt(base_dt, sub_event_index);
+    event
+        .record_ts(format_record_ts(&dt))
+        .event_ts(format_event_ts(&dt))
+}
+
+fn push_hermes_session_event(
+    emitter: &mut SourceEmitter<'_>,
+    event: EventBuilder,
+    base_dt: Option<DateTime<Utc>>,
+    sub_event_index: &mut usize,
+) {
+    let event = stamp_hermes_session_event_time(event, base_dt, *sub_event_index);
+    emitter.push_event(event);
+    *sub_event_index += 1;
 }

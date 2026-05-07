@@ -450,6 +450,7 @@ fn cap_u32(value: u64) -> u32 {
     value.min(u32::MAX as u64) as u32
 }
 
+#[allow(dead_code)]
 pub(crate) fn stamp_token_accounting(
     row: &mut Map<String, Value>,
     endpoint_kind: &str,
