@@ -1,5 +1,8 @@
 use super::shared::*;
-use super::{IngestSource, NormalizedPartials, SourceRecordContext};
+use super::{
+    emitter::{EventBuilder, SourceEmitter},
+    IngestSource, NormalizedPartials, SourceRecordContext,
+};
 use serde_json::{json, Map, Value};
 
 pub(crate) static CODEX: Codex = Codex;
@@ -39,7 +42,7 @@ impl IngestSource for Codex {
         base_uid: &str,
         model_hint: &str,
     ) -> NormalizedPartials {
-        normalize_codex_event(record, ctx, top_type, base_uid, model_hint).into()
+        normalize_codex_event(record, ctx, top_type, base_uid, model_hint)
     }
 }
 
@@ -49,549 +52,604 @@ fn normalize_codex_event(
     top_type: &str,
     base_uid: &str,
     model_hint: &str,
-) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
-    let mut events = Vec::<Value>::new();
-    let mut links = Vec::<Value>::new();
-    let mut tools = Vec::<Value>::new();
+) -> NormalizedPartials {
+    let codex_record = build_codex_record(record, top_type, base_uid, model_hint);
+    let mut emitter = SourceEmitter::new(ctx);
 
+    route_codex_record(&codex_record, &mut emitter);
+
+    let mut partials = emitter.finish();
+    stamp_codex_model_fallbacks(&codex_record, &mut partials.event_rows);
+    append_codex_parent_link(&codex_record, ctx, &mut partials);
+    partials
+}
+
+struct CodexRecord<'a> {
+    record: &'a Value,
+    top_type: &'a str,
+    base_uid: &'a str,
+    model_hint: &'a str,
+    payload: Value,
+    payload_obj: Map<String, Value>,
+    payload_json: String,
+}
+
+impl<'a> CodexRecord<'a> {
+    fn payload(&self) -> &Value {
+        &self.payload
+    }
+
+    fn payload_field(&self, key: &str) -> Option<&Value> {
+        self.payload_obj.get(key)
+    }
+
+    fn payload_json(&self) -> &str {
+        &self.payload_json
+    }
+
+    fn payload_type(&self) -> String {
+        to_str(self.payload_field("type"))
+    }
+}
+
+fn build_codex_record<'a>(
+    record: &'a Value,
+    top_type: &'a str,
+    base_uid: &'a str,
+    model_hint: &'a str,
+) -> CodexRecord<'a> {
     let payload = record.get("payload").cloned().unwrap_or(Value::Null);
     let payload_obj = payload.as_object().cloned().unwrap_or_else(Map::new);
     let payload_json = compact_json(&Value::Object(payload_obj.clone()));
 
-    let push_parent_link = |links: &mut Vec<Value>, uid: &str, parent: &str| {
-        if !parent.is_empty() {
-            links.push(build_external_link_row(
-                ctx,
-                uid,
-                parent,
-                "parent_event",
-                "{}",
-            ));
-        }
-    };
+    CodexRecord {
+        record,
+        top_type,
+        base_uid,
+        model_hint,
+        payload,
+        payload_obj,
+        payload_json,
+    }
+}
 
-    match top_type {
-        "session_meta" => {
-            let mut row = base_event_obj(
-                ctx,
-                base_uid,
-                "session_meta",
-                "session_meta",
-                "system",
-                "",
-                &payload_json,
-            );
-            row.insert("item_id".to_string(), json!(to_str(payload_obj.get("id"))));
-            events.push(Value::Object(row));
-        }
-        "turn_context" => {
-            let mut row = base_event_obj(
-                ctx,
-                base_uid,
-                "turn_context",
-                "turn_context",
-                "system",
-                "",
-                &payload_json,
-            );
-            row.insert(
-                "turn_index".to_string(),
-                json!(to_u32(payload_obj.get("turn_id"))),
-            );
-            let turn_id = to_str(payload_obj.get("turn_id"));
-            if !turn_id.is_empty() {
-                row.insert("request_id".to_string(), json!(turn_id.clone()));
-                row.insert("item_id".to_string(), json!(turn_id));
-            }
-            let model = canonicalize_model("codex", &to_str(payload_obj.get("model")));
-            if !model.is_empty() {
-                row.insert("model".to_string(), json!(model));
-            }
-            events.push(Value::Object(row));
-        }
-        "response_item" => {
-            let payload_type = to_str(payload_obj.get("type"));
-            match payload_type.as_str() {
-                "message" => {
-                    let role = to_str(payload_obj.get("role"));
-                    let content = payload_obj.get("content").cloned().unwrap_or(Value::Null);
-                    let text = extract_message_text(&content);
-                    let mut row = base_event_obj(
-                        ctx,
-                        base_uid,
-                        "message",
-                        "message",
-                        if role.is_empty() {
-                            "assistant"
-                        } else {
-                            role.as_str()
-                        },
-                        &text,
-                        &payload_json,
-                    );
-                    row.insert(
-                        "content_types".to_string(),
-                        json!(extract_content_types(&content)),
-                    );
-                    row.insert("item_id".to_string(), json!(to_str(payload_obj.get("id"))));
-                    row.insert(
-                        "op_status".to_string(),
-                        json!(to_str(payload_obj.get("phase"))),
-                    );
-                    events.push(Value::Object(row));
-                }
-                "function_call" => {
-                    let args = to_str(payload_obj.get("arguments"));
-                    let call_id = to_str(payload_obj.get("call_id"));
-                    let name = to_str(payload_obj.get("name"));
-                    let mut row = base_event_obj(
-                        ctx,
-                        base_uid,
-                        "tool_call",
-                        "function_call",
-                        "assistant",
-                        &args,
-                        &payload_json,
-                    );
-                    row.insert("tool_call_id".to_string(), json!(call_id.clone()));
-                    row.insert("tool_name".to_string(), json!(name.clone()));
-                    events.push(Value::Object(row));
-
-                    tools.push(build_tool_row(
-                        ctx, base_uid, &call_id, "", &name, "request", 0, &args, "", "",
-                    ));
-                }
-                "function_call_output" => {
-                    let output = to_str(payload_obj.get("output"));
-                    let call_id = to_str(payload_obj.get("call_id"));
-                    let mut row = base_event_obj(
-                        ctx,
-                        base_uid,
-                        "tool_result",
-                        "function_call_output",
-                        "tool",
-                        &output,
-                        &payload_json,
-                    );
-                    row.insert("tool_call_id".to_string(), json!(call_id.clone()));
-                    events.push(Value::Object(row));
-
-                    tools.push(build_tool_row(
-                        ctx,
-                        base_uid,
-                        &call_id,
-                        "",
-                        "",
-                        "response",
-                        0,
-                        "",
-                        &compact_json(payload_obj.get("output").unwrap_or(&Value::Null)),
-                        &output,
-                    ));
-                }
-                "custom_tool_call" => {
-                    let input = to_str(payload_obj.get("input"));
-                    let call_id = to_str(payload_obj.get("call_id"));
-                    let name = to_str(payload_obj.get("name"));
-                    let status = to_str(payload_obj.get("status"));
-                    let mut row = base_event_obj(
-                        ctx,
-                        base_uid,
-                        "tool_call",
-                        "custom_tool_call",
-                        "assistant",
-                        &input,
-                        &payload_json,
-                    );
-                    row.insert("tool_call_id".to_string(), json!(call_id.clone()));
-                    row.insert("tool_name".to_string(), json!(name.clone()));
-                    row.insert("op_status".to_string(), json!(status));
-                    events.push(Value::Object(row));
-
-                    tools.push(build_tool_row(
-                        ctx, base_uid, &call_id, "", &name, "request", 0, &input, "", "",
-                    ));
-                }
-                "custom_tool_call_output" => {
-                    let output = to_str(payload_obj.get("output"));
-                    let call_id = to_str(payload_obj.get("call_id"));
-                    let status = to_str(payload_obj.get("status"));
-                    let output_json = serde_json::from_str::<Value>(&output)
-                        .map(|parsed| compact_json(&parsed))
-                        .unwrap_or_else(|_| {
-                            compact_json(payload_obj.get("output").unwrap_or(&Value::Null))
-                        });
-
-                    let mut row = base_event_obj(
-                        ctx,
-                        base_uid,
-                        "tool_result",
-                        "custom_tool_call_output",
-                        "tool",
-                        &output,
-                        &payload_json,
-                    );
-                    row.insert("tool_call_id".to_string(), json!(call_id.clone()));
-                    row.insert("op_status".to_string(), json!(status));
-                    events.push(Value::Object(row));
-
-                    tools.push(build_tool_row(
-                        ctx,
-                        base_uid,
-                        &call_id,
-                        "",
-                        "",
-                        "response",
-                        0,
-                        "",
-                        &output_json,
-                        &output,
-                    ));
-                }
-                "web_search_call" => {
-                    let action = payload_obj.get("action").cloned().unwrap_or(Value::Null);
-                    let action_type = to_str(action.get("type"));
-                    let status = to_str(payload_obj.get("status"));
-                    let mut row = base_event_obj(
-                        ctx,
-                        base_uid,
-                        "tool_call",
-                        "web_search_call",
-                        "assistant",
-                        &extract_message_text(&action),
-                        &payload_json,
-                    );
-                    row.insert("tool_name".to_string(), json!("web_search"));
-                    row.insert("op_kind".to_string(), json!(action_type));
-                    row.insert("op_status".to_string(), json!(status.clone()));
-                    row.insert("tool_phase".to_string(), json!(status));
-                    events.push(Value::Object(row));
-                }
-                "reasoning" => {
-                    let summary = payload_obj.get("summary").cloned().unwrap_or(Value::Null);
-                    let mut row = base_event_obj(
-                        ctx,
-                        base_uid,
-                        "reasoning",
-                        "reasoning",
-                        "assistant",
-                        &extract_message_text(&summary),
-                        &payload_json,
-                    );
-                    mark_reasoning_metadata(&mut row);
-                    row.insert("item_id".to_string(), json!(to_str(payload_obj.get("id"))));
-                    events.push(Value::Object(row));
-                }
-                _ => {
-                    events.push(Value::Object(base_event_obj(
-                        ctx,
-                        base_uid,
-                        "unknown",
-                        if payload_type.is_empty() {
-                            "response_item"
-                        } else {
-                            payload_type.as_str()
-                        },
-                        "system",
-                        &extract_message_text(&payload),
-                        &payload_json,
-                    )));
-                }
-            }
-        }
-        "event_msg" => {
-            let payload_type = to_str(payload_obj.get("type"));
-            let actor = match payload_type.as_str() {
-                "user_message" => "user",
-                "agent_message" | "agent_reasoning" => "assistant",
-                _ => "system",
-            };
-            let mut row = base_event_obj(
-                ctx,
-                base_uid,
-                "event_msg",
-                if payload_type.is_empty() {
-                    "event_msg"
-                } else {
-                    payload_type.as_str()
-                },
-                actor,
-                &extract_message_text(&payload),
-                &payload_json,
-            );
-            let turn_id = to_str(payload_obj.get("turn_id"));
-            if !turn_id.is_empty() {
-                row.insert("request_id".to_string(), json!(turn_id.clone()));
-                row.insert("item_id".to_string(), json!(turn_id));
-            }
-            let status = to_str(payload_obj.get("status"));
-            if !status.is_empty() {
-                row.insert("op_status".to_string(), json!(status));
-            }
-            if payload_type == "token_count" {
-                let usage = payload_obj
-                    .get("info")
-                    .and_then(|v| v.get("last_token_usage"));
-                let input_tokens = to_u32(usage.and_then(|v| v.get("input_tokens")));
-                let output_tokens = to_u32(usage.and_then(|v| v.get("output_tokens")));
-                let cache_read_tokens = to_u32(
-                    usage
-                        .and_then(|v| v.get("cached_input_tokens"))
-                        .or_else(|| usage.and_then(|v| v.get("cache_read_input_tokens"))),
-                );
-                let cache_write_tokens = to_u32(
-                    usage
-                        .and_then(|v| v.get("cache_creation_input_tokens"))
-                        .or_else(|| usage.and_then(|v| v.get("cache_write_input_tokens"))),
-                );
-                let canonical_buckets = openai_generation_token_buckets(usage);
-
-                let model = to_str(
-                    payload_obj
-                        .get("rate_limits")
-                        .and_then(|v| v.get("limit_name")),
-                );
-                let fallback_model = to_str(payload_obj.get("model"));
-                let fallback_limit_id = to_str(
-                    payload_obj
-                        .get("rate_limits")
-                        .and_then(|v| v.get("limit_id")),
-                );
-                let resolved_model = if !model.is_empty() {
-                    canonicalize_model("codex", &model)
-                } else if !fallback_model.is_empty() {
-                    canonicalize_model("codex", &fallback_model)
-                } else if !fallback_limit_id.is_empty() {
-                    canonicalize_model("codex", &fallback_limit_id)
-                } else {
-                    canonicalize_model("codex", model_hint)
-                };
-
-                row.insert("input_tokens".to_string(), json!(input_tokens));
-                row.insert("output_tokens".to_string(), json!(output_tokens));
-                row.insert("cache_read_tokens".to_string(), json!(cache_read_tokens));
-                row.insert("cache_write_tokens".to_string(), json!(cache_write_tokens));
-                stamp_token_accounting(
-                    &mut row,
-                    "generation",
-                    canonical_buckets,
-                    token_native_units(&[]),
-                );
-                if !resolved_model.is_empty() {
-                    row.insert("model".to_string(), json!(resolved_model));
-                }
-                row.insert(
-                    "service_tier".to_string(),
-                    json!(to_str(
-                        payload_obj
-                            .get("rate_limits")
-                            .and_then(|v| v.get("plan_type"))
-                    )),
-                );
-                row.insert(
-                    "token_usage_json".to_string(),
-                    json!(compact_json(&payload)),
-                );
-            } else if payload_type == "agent_reasoning" {
-                mark_reasoning_metadata(&mut row);
-            }
-            events.push(Value::Object(row));
-        }
-        "compacted" => {
-            events.push(Value::Object(base_event_obj(
-                ctx,
-                base_uid,
-                "compacted_raw",
-                "compacted",
-                "system",
-                "",
-                &payload_json,
-            )));
-
-            if let Some(Value::Array(items)) = payload_obj.get("replacement_history") {
-                for (idx, item) in items.iter().enumerate() {
-                    let item_uid = event_uid(
-                        ctx.source_file,
-                        ctx.source_generation,
-                        ctx.source_line_no,
-                        ctx.source_offset,
-                        &compact_json(item),
-                        &format!("compacted:{}", idx),
-                    );
-                    let item_type = to_str(item.get("type"));
-
-                    let (kind, payload_type, actor, text) = match item_type.as_str() {
-                        "message" => (
-                            "message",
-                            "message",
-                            to_str(item.get("role")),
-                            extract_message_text(item.get("content").unwrap_or(&Value::Null)),
-                        ),
-                        "function_call" => (
-                            "tool_call",
-                            "function_call",
-                            "assistant".to_string(),
-                            to_str(item.get("arguments")),
-                        ),
-                        "function_call_output" => (
-                            "tool_result",
-                            "function_call_output",
-                            "tool".to_string(),
-                            to_str(item.get("output")),
-                        ),
-                        "reasoning" => (
-                            "reasoning",
-                            "reasoning",
-                            "assistant".to_string(),
-                            extract_message_text(item.get("summary").unwrap_or(&Value::Null)),
-                        ),
-                        _ => (
-                            "unknown",
-                            if item_type.is_empty() {
-                                "unknown"
-                            } else {
-                                item_type.as_str()
-                            },
-                            "system".to_string(),
-                            extract_message_text(item),
-                        ),
-                    };
-
-                    let mut row = base_event_obj(
-                        ctx,
-                        &item_uid,
-                        kind,
-                        payload_type,
-                        if actor.is_empty() {
-                            "assistant"
-                        } else {
-                            actor.as_str()
-                        },
-                        &text,
-                        &compact_json(item),
-                    );
-                    if kind == "reasoning" {
-                        mark_reasoning_metadata(&mut row);
-                    }
-                    row.insert("origin_event_id".to_string(), json!(base_uid));
-                    events.push(Value::Object(row));
-
-                    links.push(build_event_link_row(
-                        ctx,
-                        &item_uid,
-                        base_uid,
-                        "compacted_parent",
-                        "{}",
-                    ));
-                }
-            }
-        }
+fn route_codex_record(record: &CodexRecord<'_>, emitter: &mut SourceEmitter<'_>) {
+    match record.top_type {
+        "session_meta" => normalize_codex_session_meta(record, emitter),
+        "turn_context" => normalize_codex_turn_context(record, emitter),
+        "response_item" => normalize_codex_response_item(record, emitter),
+        "event_msg" => normalize_codex_event_msg(record, emitter),
+        "compacted" => normalize_codex_compacted(record, emitter),
         "message" | "function_call" | "function_call_output" | "reasoning" => {
-            let event = if top_type == "message" {
-                let role = to_str(record.get("role"));
-                let text = extract_message_text(record.get("content").unwrap_or(&Value::Null));
-                let mut row = base_event_obj(
-                    ctx,
-                    base_uid,
-                    "message",
-                    "message",
-                    if role.is_empty() {
-                        "assistant"
-                    } else {
-                        role.as_str()
-                    },
-                    &text,
-                    &compact_json(record),
-                );
-                row.insert(
-                    "content_types".to_string(),
-                    json!(extract_content_types(
-                        record.get("content").unwrap_or(&Value::Null)
-                    )),
-                );
-                Value::Object(row)
-            } else if top_type == "function_call" {
-                let args = to_str(record.get("arguments"));
-                let call_id = to_str(record.get("call_id"));
-                let name = to_str(record.get("name"));
-                let mut row = base_event_obj(
-                    ctx,
-                    base_uid,
-                    "tool_call",
-                    "function_call",
-                    "assistant",
-                    &args,
-                    &compact_json(record),
-                );
-                row.insert("tool_call_id".to_string(), json!(call_id.clone()));
-                row.insert("tool_name".to_string(), json!(name.clone()));
-                tools.push(build_tool_row(
-                    ctx, base_uid, &call_id, "", &name, "request", 0, &args, "", "",
-                ));
-                Value::Object(row)
-            } else if top_type == "function_call_output" {
-                let output = to_str(record.get("output"));
-                let call_id = to_str(record.get("call_id"));
-                let mut row = base_event_obj(
-                    ctx,
-                    base_uid,
-                    "tool_result",
-                    "function_call_output",
-                    "tool",
-                    &output,
-                    &compact_json(record),
-                );
-                row.insert("tool_call_id".to_string(), json!(call_id.clone()));
-                tools.push(build_tool_row(
-                    ctx,
-                    base_uid,
-                    &call_id,
-                    "",
-                    "",
-                    "response",
-                    0,
-                    "",
-                    &compact_json(record.get("output").unwrap_or(&Value::Null)),
-                    &output,
-                ));
-                Value::Object(row)
-            } else {
-                let summary = record.get("summary").cloned().unwrap_or(Value::Null);
-                let mut row = base_event_obj(
-                    ctx,
-                    base_uid,
-                    "reasoning",
-                    "reasoning",
-                    "assistant",
-                    &extract_message_text(&summary),
-                    &compact_json(record),
-                );
-                mark_reasoning_metadata(&mut row);
-                Value::Object(row)
-            };
+            normalize_codex_legacy_top_level(record, emitter)
+        }
+        _ => normalize_codex_unknown_top_level(record, emitter),
+    }
+}
 
-            events.push(event);
-        }
-        _ => {
-            events.push(Value::Object(base_event_obj(
-                ctx,
-                base_uid,
-                "unknown",
-                if top_type.is_empty() {
-                    "unknown"
-                } else {
-                    top_type
-                },
-                "system",
-                &extract_message_text(record),
-                &compact_json(record),
-            )));
-        }
+fn normalize_codex_session_meta(record: &CodexRecord<'_>, emitter: &mut SourceEmitter<'_>) {
+    let event = emitter
+        .event(
+            record.base_uid,
+            "session_meta",
+            "session_meta",
+            "system",
+            "",
+            record.payload_json(),
+        )
+        .item_id(to_str(record.payload_field("id")));
+    emitter.push_event(event);
+}
+
+fn normalize_codex_turn_context(record: &CodexRecord<'_>, emitter: &mut SourceEmitter<'_>) {
+    let mut event = emitter
+        .event(
+            record.base_uid,
+            "turn_context",
+            "turn_context",
+            "system",
+            "",
+            record.payload_json(),
+        )
+        .turn_index(to_u32(record.payload_field("turn_id")));
+
+    let turn_id = to_str(record.payload_field("turn_id"));
+    if !turn_id.is_empty() {
+        event = event.request_id(turn_id.clone()).item_id(turn_id);
     }
 
-    let payload_model = canonicalize_model("codex", &to_str(payload_obj.get("model")));
-    let inherited_model = canonicalize_model("codex", model_hint);
-    for event in &mut events {
+    let model = canonicalize_model("codex", &to_str(record.payload_field("model")));
+    if !model.is_empty() {
+        event = event.model(model);
+    }
+
+    emitter.push_event(event);
+}
+
+fn normalize_codex_response_item(record: &CodexRecord<'_>, emitter: &mut SourceEmitter<'_>) {
+    let payload_type = record.payload_type();
+    match payload_type.as_str() {
+        "message" => handle_codex_response_message(record, emitter),
+        "function_call" => handle_codex_function_call(
+            record.payload(),
+            record.base_uid,
+            record.payload_json(),
+            emitter,
+        ),
+        "function_call_output" => handle_codex_function_call_output(
+            record.payload(),
+            record.base_uid,
+            record.payload_json(),
+            emitter,
+        ),
+        "custom_tool_call" => handle_codex_custom_tool_call(record, emitter),
+        "custom_tool_call_output" => handle_codex_custom_tool_call_output(record, emitter),
+        "web_search_call" => handle_codex_web_search_call(record, emitter),
+        "reasoning" => handle_codex_reasoning(
+            record.payload(),
+            record.base_uid,
+            record.payload_json(),
+            true,
+            emitter,
+        ),
+        _ => handle_codex_unknown_response_item(record, &payload_type, emitter),
+    }
+}
+
+fn handle_codex_response_message(record: &CodexRecord<'_>, emitter: &mut SourceEmitter<'_>) {
+    emit_codex_message(
+        record.payload(),
+        record.base_uid,
+        record.payload_json(),
+        true,
+        emitter,
+    );
+}
+
+fn emit_codex_message(
+    item: &Value,
+    event_uid: &str,
+    payload_json: &str,
+    include_response_fields: bool,
+    emitter: &mut SourceEmitter<'_>,
+) {
+    let role = to_str(item.get("role"));
+    let content = item.get("content").unwrap_or_else(null_value);
+    let mut event = emitter
+        .event(
+            event_uid,
+            "message",
+            "message",
+            if role.is_empty() {
+                "assistant"
+            } else {
+                role.as_str()
+            },
+            &extract_message_text(content),
+            payload_json,
+        )
+        .content_types(extract_content_types(content));
+
+    if include_response_fields {
+        event = event
+            .item_id(to_str(item.get("id")))
+            .op_status(to_str(item.get("phase")));
+    }
+
+    emitter.push_event(event);
+}
+
+fn handle_codex_function_call(
+    item: &Value,
+    event_uid: &str,
+    payload_json: &str,
+    emitter: &mut SourceEmitter<'_>,
+) {
+    let args = to_str(item.get("arguments"));
+    let call_id = to_str(item.get("call_id"));
+    let name = to_str(item.get("name"));
+    let event = emitter
+        .event(
+            event_uid,
+            "tool_call",
+            "function_call",
+            "assistant",
+            &args,
+            payload_json,
+        )
+        .tool_call_id(call_id.clone())
+        .tool_name(name.clone());
+    emitter.push_event(event);
+    emitter.push_tool_request(event_uid, &call_id, "", &name, &args);
+}
+
+fn handle_codex_function_call_output(
+    item: &Value,
+    event_uid: &str,
+    payload_json: &str,
+    emitter: &mut SourceEmitter<'_>,
+) {
+    let output = to_str(item.get("output"));
+    let call_id = to_str(item.get("call_id"));
+    let output_json = compact_json(item.get("output").unwrap_or_else(null_value));
+    let event = emitter
+        .event(
+            event_uid,
+            "tool_result",
+            "function_call_output",
+            "tool",
+            &output,
+            payload_json,
+        )
+        .tool_call_id(call_id.clone());
+    emitter.push_event(event);
+    emitter.push_tool_response(event_uid, &call_id, "", "", 0, "", &output_json, &output);
+}
+
+fn handle_codex_custom_tool_call(record: &CodexRecord<'_>, emitter: &mut SourceEmitter<'_>) {
+    let input = to_str(record.payload_field("input"));
+    let call_id = to_str(record.payload_field("call_id"));
+    let name = to_str(record.payload_field("name"));
+    let status = to_str(record.payload_field("status"));
+    let event = emitter
+        .event(
+            record.base_uid,
+            "tool_call",
+            "custom_tool_call",
+            "assistant",
+            &input,
+            record.payload_json(),
+        )
+        .tool_call_id(call_id.clone())
+        .tool_name(name.clone())
+        .op_status(status);
+    emitter.push_event(event);
+    emitter.push_tool_request(record.base_uid, &call_id, "", &name, &input);
+}
+
+fn handle_codex_custom_tool_call_output(record: &CodexRecord<'_>, emitter: &mut SourceEmitter<'_>) {
+    let output = to_str(record.payload_field("output"));
+    let call_id = to_str(record.payload_field("call_id"));
+    let status = to_str(record.payload_field("status"));
+    let output_json = serde_json::from_str::<Value>(&output)
+        .map(|parsed| compact_json(&parsed))
+        .unwrap_or_else(|_| {
+            compact_json(record.payload_field("output").unwrap_or_else(null_value))
+        });
+
+    let event = emitter
+        .event(
+            record.base_uid,
+            "tool_result",
+            "custom_tool_call_output",
+            "tool",
+            &output,
+            record.payload_json(),
+        )
+        .tool_call_id(call_id.clone())
+        .op_status(status);
+    emitter.push_event(event);
+    emitter.push_tool_response(
+        record.base_uid,
+        &call_id,
+        "",
+        "",
+        0,
+        "",
+        &output_json,
+        &output,
+    );
+}
+
+fn handle_codex_web_search_call(record: &CodexRecord<'_>, emitter: &mut SourceEmitter<'_>) {
+    let action = record
+        .payload_field("action")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let action_type = to_str(action.get("type"));
+    let status = to_str(record.payload_field("status"));
+    let event = emitter
+        .event(
+            record.base_uid,
+            "tool_call",
+            "web_search_call",
+            "assistant",
+            &extract_message_text(&action),
+            record.payload_json(),
+        )
+        .tool_name("web_search")
+        .op_kind(action_type)
+        .op_status(status.clone())
+        .tool_phase(status);
+    emitter.push_event(event);
+}
+
+fn handle_codex_reasoning(
+    item: &Value,
+    event_uid: &str,
+    payload_json: &str,
+    include_item_id: bool,
+    emitter: &mut SourceEmitter<'_>,
+) {
+    let summary = item.get("summary").cloned().unwrap_or(Value::Null);
+    let mut event = emitter
+        .event(
+            event_uid,
+            "reasoning",
+            "reasoning",
+            "assistant",
+            &extract_message_text(&summary),
+            payload_json,
+        )
+        .has_reasoning(true)
+        .content_types(["reasoning"]);
+
+    if include_item_id {
+        event = event.item_id(to_str(item.get("id")));
+    }
+
+    emitter.push_event(event);
+}
+
+fn handle_codex_unknown_response_item(
+    record: &CodexRecord<'_>,
+    payload_type: &str,
+    emitter: &mut SourceEmitter<'_>,
+) {
+    let payload_type = if payload_type.is_empty() {
+        "response_item"
+    } else {
+        payload_type
+    };
+    let event = emitter.event(
+        record.base_uid,
+        "unknown",
+        payload_type,
+        "system",
+        &extract_message_text(record.payload()),
+        record.payload_json(),
+    );
+    emitter.push_event(event);
+}
+
+fn normalize_codex_event_msg(record: &CodexRecord<'_>, emitter: &mut SourceEmitter<'_>) {
+    let payload_type = record.payload_type();
+    let actor = match payload_type.as_str() {
+        "user_message" => "user",
+        "agent_message" | "agent_reasoning" => "assistant",
+        _ => "system",
+    };
+    let payload_type_for_row = if payload_type.is_empty() {
+        "event_msg"
+    } else {
+        payload_type.as_str()
+    };
+
+    let mut event = emitter.event(
+        record.base_uid,
+        "event_msg",
+        payload_type_for_row,
+        actor,
+        &extract_message_text(record.payload()),
+        record.payload_json(),
+    );
+
+    let turn_id = to_str(record.payload_field("turn_id"));
+    if !turn_id.is_empty() {
+        event = event.request_id(turn_id.clone()).item_id(turn_id);
+    }
+
+    let status = to_str(record.payload_field("status"));
+    if !status.is_empty() {
+        event = event.op_status(status);
+    }
+
+    if payload_type == "token_count" {
+        event = stamp_codex_token_count(record, event);
+    } else if payload_type == "agent_reasoning" {
+        event = event.has_reasoning(true).content_types(["reasoning"]);
+    }
+
+    emitter.push_event(event);
+}
+
+fn stamp_codex_token_count(record: &CodexRecord<'_>, event: EventBuilder) -> EventBuilder {
+    let usage = record
+        .payload_field("info")
+        .and_then(|v| v.get("last_token_usage"));
+    let input_tokens = to_u32(usage.and_then(|v| v.get("input_tokens")));
+    let output_tokens = to_u32(usage.and_then(|v| v.get("output_tokens")));
+    let cache_read_tokens = to_u32(
+        usage
+            .and_then(|v| v.get("cached_input_tokens"))
+            .or_else(|| usage.and_then(|v| v.get("cache_read_input_tokens"))),
+    );
+    let cache_write_tokens = to_u32(
+        usage
+            .and_then(|v| v.get("cache_creation_input_tokens"))
+            .or_else(|| usage.and_then(|v| v.get("cache_write_input_tokens"))),
+    );
+    let canonical_buckets = openai_generation_token_buckets(usage);
+    let accounting =
+        TokenAccounting::from_parts("generation", canonical_buckets, token_native_units(&[]))
+            .with_legacy_scalars(
+                input_tokens as u64,
+                output_tokens as u64,
+                cache_read_tokens as u64,
+                cache_write_tokens as u64,
+            )
+            .with_raw_usage_json(record.payload_json().to_string());
+
+    let mut event = event.token_accounting(accounting).service_tier(to_str(
+        record
+            .payload_field("rate_limits")
+            .and_then(|v| v.get("plan_type")),
+    ));
+
+    let resolved_model = resolve_codex_token_count_model(record);
+    if !resolved_model.is_empty() {
+        event = event.model(resolved_model);
+    }
+
+    event
+}
+
+fn resolve_codex_token_count_model(record: &CodexRecord<'_>) -> String {
+    let model = to_str(
+        record
+            .payload_field("rate_limits")
+            .and_then(|v| v.get("limit_name")),
+    );
+    let fallback_model = to_str(record.payload_field("model"));
+    let fallback_limit_id = to_str(
+        record
+            .payload_field("rate_limits")
+            .and_then(|v| v.get("limit_id")),
+    );
+
+    if !model.is_empty() {
+        canonicalize_model("codex", &model)
+    } else if !fallback_model.is_empty() {
+        canonicalize_model("codex", &fallback_model)
+    } else if !fallback_limit_id.is_empty() {
+        canonicalize_model("codex", &fallback_limit_id)
+    } else {
+        canonicalize_model("codex", record.model_hint)
+    }
+}
+
+fn normalize_codex_compacted(record: &CodexRecord<'_>, emitter: &mut SourceEmitter<'_>) {
+    let event = emitter.event(
+        record.base_uid,
+        "compacted_raw",
+        "compacted",
+        "system",
+        "",
+        record.payload_json(),
+    );
+    emitter.push_event(event);
+
+    if let Some(Value::Array(items)) = record.payload_field("replacement_history") {
+        for (idx, item) in items.iter().enumerate() {
+            normalize_codex_compacted_item(record, item, idx, emitter);
+        }
+    }
+}
+
+fn normalize_codex_compacted_item(
+    record: &CodexRecord<'_>,
+    item: &Value,
+    idx: usize,
+    emitter: &mut SourceEmitter<'_>,
+) {
+    let item_uid = emitter.uid_for_json(item, &format!("compacted:{}", idx));
+    let item_type = to_str(item.get("type"));
+
+    let (kind, payload_type, actor, text) = match item_type.as_str() {
+        "message" => (
+            "message".to_string(),
+            "message".to_string(),
+            to_str(item.get("role")),
+            extract_message_text(item.get("content").unwrap_or_else(null_value)),
+        ),
+        "function_call" => (
+            "tool_call".to_string(),
+            "function_call".to_string(),
+            "assistant".to_string(),
+            to_str(item.get("arguments")),
+        ),
+        "function_call_output" => (
+            "tool_result".to_string(),
+            "function_call_output".to_string(),
+            "tool".to_string(),
+            to_str(item.get("output")),
+        ),
+        "reasoning" => (
+            "reasoning".to_string(),
+            "reasoning".to_string(),
+            "assistant".to_string(),
+            extract_message_text(item.get("summary").unwrap_or_else(null_value)),
+        ),
+        _ => (
+            "unknown".to_string(),
+            if item_type.is_empty() {
+                "unknown".to_string()
+            } else {
+                item_type.clone()
+            },
+            "system".to_string(),
+            extract_message_text(item),
+        ),
+    };
+
+    let actor = if actor.is_empty() {
+        "assistant"
+    } else {
+        actor.as_str()
+    };
+    let item_json = compact_json(item);
+    let mut event = emitter
+        .event(&item_uid, &kind, &payload_type, actor, &text, &item_json)
+        .origin_event_id(record.base_uid);
+    if kind == "reasoning" {
+        event = event.has_reasoning(true).content_types(["reasoning"]);
+    }
+    emitter.push_event(event);
+    emitter.push_event_link(&item_uid, record.base_uid, "compacted_parent", "{}");
+}
+
+fn normalize_codex_legacy_top_level(record: &CodexRecord<'_>, emitter: &mut SourceEmitter<'_>) {
+    let payload_json = compact_json(record.record);
+    match record.top_type {
+        "message" => emit_codex_message(
+            record.record,
+            record.base_uid,
+            &payload_json,
+            false,
+            emitter,
+        ),
+        "function_call" => {
+            handle_codex_function_call(record.record, record.base_uid, &payload_json, emitter)
+        }
+        "function_call_output" => handle_codex_function_call_output(
+            record.record,
+            record.base_uid,
+            &payload_json,
+            emitter,
+        ),
+        "reasoning" => handle_codex_reasoning(
+            record.record,
+            record.base_uid,
+            &payload_json,
+            false,
+            emitter,
+        ),
+        _ => {}
+    }
+}
+
+fn normalize_codex_unknown_top_level(record: &CodexRecord<'_>, emitter: &mut SourceEmitter<'_>) {
+    let payload_type = if record.top_type.is_empty() {
+        "unknown"
+    } else {
+        record.top_type
+    };
+    let event = emitter.event(
+        record.base_uid,
+        "unknown",
+        payload_type,
+        "system",
+        &extract_message_text(record.record),
+        &compact_json(record.record),
+    );
+    emitter.push_event(event);
+}
+
+fn stamp_codex_model_fallbacks(record: &CodexRecord<'_>, events: &mut [Value]) {
+    let payload_model = canonicalize_model("codex", &to_str(record.payload_field("model")));
+    let inherited_model = canonicalize_model("codex", record.model_hint);
+
+    for event in events {
         if let Some(row) = event.as_object_mut() {
             let row_model = canonicalize_model("codex", &to_str(row.get("model")));
             let resolved_model = if !row_model.is_empty() {
@@ -607,13 +665,33 @@ fn normalize_codex_event(
             }
         }
     }
+}
 
-    let parent = to_str(record.get("parent_id"));
-    if !events.is_empty() && !parent.is_empty() {
-        if let Some(uid) = events[0].get("event_uid").and_then(|v| v.as_str()) {
-            push_parent_link(&mut links, uid, &parent);
-        }
+fn append_codex_parent_link(
+    record: &CodexRecord<'_>,
+    ctx: &RecordContext<'_>,
+    partials: &mut NormalizedPartials,
+) {
+    let parent = to_str(record.record.get("parent_id"));
+    if parent.is_empty() || partials.event_rows.is_empty() {
+        return;
     }
 
-    (events, links, tools)
+    if let Some(uid) = partials.event_rows[0]
+        .get("event_uid")
+        .and_then(|v| v.as_str())
+    {
+        partials.push_link(build_external_link_row(
+            ctx,
+            uid,
+            &parent,
+            "parent_event",
+            "{}",
+        ));
+    }
+}
+
+fn null_value<'a>() -> &'a Value {
+    static NULL_VALUE: Value = Value::Null;
+    &NULL_VALUE
 }
