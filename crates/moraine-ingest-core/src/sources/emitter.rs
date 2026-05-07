@@ -2,7 +2,8 @@
 
 use super::shared::{
     base_event_obj, build_event_link_row, build_external_link_row, build_tool_row, compact_json,
-    event_uid, token_native_units, truncate_chars, RecordContext, PREVIEW_LIMIT, TEXT_LIMIT,
+    event_uid, token_native_units, truncate_chars, RecordContext, TokenAccounting, PREVIEW_LIMIT,
+    TEXT_LIMIT,
 };
 use super::NormalizedPartials;
 use serde_json::{json, Map, Value};
@@ -469,6 +470,11 @@ impl EventBuilder {
         self.token_usage_native_units(token_native_units(&[]))
     }
 
+    pub(crate) fn token_accounting(mut self, accounting: TokenAccounting) -> Self {
+        accounting.stamp_event_row(&mut self.row);
+        self
+    }
+
     pub(crate) fn build(self) -> Value {
         Value::Object(self.row)
     }
@@ -652,6 +658,45 @@ mod tests {
         stable_event_version(&mut expected);
         stable_event_version(&mut actual);
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn event_builder_stamps_token_accounting() {
+        let ctx = ctx();
+        let emitter = SourceEmitter::new(&ctx);
+        let usage = json!({
+            "input_tokens": 15,
+            "output_tokens": 10,
+            "input_tokens_details": {"cached_tokens": 3},
+            "output_tokens_details": {"reasoning_tokens": 2}
+        });
+        let accounting = TokenAccounting::openai_generation(Some(&usage));
+
+        let row = emitter
+            .event("event-1", "message", "message", "assistant", "", "{}")
+            .token_accounting(accounting)
+            .build();
+
+        assert_eq!(row.get("input_tokens").and_then(Value::as_u64), Some(15));
+        assert_eq!(row.get("output_tokens").and_then(Value::as_u64), Some(10));
+        assert_eq!(
+            row.get("cache_read_tokens").and_then(Value::as_u64),
+            Some(3)
+        );
+        assert_eq!(
+            row.get("token_usage_json").and_then(Value::as_str),
+            Some(compact_json(&usage).as_str())
+        );
+        assert_eq!(
+            row.pointer("/token_usage_buckets/input_text")
+                .and_then(Value::as_u64),
+            Some(12)
+        );
+        assert_eq!(
+            row.pointer("/token_usage_buckets/reasoning")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
     }
 
     #[test]
