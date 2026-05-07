@@ -79,9 +79,11 @@ format = "jsonl"
 ```
 
 Supported `harness` values are `codex`, `claude-code`, `kimi-cli`, and
-`hermes`. `glob` selects files to ingest. `watch_root` is the directory Moraine
-watches for changes. `format` can usually be omitted; set it when a source needs
-an explicit parser such as `jsonl` or `session_json`.
+`hermes`. Each value maps to a registered ingest source adapter; see
+[Ingest Sources](development/ingest-sources.md) for the development contract.
+`glob` selects files to ingest. `watch_root` is the directory Moraine watches
+for changes. `format` can usually be omitted; set it when a source needs an
+explicit parser such as `jsonl` or `session_json`.
 
 The `[ingest]` table controls batching and watcher behavior:
 

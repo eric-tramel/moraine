@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Component, Path, PathBuf};
 
+pub const KNOWN_INGEST_HARNESSES: &[&str] = &["codex", "claude-code", "hermes", "kimi-cli"];
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IngestSource {
@@ -621,18 +623,15 @@ fn resolve_runtime_subdir(root: &str, value: &str) -> String {
 
 fn normalize_harness(harness: &str, source_idx: usize, source_name: &str) -> Result<String> {
     let normalized = harness.trim().to_ascii_lowercase();
-    if normalized == "codex"
-        || normalized == "claude-code"
-        || normalized == "hermes"
-        || normalized == "kimi-cli"
-    {
+    if KNOWN_INGEST_HARNESSES.contains(&normalized.as_str()) {
         return Ok(normalized);
     }
 
     Err(anyhow::anyhow!(
-        "invalid ingest.sources[{source_idx}].harness `{}` for source `{}`; expected one of: codex, claude-code, hermes, kimi-cli",
+        "invalid ingest.sources[{source_idx}].harness `{}` for source `{}`; expected one of: {}",
         harness.trim(),
-        source_name
+        source_name,
+        KNOWN_INGEST_HARNESSES.join(", ")
     ))
 }
 

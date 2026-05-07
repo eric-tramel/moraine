@@ -13,6 +13,9 @@ nav = [
   { "Introduction" = "index.md" },
   { "Quickstart and Installation" = "quickstart.md" },
   { "Configuration" = "configuration.md" },
+  { "Development" = [
+    { "Ingest Sources" = "development/ingest-sources.md" },
+  ] },
 ]
 
 [project.theme]
