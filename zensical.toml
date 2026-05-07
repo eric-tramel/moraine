@@ -15,6 +15,7 @@ nav = [
   { "Configuration" = "configuration.md" },
   { "Development" = [
     { "Ingest Sources" = "development/ingest-sources.md" },
+    { "Harness Author Workflow" = "development/harness-author-workflow.md" },
   ] },
 ]
 

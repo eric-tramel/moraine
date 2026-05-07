@@ -80,10 +80,109 @@ format = "jsonl"
 
 Supported `harness` values are `codex`, `claude-code`, `kimi-cli`, and
 `hermes`. Each value maps to a registered ingest source adapter; see
-[Ingest Sources](development/ingest-sources.md) for the development contract.
+[Ingest Sources](development/ingest-sources.md) for the adapter contract and
+[Harness Author Workflow](development/harness-author-workflow.md) for source
+development steps.
+
 `glob` selects files to ingest. `watch_root` is the directory Moraine watches
-for changes. `format` can usually be omitted; set it when a source needs an
-explicit parser such as `jsonl` or `session_json`.
+for changes. `format` controls the file parser:
+
+| Format | Use for |
+| --- | --- |
+| `jsonl` | Append-only newline-delimited trace records. This is the default for most sources. |
+| `session_json` | One JSON file per live session that is rewritten in place. Moraine emits only newly appended synthetic session records. |
+
+When `format` is omitted, Moraine infers it. Hermes sources with a `.json` glob
+are inferred as `session_json`; otherwise sources are treated as `jsonl`.
+
+## Source Matrix
+
+The default template in `config/moraine.toml` enables these source families:
+
+| Source | Harness | Default glob | Watch root | Format |
+| --- | --- | --- | --- | --- |
+| Codex | `codex` | `~/.codex/sessions/**/*.jsonl` | `~/.codex/sessions` | inferred `jsonl` |
+| Claude Code | `claude-code` | `~/.claude/projects/**/*.jsonl` | `~/.claude/projects` | inferred `jsonl` |
+| Kimi CLI | `kimi-cli` | `~/.kimi/sessions/**/wire.jsonl` | `~/.kimi/sessions` | inferred `jsonl` |
+| Hermes live sessions | `hermes` | `~/.hermes/sessions/session_*.json` | `~/.hermes/sessions` | `session_json` |
+| Hermes trajectories | `hermes` | user-provided trajectory JSONL | trajectory output directory | `jsonl` |
+
+Hermes supports both live session JSON and offline trajectory JSONL because the
+harness is the same but the file format differs. Use a separate
+`[[ingest.sources]]` entry for each watched directory.
+
+## Source Examples
+
+Codex:
+
+```toml
+[[ingest.sources]]
+name = "codex"
+harness = "codex"
+enabled = true
+glob = "~/.codex/sessions/**/*.jsonl"
+watch_root = "~/.codex/sessions"
+```
+
+Claude Code:
+
+```toml
+[[ingest.sources]]
+name = "claude"
+harness = "claude-code"
+enabled = true
+glob = "~/.claude/projects/**/*.jsonl"
+watch_root = "~/.claude/projects"
+```
+
+Kimi CLI:
+
+```toml
+[[ingest.sources]]
+name = "kimi-cli"
+harness = "kimi-cli"
+enabled = true
+glob = "~/.kimi/sessions/**/wire.jsonl"
+watch_root = "~/.kimi/sessions"
+format = "jsonl"
+```
+
+Hermes live sessions:
+
+```toml
+[[ingest.sources]]
+name = "hermes"
+harness = "hermes"
+enabled = true
+glob = "~/.hermes/sessions/session_*.json"
+watch_root = "~/.hermes/sessions"
+format = "session_json"
+```
+
+Hermes trajectories:
+
+```toml
+[[ingest.sources]]
+name = "hermes-trajectories"
+harness = "hermes"
+enabled = true
+glob = "~/trajectories/**/*.jsonl"
+watch_root = "~/trajectories"
+format = "jsonl"
+```
+
+## Adding Harnesses
+
+The config crate validates harness names before ingest-core runs, but
+`moraine-config` cannot call the ingest adapter registry without creating a
+dependency cycle. Adding a harness therefore requires coordinated updates:
+
+- Add and register the adapter under `crates/moraine-ingest-core/src/sources/`.
+- Add the harness string to `moraine_config::KNOWN_INGEST_HARNESSES`.
+- Update defaults in `crates/moraine-config/src/lib.rs` and
+  `config/moraine.toml` when the source should ship enabled by default.
+- Update this page and the ingest source development docs.
+- Run the registry/config sync tests and ingest fixture contract tests.
 
 The `[ingest]` table controls batching and watcher behavior:
 
