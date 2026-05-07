@@ -67,7 +67,7 @@ pub(crate) fn to_u8_bool(value: Option<&Value>) -> u8 {
     }
 }
 
-const TOKEN_BUCKET_KEYS: &[&str] = &[
+pub(crate) const TOKEN_BUCKET_KEYS: &[&str] = &[
     "input_text",
     "output_text",
     "input_cache_read",
@@ -83,13 +83,24 @@ const TOKEN_BUCKET_KEYS: &[&str] = &[
     "other",
 ];
 
-const TOKEN_NATIVE_UNIT_KEYS: &[&str] = &[
+pub(crate) const TOKEN_NATIVE_UNIT_KEYS: &[&str] = &[
     "input_image_pixels",
     "output_image_pixels",
     "input_audio_seconds",
     "output_audio_seconds",
     "input_images",
     "output_images",
+];
+
+#[allow(dead_code)]
+pub(crate) const TOKEN_ENDPOINT_KIND_VALUES: &[&str] = &[
+    "generation",
+    "embedding",
+    "rerank",
+    "moderation",
+    "image_generation",
+    "audio_generation",
+    "other",
 ];
 
 fn zero_numeric_map(keys: &[&str]) -> Map<String, Value> {
@@ -105,45 +116,338 @@ fn zero_float_map(keys: &[&str]) -> Map<String, Value> {
 }
 
 pub(crate) fn token_buckets(values: &[(&str, u64)]) -> Value {
-    let mut map = zero_numeric_map(TOKEN_BUCKET_KEYS);
-    for (key, value) in values {
-        map.insert((*key).to_string(), json!(*value));
-    }
-    Value::Object(map)
+    TokenAccounting::new(TokenEndpointKind::Generation)
+        .with_buckets(values)
+        .token_usage_buckets()
 }
 
 pub(crate) fn token_native_units(values: &[(&str, f64)]) -> Value {
-    let mut map = zero_float_map(TOKEN_NATIVE_UNIT_KEYS);
-    for (key, value) in values {
-        map.insert((*key).to_string(), json!(*value));
-    }
-    Value::Object(map)
+    TokenAccounting::new(TokenEndpointKind::Generation)
+        .with_native_units(values)
+        .token_usage_native_units()
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct TokenBuckets {
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TokenEndpointKind {
+    Generation,
+    Embedding,
+    Rerank,
+    Moderation,
+    ImageGeneration,
+    AudioGeneration,
+    Other,
+}
+
+impl TokenEndpointKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Generation => "generation",
+            Self::Embedding => "embedding",
+            Self::Rerank => "rerank",
+            Self::Moderation => "moderation",
+            Self::ImageGeneration => "image_generation",
+            Self::AudioGeneration => "audio_generation",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TokenAccounting {
+    endpoint_kind: String,
+    input_tokens: u32,
+    output_tokens: u32,
+    cache_read_tokens: u32,
+    cache_write_tokens: u32,
+    token_usage_json: String,
     buckets: Map<String, Value>,
     native_units: Map<String, Value>,
 }
 
-impl TokenBuckets {
-    pub(crate) fn generation(values: &[(&str, u64)]) -> Self {
-        let mut buckets = zero_numeric_map(TOKEN_BUCKET_KEYS);
-        for (key, value) in values {
-            buckets.insert((*key).to_string(), json!(*value));
-        }
+#[allow(dead_code)]
+impl TokenAccounting {
+    pub(crate) fn new(endpoint_kind: TokenEndpointKind) -> Self {
         Self {
-            buckets,
+            endpoint_kind: endpoint_kind.as_str().to_string(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            token_usage_json: String::new(),
+            buckets: zero_numeric_map(TOKEN_BUCKET_KEYS),
             native_units: zero_float_map(TOKEN_NATIVE_UNIT_KEYS),
         }
     }
 
-    pub(crate) fn into_values(self) -> (Value, Value) {
-        (
-            Value::Object(self.buckets),
-            Value::Object(self.native_units),
-        )
+    pub(crate) fn generation(
+        input_text: u64,
+        output_text: u64,
+        cache_read: u64,
+        cache_write: u64,
+    ) -> Self {
+        Self::new(TokenEndpointKind::Generation)
+            .with_buckets(&[
+                ("input_text", input_text),
+                ("output_text", output_text),
+                ("input_cache_read", cache_read),
+                ("input_cache_write", cache_write),
+            ])
+            .with_legacy_scalars(
+                input_text
+                    .saturating_add(cache_read)
+                    .saturating_add(cache_write),
+                output_text,
+                cache_read,
+                cache_write,
+            )
     }
+
+    pub(crate) fn openai_generation(usage: Option<&Value>) -> Self {
+        let input_total = to_u64(usage.and_then(|v| {
+            v.get("input_tokens")
+                .or_else(|| v.get("prompt_tokens"))
+                .or_else(|| v.get("total_input_tokens"))
+        }));
+        let output_total = to_u64(usage.and_then(|v| {
+            v.get("output_tokens")
+                .or_else(|| v.get("completion_tokens"))
+                .or_else(|| v.get("total_output_tokens"))
+        }));
+        let input_details = usage.and_then(|v| {
+            v.get("input_tokens_details")
+                .or_else(|| v.get("prompt_tokens_details"))
+        });
+        let output_details = usage.and_then(|v| {
+            v.get("output_tokens_details")
+                .or_else(|| v.get("completion_tokens_details"))
+        });
+
+        let cache_read = to_u64(
+            usage
+                .and_then(|v| v.get("cached_input_tokens"))
+                .or_else(|| usage.and_then(|v| v.get("cache_read_input_tokens")))
+                .or_else(|| input_details.and_then(|v| v.get("cached_tokens"))),
+        );
+        let cache_write = to_u64(
+            usage
+                .and_then(|v| v.get("cache_creation_input_tokens"))
+                .or_else(|| usage.and_then(|v| v.get("cache_write_input_tokens")))
+                .or_else(|| input_details.and_then(|v| v.get("cache_creation_tokens"))),
+        );
+        let input_image = to_u64(input_details.and_then(|v| v.get("image_tokens")));
+        let input_audio = to_u64(input_details.and_then(|v| v.get("audio_tokens")));
+        let output_image = to_u64(output_details.and_then(|v| v.get("image_tokens")));
+        let output_audio = to_u64(output_details.and_then(|v| v.get("audio_tokens")));
+        let reasoning = to_u64(output_details.and_then(|v| v.get("reasoning_tokens")));
+        let server_tool_use = sum_numeric_object(usage.and_then(|v| v.get("server_tool_use")));
+
+        let input_text_detail = to_u64(input_details.and_then(|v| v.get("text_tokens")));
+        let output_text_detail = to_u64(output_details.and_then(|v| v.get("text_tokens")));
+        let input_text = if input_text_detail > 0 {
+            input_text_detail
+        } else {
+            input_total.saturating_sub(cache_read + cache_write + input_image + input_audio)
+        };
+        let output_text = if output_text_detail > 0 {
+            output_text_detail
+        } else {
+            output_total.saturating_sub(output_image + output_audio + reasoning + server_tool_use)
+        };
+
+        Self::new(TokenEndpointKind::Generation)
+            .with_buckets(&[
+                ("input_text", input_text),
+                ("output_text", output_text),
+                ("input_cache_read", cache_read),
+                ("input_cache_write", cache_write),
+                ("input_image", input_image),
+                ("output_image", output_image),
+                ("input_audio", input_audio),
+                ("output_audio", output_audio),
+                ("reasoning", reasoning),
+                ("server_tool_use", server_tool_use),
+            ])
+            .with_legacy_scalars(input_total, output_total, cache_read, cache_write)
+            .with_raw_usage(usage)
+    }
+
+    pub(crate) fn claude_generation(usage: Option<&Value>) -> Self {
+        let input_tokens = to_u64(usage.and_then(|v| v.get("input_tokens")));
+        let output_tokens = to_u64(usage.and_then(|v| v.get("output_tokens")));
+        let cache_read = to_u64(usage.and_then(|v| v.get("cache_read_input_tokens")));
+        let cache_write = to_u64(usage.and_then(|v| v.get("cache_creation_input_tokens")));
+        let reasoning = to_u64(
+            usage
+                .and_then(|v| v.get("reasoning_tokens"))
+                .or_else(|| usage.and_then(|v| v.get("thinking_tokens")))
+                .or_else(|| {
+                    usage
+                        .and_then(|v| v.get("output_tokens_details"))
+                        .and_then(|details| details.get("reasoning_tokens"))
+                }),
+        );
+        let server_tool_use = sum_numeric_object(usage.and_then(|v| v.get("server_tool_use")));
+        let input_text = input_tokens.saturating_sub(cache_read + cache_write);
+        let output_text = output_tokens.saturating_sub(reasoning + server_tool_use);
+
+        Self::new(TokenEndpointKind::Generation)
+            .with_buckets(&[
+                ("input_text", input_text),
+                ("output_text", output_text),
+                ("input_cache_read", cache_read),
+                ("input_cache_write", cache_write),
+                ("reasoning", reasoning),
+                ("server_tool_use", server_tool_use),
+            ])
+            .with_legacy_scalars(input_tokens, output_tokens, cache_read, cache_write)
+            .with_raw_usage(usage)
+    }
+
+    pub(crate) fn kimi_generation(token_usage: Option<&Value>) -> Self {
+        let input_other = to_u64(token_usage.and_then(|v| v.get("input_other")));
+        let cache_read = to_u64(token_usage.and_then(|v| v.get("input_cache_read")));
+        let cache_write = to_u64(token_usage.and_then(|v| v.get("input_cache_creation")));
+        let output = to_u64(token_usage.and_then(|v| v.get("output")));
+
+        Self::generation(input_other, output, cache_read, cache_write).with_raw_usage(token_usage)
+    }
+
+    pub(crate) fn from_parts(endpoint_kind: &str, buckets: Value, native_units: Value) -> Self {
+        Self {
+            endpoint_kind: endpoint_kind.to_string(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            token_usage_json: String::new(),
+            buckets: buckets
+                .as_object()
+                .cloned()
+                .unwrap_or_else(|| zero_numeric_map(TOKEN_BUCKET_KEYS)),
+            native_units: native_units
+                .as_object()
+                .cloned()
+                .unwrap_or_else(|| zero_float_map(TOKEN_NATIVE_UNIT_KEYS)),
+        }
+    }
+
+    pub(crate) fn with_buckets(mut self, values: &[(&str, u64)]) -> Self {
+        for (key, value) in values {
+            if self.buckets.contains_key(*key) {
+                self.buckets.insert((*key).to_string(), json!(*value));
+            }
+        }
+        self
+    }
+
+    pub(crate) fn with_native_units(mut self, values: &[(&str, f64)]) -> Self {
+        for (key, value) in values {
+            if self.native_units.contains_key(*key) {
+                self.native_units.insert((*key).to_string(), json!(*value));
+            }
+        }
+        self
+    }
+
+    pub(crate) fn with_raw_usage(mut self, usage: Option<&Value>) -> Self {
+        self.token_usage_json = usage.map(compact_json).unwrap_or_default();
+        self
+    }
+
+    pub(crate) fn with_raw_usage_json(mut self, value: impl Into<String>) -> Self {
+        self.token_usage_json = value.into();
+        self
+    }
+
+    pub(crate) fn with_legacy_scalars(
+        mut self,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+    ) -> Self {
+        self.input_tokens = cap_u32(input_tokens);
+        self.output_tokens = cap_u32(output_tokens);
+        self.cache_read_tokens = cap_u32(cache_read_tokens);
+        self.cache_write_tokens = cap_u32(cache_write_tokens);
+        self
+    }
+
+    pub(crate) fn token_usage_buckets(&self) -> Value {
+        Value::Object(self.buckets.clone())
+    }
+
+    pub(crate) fn token_usage_native_units(&self) -> Value {
+        Value::Object(self.native_units.clone())
+    }
+
+    pub(crate) fn input_tokens(&self) -> u32 {
+        self.input_tokens
+    }
+
+    pub(crate) fn output_tokens(&self) -> u32 {
+        self.output_tokens
+    }
+
+    pub(crate) fn cache_read_tokens(&self) -> u32 {
+        self.cache_read_tokens
+    }
+
+    pub(crate) fn cache_write_tokens(&self) -> u32 {
+        self.cache_write_tokens
+    }
+
+    pub(crate) fn token_usage_json(&self) -> &str {
+        &self.token_usage_json
+    }
+
+    pub(crate) fn bucket(&self, key: &str) -> u64 {
+        self.buckets
+            .get(key)
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn native_unit(&self, key: &str) -> f64 {
+        self.native_units
+            .get(key)
+            .and_then(Value::as_f64)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn stamp_event_row(&self, row: &mut Map<String, Value>) {
+        row.insert("endpoint_kind".to_string(), json!(self.endpoint_kind));
+        row.insert("input_tokens".to_string(), json!(self.input_tokens));
+        row.insert("output_tokens".to_string(), json!(self.output_tokens));
+        row.insert(
+            "cache_read_tokens".to_string(),
+            json!(self.cache_read_tokens),
+        );
+        row.insert(
+            "cache_write_tokens".to_string(),
+            json!(self.cache_write_tokens),
+        );
+        row.insert("token_usage_json".to_string(), json!(self.token_usage_json));
+        self.stamp_maps(row);
+    }
+
+    pub(crate) fn stamp_maps(&self, row: &mut Map<String, Value>) {
+        row.insert("endpoint_kind".to_string(), json!(self.endpoint_kind));
+        row.insert(
+            "token_usage_buckets".to_string(),
+            self.token_usage_buckets(),
+        );
+        row.insert(
+            "token_usage_native_units".to_string(),
+            self.token_usage_native_units(),
+        );
+    }
+}
+
+fn cap_u32(value: u64) -> u32 {
+    value.min(u32::MAX as u64) as u32
 }
 
 pub(crate) fn stamp_token_accounting(
@@ -152,9 +456,7 @@ pub(crate) fn stamp_token_accounting(
     buckets: Value,
     native_units: Value,
 ) {
-    row.insert("endpoint_kind".to_string(), json!(endpoint_kind));
-    row.insert("token_usage_buckets".to_string(), buckets);
-    row.insert("token_usage_native_units".to_string(), native_units);
+    TokenAccounting::from_parts(endpoint_kind, buckets, native_units).stamp_maps(row);
 }
 
 pub(crate) fn sum_numeric_object(value: Option<&Value>) -> u64 {
@@ -170,80 +472,12 @@ pub(crate) fn generation_token_buckets(
     cache_read: u64,
     cache_write: u64,
 ) -> Value {
-    let (buckets, _native_units) = TokenBuckets::generation(&[
-        ("input_text", input_text),
-        ("output_text", output_text),
-        ("input_cache_read", cache_read),
-        ("input_cache_write", cache_write),
-    ])
-    .into_values();
-    buckets
+    TokenAccounting::generation(input_text, output_text, cache_read, cache_write)
+        .token_usage_buckets()
 }
 
 pub(crate) fn openai_generation_token_buckets(usage: Option<&Value>) -> Value {
-    let input_total = to_u64(usage.and_then(|v| {
-        v.get("input_tokens")
-            .or_else(|| v.get("prompt_tokens"))
-            .or_else(|| v.get("total_input_tokens"))
-    }));
-    let output_total = to_u64(usage.and_then(|v| {
-        v.get("output_tokens")
-            .or_else(|| v.get("completion_tokens"))
-            .or_else(|| v.get("total_output_tokens"))
-    }));
-    let input_details = usage.and_then(|v| {
-        v.get("input_tokens_details")
-            .or_else(|| v.get("prompt_tokens_details"))
-    });
-    let output_details = usage.and_then(|v| {
-        v.get("output_tokens_details")
-            .or_else(|| v.get("completion_tokens_details"))
-    });
-
-    let cache_read = to_u64(
-        usage
-            .and_then(|v| v.get("cached_input_tokens"))
-            .or_else(|| usage.and_then(|v| v.get("cache_read_input_tokens")))
-            .or_else(|| input_details.and_then(|v| v.get("cached_tokens"))),
-    );
-    let cache_write = to_u64(
-        usage
-            .and_then(|v| v.get("cache_creation_input_tokens"))
-            .or_else(|| usage.and_then(|v| v.get("cache_write_input_tokens")))
-            .or_else(|| input_details.and_then(|v| v.get("cache_creation_tokens"))),
-    );
-    let input_image = to_u64(input_details.and_then(|v| v.get("image_tokens")));
-    let input_audio = to_u64(input_details.and_then(|v| v.get("audio_tokens")));
-    let output_image = to_u64(output_details.and_then(|v| v.get("image_tokens")));
-    let output_audio = to_u64(output_details.and_then(|v| v.get("audio_tokens")));
-    let reasoning = to_u64(output_details.and_then(|v| v.get("reasoning_tokens")));
-    let server_tool_use = sum_numeric_object(usage.and_then(|v| v.get("server_tool_use")));
-
-    let input_text_detail = to_u64(input_details.and_then(|v| v.get("text_tokens")));
-    let output_text_detail = to_u64(output_details.and_then(|v| v.get("text_tokens")));
-    let input_text = if input_text_detail > 0 {
-        input_text_detail
-    } else {
-        input_total.saturating_sub(cache_read + cache_write + input_image + input_audio)
-    };
-    let output_text = if output_text_detail > 0 {
-        output_text_detail
-    } else {
-        output_total.saturating_sub(output_image + output_audio + reasoning + server_tool_use)
-    };
-
-    token_buckets(&[
-        ("input_text", input_text),
-        ("output_text", output_text),
-        ("input_cache_read", cache_read),
-        ("input_cache_write", cache_write),
-        ("input_image", input_image),
-        ("output_image", output_image),
-        ("input_audio", input_audio),
-        ("output_audio", output_audio),
-        ("reasoning", reasoning),
-        ("server_tool_use", server_tool_use),
-    ])
+    TokenAccounting::openai_generation(usage).token_usage_buckets()
 }
 
 pub(crate) fn canonicalize_model(harness: &str, raw_model: &str) -> String {
@@ -851,7 +1085,26 @@ pub(crate) fn build_tool_row(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_link_row, RecordContext};
+    use super::*;
+
+    const SCHEMA_SQL: &str = include_str!("../../../../sql/001_schema.sql");
+    const TOKEN_SQL: &str = include_str!("../../../../sql/014_harmonized_token_accounting.sql");
+
+    fn value_u64(value: &Value, key: &str) -> u64 {
+        value
+            .as_object()
+            .and_then(|obj| obj.get(key))
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+    }
+
+    fn value_f64(value: &Value, key: &str) -> f64 {
+        value
+            .as_object()
+            .and_then(|obj| obj.get(key))
+            .and_then(Value::as_f64)
+            .unwrap_or_default()
+    }
 
     #[test]
     fn link_type_is_canonicalized_to_domain() {
@@ -875,6 +1128,224 @@ mod tests {
         assert_eq!(
             link_obj.get("link_type").unwrap().as_str().unwrap(),
             "unknown"
+        );
+    }
+
+    #[test]
+    fn token_key_constants_match_schema_and_migration_sql() {
+        for key in TOKEN_BUCKET_KEYS {
+            let quoted = format!("'{}'", key);
+            assert!(SCHEMA_SQL.contains(&quoted), "schema missing {key}");
+            assert!(TOKEN_SQL.contains(&quoted), "migration missing {key}");
+        }
+
+        for key in TOKEN_NATIVE_UNIT_KEYS {
+            let quoted = format!("'{}'", key);
+            assert!(SCHEMA_SQL.contains(&quoted), "schema missing {key}");
+            assert!(TOKEN_SQL.contains(&quoted), "migration missing {key}");
+        }
+
+        for endpoint_kind in TOKEN_ENDPOINT_KIND_VALUES {
+            let quoted = format!("'{}'", endpoint_kind);
+            assert!(
+                SCHEMA_SQL.contains(&quoted),
+                "schema missing endpoint kind {endpoint_kind}"
+            );
+            assert!(
+                TOKEN_SQL.contains(&quoted),
+                "migration missing endpoint kind {endpoint_kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn token_accounting_zero_maps_are_total() {
+        let accounting = TokenAccounting::new(TokenEndpointKind::Generation);
+        let buckets = accounting.token_usage_buckets();
+        let native_units = accounting.token_usage_native_units();
+
+        assert_eq!(buckets.as_object().unwrap().len(), TOKEN_BUCKET_KEYS.len());
+        assert_eq!(
+            native_units.as_object().unwrap().len(),
+            TOKEN_NATIVE_UNIT_KEYS.len()
+        );
+        for key in TOKEN_BUCKET_KEYS {
+            assert_eq!(value_u64(&buckets, key), 0);
+        }
+        for key in TOKEN_NATIVE_UNIT_KEYS {
+            assert_eq!(value_f64(&native_units, key), 0.0);
+        }
+    }
+
+    #[test]
+    fn token_accounting_full_maps_keep_declared_keys_only() {
+        let accounting = TokenAccounting::new(TokenEndpointKind::Generation)
+            .with_buckets(&[
+                ("input_text", 1),
+                ("output_text", 2),
+                ("input_cache_read", 3),
+                ("input_cache_write", 4),
+                ("input_image", 5),
+                ("output_image", 6),
+                ("input_audio", 7),
+                ("output_audio", 8),
+                ("reasoning", 9),
+                ("server_tool_use", 10),
+                ("embedding_input_text", 11),
+                ("embedding_input_image", 12),
+                ("other", 13),
+                ("typo_bucket", 99),
+            ])
+            .with_native_units(&[
+                ("input_image_pixels", 10.0),
+                ("output_image_pixels", 11.0),
+                ("input_audio_seconds", 12.0),
+                ("output_audio_seconds", 13.0),
+                ("input_images", 14.0),
+                ("output_images", 15.0),
+                ("typo_native_unit", 99.0),
+            ]);
+
+        let buckets = accounting.token_usage_buckets();
+        let native_units = accounting.token_usage_native_units();
+        assert_eq!(buckets.as_object().unwrap().len(), TOKEN_BUCKET_KEYS.len());
+        assert_eq!(
+            native_units.as_object().unwrap().len(),
+            TOKEN_NATIVE_UNIT_KEYS.len()
+        );
+        assert_eq!(value_u64(&buckets, "other"), 13);
+        assert_eq!(value_f64(&native_units, "output_images"), 15.0);
+        assert!(!buckets.as_object().unwrap().contains_key("typo_bucket"));
+        assert!(!native_units
+            .as_object()
+            .unwrap()
+            .contains_key("typo_native_unit"));
+    }
+
+    #[test]
+    fn openai_generation_usage_keeps_non_text_buckets_mutually_exclusive() {
+        let usage = json!({
+            "input_tokens": 120,
+            "output_tokens": 80,
+            "input_tokens_details": {
+                "cached_tokens": 20,
+                "cache_creation_tokens": 10,
+                "image_tokens": 5,
+                "audio_tokens": 3
+            },
+            "output_tokens_details": {
+                "image_tokens": 11,
+                "audio_tokens": 13,
+                "reasoning_tokens": 7
+            },
+            "server_tool_use": {
+                "web_search": 2
+            }
+        });
+
+        let accounting = TokenAccounting::openai_generation(Some(&usage));
+
+        assert_eq!(accounting.input_tokens(), 120);
+        assert_eq!(accounting.output_tokens(), 80);
+        assert_eq!(accounting.cache_read_tokens(), 20);
+        assert_eq!(accounting.cache_write_tokens(), 10);
+        assert_eq!(accounting.bucket("input_text"), 82);
+        assert_eq!(accounting.bucket("output_text"), 47);
+        assert_eq!(accounting.bucket("input_image"), 5);
+        assert_eq!(accounting.bucket("input_audio"), 3);
+        assert_eq!(accounting.bucket("output_image"), 11);
+        assert_eq!(accounting.bucket("output_audio"), 13);
+        assert_eq!(accounting.bucket("reasoning"), 7);
+        assert_eq!(accounting.bucket("server_tool_use"), 2);
+        assert_eq!(accounting.token_usage_json(), compact_json(&usage));
+    }
+
+    #[test]
+    fn claude_generation_usage_preserves_reasoning_and_server_tool_use() {
+        let usage = json!({
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cache_read_input_tokens": 20,
+            "cache_creation_input_tokens": 5,
+            "thinking_tokens": 7,
+            "server_tool_use": {
+                "web_search": 3,
+                "code_execution": 2
+            }
+        });
+
+        let accounting = TokenAccounting::claude_generation(Some(&usage));
+
+        assert_eq!(accounting.input_tokens(), 100);
+        assert_eq!(accounting.output_tokens(), 50);
+        assert_eq!(accounting.cache_read_tokens(), 20);
+        assert_eq!(accounting.cache_write_tokens(), 5);
+        assert_eq!(accounting.bucket("input_text"), 75);
+        assert_eq!(accounting.bucket("output_text"), 38);
+        assert_eq!(accounting.bucket("reasoning"), 7);
+        assert_eq!(accounting.bucket("server_tool_use"), 5);
+        assert_eq!(accounting.token_usage_json(), compact_json(&usage));
+    }
+
+    #[test]
+    fn kimi_generation_usage_maps_cache_fields_and_scalars() {
+        let usage = json!({
+            "input_other": 13,
+            "input_cache_read": 17,
+            "input_cache_creation": 19,
+            "output": 23
+        });
+
+        let accounting = TokenAccounting::kimi_generation(Some(&usage));
+
+        assert_eq!(accounting.input_tokens(), 49);
+        assert_eq!(accounting.output_tokens(), 23);
+        assert_eq!(accounting.cache_read_tokens(), 17);
+        assert_eq!(accounting.cache_write_tokens(), 19);
+        assert_eq!(accounting.bucket("input_text"), 13);
+        assert_eq!(accounting.bucket("output_text"), 23);
+        assert_eq!(accounting.bucket("input_cache_read"), 17);
+        assert_eq!(accounting.bucket("input_cache_write"), 19);
+        assert_eq!(accounting.token_usage_json(), compact_json(&usage));
+    }
+
+    #[test]
+    fn token_accounting_stamps_legacy_scalars_maps_and_raw_json() {
+        let usage = json!({"total": 12});
+        let accounting = TokenAccounting::generation(4, 5, 2, 1).with_raw_usage(Some(&usage));
+        let mut row = Map::<String, Value>::new();
+
+        accounting.stamp_event_row(&mut row);
+
+        assert_eq!(
+            row.get("endpoint_kind").and_then(Value::as_str),
+            Some("generation")
+        );
+        assert_eq!(row.get("input_tokens").and_then(Value::as_u64), Some(7));
+        assert_eq!(row.get("output_tokens").and_then(Value::as_u64), Some(5));
+        assert_eq!(
+            row.get("cache_read_tokens").and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            row.get("cache_write_tokens").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            row.get("token_usage_json").and_then(Value::as_str),
+            Some(compact_json(&usage).as_str())
+        );
+        assert_eq!(
+            row.get("token_usage_buckets")
+                .and_then(|value| value.get("input_text"))
+                .and_then(Value::as_u64),
+            Some(4)
+        );
+        assert_eq!(
+            row.get("token_usage_native_units")
+                .and_then(|value| value.get("input_images"))
+                .and_then(Value::as_f64),
+            Some(0.0)
         );
     }
 }
