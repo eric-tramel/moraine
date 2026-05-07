@@ -6,6 +6,7 @@ pub(crate) mod codex;
 pub(crate) mod emitter;
 pub(crate) mod hermes;
 pub(crate) mod kimi_cli;
+pub(crate) mod record_view;
 pub(crate) mod shared;
 
 use shared::{infer_session_id_from_file, RecordContext};
