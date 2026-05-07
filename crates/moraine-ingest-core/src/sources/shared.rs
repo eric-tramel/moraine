@@ -466,6 +466,7 @@ pub(crate) fn sum_numeric_object(value: Option<&Value>) -> u64 {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn generation_token_buckets(
     input_text: u64,
     output_text: u64,
