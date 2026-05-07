@@ -149,6 +149,39 @@ wait_for_clickhouse_count() {
   done
 }
 
+clickhouse_scalar() {
+  local clickhouse_url="$1"
+  local query="$2"
+
+  curl -fsS --max-time 10 "$clickhouse_url" --data-binary "$query" | tr -d '\r\n'
+}
+
+assert_clickhouse_scalar() {
+  local clickhouse_url="$1"
+  local label="$2"
+  local query="$3"
+  local expected="$4"
+  local actual
+
+  actual="$(clickhouse_scalar "$clickhouse_url" "$query")"
+  if [[ "$actual" != "$expected" ]]; then
+    echo "[e2e] ClickHouse assertion failed: $label" >&2
+    echo "[e2e] expected: $expected" >&2
+    echo "[e2e] actual:   $actual" >&2
+    echo "[e2e] query:    $query" >&2
+    return 1
+  fi
+}
+
+assert_clickhouse_count() {
+  local clickhouse_url="$1"
+  local label="$2"
+  local query="$3"
+  local expected="$4"
+
+  assert_clickhouse_scalar "$clickhouse_url" "$label" "$query" "$expected"
+}
+
 cleanup_e2e() {
   local moraine_bin="$1"
   local config_path="$2"
@@ -200,7 +233,9 @@ main() {
   run_stamp="$(date +%s)_$$_$RANDOM"
   local codex_keyword="${base_keyword}_codex_${run_stamp}"
   local claude_keyword="${base_keyword}_claude_${run_stamp}"
-  local hermes_keyword="${base_keyword}_hermes_${run_stamp}"
+  local kimi_keyword="${base_keyword}_kimi_${run_stamp}"
+  local hermes_keyword="${base_keyword}_hermes_trajectory_${run_stamp}"
+  local hermes_session_keyword="${base_keyword}_hermes_session_${run_stamp}"
   local clickhouse_database="moraine"
   local codex_session_suffix
   codex_session_suffix="$(printf '%06x%06x' "$RANDOM" "$RANDOM")"
@@ -208,9 +243,15 @@ main() {
   local claude_session_suffix
   claude_session_suffix="$(printf '%06x%06x' "$RANDOM" "$RANDOM")"
   local claude_session_id="00000000-0000-4000-8000-${claude_session_suffix}"
+  local kimi_session_id="kimi-${run_stamp}"
+  local kimi_raw_session_id="kimi-cli:${kimi_session_id}"
+  local hermes_session_id="session_${run_stamp}"
+  local hermes_raw_session_id="hermes:${hermes_session_id}"
   local codex_trace_marker="mcp_codex_trace_marker_${run_stamp}"
   local claude_trace_marker="mcp_claude_trace_marker_${run_stamp}"
+  local kimi_trace_marker="mcp_kimi_trace_marker_${run_stamp}"
   local hermes_trace_marker="mcp_hermes_trace_marker_${run_stamp}"
+  local hermes_session_trace_marker="mcp_hermes_session_trace_marker_${run_stamp}"
 
   need_cmd curl
   need_cmd "$python_bin"
@@ -236,31 +277,112 @@ main() {
   local config_path="$tmp_root/moraine-ci.toml"
   local codex_fixture_file="$fixtures_root/codex/sessions/2026/02/16/session-${codex_session_id}.jsonl"
   local claude_fixture_file="$fixtures_root/claude/projects/e2e/session-${claude_session_id}.jsonl"
+  local kimi_fixture_file="$fixtures_root/kimi/sessions/${kimi_session_id}/wire.jsonl"
   local hermes_fixture_file="$fixtures_root/hermes/trajectories/001-${run_stamp}.jsonl"
+  local hermes_session_fixture_file="$fixtures_root/hermes/sessions/${hermes_session_id}.json"
 
   mkdir -p "$(dirname "$codex_fixture_file")"
   mkdir -p "$(dirname "$claude_fixture_file")"
+  mkdir -p "$(dirname "$kimi_fixture_file")"
   mkdir -p "$(dirname "$hermes_fixture_file")"
+  mkdir -p "$(dirname "$hermes_session_fixture_file")"
   mkdir -p "$runtime_root"
 
   cat > "$codex_fixture_file" <<EOF
 {"timestamp":"2026-02-16T12:00:00.000Z","type":"session_meta","payload":{"id":"${codex_session_id}"}}
 {"timestamp":"2026-02-16T12:00:01.000Z","type":"turn_context","payload":{"turn_id":"1","model":"gpt-5.3-codex"}}
 {"timestamp":"2026-02-16T12:00:02.000Z","type":"response_item","payload":{"type":"message","role":"user","id":"msg-user-${run_stamp}","content":[{"type":"text","text":"local e2e codex user prompt ${codex_keyword}"}],"phase":"completed"}}
-{"timestamp":"2026-02-16T12:00:03.000Z","type":"response_item","payload":{"type":"message","role":"assistant","id":"msg-assistant-${run_stamp}","content":[{"type":"text","text":"local e2e codex assistant reply ${codex_keyword} ${codex_trace_marker}"}],"phase":"completed"}}
+{"timestamp":"2026-02-16T12:00:03.000Z","type":"response_item","parent_id":"msg-user-${run_stamp}","payload":{"type":"message","role":"assistant","id":"msg-assistant-${run_stamp}","content":[{"type":"text","text":"local e2e codex assistant reply ${codex_keyword} ${codex_trace_marker}"}],"phase":"completed"}}
+{"timestamp":"2026-02-16T12:00:03.500Z","type":"response_item","payload":{"type":"function_call","call_id":"codex-tool-${run_stamp}","name":"Read","arguments":"{\"path\":\"Cargo.toml\"}"}}
+{"timestamp":"2026-02-16T12:00:03.750Z","type":"response_item","payload":{"type":"function_call_output","call_id":"codex-tool-${run_stamp}","output":"workspace = true"}}
+{"timestamp":"2026-02-16T12:00:03.900Z","type":"event_msg","payload":{"type":"token_count","turn_id":"1","info":{"last_token_usage":{"input_tokens":17,"output_tokens":4,"cached_input_tokens":3,"cache_creation_input_tokens":2,"output_tokens_details":{"reasoning_tokens":1}}},"rate_limits":{"limit_name":"GPT-5.3-Codex-Spark","limit_id":"codex_e2e","plan_type":"pro"}}}
 EOF
 
   cat > "$claude_fixture_file" <<EOF
 {"type":"user","sessionId":"${claude_session_id}","uuid":"claude-user-${run_stamp}","timestamp":"2026-02-16T12:00:04.000Z","message":{"role":"user","content":[{"type":"text","text":"local e2e claude user prompt ${claude_keyword}"}]}}
-{"type":"assistant","sessionId":"${claude_session_id}","uuid":"claude-assistant-${run_stamp}","parentUuid":"claude-user-${run_stamp}","requestId":"req-${run_stamp}","timestamp":"2026-02-16T12:00:05.000Z","message":{"model":"claude-opus-4-5-20251101","role":"assistant","usage":{"input_tokens":9,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"service_tier":"standard"},"content":[{"type":"text","text":"local e2e claude assistant reply ${claude_keyword} ${claude_trace_marker}"}]}}
+{"type":"assistant","sessionId":"${claude_session_id}","uuid":"claude-assistant-${run_stamp}","parentUuid":"claude-user-${run_stamp}","requestId":"req-${run_stamp}","agentId":"agent-${run_stamp}","agentName":"primary","teamName":"root","timestamp":"2026-02-16T12:00:05.000Z","message":{"model":"claude-opus-4-5-20251101","role":"assistant","usage":{"input_tokens":9,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"service_tier":"standard"},"content":[{"type":"thinking","thinking":"I should inspect the manifest."},{"type":"tool_use","id":"claude-tool-${run_stamp}","name":"Read","input":{"path":"Cargo.toml"}},{"type":"text","text":"local e2e claude assistant reply ${claude_keyword} ${claude_trace_marker}"}]}}
+{"type":"user","sessionId":"${claude_session_id}","uuid":"claude-tool-result-${run_stamp}","parentUuid":"claude-assistant-${run_stamp}","parentToolUseID":"claude-tool-${run_stamp}","toolUseID":"claude-tool-${run_stamp}","sourceToolAssistantUUID":"claude-assistant-${run_stamp}","sourceToolUseID":"claude-tool-${run_stamp}","timestamp":"2026-02-16T12:00:05.500Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"claude-tool-${run_stamp}","content":[{"type":"text","text":"workspace = true"}],"is_error":false}]}}
+EOF
+
+  cat > "$kimi_fixture_file" <<EOF
+{"type":"metadata","protocol_version":"1.9"}
+{"timestamp":1771243204.000000,"message":{"type":"TurnBegin","payload":{"user_input":"local e2e kimi user prompt ${kimi_keyword}"}}}
+{"timestamp":1771243204.500000,"message":{"type":"StepBegin","payload":{"n":1}}}
+{"timestamp":1771243205.000000,"message":{"type":"ContentPart","payload":{"type":"think","think":"Need to inspect files first."}}}
+{"timestamp":1771243205.500000,"message":{"type":"ContentPart","payload":{"type":"text","text":"local e2e kimi assistant reply ${kimi_keyword} ${kimi_trace_marker}"}}}
+{"timestamp":1771243206.000000,"message":{"type":"ToolCall","payload":{"type":"function","id":"kimi-tool-${run_stamp}","function":{"name":"ReadFile","arguments":"{\"path\":\"manifest.json\"}"},"extras":null}}}
+{"timestamp":1771243206.500000,"message":{"type":"ToolResult","payload":{"tool_call_id":"kimi-tool-${run_stamp}","return_value":{"is_error":false,"output":"{\"ok\":true}","message":"Read file","display":[],"extras":null}}}}
+{"timestamp":1771243207.000000,"message":{"type":"StatusUpdate","payload":{"context_usage":0.1,"context_tokens":100,"max_context_tokens":1000,"token_usage":{"input_other":10,"output":5,"input_cache_read":2,"input_cache_creation":1},"message_id":"chatcmpl-${run_stamp}","plan_mode":false,"mcp_status":null}}}
+{"timestamp":1771243207.500000,"message":{"type":"SubagentEvent","payload":{"agent_id":"sub-${run_stamp}","event":{"type":"ContentPart","payload":{"type":"text","text":"sub-agent echo"}}}}}
 EOF
 
   # Hermes ShareGPT trajectory: one completed rollout per line. Exercises a
-  # vendor/model prefix (`anthropic/claude-sonnet-4.6`), a `<think>` segment,
-  # and an assistant text turn carrying the MCP trace marker so the
-  # search+open smoke below can find it.
+  # vendor/model prefix (`anthropic/claude-sonnet-4.6`), reasoning, tool
+  # call/result rows, and an assistant text turn carrying the MCP trace marker.
   cat > "$hermes_fixture_file" <<EOF
-{"timestamp":"2026-02-16T12:00:06.000000","model":"anthropic/claude-sonnet-4.6","prompt_index":1,"completed":true,"partial":false,"api_calls":1,"conversations":[{"from":"human","value":"local e2e hermes user prompt ${hermes_keyword}"},{"from":"gpt","value":"<think>draft the answer</think>\nlocal e2e hermes assistant reply ${hermes_keyword} ${hermes_trace_marker}"}]}
+{"timestamp":"2026-02-16T12:00:06.000000","model":"anthropic/claude-sonnet-4.6","prompt_index":1,"completed":true,"partial":false,"api_calls":1,"conversations":[{"from":"human","value":"local e2e hermes trajectory user prompt ${hermes_keyword}"},{"from":"gpt","value":"<think>draft the answer</think>\n<tool_call>{\"tool_call_id\":\"hermes-tool-${run_stamp}\",\"name\":\"weather\",\"arguments\":{\"location\":\"Boston, MA\"}}</tool_call>"},{"from":"tool","value":"<tool_response>{\"tool_call_id\":\"hermes-tool-${run_stamp}\",\"name\":\"weather\",\"content\":{\"forecast\":\"rain\"}}</tool_response>"},{"from":"gpt","value":"local e2e hermes trajectory assistant reply ${hermes_keyword} ${hermes_trace_marker}"}]}
+EOF
+
+  cat > "$hermes_session_fixture_file" <<EOF
+{
+  "session_id": "${hermes_session_id}",
+  "model": "claude-opus-4-6",
+  "base_url": "https://api.anthropic.com",
+  "platform": "cli",
+  "session_start": "2026-02-16T12:00:08.000000",
+  "last_updated": "2026-02-16T12:00:09.000000",
+  "system_prompt": "You are Hermes, a helpful CLI agent.",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "shell",
+        "description": "Run a shell command",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "cmd": {"type": "string"}
+          },
+          "required": ["cmd"]
+        }
+      }
+    }
+  ],
+  "message_count": 4,
+  "messages": [
+    {
+      "role": "user",
+      "content": "local e2e hermes session user prompt ${hermes_session_keyword}"
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "reasoning": "I should run date before answering.",
+      "finish_reason": "tool_calls",
+      "tool_calls": [
+        {
+          "id": "hermes-session-tool-${run_stamp}",
+          "type": "function",
+          "function": {
+            "name": "shell",
+            "arguments": "{\"cmd\":\"date\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "hermes-session-tool-${run_stamp}",
+      "name": "shell",
+      "content": "Mon Feb 16 12:00:09 UTC 2026"
+    },
+    {
+      "role": "assistant",
+      "content": "local e2e hermes session assistant reply ${hermes_session_keyword} ${hermes_session_trace_marker}",
+      "finish_reason": "stop"
+    }
+  ]
+}
 EOF
 
   cat > "$config_path" <<EOF
@@ -294,11 +416,26 @@ glob = "${fixtures_root}/claude/projects/**/*.jsonl"
 watch_root = "${fixtures_root}/claude/projects"
 
 [[ingest.sources]]
-name = "ci-hermes"
+name = "ci-kimi"
+harness = "kimi-cli"
+enabled = true
+glob = "${fixtures_root}/kimi/sessions/**/wire.jsonl"
+watch_root = "${fixtures_root}/kimi/sessions"
+
+[[ingest.sources]]
+name = "ci-hermes-trajectory"
 harness = "hermes"
 enabled = true
 glob = "${fixtures_root}/hermes/trajectories/**/*.jsonl"
 watch_root = "${fixtures_root}/hermes/trajectories"
+
+[[ingest.sources]]
+name = "ci-hermes-session"
+harness = "hermes"
+format = "session_json"
+enabled = true
+glob = "${fixtures_root}/hermes/sessions/*.json"
+watch_root = "${fixtures_root}/hermes/sessions"
 
 [runtime]
 root_dir = "${runtime_root}"
@@ -319,7 +456,9 @@ EOF
   echo "[e2e] clickhouse db: ${clickhouse_database}"
   echo "[e2e] codex fixture: ${codex_fixture_file}"
   echo "[e2e] claude fixture: ${claude_fixture_file}"
+  echo "[e2e] kimi fixture: ${kimi_fixture_file}"
   echo "[e2e] hermes fixture: ${hermes_fixture_file}"
+  echo "[e2e] hermes session fixture: ${hermes_session_fixture_file}"
 
   echo "[e2e] installing managed ClickHouse"
   "$moraine_bin" clickhouse install --config "$config_path"
@@ -339,12 +478,59 @@ EOF
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${codex_keyword}'" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${claude_keyword}') > 0" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${claude_keyword}'" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${kimi_keyword}') > 0" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${kimi_keyword}'" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${hermes_keyword}') > 0" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${hermes_keyword}'" 120
-  # Confirm the vendor/model split landed at ingest time: the Hermes row
-  # should carry harness=hermes and inference_provider=anthropic (parsed from
-  # the `anthropic/claude-sonnet-4.6` record field).
-  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events WHERE harness = 'hermes' AND inference_provider = 'anthropic' AND positionCaseInsensitiveUTF8(text_content, '${hermes_keyword}') > 0" 60
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${hermes_session_keyword}') > 0" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${hermes_session_keyword}'" 120
+
+  echo "[e2e] checking ClickHouse normalized ingest rows"
+  assert_clickhouse_count "$clickhouse_url" "ingest errors" "SELECT count() FROM ${clickhouse_database}.ingest_errors" "0"
+
+  assert_clickhouse_count "$clickhouse_url" "codex unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-codex'" "7"
+  assert_clickhouse_count "$clickhouse_url" "codex event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex'" "7"
+  assert_clickhouse_count "$clickhouse_url" "codex link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-codex' AND link_type = 'parent_event' AND linked_external_id = 'msg-user-${run_stamp}'" "1"
+  assert_clickhouse_count "$clickhouse_url" "codex tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-codex' AND tool_call_id = 'codex-tool-${run_stamp}'" "2"
+  assert_clickhouse_count "$clickhouse_url" "codex tool request fields" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-codex' AND tool_call_id = 'codex-tool-${run_stamp}' AND tool_name = 'Read' AND tool_phase = 'request'" "1"
+  assert_clickhouse_count "$clickhouse_url" "codex harness/session fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex' AND harness = 'codex' AND session_id = '${codex_session_id}'" "7"
+  assert_clickhouse_count "$clickhouse_url" "codex model fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex' AND model IN ('gpt-5.3-codex', 'gpt-5.3-codex-spark')" "6"
+  assert_clickhouse_count "$clickhouse_url" "codex token buckets" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex' AND payload_type = 'token_count' AND input_tokens = 17 AND output_tokens = 4 AND cache_read_tokens = 3 AND cache_write_tokens = 2 AND token_usage_buckets['input_text'] = 12 AND token_usage_buckets['output_text'] = 3 AND token_usage_buckets['reasoning'] = 1" "1"
+
+  assert_clickhouse_count "$clickhouse_url" "claude unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-claude'" "3"
+  assert_clickhouse_count "$clickhouse_url" "claude event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude'" "5"
+  assert_clickhouse_count "$clickhouse_url" "claude link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-claude'" "6"
+  assert_clickhouse_count "$clickhouse_url" "claude tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-claude' AND tool_call_id = 'claude-tool-${run_stamp}'" "2"
+  assert_clickhouse_count "$clickhouse_url" "claude harness/session fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude' AND harness = 'claude-code' AND inference_provider = 'anthropic' AND session_id = '${claude_session_id}'" "5"
+  assert_clickhouse_count "$clickhouse_url" "claude model fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude' AND model = 'claude-opus-4-5-20251101'" "3"
+  assert_clickhouse_count "$clickhouse_url" "claude token buckets" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude' AND actor_kind = 'assistant' AND input_tokens = 9 AND output_tokens = 5 AND token_usage_buckets['input_text'] = 9 AND token_usage_buckets['output_text'] = 5" "3"
+
+  assert_clickhouse_count "$clickhouse_url" "kimi unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-kimi'" "8"
+  assert_clickhouse_count "$clickhouse_url" "kimi event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kimi'" "7"
+  assert_clickhouse_count "$clickhouse_url" "kimi link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-kimi'" "0"
+  assert_clickhouse_count "$clickhouse_url" "kimi tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-kimi' AND tool_call_id = 'kimi-tool-${run_stamp}'" "2"
+  assert_clickhouse_count "$clickhouse_url" "kimi domain fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kimi' AND harness = 'kimi-cli' AND inference_provider = 'moonshot' AND session_id = '${kimi_raw_session_id}' AND model = 'kimi-cli'" "7"
+  assert_clickhouse_count "$clickhouse_url" "kimi token buckets" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kimi' AND payload_type = 'token_count' AND input_tokens = 13 AND output_tokens = 5 AND cache_read_tokens = 2 AND cache_write_tokens = 1 AND token_usage_buckets['input_text'] = 10 AND token_usage_buckets['output_text'] = 5 AND token_usage_buckets['input_cache_read'] = 2 AND token_usage_buckets['input_cache_write'] = 1" "1"
+
+  assert_clickhouse_count "$clickhouse_url" "hermes trajectory unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-hermes-trajectory'" "1"
+  assert_clickhouse_count "$clickhouse_url" "hermes trajectory event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-hermes-trajectory'" "6"
+  assert_clickhouse_count "$clickhouse_url" "hermes trajectory link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-hermes-trajectory'" "0"
+  assert_clickhouse_count "$clickhouse_url" "hermes trajectory tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-hermes-trajectory' AND tool_call_id = 'hermes-tool-${run_stamp}' AND tool_name = 'weather'" "2"
+  assert_clickhouse_count "$clickhouse_url" "hermes trajectory domain fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-hermes-trajectory' AND harness = 'hermes' AND inference_provider = 'anthropic' AND model = 'claude-sonnet-4.6'" "6"
+
+  assert_clickhouse_count "$clickhouse_url" "hermes session unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-hermes-session'" "5"
+  assert_clickhouse_count "$clickhouse_url" "hermes session event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-hermes-session'" "6"
+  assert_clickhouse_count "$clickhouse_url" "hermes session link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-hermes-session'" "0"
+  assert_clickhouse_count "$clickhouse_url" "hermes session tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-hermes-session' AND tool_call_id = 'hermes-session-tool-${run_stamp}' AND tool_name = 'shell'" "2"
+  assert_clickhouse_count "$clickhouse_url" "hermes session domain fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-hermes-session' AND harness = 'hermes' AND inference_provider = 'anthropic' AND session_id = '${hermes_raw_session_id}' AND model = 'claude-opus-4-6'" "6"
+  assert_clickhouse_count "$clickhouse_url" "token bucket map keys on all events" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE hasAll(mapKeys(token_usage_buckets), ['input_text', 'output_text', 'input_cache_read', 'input_cache_write', 'reasoning'])" "31"
+
+  local hermes_trajectory_session_id
+  hermes_trajectory_session_id="$(clickhouse_scalar "$clickhouse_url" "SELECT any(session_id) FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-hermes-trajectory'")"
+  if [[ -z "$hermes_trajectory_session_id" ]]; then
+    echo "[e2e] failed to resolve Hermes trajectory session id" >&2
+    return 1
+  fi
 
   echo "[e2e] checking monitor API routes"
   for path in /api/health /api/status /api/analytics /api/web-searches; do
@@ -371,6 +557,15 @@ EOF
     --expect-source-file "$claude_fixture_file" \
     --expect-open-text "$claude_trace_marker"
 
+  echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (kimi)"
+  "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --query "$kimi_keyword" \
+    --expect-session-id "$kimi_raw_session_id" \
+    --expect-source-file "$kimi_fixture_file" \
+    --expect-open-text "$kimi_trace_marker"
+
   # Hermes synthesizes its own `hermes:<uid>` session id, so we do not pin
   # --expect-session-id; source file + trace marker are enough to prove the
   # row round-tripped from fixture through ingest to MCP search_sessions/open/list_sessions.
@@ -378,9 +573,19 @@ EOF
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
     --moraine "$moraine_bin" \
     --config "$config_path" \
-    --query "$hermes_keyword" \
+    --query "$hermes_trace_marker" \
+    --expect-session-id "$hermes_trajectory_session_id" \
     --expect-source-file "$hermes_fixture_file" \
     --expect-open-text "$hermes_trace_marker"
+
+  echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (hermes session_json)"
+  "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --query "$hermes_session_keyword" \
+    --expect-session-id "$hermes_raw_session_id" \
+    --expect-source-file "$hermes_session_fixture_file" \
+    --expect-open-text "$hermes_session_trace_marker"
 
   if [[ "${RUN_REPLAY_BENCH_SMOKE:-0}" == "1" ]]; then
     echo "[e2e] checking replay benchmark script (dry-run)"
