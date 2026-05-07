@@ -65,6 +65,13 @@ as `~/.codex/AGENTS.md` for Codex or `~/.claude/CLAUDE.md` for Claude Code:
 - Moraine has a *real-time* view of agent sessions. You can use it to peek on active AI agent sessions, including your own, sessions running in different harnesses, sessions that are sub-agents of your current conversation, or even their subagents. All agent work, in realtime, is visible to you.
 ```
 
+With this you can do operations like the following:
+
+```
+claude -p "What are my agents doing right now?"
+codex exec "What are my agents doing right now?"
+```
+
 ## Development
 
 ```bash
