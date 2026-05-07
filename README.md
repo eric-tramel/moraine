@@ -51,6 +51,27 @@ moraine status
 
 The monitor UI runs at `http://127.0.0.1:8080` by default.
 
+## Agent Harness Guidance
+
+Moraine is most useful when your agent harness knows that it can search prior
+sessions. Add the following guidance to your global harness instructions, such
+as `~/.codex/AGENTS.md` for Codex or `~/.claude/CLAUDE.md` for Claude Code:
+
+```markdown
+- You have access to all past agent sessions (whether codex, claude, hermes, etc., anything) via moraine search tools.
+- Any time the user asks about information not located within your context, that you can't see or don't know, but implies that you *should* know, it is because it was a past conversation. You can reference and search for this conversation with moraine search tools or session listing.
+- Moraine search tooling is built around BM25 keyword search, so target your queries to keywords rather than questions. There is no semantic search.
+- Successful keyword searches often go from broad to narrow. Sometimes this narrowing isn't successful, in which case, you can always back up and try a different path.
+- Moraine has a *real-time* view of agent sessions. You can use it to peek on active AI agent sessions, including your own, sessions running in different harnesses, sessions that are sub-agents of your current conversation, or even their subagents. All agent work, in realtime, is visible to you.
+```
+
+With this you can do operations like the following:
+
+```
+claude -p "What are my agents doing right now?"
+codex exec "What are my agents doing right now?"
+```
+
 ## Development
 
 ```bash
