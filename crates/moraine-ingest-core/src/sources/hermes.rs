@@ -181,32 +181,155 @@ fn normalize_hermes_trajectory(
     base_uid: &str,
     model: &str,
 ) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
-    let mut events = Vec::<Value>::new();
-    let links = Vec::<Value>::new();
-    let mut tools = Vec::<Value>::new();
-    let mut pending_tool_calls = VecDeque::<HermesPendingToolCall>::new();
-    let mut current_turn = 0u32;
-    let base_dt = parse_record_ts(ctx.record_ts);
-    // The caller (`normalize_record`) has already split the record's
-    // `vendor/model` string into `inference_provider` (stored on ctx) and the
-    // verbatim `model` name. We intentionally do NOT call `canonicalize_model`
-    // here: Hermes models flow through verbatim (modulo lowercase+trim) so
-    // catalog strings like `claude-sonnet-4.6` are preserved end-to-end.
-    let model = model.to_string();
+    let mut emitter = HermesTrajectoryEmitter::new(ctx, model);
+
+    emit_hermes_trajectory_session_meta(record, base_uid, &mut emitter);
+    let conversations = record.get("conversations").and_then(Value::as_array);
+    if let Some(conversations) = conversations {
+        for (conv_idx, item) in conversations.iter().enumerate() {
+            handle_hermes_conversation_item(item, conv_idx, &mut emitter);
+        }
+    }
+
+    emitter.finish()
+}
+
+struct HermesTrajectoryEmitter<'ctx, 'data> {
+    ctx: &'ctx RecordContext<'data>,
+    events: Vec<Value>,
+    links: Vec<Value>,
+    tools: Vec<Value>,
+    pending_tool_calls: VecDeque<HermesPendingToolCall>,
+    current_turn: u32,
+    base_dt: Option<DateTime<Utc>>,
+    model: String,
+    event_index: usize,
+}
+
+impl<'ctx, 'data> HermesTrajectoryEmitter<'ctx, 'data> {
+    fn new(ctx: &'ctx RecordContext<'data>, model: &str) -> Self {
+        // The caller (`normalize_record`) has already split the record's
+        // `vendor/model` string into `inference_provider` (stored on ctx) and the
+        // verbatim `model` name. We intentionally do NOT call `canonicalize_model`
+        // here: Hermes models flow through verbatim (modulo lowercase+trim) so
+        // catalog strings like `claude-sonnet-4.6` are preserved end-to-end.
+        Self {
+            ctx,
+            events: Vec::new(),
+            links: Vec::new(),
+            tools: Vec::new(),
+            pending_tool_calls: VecDeque::new(),
+            current_turn: 0,
+            base_dt: parse_record_ts(ctx.record_ts),
+            model: model.to_string(),
+            event_index: 0,
+        }
+    }
+
+    fn uid(&self, item: &Value, conv_idx: usize, suffix: &str) -> String {
+        event_uid(
+            self.ctx.source_file,
+            self.ctx.source_generation,
+            self.ctx.source_line_no,
+            self.ctx.source_offset,
+            &compact_json(item),
+            &format!("hermes:{conv_idx}:{suffix}"),
+        )
+    }
+
+    fn event(
+        &self,
+        event_uid: &str,
+        event_kind: &str,
+        payload_type: &str,
+        actor_kind: &str,
+        text_content: &str,
+        payload_json: &str,
+    ) -> Value {
+        Value::Object(base_event_obj(
+            self.ctx,
+            event_uid,
+            event_kind,
+            payload_type,
+            actor_kind,
+            text_content,
+            payload_json,
+        ))
+    }
+
+    fn push_event(&mut self, mut row: Value) -> usize {
+        hermes_stamp_time(&mut row, &hermes_event_dt(self.base_dt, self.event_index));
+        self.events.push(row);
+        self.event_index += 1;
+        self.events.len() - 1
+    }
+
+    fn push_tool_request(
+        &mut self,
+        event_uid: &str,
+        tool_call_id: &str,
+        tool_name: &str,
+        input_json: &str,
+    ) -> usize {
+        self.tools.push(build_tool_row(
+            self.ctx,
+            event_uid,
+            tool_call_id,
+            "",
+            tool_name,
+            "request",
+            0,
+            input_json,
+            "",
+            "",
+        ));
+        self.tools.len() - 1
+    }
+
+    fn push_tool_response(
+        &mut self,
+        event_uid: &str,
+        tool_call_id: &str,
+        tool_name: &str,
+        output_json: &str,
+        output_text: &str,
+    ) {
+        self.tools.push(build_tool_row(
+            self.ctx,
+            event_uid,
+            tool_call_id,
+            "",
+            tool_name,
+            "response",
+            0,
+            "",
+            output_json,
+            output_text,
+        ));
+    }
+
+    fn finish(self) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
+        (self.events, self.links, self.tools)
+    }
+}
+
+fn emit_hermes_trajectory_session_meta(
+    record: &Value,
+    base_uid: &str,
+    emitter: &mut HermesTrajectoryEmitter<'_, '_>,
+) {
     let status = hermes_status(record);
     let metadata_payload = hermes_metadata_payload(record);
-
-    let mut session_meta = Value::Object(base_event_obj(
-        ctx,
+    let mut session_meta = emitter.event(
         base_uid,
         "session_meta",
         "session_meta",
         "system",
         "",
         &compact_json(&metadata_payload),
-    ));
-    if !model.is_empty() {
-        update_string_field(&mut session_meta, "model", &model);
+    );
+    if !emitter.model.is_empty() {
+        update_string_field(&mut session_meta, "model", &emitter.model);
     }
     if !status.is_empty() {
         update_string_field(&mut session_meta, "op_status", &status);
@@ -215,373 +338,450 @@ fn normalize_hermes_trajectory(
     if !prompt_index.is_empty() {
         update_string_field(&mut session_meta, "item_id", &prompt_index);
     }
-    hermes_stamp_time(&mut session_meta, &hermes_event_dt(base_dt, 0));
-    events.push(session_meta);
+    emitter.push_event(session_meta);
+}
 
-    let conversations = record
-        .get("conversations")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+fn handle_hermes_conversation_item(
+    item: &Value,
+    conv_idx: usize,
+    emitter: &mut HermesTrajectoryEmitter<'_, '_>,
+) {
+    let role = to_str(item.get("from"));
+    let value = to_str(item.get("value"));
+    let current_turn_for_item = emitter.current_turn;
 
-    let mut event_index = 1usize;
-    for (conv_idx, item) in conversations.iter().enumerate() {
-        let role = to_str(item.get("from"));
-        let value = to_str(item.get("value"));
-        let current_turn_for_item = current_turn;
+    match role.as_str() {
+        "system" => handle_hermes_system_item(item, conv_idx, &value, emitter),
+        "human" => handle_hermes_human_item(item, conv_idx, &value, emitter),
+        "gpt" => handle_hermes_gpt_item(item, conv_idx, &value, current_turn_for_item, emitter),
+        "tool" => handle_hermes_tool_item(item, conv_idx, &value, current_turn_for_item, emitter),
+        _ => handle_hermes_unknown_item(item, conv_idx, &value, emitter),
+    }
+}
 
-        let next_uid = |suffix: &str| {
-            event_uid(
-                ctx.source_file,
-                ctx.source_generation,
-                ctx.source_line_no,
-                ctx.source_offset,
-                &compact_json(item),
-                &format!("hermes:{conv_idx}:{suffix}"),
-            )
-        };
+fn handle_hermes_system_item(
+    item: &Value,
+    conv_idx: usize,
+    value: &str,
+    emitter: &mut HermesTrajectoryEmitter<'_, '_>,
+) {
+    let segment_uid = emitter.uid(item, conv_idx, "system");
+    let mut row = emitter.event(
+        &segment_uid,
+        "system",
+        "system",
+        "system",
+        value,
+        &compact_json(item),
+    );
+    if !emitter.model.is_empty() {
+        update_string_field(&mut row, "model", &emitter.model);
+    }
+    emitter.push_event(row);
+}
 
-        match role.as_str() {
-            "system" => {
-                let mut row = Value::Object(base_event_obj(
-                    ctx,
-                    &next_uid("system"),
-                    "system",
-                    "system",
-                    "system",
-                    &value,
-                    &compact_json(item),
-                ));
-                if !model.is_empty() {
-                    update_string_field(&mut row, "model", &model);
-                }
-                hermes_stamp_time(&mut row, &hermes_event_dt(base_dt, event_index));
-                events.push(row);
-                event_index += 1;
-            }
-            "human" => {
-                current_turn = current_turn.saturating_add(1).max(1);
-                let mut row = Value::Object(base_event_obj(
-                    ctx,
-                    &next_uid("human"),
-                    "message",
-                    "message",
-                    "user",
-                    &value,
-                    &compact_json(item),
-                ));
-                update_string_field(&mut row, "model", &model);
-                if let Some(obj) = row.as_object_mut() {
-                    obj.insert("content_types".to_string(), json!(["text"]));
-                    obj.insert("turn_index".to_string(), json!(current_turn));
-                }
-                hermes_stamp_time(&mut row, &hermes_event_dt(base_dt, event_index));
-                events.push(row);
-                event_index += 1;
-            }
-            "gpt" => {
-                let segments = parse_hermes_segments(&value);
-                for (segment_idx, segment) in segments.into_iter().enumerate() {
-                    let suffix = match &segment {
-                        HermesSegment::Text(_) => format!("assistant:text:{segment_idx}"),
-                        HermesSegment::Think(_) => format!("assistant:think:{segment_idx}"),
-                        HermesSegment::ToolCall(_) => format!("assistant:tool_call:{segment_idx}"),
-                        HermesSegment::ToolResponse(_) => {
-                            format!("assistant:tool_response:{segment_idx}")
-                        }
-                    };
-                    let segment_uid = next_uid(&suffix);
+fn handle_hermes_human_item(
+    item: &Value,
+    conv_idx: usize,
+    value: &str,
+    emitter: &mut HermesTrajectoryEmitter<'_, '_>,
+) {
+    emitter.current_turn = emitter.current_turn.saturating_add(1).max(1);
+    let segment_uid = emitter.uid(item, conv_idx, "human");
+    let mut row = emitter.event(
+        &segment_uid,
+        "message",
+        "message",
+        "user",
+        value,
+        &compact_json(item),
+    );
+    update_string_field(&mut row, "model", &emitter.model);
+    hermes_content_metadata(&mut row, &["text"], emitter.current_turn);
+    emitter.push_event(row);
+}
 
-                    match segment {
-                        HermesSegment::Text(text) => {
-                            if text.is_empty() {
-                                continue;
-                            }
-                            let mut row = Value::Object(base_event_obj(
-                                ctx,
-                                &segment_uid,
-                                "message",
-                                "message",
-                                "assistant",
-                                &text,
-                                &compact_json(&json!({
-                                    "from": "gpt",
-                                    "type": "text",
-                                    "value": text,
-                                })),
-                            ));
-                            if let Some(obj) = row.as_object_mut() {
-                                obj.insert("content_types".to_string(), json!(["text"]));
-                                obj.insert("turn_index".to_string(), json!(current_turn_for_item));
-                            }
-                            update_string_field(&mut row, "model", &model);
-                            hermes_stamp_time(&mut row, &hermes_event_dt(base_dt, event_index));
-                            events.push(row);
-                            event_index += 1;
-                        }
-                        HermesSegment::Think(thinking) => {
-                            let mut row = Value::Object(base_event_obj(
-                                ctx,
-                                &segment_uid,
-                                "reasoning",
-                                "reasoning",
-                                "assistant",
-                                &thinking,
-                                &compact_json(&json!({
-                                    "from": "gpt",
-                                    "type": "thinking",
-                                    "value": thinking,
-                                })),
-                            ));
-                            if let Some(obj) = row.as_object_mut() {
-                                mark_reasoning_metadata(obj);
-                                obj.insert("turn_index".to_string(), json!(current_turn_for_item));
-                            }
-                            update_string_field(&mut row, "model", &model);
-                            hermes_stamp_time(&mut row, &hermes_event_dt(base_dt, event_index));
-                            events.push(row);
-                            event_index += 1;
-                        }
-                        HermesSegment::ToolCall(raw_call) => {
-                            let parsed_call = parse_json_string(&raw_call)
-                                .unwrap_or_else(|| json!({ "raw": raw_call }));
-                            let tool_name = to_str(parsed_call.get("name"));
-                            let arguments =
-                                parsed_call.get("arguments").cloned().unwrap_or(Value::Null);
-                            let input_json = compact_json(&arguments);
-                            let input_text = {
-                                let extracted = extract_message_text(&arguments);
-                                if extracted.is_empty() {
-                                    input_json.clone()
-                                } else {
-                                    extracted
-                                }
-                            };
-                            let mut tool_call_id = to_str(parsed_call.get("tool_call_id"));
-                            if tool_call_id.is_empty() {
-                                tool_call_id = format!("hermes-call-{conv_idx}-{segment_idx}");
-                            }
-
-                            let mut row = Value::Object(base_event_obj(
-                                ctx,
-                                &segment_uid,
-                                "tool_call",
-                                "tool_use",
-                                "assistant",
-                                &input_text,
-                                &compact_json(&parsed_call),
-                            ));
-                            if let Some(obj) = row.as_object_mut() {
-                                obj.insert("content_types".to_string(), json!(["tool_use"]));
-                                obj.insert("turn_index".to_string(), json!(current_turn_for_item));
-                            }
-                            update_string_field(&mut row, "tool_call_id", &tool_call_id);
-                            update_string_field(&mut row, "tool_name", &tool_name);
-                            update_string_field(&mut row, "model", &model);
-                            hermes_stamp_time(&mut row, &hermes_event_dt(base_dt, event_index));
-                            events.push(row);
-
-                            let tool_idx = tools.len();
-                            tools.push(build_tool_row(
-                                ctx,
-                                &segment_uid,
-                                &tool_call_id,
-                                "",
-                                &tool_name,
-                                "request",
-                                0,
-                                &input_json,
-                                "",
-                                "",
-                            ));
-                            pending_tool_calls.push_back(HermesPendingToolCall {
-                                event_idx: events.len() - 1,
-                                tool_idx,
-                                tool_call_id,
-                                tool_name,
-                            });
-                            event_index += 1;
-                        }
-                        HermesSegment::ToolResponse(raw_response) => {
-                            let text = raw_response.trim();
-                            if !text.is_empty() {
-                                let mut row = Value::Object(base_event_obj(
-                                    ctx,
-                                    &segment_uid,
-                                    "tool_result",
-                                    "tool_result",
-                                    "tool",
-                                    text,
-                                    &compact_json(&json!({
-                                        "from": "gpt",
-                                        "type": "tool_response_text",
-                                        "value": text,
-                                    })),
-                                ));
-                                if let Some(obj) = row.as_object_mut() {
-                                    obj.insert("content_types".to_string(), json!(["tool_result"]));
-                                    obj.insert(
-                                        "turn_index".to_string(),
-                                        json!(current_turn_for_item),
-                                    );
-                                }
-                                update_string_field(&mut row, "model", &model);
-                                update_u8_field(&mut row, "tool_error", 1);
-                                hermes_stamp_time(&mut row, &hermes_event_dt(base_dt, event_index));
-                                events.push(row);
-                                event_index += 1;
-                            }
-                        }
-                    }
-                }
-            }
-            "tool" => {
-                let segments = parse_hermes_segments(&value);
-                for (segment_idx, segment) in segments.into_iter().enumerate() {
-                    match segment {
-                        HermesSegment::ToolResponse(raw_response) => {
-                            let parsed_response = parse_json_string(&raw_response)
-                                .unwrap_or_else(|| json!({ "content": raw_response }));
-                            let pending = pending_tool_calls.pop_front();
-                            let pending_tool_name = pending
-                                .as_ref()
-                                .map(|call| call.tool_name.clone())
-                                .unwrap_or_default();
-                            let response_call_id = to_str(parsed_response.get("tool_call_id"));
-                            let mut tool_call_id = response_call_id.clone();
-                            if tool_call_id.is_empty() {
-                                if let Some(call) = pending.as_ref() {
-                                    tool_call_id = call.tool_call_id.clone();
-                                } else {
-                                    tool_call_id =
-                                        format!("hermes-result-{conv_idx}-{segment_idx}");
-                                }
-                            }
-
-                            if let Some(call) = pending {
-                                if response_call_id != call.tool_call_id
-                                    && !response_call_id.is_empty()
-                                {
-                                    update_string_field(
-                                        &mut events[call.event_idx],
-                                        "tool_call_id",
-                                        &response_call_id,
-                                    );
-                                    update_string_field(
-                                        &mut tools[call.tool_idx],
-                                        "tool_call_id",
-                                        &response_call_id,
-                                    );
-                                    tool_call_id = response_call_id;
-                                }
-                            }
-
-                            let tool_name = {
-                                let name = to_str(parsed_response.get("name"));
-                                if !name.is_empty() {
-                                    name
-                                } else {
-                                    pending_tool_name
-                                }
-                            };
-                            let content = parsed_response
-                                .get("content")
-                                .cloned()
-                                .unwrap_or(Value::Null);
-                            let output_json = compact_json(&content);
-                            let output_text = {
-                                let extracted = extract_message_text(&content);
-                                if extracted.is_empty() {
-                                    output_json.clone()
-                                } else {
-                                    extracted
-                                }
-                            };
-                            let segment_uid = next_uid(&format!("tool:response:{segment_idx}"));
-                            let mut row = Value::Object(base_event_obj(
-                                ctx,
-                                &segment_uid,
-                                "tool_result",
-                                "tool_result",
-                                "tool",
-                                &output_text,
-                                &compact_json(&parsed_response),
-                            ));
-                            if let Some(obj) = row.as_object_mut() {
-                                obj.insert("content_types".to_string(), json!(["tool_result"]));
-                                obj.insert("turn_index".to_string(), json!(current_turn_for_item));
-                            }
-                            update_string_field(&mut row, "tool_call_id", &tool_call_id);
-                            update_string_field(&mut row, "tool_name", &tool_name);
-                            update_string_field(&mut row, "model", &model);
-                            hermes_stamp_time(&mut row, &hermes_event_dt(base_dt, event_index));
-                            events.push(row);
-                            tools.push(build_tool_row(
-                                ctx,
-                                &segment_uid,
-                                &tool_call_id,
-                                "",
-                                &tool_name,
-                                "response",
-                                0,
-                                "",
-                                &output_json,
-                                &output_text,
-                            ));
-                            event_index += 1;
-                        }
-                        HermesSegment::Text(text) => {
-                            if text.is_empty() {
-                                continue;
-                            }
-                            let segment_uid = next_uid(&format!("tool:text:{segment_idx}"));
-                            let mut row = Value::Object(base_event_obj(
-                                ctx,
-                                &segment_uid,
-                                "tool_result",
-                                "tool_result",
-                                "tool",
-                                &text,
-                                &compact_json(&json!({
-                                    "from": "tool",
-                                    "type": "tool_text",
-                                    "value": text,
-                                })),
-                            ));
-                            if let Some(obj) = row.as_object_mut() {
-                                obj.insert("content_types".to_string(), json!(["tool_result"]));
-                                obj.insert("turn_index".to_string(), json!(current_turn_for_item));
-                            }
-                            update_string_field(&mut row, "model", &model);
-                            update_u8_field(&mut row, "tool_error", 1);
-                            hermes_stamp_time(&mut row, &hermes_event_dt(base_dt, event_index));
-                            events.push(row);
-                            event_index += 1;
-                        }
-                        HermesSegment::Think(_) | HermesSegment::ToolCall(_) => {}
-                    }
-                }
-            }
-            _ => {
-                let segment_uid = next_uid("unknown");
-                let mut row = Value::Object(base_event_obj(
-                    ctx,
-                    &segment_uid,
-                    "unknown",
-                    "unknown",
-                    "system",
-                    &value,
-                    &compact_json(item),
-                ));
-                update_string_field(&mut row, "model", &model);
-                hermes_stamp_time(&mut row, &hermes_event_dt(base_dt, event_index));
-                events.push(row);
-                event_index += 1;
+fn handle_hermes_gpt_item(
+    item: &Value,
+    conv_idx: usize,
+    value: &str,
+    current_turn_for_item: u32,
+    emitter: &mut HermesTrajectoryEmitter<'_, '_>,
+) {
+    for (segment_idx, segment) in parse_hermes_segments(value).into_iter().enumerate() {
+        match segment {
+            HermesSegment::Text(text) => handle_hermes_gpt_text_segment(
+                item,
+                conv_idx,
+                segment_idx,
+                &text,
+                current_turn_for_item,
+                emitter,
+            ),
+            HermesSegment::Think(thinking) => handle_hermes_gpt_think_segment(
+                item,
+                conv_idx,
+                segment_idx,
+                &thinking,
+                current_turn_for_item,
+                emitter,
+            ),
+            HermesSegment::ToolCall(raw_call) => handle_hermes_gpt_tool_call_segment(
+                item,
+                conv_idx,
+                segment_idx,
+                &raw_call,
+                current_turn_for_item,
+                emitter,
+            ),
+            HermesSegment::ToolResponse(raw_response) => {
+                handle_hermes_gpt_tool_response_text_segment(
+                    item,
+                    conv_idx,
+                    segment_idx,
+                    &raw_response,
+                    current_turn_for_item,
+                    emitter,
+                )
             }
         }
     }
+}
 
-    (events, links, tools)
+fn handle_hermes_tool_item(
+    item: &Value,
+    conv_idx: usize,
+    value: &str,
+    current_turn_for_item: u32,
+    emitter: &mut HermesTrajectoryEmitter<'_, '_>,
+) {
+    for (segment_idx, segment) in parse_hermes_segments(value).into_iter().enumerate() {
+        match segment {
+            HermesSegment::ToolResponse(raw_response) => handle_hermes_tool_response_segment(
+                item,
+                conv_idx,
+                segment_idx,
+                &raw_response,
+                current_turn_for_item,
+                emitter,
+            ),
+            HermesSegment::Text(text) => handle_hermes_tool_text_segment(
+                item,
+                conv_idx,
+                segment_idx,
+                &text,
+                current_turn_for_item,
+                emitter,
+            ),
+            HermesSegment::Think(_) | HermesSegment::ToolCall(_) => {}
+        }
+    }
+}
+
+fn handle_hermes_gpt_text_segment(
+    item: &Value,
+    conv_idx: usize,
+    segment_idx: usize,
+    text: &str,
+    current_turn_for_item: u32,
+    emitter: &mut HermesTrajectoryEmitter<'_, '_>,
+) {
+    if text.is_empty() {
+        return;
+    }
+
+    let segment_uid = emitter.uid(item, conv_idx, &format!("assistant:text:{segment_idx}"));
+    let payload = json!({
+        "from": "gpt",
+        "type": "text",
+        "value": text,
+    });
+    let mut row = emitter.event(
+        &segment_uid,
+        "message",
+        "message",
+        "assistant",
+        text,
+        &compact_json(&payload),
+    );
+    hermes_content_metadata(&mut row, &["text"], current_turn_for_item);
+    update_string_field(&mut row, "model", &emitter.model);
+    emitter.push_event(row);
+}
+
+fn handle_hermes_gpt_think_segment(
+    item: &Value,
+    conv_idx: usize,
+    segment_idx: usize,
+    thinking: &str,
+    current_turn_for_item: u32,
+    emitter: &mut HermesTrajectoryEmitter<'_, '_>,
+) {
+    let segment_uid = emitter.uid(item, conv_idx, &format!("assistant:think:{segment_idx}"));
+    let payload = json!({
+        "from": "gpt",
+        "type": "thinking",
+        "value": thinking,
+    });
+    let mut row = emitter.event(
+        &segment_uid,
+        "reasoning",
+        "reasoning",
+        "assistant",
+        thinking,
+        &compact_json(&payload),
+    );
+    if let Some(obj) = row.as_object_mut() {
+        mark_reasoning_metadata(obj);
+        obj.insert("turn_index".to_string(), json!(current_turn_for_item));
+    }
+    update_string_field(&mut row, "model", &emitter.model);
+    emitter.push_event(row);
+}
+
+fn handle_hermes_gpt_tool_call_segment(
+    item: &Value,
+    conv_idx: usize,
+    segment_idx: usize,
+    raw_call: &str,
+    current_turn_for_item: u32,
+    emitter: &mut HermesTrajectoryEmitter<'_, '_>,
+) {
+    let segment_uid = emitter.uid(
+        item,
+        conv_idx,
+        &format!("assistant:tool_call:{segment_idx}"),
+    );
+    let parsed_call = parse_json_string(raw_call).unwrap_or_else(|| json!({ "raw": raw_call }));
+    let tool_name = to_str(parsed_call.get("name"));
+    let arguments = parsed_call.get("arguments").cloned().unwrap_or(Value::Null);
+    let input_json = compact_json(&arguments);
+    let input_text = {
+        let extracted = extract_message_text(&arguments);
+        if extracted.is_empty() {
+            input_json.clone()
+        } else {
+            extracted
+        }
+    };
+    let mut tool_call_id = to_str(parsed_call.get("tool_call_id"));
+    if tool_call_id.is_empty() {
+        tool_call_id = format!("hermes-call-{conv_idx}-{segment_idx}");
+    }
+
+    let mut row = emitter.event(
+        &segment_uid,
+        "tool_call",
+        "tool_use",
+        "assistant",
+        &input_text,
+        &compact_json(&parsed_call),
+    );
+    hermes_content_metadata(&mut row, &["tool_use"], current_turn_for_item);
+    update_string_field(&mut row, "tool_call_id", &tool_call_id);
+    update_string_field(&mut row, "tool_name", &tool_name);
+    update_string_field(&mut row, "model", &emitter.model);
+    let event_idx = emitter.push_event(row);
+
+    let tool_idx = emitter.push_tool_request(&segment_uid, &tool_call_id, &tool_name, &input_json);
+    emitter.pending_tool_calls.push_back(HermesPendingToolCall {
+        event_idx,
+        tool_idx,
+        tool_call_id,
+        tool_name,
+    });
+}
+
+fn handle_hermes_gpt_tool_response_text_segment(
+    item: &Value,
+    conv_idx: usize,
+    segment_idx: usize,
+    raw_response: &str,
+    current_turn_for_item: u32,
+    emitter: &mut HermesTrajectoryEmitter<'_, '_>,
+) {
+    let text = raw_response.trim();
+    if text.is_empty() {
+        return;
+    }
+
+    let segment_uid = emitter.uid(
+        item,
+        conv_idx,
+        &format!("assistant:tool_response:{segment_idx}"),
+    );
+    let payload = json!({
+        "from": "gpt",
+        "type": "tool_response_text",
+        "value": text,
+    });
+    let mut row = emitter.event(
+        &segment_uid,
+        "tool_result",
+        "tool_result",
+        "tool",
+        text,
+        &compact_json(&payload),
+    );
+    hermes_content_metadata(&mut row, &["tool_result"], current_turn_for_item);
+    update_string_field(&mut row, "model", &emitter.model);
+    update_u8_field(&mut row, "tool_error", 1);
+    emitter.push_event(row);
+}
+
+fn handle_hermes_tool_response_segment(
+    item: &Value,
+    conv_idx: usize,
+    segment_idx: usize,
+    raw_response: &str,
+    current_turn_for_item: u32,
+    emitter: &mut HermesTrajectoryEmitter<'_, '_>,
+) {
+    let parsed_response =
+        parse_json_string(raw_response).unwrap_or_else(|| json!({ "content": raw_response }));
+    let (tool_call_id, tool_name) =
+        resolve_hermes_tool_response(emitter, &parsed_response, conv_idx, segment_idx);
+    let content = parsed_response
+        .get("content")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let output_json = compact_json(&content);
+    let output_text = {
+        let extracted = extract_message_text(&content);
+        if extracted.is_empty() {
+            output_json.clone()
+        } else {
+            extracted
+        }
+    };
+    let segment_uid = emitter.uid(item, conv_idx, &format!("tool:response:{segment_idx}"));
+    let mut row = emitter.event(
+        &segment_uid,
+        "tool_result",
+        "tool_result",
+        "tool",
+        &output_text,
+        &compact_json(&parsed_response),
+    );
+    hermes_content_metadata(&mut row, &["tool_result"], current_turn_for_item);
+    update_string_field(&mut row, "tool_call_id", &tool_call_id);
+    update_string_field(&mut row, "tool_name", &tool_name);
+    update_string_field(&mut row, "model", &emitter.model);
+    emitter.push_event(row);
+    emitter.push_tool_response(
+        &segment_uid,
+        &tool_call_id,
+        &tool_name,
+        &output_json,
+        &output_text,
+    );
+}
+
+fn handle_hermes_tool_text_segment(
+    item: &Value,
+    conv_idx: usize,
+    segment_idx: usize,
+    text: &str,
+    current_turn_for_item: u32,
+    emitter: &mut HermesTrajectoryEmitter<'_, '_>,
+) {
+    if text.is_empty() {
+        return;
+    }
+
+    let segment_uid = emitter.uid(item, conv_idx, &format!("tool:text:{segment_idx}"));
+    let payload = json!({
+        "from": "tool",
+        "type": "tool_text",
+        "value": text,
+    });
+    let mut row = emitter.event(
+        &segment_uid,
+        "tool_result",
+        "tool_result",
+        "tool",
+        text,
+        &compact_json(&payload),
+    );
+    hermes_content_metadata(&mut row, &["tool_result"], current_turn_for_item);
+    update_string_field(&mut row, "model", &emitter.model);
+    update_u8_field(&mut row, "tool_error", 1);
+    emitter.push_event(row);
+}
+
+fn handle_hermes_unknown_item(
+    item: &Value,
+    conv_idx: usize,
+    value: &str,
+    emitter: &mut HermesTrajectoryEmitter<'_, '_>,
+) {
+    let segment_uid = emitter.uid(item, conv_idx, "unknown");
+    let mut row = emitter.event(
+        &segment_uid,
+        "unknown",
+        "unknown",
+        "system",
+        value,
+        &compact_json(item),
+    );
+    update_string_field(&mut row, "model", &emitter.model);
+    emitter.push_event(row);
+}
+
+fn resolve_hermes_tool_response(
+    emitter: &mut HermesTrajectoryEmitter<'_, '_>,
+    parsed_response: &Value,
+    conv_idx: usize,
+    segment_idx: usize,
+) -> (String, String) {
+    let pending = emitter.pending_tool_calls.pop_front();
+    let pending_tool_name = pending
+        .as_ref()
+        .map(|call| call.tool_name.clone())
+        .unwrap_or_default();
+    let response_call_id = to_str(parsed_response.get("tool_call_id"));
+    let mut tool_call_id = response_call_id.clone();
+    if tool_call_id.is_empty() {
+        if let Some(call) = pending.as_ref() {
+            tool_call_id = call.tool_call_id.clone();
+        } else {
+            tool_call_id = format!("hermes-result-{conv_idx}-{segment_idx}");
+        }
+    }
+
+    if let Some(call) = pending {
+        if response_call_id != call.tool_call_id && !response_call_id.is_empty() {
+            update_string_field(
+                &mut emitter.events[call.event_idx],
+                "tool_call_id",
+                &response_call_id,
+            );
+            update_string_field(
+                &mut emitter.tools[call.tool_idx],
+                "tool_call_id",
+                &response_call_id,
+            );
+            tool_call_id = response_call_id;
+        }
+    }
+
+    let tool_name = {
+        let name = to_str(parsed_response.get("name"));
+        if !name.is_empty() {
+            name
+        } else {
+            pending_tool_name
+        }
+    };
+
+    (tool_call_id, tool_name)
+}
+
+fn hermes_content_metadata(row: &mut Value, content_types: &[&str], turn_index: u32) {
+    if let Some(obj) = row.as_object_mut() {
+        obj.insert("content_types".to_string(), json!(content_types));
+        obj.insert("turn_index".to_string(), json!(turn_index));
+    }
 }
 
 /// Normalize a synthetic `session_meta` record emitted by the session_json
