@@ -28,6 +28,18 @@ change across minor releases.
 - [Configuration](https://eric-tramel.github.io/moraine/configuration.html)
 - [MCP Search Interface Specification](https://eric-tramel.github.io/moraine/mcp-search-interface-spec.html)
 
+## Supported Agent Harnesses
+
+Moraine ships session trace ingestion adapters for these agent harnesses:
+
+| Harness | Config value | Session traces ingested |
+| --- | --- | --- |
+| [Codex](https://developers.openai.com/codex) | `codex` | JSONL session files under `~/.codex/sessions` |
+| [Claude Code](https://code.claude.com/docs/en/overview) | `claude-code` | JSONL project session files under `~/.claude/projects` |
+| [Kimi CLI](https://moonshotai.github.io/kimi-cli/en/) | `kimi-cli` | `wire.jsonl` session traces under `~/.kimi/sessions` |
+| [Hermes](https://hermes-agent.nousresearch.com/docs/) | `hermes` | Live session JSON and trajectory JSONL traces |
+| [Pi Coding Agent](https://pi.dev/docs/latest) | `pi-coding-agent` | JSONL session trees under `~/.pi/agent/sessions` |
+
 ## Quickstart
 
 Install from PyPI with `uv`:
