@@ -500,6 +500,46 @@ fn invalid_timestamp_uses_epoch_and_emits_timestamp_parse_error() {
 }
 
 #[test]
+fn missing_codex_timestamp_infers_rollout_file_timestamp() {
+    let record = json!({
+        "type": "function_call",
+        "call_id": "call_legacy_rollout",
+        "name": "shell",
+        "arguments": "{}"
+    });
+
+    let out = normalize_record(
+        &record,
+        "codex",
+        "codex",
+        "/Users/eric/.codex/sessions/2025/09/21/rollout-2025-09-21T17-12-48-6ce8b66e-8a97-441b-a606-16d2a0c27083.jsonl",
+        9,
+        1,
+        7,
+        99,
+        "",
+        "",
+    )
+    .expect("legacy codex rollout record should normalize");
+
+    assert!(out.error_rows.is_empty());
+    let raw_row = out.raw_row.as_object().unwrap();
+    assert_eq!(
+        raw_row.get("record_ts").unwrap().as_str().unwrap(),
+        "2025-09-21T17:12:48.000Z"
+    );
+    let event_row = out.event_rows[0].as_object().unwrap();
+    assert_eq!(
+        event_row.get("event_ts").unwrap().as_str().unwrap(),
+        "2025-09-21 17:12:48.000"
+    );
+    assert_eq!(
+        event_row.get("session_date").unwrap().as_str().unwrap(),
+        "2025-09-21"
+    );
+}
+
+#[test]
 fn invalid_timestamp_preserves_session_date_from_source_path() {
     let record = json!({
         "timestamp": "still-not-a-timestamp",

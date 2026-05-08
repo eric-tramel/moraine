@@ -3,8 +3,10 @@ use std::sync::OnceLock;
 
 pub(crate) mod claude_code;
 pub(crate) mod codex;
+pub(crate) mod emitter;
 pub(crate) mod hermes;
 pub(crate) mod kimi_cli;
+pub(crate) mod record_view;
 pub(crate) mod shared;
 
 use shared::{infer_session_id_from_file, RecordContext};
@@ -50,6 +52,27 @@ pub(crate) struct NormalizedPartials {
     pub(crate) event_rows: Vec<Value>,
     pub(crate) link_rows: Vec<Value>,
     pub(crate) tool_rows: Vec<Value>,
+}
+
+#[allow(dead_code)]
+impl NormalizedPartials {
+    pub(crate) fn push_event(&mut self, row: Value) {
+        self.event_rows.push(row);
+    }
+
+    pub(crate) fn push_link(&mut self, row: Value) {
+        self.link_rows.push(row);
+    }
+
+    pub(crate) fn push_tool(&mut self, row: Value) {
+        self.tool_rows.push(row);
+    }
+
+    pub(crate) fn append(&mut self, mut other: Self) {
+        self.event_rows.append(&mut other.event_rows);
+        self.link_rows.append(&mut other.link_rows);
+        self.tool_rows.append(&mut other.tool_rows);
+    }
 }
 
 impl From<(Vec<Value>, Vec<Value>, Vec<Value>)> for NormalizedPartials {

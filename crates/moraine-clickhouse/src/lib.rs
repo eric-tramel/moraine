@@ -7,6 +7,8 @@ use reqwest::{
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::Value;
+
+const MAX_INSERT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -198,20 +200,29 @@ impl ClickHouseClient {
             return Ok(());
         }
 
-        let mut payload = Vec::<u8>::new();
-        for row in rows {
-            let line = serde_json::to_vec(row).context("failed to encode JSON row")?;
-            payload.extend_from_slice(&line);
-            payload.push(b'\n');
-        }
-
         let query = format!(
             "INSERT INTO {}.{} FORMAT JSONEachRow",
             escape_identifier(&self.cfg.database),
             escape_identifier(table)
         );
-        self.request_text(&query, Some(payload), None, true, None)
-            .await?;
+        let mut payload = Vec::<u8>::new();
+        for row in rows {
+            let line = serde_json::to_vec(row).context("failed to encode JSON row")?;
+            if !payload.is_empty()
+                && payload.len().saturating_add(line.len()).saturating_add(1)
+                    > MAX_INSERT_PAYLOAD_BYTES
+            {
+                self.request_text(&query, Some(std::mem::take(&mut payload)), None, true, None)
+                    .await?;
+            }
+            payload.extend_from_slice(&line);
+            payload.push(b'\n');
+        }
+
+        if !payload.is_empty() {
+            self.request_text(&query, Some(payload), None, true, None)
+                .await?;
+        }
         Ok(())
     }
 
@@ -633,14 +644,17 @@ fn has_explicit_json_each_row_format(query: &str) -> bool {
 mod tests {
     use super::*;
     use axum::{
-        extract::Query,
+        body::Bytes,
+        extract::{DefaultBodyLimit, Query, State},
         http::{HeaderMap, StatusCode},
-        routing::get,
+        routing::{get, post},
         Router,
     };
     use moraine_config::ClickHouseConfig;
     use serde::Deserialize;
+    use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
 
     fn test_clickhouse_config(url: String) -> ClickHouseConfig {
         ClickHouseConfig {
@@ -685,6 +699,33 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        format!("http://{}", addr)
+    }
+
+    async fn spawn_insert_capture_server(lengths: Arc<Mutex<Vec<usize>>>) -> String {
+        async fn handler(State(lengths): State<Arc<Mutex<Vec<usize>>>>, body: Bytes) -> StatusCode {
+            lengths
+                .lock()
+                .expect("length capture mutex poisoned")
+                .push(body.len());
+            StatusCode::OK
+        }
+
+        let app = Router::new()
+            .route("/", post(handler))
+            .layer(DefaultBodyLimit::max(
+                MAX_INSERT_PAYLOAD_BYTES.saturating_mul(2),
+            ))
+            .with_state(lengths);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind insert capture listener");
         let addr = listener.local_addr().expect("listener addr");
 
         tokio::spawn(async move {
@@ -888,6 +929,32 @@ mod tests {
             .expect("fallback query_rows");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].value, 7);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn insert_json_rows_chunks_large_payloads() {
+        let lengths = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let base_url = spawn_insert_capture_server(lengths.clone()).await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+        let large_value = "x".repeat((MAX_INSERT_PAYLOAD_BYTES / 2).saturating_add(1024));
+
+        client
+            .insert_json_rows(
+                "raw_events",
+                &[
+                    json!({ "payload": large_value }),
+                    json!({ "payload": large_value }),
+                ],
+            )
+            .await
+            .expect("chunked insert should succeed");
+
+        let lengths = lengths.lock().expect("length capture mutex poisoned");
+        assert_eq!(lengths.len(), 2, "rows should be split into two inserts");
+        assert!(
+            lengths.iter().all(|len| *len < MAX_INSERT_PAYLOAD_BYTES),
+            "each captured payload should stay below the byte cap: {lengths:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -1,6 +1,7 @@
 use crate::checkpoint::checkpoint_key;
 use crate::model::{Checkpoint, RowBatch};
-use crate::normalize::normalize_record;
+use crate::normalize::{normalize_record, normalize_record_with_ts_hint};
+use crate::sources::shared::parse_record_ts;
 use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
 use anyhow::{Context, Result};
 use moraine_config::{AppConfig, SOURCE_FORMAT_SESSION_JSON};
@@ -98,6 +99,36 @@ fn parse_event_ts_ms(event_ts: &str) -> Option<i64> {
     chrono::NaiveDateTime::parse_from_str(event_ts, "%Y-%m-%d %H:%M:%S%.3f")
         .ok()
         .map(|dt| dt.and_utc().timestamp_millis())
+}
+
+fn infer_initial_record_ts_hint(source_file: &str, offset: u64) -> Option<String> {
+    let mut file = std::fs::File::open(source_file).ok()?;
+    file.seek(SeekFrom::Start(offset)).ok()?;
+
+    let mut reader = BufReader::new(file);
+    loop {
+        let mut buf = Vec::<u8>::new();
+        let bytes_read = reader.read_until(b'\n', &mut buf).ok()?;
+        if bytes_read == 0 {
+            return None;
+        }
+
+        let text = String::from_utf8_lossy(&buf);
+        if text.trim().is_empty() {
+            continue;
+        }
+
+        let Ok(parsed) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        let Some(record_ts) = parsed.get("timestamp").and_then(Value::as_str) else {
+            continue;
+        };
+        let record_ts = record_ts.trim();
+        if parse_record_ts(record_ts).is_some() {
+            return Some(record_ts.to_string());
+        }
+    }
 }
 
 /// Post-process event rows from a single Claude Code record:
@@ -376,6 +407,8 @@ pub(crate) async fn process_file(
     let mut line_no = checkpoint.last_line_no;
     let mut session_hint = String::new();
     let mut model_hint = String::new();
+    let mut record_ts_hint =
+        infer_initial_record_ts_hint(source_file, checkpoint.last_offset).unwrap_or_default();
     let mut session_cursors: HashMap<String, SessionCursor> = HashMap::new();
 
     let mut batch = RowBatch::default();
@@ -406,7 +439,7 @@ pub(crate) async fn process_file(
         let parsed: Value = match serde_json::from_str::<Value>(&text) {
             Ok(value) if value.is_object() => value,
             Ok(_) => {
-                batch.error_rows.push(json!({
+                batch.push_error_row(json!({
                     "source_name": work.source_name,
                     "harness": work.harness,
                     "source_file": source_file,
@@ -421,7 +454,7 @@ pub(crate) async fn process_file(
                 continue;
             }
             Err(exc) => {
-                batch.error_rows.push(json!({
+                batch.push_error_row(json!({
                     "source_name": work.source_name,
                     "harness": work.harness,
                     "source_file": source_file,
@@ -437,7 +470,7 @@ pub(crate) async fn process_file(
             }
         };
 
-        let mut normalized = match normalize_record(
+        let mut normalized = match normalize_record_with_ts_hint(
             &parsed,
             &work.source_name,
             &work.harness,
@@ -448,10 +481,11 @@ pub(crate) async fn process_file(
             start_offset,
             &session_hint,
             &model_hint,
+            &record_ts_hint,
         ) {
             Ok(normalized) => normalized,
             Err(exc) => {
-                batch.error_rows.push(json!({
+                batch.push_error_row(json!({
                     "source_name": work.source_name,
                     "harness": work.harness,
                     "source_file": source_file,
@@ -467,37 +501,30 @@ pub(crate) async fn process_file(
             }
         };
 
+        if let Some(record_ts) = normalized.raw_row.get("record_ts").and_then(Value::as_str) {
+            if parse_record_ts(record_ts).is_some() {
+                record_ts_hint = record_ts.to_string();
+            }
+        }
+
         enrich_claude_model_latency(
             &work.harness,
             &mut normalized.event_rows,
             &mut session_cursors,
         );
 
-        session_hint = normalized.session_hint;
-        model_hint = normalized.model_hint;
+        session_hint = normalized.session_hint.clone();
+        model_hint = normalized.model_hint.clone();
         // A null `raw_row` means the normalizer deliberately skipped the
         // record (e.g. the Kimi wire metadata header). Advance the line
         // counter and checkpoint, but emit nothing downstream — passing a
         // `Value::Null` through to ClickHouse breaks the whole JSONEachRow
         // batch with "expected '{' before: 'null'".
-        if !normalized.raw_row.is_null() {
-            batch.raw_rows.push(normalized.raw_row);
-        }
-        batch.event_rows.extend(normalized.event_rows);
-        batch.link_rows.extend(normalized.link_rows);
-        batch.tool_rows.extend(normalized.tool_rows);
-        batch.error_rows.extend(normalized.error_rows);
+        batch.extend_normalized(normalized);
         batch.lines_processed = batch.lines_processed.saturating_add(1);
 
-        if batch.row_count() >= config.ingest.batch_size {
-            let mut chunk = RowBatch::default();
-            chunk.raw_rows = std::mem::take(&mut batch.raw_rows);
-            chunk.event_rows = std::mem::take(&mut batch.event_rows);
-            chunk.link_rows = std::mem::take(&mut batch.link_rows);
-            chunk.tool_rows = std::mem::take(&mut batch.tool_rows);
-            chunk.error_rows = std::mem::take(&mut batch.error_rows);
-            chunk.lines_processed = batch.lines_processed;
-            batch.lines_processed = 0;
+        if batch.exceeds_limits(config.ingest.batch_size, config.ingest.max_batch_bytes) {
+            let mut chunk = batch.drain_to_chunk();
             chunk.checkpoint = Some(Checkpoint {
                 source_name: work.source_name.clone(),
                 source_file: source_file.to_string(),
@@ -592,7 +619,7 @@ async fn process_session_json_file(
                 "raw_fragment": truncate(&body, 20_000),
             });
             let mut batch = RowBatch::default();
-            batch.error_rows.push(error_row);
+            batch.push_error_row(error_row);
             sink_tx
                 .send(SinkMessage::Batch(batch))
                 .await
@@ -684,16 +711,16 @@ async fn process_session_json_file(
                 // line for checkpointing, but don't emit a null row — it
                 // would poison the JSONEachRow batch at flush time.
                 if !normalized.raw_row.is_null() {
-                    batch.raw_rows.push(normalized.raw_row);
+                    batch.push_raw_row(normalized.raw_row);
                 }
-                batch.event_rows.extend(normalized.event_rows);
-                batch.link_rows.extend(normalized.link_rows);
-                batch.tool_rows.extend(normalized.tool_rows);
-                batch.error_rows.extend(normalized.error_rows);
+                batch.extend_event_rows(normalized.event_rows);
+                batch.extend_link_rows(normalized.link_rows);
+                batch.extend_tool_rows(normalized.tool_rows);
+                batch.extend_error_rows(normalized.error_rows);
                 batch.lines_processed = batch.lines_processed.saturating_add(1);
             }
             Err(exc) => {
-                batch.error_rows.push(json!({
+                batch.push_error_row(json!({
                     "source_name": work.source_name,
                     "harness": work.harness,
                     "source_file": source_file,
@@ -708,15 +735,8 @@ async fn process_session_json_file(
             }
         }
 
-        if batch.row_count() >= config.ingest.batch_size {
-            let mut chunk = RowBatch::default();
-            chunk.raw_rows = std::mem::take(&mut batch.raw_rows);
-            chunk.event_rows = std::mem::take(&mut batch.event_rows);
-            chunk.link_rows = std::mem::take(&mut batch.link_rows);
-            chunk.tool_rows = std::mem::take(&mut batch.tool_rows);
-            chunk.error_rows = std::mem::take(&mut batch.error_rows);
-            chunk.lines_processed = batch.lines_processed;
-            batch.lines_processed = 0;
+        if batch.exceeds_limits(config.ingest.batch_size, config.ingest.max_batch_bytes) {
+            let chunk = batch.drain_to_chunk();
             sink_tx
                 .send(SinkMessage::Batch(chunk))
                 .await
@@ -930,9 +950,9 @@ fn truncate(input: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         complete_work, compose_hermes_model, enrich_claude_model_latency,
-        infer_vendor_from_base_url, path_matches_extension, process_session_json_file,
-        run_work_item, source_inode_for_file, work_extension, SessionCursor,
-        SESSION_JSON_GENERATION, SESSION_JSON_INODE,
+        infer_vendor_from_base_url, path_matches_extension, process_file,
+        process_session_json_file, run_work_item, source_inode_for_file, work_extension,
+        SessionCursor, SESSION_JSON_GENERATION, SESSION_JSON_INODE,
     };
     use crate::model::Checkpoint;
     use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
@@ -1239,6 +1259,164 @@ mod tests {
             out.push(batch);
         }
         out
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_file_inherits_codex_timestamp_for_legacy_rollout_records() {
+        let path = unique_test_file("rollout-2025-09-21T17-12-48-legacy");
+        fs::write(
+            &path,
+            [
+                json!({
+                    "id": "6ce8b66e-8a97-441b-a606-16d2a0c27083",
+                    "timestamp": "2025-09-21T17:12:48.127Z",
+                    "instructions": null
+                })
+                .to_string(),
+                json!({
+                    "type": "function_call",
+                    "call_id": "call_legacy_rollout",
+                    "name": "shell",
+                    "arguments": "{}"
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("write legacy rollout fixture");
+
+        let config = moraine_config::AppConfig::default();
+        let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(16);
+        let source_file = path.to_string_lossy().to_string();
+        let work = WorkItem {
+            source_name: "codex".to_string(),
+            harness: "codex".to_string(),
+            format: "jsonl".to_string(),
+            path: source_file,
+        };
+
+        process_file(&config, &work, checkpoints, sink_tx, &metrics)
+            .await
+            .expect("legacy codex file should process");
+
+        let batches = drain_batches(&mut sink_rx).await;
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.raw_rows.len(), 2);
+        assert!(
+            batch
+                .error_rows
+                .iter()
+                .all(|row| row.get("error_kind").and_then(Value::as_str)
+                    != Some("timestamp_parse_error")),
+            "legacy timestamp inheritance should avoid timestamp_parse_error rows"
+        );
+        assert_eq!(
+            batch.raw_rows[1]
+                .get("record_ts")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "2025-09-21T17:12:48.127Z"
+        );
+        assert_eq!(
+            batch.event_rows[1]
+                .get("event_ts")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "2025-09-21 17:12:48.127"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_file_infers_leading_claude_metadata_timestamp() {
+        let path = unique_test_file("claude-leading-metadata");
+        fs::write(
+            &path,
+            [
+                json!({
+                    "type": "permission-mode",
+                    "sessionId": "session-with-leading-metadata",
+                    "permissionMode": "acceptEdits"
+                })
+                .to_string(),
+                json!({
+                    "type": "file-history-snapshot",
+                    "messageId": "msg_1",
+                    "isSnapshotUpdate": true,
+                    "snapshot": {}
+                })
+                .to_string(),
+                json!({
+                    "type": "user",
+                    "timestamp": "2026-04-18T20:43:51.069Z",
+                    "uuid": "00a635eb-f13f-4a0e-9898-a3ad7b71ca47",
+                    "parentUuid": null,
+                    "sessionId": "session-with-leading-metadata",
+                    "message": {
+                        "role": "user",
+                        "content": "hello"
+                    }
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("write claude metadata fixture");
+
+        let config = moraine_config::AppConfig::default();
+        let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(16);
+        let source_file = path.to_string_lossy().to_string();
+        let work = WorkItem {
+            source_name: "claude".to_string(),
+            harness: "claude-code".to_string(),
+            format: "jsonl".to_string(),
+            path: source_file,
+        };
+
+        process_file(&config, &work, checkpoints, sink_tx, &metrics)
+            .await
+            .expect("claude file should process");
+
+        let batches = drain_batches(&mut sink_rx).await;
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.raw_rows.len(), 3);
+        assert!(
+            batch
+                .error_rows
+                .iter()
+                .all(|row| row.get("error_kind").and_then(Value::as_str)
+                    != Some("timestamp_parse_error")),
+            "leading metadata should inherit the first parseable record timestamp"
+        );
+        assert_eq!(
+            batch.raw_rows[0]
+                .get("record_ts")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "2026-04-18T20:43:51.069Z"
+        );
+        assert_eq!(
+            batch.raw_rows[1]
+                .get("record_ts")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "2026-04-18T20:43:51.069Z"
+        );
+        assert!(
+            batch.event_rows.iter().all(|row| {
+                row.get("event_ts").and_then(Value::as_str) == Some("2026-04-18 20:43:51.069")
+            }),
+            "metadata and message events should share the inferred timestamp"
+        );
+
+        let _ = fs::remove_file(&path);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -52,6 +52,8 @@ pub struct IngestConfig {
     pub sources: Vec<IngestSource>,
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    #[serde(default = "default_max_batch_bytes")]
+    pub max_batch_bytes: usize,
     #[serde(default = "default_flush_interval_seconds")]
     pub flush_interval_seconds: f64,
     #[serde(default = "default_state_dir")]
@@ -178,6 +180,7 @@ impl Default for IngestConfig {
         Self {
             sources: default_sources(),
             batch_size: default_batch_size(),
+            max_batch_bytes: default_max_batch_bytes(),
             flush_interval_seconds: default_flush_interval_seconds(),
             state_dir: default_state_dir(),
             backfill_on_start: true,
@@ -353,6 +356,10 @@ fn default_batch_size() -> usize {
     4000
 }
 
+fn default_max_batch_bytes() -> usize {
+    8 * 1024 * 1024
+}
+
 fn default_flush_interval_seconds() -> f64 {
     0.5
 }
@@ -366,7 +373,7 @@ fn default_max_file_workers() -> usize {
 }
 
 fn default_max_inflight_batches() -> usize {
-    64
+    16
 }
 
 fn default_debounce_ms() -> u64 {
