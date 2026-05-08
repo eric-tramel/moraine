@@ -1,0 +1,61 @@
+{
+  "baseURL": "http://127.0.0.1:60948",
+  "seededRangeShape": {
+    "24h": {
+      "ok": true,
+      "tokens": 0,
+      "turns": 0,
+      "concurrentSessions": 0
+    },
+    "7d": {
+      "ok": true,
+      "tokens": 0,
+      "turns": 0,
+      "concurrentSessions": 0
+    },
+    "30d": {
+      "ok": true,
+      "tokens": 2,
+      "turns": 1,
+      "concurrentSessions": 1
+    }
+  },
+  "metrics": [
+    {
+      "label": "desktop-analytics-30d",
+      "viewportWidth": 1440,
+      "documentWidth": 1440,
+      "bodyWidth": 1440,
+      "overflowX": 0
+    },
+    {
+      "label": "mobile-dashboard-30d",
+      "viewportWidth": 390,
+      "documentWidth": 390,
+      "bodyWidth": 390,
+      "overflowX": 0
+    },
+    {
+      "label": "mobile-sidepanel-transcript",
+      "viewportWidth": 390,
+      "documentWidth": 390,
+      "bodyWidth": 390,
+      "overflowX": 0
+    },
+    {
+      "label": "mobile-flamegraph",
+      "viewportWidth": 390,
+      "documentWidth": 390,
+      "bodyWidth": 390,
+      "overflowX": 0
+    }
+  ],
+  "consoleErrors": [],
+  "pageErrors": [],
+  "screenshots": [
+    "desktop-analytics-30d.png",
+    "mobile-dashboard-30d.png",
+    "mobile-flamegraph.png",
+    "mobile-sidepanel-transcript.png"
+  ]
+}
