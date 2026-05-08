@@ -91,6 +91,7 @@ pub(crate) fn spawn_sink_task(
         let mut tool_rows = Vec::<Value>::new();
         let mut error_rows = Vec::<Value>::new();
         let mut checkpoint_updates = HashMap::<String, Checkpoint>::new();
+        let mut pending_batch_bytes = 0usize;
 
         let flush_interval = duration_from_config_seconds(
             config.ingest.flush_interval_seconds,
@@ -136,6 +137,7 @@ pub(crate) fn spawn_sink_task(
                 )
                 .await
                 {
+                    pending_batch_bytes = 0;
                     throttling_flush_retries = false;
                     info!("flush retry succeeded; resuming sink intake");
                 } else {
@@ -153,6 +155,8 @@ pub(crate) fn spawn_sink_task(
                 maybe_msg = rx.recv() => {
                     match maybe_msg {
                         Some(SinkMessage::Batch(batch)) => {
+                            pending_batch_bytes =
+                                pending_batch_bytes.saturating_add(batch.approx_bytes());
                             raw_rows.extend(batch.raw_rows);
                             event_rows.extend(batch.event_rows);
                             link_rows.extend(batch.link_rows);
@@ -163,7 +167,9 @@ pub(crate) fn spawn_sink_task(
                             }
 
                             let total_rows = raw_rows.len() + event_rows.len() + link_rows.len() + tool_rows.len() + error_rows.len();
-                            if total_rows >= config.ingest.batch_size {
+                            if total_rows >= config.ingest.batch_size
+                                || pending_batch_bytes >= config.ingest.max_batch_bytes.max(1)
+                            {
                                 if !flush_pending(
                                     &clickhouse,
                                     &checkpoints,
@@ -182,6 +188,8 @@ pub(crate) fn spawn_sink_task(
                                         );
                                     }
                                     throttling_flush_retries = true;
+                                } else {
+                                    pending_batch_bytes = 0;
                                 }
                             }
                         }
@@ -208,6 +216,8 @@ pub(crate) fn spawn_sink_task(
                                 );
                             }
                             throttling_flush_retries = true;
+                        } else {
+                            pending_batch_bytes = 0;
                         }
                     }
                 }

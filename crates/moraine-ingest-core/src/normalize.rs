@@ -1,7 +1,7 @@
 use crate::model::NormalizedRecord;
 use crate::sources::shared::{
-    compact_json, event_uid, parse_event_ts, raw_hash, resolve_model_hint, truncate_chars,
-    RecordContext, UNPARSEABLE_EVENT_TS,
+    compact_json, event_uid, infer_rollout_record_ts_from_file, parse_event_ts, raw_hash,
+    resolve_model_hint, truncate_chars, RecordContext, UNPARSEABLE_EVENT_TS,
 };
 use crate::sources::{registry, Preflight, SourceRecordContext};
 use anyhow::{anyhow, Result};
@@ -20,6 +20,35 @@ pub fn normalize_record(
     source_offset: u64,
     session_hint: &str,
     model_hint: &str,
+) -> Result<NormalizedRecord> {
+    normalize_record_with_ts_hint(
+        record,
+        source_name,
+        harness,
+        source_file,
+        source_inode,
+        source_generation,
+        source_line_no,
+        source_offset,
+        session_hint,
+        model_hint,
+        "",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn normalize_record_with_ts_hint(
+    record: &Value,
+    source_name: &str,
+    harness: &str,
+    source_file: &str,
+    source_inode: u64,
+    source_generation: u32,
+    source_line_no: u64,
+    source_offset: u64,
+    session_hint: &str,
+    model_hint: &str,
+    record_ts_hint: &str,
 ) -> Result<NormalizedRecord> {
     let sources = registry();
     let source = if sources.is_known(harness) {
@@ -42,7 +71,8 @@ pub fn normalize_record(
 
     let harness_name = source.harness();
     let metadata = source.source_metadata(record);
-    let record_ts = source.record_ts(record);
+    let source_record_ts = source.record_ts(record);
+    let record_ts = resolve_record_ts(harness_name, source_file, &source_record_ts, record_ts_hint);
     let (event_ts, event_ts_parse_failed) = parse_event_ts(&record_ts);
     let top_type = source.top_type(record);
     let session_date = infer_session_date_from_file(source_file, &record_ts);
@@ -134,4 +164,29 @@ pub fn normalize_record(
         session_hint: session_id,
         model_hint,
     })
+}
+
+fn resolve_record_ts(
+    harness: &str,
+    source_file: &str,
+    source_record_ts: &str,
+    record_ts_hint: &str,
+) -> String {
+    let trimmed = source_record_ts.trim();
+    if !trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+
+    let hint = record_ts_hint.trim();
+    if !hint.is_empty() {
+        return hint.to_string();
+    }
+
+    if harness == "codex" {
+        if let Some(file_ts) = infer_rollout_record_ts_from_file(source_file) {
+            return file_ts;
+        }
+    }
+
+    String::new()
 }

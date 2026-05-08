@@ -27,6 +27,14 @@ fn session_date_re() -> &'static Regex {
     })
 }
 
+fn rollout_timestamp_re() -> &'static Regex {
+    static ROLLOUT_TIMESTAMP_RE: OnceLock<Regex> = OnceLock::new();
+    ROLLOUT_TIMESTAMP_RE.get_or_init(|| {
+        Regex::new(r"(?:^|/)rollout-(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})-")
+            .expect("valid rollout timestamp regex")
+    })
+}
+
 pub(crate) fn to_str(value: Option<&Value>) -> String {
     match value {
         None | Some(Value::Null) => String::new(),
@@ -645,6 +653,14 @@ pub fn infer_session_date_from_file(source_file: &str, record_ts: &str) -> Strin
     parse_record_ts(record_ts)
         .map(|dt| dt.format("%Y-%m-%d").to_string())
         .unwrap_or_else(|| "1970-01-01".to_string())
+}
+
+pub(crate) fn infer_rollout_record_ts_from_file(source_file: &str) -> Option<String> {
+    let cap = rollout_timestamp_re().captures(source_file)?;
+    Some(format!(
+        "{}-{}-{}T{}:{}:{}.000Z",
+        &cap[1], &cap[2], &cap[3], &cap[4], &cap[5], &cap[6]
+    ))
 }
 
 pub(crate) fn parse_record_ts(record_ts: &str) -> Option<DateTime<Utc>> {

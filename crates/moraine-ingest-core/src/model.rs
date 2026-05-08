@@ -32,6 +32,7 @@ pub struct RowBatch {
     pub error_rows: Vec<Value>,
     pub checkpoint: Option<Checkpoint>,
     pub lines_processed: u64,
+    approx_bytes: usize,
 }
 
 impl RowBatch {
@@ -42,4 +43,132 @@ impl RowBatch {
             + self.tool_rows.len()
             + self.error_rows.len()
     }
+
+    pub fn approx_bytes(&self) -> usize {
+        if self.approx_bytes > 0 {
+            return self.approx_bytes;
+        }
+
+        self.raw_rows
+            .iter()
+            .map(approx_json_row_bytes)
+            .sum::<usize>()
+            + self
+                .event_rows
+                .iter()
+                .map(approx_json_row_bytes)
+                .sum::<usize>()
+            + self
+                .link_rows
+                .iter()
+                .map(approx_json_row_bytes)
+                .sum::<usize>()
+            + self
+                .tool_rows
+                .iter()
+                .map(approx_json_row_bytes)
+                .sum::<usize>()
+            + self
+                .error_rows
+                .iter()
+                .map(approx_json_row_bytes)
+                .sum::<usize>()
+    }
+
+    pub fn push_raw_row(&mut self, row: Value) {
+        self.approx_bytes = self
+            .approx_bytes
+            .saturating_add(approx_json_row_bytes(&row));
+        self.raw_rows.push(row);
+    }
+
+    pub fn push_error_row(&mut self, row: Value) {
+        self.approx_bytes = self
+            .approx_bytes
+            .saturating_add(approx_json_row_bytes(&row));
+        self.error_rows.push(row);
+    }
+
+    pub fn extend_normalized(&mut self, normalized: NormalizedRecord) {
+        if !normalized.raw_row.is_null() {
+            self.push_raw_row(normalized.raw_row);
+        }
+        self.extend_event_rows(normalized.event_rows);
+        self.extend_link_rows(normalized.link_rows);
+        self.extend_tool_rows(normalized.tool_rows);
+        self.extend_error_rows(normalized.error_rows);
+    }
+
+    pub fn extend_event_rows<I>(&mut self, rows: I)
+    where
+        I: IntoIterator<Item = Value>,
+    {
+        for row in rows {
+            self.approx_bytes = self
+                .approx_bytes
+                .saturating_add(approx_json_row_bytes(&row));
+            self.event_rows.push(row);
+        }
+    }
+
+    pub fn extend_link_rows<I>(&mut self, rows: I)
+    where
+        I: IntoIterator<Item = Value>,
+    {
+        for row in rows {
+            self.approx_bytes = self
+                .approx_bytes
+                .saturating_add(approx_json_row_bytes(&row));
+            self.link_rows.push(row);
+        }
+    }
+
+    pub fn extend_tool_rows<I>(&mut self, rows: I)
+    where
+        I: IntoIterator<Item = Value>,
+    {
+        for row in rows {
+            self.approx_bytes = self
+                .approx_bytes
+                .saturating_add(approx_json_row_bytes(&row));
+            self.tool_rows.push(row);
+        }
+    }
+
+    pub fn extend_error_rows<I>(&mut self, rows: I)
+    where
+        I: IntoIterator<Item = Value>,
+    {
+        for row in rows {
+            self.push_error_row(row);
+        }
+    }
+
+    pub fn drain_to_chunk(&mut self) -> Self {
+        let chunk = Self {
+            raw_rows: std::mem::take(&mut self.raw_rows),
+            event_rows: std::mem::take(&mut self.event_rows),
+            link_rows: std::mem::take(&mut self.link_rows),
+            tool_rows: std::mem::take(&mut self.tool_rows),
+            error_rows: std::mem::take(&mut self.error_rows),
+            checkpoint: None,
+            lines_processed: self.lines_processed,
+            approx_bytes: self.approx_bytes,
+        };
+        self.lines_processed = 0;
+        self.approx_bytes = 0;
+        chunk
+    }
+
+    pub fn exceeds_limits(&self, max_rows: usize, max_bytes: usize) -> bool {
+        let max_rows = max_rows.max(1);
+        let max_bytes = max_bytes.max(1);
+        self.row_count() >= max_rows || self.approx_bytes() >= max_bytes
+    }
+}
+
+fn approx_json_row_bytes(row: &Value) -> usize {
+    serde_json::to_vec(row)
+        .map(|bytes| bytes.len().saturating_add(1))
+        .unwrap_or(1)
 }

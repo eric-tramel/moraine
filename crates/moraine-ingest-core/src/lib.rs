@@ -113,7 +113,7 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         .max(1024);
     let (process_tx, mut process_rx) = mpsc::channel::<WorkItem>(process_queue_capacity);
     let (sink_tx, sink_rx) =
-        mpsc::channel::<SinkMessage>(config.ingest.max_inflight_batches.max(16));
+        mpsc::channel::<SinkMessage>(config.ingest.max_inflight_batches.max(1));
     let (watch_path_tx, watch_path_rx) = mpsc::unbounded_channel::<WorkItem>();
 
     let sink_handle = spawn_sink_task(
@@ -185,6 +185,7 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         spawn_watcher_threads(enabled_sources.clone(), watch_path_tx, metrics.clone())?;
 
     if config.ingest.backfill_on_start {
+        let mut backfill_sources = Vec::new();
         for source in &enabled_sources {
             let files = enumerate_tracked_files(&source.glob, source.tracked_extension())?;
             info!(
@@ -193,19 +194,31 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
                 source.name,
                 source.format
             );
-            for path in files {
-                enqueue_work(
-                    WorkItem {
-                        source_name: source.name.clone(),
-                        harness: source.harness.clone(),
-                        format: source.format.clone(),
-                        path,
-                    },
-                    &process_tx,
-                    &dispatch,
-                    &metrics,
-                )
-                .await;
+            backfill_sources.push((source.clone(), files.into_iter()));
+        }
+
+        loop {
+            let mut queued_any = false;
+            for (source, files) in &mut backfill_sources {
+                if let Some(path) = files.next() {
+                    queued_any = true;
+                    enqueue_work(
+                        WorkItem {
+                            source_name: source.name.clone(),
+                            harness: source.harness.clone(),
+                            format: source.format.clone(),
+                            path,
+                        },
+                        &process_tx,
+                        &dispatch,
+                        &metrics,
+                    )
+                    .await;
+                }
+            }
+
+            if !queued_any {
+                break;
             }
         }
     }

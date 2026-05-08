@@ -189,11 +189,12 @@ The `[ingest]` table controls batching and watcher behavior:
 ```toml
 [ingest]
 batch_size = 4000
+max_batch_bytes = 8388608
 flush_interval_seconds = 0.5
 state_dir = "~/.moraine/ingestor"
 backfill_on_start = true
 max_file_workers = 8
-max_inflight_batches = 64
+max_inflight_batches = 16
 ```
 
 ## MCP
