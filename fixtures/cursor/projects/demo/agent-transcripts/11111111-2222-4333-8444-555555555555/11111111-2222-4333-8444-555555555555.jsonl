@@ -1,0 +1,5 @@
+{"timestamp":"2026-02-16T12:00:10.000Z","role":"user","model":"cursor-small","message":{"content":[{"type":"text","text":"local fixture cursor user prompt cursor_fixture_keyword"}]}}
+{"timestamp":"2026-02-16T12:00:11.000Z","role":"assistant","model":"cursor-small","message":{"content":[{"type":"text","text":"I will inspect the target file."},{"type":"tool_use","id":"cursor-tool-fixture","name":"Read","input":{"path":"/workspace/src/main.rs","symbol":"main","range":"1:1-20:1"}}]}}
+{"timestamp":"2026-02-16T12:00:12.000Z","role":"tool","model":"cursor-small","message":{"content":[{"type":"tool_result","tool_use_id":"cursor-tool-fixture","content":[{"type":"text","text":"fn main() { println!(\"cursor fixture\"); }"}],"is_error":false}]}}
+{"timestamp":"2026-02-16T12:00:13.000Z","role":"assistant","model":"cursor-small","message":{"content":[{"type":"reasoning","text":"The file contains a small main function."},{"type":"text","text":"local fixture cursor assistant reply cursor_fixture_keyword cursor_fixture_trace"}]}}
+{"timestamp":"2026-02-16T12:00:14.000Z","role":"assistant","model":"cursor-small","message":{"content":[]}}

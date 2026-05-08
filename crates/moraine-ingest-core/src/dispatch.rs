@@ -1,7 +1,7 @@
 use crate::checkpoint::checkpoint_key;
 use crate::model::{Checkpoint, RowBatch};
 use crate::normalize::{normalize_record, normalize_record_with_ts_hint};
-use crate::sources::shared::parse_record_ts;
+use crate::sources::shared::{format_record_ts, parse_record_ts};
 use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
 use anyhow::{Context, Result};
 use moraine_config::{AppConfig, SOURCE_FORMAT_SESSION_JSON};
@@ -110,7 +110,7 @@ fn infer_initial_record_ts_hint(source_file: &str, offset: u64) -> Option<String
         let mut buf = Vec::<u8>::new();
         let bytes_read = reader.read_until(b'\n', &mut buf).ok()?;
         if bytes_read == 0 {
-            return None;
+            break;
         }
 
         let text = String::from_utf8_lossy(&buf);
@@ -129,6 +129,14 @@ fn infer_initial_record_ts_hint(source_file: &str, offset: u64) -> Option<String
             return Some(record_ts.to_string());
         }
     }
+
+    std::fs::metadata(source_file)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .map(|modified| {
+            let dt: chrono::DateTime<chrono::Utc> = modified.into();
+            format_record_ts(&dt)
+        })
 }
 
 /// Post-process event rows from a single Claude Code record:

@@ -42,6 +42,14 @@ watch_root = "~/.kimi/sessions"
 format = "jsonl"
 
 [[ingest.sources]]
+name = "cursor"
+harness = "cursor"
+enabled = true
+glob = "~/.cursor/projects/*/agent-transcripts/**/*.jsonl"
+watch_root = "~/.cursor/projects"
+format = "jsonl"
+
+[[ingest.sources]]
 name = "pi"
 harness = "pi-coding-agent"
 enabled = true

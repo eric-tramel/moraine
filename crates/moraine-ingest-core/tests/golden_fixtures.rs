@@ -106,7 +106,7 @@ const TOKEN_NATIVE_UNIT_KEYS: &[&str] = &[
     "output_images",
 ];
 
-fn golden_cases() -> [GoldenCase; 6] {
+fn golden_cases() -> [GoldenCase; 7] {
     [
         GoldenCase {
             name: "codex",
@@ -130,6 +130,14 @@ fn golden_cases() -> [GoldenCase; 6] {
             source_name: "golden-kimi-cli",
             fixture_rel: "fixtures/kimi-cli/wire.jsonl",
             source_file: "/fixtures/kimi-cli/wire.jsonl",
+            format: GoldenFormat::Jsonl,
+        },
+        GoldenCase {
+            name: "cursor",
+            harness: "cursor",
+            source_name: "golden-cursor",
+            fixture_rel: "fixtures/cursor/projects/demo/agent-transcripts/11111111-2222-4333-8444-555555555555/11111111-2222-4333-8444-555555555555.jsonl",
+            source_file: "/fixtures/cursor/projects/demo/agent-transcripts/11111111-2222-4333-8444-555555555555/11111111-2222-4333-8444-555555555555.jsonl",
             format: GoldenFormat::Jsonl,
         },
         GoldenCase {

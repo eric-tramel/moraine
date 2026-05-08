@@ -78,8 +78,9 @@ watch_root = "~/.claude/projects"
 format = "jsonl"
 ```
 
-Supported `harness` values are `codex`, `claude-code`, `kimi-cli`, `hermes`,
-and `pi-coding-agent`. Each value maps to a registered ingest source adapter; see
+Supported `harness` values are `codex`, `claude-code`, `cursor`, `kimi-cli`,
+`hermes`, and `pi-coding-agent`. Each value maps to a registered ingest source
+adapter; see
 [Ingest Sources](development/ingest-sources.md) for the adapter contract and
 [Harness Author Workflow](development/harness-author-workflow.md) for source
 development steps.
@@ -104,6 +105,7 @@ The default template in `config/moraine.toml` enables these source families:
 | Codex | `codex` | `~/.codex/sessions/**/*.jsonl` | `~/.codex/sessions` | inferred `jsonl` |
 | Claude Code | `claude-code` | `~/.claude/projects/**/*.jsonl` | `~/.claude/projects` | inferred `jsonl` |
 | Kimi CLI | `kimi-cli` | `~/.kimi/sessions/**/wire.jsonl` | `~/.kimi/sessions` | inferred `jsonl` |
+| Cursor Agent | `cursor` | `~/.cursor/projects/*/agent-transcripts/**/*.jsonl` | `~/.cursor/projects` | inferred `jsonl` |
 | Pi Coding Agent | `pi-coding-agent` | `~/.pi/agent/sessions/**/*.jsonl` | `~/.pi/agent/sessions` | `jsonl` |
 | Hermes live sessions | `hermes` | `~/.hermes/sessions/session_*.json` | `~/.hermes/sessions` | `session_json` |
 | Hermes trajectories | `hermes` | user-provided trajectory JSONL | trajectory output directory | `jsonl` |
@@ -147,6 +149,22 @@ glob = "~/.kimi/sessions/**/wire.jsonl"
 watch_root = "~/.kimi/sessions"
 format = "jsonl"
 ```
+
+Cursor Agent JSONL:
+
+```toml
+[[ingest.sources]]
+name = "cursor"
+harness = "cursor"
+enabled = true
+glob = "~/.cursor/projects/*/agent-transcripts/**/*.jsonl"
+watch_root = "~/.cursor/projects"
+format = "jsonl"
+```
+
+Cursor support watches local Agent JSONL transcripts under
+`agent-transcripts/`. Cursor SQLite workspace history is not ingested by this
+source.
 
 Pi Coding Agent:
 

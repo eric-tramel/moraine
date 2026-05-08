@@ -5,6 +5,7 @@ use std::path::{Component, Path, PathBuf};
 pub const KNOWN_INGEST_HARNESSES: &[&str] = &[
     "codex",
     "claude-code",
+    "cursor",
     "hermes",
     "kimi-cli",
     "pi-coding-agent",
@@ -305,6 +306,14 @@ fn default_sources() -> Vec<IngestSource> {
             enabled: true,
             glob: "~/.kimi/sessions/**/wire.jsonl".to_string(),
             watch_root: "~/.kimi/sessions".to_string(),
+            format: String::new(),
+        },
+        IngestSource {
+            name: "cursor".to_string(),
+            harness: "cursor".to_string(),
+            enabled: true,
+            glob: "~/.cursor/projects/*/agent-transcripts/**/*.jsonl".to_string(),
+            watch_root: "~/.cursor/projects".to_string(),
             format: String::new(),
         },
         IngestSource {
@@ -965,8 +974,9 @@ watch_root = "~/.custom/sessions"
         let err = load_config(&path).expect_err("unknown ingest harness should fail");
         std::fs::remove_file(&path).ok();
         assert!(
-            format!("{err:#}")
-                .contains("expected one of: codex, claude-code, hermes, kimi-cli, pi-coding-agent"),
+            format!("{err:#}").contains(
+                "expected one of: codex, claude-code, cursor, hermes, kimi-cli, pi-coding-agent"
+            ),
             "unexpected error: {err:#}"
         );
     }
@@ -987,8 +997,9 @@ watch_root = "~/.claude/projects"
         let err = load_config(&path).expect_err("legacy `claude` harness value should fail");
         std::fs::remove_file(&path).ok();
         assert!(
-            format!("{err:#}")
-                .contains("expected one of: codex, claude-code, hermes, kimi-cli, pi-coding-agent"),
+            format!("{err:#}").contains(
+                "expected one of: codex, claude-code, cursor, hermes, kimi-cli, pi-coding-agent"
+            ),
             "unexpected error: {err:#}"
         );
     }
@@ -1064,6 +1075,31 @@ watch_root = "~/.kimi/sessions"
             .iter()
             .find(|source| source.harness == "kimi-cli")
             .expect("kimi-cli source");
+        assert_eq!(source.format, SOURCE_FORMAT_JSONL);
+        assert_eq!(source.tracked_extension(), "jsonl");
+    }
+
+    #[test]
+    fn load_config_accepts_cursor_harness_value() {
+        let path = write_temp_config(
+            r#"
+[[ingest.sources]]
+name = "cursor"
+harness = "cursor"
+enabled = true
+glob = "~/.cursor/projects/*/agent-transcripts/**/*.jsonl"
+watch_root = "~/.cursor/projects"
+"#,
+            "cursor-harness",
+        );
+        let cfg = load_config(&path).expect("cursor harness should be accepted");
+        std::fs::remove_file(&path).ok();
+        let source = cfg
+            .ingest
+            .sources
+            .iter()
+            .find(|source| source.harness == "cursor")
+            .expect("cursor source");
         assert_eq!(source.format, SOURCE_FORMAT_JSONL);
         assert_eq!(source.tracked_extension(), "jsonl");
     }
