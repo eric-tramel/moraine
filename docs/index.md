@@ -5,15 +5,15 @@ normalizes them into a ClickHouse database, serves a monitor UI, and exposes an
 MCP server so agents can search prior sessions.
 
 Use Moraine when you want a private record of what your agents did across
-harnesses such as Codex, Claude Code, Kimi CLI, and Hermes. The default setup
-runs on your machine and writes runtime state under `~/.moraine`.
+harnesses such as Codex, Claude Code, Cursor, Kimi CLI, and Hermes. The
+default setup runs on your machine and writes runtime state under `~/.moraine`.
 
 ## What You Get
 
 - **Unified trace database.** Conversation turns, tool calls, token counts, and
   timestamps land in ClickHouse under a consistent schema.
-- **Realtime local ingest.** Moraine watches Codex, Claude Code, Kimi CLI, and
-  Hermes session files and backfills existing history on startup.
+- **Realtime local ingest.** Moraine watches Codex, Claude Code, Cursor, Kimi
+  CLI, and Hermes session files and backfills existing history on startup.
 - **Monitor UI.** Browse sessions, inspect indexing health, and check what has
   been captured at `http://127.0.0.1:8080`.
 - **MCP retrieval.** Agents can search prior decisions, fixes, errors, and

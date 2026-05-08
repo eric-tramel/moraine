@@ -18,6 +18,7 @@ all rows that leave the adapter.
 | `codex` | `sources/codex.rs` | `openai` | `jsonl` | OpenAI/Codex events, response items, tool calls, compaction, token counts. |
 | `claude-code` | `sources/claude_code.rs` | `anthropic` | `jsonl` | Claude Code message blocks, operational records, parent/tool external links. |
 | `kimi-cli` | `sources/kimi_cli.rs` | `moonshot` | `jsonl` | Kimi `wire.jsonl`; skips metadata headers and drops parent `SubagentEvent` rows. |
+| `cursor` | `sources/cursor.rs` | `cursor` | `jsonl` | Cursor Agent transcripts under `agent-transcripts/`; text blocks, tool-use blocks, and local file references. |
 | `hermes` | `sources/hermes.rs` | record-derived | `jsonl` or `session_json` | ShareGPT trajectories and live Hermes session JSON with vendor/model splitting. |
 
 ## Adapter Contract

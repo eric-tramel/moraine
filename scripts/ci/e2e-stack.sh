@@ -234,6 +234,8 @@ main() {
   local codex_keyword="${base_keyword}_codex_${run_stamp}"
   local claude_keyword="${base_keyword}_claude_${run_stamp}"
   local kimi_keyword="${base_keyword}_kimi_${run_stamp}"
+  local cursor_keyword="${base_keyword}_cursor_${run_stamp}"
+  local cursor_fallback_keyword="${base_keyword}_cursor_fallback_${run_stamp}"
   local hermes_keyword="${base_keyword}_hermes_trajectory_${run_stamp}"
   local hermes_session_keyword="${base_keyword}_hermes_session_${run_stamp}"
   local clickhouse_database="moraine"
@@ -245,11 +247,18 @@ main() {
   local claude_session_id="00000000-0000-4000-8000-${claude_session_suffix}"
   local kimi_session_id="kimi-${run_stamp}"
   local kimi_raw_session_id="kimi-cli:${kimi_session_id}"
+  local cursor_session_suffix
+  cursor_session_suffix="$(printf '%06x%06x' "$RANDOM" "$RANDOM")"
+  local cursor_session_id="00000000-0000-4000-8000-${cursor_session_suffix}"
+  local cursor_fallback_session_suffix
+  cursor_fallback_session_suffix="$(printf '%06x%06x' "$RANDOM" "$RANDOM")"
+  local cursor_fallback_session_id="00000000-0000-4000-8000-${cursor_fallback_session_suffix}"
   local hermes_session_id="session_${run_stamp}"
   local hermes_raw_session_id="hermes:${hermes_session_id}"
   local codex_trace_marker="mcp_codex_trace_marker_${run_stamp}"
   local claude_trace_marker="mcp_claude_trace_marker_${run_stamp}"
   local kimi_trace_marker="mcp_kimi_trace_marker_${run_stamp}"
+  local cursor_trace_marker="mcp_cursor_trace_marker_${run_stamp}"
   local hermes_trace_marker="mcp_hermes_trace_marker_${run_stamp}"
   local hermes_session_trace_marker="mcp_hermes_session_trace_marker_${run_stamp}"
 
@@ -278,12 +287,16 @@ main() {
   local codex_fixture_file="$fixtures_root/codex/sessions/2026/02/16/session-${codex_session_id}.jsonl"
   local claude_fixture_file="$fixtures_root/claude/projects/e2e/session-${claude_session_id}.jsonl"
   local kimi_fixture_file="$fixtures_root/kimi/sessions/${kimi_session_id}/wire.jsonl"
+  local cursor_fixture_file="$fixtures_root/cursor/projects/e2e/agent-transcripts/${cursor_session_id}/${cursor_session_id}.jsonl"
+  local cursor_fallback_fixture_file="$fixtures_root/cursor/projects/e2e-fallback/agent-transcripts/${cursor_fallback_session_id}/${cursor_fallback_session_id}.jsonl"
   local hermes_fixture_file="$fixtures_root/hermes/trajectories/001-${run_stamp}.jsonl"
   local hermes_session_fixture_file="$fixtures_root/hermes/sessions/${hermes_session_id}.json"
 
   mkdir -p "$(dirname "$codex_fixture_file")"
   mkdir -p "$(dirname "$claude_fixture_file")"
   mkdir -p "$(dirname "$kimi_fixture_file")"
+  mkdir -p "$(dirname "$cursor_fixture_file")"
+  mkdir -p "$(dirname "$cursor_fallback_fixture_file")"
   mkdir -p "$(dirname "$hermes_fixture_file")"
   mkdir -p "$(dirname "$hermes_session_fixture_file")"
   mkdir -p "$runtime_root"
@@ -314,6 +327,22 @@ EOF
 {"timestamp":1771243206.500000,"message":{"type":"ToolResult","payload":{"tool_call_id":"kimi-tool-${run_stamp}","return_value":{"is_error":false,"output":"{\"ok\":true}","message":"Read file","display":[],"extras":null}}}}
 {"timestamp":1771243207.000000,"message":{"type":"StatusUpdate","payload":{"context_usage":0.1,"context_tokens":100,"max_context_tokens":1000,"token_usage":{"input_other":10,"output":5,"input_cache_read":2,"input_cache_creation":1},"message_id":"chatcmpl-${run_stamp}","plan_mode":false,"mcp_status":null}}}
 {"timestamp":1771243207.500000,"message":{"type":"SubagentEvent","payload":{"agent_id":"sub-${run_stamp}","event":{"type":"ContentPart","payload":{"type":"text","text":"sub-agent echo"}}}}}
+EOF
+
+  # Cursor Agent transcripts observed under ~/.cursor/projects/.../agent-transcripts
+  # use role/message envelopes. This deterministic fixture stays inside the
+  # MCP smoke test window; the small fixture below covers timestamp-less files.
+  cat > "$cursor_fixture_file" <<EOF
+{"timestamp":"2026-02-16T12:00:10.000Z","role":"user","message":{"content":[{"type":"text","text":"local e2e cursor user prompt ${cursor_keyword}"}]}}
+{"timestamp":"2026-02-16T12:00:11.000Z","role":"assistant","message":{"content":[{"type":"text","text":"I will inspect the target file."},{"type":"tool_use","id":"cursor-tool-${run_stamp}","name":"Read","input":{"path":"/workspace/cursor-e2e.txt","filename":"cursor-e2e.txt","symbol":"cursorE2e"}}]}}
+{"timestamp":"2026-02-16T12:00:12.000Z","role":"tool","message":{"content":[{"type":"tool_result","tool_use_id":"cursor-tool-${run_stamp}","content":[{"type":"text","text":"cursor tool output"}],"is_error":false}]}}
+{"timestamp":"2026-02-16T12:00:13.000Z","role":"assistant","message":{"content":[{"type":"text","text":"local e2e cursor assistant reply ${cursor_keyword} ${cursor_trace_marker}"}]}}
+EOF
+
+  # Cursor JSONL files can omit per-row timestamps. This file proves ingest
+  # still assigns a usable event timestamp from the append-only file metadata.
+  cat > "$cursor_fallback_fixture_file" <<EOF
+{"role":"user","message":{"content":[{"type":"text","text":"local e2e cursor fallback prompt ${cursor_fallback_keyword}"}]}}
 EOF
 
   # Hermes ShareGPT trajectory: one completed rollout per line. Exercises a
@@ -423,6 +452,13 @@ glob = "${fixtures_root}/kimi/sessions/**/wire.jsonl"
 watch_root = "${fixtures_root}/kimi/sessions"
 
 [[ingest.sources]]
+name = "ci-cursor"
+harness = "cursor"
+enabled = true
+glob = "${fixtures_root}/cursor/projects/*/agent-transcripts/**/*.jsonl"
+watch_root = "${fixtures_root}/cursor/projects"
+
+[[ingest.sources]]
 name = "ci-hermes-trajectory"
 harness = "hermes"
 enabled = true
@@ -457,6 +493,8 @@ EOF
   echo "[e2e] codex fixture: ${codex_fixture_file}"
   echo "[e2e] claude fixture: ${claude_fixture_file}"
   echo "[e2e] kimi fixture: ${kimi_fixture_file}"
+  echo "[e2e] cursor fixture: ${cursor_fixture_file}"
+  echo "[e2e] cursor fallback fixture: ${cursor_fallback_fixture_file}"
   echo "[e2e] hermes fixture: ${hermes_fixture_file}"
   echo "[e2e] hermes session fixture: ${hermes_session_fixture_file}"
 
@@ -480,6 +518,11 @@ EOF
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${claude_keyword}'" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${kimi_keyword}') > 0" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${kimi_keyword}'" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${cursor_keyword}') > 0" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${cursor_keyword}'" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.event_links WHERE source_name = 'ci-cursor' AND linked_external_id = '/workspace/cursor-e2e.txt'" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.tool_io WHERE source_name = 'ci-cursor' AND tool_call_id = 'cursor-tool-${run_stamp}'" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events WHERE source_name = 'ci-cursor' AND session_id = '${cursor_fallback_session_id}' AND positionCaseInsensitiveUTF8(text_content, '${cursor_fallback_keyword}') > 0" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${hermes_keyword}') > 0" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${hermes_keyword}'" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${hermes_session_keyword}') > 0" 120
@@ -512,6 +555,14 @@ EOF
   assert_clickhouse_count "$clickhouse_url" "kimi domain fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kimi' AND harness = 'kimi-cli' AND inference_provider = 'moonshot' AND session_id = '${kimi_raw_session_id}' AND model = 'kimi-cli'" "7"
   assert_clickhouse_count "$clickhouse_url" "kimi token buckets" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kimi' AND payload_type = 'token_count' AND input_tokens = 13 AND output_tokens = 5 AND cache_read_tokens = 2 AND cache_write_tokens = 1 AND token_usage_buckets['input_text'] = 10 AND token_usage_buckets['output_text'] = 5 AND token_usage_buckets['input_cache_read'] = 2 AND token_usage_buckets['input_cache_write'] = 1" "1"
 
+  assert_clickhouse_count "$clickhouse_url" "cursor unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-cursor'" "5"
+  assert_clickhouse_count "$clickhouse_url" "cursor event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-cursor'" "6"
+  assert_clickhouse_count "$clickhouse_url" "cursor file link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-cursor' AND linked_external_id = '/workspace/cursor-e2e.txt'" "1"
+  assert_clickhouse_count "$clickhouse_url" "cursor file path searchable" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-cursor' AND event_kind = 'tool_call' AND position(text_content, '/workspace/cursor-e2e.txt') > 0" "1"
+  assert_clickhouse_count "$clickhouse_url" "cursor tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-cursor' AND tool_call_id = 'cursor-tool-${run_stamp}'" "2"
+  assert_clickhouse_count "$clickhouse_url" "cursor domain fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-cursor' AND harness = 'cursor' AND inference_provider = 'cursor' AND session_id = '${cursor_session_id}'" "5"
+  assert_clickhouse_count "$clickhouse_url" "cursor timestamp fallback" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-cursor' AND session_id = '${cursor_fallback_session_id}' AND event_ts > toDateTime64('2026-01-01', 3)" "1"
+
   assert_clickhouse_count "$clickhouse_url" "hermes trajectory unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-hermes-trajectory'" "1"
   assert_clickhouse_count "$clickhouse_url" "hermes trajectory event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-hermes-trajectory'" "6"
   assert_clickhouse_count "$clickhouse_url" "hermes trajectory link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-hermes-trajectory'" "0"
@@ -523,7 +574,7 @@ EOF
   assert_clickhouse_count "$clickhouse_url" "hermes session link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-hermes-session'" "0"
   assert_clickhouse_count "$clickhouse_url" "hermes session tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-hermes-session' AND tool_call_id = 'hermes-session-tool-${run_stamp}' AND tool_name = 'shell'" "2"
   assert_clickhouse_count "$clickhouse_url" "hermes session domain fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-hermes-session' AND harness = 'hermes' AND inference_provider = 'anthropic' AND session_id = '${hermes_raw_session_id}' AND model = 'claude-opus-4-6'" "6"
-  assert_clickhouse_count "$clickhouse_url" "token bucket map keys on all events" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE hasAll(mapKeys(token_usage_buckets), ['input_text', 'output_text', 'input_cache_read', 'input_cache_write', 'reasoning'])" "31"
+  assert_clickhouse_count "$clickhouse_url" "token bucket map keys on all events" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE hasAll(mapKeys(token_usage_buckets), ['input_text', 'output_text', 'input_cache_read', 'input_cache_write', 'reasoning'])" "37"
 
   local hermes_trajectory_session_id
   hermes_trajectory_session_id="$(clickhouse_scalar "$clickhouse_url" "SELECT any(session_id) FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-hermes-trajectory'")"
@@ -565,6 +616,15 @@ EOF
     --expect-session-id "$kimi_raw_session_id" \
     --expect-source-file "$kimi_fixture_file" \
     --expect-open-text "$kimi_trace_marker"
+
+  echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (cursor)"
+  "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --query "$cursor_keyword" \
+    --expect-session-id "$cursor_session_id" \
+    --expect-source-file "$cursor_fixture_file" \
+    --expect-open-text "$cursor_trace_marker"
 
   # Hermes synthesizes its own `hermes:<uid>` session id, so we do not pin
   # --expect-session-id; source file + trace marker are enough to prove the

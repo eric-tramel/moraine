@@ -3,6 +3,7 @@ use std::sync::OnceLock;
 
 pub(crate) mod claude_code;
 pub(crate) mod codex;
+pub(crate) mod cursor;
 pub(crate) mod emitter;
 pub(crate) mod hermes;
 pub(crate) mod kimi_cli;
@@ -170,6 +171,7 @@ pub(crate) fn registry() -> &'static SourceRegistry {
         SourceRegistry::new()
             .register(&codex::CODEX)
             .register(&claude_code::CLAUDE_CODE)
+            .register(&cursor::CURSOR)
             .register(&hermes::HERMES)
             .register(&kimi_cli::KIMI_CLI)
     })
