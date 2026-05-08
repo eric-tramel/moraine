@@ -106,7 +106,7 @@ const TOKEN_NATIVE_UNIT_KEYS: &[&str] = &[
     "output_images",
 ];
 
-fn golden_cases() -> [GoldenCase; 5] {
+fn golden_cases() -> [GoldenCase; 6] {
     [
         GoldenCase {
             name: "codex",
@@ -147,6 +147,14 @@ fn golden_cases() -> [GoldenCase; 5] {
             fixture_rel: "fixtures/hermes/sessions/session_20260418_142200_live01.json",
             source_file: "/fixtures/hermes/sessions/session_20260418_142200_live01.json",
             format: GoldenFormat::HermesSessionJson,
+        },
+        GoldenCase {
+            name: "pi_coding_agent",
+            harness: "pi-coding-agent",
+            source_name: "golden-pi",
+            fixture_rel: "fixtures/pi/session.jsonl",
+            source_file: "/fixtures/pi/session.jsonl",
+            format: GoldenFormat::Jsonl,
         },
     ]
 }

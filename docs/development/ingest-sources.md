@@ -19,6 +19,7 @@ all rows that leave the adapter.
 | `claude-code` | `sources/claude_code.rs` | `anthropic` | `jsonl` | Claude Code message blocks, operational records, parent/tool external links. |
 | `kimi-cli` | `sources/kimi_cli.rs` | `moonshot` | `jsonl` | Kimi `wire.jsonl`; skips metadata headers and drops parent `SubagentEvent` rows. |
 | `hermes` | `sources/hermes.rs` | record-derived | `jsonl` or `session_json` | ShareGPT trajectories and live Hermes session JSON with vendor/model splitting. |
+| `pi-coding-agent` | `sources/pi.rs` | record-derived | `jsonl` | Pi session JSONL trees, model/thinking metadata, assistant tool calls, tool results, and parent links. |
 
 ## Adapter Contract
 

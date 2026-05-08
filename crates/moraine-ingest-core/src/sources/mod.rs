@@ -6,6 +6,7 @@ pub(crate) mod codex;
 pub(crate) mod emitter;
 pub(crate) mod hermes;
 pub(crate) mod kimi_cli;
+pub(crate) mod pi;
 pub(crate) mod record_view;
 pub(crate) mod shared;
 
@@ -172,6 +173,7 @@ pub(crate) fn registry() -> &'static SourceRegistry {
             .register(&claude_code::CLAUDE_CODE)
             .register(&hermes::HERMES)
             .register(&kimi_cli::KIMI_CLI)
+            .register(&pi::PI_CODING_AGENT)
     })
 }
 

@@ -2,7 +2,13 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Component, Path, PathBuf};
 
-pub const KNOWN_INGEST_HARNESSES: &[&str] = &["codex", "claude-code", "hermes", "kimi-cli"];
+pub const KNOWN_INGEST_HARNESSES: &[&str] = &[
+    "codex",
+    "claude-code",
+    "hermes",
+    "kimi-cli",
+    "pi-coding-agent",
+];
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -299,6 +305,14 @@ fn default_sources() -> Vec<IngestSource> {
             enabled: true,
             glob: "~/.kimi/sessions/**/wire.jsonl".to_string(),
             watch_root: "~/.kimi/sessions".to_string(),
+            format: String::new(),
+        },
+        IngestSource {
+            name: "pi".to_string(),
+            harness: "pi-coding-agent".to_string(),
+            enabled: true,
+            glob: "~/.pi/agent/sessions/**/*.jsonl".to_string(),
+            watch_root: "~/.pi/agent/sessions".to_string(),
             format: String::new(),
         },
     ]
@@ -951,7 +965,8 @@ watch_root = "~/.custom/sessions"
         let err = load_config(&path).expect_err("unknown ingest harness should fail");
         std::fs::remove_file(&path).ok();
         assert!(
-            format!("{err:#}").contains("expected one of: codex, claude-code, hermes, kimi-cli"),
+            format!("{err:#}")
+                .contains("expected one of: codex, claude-code, hermes, kimi-cli, pi-coding-agent"),
             "unexpected error: {err:#}"
         );
     }
@@ -972,7 +987,8 @@ watch_root = "~/.claude/projects"
         let err = load_config(&path).expect_err("legacy `claude` harness value should fail");
         std::fs::remove_file(&path).ok();
         assert!(
-            format!("{err:#}").contains("expected one of: codex, claude-code, hermes, kimi-cli"),
+            format!("{err:#}")
+                .contains("expected one of: codex, claude-code, hermes, kimi-cli, pi-coding-agent"),
             "unexpected error: {err:#}"
         );
     }
@@ -1048,6 +1064,31 @@ watch_root = "~/.kimi/sessions"
             .iter()
             .find(|source| source.harness == "kimi-cli")
             .expect("kimi-cli source");
+        assert_eq!(source.format, SOURCE_FORMAT_JSONL);
+        assert_eq!(source.tracked_extension(), "jsonl");
+    }
+
+    #[test]
+    fn load_config_accepts_pi_coding_agent_harness_value() {
+        let path = write_temp_config(
+            r#"
+[[ingest.sources]]
+name = "pi"
+harness = "pi-coding-agent"
+enabled = true
+glob = "~/.pi/agent/sessions/**/*.jsonl"
+watch_root = "~/.pi/agent/sessions"
+"#,
+            "pi-coding-agent-harness",
+        );
+        let cfg = load_config(&path).expect("pi-coding-agent harness should be accepted");
+        std::fs::remove_file(&path).ok();
+        let source = cfg
+            .ingest
+            .sources
+            .iter()
+            .find(|source| source.harness == "pi-coding-agent")
+            .expect("pi source");
         assert_eq!(source.format, SOURCE_FORMAT_JSONL);
         assert_eq!(source.tracked_extension(), "jsonl");
     }

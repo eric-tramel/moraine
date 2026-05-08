@@ -234,6 +234,7 @@ main() {
   local codex_keyword="${base_keyword}_codex_${run_stamp}"
   local claude_keyword="${base_keyword}_claude_${run_stamp}"
   local kimi_keyword="${base_keyword}_kimi_${run_stamp}"
+  local pi_keyword="${base_keyword}_pi_${run_stamp}"
   local hermes_keyword="${base_keyword}_hermes_trajectory_${run_stamp}"
   local hermes_session_keyword="${base_keyword}_hermes_session_${run_stamp}"
   local clickhouse_database="moraine"
@@ -245,11 +246,15 @@ main() {
   local claude_session_id="00000000-0000-4000-8000-${claude_session_suffix}"
   local kimi_session_id="kimi-${run_stamp}"
   local kimi_raw_session_id="kimi-cli:${kimi_session_id}"
+  local pi_session_suffix
+  pi_session_suffix="$(printf '%06x%06x' "$RANDOM" "$RANDOM")"
+  local pi_session_id="00000000-0000-4000-8000-${pi_session_suffix}"
   local hermes_session_id="session_${run_stamp}"
   local hermes_raw_session_id="hermes:${hermes_session_id}"
   local codex_trace_marker="mcp_codex_trace_marker_${run_stamp}"
   local claude_trace_marker="mcp_claude_trace_marker_${run_stamp}"
   local kimi_trace_marker="mcp_kimi_trace_marker_${run_stamp}"
+  local pi_trace_marker="mcp_pi_trace_marker_${run_stamp}"
   local hermes_trace_marker="mcp_hermes_trace_marker_${run_stamp}"
   local hermes_session_trace_marker="mcp_hermes_session_trace_marker_${run_stamp}"
 
@@ -278,12 +283,14 @@ main() {
   local codex_fixture_file="$fixtures_root/codex/sessions/2026/02/16/session-${codex_session_id}.jsonl"
   local claude_fixture_file="$fixtures_root/claude/projects/e2e/session-${claude_session_id}.jsonl"
   local kimi_fixture_file="$fixtures_root/kimi/sessions/${kimi_session_id}/wire.jsonl"
+  local pi_fixture_file="$fixtures_root/pi/agent/sessions/--tmp-moraine-e2e--/2026-02-16T12-00-08-000Z_${pi_session_id}.jsonl"
   local hermes_fixture_file="$fixtures_root/hermes/trajectories/001-${run_stamp}.jsonl"
   local hermes_session_fixture_file="$fixtures_root/hermes/sessions/${hermes_session_id}.json"
 
   mkdir -p "$(dirname "$codex_fixture_file")"
   mkdir -p "$(dirname "$claude_fixture_file")"
   mkdir -p "$(dirname "$kimi_fixture_file")"
+  mkdir -p "$(dirname "$pi_fixture_file")"
   mkdir -p "$(dirname "$hermes_fixture_file")"
   mkdir -p "$(dirname "$hermes_session_fixture_file")"
   mkdir -p "$runtime_root"
@@ -314,6 +321,16 @@ EOF
 {"timestamp":1771243206.500000,"message":{"type":"ToolResult","payload":{"tool_call_id":"kimi-tool-${run_stamp}","return_value":{"is_error":false,"output":"{\"ok\":true}","message":"Read file","display":[],"extras":null}}}}
 {"timestamp":1771243207.000000,"message":{"type":"StatusUpdate","payload":{"context_usage":0.1,"context_tokens":100,"max_context_tokens":1000,"token_usage":{"input_other":10,"output":5,"input_cache_read":2,"input_cache_creation":1},"message_id":"chatcmpl-${run_stamp}","plan_mode":false,"mcp_status":null}}}
 {"timestamp":1771243207.500000,"message":{"type":"SubagentEvent","payload":{"agent_id":"sub-${run_stamp}","event":{"type":"ContentPart","payload":{"type":"text","text":"sub-agent echo"}}}}}
+EOF
+
+  cat > "$pi_fixture_file" <<EOF
+{"type":"session","version":3,"id":"${pi_session_id}","timestamp":"2026-02-16T12:00:08.000Z","cwd":"${tmp_root}"}
+{"type":"model_change","id":"pi-model-${run_stamp}","parentId":null,"timestamp":"2026-02-16T12:00:08.100Z","provider":"openai","modelId":"gpt-5.2-chat-latest"}
+{"type":"thinking_level_change","id":"pi-thinking-${run_stamp}","parentId":"pi-model-${run_stamp}","timestamp":"2026-02-16T12:00:08.200Z","thinkingLevel":"high"}
+{"type":"message","id":"pi-user-${run_stamp}","parentId":"pi-thinking-${run_stamp}","timestamp":"2026-02-16T12:00:09.000Z","message":{"role":"user","content":[{"type":"text","text":"local e2e pi user prompt ${pi_keyword}"}],"timestamp":1771243209000}}
+{"type":"message","id":"pi-assistant-${run_stamp}","parentId":"pi-user-${run_stamp}","timestamp":"2026-02-16T12:00:10.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"Need to inspect package metadata."},{"type":"text","text":"local e2e pi assistant reply ${pi_keyword} ${pi_trace_marker}"},{"type":"toolCall","id":"pi-tool-${run_stamp}","name":"read","arguments":{"path":"Cargo.toml"}}],"api":"chat","provider":"openai","model":"gpt-5.2-chat-latest","usage":{"input":16,"output":8,"cacheRead":2,"cacheWrite":1,"totalTokens":27,"cost":{"input":0.001,"output":0.002,"cacheRead":0.0001,"cacheWrite":0.0002,"total":0.0033}},"stopReason":"toolUse","timestamp":1771243210000}}
+{"type":"message","id":"pi-tool-result-${run_stamp}","parentId":"pi-assistant-${run_stamp}","timestamp":"2026-02-16T12:00:11.000Z","message":{"role":"toolResult","toolCallId":"pi-tool-${run_stamp}","toolName":"read","content":[{"type":"text","text":"workspace = true"}],"isError":false,"timestamp":1771243211000}}
+{"type":"session_info","id":"pi-info-${run_stamp}","parentId":"pi-tool-result-${run_stamp}","timestamp":"2026-02-16T12:00:12.000Z","name":"Pi e2e ${run_stamp}"}
 EOF
 
   # Hermes ShareGPT trajectory: one completed rollout per line. Exercises a
@@ -423,6 +440,14 @@ glob = "${fixtures_root}/kimi/sessions/**/wire.jsonl"
 watch_root = "${fixtures_root}/kimi/sessions"
 
 [[ingest.sources]]
+name = "ci-pi"
+harness = "pi-coding-agent"
+format = "jsonl"
+enabled = true
+glob = "${fixtures_root}/pi/agent/sessions/**/*.jsonl"
+watch_root = "${fixtures_root}/pi/agent/sessions"
+
+[[ingest.sources]]
 name = "ci-hermes-trajectory"
 harness = "hermes"
 enabled = true
@@ -457,6 +482,7 @@ EOF
   echo "[e2e] codex fixture: ${codex_fixture_file}"
   echo "[e2e] claude fixture: ${claude_fixture_file}"
   echo "[e2e] kimi fixture: ${kimi_fixture_file}"
+  echo "[e2e] pi fixture: ${pi_fixture_file}"
   echo "[e2e] hermes fixture: ${hermes_fixture_file}"
   echo "[e2e] hermes session fixture: ${hermes_session_fixture_file}"
 
@@ -480,6 +506,8 @@ EOF
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${claude_keyword}'" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${kimi_keyword}') > 0" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${kimi_keyword}'" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${pi_keyword}') > 0" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${pi_keyword}'" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${hermes_keyword}') > 0" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${hermes_keyword}'" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${hermes_session_keyword}') > 0" 120
@@ -512,6 +540,15 @@ EOF
   assert_clickhouse_count "$clickhouse_url" "kimi domain fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kimi' AND harness = 'kimi-cli' AND inference_provider = 'moonshot' AND session_id = '${kimi_raw_session_id}' AND model = 'kimi-cli'" "7"
   assert_clickhouse_count "$clickhouse_url" "kimi token buckets" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kimi' AND payload_type = 'token_count' AND input_tokens = 13 AND output_tokens = 5 AND cache_read_tokens = 2 AND cache_write_tokens = 1 AND token_usage_buckets['input_text'] = 10 AND token_usage_buckets['output_text'] = 5 AND token_usage_buckets['input_cache_read'] = 2 AND token_usage_buckets['input_cache_write'] = 1" "1"
 
+  assert_clickhouse_count "$clickhouse_url" "pi unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-pi'" "7"
+  assert_clickhouse_count "$clickhouse_url" "pi event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-pi'" "9"
+  assert_clickhouse_count "$clickhouse_url" "pi link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-pi' AND link_type = 'parent_event'" "7"
+  assert_clickhouse_count "$clickhouse_url" "pi tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-pi' AND tool_call_id = 'pi-tool-${run_stamp}'" "2"
+  assert_clickhouse_count "$clickhouse_url" "pi harness/session fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-pi' AND harness = 'pi-coding-agent' AND session_id = '${pi_session_id}'" "9"
+  assert_clickhouse_count "$clickhouse_url" "pi provider fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-pi' AND inference_provider = 'openai'" "4"
+  assert_clickhouse_count "$clickhouse_url" "pi model fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-pi' AND model = 'gpt-5.2-chat-latest'" "6"
+  assert_clickhouse_count "$clickhouse_url" "pi token buckets" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-pi' AND payload_type = 'thinking' AND input_tokens = 19 AND output_tokens = 8 AND cache_read_tokens = 2 AND cache_write_tokens = 1 AND token_usage_buckets['input_text'] = 16 AND token_usage_buckets['output_text'] = 8 AND token_usage_buckets['input_cache_read'] = 2 AND token_usage_buckets['input_cache_write'] = 1" "1"
+
   assert_clickhouse_count "$clickhouse_url" "hermes trajectory unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-hermes-trajectory'" "1"
   assert_clickhouse_count "$clickhouse_url" "hermes trajectory event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-hermes-trajectory'" "6"
   assert_clickhouse_count "$clickhouse_url" "hermes trajectory link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-hermes-trajectory'" "0"
@@ -523,7 +560,7 @@ EOF
   assert_clickhouse_count "$clickhouse_url" "hermes session link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-hermes-session'" "0"
   assert_clickhouse_count "$clickhouse_url" "hermes session tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-hermes-session' AND tool_call_id = 'hermes-session-tool-${run_stamp}' AND tool_name = 'shell'" "2"
   assert_clickhouse_count "$clickhouse_url" "hermes session domain fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-hermes-session' AND harness = 'hermes' AND inference_provider = 'anthropic' AND session_id = '${hermes_raw_session_id}' AND model = 'claude-opus-4-6'" "6"
-  assert_clickhouse_count "$clickhouse_url" "token bucket map keys on all events" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE hasAll(mapKeys(token_usage_buckets), ['input_text', 'output_text', 'input_cache_read', 'input_cache_write', 'reasoning'])" "31"
+  assert_clickhouse_count "$clickhouse_url" "token bucket map keys on all events" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE hasAll(mapKeys(token_usage_buckets), ['input_text', 'output_text', 'input_cache_read', 'input_cache_write', 'reasoning'])" "40"
 
   local hermes_trajectory_session_id
   hermes_trajectory_session_id="$(clickhouse_scalar "$clickhouse_url" "SELECT any(session_id) FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-hermes-trajectory'")"
@@ -533,11 +570,14 @@ EOF
   fi
 
   echo "[e2e] checking monitor API routes"
-  for path in /api/health /api/status /api/analytics /api/web-searches; do
+  for path in /api/health /api/status /api/analytics /api/web-searches /api/sessions; do
     local body
     body="$(curl -fsS "http://127.0.0.1:${monitor_port}${path}")"
     printf '%s' "$body" | json_ok_true "$python_bin"
   done
+  local sessions_body
+  sessions_body="$(curl -fsS "http://127.0.0.1:${monitor_port}/api/sessions?since=all&limit=200")"
+  printf '%s' "$sessions_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; ok=any(s.get("id")==sid and s.get("harness",{}).get("id")=="pi-coding-agent" for s in data.get("sessions", [])); sys.exit(0 if ok else 1)' "$pi_session_id"
 
   echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (codex)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
@@ -565,6 +605,15 @@ EOF
     --expect-session-id "$kimi_raw_session_id" \
     --expect-source-file "$kimi_fixture_file" \
     --expect-open-text "$kimi_trace_marker"
+
+  echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (pi)"
+  "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --query "$pi_keyword" \
+    --expect-session-id "$pi_session_id" \
+    --expect-source-file "$pi_fixture_file" \
+    --expect-open-text "$pi_trace_marker"
 
   # Hermes synthesizes its own `hermes:<uid>` session id, so we do not pin
   # --expect-session-id; source file + trace marker are enough to prove the
