@@ -36,5 +36,5 @@ local stack.
 Read [Configuration](configuration.md) when you need to change watched sources,
 ports, ClickHouse settings, MCP defaults, or runtime paths.
 
-Read [MCP Search Interface Specification](mcp-search-interface-spec.md) for the
-concrete `search_sessions` and `open` tool contracts.
+Read [Agent MCP Search](agent-mcp-search/index.md) to connect agent harnesses,
+write effective search instructions, and understand the MCP retrieval tools.

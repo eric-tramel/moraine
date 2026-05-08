@@ -26,7 +26,7 @@ change across minor releases.
 - [Introduction](https://eric-tramel.github.io/moraine/)
 - [Quickstart and Installation](https://eric-tramel.github.io/moraine/quickstart.html)
 - [Configuration](https://eric-tramel.github.io/moraine/configuration.html)
-- [MCP Search Interface Specification](https://eric-tramel.github.io/moraine/mcp-search-interface-spec.html)
+- [Agent MCP Search](https://eric-tramel.github.io/moraine/agent-mcp-search/index.html)
 
 ## Quickstart
 

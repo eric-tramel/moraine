@@ -13,6 +13,13 @@ nav = [
   { "Introduction" = "index.md" },
   { "Quickstart and Installation" = "quickstart.md" },
   { "Configuration" = "configuration.md" },
+  { "Agent MCP Search" = [
+    { "Overview" = "agent-mcp-search/index.md" },
+    { "Install by Harness" = "agent-mcp-search/install.md" },
+    { "Patterns" = "agent-mcp-search/patterns.md" },
+    { "MCP Interface" = "agent-mcp-search/interface.md" },
+    { "Interface Specification" = "mcp-search-interface-spec.md" },
+  ] },
   { "Development" = [
     { "Ingest Sources" = "development/ingest-sources.md" },
     { "Harness Author Workflow" = "development/harness-author-workflow.md" },

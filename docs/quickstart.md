@@ -51,27 +51,32 @@ status output should show fresh ingest activity.
 
 ## Add MCP Retrieval
 
-For Claude Code, add Moraine to `.mcp.json`:
+Moraine MCP search runs as a local stdio MCP server. Each agent harness starts
+`moraine run mcp` when it needs the tools, so keep the Moraine stack running
+with `moraine up`.
 
-```json
-{
-  "mcpServers": {
-    "moraine": {
-      "command": "moraine",
-      "args": ["run", "mcp"]
-    }
-  }
-}
-```
-
-For Codex, add the MCP server from a shell:
+Add Moraine to Codex globally:
 
 ```bash
 codex mcp add moraine -- moraine run mcp
 ```
 
+Add Moraine to Claude Code for all projects:
+
+```bash
+claude mcp add --transport stdio --scope user moraine -- moraine run mcp
+```
+
+Add Moraine to Hermes:
+
+```bash
+hermes mcp add moraine --command moraine --args run mcp
+```
+
 The MCP server uses the same config resolution rules as the rest of Moraine, with
 `MORAINE_MCP_CONFIG` taking precedence over the generic `MORAINE_CONFIG`.
+For Cursor, Kimi CLI, Pi, project-scoped Claude Code, and other clients, see
+[Agent MCP Search](agent-mcp-search/install.md).
 
 ## Common Commands
 
