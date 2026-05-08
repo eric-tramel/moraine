@@ -4,6 +4,7 @@ export type HarnessId =
   | 'claude-code'
   | 'codex'
   | 'hermes'
+  | 'pi-coding-agent'
   | 'cursor'
   | 'aider'
   | 'cli'
