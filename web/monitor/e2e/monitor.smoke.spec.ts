@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 
 function analyticsFixture(range: string) {
   const rangeMap: Record<string, { label: string; bucket_seconds: number }> = {
@@ -51,7 +51,7 @@ function analyticsFixture(range: string) {
   };
 }
 
-test('loads dashboard and handles core interactions', async ({ page }) => {
+async function setupMockMonitorApi(page: Page): Promise<void> {
   await page.route('**/api/health', async (route) => {
     await route.fulfill({
       json: {
@@ -95,7 +95,30 @@ test('loads dashboard and handles core interactions', async ({ page }) => {
       json: analyticsFixture(range),
     });
   });
+}
 
+async function expectNoPageOverflow(page: Page): Promise<void> {
+  const metrics = await page.evaluate(() => {
+    const documentWidth = document.documentElement.scrollWidth;
+    const bodyWidth = document.body.scrollWidth;
+    const viewportWidth = window.innerWidth;
+
+    return {
+      viewportWidth,
+      documentWidth,
+      bodyWidth,
+      overflowX: Math.max(documentWidth, bodyWidth) - viewportWidth,
+    };
+  });
+
+  expect(metrics.overflowX, JSON.stringify(metrics)).toBeLessThanOrEqual(1);
+}
+
+test.beforeEach(async ({ page }) => {
+  await setupMockMonitorApi(page);
+});
+
+test('loads dashboard and handles core interactions', async ({ page }) => {
   await page.goto('/');
 
   await expect(page.getByRole('heading', { name: 'Moraine Monitor' })).toBeVisible();
@@ -119,7 +142,9 @@ test('loads dashboard and handles core interactions', async ({ page }) => {
 
   // Toggle to flamegraph view
   await page.locator('.mv-viz-toggle button', { hasText: 'flamegraph' }).click();
-  await expect(page.locator('.mv-turnblock').first()).toBeVisible();
+  const flameTurn = page.locator('.mv-flame-turn').first();
+  await expect(flameTurn).toBeVisible();
+  await expect(flameTurn.locator('.mv-tr-row').first()).toBeVisible();
 
   // Back to transcript
   await page.locator('.mv-viz-toggle button', { hasText: 'transcript' }).click();
@@ -144,4 +169,22 @@ test('loads dashboard and handles core interactions', async ({ page }) => {
   await page.locator(otherTheme === 'dark' ? '#themeDark' : '#themeLight').click();
   const htmlThemeAfter = await page.locator('html').getAttribute('data-theme');
   expect(htmlThemeAfter).toBe(otherTheme);
+});
+
+test('keeps dashboard and detail views inside the mobile viewport', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/');
+
+  await expect(page.getByRole('heading', { name: 'Moraine Monitor' })).toBeVisible();
+  await expect(page.locator('#sessionsPanel')).toBeVisible();
+  await expectNoPageOverflow(page);
+
+  await page.locator('.mv-card').first().click();
+  await expect(page.locator('.mv-sidepanel')).toBeVisible();
+  await expectNoPageOverflow(page);
+
+  await page.locator('.mv-viz-toggle button', { hasText: 'flamegraph' }).click();
+  await expect(page.locator('.mv-flame-turn').first()).toBeVisible();
+  await expect(page.locator('.mv-tr-row').first()).toBeVisible();
+  await expectNoPageOverflow(page);
 });

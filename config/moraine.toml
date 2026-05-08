@@ -49,6 +49,14 @@ glob = "~/.cursor/projects/*/agent-transcripts/**/*.jsonl"
 watch_root = "~/.cursor/projects"
 format = "jsonl"
 
+[[ingest.sources]]
+name = "pi"
+harness = "pi-coding-agent"
+enabled = true
+glob = "~/.pi/agent/sessions/**/*.jsonl"
+watch_root = "~/.pi/agent/sessions"
+format = "jsonl"
+
 # Hermes Agent LIVE sessions: one JSON file per conversation under
 # ~/.hermes/sessions/ that the agent rewrites in place every turn.
 # `format = "session_json"` opts into the rewrite-aware processor that emits

@@ -20,6 +20,7 @@ all rows that leave the adapter.
 | `kimi-cli` | `sources/kimi_cli.rs` | `moonshot` | `jsonl` | Kimi `wire.jsonl`; skips metadata headers and drops parent `SubagentEvent` rows. |
 | `cursor` | `sources/cursor.rs` | `cursor` | `jsonl` | Cursor Agent transcripts under `agent-transcripts/`; text blocks, tool-use blocks, and local file references. |
 | `hermes` | `sources/hermes.rs` | record-derived | `jsonl` or `session_json` | ShareGPT trajectories and live Hermes session JSON with vendor/model splitting. |
+| `pi-coding-agent` | `sources/pi.rs` | record-derived | `jsonl` | Pi session JSONL trees, model/thinking metadata, assistant tool calls, tool results, and parent links. |
 
 ## Adapter Contract
 

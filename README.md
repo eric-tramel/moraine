@@ -5,7 +5,7 @@
 [![Docs](https://github.com/eric-tramel/moraine/actions/workflows/docs-deploy.yml/badge.svg)](https://eric-tramel.github.io/moraine/)
 
 Moraine is a local trace stack for agent work. It indexes sessions from agent
-harnesses such as Codex, Claude Code, Kimi CLI, and Hermes into ClickHouse,
+harnesses such as Codex, Claude Code, Kimi CLI, Hermes, and Pi Coding Agent into ClickHouse,
 serves a monitor UI, and exposes MCP retrieval over the indexed history.
 
 Agents get searchable long-term memory through MCP. You get a unified local

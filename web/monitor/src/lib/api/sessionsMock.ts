@@ -91,6 +91,7 @@ const HARNESSES: Harness[] = [
   { id: 'claude-code', label: 'claude-code', short: 'CC', hue: 25 },
   { id: 'codex', label: 'codex', short: 'CX', hue: 150 },
   { id: 'hermes', label: 'hermes', short: 'HM', hue: 265 },
+  { id: 'pi-coding-agent', label: 'pi-coding-agent', short: 'PC', hue: 315 },
   { id: 'cursor', label: 'cursor', short: 'CU', hue: 200 },
   { id: 'aider', label: 'aider', short: 'AD', hue: 340 },
   { id: 'cli', label: 'cli', short: 'CL', hue: 60 },

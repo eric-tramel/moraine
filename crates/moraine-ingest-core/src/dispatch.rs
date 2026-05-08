@@ -292,10 +292,8 @@ pub(crate) async fn enqueue_work(
         }
     }
 
-    if should_send {
-        if process_tx.send(work).await.is_ok() {
-            metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
-        }
+    if should_send && process_tx.send(work).await.is_ok() {
+        metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1425,6 +1423,49 @@ mod tests {
         );
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_file_reports_pi_malformed_jsonl_without_dropping_valid_rows() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("fixtures")
+            .join("pi")
+            .join("malformed.jsonl");
+        let source_file = path.to_string_lossy().to_string();
+
+        let config = moraine_config::AppConfig::default();
+        let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(16);
+        let work = WorkItem {
+            source_name: "pi".to_string(),
+            harness: "pi-coding-agent".to_string(),
+            format: "jsonl".to_string(),
+            path: source_file,
+        };
+
+        process_file(&config, &work, checkpoints, sink_tx, &metrics)
+            .await
+            .expect("pi fixture should process around malformed line");
+
+        let batches = drain_batches(&mut sink_rx).await;
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.raw_rows.len(), 2);
+        assert_eq!(batch.event_rows.len(), 2);
+        assert_eq!(batch.error_rows.len(), 1);
+        assert_eq!(
+            batch.error_rows[0]
+                .get("error_kind")
+                .and_then(Value::as_str),
+            Some("json_parse_error")
+        );
+        assert_eq!(
+            batch.raw_rows[0].get("harness").and_then(Value::as_str),
+            Some("pi-coding-agent")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
