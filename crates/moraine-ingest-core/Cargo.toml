@@ -1,6 +1,6 @@
 [package]
 name = "moraine-ingest-core"
-version = "0.5.4"
+version = "0.5.5"
 edition = "2021"
 description = "Core ingestion pipeline internals for Moraine"
 
