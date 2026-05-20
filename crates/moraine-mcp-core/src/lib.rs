@@ -231,13 +231,23 @@ impl AppState {
                                 "description": "Opaque cursor from a previous list_sessions response with the same filter and sort values."
                             },
                             "mode": {
-                                "type": ["string", "null"],
-                                "enum": ["web_search", "mcp_internal", "tool_calling", "chat", null],
+                                "anyOf": [
+                                    {
+                                        "type": "string",
+                                        "enum": ["web_search", "mcp_internal", "tool_calling", "chat"]
+                                    },
+                                    { "type": "null" }
+                                ],
                                 "description": "Optional session mode filter."
                             },
                             "sort": {
-                                "type": ["string", "null"],
-                                "enum": ["desc", "asc", null],
+                                "anyOf": [
+                                    {
+                                        "type": "string",
+                                        "enum": ["desc", "asc"]
+                                    },
+                                    { "type": "null" }
+                                ],
                                 "default": "desc",
                                 "description": "Sort order by session updated_at and session ID."
                             }
@@ -464,6 +474,43 @@ mod tests {
             list_sessions["inputSchema"]["properties"]["sort"]["default"],
             json!("desc")
         );
+        assert_eq!(
+            list_sessions["inputSchema"]["properties"]["mode"]["anyOf"],
+            json!([
+                {
+                    "type": "string",
+                    "enum": ["web_search", "mcp_internal", "tool_calling", "chat"]
+                },
+                { "type": "null" }
+            ])
+        );
+        assert_eq!(
+            list_sessions["inputSchema"]["properties"]["sort"]["anyOf"],
+            json!([
+                {
+                    "type": "string",
+                    "enum": ["desc", "asc"]
+                },
+                { "type": "null" }
+            ])
+        );
+        for field in ["mode", "sort"] {
+            let variants = list_sessions["inputSchema"]["properties"][field]["anyOf"]
+                .as_array()
+                .expect("nullable enum anyOf");
+            for variant in variants {
+                if variant["type"] == json!("string") {
+                    assert!(
+                        !variant["enum"]
+                            .as_array()
+                            .expect("string enum")
+                            .iter()
+                            .any(Value::is_null),
+                        "{field} string enum branch must not include null"
+                    );
+                }
+            }
+        }
         assert_eq!(
             list_sessions["outputSchema"]["properties"]["data"]["required"],
             json!([
