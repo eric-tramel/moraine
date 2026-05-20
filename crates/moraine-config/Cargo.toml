@@ -1,6 +1,6 @@
 [package]
 name = "moraine-config"
-version = "0.5.4"
+version = "0.5.5"
 edition = "2021"
 description = "Shared Moraine configuration schema and loaders"
 
