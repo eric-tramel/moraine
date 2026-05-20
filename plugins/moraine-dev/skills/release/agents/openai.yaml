@@ -1,0 +1,4 @@
+interface:
+  display_name: "Release"
+  short_description: "Cut and publish Moraine releases"
+  default_prompt: "/goal Use $moraine-dev:release to cut Moraine X.Y.Z, including version bump, release PR, tag, GitHub release notes, and PyPI verification."
