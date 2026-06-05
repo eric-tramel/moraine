@@ -53,6 +53,10 @@ const TERM_POSTINGS_CACHE_TTL: Duration = Duration::from_secs(15);
 const TERM_POSTINGS_CACHE_MAX_ENTRIES: usize = 2048;
 const TERM_POSTINGS_CACHE_MAX_ROWS_PER_TERM: usize = 131_072;
 const TERM_POSTINGS_CACHE_MAX_ROWS_TOTAL: usize = 262_144;
+const TERM_POSTINGS_FAST_PATH_MAX_ROWS_PER_TERM: u64 = TERM_POSTINGS_CACHE_MAX_ROWS_PER_TERM as u64;
+const TERM_POSTINGS_FAST_PATH_RATIO_MIN_DOCS: u64 = 10_000;
+const TERM_POSTINGS_FAST_PATH_MAX_DOC_RATIO_NUMERATOR: u64 = 1;
+const TERM_POSTINGS_FAST_PATH_MAX_DOC_RATIO_DENOMINATOR: u64 = 4;
 const SEARCH_DOC_EXTRA_CACHE_TTL: Duration = Duration::from_secs(15);
 const SEARCH_DOC_EXTRA_CACHE_MAX_ENTRIES: usize = 65536;
 const CONVERSATION_CANDIDATE_MIN: usize = 512;
@@ -662,12 +666,13 @@ impl ClickHouseConversationRepository {
         limit: u16,
     ) {
         for query in queries {
-            if query.trim().is_empty() {
+            let query = query.trim();
+            if query.is_empty() || !self.is_safe_mcp_prewarm_query(query) {
                 continue;
             }
             if let Err(err) = self
                 .search_events(SearchEventsQuery {
-                    query,
+                    query: query.to_string(),
                     source: Some(BENCHMARK_REPLAY_SOURCE.to_string()),
                     limit: Some(limit),
                     session_id: None,
@@ -687,46 +692,23 @@ impl ClickHouseConversationRepository {
         }
     }
 
-    pub async fn prewarm_mcp_search_state_quick(&self) -> RepoResult<()> {
-        // Keep synchronous initialize prewarm deterministic and bounded.
-        // Variable hot-query prewarm stays in the async background path.
-        const PREWARM_QUERY: &str = "the";
-        const PREWARM_LIMITS: [u16; 2] = [1, 25];
+    fn is_safe_mcp_prewarm_query(&self, query: &str) -> bool {
+        Self::is_safe_mcp_prewarm_query_with_max_terms(query, self.cfg.bm25_max_query_terms)
+    }
 
-        for limit in PREWARM_LIMITS {
-            if let Err(err) = self
-                .search_events(SearchEventsQuery {
-                    query: PREWARM_QUERY.to_string(),
-                    source: Some(BENCHMARK_REPLAY_SOURCE.to_string()),
-                    limit: Some(limit),
-                    session_id: None,
-                    session_ids: None,
-                    min_score: None,
-                    min_should_match: None,
-                    include_tool_events: None,
-                    event_kinds: None,
-                    exclude_codex_mcp: None,
-                    disable_cache: Some(false),
-                    search_strategy: Some(SearchEventsStrategy::Optimized),
-                })
-                .await
-            {
-                warn!("mcp quick prewarm query failed: {}", err);
-            }
-        }
-
-        Ok(())
+    fn is_safe_mcp_prewarm_query_with_max_terms(query: &str, max_terms: usize) -> bool {
+        tokenize_query(query, max_terms).len() >= 2
     }
 
     pub async fn prewarm_mcp_search_state(&self) -> RepoResult<()> {
         const PREWARM_QUERY_LIMIT: u16 = 10;
         const PREWARM_HOT_QUERY_COUNT: usize = 6;
         const PREWARM_FALLBACK_QUERIES: [&str; 5] = [
-            "the",
-            "error",
-            "test",
+            "error stack trace",
+            "test failure assertion",
             "file directory path config",
             "function code implementation",
+            "session search results",
         ];
 
         let mut queries = self
@@ -3072,6 +3054,26 @@ FORMAT JSONEachRow",
         idf.max(0.0)
     }
 
+    fn has_broad_fast_path_term(
+        terms: &[String],
+        df_by_term: &HashMap<String, u64>,
+        docs: u64,
+    ) -> bool {
+        terms.iter().any(|term| {
+            Self::term_df_too_broad_for_fast_path(*df_by_term.get(term).unwrap_or(&0), docs)
+        })
+    }
+
+    fn term_df_too_broad_for_fast_path(df: u64, docs: u64) -> bool {
+        if df > TERM_POSTINGS_FAST_PATH_MAX_ROWS_PER_TERM {
+            return true;
+        }
+
+        docs >= TERM_POSTINGS_FAST_PATH_RATIO_MIN_DOCS
+            && df.saturating_mul(TERM_POSTINGS_FAST_PATH_MAX_DOC_RATIO_DENOMINATOR)
+                >= docs.saturating_mul(TERM_POSTINGS_FAST_PATH_MAX_DOC_RATIO_NUMERATOR)
+    }
+
     async fn load_term_postings_for_terms(
         &self,
         terms: &[String],
@@ -3451,9 +3453,13 @@ FORMAT JSONEachRow",
             matched_terms: u64,
         }
 
+        let df_map = self.df_map(terms).await?;
+        if Self::has_broad_fast_path_term(terms, &df_map, docs) {
+            return Ok(Vec::new());
+        }
+
         let postings_by_term = self.load_term_postings_for_terms(terms).await?;
         let use_document_codex_flag = self.search_documents_has_codex_flag().await?;
-        let df_map = self.df_map(terms).await?;
         let k1 = self.cfg.bm25_k1.max(0.01);
         let b = self.cfg.bm25_b.clamp(0.0, 1.0);
         let mut idf_by_term = HashMap::<&str, f64>::new();
@@ -3717,9 +3723,13 @@ FORMAT JSONEachRow",
             matched_terms: u64,
         }
 
+        let df_map = self.df_map(terms).await?;
+        if Self::has_broad_fast_path_term(terms, &df_map, docs) {
+            return Ok((Vec::new(), 0));
+        }
+
         let postings_by_term = self.load_term_postings_for_terms(terms).await?;
         let use_document_codex_flag = self.search_documents_has_codex_flag().await?;
-        let df_map = self.df_map(terms).await?;
         let k1 = self.cfg.bm25_k1.max(0.01);
         let b = self.cfg.bm25_b.clamp(0.0, 1.0);
         let mut idf_by_term = HashMap::<&str, f64>::new();
@@ -6655,6 +6665,48 @@ mod tests {
             .map(|row| row.event_uid.as_str())
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["evt-c", "evt-b", "evt-d", "evt-a"]);
+    }
+
+    #[test]
+    fn prewarm_query_filter_rejects_single_term_queries() {
+        assert!(
+            !ClickHouseConversationRepository::is_safe_mcp_prewarm_query_with_max_terms("the", 32)
+        );
+        assert!(
+            !ClickHouseConversationRepository::is_safe_mcp_prewarm_query_with_max_terms(
+                "error", 32
+            )
+        );
+        assert!(
+            ClickHouseConversationRepository::is_safe_mcp_prewarm_query_with_max_terms(
+                "file directory path config",
+                32
+            )
+        );
+    }
+
+    #[test]
+    fn broad_fast_path_term_guard_uses_row_cap_and_corpus_ratio() {
+        assert!(
+            ClickHouseConversationRepository::term_df_too_broad_for_fast_path(
+                TERM_POSTINGS_FAST_PATH_MAX_ROWS_PER_TERM + 1,
+                1_000_000
+            )
+        );
+        assert!(ClickHouseConversationRepository::term_df_too_broad_for_fast_path(25_000, 100_000));
+        assert!(
+            !ClickHouseConversationRepository::term_df_too_broad_for_fast_path(24_999, 100_000)
+        );
+
+        let terms = vec!["the".to_string(), "rare".to_string()];
+        let mut df_by_term = HashMap::<String, u64>::new();
+        df_by_term.insert("the".to_string(), 25_000);
+        df_by_term.insert("rare".to_string(), 12);
+        assert!(ClickHouseConversationRepository::has_broad_fast_path_term(
+            &terms,
+            &df_by_term,
+            100_000
+        ));
     }
 
     #[test]
