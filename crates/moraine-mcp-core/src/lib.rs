@@ -47,17 +47,12 @@ impl AppState {
 
         match req.method.as_str() {
             "initialize" => {
-                if self
-                    .prewarm_started
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
+                if self.cfg.mcp.prewarm_on_initialize
+                    && self
+                        .prewarm_started
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
                 {
-                    if let Err(err) = self.repo.prewarm_mcp_search_state_quick().await {
-                        warn!("mcp quick prewarm failed: {}", err);
-                    } else {
-                        debug!("mcp quick prewarm completed");
-                    }
-
                     let repo = self.repo.clone();
                     tokio::spawn(async move {
                         if let Err(err) = repo.prewarm_mcp_search_state().await {
@@ -401,6 +396,25 @@ mod tests {
             repo,
             prewarm_started: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[tokio::test]
+    async fn initialize_does_not_prewarm_by_default() {
+        let state = test_state();
+        let response = state
+            .handle_request(RpcRequest {
+                id: Some(json!(1)),
+                method: "initialize".to_string(),
+                params: json!({}),
+            })
+            .await
+            .expect("initialize response");
+
+        assert_eq!(
+            response["result"]["serverInfo"]["name"],
+            json!("moraine-mcp")
+        );
+        assert!(!state.prewarm_started.load(Ordering::Acquire));
     }
 
     #[test]

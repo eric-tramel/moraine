@@ -95,6 +95,8 @@ pub struct McpConfig {
     #[serde(default = "default_true")]
     pub default_exclude_codex_mcp: bool,
     #[serde(default = "default_false")]
+    pub prewarm_on_initialize: bool,
+    #[serde(default = "default_false")]
     pub async_log_writes: bool,
     #[serde(default = "default_protocol_version")]
     pub protocol_version: String,
@@ -209,6 +211,7 @@ impl Default for McpConfig {
             default_context_after: default_context_after(),
             default_include_tool_events: false,
             default_exclude_codex_mcp: true,
+            prewarm_on_initialize: false,
             async_log_writes: true,
             protocol_version: default_protocol_version(),
         }
@@ -913,7 +916,22 @@ mod tests {
         let cfg = load_config(&path).expect("minimal config should load with defaults");
         std::fs::remove_file(&path).ok();
         assert_eq!(cfg.clickhouse.url, "http://127.0.0.1:8123");
+        assert!(!cfg.mcp.prewarm_on_initialize);
         assert!(!cfg.ingest.sources.is_empty());
+    }
+
+    #[test]
+    fn load_config_accepts_mcp_prewarm_toggle() {
+        let path = write_temp_config(
+            r#"
+[mcp]
+prewarm_on_initialize = true
+"#,
+            "mcp-prewarm-toggle",
+        );
+        let cfg = load_config(&path).expect("mcp prewarm toggle should load");
+        std::fs::remove_file(&path).ok();
+        assert!(cfg.mcp.prewarm_on_initialize);
     }
 
     #[test]

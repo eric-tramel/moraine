@@ -240,12 +240,16 @@ default_context_before = 3
 default_context_after = 3
 default_include_tool_events = false
 default_exclude_codex_mcp = true
+prewarm_on_initialize = false
 async_log_writes = true
 protocol_version = "2024-11-05"
 ```
 
 Raise `max_results` only when clients need larger result windows. Increase
 context defaults when retrieval snippets are too narrow.
+Leave `prewarm_on_initialize` disabled for harnesses that launch multiple MCP
+processes at once; enabling it trades startup CPU/database work for lower
+first-search latency.
 
 ## Search Ranking
 
