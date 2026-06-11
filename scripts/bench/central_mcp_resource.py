@@ -184,19 +184,50 @@ class ResourceSample:
     threads: int = 0
 
 
-def sample_pids(pids: list[int]) -> ResourceSample:
-    if psutil is None:
-        raise RuntimeError("psutil is required for measurement")
-    sample = ResourceSample()
-    for pid in pids:
+_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+
+
+def _read_proc(pid: int) -> Optional[tuple[int, int]]:
+    """Return (rss_bytes, threads) from Linux /proc, or None if unavailable."""
+    try:
+        rss_bytes = 0
+        threads = 0
+        with open(f"/proc/{pid}/status", "r") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    rss_bytes = int(line.split()[1]) * 1024  # kB -> bytes
+                elif line.startswith("Threads:"):
+                    threads = int(line.split()[1])
+        return rss_bytes, threads
+    except Exception:
+        return None
+
+
+def _read_pid(pid: int) -> Optional[tuple[int, int]]:
+    """Return (rss_bytes, threads) via psutil, falling back to /proc on Linux."""
+    if psutil is not None:
         try:
             p = psutil.Process(pid)
             with p.oneshot():
-                sample.rss_bytes += int(p.memory_info().rss)
-                sample.threads += int(p.num_threads())
-            sample.proc_count += 1
+                return int(p.memory_info().rss), int(p.num_threads())
         except Exception:
+            return None
+    return _read_proc(pid)
+
+
+def measurement_available() -> bool:
+    return psutil is not None or sys.platform.startswith("linux")
+
+
+def sample_pids(pids: list[int]) -> ResourceSample:
+    sample = ResourceSample()
+    for pid in pids:
+        got = _read_pid(pid)
+        if got is None:
             continue
+        sample.rss_bytes += got[0]
+        sample.threads += got[1]
+        sample.proc_count += 1
     return sample
 
 
@@ -364,8 +395,11 @@ def main() -> int:
     ap.add_argument("--json-out", help="write raw results to this JSON path")
     args = ap.parse_args()
 
-    if psutil is None:
-        print("error: psutil is required (run via `uv run` or `pip install psutil`)", file=sys.stderr)
+    if not measurement_available():
+        print(
+            "error: need psutil or a Linux /proc filesystem for measurement",
+            file=sys.stderr,
+        )
         return 2
 
     raise_fd_limit()

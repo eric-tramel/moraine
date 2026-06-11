@@ -26,6 +26,10 @@ fn main() -> Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .with_target(false)
+        // Logs MUST go to stderr: stdout is the MCP JSON-RPC stream (for the
+        // embedded server and the proxy), and any log line written there would
+        // corrupt the protocol for the connected agent.
+        .with_writer(std::io::stderr)
         .init();
 
     let args = cli::parse_args()?;

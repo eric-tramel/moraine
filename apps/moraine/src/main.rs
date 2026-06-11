@@ -2277,10 +2277,18 @@ async fn main() -> Result<ExitCode> {
                 // `--serve socket` flag is injected here (NOT in the shared
                 // service_args_with_defaults helper) so the foreground
                 // `moraine run mcp` path that agents register stays a stdio
-                // client and never accidentally becomes a server.
+                // client and never accidentally becomes a server. The explicit
+                // `--socket` pins the daemon to the launcher-resolved path so it
+                // binds exactly where clients (which resolve from the same
+                // config) connect.
                 let extra_args: Vec<String> =
                     if service == Service::Mcp && cfg.mcp.start_central_on_up {
-                        vec!["--serve".to_string(), "socket".to_string()]
+                        vec![
+                            "--serve".to_string(),
+                            "socket".to_string(),
+                            "--socket".to_string(),
+                            cfg.mcp.central_socket_path.clone(),
+                        ]
                     } else {
                         Vec::new()
                     };
