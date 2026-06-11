@@ -429,44 +429,64 @@ pub async fn run_socket(cfg: AppConfig, socket_path: PathBuf) -> Result<()> {
 
     let state = AppState::build(cfg)?;
 
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)
+    if let Some(parent) = socket_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        use std::os::unix::fs::DirBuilderExt;
+        // 0o700 on directories we create, so the socket is never reachable
+        // through a fresh directory even before its own permissions are set.
+        // An existing directory's mode is left alone (it may be shared, e.g.
+        // /tmp for an absolute central_socket_path override).
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
             .with_context(|| format!("failed to create socket directory {}", parent.display()))?;
     }
 
     // Stale-socket dance: if a live server already owns the path, this start is
-    // a no-op (idempotent `moraine up`). Otherwise remove the dead socket file
-    // so bind() can succeed.
-    if socket_path.exists() {
-        match UnixStream::connect(&socket_path).await {
-            Ok(_) => {
-                warn!(
-                    "central MCP server already listening at {}; nothing to do",
-                    socket_path.display()
-                );
-                return Ok(());
-            }
-            Err(_) => {
-                let _ = std::fs::remove_file(&socket_path);
-            }
-        }
+    // a no-op (idempotent `moraine up`). A dead socket file needs no removal —
+    // the rename below atomically replaces it.
+    if socket_path.exists() && UnixStream::connect(&socket_path).await.is_ok() {
+        warn!(
+            "central MCP server already listening at {}; nothing to do",
+            socket_path.display()
+        );
+        return Ok(());
     }
 
-    let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("failed to bind MCP socket {}", socket_path.display()))?;
+    // Bind on a private temp path, restrict it, then atomically rename into
+    // place. The socket is therefore never connectable at the public path with
+    // umask-derived (possibly world-connectable) permissions — there is no
+    // bind-then-chmod window. Unix sockets are bound to the inode, so the
+    // listener keeps accepting through the renamed path.
+    let tmp_path = socket_path.with_extension(format!("{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&tmp_path);
+    let listener = UnixListener::bind(&tmp_path)
+        .with_context(|| format!("failed to bind MCP socket {}", tmp_path.display()))?;
 
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(err) =
-            std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
-        {
-            warn!(
-                "failed to set 0o600 permissions on {}: {}",
-                socket_path.display(),
-                err
-            );
-        }
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&tmp_path);
+            })
+            .with_context(|| {
+                format!(
+                    "failed to set 0o600 permissions on MCP socket {}",
+                    tmp_path.display()
+                )
+            })?;
     }
+
+    std::fs::rename(&tmp_path, &socket_path)
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp_path);
+        })
+        .with_context(|| {
+            format!(
+                "failed to move MCP socket into place at {}",
+                socket_path.display()
+            )
+        })?;
 
     spawn_socket_cleanup_on_signal(socket_path.clone());
 
@@ -870,6 +890,16 @@ mod tests {
             }
         }
         let mut stream = stream.expect("connect to central socket");
+
+        // The bind-restrict-rename dance must leave the public path user-only.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&sock)
+                .expect("socket metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "socket must be user-only (0o600)");
+        }
 
         stream
             .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"initialize\",\"params\":{}}\n")

@@ -171,6 +171,11 @@ pub struct RuntimeConfig {
     pub clickhouse_version: String,
     #[serde(default = "default_true")]
     pub start_monitor_on_up: bool,
+    /// Deprecated (v0.6.0): the up-managed MCP service is always the shared
+    /// central server now, controlled by `mcp.start_central_on_up`. This key
+    /// is still parsed (existing configs must keep loading under
+    /// `deny_unknown_fields`) and acts as a force-on alias, like
+    /// `moraine up --mcp`.
     #[serde(default = "default_false")]
     pub start_mcp_on_up: bool,
 }

@@ -124,4 +124,3 @@ healthcheck_interval_ms = 500
 clickhouse_auto_install = true
 clickhouse_version = "v25.12.5.44-stable"
 start_monitor_on_up = true
-start_mcp_on_up = false

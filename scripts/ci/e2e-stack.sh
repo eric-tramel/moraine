@@ -515,7 +515,6 @@ managed_clickhouse_dir = "${runtime_root}/managed-clickhouse"
 clickhouse_auto_install = true
 clickhouse_start_timeout_seconds = 90.0
 start_monitor_on_up = true
-start_mcp_on_up = false
 EOF
 
   trap "cleanup_e2e \"$moraine_bin\" \"$config_path\" \"$runtime_root\" \"$tmp_root\"" EXIT

@@ -22,3 +22,10 @@ tracing = "0.1"
 moraine-config = { path = "../moraine-config" }
 moraine-clickhouse = { path = "../moraine-clickhouse" }
 moraine-conversations = { path = "../moraine-conversations" }
+
+[dev-dependencies]
+# `#[tokio::test]` needs the macros feature explicitly; without this it only
+# compiles via feature unification from moraine-conversations' tokio features,
+# which would break `cargo test -p moraine-mcp-core` if that crate ever
+# dropped "macros".
+tokio = { version = "1.40", features = ["macros"] }

@@ -35,7 +35,6 @@ port = 8080
 [runtime]
 root_dir = "~/.moraine"
 start_monitor_on_up = true
-start_mcp_on_up = false
 
 [[ingest.sources]]
 name = "codex"
@@ -277,6 +276,12 @@ user runs their own central server. See
 [Agent MCP Search → Install](agent-mcp-search/install.md#shared-central-server-default)
 for operational notes.
 
+The up-managed MCP service is always the central socket server; the legacy
+per-`up` stdio daemon is gone (v0.6.0). `runtime.start_mcp_on_up` is
+deprecated: it is still parsed so existing configs keep loading, and it now
+acts as a force-on alias for the central server (the same as `moraine up
+--mcp`). Use `mcp.start_central_on_up` instead.
+
 ## Search Ranking
 
 `[bm25]` tunes search behavior:
@@ -306,7 +311,6 @@ service_bin_dir = "~/.local/bin"
 managed_clickhouse_dir = "~/.local/lib/moraine/clickhouse/current"
 clickhouse_auto_install = true
 start_monitor_on_up = true
-start_mcp_on_up = false
 ```
 
 Relative `logs_dir` and `pids_dir` values are resolved under `root_dir`.
