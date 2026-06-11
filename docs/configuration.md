@@ -243,6 +243,10 @@ default_exclude_codex_mcp = true
 prewarm_on_initialize = false
 async_log_writes = true
 protocol_version = "2024-11-05"
+use_central_server = true
+start_central_on_up = true
+central_socket_path = "mcp.sock"
+central_connect_timeout_ms = 250
 ```
 
 Raise `max_results` only when clients need larger result windows. Increase
@@ -250,6 +254,28 @@ context defaults when retrieval snippets are too narrow.
 Leave `prewarm_on_initialize` disabled for harnesses that launch multiple MCP
 processes at once; enabling it trades startup CPU/database work for lower
 first-search latency.
+
+### Shared central MCP server
+
+By default Moraine runs a single shared MCP server per host instead of one
+full server per agent session, which sharply reduces CPU and memory when many
+sessions are active at once. The fields above control it:
+
+| Field | Default | Purpose |
+| --- | --- | --- |
+| `use_central_server` | `true` | When set, `moraine run mcp` connects to the central server's socket and proxies to it; if the socket is missing or unreachable it transparently falls back to an embedded server. Set to `false` to always run embedded (pre-central behavior). |
+| `start_central_on_up` | `true` | When set, `moraine up` launches the central server as a background daemon. |
+| `central_socket_path` | `mcp.sock` | Unix socket path. A bare filename resolves under the runtime pids dir (`~/.moraine/run/mcp.sock`, mode `0o600`); an absolute path is used verbatim. |
+| `central_connect_timeout_ms` | `250` | How long a client waits to connect before falling back to embedded. |
+
+The MCP registration command is unchanged — agents still launch
+`moraine run mcp`. The proxy-vs-embedded decision is internal. The daemon and
+its clients must resolve the same `central_socket_path` (i.e. load the same
+config) to share a server; otherwise clients silently fall back to embedded.
+The `0o600` socket scopes the server to a single user, so on a shared host each
+user runs their own central server. See
+[Agent MCP Search → Install](agent-mcp-search/install.md#shared-central-server-default)
+for operational notes.
 
 ## Search Ranking
 

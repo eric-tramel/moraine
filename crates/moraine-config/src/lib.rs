@@ -100,6 +100,28 @@ pub struct McpConfig {
     pub async_log_writes: bool,
     #[serde(default = "default_protocol_version")]
     pub protocol_version: String,
+    /// When true, `moraine run mcp` first tries to reach the shared central
+    /// MCP server over its Unix socket and proxies to it; if the socket is
+    /// absent or unreachable it transparently falls back to an embedded
+    /// stdio server. When false, `moraine run mcp` always runs embedded
+    /// (pre-central behavior).
+    #[serde(default = "default_true")]
+    pub use_central_server: bool,
+    /// Filesystem path of the central MCP server's Unix domain socket. A
+    /// bare filename is resolved relative to the runtime pids dir
+    /// (`~/.moraine/run`), so the default lands at `~/.moraine/run/mcp.sock`.
+    /// An absolute path is used verbatim.
+    #[serde(default = "default_mcp_socket")]
+    pub central_socket_path: String,
+    /// When true, `moraine up` launches the shared central MCP server as a
+    /// background daemon (Service::Mcp in `--serve socket` mode).
+    #[serde(default = "default_true")]
+    pub start_central_on_up: bool,
+    /// Upper bound, in milliseconds, on how long a proxy client waits to
+    /// connect to the central socket before giving up and falling back to
+    /// an embedded server. Keeps startup fast when the daemon is absent.
+    #[serde(default = "default_central_connect_timeout_ms")]
+    pub central_connect_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -214,6 +236,10 @@ impl Default for McpConfig {
             prewarm_on_initialize: false,
             async_log_writes: true,
             protocol_version: default_protocol_version(),
+            use_central_server: true,
+            central_socket_path: default_mcp_socket(),
+            start_central_on_up: true,
+            central_connect_timeout_ms: default_central_connect_timeout_ms(),
         }
     }
 }
@@ -432,6 +458,14 @@ fn default_context_after() -> u16 {
 
 fn default_protocol_version() -> String {
     "2024-11-05".to_string()
+}
+
+fn default_mcp_socket() -> String {
+    "mcp.sock".to_string()
+}
+
+fn default_central_connect_timeout_ms() -> u64 {
+    250
 }
 
 fn default_k1() -> f64 {
@@ -693,6 +727,14 @@ fn normalize_config(mut cfg: AppConfig) -> Result<AppConfig> {
     cfg.runtime.service_bin_dir = expand_path(&cfg.runtime.service_bin_dir);
     cfg.runtime.managed_clickhouse_dir = expand_path(&cfg.runtime.managed_clickhouse_dir);
 
+    // Resolve the central MCP socket path against the (already-normalized)
+    // pids dir so a bare filename lands at `~/.moraine/run/mcp.sock` while an
+    // absolute path is preserved. The daemon (`moraine up`) and proxy clients
+    // (`moraine run mcp`) both read this resolved value, so they agree on the
+    // socket as long as they load the same config.
+    cfg.mcp.central_socket_path =
+        resolve_runtime_subdir(&cfg.runtime.pids_dir, &cfg.mcp.central_socket_path);
+
     Ok(cfg)
 }
 
@@ -932,6 +974,68 @@ prewarm_on_initialize = true
         let cfg = load_config(&path).expect("mcp prewarm toggle should load");
         std::fs::remove_file(&path).ok();
         assert!(cfg.mcp.prewarm_on_initialize);
+    }
+
+    #[test]
+    fn central_mcp_defaults_are_on() {
+        let cfg = McpConfig::default();
+        assert!(cfg.use_central_server);
+        assert!(cfg.start_central_on_up);
+        assert_eq!(cfg.central_connect_timeout_ms, 250);
+        assert_eq!(cfg.central_socket_path, "mcp.sock");
+    }
+
+    #[test]
+    fn central_socket_path_resolves_relative_to_pids_dir() {
+        let path = write_temp_config(
+            r#"
+[runtime]
+root_dir = "/tmp/moraine-central-test"
+"#,
+            "central-socket-relative",
+        );
+        let cfg = load_config(&path).expect("config should load");
+        std::fs::remove_file(&path).ok();
+        // Bare "mcp.sock" default resolves under <root>/run.
+        assert_eq!(
+            cfg.mcp.central_socket_path,
+            "/tmp/moraine-central-test/run/mcp.sock"
+        );
+    }
+
+    #[test]
+    fn central_socket_path_absolute_is_preserved() {
+        let path = write_temp_config(
+            r#"
+[runtime]
+root_dir = "/tmp/moraine-central-test"
+
+[mcp]
+central_socket_path = "/var/run/moraine/custom.sock"
+"#,
+            "central-socket-absolute",
+        );
+        let cfg = load_config(&path).expect("config should load");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(cfg.mcp.central_socket_path, "/var/run/moraine/custom.sock");
+    }
+
+    #[test]
+    fn central_mcp_toggles_are_optional_in_toml() {
+        // A config that predates the central-server feature (no central keys)
+        // must still parse, picking up the new defaults.
+        let path = write_temp_config(
+            r#"
+[mcp]
+max_results = 25
+"#,
+            "central-omitted-keys",
+        );
+        let cfg = load_config(&path).expect("legacy mcp config should load");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(cfg.mcp.max_results, 25);
+        assert!(cfg.mcp.use_central_server);
+        assert!(cfg.mcp.start_central_on_up);
     }
 
     #[test]

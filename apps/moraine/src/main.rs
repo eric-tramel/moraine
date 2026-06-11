@@ -1487,6 +1487,10 @@ fn start_background_service(
 
     let child = Command::new(&binary)
         .args(args)
+        // Background services never read stdin; closing it avoids inheriting the
+        // launcher's terminal/pipe fd (and a SIGHUP/blocking-read footgun for the
+        // central MCP server, which would otherwise hold an unused stdin handle).
+        .stdin(Stdio::null())
         .stdout(Stdio::from(logfile))
         .stderr(Stdio::from(logfile_err))
         .spawn()
@@ -1828,7 +1832,10 @@ fn selected_up_services(args: &UpArgs, cfg: &AppConfig) -> Vec<Service> {
     if args.monitor || cfg.runtime.start_monitor_on_up {
         services.push(Service::Monitor);
     }
-    if args.mcp || cfg.runtime.start_mcp_on_up {
+    // The Mcp service now runs the shared central MCP server (`--serve socket`)
+    // when start_central_on_up is set (the default). The legacy
+    // runtime.start_mcp_on_up flag and the --mcp CLI flag still force it on too.
+    if args.mcp || cfg.runtime.start_mcp_on_up || cfg.mcp.start_central_on_up {
         services.push(Service::Mcp);
     }
     services
@@ -2266,12 +2273,23 @@ async fn main() -> Result<ExitCode> {
 
             let mut started_services = Vec::new();
             for service in services_to_start {
+                // Launch the Mcp service as the shared central server. The
+                // `--serve socket` flag is injected here (NOT in the shared
+                // service_args_with_defaults helper) so the foreground
+                // `moraine run mcp` path that agents register stays a stdio
+                // client and never accidentally becomes a server.
+                let extra_args: Vec<String> =
+                    if service == Service::Mcp && cfg.mcp.start_central_on_up {
+                        vec!["--serve".to_string(), "socket".to_string()]
+                    } else {
+                        Vec::new()
+                    };
                 started_services.push(start_background_service(
                     service,
                     &config_path,
                     &cfg,
                     &paths,
-                    &[],
+                    &extra_args,
                 )?);
             }
 
@@ -2299,6 +2317,9 @@ async fn main() -> Result<ExitCode> {
                     stopped.push(service);
                 }
             }
+            // Defensively remove the central MCP socket so a stopped stack never
+            // leaves a stale socket that a client would connect to and hang on.
+            let _ = fs::remove_file(&cfg.mcp.central_socket_path);
             render_down(&output, &DownSnapshot { stopped })?;
             Ok(ExitCode::SUCCESS)
         }

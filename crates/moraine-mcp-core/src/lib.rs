@@ -11,11 +11,13 @@ use moraine_config::AppConfig;
 use moraine_conversations::{ClickHouseConversationRepository, RepoConfig};
 use serde::Deserialize;
 use serde_json::{json, Value};
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tracing::{debug, warn};
 
 #[derive(Debug, Deserialize)]
@@ -326,34 +328,51 @@ fn tool_error_result(message: String) -> Value {
     })
 }
 
-pub async fn run_stdio(cfg: AppConfig) -> Result<()> {
-    let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
+impl AppState {
+    /// Build the shared MCP application state: one ClickHouse client (and its
+    /// reqwest connection pool) and one conversation repository (and its
+    /// caches). A single instance is shared across every connection a central
+    /// server handles, so the heavy state is allocated once per host rather
+    /// than once per agent session.
+    pub fn build(cfg: AppConfig) -> Result<Arc<AppState>> {
+        let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
 
-    let repo_cfg = RepoConfig {
-        max_results: cfg.mcp.max_results,
-        preview_chars: cfg.mcp.preview_chars,
-        default_context_before: cfg.mcp.default_context_before,
-        default_context_after: cfg.mcp.default_context_after,
-        default_include_tool_events: cfg.mcp.default_include_tool_events,
-        default_exclude_codex_mcp: cfg.mcp.default_exclude_codex_mcp,
-        async_log_writes: cfg.mcp.async_log_writes,
-        bm25_k1: cfg.bm25.k1,
-        bm25_b: cfg.bm25.b,
-        bm25_default_min_score: cfg.bm25.default_min_score,
-        bm25_default_min_should_match: cfg.bm25.default_min_should_match,
-        bm25_max_query_terms: cfg.bm25.max_query_terms,
-    };
+        let repo_cfg = RepoConfig {
+            max_results: cfg.mcp.max_results,
+            preview_chars: cfg.mcp.preview_chars,
+            default_context_before: cfg.mcp.default_context_before,
+            default_context_after: cfg.mcp.default_context_after,
+            default_include_tool_events: cfg.mcp.default_include_tool_events,
+            default_exclude_codex_mcp: cfg.mcp.default_exclude_codex_mcp,
+            async_log_writes: cfg.mcp.async_log_writes,
+            bm25_k1: cfg.bm25.k1,
+            bm25_b: cfg.bm25.b,
+            bm25_default_min_score: cfg.bm25.default_min_score,
+            bm25_default_min_should_match: cfg.bm25.default_min_should_match,
+            bm25_max_query_terms: cfg.bm25.max_query_terms,
+        };
 
-    let repo = ClickHouseConversationRepository::new(ch, repo_cfg);
-    let state = Arc::new(AppState {
-        cfg,
-        repo,
-        prewarm_started: Arc::new(AtomicBool::new(false)),
-    });
+        let repo = ClickHouseConversationRepository::new(ch, repo_cfg);
+        Ok(Arc::new(AppState {
+            cfg,
+            repo,
+            prewarm_started: Arc::new(AtomicBool::new(false)),
+        }))
+    }
+}
 
-    let stdin = BufReader::new(tokio::io::stdin());
-    let mut lines = stdin.lines();
-    let mut stdout = tokio::io::stdout();
+/// Drive a single newline-delimited JSON-RPC connection to completion.
+///
+/// This is the one source of truth for the MCP wire framing: one JSON object
+/// per line in, one JSON object + `\n` per response out, blank lines skipped.
+/// `run_stdio` drives it over stdin/stdout; the central server drives one of
+/// these per accepted socket connection, all sharing a single `Arc<AppState>`.
+async fn serve_connection<R, W>(state: Arc<AppState>, reader: R, mut writer: W) -> Result<()>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut lines = reader.lines();
 
     while let Some(line) = lines.next_line().await? {
         let line = line.trim();
@@ -374,13 +393,246 @@ pub async fn run_stdio(cfg: AppConfig) -> Result<()> {
 
         if let Some(resp) = state.handle_request(req).await {
             let payload = serde_json::to_vec(&resp)?;
-            stdout.write_all(&payload).await?;
-            stdout.write_all(b"\n").await?;
-            stdout.flush().await?;
+            writer.write_all(&payload).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
         }
     }
 
     Ok(())
+}
+
+/// Run an embedded MCP server over stdin/stdout. This is the pre-central
+/// behavior: one full server (ClickHouse client + caches) per process, owned
+/// by the agent session that spawned it. Used directly when the central server
+/// is disabled, and as the transparent fallback when it is unreachable.
+pub async fn run_stdio(cfg: AppConfig) -> Result<()> {
+    let state = AppState::build(cfg)?;
+    serve_connection(
+        state,
+        BufReader::new(tokio::io::stdin()),
+        tokio::io::stdout(),
+    )
+    .await
+}
+
+/// Run the shared central MCP server, listening on a Unix domain socket.
+///
+/// Builds the heavy `AppState` exactly once, then accepts connections and
+/// serves each on its own task sharing that single state. One bad client never
+/// takes down the server; transient `accept` errors back off and retry. A
+/// SIGTERM/SIGINT handler unlinks the socket so a clean `moraine down` leaves
+/// no stale socket behind.
+#[cfg(unix)]
+pub async fn run_socket(cfg: AppConfig, socket_path: PathBuf) -> Result<()> {
+    use tokio::net::{UnixListener, UnixStream};
+
+    let state = AppState::build(cfg)?;
+
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create socket directory {}", parent.display()))?;
+    }
+
+    // Stale-socket dance: if a live server already owns the path, this start is
+    // a no-op (idempotent `moraine up`). Otherwise remove the dead socket file
+    // so bind() can succeed.
+    if socket_path.exists() {
+        match UnixStream::connect(&socket_path).await {
+            Ok(_) => {
+                warn!(
+                    "central MCP server already listening at {}; nothing to do",
+                    socket_path.display()
+                );
+                return Ok(());
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(&socket_path);
+            }
+        }
+    }
+
+    let listener = UnixListener::bind(&socket_path)
+        .with_context(|| format!("failed to bind MCP socket {}", socket_path.display()))?;
+
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(err) =
+            std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+        {
+            warn!(
+                "failed to set 0o600 permissions on {}: {}",
+                socket_path.display(),
+                err
+            );
+        }
+    }
+
+    spawn_socket_cleanup_on_signal(socket_path.clone());
+
+    debug!("central MCP server listening on {}", socket_path.display());
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, _addr)) => {
+                let conn_state = state.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = serve_socket_connection(conn_state, stream).await {
+                        debug!("mcp connection ended: {}", err);
+                    }
+                });
+            }
+            Err(err) => {
+                // e.g. EMFILE under fd pressure: log and keep serving rather
+                // than tearing down every other session's connection.
+                warn!("mcp accept error: {}", err);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn serve_socket_connection(
+    state: Arc<AppState>,
+    stream: tokio::net::UnixStream,
+) -> Result<()> {
+    let (read_half, write_half) = stream.into_split();
+    serve_connection(state, BufReader::new(read_half), write_half).await
+}
+
+#[cfg(unix)]
+fn spawn_socket_cleanup_on_signal(socket_path: PathBuf) {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    tokio::spawn(async move {
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(sig) => sig,
+            Err(err) => {
+                warn!("failed to install SIGTERM handler: {}", err);
+                return;
+            }
+        };
+        let mut int = match signal(SignalKind::interrupt()) {
+            Ok(sig) => sig,
+            Err(err) => {
+                warn!("failed to install SIGINT handler: {}", err);
+                return;
+            }
+        };
+
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+
+        let _ = std::fs::remove_file(&socket_path);
+        std::process::exit(0);
+    });
+}
+
+/// Run a near-zero-cost stdio<->socket proxy for a single agent session.
+///
+/// No ClickHouse client, no caches, no multi-threaded runtime: just two byte
+/// pumps. Because it never parses the JSON, it cannot perturb the framing
+/// (id presence, compact spacing, etc.) — it forwards bytes verbatim.
+///
+/// Half-close semantics matter: when the agent closes stdin we must *not* abort
+/// the downstream copy, or a large in-flight `tools/call` response would be
+/// truncated. So the downstream pump (server -> stdout) is authoritative for
+/// exit; on stdin EOF we shut down the socket write half (signalling EOF to the
+/// server) and keep draining downstream until the server closes its side.
+#[cfg(unix)]
+pub async fn run_proxy(stream: tokio::net::UnixStream) -> Result<()> {
+    proxy_streams(tokio::io::stdin(), tokio::io::stdout(), stream).await
+}
+
+/// Core of [`run_proxy`], generic over the client side so it can be exercised
+/// with in-memory streams in tests. `client_in`/`client_out` are stdin/stdout
+/// in production; `stream` is the connection to the central server.
+#[cfg(unix)]
+async fn proxy_streams<I, O>(
+    mut client_in: I,
+    mut client_out: O,
+    stream: tokio::net::UnixStream,
+) -> Result<()>
+where
+    I: AsyncRead + Unpin,
+    O: AsyncWrite + Unpin,
+{
+    let (mut sock_read, mut sock_write) = stream.into_split();
+
+    let upstream = async {
+        let _ = tokio::io::copy(&mut client_in, &mut sock_write).await;
+        // Signal EOF to the server so it can finish any in-flight response and
+        // close its write half. Ignore errors (server may already be gone).
+        let _ = sock_write.shutdown().await;
+    };
+
+    let downstream = async {
+        let _ = tokio::io::copy(&mut sock_read, &mut client_out).await;
+        let _ = client_out.flush().await;
+    };
+
+    tokio::pin!(upstream);
+    tokio::pin!(downstream);
+
+    tokio::select! {
+        // Server closed its write half (normal end, or crash/EOF): we are done.
+        _ = &mut downstream => {}
+        // Agent finished sending and we half-closed upstream: keep draining the
+        // server's response stream to completion before exiting.
+        _ = &mut upstream => {
+            downstream.await;
+        }
+    }
+
+    Ok(())
+}
+
+/// Entry point used by `moraine run mcp` (the command agents register).
+///
+/// When the central server is enabled (the default), connect to its socket and
+/// proxy; if the socket is missing, refused, or slow to answer, fall back to an
+/// embedded stdio server so correctness never depends on the daemon being up.
+/// When central mode is disabled, run embedded directly (pre-central behavior).
+pub async fn run_mcp_entry(cfg: AppConfig) -> Result<()> {
+    #[cfg(unix)]
+    if cfg.mcp.use_central_server {
+        use tokio::net::UnixStream;
+
+        let socket_path = PathBuf::from(&cfg.mcp.central_socket_path);
+        let dur = std::time::Duration::from_millis(cfg.mcp.central_connect_timeout_ms);
+        match tokio::time::timeout(dur, UnixStream::connect(&socket_path)).await {
+            Ok(Ok(stream)) => {
+                debug!(
+                    "proxying stdio to central MCP server at {}",
+                    socket_path.display()
+                );
+                return run_proxy(stream).await;
+            }
+            Ok(Err(err)) => warn!(
+                "central MCP server unreachable at {} ({}); using embedded server",
+                socket_path.display(),
+                err
+            ),
+            Err(_) => warn!(
+                "central MCP server connect timed out at {} after {}ms; using embedded server",
+                socket_path.display(),
+                cfg.mcp.central_connect_timeout_ms
+            ),
+        }
+    }
+
+    run_stdio(cfg).await
+}
+
+/// Non-Unix platforms do not support the Unix-socket central server. The
+/// `moraine run mcp` entry point still works (embedded only) via the
+/// `run_mcp_entry` fallback above.
+#[cfg(not(unix))]
+pub async fn run_socket(_cfg: AppConfig, _socket_path: std::path::PathBuf) -> Result<()> {
+    anyhow::bail!("the central MCP socket server is only supported on Unix platforms")
 }
 
 #[cfg(test)]
@@ -534,6 +786,149 @@ mod tests {
                 "sessions",
                 "next_cursor"
             ])
+        );
+    }
+
+    #[test]
+    fn app_state_build_succeeds_without_live_clickhouse() {
+        // Building state only constructs the HTTP client and caches; it must
+        // not require ClickHouse to be reachable.
+        let state = AppState::build(AppConfig::default()).expect("build state");
+        assert!(!state.prewarm_started.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn serve_connection_frames_one_response_per_request() {
+        let state = AppState::build(AppConfig::default()).expect("build state");
+
+        // Two requests separated by a blank line (which must be skipped).
+        let input = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+            "\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n",
+        )
+        .as_bytes()
+        .to_vec();
+
+        let mut out: Vec<u8> = Vec::new();
+        serve_connection(state, BufReader::new(&input[..]), &mut out)
+            .await
+            .expect("serve connection");
+
+        let text = String::from_utf8(out).expect("utf8");
+        let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2, "exactly one response per request: {text}");
+
+        let first: Value = serde_json::from_str(lines[0]).expect("json line 1");
+        assert_eq!(first["id"], json!(1));
+        assert_eq!(first["result"]["serverInfo"]["name"], json!("moraine-mcp"));
+
+        let second: Value = serde_json::from_str(lines[1]).expect("json line 2");
+        assert_eq!(second["id"], json!(2));
+        assert_eq!(second["result"], json!({}));
+    }
+
+    #[cfg(unix)]
+    fn unique_socket_path(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::AtomicU32;
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        // Keep the path short to stay well under the ~104-byte sun_path limit.
+        std::path::PathBuf::from(format!(
+            "/tmp/moraine-{tag}-{}-{nanos}-{n}.sock",
+            std::process::id()
+        ))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_socket_serves_initialize_over_unix_socket() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        let sock = unique_socket_path("serve");
+        let _ = std::fs::remove_file(&sock);
+
+        let server_sock = sock.clone();
+        let server = tokio::spawn(async move {
+            let _ = run_socket(AppConfig::default(), server_sock).await;
+        });
+
+        // Connect with a few retries while the listener comes up.
+        let mut stream = None;
+        for _ in 0..50 {
+            match UnixStream::connect(&sock).await {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        }
+        let mut stream = stream.expect("connect to central socket");
+
+        stream
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"initialize\",\"params\":{}}\n")
+            .await
+            .expect("write request");
+
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read response");
+
+        let resp: Value = serde_json::from_str(line.trim()).expect("json response");
+        assert_eq!(resp["id"], json!(7));
+        assert_eq!(resp["result"]["serverInfo"]["name"], json!("moraine-mcp"));
+
+        server.abort();
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn proxy_streams_drains_downstream_after_client_eof() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        let (client_side, server_side) = UnixStream::pair().expect("socket pair");
+
+        // Fake server: read the (small) request, then write a LARGE response and
+        // close its write half. If the proxy aborted downstream on client stdin
+        // EOF, this response would be truncated.
+        const BIG: usize = 1_000_000;
+        let server = tokio::spawn(async move {
+            let (read_half, mut write_half) = server_side.into_split();
+            let mut reader = BufReader::new(read_half);
+            let mut req = String::new();
+            reader
+                .read_line(&mut req)
+                .await
+                .expect("server read request");
+            write_half
+                .write_all(&vec![b'x'; BIG])
+                .await
+                .expect("server write big");
+            write_half.write_all(b"\n").await.expect("server write nl");
+            write_half.shutdown().await.expect("server shutdown");
+        });
+
+        // Client stdin is a tiny request that hits EOF immediately.
+        let client_in = std::io::Cursor::new(b"{\"id\":1}\n".to_vec());
+        let mut client_out: Vec<u8> = Vec::new();
+
+        proxy_streams(client_in, &mut client_out, client_side)
+            .await
+            .expect("proxy");
+        server.await.expect("server task");
+
+        assert_eq!(
+            client_out.len(),
+            BIG + 1,
+            "downstream response must not be truncated when stdin closes first"
         );
     }
 }
