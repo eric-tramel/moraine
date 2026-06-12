@@ -4,7 +4,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use glob::glob;
-use moraine_config::{map_tracked_path, IngestSource};
+use moraine_config::{map_tracked_path, IngestSource, SOURCE_FORMAT_CURSOR_SQLITE};
 use notify::{
     event::{EventKind, ModifyKind},
     Config as NotifyConfig, Event, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher,
@@ -147,18 +147,28 @@ fn event_tracked_paths(event: &Event, format: &str) -> Vec<String> {
     let mut dedup = BTreeSet::<String>::new();
     for path in &event.paths {
         if let Some(tracked) = map_tracked_path(format, &path.to_string_lossy()) {
-            dedup.insert(canonicalize_path_string(&tracked));
+            dedup.insert(tracked_path_identity(format, &tracked));
         }
     }
     dedup.into_iter().collect()
 }
 
-/// Resolves symlinks so every ingestion entry point agrees on one path per
-/// file. Backfill/reconcile paths come from the config glob while watcher
-/// events report the symlink-resolved location (macOS FSEvents turns
-/// `/var/...` into `/private/var/...`); without canonicalization the same
-/// file gets two checkpoint keys and two sets of event UIDs.
-fn canonicalize_path_string(path: &str) -> String {
+/// Resolves symlinks for `cursor_sqlite` so every ingestion entry point
+/// agrees on one path per database. Backfill/reconcile paths come from the
+/// config glob while watcher events report the symlink-resolved location
+/// (macOS FSEvents turns `/var/...` into `/private/var/...`); without
+/// canonicalization the same database gets two checkpoint keys and two sets
+/// of event UIDs.
+///
+/// File-backed formats keep the as-reported path: checkpoint keys and event
+/// UIDs embed `source_file`, so changing the identity of long-standing
+/// sources (e.g. dotfiles-managed symlinked session dirs) would orphan every
+/// existing checkpoint and re-ingest history under new UIDs. `cursor_sqlite`
+/// is new — no install has pre-canonicalization identities to preserve.
+fn tracked_path_identity(format: &str, path: &str) -> String {
+    if format != SOURCE_FORMAT_CURSOR_SQLITE {
+        return path.to_string();
+    }
     std::fs::canonicalize(path)
         .map(|resolved| resolved.to_string_lossy().to_string())
         .unwrap_or_else(|_| path.to_string())
@@ -383,7 +393,7 @@ pub(crate) fn enumerate_tracked_files(glob_pattern: &str, format: &str) -> Resul
         // match a sidecar must not produce a duplicate work item.
         let lossy = path.to_string_lossy();
         if map_tracked_path(format, &lossy).as_deref() == Some(lossy.as_ref()) {
-            files.push(canonicalize_path_string(&lossy));
+            files.push(tracked_path_identity(format, &lossy));
         }
     }
     files.sort();
@@ -455,6 +465,47 @@ mod tests {
             vec!["/tmp/User/globalStorage/state.vscdb".to_string()],
             "base + sidecars coalesce to one canonical path; backups are ignored"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_formats_keep_symlinked_paths_as_reported() {
+        // Checkpoint keys and event UIDs embed source_file: resolving
+        // symlinks for long-standing file-backed sources would orphan every
+        // existing checkpoint and duplicate history under new UIDs.
+        let dir = std::env::temp_dir().join(format!(
+            "moraine-watch-symlink-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock before unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let target = dir.join("real-session.jsonl");
+        std::fs::write(&target, "{}\n").expect("write target");
+        let link = dir.join("link-session.jsonl");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+        let link_str = link.to_string_lossy().to_string();
+
+        let mut event = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any)));
+        event.paths = vec![link.clone()];
+        assert_eq!(
+            event_tracked_paths(&event, "jsonl"),
+            vec![link_str.clone()],
+            "jsonl watcher paths must not be symlink-resolved"
+        );
+
+        let glob_pattern = dir.join("link-*.jsonl").to_string_lossy().to_string();
+        let enumerated = enumerate_tracked_files(&glob_pattern, "jsonl").expect("enumerate");
+        assert_eq!(
+            enumerated,
+            vec![link_str],
+            "jsonl enumeration must not be symlink-resolved"
+        );
+
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]

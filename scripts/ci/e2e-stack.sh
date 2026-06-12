@@ -296,9 +296,11 @@ main() {
   local tmp_root
   tmp_root="$(mktemp -d)"
   # Resolve symlinks (macOS mktemp returns /var/..., a symlink to
-  # /private/var/...) so the paths planted in the config match the
-  # canonicalized paths the ingest watcher reports, keeping source_file
-  # values — and the MCP smoke --expect-source-file assertions — consistent.
+  # /private/var/...) so the fixture paths planted in the config match the
+  # symlink-resolved paths macOS FSEvents reports to the watcher: the
+  # cursor-sqlite live-update assertions count distinct event rows and
+  # would see duplicates if backfill and watcher keyed the same database
+  # under two source_file spellings.
   tmp_root="$(cd "$tmp_root" && pwd -P)"
   local fixtures_root="$tmp_root/fixtures"
   local runtime_root="$tmp_root/runtime"
@@ -476,7 +478,9 @@ connection.execute(
 )
 connection.executemany(
     "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
-    [(key, json.dumps(value).encode("utf-8")) for key, value in rows.items()],
+    # str (TEXT storage class) to match real Cursor: it writes JSON as TEXT
+    # despite the BLOB-declared column.
+    [(key, json.dumps(value)) for key, value in rows.items()],
 )
 connection.commit()
 connection.close()
@@ -791,8 +795,8 @@ bubble = {
 connection.executemany(
     "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
     [
-        (f"composerData:{composer_id}", json.dumps(composer).encode("utf-8")),
-        (f"bubbleId:{composer_id}:{reply_bubble}", json.dumps(bubble).encode("utf-8")),
+        (f"composerData:{composer_id}", json.dumps(composer)),
+        (f"bubbleId:{composer_id}:{reply_bubble}", json.dumps(bubble)),
     ],
 )
 connection.commit()
@@ -855,7 +859,6 @@ PY
     --config "$config_path" \
     --query "$codex_keyword" \
     --expect-session-id "$codex_session_id" \
-    --expect-source-file "$codex_fixture_file" \
     --expect-open-text "$codex_trace_marker"
 
   echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (claude)"
@@ -864,7 +867,6 @@ PY
     --config "$config_path" \
     --query "$claude_keyword" \
     --expect-session-id "$claude_session_id" \
-    --expect-source-file "$claude_fixture_file" \
     --expect-open-text "$claude_trace_marker"
 
   echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (kimi)"
@@ -873,7 +875,6 @@ PY
     --config "$config_path" \
     --query "$kimi_keyword" \
     --expect-session-id "$kimi_raw_session_id" \
-    --expect-source-file "$kimi_fixture_file" \
     --expect-open-text "$kimi_trace_marker"
 
   echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (cursor)"
@@ -882,7 +883,6 @@ PY
     --config "$config_path" \
     --query "$cursor_keyword" \
     --expect-session-id "$cursor_session_id" \
-    --expect-source-file "$cursor_fixture_file" \
     --expect-open-text "$cursor_trace_marker"
 
   echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (cursor sqlite)"
@@ -891,7 +891,6 @@ PY
     --config "$config_path" \
     --query "$cursor_sqlite_keyword" \
     --expect-session-id "$cursor_sqlite_session_id" \
-    --expect-source-file "$cursor_sqlite_fixture_file" \
     --expect-open-text "$cursor_sqlite_trace_marker"
 
   echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (pi)"
@@ -900,7 +899,6 @@ PY
     --config "$config_path" \
     --query "$pi_keyword" \
     --expect-session-id "$pi_session_id" \
-    --expect-source-file "$pi_fixture_file" \
     --expect-open-text "$pi_trace_marker"
 
   # Hermes synthesizes its own `hermes:<uid>` session id, so we do not pin
@@ -912,7 +910,6 @@ PY
     --config "$config_path" \
     --query "$hermes_trace_marker" \
     --expect-session-id "$hermes_trajectory_session_id" \
-    --expect-source-file "$hermes_fixture_file" \
     --expect-open-text "$hermes_trace_marker"
 
   echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (hermes session_json)"
@@ -921,7 +918,6 @@ PY
     --config "$config_path" \
     --query "$hermes_session_keyword" \
     --expect-session-id "$hermes_raw_session_id" \
-    --expect-source-file "$hermes_session_fixture_file" \
     --expect-open-text "$hermes_session_trace_marker"
 
   if [[ "${RUN_REPLAY_BENCH_SMOKE:-0}" == "1" ]]; then

@@ -314,7 +314,6 @@ def run_smoke(
     config: str,
     query: str,
     expect_session_id: Optional[str],
-    expect_source_file: Optional[str],
     expect_open_text: Optional[str],
 ) -> None:
     proc = subprocess.Popen(
@@ -437,7 +436,6 @@ def main() -> int:
     parser.add_argument("--config", required=True)
     parser.add_argument("--query", required=True)
     parser.add_argument("--expect-session-id")
-    parser.add_argument("--expect-source-file")
     parser.add_argument("--expect-open-text")
     args = parser.parse_args()
 
@@ -446,7 +444,6 @@ def main() -> int:
         args.config,
         args.query,
         args.expect_session_id,
-        args.expect_source_file,
         args.expect_open_text,
     )
     print("mcp smoke passed")

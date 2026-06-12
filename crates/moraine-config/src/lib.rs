@@ -373,7 +373,10 @@ const SQLITE_SIDECAR_SUFFIXES: &[&str] = &["-wal", "-shm"];
 
 fn infer_source_format(harness: &str, glob: &str) -> &'static str {
     let glob_lower = glob.to_ascii_lowercase();
-    if glob_lower.ends_with(".vscdb") {
+    // Harness-gated like the hermes branch below: cursor_sqlite synthetic
+    // records only normalize through the cursor adapter, so inferring it for
+    // another harness would silently produce junk events.
+    if harness == "cursor" && glob_lower.ends_with(".vscdb") {
         return SOURCE_FORMAT_CURSOR_SQLITE;
     }
     let looks_like_json = !glob_lower.ends_with(".jsonl")
@@ -399,6 +402,9 @@ fn normalize_source_format(
         trimmed
     };
     match resolved.as_str() {
+        SOURCE_FORMAT_CURSOR_SQLITE if harness != "cursor" => Err(anyhow::anyhow!(
+            "ingest.sources[{source_idx}].format `{SOURCE_FORMAT_CURSOR_SQLITE}` requires harness `cursor` (source `{source_name}` has harness `{harness}`); its synthetic records only normalize through the cursor adapter"
+        )),
         SOURCE_FORMAT_JSONL | SOURCE_FORMAT_SESSION_JSON | SOURCE_FORMAT_CURSOR_SQLITE => {
             Ok(resolved)
         }

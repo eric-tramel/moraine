@@ -32,6 +32,7 @@ use crate::{Metrics, SinkMessage, WorkItem};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use moraine_config::{AppConfig, SOURCE_FORMAT_CURSOR_SQLITE};
+use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -59,6 +60,12 @@ const LONG_STRING_ELIDE_CHARS: usize = 65_536;
 
 /// Rows fetched per statement so a poll never holds one long read transaction.
 const SCAN_PAGE_SIZE: usize = 512;
+
+/// Byte budget for one page's raw values. A page of screenshot-bearing tool
+/// bubbles (~2.4 MB each with the `toolCallBinary` duplicate) would otherwise
+/// buffer over a gigabyte at `SCAN_PAGE_SIZE` rows; the cap ends the page
+/// early so the scan's working set stays bounded regardless of value sizes.
+const SCAN_PAGE_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 const CURSOR_STATE_VERSION: u32 = 1;
 
@@ -353,30 +360,42 @@ pub(crate) async fn process_cursor_sqlite_db(
             error_kind,
             error_text,
         } => {
-            let mut batch = RowBatch::default();
+            // A repeat of the failure already marked in the committed
+            // checkpoint sends nothing: the marker is durable, and reconcile
+            // re-polls every tick — re-sending an identical checkpoint would
+            // grow ingest_checkpoints (and re-serialize the whole kv-hash
+            // map) forever for a permanently failing database.
+            if state.last_error == error_kind {
+                return Ok(());
+            }
+
             // Emit each failure mode once per state change, not once per
             // reconcile tick — ingest_errors is append-only.
-            if state.last_error != error_kind {
-                warn!(
-                    "cursor_sqlite poll failed for {}: {} ({})",
-                    source_file, error_kind, error_text
-                );
-                batch.push_error_row(json!({
-                    "source_name": work.source_name,
-                    "harness": work.harness,
-                    "source_file": source_file,
-                    "source_inode": inode,
-                    "source_generation": checkpoint.source_generation,
-                    "source_line_no": 0u64,
-                    "source_offset": 0u64,
-                    "error_kind": error_kind,
-                    "error_text": error_text,
-                    "raw_fragment": "",
-                }));
-            }
+            let mut batch = RowBatch::default();
+            warn!(
+                "cursor_sqlite poll failed for {}: {} ({})",
+                source_file, error_kind, error_text
+            );
+            batch.push_error_row(json!({
+                "source_name": work.source_name,
+                "harness": work.harness,
+                "source_file": source_file,
+                "source_inode": inode,
+                "source_generation": checkpoint.source_generation,
+                "source_line_no": 0u64,
+                "source_offset": 0u64,
+                "error_kind": error_kind,
+                "error_text": error_text,
+                "raw_fragment": "",
+            }));
 
             // Preserve the data cursor (kv hashes and stat fingerprint stay
             // as-is so the next poll retries); only the error marker moves.
+            // last_offset deliberately does NOT advance: a successful poll's
+            // checkpoint may still be pending in the sink's flush window, and
+            // merge_checkpoint replaces pending entries on last_offset >= —
+            // an error marker must never outrank (and discard) a fresh data
+            // cursor.
             let mut error_state = state.clone();
             error_state.last_error = error_kind.to_string();
             batch.checkpoint = Some(Checkpoint {
@@ -384,7 +403,7 @@ pub(crate) async fn process_cursor_sqlite_db(
                 source_file: source_file.clone(),
                 source_inode: inode,
                 source_generation: checkpoint.source_generation,
-                last_offset: checkpoint.last_offset.saturating_add(1),
+                last_offset: checkpoint.last_offset,
                 last_line_no: checkpoint.last_line_no,
                 status: "active".to_string(),
                 cursor_json: error_state.serialize(),
@@ -409,7 +428,7 @@ fn scan_database(db_path: &str, prior: &CursorState) -> ScanOutcome {
         Err(exc) => {
             return ScanOutcome::Failed {
                 error_kind: ERROR_KIND_OPEN,
-                error_text: exc.to_string(),
+                error_text: format!("{exc:#}"),
             }
         }
     };
@@ -438,7 +457,7 @@ fn scan_database(db_path: &str, prior: &CursorState) -> ScanOutcome {
         Err(exc) => {
             return ScanOutcome::Failed {
                 error_kind: ERROR_KIND_SCAN,
-                error_text: exc.to_string(),
+                error_text: format!("{exc:#}"),
             };
         }
     }
@@ -450,7 +469,7 @@ fn scan_database(db_path: &str, prior: &CursorState) -> ScanOutcome {
         kv_hashes: BTreeMap::new(),
         last_error: String::new(),
     };
-    let mut changed: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut records = Vec::<SyntheticRecord>::new();
     let mut relevant_keys = 0u64;
 
     for prefix in RELEVANT_PREFIXES {
@@ -459,23 +478,29 @@ fn scan_database(db_path: &str, prior: &CursorState) -> ScanOutcome {
             prefix,
             &prior.kv_hashes,
             &mut new_state.kv_hashes,
-            &mut changed,
+            &mut records,
         );
         match scan {
             Ok(seen) => relevant_keys += seen,
             Err(exc) => {
                 return ScanOutcome::Failed {
                     error_kind: ERROR_KIND_SCAN,
-                    error_text: exc.to_string(),
+                    error_text: format!("{exc:#}"),
                 };
             }
         }
-    }
-
-    let mut records = Vec::<SyntheticRecord>::new();
-    for (key, value) in &changed {
-        if let Some(record) = synthesize_cursor_sqlite_record(key, value) {
-            records.push(record);
+        // Re-check the ceiling against what the scan actually saw: the count
+        // ran in its own read transaction, so keys written in between could
+        // otherwise grow cursor_json past the checkpoint payload budget.
+        if new_state.kv_hashes.len() > MAX_RELEVANT_KEYS {
+            return ScanOutcome::Failed {
+                error_kind: ERROR_KIND_TOO_LARGE,
+                error_text: format!(
+                    "{} relevant keys exceed the {MAX_RELEVANT_KEYS} checkpoint ceiling; \
+                     use Cursor agent transcripts (JSONL) for this history",
+                    new_state.kv_hashes.len()
+                ),
+            };
         }
     }
 
@@ -520,11 +545,40 @@ fn scan_database(db_path: &str, prior: &CursorState) -> ScanOutcome {
     }
 }
 
+/// Opens the database read-only, retrying with `immutable=1` when the plain
+/// open is refused.
+///
+/// A cleanly closed WAL-mode database on read-only media cannot be opened by
+/// a plain read-only connection: SQLite must materialize the WAL shared-memory
+/// index and the filesystem refuses the `-shm` create (observed with Cursor
+/// `state.vscdb` files under the sandbox's read-only bind mount). The
+/// `immutable=1` retry is safe precisely because the sidecar files are absent:
+/// no writer is active and every page lives in the main file. Databases with
+/// live sidecars never reach the fallback — the existing `-shm` is readable
+/// and the plain open succeeds.
 fn open_read_only(db_path: &str) -> Result<Connection> {
-    let connection = Connection::open_with_flags(
-        db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
+    match open_and_probe(db_path, false) {
+        Ok(connection) => Ok(connection),
+        Err(exc) if blocked_by_readonly_media(&exc) => open_and_probe(db_path, true)
+            .with_context(|| format!("immutable fallback failed for {db_path}")),
+        Err(exc) => Err(exc),
+    }
+}
+
+fn open_and_probe(db_path: &str, immutable: bool) -> Result<Connection> {
+    let connection = if immutable {
+        Connection::open_with_flags(
+            sqlite_immutable_uri(db_path),
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_URI,
+        )
+    } else {
+        Connection::open_with_flags(
+            db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+    }
     .with_context(|| format!("failed to open {db_path} read-only"))?;
     connection
         .busy_timeout(std::time::Duration::from_millis(500))
@@ -534,7 +588,44 @@ fn open_read_only(db_path: &str) -> Result<Connection> {
     connection
         .pragma_update(None, "query_only", "ON")
         .context("failed to set query_only")?;
+    // SQLite opens lazily; force the first page read here so open-class
+    // failures are reported as open errors instead of leaking out of the
+    // first schema query as a bogus schema mismatch.
+    connection
+        .query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+        .with_context(|| format!("failed to read {db_path}"))?;
     Ok(connection)
+}
+
+/// The sidecar-create failure surfaces as `SQLITE_CANTOPEN` on Linux and as
+/// `SQLITE_READONLY` (extended: `SQLITE_READONLY_DIRECTORY`) on macOS; both
+/// mean "the filesystem refused the WAL sidecars", so both retry immutable.
+fn blocked_by_readonly_media(exc: &anyhow::Error) -> bool {
+    exc.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(failure, _))
+                if matches!(
+                    failure.code,
+                    rusqlite::ErrorCode::CannotOpen | rusqlite::ErrorCode::ReadOnly
+                )
+        )
+    })
+}
+
+/// SQLite URI filenames percent-decode `%XX` and treat `?`/`#` as delimiters;
+/// escape those so arbitrary paths round-trip.
+fn sqlite_immutable_uri(db_path: &str) -> String {
+    let mut encoded = String::with_capacity(db_path.len());
+    for ch in db_path.chars() {
+        match ch {
+            '%' => encoded.push_str("%25"),
+            '#' => encoded.push_str("%23"),
+            '?' => encoded.push_str("%3F"),
+            other => encoded.push(other),
+        }
+    }
+    format!("file:{encoded}?immutable=1")
 }
 
 fn validate_schema(connection: &Connection) -> std::result::Result<u64, String> {
@@ -584,7 +675,10 @@ fn count_relevant_keys(connection: &Connection) -> Result<usize> {
     for prefix in RELEVANT_PREFIXES {
         let count: i64 = connection
             .query_row(
-                "SELECT count(*) FROM cursorDiskKV WHERE key >= ?1 AND key < ?2",
+                // Strictly greater, matching scan_prefix's seed of the bare
+                // prefix — a key exactly equal to the prefix is never scanned
+                // and must not count toward the ceiling.
+                "SELECT count(*) FROM cursorDiskKV WHERE key > ?1 AND key < ?2",
                 rusqlite::params![prefix, prefix_range_end(prefix)],
                 |row| row.get(0),
             )
@@ -595,49 +689,79 @@ fn count_relevant_keys(connection: &Connection) -> Result<usize> {
 }
 
 /// Pages through one key prefix, recording content hashes for every key and
-/// collecting the value bytes for keys that are new or changed. Paging keeps
-/// each implicit read transaction short (issue #361 decision 4).
+/// synthesizing records for keys that are new or changed. Paging keeps each
+/// implicit read transaction short (issue #361 decision 4), and synthesizing
+/// page-by-page keeps raw value bytes from accumulating: sanitization
+/// (toolCallBinary drop, long-string elision) shrinks the retained record by
+/// orders of magnitude for media-heavy bubbles, so the scan's peak raw-byte
+/// buffer is one page, additionally capped by `SCAN_PAGE_MAX_BYTES`.
 fn scan_prefix(
     connection: &Connection,
     prefix: &str,
     prior_hashes: &BTreeMap<String, String>,
     new_hashes: &mut BTreeMap<String, String>,
-    changed: &mut Vec<(String, Vec<u8>)>,
+    records: &mut Vec<SyntheticRecord>,
 ) -> Result<u64> {
     let range_end = prefix_range_end(prefix);
     let mut last_key = prefix.to_string();
     let mut seen = 0u64;
 
     loop {
-        let mut stmt = connection
-            .prepare_cached(
-                "SELECT key, value FROM cursorDiskKV \
-                 WHERE key > ?1 AND key < ?2 ORDER BY key LIMIT ?3",
-            )
-            .context("failed to prepare prefix scan")?;
-        let page: Vec<(String, Option<Vec<u8>>)> = stmt
-            .query_map(
-                rusqlite::params![last_key, range_end, SCAN_PAGE_SIZE as i64],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
-            )
-            .context("prefix scan query failed")?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("prefix scan row failed")?;
+        let mut page: Vec<(String, Option<Vec<u8>>)> = Vec::new();
+        let mut page_bytes = 0usize;
+        {
+            let mut stmt = connection
+                .prepare_cached(
+                    "SELECT key, value FROM cursorDiskKV \
+                     WHERE key > ?1 AND key < ?2 ORDER BY key LIMIT ?3",
+                )
+                .context("failed to prepare prefix scan")?;
+            let mut rows = stmt
+                .query(rusqlite::params![
+                    last_key,
+                    range_end,
+                    SCAN_PAGE_SIZE as i64
+                ])
+                .context("prefix scan query failed")?;
+            while let Some(row) = rows.next().context("prefix scan row failed")? {
+                let key = row.get::<_, String>(0).context("prefix scan key failed")?;
+                // Cursor writes JSON documents as TEXT even though the
+                // column is declared BLOB; accept any storage class instead
+                // of trusting the declared affinity.
+                let value = match row.get_ref(1).context("prefix scan value failed")? {
+                    ValueRef::Null => None,
+                    ValueRef::Text(text) => Some(text.to_vec()),
+                    ValueRef::Blob(blob) => Some(blob.to_vec()),
+                    ValueRef::Integer(int) => Some(int.to_string().into_bytes()),
+                    ValueRef::Real(real) => Some(real.to_string().into_bytes()),
+                };
+                page_bytes += value.as_ref().map_or(0, Vec::len);
+                page.push((key, value));
+                if page_bytes >= SCAN_PAGE_MAX_BYTES {
+                    break;
+                }
+            }
+        }
 
-        let page_len = page.len();
+        // A row-capped page may have more rows behind it; so may a
+        // byte-capped one.
+        let more = page.len() == SCAN_PAGE_SIZE || page_bytes >= SCAN_PAGE_MAX_BYTES;
+
         for (key, value) in page {
-            last_key = key.clone();
             seen += 1;
             let bytes = value.unwrap_or_default();
             let hash = format!("{:016x}", hash_bytes(&bytes));
             let unchanged = prior_hashes.get(&key) == Some(&hash);
-            new_hashes.insert(key.clone(), hash);
             if !unchanged && !bytes.is_empty() {
-                changed.push((key, bytes));
+                if let Some(record) = synthesize_cursor_sqlite_record(&key, &bytes) {
+                    records.push(record);
+                }
             }
+            new_hashes.insert(key.clone(), hash);
+            last_key = key;
         }
 
-        if page_len < SCAN_PAGE_SIZE {
+        if !more {
             break;
         }
     }
@@ -694,11 +818,17 @@ fn synthesize_composer_record(composer_id: &str, data: &Value) -> Option<Synthet
         return None;
     }
 
-    let created_at_ms = data.get("createdAt").and_then(Value::as_i64).unwrap_or(0);
     // Always stamp the *creation* time: `event_ts` participates in the
     // events table sort key, so a re-emitted composer must keep a stable
-    // timestamp for ReplacingMergeTree to collapse versions.
-    let timestamp = epoch_ms_to_record_ts(created_at_ms).unwrap_or_default();
+    // timestamp for ReplacingMergeTree to collapse versions. A composer
+    // without a positive createdAt is deferred entirely — a placeholder
+    // timestamp would strand a permanent epoch-dated row in the sort key
+    // when the real value appears on a later re-emission.
+    let created_at_ms = data
+        .get("createdAt")
+        .and_then(Value::as_i64)
+        .filter(|ms| *ms > 0)?;
+    let timestamp = epoch_ms_to_record_ts(created_at_ms)?;
 
     let mut record = Map::new();
     record.insert("type".to_string(), json!("cursor_composer"));
@@ -762,14 +892,23 @@ fn synthesize_bubble_record(
         return None;
     }
 
+    // Same stability rule as composers: a bubble without a parseable
+    // createdAt is deferred until Cursor writes one (it does at creation).
+    // A fallback timestamp would spam timestamp_parse_error rows on every
+    // re-emission of a mutating bubble and strand a permanent epoch-dated
+    // duplicate once the real value appears — event_ts is in the sort key.
+    // Validation uses the same parser the normalizer applies downstream.
+    let created_at = data
+        .get("createdAt")
+        .and_then(Value::as_str)
+        .filter(|raw| crate::sources::shared::parse_record_ts(raw).is_some())?;
+
     let mut record = Map::new();
     record.insert("type".to_string(), json!("cursor_bubble"));
     record.insert("sessionId".to_string(), json!(composer_id));
     record.insert("bubbleId".to_string(), json!(bubble_id));
     record.insert("bubbleType".to_string(), json!(bubble_type));
-    if let Some(created_at) = data.get("createdAt").and_then(Value::as_str) {
-        record.insert("timestamp".to_string(), json!(created_at));
-    }
+    record.insert("timestamp".to_string(), json!(created_at));
 
     let mut text = data
         .get("text")
@@ -970,10 +1109,13 @@ mod tests {
     }
 
     fn put(connection: &Connection, key: &str, value: &Value) {
+        // Real Cursor writes JSON as TEXT despite the BLOB-declared column;
+        // fixtures must match or the scan's storage-class handling goes
+        // untested (this exact mismatch shipped once).
         connection
             .execute(
                 "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
-                rusqlite::params![key, serde_json::to_vec(value).expect("serialize value")],
+                rusqlite::params![key, serde_json::to_string(value).expect("serialize value")],
             )
             .expect("insert kv row");
     }
@@ -1339,6 +1481,122 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn blob_stored_json_values_normalize() {
+        let path = unique_db_path("blob-values");
+        let db = create_kv_db(&path);
+        // Cursor writes TEXT today, but both storage classes must normalize
+        // identically — the column is declared BLOB and writers can change.
+        for (key, value) in [
+            (
+                format!("composerData:{COMPOSER_ID}"),
+                composer_value("Blob storage", 1),
+            ),
+            (
+                format!("bubbleId:{COMPOSER_ID}:{USER_BUBBLE_ID}"),
+                user_bubble_value(),
+            ),
+        ] {
+            db.execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+                rusqlite::params![key, serde_json::to_vec(&value).expect("serialize value")],
+            )
+            .expect("insert blob kv row");
+        }
+
+        let work = sqlite_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let batches = run_poll(&work, &checkpoints).await;
+
+        let rows = all_event_rows(&batches);
+        for expected in ["session_meta", "message"] {
+            assert!(
+                rows.iter()
+                    .any(|row| row.get("event_kind").and_then(Value::as_str) == Some(expected)),
+                "blob-stored rows must emit {expected}: {rows:?}"
+            );
+        }
+
+        cleanup(&path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wal_db_in_read_only_directory_opens_via_immutable_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "moraine-sqlite-poll-rodir-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock before unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("state.vscdb");
+        {
+            let connection = Connection::open(&path).expect("create fixture db");
+            connection
+                .pragma_update(None, "journal_mode", "WAL")
+                .expect("enable WAL");
+            connection
+                .execute_batch(
+                    "CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);",
+                )
+                .expect("create tables");
+            put(
+                &connection,
+                &format!("composerData:{COMPOSER_ID}"),
+                &composer_value("Read-only media", 1),
+            );
+            put(
+                &connection,
+                &format!("bubbleId:{COMPOSER_ID}:{USER_BUBBLE_ID}"),
+                &user_bubble_value(),
+            );
+        }
+        // A clean close checkpoints the WAL and removes the sidecars — the
+        // exact shape that breaks plain read-only opens on read-only media.
+        assert!(
+            !dir.join("state.vscdb-wal").exists(),
+            "clean close should remove the WAL sidecar"
+        );
+
+        let writable = std::fs::metadata(&dir).expect("stat dir").permissions();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))
+            .expect("make dir read-only");
+
+        let work = sqlite_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let batches = run_poll(&work, &checkpoints).await;
+
+        std::fs::set_permissions(&dir, writable).expect("restore dir permissions");
+
+        let error_rows: Vec<Value> = batches
+            .iter()
+            .flat_map(|batch| batch.error_rows.iter().cloned())
+            .collect();
+        assert!(
+            error_rows.is_empty(),
+            "read-only directory must not emit error rows: {error_rows:?}"
+        );
+        assert!(
+            !all_event_rows(&batches).is_empty(),
+            "expected events from the read-only db"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn sqlite_immutable_uri_escapes_delimiters() {
+        assert_eq!(
+            sqlite_immutable_uri("/tmp/cache 100%?x#y.vscdb"),
+            "file:/tmp/cache 100%25%3Fx%23y.vscdb?immutable=1"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn schema_mismatch_emits_one_error_and_preserves_cursor() {
         let path = unique_db_path("schema-mismatch");
         let db = Connection::open(&path).expect("create db");
@@ -1360,11 +1618,77 @@ mod tests {
             Some(ERROR_KIND_SCHEMA)
         );
 
+        let first_checkpoint = first
+            .last()
+            .and_then(|batch| batch.checkpoint.clone())
+            .expect("first failure persists the error marker");
+        assert_eq!(
+            first_checkpoint.last_offset, 0,
+            "error checkpoints must not advance last_offset past a pending success checkpoint"
+        );
+
         let second = run_poll(&work, &checkpoints).await;
         let second_errors: usize = second.iter().map(|batch| batch.error_rows.len()).sum();
         assert_eq!(
             second_errors, 0,
             "persistent schema mismatch is reported once, not per poll"
+        );
+        assert!(
+            second.iter().all(|batch| batch.checkpoint.is_none()),
+            "a repeated failure must not re-send checkpoints every reconcile tick"
+        );
+
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rows_without_created_at_are_deferred_without_events_or_errors() {
+        let path = unique_db_path("no-created-at");
+        let db = create_kv_db(&path);
+        let mut composer = composer_value("Cooking ideas inspiration", 1);
+        composer
+            .as_object_mut()
+            .expect("composer object")
+            .remove("createdAt");
+        put(&db, &format!("composerData:{COMPOSER_ID}"), &composer);
+        let mut bubble = user_bubble_value();
+        bubble
+            .as_object_mut()
+            .expect("bubble object")
+            .remove("createdAt");
+        put(
+            &db,
+            &format!("bubbleId:{COMPOSER_ID}:{USER_BUBBLE_ID}"),
+            &bubble,
+        );
+
+        let work = sqlite_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let batches = run_poll(&work, &checkpoints).await;
+
+        // event_ts is in the events sort key: emitting placeholder timestamps
+        // would strand permanent epoch-dated duplicates once createdAt
+        // appears on a later re-emission. Defer instead.
+        assert!(
+            all_event_rows(&batches).is_empty(),
+            "rows without createdAt must not emit events"
+        );
+        let error_rows: usize = batches.iter().map(|batch| batch.error_rows.len()).sum();
+        assert_eq!(error_rows, 0, "deferral must not emit error rows");
+
+        // The mutation that adds createdAt re-emits with the real timestamp.
+        put(
+            &db,
+            &format!("bubbleId:{COMPOSER_ID}:{USER_BUBBLE_ID}"),
+            &user_bubble_value(),
+        );
+        let batches = run_poll(&work, &checkpoints).await;
+        let rows = all_event_rows(&batches);
+        assert_eq!(rows.len(), 1, "bubble emits once createdAt appears");
+        assert_eq!(
+            rows[0].get("event_ts").and_then(Value::as_str),
+            Some("2026-05-08 02:04:37.835"),
+            "the real creation time is stamped, not a placeholder"
         );
 
         cleanup(&path);

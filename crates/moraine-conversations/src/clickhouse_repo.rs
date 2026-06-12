@@ -1991,6 +1991,11 @@ FORMAT JSONEachRow",
         } else {
             (text_preview_expr, payload_preview_expr)
         };
+        // events is partitioned by toYYYYMM(ingested_at), and ReplacingMergeTree
+        // never collapses across partitions — a row re-emitted in a later month
+        // (e.g. a mutated cursor_sqlite kv row, a rewritten hermes session file)
+        // is a permanent second copy. The newest event_version per event_uid
+        // wins here so transcripts render each event exactly once.
         let query = format!(
             "WITH ifNull(parseDateTime64BestEffortOrNull(record_ts), ingested_at) AS resolved_event_time
 SELECT
@@ -2016,7 +2021,8 @@ SELECT
   token_usage_native_units
 FROM {events_table}
 WHERE session_id = {}
-ORDER BY resolved_event_time, source_file, source_generation, source_offset, source_line_no, event_uid
+ORDER BY resolved_event_time, source_file, source_generation, source_offset, source_line_no, event_uid, event_version DESC
+LIMIT 1 BY event_uid
 FORMAT JSONEachRow",
             sql_quote(session_id),
         );

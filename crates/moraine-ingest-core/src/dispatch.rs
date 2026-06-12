@@ -252,6 +252,10 @@ pub(crate) fn spawn_debounce_task(
                     for key in ready {
                         if let Some((work, _)) = pending.remove(&key) {
                             if !work_path_is_canonical(&work) {
+                                debug!(
+                                    "dropping non-canonical work item {} (format {})",
+                                    work.path, work.format
+                                );
                                 continue;
                             }
 
@@ -271,6 +275,10 @@ pub(crate) async fn enqueue_work(
     metrics: &Arc<Metrics>,
 ) {
     if !work_path_is_canonical(&work) {
+        debug!(
+            "dropping non-canonical work item {} (format {})",
+            work.path, work.format
+        );
         return;
     }
 

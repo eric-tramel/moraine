@@ -99,7 +99,10 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
     if !checkpoint_cursor_columns {
         warn!(
             "ingest_checkpoints is missing the SQLite cursor columns (migration 015); \
-             cursor_sqlite poll cursors will not persist until `moraine db migrate` runs"
+             cursor_sqlite poll cursors will not persist until `moraine db migrate` runs \
+             AND this ingest service restarts (the column probe is startup-only) — \
+             until then every restart re-scans Cursor databases from scratch and \
+             re-appends their rows to raw_events"
         );
     }
 
