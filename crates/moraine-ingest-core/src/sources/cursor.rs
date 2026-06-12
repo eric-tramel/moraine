@@ -90,7 +90,242 @@ impl IngestSource for Cursor {
         base_uid: &str,
         model_hint: &str,
     ) -> NormalizedPartials {
-        normalize_cursor_record(record, ctx, top_type, base_uid, model_hint)
+        // Synthetic records produced by the cursor_sqlite poller route by
+        // top-level type (the Hermes precedent); JSONL agent transcripts fall
+        // through to the shape-based normalizer below.
+        match top_type {
+            "cursor_composer" => normalize_cursor_composer(record, ctx),
+            "cursor_bubble" => normalize_cursor_sqlite_bubble(record, ctx),
+            _ => normalize_cursor_record(record, ctx, top_type, base_uid, model_hint),
+        }
+    }
+}
+
+/// Normalizes a `cursor_composer` synthetic record (one per `composerData:`
+/// row) into a `session_meta` event. The payload keeps `title`/`name` so the
+/// MCP session-info extraction surfaces Cursor's own session name.
+fn normalize_cursor_composer(record: &Value, ctx: &RecordContext<'_>) -> NormalizedPartials {
+    let mut emitter = SourceEmitter::new(ctx);
+    let session_id = first_string(record, &["sessionId"]).unwrap_or_default();
+    let uid = emitter.uid(
+        &format!("cursor_sqlite:composer:{session_id}"),
+        "session_meta",
+    );
+
+    let name = first_string(record, &["name", "title"]).unwrap_or_default();
+    let subtitle = first_string(record, &["subtitle"]).unwrap_or_default();
+    let text = match (name.is_empty(), subtitle.is_empty()) {
+        (false, false) => format!("{name} — {subtitle}"),
+        (false, true) => name,
+        (true, false) => subtitle,
+        (true, true) => String::new(),
+    };
+
+    let event = emitter.event_for_json(
+        &uid,
+        "session_meta",
+        "session_meta",
+        "system",
+        &text,
+        record,
+    );
+    emitter.push_event(event);
+    emitter.finish()
+}
+
+/// Normalizes a `cursor_bubble` synthetic record (one per `bubbleId:` row).
+///
+/// Bubbles mutate in place while Cursor streams (text grows, tool status
+/// flips `pending` → `completed`), so every event UID here is derived from
+/// the bubble's logical identity — never its payload — letting a re-emit
+/// replace the prior row via `ReplacingMergeTree(event_version)`.
+fn normalize_cursor_sqlite_bubble(record: &Value, ctx: &RecordContext<'_>) -> NormalizedPartials {
+    let mut emitter = SourceEmitter::new(ctx);
+    let session_id = first_string(record, &["sessionId"]).unwrap_or_default();
+    let bubble_id = first_string(record, &["bubbleId"]).unwrap_or_default();
+    let identity = format!("cursor_sqlite:bubble:{session_id}:{bubble_id}");
+    let bubble_type = record
+        .get("bubbleType")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let request_id = first_string(record, &["requestId"]).unwrap_or_default();
+
+    let stamp = |event: EventBuilder| {
+        event
+            .request_id(request_id.clone())
+            .trace_id(request_id.clone())
+            .item_id(bubble_id.clone())
+    };
+
+    if let Some(thinking_text) = record
+        .pointer("/thinking/text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+    {
+        let uid = emitter.uid(&identity, "reasoning");
+        let payload = record.get("thinking").cloned().unwrap_or(Value::Null);
+        let event = stamp(emitter.event_for_json(
+            &uid,
+            "reasoning",
+            "reasoning",
+            "assistant",
+            thinking_text,
+            &payload,
+        ))
+        .has_reasoning(true)
+        .content_types(["reasoning"]);
+        emitter.push_event(event);
+    }
+
+    if let Some(text) = record
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+    {
+        let (suffix, payload_type, actor) = if bubble_type == 1 {
+            ("user_message", "user_message", "user")
+        } else {
+            ("agent_message", "agent_message", "assistant")
+        };
+        let uid = emitter.uid(&identity, suffix);
+        let event = stamp(emitter.event_for_json(
+            &uid,
+            "message",
+            payload_type,
+            actor,
+            text,
+            &json!({ "text": text }),
+        ))
+        .content_types(["text"]);
+        emitter.push_event(event);
+    }
+
+    if let Some(tool_data) = record.get("toolFormerData").filter(|v| v.is_object()) {
+        normalize_cursor_tool_former(&identity, tool_data, &stamp, &mut emitter);
+    }
+
+    emitter.finish()
+}
+
+/// Emits the tool-call (and, once the call reached a terminal status, the
+/// tool-result) events plus `tool_io` rows for one `toolFormerData` payload.
+fn normalize_cursor_tool_former(
+    identity: &str,
+    tool_data: &Value,
+    stamp: &dyn Fn(EventBuilder) -> EventBuilder,
+    emitter: &mut SourceEmitter<'_>,
+) {
+    let tool_name = cursor_former_tool_name(tool_data);
+    let status = first_string(tool_data, &["status"])
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    // Cursor joins two ids with a literal newline ("call_…\nfc_…"); the
+    // first line is the stable call id.
+    let tool_call_id = first_string(tool_data, &["toolCallId"])
+        .and_then(|raw| raw.lines().next().map(ToOwned::to_owned))
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| identity.to_string());
+
+    let input = tool_data
+        .get("params")
+        .filter(|v| !v.is_null())
+        .or_else(|| tool_data.get("rawArgs").filter(|v| !v.is_null()))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let input_json = compact_json(&input);
+    let input_text = cursor_text_or_json(&input);
+
+    let use_uid = emitter.uid(identity, "tool_use");
+    let event = stamp(emitter.event_for_json(
+        &use_uid,
+        "tool_call",
+        "tool_use",
+        "assistant",
+        &input_text,
+        tool_data,
+    ))
+    .content_types(["tool_use"])
+    .tool_call_id(tool_call_id.clone())
+    .tool_name(tool_name.clone())
+    .op_status(status.clone());
+    emitter.push_event(event);
+    emitter.push_tool_request(&use_uid, &tool_call_id, "", &tool_name, &input_json);
+    emit_cursor_reference_links(&use_uid, &input, emitter);
+
+    // `result` can be legitimately absent on a completed call (ripgrep keeps
+    // its summary in additionalData; `await` has neither params nor result),
+    // so terminality is decided by status alone.
+    let terminal = matches!(
+        status.as_str(),
+        "completed" | "error" | "errored" | "cancelled" | "canceled" | "aborted" | "rejected"
+    );
+    if !terminal {
+        return;
+    }
+
+    let output = tool_data
+        .get("result")
+        .filter(|v| !v.is_null())
+        .or_else(|| tool_data.get("error").filter(|v| !v.is_null()))
+        .or_else(|| tool_data.get("additionalData").filter(|v| !v.is_null()))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let output_json = compact_json(&output);
+    let output_text = cursor_text_or_json(&output);
+    let rejected = output
+        .get("rejected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let tool_error = u8::from(status != "completed" || rejected);
+
+    let result_uid = emitter.uid(identity, "tool_result");
+    let event = stamp(emitter.event_for_json(
+        &result_uid,
+        "tool_result",
+        "tool_result",
+        "tool",
+        &output_text,
+        &output,
+    ))
+    .content_types(["tool_result"])
+    .tool_call_id(tool_call_id.clone())
+    .tool_name(tool_name.clone())
+    .op_status(status.clone())
+    .tool_error(tool_error);
+    emitter.push_event(event);
+    emitter.push_tool_response(
+        &result_uid,
+        &tool_call_id,
+        "",
+        &tool_name,
+        tool_error,
+        &input_json,
+        &output_json,
+        &output_text,
+    );
+}
+
+/// Tool name for a `toolFormerData` payload. MCP calls degrade to `"mcp--"`
+/// on some errors; recover the real name from `rawArgs`/`params` when the
+/// recorded one is degenerate.
+fn cursor_former_tool_name(tool_data: &Value) -> String {
+    let name = first_string(tool_data, &["name"]).unwrap_or_default();
+    if !name.is_empty() && name != "mcp--" && name != "mcp-" {
+        return name;
+    }
+
+    let from_raw_args = tool_data
+        .get("rawArgs")
+        .and_then(|raw| first_string(raw, &["name"]))
+        .map(|tool| format!("mcp:{tool}"));
+    if let Some(recovered) = from_raw_args {
+        return recovered;
+    }
+
+    if name.is_empty() {
+        "unknown".to_string()
+    } else {
+        name
     }
 }
 

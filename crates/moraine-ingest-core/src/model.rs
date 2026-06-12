@@ -10,6 +10,17 @@ pub struct Checkpoint {
     pub last_offset: u64,
     pub last_line_no: u64,
     pub status: String,
+    /// Structured poll cursor for database-backed sources (issue #361).
+    /// Authoritative for `cursor_sqlite`; always empty for file-backed
+    /// formats, whose `last_offset`/`last_line_no` semantics are unchanged.
+    #[serde(default)]
+    pub cursor_json: String,
+    /// Identity hash of the underlying database file for DB-backed sources.
+    #[serde(default)]
+    pub source_fingerprint: u64,
+    /// Hash of the relevant database schema for DB-backed sources.
+    #[serde(default)]
+    pub schema_fingerprint: u64,
 }
 
 #[derive(Debug, Clone, Default)]

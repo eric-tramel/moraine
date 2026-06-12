@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use moraine_ingest_core::model::NormalizedRecord;
 use moraine_ingest_core::normalize::normalize_record;
+use moraine_ingest_core::sqlite_poll::synthesize_cursor_sqlite_record;
 use serde_json::{json, Value};
 
 const UPDATE_ENV: &str = "MORAINE_UPDATE_INGEST_GOLDENS";
@@ -20,6 +21,10 @@ struct GoldenCase {
 enum GoldenFormat {
     Jsonl,
     HermesSessionJson,
+    /// kv fixture rows ({"key", "value"} JSONL) fed through the production
+    /// `synthesize_cursor_sqlite_record` synthesis, exactly as the
+    /// `cursor_sqlite` poller does for changed `state.vscdb` rows.
+    CursorSqlite,
 }
 
 const SCHEMA_SQL: &str = include_str!("../../../sql/001_schema.sql");
@@ -106,7 +111,7 @@ const TOKEN_NATIVE_UNIT_KEYS: &[&str] = &[
     "output_images",
 ];
 
-fn golden_cases() -> [GoldenCase; 7] {
+fn golden_cases() -> [GoldenCase; 8] {
     [
         GoldenCase {
             name: "codex",
@@ -139,6 +144,15 @@ fn golden_cases() -> [GoldenCase; 7] {
             fixture_rel: "fixtures/cursor/projects/demo/agent-transcripts/11111111-2222-4333-8444-555555555555/11111111-2222-4333-8444-555555555555.jsonl",
             source_file: "/fixtures/cursor/projects/demo/agent-transcripts/11111111-2222-4333-8444-555555555555/11111111-2222-4333-8444-555555555555.jsonl",
             format: GoldenFormat::Jsonl,
+        },
+        GoldenCase {
+            name: "cursor_sqlite",
+            harness: "cursor",
+            source_name: "golden-cursor-sqlite",
+            fixture_rel: "fixtures/cursor/state-vscdb-kv.jsonl",
+            // The poller's source_file is the canonical database path.
+            source_file: "/fixtures/cursor/User/globalStorage/state.vscdb",
+            format: GoldenFormat::CursorSqlite,
         },
         GoldenCase {
             name: "hermes_trajectory",
@@ -340,7 +354,58 @@ fn normalize_case(case: &GoldenCase) -> Vec<NormalizedRecord> {
     match case.format {
         GoldenFormat::Jsonl => normalize_jsonl(case),
         GoldenFormat::HermesSessionJson => normalize_hermes_session_json(case),
+        GoldenFormat::CursorSqlite => normalize_cursor_sqlite(case),
     }
+}
+
+/// Mirrors `sqlite_poll::process_cursor_sqlite_db`: each fixture row is one
+/// `cursorDiskKV` entry; synthesis and the stable source coordinates come
+/// from the production code, so this golden cannot drift from the poller.
+fn normalize_cursor_sqlite(case: &GoldenCase) -> Vec<NormalizedRecord> {
+    let path = fixture_path(case.fixture_rel);
+    let body = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("read fixture {}: {err}", path.display()));
+
+    let mut records = Vec::new();
+    for (idx, line) in body.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let row: Value = serde_json::from_str(trimmed)
+            .unwrap_or_else(|err| panic!("fixture {} line {}: {err}", path.display(), idx + 1));
+        let key = row
+            .get("key")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("fixture line {} is missing `key`", idx + 1));
+        let value_bytes = serde_json::to_vec(row.get("value").unwrap_or(&Value::Null))
+            .expect("serialize fixture value");
+
+        let Some(synthetic) = synthesize_cursor_sqlite_record(key, &value_bytes) else {
+            // Skipped rows (ghost composers, placeholder bubbles, out-of-scope
+            // key families) appear in the golden as empty snapshots so scope
+            // changes are visible in review.
+            records.push(NormalizedRecord::default());
+            continue;
+        };
+
+        let normalized = normalize_record(
+            &synthetic.record,
+            case.source_name,
+            case.harness,
+            case.source_file,
+            1,
+            1,
+            synthetic.source_line_no,
+            synthetic.source_offset,
+            "",
+            "",
+        )
+        .unwrap_or_else(|err| panic!("normalize {} kv row {}: {err:#}", case.name, idx + 1));
+        records.push(normalized);
+    }
+
+    records
 }
 
 fn snapshot_record(record: &NormalizedRecord) -> Value {

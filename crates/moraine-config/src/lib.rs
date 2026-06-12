@@ -26,9 +26,10 @@ pub struct IngestSource {
     pub watch_root: String,
     /// On-disk trace format: `"jsonl"` (append-only newline-delimited records,
     /// the default used by Codex, Claude Code, Kimi CLI, and Hermes ShareGPT
-    /// dumps) or `"session_json"` (single-file-per-session JSON rewritten in
-    /// place via atomic rename — used by live Hermes agent sessions). Empty means
-    /// "infer": hermes + `*.json` glob → `session_json`, otherwise `jsonl`.
+    /// dumps), `"session_json"` (single-file-per-session JSON rewritten in
+    /// place via atomic rename — used by live Hermes agent sessions), or
+    /// `"cursor_sqlite"` (polled Cursor `state.vscdb` SQLite databases). Empty
+    /// means "infer": hermes + `*.json` glob → `session_json`, otherwise `jsonl`.
     #[serde(default)]
     pub format: String,
 }
@@ -363,6 +364,12 @@ fn default_sources() -> Vec<IngestSource> {
 
 pub const SOURCE_FORMAT_JSONL: &str = "jsonl";
 pub const SOURCE_FORMAT_SESSION_JSON: &str = "session_json";
+pub const SOURCE_FORMAT_CURSOR_SQLITE: &str = "cursor_sqlite";
+
+/// SQLite WAL sidecar suffixes that must map back to the canonical database
+/// path for watching/debouncing. WAL-mode writes often touch only these files,
+/// so dropping them would miss updates entirely (issue #361, decision 5).
+const SQLITE_SIDECAR_SUFFIXES: &[&str] = &["-wal", "-shm"];
 
 fn infer_source_format(harness: &str, glob: &str) -> &'static str {
     let glob_lower = glob.to_ascii_lowercase();
@@ -389,9 +396,11 @@ fn normalize_source_format(
         trimmed
     };
     match resolved.as_str() {
-        SOURCE_FORMAT_JSONL | SOURCE_FORMAT_SESSION_JSON => Ok(resolved),
+        SOURCE_FORMAT_JSONL | SOURCE_FORMAT_SESSION_JSON | SOURCE_FORMAT_CURSOR_SQLITE => {
+            Ok(resolved)
+        }
         _ => Err(anyhow::anyhow!(
-            "invalid ingest.sources[{source_idx}].format `{}` for source `{}`; expected one of: {SOURCE_FORMAT_JSONL}, {SOURCE_FORMAT_SESSION_JSON}",
+            "invalid ingest.sources[{source_idx}].format `{}` for source `{}`; expected one of: {SOURCE_FORMAT_JSONL}, {SOURCE_FORMAT_SESSION_JSON}, {SOURCE_FORMAT_CURSOR_SQLITE}",
             format.trim(),
             source_name
         )),
@@ -400,13 +409,54 @@ fn normalize_source_format(
 
 impl IngestSource {
     /// Returns the file extension (without leading `.`) this source's format
-    /// records are stored in: `jsonl` or `json`.
+    /// records are stored in: `jsonl`, `json`, or `vscdb`.
     pub fn tracked_extension(&self) -> &'static str {
-        match self.format.as_str() {
-            SOURCE_FORMAT_SESSION_JSON => "json",
-            _ => "jsonl",
+        format_tracked_extension(&self.format)
+    }
+}
+
+fn format_tracked_extension(format: &str) -> &'static str {
+    match format {
+        SOURCE_FORMAT_SESSION_JSON => "json",
+        SOURCE_FORMAT_CURSOR_SQLITE => "vscdb",
+        _ => "jsonl",
+    }
+}
+
+/// Maps a filesystem path seen by enumeration or the watcher to the canonical
+/// tracked path for `format`, or `None` when the path is not tracked.
+///
+/// For file-backed formats this is an extension filter that returns the path
+/// unchanged. For SQLite-backed formats the canonical path is the base
+/// database file: `state.vscdb` maps to itself, while the `state.vscdb-wal` /
+/// `state.vscdb-shm` sidecars map back to `state.vscdb` so WAL-only writes
+/// still enqueue (and debounce-coalesce on) the database they belong to.
+/// Anything else — including `state.vscdb.backup` — is untracked.
+pub fn map_tracked_path(format: &str, path: &str) -> Option<String> {
+    let extension = format_tracked_extension(format);
+    let has_extension = |candidate: &str| {
+        Path::new(candidate)
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|ext| ext == extension)
+            .unwrap_or(false)
+    };
+
+    if has_extension(path) {
+        return Some(path.to_string());
+    }
+
+    if format == SOURCE_FORMAT_CURSOR_SQLITE {
+        for suffix in SQLITE_SIDECAR_SUFFIXES {
+            if let Some(base) = path.strip_suffix(suffix) {
+                if has_extension(base) {
+                    return Some(base.to_string());
+                }
+            }
         }
     }
+
+    None
 }
 
 fn default_batch_size() -> usize {
@@ -1229,6 +1279,102 @@ watch_root = "~/.cursor/projects"
             .expect("cursor source");
         assert_eq!(source.format, SOURCE_FORMAT_JSONL);
         assert_eq!(source.tracked_extension(), "jsonl");
+    }
+
+    #[test]
+    fn load_config_accepts_cursor_sqlite_format() {
+        let path = write_temp_config(
+            r#"
+[[ingest.sources]]
+name = "cursor-sqlite"
+harness = "cursor"
+enabled = false
+glob = "~/Library/Application Support/Cursor/User/**/state.vscdb"
+watch_root = "~/Library/Application Support/Cursor/User"
+format = "cursor_sqlite"
+"#,
+            "cursor-sqlite-format",
+        );
+        let cfg = load_config(&path).expect("cursor_sqlite format should be accepted");
+        std::fs::remove_file(&path).ok();
+        let source = cfg
+            .ingest
+            .sources
+            .iter()
+            .find(|source| source.name == "cursor-sqlite")
+            .expect("cursor-sqlite source");
+        assert_eq!(source.format, SOURCE_FORMAT_CURSOR_SQLITE);
+        assert_eq!(source.tracked_extension(), "vscdb");
+        assert!(!source.enabled);
+    }
+
+    #[test]
+    fn load_config_rejects_unknown_format_value() {
+        let path = write_temp_config(
+            r#"
+[[ingest.sources]]
+name = "cursor-sqlite"
+harness = "cursor"
+enabled = true
+glob = "~/Library/Application Support/Cursor/User/**/state.vscdb"
+watch_root = "~/Library/Application Support/Cursor/User"
+format = "sqlite"
+"#,
+            "unknown-format",
+        );
+        let err = load_config(&path).expect_err("unknown format should fail");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            format!("{err:#}").contains("expected one of: jsonl, session_json, cursor_sqlite"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn map_tracked_path_filters_by_extension_for_file_formats() {
+        assert_eq!(
+            map_tracked_path(SOURCE_FORMAT_JSONL, "/tmp/a.jsonl"),
+            Some("/tmp/a.jsonl".to_string())
+        );
+        assert_eq!(map_tracked_path(SOURCE_FORMAT_JSONL, "/tmp/a.json"), None);
+        assert_eq!(
+            map_tracked_path(SOURCE_FORMAT_SESSION_JSON, "/tmp/session_a.json"),
+            Some("/tmp/session_a.json".to_string())
+        );
+        assert_eq!(
+            map_tracked_path(SOURCE_FORMAT_SESSION_JSON, "/tmp/a.jsonl"),
+            None
+        );
+    }
+
+    #[test]
+    fn map_tracked_path_maps_sqlite_sidecars_to_canonical_db() {
+        let base = "/tmp/User/globalStorage/state.vscdb";
+        assert_eq!(
+            map_tracked_path(SOURCE_FORMAT_CURSOR_SQLITE, base),
+            Some(base.to_string())
+        );
+        assert_eq!(
+            map_tracked_path(SOURCE_FORMAT_CURSOR_SQLITE, "/tmp/User/state.vscdb-wal"),
+            Some("/tmp/User/state.vscdb".to_string())
+        );
+        assert_eq!(
+            map_tracked_path(SOURCE_FORMAT_CURSOR_SQLITE, "/tmp/User/state.vscdb-shm"),
+            Some("/tmp/User/state.vscdb".to_string())
+        );
+        // Backups and unrelated files must stay untracked.
+        assert_eq!(
+            map_tracked_path(SOURCE_FORMAT_CURSOR_SQLITE, "/tmp/User/state.vscdb.backup"),
+            None
+        );
+        assert_eq!(
+            map_tracked_path(SOURCE_FORMAT_CURSOR_SQLITE, "/tmp/User/state.db-wal"),
+            None
+        );
+        assert_eq!(
+            map_tracked_path(SOURCE_FORMAT_CURSOR_SQLITE, "/tmp/User/notes.jsonl"),
+            None
+        );
     }
 
     #[test]

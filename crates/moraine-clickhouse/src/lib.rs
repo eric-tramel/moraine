@@ -524,6 +524,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             name: "014_harmonized_token_accounting.sql",
             sql: include_str!("../../../sql/014_harmonized_token_accounting.sql"),
         },
+        Migration {
+            version: "015",
+            name: "015_sqlite_checkpoint_cursor.sql",
+            sql: include_str!("../../../sql/015_sqlite_checkpoint_cursor.sql"),
+        },
     ]
 }
 

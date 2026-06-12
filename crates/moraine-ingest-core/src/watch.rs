@@ -4,7 +4,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use glob::glob;
-use moraine_config::IngestSource;
+use moraine_config::{map_tracked_path, IngestSource};
 use notify::{
     event::{EventKind, ModifyKind},
     Config as NotifyConfig, Event, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher,
@@ -140,28 +140,29 @@ fn event_is_relevant(kind: &EventKind) -> bool {
     }
 }
 
-fn event_tracked_paths(event: &Event, extension: &str) -> Vec<String> {
+/// Canonical tracked paths touched by a watcher event. Sidecar writes (e.g.
+/// SQLite `-wal`/`-shm`) map to their canonical database path, and the
+/// `BTreeSet` coalesces a burst touching base + sidecars into one work item.
+fn event_tracked_paths(event: &Event, format: &str) -> Vec<String> {
     let mut dedup = BTreeSet::<String>::new();
     for path in &event.paths {
-        if path.extension().and_then(|s| s.to_str()) == Some(extension) {
-            dedup.insert(path.to_string_lossy().to_string());
+        if let Some(canonical) = map_tracked_path(format, &path.to_string_lossy()) {
+            dedup.insert(canonical);
         }
     }
     dedup.into_iter().collect()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn queue_rescan(
     glob_pattern: &str,
     source_name: &str,
     harness: &str,
     format: &str,
-    extension: &str,
     tx: &mpsc::UnboundedSender<WorkItem>,
     metrics: &Arc<Metrics>,
 ) {
     record_rescan(metrics);
-    match enumerate_tracked_files(glob_pattern, extension) {
+    match enumerate_tracked_files(glob_pattern, format) {
         Ok(paths) => {
             for path in paths {
                 let _ = tx.send(WorkItem {
@@ -202,7 +203,6 @@ pub(crate) fn spawn_watcher_threads(
         let source_name = source.name.clone();
         let harness = source.harness.clone();
         let format = source.format.clone();
-        let extension = source.tracked_extension().to_string();
         let glob_pattern = source.glob.clone();
         let watch_root = std::path::PathBuf::from(source.watch_root.clone());
         let tx_clone = tx.clone();
@@ -268,7 +268,6 @@ pub(crate) fn spawn_watcher_threads(
                                 &source_name,
                                 &harness,
                                 &format,
-                                &extension,
                                 &tx_clone,
                                 &metrics_clone,
                             );
@@ -297,7 +296,6 @@ pub(crate) fn spawn_watcher_threads(
                     &source_name,
                     &harness,
                     &format,
-                    &extension,
                     &tx_clone,
                     &metrics_clone,
                 );
@@ -314,7 +312,6 @@ pub(crate) fn spawn_watcher_threads(
                                 &source_name,
                                 &harness,
                                 &format,
-                                &extension,
                                 &tx_clone,
                                 &metrics_clone,
                             );
@@ -325,7 +322,7 @@ pub(crate) fn spawn_watcher_threads(
                             continue;
                         }
 
-                        for path in event_tracked_paths(&event, &extension) {
+                        for path in event_tracked_paths(&event, &format) {
                             let _ = tx_clone.send(WorkItem {
                                 source_name: source_name.clone(),
                                 harness: harness.clone(),
@@ -345,7 +342,6 @@ pub(crate) fn spawn_watcher_threads(
                             &source_name,
                             &harness,
                             &format,
-                            &extension,
                             &tx_clone,
                             &metrics_clone,
                         );
@@ -361,7 +357,7 @@ pub(crate) fn spawn_watcher_threads(
     Ok(handles)
 }
 
-pub(crate) fn enumerate_tracked_files(glob_pattern: &str, extension: &str) -> Result<Vec<String>> {
+pub(crate) fn enumerate_tracked_files(glob_pattern: &str, format: &str) -> Result<Vec<String>> {
     let mut files = Vec::<String>::new();
     for entry in glob(glob_pattern).with_context(|| format!("invalid glob: {}", glob_pattern))? {
         let path = match entry {
@@ -372,8 +368,11 @@ pub(crate) fn enumerate_tracked_files(glob_pattern: &str, extension: &str) -> Re
             }
         };
 
-        if path.extension().and_then(|s| s.to_str()) == Some(extension) {
-            files.push(path.to_string_lossy().to_string());
+        // Enumeration keeps canonical files only: a glob that happens to
+        // match a sidecar must not produce a duplicate work item.
+        let lossy = path.to_string_lossy();
+        if map_tracked_path(format, &lossy).as_deref() == Some(lossy.as_ref()) {
+            files.push(lossy.to_string());
         }
     }
     files.sort();
@@ -425,8 +424,26 @@ mod tests {
         let jsonl = event_tracked_paths(&event, "jsonl");
         assert_eq!(jsonl, vec!["/tmp/a.jsonl".to_string()]);
 
-        let session_json = event_tracked_paths(&event, "json");
+        let session_json = event_tracked_paths(&event, "session_json");
         assert_eq!(session_json, vec!["/tmp/c.json".to_string()]);
+    }
+
+    #[test]
+    fn sqlite_sidecar_events_coalesce_to_canonical_db_path() {
+        let mut event = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any)));
+        event.paths = vec![
+            PathBuf::from("/tmp/User/globalStorage/state.vscdb"),
+            PathBuf::from("/tmp/User/globalStorage/state.vscdb-wal"),
+            PathBuf::from("/tmp/User/globalStorage/state.vscdb-shm"),
+            PathBuf::from("/tmp/User/globalStorage/state.vscdb.backup"),
+        ];
+
+        let tracked = event_tracked_paths(&event, "cursor_sqlite");
+        assert_eq!(
+            tracked,
+            vec!["/tmp/User/globalStorage/state.vscdb".to_string()],
+            "base + sidecars coalesce to one canonical path; backups are ignored"
+        );
     }
 
     #[test]
@@ -448,15 +465,7 @@ mod tests {
         let metrics = Arc::new(Metrics::default());
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        queue_rescan(
-            "[",
-            "source-alpha",
-            "harness-alpha",
-            "jsonl",
-            "jsonl",
-            &tx,
-            &metrics,
-        );
+        queue_rescan("[", "source-alpha", "harness-alpha", "jsonl", &tx, &metrics);
 
         assert!(rx.try_recv().is_err());
         assert_eq!(metrics.watcher_reset_count.load(Ordering::Relaxed), 1);
