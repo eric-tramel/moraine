@@ -28,7 +28,7 @@ use crate::domain::{
     SearchMcpEventHit, SearchMcpEventsQuery, SearchMcpEventsResult, SearchMcpEventsStats,
     SessionEventsDirection, SessionEventsQuery, SessionMetadata, SessionMetadataSearchHit,
     SessionMetadataSearchQuery, SessionMetadataSearchResults, SessionMetadataSearchStats,
-    TraceEvent, Turn, TurnListFilter, TurnSummary,
+    SessionOriginScope, TraceEvent, Turn, TurnListFilter, TurnSummary,
 };
 use crate::error::{RepoError, RepoResult};
 use crate::repo::ConversationRepository;
@@ -41,6 +41,12 @@ pub struct ClickHouseConversationRepository {
     search_cache: Arc<RwLock<HashMap<String, SearchEventsCacheEntry>>>,
     term_postings_cache: Arc<RwLock<HashMap<String, TermPostingsCacheEntry>>>,
     search_doc_extra_cache: Arc<RwLock<HashMap<String, SearchDocExtraCacheEntry>>>,
+    /// Sessions already proven to fall inside `cfg.session_scope`. A session's
+    /// origin directory is its first recorded cwd and never changes, so
+    /// positive results are cacheable forever. Negative results are NOT
+    /// cached: a freshly started session may not have ingested its first
+    /// cwd-bearing event yet.
+    scoped_session_cache: Arc<RwLock<std::collections::HashSet<String>>>,
 }
 
 const BENCHMARK_REPLAY_SOURCE: &str = "benchmark-replay";
@@ -582,11 +588,115 @@ impl ClickHouseConversationRepository {
             search_cache: Arc::new(RwLock::new(HashMap::new())),
             term_postings_cache: Arc::new(RwLock::new(HashMap::new())),
             search_doc_extra_cache: Arc::new(RwLock::new(HashMap::new())),
+            scoped_session_cache: Arc::new(RwLock::new(std::collections::HashSet::new())),
         }
     }
 
     pub fn config(&self) -> &RepoConfig {
         &self.cfg
+    }
+
+    /// Per-event SQL expression for the origin working directory recorded in
+    /// `payload_json`, or `''` when the event carries none. `cwd` covers
+    /// claude-code / codex / pi payloads; `workspacePath` covers
+    /// cursor_sqlite session metadata.
+    fn session_origin_value_expr() -> &'static str {
+        "coalesce(
+        nullIf(JSONExtractString(payload_json, 'cwd'), ''),
+        nullIf(JSONExtractString(payload_json, 'workspacePath'), ''),
+        ''
+      )"
+    }
+
+    /// Subquery selecting the session IDs whose origin directory falls inside
+    /// `scope`. A session's origin is the first (by event time) non-empty
+    /// origin value across its events; `session_meta` and `message` are the
+    /// only event kinds that record one at ingest. The `position()` guards
+    /// skip JSON extraction on rows that cannot contain either key.
+    ///
+    /// `session_id` narrows the scan to one session for cheap point lookups.
+    fn session_origin_scope_subquery(
+        &self,
+        scope: &SessionOriginScope,
+        session_id: Option<&str>,
+    ) -> String {
+        let events_table = self.table_ref("events");
+        let origin_expr = Self::session_origin_value_expr();
+        let session_filter = session_id
+            .map(|session_id| format!("session_id = {}\n      AND ", sql_quote(session_id)))
+            .unwrap_or_default();
+        let root_clauses: Vec<String> = scope
+            .roots
+            .iter()
+            .map(|root| {
+                format!(
+                    "origin_cwd = {root_sql} OR startsWith(origin_cwd, {root_prefix_sql})",
+                    root_sql = sql_quote(root),
+                    root_prefix_sql = sql_quote(&format!("{root}/")),
+                )
+            })
+            .collect();
+        format!(
+            "(SELECT session_id FROM (
+    SELECT
+      session_id,
+      argMinIf(origin_val, tuple(event_ts, event_uid), origin_val != '') AS origin_cwd
+    FROM (
+      SELECT session_id, event_ts, event_uid, {origin_expr} AS origin_val
+      FROM {events_table}
+      WHERE {session_filter}event_kind IN ('session_meta', 'message')
+        AND (position(payload_json, '\"cwd\"') > 0 OR position(payload_json, '\"workspacePath\"') > 0)
+    )
+    GROUP BY session_id
+  )
+  WHERE {root_clauses})",
+            root_clauses = root_clauses.join("\n    OR "),
+        )
+    }
+
+    /// `IN`-clause restricting `column` to sessions inside the configured
+    /// scope, or `None` when retrieval is unscoped.
+    fn session_scope_clause(&self, column: &str) -> Option<String> {
+        let scope = self.cfg.session_scope.as_ref()?;
+        Some(format!(
+            "{column} IN {}",
+            self.session_origin_scope_subquery(scope, None)
+        ))
+    }
+
+    /// Whether `session_id` is visible under the configured scope. Always
+    /// true when unscoped. Positive answers are cached for the lifetime of
+    /// the repository (a session's origin never changes); negative answers
+    /// are re-checked on every call.
+    async fn session_in_scope(&self, session_id: &str) -> RepoResult<bool> {
+        let Some(scope) = self.cfg.session_scope.as_ref() else {
+            return Ok(true);
+        };
+
+        if self.scoped_session_cache.read().await.contains(session_id) {
+            return Ok(true);
+        }
+
+        let query = format!(
+            "SELECT session_id FROM {} LIMIT 1 FORMAT JSONEachRow",
+            self.session_origin_scope_subquery(scope, Some(session_id))
+        );
+
+        #[derive(Deserialize)]
+        struct SessionIdRow {
+            #[allow(dead_code)]
+            session_id: String,
+        }
+
+        let rows: Vec<SessionIdRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
+        let in_scope = !rows.is_empty();
+        if in_scope {
+            self.scoped_session_cache
+                .write()
+                .await
+                .insert(session_id.to_string());
+        }
+        Ok(in_scope)
     }
 
     pub async fn search_session_metadata(
@@ -868,9 +978,18 @@ GROUP BY session_id"
         )
     }
 
-    fn mcp_session_list_filter_sig(filter: &McpSessionListFilter) -> String {
+    fn mcp_session_list_filter_sig(&self, filter: &McpSessionListFilter) -> String {
+        // The session scope participates in the signature so a cursor minted
+        // by an unscoped (or differently scoped) server is rejected instead
+        // of silently resuming with different visibility.
+        let scope = self
+            .cfg
+            .session_scope
+            .as_ref()
+            .map(|scope| scope.roots.join(","))
+            .unwrap_or_else(|| "__none__".to_string());
         format!(
-            "start={};end={};mode={};sort={}",
+            "start={};end={};mode={};sort={};scope={}",
             filter.start_unix_ms,
             filter.end_unix_ms,
             filter
@@ -878,6 +997,7 @@ GROUP BY session_id"
                 .map(ConversationMode::as_str)
                 .unwrap_or("__none__"),
             filter.sort.as_str(),
+            scope,
         )
     }
 
@@ -2785,6 +2905,9 @@ GROUP BY t.event_uid)"
             "d.actor_role",
             event_types,
         ));
+        if let Some(scope_clause) = self.session_scope_clause("d.session_id") {
+            where_clauses.push(scope_clause);
+        }
 
         let where_sql = where_clauses.join("\n  AND ");
         let mcp_event_type_expr =
@@ -3399,7 +3522,11 @@ FORMAT JSONEachRow",
         min_score: f64,
         limit: u16,
     ) -> RepoResult<Vec<SearchMcpEventRow>> {
-        if turn_seq.is_none() {
+        // The in-memory postings fast pass filters per-session only after
+        // hydration and knows nothing about origin scoping, so a scoped
+        // repository always takes the SQL path, where the scope is a WHERE
+        // clause.
+        if turn_seq.is_none() && self.cfg.session_scope.is_none() {
             let fast_rows = self
                 .search_mcp_event_rows_fast_pass(
                     terms,
@@ -5029,7 +5156,7 @@ FORMAT JSONEachRow",
         Self::validate_required_time_bounds(filter.start_unix_ms, filter.end_unix_ms)?;
 
         let limit = page.normalized_limit(self.cfg.max_results);
-        let filter_sig = Self::mcp_session_list_filter_sig(&filter);
+        let filter_sig = self.mcp_session_list_filter_sig(&filter);
         let sort = filter.sort;
 
         let cursor = if let Some(token) = page.cursor.as_deref() {
@@ -5065,6 +5192,9 @@ FORMAT JSONEachRow",
         ];
         if let Some(mode_clause) = Self::mode_filter_clause(filter.mode) {
             where_clauses.push(mode_clause);
+        }
+        if let Some(scope_clause) = self.session_scope_clause("s.session_id") {
+            where_clauses.push(scope_clause);
         }
 
         if let Some(cursor) = &cursor {
@@ -5222,11 +5352,17 @@ FORMAT JSONEachRow",
 
     async fn get_session_metadata(&self, session_id: &str) -> RepoResult<Option<SessionMetadata>> {
         Self::validate_session_id(session_id)?;
+        if !self.session_in_scope(session_id).await? {
+            return Ok(None);
+        }
         self.load_session_metadata(session_id).await
     }
 
     async fn get_mcp_session(&self, session_id: &str) -> RepoResult<Option<McpSessionOpen>> {
         Self::validate_session_id(session_id)?;
+        if !self.session_in_scope(session_id).await? {
+            return Ok(None);
+        }
 
         let events = self
             .load_indexed_session_events_from_events(session_id, None)
@@ -5384,6 +5520,9 @@ FORMAT JSONEachRow",
         turn_seq: u32,
     ) -> RepoResult<Option<McpTurnOpen>> {
         Self::validate_session_id(session_id)?;
+        if !self.session_in_scope(session_id).await? {
+            return Ok(None);
+        }
 
         let indexed_events = self
             .load_indexed_session_events_from_events(session_id, None)
@@ -5626,6 +5765,11 @@ FORMAT JSONEachRow",
         } else {
             return Ok(None);
         };
+        // Out-of-scope events answer exactly like missing ones, so an event
+        // ID cannot be used to probe sessions outside the project scope.
+        if !self.session_in_scope(&session_id).await? {
+            return Ok(None);
+        }
 
         let indexed_events = self
             .load_indexed_session_events_from_events(&session_id, Some(event_uid))

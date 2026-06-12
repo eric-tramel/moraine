@@ -16,7 +16,7 @@ pub use domain::{
     SearchMcpEventHit, SearchMcpEventsQuery, SearchMcpEventsResult, SearchMcpEventsStats,
     SessionEventsDirection, SessionEventsQuery, SessionMetadata, SessionMetadataSearchHit,
     SessionMetadataSearchQuery, SessionMetadataSearchResults, SessionMetadataSearchStats,
-    TraceEvent, Turn, TurnListFilter, TurnSummary,
+    SessionOriginScope, TraceEvent, Turn, TurnListFilter, TurnSummary,
 };
 pub use error::{RepoError, RepoResult};
 pub use repo::ConversationRepository;

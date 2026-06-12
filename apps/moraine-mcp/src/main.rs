@@ -42,5 +42,13 @@ fn main() -> Result<()> {
         cfg.mcp.central_socket_path = socket.to_string_lossy().to_string();
     }
 
-    rpc::run(cfg, args.serve_mode)
+    // The scope is anchored to the launch directory, so it must be resolved
+    // before anything has a chance to chdir.
+    let session_scope = if args.project_only {
+        Some(moraine_mcp_core::project_scope_from_launch_dir()?)
+    } else {
+        None
+    };
+
+    rpc::run(cfg, args.serve_mode, session_scope)
 }
