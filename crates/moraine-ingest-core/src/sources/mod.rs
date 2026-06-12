@@ -112,6 +112,15 @@ pub(crate) trait IngestSource: Send + Sync {
         shared::to_str(record.get("type"))
     }
 
+    /// Working directory carried by the record content itself (never derived
+    /// from file paths). Harnesses that only expose a session-level cwd return
+    /// it on the records that carry it; the normalizer handles the
+    /// session-level fallback for the rest. Defaults to empty for harnesses
+    /// without a discoverable cwd.
+    fn cwd(&self, _record: &Value) -> String {
+        String::new()
+    }
+
     fn session_id(&self, _record: &Value, ctx: &SourceRecordContext<'_>) -> String {
         if ctx.session_hint.is_empty() {
             infer_session_id_from_file(ctx.source_file)

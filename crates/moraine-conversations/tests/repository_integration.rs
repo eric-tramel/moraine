@@ -38,6 +38,7 @@ fn test_clickhouse_config(url: String) -> ClickHouseConfig {
         timeout_seconds: 5.0,
         async_insert: true,
         wait_for_async_insert: true,
+        allow_newer_server: false,
     }
 }
 

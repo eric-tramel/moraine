@@ -32,6 +32,11 @@ pub struct NormalizedRecord {
     pub error_rows: Vec<Value>,
     pub session_hint: String,
     pub model_hint: String,
+    /// Resolved working directory for this record (record-level cwd where the
+    /// harness carries one, otherwise the caller-supplied session-level hint).
+    /// Callers chain it back in like `session_hint`/`model_hint` so records
+    /// after a harness's session header inherit the session cwd.
+    pub cwd_hint: String,
 }
 
 #[derive(Debug, Clone, Default)]

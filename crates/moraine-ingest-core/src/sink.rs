@@ -1,6 +1,10 @@
-use crate::checkpoint::{checkpoint_key, merge_checkpoint};
+use crate::checkpoint::merge_checkpoint;
 use crate::heartbeat::host_name;
 use crate::model::Checkpoint;
+use crate::tee::{
+    backend_sinks_json, filter_batch_for_backend, BackendSinkCell, ReplayFloor,
+    SharedRouteResolver, StatusRegistry,
+};
 use crate::{
     DispatchState, Metrics, SinkMessage, WATCHER_BACKEND_MIXED, WATCHER_BACKEND_NATIVE,
     WATCHER_BACKEND_POLL,
@@ -12,9 +16,86 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Notify, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
+
+/// What a sink task is writing for. The flush/checkpoint/retry machinery is
+/// identical for both; the role decides intake filtering, heartbeats, and
+/// health transitions.
+pub(crate) enum SinkRole {
+    /// The always-on local sink: receives everything and owns heartbeats.
+    Default {
+        dispatch: Arc<Mutex<DispatchState>>,
+        /// Mirror sink status cells, surfaced through the heartbeat.
+        backends: StatusRegistry,
+        /// Whether `ingest_heartbeats` carries the `backend_sinks` column
+        /// (migration 017). Pre-017 schemas reject unknown columns at insert
+        /// time, so the field is attached only when the column exists.
+        backend_sinks_column: bool,
+    },
+    /// A mirror sink for one named backend: filters intake down to the
+    /// sessions routed to it and reports flush health on its status cell.
+    Backend {
+        cell: Arc<BackendSinkCell>,
+        resolver: SharedRouteResolver,
+        /// Signalled on the lagging/unreachable -> ok transition so the
+        /// backend's supervisor schedules a catch-up replay pass.
+        replay_notify: Arc<Notify>,
+        /// Checkpoint floor handed to that pass, captured at the same
+        /// transition (see `note_flush_outcome` for why it must be taken
+        /// here, inside the sink task, and not when the supervisor wakes).
+        replay_floor: ReplayFloor,
+    },
+}
+
+/// Backend-role health bookkeeping after a flush attempt; no-op for the
+/// default sink. Recovery requires a drained queue so one successful flush
+/// mid-backlog does not trigger a replay storm.
+async fn note_flush_outcome(
+    role: &SinkRole,
+    checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
+    flush_ok: bool,
+    queue_drained: bool,
+) {
+    let SinkRole::Backend {
+        cell,
+        replay_notify,
+        replay_floor,
+        ..
+    } = role
+    else {
+        return;
+    };
+
+    if !flush_ok {
+        if cell.mark_flush_failure() {
+            warn!(
+                backend = cell.name(),
+                "backend flush failing; marked unreachable (live mirroring pauses; \
+                 catch-up replay runs once it recovers)"
+            );
+        }
+        return;
+    }
+
+    if queue_drained && cell.mark_recovered() {
+        // Capture the replay floor BEFORE signalling the supervisor. This
+        // sink task is the checkpoint map's only writer and has not yet
+        // accepted any post-recovery batch, so the snapshot cannot contain
+        // a live-forwarded checkpoint that jumps past the outage's dropped
+        // span — the gap the scheduled pass exists to close. Snapshotting
+        // when the supervisor wakes instead would race the next live flush.
+        let floor = checkpoints.read().await.clone();
+        *replay_floor.lock().expect("replay floor mutex poisoned") = Some(floor);
+        info!(
+            backend = cell.name(),
+            dropped_batches = cell.dropped_batches(),
+            "backend drained after lagging/unreachable; scheduling catch-up replay"
+        );
+        replay_notify.notify_one();
+    }
+}
 
 fn watcher_backend_label(value: u64) -> &'static str {
     match value {
@@ -83,8 +164,8 @@ pub(crate) fn spawn_sink_task(
     checkpoints: Arc<RwLock<HashMap<String, Checkpoint>>>,
     metrics: Arc<Metrics>,
     mut rx: mpsc::Receiver<SinkMessage>,
-    dispatch: Arc<Mutex<DispatchState>>,
     checkpoint_cursor_columns: bool,
+    role: SinkRole,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut raw_rows = Vec::<Value>::new();
@@ -94,6 +175,16 @@ pub(crate) fn spawn_sink_task(
         let mut error_rows = Vec::<Value>::new();
         let mut checkpoint_updates = HashMap::<String, Checkpoint>::new();
         let mut pending_batch_bytes = 0usize;
+
+        // Mirror sinks share one ingest_checkpoints table per team backend,
+        // so their rows are scoped per host (migration 018; guaranteed
+        // present by the schema handshake). The default backend stays
+        // single-writer and keeps writing host-less rows, which also keeps
+        // it working before `moraine db migrate` adds the column locally.
+        let checkpoint_host = match &role {
+            SinkRole::Backend { .. } => host_name(),
+            SinkRole::Default { .. } => String::new(),
+        };
 
         let flush_interval = duration_from_config_seconds(
             config.ingest.flush_interval_seconds,
@@ -126,7 +217,7 @@ pub(crate) fn spawn_sink_task(
                     &checkpoint_updates,
                 )
             {
-                if flush_pending(
+                let flush_ok = flush_pending(
                     &clickhouse,
                     &checkpoints,
                     &metrics,
@@ -137,9 +228,11 @@ pub(crate) fn spawn_sink_task(
                     &mut error_rows,
                     &mut checkpoint_updates,
                     checkpoint_cursor_columns,
+                    &checkpoint_host,
                 )
-                .await
-                {
+                .await;
+                note_flush_outcome(&role, &checkpoints, flush_ok, rx.is_empty()).await;
+                if flush_ok {
                     pending_batch_bytes = 0;
                     throttling_flush_retries = false;
                     info!("flush retry succeeded; resuming sink intake");
@@ -147,7 +240,7 @@ pub(crate) fn spawn_sink_task(
                     tokio::select! {
                         _ = tokio::time::sleep(retry_backoff) => {}
                         _ = heartbeat_tick.tick() => {
-                            emit_heartbeat(&clickhouse, &metrics, &dispatch).await;
+                            emit_heartbeat(&clickhouse, &metrics, &role).await;
                         }
                     }
                 }
@@ -158,6 +251,16 @@ pub(crate) fn spawn_sink_task(
                 maybe_msg = rx.recv() => {
                     match maybe_msg {
                         Some(SinkMessage::Batch(batch)) => {
+                            // Mirror sinks only buffer the sessions routed to
+                            // them; the default sink takes batches whole.
+                            let batch = match &role {
+                                SinkRole::Backend { cell, resolver, .. } => {
+                                    let mut resolver =
+                                        resolver.lock().expect("route resolver mutex poisoned");
+                                    filter_batch_for_backend(&batch, cell.name(), &mut resolver)
+                                }
+                                SinkRole::Default { .. } => batch,
+                            };
                             pending_batch_bytes =
                                 pending_batch_bytes.saturating_add(batch.approx_bytes());
                             raw_rows.extend(batch.raw_rows);
@@ -173,7 +276,7 @@ pub(crate) fn spawn_sink_task(
                             if total_rows >= config.ingest.batch_size
                                 || pending_batch_bytes >= config.ingest.max_batch_bytes.max(1)
                             {
-                                if !flush_pending(
+                                let flush_ok = flush_pending(
                                     &clickhouse,
                                     &checkpoints,
                                     &metrics,
@@ -184,7 +287,10 @@ pub(crate) fn spawn_sink_task(
                                     &mut error_rows,
                                     &mut checkpoint_updates,
                                     checkpoint_cursor_columns,
-                                ).await {
+                                    &checkpoint_host,
+                                ).await;
+                                note_flush_outcome(&role, &checkpoints, flush_ok, rx.is_empty()).await;
+                                if !flush_ok {
                                     if !throttling_flush_retries {
                                         warn!(
                                             "flush failed; pausing sink intake and retrying pending rows every {} ms",
@@ -202,7 +308,7 @@ pub(crate) fn spawn_sink_task(
                 }
                 _ = flush_tick.tick() => {
                     if has_pending_data(&raw_rows, &event_rows, &link_rows, &tool_rows, &error_rows, &checkpoint_updates) {
-                        if !flush_pending(
+                        let flush_ok = flush_pending(
                             &clickhouse,
                             &checkpoints,
                             &metrics,
@@ -213,7 +319,10 @@ pub(crate) fn spawn_sink_task(
                             &mut error_rows,
                             &mut checkpoint_updates,
                             checkpoint_cursor_columns,
-                        ).await {
+                            &checkpoint_host,
+                        ).await;
+                        note_flush_outcome(&role, &checkpoints, flush_ok, rx.is_empty()).await;
+                        if !flush_ok {
                             if !throttling_flush_retries {
                                 warn!(
                                     "flush failed; pausing sink intake and retrying pending rows every {} ms",
@@ -227,7 +336,7 @@ pub(crate) fn spawn_sink_task(
                     }
                 }
                 _ = heartbeat_tick.tick() => {
-                    emit_heartbeat(&clickhouse, &metrics, &dispatch).await;
+                    emit_heartbeat(&clickhouse, &metrics, &role).await;
                 }
             }
         }
@@ -240,7 +349,7 @@ pub(crate) fn spawn_sink_task(
             &error_rows,
             &checkpoint_updates,
         ) {
-            flush_pending(
+            let flush_ok = flush_pending(
                 &clickhouse,
                 &checkpoints,
                 &metrics,
@@ -251,8 +360,10 @@ pub(crate) fn spawn_sink_task(
                 &mut error_rows,
                 &mut checkpoint_updates,
                 checkpoint_cursor_columns,
+                &checkpoint_host,
             )
             .await;
+            note_flush_outcome(&role, &checkpoints, flush_ok, true).await;
         }
     })
 }
@@ -273,11 +384,19 @@ fn has_pending_data(
         && checkpoint_updates.is_empty())
 }
 
-async fn emit_heartbeat(
-    clickhouse: &ClickHouseClient,
-    metrics: &Arc<Metrics>,
-    dispatch: &Arc<Mutex<DispatchState>>,
-) {
+/// Default-role only: mirror sinks write rows into databases this host does
+/// not own, so the ingest heartbeat (including per-backend mirror status)
+/// always lands in the default backend.
+async fn emit_heartbeat(clickhouse: &ClickHouseClient, metrics: &Arc<Metrics>, role: &SinkRole) {
+    let SinkRole::Default {
+        dispatch,
+        backends,
+        backend_sinks_column,
+    } = role
+    else {
+        return;
+    };
+
     let files_active = {
         let state = dispatch.lock().expect("dispatch mutex poisoned");
         state.inflight.len() as u32
@@ -293,7 +412,7 @@ async fn emit_heartbeat(
     let watcher_backend =
         watcher_backend_label(metrics.watcher_backend_state.load(Ordering::Relaxed));
 
-    let heartbeat = json!({
+    let mut heartbeat = json!({
         "host": host_name(),
         "service_version": env!("CARGO_PKG_VERSION"),
         "queue_depth": metrics.queue_depth.load(Ordering::Relaxed),
@@ -311,6 +430,16 @@ async fn emit_heartbeat(
         "watcher_last_reset_unix_ms": metrics.watcher_last_reset_unix_ms.load(Ordering::Relaxed),
         "last_error": last_error,
     });
+
+    // Attached only when at least one mirror sink exists AND the column is
+    // present (pre-017 schemas reject unknown columns at insert time).
+    if *backend_sinks_column {
+        if let Some(statuses) = backend_sinks_json(backends) {
+            if let Some(obj) = heartbeat.as_object_mut() {
+                obj.insert("backend_sinks".to_string(), json!(statuses));
+            }
+        }
+    }
 
     if let Err(exc) = clickhouse
         .insert_json_rows("ingest_heartbeats", &[heartbeat])
@@ -332,6 +461,7 @@ async fn flush_pending(
     error_rows: &mut Vec<Value>,
     checkpoint_updates: &mut HashMap<String, Checkpoint>,
     checkpoint_cursor_columns: bool,
+    checkpoint_host: &str,
 ) -> bool {
     let started = Instant::now();
 
@@ -360,6 +490,13 @@ async fn flush_pending(
                         "schema_fingerprint".to_string(),
                         json!(cp.schema_fingerprint),
                     );
+                }
+            }
+            // Backend-role only (migration 018): scopes rows in a shared
+            // team table to this host. Empty for the default sink.
+            if !checkpoint_host.is_empty() {
+                if let Some(obj) = row.as_object_mut() {
+                    obj.insert("host".to_string(), json!(checkpoint_host));
                 }
             }
             row
@@ -419,10 +556,14 @@ async fn flush_pending(
                 .await?;
 
             {
+                // Offset-monotone merge, not a blind insert: a backend map
+                // has two producers (live router batches and catch-up
+                // replay), so an out-of-order flush must never regress —
+                // or, for replay overlapping fresher live data, rewind —
+                // what the map already committed.
                 let mut state = checkpoints.write().await;
                 for cp in checkpoint_updates.values() {
-                    let key = checkpoint_key(&cp.source_name, &cp.source_file);
-                    state.insert(key, cp.clone());
+                    merge_checkpoint(&mut state, cp.clone());
                 }
             }
             checkpoint_updates.clear();
@@ -452,6 +593,7 @@ async fn flush_pending(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkpoint::checkpoint_key;
     use crate::model::RowBatch;
     use axum::{
         extract::{Query, State},
@@ -466,6 +608,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct MockClickHouseState {
         calls_by_table: Arc<Mutex<HashMap<String, usize>>>,
+        rows_by_table: Arc<Mutex<HashMap<String, Vec<Value>>>>,
         fail_once_by_table: Arc<Mutex<HashMap<String, usize>>>,
     }
 
@@ -487,6 +630,15 @@ mod tests {
                 .expect("mock calls mutex poisoned")
                 .get(table)
                 .unwrap_or(&0)
+        }
+
+        fn rows(&self, table: &str) -> Vec<Value> {
+            self.rows_by_table
+                .lock()
+                .expect("mock rows mutex poisoned")
+                .get(table)
+                .cloned()
+                .unwrap_or_default()
         }
     }
 
@@ -511,6 +663,7 @@ mod tests {
     async fn mock_clickhouse_handler(
         State(state): State<MockClickHouseState>,
         Query(params): Query<HashMap<String, String>>,
+        body: String,
     ) -> (StatusCode, String) {
         let query = params.get("query").cloned().unwrap_or_default();
         let Some(table) = inserted_table_name(&query) else {
@@ -527,18 +680,32 @@ mod tests {
                 .expect("mock calls mutex poisoned");
             *calls.entry(table.to_string()).or_insert(0) += 1;
         }
+        {
+            let mut fail_once = state
+                .fail_once_by_table
+                .lock()
+                .expect("mock fail_once mutex poisoned");
+            if let Some(remaining) = fail_once.get_mut(table) {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("intentional failure for {table}"),
+                    );
+                }
+            }
+        }
 
-        let mut fail_once = state
-            .fail_once_by_table
-            .lock()
-            .expect("mock fail_once mutex poisoned");
-        if let Some(remaining) = fail_once.get_mut(table) {
-            if *remaining > 0 {
-                *remaining -= 1;
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("intentional failure for {table}"),
-                );
+        {
+            let mut rows = state
+                .rows_by_table
+                .lock()
+                .expect("mock rows mutex poisoned");
+            let entry = rows.entry(table.to_string()).or_default();
+            for line in body.lines().filter(|line| !line.trim().is_empty()) {
+                if let Ok(row) = serde_json::from_str::<Value>(line) {
+                    entry.push(row);
+                }
             }
         }
 
@@ -590,6 +757,14 @@ mod tests {
         SinkMessage::Batch(batch)
     }
 
+    fn default_role() -> SinkRole {
+        SinkRole::Default {
+            dispatch: Arc::new(Mutex::new(DispatchState::default())),
+            backends: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            backend_sinks_column: false,
+        }
+    }
+
     #[tokio::test]
     async fn failed_flush_throttles_sink_consumption() {
         let mut config = moraine_config::AppConfig::default();
@@ -603,10 +778,17 @@ mod tests {
             .expect("clickhouse client should initialize");
         let checkpoints = Arc::new(RwLock::new(HashMap::new()));
         let metrics = Arc::new(Metrics::default());
-        let dispatch = Arc::new(Mutex::new(DispatchState::default()));
         let (tx, rx) = mpsc::channel(1);
 
-        let handle = spawn_sink_task(config, clickhouse, checkpoints, metrics, rx, dispatch, true);
+        let handle = spawn_sink_task(
+            config,
+            clickhouse,
+            checkpoints,
+            metrics,
+            rx,
+            true,
+            default_role(),
+        );
 
         tx.send(single_row_batch(1))
             .await
@@ -656,6 +838,7 @@ mod tests {
             &mut error_rows,
             &mut checkpoint_updates,
             true,
+            "",
         )
         .await;
         assert!(!first_attempt, "first flush should fail at events stage");
@@ -686,6 +869,7 @@ mod tests {
             &mut error_rows,
             &mut checkpoint_updates,
             true,
+            "",
         )
         .await;
         assert!(
@@ -708,6 +892,197 @@ mod tests {
         assert!(
             state.contains_key(&checkpoint_key_value),
             "checkpoint cache should advance after checkpoint stage succeeds"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backend_sink_filters_intake_to_routed_sessions() {
+        let (clickhouse, mock_state) = spawn_mock_clickhouse("unused-table").await;
+
+        let mut route_config = moraine_config::AppConfig::default();
+        route_config.backends.insert(
+            "team-ch".to_string(),
+            moraine_config::ClickHouseConfig::default(),
+        );
+        route_config.routes.push(moraine_config::RouteConfig {
+            dir: "/work/team/**".to_string(),
+            backend: "team-ch".to_string(),
+            mode: moraine_config::ROUTE_MODE_MIRROR.to_string(),
+        });
+        let resolver: SharedRouteResolver = Arc::new(Mutex::new(crate::tee::RouteResolver::new(
+            Arc::new(route_config),
+        )));
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.heartbeat_interval_seconds = 60.0;
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (tx, rx) = mpsc::channel::<SinkMessage>(8);
+
+        let handle = spawn_sink_task(
+            config,
+            clickhouse,
+            checkpoints,
+            metrics,
+            rx,
+            true,
+            SinkRole::Backend {
+                cell: Arc::new(BackendSinkCell::new("team-ch")),
+                resolver,
+                replay_notify: Arc::new(Notify::new()),
+                replay_floor: Arc::new(Mutex::new(None)),
+            },
+        );
+
+        let mut batch = RowBatch::default();
+        batch.push_raw_row(json!({
+            "session_id": "team-session",
+            "cwd": "/work/team/project",
+            "record_ts": "2026-02-17T00:00:01.000Z",
+        }));
+        batch.push_raw_row(json!({
+            "session_id": "other-session",
+            "cwd": "/home/other",
+            "record_ts": "2026-02-17T00:00:01.000Z",
+        }));
+        batch.checkpoint = Some(sample_checkpoint());
+        tx.send(SinkMessage::Batch(batch))
+            .await
+            .expect("send mixed batch");
+        drop(tx); // close the channel so the final flush runs deterministically
+
+        timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("backend sink should finish")
+            .expect("backend sink task should not panic");
+
+        let raw_rows = mock_state.rows("raw_events");
+        assert_eq!(raw_rows.len(), 1, "only the routed session's rows flush");
+        assert_eq!(
+            raw_rows[0].get("session_id").and_then(Value::as_str),
+            Some("team-session")
+        );
+        let checkpoint_rows = mock_state.rows("ingest_checkpoints");
+        assert_eq!(
+            checkpoint_rows.len(),
+            1,
+            "the checkpoint lands in the backend's own database even though \
+             part of the batch was filtered away"
+        );
+        assert_eq!(
+            checkpoint_rows[0].get("host").and_then(Value::as_str),
+            Some(host_name().as_str()),
+            "backend checkpoint rows are host-scoped: team backends share one \
+             ingest_checkpoints table across members"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flush_pending_map_merge_is_offset_monotone() {
+        let (clickhouse, mock_state) = spawn_mock_clickhouse("unused-table").await;
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+        let mut raw_rows = Vec::<Value>::new();
+        let mut event_rows = Vec::<Value>::new();
+        let mut link_rows = Vec::<Value>::new();
+        let mut tool_rows = Vec::<Value>::new();
+        let mut error_rows = Vec::<Value>::new();
+
+        let ahead = sample_checkpoint(); // offset 100
+        let key = checkpoint_key(&ahead.source_name, &ahead.source_file);
+        let mut behind = sample_checkpoint();
+        behind.last_offset = 50;
+
+        for cp in [ahead, behind] {
+            let mut checkpoint_updates = HashMap::new();
+            checkpoint_updates.insert(key.clone(), cp);
+            assert!(
+                flush_pending(
+                    &clickhouse,
+                    &checkpoints,
+                    &metrics,
+                    &mut raw_rows,
+                    &mut event_rows,
+                    &mut link_rows,
+                    &mut tool_rows,
+                    &mut error_rows,
+                    &mut checkpoint_updates,
+                    true,
+                    "",
+                )
+                .await
+            );
+        }
+
+        // A backend map has two producers (live router batches and replay),
+        // so an out-of-order flush must never rewind the committed offset —
+        // the replay pass would otherwise re-trust a stale floor.
+        let state = checkpoints.read().await;
+        assert_eq!(
+            state.get(&key).map(|cp| cp.last_offset),
+            Some(100),
+            "a lower-offset flush must not regress the committed map"
+        );
+        assert!(
+            mock_state.rows("ingest_checkpoints").len() == 2,
+            "both checkpoint rows still flush; only the map merge is monotone"
+        );
+        let default_role_rows = mock_state.rows("ingest_checkpoints");
+        assert!(
+            default_role_rows
+                .iter()
+                .all(|row| row.get("host").is_none()),
+            "an empty checkpoint host (default role) must omit the column"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_captures_the_replay_floor_before_post_recovery_flushes() {
+        let cell = Arc::new(BackendSinkCell::new("team-ch"));
+        cell.set_status(crate::tee::BackendSinkStatus::Lagging);
+        let replay_notify = Arc::new(Notify::new());
+        let replay_floor: ReplayFloor = Arc::new(Mutex::new(None));
+        let role = SinkRole::Backend {
+            cell,
+            resolver: Arc::new(Mutex::new(crate::tee::RouteResolver::new(Arc::new(
+                moraine_config::AppConfig::default(),
+            )))),
+            replay_notify: replay_notify.clone(),
+            replay_floor: replay_floor.clone(),
+        };
+
+        let checkpoint = sample_checkpoint(); // offset 100
+        let key = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
+        let checkpoints = Arc::new(RwLock::new(HashMap::from([(
+            key.clone(),
+            checkpoint.clone(),
+        )])));
+
+        note_flush_outcome(&role, &checkpoints, true, true).await;
+
+        // A live batch flushed after recovery jumps the map past the outage
+        // gap; the floor captured at the transition must not move with it.
+        {
+            let mut state = checkpoints.write().await;
+            let entry = state.get_mut(&key).expect("checkpoint present");
+            entry.last_offset = 900;
+        }
+
+        let floor = replay_floor
+            .lock()
+            .expect("replay floor mutex poisoned")
+            .take()
+            .expect("recovery must capture a replay floor");
+        assert_eq!(
+            floor.get(&key).map(|cp| cp.last_offset),
+            Some(100),
+            "the floor reflects what the backend had flushed at recovery"
+        );
+        assert!(
+            timeout(Duration::from_millis(100), replay_notify.notified())
+                .await
+                .is_ok(),
+            "recovery must schedule a replay pass"
         );
     }
 

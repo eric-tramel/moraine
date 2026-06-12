@@ -3,6 +3,7 @@
   "name": "hermes_trajectory",
   "records": [
     {
+      "cwd_hint": "",
       "error_rows": [],
       "event_rows": [
         {
@@ -14,6 +15,7 @@
           "content_types": [],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "session_meta",
           "event_ts": "2026-03-30 14:22:31.456",
@@ -90,6 +92,7 @@
           "content_types": [],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "system",
           "event_ts": "2026-03-30 14:22:31.456",
@@ -168,6 +171,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-03-30 14:22:31.456",
@@ -246,6 +250,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "reasoning",
           "event_ts": "2026-03-30 14:22:31.456",
@@ -324,6 +329,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "tool_call",
           "event_ts": "2026-03-30 14:22:31.456",
@@ -402,6 +408,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "tool_result",
           "event_ts": "2026-03-30 14:22:31.456",
@@ -480,6 +487,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-03-30 14:22:31.456",
@@ -552,6 +560,7 @@
       "model_hint": "claude-sonnet-4.6",
       "raw_rows": [
         {
+          "cwd": "",
           "event_uid": "0ca05e01889824d1362c36fb5987aaaf3f860e6321d0ffd07c4856db062d593f",
           "harness": "hermes",
           "inference_provider": "anthropic",

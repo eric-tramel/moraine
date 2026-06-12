@@ -34,6 +34,13 @@ impl IngestSource for Codex {
         }
     }
 
+    fn cwd(&self, record: &Value) -> String {
+        // Codex carries the working directory in `payload.cwd` on
+        // `session_meta` (and on `turn_context` in newer rollouts); other
+        // records inherit it via the normalizer's session-level fallback.
+        to_str(record.pointer("/payload/cwd"))
+    }
+
     fn normalize(
         &self,
         record: &Value,

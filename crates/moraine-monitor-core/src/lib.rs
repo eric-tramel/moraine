@@ -1286,18 +1286,25 @@ async fn query_table_summaries(state: &AppState) -> Result<Vec<TableSummary>> {
 
 async fn query_heartbeat(state: &AppState) -> Result<Value> {
     let database = &state.clickhouse.config().database;
-    let present = state
+    // Column-level probe: presence of any column means the table exists, and
+    // the optional backend_sinks column (migration 017) is only selected when
+    // the database actually carries it.
+    #[derive(serde::Deserialize)]
+    struct ColumnRow {
+        name: String,
+    }
+    let columns = state
         .clickhouse
-        .query_rows::<Value>(
+        .query_rows::<ColumnRow>(
             &format!(
-            "SELECT name FROM system.tables WHERE database = '{}' AND name = 'ingest_heartbeats'",
+            "SELECT name FROM system.columns WHERE database = '{}' AND table = 'ingest_heartbeats'",
             escape_literal(database)
         ),
             None,
         )
         .await?;
 
-    if present.is_empty() {
+    if columns.is_empty() {
         return Ok(json!({
             "present": false,
             "alive": false,
@@ -1306,8 +1313,14 @@ async fn query_heartbeat(state: &AppState) -> Result<Value> {
         }));
     }
 
+    let backend_sinks_select = if columns.iter().any(|col| col.name == "backend_sinks") {
+        ", backend_sinks"
+    } else {
+        ""
+    };
     let query = format!(
-        "SELECT ts, toUnixTimestamp64Milli(ts) AS ts_unix_ms, host, service_version, queue_depth, files_active, files_watched, rows_raw_written, rows_events_written, rows_errors_written, flush_latency_ms, append_to_visible_p50_ms, append_to_visible_p95_ms, last_error FROM {}.ingest_heartbeats ORDER BY ts DESC LIMIT 1",
+        "SELECT ts, toUnixTimestamp64Milli(ts) AS ts_unix_ms, host, service_version, queue_depth, files_active, files_watched, rows_raw_written, rows_events_written, rows_errors_written, flush_latency_ms, append_to_visible_p50_ms, append_to_visible_p95_ms, last_error{} FROM {}.ingest_heartbeats ORDER BY ts DESC LIMIT 1",
+        backend_sinks_select,
         escape_identifier(database)
     );
 
@@ -1318,11 +1331,24 @@ async fn query_heartbeat(state: &AppState) -> Result<Value> {
         .into_iter()
         .next();
 
-    let Some(latest) = latest else {
+    let Some(mut latest) = latest else {
         return Ok(
             json!({"present": false, "alive": false, "latest": Value::Null, "age_seconds": Value::Null}),
         );
     };
+
+    // The sink stores backend_sinks as a JSON-encoded string; decode it so
+    // /api/health consumers see a structured `{backend: status}` map.
+    if let Some(obj) = latest.as_object_mut() {
+        if let Some(Value::String(raw)) = obj.get("backend_sinks") {
+            let decoded = if raw.trim().is_empty() {
+                json!({})
+            } else {
+                serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.clone()))
+            };
+            obj.insert("backend_sinks".to_string(), decoded);
+        }
+    }
 
     let age_seconds = latest
         .get("ts_unix_ms")

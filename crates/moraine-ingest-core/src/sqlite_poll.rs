@@ -283,6 +283,11 @@ pub(crate) async fn process_cursor_sqlite_db(
             for synthetic in &records {
                 let raw_json =
                     serde_json::to_string(&synthetic.record).unwrap_or_else(|_| "{}".to_string());
+                // No cwd hint: kv rows interleave many composers, so a linear
+                // hint chain would bleed one session's workspace path onto
+                // another's bubbles. Composer records carry `workspacePath`
+                // themselves, and the scan stamps it onto changed bubbles
+                // (`stamp_bubble_workspace`) so every row is self-describing.
                 match normalize_record(
                     &synthetic.record,
                     &work.source_name,
@@ -292,6 +297,7 @@ pub(crate) async fn process_cursor_sqlite_db(
                     checkpoint.source_generation,
                     synthetic.source_line_no,
                     synthetic.source_offset,
+                    "",
                     "",
                     "",
                 ) {
@@ -471,6 +477,7 @@ fn scan_database(db_path: &str, prior: &CursorState) -> ScanOutcome {
     };
     let mut records = Vec::<SyntheticRecord>::new();
     let mut relevant_keys = 0u64;
+    let mut workspace_cache = HashMap::<String, Option<String>>::new();
 
     for prefix in RELEVANT_PREFIXES {
         let scan = scan_prefix(
@@ -479,6 +486,7 @@ fn scan_database(db_path: &str, prior: &CursorState) -> ScanOutcome {
             &prior.kv_hashes,
             &mut new_state.kv_hashes,
             &mut records,
+            &mut workspace_cache,
         );
         match scan {
             Ok(seen) => relevant_keys += seen,
@@ -701,6 +709,7 @@ fn scan_prefix(
     prior_hashes: &BTreeMap<String, String>,
     new_hashes: &mut BTreeMap<String, String>,
     records: &mut Vec<SyntheticRecord>,
+    workspace_cache: &mut HashMap<String, Option<String>>,
 ) -> Result<u64> {
     let range_end = prefix_range_end(prefix);
     let mut last_key = prefix.to_string();
@@ -753,7 +762,8 @@ fn scan_prefix(
             let hash = format!("{:016x}", hash_bytes(&bytes));
             let unchanged = prior_hashes.get(&key) == Some(&hash);
             if !unchanged && !bytes.is_empty() {
-                if let Some(record) = synthesize_cursor_sqlite_record(&key, &bytes) {
+                if let Some(mut record) = synthesize_cursor_sqlite_record(&key, &bytes) {
+                    stamp_bubble_workspace(connection, workspace_cache, &mut record);
                     records.push(record);
                 }
             }
@@ -965,6 +975,62 @@ fn synthesize_bubble_record(
         source_line_no: line_no,
         source_offset: offset,
     })
+}
+
+/// Bubble rows carry no working directory of their own, and the route
+/// resolver's sticky session pin lives only in process memory: after an
+/// ingest restart, a poll delta containing only mutated bubbles (parent
+/// composer blob unchanged, so no composer record re-emits) would resolve
+/// to no backend and silently miss the mirror while the hash cursor still
+/// advances. Stamping the parent composer's `workspacePath` onto each
+/// changed bubble makes bubble rows self-describing for route resolution,
+/// like claude_code records. One point query per distinct composer per
+/// scan, cached; unchanged bubbles never trigger it.
+fn stamp_bubble_workspace(
+    connection: &Connection,
+    cache: &mut HashMap<String, Option<String>>,
+    synthetic: &mut SyntheticRecord,
+) {
+    let Some(record) = synthetic.record.as_object_mut() else {
+        return;
+    };
+    if record.get("type").and_then(Value::as_str) != Some("cursor_bubble") {
+        return;
+    }
+    let Some(composer_id) = record.get("sessionId").and_then(Value::as_str) else {
+        return;
+    };
+    let composer_id = composer_id.to_string();
+    let workspace = cache
+        .entry(composer_id.clone())
+        .or_insert_with(|| lookup_composer_workspace(connection, &composer_id))
+        .clone();
+    if let Some(path) = workspace {
+        record.insert("workspacePath".to_string(), json!(path));
+    }
+}
+
+/// Best-effort read of `workspaceIdentifier.uri.fsPath` from a bubble's
+/// parent `composerData:` blob. Works even for composers the synthesizer
+/// defers (no positive `createdAt` yet): Cursor writes the workspace
+/// identifier at creation. Any failure resolves to `None`.
+fn lookup_composer_workspace(connection: &Connection, composer_id: &str) -> Option<String> {
+    let bytes: Vec<u8> = connection
+        .query_row(
+            "SELECT value FROM cursorDiskKV WHERE key = ?1",
+            rusqlite::params![format!("composerData:{composer_id}")],
+            |row| match row.get_ref(0)? {
+                ValueRef::Text(text) => Ok(text.to_vec()),
+                ValueRef::Blob(blob) => Ok(blob.to_vec()),
+                _ => Ok(Vec::new()),
+            },
+        )
+        .ok()?;
+    let parsed: Value = serde_json::from_slice(&bytes).ok()?;
+    parsed
+        .pointer("/workspaceIdentifier/uri/fsPath")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn copy_fields(source: &Value, target: &mut Map<String, Value>, fields: &[&str]) {
@@ -1429,6 +1495,39 @@ mod tests {
                 Some("edit_file_v2")
             );
         }
+
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn changed_bubbles_are_stamped_with_the_composer_workspace() {
+        let path = unique_db_path("bubble-workspace");
+        let db = seed_fixture_db(&path);
+        let work = sqlite_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+
+        let _ = run_poll(&work, &checkpoints).await;
+
+        // Bubble-only delta, as after an ingest restart: the parent composer
+        // blob is unchanged, so no composer record re-emits to re-pin the
+        // session's route. The bubble row itself must carry the cwd.
+        put(
+            &db,
+            &format!("bubbleId:{COMPOSER_ID}:{TOOL_BUBBLE_ID}"),
+            &tool_bubble_value("completed", true),
+        );
+        let second = run_poll(&work, &checkpoints).await;
+
+        let raw_rows: Vec<Value> = second
+            .iter()
+            .flat_map(|batch| batch.raw_rows.iter().cloned())
+            .collect();
+        assert_eq!(raw_rows.len(), 1, "only the mutated bubble re-emits");
+        assert_eq!(
+            raw_rows[0].get("cwd").and_then(Value::as_str),
+            Some("/Users/demo/project"),
+            "bubble rows must be self-describing for route resolution"
+        );
 
         cleanup(&path);
     }

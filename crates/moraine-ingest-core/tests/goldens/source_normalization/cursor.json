@@ -3,6 +3,7 @@
   "name": "cursor",
   "records": [
     {
+      "cwd_hint": "",
       "error_rows": [],
       "event_rows": [
         {
@@ -16,6 +17,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-02-16 12:00:10.000",
@@ -88,6 +90,7 @@
       "model_hint": "cursor-small",
       "raw_rows": [
         {
+          "cwd": "",
           "event_uid": "3eeec9e079533149e9be64ffd881295f152b2db141fd8130113dd4bf2f7101d0",
           "harness": "cursor",
           "inference_provider": "cursor",
@@ -108,6 +111,7 @@
       "tool_rows": []
     },
     {
+      "cwd_hint": "",
       "error_rows": [],
       "event_rows": [
         {
@@ -121,6 +125,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-02-16 12:00:11.000",
@@ -199,6 +204,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "tool_call",
           "event_ts": "2026-02-16 12:00:11.000",
@@ -284,6 +290,7 @@
       "model_hint": "cursor-small",
       "raw_rows": [
         {
+          "cwd": "",
           "event_uid": "9e00d44ef3ecd8c18a97db53a8616d39b547368f3a8ab9f47cb6f28375878f74",
           "harness": "cursor",
           "inference_provider": "cursor",
@@ -327,6 +334,7 @@
       ]
     },
     {
+      "cwd_hint": "",
       "error_rows": [],
       "event_rows": [
         {
@@ -340,6 +348,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "tool_result",
           "event_ts": "2026-02-16 12:00:12.000",
@@ -412,6 +421,7 @@
       "model_hint": "cursor-small",
       "raw_rows": [
         {
+          "cwd": "",
           "event_uid": "e52cd7ff06511e82d5d9c2f327721d2d23a8367ef0b389fcbff248289da08488",
           "harness": "cursor",
           "inference_provider": "cursor",
@@ -455,6 +465,7 @@
       ]
     },
     {
+      "cwd_hint": "",
       "error_rows": [],
       "event_rows": [
         {
@@ -468,6 +479,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "reasoning",
           "event_ts": "2026-02-16 12:00:13.000",
@@ -546,6 +558,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-02-16 12:00:13.000",
@@ -618,6 +631,7 @@
       "model_hint": "cursor-small",
       "raw_rows": [
         {
+          "cwd": "",
           "event_uid": "e4b252817ca1435015af5c57c571d68b087e4cdb893cb6c00c0e8f2c88481683",
           "harness": "cursor",
           "inference_provider": "cursor",
@@ -638,6 +652,7 @@
       "tool_rows": []
     },
     {
+      "cwd_hint": "",
       "error_rows": [],
       "event_rows": [
         {
@@ -649,6 +664,7 @@
           "content_types": [],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-02-16 12:00:14.000",
@@ -721,6 +737,7 @@
       "model_hint": "cursor-small",
       "raw_rows": [
         {
+          "cwd": "",
           "event_uid": "efd1cc371a6593f26ff005ba4a47ae1f02b594c51c42f208e185efcc74c050a7",
           "harness": "cursor",
           "inference_provider": "cursor",

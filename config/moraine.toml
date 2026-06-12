@@ -7,6 +7,27 @@ timeout_seconds = 30.0
 async_insert = true
 wait_for_async_insert = true
 
+# Named ClickHouse backends with per-project routing. The [clickhouse] block
+# above IS the `default` backend (declaring both [clickhouse] and
+# [backends.default] is a config error). Sessions whose working directory
+# matches a route are MIRRORED to the named backend in addition to the local
+# default; moraine never runs migrations against non-default backends, so the
+# remote schema must already match this build. A repo can also opt in by name
+# with a `.moraine.toml` containing `backend = "team-ch"`. See
+# docs/configuration.md ("Backends and Per-Project Routing") for details.
+# [backends.team-ch]
+# url = "https://ch.team.example:8443"
+# database = "moraine_team"
+# username = "svc-moraine"
+# password = ""
+# # Accept a server whose migration ledger is ahead of this moraine build.
+# allow_newer_server = false
+
+# [[routes]]
+# dir = "~/src/teamproject/**"  # first matching route wins; `/**` includes the base dir
+# backend = "team-ch"
+# mode = "mirror"               # default; the only supported mode
+
 [ingest]
 batch_size = 4000
 max_batch_bytes = 8388608

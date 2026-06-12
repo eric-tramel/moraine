@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 const MAX_INSERT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::time::Duration;
 
 #[derive(Clone)]
@@ -28,6 +28,22 @@ pub struct Migration {
     pub version: &'static str,
     pub name: &'static str,
     pub sql: &'static str,
+}
+
+/// Result of comparing the server's `schema_migrations` ledger against this
+/// build's `bundled_migrations()`. Both lists are sorted ascending.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SchemaSkew {
+    /// Bundled versions the server has not applied (server is behind).
+    pub missing_on_server: Vec<String>,
+    /// Server-applied versions this build does not bundle (server is ahead).
+    pub unknown_on_server: Vec<String>,
+}
+
+impl SchemaSkew {
+    pub fn is_clean(&self) -> bool {
+        self.missing_on_server.is_empty() && self.unknown_on_server.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -289,6 +305,24 @@ impl ClickHouseClient {
             .collect())
     }
 
+    /// Probe schema skew between the server's migration ledger and this
+    /// build's bundled migrations. Strictly read-only: unlike
+    /// `pending_migration_versions`, it never creates the ledger table, so it
+    /// is safe to run against backends moraine does not own. A missing ledger
+    /// (or missing database) reports every bundled version as missing.
+    pub async fn schema_skew(&self) -> Result<SchemaSkew> {
+        let bundled: Vec<&str> = bundled_migrations().iter().map(|m| m.version).collect();
+        let applied: Vec<String> = if self.migration_ledger_exists().await? {
+            self.applied_migration_versions()
+                .await?
+                .into_iter()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Ok(compute_schema_skew(&bundled, &applied))
+    }
+
     pub async fn doctor_report(&self) -> Result<DoctorReport> {
         let mut report = DoctorReport {
             clickhouse_healthy: false,
@@ -434,6 +468,22 @@ impl ClickHouseClient {
         Ok(())
     }
 
+    async fn migration_ledger_exists(&self) -> Result<bool> {
+        #[derive(Deserialize)]
+        struct ExistsRow {
+            exists: u8,
+        }
+
+        let query = format!(
+            "SELECT toUInt8(count() > 0) AS exists FROM system.tables \
+             WHERE database = {} AND name = 'schema_migrations'",
+            escape_literal(&self.cfg.database)
+        );
+
+        let rows: Vec<ExistsRow> = self.query_json_data(&query, Some("system")).await?;
+        Ok(rows.first().map(|r| r.exists == 1).unwrap_or(false))
+    }
+
     async fn applied_migration_versions(&self) -> Result<HashSet<String>> {
         #[derive(Deserialize)]
         struct Row {
@@ -529,7 +579,74 @@ pub fn bundled_migrations() -> Vec<Migration> {
             name: "015_sqlite_checkpoint_cursor.sql",
             sql: include_str!("../../../sql/015_sqlite_checkpoint_cursor.sql"),
         },
+        Migration {
+            version: "016",
+            name: "016_add_event_cwd.sql",
+            sql: include_str!("../../../sql/016_add_event_cwd.sql"),
+        },
+        Migration {
+            version: "017",
+            name: "017_heartbeat_backend_sinks.sql",
+            sql: include_str!("../../../sql/017_heartbeat_backend_sinks.sql"),
+        },
+        Migration {
+            version: "018",
+            name: "018_checkpoint_host.sql",
+            sql: include_str!("../../../sql/018_checkpoint_host.sql"),
+        },
     ]
+}
+
+/// Pure comparison of two migration-version lists; the basis of
+/// `ClickHouseClient::schema_skew`. Output vectors are sorted and deduplicated.
+pub fn compute_schema_skew<B: AsRef<str>, S: AsRef<str>>(
+    bundled_versions: &[B],
+    server_versions: &[S],
+) -> SchemaSkew {
+    let bundled: BTreeSet<&str> = bundled_versions.iter().map(AsRef::as_ref).collect();
+    let server: BTreeSet<&str> = server_versions.iter().map(AsRef::as_ref).collect();
+
+    SchemaSkew {
+        missing_on_server: bundled
+            .difference(&server)
+            .map(|v| (*v).to_string())
+            .collect(),
+        unknown_on_server: server
+            .difference(&bundled)
+            .map(|v| (*v).to_string())
+            .collect(),
+    }
+}
+
+/// Skew policy for non-default backends, which moraine NEVER migrates (the
+/// default backend keeps using `run_migrations` and must not go through this).
+/// Server behind => hard error; server ahead => hard error unless the
+/// backend's `allow_newer_server` is set. Exists to make skew loud, not to
+/// manage it.
+pub fn enforce_remote_schema_policy(
+    backend_name: &str,
+    skew: &SchemaSkew,
+    allow_newer_server: bool,
+) -> Result<()> {
+    if !skew.missing_on_server.is_empty() {
+        bail!(
+            "backend '{}': server schema is behind this moraine build (missing migrations: {}); \
+             moraine never migrates non-default backends — apply these migrations on the server first",
+            backend_name,
+            skew.missing_on_server.join(", ")
+        );
+    }
+
+    if !skew.unknown_on_server.is_empty() && !allow_newer_server {
+        bail!(
+            "backend '{}': server schema is ahead of this moraine build (unknown migrations: {}); \
+             upgrade moraine, or set `allow_newer_server = true` on this backend to accept it",
+            backend_name,
+            skew.unknown_on_server.join(", ")
+        );
+    }
+
+    Ok(())
 }
 
 fn truncate_for_error(statement: &str) -> String {
@@ -670,6 +787,7 @@ mod tests {
             timeout_seconds: 5.0,
             async_insert: true,
             wait_for_async_insert: true,
+            allow_newer_server: false,
         }
     }
 
@@ -731,6 +849,60 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind insert capture listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        format!("http://{}", addr)
+    }
+
+    #[derive(Clone)]
+    struct SkewMockState {
+        ledger_exists: bool,
+        versions: Vec<String>,
+        queries: Arc<Mutex<Vec<String>>>,
+    }
+
+    async fn spawn_skew_mock_server(state: SkewMockState) -> String {
+        async fn handler(
+            State(state): State<SkewMockState>,
+            Query(params): Query<HashMap<String, String>>,
+        ) -> (StatusCode, String) {
+            let query = params.get("query").cloned().unwrap_or_default();
+            state
+                .queries
+                .lock()
+                .expect("query capture mutex poisoned")
+                .push(query.clone());
+
+            if query.contains("system.tables") {
+                let exists = u8::from(state.ledger_exists);
+                return (
+                    StatusCode::OK,
+                    format!("{{\"data\":[{{\"exists\":{exists}}}]}}"),
+                );
+            }
+
+            if query.contains("schema_migrations") {
+                let rows: Vec<Value> = state
+                    .versions
+                    .iter()
+                    .map(|v| json!({ "version": v }))
+                    .collect();
+                let body =
+                    serde_json::to_string(&json!({ "data": rows })).expect("encode mock rows");
+                return (StatusCode::OK, body);
+            }
+
+            (StatusCode::OK, "{\"data\":[]}".to_string())
+        }
+
+        let app = Router::new().route("/", post(handler)).with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind skew mock listener");
         let addr = listener.local_addr().expect("listener addr");
 
         tokio::spawn(async move {
@@ -912,6 +1084,101 @@ mod tests {
     }
 
     #[test]
+    fn schema_skew_clean_when_versions_match() {
+        let skew = compute_schema_skew(&["001", "002"], &["002".to_string(), "001".to_string()]);
+        assert!(skew.is_clean());
+        assert_eq!(skew, SchemaSkew::default());
+    }
+
+    #[test]
+    fn schema_skew_reports_server_behind() {
+        let skew = compute_schema_skew(&["001", "002", "003"], &["001".to_string()]);
+        assert_eq!(skew.missing_on_server, vec!["002", "003"]);
+        assert!(skew.unknown_on_server.is_empty());
+        assert!(!skew.is_clean());
+    }
+
+    #[test]
+    fn schema_skew_reports_server_ahead() {
+        let skew = compute_schema_skew(&["001"], &["001".to_string(), "017".to_string()]);
+        assert!(skew.missing_on_server.is_empty());
+        assert_eq!(skew.unknown_on_server, vec!["017"]);
+    }
+
+    #[test]
+    fn schema_skew_reports_divergence_in_both_directions() {
+        let skew = compute_schema_skew(
+            &["001", "002"],
+            &["001".to_string(), "099".to_string(), "099".to_string()],
+        );
+        assert_eq!(skew.missing_on_server, vec!["002"]);
+        // Output is deduplicated and sorted.
+        assert_eq!(skew.unknown_on_server, vec!["099"]);
+    }
+
+    #[test]
+    fn schema_skew_with_empty_server_ledger_reports_everything_missing() {
+        let bundled: Vec<&str> = bundled_migrations().iter().map(|m| m.version).collect();
+        let skew = compute_schema_skew(&bundled, &Vec::<String>::new());
+        assert_eq!(skew.missing_on_server.len(), bundled.len());
+        assert!(skew.unknown_on_server.is_empty());
+    }
+
+    #[test]
+    fn remote_schema_policy_accepts_clean_skew() {
+        let skew = SchemaSkew::default();
+        assert!(enforce_remote_schema_policy("team-ch", &skew, false).is_ok());
+    }
+
+    #[test]
+    fn remote_schema_policy_rejects_server_behind() {
+        let skew = SchemaSkew {
+            missing_on_server: vec!["015".to_string(), "016".to_string()],
+            unknown_on_server: Vec::new(),
+        };
+        let err = enforce_remote_schema_policy("team-ch", &skew, false)
+            .expect_err("server behind must be a hard error");
+        let msg = err.to_string();
+        assert!(msg.contains("'team-ch'"));
+        assert!(msg.contains("015, 016"));
+        assert!(msg.contains("never migrates"));
+    }
+
+    #[test]
+    fn remote_schema_policy_rejects_server_behind_even_with_allow_newer() {
+        let skew = SchemaSkew {
+            missing_on_server: vec!["016".to_string()],
+            unknown_on_server: vec!["017".to_string()],
+        };
+        let err = enforce_remote_schema_policy("team-ch", &skew, true)
+            .expect_err("allow_newer_server must not excuse a server that is behind");
+        assert!(err.to_string().contains("016"));
+    }
+
+    #[test]
+    fn remote_schema_policy_rejects_server_ahead_by_default() {
+        let skew = SchemaSkew {
+            missing_on_server: Vec::new(),
+            unknown_on_server: vec!["017".to_string()],
+        };
+        let err = enforce_remote_schema_policy("team-ch", &skew, false)
+            .expect_err("server ahead must be a hard error without opt-in");
+        let msg = err.to_string();
+        assert!(msg.contains("'team-ch'"));
+        assert!(msg.contains("017"));
+        assert!(msg.contains("allow_newer_server"));
+    }
+
+    #[test]
+    fn remote_schema_policy_allows_server_ahead_when_opted_in() {
+        let skew = SchemaSkew {
+            missing_on_server: Vec::new(),
+            unknown_on_server: vec!["017".to_string()],
+        };
+        assert!(enforce_remote_schema_policy("team-ch", &skew, true).is_ok());
+    }
+
+    #[test]
     fn truncate_for_error_handles_multibyte_utf8_boundaries() {
         let statement = format!("{}é{}", "a".repeat(239), "b".repeat(10));
         let truncated = truncate_for_error(&statement);
@@ -960,6 +1227,57 @@ mod tests {
             lengths.iter().all(|len| *len < MAX_INSERT_PAYLOAD_BYTES),
             "each captured payload should stay below the byte cap: {lengths:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn schema_skew_probe_compares_remote_ledger_without_writing() {
+        let queries = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut versions: Vec<String> = bundled_migrations()
+            .iter()
+            .map(|m| m.version.to_string())
+            .collect();
+        versions.pop(); // server is behind by the newest bundled migration
+        versions.push("999".to_string()); // and ahead by one unknown version
+
+        let base_url = spawn_skew_mock_server(SkewMockState {
+            ledger_exists: true,
+            versions,
+            queries: queries.clone(),
+        })
+        .await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+
+        let skew = client.schema_skew().await.expect("skew probe");
+        let newest = bundled_migrations()
+            .last()
+            .expect("bundled migrations non-empty")
+            .version;
+        assert_eq!(skew.missing_on_server, vec![newest.to_string()]);
+        assert_eq!(skew.unknown_on_server, vec!["999".to_string()]);
+
+        // The probe must be read-only: no CREATE/INSERT may reach the server.
+        let queries = queries.lock().expect("query capture mutex poisoned");
+        assert!(
+            queries
+                .iter()
+                .all(|q| !q.contains("CREATE") && !q.contains("INSERT")),
+            "schema_skew issued a write statement: {queries:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn schema_skew_probe_treats_missing_ledger_as_all_missing() {
+        let base_url = spawn_skew_mock_server(SkewMockState {
+            ledger_exists: false,
+            versions: vec!["001".to_string()], // must never be consulted
+            queries: Arc::new(Mutex::new(Vec::new())),
+        })
+        .await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+
+        let skew = client.schema_skew().await.expect("skew probe");
+        assert_eq!(skew.missing_on_server.len(), bundled_migrations().len());
+        assert!(skew.unknown_on_server.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]

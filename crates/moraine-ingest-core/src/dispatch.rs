@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 #[cfg(not(unix))]
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -131,6 +131,41 @@ fn infer_initial_record_ts_hint(source_file: &str, offset: u64) -> Option<String
             let dt: chrono::DateTime<chrono::Utc> = modified.into();
             format_record_ts(&dt)
         })
+}
+
+/// Best-effort session-level cwd recovered from the head of a file that is
+/// being resumed mid-stream. Harnesses like codex and pi only carry the
+/// working directory on the session header (line 1); after a restart the
+/// resumed tail would otherwise stamp empty `cwd` values and leave backend
+/// route resolution blind to the session's directory. Bounded so the peek
+/// stays cheap on every resumed-file processing pass.
+fn infer_initial_cwd_hint(source_file: &str, harness: &str) -> Option<String> {
+    const MAX_HEAD_LINES: usize = 25;
+    const MAX_HEAD_BYTES: u64 = 512 * 1024;
+
+    let source = crate::sources::registry().get(harness)?;
+    let file = std::fs::File::open(source_file).ok()?;
+    let mut reader = BufReader::new(file.take(MAX_HEAD_BYTES));
+
+    for _ in 0..MAX_HEAD_LINES {
+        let mut buf = Vec::<u8>::new();
+        let bytes_read = reader.read_until(b'\n', &mut buf).ok()?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        let text = String::from_utf8_lossy(&buf);
+        let Ok(record) = serde_json::from_str::<Value>(text.trim()) else {
+            continue;
+        };
+        let cwd = source.cwd(&record);
+        let trimmed = cwd.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    None
 }
 
 /// Post-process event rows from a single Claude Code record:
@@ -426,6 +461,13 @@ pub(crate) async fn process_file(
     let mut line_no = checkpoint.last_line_no;
     let mut session_hint = String::new();
     let mut model_hint = String::new();
+    // Resuming mid-file restarts the hint chain after the session header,
+    // so recover the session-level cwd from the file head when needed.
+    let mut cwd_hint = if checkpoint.last_offset > 0 {
+        infer_initial_cwd_hint(source_file, &work.harness).unwrap_or_default()
+    } else {
+        String::new()
+    };
     let mut record_ts_hint =
         infer_initial_record_ts_hint(source_file, checkpoint.last_offset).unwrap_or_default();
     let mut session_cursors: HashMap<String, SessionCursor> = HashMap::new();
@@ -500,6 +542,7 @@ pub(crate) async fn process_file(
             start_offset,
             &session_hint,
             &model_hint,
+            &cwd_hint,
             &record_ts_hint,
         ) {
             Ok(normalized) => normalized,
@@ -534,6 +577,7 @@ pub(crate) async fn process_file(
 
         session_hint = normalized.session_hint.clone();
         model_hint = normalized.model_hint.clone();
+        cwd_hint = normalized.cwd_hint.clone();
         // A null `raw_row` means the normalizer deliberately skipped the
         // record (e.g. the Kimi wire metadata header). Advance the line
         // counter and checkpoint, but emit nothing downstream — passing a
@@ -710,6 +754,7 @@ async fn process_session_json_file(
     let mut batch = RowBatch::default();
     let mut session_hint = String::new();
     let mut model_hint = String::new();
+    let mut cwd_hint = String::new();
 
     for (line_no, record) in synthetic_records {
         let raw_json = serde_json::to_string(&record).unwrap_or_else(|_| "{}".to_string());
@@ -724,10 +769,12 @@ async fn process_session_json_file(
             0,
             &session_hint,
             &model_hint,
+            &cwd_hint,
         ) {
             Ok(normalized) => {
                 session_hint = normalized.session_hint;
                 model_hint = normalized.model_hint;
+                cwd_hint = normalized.cwd_hint;
                 // A null `raw_row` is the normalizer's "skip this record"
                 // signal (e.g. Kimi wire metadata header). Still count the
                 // line for checkpointing, but don't emit a null row — it
@@ -1359,6 +1406,81 @@ mod tests {
                 .and_then(Value::as_str)
                 .unwrap_or(""),
             "2025-09-21 17:12:48.127"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_file_recovers_session_cwd_when_resuming_mid_file() {
+        let path = unique_test_file("codex-resume-cwd");
+        let header = serde_json::json!({
+            "type": "session_meta",
+            "timestamp": "2026-04-18T20:43:51.069Z",
+            "payload": {
+                "id": "codex-session-1",
+                "cwd": "/repo"
+            }
+        })
+        .to_string();
+        let tail = serde_json::json!({
+            "type": "function_call",
+            "timestamp": "2026-04-18T20:43:52.069Z",
+            "call_id": "call_resumed",
+            "name": "shell",
+            "arguments": "{}"
+        })
+        .to_string();
+        fs::write(&path, format!("{header}\n{tail}\n")).expect("write codex resume fixture");
+
+        let source_file = path.to_string_lossy().to_string();
+        let work = WorkItem {
+            source_name: "codex".to_string(),
+            harness: "codex".to_string(),
+            format: "jsonl".to_string(),
+            path: source_file.clone(),
+        };
+
+        // Simulate a restart that already ingested the session header: the
+        // checkpoint sits past line 1, so the in-stream cwd hint chain never
+        // sees `payload.cwd` and must be recovered from the file head.
+        let meta = fs::metadata(&path).expect("fixture metadata");
+        let inode = source_inode_for_file(&source_file, &meta);
+        let committed = Checkpoint {
+            source_name: work.source_name.clone(),
+            source_file: source_file.clone(),
+            source_inode: inode,
+            source_generation: 1,
+            last_offset: (header.len() + 1) as u64,
+            last_line_no: 1,
+            status: "active".to_string(),
+            ..Default::default()
+        };
+        let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+        {
+            let mut guard = checkpoints.write().await;
+            guard.insert(
+                crate::checkpoint::checkpoint_key(&work.source_name, &source_file),
+                committed,
+            );
+        }
+
+        let config = moraine_config::AppConfig::default();
+        let metrics = Arc::new(Metrics::default());
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(16);
+
+        process_file(&config, &work, checkpoints, sink_tx, &metrics)
+            .await
+            .expect("resumed codex file should process");
+
+        let batches = drain_batches(&mut sink_rx).await;
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.raw_rows.len(), 1, "only the tail record re-emits");
+        assert_eq!(
+            batch.raw_rows[0].get("cwd").and_then(Value::as_str),
+            Some("/repo"),
+            "resumed records inherit the session cwd from the file head"
         );
 
         let _ = fs::remove_file(&path);

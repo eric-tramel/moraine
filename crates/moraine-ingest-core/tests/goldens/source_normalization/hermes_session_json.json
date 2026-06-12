@@ -3,6 +3,7 @@
   "name": "hermes_session_json",
   "records": [
     {
+      "cwd_hint": "",
       "error_rows": [],
       "event_rows": [
         {
@@ -14,6 +15,7 @@
           "content_types": [],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "session_meta",
           "event_ts": "2026-04-18 14:22:00.000",
@@ -86,6 +88,7 @@
       "model_hint": "claude-opus-4-6",
       "raw_rows": [
         {
+          "cwd": "",
           "event_uid": "15519b289c0a5ec7d900421a482a80c705f803729d94283410b9ce382a84025d",
           "harness": "hermes",
           "inference_provider": "anthropic",
@@ -106,6 +109,7 @@
       "tool_rows": []
     },
     {
+      "cwd_hint": "",
       "error_rows": [],
       "event_rows": [
         {
@@ -117,6 +121,7 @@
           "content_types": [],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-04-18 14:23:05.000",
@@ -189,6 +194,7 @@
       "model_hint": "claude-opus-4-6",
       "raw_rows": [
         {
+          "cwd": "",
           "event_uid": "52a10d0ade0c9f09f1fc7e09ed971ba4fe953dcc6d1bc24a27a445cdb30f0588",
           "harness": "hermes",
           "inference_provider": "anthropic",
@@ -209,6 +215,7 @@
       "tool_rows": []
     },
     {
+      "cwd_hint": "",
       "error_rows": [],
       "event_rows": [
         {
@@ -222,6 +229,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "reasoning",
           "event_ts": "2026-04-18 14:23:05.000",
@@ -300,6 +308,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "tool_call",
           "event_ts": "2026-04-18 14:23:05.000",
@@ -372,6 +381,7 @@
       "model_hint": "claude-opus-4-6",
       "raw_rows": [
         {
+          "cwd": "",
           "event_uid": "f1d7d8ae558139e15806f9a9cbb7bacc03cd2e53316136b74ccae7ab42f6dd37",
           "harness": "hermes",
           "inference_provider": "anthropic",
@@ -415,6 +425,7 @@
       ]
     },
     {
+      "cwd_hint": "",
       "error_rows": [],
       "event_rows": [
         {
@@ -428,6 +439,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "tool_result",
           "event_ts": "2026-04-18 14:23:05.000",
@@ -500,6 +512,7 @@
       "model_hint": "claude-opus-4-6",
       "raw_rows": [
         {
+          "cwd": "",
           "event_uid": "e7e7fe77a0bb3671cdb123df1fd2edf24568006186d59737f576a6468ad1efef",
           "harness": "hermes",
           "inference_provider": "anthropic",
@@ -543,6 +556,7 @@
       ]
     },
     {
+      "cwd_hint": "",
       "error_rows": [],
       "event_rows": [
         {
@@ -554,6 +568,7 @@
           "content_types": [],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-04-18 14:23:05.000",
@@ -626,6 +641,7 @@
       "model_hint": "claude-opus-4-6",
       "raw_rows": [
         {
+          "cwd": "",
           "event_uid": "b6596cc2175056fb88ff914dc0e0bdb9f8c85edae7085b7b869c0e1c54987974",
           "harness": "hermes",
           "inference_provider": "anthropic",

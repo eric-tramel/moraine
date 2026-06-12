@@ -3,6 +3,7 @@
   "name": "pi_coding_agent",
   "records": [
     {
+      "cwd_hint": "/work/pi-demo",
       "error_rows": [],
       "event_rows": [
         {
@@ -14,6 +15,7 @@
           "content_types": [],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "/work/pi-demo",
           "endpoint_kind": "generation",
           "event_kind": "session_meta",
           "event_ts": "2026-05-08 02:00:00.000",
@@ -86,6 +88,7 @@
       "model_hint": "",
       "raw_rows": [
         {
+          "cwd": "/work/pi-demo",
           "event_uid": "74f53d28a2dfb50fee76f20468c9c8e15cab26c409480cf9b0abf4fd447ebb01",
           "harness": "pi-coding-agent",
           "inference_provider": "",
@@ -106,6 +109,7 @@
       "tool_rows": []
     },
     {
+      "cwd_hint": "/work/pi-demo",
       "error_rows": [],
       "event_rows": [
         {
@@ -117,6 +121,7 @@
           "content_types": [],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "/work/pi-demo",
           "endpoint_kind": "generation",
           "event_kind": "system",
           "event_ts": "2026-05-08 02:00:00.100",
@@ -189,6 +194,7 @@
       "model_hint": "arcee-ai/trinity-large-thinking",
       "raw_rows": [
         {
+          "cwd": "/work/pi-demo",
           "event_uid": "15c7b965896e1802d85d2344c4b5a29a5920cb31f85b1abfce4a15f8c2463ff8",
           "harness": "pi-coding-agent",
           "inference_provider": "openrouter",
@@ -209,6 +215,7 @@
       "tool_rows": []
     },
     {
+      "cwd_hint": "/work/pi-demo",
       "error_rows": [],
       "event_rows": [
         {
@@ -220,6 +227,7 @@
           "content_types": [],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "/work/pi-demo",
           "endpoint_kind": "generation",
           "event_kind": "system",
           "event_ts": "2026-05-08 02:00:00.200",
@@ -305,6 +313,7 @@
       "model_hint": "arcee-ai/trinity-large-thinking",
       "raw_rows": [
         {
+          "cwd": "/work/pi-demo",
           "event_uid": "84d57683f0cca67f1b3d6b228958bea21ebc8c2b28fe9b80d6fdb5043066dc24",
           "harness": "pi-coding-agent",
           "inference_provider": "",
@@ -325,6 +334,7 @@
       "tool_rows": []
     },
     {
+      "cwd_hint": "/work/pi-demo",
       "error_rows": [],
       "event_rows": [
         {
@@ -338,6 +348,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "/work/pi-demo",
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-05-08 02:00:01.000",
@@ -423,6 +434,7 @@
       "model_hint": "arcee-ai/trinity-large-thinking",
       "raw_rows": [
         {
+          "cwd": "/work/pi-demo",
           "event_uid": "e8a5998f3d065005bdb660f8b59b0ba108856d0b1dd1f9abc951a1cdd007c72a",
           "harness": "pi-coding-agent",
           "inference_provider": "",
@@ -443,6 +455,7 @@
       "tool_rows": []
     },
     {
+      "cwd_hint": "/work/pi-demo",
       "error_rows": [],
       "event_rows": [
         {
@@ -456,6 +469,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "/work/pi-demo",
           "endpoint_kind": "generation",
           "event_kind": "reasoning",
           "event_ts": "2026-05-08 02:00:02.000",
@@ -534,6 +548,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "/work/pi-demo",
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-05-08 02:00:02.000",
@@ -612,6 +627,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "/work/pi-demo",
           "endpoint_kind": "generation",
           "event_kind": "tool_call",
           "event_ts": "2026-05-08 02:00:02.000",
@@ -721,6 +737,7 @@
       "model_hint": "arcee-ai/trinity-large-thinking",
       "raw_rows": [
         {
+          "cwd": "/work/pi-demo",
           "event_uid": "b0625f0f27519f9aba4726c28d790db2195dd8262d7a85e0dc9701c9f878bf4d",
           "harness": "pi-coding-agent",
           "inference_provider": "openrouter",
@@ -764,6 +781,7 @@
       ]
     },
     {
+      "cwd_hint": "/work/pi-demo",
       "error_rows": [],
       "event_rows": [
         {
@@ -777,6 +795,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "/work/pi-demo",
           "endpoint_kind": "generation",
           "event_kind": "tool_result",
           "event_ts": "2026-05-08 02:00:03.000",
@@ -862,6 +881,7 @@
       "model_hint": "arcee-ai/trinity-large-thinking",
       "raw_rows": [
         {
+          "cwd": "/work/pi-demo",
           "event_uid": "b792ac09b1ddd1aa506a2d84ff4da3aa7a4ee1b791d12c8ed77eca2b46c18355",
           "harness": "pi-coding-agent",
           "inference_provider": "",
@@ -905,6 +925,7 @@
       ]
     },
     {
+      "cwd_hint": "/work/pi-demo",
       "error_rows": [],
       "event_rows": [
         {
@@ -918,6 +939,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "/work/pi-demo",
           "endpoint_kind": "generation",
           "event_kind": "tool_result",
           "event_ts": "2026-05-08 02:00:04.000",
@@ -1003,6 +1025,7 @@
       "model_hint": "arcee-ai/trinity-large-thinking",
       "raw_rows": [
         {
+          "cwd": "/work/pi-demo",
           "event_uid": "b973ebf61f6db383539ef8d23f219662932b4cda5a03ce4645888ff481132a2a",
           "harness": "pi-coding-agent",
           "inference_provider": "",
@@ -1068,6 +1091,7 @@
       ]
     },
     {
+      "cwd_hint": "/work/pi-demo",
       "error_rows": [],
       "event_rows": [
         {
@@ -1079,6 +1103,7 @@
           "content_types": [],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "/work/pi-demo",
           "endpoint_kind": "generation",
           "event_kind": "summary",
           "event_ts": "2026-05-08 02:00:05.000",
@@ -1164,6 +1189,7 @@
       "model_hint": "arcee-ai/trinity-large-thinking",
       "raw_rows": [
         {
+          "cwd": "/work/pi-demo",
           "event_uid": "b0f5dd7b04c0801fd2335b6d07ddf79cc761ef256c9ebb7ae67b4ad6970131bc",
           "harness": "pi-coding-agent",
           "inference_provider": "",
@@ -1184,6 +1210,7 @@
       "tool_rows": []
     },
     {
+      "cwd_hint": "/work/pi-demo",
       "error_rows": [],
       "event_rows": [
         {
@@ -1195,6 +1222,7 @@
           "content_types": [],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "/work/pi-demo",
           "endpoint_kind": "generation",
           "event_kind": "summary",
           "event_ts": "2026-05-08 02:00:06.000",
@@ -1280,6 +1308,7 @@
       "model_hint": "arcee-ai/trinity-large-thinking",
       "raw_rows": [
         {
+          "cwd": "/work/pi-demo",
           "event_uid": "80d6b4f50cc1bd94b4f8d1223e5c94417ff15c91b52122708acb2fd4edf714b0",
           "harness": "pi-coding-agent",
           "inference_provider": "",
@@ -1300,6 +1329,7 @@
       "tool_rows": []
     },
     {
+      "cwd_hint": "/work/pi-demo",
       "error_rows": [],
       "event_rows": [
         {
@@ -1311,6 +1341,7 @@
           "content_types": [],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "/work/pi-demo",
           "endpoint_kind": "generation",
           "event_kind": "system",
           "event_ts": "2026-05-08 02:00:07.000",
@@ -1396,6 +1427,7 @@
       "model_hint": "arcee-ai/trinity-large-thinking",
       "raw_rows": [
         {
+          "cwd": "/work/pi-demo",
           "event_uid": "986068c400507a10abaf59f58c472d0642af51cbaa5a8a7f7c647f6397a73060",
           "harness": "pi-coding-agent",
           "inference_provider": "",
@@ -1416,6 +1448,7 @@
       "tool_rows": []
     },
     {
+      "cwd_hint": "/work/pi-demo",
       "error_rows": [],
       "event_rows": [
         {
@@ -1429,6 +1462,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "/work/pi-demo",
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-05-08 02:00:08.000",
@@ -1514,6 +1548,7 @@
       "model_hint": "arcee-ai/trinity-large-thinking",
       "raw_rows": [
         {
+          "cwd": "/work/pi-demo",
           "event_uid": "98f6308de6962dac48ee4e0931eeb21c0661cdf1c3375b567858a41ed96cc845",
           "harness": "pi-coding-agent",
           "inference_provider": "",
@@ -1534,6 +1569,7 @@
       "tool_rows": []
     },
     {
+      "cwd_hint": "/work/pi-demo",
       "error_rows": [],
       "event_rows": [
         {
@@ -1545,6 +1581,7 @@
           "content_types": [],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "/work/pi-demo",
           "endpoint_kind": "generation",
           "event_kind": "system",
           "event_ts": "2026-05-08 02:00:09.000",
@@ -1630,6 +1667,7 @@
       "model_hint": "arcee-ai/trinity-large-thinking",
       "raw_rows": [
         {
+          "cwd": "/work/pi-demo",
           "event_uid": "3d28aeec7b8166f63655db07cf375c899198c745d32b7945104a535fc55ab31d",
           "harness": "pi-coding-agent",
           "inference_provider": "",
@@ -1650,6 +1688,7 @@
       "tool_rows": []
     },
     {
+      "cwd_hint": "/work/pi-demo",
       "error_rows": [],
       "event_rows": [
         {
@@ -1661,6 +1700,7 @@
           "content_types": [],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "/work/pi-demo",
           "endpoint_kind": "generation",
           "event_kind": "session_meta",
           "event_ts": "2026-05-08 02:00:10.000",
@@ -1746,6 +1786,7 @@
       "model_hint": "arcee-ai/trinity-large-thinking",
       "raw_rows": [
         {
+          "cwd": "/work/pi-demo",
           "event_uid": "e0403bedf13e57b631dfe0b7f893c96d1854fcfd1f5019bf59334d2cb3c45542",
           "harness": "pi-coding-agent",
           "inference_provider": "",
