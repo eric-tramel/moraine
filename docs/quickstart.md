@@ -55,6 +55,13 @@ Moraine MCP search runs as a local stdio MCP server. Each agent harness starts
 `moraine run mcp` when it needs the tools, so keep the Moraine stack running
 with `moraine up`.
 
+By default `moraine up` also starts a single **shared** MCP server for the host,
+and each `moraine run mcp` proxies to it instead of booting a full server per
+session — this is what keeps many concurrent agents cheap. Registration is
+unchanged; if the shared server is not running, `moraine run mcp` falls back to
+an embedded server automatically. See
+[Agent MCP Search → Install](agent-mcp-search/install.md#shared-central-server-default).
+
 Add Moraine to Codex globally:
 
 ```bash
@@ -82,8 +89,8 @@ For Cursor, Kimi CLI, Pi, project-scoped Claude Code, and other clients, see
 
 | Command | Purpose |
 | --- | --- |
-| `moraine up` | Start ClickHouse, ingest, and the monitor UI. |
-| `moraine up --mcp` | Start the MCP server along with the default services. |
+| `moraine up` | Start ClickHouse, ingest, the monitor UI, and the shared MCP server. |
+| `moraine up --mcp` | Force-start the shared MCP server (also on by default). |
 | `moraine status` | Print service and ingest health. |
 | `moraine logs` | Show recent service logs. |
 | `moraine logs ingest --lines 500` | Show recent ingest logs. |

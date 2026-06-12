@@ -448,7 +448,6 @@ managed_clickhouse_dir = "/home/moraine/.moraine/clickhouse"
 clickhouse_auto_install = false
 clickhouse_version = "${ch_version}"
 start_monitor_on_up = true
-start_mcp_on_up = false
 EOF
     log "wrote config ${toml_path}"
 }

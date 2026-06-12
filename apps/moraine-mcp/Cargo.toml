@@ -6,7 +6,14 @@ description = "Moraine MCP stdio server"
 
 [dependencies]
 anyhow = "1.0"
-tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.40", features = [
+    "rt",
+    "rt-multi-thread",
+    "io-std",
+    "io-util",
+    "net",
+    "time",
+] }
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 moraine-config = { path = "../../crates/moraine-config" }
 moraine-mcp-core = { path = "../../crates/moraine-mcp-core" }

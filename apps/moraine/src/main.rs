@@ -330,13 +330,20 @@ struct ClickhouseStatusSnapshot {
 enum StartState {
     Started,
     AlreadyRunning,
+    /// A live central MCP server already owns the socket but no fresh PID file
+    /// tracks it (e.g. the file was deleted while the daemon survived). Nothing
+    /// was spawned: a second daemon would no-op-exit, and recording its PID
+    /// would clobber the file with a dead PID, breaking `status` and `down`.
+    AlreadyServing,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct StartOutcome {
     service: Service,
     state: StartState,
-    pid: u32,
+    /// `None` when the service is alive but not launcher-tracked
+    /// (`StartState::AlreadyServing`).
+    pid: Option<u32>,
     log_path: Option<String>,
 }
 
@@ -351,6 +358,8 @@ struct UpSnapshot {
 #[derive(Debug, Clone, serde::Serialize)]
 struct DownSnapshot {
     stopped: Vec<Service>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
 }
 
 struct CliOutput {
@@ -621,6 +630,23 @@ fn service_running(paths: &RuntimePaths, service: Service) -> Option<u32> {
         Some(pid)
     } else {
         None
+    }
+}
+
+/// True when something is currently accepting connections on the central MCP
+/// socket. Used alongside (not instead of) the PID file: the daemon can
+/// outlive a deleted or stale PID file, and acting on the file alone either
+/// spawns a useless second daemon (`up`) or unlinks a live server's socket,
+/// orphaning it unreachably (`down`).
+fn central_socket_live(socket_path: &str) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::net::UnixStream::connect(socket_path).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = socket_path;
+        false
     }
 }
 
@@ -1182,7 +1208,7 @@ async fn start_clickhouse(cfg: &AppConfig, paths: &RuntimePaths) -> Result<Start
         return Ok(StartOutcome {
             service: Service::ClickHouse,
             state: StartState::AlreadyRunning,
-            pid,
+            pid: Some(pid),
             log_path: Some(log_path(paths, Service::ClickHouse).display().to_string()),
         });
     }
@@ -1207,7 +1233,7 @@ async fn start_clickhouse(cfg: &AppConfig, paths: &RuntimePaths) -> Result<Start
     Ok(StartOutcome {
         service: Service::ClickHouse,
         state: StartState::Started,
-        pid: child.id(),
+        pid: Some(child.id()),
         log_path: Some(log_path(paths, Service::ClickHouse).display().to_string()),
     })
 }
@@ -1467,7 +1493,21 @@ fn start_background_service(
         return Ok(StartOutcome {
             service,
             state: StartState::AlreadyRunning,
-            pid,
+            pid: Some(pid),
+            log_path: Some(log_path(paths, service).display().to_string()),
+        });
+    }
+
+    // The central MCP server can outlive its PID file (e.g. the file was
+    // deleted while the daemon survived). Probe the socket before spawning:
+    // a second daemon would just no-op-exit, and the write_pid below would
+    // then record that dead PID, breaking `status` and `down` for the live
+    // server.
+    if service == Service::Mcp && central_socket_live(&cfg.mcp.central_socket_path) {
+        return Ok(StartOutcome {
+            service,
+            state: StartState::AlreadyServing,
+            pid: None,
             log_path: Some(log_path(paths, service).display().to_string()),
         });
     }
@@ -1487,6 +1527,10 @@ fn start_background_service(
 
     let child = Command::new(&binary)
         .args(args)
+        // Background services never read stdin; closing it avoids inheriting the
+        // launcher's terminal/pipe fd (and a SIGHUP/blocking-read footgun for the
+        // central MCP server, which would otherwise hold an unused stdin handle).
+        .stdin(Stdio::null())
         .stdout(Stdio::from(logfile))
         .stderr(Stdio::from(logfile_err))
         .spawn()
@@ -1496,7 +1540,7 @@ fn start_background_service(
     Ok(StartOutcome {
         service,
         state: StartState::Started,
-        pid: child.id(),
+        pid: Some(child.id()),
         log_path: Some(log_path(paths, service).display().to_string()),
     })
 }
@@ -1828,7 +1872,11 @@ fn selected_up_services(args: &UpArgs, cfg: &AppConfig) -> Vec<Service> {
     if args.monitor || cfg.runtime.start_monitor_on_up {
         services.push(Service::Monitor);
     }
-    if args.mcp || cfg.runtime.start_mcp_on_up {
+    // The up-managed Mcp service is always the shared central MCP server
+    // (`--serve socket`); the legacy stdio daemon variant is gone. `--mcp` and
+    // the deprecated runtime.start_mcp_on_up alias force it on even when
+    // mcp.start_central_on_up is disabled.
+    if args.mcp || cfg.runtime.start_mcp_on_up || cfg.mcp.start_central_on_up {
         services.push(Service::Mcp);
     }
     services
@@ -1920,6 +1968,14 @@ fn format_start_state(outcome: &StartOutcome) -> String {
     match outcome.state {
         StartState::Started => "started".to_string(),
         StartState::AlreadyRunning => "already running".to_string(),
+        StartState::AlreadyServing => "already serving (unmanaged)".to_string(),
+    }
+}
+
+fn format_start_pid(outcome: &StartOutcome) -> String {
+    match outcome.pid {
+        Some(pid) => pid.to_string(),
+        None => "-".to_string(),
     }
 }
 
@@ -2215,13 +2271,13 @@ fn render_up(output: &CliOutput, snapshot: &UpSnapshot) -> Result<()> {
     let mut rows = vec![vec![
         snapshot.clickhouse.service.name().to_string(),
         format_start_state(&snapshot.clickhouse),
-        snapshot.clickhouse.pid.to_string(),
+        format_start_pid(&snapshot.clickhouse),
     ]];
     rows.extend(snapshot.services.iter().map(|outcome| {
         vec![
             outcome.service.name().to_string(),
             format_start_state(outcome),
-            outcome.pid.to_string(),
+            format_start_pid(outcome),
         ]
     }));
     output.table("Startup Results", &["service", "result", "pid"], &rows);
@@ -2237,6 +2293,9 @@ fn render_down(output: &CliOutput, snapshot: &DownSnapshot) -> Result<()> {
     }
     if snapshot.stopped.is_empty() {
         output.section("Shutdown", &["no running services found".to_string()]);
+        if let Some(warning) = &snapshot.warning {
+            output.section("Warning", std::slice::from_ref(warning));
+        }
         return Ok(());
     }
     let rows = snapshot
@@ -2245,6 +2304,9 @@ fn render_down(output: &CliOutput, snapshot: &DownSnapshot) -> Result<()> {
         .map(|service| vec![service.name().to_string(), "stopped".to_string()])
         .collect::<Vec<_>>();
     output.table("Shutdown", &["service", "result"], &rows);
+    if let Some(warning) = &snapshot.warning {
+        output.section("Warning", std::slice::from_ref(warning));
+    }
     Ok(())
 }
 
@@ -2266,12 +2328,31 @@ async fn main() -> Result<ExitCode> {
 
             let mut started_services = Vec::new();
             for service in services_to_start {
+                // The up-managed Mcp service IS the shared central server;
+                // there is no up-managed stdio variant. The `--serve socket`
+                // flag is injected here (NOT in the shared
+                // service_args_with_defaults helper) so the foreground
+                // `moraine run mcp` path that agents register stays a stdio
+                // client and never accidentally becomes a server. The explicit
+                // `--socket` pins the daemon to the launcher-resolved path so it
+                // binds exactly where clients (which resolve from the same
+                // config) connect.
+                let extra_args: Vec<String> = if service == Service::Mcp {
+                    vec![
+                        "--serve".to_string(),
+                        "socket".to_string(),
+                        "--socket".to_string(),
+                        cfg.mcp.central_socket_path.clone(),
+                    ]
+                } else {
+                    Vec::new()
+                };
                 started_services.push(start_background_service(
                     service,
                     &config_path,
                     &cfg,
                     &paths,
-                    &[],
+                    &extra_args,
                 )?);
             }
 
@@ -2299,7 +2380,25 @@ async fn main() -> Result<ExitCode> {
                     stopped.push(service);
                 }
             }
-            render_down(&output, &DownSnapshot { stopped })?;
+            // Remove the central MCP socket only when nothing is listening on
+            // it: a dead socket would make clients connect-then-stall before
+            // falling back to embedded, but unlinking a *live* server's socket
+            // (possible when its PID file was lost, so stop_service had nothing
+            // to kill) would orphan that server unreachably while it keeps
+            // running. A daemon stopped by stop_service above has already
+            // removed its own socket via its signal handler.
+            let warning = if central_socket_live(&cfg.mcp.central_socket_path) {
+                Some(format!(
+                    "an MCP server is still listening on {} but is not tracked by a \
+                     PID file, so it was not stopped and its socket was left in place; \
+                     stop that process manually and re-run `moraine down`",
+                    cfg.mcp.central_socket_path
+                ))
+            } else {
+                let _ = fs::remove_file(&cfg.mcp.central_socket_path);
+                None
+            };
+            render_down(&output, &DownSnapshot { stopped, warning })?;
             Ok(ExitCode::SUCCESS)
         }
         CliCommand::Status => {
@@ -2883,5 +2982,34 @@ mod tests {
 
         assert_eq!(managed_clickhouse_checksum_state(&cfg, &paths), "verified");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn central_socket_live_detects_listener_vs_dead_socket() {
+        // Keep the path short: macOS temp_dir() exceeds the ~104-byte sun_path
+        // limit for Unix socket addresses.
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let sock = PathBuf::from(format!(
+            "/tmp/moraine-csl-{}-{stamp}.sock",
+            std::process::id()
+        ));
+        let sock_str = sock.to_string_lossy().to_string();
+
+        // No socket file at all.
+        assert!(!central_socket_live(&sock_str));
+
+        // A live listener is detected even with no PID file anywhere.
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind socket");
+        assert!(central_socket_live(&sock_str));
+
+        // A dead socket file (listener gone) is not treated as live.
+        drop(listener);
+        assert!(!central_socket_live(&sock_str));
+
+        let _ = fs::remove_file(&sock);
     }
 }

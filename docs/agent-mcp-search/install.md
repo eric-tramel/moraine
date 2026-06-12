@@ -10,6 +10,33 @@ Run `moraine up` first so ClickHouse, ingest, and the monitor are available.
 If you use a non-default Moraine config, pass it through the harness's
 environment support as `MORAINE_MCP_CONFIG=/path/to/moraine.toml`.
 
+## Shared central server (default)
+
+By default `moraine up` starts a single shared MCP server for the whole host,
+and every `moraine run mcp` becomes a thin stdio↔socket proxy to it. This
+replaces the previous model of booting a full MCP server (its own ClickHouse
+client, caches, and runtime threads) inside every agent session, and is what
+keeps hundreds of concurrent sessions cheap.
+
+What this means for you:
+
+- **Registration is unchanged.** Keep registering `moraine run mcp` exactly as
+  shown below. The proxy-vs-embedded choice is made internally.
+- **`moraine up` is required** for the shared server. The daemon listens on a
+  Unix socket at `~/.moraine/run/mcp.sock` (mode `0o600`, so it is scoped to
+  your user). `moraine down` stops it and removes the socket.
+- **Automatic fallback.** If the central server is not running (you skipped
+  `moraine up`, or it crashed), `moraine run mcp` transparently falls back to an
+  embedded server after ~250&nbsp;ms, so retrieval keeps working either way.
+- **Crash blast radius.** A central-server crash drops all live sessions' MCP
+  connections at once; harnesses re-establish the connection on their next tool
+  use, and `moraine up` restarts the daemon. To opt out and return to a server
+  per session, set `use_central_server = false` (see
+  [Configuration → MCP](../configuration.md#shared-central-mcp-server)).
+
+The remaining sections register the unchanged `moraine run mcp` command with
+each harness.
+
 ## Global Codex
 
 Codex stores user-level configuration in `~/.codex/config.toml`, and the Codex

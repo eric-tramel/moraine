@@ -498,6 +498,14 @@ enabled = true
 glob = "${fixtures_root}/hermes/sessions/*.json"
 watch_root = "${fixtures_root}/hermes/sessions"
 
+[mcp]
+# Exercise the shared central server end to end: `moraine up` starts the
+# daemon and the mcp_smoke.py runs below proxy through it (falling back to an
+# embedded server if the socket is not yet up). Both are the defaults; pinned
+# here so the e2e's coverage of the proxy path is explicit, not incidental.
+use_central_server = true
+start_central_on_up = true
+
 [runtime]
 root_dir = "${runtime_root}"
 logs_dir = "logs"
@@ -507,7 +515,6 @@ managed_clickhouse_dir = "${runtime_root}/managed-clickhouse"
 clickhouse_auto_install = true
 clickhouse_start_timeout_seconds = 90.0
 start_monitor_on_up = true
-start_mcp_on_up = false
 EOF
 
   trap "cleanup_e2e \"$moraine_bin\" \"$config_path\" \"$runtime_root\" \"$tmp_root\"" EXIT
