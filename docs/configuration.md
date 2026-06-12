@@ -107,7 +107,7 @@ The default template in `config/moraine.toml` enables these source families:
 | Claude Code | `claude-code` | `~/.claude/projects/**/*.jsonl` | `~/.claude/projects` | inferred `jsonl` |
 | Kimi CLI | `kimi-cli` | `~/.kimi/sessions/**/wire.jsonl` | `~/.kimi/sessions` | inferred `jsonl` |
 | Cursor Agent | `cursor` | `~/.cursor/projects/*/agent-transcripts/**/*.jsonl` | `~/.cursor/projects` | inferred `jsonl` |
-| Cursor SQLite history | `cursor` | `~/Library/Application Support/Cursor/User/**/state.vscdb` (macOS) | `~/Library/Application Support/Cursor/User` | `cursor_sqlite` (opt-in) |
+| Cursor SQLite history | `cursor` | `~/Library/Application Support/Cursor/User/**/state.vscdb` (macOS) | `~/Library/Application Support/Cursor/User` | `cursor_sqlite` (default on) |
 | Pi Coding Agent | `pi-coding-agent` | `~/.pi/agent/sessions/**/*.jsonl` | `~/.pi/agent/sessions` | `jsonl` |
 | Hermes live sessions | `hermes` | `~/.hermes/sessions/session_*.json` | `~/.hermes/sessions` | `session_json` |
 | Hermes trajectories | `hermes` | user-provided trajectory JSONL | trajectory output directory | `jsonl` |
@@ -115,9 +115,8 @@ The default template in `config/moraine.toml` enables these source families:
 Hermes supports both live session JSON and offline trajectory JSONL because the
 harness is the same but the file format differs. Use a separate
 `[[ingest.sources]]` entry for each watched directory. Cursor likewise has two
-trace forms under one harness: Agent transcript JSONL (enabled by default) and
-opt-in SQLite chat history (`cursor_sqlite`, shipped commented out in the
-default template).
+trace forms under one harness: Agent transcript JSONL and SQLite chat history
+(`cursor_sqlite`); both are enabled by default.
 
 ## Source Examples
 
@@ -169,7 +168,7 @@ format = "jsonl"
 
 This source watches local Agent JSONL transcripts under `agent-transcripts/`.
 Cursor's IDE chat history lives elsewhere — in `state.vscdb` SQLite databases —
-and is ingested by the separate opt-in `cursor_sqlite` source below.
+and is ingested by the separate `cursor_sqlite` source below.
 
 Cursor SQLite history (macOS):
 
@@ -177,7 +176,7 @@ Cursor SQLite history (macOS):
 [[ingest.sources]]
 name = "cursor-sqlite"
 harness = "cursor"
-enabled = false
+enabled = true
 glob = "~/Library/Application Support/Cursor/User/**/state.vscdb"
 watch_root = "~/Library/Application Support/Cursor/User"
 format = "cursor_sqlite"
@@ -189,7 +188,7 @@ Cursor SQLite history (Linux):
 [[ingest.sources]]
 name = "cursor-sqlite"
 harness = "cursor"
-enabled = false
+enabled = true
 glob = "~/.config/Cursor/User/**/state.vscdb"
 watch_root = "~/.config/Cursor/User"
 format = "cursor_sqlite"
@@ -202,11 +201,12 @@ databases under `workspaceStorage` match the same glob but are mostly empty.
 Moraine also reacts to the `-wal`/`-shm` sidecar files so WAL-only writes
 trigger polls; `state.vscdb.backup` files are ignored.
 
-Keep `enabled = false` (or leave the template entry commented out) unless you
-explicitly want Cursor IDE chat history: Cursor has no stable local-database
-contract, so an editor update can change the schema at any time (issue #361).
-When the schema drifts, Moraine reports rate-limited `sqlite_*` ingest errors
-and skips the database rather than ingesting bad rows.
+This source ships enabled. Cursor has no stable local-database contract, so an
+editor update can change the schema at any time (issue #361) — tracking that
+drift is Moraine's job. When the schema drifts, Moraine reports rate-limited
+`sqlite_*` ingest errors and skips the database rather than ingesting bad rows,
+until the normalizer is updated to follow the new format. Set `enabled = false`
+if you don't want IDE chat history ingested.
 
 Pi Coding Agent:
 

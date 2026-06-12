@@ -51,17 +51,19 @@ format = "jsonl"
 
 # Cursor IDE chat history: composer sessions and message bubbles stored in
 # Cursor's `state.vscdb` SQLite databases, polled read-only by the
-# `cursor_sqlite` format. Opt-in (issue #361): Cursor has no stable
-# local-database contract, so an editor update can change the schema at any
-# time. Uncomment to enable; on Linux use `~/.config/Cursor/User` for the
-# glob and watch_root instead.
-# [[ingest.sources]]
-# name = "cursor-sqlite"
-# harness = "cursor"
-# enabled = true
-# glob = "~/Library/Application Support/Cursor/User/**/state.vscdb"
-# watch_root = "~/Library/Application Support/Cursor/User"
-# format = "cursor_sqlite"
+# `cursor_sqlite` format. Cursor has no stable local-database contract, so an
+# editor update can change the schema at any time (issue #361); when it
+# drifts, moraine reports rate-limited `sqlite_*` ingest errors and skips the
+# database rather than ingesting bad rows, and the normalizer gets updated to
+# follow the format. On Linux use `~/.config/Cursor/User` for the glob and
+# watch_root instead.
+[[ingest.sources]]
+name = "cursor-sqlite"
+harness = "cursor"
+enabled = true
+glob = "~/Library/Application Support/Cursor/User/**/state.vscdb"
+watch_root = "~/Library/Application Support/Cursor/User"
+format = "cursor_sqlite"
 
 [[ingest.sources]]
 name = "pi"

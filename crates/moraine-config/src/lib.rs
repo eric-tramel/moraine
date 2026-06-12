@@ -310,6 +310,12 @@ fn default_enabled() -> bool {
 }
 
 fn default_sources() -> Vec<IngestSource> {
+    // Cursor's IDE state directory differs by platform.
+    let cursor_state_root = if cfg!(target_os = "macos") {
+        "~/Library/Application Support/Cursor/User"
+    } else {
+        "~/.config/Cursor/User"
+    };
     vec![
         IngestSource {
             name: "codex".to_string(),
@@ -350,6 +356,14 @@ fn default_sources() -> Vec<IngestSource> {
             glob: "~/.cursor/projects/*/agent-transcripts/**/*.jsonl".to_string(),
             watch_root: "~/.cursor/projects".to_string(),
             format: String::new(),
+        },
+        IngestSource {
+            name: "cursor-sqlite".to_string(),
+            harness: "cursor".to_string(),
+            enabled: true,
+            glob: format!("{cursor_state_root}/**/state.vscdb"),
+            watch_root: cursor_state_root.to_string(),
+            format: SOURCE_FORMAT_CURSOR_SQLITE.to_string(),
         },
         IngestSource {
             name: "pi".to_string(),
@@ -1288,6 +1302,37 @@ watch_root = "~/.cursor/projects"
             .expect("cursor source");
         assert_eq!(source.format, SOURCE_FORMAT_JSONL);
         assert_eq!(source.tracked_extension(), "jsonl");
+    }
+
+    #[test]
+    fn shipped_template_enables_cursor_sqlite_by_default() {
+        let path = write_temp_config(
+            include_str!("../../../config/moraine.toml"),
+            "shipped-template",
+        );
+        let cfg = load_config(&path).expect("shipped template must parse");
+        std::fs::remove_file(&path).ok();
+        let source = cfg
+            .ingest
+            .sources
+            .iter()
+            .find(|source| source.name == "cursor-sqlite")
+            .expect("template ships a cursor-sqlite source");
+        assert!(source.enabled, "cursor_sqlite is default on");
+        assert_eq!(source.format, SOURCE_FORMAT_CURSOR_SQLITE);
+        assert_eq!(source.harness, "cursor");
+    }
+
+    #[test]
+    fn default_sources_enable_cursor_sqlite() {
+        let sources = default_sources();
+        let source = sources
+            .iter()
+            .find(|source| source.name == "cursor-sqlite")
+            .expect("defaults include a cursor-sqlite source");
+        assert!(source.enabled, "cursor_sqlite is default on");
+        assert_eq!(source.format, SOURCE_FORMAT_CURSOR_SQLITE);
+        assert!(source.glob.ends_with("/**/state.vscdb"));
     }
 
     #[test]
