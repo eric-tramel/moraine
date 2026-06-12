@@ -17,7 +17,7 @@
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-01-19 15:58:40.000",
-          "event_uid": "252954c671504d8896d2f35ffbec8f577a5c1f7824c6ba1ae52e407a15cd284c",
+          "event_uid": "c14ed8798d0f1532c001794fcee69b1e5dd8d9917bb6d329912d97ca503295a6",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "has_reasoning": 0,
@@ -33,7 +33,7 @@
           "origin_tool_call_id": "",
           "output_tokens": 0,
           "parent_tool_call_id": "",
-          "payload_json": "{\"message\":{\"content\":\"Please inspect the sample project.\",\"role\":\"user\"},\"sessionId\":\"7c666c01-d38e-4658-8650-854ffb5b626e\",\"timestamp\":\"2026-01-19T15:58:40.000Z\",\"type\":\"user\",\"uuid\":\"user-1\"}",
+          "payload_json": "{\"cwd\":\"/work/claude-demo\",\"message\":{\"content\":\"Please inspect the sample project.\",\"role\":\"user\"},\"sessionId\":\"7c666c01-d38e-4658-8650-854ffb5b626e\",\"timestamp\":\"2026-01-19T15:58:40.000Z\",\"type\":\"user\",\"uuid\":\"user-1\"}",
           "payload_type": "message",
           "record_ts": "2026-01-19T15:58:40.000Z",
           "request_id": "",
@@ -86,11 +86,11 @@
       "model_hint": "",
       "raw_rows": [
         {
-          "event_uid": "252954c671504d8896d2f35ffbec8f577a5c1f7824c6ba1ae52e407a15cd284c",
+          "event_uid": "c14ed8798d0f1532c001794fcee69b1e5dd8d9917bb6d329912d97ca503295a6",
           "harness": "claude-code",
           "inference_provider": "anthropic",
-          "raw_json": "{\"message\":{\"content\":\"Please inspect the sample project.\",\"role\":\"user\"},\"sessionId\":\"7c666c01-d38e-4658-8650-854ffb5b626e\",\"timestamp\":\"2026-01-19T15:58:40.000Z\",\"type\":\"user\",\"uuid\":\"user-1\"}",
-          "raw_json_hash": 8101760035134840698,
+          "raw_json": "{\"cwd\":\"/work/claude-demo\",\"message\":{\"content\":\"Please inspect the sample project.\",\"role\":\"user\"},\"sessionId\":\"7c666c01-d38e-4658-8650-854ffb5b626e\",\"timestamp\":\"2026-01-19T15:58:40.000Z\",\"type\":\"user\",\"uuid\":\"user-1\"}",
+          "raw_json_hash": 7400759604312179313,
           "record_ts": "2026-01-19T15:58:40.000Z",
           "session_id": "7c666c01-d38e-4658-8650-854ffb5b626e",
           "source_file": "/fixtures/claude-code/session.jsonl",
@@ -122,7 +122,7 @@
           "endpoint_kind": "generation",
           "event_kind": "reasoning",
           "event_ts": "2026-01-19 15:58:41.421",
-          "event_uid": "137b01f48aeb4d1f6ffcd916838f534a62697e6acaf4c8f4ff5a04988d8d0701",
+          "event_uid": "d65646c86e60d1ac7d7722167ad992d2d60d16c7e73fcd1492fc5f11f18cc389",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "has_reasoning": 1,
@@ -151,7 +151,7 @@
           "source_inode": 1,
           "source_line_no": 2,
           "source_name": "golden-claude-code",
-          "source_offset": 195,
+          "source_offset": 221,
           "source_ref": "/fixtures/claude-code/session.jsonl:1:2",
           "text_content": "I should inspect files first.",
           "text_preview": "I should inspect files first.",
@@ -200,7 +200,7 @@
           "endpoint_kind": "generation",
           "event_kind": "tool_call",
           "event_ts": "2026-01-19 15:58:41.421",
-          "event_uid": "e33b9568ed53331cbc820eb1ceee181253522e8bff4a97f4e4356fed6d6f9543",
+          "event_uid": "c915d21ce2a09f164700a6084cb6bd0f16834d60c131fc652bd92e47fc18d187",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "has_reasoning": 0,
@@ -229,7 +229,7 @@
           "source_inode": 1,
           "source_line_no": 2,
           "source_name": "golden-claude-code",
-          "source_offset": 195,
+          "source_offset": 221,
           "source_ref": "/fixtures/claude-code/session.jsonl:1:2",
           "text_content": "",
           "text_preview": "",
@@ -278,7 +278,7 @@
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-01-19 15:58:41.421",
-          "event_uid": "7c1a4a2cef53124b7ab9b4b0875f98f5c8d3b2283f9a8bf7392915fd93cfc922",
+          "event_uid": "1a2d94b41775e8813248874ae1e29d2e0564a141d984e572f21ff4dd06af8498",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "has_reasoning": 0,
@@ -307,7 +307,7 @@
           "source_inode": 1,
           "source_line_no": 2,
           "source_name": "golden-claude-code",
-          "source_offset": 195,
+          "source_offset": 221,
           "source_ref": "/fixtures/claude-code/session.jsonl:1:2",
           "text_content": "I will read the manifest.",
           "text_preview": "I will read the manifest.",
@@ -345,7 +345,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "137b01f48aeb4d1f6ffcd916838f534a62697e6acaf4c8f4ff5a04988d8d0701",
+          "event_uid": "d65646c86e60d1ac7d7722167ad992d2d60d16c7e73fcd1492fc5f11f18cc389",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "inference_provider": "anthropic",
@@ -357,7 +357,7 @@
           "source_name": "golden-claude-code"
         },
         {
-          "event_uid": "e33b9568ed53331cbc820eb1ceee181253522e8bff4a97f4e4356fed6d6f9543",
+          "event_uid": "c915d21ce2a09f164700a6084cb6bd0f16834d60c131fc652bd92e47fc18d187",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "inference_provider": "anthropic",
@@ -369,7 +369,7 @@
           "source_name": "golden-claude-code"
         },
         {
-          "event_uid": "7c1a4a2cef53124b7ab9b4b0875f98f5c8d3b2283f9a8bf7392915fd93cfc922",
+          "event_uid": "1a2d94b41775e8813248874ae1e29d2e0564a141d984e572f21ff4dd06af8498",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "inference_provider": "anthropic",
@@ -384,11 +384,11 @@
       "model_hint": "claude-opus-4-5-20251101",
       "raw_rows": [
         {
-          "event_uid": "52df1581534425f5ea5b013d134fa43eb07279cb827a943edbab64e456fb47bb",
+          "event_uid": "feff427900ab83669b698e1561c057bacc7bec19597c78a737fe7902424eed47",
           "harness": "claude-code",
           "inference_provider": "anthropic",
-          "raw_json": "{\"agentId\":\"agent-1\",\"agentName\":\"primary\",\"message\":{\"content\":[{\"thinking\":\"I should inspect files first.\",\"type\":\"thinking\"},{\"id\":\"toolu_1\",\"input\":{\"path\":\"Cargo.toml\"},\"name\":\"Read\",\"type\":\"tool_use\"},{\"text\":\"I will read the manifest.\",\"type\":\"text\"}],\"model\":\"claude-opus-4-5-20251101\",\"role\":\"assistant\",\"usage\":{\"cache_creation_input_tokens\":19630,\"cache_read_input_tokens\":2,\"input_tokens\":9,\"output_tokens\":5,\"output_tokens_details\":{\"reasoning_tokens\":1},\"server_tool_use\":{\"web_search_requests\":1},\"service_tier\":\"standard\"}},\"parentUuid\":\"user-1\",\"requestId\":\"req-1\",\"sessionId\":\"7c666c01-d38e-4658-8650-854ffb5b626e\",\"teamName\":\"root\",\"timestamp\":\"2026-01-19T15:58:41.421Z\",\"type\":\"assistant\",\"uuid\":\"assistant-1\"}",
-          "raw_json_hash": 5406334363724058730,
+          "raw_json": "{\"agentId\":\"agent-1\",\"agentName\":\"primary\",\"cwd\":\"/work/claude-demo\",\"message\":{\"content\":[{\"thinking\":\"I should inspect files first.\",\"type\":\"thinking\"},{\"id\":\"toolu_1\",\"input\":{\"path\":\"Cargo.toml\"},\"name\":\"Read\",\"type\":\"tool_use\"},{\"text\":\"I will read the manifest.\",\"type\":\"text\"}],\"model\":\"claude-opus-4-5-20251101\",\"role\":\"assistant\",\"usage\":{\"cache_creation_input_tokens\":19630,\"cache_read_input_tokens\":2,\"input_tokens\":9,\"output_tokens\":5,\"output_tokens_details\":{\"reasoning_tokens\":1},\"server_tool_use\":{\"web_search_requests\":1},\"service_tier\":\"standard\"}},\"parentUuid\":\"user-1\",\"requestId\":\"req-1\",\"sessionId\":\"7c666c01-d38e-4658-8650-854ffb5b626e\",\"teamName\":\"root\",\"timestamp\":\"2026-01-19T15:58:41.421Z\",\"type\":\"assistant\",\"uuid\":\"assistant-1\"}",
+          "raw_json_hash": 12181880093520818161,
           "record_ts": "2026-01-19T15:58:41.421Z",
           "session_id": "7c666c01-d38e-4658-8650-854ffb5b626e",
           "source_file": "/fixtures/claude-code/session.jsonl",
@@ -396,14 +396,14 @@
           "source_inode": 1,
           "source_line_no": 2,
           "source_name": "golden-claude-code",
-          "source_offset": 195,
+          "source_offset": 221,
           "top_type": "assistant"
         }
       ],
       "session_hint": "7c666c01-d38e-4658-8650-854ffb5b626e",
       "tool_rows": [
         {
-          "event_uid": "e33b9568ed53331cbc820eb1ceee181253522e8bff4a97f4e4356fed6d6f9543",
+          "event_uid": "c915d21ce2a09f164700a6084cb6bd0f16834d60c131fc652bd92e47fc18d187",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "inference_provider": "anthropic",
@@ -443,7 +443,7 @@
           "endpoint_kind": "generation",
           "event_kind": "tool_result",
           "event_ts": "2026-01-19 15:58:42.000",
-          "event_uid": "2c07f0aa061d376174c3c2cd2e1a0df8ef43bfe76eef631f7905f085613ecfad",
+          "event_uid": "b3a1370847be7510e44dc5c44534bf0d6099fcd0e899b5a9cf25bdee14c75930",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "has_reasoning": 0,
@@ -472,7 +472,7 @@
           "source_inode": 1,
           "source_line_no": 3,
           "source_name": "golden-claude-code",
-          "source_offset": 926,
+          "source_offset": 978,
           "source_ref": "/fixtures/claude-code/session.jsonl:1:3",
           "text_content": "workspace = true",
           "text_preview": "workspace = true",
@@ -510,7 +510,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "2c07f0aa061d376174c3c2cd2e1a0df8ef43bfe76eef631f7905f085613ecfad",
+          "event_uid": "b3a1370847be7510e44dc5c44534bf0d6099fcd0e899b5a9cf25bdee14c75930",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "inference_provider": "anthropic",
@@ -522,7 +522,7 @@
           "source_name": "golden-claude-code"
         },
         {
-          "event_uid": "2c07f0aa061d376174c3c2cd2e1a0df8ef43bfe76eef631f7905f085613ecfad",
+          "event_uid": "b3a1370847be7510e44dc5c44534bf0d6099fcd0e899b5a9cf25bdee14c75930",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "inference_provider": "anthropic",
@@ -534,7 +534,7 @@
           "source_name": "golden-claude-code"
         },
         {
-          "event_uid": "2c07f0aa061d376174c3c2cd2e1a0df8ef43bfe76eef631f7905f085613ecfad",
+          "event_uid": "b3a1370847be7510e44dc5c44534bf0d6099fcd0e899b5a9cf25bdee14c75930",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "inference_provider": "anthropic",
@@ -549,11 +549,11 @@
       "model_hint": "claude-opus-4-5-20251101",
       "raw_rows": [
         {
-          "event_uid": "7631dbe2584470fb225450333b18d2becf2b1b5515cf46b6169b5b6c7b9c90f3",
+          "event_uid": "cd50584c647108ec06939625fd0c79bed00203e7e101b395130a74b3a4fff127",
           "harness": "claude-code",
           "inference_provider": "anthropic",
-          "raw_json": "{\"message\":{\"content\":[{\"content\":[{\"text\":\"workspace = true\",\"type\":\"text\"}],\"is_error\":false,\"tool_use_id\":\"toolu_1\",\"type\":\"tool_result\"}],\"role\":\"user\"},\"parentToolUseID\":\"toolu_1\",\"parentUuid\":\"assistant-1\",\"sessionId\":\"7c666c01-d38e-4658-8650-854ffb5b626e\",\"sourceToolAssistantUUID\":\"assistant-1\",\"sourceToolUseID\":\"toolu_1\",\"timestamp\":\"2026-01-19T15:58:42.000Z\",\"toolUseID\":\"toolu_1\",\"type\":\"user\",\"uuid\":\"user-2\"}",
-          "raw_json_hash": 6375781059995110862,
+          "raw_json": "{\"cwd\":\"/work/claude-demo\",\"message\":{\"content\":[{\"content\":[{\"text\":\"workspace = true\",\"type\":\"text\"}],\"is_error\":false,\"tool_use_id\":\"toolu_1\",\"type\":\"tool_result\"}],\"role\":\"user\"},\"parentToolUseID\":\"toolu_1\",\"parentUuid\":\"assistant-1\",\"sessionId\":\"7c666c01-d38e-4658-8650-854ffb5b626e\",\"sourceToolAssistantUUID\":\"assistant-1\",\"sourceToolUseID\":\"toolu_1\",\"timestamp\":\"2026-01-19T15:58:42.000Z\",\"toolUseID\":\"toolu_1\",\"type\":\"user\",\"uuid\":\"user-2\"}",
+          "raw_json_hash": 11697653349065586273,
           "record_ts": "2026-01-19T15:58:42.000Z",
           "session_id": "7c666c01-d38e-4658-8650-854ffb5b626e",
           "source_file": "/fixtures/claude-code/session.jsonl",
@@ -561,14 +561,14 @@
           "source_inode": 1,
           "source_line_no": 3,
           "source_name": "golden-claude-code",
-          "source_offset": 926,
+          "source_offset": 978,
           "top_type": "user"
         }
       ],
       "session_hint": "7c666c01-d38e-4658-8650-854ffb5b626e",
       "tool_rows": [
         {
-          "event_uid": "2c07f0aa061d376174c3c2cd2e1a0df8ef43bfe76eef631f7905f085613ecfad",
+          "event_uid": "b3a1370847be7510e44dc5c44534bf0d6099fcd0e899b5a9cf25bdee14c75930",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "inference_provider": "anthropic",
@@ -606,7 +606,7 @@
           "endpoint_kind": "generation",
           "event_kind": "progress",
           "event_ts": "2026-01-19 15:58:43.000",
-          "event_uid": "585e00e3d91d1d4fc2a2b623c167a81deec7e97e89d6e52947c149ae63470f2b",
+          "event_uid": "8eac2750d4dc95140aa61a44fce93592fb6b1f926c492b2990eca27f2a598612",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "has_reasoning": 0,
@@ -635,7 +635,7 @@
           "source_inode": 1,
           "source_line_no": 4,
           "source_name": "golden-claude-code",
-          "source_offset": 1349,
+          "source_offset": 1427,
           "source_ref": "/fixtures/claude-code/session.jsonl:1:4",
           "text_content": "",
           "text_preview": "",
@@ -673,7 +673,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "585e00e3d91d1d4fc2a2b623c167a81deec7e97e89d6e52947c149ae63470f2b",
+          "event_uid": "8eac2750d4dc95140aa61a44fce93592fb6b1f926c492b2990eca27f2a598612",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "inference_provider": "anthropic",
@@ -688,7 +688,7 @@
       "model_hint": "claude-opus-4-5-20251101",
       "raw_rows": [
         {
-          "event_uid": "585e00e3d91d1d4fc2a2b623c167a81deec7e97e89d6e52947c149ae63470f2b",
+          "event_uid": "8eac2750d4dc95140aa61a44fce93592fb6b1f926c492b2990eca27f2a598612",
           "harness": "claude-code",
           "inference_provider": "anthropic",
           "raw_json": "{\"data\":{\"query\":\"moraine\",\"type\":\"search_results_received\"},\"durationMs\":12,\"parentUuid\":\"user-2\",\"retryAttempt\":1,\"sessionId\":\"7c666c01-d38e-4658-8650-854ffb5b626e\",\"status\":\"ok\",\"timestamp\":\"2026-01-19T15:58:43.000Z\",\"type\":\"progress\",\"uuid\":\"progress-1\"}",
@@ -700,7 +700,7 @@
           "source_inode": 1,
           "source_line_no": 4,
           "source_name": "golden-claude-code",
-          "source_offset": 1349,
+          "source_offset": 1427,
           "top_type": "progress"
         }
       ],

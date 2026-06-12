@@ -34,6 +34,36 @@ What this means for you:
   per session, set `use_central_server = false` (see
   [Configuration → MCP](../configuration.md#shared-central-mcp-server)).
 
+## Project-scoped retrieval (`--project-only`)
+
+Add `--project-only` to restrict retrieval to sessions that originated from
+the directory the server is launched in:
+
+```bash
+claude mcp add --transport stdio --scope project moraine -- moraine run mcp --project-only
+```
+
+With the flag set, `search_sessions`, `list_sessions`, and `open` only see
+sessions whose recorded working directory is the launch directory or a
+subdirectory of it (worktrees under a repo root count). Opening an ID from
+another project answers `not_found`, exactly as if the session did not exist.
+
+Details worth knowing:
+
+- **A session's origin is the first working directory it recorded.** Claude
+  Code, Codex, Pi, and Cursor (`state.vscdb`) sessions all record one.
+  Sessions that never recorded a working directory (e.g. Hermes trajectories)
+  are not visible to a project-scoped server.
+- **Scoped servers always run embedded.** The shared central server serves
+  every project on the host, so a `--project-only` session never proxies to
+  it — it boots its own server, like `use_central_server = false` does.
+  Pair the flag with project-scoped registration (e.g. a per-repo
+  `.mcp.json`) rather than user-scoped registration, unless you want every
+  project scoped to itself.
+- The `initialize` response advertises the active scope in its
+  `instructions` field, so agents can tell they are looking at a filtered
+  view.
+
 The remaining sections register the unchanged `moraine run mcp` command with
 each harness.
 

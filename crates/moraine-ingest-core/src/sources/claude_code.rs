@@ -3,7 +3,7 @@ use super::{
     emitter::{EventBuilder, SourceEmitter},
     IngestSource, NormalizedPartials, SourceRecordContext,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 
 pub(crate) static CLAUDE_CODE: ClaudeCode = ClaudeCode;
 
@@ -59,6 +59,115 @@ fn normalize_claude_event(
     let mut partials = emitter.finish();
     append_claude_record_links(&record, ctx, &mut partials);
     partials
+}
+
+/// The working directory a Claude Code record reports, or `""` when absent.
+///
+/// Claude Code stamps `cwd` as a top-level field on its conversational lines
+/// (user/assistant/tool messages) but not on every operational line
+/// (`mode`, `file-history-snapshot`, …), and — unlike codex/pi/cursor — emits
+/// no dedicated session-scoped record. The normalized content events keep
+/// only their content block as payload, so the cwd never reaches storage on
+/// its own. The ingest dispatch loop reads it here and synthesizes one
+/// `session_meta` per session (see `build_claude_cwd_session_meta`) so
+/// `--project-only` MCP scoping can derive a claude session's origin
+/// directory the same way it does for the other harnesses.
+pub(crate) fn claude_record_cwd(record: &Value) -> String {
+    to_str(record.get("cwd"))
+}
+
+/// Build a synthetic `session_meta` event row carrying `cwd`, derived from a
+/// real event row of the same record (`template`) so it inherits the correct
+/// `session_id`, timestamps, and source coordinates. The dispatch loop emits
+/// exactly one of these per session per scan, on the first cwd-bearing
+/// record, so it lands at a real conversational event's timestamp (keeping
+/// `first_event_time` honest) rather than once per line.
+///
+/// `--project-only` scoping resolves a session's origin with
+/// `argMinIf(first non-empty cwd)`, so the at-most-one extra row a later
+/// incremental scan may add is deduplicated at query time.
+pub(crate) fn build_claude_cwd_session_meta(template: &Value, cwd: &str) -> Option<Value> {
+    let mut row = template.as_object()?.clone();
+
+    let source_file = template.get("source_file").and_then(Value::as_str)?;
+    let source_generation = template
+        .get("source_generation")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as u32;
+    let source_line_no = template
+        .get("source_line_no")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let source_offset = template
+        .get("source_offset")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let uid = event_uid(
+        source_file,
+        source_generation,
+        source_line_no,
+        source_offset,
+        cwd,
+        "claude:session_meta:cwd",
+    );
+
+    let payload_json = compact_json(&json!({ "cwd": cwd }));
+    // Core identity/content fields define a session_meta event and must always
+    // be present.
+    for (key, value) in [
+        ("event_uid", uid.as_str()),
+        ("event_kind", "session_meta"),
+        ("payload_type", "session_meta"),
+        ("actor_kind", "system"),
+        ("text_content", cwd),
+        ("text_preview", cwd),
+        ("payload_json", payload_json.as_str()),
+    ] {
+        row.insert(key.to_string(), Value::String(value.to_string()));
+    }
+    // Clear every field carried over from the conversational template that
+    // would misrepresent a session_meta event (it has no model, tool, agent,
+    // or content semantics of its own). Only touch keys the template actually
+    // has, so the synthetic row keeps the exact column set of a normal event.
+    for key in [
+        "item_id",
+        "tool_call_id",
+        "parent_tool_call_id",
+        "origin_event_id",
+        "origin_tool_call_id",
+        "tool_name",
+        "tool_phase",
+        "model",
+        "agent_run_id",
+        "agent_label",
+        "coord_group_id",
+        "coord_group_label",
+        "request_id",
+        "trace_id",
+        "op_kind",
+        "op_status",
+        "service_tier",
+        "token_usage_json",
+    ] {
+        clear_if_present(&mut row, key, Value::String(String::new()));
+    }
+    if row.contains_key("content_types") {
+        row.insert("content_types".to_string(), json!([]));
+    }
+    for key in ["has_reasoning", "is_substream", "tool_error"] {
+        clear_if_present(&mut row, key, json!(0u8));
+    }
+    for key in ["input_tokens", "output_tokens", "latency_ms", "turn_index"] {
+        clear_if_present(&mut row, key, json!(0u32));
+    }
+
+    Some(Value::Object(row))
+}
+
+fn clear_if_present(row: &mut serde_json::Map<String, Value>, key: &str, value: Value) {
+    if row.contains_key(key) {
+        row.insert(key.to_string(), value);
+    }
 }
 
 struct ClaudeRecord<'a> {

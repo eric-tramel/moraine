@@ -208,6 +208,47 @@ fn enrich_claude_model_latency(
     }
 }
 
+/// Emit one synthetic claude-code `session_meta` carrying the session's
+/// working directory, so `--project-only` MCP scoping can derive a claude
+/// session's origin directory (claude records the cwd inline but, unlike the
+/// other harnesses, emits no session-scoped record).
+///
+/// Claude's first lines are often cwd-less operational records
+/// (`mode`, `file-history-snapshot`), so this fires on the first *cwd-bearing*
+/// record of a session — tracked in `cwd_captured` for the duration of the
+/// scan — rather than the literal first record. A long session split across
+/// incremental scans may therefore add one extra row per scan; the scope
+/// query resolves the origin with `argMinIf(first non-empty cwd)`, so the
+/// duplicates are deduplicated at query time.
+fn inject_claude_cwd_session_meta(
+    harness: &str,
+    record: &Value,
+    event_rows: &mut Vec<Value>,
+    cwd_captured: &mut std::collections::HashSet<String>,
+) {
+    if harness != "claude-code" || event_rows.is_empty() {
+        return;
+    }
+    let cwd = crate::sources::claude_code::claude_record_cwd(record);
+    if cwd.is_empty() {
+        return;
+    }
+    let session_id = event_rows[0]
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if session_id.is_empty() || cwd_captured.contains(&session_id) {
+        return;
+    }
+    if let Some(meta_row) =
+        crate::sources::claude_code::build_claude_cwd_session_meta(&event_rows[0], &cwd)
+    {
+        event_rows.push(meta_row);
+        cwd_captured.insert(session_id);
+    }
+}
+
 pub(crate) fn spawn_debounce_task(
     config: AppConfig,
     mut rx: mpsc::UnboundedReceiver<WorkItem>,
@@ -429,6 +470,8 @@ pub(crate) async fn process_file(
     let mut record_ts_hint =
         infer_initial_record_ts_hint(source_file, checkpoint.last_offset).unwrap_or_default();
     let mut session_cursors: HashMap<String, SessionCursor> = HashMap::new();
+    let mut claude_cwd_captured: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     let mut batch = RowBatch::default();
 
@@ -530,6 +573,12 @@ pub(crate) async fn process_file(
             &work.harness,
             &mut normalized.event_rows,
             &mut session_cursors,
+        );
+        inject_claude_cwd_session_meta(
+            &work.harness,
+            &parsed,
+            &mut normalized.event_rows,
+            &mut claude_cwd_captured,
         );
 
         session_hint = normalized.session_hint.clone();
@@ -973,9 +1022,9 @@ fn truncate(input: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         complete_work, compose_hermes_model, enrich_claude_model_latency,
-        infer_vendor_from_base_url, process_file, process_session_json_file, run_work_item,
-        source_inode_for_file, work_path_is_canonical, SessionCursor, SESSION_JSON_GENERATION,
-        SESSION_JSON_INODE,
+        infer_vendor_from_base_url, inject_claude_cwd_session_meta, process_file,
+        process_session_json_file, run_work_item, source_inode_for_file, work_path_is_canonical,
+        SessionCursor, SESSION_JSON_GENERATION, SESSION_JSON_INODE,
     };
     use crate::model::Checkpoint;
     use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
@@ -1845,5 +1894,99 @@ mod tests {
             3000,
             "system event should not reset the tool_result → assistant chain"
         );
+    }
+
+    fn claude_template_row(session_id: &str, line_no: u64) -> Value {
+        json!({
+            "session_id": session_id,
+            "event_ts": "2026-04-19 12:00:00.000",
+            "event_kind": "message",
+            "payload_type": "text",
+            "actor_kind": "user",
+            "source_file": "/tmp/claude/session.jsonl",
+            "source_generation": 0u32,
+            "source_line_no": line_no,
+            "source_offset": line_no * 100,
+            "model": "claude-opus-4-6",
+            "item_id": "user-1",
+            "tool_call_id": "",
+            "content_types": ["text"],
+            "has_reasoning": 0u8,
+            "input_tokens": 9u32,
+            "output_tokens": 5u32,
+            "payload_json": "{\"type\":\"text\"}"
+        })
+    }
+
+    #[test]
+    fn cwd_meta_skips_leading_cwdless_records_then_captures_first_cwd() {
+        let mut captured: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let session = "claude-sess";
+
+        // Real claude sessions open with operational lines that carry no cwd
+        // (mode, file-history-snapshot). They must not capture an origin.
+        let mut rows = vec![claude_template_row(session, 0)];
+        inject_claude_cwd_session_meta(
+            "claude-code",
+            &json!({ "type": "file-history-snapshot" }),
+            &mut rows,
+            &mut captured,
+        );
+        assert_eq!(rows.len(), 1, "cwd-less record must not synthesize a meta");
+        assert!(captured.is_empty());
+
+        // First cwd-bearing record synthesizes exactly one session_meta.
+        let mut rows = vec![claude_template_row(session, 3)];
+        inject_claude_cwd_session_meta(
+            "claude-code",
+            &json!({ "type": "user", "cwd": "/work/proj" }),
+            &mut rows,
+            &mut captured,
+        );
+        assert_eq!(rows.len(), 2, "first cwd record appends a session_meta");
+        let meta = &rows[1];
+        assert_eq!(meta["event_kind"], json!("session_meta"));
+        assert_eq!(meta["payload_type"], json!("session_meta"));
+        assert_eq!(meta["actor_kind"], json!("system"));
+        assert_eq!(meta["text_content"], json!("/work/proj"));
+        assert_eq!(meta["payload_json"], json!("{\"cwd\":\"/work/proj\"}"));
+        // Conversational fields from the template must not leak through.
+        assert_eq!(meta["model"], json!(""));
+        assert_eq!(meta["item_id"], json!(""));
+        assert_eq!(meta["content_types"], json!([]));
+        assert_eq!(meta["input_tokens"], json!(0u32));
+        assert!(captured.contains(session));
+
+        // A later cwd-bearing record for the same session does not duplicate.
+        let mut rows = vec![claude_template_row(session, 5)];
+        inject_claude_cwd_session_meta(
+            "claude-code",
+            &json!({ "type": "assistant", "cwd": "/work/proj" }),
+            &mut rows,
+            &mut captured,
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "origin is captured once per session per scan"
+        );
+    }
+
+    #[test]
+    fn cwd_meta_is_noop_for_non_claude_harness() {
+        let mut captured: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut rows = vec![claude_template_row("codex-sess", 0)];
+        inject_claude_cwd_session_meta(
+            "codex",
+            &json!({ "type": "session_meta", "cwd": "/work/proj" }),
+            &mut rows,
+            &mut captured,
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "non-claude harnesses already record cwd themselves"
+        );
+        assert!(captured.is_empty());
     }
 }

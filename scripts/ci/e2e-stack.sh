@@ -314,6 +314,12 @@ main() {
   local pi_fixture_file="$fixtures_root/pi/agent/sessions/--tmp-moraine-e2e--/2026-02-16T12-00-08-000Z_${pi_session_id}.jsonl"
   local hermes_fixture_file="$fixtures_root/hermes/trajectories/001-${run_stamp}.jsonl"
   local hermes_session_fixture_file="$fixtures_root/hermes/sessions/${hermes_session_id}.json"
+  # The directory the claude fixture session "originated from": real Claude
+  # Code records a cwd on every message line, and `--project-only` scoping
+  # keys off it. Must be a real directory so mcp_smoke.py can launch the
+  # MCP server from inside it.
+  local claude_project_dir="$tmp_root/claude-project"
+  mkdir -p "$claude_project_dir"
 
   mkdir -p "$(dirname "$codex_fixture_file")"
   mkdir -p "$(dirname "$claude_fixture_file")"
@@ -337,9 +343,9 @@ main() {
 EOF
 
   cat > "$claude_fixture_file" <<EOF
-{"type":"user","sessionId":"${claude_session_id}","uuid":"claude-user-${run_stamp}","timestamp":"2026-02-16T12:00:04.000Z","message":{"role":"user","content":[{"type":"text","text":"local e2e claude user prompt ${claude_keyword}"}]}}
-{"type":"assistant","sessionId":"${claude_session_id}","uuid":"claude-assistant-${run_stamp}","parentUuid":"claude-user-${run_stamp}","requestId":"req-${run_stamp}","agentId":"agent-${run_stamp}","agentName":"primary","teamName":"root","timestamp":"2026-02-16T12:00:05.000Z","message":{"model":"claude-opus-4-5-20251101","role":"assistant","usage":{"input_tokens":9,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"service_tier":"standard"},"content":[{"type":"thinking","thinking":"I should inspect the manifest."},{"type":"tool_use","id":"claude-tool-${run_stamp}","name":"Read","input":{"path":"Cargo.toml"}},{"type":"text","text":"local e2e claude assistant reply ${claude_keyword} ${claude_trace_marker}"}]}}
-{"type":"user","sessionId":"${claude_session_id}","uuid":"claude-tool-result-${run_stamp}","parentUuid":"claude-assistant-${run_stamp}","parentToolUseID":"claude-tool-${run_stamp}","toolUseID":"claude-tool-${run_stamp}","sourceToolAssistantUUID":"claude-assistant-${run_stamp}","sourceToolUseID":"claude-tool-${run_stamp}","timestamp":"2026-02-16T12:00:05.500Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"claude-tool-${run_stamp}","content":[{"type":"text","text":"workspace = true"}],"is_error":false}]}}
+{"type":"user","sessionId":"${claude_session_id}","uuid":"claude-user-${run_stamp}","cwd":"${claude_project_dir}","timestamp":"2026-02-16T12:00:04.000Z","message":{"role":"user","content":[{"type":"text","text":"local e2e claude user prompt ${claude_keyword}"}]}}
+{"type":"assistant","sessionId":"${claude_session_id}","uuid":"claude-assistant-${run_stamp}","cwd":"${claude_project_dir}","parentUuid":"claude-user-${run_stamp}","requestId":"req-${run_stamp}","agentId":"agent-${run_stamp}","agentName":"primary","teamName":"root","timestamp":"2026-02-16T12:00:05.000Z","message":{"model":"claude-opus-4-5-20251101","role":"assistant","usage":{"input_tokens":9,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"service_tier":"standard"},"content":[{"type":"thinking","thinking":"I should inspect the manifest."},{"type":"tool_use","id":"claude-tool-${run_stamp}","name":"Read","input":{"path":"Cargo.toml"}},{"type":"text","text":"local e2e claude assistant reply ${claude_keyword} ${claude_trace_marker}"}]}}
+{"type":"user","sessionId":"${claude_session_id}","uuid":"claude-tool-result-${run_stamp}","cwd":"${claude_project_dir}","parentUuid":"claude-assistant-${run_stamp}","parentToolUseID":"claude-tool-${run_stamp}","toolUseID":"claude-tool-${run_stamp}","sourceToolAssistantUUID":"claude-assistant-${run_stamp}","sourceToolUseID":"claude-tool-${run_stamp}","timestamp":"2026-02-16T12:00:05.500Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"claude-tool-${run_stamp}","content":[{"type":"text","text":"workspace = true"}],"is_error":false}]}}
 EOF
 
   cat > "$kimi_fixture_file" <<EOF
@@ -728,10 +734,14 @@ EOF
   assert_clickhouse_count "$clickhouse_url" "codex token buckets" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex' AND payload_type = 'token_count' AND input_tokens = 17 AND output_tokens = 4 AND cache_read_tokens = 3 AND cache_write_tokens = 2 AND token_usage_buckets['input_text'] = 12 AND token_usage_buckets['output_text'] = 3 AND token_usage_buckets['reasoning'] = 1" "1"
 
   assert_clickhouse_count "$clickhouse_url" "claude unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-claude'" "3"
-  assert_clickhouse_count "$clickhouse_url" "claude event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude'" "5"
+  # 5 content events + 1 synthetic session_meta carrying the recorded cwd,
+  # injected once per session (on the first cwd-bearing record) by ingest
+  # dispatch so --project-only scoping can see the claude session's origin.
+  assert_clickhouse_count "$clickhouse_url" "claude event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude'" "6"
+  assert_clickhouse_count "$clickhouse_url" "claude session_meta cwd" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude' AND event_kind = 'session_meta' AND JSONExtractString(payload_json, 'cwd') != ''" "1"
   assert_clickhouse_count "$clickhouse_url" "claude link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-claude'" "6"
   assert_clickhouse_count "$clickhouse_url" "claude tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-claude' AND tool_call_id = 'claude-tool-${run_stamp}'" "2"
-  assert_clickhouse_count "$clickhouse_url" "claude harness/session fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude' AND harness = 'claude-code' AND inference_provider = 'anthropic' AND session_id = '${claude_session_id}'" "5"
+  assert_clickhouse_count "$clickhouse_url" "claude harness/session fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude' AND harness = 'claude-code' AND inference_provider = 'anthropic' AND session_id = '${claude_session_id}'" "6"
   assert_clickhouse_count "$clickhouse_url" "claude model fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude' AND model = 'claude-opus-4-5-20251101'" "3"
   assert_clickhouse_count "$clickhouse_url" "claude token buckets" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude' AND actor_kind = 'assistant' AND input_tokens = 9 AND output_tokens = 5 AND token_usage_buckets['input_text'] = 9 AND token_usage_buckets['output_text'] = 5" "3"
 
@@ -833,7 +843,9 @@ PY
   assert_clickhouse_count "$clickhouse_url" "hermes session link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-hermes-session'" "0"
   assert_clickhouse_count "$clickhouse_url" "hermes session tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-hermes-session' AND tool_call_id = 'hermes-session-tool-${run_stamp}' AND tool_name = 'shell'" "2"
   assert_clickhouse_count "$clickhouse_url" "hermes session domain fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-hermes-session' AND harness = 'hermes' AND inference_provider = 'anthropic' AND session_id = '${hermes_raw_session_id}' AND model = 'claude-opus-4-6'" "6"
-  assert_clickhouse_count "$clickhouse_url" "token bucket map keys on all events" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE hasAll(mapKeys(token_usage_buckets), ['input_text', 'output_text', 'input_cache_read', 'input_cache_write', 'reasoning'])" "52"
+  # 52 prior events + 1 synthetic claude cwd session_meta (it carries the
+  # canonical all-zero token bucket map like every other normalized event).
+  assert_clickhouse_count "$clickhouse_url" "token bucket map keys on all events" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE hasAll(mapKeys(token_usage_buckets), ['input_text', 'output_text', 'input_cache_read', 'input_cache_write', 'reasoning'])" "53"
 
   local hermes_trajectory_session_id
   hermes_trajectory_session_id="$(clickhouse_scalar "$clickhouse_url" "SELECT any(session_id) FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-hermes-trajectory'")"
@@ -919,6 +931,34 @@ PY
     --query "$hermes_session_keyword" \
     --expect-session-id "$hermes_raw_session_id" \
     --expect-open-text "$hermes_session_trace_marker"
+
+  # --project-only: launched from the claude fixture's recorded cwd, the MCP
+  # server must serve that session normally while sessions from other
+  # directories (pi: cwd=$tmp_root) or with no recorded cwd (codex) are
+  # invisible to search/list and answer not_found on open.
+  echo "[e2e] checking MCP --project-only serves in-scope session and hides others"
+  "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --query "$claude_keyword" \
+    --expect-session-id "$claude_session_id" \
+    --expect-open-text "$claude_trace_marker" \
+    --project-dir "$claude_project_dir" \
+    --expect-absent-session-id "$codex_session_id" \
+    --expect-absent-session-id "$pi_session_id"
+
+  # Search for an out-of-scope keyword returns nothing, while list_sessions
+  # still surfaces the in-scope claude session (--expect-session-id) — so an
+  # empty search proves scoping, not a dead backend.
+  echo "[e2e] checking MCP --project-only returns no hits for out-of-scope keyword"
+  "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --query "$codex_keyword" \
+    --expect-no-results \
+    --expect-session-id "$claude_session_id" \
+    --project-dir "$claude_project_dir" \
+    --expect-absent-session-id "$codex_session_id"
 
   if [[ "${RUN_REPLAY_BENCH_SMOKE:-0}" == "1" ]]; then
     echo "[e2e] checking replay benchmark script (dry-run)"

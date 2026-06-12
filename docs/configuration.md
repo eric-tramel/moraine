@@ -319,6 +319,12 @@ user runs their own central server. See
 [Agent MCP Search → Install](agent-mcp-search/install.md#shared-central-server-default)
 for operational notes.
 
+One exception: `moraine run mcp --project-only` (retrieval restricted to
+sessions that originated from the launch directory) always runs an embedded
+server, because the shared central server serves every project on the host.
+See
+[Agent MCP Search → Install](agent-mcp-search/install.md#project-scoped-retrieval-project-only).
+
 The up-managed MCP service is always the central socket server; the legacy
 per-`up` stdio daemon is gone (v0.6.0). `runtime.start_mcp_on_up` is
 deprecated: it is still parsed so existing configs keep loading, and it now
