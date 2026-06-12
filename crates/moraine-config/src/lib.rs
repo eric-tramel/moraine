@@ -373,6 +373,9 @@ const SQLITE_SIDECAR_SUFFIXES: &[&str] = &["-wal", "-shm"];
 
 fn infer_source_format(harness: &str, glob: &str) -> &'static str {
     let glob_lower = glob.to_ascii_lowercase();
+    if glob_lower.ends_with(".vscdb") {
+        return SOURCE_FORMAT_CURSOR_SQLITE;
+    }
     let looks_like_json = !glob_lower.ends_with(".jsonl")
         && (glob_lower.ends_with(".json") || glob_lower.contains(".json"));
     if harness == "hermes" && looks_like_json {

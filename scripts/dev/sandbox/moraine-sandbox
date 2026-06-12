@@ -38,13 +38,14 @@ PROJECT_PREFIX="moraine-sandbox-"
 : "${SANDBOX_HERMES_SESSIONS_DIR:=/dev/null}"
 : "${SANDBOX_KIMI_SESSIONS_DIR:=/dev/null}"
 : "${SANDBOX_CURSOR_PROJECTS_DIR:=/dev/null}"
+: "${SANDBOX_CURSOR_STATE_DIR:=/dev/null}"
 : "${SANDBOX_MONITOR_HOST_PORT:=0}"
 : "${SANDBOX_CLICKHOUSE_HTTP_HOST_PORT:=0}"
 : "${SANDBOX_CLICKHOUSE_TCP_HOST_PORT:=0}"
 : "${SANDBOX_CLICKHOUSE_IMAGE:=clickhouse/clickhouse-server:latest}"
 export SANDBOX_REPO_ROOT SANDBOX_BIN_DIR SANDBOX_WEB_DIR SANDBOX_CONFIG_DIR
 export SANDBOX_CODEX_SESSIONS_DIR SANDBOX_CLAUDE_PROJECTS_DIR SANDBOX_HERMES_SESSIONS_DIR
-export SANDBOX_KIMI_SESSIONS_DIR SANDBOX_CURSOR_PROJECTS_DIR
+export SANDBOX_KIMI_SESSIONS_DIR SANDBOX_CURSOR_PROJECTS_DIR SANDBOX_CURSOR_STATE_DIR
 export SANDBOX_MONITOR_HOST_PORT SANDBOX_CLICKHOUSE_HTTP_HOST_PORT SANDBOX_CLICKHOUSE_TCP_HOST_PORT
 export SANDBOX_CLICKHOUSE_IMAGE
 
@@ -275,6 +276,7 @@ ensure_compose_env() {
     : "${SANDBOX_HERMES_SESSIONS_DIR:=/tmp}"
     : "${SANDBOX_KIMI_SESSIONS_DIR:=/tmp}"
     : "${SANDBOX_CURSOR_PROJECTS_DIR:=/tmp}"
+    : "${SANDBOX_CURSOR_STATE_DIR:=/tmp}"
     : "${SANDBOX_SCCACHE_HOST_DIR:=/tmp}"
     : "${SANDBOX_REBUILD:=0}"
     export SANDBOX_CLICKHOUSE_IMAGE SANDBOX_CLICKHOUSE_HTTP_HOST_PORT \
@@ -282,7 +284,7 @@ ensure_compose_env() {
         SANDBOX_REPO_ROOT SANDBOX_WEB_DIR SANDBOX_CONFIG_DIR \
         SANDBOX_ENTRYPOINT SANDBOX_CODEX_SESSIONS_DIR SANDBOX_CLAUDE_PROJECTS_DIR \
         SANDBOX_HERMES_SESSIONS_DIR SANDBOX_KIMI_SESSIONS_DIR \
-        SANDBOX_CURSOR_PROJECTS_DIR \
+        SANDBOX_CURSOR_PROJECTS_DIR SANDBOX_CURSOR_STATE_DIR \
         SANDBOX_SCCACHE_HOST_DIR SANDBOX_REBUILD
 }
 
@@ -352,7 +354,8 @@ for proj in data:
 #   $6 hermes_sessions_dir (host) — may be ""
 #   $7 kimi_sessions_dir (host) — may be ""
 #   $8 cursor_projects_dir (host) — may be ""
-#   $9 clickhouse_version
+#   $9 cursor_state_dir (host) — may be ""
+#   $10 clickhouse_version
 generate_moraine_toml() {
     local config_dir="$1"
     local id="$2"
@@ -362,7 +365,8 @@ generate_moraine_toml() {
     local hermes_dir="$6"
     local kimi_dir="$7"
     local cursor_dir="$8"
-    local ch_version="$9"
+    local cursor_state_dir="$9"
+    local ch_version="${10}"
 
     mkdir -p "$config_dir"
 
@@ -371,6 +375,7 @@ generate_moraine_toml() {
     local hermes_src_block=""
     local kimi_src_block=""
     local cursor_src_block=""
+    local cursor_sqlite_src_block=""
 
     if [[ "$mount_sessions" == "1" ]]; then
         if [[ -n "$codex_dir" && -d "$codex_dir" ]]; then
@@ -397,6 +402,15 @@ generate_moraine_toml() {
             cursor_src_block=$'[[ingest.sources]]\nname = "host-cursor"\nharness = "cursor"\nenabled = true\nglob = "/host/cursor/projects/*/agent-transcripts/**/*.jsonl"\nwatch_root = "/host/cursor/projects"\n'
         else
             warn "host cursor projects dir not found (${cursor_dir}); skipping that source"
+        fi
+        if [[ -n "$cursor_state_dir" && -d "$cursor_state_dir" ]]; then
+            # cursor_sqlite is disabled by default in production configs
+            # (Cursor has no stable local-DB contract — RFC #361). The
+            # sandbox exists to exercise the format, so enabled = true here
+            # is intentional.
+            cursor_sqlite_src_block=$'[[ingest.sources]]\nname = "host-cursor-sqlite"\nharness = "cursor"\nenabled = true\nglob = "/host/cursor/state/**/state.vscdb"\nwatch_root = "/host/cursor/state"\nformat = "cursor_sqlite"\n'
+        else
+            warn "host cursor state dir not found (${cursor_state_dir}); skipping that source"
         fi
     else
         # Fixture-based sources. Create empty dirs under config dir that will
@@ -434,6 +448,7 @@ ${claude_src_block}
 ${hermes_src_block}
 ${kimi_src_block}
 ${cursor_src_block}
+${cursor_sqlite_src_block}
 [monitor]
 host = "0.0.0.0"
 port = 8080
@@ -598,10 +613,21 @@ cmd_up() {
     [[ -z "$kimi_dir" || "$kimi_dir" == "/dev/null" ]] && kimi_dir="${HOME}/.kimi/sessions"
     local cursor_dir="$SANDBOX_CURSOR_PROJECTS_DIR"
     [[ -z "$cursor_dir" || "$cursor_dir" == "/dev/null" ]] && cursor_dir="${HOME}/.cursor/projects"
+    local cursor_state_dir="$SANDBOX_CURSOR_STATE_DIR"
+    if [[ -z "$cursor_state_dir" || "$cursor_state_dir" == "/dev/null" ]]; then
+        # macOS keeps Cursor's state.vscdb under Application Support; Linux
+        # under ~/.config. Prefer whichever exists on this host.
+        if [[ -d "${HOME}/Library/Application Support/Cursor/User" ]]; then
+            cursor_state_dir="${HOME}/Library/Application Support/Cursor/User"
+        else
+            cursor_state_dir="${HOME}/.config/Cursor/User"
+        fi
+    fi
     local ch_version
     ch_version="$(clickhouse_version_from_default_config)"
     generate_moraine_toml "$config_dir" "$id" "$mount_sessions" \
-        "$codex_dir" "$claude_dir" "$hermes_dir" "$kimi_dir" "$cursor_dir" "$ch_version"
+        "$codex_dir" "$claude_dir" "$hermes_dir" "$kimi_dir" "$cursor_dir" \
+        "$cursor_state_dir" "$ch_version"
     local config_path="${config_dir}/moraine.toml"
 
     # Translate moraine's clickhouse_version (e.g. "v25.12.5.44-stable") to
@@ -653,6 +679,11 @@ cmd_up() {
             export SANDBOX_CURSOR_PROJECTS_DIR="$cursor_dir"
         else
             export SANDBOX_CURSOR_PROJECTS_DIR="/dev/null"
+        fi
+        if [[ -d "$cursor_state_dir" ]]; then
+            export SANDBOX_CURSOR_STATE_DIR="$cursor_state_dir"
+        else
+            export SANDBOX_CURSOR_STATE_DIR="/dev/null"
         fi
     fi
 
@@ -923,6 +954,13 @@ ENVIRONMENT:
     SANDBOX_CURSOR_PROJECTS_DIR  override host Cursor projects dir (default
                                 ~/.cursor/projects). Ingests Agent JSONL
                                 transcripts under agent-transcripts/.
+    SANDBOX_CURSOR_STATE_DIR    override host Cursor SQLite state dir
+                                (default "~/Library/Application Support/
+                                Cursor/User" when it exists, else
+                                ~/.config/Cursor/User). Ingests state.vscdb
+                                databases via the cursor_sqlite format; the
+                                format is opt-in elsewhere but enabled inside
+                                the sandbox so it can be exercised.
 EOF
 }
 

@@ -236,6 +236,8 @@ main() {
   local kimi_keyword="${base_keyword}_kimi_${run_stamp}"
   local cursor_keyword="${base_keyword}_cursor_${run_stamp}"
   local cursor_fallback_keyword="${base_keyword}_cursor_fallback_${run_stamp}"
+  local cursor_sqlite_keyword="${base_keyword}_cursorsqlite_${run_stamp}"
+  local cursor_sqlite_live_keyword="${base_keyword}_cursorsqlite_live_${run_stamp}"
   local pi_keyword="${base_keyword}_pi_${run_stamp}"
   local hermes_keyword="${base_keyword}_hermes_trajectory_${run_stamp}"
   local hermes_session_keyword="${base_keyword}_hermes_session_${run_stamp}"
@@ -254,6 +256,12 @@ main() {
   local cursor_fallback_session_suffix
   cursor_fallback_session_suffix="$(printf '%06x%06x' "$RANDOM" "$RANDOM")"
   local cursor_fallback_session_id="00000000-0000-4000-8000-${cursor_fallback_session_suffix}"
+  # The cursor_sqlite session id is the composer uuid: every event the poller
+  # synthesizes for a composerData/bubbleId row carries it as session_id.
+  local cursor_sqlite_session_suffix
+  cursor_sqlite_session_suffix="$(printf '%06x%06x' "$RANDOM" "$RANDOM")"
+  local cursor_sqlite_session_id="00000000-0000-4000-8000-${cursor_sqlite_session_suffix}"
+  local cursor_sqlite_session_title="Cursor sqlite e2e ${cursor_sqlite_keyword}"
   local pi_session_suffix
   pi_session_suffix="$(printf '%06x%06x' "$RANDOM" "$RANDOM")"
   local pi_session_id="00000000-0000-4000-8000-${pi_session_suffix}"
@@ -263,6 +271,7 @@ main() {
   local claude_trace_marker="mcp_claude_trace_marker_${run_stamp}"
   local kimi_trace_marker="mcp_kimi_trace_marker_${run_stamp}"
   local cursor_trace_marker="mcp_cursor_trace_marker_${run_stamp}"
+  local cursor_sqlite_trace_marker="mcp_cursor_sqlite_trace_marker_${run_stamp}"
   local pi_trace_marker="mcp_pi_trace_marker_${run_stamp}"
   local hermes_trace_marker="mcp_hermes_trace_marker_${run_stamp}"
   local hermes_session_trace_marker="mcp_hermes_session_trace_marker_${run_stamp}"
@@ -286,6 +295,11 @@ main() {
 
   local tmp_root
   tmp_root="$(mktemp -d)"
+  # Resolve symlinks (macOS mktemp returns /var/..., a symlink to
+  # /private/var/...) so the paths planted in the config match the
+  # canonicalized paths the ingest watcher reports, keeping source_file
+  # values — and the MCP smoke --expect-source-file assertions — consistent.
+  tmp_root="$(cd "$tmp_root" && pwd -P)"
   local fixtures_root="$tmp_root/fixtures"
   local runtime_root="$tmp_root/runtime"
   local config_path="$tmp_root/moraine-ci.toml"
@@ -294,6 +308,7 @@ main() {
   local kimi_fixture_file="$fixtures_root/kimi/sessions/${kimi_session_id}/wire.jsonl"
   local cursor_fixture_file="$fixtures_root/cursor/projects/e2e/agent-transcripts/${cursor_session_id}/${cursor_session_id}.jsonl"
   local cursor_fallback_fixture_file="$fixtures_root/cursor/projects/e2e-fallback/agent-transcripts/${cursor_fallback_session_id}/${cursor_fallback_session_id}.jsonl"
+  local cursor_sqlite_fixture_file="$fixtures_root/cursor-sqlite/User/globalStorage/state.vscdb"
   local pi_fixture_file="$fixtures_root/pi/agent/sessions/--tmp-moraine-e2e--/2026-02-16T12-00-08-000Z_${pi_session_id}.jsonl"
   local hermes_fixture_file="$fixtures_root/hermes/trajectories/001-${run_stamp}.jsonl"
   local hermes_session_fixture_file="$fixtures_root/hermes/sessions/${hermes_session_id}.json"
@@ -303,6 +318,7 @@ main() {
   mkdir -p "$(dirname "$kimi_fixture_file")"
   mkdir -p "$(dirname "$cursor_fixture_file")"
   mkdir -p "$(dirname "$cursor_fallback_fixture_file")"
+  mkdir -p "$(dirname "$cursor_sqlite_fixture_file")"
   mkdir -p "$(dirname "$pi_fixture_file")"
   mkdir -p "$(dirname "$hermes_fixture_file")"
   mkdir -p "$(dirname "$hermes_session_fixture_file")"
@@ -351,6 +367,120 @@ EOF
   cat > "$cursor_fallback_fixture_file" <<EOF
 {"role":"user","message":{"content":[{"type":"text","text":"local e2e cursor fallback prompt ${cursor_fallback_keyword}"}]}}
 EOF
+
+  # Cursor's IDE-side history lives in a SQLite kv store (state.vscdb), not
+  # JSONL; the cursor_sqlite format polls it (issue #361). Planted via
+  # Python's stdlib sqlite3 because the sqlite3 CLI is not guaranteed on CI
+  # hosts, and committed in full before 'moraine up' so the first poll sees a
+  # schema-complete database. Row shapes mirror
+  # fixtures/cursor/state-vscdb-kv.jsonl: one composerData row plus a user
+  # bubble, a thinking bubble, and a completed tool bubble.
+  "$python_bin" - \
+    "$cursor_sqlite_fixture_file" \
+    "$cursor_sqlite_session_id" \
+    "$cursor_sqlite_session_title" \
+    "local e2e cursor sqlite user prompt ${cursor_sqlite_keyword} ${cursor_sqlite_trace_marker}" \
+    "cursor-sqlite-tool-${run_stamp}" <<'PY'
+import json
+import sqlite3
+import sys
+
+db_path, composer_id, session_name, user_text, tool_call_id = sys.argv[1:6]
+
+user_bubble = "aaaaaaaa-1111-4111-8111-111111111111"
+thinking_bubble = "bbbbbbbb-2222-4222-8222-222222222222"
+tool_bubble = "cccccccc-3333-4333-8333-333333333333"
+
+composer = {
+    "_v": 16,
+    "composerId": composer_id,
+    "name": session_name,
+    "subtitle": "Edited cursor-sqlite-e2e.txt",
+    "unifiedMode": "agent",
+    "agentBackend": "cursor-agent",
+    "status": "completed",
+    "createdAt": 1771243220000,
+    "lastUpdatedAt": 1771243222000,
+    "workspaceIdentifier": {"id": "e2e-window", "uri": {"fsPath": "/workspace"}},
+    "fullConversationHeadersOnly": [
+        {"bubbleId": user_bubble, "type": 1},
+        {"bubbleId": thinking_bubble, "type": 2},
+        {"bubbleId": tool_bubble, "type": 2},
+    ],
+}
+rows = {
+    f"composerData:{composer_id}": composer,
+    f"bubbleId:{composer_id}:{user_bubble}": {
+        "_v": 3,
+        "type": 1,
+        "bubbleId": user_bubble,
+        "createdAt": "2026-02-16T12:00:20.000Z",
+        "requestId": "11111111-aaaa-4aaa-8aaa-111111111111",
+        "text": user_text,
+        "richText": json.dumps(
+            {
+                "type": "doc",
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": user_text}],
+                    }
+                ],
+            }
+        ),
+        "modelInfo": {"modelName": "default"},
+    },
+    f"bubbleId:{composer_id}:{thinking_bubble}": {
+        "_v": 3,
+        "type": 2,
+        "bubbleId": thinking_bubble,
+        "createdAt": "2026-02-16T12:00:21.000Z",
+        "capabilityType": 30,
+        "thinkingStyle": 2,
+        "thinking": {
+            "text": "**Planning the edit**\n\nInspect the target file first.",
+            "signature": "",
+        },
+        "thinkingDurationMs": 1200,
+    },
+    f"bubbleId:{composer_id}:{tool_bubble}": {
+        "_v": 3,
+        "type": 2,
+        "bubbleId": tool_bubble,
+        "createdAt": "2026-02-16T12:00:22.000Z",
+        "capabilityType": 15,
+        "toolFormerData": {
+            "tool": 38,
+            "toolIndex": 0,
+            "name": "edit_file_v2",
+            "modelCallId": "",
+            "toolCallId": tool_call_id,
+            "status": "completed",
+            "params": json.dumps(
+                {
+                    "relativeWorkspacePath": "/workspace/cursor-sqlite-e2e.txt",
+                    "noCodeblock": True,
+                }
+            ),
+            "rawArgs": "{}",
+            "result": json.dumps({"afterContentId": "composer.content.e2e"}),
+            "additionalData": {"status": "completed", "startedAtMs": 1771243222000},
+            "userDecision": "accepted",
+        },
+    },
+}
+
+connection = sqlite3.connect(db_path)
+connection.execute(
+    "CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)"
+)
+connection.executemany(
+    "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+    [(key, json.dumps(value).encode("utf-8")) for key, value in rows.items()],
+)
+connection.commit()
+connection.close()
+PY
 
   cat > "$pi_fixture_file" <<EOF
 {"type":"session","version":3,"id":"${pi_session_id}","timestamp":"2026-02-16T12:00:08.000Z","cwd":"${tmp_root}"}
@@ -475,6 +605,18 @@ enabled = true
 glob = "${fixtures_root}/cursor/projects/*/agent-transcripts/**/*.jsonl"
 watch_root = "${fixtures_root}/cursor/projects"
 
+# cursor_sqlite polls Cursor's state.vscdb kv store instead of tailing JSONL.
+# The format ships disabled by default (issue #361: Cursor publishes no
+# stable local-DB contract), so the e2e opts in explicitly here against a
+# fixture database.
+[[ingest.sources]]
+name = "cursor-sqlite"
+harness = "cursor"
+format = "cursor_sqlite"
+enabled = true
+glob = "${fixtures_root}/cursor-sqlite/User/**/state.vscdb"
+watch_root = "${fixtures_root}/cursor-sqlite/User"
+
 [[ingest.sources]]
 name = "ci-pi"
 harness = "pi-coding-agent"
@@ -528,6 +670,7 @@ EOF
   echo "[e2e] kimi fixture: ${kimi_fixture_file}"
   echo "[e2e] cursor fixture: ${cursor_fixture_file}"
   echo "[e2e] cursor fallback fixture: ${cursor_fallback_fixture_file}"
+  echo "[e2e] cursor sqlite fixture: ${cursor_sqlite_fixture_file}"
   echo "[e2e] pi fixture: ${pi_fixture_file}"
   echo "[e2e] hermes fixture: ${hermes_fixture_file}"
   echo "[e2e] hermes session fixture: ${hermes_session_fixture_file}"
@@ -557,6 +700,10 @@ EOF
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.event_links WHERE source_name = 'ci-cursor' AND linked_external_id = '/workspace/cursor-e2e.txt'" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.tool_io WHERE source_name = 'ci-cursor' AND tool_call_id = 'cursor-tool-${run_stamp}'" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events WHERE source_name = 'ci-cursor' AND session_id = '${cursor_fallback_session_id}' AND positionCaseInsensitiveUTF8(text_content, '${cursor_fallback_keyword}') > 0" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${cursor_sqlite_keyword}') > 0" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${cursor_sqlite_keyword}'" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.raw_events WHERE source_name = 'cursor-sqlite' AND positionCaseInsensitiveUTF8(raw_json, '${cursor_sqlite_keyword}') > 0" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.tool_io WHERE source_name = 'cursor-sqlite' AND tool_call_id = 'cursor-sqlite-tool-${run_stamp}'" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${pi_keyword}') > 0" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${pi_keyword}'" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${hermes_keyword}') > 0" 120
@@ -598,6 +745,70 @@ EOF
   assert_clickhouse_count "$clickhouse_url" "cursor tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-cursor' AND tool_call_id = 'cursor-tool-${run_stamp}'" "2"
   assert_clickhouse_count "$clickhouse_url" "cursor domain fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-cursor' AND harness = 'cursor' AND inference_provider = 'cursor' AND session_id = '${cursor_session_id}'" "5"
   assert_clickhouse_count "$clickhouse_url" "cursor timestamp fallback" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-cursor' AND session_id = '${cursor_fallback_session_id}' AND event_ts > toDateTime64('2026-01-01', 3)" "1"
+
+  # cursor_sqlite first poll: 4 changed kv rows synthesize 5 events — one
+  # session_meta (composer), one user message, one reasoning, and the
+  # completed tool bubble's tool_call + tool_result pair.
+  assert_clickhouse_count "$clickhouse_url" "cursor sqlite unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'cursor-sqlite'" "4"
+  assert_clickhouse_count "$clickhouse_url" "cursor sqlite event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'cursor-sqlite'" "5"
+  assert_clickhouse_count "$clickhouse_url" "cursor sqlite event kinds" "SELECT uniqExact(event_kind) FROM ${clickhouse_database}.events FINAL WHERE source_name = 'cursor-sqlite' AND event_kind IN ('session_meta', 'message', 'reasoning', 'tool_call', 'tool_result')" "5"
+  assert_clickhouse_count "$clickhouse_url" "cursor sqlite tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'cursor-sqlite' AND tool_call_id = 'cursor-sqlite-tool-${run_stamp}' AND tool_name = 'edit_file_v2'" "2"
+  assert_clickhouse_count "$clickhouse_url" "cursor sqlite domain fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'cursor-sqlite' AND harness = 'cursor' AND inference_provider = 'cursor' AND session_id = '${cursor_sqlite_session_id}'" "5"
+  assert_clickhouse_count "$clickhouse_url" "cursor sqlite session title" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'cursor-sqlite' AND event_kind = 'session_meta' AND JSONExtractString(payload_json, 'title') = '${cursor_sqlite_session_title}'" "1"
+
+  # Live update: Cursor mutates state.vscdb in place while a conversation
+  # runs. Append an assistant bubble (growing the composer's header list) to
+  # prove the watcher/sidecar/reconcile path re-polls a changed database, and
+  # that the re-emitted composer collapses onto its stable event UID.
+  echo "[e2e] cursor sqlite live update: appending an assistant bubble"
+  "$python_bin" - \
+    "$cursor_sqlite_fixture_file" \
+    "$cursor_sqlite_session_id" \
+    "local e2e cursor sqlite assistant reply ${cursor_sqlite_live_keyword}" <<'PY'
+import json
+import sqlite3
+import sys
+
+db_path, composer_id, reply_text = sys.argv[1:4]
+reply_bubble = "dddddddd-4444-4444-8444-444444444444"
+
+connection = sqlite3.connect(db_path, timeout=30)
+row = connection.execute(
+    "SELECT value FROM cursorDiskKV WHERE key = ?",
+    (f"composerData:{composer_id}",),
+).fetchone()
+composer = json.loads(row[0])
+composer["fullConversationHeadersOnly"].append({"bubbleId": reply_bubble, "type": 2})
+composer["lastUpdatedAt"] = 1771243224000
+bubble = {
+    "_v": 3,
+    "type": 2,
+    "bubbleId": reply_bubble,
+    "createdAt": "2026-02-16T12:00:24.000Z",
+    "text": reply_text,
+    "turnDurationMs": 1800,
+}
+connection.executemany(
+    "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+    [
+        (f"composerData:{composer_id}", json.dumps(composer).encode("utf-8")),
+        (f"bubbleId:{composer_id}:{reply_bubble}", json.dumps(bubble).encode("utf-8")),
+    ],
+)
+connection.commit()
+connection.close()
+PY
+
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events WHERE source_name = 'cursor-sqlite' AND positionCaseInsensitiveUTF8(text_content, '${cursor_sqlite_live_keyword}') > 0" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.raw_events WHERE source_name = 'cursor-sqlite' AND positionCaseInsensitiveUTF8(raw_json, '${cursor_sqlite_live_keyword}') > 0" 120
+  # Two kv rows changed (new bubble + mutated composer), so two new raw rows;
+  # the events table gains only the assistant message because the composer's
+  # session_meta re-emits under the same event UID and ReplacingMergeTree
+  # collapses it.
+  assert_clickhouse_count "$clickhouse_url" "cursor sqlite unique raw rows after live update" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'cursor-sqlite'" "6"
+  assert_clickhouse_count "$clickhouse_url" "cursor sqlite event rows after live update" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'cursor-sqlite'" "6"
+  assert_clickhouse_count "$clickhouse_url" "cursor sqlite session_meta collapses on re-emit" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'cursor-sqlite' AND event_kind = 'session_meta'" "1"
+
   assert_clickhouse_count "$clickhouse_url" "pi unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-pi'" "7"
   assert_clickhouse_count "$clickhouse_url" "pi event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-pi'" "9"
   assert_clickhouse_count "$clickhouse_url" "pi link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-pi' AND link_type = 'parent_event'" "7"
@@ -618,7 +829,7 @@ EOF
   assert_clickhouse_count "$clickhouse_url" "hermes session link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-hermes-session'" "0"
   assert_clickhouse_count "$clickhouse_url" "hermes session tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-hermes-session' AND tool_call_id = 'hermes-session-tool-${run_stamp}' AND tool_name = 'shell'" "2"
   assert_clickhouse_count "$clickhouse_url" "hermes session domain fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-hermes-session' AND harness = 'hermes' AND inference_provider = 'anthropic' AND session_id = '${hermes_raw_session_id}' AND model = 'claude-opus-4-6'" "6"
-  assert_clickhouse_count "$clickhouse_url" "token bucket map keys on all events" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE hasAll(mapKeys(token_usage_buckets), ['input_text', 'output_text', 'input_cache_read', 'input_cache_write', 'reasoning'])" "46"
+  assert_clickhouse_count "$clickhouse_url" "token bucket map keys on all events" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE hasAll(mapKeys(token_usage_buckets), ['input_text', 'output_text', 'input_cache_read', 'input_cache_write', 'reasoning'])" "52"
 
   local hermes_trajectory_session_id
   hermes_trajectory_session_id="$(clickhouse_scalar "$clickhouse_url" "SELECT any(session_id) FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-hermes-trajectory'")"
@@ -673,6 +884,15 @@ EOF
     --expect-session-id "$cursor_session_id" \
     --expect-source-file "$cursor_fixture_file" \
     --expect-open-text "$cursor_trace_marker"
+
+  echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (cursor sqlite)"
+  "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --query "$cursor_sqlite_keyword" \
+    --expect-session-id "$cursor_sqlite_session_id" \
+    --expect-source-file "$cursor_sqlite_fixture_file" \
+    --expect-open-text "$cursor_sqlite_trace_marker"
 
   echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (pi)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \

@@ -146,11 +146,22 @@ fn event_is_relevant(kind: &EventKind) -> bool {
 fn event_tracked_paths(event: &Event, format: &str) -> Vec<String> {
     let mut dedup = BTreeSet::<String>::new();
     for path in &event.paths {
-        if let Some(canonical) = map_tracked_path(format, &path.to_string_lossy()) {
-            dedup.insert(canonical);
+        if let Some(tracked) = map_tracked_path(format, &path.to_string_lossy()) {
+            dedup.insert(canonicalize_path_string(&tracked));
         }
     }
     dedup.into_iter().collect()
+}
+
+/// Resolves symlinks so every ingestion entry point agrees on one path per
+/// file. Backfill/reconcile paths come from the config glob while watcher
+/// events report the symlink-resolved location (macOS FSEvents turns
+/// `/var/...` into `/private/var/...`); without canonicalization the same
+/// file gets two checkpoint keys and two sets of event UIDs.
+fn canonicalize_path_string(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map(|resolved| resolved.to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.to_string())
 }
 
 fn queue_rescan(
@@ -372,7 +383,7 @@ pub(crate) fn enumerate_tracked_files(glob_pattern: &str, format: &str) -> Resul
         // match a sidecar must not produce a duplicate work item.
         let lossy = path.to_string_lossy();
         if map_tracked_path(format, &lossy).as_deref() == Some(lossy.as_ref()) {
-            files.push(lossy.to_string());
+            files.push(canonicalize_path_string(&lossy));
         }
     }
     files.sort();

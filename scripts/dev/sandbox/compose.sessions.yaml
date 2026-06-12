@@ -17,6 +17,11 @@
 #   SANDBOX_CURSOR_PROJECTS_DIR   host ~/.cursor/projects, read-only
 #                                 (Agent JSONL transcript files under
 #                                 agent-transcripts/)
+#   SANDBOX_CURSOR_STATE_DIR      host Cursor User state dir, read-only
+#                                 (~/Library/Application Support/Cursor/User
+#                                 on macOS, ~/.config/Cursor/User on Linux;
+#                                 state.vscdb SQLite databases ingested via
+#                                 the format = "cursor_sqlite" path)
 
 services:
   moraine:
@@ -26,3 +31,4 @@ services:
       - "${SANDBOX_HERMES_SESSIONS_DIR}:/host/hermes/sessions:ro"
       - "${SANDBOX_KIMI_SESSIONS_DIR}:/host/kimi/sessions:ro"
       - "${SANDBOX_CURSOR_PROJECTS_DIR}:/host/cursor/projects:ro"
+      - "${SANDBOX_CURSOR_STATE_DIR}:/host/cursor/state:ro"

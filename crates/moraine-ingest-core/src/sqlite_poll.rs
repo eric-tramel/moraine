@@ -908,14 +908,12 @@ fn parse_embedded_json(value: &Value) -> Value {
 
 fn elide_long_strings(value: &mut Value) {
     match value {
-        Value::String(text) => {
-            if text.chars().count() > LONG_STRING_ELIDE_CHARS {
-                let prefix: String = text.chars().take(256).collect();
-                *value = Value::String(format!(
-                    "{prefix}… <moraine: elided {} chars>",
-                    text.chars().count()
-                ));
-            }
+        Value::String(text) if text.chars().count() > LONG_STRING_ELIDE_CHARS => {
+            let prefix: String = text.chars().take(256).collect();
+            *value = Value::String(format!(
+                "{prefix}… <moraine: elided {} chars>",
+                text.chars().count()
+            ));
         }
         Value::Array(items) => {
             for item in items {
@@ -943,7 +941,7 @@ mod tests {
     use super::*;
     use crate::model::RowBatch;
     use serde_json::json;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::time::timeout;
 
@@ -1078,7 +1076,7 @@ mod tests {
         connection
     }
 
-    fn sqlite_work(path: &PathBuf) -> WorkItem {
+    fn sqlite_work(path: &Path) -> WorkItem {
         WorkItem {
             source_name: "cursor-sqlite-test".to_string(),
             harness: "cursor".to_string(),
@@ -1138,7 +1136,7 @@ mod tests {
             .collect()
     }
 
-    fn cleanup(path: &PathBuf) {
+    fn cleanup(path: &Path) {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{}", path.to_string_lossy(), suffix));
         }

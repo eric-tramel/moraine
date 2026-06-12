@@ -18,7 +18,7 @@ all rows that leave the adapter.
 | `codex` | `sources/codex.rs` | `openai` | `jsonl` | OpenAI/Codex events, response items, tool calls, compaction, token counts. |
 | `claude-code` | `sources/claude_code.rs` | `anthropic` | `jsonl` | Claude Code message blocks, operational records, parent/tool external links. |
 | `kimi-cli` | `sources/kimi_cli.rs` | `moonshot` | `jsonl` | Kimi `wire.jsonl`; skips metadata headers and drops parent `SubagentEvent` rows. |
-| `cursor` | `sources/cursor.rs` | `cursor` | `jsonl` | Cursor Agent transcripts under `agent-transcripts/`; text blocks, tool-use blocks, and local file references. |
+| `cursor` | `sources/cursor.rs` | `cursor` | `jsonl` or `cursor_sqlite` | Cursor Agent transcripts under `agent-transcripts/`; text blocks, tool-use blocks, and local file references. Also normalizes the synthetic `cursor_composer`/`cursor_bubble` records produced by polling `state.vscdb` (see SQLite-Polled Sources below); composer names become `session_meta` events that carry the session title. |
 | `hermes` | `sources/hermes.rs` | record-derived | `jsonl` or `session_json` | ShareGPT trajectories and live Hermes session JSON with vendor/model splitting. |
 | `pi-coding-agent` | `sources/pi.rs` | record-derived | `jsonl` | Pi session JSONL trees, model/thinking metadata, assistant tool calls, tool results, and parent links. |
 
@@ -107,6 +107,55 @@ Adapters must emit rows that already satisfy the normalized schema domain:
   not blindly canonicalized through generic helpers.
 - Synthetic timestamp sequencing should only advance for rows that are actually
   emitted. This matters for Hermes trajectory segment parsing.
+
+## SQLite-Polled Sources
+
+Some harnesses keep history in a live SQLite database instead of append-only
+trace files. `crates/moraine-ingest-core/src/sqlite_poll.rs` is the shared
+polling engine for those sources; the `cursor_sqlite` format (Cursor
+`state.vscdb`) is its first consumer. The engine synthesizes one record per
+relevant database row and feeds it through `normalize_record`, so the source
+adapter stays format-agnostic — `sources/cursor.rs` handles the synthetic
+`cursor_composer`/`cursor_bubble` records the same way it handles JSONL lines.
+
+Mechanics that differ from file-backed sources:
+
+- **Hash-based change cursor.** Cursor's `cursorDiskKV` table has no rowid or
+  timestamp watermark, so the poll cursor is a per-key content-hash map
+  persisted in the `ingest_checkpoints.cursor_json` column (migration
+  `sql/015_sqlite_checkpoint_cursor.sql`). A poll emits synthetic records only
+  for keys that are new or whose hash changed, and prunes deleted keys after
+  each full scan.
+- **Bounded prefix scans.** Only the `composerData:` and `bubbleId:` key
+  prefixes are scanned, in pages, with a 10,000-key ceiling. Larger key spaces
+  fail the poll instead of persisting an oversized cursor. `agentKv:*`,
+  `checkpointId:*`, and the entire `ItemTable` (which holds live auth tokens)
+  are deliberately out of scope for v1.
+- **Stable logical event UIDs.** UID material derives from the kv key
+  (`cursor_sqlite:<table>:<pk>`), not the mutable payload, so a row that
+  mutates in place (streaming text, tool status changes) re-emits the same
+  event UIDs with a newer `event_version` and `ReplacingMergeTree` collapses
+  them.
+- **Sidecar watching.** `moraine_config::map_tracked_path` maps
+  `state.vscdb-wal`/`state.vscdb-shm` filesystem events back to the canonical
+  `state.vscdb` path so WAL-only writes trigger polls; `state.vscdb.backup` is
+  untracked. Databases are opened read-only with a short busy timeout, and
+  Moraine never checkpoints another application's WAL.
+- **Rate-limited errors.** Failures surface as `ingest_errors` rows with kinds
+  `sqlite_open_error`, `sqlite_schema_mismatch`, `sqlite_cursor_too_large`, and
+  `sqlite_scan_error`. The cursor records the last reported kind so a
+  persistent failure is emitted once rather than on every reconcile tick, and
+  the data cursor is left untouched so the next poll retries.
+
+Fixtures: `fixtures/cursor/state-vscdb-kv.jsonl` stores `cursorDiskKV` rows as
+JSONL (`key`/`value` pairs). The golden contract test feeds each row through
+the production synthesis path, so golden output cannot drift from the poller;
+skipped rows (ghost composers, out-of-scope key families) appear as empty
+snapshots so scope changes stay visible in review. Unit tests in
+`sqlite_poll.rs` build temporary `rusqlite` databases to cover first-poll
+emission, no-op repolls, in-place mutation re-emitting stable UIDs, payload
+hygiene, and the schema-mismatch and oversized-key-space error paths; sidecar
+path mapping is tested in `moraine-config`.
 
 ## Fixtures And Contracts
 

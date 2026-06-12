@@ -23,7 +23,8 @@ worktree's code. See RFC #232.
 scripts/dev/sandbox/moraine-sandbox up
 
 # Optionally mount your host session archives (read-only), including Codex,
-# Claude Code, Cursor, Hermes, and Kimi when their default directories exist:
+# Claude Code, Cursor (Agent transcripts + SQLite state), Hermes, and Kimi
+# when their default directories exist:
 scripts/dev/sandbox/moraine-sandbox up --mount-host-sessions
 
 # Interactive shell inside the running container.
@@ -41,6 +42,27 @@ scripts/dev/sandbox/moraine-sandbox down --all
 ```
 
 Agents: always call `down` before reporting your task complete.
+
+## Host session mounts (`--mount-host-sessions`)
+
+Each mount is read-only and can be overridden with the matching env var;
+directories that don't exist on the host fall back to a `/dev/null`
+placeholder and their ingest source is skipped.
+
+| Host default | Container path | Override |
+|---|---|---|
+| `~/.codex/sessions` | `/host/codex/sessions` | `SANDBOX_CODEX_SESSIONS_DIR` |
+| `~/.claude/projects` | `/host/claude/projects` | `SANDBOX_CLAUDE_PROJECTS_DIR` |
+| `~/.hermes/sessions` | `/host/hermes/sessions` | `SANDBOX_HERMES_SESSIONS_DIR` |
+| `~/.kimi/sessions` | `/host/kimi/sessions` | `SANDBOX_KIMI_SESSIONS_DIR` |
+| `~/.cursor/projects` | `/host/cursor/projects` | `SANDBOX_CURSOR_PROJECTS_DIR` |
+| `~/Library/Application Support/Cursor/User` (macOS) or `~/.config/Cursor/User` (Linux) | `/host/cursor/state` | `SANDBOX_CURSOR_STATE_DIR` |
+
+The Cursor state mount feeds the `cursor_sqlite` ingest format
+(`state.vscdb` SQLite databases). That format is opt-in / disabled by
+default in production configs (RFC #361 — Cursor has no stable local-DB
+contract), but the generated sandbox config enables it on purpose: the
+sandbox exists to exercise it.
 
 ## Where state lives
 
