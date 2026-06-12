@@ -20,6 +20,7 @@ walkdir = "2.5"
 same-file = "1.0"
 moraine-config = { path = "../moraine-config" }
 moraine-clickhouse = { path = "../moraine-clickhouse" }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 
 [dev-dependencies]
 axum = "0.7"

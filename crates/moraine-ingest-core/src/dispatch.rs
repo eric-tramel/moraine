@@ -4,7 +4,9 @@ use crate::normalize::{normalize_record, normalize_record_with_ts_hint};
 use crate::sources::shared::{format_record_ts, parse_record_ts};
 use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
 use anyhow::{Context, Result};
-use moraine_config::{AppConfig, SOURCE_FORMAT_SESSION_JSON};
+use moraine_config::{
+    map_tracked_path, AppConfig, SOURCE_FORMAT_CURSOR_SQLITE, SOURCE_FORMAT_SESSION_JSON,
+};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 #[cfg(not(unix))]
@@ -30,19 +32,11 @@ use std::time::UNIX_EPOCH;
 const SESSION_JSON_INODE: u64 = 0;
 const SESSION_JSON_GENERATION: u32 = 1;
 
-fn work_extension(work: &WorkItem) -> &'static str {
-    if work.format == SOURCE_FORMAT_SESSION_JSON {
-        "json"
-    } else {
-        "jsonl"
-    }
-}
-
-fn path_matches_extension(path: &str, extension: &str) -> bool {
-    std::path::Path::new(path)
-        .extension()
-        .and_then(|s| s.to_str())
-        == Some(extension)
+/// A work item is processable only when its path is already the canonical
+/// tracked path for its format (sidecar paths are canonicalized at the
+/// watcher; anything else here is a stray event for an untracked file).
+fn work_path_is_canonical(work: &WorkItem) -> bool {
+    map_tracked_path(&work.format, &work.path).as_deref() == Some(work.path.as_str())
 }
 
 /// Best-effort mapping from a Hermes session `base_url` to an inference
@@ -257,7 +251,11 @@ pub(crate) fn spawn_debounce_task(
 
                     for key in ready {
                         if let Some((work, _)) = pending.remove(&key) {
-                            if !path_matches_extension(&work.path, work_extension(&work)) {
+                            if !work_path_is_canonical(&work) {
+                                debug!(
+                                    "dropping non-canonical work item {} (format {})",
+                                    work.path, work.format
+                                );
                                 continue;
                             }
 
@@ -276,7 +274,11 @@ pub(crate) async fn enqueue_work(
     dispatch: &Arc<Mutex<DispatchState>>,
     metrics: &Arc<Metrics>,
 ) {
-    if !path_matches_extension(&work.path, work_extension(&work)) {
+    if !work_path_is_canonical(&work) {
+        debug!(
+            "dropping non-canonical work item {} (format {})",
+            work.path, work.format
+        );
         return;
     }
 
@@ -362,6 +364,16 @@ pub(crate) async fn process_file(
     if work.format == SOURCE_FORMAT_SESSION_JSON {
         return process_session_json_file(config, work, checkpoints, sink_tx, metrics).await;
     }
+    if work.format == SOURCE_FORMAT_CURSOR_SQLITE {
+        return crate::sqlite_poll::process_cursor_sqlite_db(
+            config,
+            work,
+            checkpoints,
+            sink_tx,
+            metrics,
+        )
+        .await;
+    }
 
     let source_file = &work.path;
 
@@ -387,6 +399,7 @@ pub(crate) async fn process_file(
         last_offset: 0,
         last_line_no: 0,
         status: "active".to_string(),
+        ..Default::default()
     });
 
     let mut generation_changed = false;
@@ -539,6 +552,7 @@ pub(crate) async fn process_file(
                 last_offset: offset,
                 last_line_no: line_no,
                 status: "active".to_string(),
+                ..Default::default()
             });
 
             sink_tx
@@ -556,6 +570,7 @@ pub(crate) async fn process_file(
         last_offset: offset,
         last_line_no: line_no,
         status: "active".to_string(),
+        ..Default::default()
     };
 
     if batch.row_count() > 0 || generation_changed || offset != checkpoint.last_offset {
@@ -652,6 +667,7 @@ async fn process_session_json_file(
         last_offset: 0,
         last_line_no: 0,
         status: "active".to_string(),
+        ..Default::default()
     });
 
     // Re-pin the synthetic identity on every run — older checkpoints written
@@ -758,6 +774,7 @@ async fn process_session_json_file(
         last_offset: file_size,
         last_line_no: message_count,
         status: "active".to_string(),
+        ..Default::default()
     };
 
     if batch.row_count() > 0
@@ -899,7 +916,7 @@ fn build_session_message_record(session_doc: &Value, message: &Value, message_in
     })
 }
 
-fn source_inode_for_file(source_file: &str, meta: &std::fs::Metadata) -> u64 {
+pub(crate) fn source_inode_for_file(source_file: &str, meta: &std::fs::Metadata) -> u64 {
     #[cfg(unix)]
     {
         let _ = source_file;
@@ -956,9 +973,9 @@ fn truncate(input: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         complete_work, compose_hermes_model, enrich_claude_model_latency,
-        infer_vendor_from_base_url, path_matches_extension, process_file,
-        process_session_json_file, run_work_item, source_inode_for_file, work_extension,
-        SessionCursor, SESSION_JSON_GENERATION, SESSION_JSON_INODE,
+        infer_vendor_from_base_url, process_file, process_session_json_file, run_work_item,
+        source_inode_for_file, work_path_is_canonical, SessionCursor, SESSION_JSON_GENERATION,
+        SESSION_JSON_INODE,
     };
     use crate::model::Checkpoint;
     use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
@@ -1164,15 +1181,14 @@ mod tests {
     }
 
     #[test]
-    fn work_extension_matches_format() {
+    fn work_path_canonical_check_matches_format() {
         let jsonl = WorkItem {
             source_name: "s".to_string(),
             harness: "hermes".to_string(),
             format: "jsonl".to_string(),
             path: "/tmp/x.jsonl".to_string(),
         };
-        assert_eq!(work_extension(&jsonl), "jsonl");
-        assert!(path_matches_extension(&jsonl.path, work_extension(&jsonl)));
+        assert!(work_path_is_canonical(&jsonl));
 
         let session = WorkItem {
             source_name: "s".to_string(),
@@ -1180,17 +1196,28 @@ mod tests {
             format: "session_json".to_string(),
             path: "/tmp/session_x.json".to_string(),
         };
-        assert_eq!(work_extension(&session), "json");
-        assert!(path_matches_extension(
-            &session.path,
-            work_extension(&session)
-        ));
+        assert!(work_path_is_canonical(&session));
         // session_json format must NOT pick up .jsonl files
         let wrong = WorkItem {
             path: "/tmp/x.jsonl".to_string(),
             ..session.clone()
         };
-        assert!(!path_matches_extension(&wrong.path, work_extension(&wrong)));
+        assert!(!work_path_is_canonical(&wrong));
+
+        let sqlite = WorkItem {
+            source_name: "s".to_string(),
+            harness: "cursor".to_string(),
+            format: "cursor_sqlite".to_string(),
+            path: "/tmp/User/state.vscdb".to_string(),
+        };
+        assert!(work_path_is_canonical(&sqlite));
+        // Sidecars are canonicalized upstream; a sidecar path reaching the
+        // dispatcher directly is dropped rather than processed.
+        let sidecar = WorkItem {
+            path: "/tmp/User/state.vscdb-wal".to_string(),
+            ..sqlite.clone()
+        };
+        assert!(!work_path_is_canonical(&sidecar));
     }
 
     #[test]

@@ -4,7 +4,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use glob::glob;
-use moraine_config::IngestSource;
+use moraine_config::{map_tracked_path, IngestSource, SOURCE_FORMAT_CURSOR_SQLITE};
 use notify::{
     event::{EventKind, ModifyKind},
     Config as NotifyConfig, Event, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher,
@@ -140,28 +140,50 @@ fn event_is_relevant(kind: &EventKind) -> bool {
     }
 }
 
-fn event_tracked_paths(event: &Event, extension: &str) -> Vec<String> {
+/// Canonical tracked paths touched by a watcher event. Sidecar writes (e.g.
+/// SQLite `-wal`/`-shm`) map to their canonical database path, and the
+/// `BTreeSet` coalesces a burst touching base + sidecars into one work item.
+fn event_tracked_paths(event: &Event, format: &str) -> Vec<String> {
     let mut dedup = BTreeSet::<String>::new();
     for path in &event.paths {
-        if path.extension().and_then(|s| s.to_str()) == Some(extension) {
-            dedup.insert(path.to_string_lossy().to_string());
+        if let Some(tracked) = map_tracked_path(format, &path.to_string_lossy()) {
+            dedup.insert(tracked_path_identity(format, &tracked));
         }
     }
     dedup.into_iter().collect()
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Resolves symlinks for `cursor_sqlite` so every ingestion entry point
+/// agrees on one path per database. Backfill/reconcile paths come from the
+/// config glob while watcher events report the symlink-resolved location
+/// (macOS FSEvents turns `/var/...` into `/private/var/...`); without
+/// canonicalization the same database gets two checkpoint keys and two sets
+/// of event UIDs.
+///
+/// File-backed formats keep the as-reported path: checkpoint keys and event
+/// UIDs embed `source_file`, so changing the identity of long-standing
+/// sources (e.g. dotfiles-managed symlinked session dirs) would orphan every
+/// existing checkpoint and re-ingest history under new UIDs. `cursor_sqlite`
+/// is new — no install has pre-canonicalization identities to preserve.
+fn tracked_path_identity(format: &str, path: &str) -> String {
+    if format != SOURCE_FORMAT_CURSOR_SQLITE {
+        return path.to_string();
+    }
+    std::fs::canonicalize(path)
+        .map(|resolved| resolved.to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.to_string())
+}
+
 fn queue_rescan(
     glob_pattern: &str,
     source_name: &str,
     harness: &str,
     format: &str,
-    extension: &str,
     tx: &mpsc::UnboundedSender<WorkItem>,
     metrics: &Arc<Metrics>,
 ) {
     record_rescan(metrics);
-    match enumerate_tracked_files(glob_pattern, extension) {
+    match enumerate_tracked_files(glob_pattern, format) {
         Ok(paths) => {
             for path in paths {
                 let _ = tx.send(WorkItem {
@@ -202,7 +224,6 @@ pub(crate) fn spawn_watcher_threads(
         let source_name = source.name.clone();
         let harness = source.harness.clone();
         let format = source.format.clone();
-        let extension = source.tracked_extension().to_string();
         let glob_pattern = source.glob.clone();
         let watch_root = std::path::PathBuf::from(source.watch_root.clone());
         let tx_clone = tx.clone();
@@ -268,7 +289,6 @@ pub(crate) fn spawn_watcher_threads(
                                 &source_name,
                                 &harness,
                                 &format,
-                                &extension,
                                 &tx_clone,
                                 &metrics_clone,
                             );
@@ -297,7 +317,6 @@ pub(crate) fn spawn_watcher_threads(
                     &source_name,
                     &harness,
                     &format,
-                    &extension,
                     &tx_clone,
                     &metrics_clone,
                 );
@@ -314,7 +333,6 @@ pub(crate) fn spawn_watcher_threads(
                                 &source_name,
                                 &harness,
                                 &format,
-                                &extension,
                                 &tx_clone,
                                 &metrics_clone,
                             );
@@ -325,7 +343,7 @@ pub(crate) fn spawn_watcher_threads(
                             continue;
                         }
 
-                        for path in event_tracked_paths(&event, &extension) {
+                        for path in event_tracked_paths(&event, &format) {
                             let _ = tx_clone.send(WorkItem {
                                 source_name: source_name.clone(),
                                 harness: harness.clone(),
@@ -345,7 +363,6 @@ pub(crate) fn spawn_watcher_threads(
                             &source_name,
                             &harness,
                             &format,
-                            &extension,
                             &tx_clone,
                             &metrics_clone,
                         );
@@ -361,7 +378,7 @@ pub(crate) fn spawn_watcher_threads(
     Ok(handles)
 }
 
-pub(crate) fn enumerate_tracked_files(glob_pattern: &str, extension: &str) -> Result<Vec<String>> {
+pub(crate) fn enumerate_tracked_files(glob_pattern: &str, format: &str) -> Result<Vec<String>> {
     let mut files = Vec::<String>::new();
     for entry in glob(glob_pattern).with_context(|| format!("invalid glob: {}", glob_pattern))? {
         let path = match entry {
@@ -372,8 +389,11 @@ pub(crate) fn enumerate_tracked_files(glob_pattern: &str, extension: &str) -> Re
             }
         };
 
-        if path.extension().and_then(|s| s.to_str()) == Some(extension) {
-            files.push(path.to_string_lossy().to_string());
+        // Enumeration keeps canonical files only: a glob that happens to
+        // match a sidecar must not produce a duplicate work item.
+        let lossy = path.to_string_lossy();
+        if map_tracked_path(format, &lossy).as_deref() == Some(lossy.as_ref()) {
+            files.push(tracked_path_identity(format, &lossy));
         }
     }
     files.sort();
@@ -425,8 +445,67 @@ mod tests {
         let jsonl = event_tracked_paths(&event, "jsonl");
         assert_eq!(jsonl, vec!["/tmp/a.jsonl".to_string()]);
 
-        let session_json = event_tracked_paths(&event, "json");
+        let session_json = event_tracked_paths(&event, "session_json");
         assert_eq!(session_json, vec!["/tmp/c.json".to_string()]);
+    }
+
+    #[test]
+    fn sqlite_sidecar_events_coalesce_to_canonical_db_path() {
+        let mut event = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any)));
+        event.paths = vec![
+            PathBuf::from("/tmp/User/globalStorage/state.vscdb"),
+            PathBuf::from("/tmp/User/globalStorage/state.vscdb-wal"),
+            PathBuf::from("/tmp/User/globalStorage/state.vscdb-shm"),
+            PathBuf::from("/tmp/User/globalStorage/state.vscdb.backup"),
+        ];
+
+        let tracked = event_tracked_paths(&event, "cursor_sqlite");
+        assert_eq!(
+            tracked,
+            vec!["/tmp/User/globalStorage/state.vscdb".to_string()],
+            "base + sidecars coalesce to one canonical path; backups are ignored"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_formats_keep_symlinked_paths_as_reported() {
+        // Checkpoint keys and event UIDs embed source_file: resolving
+        // symlinks for long-standing file-backed sources would orphan every
+        // existing checkpoint and duplicate history under new UIDs.
+        let dir = std::env::temp_dir().join(format!(
+            "moraine-watch-symlink-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock before unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let target = dir.join("real-session.jsonl");
+        std::fs::write(&target, "{}\n").expect("write target");
+        let link = dir.join("link-session.jsonl");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+        let link_str = link.to_string_lossy().to_string();
+
+        let mut event = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any)));
+        event.paths = vec![link.clone()];
+        assert_eq!(
+            event_tracked_paths(&event, "jsonl"),
+            vec![link_str.clone()],
+            "jsonl watcher paths must not be symlink-resolved"
+        );
+
+        let glob_pattern = dir.join("link-*.jsonl").to_string_lossy().to_string();
+        let enumerated = enumerate_tracked_files(&glob_pattern, "jsonl").expect("enumerate");
+        assert_eq!(
+            enumerated,
+            vec![link_str],
+            "jsonl enumeration must not be symlink-resolved"
+        );
+
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
@@ -448,15 +527,7 @@ mod tests {
         let metrics = Arc::new(Metrics::default());
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        queue_rescan(
-            "[",
-            "source-alpha",
-            "harness-alpha",
-            "jsonl",
-            "jsonl",
-            &tx,
-            &metrics,
-        );
+        queue_rescan("[", "source-alpha", "harness-alpha", "jsonl", &tx, &metrics);
 
         assert!(rx.try_recv().is_err());
         assert_eq!(metrics.watcher_reset_count.load(Ordering::Relaxed), 1);

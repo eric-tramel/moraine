@@ -22,7 +22,7 @@ pub(crate) fn spawn_reconcile_task(
         loop {
             ticker.tick().await;
             for source in &sources {
-                match enumerate_tracked_files(&source.glob, source.tracked_extension()) {
+                match enumerate_tracked_files(&source.glob, &source.format) {
                     Ok(paths) => {
                         debug!(
                             "reconcile scanning {} files for source={} (format={})",

@@ -6,6 +6,7 @@ pub mod normalize;
 mod reconcile;
 mod sink;
 mod sources;
+pub mod sqlite_poll;
 mod watch;
 
 use crate::checkpoint::checkpoint_key;
@@ -22,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, RwLock, Semaphore};
-use tracing::info;
+use tracing::{info, warn};
 
 pub(crate) const WATCHER_BACKEND_UNKNOWN: u64 = 0;
 pub(crate) const WATCHER_BACKEND_NATIVE: u64 = 1;
@@ -92,7 +93,20 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
     let clickhouse = ClickHouseClient::new(config.clickhouse.clone())?;
     clickhouse.ping().await.context("clickhouse ping failed")?;
 
-    let checkpoint_map = load_checkpoints(&clickhouse)
+    let checkpoint_cursor_columns = checkpoint_cursor_columns_available(&clickhouse)
+        .await
+        .context("failed to inspect ingest_checkpoints columns")?;
+    if !checkpoint_cursor_columns {
+        warn!(
+            "ingest_checkpoints is missing the SQLite cursor columns (migration 015); \
+             cursor_sqlite poll cursors will not persist until `moraine db migrate` runs \
+             AND this ingest service restarts (the column probe is startup-only) — \
+             until then every restart re-scans Cursor databases from scratch and \
+             re-appends their rows to raw_events"
+        );
+    }
+
+    let checkpoint_map = load_checkpoints(&clickhouse, checkpoint_cursor_columns)
         .await
         .context("failed to load checkpoints from clickhouse")?;
 
@@ -123,6 +137,7 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         metrics.clone(),
         sink_rx,
         dispatch.clone(),
+        checkpoint_cursor_columns,
     );
 
     let sem = Arc::new(Semaphore::new(config.ingest.max_file_workers.max(1)));
@@ -187,7 +202,7 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
     if config.ingest.backfill_on_start {
         let mut backfill_sources = Vec::new();
         for source in &enabled_sources {
-            let files = enumerate_tracked_files(&source.glob, source.tracked_extension())?;
+            let files = enumerate_tracked_files(&source.glob, &source.format)?;
             info!(
                 "startup backfill queueing {} files for source={} (format={})",
                 files.len(),
@@ -253,11 +268,50 @@ struct CheckpointRow {
     last_offset: u64,
     last_line_no: u64,
     status: String,
+    #[serde(default)]
+    cursor_json: String,
+    #[serde(default)]
+    source_fingerprint: u64,
+    #[serde(default)]
+    schema_fingerprint: u64,
+}
+
+/// Returns whether `ingest_checkpoints` carries the SQLite cursor columns
+/// added by migration 015. Selecting them unconditionally would abort startup
+/// for every source on a database that has not run `moraine db migrate` yet.
+async fn checkpoint_cursor_columns_available(clickhouse: &ClickHouseClient) -> Result<bool> {
+    #[derive(Deserialize)]
+    struct CountRow {
+        column_count: u64,
+    }
+
+    let query = format!(
+        "SELECT toUInt64(count()) AS column_count \
+         FROM system.columns \
+         WHERE database = '{}' AND table = 'ingest_checkpoints' AND name = 'cursor_json'",
+        clickhouse.config().database.replace('\'', "\\'")
+    );
+    let rows: Vec<CountRow> = clickhouse.query_rows(&query, None).await?;
+    Ok(rows
+        .first()
+        .map(|row| row.column_count > 0)
+        .unwrap_or(false))
 }
 
 async fn load_checkpoints(
     clickhouse: &ClickHouseClient,
+    cursor_columns: bool,
 ) -> Result<HashMap<String, model::Checkpoint>> {
+    let cursor_column_selects = if cursor_columns {
+        ", argMax(cursor_json, updated_at) AS cursor_json \
+         , toUInt64(argMax(source_fingerprint, updated_at)) AS source_fingerprint \
+         , toUInt64(argMax(schema_fingerprint, updated_at)) AS schema_fingerprint"
+    } else {
+        ", '' AS cursor_json \
+         , toUInt64(0) AS source_fingerprint \
+         , toUInt64(0) AS schema_fingerprint"
+    };
+
     let query = format!(
         "SELECT \
             source_name, \
@@ -267,8 +321,10 @@ async fn load_checkpoints(
             toUInt64(argMax(last_offset, updated_at)) AS last_offset, \
             toUInt64(argMax(last_line_no, updated_at)) AS last_line_no, \
             argMax(status, updated_at) AS status \
+            {} \
          FROM {}.ingest_checkpoints \
          GROUP BY source_name, source_file",
+        cursor_column_selects,
         clickhouse.config().database
     );
 
@@ -287,6 +343,9 @@ async fn load_checkpoints(
                 last_offset: row.last_offset,
                 last_line_no: row.last_line_no,
                 status: row.status,
+                cursor_json: row.cursor_json,
+                source_fingerprint: row.source_fingerprint,
+                schema_fingerprint: row.schema_fingerprint,
             },
         );
     }

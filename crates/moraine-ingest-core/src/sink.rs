@@ -76,6 +76,7 @@ fn compute_append_to_visible_stats(
     Some((saturating_u64_to_u32(p50), saturating_u64_to_u32(p95)))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_sink_task(
     config: moraine_config::AppConfig,
     clickhouse: ClickHouseClient,
@@ -83,6 +84,7 @@ pub(crate) fn spawn_sink_task(
     metrics: Arc<Metrics>,
     mut rx: mpsc::Receiver<SinkMessage>,
     dispatch: Arc<Mutex<DispatchState>>,
+    checkpoint_cursor_columns: bool,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut raw_rows = Vec::<Value>::new();
@@ -134,6 +136,7 @@ pub(crate) fn spawn_sink_task(
                     &mut tool_rows,
                     &mut error_rows,
                     &mut checkpoint_updates,
+                    checkpoint_cursor_columns,
                 )
                 .await
                 {
@@ -180,6 +183,7 @@ pub(crate) fn spawn_sink_task(
                                     &mut tool_rows,
                                     &mut error_rows,
                                     &mut checkpoint_updates,
+                                    checkpoint_cursor_columns,
                                 ).await {
                                     if !throttling_flush_retries {
                                         warn!(
@@ -208,6 +212,7 @@ pub(crate) fn spawn_sink_task(
                             &mut tool_rows,
                             &mut error_rows,
                             &mut checkpoint_updates,
+                            checkpoint_cursor_columns,
                         ).await {
                             if !throttling_flush_retries {
                                 warn!(
@@ -245,6 +250,7 @@ pub(crate) fn spawn_sink_task(
                 &mut tool_rows,
                 &mut error_rows,
                 &mut checkpoint_updates,
+                checkpoint_cursor_columns,
             )
             .await;
         }
@@ -314,6 +320,7 @@ async fn emit_heartbeat(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn flush_pending(
     clickhouse: &ClickHouseClient,
     checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
@@ -324,13 +331,14 @@ async fn flush_pending(
     tool_rows: &mut Vec<Value>,
     error_rows: &mut Vec<Value>,
     checkpoint_updates: &mut HashMap<String, Checkpoint>,
+    checkpoint_cursor_columns: bool,
 ) -> bool {
     let started = Instant::now();
 
     let checkpoint_rows: Vec<Value> = checkpoint_updates
         .values()
         .map(|cp| {
-            json!({
+            let mut row = json!({
                 "source_name": cp.source_name,
                 "source_file": cp.source_file,
                 "source_inode": cp.source_inode,
@@ -338,7 +346,23 @@ async fn flush_pending(
                 "last_offset": cp.last_offset,
                 "last_line_no": cp.last_line_no,
                 "status": cp.status,
-            })
+            });
+            // Older schemas (pre-015) reject unknown columns at insert time,
+            // so the SQLite cursor fields are attached only when present.
+            if checkpoint_cursor_columns {
+                if let Some(obj) = row.as_object_mut() {
+                    obj.insert("cursor_json".to_string(), json!(cp.cursor_json));
+                    obj.insert(
+                        "source_fingerprint".to_string(),
+                        json!(cp.source_fingerprint),
+                    );
+                    obj.insert(
+                        "schema_fingerprint".to_string(),
+                        json!(cp.schema_fingerprint),
+                    );
+                }
+            }
+            row
         })
         .collect();
 
@@ -556,6 +580,7 @@ mod tests {
             last_offset: 100,
             last_line_no: 3,
             status: "active".to_string(),
+            ..Default::default()
         }
     }
 
@@ -581,7 +606,7 @@ mod tests {
         let dispatch = Arc::new(Mutex::new(DispatchState::default()));
         let (tx, rx) = mpsc::channel(1);
 
-        let handle = spawn_sink_task(config, clickhouse, checkpoints, metrics, rx, dispatch);
+        let handle = spawn_sink_task(config, clickhouse, checkpoints, metrics, rx, dispatch, true);
 
         tx.send(single_row_batch(1))
             .await
@@ -630,6 +655,7 @@ mod tests {
             &mut tool_rows,
             &mut error_rows,
             &mut checkpoint_updates,
+            true,
         )
         .await;
         assert!(!first_attempt, "first flush should fail at events stage");
@@ -659,6 +685,7 @@ mod tests {
             &mut tool_rows,
             &mut error_rows,
             &mut checkpoint_updates,
+            true,
         )
         .await;
         assert!(

@@ -112,6 +112,12 @@ Choose `format` carefully:
 - Use `jsonl` for append-only newline-delimited trace records.
 - Use `session_json` for one JSON file per live session that is rewritten in
   place. The session processor emits only newly appended synthetic records.
+- Use `cursor_sqlite` for Cursor `state.vscdb` databases. A DB-polling format
+  is only appropriate when the harness keeps its history in a live local
+  database with no append-only trace files; the polling engine in
+  `sqlite_poll.rs` diffs the database against a persisted cursor and routes
+  synthetic records through the normal adapter path (see
+  [Ingest Sources → SQLite-Polled Sources](ingest-sources.md#sqlite-polled-sources)).
 
 ## 6. Add Fixtures
 
