@@ -499,7 +499,8 @@ glob = "${fixtures_root}/hermes/sessions/*.json"
 watch_root = "${fixtures_root}/hermes/sessions"
 
 [mcp]
-# Exercise the shared central server end to end: `moraine up` starts the
+# Exercise the shared central server end to end: 'moraine up' starts the
+# (n.b. no backticks in this heredoc: it is unquoted, so they would execute)
 # daemon and the mcp_smoke.py runs below proxy through it (falling back to an
 # embedded server if the socket is not yet up). Both are the defaults; pinned
 # here so the e2e's coverage of the proxy path is explicit, not incidental.
