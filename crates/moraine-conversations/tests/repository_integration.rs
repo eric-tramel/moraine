@@ -15,6 +15,7 @@ use moraine_conversations::{
     ConversationMode, ConversationRepository, ConversationSearchQuery, McpEventType,
     McpSessionListFilter, PageRequest, RepoConfig, RepoError, SearchEventKind, SearchEventsQuery,
     SearchMcpEventsQuery, SessionEventsDirection, SessionEventsQuery, SessionMetadataSearchQuery,
+    SessionOriginScope,
 };
 use serde_json::json;
 
@@ -138,6 +139,37 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
             .lock()
             .expect("query lock")
             .push(query.clone());
+
+        // --project-only origin-scope gate: the point lookup issued by
+        // `session_in_scope`. Sessions whose ID contains "out-of-scope" are
+        // outside the scope; everything else is inside it. Only the
+        // standalone gate query starts with this prefix — list/search
+        // queries embed the same subquery but match their own branches.
+        if query.starts_with("SELECT session_id FROM (")
+            && query.contains("argMin(cwd, tuple(event_ts, event_uid))")
+        {
+            let session_id = query
+                .split("session_id = '")
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                .unwrap_or("");
+            if session_id.is_empty() || session_id.contains("out-of-scope") {
+                return (StatusCode::OK, json_each_row(json!([])));
+            }
+            return (
+                StatusCode::OK,
+                json_each_row(json!([{ "session_id": session_id }])),
+            );
+        }
+
+        if query.contains("argMax(session_id, doc_version) AS session_id")
+            && query.contains("WHERE event_uid = 'evt-out-of-scope'")
+        {
+            return (
+                StatusCode::OK,
+                json_each_row(json!([{ "session_id": "sess-out-of-scope" }])),
+            );
+        }
 
         if query.contains("FROM `moraine`.`v_session_summary` AS s")
             && query.contains("AS completed")
@@ -1636,6 +1668,24 @@ async fn build_repo() -> (ClickHouseConversationRepository, Arc<MockState>) {
     build_repo_with_max_results(100).await
 }
 
+/// Repository with a `--project-only` session origin scope configured.
+async fn build_scoped_repo(roots: &[&str]) -> (ClickHouseConversationRepository, Arc<MockState>) {
+    let (base_url, state) = spawn_mock_server(MockOptions::default()).await;
+    let client =
+        ClickHouseClient::new(test_clickhouse_config(base_url)).expect("valid clickhouse client");
+
+    let repo = ClickHouseConversationRepository::new(
+        client,
+        RepoConfig {
+            max_results: 100,
+            session_scope: SessionOriginScope::from_roots(roots.iter().copied()),
+            ..RepoConfig::default()
+        },
+    );
+
+    (repo, state)
+}
+
 /// Regression helper for issue #253: ClickHouse 25.12's new analyzer treats
 /// `any(column) AS column` as a nested aggregate because the inner `column`
 /// binds to the alias expression. Returns true if the SQL contains that
@@ -1918,6 +1968,185 @@ async fn list_mcp_sessions_rejects_cursor_filter_mismatch() {
     assert_eq!(
         err.to_string(),
         "invalid cursor: cursor does not match current list_sessions filter"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_mcp_sessions_applies_session_origin_scope() {
+    let (repo, state) = build_scoped_repo(&["/work/project"]).await;
+
+    repo.list_mcp_sessions(
+        McpSessionListFilter {
+            start_unix_ms: 1767261600000_i64,
+            end_unix_ms: 1767500000000_i64,
+            mode: None,
+            sort: ConversationListSort::Desc,
+        },
+        PageRequest {
+            limit: 5,
+            cursor: None,
+        },
+    )
+    .await
+    .expect("scoped list_mcp_sessions");
+
+    let queries = state.queries.lock().expect("queries lock").clone();
+    let list_query = queries
+        .iter()
+        .find(|q| q.contains("AS completed") && q.contains("latest_terminal_payload_type"))
+        .expect("list_sessions query should be captured");
+
+    assert!(list_query.contains("s.session_id IN (SELECT session_id FROM ("));
+    assert!(list_query.contains("argMin(cwd, tuple(event_ts, event_uid)) AS origin_cwd"));
+    assert!(list_query.contains("WHERE cwd != ''"));
+    assert!(list_query.contains("origin_cwd = '/work/project'"));
+    assert!(list_query.contains("startsWith(origin_cwd, '/work/project/')"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_mcp_sessions_rejects_cursor_from_differently_scoped_server() {
+    let (unscoped_repo, _state) = build_repo().await;
+    let (scoped_repo, _scoped_state) = build_scoped_repo(&["/work/project"]).await;
+
+    let filter = McpSessionListFilter {
+        start_unix_ms: 1767261600000_i64,
+        end_unix_ms: 1767500000000_i64,
+        mode: Some(ConversationMode::WebSearch),
+        sort: ConversationListSort::Desc,
+    };
+
+    let first = unscoped_repo
+        .list_mcp_sessions(
+            filter.clone(),
+            PageRequest {
+                limit: 1,
+                cursor: None,
+            },
+        )
+        .await
+        .expect("first page from unscoped repo");
+    let cursor = first.next_cursor.expect("next cursor");
+
+    let err = scoped_repo
+        .list_mcp_sessions(
+            filter,
+            PageRequest {
+                limit: 1,
+                cursor: Some(cursor),
+            },
+        )
+        .await
+        .expect_err("cursor minted without the scope must be rejected");
+
+    assert_eq!(
+        err.to_string(),
+        "invalid cursor: cursor does not match current list_sessions filter"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_mcp_events_applies_session_origin_scope() {
+    let (repo, state) = build_scoped_repo(&["/work/project"]).await;
+
+    repo.search_mcp_events(SearchMcpEventsQuery {
+        query: "hello world".to_string(),
+        n_hits: Some(10),
+        event_types: Some(vec![
+            McpEventType::UserInput,
+            McpEventType::AssistantResponse,
+        ]),
+        min_score: Some(0.0),
+        min_should_match: Some(1),
+        ..SearchMcpEventsQuery::default()
+    })
+    .await
+    .expect("scoped search_mcp_events");
+
+    let queries = state.queries.lock().expect("queries lock").clone();
+    let search_query = queries
+        .iter()
+        .find(|q| q.contains("AS mcp_event_type") && q.contains("AS raw_score"))
+        .expect("search query should be captured");
+
+    assert!(search_query.contains("d.session_id IN (SELECT session_id FROM ("));
+    assert!(search_query.contains("origin_cwd = '/work/project'"));
+    assert!(search_query.contains("startsWith(origin_cwd, '/work/project/')"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scoped_point_lookups_hide_out_of_scope_sessions() {
+    let (repo, state) = build_scoped_repo(&["/work/project"]).await;
+
+    let metadata = repo
+        .get_session_metadata("sess-out-of-scope")
+        .await
+        .expect("metadata query succeeds");
+    assert!(metadata.is_none(), "out-of-scope metadata must be hidden");
+
+    let session = repo
+        .get_mcp_session("sess-out-of-scope")
+        .await
+        .expect("session query succeeds");
+    assert!(session.is_none(), "out-of-scope session must be hidden");
+
+    let turn = repo
+        .get_mcp_turn("sess-out-of-scope", 1)
+        .await
+        .expect("turn query succeeds");
+    assert!(turn.is_none(), "out-of-scope turn must be hidden");
+
+    let event = repo
+        .get_mcp_event("evt-out-of-scope")
+        .await
+        .expect("event query succeeds");
+    assert!(event.is_none(), "out-of-scope event must be hidden");
+
+    let queries = state.queries.lock().expect("queries lock").clone();
+    let gate_queries: Vec<&String> = queries
+        .iter()
+        .filter(|q| {
+            q.starts_with("SELECT session_id FROM (")
+                && q.contains("argMin(cwd, tuple(event_ts, event_uid))")
+        })
+        .collect();
+    assert!(
+        gate_queries.len() >= 4,
+        "each point lookup should run the scope gate, saw {}",
+        gate_queries.len()
+    );
+    assert!(gate_queries
+        .iter()
+        .any(|q| q.contains("session_id = 'sess-out-of-scope'")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scoped_point_lookups_serve_in_scope_sessions() {
+    let (repo, state) = build_scoped_repo(&["/work/project"]).await;
+
+    let session = repo
+        .get_mcp_session("sess-open")
+        .await
+        .expect("session query succeeds")
+        .expect("in-scope session is served");
+    assert_eq!(session.metadata.session_id, "sess-open");
+
+    // The positive result is cached: a second lookup must not re-run the gate.
+    let _ = repo
+        .get_session_metadata("sess-open")
+        .await
+        .expect("metadata query succeeds");
+
+    let queries = state.queries.lock().expect("queries lock").clone();
+    let gate_queries: Vec<&String> = queries
+        .iter()
+        .filter(|q| {
+            q.starts_with("SELECT session_id FROM (") && q.contains("session_id = 'sess-open'")
+        })
+        .collect();
+    assert_eq!(
+        gate_queries.len(),
+        1,
+        "in-scope verdicts should be cached after the first gate query"
     );
 }
 

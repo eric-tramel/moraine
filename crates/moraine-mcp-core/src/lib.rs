@@ -8,6 +8,7 @@ mod search_sessions_v1;
 use anyhow::{anyhow, Context, Result};
 use moraine_clickhouse::{enforce_remote_schema_policy, ClickHouseClient};
 use moraine_config::{AppConfig, DEFAULT_BACKEND_NAME};
+pub use moraine_conversations::SessionOriginScope;
 use moraine_conversations::{ClickHouseConversationRepository, RepoConfig};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -65,7 +66,7 @@ impl AppState {
                     });
                 }
 
-                let result = json!({
+                let mut result = json!({
                     "protocolVersion": self.cfg.mcp.protocol_version,
                     "capabilities": {
                         "tools": {
@@ -77,6 +78,14 @@ impl AppState {
                         "version": env!("CARGO_PKG_VERSION")
                     }
                 });
+                if let Some(scope) = self.repo.config().session_scope.as_ref() {
+                    result["instructions"] = json!(format!(
+                        "Retrieval is scoped to sessions that originated under: {}. \
+                         Sessions from other directories (or with no recorded working \
+                         directory) are not visible.",
+                        scope.roots.join(", ")
+                    ));
+                }
 
                 id.map(|msg_id| rpc_ok(msg_id, result))
             }
@@ -334,7 +343,15 @@ impl AppState {
     /// caches). A single instance is shared across every connection a central
     /// server handles, so the heavy state is allocated once per host rather
     /// than once per agent session.
-    pub fn build(cfg: AppConfig) -> Result<Arc<AppState>> {
+    ///
+    /// `session_scope` restricts every retrieval tool to sessions originating
+    /// under the given roots (`--project-only`). Scoped states are only ever
+    /// built for embedded per-session servers — the central server is shared
+    /// across projects and must stay unscoped.
+    pub fn build(
+        cfg: AppConfig,
+        session_scope: Option<SessionOriginScope>,
+    ) -> Result<Arc<AppState>> {
         let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
 
         let repo_cfg = RepoConfig {
@@ -350,6 +367,7 @@ impl AppState {
             bm25_default_min_score: cfg.bm25.default_min_score,
             bm25_default_min_should_match: cfg.bm25.default_min_should_match,
             bm25_max_query_terms: cfg.bm25.max_query_terms,
+            session_scope,
         };
 
         let repo = ClickHouseConversationRepository::new(ch, repo_cfg);
@@ -406,8 +424,11 @@ where
 /// behavior: one full server (ClickHouse client + caches) per process, owned
 /// by the agent session that spawned it. Used directly when the central server
 /// is disabled, and as the transparent fallback when it is unreachable.
-pub async fn run_stdio(cfg: AppConfig) -> Result<()> {
-    let state = AppState::build(cfg)?;
+///
+/// `session_scope` carries the `--project-only` restriction; it is `None` for
+/// ordinary unscoped serving.
+pub async fn run_stdio(cfg: AppConfig, session_scope: Option<SessionOriginScope>) -> Result<()> {
+    let state = AppState::build(cfg, session_scope)?;
     serve_connection(
         state,
         BufReader::new(tokio::io::stdin()),
@@ -427,7 +448,10 @@ pub async fn run_stdio(cfg: AppConfig) -> Result<()> {
 pub async fn run_socket(cfg: AppConfig, socket_path: PathBuf) -> Result<()> {
     use tokio::net::{UnixListener, UnixStream};
 
-    let state = AppState::build(cfg)?;
+    // The central server is shared by sessions from every project on the
+    // host, so it always runs unscoped; `--project-only` sessions run
+    // embedded instead (see `apps/moraine-mcp`).
+    let state = AppState::build(cfg, None)?;
 
     if let Some(parent) = socket_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         use std::os::unix::fs::DirBuilderExt;
@@ -667,7 +691,11 @@ fn resolve_stdio_backend_with_lookup(
 /// loudly at startup rather than degrade at query time. Only after the
 /// handshake passes is the backend's config swapped in as `cfg.clickhouse`,
 /// which is all `AppState::build` reads.
-async fn run_stdio_for_backend(mut cfg: AppConfig, backend: &str) -> Result<()> {
+async fn run_stdio_for_backend(
+    mut cfg: AppConfig,
+    backend: &str,
+    session_scope: Option<SessionOriginScope>,
+) -> Result<()> {
     let backend_cfg = cfg
         .backends
         .get(backend)
@@ -681,7 +709,7 @@ async fn run_stdio_for_backend(mut cfg: AppConfig, backend: &str) -> Result<()> 
     enforce_remote_schema_policy(backend, &skew, backend_cfg.allow_newer_server)?;
 
     cfg.clickhouse = backend_cfg;
-    run_stdio(cfg).await
+    run_stdio(cfg, session_scope).await
 }
 
 /// Entry point used by `moraine run mcp` (the command agents register).
@@ -697,7 +725,16 @@ async fn run_stdio_for_backend(mut cfg: AppConfig, backend: &str) -> Result<()> 
 /// fall back to an embedded stdio server so correctness never depends on the
 /// daemon being up. When central mode is disabled, run embedded directly
 /// (pre-central behavior).
-pub async fn run_mcp_entry(cfg: AppConfig) -> Result<()> {
+///
+/// `session_scope` carries the `--project-only` restriction. A scoped session
+/// never proxies — the central server is shared across projects and the proxy
+/// forwards bytes verbatim, so the scope could not be enforced through it — but
+/// it still honors per-project backend routing: the scope is applied to an
+/// embedded server against whichever backend the cwd routes to.
+pub async fn run_mcp_entry(
+    cfg: AppConfig,
+    session_scope: Option<SessionOriginScope>,
+) -> Result<()> {
     let cwd = std::env::current_dir()
         .map(|dir| dir.to_string_lossy().into_owned())
         .unwrap_or_default();
@@ -705,13 +742,15 @@ pub async fn run_mcp_entry(cfg: AppConfig) -> Result<()> {
         info!(
             backend = %backend,
             cwd,
+            scoped = session_scope.is_some(),
             "cwd routes to a non-default backend; serving embedded against it"
         );
-        return run_stdio_for_backend(cfg, &backend).await;
+        return run_stdio_for_backend(cfg, &backend, session_scope).await;
     }
 
+    // A scoped session always runs embedded; skip the proxy entirely.
     #[cfg(unix)]
-    if cfg.mcp.use_central_server {
+    if session_scope.is_none() && cfg.mcp.use_central_server {
         use tokio::net::UnixStream;
 
         let socket_path = PathBuf::from(&cfg.mcp.central_socket_path);
@@ -737,7 +776,44 @@ pub async fn run_mcp_entry(cfg: AppConfig) -> Result<()> {
         }
     }
 
-    run_stdio(cfg).await
+    run_stdio(cfg, session_scope).await
+}
+
+/// Resolve the `--project-only` scope from the directory this process was
+/// launched in.
+///
+/// Harnesses record the working directory their own process reported, which
+/// can be a logical path (the shell's `$PWD`, possibly through symlinks) or a
+/// fully resolved one. To match either spelling, the scope contains the
+/// launch directory as the OS reports it, its canonicalized form, and `$PWD`
+/// when it names the same directory.
+pub fn project_scope_from_launch_dir() -> Result<SessionOriginScope> {
+    let cwd = std::env::current_dir()
+        .context("--project-only requires a readable current working directory")?;
+    let canonical_cwd = cwd.canonicalize().ok();
+
+    let mut roots: Vec<String> = vec![cwd.to_string_lossy().into_owned()];
+    if let Some(canonical) = &canonical_cwd {
+        roots.push(canonical.to_string_lossy().into_owned());
+    }
+    if let Ok(pwd) = std::env::var("PWD") {
+        let same_dir = match (
+            std::path::Path::new(&pwd).canonicalize().ok(),
+            &canonical_cwd,
+        ) {
+            (Some(pwd_canonical), Some(canonical)) => &pwd_canonical == canonical,
+            _ => false,
+        };
+        if same_dir {
+            roots.push(pwd);
+        }
+    }
+
+    SessionOriginScope::from_roots(roots).ok_or_else(|| {
+        anyhow!(
+            "--project-only could not resolve an absolute project root from the launch directory"
+        )
+    })
 }
 
 /// Non-Unix platforms do not support the Unix-socket central server. The
@@ -761,6 +837,37 @@ mod tests {
             repo,
             prewarm_started: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[tokio::test]
+    async fn initialize_advertises_project_scope_in_instructions() {
+        let scope = SessionOriginScope::from_roots(["/work/project"]).expect("valid scope");
+        let state = AppState::build(AppConfig::default(), Some(scope)).expect("build state");
+        let response = state
+            .handle_request(RpcRequest {
+                id: Some(json!(1)),
+                method: "initialize".to_string(),
+                params: json!({}),
+            })
+            .await
+            .expect("initialize response");
+
+        let instructions = response["result"]["instructions"]
+            .as_str()
+            .expect("scoped server advertises instructions");
+        assert!(instructions.contains("/work/project"));
+
+        // Unscoped servers must not grow an instructions field.
+        let unscoped = AppState::build(AppConfig::default(), None).expect("build state");
+        let response = unscoped
+            .handle_request(RpcRequest {
+                id: Some(json!(1)),
+                method: "initialize".to_string(),
+                params: json!({}),
+            })
+            .await
+            .expect("initialize response");
+        assert!(response["result"].get("instructions").is_none());
     }
 
     #[tokio::test]
@@ -906,7 +1013,7 @@ mod tests {
     fn app_state_build_succeeds_without_live_clickhouse() {
         // Building state only constructs the HTTP client and caches; it must
         // not require ClickHouse to be reachable.
-        let state = AppState::build(AppConfig::default()).expect("build state");
+        let state = AppState::build(AppConfig::default(), None).expect("build state");
         assert!(!state.prewarm_started.load(Ordering::Acquire));
     }
 
@@ -1028,7 +1135,7 @@ mod tests {
         // startup with an error naming the backend, never fall back to the
         // default backend or start serving stdio.
         let cfg = routed_config();
-        let err = run_stdio_for_backend(cfg, "team-ch")
+        let err = run_stdio_for_backend(cfg, "team-ch", None)
             .await
             .expect_err("unreachable backend must fail the handshake");
         let chain = format!("{err:#}");
@@ -1044,7 +1151,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_stdio_for_backend_rejects_unconfigured_backend() {
-        let err = run_stdio_for_backend(AppConfig::default(), "ghost")
+        let err = run_stdio_for_backend(AppConfig::default(), "ghost", None)
             .await
             .expect_err("unknown backend must error");
         assert!(err.to_string().contains("'ghost' is not configured"));
@@ -1052,7 +1159,7 @@ mod tests {
 
     #[tokio::test]
     async fn serve_connection_frames_one_response_per_request() {
-        let state = AppState::build(AppConfig::default()).expect("build state");
+        let state = AppState::build(AppConfig::default(), None).expect("build state");
 
         // Two requests separated by a blank line (which must be skipped).
         let input = concat!(

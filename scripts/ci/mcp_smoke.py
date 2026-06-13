@@ -309,20 +309,76 @@ def assert_open_search_ids(
     return next_id
 
 
+def assert_sessions_absent(
+    results: list[Any],
+    absent_session_ids: list[str],
+    tool_name: str,
+) -> None:
+    for raw_session_id in absent_session_ids:
+        expected_session = expected_mcp_session_id(raw_session_id)
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            found = {
+                nested_string(result, "session", "id"),
+                nested_string(result, "open", "session_id"),
+            }
+            if expected_session in found:
+                raise AssertionError(
+                    f"{tool_name} leaked out-of-scope session {raw_session_id}: {result}"
+                )
+
+
+def assert_open_not_found(
+    proc: subprocess.Popen[str],
+    next_id: int,
+    raw_session_id: str,
+) -> int:
+    open_id = expected_mcp_session_id(raw_session_id)
+    assert open_id is not None
+    open_result = call_tool(proc, next_id, "open", {"id": open_id})
+    next_id += 1
+    payload = open_result.get("structuredContent")
+    if not isinstance(payload, dict):
+        raise AssertionError(f"open structuredContent missing: {open_result}")
+    error_code = nested_string(payload, "error", "code")
+    if error_code != "not_found":
+        raise AssertionError(
+            f"open of out-of-scope session {raw_session_id} must return not_found, "
+            f"got: {payload.get('error') or payload.get('data')}"
+        )
+    return next_id
+
+
 def run_smoke(
     moraine: str,
     config: str,
     query: str,
     expect_session_id: Optional[str],
     expect_open_text: Optional[str],
+    project_dir: Optional[str] = None,
+    absent_session_ids: Optional[list[str]] = None,
+    expect_no_results: bool = False,
 ) -> None:
+    absent_session_ids = absent_session_ids or []
+    argv = [moraine, "run", "mcp", "--config", config]
+    popen_kwargs: Dict[str, Any] = {}
+    if project_dir is not None:
+        argv.append("--project-only")
+        # Mimic a shell launching from the project directory: cwd is the
+        # physical path and PWD carries the logical spelling, which may
+        # differ through symlinks (e.g. /var vs /private/var on macOS).
+        popen_kwargs["cwd"] = project_dir
+        popen_kwargs["env"] = {**os.environ, "PWD": project_dir}
+
     proc = subprocess.Popen(
-        [moraine, "run", "mcp", "--config", config],
+        argv,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
+        **popen_kwargs,
     )
 
     try:
@@ -338,6 +394,12 @@ def run_smoke(
         init_result = assert_rpc_ok(init_resp, 1)
         if "protocolVersion" not in init_result:
             raise AssertionError("initialize response missing protocolVersion")
+        if project_dir is not None:
+            instructions = init_result.get("instructions")
+            if not isinstance(instructions, str) or "scoped" not in instructions:
+                raise AssertionError(
+                    f"project-only initialize must advertise the scope, got: {instructions!r}"
+                )
 
         tools_resp = send_request(
             proc,
@@ -378,21 +440,31 @@ def run_smoke(
         search_payload = assert_structured_content(search_result, "search_sessions")
 
         results = search_payload["data"].get("results")
-        if not isinstance(results, list) or not results:
-            raise AssertionError(f"search_sessions returned no results for query={query}")
+        if not isinstance(results, list):
+            raise AssertionError(f"search_sessions returned no results array for query={query}")
 
-        selected_result = select_search_sessions_result(
-            results,
-            expect_session_id,
-            expect_open_text,
-        )
-        next_id = assert_open_search_ids(
-            proc,
-            next_id,
-            open_ids_from_search_result(selected_result),
-            expect_session_id,
-            expect_open_text,
-        )
+        assert_sessions_absent(results, absent_session_ids, "search_sessions")
+
+        if expect_no_results:
+            if results:
+                raise AssertionError(
+                    f"search_sessions must return no results for query={query}, got: {results[:3]}"
+                )
+        else:
+            if not results:
+                raise AssertionError(f"search_sessions returned no results for query={query}")
+            selected_result = select_search_sessions_result(
+                results,
+                expect_session_id,
+                expect_open_text,
+            )
+            next_id = assert_open_search_ids(
+                proc,
+                next_id,
+                open_ids_from_search_result(selected_result),
+                expect_session_id,
+                expect_open_text,
+            )
 
         list_result = call_tool(
             proc,
@@ -407,17 +479,33 @@ def run_smoke(
         next_id += 1
         list_payload = assert_structured_content(list_result, "list_sessions")
         sessions = list_payload["data"].get("sessions")
-        if not isinstance(sessions, list) or not sessions:
+        if not isinstance(sessions, list):
+            raise AssertionError("list_sessions returned no sessions array")
+
+        assert_sessions_absent(sessions, absent_session_ids, "list_sessions")
+
+        # Verifying the in-scope session is reachable runs even in the
+        # expect_no_results case (where the search query is for an out-of-scope
+        # keyword): it proves the scoped server is genuinely live and serving,
+        # so an empty search result reflects scoping rather than a dead backend.
+        if expect_session_id is not None:
+            if not sessions:
+                raise AssertionError(
+                    "list_sessions returned no sessions for the in-scope fixture window"
+                )
+            selected_session = select_list_sessions_result(sessions, expect_session_id)
+            next_id = assert_open_search_ids(
+                proc,
+                next_id,
+                [open_id_from_list_sessions_result(selected_session)],
+                expect_session_id,
+                expect_open_text,
+            )
+        elif not sessions and not expect_no_results:
             raise AssertionError("list_sessions returned no sessions for e2e fixture window")
 
-        selected_session = select_list_sessions_result(sessions, expect_session_id)
-        next_id = assert_open_search_ids(
-            proc,
-            next_id,
-            [open_id_from_list_sessions_result(selected_session)],
-            expect_session_id,
-            expect_open_text,
-        )
+        for raw_session_id in absent_session_ids:
+            next_id = assert_open_not_found(proc, next_id, raw_session_id)
 
     finally:
         if proc.stdin:
@@ -437,6 +525,28 @@ def main() -> int:
     parser.add_argument("--query", required=True)
     parser.add_argument("--expect-session-id")
     parser.add_argument("--expect-open-text")
+    parser.add_argument(
+        "--project-dir",
+        help=(
+            "run `moraine run mcp --project-only` from this directory and "
+            "assert the initialize response advertises the scope"
+        ),
+    )
+    parser.add_argument(
+        "--expect-absent-session-id",
+        action="append",
+        default=[],
+        help=(
+            "raw session id that must NOT appear in search_sessions or "
+            "list_sessions results, and whose open must return not_found "
+            "(repeatable)"
+        ),
+    )
+    parser.add_argument(
+        "--expect-no-results",
+        action="store_true",
+        help="assert search_sessions returns zero results for the query",
+    )
     args = parser.parse_args()
 
     run_smoke(
@@ -445,6 +555,9 @@ def main() -> int:
         args.query,
         args.expect_session_id,
         args.expect_open_text,
+        project_dir=args.project_dir,
+        absent_session_ids=args.expect_absent_session_id,
+        expect_no_results=args.expect_no_results,
     )
     print("mcp smoke passed")
     return 0

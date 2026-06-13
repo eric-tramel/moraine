@@ -60,6 +60,59 @@ pub struct McpSessionListFilter {
     pub sort: ConversationListSort,
 }
 
+/// Restricts MCP retrieval to sessions whose origin working directory falls
+/// under one of `roots`.
+///
+/// A session's origin is the first non-empty `cwd` / `workspacePath` value
+/// found in its events' `payload_json` (in event order). A session matches
+/// when its origin equals a root exactly or lives underneath it
+/// (`startsWith(origin, root + "/")`). Sessions that never recorded a
+/// working directory have no origin and never match.
+///
+/// When set on [`RepoConfig`], every MCP retrieval path enforces the scope:
+/// `search_mcp_events`, `list_mcp_sessions`, `get_session_metadata`, and
+/// `get_mcp_session` / `get_mcp_turn` / `get_mcp_event` (out-of-scope IDs
+/// behave as not found). Non-MCP repository methods are not scoped.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionOriginScope {
+    /// Absolute directory roots, without trailing slashes.
+    pub roots: Vec<String>,
+}
+
+impl SessionOriginScope {
+    /// Build a scope from raw root paths, trimming trailing slashes and
+    /// dropping empty/relative entries. Returns `None` when nothing usable
+    /// remains, so callers cannot accidentally construct an empty scope that
+    /// matches nothing.
+    pub fn from_roots<I, S>(roots: I) -> Option<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut normalized: Vec<String> = Vec::new();
+        for root in roots {
+            let root = root.as_ref().trim();
+            if !root.starts_with('/') {
+                continue;
+            }
+            let trimmed = root.trim_end_matches('/');
+            // "/" trims to empty; scoping the whole filesystem is meaningless
+            // (it would only exclude origin-less sessions), so skip it.
+            if trimmed.is_empty() {
+                continue;
+            }
+            if !normalized.iter().any(|existing| existing == trimmed) {
+                normalized.push(trimmed.to_string());
+            }
+        }
+        if normalized.is_empty() {
+            None
+        } else {
+            Some(Self { roots: normalized })
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TurnListFilter {
     #[serde(default)]
@@ -782,6 +835,10 @@ pub struct RepoConfig {
     pub bm25_default_min_score: f64,
     pub bm25_default_min_should_match: u16,
     pub bm25_max_query_terms: usize,
+    /// When set, MCP retrieval only sees sessions originating under these
+    /// roots. See [`SessionOriginScope`].
+    #[serde(default)]
+    pub session_scope: Option<SessionOriginScope>,
 }
 
 impl Default for RepoConfig {
@@ -799,10 +856,29 @@ impl Default for RepoConfig {
             bm25_default_min_score: 0.0,
             bm25_default_min_should_match: 1,
             bm25_max_query_terms: 16,
+            session_scope: None,
         }
     }
 }
 
 fn default_page_limit() -> u16 {
     50
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionOriginScope;
+
+    #[test]
+    fn from_roots_normalizes_and_dedupes() {
+        let scope =
+            SessionOriginScope::from_roots(["/work/project/", "/work/project", "  /work/other  "])
+                .expect("scope from valid roots");
+        assert_eq!(scope.roots, vec!["/work/project", "/work/other"]);
+    }
+
+    #[test]
+    fn from_roots_rejects_relative_root_and_bare_slash() {
+        assert!(SessionOriginScope::from_roots(["relative/path", "", "/"]).is_none());
+    }
 }
