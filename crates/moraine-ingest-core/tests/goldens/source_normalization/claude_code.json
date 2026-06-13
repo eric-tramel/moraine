@@ -3,6 +3,7 @@
   "name": "claude_code",
   "records": [
     {
+      "cwd_hint": "/work/claude-demo",
       "error_rows": [],
       "event_rows": [
         {
@@ -14,6 +15,7 @@
           "content_types": [],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "/work/claude-demo",
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-01-19 15:58:40.000",
@@ -86,6 +88,7 @@
       "model_hint": "",
       "raw_rows": [
         {
+          "cwd": "/work/claude-demo",
           "event_uid": "c14ed8798d0f1532c001794fcee69b1e5dd8d9917bb6d329912d97ca503295a6",
           "harness": "claude-code",
           "inference_provider": "anthropic",
@@ -106,6 +109,7 @@
       "tool_rows": []
     },
     {
+      "cwd_hint": "/work/claude-demo",
       "error_rows": [],
       "event_rows": [
         {
@@ -119,6 +123,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "root",
+          "cwd": "/work/claude-demo",
           "endpoint_kind": "generation",
           "event_kind": "reasoning",
           "event_ts": "2026-01-19 15:58:41.421",
@@ -197,6 +202,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "root",
+          "cwd": "/work/claude-demo",
           "endpoint_kind": "generation",
           "event_kind": "tool_call",
           "event_ts": "2026-01-19 15:58:41.421",
@@ -275,6 +281,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "root",
+          "cwd": "/work/claude-demo",
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-01-19 15:58:41.421",
@@ -384,6 +391,7 @@
       "model_hint": "claude-opus-4-5-20251101",
       "raw_rows": [
         {
+          "cwd": "/work/claude-demo",
           "event_uid": "feff427900ab83669b698e1561c057bacc7bec19597c78a737fe7902424eed47",
           "harness": "claude-code",
           "inference_provider": "anthropic",
@@ -427,6 +435,7 @@
       ]
     },
     {
+      "cwd_hint": "/work/claude-demo",
       "error_rows": [],
       "event_rows": [
         {
@@ -440,6 +449,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "/work/claude-demo",
           "endpoint_kind": "generation",
           "event_kind": "tool_result",
           "event_ts": "2026-01-19 15:58:42.000",
@@ -549,6 +559,7 @@
       "model_hint": "claude-opus-4-5-20251101",
       "raw_rows": [
         {
+          "cwd": "/work/claude-demo",
           "event_uid": "cd50584c647108ec06939625fd0c79bed00203e7e101b395130a74b3a4fff127",
           "harness": "claude-code",
           "inference_provider": "anthropic",
@@ -592,6 +603,7 @@
       ]
     },
     {
+      "cwd_hint": "/work/claude-demo",
       "error_rows": [],
       "event_rows": [
         {
@@ -603,10 +615,11 @@
           "content_types": [],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "/work/claude-demo",
           "endpoint_kind": "generation",
           "event_kind": "progress",
           "event_ts": "2026-01-19 15:58:43.000",
-          "event_uid": "8eac2750d4dc95140aa61a44fce93592fb6b1f926c492b2990eca27f2a598612",
+          "event_uid": "fcd0abbf73c3ed9071b8863c3ecf5e79bc4c3700c13563c926077e999d6088a4",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "has_reasoning": 0,
@@ -622,7 +635,7 @@
           "origin_tool_call_id": "",
           "output_tokens": 0,
           "parent_tool_call_id": "",
-          "payload_json": "{\"data\":{\"query\":\"moraine\",\"type\":\"search_results_received\"},\"durationMs\":12,\"parentUuid\":\"user-2\",\"retryAttempt\":1,\"sessionId\":\"7c666c01-d38e-4658-8650-854ffb5b626e\",\"status\":\"ok\",\"timestamp\":\"2026-01-19T15:58:43.000Z\",\"type\":\"progress\",\"uuid\":\"progress-1\"}",
+          "payload_json": "{\"cwd\":\"/work/claude-demo\",\"data\":{\"query\":\"moraine\",\"type\":\"search_results_received\"},\"durationMs\":12,\"parentUuid\":\"user-2\",\"retryAttempt\":1,\"sessionId\":\"7c666c01-d38e-4658-8650-854ffb5b626e\",\"status\":\"ok\",\"timestamp\":\"2026-01-19T15:58:43.000Z\",\"type\":\"progress\",\"uuid\":\"progress-1\"}",
           "payload_type": "search_results_received",
           "record_ts": "2026-01-19T15:58:43.000Z",
           "request_id": "",
@@ -673,7 +686,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "8eac2750d4dc95140aa61a44fce93592fb6b1f926c492b2990eca27f2a598612",
+          "event_uid": "fcd0abbf73c3ed9071b8863c3ecf5e79bc4c3700c13563c926077e999d6088a4",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "inference_provider": "anthropic",
@@ -688,11 +701,12 @@
       "model_hint": "claude-opus-4-5-20251101",
       "raw_rows": [
         {
-          "event_uid": "8eac2750d4dc95140aa61a44fce93592fb6b1f926c492b2990eca27f2a598612",
+          "cwd": "/work/claude-demo",
+          "event_uid": "fcd0abbf73c3ed9071b8863c3ecf5e79bc4c3700c13563c926077e999d6088a4",
           "harness": "claude-code",
           "inference_provider": "anthropic",
-          "raw_json": "{\"data\":{\"query\":\"moraine\",\"type\":\"search_results_received\"},\"durationMs\":12,\"parentUuid\":\"user-2\",\"retryAttempt\":1,\"sessionId\":\"7c666c01-d38e-4658-8650-854ffb5b626e\",\"status\":\"ok\",\"timestamp\":\"2026-01-19T15:58:43.000Z\",\"type\":\"progress\",\"uuid\":\"progress-1\"}",
-          "raw_json_hash": 1267267673704204067,
+          "raw_json": "{\"cwd\":\"/work/claude-demo\",\"data\":{\"query\":\"moraine\",\"type\":\"search_results_received\"},\"durationMs\":12,\"parentUuid\":\"user-2\",\"retryAttempt\":1,\"sessionId\":\"7c666c01-d38e-4658-8650-854ffb5b626e\",\"status\":\"ok\",\"timestamp\":\"2026-01-19T15:58:43.000Z\",\"type\":\"progress\",\"uuid\":\"progress-1\"}",
+          "raw_json_hash": 8865427752574408776,
           "record_ts": "2026-01-19T15:58:43.000Z",
           "session_id": "7c666c01-d38e-4658-8650-854ffb5b626e",
           "source_file": "/fixtures/claude-code/session.jsonl",

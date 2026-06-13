@@ -107,6 +107,7 @@ fn normalize_all(session_doc: &Value) -> Vec<moraine_ingest_core::model::Normali
             0,
             "",
             "",
+            "",
         )
         .expect("session_meta normalizes"),
     );
@@ -122,6 +123,7 @@ fn normalize_all(session_doc: &Value) -> Vec<moraine_ingest_core::model::Normali
                 1,
                 (idx + 1) as u64,
                 0,
+                "",
                 "",
                 "",
             )

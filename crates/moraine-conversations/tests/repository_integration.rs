@@ -39,6 +39,7 @@ fn test_clickhouse_config(url: String) -> ClickHouseConfig {
         timeout_seconds: 5.0,
         async_insert: true,
         wait_for_async_insert: true,
+        allow_newer_server: false,
     }
 }
 
@@ -144,7 +145,9 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
         // outside the scope; everything else is inside it. Only the
         // standalone gate query starts with this prefix — list/search
         // queries embed the same subquery but match their own branches.
-        if query.starts_with("SELECT session_id FROM (") && query.contains("argMinIf(origin_val") {
+        if query.starts_with("SELECT session_id FROM (")
+            && query.contains("argMin(cwd, tuple(event_ts, event_uid))")
+        {
             let session_id = query
                 .split("session_id = '")
                 .nth(1)
@@ -1994,14 +1997,10 @@ async fn list_mcp_sessions_applies_session_origin_scope() {
         .expect("list_sessions query should be captured");
 
     assert!(list_query.contains("s.session_id IN (SELECT session_id FROM ("));
-    assert!(list_query.contains(
-        "argMinIf(origin_val, tuple(event_ts, event_uid), origin_val != '') AS origin_cwd"
-    ));
+    assert!(list_query.contains("argMin(cwd, tuple(event_ts, event_uid)) AS origin_cwd"));
+    assert!(list_query.contains("WHERE cwd != ''"));
     assert!(list_query.contains("origin_cwd = '/work/project'"));
     assert!(list_query.contains("startsWith(origin_cwd, '/work/project/')"));
-    assert!(list_query.contains("JSONExtractString(payload_json, 'cwd')"));
-    assert!(list_query.contains("JSONExtractString(payload_json, 'workspacePath')"));
-    assert!(list_query.contains("event_kind IN ('session_meta', 'message')"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2105,7 +2104,10 @@ async fn scoped_point_lookups_hide_out_of_scope_sessions() {
     let queries = state.queries.lock().expect("queries lock").clone();
     let gate_queries: Vec<&String> = queries
         .iter()
-        .filter(|q| q.starts_with("SELECT session_id FROM (") && q.contains("argMinIf(origin_val"))
+        .filter(|q| {
+            q.starts_with("SELECT session_id FROM (")
+                && q.contains("argMin(cwd, tuple(event_ts, event_uid))")
+        })
         .collect();
     assert!(
         gate_queries.len() >= 4,

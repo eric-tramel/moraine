@@ -35,6 +35,7 @@ fn normalize_lines(name: &str) -> Vec<moraine_ingest_core::model::NormalizedReco
                     idx as u64,
                     "",
                     "",
+                    "",
                 )
                 .expect("kimi fixture normalizes"),
             )

@@ -7,19 +7,21 @@ mod reconcile;
 mod sink;
 mod sources;
 pub mod sqlite_poll;
+mod tee;
 mod watch;
 
 use crate::checkpoint::checkpoint_key;
 use crate::dispatch::{enqueue_work, run_work_item, spawn_debounce_task};
 use crate::model::RowBatch;
 use crate::reconcile::spawn_reconcile_task;
-use crate::sink::spawn_sink_task;
+use crate::sink::{spawn_sink_task, SinkRole};
+use crate::tee::{spawn_tee_router, RouteResolver, SharedRouteResolver, StatusRegistry};
 use crate::watch::{enumerate_tracked_files, spawn_watcher_threads};
 use anyhow::{Context, Result};
 use moraine_clickhouse::ClickHouseClient;
-use moraine_config::{AppConfig, IngestSource};
+use moraine_config::{AppConfig, IngestSource, DEFAULT_BACKEND_NAME};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, RwLock, Semaphore};
@@ -106,7 +108,7 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         );
     }
 
-    let checkpoint_map = load_checkpoints(&clickhouse, checkpoint_cursor_columns)
+    let checkpoint_map = load_checkpoints(&clickhouse, checkpoint_cursor_columns, None)
         .await
         .context("failed to load checkpoints from clickhouse")?;
 
@@ -115,6 +117,26 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         checkpoint_map.len(),
         enabled_sources.len()
     );
+
+    let has_named_backends = config
+        .backends
+        .keys()
+        .any(|name| name != DEFAULT_BACKEND_NAME);
+    let heartbeat_backend_column = if has_named_backends {
+        let available = heartbeat_backend_sinks_column_available(&clickhouse)
+            .await
+            .context("failed to inspect ingest_heartbeats columns")?;
+        if !available {
+            warn!(
+                "ingest_heartbeats is missing the backend_sinks column (migration 017); \
+                 per-backend mirror sink status will not appear in heartbeats until \
+                 `moraine db migrate` runs and this ingest service restarts"
+            );
+        }
+        available
+    } else {
+        false
+    };
 
     let checkpoints = Arc::new(RwLock::new(checkpoint_map));
     let dispatch = Arc::new(Mutex::new(DispatchState::default()));
@@ -130,14 +152,38 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         mpsc::channel::<SinkMessage>(config.ingest.max_inflight_batches.max(1));
     let (watch_path_tx, watch_path_rx) = mpsc::unbounded_channel::<WorkItem>();
 
+    // The tee router sits between the processors and the default sink: the
+    // default sink still receives everything (same backpressure as before,
+    // one channel hop later), while sessions routed to named backends are
+    // additionally mirrored to per-backend sinks that can never stall it.
+    let (default_sink_tx, default_sink_rx) =
+        mpsc::channel::<SinkMessage>(config.ingest.max_inflight_batches.max(1));
+    let shared_config = Arc::new(config.clone());
+    let resolver: SharedRouteResolver =
+        Arc::new(Mutex::new(RouteResolver::new(shared_config.clone())));
+    let backend_statuses: StatusRegistry = Arc::new(Mutex::new(BTreeMap::new()));
+
     let sink_handle = spawn_sink_task(
         config.clone(),
         clickhouse.clone(),
         checkpoints.clone(),
         metrics.clone(),
-        sink_rx,
-        dispatch.clone(),
+        default_sink_rx,
         checkpoint_cursor_columns,
+        SinkRole::Default {
+            dispatch: dispatch.clone(),
+            backends: backend_statuses.clone(),
+            backend_sinks_column: heartbeat_backend_column,
+        },
+    );
+
+    let router_handle = spawn_tee_router(
+        shared_config,
+        enabled_sources.clone(),
+        sink_rx,
+        default_sink_tx,
+        resolver,
+        backend_statuses,
     );
 
     let sem = Arc::new(Semaphore::new(config.ingest.max_file_workers.max(1)));
@@ -250,6 +296,7 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
     debounce_handle.abort();
     reconcile_handle.abort();
     processor_handle.abort();
+    router_handle.abort();
     sink_handle.abort();
 
     for handle in watcher_threads {
@@ -298,10 +345,35 @@ async fn checkpoint_cursor_columns_available(clickhouse: &ClickHouseClient) -> R
         .unwrap_or(false))
 }
 
-async fn load_checkpoints(
-    clickhouse: &ClickHouseClient,
-    cursor_columns: bool,
-) -> Result<HashMap<String, model::Checkpoint>> {
+/// Returns whether `ingest_heartbeats` carries the `backend_sinks` column
+/// added by migration 017. Inserting it unconditionally would break every
+/// heartbeat on a database that has not run `moraine db migrate` yet.
+async fn heartbeat_backend_sinks_column_available(clickhouse: &ClickHouseClient) -> Result<bool> {
+    #[derive(Deserialize)]
+    struct CountRow {
+        column_count: u64,
+    }
+
+    let query = format!(
+        "SELECT toUInt64(count()) AS column_count \
+         FROM system.columns \
+         WHERE database = '{}' AND table = 'ingest_heartbeats' AND name = 'backend_sinks'",
+        clickhouse.config().database.replace('\'', "\\'")
+    );
+    let rows: Vec<CountRow> = clickhouse.query_rows(&query, None).await?;
+    Ok(rows
+        .first()
+        .map(|row| row.column_count > 0)
+        .unwrap_or(false))
+}
+
+/// Builds the checkpoint-load query. `host` scopes the load to one host's
+/// rows: backend mirror sinks share an `ingest_checkpoints` table per team
+/// backend (host column added by migration 018), and loading another host's
+/// rows would adopt offsets/generations for files this host never wrote.
+/// The default backend passes `None` — it is single-writer, its rows carry
+/// no host, and the column may not exist before `moraine db migrate` runs.
+fn checkpoints_query(database: &str, cursor_columns: bool, host: Option<&str>) -> String {
     let cursor_column_selects = if cursor_columns {
         ", argMax(cursor_json, updated_at) AS cursor_json \
          , toUInt64(argMax(source_fingerprint, updated_at)) AS source_fingerprint \
@@ -312,7 +384,15 @@ async fn load_checkpoints(
          , toUInt64(0) AS schema_fingerprint"
     };
 
-    let query = format!(
+    let host_filter = match host {
+        Some(host) => format!(
+            " WHERE host = '{}'",
+            host.replace('\\', "\\\\").replace('\'', "\\'")
+        ),
+        None => String::new(),
+    };
+
+    format!(
         "SELECT \
             source_name, \
             source_file, \
@@ -322,12 +402,18 @@ async fn load_checkpoints(
             toUInt64(argMax(last_line_no, updated_at)) AS last_line_no, \
             argMax(status, updated_at) AS status \
             {} \
-         FROM {}.ingest_checkpoints \
+         FROM {}.ingest_checkpoints{} \
          GROUP BY source_name, source_file",
-        cursor_column_selects,
-        clickhouse.config().database
-    );
+        cursor_column_selects, database, host_filter
+    )
+}
 
+async fn load_checkpoints(
+    clickhouse: &ClickHouseClient,
+    cursor_columns: bool,
+    host: Option<&str>,
+) -> Result<HashMap<String, model::Checkpoint>> {
+    let query = checkpoints_query(&clickhouse.config().database, cursor_columns, host);
     let rows: Vec<CheckpointRow> = clickhouse.query_rows(&query, None).await?;
     let mut map = HashMap::<String, model::Checkpoint>::new();
 
@@ -351,4 +437,34 @@ async fn load_checkpoints(
     }
 
     Ok(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::checkpoints_query;
+
+    #[test]
+    fn checkpoints_query_without_host_keeps_legacy_shape() {
+        let query = checkpoints_query("moraine", true, None);
+        assert!(
+            !query.contains("host"),
+            "the default backend must not reference the migration-018 column: {query}"
+        );
+        assert!(query.contains("FROM moraine.ingest_checkpoints "));
+    }
+
+    #[test]
+    fn checkpoints_query_scopes_backend_loads_to_one_host() {
+        let query = checkpoints_query("moraine_team", true, Some("dev-box"));
+        assert!(
+            query.contains("WHERE host = 'dev-box'"),
+            "backend loads must never adopt another team member's checkpoints: {query}"
+        );
+    }
+
+    #[test]
+    fn checkpoints_query_escapes_hostile_host_names() {
+        let query = checkpoints_query("moraine_team", false, Some("a'b\\c"));
+        assert!(query.contains("WHERE host = 'a\\'b\\\\c'"));
+    }
 }

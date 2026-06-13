@@ -55,6 +55,7 @@ fn normalize_fixture_lines() -> Vec<moraine_ingest_core::model::NormalizedRecord
             offset_this,
             /* session_hint */ "",
             /* model_hint */ "",
+            /* cwd_hint */ "",
         )
         .expect("hermes fixture line should normalize");
         out.push(normalized);
@@ -264,6 +265,7 @@ fn hermes_vendor_split_keeps_cloud_prefixed_models_as_followup() {
         0,
         "",
         "",
+        "",
     )
     .expect("normalize");
 
@@ -304,6 +306,7 @@ fn hermes_vendor_split_handles_model_without_slash() {
         1,
         1,
         0,
+        "",
         "",
         "",
     )

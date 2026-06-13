@@ -34,6 +34,7 @@ const EVENT_REQUIRED_STRING_FIELDS: &[&str] = &[
     "event_uid",
     "session_id",
     "session_date",
+    "cwd",
     "source_name",
     "harness",
     "inference_provider",
@@ -205,6 +206,7 @@ fn normalize_jsonl(case: &GoldenCase) -> Vec<NormalizedRecord> {
     let mut offset = 0_u64;
     let mut session_hint = String::new();
     let mut model_hint = String::new();
+    let mut cwd_hint = String::new();
     let mut records = Vec::new();
 
     for (idx, raw_line) in body.split_inclusive('\n').enumerate() {
@@ -229,10 +231,12 @@ fn normalize_jsonl(case: &GoldenCase) -> Vec<NormalizedRecord> {
             start_offset,
             &session_hint,
             &model_hint,
+            &cwd_hint,
         )
         .unwrap_or_else(|err| panic!("normalize {} line {line_no}: {err:#}", case.name));
         session_hint = normalized.session_hint.clone();
         model_hint = normalized.model_hint.clone();
+        cwd_hint = normalized.cwd_hint.clone();
         records.push(normalized);
     }
 
@@ -261,6 +265,7 @@ fn normalize_hermes_session_json(case: &GoldenCase) -> Vec<NormalizedRecord> {
 
     let mut session_hint = String::new();
     let mut model_hint = String::new();
+    let mut cwd_hint = String::new();
     let mut records = Vec::new();
     for (line_no, record) in synthetic_records {
         let normalized = normalize_record(
@@ -274,10 +279,12 @@ fn normalize_hermes_session_json(case: &GoldenCase) -> Vec<NormalizedRecord> {
             0,
             &session_hint,
             &model_hint,
+            &cwd_hint,
         )
         .unwrap_or_else(|err| panic!("normalize {} pseudo-line {line_no}: {err:#}", case.name));
         session_hint = normalized.session_hint.clone();
         model_hint = normalized.model_hint.clone();
+        cwd_hint = normalized.cwd_hint.clone();
         records.push(normalized);
     }
 
@@ -400,6 +407,7 @@ fn normalize_cursor_sqlite(case: &GoldenCase) -> Vec<NormalizedRecord> {
             synthetic.source_offset,
             "",
             "",
+            "",
         )
         .unwrap_or_else(|err| panic!("normalize {} kv row {}: {err:#}", case.name, idx + 1));
         records.push(normalized);
@@ -417,6 +425,7 @@ fn snapshot_record(record: &NormalizedRecord) -> Value {
         "error_rows": redact_rows(record.error_rows.clone()),
         "session_hint": record.session_hint,
         "model_hint": record.model_hint,
+        "cwd_hint": record.cwd_hint,
     })
 }
 
@@ -675,6 +684,7 @@ fn assert_raw_row_shape(row: &Value, case: &GoldenCase, context: &str) {
         "source_name",
         "harness",
         "inference_provider",
+        "cwd",
         "source_file",
         "record_ts",
         "top_type",

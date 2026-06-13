@@ -63,6 +63,147 @@ For a managed local install, leave these values at their defaults. For an
 external ClickHouse instance, point `url`, credentials, and `database` at that
 server.
 
+`[clickhouse]` is an alias for `[backends.default]`. To mirror specific
+projects to additional servers, see
+[Backends and Per-Project Routing](#backends-and-per-project-routing).
+
+## Backends and Per-Project Routing
+
+A project may belong to a team with a shared ClickHouse deployment. Named
+backends plus routes mirror that project's sessions to the team server while
+keeping the complete local history:
+
+```toml
+[backends.team-ch]
+url = "https://ch.team.example:8443"
+database = "moraine_team"
+username = "svc-moraine"
+password = "..."
+allow_newer_server = false
+
+[[routes]]
+dir = "~/src/teamproject/**"
+backend = "team-ch"
+mode = "mirror"
+```
+
+### Named backends
+
+Each `[backends.<name>]` block takes the same fields as `[clickhouse]`, plus
+`allow_newer_server` (see the
+[schema version handshake](#schema-version-handshake)). The `default` backend
+always exists after config load: `[clickhouse]` and `[backends.default]` are
+aliases for it, so when `[backends.default]` is not declared it is synthesized
+from `[clickhouse]` (or built-in defaults). Declaring both blocks is a load
+error.
+
+### Routes
+
+Each `[[routes]]` entry maps session working directories to a named backend.
+Routes are ordered; the first matching route wins.
+
+| Field | Behavior |
+| --- | --- |
+| `dir` | Directory glob matched against a session's absolute working directory. `~` expands during load. `*` stays within one path component; a glob ending in `/**` matches the base directory itself as well as everything beneath it (`~/p/**` matches `~/p`). |
+| `backend` | Name of a `[backends.<name>]` entry. An unknown name here is a load error — the home config is user-owned, so typos fail loudly. Routing to `default` is accepted but is a no-op: the default backend already receives everything. |
+| `mode` | Optional, defaults to `"mirror"` — the only supported mode. Other values (including `"exclusive"`) are rejected at load. |
+
+A session's routing directory is sticky: the first non-empty working
+directory observed for the session decides its route, so a mid-session `cd`
+never splits a session across backends. The working directory is extracted
+from session trace content during ingest (record-level where the harness
+stamps it, session metadata otherwise); sessions whose traces carry no
+discoverable working directory stay on the default backend.
+
+### Repo-level `.moraine.toml`
+
+A repository can opt into a backend without a home-config route by carrying a
+`.moraine.toml` at its root:
+
+```toml
+backend = "team-ch"
+```
+
+Moraine walks up from the session's working directory, stopping at `$HOME` or
+the filesystem root; the nearest file wins and ends the walk. The file is a
+**name reference only** — never URLs or credentials — and resolves only
+against `[backends.*]` entries in your home config. This is the trust
+boundary: a hostile cloned repo cannot redirect traces to a server you never
+configured. A name with no matching backend logs a warning (once per name)
+and the session stays on the default backend. Unknown keys in the file are
+ignored, and an explicit `[[routes]]` match in the home config takes
+precedence over the repo file.
+
+### Mirror semantics
+
+Routing never replaces local history. The default backend receives every
+session unconditionally; a routed session is *additionally* mirrored to its
+backend. Each mirror runs its own sink with its own `ingest_checkpoints`
+stored in that backend's database, scoped per host (migration 018), so team
+members sharing one backend never disturb each other's mirror progress —
+even when session files on two machines share an absolute path.
+
+A slow or unreachable backend never stalls local ingest. Mirror forwarding
+uses a bounded queue; on overflow the backend is marked lagging and live
+mirroring to it pauses. The source session files on disk act as the
+write-ahead log: at startup and whenever a lagging or unreachable backend
+recovers, a targeted replay pass re-reads tracked files against that
+backend's own checkpoints and closes the gap, without touching the default
+sink. Files deleted before a backend catches up are lost to that backend only
+(the local copy already ingested them live); Moraine logs when this happens.
+One known limitation: rows observed before a session's working directory is
+known resolve to the default backend only and are not retroactively
+mirrored once the session pins to a route. The harness adapters keep this
+window effectively empty (the working directory rides the records
+themselves, or is recovered from the session header), so in practice it
+only affects traces that carry no working directory at all.
+
+Per-backend mirror status — `connecting`, `ok`, `lagging`, `unreachable`, or
+`disabled_skew` — is written to ingest heartbeats as a `backend_sinks` map
+and surfaced through the monitor's `/api/health`. This uses a column added by
+migration 017; until `moraine db migrate` runs (and ingest restarts), ingest
+warns and omits the field rather than failing heartbeats.
+
+### Schema version handshake
+
+Moraine migrates only the default backend (`moraine db migrate`, or
+automatically on `moraine up`). It **never** runs migrations against a
+non-default backend. Before mirroring starts, it compares the backend's
+`schema_migrations` ledger against the migrations bundled in the running
+build — a strictly read-only probe — and enforces:
+
+| Skew | Outcome |
+| --- | --- |
+| Server behind (bundled migrations missing on the server) | Mirror disabled. The error names the backend and the missing versions; apply those migrations on the server first. |
+| Server ahead (server-applied migrations unknown to this build) | Mirror disabled unless that backend sets `allow_newer_server = true`. Upgrade Moraine, or opt in. |
+
+For ingest mirroring, a skew failure disables that one mirror until the
+ingest service restarts and shows as `disabled_skew` in `/api/health`; the
+default backend is unaffected. A backend that simply does not answer retries
+the handshake periodically and shows as `unreachable`. The same handshake
+also runs when `moraine run mcp` starts in a routed directory, where it
+fails the MCP process instead (see below). The handshake exists to make skew
+loud, not to manage it.
+
+### MCP in routed directories
+
+Routing changes what agents search, not just what ingest mirrors. When
+`moraine run mcp` starts in a directory that routes to a non-default backend
+(home-config `[[routes]]` first, then the repo `.moraine.toml` walk-up), it
+skips the central proxy entirely — the central server only serves the
+default backend — and runs an embedded server against the routed backend.
+Search results then come from the team server, not from local history.
+
+Startup in a routed directory is deliberately fail-fast: the schema
+handshake runs first, and if the backend is skewed *or simply unreachable*,
+`moraine run mcp` exits with an error naming the backend instead of falling
+back to the default backend. Serving local results while the agent believes
+it is searching the team server would be silently wrong. So if MCP dies at
+startup in exactly one project, check that project's route and the team
+backend's health/schema first. As with ingest routes, a repo `.moraine.toml`
+naming an unconfigured backend logs a warning and keeps the default
+behavior.
+
 ## Ingest Sources
 
 Each `[[ingest.sources]]` entry describes one watched source:
@@ -305,13 +446,16 @@ sessions are active at once. The fields above control it:
 
 | Field | Default | Purpose |
 | --- | --- | --- |
-| `use_central_server` | `true` | When set, `moraine run mcp` connects to the central server's socket and proxies to it; if the socket is missing or unreachable it transparently falls back to an embedded server. Set to `false` to always run embedded (pre-central behavior). |
+| `use_central_server` | `true` | When set, `moraine run mcp` connects to the central server's socket and proxies to it; if the socket is missing or unreachable it transparently falls back to an embedded server. Set to `false` to always run embedded (pre-central behavior). In a directory routed to a non-default backend the central proxy is bypassed regardless of this flag (see [MCP in routed directories](#mcp-in-routed-directories)). |
 | `start_central_on_up` | `true` | When set, `moraine up` launches the central server as a background daemon. |
 | `central_socket_path` | `mcp.sock` | Unix socket path. A bare filename resolves under the runtime pids dir (`~/.moraine/run/mcp.sock`, mode `0o600`); an absolute path is used verbatim. |
 | `central_connect_timeout_ms` | `250` | How long a client waits to connect before falling back to embedded. |
 
 The MCP registration command is unchanged — agents still launch
-`moraine run mcp`. The proxy-vs-embedded decision is internal. The daemon and
+`moraine run mcp`. The proxy-vs-embedded decision is internal, with one
+exception: directories routed to a non-default backend always run embedded
+against that backend and fail fast when it is unreachable or skewed (see
+[MCP in routed directories](#mcp-in-routed-directories)). The daemon and
 its clients must resolve the same `central_socket_path` (i.e. load the same
 config) to share a server; otherwise clients silently fall back to embedded.
 The `0o600` socket scopes the server to a single user, so on a shared host each

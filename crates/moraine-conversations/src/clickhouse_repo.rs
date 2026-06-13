@@ -596,23 +596,13 @@ impl ClickHouseConversationRepository {
         &self.cfg
     }
 
-    /// Per-event SQL expression for the origin working directory recorded in
-    /// `payload_json`, or `''` when the event carries none. `cwd` covers
-    /// claude-code / codex / pi payloads; `workspacePath` covers
-    /// cursor_sqlite session metadata.
-    fn session_origin_value_expr() -> &'static str {
-        "coalesce(
-        nullIf(JSONExtractString(payload_json, 'cwd'), ''),
-        nullIf(JSONExtractString(payload_json, 'workspacePath'), ''),
-        ''
-      )"
-    }
-
     /// Subquery selecting the session IDs whose origin directory falls inside
-    /// `scope`. A session's origin is the first (by event time) non-empty
-    /// origin value across its events; `session_meta` and `message` are the
-    /// only event kinds that record one at ingest. The `position()` guards
-    /// skip JSON extraction on rows that cannot contain either key.
+    /// `scope`. A session's origin is its first (by event time) non-empty
+    /// `cwd` — the column the ingest normalizer fills for every event from the
+    /// harness's recorded working directory (record-level for claude-code,
+    /// session-level for codex/pi, `workspacePath` for cursor). Sessions whose
+    /// harness records no working directory have an empty origin and match no
+    /// root.
     ///
     /// `session_id` narrows the scan to one session for cheap point lookups.
     fn session_origin_scope_subquery(
@@ -621,7 +611,6 @@ impl ClickHouseConversationRepository {
         session_id: Option<&str>,
     ) -> String {
         let events_table = self.table_ref("events");
-        let origin_expr = Self::session_origin_value_expr();
         let session_filter = session_id
             .map(|session_id| format!("session_id = {}\n      AND ", sql_quote(session_id)))
             .unwrap_or_default();
@@ -640,13 +629,9 @@ impl ClickHouseConversationRepository {
             "(SELECT session_id FROM (
     SELECT
       session_id,
-      argMinIf(origin_val, tuple(event_ts, event_uid), origin_val != '') AS origin_cwd
-    FROM (
-      SELECT session_id, event_ts, event_uid, {origin_expr} AS origin_val
-      FROM {events_table}
-      WHERE {session_filter}event_kind IN ('session_meta', 'message')
-        AND (position(payload_json, '\"cwd\"') > 0 OR position(payload_json, '\"workspacePath\"') > 0)
-    )
+      argMin(cwd, tuple(event_ts, event_uid)) AS origin_cwd
+    FROM {events_table}
+    WHERE {session_filter}cwd != ''
     GROUP BY session_id
   )
   WHERE {root_clauses})",

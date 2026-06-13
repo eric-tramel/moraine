@@ -6,8 +6,8 @@ mod open_v1;
 mod search_sessions_v1;
 
 use anyhow::{anyhow, Context, Result};
-use moraine_clickhouse::ClickHouseClient;
-use moraine_config::AppConfig;
+use moraine_clickhouse::{enforce_remote_schema_policy, ClickHouseClient};
+use moraine_config::{AppConfig, DEFAULT_BACKEND_NAME};
 pub use moraine_conversations::SessionOriginScope;
 use moraine_conversations::{ClickHouseConversationRepository, RepoConfig};
 use serde::Deserialize;
@@ -19,7 +19,7 @@ use std::sync::{
     Arc,
 };
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
@@ -634,15 +634,123 @@ where
     Ok(())
 }
 
+/// Resolve the non-default backend a stdio entry should serve against, given
+/// the process working directory: home-config `[[routes]]` win over a repo
+/// `.moraine.toml` reference, a reference to an unknown backend name warns
+/// and falls back to default behavior (the trust boundary: a cloned repo can
+/// only name backends the user already configured), and routing to
+/// `"default"` is a no-op. `None` means keep the default entry behavior.
+fn resolve_stdio_backend(cfg: &AppConfig, cwd: &str) -> Option<String> {
+    resolve_stdio_backend_with_lookup(cfg, cwd, |dir| moraine_config::find_repo_backend_ref(dir))
+}
+
+/// Core of [`resolve_stdio_backend`], with the repo `.moraine.toml` lookup
+/// injectable so the decision is testable without a filesystem walk-up.
+fn resolve_stdio_backend_with_lookup(
+    cfg: &AppConfig,
+    cwd: &str,
+    repo_lookup: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    // With only the default backend configured there is nothing to route to;
+    // skip resolution (and the repo-file filesystem walk) entirely so the
+    // common single-backend install pays nothing at startup.
+    if !cfg.backends.keys().any(|name| name != DEFAULT_BACKEND_NAME) {
+        return None;
+    }
+    let cwd = cwd.trim();
+    if cwd.is_empty() {
+        return None;
+    }
+    // A matching home route decides the name even when it fails validation
+    // below: first match wins, it never falls through to the repo file.
+    let name = match cfg.route_for_dir(cwd) {
+        Some(route) => route.backend.clone(),
+        None => repo_lookup(cwd)?,
+    };
+    if name == DEFAULT_BACKEND_NAME {
+        // Explicitly routing to default is the default behavior already.
+        return None;
+    }
+    if cfg.backends.contains_key(&name) {
+        return Some(name);
+    }
+    warn!(
+        backend = %name,
+        cwd,
+        "route names a backend with no [backends.{}] entry in the home config; \
+         serving against the default backend",
+        name
+    );
+    None
+}
+
+/// Run an embedded stdio server against a named non-default backend.
+///
+/// The schema handshake runs first and fails fast: moraine never migrates
+/// non-default backends, so a skewed (or unreachable) server must error
+/// loudly at startup rather than degrade at query time. Only after the
+/// handshake passes is the backend's config swapped in as `cfg.clickhouse`,
+/// which is all `AppState::build` reads.
+async fn run_stdio_for_backend(
+    mut cfg: AppConfig,
+    backend: &str,
+    session_scope: Option<SessionOriginScope>,
+) -> Result<()> {
+    let backend_cfg = cfg
+        .backends
+        .get(backend)
+        .cloned()
+        .ok_or_else(|| anyhow!("backend '{backend}' is not configured"))?;
+
+    let client = ClickHouseClient::new(backend_cfg.clone())?;
+    let skew = client.schema_skew().await.with_context(|| {
+        format!("backend '{backend}': schema handshake failed (is the server reachable?)")
+    })?;
+    enforce_remote_schema_policy(backend, &skew, backend_cfg.allow_newer_server)?;
+
+    cfg.clickhouse = backend_cfg;
+    run_stdio(cfg, session_scope).await
+}
+
 /// Entry point used by `moraine run mcp` (the command agents register).
 ///
-/// When the central server is enabled (the default), connect to its socket and
-/// proxy; if the socket is missing, refused, or slow to answer, fall back to an
-/// embedded stdio server so correctness never depends on the daemon being up.
-/// When central mode is disabled, run embedded directly (pre-central behavior).
-pub async fn run_mcp_entry(cfg: AppConfig) -> Result<()> {
+/// First, per-project routing: when the process cwd routes to a non-default
+/// backend (home-config routes, then the repo `.moraine.toml` walk-up), the
+/// central proxy is skipped — the central server only serves the default
+/// backend — and an embedded server runs against the routed backend instead,
+/// failing fast on schema skew.
+///
+/// Otherwise, when the central server is enabled (the default), connect to its
+/// socket and proxy; if the socket is missing, refused, or slow to answer,
+/// fall back to an embedded stdio server so correctness never depends on the
+/// daemon being up. When central mode is disabled, run embedded directly
+/// (pre-central behavior).
+///
+/// `session_scope` carries the `--project-only` restriction. A scoped session
+/// never proxies — the central server is shared across projects and the proxy
+/// forwards bytes verbatim, so the scope could not be enforced through it — but
+/// it still honors per-project backend routing: the scope is applied to an
+/// embedded server against whichever backend the cwd routes to.
+pub async fn run_mcp_entry(
+    cfg: AppConfig,
+    session_scope: Option<SessionOriginScope>,
+) -> Result<()> {
+    let cwd = std::env::current_dir()
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if let Some(backend) = resolve_stdio_backend(&cfg, &cwd) {
+        info!(
+            backend = %backend,
+            cwd,
+            scoped = session_scope.is_some(),
+            "cwd routes to a non-default backend; serving embedded against it"
+        );
+        return run_stdio_for_backend(cfg, &backend, session_scope).await;
+    }
+
+    // A scoped session always runs embedded; skip the proxy entirely.
     #[cfg(unix)]
-    if cfg.mcp.use_central_server {
+    if session_scope.is_none() && cfg.mcp.use_central_server {
         use tokio::net::UnixStream;
 
         let socket_path = PathBuf::from(&cfg.mcp.central_socket_path);
@@ -668,7 +776,7 @@ pub async fn run_mcp_entry(cfg: AppConfig) -> Result<()> {
         }
     }
 
-    run_stdio(cfg, None).await
+    run_stdio(cfg, session_scope).await
 }
 
 /// Resolve the `--project-only` scope from the directory this process was
@@ -907,6 +1015,146 @@ mod tests {
         // not require ClickHouse to be reachable.
         let state = AppState::build(AppConfig::default(), None).expect("build state");
         assert!(!state.prewarm_started.load(Ordering::Acquire));
+    }
+
+    /// Config with one non-default backend (`team-ch`) and a single home
+    /// route mapping `/work/team/**` to it.
+    fn routed_config() -> AppConfig {
+        let mut cfg = AppConfig::default();
+        cfg.backends.insert(
+            "team-ch".to_string(),
+            moraine_config::ClickHouseConfig {
+                url: "http://127.0.0.1:1".to_string(),
+                database: "moraine_team".to_string(),
+                ..Default::default()
+            },
+        );
+        cfg.routes.push(moraine_config::RouteConfig {
+            dir: "/work/team/**".to_string(),
+            backend: "team-ch".to_string(),
+            mode: moraine_config::ROUTE_MODE_MIRROR.to_string(),
+        });
+        cfg
+    }
+
+    /// Repo lookup that fails the test if consulted; used to prove a branch
+    /// never reaches the filesystem walk-up.
+    fn panicking_lookup(dir: &str) -> Option<String> {
+        panic!("repo lookup must not be consulted (cwd: {dir})");
+    }
+
+    #[test]
+    fn resolve_stdio_backend_skips_lookup_when_only_default_backend() {
+        let cfg = AppConfig::default();
+        assert_eq!(
+            resolve_stdio_backend_with_lookup(&cfg, "/work/team/x", panicking_lookup),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_stdio_backend_prefers_home_route_over_repo_file() {
+        let cfg = routed_config();
+        assert_eq!(
+            resolve_stdio_backend_with_lookup(&cfg, "/work/team/x", panicking_lookup),
+            Some("team-ch".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_stdio_backend_falls_back_to_repo_reference() {
+        let cfg = routed_config();
+        let resolved = resolve_stdio_backend_with_lookup(&cfg, "/elsewhere/proj", |dir| {
+            assert_eq!(dir, "/elsewhere/proj");
+            Some("team-ch".to_string())
+        });
+        assert_eq!(resolved, Some("team-ch".to_string()));
+    }
+
+    #[test]
+    fn resolve_stdio_backend_warns_and_continues_on_unknown_repo_name() {
+        let cfg = routed_config();
+        let resolved = resolve_stdio_backend_with_lookup(&cfg, "/elsewhere/proj", |_| {
+            Some("ghost".to_string())
+        });
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn resolve_stdio_backend_treats_default_reference_as_no_route() {
+        let mut cfg = routed_config();
+        cfg.routes.insert(
+            0,
+            moraine_config::RouteConfig {
+                dir: "/work/local/**".to_string(),
+                backend: DEFAULT_BACKEND_NAME.to_string(),
+                mode: moraine_config::ROUTE_MODE_MIRROR.to_string(),
+            },
+        );
+
+        // Via a home route...
+        assert_eq!(
+            resolve_stdio_backend_with_lookup(&cfg, "/work/local/x", panicking_lookup),
+            None
+        );
+        // ...and via a repo reference.
+        let resolved = resolve_stdio_backend_with_lookup(&cfg, "/elsewhere/proj", |_| {
+            Some(DEFAULT_BACKEND_NAME.to_string())
+        });
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn resolve_stdio_backend_home_route_to_unknown_name_does_not_fall_through() {
+        // First match wins even when its backend name fails validation: the
+        // repo file must not be consulted for a cwd a home route claimed.
+        let mut cfg = routed_config();
+        cfg.routes[0].backend = "ghost".to_string();
+        assert_eq!(
+            resolve_stdio_backend_with_lookup(&cfg, "/work/team/x", panicking_lookup),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_stdio_backend_ignores_empty_cwd() {
+        let cfg = routed_config();
+        assert_eq!(
+            resolve_stdio_backend_with_lookup(&cfg, "", panicking_lookup),
+            None
+        );
+        assert_eq!(
+            resolve_stdio_backend_with_lookup(&cfg, "   ", panicking_lookup),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn run_stdio_for_backend_fails_fast_when_backend_unreachable() {
+        // The handshake against a connection-refused backend must fail at
+        // startup with an error naming the backend, never fall back to the
+        // default backend or start serving stdio.
+        let cfg = routed_config();
+        let err = run_stdio_for_backend(cfg, "team-ch", None)
+            .await
+            .expect_err("unreachable backend must fail the handshake");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("team-ch"),
+            "error names the backend: {chain}"
+        );
+        assert!(
+            chain.contains("schema handshake failed"),
+            "error explains the handshake: {chain}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_stdio_for_backend_rejects_unconfigured_backend() {
+        let err = run_stdio_for_backend(AppConfig::default(), "ghost", None)
+            .await
+            .expect_err("unknown backend must error");
+        assert!(err.to_string().contains("'ghost' is not configured"));
     }
 
     #[tokio::test]
