@@ -3,6 +3,7 @@
   "name": "cursor_sqlite",
   "records": [
     {
+      "cwd_hint": "/Users/demo/project",
       "error_rows": [],
       "event_rows": [
         {
@@ -14,6 +15,7 @@
           "content_types": [],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "/Users/demo/project",
           "endpoint_kind": "generation",
           "event_kind": "session_meta",
           "event_ts": "2026-05-08 02:04:37.751",
@@ -86,6 +88,7 @@
       "model_hint": "",
       "raw_rows": [
         {
+          "cwd": "/Users/demo/project",
           "event_uid": "68334fe717c6abda79a5bf4afe9fdb00193671ada8cfa2ea5eea9b20a4fbc975",
           "harness": "cursor",
           "inference_provider": "cursor",
@@ -106,6 +109,7 @@
       "tool_rows": []
     },
     {
+      "cwd_hint": "",
       "error_rows": [],
       "event_rows": [],
       "link_rows": [],
@@ -115,6 +119,7 @@
       "tool_rows": []
     },
     {
+      "cwd_hint": "",
       "error_rows": [],
       "event_rows": [
         {
@@ -128,6 +133,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-05-08 02:04:37.835",
@@ -200,6 +206,7 @@
       "model_hint": "",
       "raw_rows": [
         {
+          "cwd": "",
           "event_uid": "d3bf78a8595e95863279e462f60a257133dd31d881f1551a007a3bf06476bdd7",
           "harness": "cursor",
           "inference_provider": "cursor",
@@ -220,6 +227,7 @@
       "tool_rows": []
     },
     {
+      "cwd_hint": "",
       "error_rows": [],
       "event_rows": [
         {
@@ -233,6 +241,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "reasoning",
           "event_ts": "2026-05-08 02:04:39.829",
@@ -305,6 +314,7 @@
       "model_hint": "",
       "raw_rows": [
         {
+          "cwd": "",
           "event_uid": "e2191c5aba39ec269c9f97a11eaefbebeba97fc659703d252afe7d1ed95db544",
           "harness": "cursor",
           "inference_provider": "cursor",
@@ -325,6 +335,7 @@
       "tool_rows": []
     },
     {
+      "cwd_hint": "",
       "error_rows": [],
       "event_rows": [
         {
@@ -338,6 +349,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "tool_call",
           "event_ts": "2026-05-08 02:05:34.020",
@@ -416,6 +428,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "tool_result",
           "event_ts": "2026-05-08 02:05:34.020",
@@ -488,6 +501,7 @@
       "model_hint": "",
       "raw_rows": [
         {
+          "cwd": "",
           "event_uid": "653c009760e5cf14a566c7d9e11f96321973b451da4bd56b217213dda55241a0",
           "harness": "cursor",
           "inference_provider": "cursor",
@@ -553,6 +567,7 @@
       ]
     },
     {
+      "cwd_hint": "",
       "error_rows": [],
       "event_rows": [
         {
@@ -566,6 +581,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "tool_call",
           "event_ts": "2026-05-08 02:05:41.812",
@@ -644,6 +660,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "tool_result",
           "event_ts": "2026-05-08 02:05:41.812",
@@ -716,6 +733,7 @@
       "model_hint": "",
       "raw_rows": [
         {
+          "cwd": "",
           "event_uid": "6750c4ebbf7255bb32554837ae6988a173a04607bda46a86a0f024dac404fd69",
           "harness": "cursor",
           "inference_provider": "cursor",
@@ -781,6 +799,7 @@
       ]
     },
     {
+      "cwd_hint": "",
       "error_rows": [],
       "event_rows": [
         {
@@ -794,6 +813,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-05-08 02:05:58.404",
@@ -866,6 +886,7 @@
       "model_hint": "",
       "raw_rows": [
         {
+          "cwd": "",
           "event_uid": "0eb57b3252b05fc41837668f5f1daade9c75837e7c130e0cf94a6cd45bc2d1af",
           "harness": "cursor",
           "inference_provider": "cursor",
@@ -886,6 +907,7 @@
       "tool_rows": []
     },
     {
+      "cwd_hint": "",
       "error_rows": [],
       "event_rows": [],
       "link_rows": [],
@@ -895,6 +917,7 @@
       "tool_rows": []
     },
     {
+      "cwd_hint": "",
       "error_rows": [],
       "event_rows": [],
       "link_rows": [],

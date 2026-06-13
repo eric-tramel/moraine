@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 
 pub use crate::sources::shared::{infer_session_date_from_file, infer_session_id_from_file};
 
+#[allow(clippy::too_many_arguments)]
 pub fn normalize_record(
     record: &Value,
     source_name: &str,
@@ -20,6 +21,7 @@ pub fn normalize_record(
     source_offset: u64,
     session_hint: &str,
     model_hint: &str,
+    cwd_hint: &str,
 ) -> Result<NormalizedRecord> {
     normalize_record_with_ts_hint(
         record,
@@ -32,6 +34,7 @@ pub fn normalize_record(
         source_offset,
         session_hint,
         model_hint,
+        cwd_hint,
         "",
     )
 }
@@ -48,6 +51,7 @@ pub(crate) fn normalize_record_with_ts_hint(
     source_offset: u64,
     session_hint: &str,
     model_hint: &str,
+    cwd_hint: &str,
     record_ts_hint: &str,
 ) -> Result<NormalizedRecord> {
     let sources = registry();
@@ -94,11 +98,13 @@ pub(crate) fn normalize_record_with_ts_hint(
         base_uid: &base_uid,
     };
     let session_id = source.session_id(record, &source_ctx);
+    let cwd = resolve_cwd(&source.cwd(record), cwd_hint);
 
     let raw_row = json!({
         "source_name": source_name,
         "harness": harness_name,
         "inference_provider": metadata.inference_provider,
+        "cwd": cwd,
         "source_file": source_file,
         "source_inode": source_inode,
         "source_generation": source_generation,
@@ -138,6 +144,7 @@ pub(crate) fn normalize_record_with_ts_hint(
         inference_provider: &metadata.inference_provider,
         session_id: &session_id,
         session_date: &session_date,
+        cwd: &cwd,
         source_file,
         source_inode,
         source_generation,
@@ -163,7 +170,19 @@ pub(crate) fn normalize_record_with_ts_hint(
         error_rows,
         session_hint: session_id,
         model_hint,
+        cwd_hint: cwd,
     })
+}
+
+/// Record-level cwd wins; otherwise fall back to the session-level hint
+/// chained in by the caller. Whitespace-only values count as absent.
+fn resolve_cwd(record_cwd: &str, cwd_hint: &str) -> String {
+    let trimmed = record_cwd.trim();
+    if !trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+
+    cwd_hint.trim().to_string()
 }
 
 fn resolve_record_ts(

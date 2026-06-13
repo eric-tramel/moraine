@@ -860,6 +860,7 @@ pub(crate) struct RecordContext<'a> {
     pub(crate) inference_provider: &'a str,
     pub(crate) session_id: &'a str,
     pub(crate) session_date: &'a str,
+    pub(crate) cwd: &'a str,
     pub(crate) source_file: &'a str,
     pub(crate) source_inode: u64,
     pub(crate) source_generation: u32,
@@ -894,6 +895,7 @@ pub(crate) fn base_event_obj(
         "session_date".to_string(),
         Value::String(ctx.session_date.to_string()),
     );
+    obj.insert("cwd".to_string(), Value::String(ctx.cwd.to_string()));
     obj.insert(
         "source_name".to_string(),
         Value::String(ctx.source_name.to_string()),
@@ -1132,6 +1134,7 @@ mod tests {
             inference_provider: "openai",
             session_id: "s1",
             session_date: "2026-02-15",
+            cwd: "/repo",
             source_file: "/tmp/s1.jsonl",
             source_inode: 1,
             source_generation: 1,

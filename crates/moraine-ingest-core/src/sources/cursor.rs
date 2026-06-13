@@ -28,6 +28,13 @@ impl IngestSource for Cursor {
         cursor_record_ts(record)
     }
 
+    fn cwd(&self, record: &Value) -> String {
+        // The cursor_sqlite poller surfaces `workspaceIdentifier.uri.fsPath`
+        // as `workspacePath` on synthesized composer records; bubbles and
+        // file-backed transcripts carry no working directory of their own.
+        to_str(record.get("workspacePath"))
+    }
+
     fn top_type(&self, record: &Value) -> String {
         let role = cursor_role(record);
         if !role.is_empty() {

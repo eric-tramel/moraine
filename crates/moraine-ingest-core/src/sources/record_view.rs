@@ -335,6 +335,7 @@ mod tests {
             inference_provider: "openai",
             session_id: "session-1",
             session_date: "2026-05-07",
+            cwd: "",
             source_file: "/fixtures/dummy/session.jsonl",
             source_inode: 7,
             source_generation: 1,

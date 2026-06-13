@@ -29,6 +29,11 @@ impl IngestSource for ClaudeCode {
         }
     }
 
+    fn cwd(&self, record: &Value) -> String {
+        // Claude Code stamps the working directory on every JSONL record.
+        to_str(record.get("cwd"))
+    }
+
     fn normalize(
         &self,
         record: &Value,

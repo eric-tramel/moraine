@@ -40,6 +40,7 @@ fn codex_tool_call_normalization() {
         1024,
         "",
         "",
+        "",
     )
     .expect("codex tool call should normalize");
 
@@ -74,6 +75,7 @@ fn codex_turn_context_promotes_model_and_turn_id() {
         1,
         1,
         1,
+        "",
         "",
         "",
     )
@@ -133,6 +135,7 @@ fn codex_token_count_promotes_usage_fields() {
         1,
         2,
         2,
+        "",
         "",
         "",
     )
@@ -218,6 +221,7 @@ fn codex_token_count_alias_codex_maps_to_xhigh() {
         4,
         "",
         "",
+        "",
     )
     .expect("codex token count alias should normalize");
 
@@ -251,6 +255,7 @@ fn codex_custom_tool_call_promotes_tool_fields() {
         1,
         3,
         3,
+        "",
         "",
         "",
     )
@@ -317,6 +322,7 @@ fn codex_reasoning_branches_use_canonical_metadata() {
             idx as u64 + 20,
             "",
             "",
+            "",
         )
         .expect("codex reasoning record should normalize");
 
@@ -377,6 +383,7 @@ fn claude_tool_use_and_result_blocks() {
         2,
         10,
         100,
+        "",
         "",
         "",
     )
@@ -442,6 +449,7 @@ fn claude_reasoning_block_uses_canonical_metadata() {
         120,
         "",
         "",
+        "",
     )
     .expect("claude reasoning event should normalize");
 
@@ -472,6 +480,7 @@ fn invalid_timestamp_uses_epoch_and_emits_timestamp_parse_error() {
         2,
         7,
         99,
+        "",
         "",
         "",
     )
@@ -519,6 +528,7 @@ fn missing_codex_timestamp_infers_rollout_file_timestamp() {
         99,
         "",
         "",
+        "",
     )
     .expect("legacy codex rollout record should normalize");
 
@@ -563,6 +573,7 @@ fn invalid_timestamp_preserves_session_date_from_source_path() {
         144,
         "",
         "",
+        "",
     )
     .expect("codex event should normalize while preserving session date from path");
 
@@ -596,6 +607,7 @@ fn unknown_harness_is_rejected() {
         1,
         "",
         "",
+        "",
     )
     .expect_err("unknown harness should be rejected");
 
@@ -624,6 +636,7 @@ fn legacy_claude_harness_value_is_rejected() {
         1,
         1,
         1,
+        "",
         "",
         "",
     )
@@ -657,6 +670,7 @@ fn codex_event_populates_inference_provider_openai() {
         1,
         1,
         1,
+        "",
         "",
         "",
     )
@@ -713,6 +727,7 @@ fn claude_links_split_event_uids_from_external_ids() {
         2,
         11,
         101,
+        "",
         "",
         "",
     )
@@ -814,6 +829,7 @@ fn codex_compacted_parent_link_uses_event_uid_target() {
         12,
         "",
         "",
+        "",
     )
     .expect("compacted record should normalize");
 
@@ -863,6 +879,7 @@ fn codex_unknown_payload_type_is_canonicalized() {
         5,
         "",
         "",
+        "",
     )
     .expect("record should normalize");
 
@@ -894,6 +911,7 @@ fn codex_event_msg_known_operational_payload_type_is_preserved() {
         1,
         6,
         6,
+        "",
         "",
         "",
     )
@@ -931,6 +949,7 @@ fn claude_progress_unknown_payload_type_moves_to_unknown_and_preserves_op_kind()
         1,
         6,
         6,
+        "",
         "",
         "",
     )
@@ -990,6 +1009,7 @@ fn hermes_sharegpt_trajectory_normalizes_messages_and_tool_io() {
         1,
         1,
         128,
+        "",
         "",
         "",
     )
@@ -1158,6 +1178,7 @@ fn kimi_cli_status_update_stamps_placeholder_model() {
         500,
         "",
         "",
+        "",
     )
     .expect("kimi status update should normalize");
 
@@ -1212,9 +1233,251 @@ fn kimi_cli_content_part_stamps_placeholder_model() {
         600,
         "",
         "",
+        "",
     )
     .expect("kimi content part should normalize");
 
     let row = out.event_rows[0].as_object().unwrap();
     assert_eq!(row.get("model").and_then(Value::as_str), Some("kimi-cli"));
+}
+
+#[test]
+fn claude_code_record_level_cwd_wins_over_hint() {
+    let record = json!({
+        "type": "user",
+        "sessionId": "7c666c01-d38e-4658-8650-854ffb5b626e",
+        "cwd": "/work/claude-demo",
+        "uuid": "user-1",
+        "timestamp": "2026-01-19T15:58:40.000Z",
+        "message": {"role": "user", "content": "hello"}
+    });
+
+    let out = normalize_record(
+        &record,
+        "claude",
+        "claude-code",
+        "/Users/eric/.claude/projects/demo/7c666c01-d38e-4658-8650-854ffb5b626e.jsonl",
+        1,
+        1,
+        1,
+        0,
+        "",
+        "",
+        "/somewhere/else",
+    )
+    .expect("claude record should normalize");
+
+    assert_eq!(
+        out.raw_row.get("cwd").and_then(Value::as_str),
+        Some("/work/claude-demo")
+    );
+    for row in &out.event_rows {
+        assert_eq!(
+            row.get("cwd").and_then(Value::as_str),
+            Some("/work/claude-demo")
+        );
+    }
+    assert_eq!(out.cwd_hint, "/work/claude-demo");
+}
+
+#[test]
+fn codex_session_meta_cwd_flows_to_later_records_via_hint() {
+    let meta = json!({
+        "timestamp": "2026-02-15T03:50:40.000Z",
+        "type": "session_meta",
+        "payload": {
+            "id": "019c5f6a-49bd-7920-ac67-1dd8e33b0e95",
+            "cwd": "/repo",
+            "cli_version": "0.5.3"
+        }
+    });
+
+    let meta_out = normalize_record(
+        &meta,
+        "codex",
+        "codex",
+        "/Users/eric/.codex/sessions/2026/02/15/session-019c5f6a-49bd-7920-ac67-1dd8e33b0e95.jsonl",
+        1,
+        1,
+        1,
+        0,
+        "",
+        "",
+        "",
+    )
+    .expect("codex session meta should normalize");
+
+    assert_eq!(
+        meta_out.raw_row.get("cwd").and_then(Value::as_str),
+        Some("/repo")
+    );
+    assert_eq!(meta_out.cwd_hint, "/repo");
+
+    // A follow-on record carries no cwd of its own; the chained hint from the
+    // session meta record fills it in (mirrors the dispatch loop).
+    let item = json!({
+        "timestamp": "2026-02-15T03:50:43.000Z",
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hi"}]
+        }
+    });
+
+    let item_out = normalize_record(
+        &item,
+        "codex",
+        "codex",
+        "/Users/eric/.codex/sessions/2026/02/15/session-019c5f6a-49bd-7920-ac67-1dd8e33b0e95.jsonl",
+        1,
+        1,
+        2,
+        100,
+        &meta_out.session_hint,
+        &meta_out.model_hint,
+        &meta_out.cwd_hint,
+    )
+    .expect("codex response item should normalize");
+
+    assert_eq!(
+        item_out.raw_row.get("cwd").and_then(Value::as_str),
+        Some("/repo")
+    );
+    for row in &item_out.event_rows {
+        assert_eq!(row.get("cwd").and_then(Value::as_str), Some("/repo"));
+    }
+    assert_eq!(item_out.cwd_hint, "/repo");
+}
+
+#[test]
+fn cursor_composer_workspace_path_becomes_cwd() {
+    // Shape produced by `synthesize_cursor_sqlite_record` for composerData
+    // rows: `workspaceIdentifier.uri.fsPath` is surfaced as `workspacePath`.
+    let record = json!({
+        "type": "cursor_composer",
+        "sessionId": "11111111-2222-4333-8444-555555555555",
+        "timestamp": "2026-05-08T02:04:37.751Z",
+        "messageCount": 5,
+        "name": "Demo refactor session",
+        "workspacePath": "/Users/demo/project"
+    });
+
+    let out = normalize_record(
+        &record,
+        "cursor-sqlite",
+        "cursor",
+        "/fixtures/cursor/User/globalStorage/state.vscdb",
+        1,
+        1,
+        1,
+        0,
+        "",
+        "",
+        "",
+    )
+    .expect("cursor composer should normalize");
+
+    assert_eq!(
+        out.raw_row.get("cwd").and_then(Value::as_str),
+        Some("/Users/demo/project")
+    );
+    for row in &out.event_rows {
+        assert_eq!(
+            row.get("cwd").and_then(Value::as_str),
+            Some("/Users/demo/project")
+        );
+    }
+    assert_eq!(out.cwd_hint, "/Users/demo/project");
+}
+
+#[test]
+fn pi_session_header_cwd_is_extracted() {
+    let record = json!({
+        "type": "session",
+        "version": 3,
+        "id": "11111111-2222-4333-8444-555555555555",
+        "timestamp": "2026-05-08T02:00:00.000Z",
+        "cwd": "/work/pi-demo"
+    });
+
+    let out = normalize_record(
+        &record,
+        "pi",
+        "pi-coding-agent",
+        "/Users/eric/.pi/agent/sessions/demo/2026-05-08T02-00-00-000Z_11111111-2222-4333-8444-555555555555.jsonl",
+        1,
+        1,
+        1,
+        0,
+        "",
+        "",
+        "",
+    )
+    .expect("pi session header should normalize");
+
+    assert_eq!(
+        out.raw_row.get("cwd").and_then(Value::as_str),
+        Some("/work/pi-demo")
+    );
+    assert_eq!(out.cwd_hint, "/work/pi-demo");
+}
+
+#[test]
+fn harnesses_without_cwd_emit_empty_cwd() {
+    let kimi = json!({
+        "timestamp": 1775953946.2_f64,
+        "message": {
+            "type": "ContentPart",
+            "payload": {"type": "text", "text": "hello"}
+        }
+    });
+    let kimi_out = normalize_record(
+        &kimi,
+        "kimi-cli",
+        "kimi-cli",
+        "/Users/eric/.kimi/sessions/work-abc/sess-xyz/wire.jsonl",
+        1,
+        1,
+        2,
+        50,
+        "",
+        "",
+        "",
+    )
+    .expect("kimi record should normalize");
+    assert_eq!(
+        kimi_out.raw_row.get("cwd").and_then(Value::as_str),
+        Some("")
+    );
+    assert_eq!(kimi_out.cwd_hint, "");
+
+    let hermes = json!({
+        "timestamp": "2026-03-30T14:22:31.456789",
+        "model": "anthropic/claude-sonnet-4.6",
+        "conversations": [{"from": "human", "value": "hi"}]
+    });
+    let hermes_out = normalize_record(
+        &hermes,
+        "hermes",
+        "hermes",
+        "/Users/eric/hermes/trajectories/001.jsonl",
+        1,
+        1,
+        1,
+        0,
+        "",
+        "",
+        "",
+    )
+    .expect("hermes record should normalize");
+    assert_eq!(
+        hermes_out.raw_row.get("cwd").and_then(Value::as_str),
+        Some("")
+    );
+    assert_eq!(hermes_out.cwd_hint, "");
+
+    for row in kimi_out.event_rows.iter().chain(&hermes_out.event_rows) {
+        assert_eq!(row.get("cwd").and_then(Value::as_str), Some(""));
+    }
 }

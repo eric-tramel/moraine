@@ -12,8 +12,13 @@ use tokio::runtime::Builder;
 ///   for one agent session. A current-thread runtime is sufficient — the agent
 ///   issues one RPC at a time — and keeps the per-session footprint to ~1
 ///   thread, which is the whole point at hundreds of sessions.
-/// - default (stdio) with central disabled: the legacy embedded server on a
-///   multi-threaded runtime (byte-for-byte the pre-central behavior).
+/// - default (stdio) with central disabled: the embedded server on a
+///   multi-threaded runtime (pre-central behavior).
+///
+/// Both stdio arms go through `run_mcp_entry`, which first resolves
+/// per-project routing for the process cwd: a cwd routed to a non-default
+/// backend serves embedded against that backend regardless of the central
+/// toggle. With no route it honors `use_central_server` exactly as before.
 pub fn run(cfg: AppConfig, serve_mode: ServeMode) -> Result<()> {
     match serve_mode {
         ServeMode::Socket => {
@@ -36,7 +41,7 @@ pub fn run(cfg: AppConfig, serve_mode: ServeMode) -> Result<()> {
                 .enable_all()
                 .build()
                 .context("failed to build multi-threaded runtime")?;
-            rt.block_on(moraine_mcp_core::run_stdio(cfg))
+            rt.block_on(moraine_mcp_core::run_mcp_entry(cfg))
         }
     }
 }

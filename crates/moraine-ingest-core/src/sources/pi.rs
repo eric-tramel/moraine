@@ -37,6 +37,12 @@ impl IngestSource for PiCodingAgent {
         }
     }
 
+    fn cwd(&self, record: &Value) -> String {
+        // Only the `session` header record carries the working directory;
+        // later records inherit it via the normalizer's session-level fallback.
+        to_str(record.get("cwd"))
+    }
+
     fn normalize(
         &self,
         record: &Value,

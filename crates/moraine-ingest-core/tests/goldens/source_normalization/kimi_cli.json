@@ -3,6 +3,7 @@
   "name": "kimi_cli",
   "records": [
     {
+      "cwd_hint": "",
       "error_rows": [],
       "event_rows": [],
       "link_rows": [],
@@ -12,6 +13,7 @@
       "tool_rows": []
     },
     {
+      "cwd_hint": "",
       "error_rows": [],
       "event_rows": [
         {
@@ -23,6 +25,7 @@
           "content_types": [],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-04-12 00:32:24.549",
@@ -95,6 +98,7 @@
       "model_hint": "kimi-cli",
       "raw_rows": [
         {
+          "cwd": "",
           "event_uid": "8c58f2f27a328f6b79ee6b14f6ecd4037af86e6abea476a49901faf68722de9f",
           "harness": "kimi-cli",
           "inference_provider": "moonshot",
@@ -115,6 +119,7 @@
       "tool_rows": []
     },
     {
+      "cwd_hint": "",
       "error_rows": [],
       "event_rows": [
         {
@@ -126,6 +131,7 @@
           "content_types": [],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "progress",
           "event_ts": "2026-04-12 00:32:24.550",
@@ -198,6 +204,7 @@
       "model_hint": "kimi-cli",
       "raw_rows": [
         {
+          "cwd": "",
           "event_uid": "85a7d36fabfc7094c422195e75044c417319156c9a32855aa267e062045b2378",
           "harness": "kimi-cli",
           "inference_provider": "moonshot",
@@ -218,6 +225,7 @@
       "tool_rows": []
     },
     {
+      "cwd_hint": "",
       "error_rows": [],
       "event_rows": [
         {
@@ -231,6 +239,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "reasoning",
           "event_ts": "2026-04-12 00:32:25.100",
@@ -303,6 +312,7 @@
       "model_hint": "kimi-cli",
       "raw_rows": [
         {
+          "cwd": "",
           "event_uid": "e5429a610df363f7be32c85ad29b8870169e29cbe5b0706882983f91f8f5c3d2",
           "harness": "kimi-cli",
           "inference_provider": "moonshot",
@@ -323,6 +333,7 @@
       "tool_rows": []
     },
     {
+      "cwd_hint": "",
       "error_rows": [],
       "event_rows": [
         {
@@ -336,6 +347,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-04-12 00:32:26.200",
@@ -408,6 +420,7 @@
       "model_hint": "kimi-cli",
       "raw_rows": [
         {
+          "cwd": "",
           "event_uid": "460413027f300028aa61114b8effef874a0fc16159aac7ad79f24ccefc02ffc8",
           "harness": "kimi-cli",
           "inference_provider": "moonshot",
@@ -428,6 +441,7 @@
       "tool_rows": []
     },
     {
+      "cwd_hint": "",
       "error_rows": [],
       "event_rows": [
         {
@@ -441,6 +455,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "tool_call",
           "event_ts": "2026-04-12 00:32:27.300",
@@ -513,6 +528,7 @@
       "model_hint": "kimi-cli",
       "raw_rows": [
         {
+          "cwd": "",
           "event_uid": "fd323b46d3ef60e520fd4c59538c757d73bc06893d8596214df318859e6dff5c",
           "harness": "kimi-cli",
           "inference_provider": "moonshot",
@@ -556,6 +572,7 @@
       ]
     },
     {
+      "cwd_hint": "",
       "error_rows": [],
       "event_rows": [
         {
@@ -569,6 +586,7 @@
           ],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "tool_result",
           "event_ts": "2026-04-12 00:32:28.400",
@@ -641,6 +659,7 @@
       "model_hint": "kimi-cli",
       "raw_rows": [
         {
+          "cwd": "",
           "event_uid": "aaae5ab5dc4e77a7833488f29e2fd4393c611613bc5723f95180732eb70bde4c",
           "harness": "kimi-cli",
           "inference_provider": "moonshot",
@@ -684,6 +703,7 @@
       ]
     },
     {
+      "cwd_hint": "",
       "error_rows": [],
       "event_rows": [
         {
@@ -695,6 +715,7 @@
           "content_types": [],
           "coord_group_id": "",
           "coord_group_label": "",
+          "cwd": "",
           "endpoint_kind": "generation",
           "event_kind": "event_msg",
           "event_ts": "2026-04-12 00:32:29.500",
@@ -767,6 +788,7 @@
       "model_hint": "kimi-cli",
       "raw_rows": [
         {
+          "cwd": "",
           "event_uid": "6b4f49263cef9199e785cadb1271518b85d39b8cc218dd079bcd97efac664755",
           "harness": "kimi-cli",
           "inference_provider": "moonshot",
@@ -787,12 +809,14 @@
       "tool_rows": []
     },
     {
+      "cwd_hint": "",
       "error_rows": [],
       "event_rows": [],
       "link_rows": [],
       "model_hint": "kimi-cli",
       "raw_rows": [
         {
+          "cwd": "",
           "event_uid": "2f9af6b75b189e5374dde29965880d6aed73e49c506e71dd91f82786c36bbf4a",
           "harness": "kimi-cli",
           "inference_provider": "moonshot",

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 pub const KNOWN_INGEST_HARNESSES: &[&str] = &[
@@ -51,6 +52,38 @@ pub struct ClickHouseConfig {
     pub async_insert: bool,
     #[serde(default = "default_true")]
     pub wait_for_async_insert: bool,
+    /// Permit connecting to a backend whose schema ledger holds migration
+    /// versions newer than this build's bundled set. Only consulted for
+    /// non-default backends (the default backend is migrated by moraine
+    /// itself); false means unknown server-side versions are a hard error.
+    #[serde(default = "default_false")]
+    pub allow_newer_server: bool,
+}
+
+/// Reserved name of the backend that the `[clickhouse]` block aliases. The
+/// default backend is the always-on local sink and the only backend moraine
+/// migrates itself.
+pub const DEFAULT_BACKEND_NAME: &str = "default";
+
+/// The only routing mode implemented in v1: routed sessions are mirrored
+/// (tee'd) to the named backend in addition to the default backend.
+pub const ROUTE_MODE_MIRROR: &str = "mirror";
+
+/// Routes sessions whose working directory matches `dir` to a named backend.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteConfig {
+    /// Directory glob matched against a session's absolute working
+    /// directory; `~` is expanded during config normalization. A glob ending
+    /// in `/**` matches the base directory itself as well as everything
+    /// beneath it.
+    pub dir: String,
+    /// Name of a `[backends.<name>]` entry; unknown names are a load error
+    /// (the home config is user-owned — typos should fail loudly).
+    pub backend: String,
+    /// Routing mode; `"mirror"` is the only accepted value in v1.
+    #[serde(default = "default_route_mode")]
+    pub mode: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -181,11 +214,20 @@ pub struct RuntimeConfig {
     pub start_mcp_on_up: bool,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     #[serde(default)]
     pub clickhouse: ClickHouseConfig,
+    /// Named ClickHouse backends. `"default"` always exists after config
+    /// load: it is synthesized from `[clickhouse]` (or built-in defaults)
+    /// unless declared explicitly as `[backends.default]`. Declaring both
+    /// `[clickhouse]` and `[backends.default]` is a load error (ambiguous).
+    #[serde(default)]
+    pub backends: BTreeMap<String, ClickHouseConfig>,
+    /// Ordered directory-glob routes to named backends; first match wins.
+    #[serde(default)]
+    pub routes: Vec<RouteConfig>,
     #[serde(default)]
     pub ingest: IngestConfig,
     #[serde(default)]
@@ -198,6 +240,38 @@ pub struct AppConfig {
     pub runtime: RuntimeConfig,
 }
 
+impl AppConfig {
+    /// Returns the first route whose `dir` glob matches the absolute
+    /// directory `dir` (routes are ordered; first match wins), or `None`
+    /// when no route matches. Trailing slashes on `dir` are ignored, and a
+    /// glob ending in `/**` also matches its base directory itself
+    /// (`~/p/**` matches `~/p`), since sessions usually start at the
+    /// project root. `*` does not cross `/`, matching the per-component
+    /// semantics of the filesystem glob enumeration used by ingest sources.
+    pub fn route_for_dir(&self, dir: &str) -> Option<&RouteConfig> {
+        if dir.trim().is_empty() {
+            return None;
+        }
+        let trimmed = dir.trim_end_matches('/');
+        let candidate = if trimmed.is_empty() { "/" } else { trimmed };
+        let options = glob::MatchOptions {
+            case_sensitive: true,
+            require_literal_separator: true,
+            require_literal_leading_dot: false,
+        };
+        self.routes.iter().find(|route| {
+            // Route globs are validated at load time; a programmatically
+            // built config with an invalid glob simply never matches.
+            let Ok(pattern) = glob::Pattern::new(&route.dir) else {
+                return false;
+            };
+            pattern.matches_with(candidate, options)
+                || (route.dir.ends_with("/**")
+                    && pattern.matches_with(&format!("{candidate}/"), options))
+        })
+    }
+}
+
 impl Default for ClickHouseConfig {
     fn default() -> Self {
         Self {
@@ -208,6 +282,27 @@ impl Default for ClickHouseConfig {
             timeout_seconds: default_timeout_seconds(),
             async_insert: true,
             wait_for_async_insert: true,
+            allow_newer_server: false,
+        }
+    }
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        // Uphold the post-load invariant for programmatic construction too:
+        // `backends["default"]` always exists and mirrors `clickhouse`.
+        let clickhouse = ClickHouseConfig::default();
+        let mut backends = BTreeMap::new();
+        backends.insert(DEFAULT_BACKEND_NAME.to_string(), clickhouse.clone());
+        Self {
+            clickhouse,
+            backends,
+            routes: Vec::new(),
+            ingest: IngestConfig::default(),
+            mcp: McpConfig::default(),
+            bm25: Bm25Config::default(),
+            monitor: MonitorConfig::default(),
+            runtime: RuntimeConfig::default(),
         }
     }
 }
@@ -546,6 +641,10 @@ fn default_central_connect_timeout_ms() -> u64 {
     250
 }
 
+fn default_route_mode() -> String {
+    ROUTE_MODE_MIRROR.to_string()
+}
+
 fn default_k1() -> f64 {
     1.2
 }
@@ -780,6 +879,59 @@ fn normalize_harness(harness: &str, source_idx: usize, source_name: &str) -> Res
     ))
 }
 
+/// Synthesizes the `"default"` backend from `[clickhouse]` — or copies an
+/// explicit `[backends.default]` back onto `cfg.clickhouse` so existing call
+/// sites keep working unchanged — then expands `~` in route dir globs and
+/// validates that every route names a configured backend with a parseable
+/// glob and a supported mode. The both-declared ambiguity (`[clickhouse]`
+/// AND `[backends.default]`) is rejected earlier in `load_config`, where the
+/// raw TOML document is still visible.
+fn normalize_backends_and_routes(cfg: &mut AppConfig) -> Result<()> {
+    match cfg.backends.get(DEFAULT_BACKEND_NAME) {
+        Some(default_backend) => cfg.clickhouse = default_backend.clone(),
+        None => {
+            cfg.backends
+                .insert(DEFAULT_BACKEND_NAME.to_string(), cfg.clickhouse.clone());
+        }
+    }
+
+    for (route_idx, route) in cfg.routes.iter_mut().enumerate() {
+        route.dir = expand_path(route.dir.trim());
+        if route.dir.is_empty() {
+            return Err(anyhow::anyhow!(
+                "routes[{route_idx}].dir must be a non-empty directory glob"
+            ));
+        }
+        glob::Pattern::new(&route.dir).map_err(|exc| {
+            anyhow::anyhow!(
+                "invalid routes[{route_idx}].dir glob `{}`: {exc}",
+                route.dir
+            )
+        })?;
+
+        route.backend = route.backend.trim().to_string();
+        if !cfg.backends.contains_key(&route.backend) {
+            return Err(anyhow::anyhow!(
+                "routes[{route_idx}].backend `{}` is not a configured backend; configured backends: {}",
+                route.backend,
+                cfg.backends.keys().cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+
+        let mode = route.mode.trim().to_ascii_lowercase();
+        if mode != ROUTE_MODE_MIRROR {
+            return Err(anyhow::anyhow!(
+                "invalid routes[{route_idx}].mode `{}` (backend `{}`); only `{ROUTE_MODE_MIRROR}` is supported (`exclusive` is not implemented yet)",
+                route.mode.trim(),
+                route.backend
+            ));
+        }
+        route.mode = mode;
+    }
+
+    Ok(())
+}
+
 fn normalize_config(mut cfg: AppConfig) -> Result<AppConfig> {
     for (source_idx, source) in cfg.ingest.sources.iter_mut().enumerate() {
         source.harness = normalize_harness(&source.harness, source_idx, &source.name)?;
@@ -813,6 +965,8 @@ fn normalize_config(mut cfg: AppConfig) -> Result<AppConfig> {
     cfg.mcp.central_socket_path =
         resolve_runtime_subdir(&cfg.runtime.pids_dir, &cfg.mcp.central_socket_path);
 
+    normalize_backends_and_routes(&mut cfg)?;
+
     Ok(cfg)
 }
 
@@ -820,7 +974,72 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<AppConfig> {
     let content = std::fs::read_to_string(path.as_ref())
         .with_context(|| format!("failed to read config {}", path.as_ref().display()))?;
     let cfg: AppConfig = toml::from_str(&content).context("failed to parse TOML config")?;
+    // The struct-level parse cannot tell an explicit `[clickhouse]` block
+    // from its serde default, so the both-declared ambiguity is detected on
+    // the raw TOML document instead.
+    let raw: toml::Value = toml::from_str(&content).context("failed to parse TOML config")?;
+    if raw.get("clickhouse").is_some()
+        && raw
+            .get("backends")
+            .and_then(|backends| backends.get(DEFAULT_BACKEND_NAME))
+            .is_some()
+    {
+        return Err(anyhow::anyhow!(
+            "config declares both [clickhouse] and [backends.default]; they are aliases for the same backend — keep exactly one"
+        ));
+    }
     normalize_config(cfg)
+}
+
+/// Name of the optional repo-level backend reference file. It carries a
+/// backend *name only* — never credentials or URLs — and resolves only if
+/// that name exists in the user's home config. This is the trust boundary:
+/// a hostile cloned repo cannot redirect traces.
+pub const REPO_BACKEND_FILE: &str = ".moraine.toml";
+
+/// Walks up from `start_dir` (inclusive) looking for a [`REPO_BACKEND_FILE`]
+/// and returns the `backend = "<name>"` it declares. The walk stops after
+/// checking `$HOME` (when `start_dir` is beneath it) or the filesystem root,
+/// whichever comes first. The nearest file wins and ends the walk even when
+/// it declares no usable name; unknown keys in the file are ignored, and a
+/// malformed file is treated as absent. Callers are expected to pass an
+/// absolute directory, warn on names that do not resolve against
+/// `AppConfig::backends`, and treat that as no route.
+pub fn find_repo_backend_ref(start_dir: impl AsRef<Path>) -> Option<String> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    find_repo_backend_ref_bounded(start_dir.as_ref(), home.as_deref())
+}
+
+fn find_repo_backend_ref_bounded(start_dir: &Path, stop_at: Option<&Path>) -> Option<String> {
+    let mut dir = start_dir;
+    loop {
+        let candidate = dir.join(REPO_BACKEND_FILE);
+        if candidate.is_file() {
+            return parse_repo_backend_ref(&candidate);
+        }
+        if stop_at == Some(dir) {
+            return None;
+        }
+        dir = dir.parent()?;
+    }
+}
+
+fn parse_repo_backend_ref(path: &Path) -> Option<String> {
+    // Deliberately NOT deny_unknown_fields: the repo file may grow keys in
+    // future versions and older binaries must keep ignoring them.
+    #[derive(Deserialize)]
+    struct RepoBackendFile {
+        backend: Option<String>,
+    }
+
+    let content = std::fs::read_to_string(path).ok()?;
+    let parsed: RepoBackendFile = toml::from_str(&content).ok()?;
+    let name = parsed.backend?.trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
 }
 
 #[cfg(test)]
@@ -1429,6 +1648,419 @@ format = "sqlite"
             map_tracked_path(SOURCE_FORMAT_CURSOR_SQLITE, "/tmp/User/notes.jsonl"),
             None
         );
+    }
+
+    fn make_temp_dir(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "moraine-config-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    #[test]
+    fn backends_default_synthesized_from_clickhouse_block() {
+        let path = write_temp_config(
+            r#"
+[clickhouse]
+url = "http://127.0.0.1:9999"
+database = "custom"
+"#,
+            "backends-synthesized",
+        );
+        let cfg = load_config(&path).expect("legacy [clickhouse] shape should load");
+        std::fs::remove_file(&path).ok();
+        let default_backend = cfg
+            .backends
+            .get(DEFAULT_BACKEND_NAME)
+            .expect("default backend synthesized from [clickhouse]");
+        assert_eq!(default_backend.url, "http://127.0.0.1:9999");
+        assert_eq!(default_backend.database, "custom");
+        assert_eq!(default_backend.url, cfg.clickhouse.url);
+        assert!(!default_backend.allow_newer_server);
+        assert_eq!(cfg.backends.len(), 1);
+    }
+
+    #[test]
+    fn explicit_backends_default_back_fills_clickhouse() {
+        let path = write_temp_config(
+            r#"
+[backends.default]
+url = "http://10.0.0.1:8123"
+database = "moraine"
+"#,
+            "backends-explicit-default",
+        );
+        let cfg = load_config(&path).expect("[backends.default] shape should load");
+        std::fs::remove_file(&path).ok();
+        // Existing call sites read cfg.clickhouse; it must mirror the
+        // explicit default backend.
+        assert_eq!(cfg.clickhouse.url, "http://10.0.0.1:8123");
+        assert_eq!(
+            cfg.backends[DEFAULT_BACKEND_NAME].url,
+            "http://10.0.0.1:8123"
+        );
+    }
+
+    #[test]
+    fn load_config_errors_when_clickhouse_and_backends_default_both_declared() {
+        let path = write_temp_config(
+            r#"
+[clickhouse]
+url = "http://127.0.0.1:8123"
+
+[backends.default]
+url = "http://10.0.0.1:8123"
+"#,
+            "backends-ambiguous-default",
+        );
+        let err = load_config(&path).expect_err("declaring both aliases should fail");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            format!("{err:#}").contains("both [clickhouse] and [backends.default]"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn clickhouse_block_plus_named_backends_coexist_in_sorted_order() {
+        let path = write_temp_config(
+            r#"
+[clickhouse]
+url = "http://127.0.0.1:9999"
+
+[backends.team-ch]
+url = "https://ch.team.example:8443"
+database = "moraine_team"
+allow_newer_server = true
+
+[backends.alpha]
+url = "http://alpha.example:8123"
+"#,
+            "backends-named",
+        );
+        let cfg = load_config(&path).expect("[clickhouse] + named backends should load");
+        std::fs::remove_file(&path).ok();
+        // BTreeMap iteration order is deterministic for logs/tests.
+        let names: Vec<&str> = cfg.backends.keys().map(String::as_str).collect();
+        assert_eq!(names, vec!["alpha", "default", "team-ch"]);
+        assert_eq!(cfg.backends["default"].url, "http://127.0.0.1:9999");
+        assert!(cfg.backends["team-ch"].allow_newer_server);
+        assert!(!cfg.backends["alpha"].allow_newer_server);
+        assert!(!cfg.backends["default"].allow_newer_server);
+    }
+
+    #[test]
+    fn app_config_default_upholds_default_backend_invariant() {
+        let cfg = AppConfig::default();
+        let default_backend = cfg
+            .backends
+            .get(DEFAULT_BACKEND_NAME)
+            .expect("default backend present on AppConfig::default()");
+        assert_eq!(default_backend.url, cfg.clickhouse.url);
+        assert!(cfg.routes.is_empty());
+    }
+
+    #[test]
+    fn routes_unknown_backend_is_load_error() {
+        let path = write_temp_config(
+            r#"
+[backends.team]
+url = "http://team.example:8123"
+
+[[routes]]
+dir = "~/src/teamproject/**"
+backend = "tema"
+"#,
+            "routes-unknown-backend",
+        );
+        let err = load_config(&path).expect_err("unknown route backend should fail");
+        std::fs::remove_file(&path).ok();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("routes[0].backend `tema` is not a configured backend"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("default, team"),
+            "error should list configured backends: {message}"
+        );
+    }
+
+    #[test]
+    fn routes_reject_non_mirror_mode() {
+        let path = write_temp_config(
+            r#"
+[backends.team]
+url = "http://team.example:8123"
+
+[[routes]]
+dir = "~/src/teamproject/**"
+backend = "team"
+mode = "exclusive"
+"#,
+            "routes-exclusive-mode",
+        );
+        let err = load_config(&path).expect_err("exclusive mode should fail");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            format!("{err:#}").contains("`exclusive` is not implemented yet"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn routes_mode_defaults_to_mirror_and_normalizes_case() {
+        let path = write_temp_config(
+            r#"
+[backends.team]
+url = "http://team.example:8123"
+
+[[routes]]
+dir = "~/src/a/**"
+backend = "team"
+
+[[routes]]
+dir = "~/src/b/**"
+backend = "team"
+mode = "Mirror"
+"#,
+            "routes-default-mode",
+        );
+        let cfg = load_config(&path).expect("routes with default mode should load");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(cfg.routes[0].mode, ROUTE_MODE_MIRROR);
+        assert_eq!(cfg.routes[1].mode, ROUTE_MODE_MIRROR);
+    }
+
+    #[test]
+    fn routes_reject_unknown_keys_and_missing_fields() {
+        let unknown_key = write_temp_config(
+            r#"
+[backends.team]
+url = "http://team.example:8123"
+
+[[routes]]
+dir = "~/src/a/**"
+backend = "team"
+extra = "nope"
+"#,
+            "routes-unknown-key",
+        );
+        let err = load_config(&unknown_key).expect_err("unknown route key should fail");
+        std::fs::remove_file(&unknown_key).ok();
+        assert!(
+            format!("{err:#}").contains("unknown field `extra`"),
+            "unexpected error: {err:#}"
+        );
+
+        let missing_dir = write_temp_config(
+            r#"
+[backends.team]
+url = "http://team.example:8123"
+
+[[routes]]
+backend = "team"
+"#,
+            "routes-missing-dir",
+        );
+        let err = load_config(&missing_dir).expect_err("missing route dir should fail");
+        std::fs::remove_file(&missing_dir).ok();
+        assert!(
+            format!("{err:#}").contains("missing field `dir`"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn routes_reject_invalid_dir_glob() {
+        let path = write_temp_config(
+            r#"
+[backends.team]
+url = "http://team.example:8123"
+
+[[routes]]
+dir = "/work/a**"
+backend = "team"
+"#,
+            "routes-invalid-glob",
+        );
+        let err = load_config(&path).expect_err("invalid route glob should fail");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            format!("{err:#}").contains("invalid routes[0].dir glob"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn route_for_dir_expands_tilde_and_matches_project_root_and_descendants() {
+        let home = std::env::var("HOME").expect("HOME set in test env");
+        let path = write_temp_config(
+            r#"
+[backends.team]
+url = "http://team.example:8123"
+
+[[routes]]
+dir = "~/src/teamproject/**"
+backend = "team"
+"#,
+            "route-match-tilde",
+        );
+        let cfg = load_config(&path).expect("route config should load");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(cfg.routes[0].dir, format!("{home}/src/teamproject/**"));
+        // The project root itself, nested dirs, and trailing slashes match.
+        for dir in [
+            format!("{home}/src/teamproject"),
+            format!("{home}/src/teamproject/"),
+            format!("{home}/src/teamproject/sub/dir"),
+        ] {
+            let route = cfg.route_for_dir(&dir);
+            assert_eq!(
+                route.map(|r| r.backend.as_str()),
+                Some("team"),
+                "expected match for {dir}"
+            );
+        }
+        assert!(cfg.route_for_dir(&format!("{home}/src/other")).is_none());
+        assert!(cfg
+            .route_for_dir(&format!("{home}/src/teamproject2"))
+            .is_none());
+        assert!(cfg.route_for_dir("").is_none());
+    }
+
+    #[test]
+    fn route_for_dir_first_match_wins() {
+        let mut cfg = AppConfig::default();
+        cfg.backends
+            .insert("a".to_string(), ClickHouseConfig::default());
+        cfg.backends
+            .insert("b".to_string(), ClickHouseConfig::default());
+        cfg.routes = vec![
+            RouteConfig {
+                dir: "/work/**".to_string(),
+                backend: "a".to_string(),
+                mode: ROUTE_MODE_MIRROR.to_string(),
+            },
+            RouteConfig {
+                dir: "/work/proj/**".to_string(),
+                backend: "b".to_string(),
+                mode: ROUTE_MODE_MIRROR.to_string(),
+            },
+        ];
+        let route = cfg.route_for_dir("/work/proj/x").expect("route matches");
+        assert_eq!(route.backend, "a");
+    }
+
+    #[test]
+    fn route_for_dir_single_star_stays_within_one_component() {
+        let mut cfg = AppConfig::default();
+        cfg.backends
+            .insert("a".to_string(), ClickHouseConfig::default());
+        cfg.routes = vec![RouteConfig {
+            dir: "/work/*".to_string(),
+            backend: "a".to_string(),
+            mode: ROUTE_MODE_MIRROR.to_string(),
+        }];
+        assert!(cfg.route_for_dir("/work/proj").is_some());
+        assert!(cfg.route_for_dir("/work/proj/sub").is_none());
+        // Without a trailing `/**` the base dir itself is not matched.
+        assert!(cfg.route_for_dir("/work").is_none());
+    }
+
+    #[test]
+    fn repo_backend_ref_found_in_ancestor_and_nearest_wins() {
+        let root = make_temp_dir("repo-ref-nearest");
+        let nested = root.join("repo/sub/dir");
+        std::fs::create_dir_all(&nested).expect("create nested dirs");
+        std::fs::write(
+            root.join(REPO_BACKEND_FILE),
+            "backend = \"outer\"\nunknown_key = true\n",
+        )
+        .expect("write outer ref");
+
+        // Ancestor file resolves through intermediate dirs without one.
+        assert_eq!(
+            find_repo_backend_ref_bounded(&nested, Some(&root)),
+            Some("outer".to_string())
+        );
+
+        // A nearer file shadows the ancestor.
+        std::fs::write(
+            root.join("repo").join(REPO_BACKEND_FILE),
+            "backend = \"inner\"\n",
+        )
+        .expect("write inner ref");
+        assert_eq!(
+            find_repo_backend_ref_bounded(&nested, Some(&root)),
+            Some("inner".to_string())
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn repo_backend_ref_stops_at_boundary_inclusive() {
+        let root = make_temp_dir("repo-ref-boundary");
+        let home = root.join("home");
+        let nested = home.join("src/project");
+        std::fs::create_dir_all(&nested).expect("create nested dirs");
+        // A file ABOVE the stop dir must never be consulted.
+        std::fs::write(root.join(REPO_BACKEND_FILE), "backend = \"escaped\"\n")
+            .expect("write outer ref");
+        assert_eq!(find_repo_backend_ref_bounded(&nested, Some(&home)), None);
+
+        // A file AT the stop dir is still consulted (stop is inclusive).
+        std::fs::write(home.join(REPO_BACKEND_FILE), "backend = \"athome\"\n")
+            .expect("write home ref");
+        assert_eq!(
+            find_repo_backend_ref_bounded(&nested, Some(&home)),
+            Some("athome".to_string())
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn repo_backend_ref_nearest_file_ends_walk_even_without_name() {
+        let root = make_temp_dir("repo-ref-ends-walk");
+        let nested = root.join("repo");
+        std::fs::create_dir_all(&nested).expect("create nested dir");
+        std::fs::write(root.join(REPO_BACKEND_FILE), "backend = \"outer\"\n")
+            .expect("write outer ref");
+
+        // Nearest file has no backend key: walk ends there with no name.
+        std::fs::write(nested.join(REPO_BACKEND_FILE), "other = 1\n").expect("write keyless ref");
+        assert_eq!(find_repo_backend_ref_bounded(&nested, Some(&root)), None);
+
+        // Malformed TOML and blank names are treated the same way.
+        std::fs::write(nested.join(REPO_BACKEND_FILE), "backend = [broken\n")
+            .expect("write malformed ref");
+        assert_eq!(find_repo_backend_ref_bounded(&nested, Some(&root)), None);
+        std::fs::write(nested.join(REPO_BACKEND_FILE), "backend = \"  \"\n")
+            .expect("write blank ref");
+        assert_eq!(find_repo_backend_ref_bounded(&nested, Some(&root)), None);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn repo_backend_ref_public_helper_walks_up_from_start_dir() {
+        // temp_dir is outside $HOME on macOS and Linux CI, so the public
+        // helper's walk terminates via the filesystem-root bound; the file
+        // is planted close enough that the search never escapes the tempdir.
+        let root = make_temp_dir("repo-ref-public");
+        let nested = root.join("a/b");
+        std::fs::create_dir_all(&nested).expect("create nested dirs");
+        std::fs::write(root.join(REPO_BACKEND_FILE), "backend = \"team-ch\"\n").expect("write ref");
+        assert_eq!(find_repo_backend_ref(&nested), Some("team-ch".to_string()));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
