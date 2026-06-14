@@ -1,0 +1,13 @@
+<svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Moraine">
+  <defs>
+    <linearGradient id="mg" x1="2" y1="9" x2="30" y2="27" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7dd3fc"/>
+      <stop offset="0.55" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#2dd4bf"/>
+    </linearGradient>
+  </defs>
+  <!-- stacked, lumpy sediment ridges: a moraine left behind by a glacier -->
+  <path d="M2 24.5 Q9 12 15 17 Q21 22 30 9.5" stroke="url(#mg)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" opacity="0.5"/>
+  <path d="M2 27.5 Q9.5 16 15.5 20.5 Q21 24.5 30 14" stroke="url(#mg)" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" opacity="0.78"/>
+  <path d="M2 30 Q10 21 16 24 Q22 27 30 19" stroke="url(#mg)" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

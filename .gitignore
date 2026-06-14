@@ -26,3 +26,6 @@ web/monitor/.vite/
 web/monitor/.playwright/
 web/monitor/playwright-report/
 web/monitor/test-results/
+
+# Landing-page QA screenshots (generated)
+web/landing/qa-shots/

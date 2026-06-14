@@ -53,7 +53,10 @@ jobs:
               - 'crates/**'
               - 'scripts/**'
               - 'sql/**'
-              - 'web/**'
+              # Only the monitor frontend is exercised by the e2e stack. Other
+              # web/ trees (e.g. web/landing/, the static GitHub Pages hero page)
+              # are validated by docs-deploy, not the functional stack.
+              - 'web/monitor/**'
 
       - name: Functional stack + MCP smoke (Linux)
         if: github.event_name != 'pull_request' || steps.e2e_changes.outputs.e2e == 'true'
