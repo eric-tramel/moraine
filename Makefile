@@ -72,6 +72,7 @@ docs-build:
 	$(UV) run --with zensical zensical build
 	@echo "[docs] overlaying landing page onto site root"
 	@cp web/landing/index.html site/index.html
+	@cp web/landing/CNAME site/CNAME
 	@mkdir -p site/assets
 	@cp -R web/landing/assets/. site/assets/
 
