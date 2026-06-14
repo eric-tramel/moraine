@@ -18,7 +18,7 @@ endif
 CARGO_TARGET_DIR ?= $(DEFAULT_CARGO_TARGET_DIR)
 RUST_LABEL = $(if $(filter 1,$(USE_RUSTUP)),$(RUST_TOOLCHAIN) via $(RUSTUP_BIN_DIR),host PATH)
 
-.PHONY: help fmt clippy build test ci-check docs-build docs-serve docs-clean sandbox-up sandbox-down sandbox-list hooks-install
+.PHONY: help fmt clippy build test ci-check install docs-build docs-serve docs-clean sandbox-up sandbox-down sandbox-list hooks-install
 
 help:
 	@echo "Available targets:"
@@ -27,6 +27,7 @@ help:
 	@echo "  make build          Build all workspace crates"
 	@echo "  make test           Run workspace tests"
 	@echo "  make ci-check       Run local CI checks: fmt, clippy, build, test"
+	@echo "  make install        Build the current checkout and install it to the host"
 	@echo "  make docs-build     Build static docs site into ./site"
 	@echo "  make docs-serve     Run live docs server at $(DOCS_ADDR)"
 	@echo "  make docs-clean     Remove generated docs site output"
@@ -57,6 +58,12 @@ test:
 	@$(CARGO_ENV) CARGO_TARGET_DIR='$(CARGO_TARGET_DIR)' $(CARGO_CMD) test --workspace --locked
 
 ci-check: fmt clippy build test
+
+# Build the current checkout for the host target and install it over the
+# active `moraine` on your PATH. Pass flags via INSTALL_ARGS, e.g.
+#   make install INSTALL_ARGS="--with-clickhouse"
+install:
+	scripts/dev/install-host.sh $(INSTALL_ARGS)
 
 hooks-install:
 	scripts/dev/install-hooks.sh
