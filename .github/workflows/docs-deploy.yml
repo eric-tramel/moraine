@@ -1,3 +1,8 @@
+# Builds and publishes the GitHub Pages site on every push to main:
+#   - the hand-built hero landing page (web/landing/) as the site root, and
+#   - the Zensical-built docs.
+# `make docs-build` overlays the landing page onto site/ after the docs build,
+# so this workflow stays a thin build-and-deploy wrapper.
 name: docs-deploy
 
 on:
@@ -27,8 +32,20 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v4
 
-      - name: Build docs with Zensical
+      - name: Build site (landing + docs)
         run: make docs-build
+
+      - name: Verify landing page and docs are present
+        run: |
+          set -euo pipefail
+          for f in site/index.html site/introduction.html site/quickstart.html \
+                   site/configuration.html site/assets/og.png site/assets/favicon.svg \
+                   site/assets/monitor-desktop.png site/assets/fonts/space-grotesk-700.woff2; do
+            test -f "$f" || { echo "::error::missing $f"; exit 1; }
+          done
+          grep -q "Long-term memory" site/index.html || { echo "::error::hero headline missing from site/index.html"; exit 1; }
+          grep -q "The traces are the truth" site/index.html || { echo "::error::landing page not overlaid onto site root"; exit 1; }
+          echo "verified: hero landing page + docs built into site/"
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v4

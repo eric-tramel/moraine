@@ -3,23 +3,23 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Moraine — long-term memory for your coding agents</title>
-<meta name="description" content="Moraine indexes every Codex, Claude Code, Cursor, Kimi, Hermes and Pi session into a local ClickHouse trace stack and serves it over MCP, so your agents can search everything they've ever done. Fully local.">
+<title>Moraine — long-term memory for your agents</title>
+<meta name="description" content="Moraine keeps the complete, lossless trace of every agent session — exactly what happened, not a summary — and makes it searchable, so your agents can recall everything they've ever done. Fully local.">
 <link rel="canonical" href="https://eric-tramel.github.io/moraine/">
 <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
 <meta name="theme-color" content="#080b11">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="Moraine">
-<meta property="og:title" content="Moraine — long-term memory for your coding agents">
-<meta property="og:description" content="Indexes every Codex, Claude Code, Cursor, Kimi, Hermes & Pi session into local ClickHouse, served over MCP as searchable long-term memory. Fully local.">
+<meta property="og:title" content="Moraine — long-term memory for your agents">
+<meta property="og:description" content="The complete, lossless trace of every agent session — exactly what happened, not a summary — made searchable. The traces are the truth. Fully local.">
 <meta property="og:url" content="https://eric-tramel.github.io/moraine/">
 <meta property="og:image" content="https://eric-tramel.github.io/moraine/assets/og.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="Moraine — a local trace stack for agent work">
+<meta property="og:image:alt" content="Moraine — long-term memory for your agents">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="Moraine — long-term memory for your coding agents">
-<meta name="twitter:description" content="A local trace stack for agent work: Codex, Claude Code, Cursor, Kimi, Hermes & Pi sessions indexed into ClickHouse, searchable over MCP.">
+<meta name="twitter:title" content="Moraine — long-term memory for your agents">
+<meta name="twitter:description" content="The complete, lossless trace of every agent session — exactly what happened, not a summary — made searchable. The traces are the truth. Fully local.">
 <meta name="twitter:image" content="https://eric-tramel.github.io/moraine/assets/og.png">
 <link rel="preload" href="assets/fonts/space-grotesk-700.woff2" as="font" type="font/woff2" crossorigin>
 <style>
@@ -122,12 +122,12 @@
     content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 320px;
     background: linear-gradient(180deg, transparent, rgba(4, 7, 12, 0.55));
   }
-  /* banded strata settling at the hero floor — the moraine */
-  .strata { position: absolute; left: 0; right: 0; bottom: 0; height: 340px; z-index: 0; }
-  .strata i {
-    position: absolute; left: -4%; right: -4%; display: block;
-    border-top: 1px solid rgba(125, 211, 252, 0.28);
-  }
+  /* a moraine ridge settling at the hero floor — sediment deposited by the glacier.
+     edge-faded so it never reads as a full-width horizontal rule */
+  .strata { position: absolute; left: 0; right: 0; bottom: 0; height: 360px; z-index: 0;
+    -webkit-mask-image: linear-gradient(90deg, transparent, #000 13%, #000 87%, transparent);
+    mask-image: linear-gradient(90deg, transparent, #000 13%, #000 87%, transparent); }
+  .strata svg { position: absolute; left: 0; right: 0; bottom: 0; width: 100%; height: 100%; display: block; }
   .hero-inner { position: relative; z-index: 1; display: grid; grid-template-columns: minmax(0, 1.12fr) minmax(0, 0.88fr); gap: 52px; align-items: center; }
   .hero-inner > * { min-width: 0; } /* prevent grid min-content blowout (mobile overflow) */
   .hero h1 { font-size: clamp(40px, 5.2vw, 60px); margin: 14px 0 0; letter-spacing: -0.03em; text-wrap: balance; }
@@ -198,6 +198,39 @@
   .define .thesis { font-family: var(--display); color: var(--ink); font-size: clamp(19px, 2.3vw, 26px); font-weight: 600; letter-spacing: -.01em; margin: 16px 0 0; max-width: 26ch; line-height: 1.25; }
   .define .thesis b { background: var(--accent-grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
 
+  /* ---------- lossless comparison ---------- */
+  .versus { display: grid; grid-template-columns: 1fr auto 1fr; align-items: stretch; gap: 0; }
+  .vs-card { border: 1px solid var(--line); border-radius: 18px; background: var(--surface); padding: 24px; display: flex; flex-direction: column; }
+  .vs-card .vs-tag { font-family: var(--mono); font-size: 11px; letter-spacing: .1em; text-transform: uppercase; display: inline-flex; align-items: center; gap: 7px; padding: 5px 12px; border-radius: 999px; align-self: flex-start; }
+  .vs-card .vs-tag::before { content: ""; width: 7px; height: 7px; border-radius: 99px; background: currentColor; }
+  .vs-lossy .vs-tag { color: var(--sediment); background: rgba(232,176,122,.09); border: 1px solid rgba(232,176,122,.24); }
+  .vs-true  .vs-tag { color: var(--teal); background: rgba(45,212,191,.1); border: 1px solid rgba(45,212,191,.3); }
+  .vs-card h3 { font-size: 19px; margin: 16px 0 0; }
+  .vs-card > p { color: var(--ink-2); font-size: 14.5px; margin: 16px 0 0; }
+  .vs-card > p b { color: var(--ink); }
+  .vs-true { border-color: rgba(45,212,191,.32); background: linear-gradient(180deg, rgba(45,212,191,.055), var(--surface)); box-shadow: 0 40px 70px -46px rgba(45,212,191,.45); }
+  .vs-mid { display: grid; place-items: center; padding: 0 22px; }
+  .vs-mid span { font-family: var(--mono); font-size: 12px; color: var(--ink-2); border: 1px solid var(--line-2); border-radius: 999px; width: 46px; height: 46px; display: grid; place-items: center; background: var(--bg); }
+
+  .mock { margin-top: 18px; border-radius: 11px; border: 1px solid var(--line); overflow: hidden; font-family: var(--mono); font-size: 12.5px; background: var(--bg-2); }
+  .mock-bar { display: flex; justify-content: space-between; padding: 9px 13px; border-bottom: 1px solid var(--line); color: var(--ink-3); font-size: 11px; background: rgba(255,255,255,.02); }
+  .mock-body { padding: 13px 15px; line-height: 1.75; position: relative; }
+  /* lossy markdown notes */
+  .f-h { color: var(--ink-3); }
+  .f-l { color: var(--ink-2); }
+  .f-l.gone { color: var(--ink-3); text-decoration: line-through; text-decoration-color: rgba(232,176,122,.6); opacity: .65; }
+  .f-l .q { color: var(--sediment); }
+  .lossy-body { -webkit-mask-image: linear-gradient(180deg, #000 62%, transparent); mask-image: linear-gradient(180deg, #000 62%, transparent); }
+  .lossy-foot { margin-top: 14px; font-family: var(--mono); font-size: 11.5px; color: var(--sediment); }
+  /* lossless trace */
+  .tr { display: grid; grid-template-columns: 46px 70px 1fr; gap: 10px; padding: 2.5px 0; align-items: baseline; }
+  .tr .ts { color: var(--ink-3); }
+  .tr .ev { font-size: 10.5px; letter-spacing: .04em; }
+  .tr .ev.u { color: var(--ice); } .tr .ev.a { color: var(--teal); } .tr .ev.t { color: var(--cyan); }
+  .tr .dt { color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tr .dt .ok { color: var(--teal); }
+  .true-foot { margin-top: 14px; font-family: var(--mono); font-size: 11.5px; color: var(--teal); }
+
   /* ---------- generic section ---------- */
   section.band { padding: 92px 0; position: relative; }
   /* recurring stratified divider keeps the geology alive after the fold */
@@ -223,17 +256,18 @@
   .card code { font-family: var(--mono); font-size: 12.5px; color: var(--ice); background: rgba(125,211,252,.08); padding: 1px 6px; border-radius: 5px; }
 
   /* pipeline */
-  .pipe { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; align-items: stretch; gap: 0; }
+  .pipe { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr auto 1fr; align-items: stretch; gap: 0; }
   .pnode {
     border: 1px solid var(--line); border-radius: 14px; background: var(--surface);
-    padding: 20px 18px; text-align: center; display: flex; flex-direction: column; gap: 6px; justify-content: center;
+    padding: 18px 17px; display: flex; flex-direction: column; gap: 13px;
   }
-  .pnode .k { font-family: var(--mono); font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: var(--cyan); }
-  .pnode strong { font-family: var(--display); font-size: 16px; font-weight: 600; letter-spacing: -.01em; }
-  .pnode span { color: var(--ink-3); font-size: 13px; }
-  .parrow { display: grid; place-items: center; padding: 0 14px; color: var(--ink-3); }
-  .parrow svg { width: 26px; height: 26px; }
-  .pfan { display: flex; flex-direction: column; gap: 12px; }
+  .pnode .chip { font-family: var(--mono); font-size: 11px; color: var(--ice); background: rgba(125,211,252,.06); border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pnode .chip .mut { color: var(--ink-3); }
+  .pnode .k { font-family: var(--mono); font-size: 10.5px; letter-spacing: .14em; text-transform: uppercase; color: var(--cyan); display: block; }
+  .pnode strong { font-family: var(--display); font-size: 16px; font-weight: 600; letter-spacing: -.01em; display: block; margin-top: 3px; }
+  .pnode .d { color: var(--ink-3); font-size: 12.5px; line-height: 1.5; margin-top: 5px; display: block; }
+  .parrow { display: grid; place-items: center; padding: 0 10px; color: var(--ink-3); }
+  .parrow svg { width: 22px; height: 22px; }
 
   /* harness grid */
   .harness { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
@@ -318,6 +352,8 @@
     .harness { grid-template-columns: repeat(2, 1fr); }
     .pipe { grid-template-columns: 1fr; gap: 12px; }
     .parrow { transform: rotate(90deg); padding: 4px 0; }
+    .versus { grid-template-columns: 1fr; gap: 14px; }
+    .vs-mid { transform: rotate(90deg); padding: 2px 0; }
     .foot { grid-template-columns: 1fr 1fr; }
   }
   @media (max-width: 640px) {
@@ -369,20 +405,35 @@
   <section class="hero">
     <div class="hero-bg" aria-hidden="true">
       <div class="strata">
-        <i style="bottom:0;height:44px;background:linear-gradient(180deg,rgba(232,176,122,.14),transparent)"></i>
-        <i style="bottom:44px;height:30px;background:linear-gradient(180deg,rgba(148,178,210,.12),transparent)"></i>
-        <i style="bottom:74px;height:40px;background:linear-gradient(180deg,rgba(45,212,191,.13),transparent)"></i>
-        <i style="bottom:114px;height:24px;background:linear-gradient(180deg,rgba(34,211,238,.11),transparent)"></i>
-        <i style="bottom:138px;height:34px;background:linear-gradient(180deg,rgba(125,211,252,.075),transparent)"></i>
-        <i style="bottom:172px;height:20px;background:linear-gradient(180deg,rgba(34,211,238,.05),transparent)"></i>
-        <i style="bottom:192px;height:46px;background:linear-gradient(180deg,rgba(125,211,252,.04),transparent);border-top-color:rgba(125,211,252,.14)"></i>
+        <svg viewBox="0 0 1440 360" preserveAspectRatio="none" fill="none">
+          <defs>
+            <linearGradient id="rg-back" x1="0" y1="180" x2="0" y2="360" gradientUnits="userSpaceOnUse">
+              <stop stop-color="#22d3ee" stop-opacity="0.085"/><stop offset="1" stop-color="#22d3ee" stop-opacity="0"/>
+            </linearGradient>
+            <linearGradient id="rg-mid" x1="0" y1="215" x2="0" y2="360" gradientUnits="userSpaceOnUse">
+              <stop stop-color="#2dd4bf" stop-opacity="0.11"/><stop offset="1" stop-color="#2dd4bf" stop-opacity="0"/>
+            </linearGradient>
+            <linearGradient id="rg-front" x1="0" y1="280" x2="0" y2="360" gradientUnits="userSpaceOnUse">
+              <stop stop-color="#e8b07a" stop-opacity="0.07"/><stop offset="1" stop-color="#e8b07a" stop-opacity="0"/>
+            </linearGradient>
+          </defs>
+          <!-- back ridge -->
+          <path d="M0 250 C 300 150 520 215 780 195 C 1020 175 1240 235 1440 205 L1440 360 L0 360 Z" fill="url(#rg-back)"/>
+          <path d="M0 250 C 300 150 520 215 780 195 C 1020 175 1240 235 1440 205" stroke="#7dd3fc" stroke-opacity="0.16" stroke-width="1.4"/>
+          <!-- mid ridge -->
+          <path d="M0 285 C 360 215 560 258 820 244 C 1080 230 1280 272 1440 250 L1440 360 L0 360 Z" fill="url(#rg-mid)"/>
+          <path d="M0 285 C 360 215 560 258 820 244 C 1080 230 1280 272 1440 250" stroke="#2dd4bf" stroke-opacity="0.15" stroke-width="1.4"/>
+          <!-- sediment front -->
+          <path d="M0 320 C 320 282 600 306 880 297 C 1120 289 1300 313 1440 301 L1440 360 L0 360 Z" fill="url(#rg-front)"/>
+          <path d="M0 320 C 320 282 600 306 880 297 C 1120 289 1300 313 1440 301" stroke="#e8b07a" stroke-opacity="0.10" stroke-width="1.2"/>
+        </svg>
       </div>
     </div>
     <div class="wrap hero-inner">
       <div class="hero-copy">
-        <span class="eyebrow">Local-first · MCP-native · Apache-2.0</span>
-        <h1>Long-term memory<br>for your <span class="grad-text">coding agents.</span></h1>
-        <p class="lede">Your agents forget everything between sessions, and their history is scattered across tools you can't search. Moraine indexes every Codex, Claude&nbsp;Code, Cursor, Kimi, Hermes and Pi session into a local <b>ClickHouse</b> trace stack and serves it over <b>MCP</b> — so agents can search <b>everything they've ever done.</b> <span class="priv">Nothing leaves your machine.</span></p>
+        <span class="eyebrow">Lossless · Local-first · Apache-2.0</span>
+        <h1>Long-term memory<br>for your <span class="grad-text">agents.</span></h1>
+        <p class="lede">Your agents forget everything between sessions, and their history is scattered across tools you can't search. Moraine keeps the <b>complete trace</b> of every session — exactly what happened, not a summary — and makes it searchable, so agents can recall <b>everything they've ever done.</b> <span class="priv">It all stays on your machine.</span></p>
 
         <div class="cmd">
           <span class="prompt">$</span>
@@ -405,8 +456,8 @@
         </div>
         <div class="trust">
           <span>Apache-2.0</span><span class="dot"></span>
-          <span>Written in Rust</span><span class="dot"></span>
-          <span>Runs on your machine</span>
+          <span>100% local</span><span class="dot"></span>
+          <span>No account, no cloud</span>
         </div>
       </div>
 
@@ -439,6 +490,56 @@
     </div>
   </div>
 
+  <!-- LOSSLESS -->
+  <section class="band">
+    <div class="wrap">
+      <div class="band-head reveal" style="max-width:720px">
+        <span class="eyebrow">Lossless by construction</span>
+        <h2>Markdown memory forgets.<br>The traces are the truth.</h2>
+        <p>Every other "agent memory" asks the model to write down what it <em>thinks</em> mattered. That push model is lossy by definition — it editorializes, compresses, and the instant the note is written the real detail is gone. Moraine never summarizes. It records the complete session trace and lets agents pull from it — you read what actually happened, not a story about it.</p>
+      </div>
+      <div class="versus reveal">
+        <div class="vs-card vs-lossy">
+          <span class="vs-tag">Push memory · lossy</span>
+          <h3>The agent writes notes.</h3>
+          <div class="mock">
+            <div class="mock-bar"><span>memory.md</span><span>~ the agent's guess</span></div>
+            <div class="mock-body lossy-body">
+              <div class="f-h"># what I remember</div>
+              <div class="f-l">- fixed the socket <span class="q">thing</span> (i think)</div>
+              <div class="f-l">- routing changed — ask the user later</div>
+              <div class="f-l gone">- use the old config path</div>
+              <div class="f-l">- TODO: write this up properly</div>
+              <div class="f-l f-h">- …</div>
+              <div class="f-l f-h">- …</div>
+            </div>
+          </div>
+          <p class="lossy-foot">↳ only what the agent chose to keep — the rest is gone.</p>
+          <p>A summary chosen in the moment: <b>editorialized, partial, and stale</b> the instant it's written. What it left out, you can never get back.</p>
+        </div>
+
+        <div class="vs-mid" aria-hidden="true"><span>vs</span></div>
+
+        <div class="vs-card vs-true">
+          <span class="vs-tag">Moraine · lossless</span>
+          <h3>Moraine keeps the trace.</h3>
+          <div class="mock">
+            <div class="mock-bar"><span>session 7f3a · codex</span><span>verbatim</span></div>
+            <div class="mock-body">
+              <div class="tr"><span class="ts">14:02</span><span class="ev u">user</span><span class="dt">"the socket routing looks wrong…"</span></div>
+              <div class="tr"><span class="ts">14:02</span><span class="ev t">tool</span><span class="dt">grep -r mcp.sock crates/</span></div>
+              <div class="tr"><span class="ts">14:03</span><span class="ev a">asst</span><span class="dt">patch central proxy → log to stderr</span></div>
+              <div class="tr"><span class="ts">14:05</span><span class="ev t">tool</span><span class="dt">cargo test → <span class="ok">142 passed ✓</span></span></div>
+              <div class="tr"><span class="ts">14:06</span><span class="ev a">asst</span><span class="dt">"central socket at ~/.moraine/run/…"</span></div>
+            </div>
+          </div>
+          <p class="true-foot">↳ every turn, tool call &amp; token — recorded, queryable.</p>
+          <p>The raw record of what actually happened. Agents pull from <b>ground truth</b> — and you can always re-read the exact session, byte for byte.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <!-- FEATURES -->
   <section class="band">
     <div class="wrap">
@@ -446,13 +547,13 @@
         <span class="eyebrow">What you get</span>
         <h2>One unified record of everything your agents did.</h2>
         <p>Conversation turns, tool calls, token counts and timestamps from every harness, in one consistent schema you can browse, query, and search.</p>
-        <p class="who">For developers who run coding agents all day — across more than one tool.</p>
+        <p class="who">For anyone who runs agents all day — across more than one tool.</p>
       </div>
       <div class="features">
         <div class="card reveal">
           <div class="ic"><svg viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg></div>
-          <h3>Just ClickHouse underneath</h3>
-          <p>Turns, tool calls, tokens and timing land in one schema. Query <code>moraine.events</code> with your own SQL, dashboards or notebooks — no lock-in.</p>
+          <h3>Query the raw record</h3>
+          <p>Turns, tool calls, tokens and timing land in one open schema. Point your own SQL, dashboards or notebooks at <code>moraine.events</code> — no lock-in, no black box.</p>
         </div>
         <div class="card reveal">
           <div class="ic"><svg viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><path d="M12 2v4M12 18v4M2 12h4M18 12h4M5 5l3 3M16 16l3 3M19 5l-3 3M8 16l-3 3"/><circle cx="12" cy="12" r="3"/></svg></div>
@@ -466,13 +567,13 @@
         </div>
         <div class="card reveal">
           <div class="ic"><svg viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></div>
-          <h3>MCP retrieval</h3>
-          <p>Agents search prior decisions, fixes and errors over <code>moraine run mcp</code> — long-term memory exposed as standard MCP tools.</p>
+          <h3>Recall for your agents</h3>
+          <p>Agents search their own past decisions, fixes and errors on demand — the whole record, exposed as tools they already know how to call.</p>
         </div>
         <div class="card reveal">
           <div class="ic"><svg viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><path d="M3 6h18M6 12h12M10 18h4"/></svg></div>
           <h3>Cross-provider search</h3>
-          <p>One BM25 query spans every harness at once. Find that decision, fix or error wherever it happened — Codex, Claude or Cursor alike.</p>
+          <p>One keyword search spans every harness at once. Find that decision, fix or error wherever it happened — whichever agent did the work.</p>
         </div>
         <div class="card reveal">
           <div class="ic"><svg viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg></div>
@@ -492,28 +593,27 @@
       </div>
       <div class="pipe reveal">
         <div class="pnode">
-          <span class="k">Sources</span>
-          <strong>Agent harnesses</strong>
-          <span>Codex · Claude · Cursor · Kimi · Hermes · Pi</span>
+          <span class="chip">~/.codex/sessions/…jsonl<span class="mut"> +5</span></span>
+          <div><span class="k">Sources</span><strong>Your sessions</strong></div>
+          <span class="d">Every harness you run — watched live and backfilled on first start.</span>
         </div>
         <div class="parrow"><span class="sr-only">then</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg></div>
         <div class="pnode">
-          <span class="k">Ingest</span>
-          <strong>Watch &amp; normalize</strong>
-          <span>Realtime tail + startup backfill into one schema</span>
+          <span class="chip">turn · tool · result</span>
+          <div><span class="k">Capture</span><strong>The complete trace</strong></div>
+          <span class="d">Every turn, tool call and result, recorded verbatim — not summarized.</span>
         </div>
         <div class="parrow"><span class="sr-only">then</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg></div>
-        <div class="pfan">
-          <div class="pnode" style="flex:1">
-            <span class="k">Store</span>
-            <strong>ClickHouse + BM25</strong>
-            <span>moraine.events &amp; views, keyword-indexed</span>
-          </div>
-          <div class="pnode" style="flex:1">
-            <span class="k">Serve</span>
-            <strong>Monitor UI &amp; MCP</strong>
-            <span>Browse at :8080 · search over MCP</span>
-          </div>
+        <div class="pnode">
+          <span class="chip">moraine.events</span>
+          <div><span class="k">Store</span><strong>One local record</strong></div>
+          <span class="d">A fast local store, keyword-indexed so anything is instantly searchable.</span>
+        </div>
+        <div class="parrow"><span class="sr-only">then</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg></div>
+        <div class="pnode">
+          <span class="chip">search · open · list</span>
+          <div><span class="k">Recall</span><strong>Browse &amp; retrieve</strong></div>
+          <span class="d">See the whole fleet in the monitor; agents pull what they need on demand.</span>
         </div>
       </div>
     </div>
@@ -559,7 +659,7 @@
         <p>Add a few lines to your harness instructions and your agents stop asking you what already happened. They search the record themselves — across providers, in realtime.</p>
         <ul class="toollist">
           <li><code>list_sessions</code><span>Enumerate recent and active sessions, any harness.</span></li>
-          <li><code>search_sessions</code><span>BM25 keyword search over the full trace history.</span></li>
+          <li><code>search_sessions</code><span>Keyword search over the full trace history.</span></li>
           <li><code>open</code><span>Pull a specific session's turns, tools and context.</span></li>
         </ul>
         <div class="cta-row">
@@ -581,7 +681,7 @@
       </div>
       <div class="frame reveal">
         <div class="chrome"><i style="background:#ff5f57"></i><i style="background:#febc2e"></i><i style="background:#28c840"></i><span class="url">127.0.0.1:8080</span></div>
-        <img src="assets/monitor-desktop.png" width="1440" height="916" loading="lazy" decoding="async" alt="Moraine monitor dashboard showing live analytics: generation tokens per model, turns per model, concurrent sessions, and a searchable session list.">
+        <img src="assets/monitor-desktop.png" width="2680" height="2234" loading="lazy" decoding="async" alt="Moraine monitor dashboard showing live analytics across six models — generation tokens per model, turns per model, concurrent sessions — plus a searchable list of agent sessions from Codex, Claude Code, Cursor, Hermes, Kimi and Pi.">
       </div>
     </div>
   </section>
