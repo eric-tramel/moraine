@@ -1,0 +1,703 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Moraine — long-term memory for your coding agents</title>
+<meta name="description" content="Moraine indexes every Codex, Claude Code, Cursor, Kimi, Hermes and Pi session into a local ClickHouse trace stack and serves it over MCP, so your agents can search everything they've ever done. Fully local.">
+<link rel="canonical" href="https://eric-tramel.github.io/moraine/">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<meta name="theme-color" content="#080b11">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Moraine">
+<meta property="og:title" content="Moraine — long-term memory for your coding agents">
+<meta property="og:description" content="Indexes every Codex, Claude Code, Cursor, Kimi, Hermes & Pi session into local ClickHouse, served over MCP as searchable long-term memory. Fully local.">
+<meta property="og:url" content="https://eric-tramel.github.io/moraine/">
+<meta property="og:image" content="https://eric-tramel.github.io/moraine/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Moraine — a local trace stack for agent work">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Moraine — long-term memory for your coding agents">
+<meta name="twitter:description" content="A local trace stack for agent work: Codex, Claude Code, Cursor, Kimi, Hermes & Pi sessions indexed into ClickHouse, searchable over MCP.">
+<meta name="twitter:image" content="https://eric-tramel.github.io/moraine/assets/og.png">
+<link rel="preload" href="assets/fonts/space-grotesk-700.woff2" as="font" type="font/woff2" crossorigin>
+<style>
+  /* ---------- self-hosted fonts (no external requests) ---------- */
+  @font-face { font-family: "Space Grotesk"; font-style: normal; font-weight: 500; font-display: swap; src: url("assets/fonts/space-grotesk-500.woff2") format("woff2"); }
+  @font-face { font-family: "Space Grotesk"; font-style: normal; font-weight: 600; font-display: swap; src: url("assets/fonts/space-grotesk-600.woff2") format("woff2"); }
+  @font-face { font-family: "Space Grotesk"; font-style: normal; font-weight: 700; font-display: swap; src: url("assets/fonts/space-grotesk-700.woff2") format("woff2"); }
+  @font-face { font-family: "JetBrains Mono"; font-style: normal; font-weight: 400; font-display: swap; src: url("assets/fonts/jetbrains-mono-400.woff2") format("woff2"); }
+  @font-face { font-family: "JetBrains Mono"; font-style: normal; font-weight: 500; font-display: swap; src: url("assets/fonts/jetbrains-mono-500.woff2") format("woff2"); }
+
+  :root {
+    --bg: #080b11;
+    --bg-1: #0b0f17;
+    --bg-2: #0f1622;
+    --bg-3: #121a27;
+    --surface: rgba(255, 255, 255, 0.025);
+    --surface-2: rgba(255, 255, 255, 0.045);
+    --line: rgba(148, 178, 210, 0.12);
+    --line-2: rgba(148, 178, 210, 0.22);
+    --ink: #e8eef6;
+    --ink-2: #aab8c8;
+    --ink-3: #93a3b5;
+    --ice: #7dd3fc;
+    --cyan: #22d3ee;
+    --teal: #2dd4bf;
+    --sediment: #e8b07a;
+    --accent-grad: linear-gradient(115deg, #7dd3fc 0%, #22d3ee 48%, #2dd4bf 100%);
+    --maxw: 1120px;
+    --r: 16px;
+    --display: "Space Grotesk", system-ui, -apple-system, "Segoe UI", sans-serif;
+    --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    font-family: var(--sans);
+    color: var(--ink);
+    background: var(--bg);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    overflow-x: hidden;
+  }
+  a { color: inherit; text-decoration: none; }
+  ::selection { background: rgba(34, 211, 238, 0.45); color: #fff; }
+  h1, h2, h3 { font-family: var(--display); line-height: 1.06; letter-spacing: -0.02em; font-weight: 700; margin: 0; }
+
+  /* visible focus ring for keyboard users */
+  :where(a, button, [tabindex]):focus-visible { outline: 2px solid var(--cyan); outline-offset: 3px; border-radius: 8px; }
+  .btn-primary:focus-visible { outline-color: #fff; box-shadow: 0 0 0 3px rgba(34, 211, 238, .65); }
+  :focus:not(:focus-visible) { outline: none; }
+
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+  .skip { position: absolute; left: -9999px; top: 0; z-index: 100; }
+  .skip:focus { left: 16px; top: 12px; background: var(--bg-2); color: var(--ink); padding: 10px 16px; border: 1px solid var(--cyan); border-radius: 10px; font-weight: 600; }
+
+  .wrap { width: 100%; max-width: var(--maxw); margin-inline: auto; padding-inline: 24px; }
+  .grad-text { background: var(--accent-grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .eyebrow {
+    font-family: var(--mono); font-size: 12px; letter-spacing: 0.2em;
+    text-transform: uppercase; color: var(--cyan); font-weight: 500;
+  }
+
+  /* ---------- nav ---------- */
+  header.nav {
+    position: sticky; top: 0; z-index: 50;
+    backdrop-filter: saturate(140%) blur(14px);
+    background: rgba(8, 11, 17, 0.72);
+    border-bottom: 1px solid var(--line);
+  }
+  .nav-inner { display: flex; align-items: center; gap: 28px; height: 62px; }
+  .brand { display: inline-flex; align-items: center; gap: 11px; font-family: var(--display); font-weight: 700; letter-spacing: -0.01em; font-size: 19px; }
+  .brand svg { width: 28px; height: 28px; display: block; }
+  .nav-links { display: flex; gap: 26px; margin-left: auto; align-items: center; font-size: 14.5px; color: var(--ink-2); }
+  .nav-links a { transition: color .15s; }
+  .nav-links a:hover { color: var(--ink); }
+  .nav-cta {
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 8px 14px; border-radius: 10px;
+    border: 1px solid var(--line-2); color: var(--ink);
+    font-weight: 560; font-size: 14px; transition: border-color .15s, background .15s;
+  }
+  .nav-cta:hover { border-color: var(--cyan); background: var(--surface-2); }
+  .nav-cta svg { width: 16px; height: 16px; }
+
+  /* ---------- hero ---------- */
+  .hero { position: relative; padding: 92px 0 96px; overflow: hidden; }
+  .hero-bg { position: absolute; inset: 0; z-index: 0; pointer-events: none; }
+  .hero-bg::before {
+    content: ""; position: absolute; inset: -22% -10% auto -10%; height: 760px;
+    background:
+      radial-gradient(58% 56% at 74% 4%, rgba(34, 211, 238, 0.22), transparent 68%),
+      radial-gradient(48% 46% at 16% 0%, rgba(125, 211, 252, 0.16), transparent 70%);
+  }
+  /* sediment darkening toward the floor */
+  .hero-bg::after {
+    content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 320px;
+    background: linear-gradient(180deg, transparent, rgba(4, 7, 12, 0.55));
+  }
+  /* banded strata settling at the hero floor — the moraine */
+  .strata { position: absolute; left: 0; right: 0; bottom: 0; height: 340px; z-index: 0; }
+  .strata i {
+    position: absolute; left: -4%; right: -4%; display: block;
+    border-top: 1px solid rgba(125, 211, 252, 0.28);
+  }
+  .hero-inner { position: relative; z-index: 1; display: grid; grid-template-columns: minmax(0, 1.12fr) minmax(0, 0.88fr); gap: 52px; align-items: center; }
+  .hero-inner > * { min-width: 0; } /* prevent grid min-content blowout (mobile overflow) */
+  .hero h1 { font-size: clamp(40px, 5.2vw, 60px); margin: 14px 0 0; letter-spacing: -0.03em; text-wrap: balance; }
+  .lede { color: var(--ink-2); font-size: clamp(16px, 1.5vw, 18.5px); margin: 26px 0 0; max-width: 40ch; overflow-wrap: break-word; }
+  .lede b { color: var(--ink); font-weight: 600; }
+  .lede .priv { color: var(--ice); font-weight: 600; }
+
+  .cmd {
+    display: flex; align-items: center; gap: 12px; margin-top: 32px; width: 100%;
+    background: var(--bg-2); border: 1px solid var(--line-2); border-radius: 12px;
+    padding: 13px 14px 13px 16px; max-width: min(440px, 100%); font-family: var(--mono); font-size: 14px;
+  }
+  .cmd .prompt { color: var(--teal); flex: none; }
+  .cmd code { color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 1; }
+  .cmd button {
+    flex: none; cursor: pointer;
+    background: var(--surface-2); border: 1px solid var(--line-2); color: var(--ink-2);
+    border-radius: 8px; padding: 6px 8px; display: inline-flex; transition: color .15s, border-color .15s;
+  }
+  .cmd button:hover { color: var(--ink); border-color: var(--cyan); }
+  .cmd button svg { width: 15px; height: 15px; }
+
+  .cta-row { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 24px; align-items: center; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 9px; font-weight: 600; font-size: 15px;
+    padding: 13px 22px; border-radius: 12px; transition: transform .12s ease, box-shadow .2s, border-color .15s, background .15s;
+  }
+  .btn-primary { color: #04121a; background: var(--accent-grad); box-shadow: 0 10px 30px -10px rgba(34,211,238,.55); }
+  .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 16px 40px -12px rgba(34,211,238,.7); }
+  .btn-ghost { color: var(--ink); border: 1px solid var(--line-2); }
+  .btn-ghost:hover { border-color: var(--cyan); background: var(--surface); }
+  .btn svg { width: 18px; height: 18px; }
+  .trust { margin-top: 22px; font-size: 13px; color: var(--ink-3); display: flex; gap: 14px; flex-wrap: wrap; align-items: center; font-family: var(--mono); }
+  .trust .dot { width: 4px; height: 4px; border-radius: 99px; background: var(--ink-3); display: inline-block; }
+
+  /* hero core-sample visual */
+  .core { position: relative; }
+  .core-card {
+    position: relative; border: 1px solid var(--line-2); border-radius: 20px;
+    background: linear-gradient(180deg, rgba(16,23,36,.92), rgba(9,13,20,.95));
+    padding: 20px; box-shadow: 0 40px 90px -42px rgba(0,0,0,.85); overflow: hidden;
+  }
+  .core-card .label { font-family: var(--mono); font-size: 11.5px; letter-spacing: .08em; color: var(--ink-3); display: flex; justify-content: space-between; }
+  .core-card .label b { color: var(--ice); font-weight: 500; }
+  .sample { margin-top: 14px; border-radius: 11px; overflow: hidden; border: 1px solid var(--line); }
+  .layer { display: flex; align-items: center; gap: 12px; padding: 13px 15px; font-size: 13.5px; position: relative; }
+  .layer + .layer { border-top: 1px solid rgba(255,255,255,.05); }
+  .layer .tag { font-family: var(--mono); font-size: 11px; color: var(--ink-2); padding: 2px 9px 2px 10px; border-radius: 6px; font-weight: 500; flex: none; background: rgba(255,255,255,.04); border-left: 2px solid var(--ld); }
+  .layer .meta { margin-left: auto; font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); flex: none; }
+  .layer .ttl { color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* row tint encodes depth (newest -> oldest), not a label rainbow */
+  .l1 { background: linear-gradient(90deg, rgba(125,211,252,.13), transparent 80%); --ld: var(--ice); }
+  .l2 { background: linear-gradient(90deg, rgba(34,211,238,.115), transparent 80%); --ld: var(--cyan); }
+  .l3 { background: linear-gradient(90deg, rgba(45,212,191,.10), transparent 80%); --ld: var(--teal); }
+  .l4 { background: linear-gradient(90deg, rgba(148,178,210,.085), transparent 80%); --ld: #9db4cc; }
+  .l5 { background: linear-gradient(90deg, rgba(232,176,122,.085), transparent 80%); --ld: var(--sediment); }
+  .core-depth { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); margin-top: 10px; padding: 0 2px; }
+
+  /* ---------- definition strip (elevated brand moment) ---------- */
+  .define { position: relative; border-block: 1px solid var(--line-2); background: linear-gradient(180deg, rgba(20,28,42,.5), var(--bg)); }
+  .define::before { content: ""; position: absolute; top: -1px; left: 0; right: 0; height: 2px; background: linear-gradient(90deg, transparent, rgba(125,211,252,.5), rgba(45,212,191,.4), transparent); }
+  .define .wrap { padding-block: 40px; }
+  .define .dfn { display: flex; gap: 14px 22px; align-items: baseline; flex-wrap: wrap; }
+  .define .word { font-family: var(--display); font-size: clamp(34px, 4.6vw, 50px); font-weight: 700; letter-spacing: -.02em; }
+  .define .ipa { font-family: var(--mono); color: var(--ink-3); font-size: 16px; }
+  .define .pos { font-style: italic; color: var(--ink-3); font-size: 15px; }
+  .define .gloss { color: var(--ink-2); font-size: 16px; margin: 14px 0 0; max-width: 70ch; }
+  .define .thesis { font-family: var(--display); color: var(--ink); font-size: clamp(19px, 2.3vw, 26px); font-weight: 600; letter-spacing: -.01em; margin: 16px 0 0; max-width: 26ch; line-height: 1.25; }
+  .define .thesis b { background: var(--accent-grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+
+  /* ---------- generic section ---------- */
+  section.band { padding: 92px 0; position: relative; }
+  /* recurring stratified divider keeps the geology alive after the fold */
+  section.band::before { content: ""; position: absolute; top: 0; left: 0; right: 0; height: 1px; background: linear-gradient(90deg, transparent, var(--line-2) 14%, var(--line-2) 86%, transparent); }
+  section.band::after { content: ""; position: absolute; top: 0; left: 50%; transform: translateX(-50%); width: 220px; height: 2px; background: linear-gradient(90deg, transparent, rgba(34,211,238,.5), transparent); }
+  .band--raised { background: linear-gradient(180deg, var(--bg-1), var(--bg)); }
+  .band-head { max-width: 680px; margin-bottom: 46px; }
+  .band-head h2 { font-size: clamp(28px, 3.4vw, 40px); margin-top: 14px; }
+  .band-head p { color: var(--ink-2); font-size: 17px; margin: 16px 0 0; }
+  .band-head .who { color: var(--ink-3); font-size: 14.5px; margin-top: 10px; font-family: var(--mono); }
+
+  /* feature grid */
+  .features { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+  .card {
+    border: 1px solid var(--line); border-radius: var(--r); background: var(--surface);
+    padding: 24px; transition: border-color .18s, background .18s, transform .18s;
+  }
+  .card:hover { border-color: var(--line-2); background: var(--surface-2); transform: translateY(-2px); }
+  .card .ic { width: 38px; height: 38px; border-radius: 10px; display: grid; place-items: center; background: rgba(34,211,238,.1); border: 1px solid rgba(34,211,238,.22); margin-bottom: 16px; }
+  .card .ic svg { width: 20px; height: 20px; stroke: var(--cyan); fill: none; }
+  .card h3 { font-size: 18px; letter-spacing: -.01em; }
+  .card p { color: var(--ink-2); font-size: 14.5px; margin: 9px 0 0; }
+  .card code { font-family: var(--mono); font-size: 12.5px; color: var(--ice); background: rgba(125,211,252,.08); padding: 1px 6px; border-radius: 5px; }
+
+  /* pipeline */
+  .pipe { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; align-items: stretch; gap: 0; }
+  .pnode {
+    border: 1px solid var(--line); border-radius: 14px; background: var(--surface);
+    padding: 20px 18px; text-align: center; display: flex; flex-direction: column; gap: 6px; justify-content: center;
+  }
+  .pnode .k { font-family: var(--mono); font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: var(--cyan); }
+  .pnode strong { font-family: var(--display); font-size: 16px; font-weight: 600; letter-spacing: -.01em; }
+  .pnode span { color: var(--ink-3); font-size: 13px; }
+  .parrow { display: grid; place-items: center; padding: 0 14px; color: var(--ink-3); }
+  .parrow svg { width: 26px; height: 26px; }
+  .pfan { display: flex; flex-direction: column; gap: 12px; }
+
+  /* harness grid */
+  .harness { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  .hcell { display: flex; align-items: center; gap: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); padding: 15px 18px; transition: border-color .18s, background .18s; }
+  .hcell:hover { border-color: var(--line-2); background: var(--surface-2); }
+  .hbadge { width: 40px; height: 40px; flex: none; border-radius: 11px; display: grid; place-items: center; font-weight: 700; font-size: 14px; color: var(--bg); font-family: var(--mono); }
+  .hcell .nm { font-weight: 600; font-size: 15px; }
+  .hcell .cfg { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); margin-top: 2px; display: flex; align-items: center; gap: 7px; }
+  .hcell .live { color: var(--teal); display: inline-flex; align-items: center; gap: 5px; }
+  .hcell .live::before { content: ""; width: 6px; height: 6px; border-radius: 99px; background: var(--teal); box-shadow: 0 0 8px rgba(45,212,191,.8); }
+
+  /* search showcase */
+  .showcase { display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 44px; align-items: center; }
+  .term {
+    border: 1px solid var(--line-2); border-radius: 14px; overflow: hidden;
+    background: linear-gradient(180deg, #0c1119, #090d14); box-shadow: 0 30px 70px -36px rgba(0,0,0,.85); font-family: var(--mono); font-size: 13.5px;
+  }
+  .term .bar { display: flex; align-items: center; gap: 8px; padding: 11px 14px; border-bottom: 1px solid var(--line); background: rgba(255,255,255,.02); }
+  .term .bar i { width: 11px; height: 11px; border-radius: 99px; display: inline-block; }
+  .term .bar .t { margin-left: 8px; color: var(--ink-3); font-size: 12px; letter-spacing: .02em; }
+  .term .body { padding: 18px 18px 22px; line-height: 1.75; }
+  .term .body .c { color: var(--ink-3); }
+  .term .body .p { color: var(--teal); }
+  .term .body .u { color: var(--ink); }
+  .term .body .o { color: var(--ink-2); }
+  .term .body .hl { color: var(--ice); }
+  .term .body .ok { color: var(--teal); }
+  .showcase .copy h2 { font-size: clamp(26px, 3vw, 36px); }
+  .showcase .copy p { color: var(--ink-2); font-size: 16px; margin: 16px 0 0; }
+  .toollist { list-style: none; padding: 0; margin: 22px 0 0; display: flex; flex-direction: column; gap: 10px; }
+  .toollist li { display: flex; gap: 12px; align-items: baseline; font-size: 15px; color: var(--ink-2); }
+  .toollist code { font-family: var(--mono); font-size: 13px; color: var(--ice); background: rgba(125,211,252,.08); padding: 2px 7px; border-radius: 6px; flex: none; }
+
+  /* monitor preview */
+  .frame { position: relative; border: 1px solid var(--line-2); border-radius: 16px; overflow: hidden; background: #0c1119; box-shadow: 0 50px 100px -50px rgba(0,0,0,.9); }
+  .frame::before { content: ""; position: absolute; top: 41px; left: 0; right: 0; height: 2px; z-index: 2; background: linear-gradient(90deg, transparent, rgba(34,211,238,.6), rgba(45,212,191,.5), transparent); }
+  .frame::after { content: ""; position: absolute; inset: 43px 0 0; z-index: 1; pointer-events: none; box-shadow: inset 0 0 90px 8px rgba(8,11,17,.55); }
+  .frame .chrome { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--line); background: rgba(255,255,255,.02); }
+  .frame .chrome i { width: 11px; height: 11px; border-radius: 99px; display: inline-block; }
+  .frame .chrome .url { margin-left: 12px; font-family: var(--mono); font-size: 12px; color: var(--ink-3); }
+  .frame img { display: block; width: 100%; height: auto; }
+
+  /* final cta */
+  .final { position: relative; border: 1px solid var(--line-2); border-radius: 24px; padding: 56px 48px; overflow: hidden; background: linear-gradient(180deg, var(--bg-2), var(--bg-1)); }
+  .final::before { content: ""; position: absolute; inset: 0; background: radial-gradient(60% 120% at 50% -10%, rgba(34,211,238,.18), transparent 70%); pointer-events: none; }
+  .final-inner { position: relative; text-align: center; max-width: 640px; margin-inline: auto; }
+  .final h2 { font-size: clamp(28px, 3.6vw, 42px); }
+  .final p { color: var(--ink-2); font-size: 17px; margin: 16px auto 0; max-width: 52ch; }
+  .steps { margin: 30px auto 0; max-width: 460px; text-align: left; display: flex; flex-direction: column; gap: 10px; }
+  .step { display: flex; align-items: center; gap: 14px; font-family: var(--mono); font-size: 14px; background: var(--bg); border: 1px solid var(--line); border-radius: 11px; padding: 13px 16px; }
+  .step .n { color: var(--teal); }
+  .step .c { color: var(--ink); }
+  .final .nextline { font-size: 14.5px; color: var(--ink-3); margin-top: 18px; }
+  .final .nextline a { color: var(--ice); border-bottom: 1px solid rgba(125,211,252,.3); }
+  .final .cta-row { justify-content: center; margin-top: 24px; }
+
+  /* footer */
+  footer { border-top: 1px solid var(--line); padding: 50px 0 40px; margin-top: 20px; color: var(--ink-3); }
+  .foot { display: grid; grid-template-columns: 1.4fr 1fr 1fr 1fr; gap: 28px; }
+  .foot .brand { font-size: 18px; }
+  .foot p { font-size: 13.5px; margin: 14px 0 0; max-width: 30ch; line-height: 1.55; }
+  .foot h4 { font-family: var(--mono); font-size: 11.5px; text-transform: uppercase; letter-spacing: .12em; color: var(--ink-2); margin: 0 0 14px; font-weight: 500; }
+  .foot ul { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 9px; }
+  .foot ul a { color: var(--ink-3); font-size: 14px; transition: color .15s; }
+  .foot ul a:hover { color: var(--ink); }
+  .foot-base { margin-top: 38px; padding-top: 22px; border-top: 1px solid var(--line); display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; font-size: 13px; font-family: var(--mono); }
+
+  /* reveal animation (skipped under reduced motion so screenshots are complete) */
+  @media (prefers-reduced-motion: no-preference) {
+    .reveal { opacity: 0; transform: translateY(18px); transition: opacity .7s ease, transform .7s ease; }
+    .reveal.in { opacity: 1; transform: none; }
+  }
+
+  /* ---------- responsive ---------- */
+  @media (max-width: 900px) {
+    .hero-inner { grid-template-columns: 1fr; gap: 40px; }
+    .core { order: 2; }
+    .lede { max-width: none; }
+    .define .thesis { max-width: none; }
+    .showcase { grid-template-columns: 1fr; gap: 28px; }
+    .features { grid-template-columns: repeat(2, 1fr); }
+    .harness { grid-template-columns: repeat(2, 1fr); }
+    .pipe { grid-template-columns: 1fr; gap: 12px; }
+    .parrow { transform: rotate(90deg); padding: 4px 0; }
+    .foot { grid-template-columns: 1fr 1fr; }
+  }
+  @media (max-width: 640px) {
+    .nav-links .secondary { display: none; }
+    .nav-links { gap: 18px; }
+    .hero { padding: 60px 0 64px; }
+    .hero h1 { font-size: clamp(33px, 8.8vw, 44px); }
+    .eyebrow { letter-spacing: 0.12em; font-size: 11px; }
+    section.band { padding: 64px 0; }
+    .features { grid-template-columns: 1fr; }
+    .harness { grid-template-columns: 1fr; }
+    .final { padding: 40px 22px; }
+    .foot { grid-template-columns: 1fr 1fr; }
+    .define .wrap { padding-block: 30px; }
+  }
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="nav">
+  <div class="wrap nav-inner">
+    <a class="brand" href="./" aria-label="Moraine home">
+      <svg viewBox="0 0 32 32" fill="none" aria-hidden="true">
+        <defs><linearGradient id="ng" x1="2" y1="6" x2="30" y2="27" gradientUnits="userSpaceOnUse">
+          <stop stop-color="#7dd3fc"/><stop offset="0.55" stop-color="#22d3ee"/><stop offset="1" stop-color="#2dd4bf"/>
+        </linearGradient></defs>
+        <path d="M2 24.5 Q9 12 15 17 Q21 22 30 9.5" stroke="url(#ng)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" opacity="0.5"/>
+        <path d="M2 27.5 Q9.5 16 15.5 20.5 Q21 24.5 30 14" stroke="url(#ng)" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" opacity="0.78"/>
+        <path d="M2 30 Q10 21 16 24 Q22 27 30 19" stroke="url(#ng)" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      moraine
+    </a>
+    <nav class="nav-links" aria-label="Primary">
+      <a href="introduction.html">Docs</a>
+      <a href="quickstart.html">Quickstart</a>
+      <a class="secondary" href="agent-mcp-search/index.html">MCP Search</a>
+      <a class="secondary" href="configuration.html">Configuration</a>
+      <a class="nav-cta" href="https://github.com/eric-tramel/moraine" target="_blank" rel="noopener">
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2C6.5 2 2 6.6 2 12.3c0 4.5 2.9 8.4 6.8 9.7.5.1.7-.2.7-.5v-1.7c-2.8.6-3.4-1.4-3.4-1.4-.5-1.2-1.1-1.5-1.1-1.5-.9-.6.1-.6.1-.6 1 .1 1.5 1 1.5 1 .9 1.6 2.4 1.1 3 .9.1-.7.4-1.1.6-1.4-2.2-.3-4.6-1.1-4.6-5 0-1.1.4-2 1-2.7-.1-.3-.4-1.3.1-2.7 0 0 .8-.3 2.7 1a9.3 9.3 0 0 1 5 0c1.9-1.3 2.7-1 2.7-1 .5 1.4.2 2.4.1 2.7.6.7 1 1.6 1 2.7 0 3.9-2.3 4.7-4.6 5 .4.3.7 1 .7 2v3c0 .3.2.6.7.5 4-1.3 6.8-5.2 6.8-9.7C22 6.6 17.5 2 12 2Z"/></svg>
+        GitHub
+      </a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+  <!-- HERO -->
+  <section class="hero">
+    <div class="hero-bg" aria-hidden="true">
+      <div class="strata">
+        <i style="bottom:0;height:44px;background:linear-gradient(180deg,rgba(232,176,122,.14),transparent)"></i>
+        <i style="bottom:44px;height:30px;background:linear-gradient(180deg,rgba(148,178,210,.12),transparent)"></i>
+        <i style="bottom:74px;height:40px;background:linear-gradient(180deg,rgba(45,212,191,.13),transparent)"></i>
+        <i style="bottom:114px;height:24px;background:linear-gradient(180deg,rgba(34,211,238,.11),transparent)"></i>
+        <i style="bottom:138px;height:34px;background:linear-gradient(180deg,rgba(125,211,252,.075),transparent)"></i>
+        <i style="bottom:172px;height:20px;background:linear-gradient(180deg,rgba(34,211,238,.05),transparent)"></i>
+        <i style="bottom:192px;height:46px;background:linear-gradient(180deg,rgba(125,211,252,.04),transparent);border-top-color:rgba(125,211,252,.14)"></i>
+      </div>
+    </div>
+    <div class="wrap hero-inner">
+      <div class="hero-copy">
+        <span class="eyebrow">Local-first · MCP-native · Apache-2.0</span>
+        <h1>Long-term memory<br>for your <span class="grad-text">coding agents.</span></h1>
+        <p class="lede">Your agents forget everything between sessions, and their history is scattered across tools you can't search. Moraine indexes every Codex, Claude&nbsp;Code, Cursor, Kimi, Hermes and Pi session into a local <b>ClickHouse</b> trace stack and serves it over <b>MCP</b> — so agents can search <b>everything they've ever done.</b> <span class="priv">Nothing leaves your machine.</span></p>
+
+        <div class="cmd">
+          <span class="prompt">$</span>
+          <code id="install-cmd">uv tool install moraine-cli</code>
+          <button id="copy-btn" type="button" aria-label="Copy install command">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          </button>
+        </div>
+        <span id="copy-status" class="sr-only" aria-live="polite"></span>
+
+        <div class="cta-row">
+          <a class="btn btn-primary" href="quickstart.html">
+            Get started
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+          </a>
+          <a class="btn btn-ghost" href="https://github.com/eric-tramel/moraine" target="_blank" rel="noopener">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2C6.5 2 2 6.6 2 12.3c0 4.5 2.9 8.4 6.8 9.7.5.1.7-.2.7-.5v-1.7c-2.8.6-3.4-1.4-3.4-1.4-.5-1.2-1.1-1.5-1.1-1.5-.9-.6.1-.6.1-.6 1 .1 1.5 1 1.5 1 .9 1.6 2.4 1.1 3 .9.1-.7.4-1.1.6-1.4-2.2-.3-4.6-1.1-4.6-5 0-1.1.4-2 1-2.7-.1-.3-.4-1.3.1-2.7 0 0 .8-.3 2.7 1a9.3 9.3 0 0 1 5 0c1.9-1.3 2.7-1 2.7-1 .5 1.4.2 2.4.1 2.7.6.7 1 1.6 1 2.7 0 3.9-2.3 4.7-4.6 5 .4.3.7 1 .7 2v3c0 .3.2.6.7.5 4-1.3 6.8-5.2 6.8-9.7C22 6.6 17.5 2 12 2Z"/></svg>
+            View on GitHub
+          </a>
+        </div>
+        <div class="trust">
+          <span>Apache-2.0</span><span class="dot"></span>
+          <span>Written in Rust</span><span class="dot"></span>
+          <span>Runs on your machine</span>
+        </div>
+      </div>
+
+      <div class="core">
+        <div class="core-card">
+          <div class="label"><span><b>moraine.events</b></span><span>recent sessions</span></div>
+          <div class="sample" role="img" aria-label="Example of indexed sessions in moraine.events: recent agent sessions from codex, claude, cursor, kimi and hermes with their turn counts, layered newest to oldest like a geological core sample.">
+            <div class="layer l1" aria-hidden="true"><span class="tag">codex</span><span class="ttl">Refactor ingest dispatch &amp; routing</span><span class="meta">2.1k turns</span></div>
+            <div class="layer l2" aria-hidden="true"><span class="tag">claude</span><span class="ttl">Wire central MCP socket proxy</span><span class="meta">880 turns</span></div>
+            <div class="layer l3" aria-hidden="true"><span class="tag">cursor</span><span class="ttl">cursor_sqlite chat backfill</span><span class="meta">1.4k turns</span></div>
+            <div class="layer l4" aria-hidden="true"><span class="tag">hermes</span><span class="ttl">Replay-floor race investigation</span><span class="meta">310 turns</span></div>
+            <div class="layer l5" aria-hidden="true"><span class="tag">kimi</span><span class="ttl">Per-project backend routing</span><span class="meta">640 turns</span></div>
+          </div>
+          <div class="core-depth" aria-hidden="true"><span>↑ newest</span><span>core sample</span><span>oldest ↓</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- DEFINITION -->
+  <div class="define">
+    <div class="wrap">
+      <div class="dfn">
+        <span class="word">mo·raine</span>
+        <span class="ipa">/məˈreɪn/</span>
+        <span class="pos">noun, geology</span>
+      </div>
+      <p class="gloss">the ridge of rock and sediment a glacier deposits as it moves and melts away.</p>
+      <p class="thesis">Your agents are the glacier. <b>Moraine is the record they leave behind.</b></p>
+    </div>
+  </div>
+
+  <!-- FEATURES -->
+  <section class="band">
+    <div class="wrap">
+      <div class="band-head reveal">
+        <span class="eyebrow">What you get</span>
+        <h2>One unified record of everything your agents did.</h2>
+        <p>Conversation turns, tool calls, token counts and timestamps from every harness, in one consistent schema you can browse, query, and search.</p>
+        <p class="who">For developers who run coding agents all day — across more than one tool.</p>
+      </div>
+      <div class="features">
+        <div class="card reveal">
+          <div class="ic"><svg viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg></div>
+          <h3>Just ClickHouse underneath</h3>
+          <p>Turns, tool calls, tokens and timing land in one schema. Query <code>moraine.events</code> with your own SQL, dashboards or notebooks — no lock-in.</p>
+        </div>
+        <div class="card reveal">
+          <div class="ic"><svg viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><path d="M12 2v4M12 18v4M2 12h4M18 12h4M5 5l3 3M16 16l3 3M19 5l-3 3M8 16l-3 3"/><circle cx="12" cy="12" r="3"/></svg></div>
+          <h3>Realtime ingest + backfill</h3>
+          <p>Watches Codex, Claude Code, Cursor, Kimi, Hermes and Pi session files live, and indexes your entire existing history on first run.</p>
+        </div>
+        <div class="card reveal">
+          <div class="ic"><svg viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M3 9h18M7 13h4M7 16h2"/></svg></div>
+          <h3>Monitor UI</h3>
+          <p>Browse sessions, inspect live analytics, and check ingest health at <code>127.0.0.1:8080</code> — token, turn and concurrency charts included.</p>
+        </div>
+        <div class="card reveal">
+          <div class="ic"><svg viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></div>
+          <h3>MCP retrieval</h3>
+          <p>Agents search prior decisions, fixes and errors over <code>moraine run mcp</code> — long-term memory exposed as standard MCP tools.</p>
+        </div>
+        <div class="card reveal">
+          <div class="ic"><svg viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><path d="M3 6h18M6 12h12M10 18h4"/></svg></div>
+          <h3>Cross-provider search</h3>
+          <p>One BM25 query spans every harness at once. Find that decision, fix or error wherever it happened — Codex, Claude or Cursor alike.</p>
+        </div>
+        <div class="card reveal">
+          <div class="ic"><svg viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg></div>
+          <h3>Fully local by default</h3>
+          <p>Runtime state lives under <code>~/.moraine</code>. Nothing leaves your machine unless you point Moraine at remote infrastructure.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- HOW IT WORKS -->
+  <section class="band band--raised">
+    <div class="wrap">
+      <div class="band-head reveal">
+        <span class="eyebrow">How it works</span>
+        <h2>From scattered session files to one searchable history.</h2>
+      </div>
+      <div class="pipe reveal">
+        <div class="pnode">
+          <span class="k">Sources</span>
+          <strong>Agent harnesses</strong>
+          <span>Codex · Claude · Cursor · Kimi · Hermes · Pi</span>
+        </div>
+        <div class="parrow"><span class="sr-only">then</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg></div>
+        <div class="pnode">
+          <span class="k">Ingest</span>
+          <strong>Watch &amp; normalize</strong>
+          <span>Realtime tail + startup backfill into one schema</span>
+        </div>
+        <div class="parrow"><span class="sr-only">then</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg></div>
+        <div class="pfan">
+          <div class="pnode" style="flex:1">
+            <span class="k">Store</span>
+            <strong>ClickHouse + BM25</strong>
+            <span>moraine.events &amp; views, keyword-indexed</span>
+          </div>
+          <div class="pnode" style="flex:1">
+            <span class="k">Serve</span>
+            <strong>Monitor UI &amp; MCP</strong>
+            <span>Browse at :8080 · search over MCP</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- HARNESSES -->
+  <section class="band">
+    <div class="wrap">
+      <div class="band-head reveal">
+        <span class="eyebrow">Supported harnesses</span>
+        <h2>Six harnesses. One trace stack.</h2>
+        <p>Moraine ships ingestion adapters for the agent tools you already use — every source runs live and backfills on first start, enabled by default.</p>
+      </div>
+      <div class="harness reveal">
+        <div class="hcell"><span class="hbadge" style="background:linear-gradient(135deg,#7dd3fc,#22d3ee)">CX</span><div><div class="nm">Codex</div><div class="cfg"><span>codex</span><span class="live">live + backfill</span></div></div></div>
+        <div class="hcell"><span class="hbadge" style="background:linear-gradient(160deg,#22d3ee,#2dd4bf)">CC</span><div><div class="nm">Claude Code</div><div class="cfg"><span>claude-code</span><span class="live">live + backfill</span></div></div></div>
+        <div class="hcell"><span class="hbadge" style="background:linear-gradient(110deg,#2dd4bf,#7dd3fc)">KI</span><div><div class="nm">Kimi CLI</div><div class="cfg"><span>kimi-cli</span><span class="live">live + backfill</span></div></div></div>
+        <div class="hcell"><span class="hbadge" style="background:linear-gradient(140deg,#e8b07a,#22d3ee)">CU</span><div><div class="nm">Cursor</div><div class="cfg"><span>cursor · cursor_sqlite</span></div></div></div>
+        <div class="hcell"><span class="hbadge" style="background:linear-gradient(125deg,#9db4cc,#2dd4bf)">HE</span><div><div class="nm">Hermes</div><div class="cfg"><span>hermes</span><span class="live">live + backfill</span></div></div></div>
+        <div class="hcell"><span class="hbadge" style="background:linear-gradient(150deg,#7dd3fc,#9db4cc)">PI</span><div><div class="nm">Pi Coding Agent</div><div class="cfg"><span>pi-coding-agent</span><span class="live">live + backfill</span></div></div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- SEARCH SHOWCASE -->
+  <section class="band band--raised">
+    <div class="wrap showcase">
+      <figure class="term reveal" style="margin:0" role="img" aria-label="Terminal example: an agent runs 'codex exec' asking what was decided about MCP socket routing. Moraine's search_sessions tool finds 3 matching sessions across claude-code and codex, surfaces that the central MCP socket lives at ~/.moraine/run/mcp.sock with a per-session proxy default-on, and the agent answers from prior history without re-litigating.">
+        <div class="bar"><i style="background:#ff5f57"></i><i style="background:#febc2e"></i><i style="background:#28c840"></i><span class="t">zsh — agent memory</span></div>
+        <div class="body" aria-hidden="true">
+          <div><span class="p">$</span> <span class="u">codex exec "what did we decide about MCP socket routing?"</span></div>
+          <div><span class="c"># agent calls moraine.search_sessions …</span></div>
+          <div><span class="o">→ found </span><span class="hl">3 sessions</span><span class="o"> across claude-code, codex</span></div>
+          <div><span class="o">  · </span><span class="hl">central MCP socket</span><span class="o"> at ~/.moraine/run/mcp.sock</span></div>
+          <div><span class="o">  · per-session proxy, default on (PR #375)</span></div>
+          <div><span class="o">  · stdio-server logs must go to </span><span class="hl">stderr</span></div>
+          <div><span class="ok">✓ answered from your own history — no re-litigating.</span></div>
+        </div>
+      </figure>
+      <div class="copy reveal">
+        <span class="eyebrow">Agent MCP search</span>
+        <h2>Give every agent recall of every session.</h2>
+        <p>Add a few lines to your harness instructions and your agents stop asking you what already happened. They search the record themselves — across providers, in realtime.</p>
+        <ul class="toollist">
+          <li><code>list_sessions</code><span>Enumerate recent and active sessions, any harness.</span></li>
+          <li><code>search_sessions</code><span>BM25 keyword search over the full trace history.</span></li>
+          <li><code>open</code><span>Pull a specific session's turns, tools and context.</span></li>
+        </ul>
+        <div class="cta-row">
+          <a class="btn btn-ghost" href="agent-mcp-search/index.html">Read the MCP guide
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+          </a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- MONITOR -->
+  <section class="band">
+    <div class="wrap">
+      <div class="band-head reveal" style="max-width:720px">
+        <span class="eyebrow">Monitor</span>
+        <h2>Watch your whole agent fleet, live.</h2>
+        <p>Generation tokens per model, turns per model, concurrent sessions, and a searchable session list — updating in realtime at <code style="font-family:var(--mono);color:var(--ice)">127.0.0.1:8080</code>.</p>
+      </div>
+      <div class="frame reveal">
+        <div class="chrome"><i style="background:#ff5f57"></i><i style="background:#febc2e"></i><i style="background:#28c840"></i><span class="url">127.0.0.1:8080</span></div>
+        <img src="assets/monitor-desktop.png" width="1440" height="916" loading="lazy" decoding="async" alt="Moraine monitor dashboard showing live analytics: generation tokens per model, turns per model, concurrent sessions, and a searchable session list.">
+      </div>
+    </div>
+  </section>
+
+  <!-- FINAL CTA -->
+  <section class="band" style="padding-top:20px">
+    <div class="wrap">
+      <div class="final reveal">
+        <div class="final-inner">
+          <span class="eyebrow">Get started</span>
+          <h2>Install and run in three commands.</h2>
+          <p>Stand up your local trace stack, then point your agents at their own memory.</p>
+          <div class="steps">
+            <div class="step"><span class="n">1</span><span class="c">uv tool install moraine-cli</span></div>
+            <div class="step"><span class="n">2</span><span class="c">moraine up</span></div>
+            <div class="step"><span class="n">3</span><span class="c">moraine status</span></div>
+          </div>
+          <p class="nextline">Then add the search guidance to your harness — <a href="agent-mcp-search/install.html">your agents do the rest</a>.</p>
+          <div class="cta-row">
+            <a class="btn btn-primary" href="quickstart.html">Quickstart &amp; install
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+            </a>
+            <a class="btn btn-ghost" href="configuration.html">Configuration</a>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="foot">
+      <div>
+        <a class="brand" href="./" aria-label="Moraine home">
+          <svg viewBox="0 0 32 32" fill="none" aria-hidden="true">
+            <path d="M2 24.5 Q9 12 15 17 Q21 22 30 9.5" stroke="#22d3ee" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" opacity="0.5"/>
+            <path d="M2 27.5 Q9.5 16 15.5 20.5 Q21 24.5 30 14" stroke="#22d3ee" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" opacity="0.78"/>
+            <path d="M2 30 Q10 21 16 24 Q22 27 30 19" stroke="#2dd4bf" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          moraine
+        </a>
+        <p>A local trace stack for agent work. Searchable long-term memory for your agents, on your machine.</p>
+      </div>
+      <nav aria-label="Docs">
+        <h4>Docs</h4>
+        <ul>
+          <li><a href="introduction.html">Introduction</a></li>
+          <li><a href="quickstart.html">Quickstart</a></li>
+          <li><a href="configuration.html">Configuration</a></li>
+        </ul>
+      </nav>
+      <nav aria-label="MCP Search">
+        <h4>MCP Search</h4>
+        <ul>
+          <li><a href="agent-mcp-search/index.html">Overview</a></li>
+          <li><a href="agent-mcp-search/install.html">Install by harness</a></li>
+          <li><a href="agent-mcp-search/patterns.html">Patterns</a></li>
+        </ul>
+      </nav>
+      <nav aria-label="Project">
+        <h4>Project</h4>
+        <ul>
+          <li><a href="https://github.com/eric-tramel/moraine" target="_blank" rel="noopener">GitHub</a></li>
+          <li><a href="https://pypi.org/project/moraine-cli/" target="_blank" rel="noopener">PyPI</a></li>
+          <li><a href="https://github.com/eric-tramel/moraine/blob/main/LICENSE" target="_blank" rel="noopener">License (Apache-2.0)</a></li>
+        </ul>
+      </nav>
+    </div>
+    <div class="foot-base">
+      <span>© 2026 Moraine · Apache-2.0</span>
+      <span>Built for local-first agent workflows.</span>
+    </div>
+  </div>
+</footer>
+
+<script>
+  // copy install command (guarded for non-secure / file:// contexts)
+  (function () {
+    var btn = document.getElementById("copy-btn");
+    var cmd = document.getElementById("install-cmd");
+    var status = document.getElementById("copy-status");
+    if (!btn || !cmd) return;
+    var def = btn.innerHTML;
+    var check = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>';
+    btn.addEventListener("click", function () {
+      var text = cmd.textContent.trim();
+      var done = function () {
+        btn.innerHTML = check;
+        if (status) status.textContent = "Copied install command";
+        setTimeout(function () { btn.innerHTML = def; if (status) status.textContent = ""; }, 1500);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done).catch(function () {});
+      } else {
+        try {
+          var t = document.createElement("textarea");
+          t.value = text; t.style.position = "fixed"; t.style.left = "-9999px";
+          document.body.appendChild(t); t.select(); document.execCommand("copy");
+          document.body.removeChild(t); done();
+        } catch (e) {}
+      }
+    });
+  })();
+
+  // scroll reveal
+  (function () {
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    var els = document.querySelectorAll(".reveal");
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); }
+      });
+    }, { threshold: 0.12, rootMargin: "0px 0px -8% 0px" });
+    els.forEach(function (el) { io.observe(el); });
+  })();
+</script>
+</body>
+</html>

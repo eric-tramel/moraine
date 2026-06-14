@@ -1,0 +1,12 @@
+<svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Moraine">
+  <defs>
+    <linearGradient id="fg" x1="3" y1="8" x2="29" y2="26" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7dd3fc"/>
+      <stop offset="0.55" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#2dd4bf"/>
+    </linearGradient>
+  </defs>
+  <!-- favicon-optimized: two bold, well-separated ridges that survive 16px -->
+  <path d="M3 14 Q10 5 16 10 Q22 15 29 7" stroke="url(#fg)" stroke-width="4.4" stroke-linecap="round" stroke-linejoin="round" opacity="0.5"/>
+  <path d="M3 25 Q10 16 16 21 Q22 26 29 18" stroke="url(#fg)" stroke-width="4.8" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

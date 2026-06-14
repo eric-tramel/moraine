@@ -63,6 +63,10 @@ hooks-install:
 
 docs-build:
 	$(UV) run --with zensical zensical build
+	@echo "[docs] overlaying landing page onto site root"
+	@cp web/landing/index.html site/index.html
+	@mkdir -p site/assets
+	@cp -R web/landing/assets/. site/assets/
 
 docs-serve:
 	$(UV) run --with zensical zensical serve --dev-addr $(DOCS_ADDR)

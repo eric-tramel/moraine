@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><style>
+  @font-face { font-family: "Space Grotesk"; font-weight: 500; src: url("../assets/fonts/space-grotesk-500.woff2") format("woff2"); }
+  @font-face { font-family: "Space Grotesk"; font-weight: 700; src: url("../assets/fonts/space-grotesk-700.woff2") format("woff2"); }
+  @font-face { font-family: "JetBrains Mono"; font-weight: 400; src: url("../assets/fonts/jetbrains-mono-400.woff2") format("woff2"); }
+  * { margin: 0; box-sizing: border-box; }
+  html, body { width: 1200px; height: 630px; }
+  body {
+    font-family: "Space Grotesk", system-ui, sans-serif;
+    background: #080b11; color: #e8eef6; position: relative; overflow: hidden;
+    padding: 78px 84px; display: flex; flex-direction: column; justify-content: space-between;
+  }
+  .glow { position: absolute; inset: -30% -10% auto -10%; height: 760px; z-index: 0;
+    background: radial-gradient(55% 60% at 78% 4%, rgba(34,211,238,.24), transparent 68%),
+                radial-gradient(48% 50% at 16% 0%, rgba(125,211,252,.17), transparent 70%); }
+  .strata { position: absolute; left: 0; right: 0; bottom: 0; height: 360px; z-index: 0; }
+  .strata i { position: absolute; left: -4%; right: -4%; display: block; border-top: 1px solid rgba(125,211,252,.26); }
+  .row { position: relative; z-index: 1; display: flex; align-items: center; gap: 18px; }
+  .row svg { width: 66px; height: 66px; }
+  .wm { font-size: 50px; font-weight: 700; letter-spacing: -.02em; }
+  h1 { position: relative; z-index: 1; font-size: 86px; font-weight: 700; letter-spacing: -.035em; line-height: 1.0; max-width: 17ch; }
+  .grad { background: linear-gradient(115deg,#7dd3fc,#22d3ee 48%,#2dd4bf); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .sub { position: relative; z-index: 1; display: flex; gap: 20px; align-items: center; font-family: "JetBrains Mono", monospace; font-size: 21px; color: #aab8c8; white-space: nowrap; }
+  .sub .dot { width: 6px; height: 6px; border-radius: 99px; background: #2dd4bf; flex: none; }
+  .sub b { color: #7dd3fc; font-weight: 400; }
+</style></head>
+<body>
+  <div class="glow"></div>
+  <div class="strata">
+    <i style="bottom:0;height:46px;background:linear-gradient(180deg,rgba(232,176,122,.10),transparent)"></i>
+    <i style="bottom:46px;height:34px;background:linear-gradient(180deg,rgba(45,212,191,.10),transparent)"></i>
+    <i style="bottom:80px;height:26px;background:linear-gradient(180deg,rgba(34,211,238,.09),transparent)"></i>
+    <i style="bottom:106px;height:40px;background:linear-gradient(180deg,rgba(125,211,252,.07),transparent)"></i>
+    <i style="bottom:146px;height:52px;background:linear-gradient(180deg,rgba(125,211,252,.04),transparent);border-top-color:rgba(125,211,252,.13)"></i>
+  </div>
+  <div class="row">
+    <svg viewBox="0 0 32 32" fill="none"><defs><linearGradient id="g" x1="2" y1="9" x2="30" y2="27" gradientUnits="userSpaceOnUse"><stop stop-color="#7dd3fc"/><stop offset=".55" stop-color="#22d3ee"/><stop offset="1" stop-color="#2dd4bf"/></linearGradient></defs>
+      <path d="M2 24.5 Q9 12 15 17 Q21 22 30 9.5" stroke="url(#g)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" opacity=".5"/>
+      <path d="M2 27.5 Q9.5 16 15.5 20.5 Q21 24.5 30 14" stroke="url(#g)" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" opacity=".78"/>
+      <path d="M2 30 Q10 21 16 24 Q22 27 30 19" stroke="url(#g)" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <span class="wm">moraine</span>
+  </div>
+  <h1>Long-term memory for your <span class="grad">coding agents.</span></h1>
+  <div class="sub"><b>Codex · Claude · Cursor · Kimi · Hermes · Pi</b><span class="dot"></span>ClickHouse + MCP<span class="dot"></span>Fully local</div>
+</body></html>
