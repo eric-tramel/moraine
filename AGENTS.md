@@ -19,6 +19,7 @@ Prefer adding new runtime logic under `apps/` + `crates/` (not legacy `rust/` or
 - `cargo fmt --all -- --check`: enforce formatting (matches CI).
 - `bash scripts/ci/e2e-stack.sh`: run functional stack + MCP smoke test.
 - `bin/moraine up` / `bin/moraine status` / `bin/moraine down`: local stack lifecycle.
+- `make install`: build the current checkout for the host target and install it over the active `moraine` on your PATH (release bundle → the same `scripts/install.sh` path users get; ClickHouse skipped by default, `INSTALL_ARGS="--with-clickhouse"` to include it). Use this to test tip-of-branch on the host instead of waiting for a tagged release. See `scripts/dev/install-host.sh --help`.
 - `make docs-build` / `make docs-serve`: MkDocs build/serve.
 - `make hooks-install`: enable the repo-managed git hooks (`.githooks/pre-commit` runs `cargo fmt --check` and the same clippy strict baseline CI uses). One-time per clone; bypass a single commit with `SKIP_PRECOMMIT=1 git commit ...` or `git commit --no-verify`.
 

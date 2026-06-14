@@ -99,3 +99,15 @@ The repository-managed pre-commit hook can be installed with:
 ```bash
 make hooks-install
 ```
+
+To put the current checkout (tip-of-branch, no tagged release needed) onto your
+host for testing, build and install it over the active `moraine` on your PATH:
+
+```bash
+make install
+```
+
+This release-builds the host target and installs through the same
+`scripts/install.sh` path end users get. ClickHouse is skipped by default
+(`make install INSTALL_ARGS="--with-clickhouse"` to include it). See
+`scripts/dev/install-host.sh --help` for the full set of options.
