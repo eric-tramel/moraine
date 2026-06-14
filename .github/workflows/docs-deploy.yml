@@ -39,13 +39,14 @@ jobs:
         run: |
           set -euo pipefail
           for f in site/index.html site/introduction.html site/quickstart.html \
-                   site/configuration.html site/assets/og.png site/assets/favicon.svg \
+                   site/configuration.html site/CNAME site/assets/og.png site/assets/favicon.svg \
                    site/assets/monitor-desktop.png site/assets/fonts/space-grotesk-700.woff2; do
             test -f "$f" || { echo "::error::missing $f"; exit 1; }
           done
           grep -q "Long-term memory" site/index.html || { echo "::error::hero headline missing from site/index.html"; exit 1; }
           grep -q "The traces are the truth" site/index.html || { echo "::error::landing page not overlaid onto site root"; exit 1; }
-          echo "verified: hero landing page + docs built into site/"
+          grep -qx "moraine.sh" site/CNAME || { echo "::error::CNAME must contain the custom domain (workflow Pages drops it otherwise)"; exit 1; }
+          echo "verified: hero landing page + docs + CNAME built into site/"
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v4
