@@ -5166,6 +5166,13 @@ FORMAT JSONEachRow",
         let mode_subquery = self.mode_subquery();
 
         let mut where_clauses = vec![
+            // A blank session_id is never a real session (e.g. the orphan
+            // Workflow-journal events ingested before #386's exclusion). Drop
+            // them here so they never consume a LIMIT slot or anchor the keyset
+            // cursor. `notEmpty(trimBoth(...))` mirrors the MCP contract's
+            // `trim().is_empty()` rejection so the repo filter and the mcp-core
+            // skip agree on what counts as blank.
+            "notEmpty(trimBoth(s.session_id))".to_string(),
             format!(
                 "toUnixTimestamp64Milli(s.last_event_time) >= {}",
                 filter.start_unix_ms

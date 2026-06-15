@@ -1926,6 +1926,9 @@ async fn list_mcp_sessions_uses_overlap_filter_and_cursor_pagination() {
     assert!(list_query.contains("ifNull(m.mode, 'chat') = 'web_search'"));
     assert!(list_query.contains("ORDER BY s.last_event_time DESC, s.session_id DESC"));
     assert!(list_query.contains("payload_type IN ('task_complete', 'turn_aborted')"));
+    // Blank session_id rows are filtered at the source so they never consume a
+    // LIMIT slot or anchor the keyset cursor (#386).
+    assert!(list_query.contains("notEmpty(trimBoth(s.session_id))"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

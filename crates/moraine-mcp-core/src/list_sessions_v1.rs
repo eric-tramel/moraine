@@ -13,6 +13,7 @@ use moraine_conversations::{
 };
 use serde_json::{json, Value};
 use tokio::time::{timeout, Duration};
+use tracing::warn;
 
 const LIST_SESSIONS_BROAD_WINDOW_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 
@@ -139,12 +140,24 @@ fn list_sessions_data_json(
     args: &CanonicalListSessionsArgs,
     page: &Page<McpSessionListItem>,
 ) -> Result<Value, ContractError> {
-    let sessions = page
-        .items
-        .iter()
-        .enumerate()
-        .map(|(index, session)| session_json(index + 1, session))
-        .collect::<Result<Vec<_>, _>>()?;
+    // Skip (and warn about) rows whose identifier can't be encoded — e.g. the
+    // empty-`session_id` orphans left by Workflow journals ingested before the
+    // exclusion landed (#386). One malformed row must never fail the whole
+    // page. Rank advances only for kept rows so it stays contiguous (1..=N).
+    let mut sessions = Vec::with_capacity(page.items.len());
+    for session in &page.items {
+        // Rank is 1-based over KEPT rows so it stays contiguous when a row is
+        // skipped — `sessions.len()` only grows on a successful push.
+        let rank = sessions.len() + 1;
+        match session_json(rank, session) {
+            Ok(value) => sessions.push(value),
+            Err(error) => warn!(
+                session_id = %session.session_id,
+                error = %error,
+                "list_sessions: skipping session row with an invalid identifier"
+            ),
+        }
+    }
 
     Ok(json!({
         "result_count": sessions.len(),
@@ -441,6 +454,105 @@ mod tests {
         assert!(first.get("snippet").is_none());
         assert!(first.get("events").is_none());
         assert!(first.get("payload_json").is_none());
+    }
+
+    #[test]
+    fn skips_session_rows_with_empty_session_id() {
+        let args = parse_list_sessions_args(
+            json!({
+                "start_datetime": "2026-04-30T09:00:00-04:00",
+                "end_datetime": "2026-04-30T13:00:00-04:00",
+                "limit": 50
+            }),
+            50,
+        )
+        .expect("valid args");
+
+        let item = |session_id: &str| McpSessionListItem {
+            session_id: session_id.to_string(),
+            first_event_time: "2026-04-30 13:00:00".to_string(),
+            first_event_unix_ms: 1_777_554_000_000,
+            last_event_time: "2026-04-30 13:10:00".to_string(),
+            last_event_unix_ms: 1_777_554_600_000,
+            total_turns: 1,
+            total_events: 1,
+            mode: ConversationMode::ToolCalling,
+            completed: true,
+            title: None,
+            source: Some("claude-code".to_string()),
+            session_slug: None,
+            session_summary: None,
+        };
+
+        // A leading empty-session_id orphan (the #386 junk) must be dropped,
+        // not fail the whole page; the valid row survives with a contiguous
+        // rank of 1.
+        let page = Page {
+            items: vec![item(""), item("real-session")],
+            next_cursor: None,
+        };
+
+        let data = list_sessions_data_json(&args, &page).expect("page must not fail on a bad row");
+        assert_eq!(data["result_count"], json!(1));
+        assert_eq!(
+            data["sessions"].as_array().expect("sessions array").len(),
+            1
+        );
+        let kept = &data["sessions"][0];
+        assert_eq!(kept["rank"], json!(1));
+        assert_eq!(
+            kept["id"],
+            json!(McpSessionId::from_raw_session_id("real-session")
+                .expect("valid id")
+                .to_string())
+        );
+    }
+
+    #[test]
+    fn skips_trailing_and_whitespace_rows_and_preserves_cursor() {
+        let args = parse_list_sessions_args(
+            json!({
+                "start_datetime": "2026-04-30T09:00:00-04:00",
+                "end_datetime": "2026-04-30T13:00:00-04:00",
+                "limit": 50
+            }),
+            50,
+        )
+        .expect("valid args");
+
+        let item = |session_id: &str| McpSessionListItem {
+            session_id: session_id.to_string(),
+            first_event_time: "2026-04-30 13:00:00".to_string(),
+            first_event_unix_ms: 1_777_554_000_000,
+            last_event_time: "2026-04-30 13:10:00".to_string(),
+            last_event_unix_ms: 1_777_554_600_000,
+            total_turns: 1,
+            total_events: 1,
+            mode: ConversationMode::ToolCalling,
+            completed: true,
+            title: None,
+            source: Some("claude-code".to_string()),
+            session_slug: None,
+            session_summary: None,
+        };
+
+        // A whitespace-only id (rejected by the contract's trim check) and a
+        // TRAILING empty-id orphan are both dropped; the valid row keeps rank
+        // 1, and the repo-provided cursor is passed through untouched.
+        let page = Page {
+            items: vec![item("real-session"), item("   "), item("")],
+            next_cursor: Some("opaque-cursor".to_string()),
+        };
+
+        let data = list_sessions_data_json(&args, &page).expect("page must not fail on bad rows");
+        assert_eq!(data["result_count"], json!(1));
+        assert_eq!(
+            data["sessions"].as_array().expect("sessions array").len(),
+            1
+        );
+        assert_eq!(data["sessions"][0]["rank"], json!(1));
+        assert_eq!(data["truncated"], json!(true));
+        assert_eq!(data["next_cursor"], json!("opaque-cursor"));
     }
 
     #[test]
