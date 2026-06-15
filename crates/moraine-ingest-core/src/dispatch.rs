@@ -5,7 +5,8 @@ use crate::sources::shared::{format_record_ts, parse_record_ts};
 use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
 use anyhow::{Context, Result};
 use moraine_config::{
-    map_tracked_path, AppConfig, SOURCE_FORMAT_CURSOR_SQLITE, SOURCE_FORMAT_SESSION_JSON,
+    is_workflow_journal_path, map_tracked_path, AppConfig, SOURCE_FORMAT_CURSOR_SQLITE,
+    SOURCE_FORMAT_SESSION_JSON,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -37,6 +38,39 @@ const SESSION_JSON_GENERATION: u32 = 1;
 /// watcher; anything else here is a stray event for an untracked file).
 fn work_path_is_canonical(work: &WorkItem) -> bool {
     map_tracked_path(&work.format, &work.path).as_deref() == Some(work.path.as_str())
+}
+
+/// The single gate before a path becomes ingest work: every entry point
+/// (backfill, reconcile, and the live watcher via the debounce task) funnels
+/// through `enqueue_work`, which calls this. A path is ingestable only when it
+/// is the canonical tracked path for its format AND it is not an
+/// orchestration-internal trace that merely shares a session source's
+/// glob/extension.
+///
+/// The only excluded class today is Claude Code `Workflow` journals (issue
+/// #386): the recursive `~/.claude/projects/**/*.jsonl` glob (and the
+/// recursive watcher) pick them up, but they carry no `sessionId` and would
+/// normalize to empty-`session_id` junk that breaks `list_sessions`. Filtering
+/// here — rather than tightening the glob — also catches live watcher writes,
+/// which never consult the glob. The exclusion is scoped to the `claude-code`
+/// harness so a same-named file under any other configured source is never
+/// silently dropped.
+fn work_item_is_ingestable(work: &WorkItem) -> bool {
+    if !work_path_is_canonical(work) {
+        debug!(
+            "dropping non-canonical work item {} (format {})",
+            work.path, work.format
+        );
+        return false;
+    }
+    if work.harness == "claude-code" && is_workflow_journal_path(&work.path) {
+        debug!(
+            "skipping workflow orchestration journal {} (no sessionId; issue #386)",
+            work.path
+        );
+        return false;
+    }
+    true
 }
 
 /// Best-effort mapping from a Hermes session `base_url` to an inference
@@ -286,14 +320,9 @@ pub(crate) fn spawn_debounce_task(
 
                     for key in ready {
                         if let Some((work, _)) = pending.remove(&key) {
-                            if !work_path_is_canonical(&work) {
-                                debug!(
-                                    "dropping non-canonical work item {} (format {})",
-                                    work.path, work.format
-                                );
-                                continue;
-                            }
-
+                            // `enqueue_work` is the single ingestability gate;
+                            // it early-returns on non-ingestable items, so no
+                            // pre-check is needed here.
                             enqueue_work(work, &process_tx, &dispatch, &metrics).await;
                         }
                     }
@@ -309,11 +338,7 @@ pub(crate) async fn enqueue_work(
     dispatch: &Arc<Mutex<DispatchState>>,
     metrics: &Arc<Metrics>,
 ) {
-    if !work_path_is_canonical(&work) {
-        debug!(
-            "dropping non-canonical work item {} (format {})",
-            work.path, work.format
-        );
+    if !work_item_is_ingestable(&work) {
         return;
     }
 
@@ -1019,10 +1044,10 @@ fn truncate(input: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        complete_work, compose_hermes_model, enrich_claude_model_latency,
+        complete_work, compose_hermes_model, enqueue_work, enrich_claude_model_latency,
         infer_vendor_from_base_url, process_file, process_session_json_file, run_work_item,
-        source_inode_for_file, work_path_is_canonical, SessionCursor, SESSION_JSON_GENERATION,
-        SESSION_JSON_INODE,
+        source_inode_for_file, work_item_is_ingestable, work_path_is_canonical, SessionCursor,
+        SESSION_JSON_GENERATION, SESSION_JSON_INODE,
     };
     use crate::model::Checkpoint;
     use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
@@ -1030,6 +1055,7 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::sync::{mpsc, RwLock, Semaphore};
@@ -1265,6 +1291,96 @@ mod tests {
             ..sqlite.clone()
         };
         assert!(!work_path_is_canonical(&sidecar));
+    }
+
+    #[test]
+    fn workflow_journals_are_not_ingestable_but_sessions_and_subagents_are() {
+        let claude = |path: &str| WorkItem {
+            source_name: "claude".to_string(),
+            harness: "claude-code".to_string(),
+            format: "jsonl".to_string(),
+            path: path.to_string(),
+        };
+        let proj = "/Users/x/.claude/projects/-Users-x-src-moraine";
+        let sid = "7e74512d-612b-4406-ae5e-069e73d7f2dc";
+
+        // The orphan workflow journal is rejected even though it is the
+        // canonical path for the jsonl format (issue #386).
+        let journal = claude(&format!(
+            "{proj}/{sid}/subagents/workflows/wf_12dc2994-7e9/journal.jsonl"
+        ));
+        assert!(work_path_is_canonical(&journal));
+        assert!(!work_item_is_ingestable(&journal));
+
+        // Real sessions and both kinds of subagent transcripts stay ingestible.
+        assert!(work_item_is_ingestable(&claude(&format!(
+            "{proj}/{sid}.jsonl"
+        ))));
+        assert!(work_item_is_ingestable(&claude(&format!(
+            "{proj}/{sid}/subagents/workflows/wf_8dc1b543-8da/agent-a38ca143465605620.jsonl"
+        ))));
+        assert!(work_item_is_ingestable(&claude(&format!(
+            "{proj}/{sid}/subagents/agent-a5a524a7f876aa747.jsonl"
+        ))));
+
+        // The exclusion is scoped to claude-code: the same path under another
+        // harness/source must not be silently dropped.
+        let codex_journal = WorkItem {
+            source_name: "codex".to_string(),
+            harness: "codex".to_string(),
+            format: "jsonl".to_string(),
+            path: format!("{proj}/{sid}/subagents/workflows/wf_x/journal.jsonl"),
+        };
+        assert!(work_item_is_ingestable(&codex_journal));
+    }
+
+    /// End-to-end through the dispatch gate: a workflow journal enqueued from
+    /// any entry point (backfill/reconcile/watcher all call `enqueue_work`)
+    /// must never reach the processor channel or the dispatch state, while a
+    /// real session transcript does. This is the behavior that keeps the
+    /// empty-`session_id` junk out of ClickHouse.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn enqueue_work_drops_workflow_journals_before_processing() {
+        let dispatch = Arc::new(Mutex::new(DispatchState::default()));
+        let metrics = Arc::new(Metrics::default());
+        let (process_tx, mut process_rx) = mpsc::channel::<WorkItem>(8);
+
+        let proj = "/Users/x/.claude/projects/-Users-x-src-moraine";
+        let sid = "7e74512d-612b-4406-ae5e-069e73d7f2dc";
+        let journal = WorkItem {
+            source_name: "claude".to_string(),
+            harness: "claude-code".to_string(),
+            format: "jsonl".to_string(),
+            path: format!("{proj}/{sid}/subagents/workflows/wf_12dc2994-7e9/journal.jsonl"),
+        };
+
+        enqueue_work(journal.clone(), &process_tx, &dispatch, &metrics).await;
+
+        assert!(
+            process_rx.try_recv().is_err(),
+            "workflow journal must not be forwarded to the processor"
+        );
+        {
+            let state = dispatch.lock().expect("dispatch mutex poisoned");
+            assert!(state.pending.is_empty(), "no pending work for a journal");
+            assert!(
+                !state.item_by_key.contains_key(&journal.key()),
+                "journal must not be tracked in dispatch state"
+            );
+        }
+        assert_eq!(metrics.queue_depth.load(Ordering::Relaxed), 0);
+
+        // A real session transcript from the same source is forwarded.
+        let session = WorkItem {
+            path: format!("{proj}/{sid}.jsonl"),
+            ..journal.clone()
+        };
+        enqueue_work(session.clone(), &process_tx, &dispatch, &metrics).await;
+        let forwarded = process_rx
+            .try_recv()
+            .expect("real session transcript must be forwarded");
+        assert_eq!(forwarded.key(), session.key());
+        assert_eq!(metrics.queue_depth.load(Ordering::Relaxed), 1);
     }
 
     #[test]
