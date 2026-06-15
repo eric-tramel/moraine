@@ -862,6 +862,26 @@ PY
   printf '%s' "$sessions_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; ok=any(s.get("id")==sid and s.get("harness",{}).get("id")=="cursor" for s in data.get("sessions", [])); sys.exit(0 if ok else 1)' "$cursor_session_id"
   printf '%s' "$sessions_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; ok=any(s.get("id")==sid and s.get("harness",{}).get("id")=="pi-coding-agent" for s in data.get("sessions", [])); sys.exit(0 if ok else 1)' "$pi_session_id"
 
+  # Regression for #388: turn_seq is computed by a running user-message window
+  # over the events ReplacingMergeTree. Re-ingestion can briefly leave a
+  # duplicate physical row live (same sort key, higher event_version) before a
+  # background merge collapses it. v_all_events now reads `events FINAL`, so the
+  # turn counter must not over-count that duplicate; otherwise search_sessions
+  # mints a turn:<session>:<seq> handle that open() cannot resolve once the
+  # merge fires (the original flake). We plant the duplicate ourselves and prove
+  # the turn count is unchanged while the duplicate is demonstrably still live.
+  echo "[e2e] checking turn_seq is stable against an un-merged duplicate event (#388)"
+  local codex_turns_before
+  codex_turns_before="$(clickhouse_scalar "$clickhouse_url" "SELECT max(turn_seq) FROM ${clickhouse_database}.v_conversation_trace WHERE session_id = '${codex_session_id}'")"
+  # Plant a duplicate of the codex user message in a fresh, un-merged part:
+  # SELECT * preserves ingested_at (so it lands in the same partition and shares
+  # the sort key), REPLACE bumps event_version so FINAL keeps exactly one row.
+  clickhouse_scalar "$clickhouse_url" "INSERT INTO ${clickhouse_database}.events SELECT * REPLACE (event_version + 1 AS event_version) FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex' AND session_id = '${codex_session_id}' AND actor_kind = 'user' AND event_kind = 'message'" >/dev/null
+  assert_clickhouse_count "$clickhouse_url" "codex duplicate user-message row is live (un-merged)" "SELECT count() FROM ${clickhouse_database}.events WHERE source_name = 'ci-codex' AND session_id = '${codex_session_id}' AND actor_kind = 'user' AND event_kind = 'message'" "2"
+  assert_clickhouse_count "$clickhouse_url" "codex duplicate collapses under FINAL" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex' AND session_id = '${codex_session_id}' AND actor_kind = 'user' AND event_kind = 'message'" "1"
+  assert_clickhouse_scalar "$clickhouse_url" "codex turn_seq unchanged by un-merged duplicate" "SELECT max(turn_seq) FROM ${clickhouse_database}.v_conversation_trace WHERE session_id = '${codex_session_id}'" "$codex_turns_before"
+  assert_clickhouse_scalar "$clickhouse_url" "codex session summary turn count unchanged by un-merged duplicate" "SELECT total_turns FROM ${clickhouse_database}.v_session_summary WHERE session_id = '${codex_session_id}'" "$codex_turns_before"
+
   echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (codex)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
     --moraine "$moraine_bin" \

@@ -594,6 +594,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             name: "018_checkpoint_host.sql",
             sql: include_str!("../../../sql/018_checkpoint_host.sql"),
         },
+        Migration {
+            version: "019",
+            name: "019_dedup_conversation_trace_final.sql",
+            sql: include_str!("../../../sql/019_dedup_conversation_trace_final.sql"),
+        },
     ]
 }
 
