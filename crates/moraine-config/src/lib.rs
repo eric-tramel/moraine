@@ -577,6 +577,48 @@ pub fn map_tracked_path(format: &str, path: &str) -> Option<String> {
     None
 }
 
+/// True for Claude Code `Workflow` orchestration journals, which share the
+/// claude-code source glob/extension but are not user sessions and must never
+/// be ingested.
+///
+/// A `Workflow` run writes `<project>/<session-uuid>/subagents/workflows/<wf>/journal.jsonl`,
+/// a `started`/`result` event log with no `sessionId`. The recursive
+/// `~/.claude/projects/**/*.jsonl` glob predates this Claude Code feature and
+/// slurps these journals; lacking a `sessionId` they land as empty-`session_id`
+/// `unknown` events that break `list_sessions` for any time range overlapping
+/// them (issue #386).
+///
+/// The match is scoped deliberately tight — only a file literally named
+/// `journal.jsonl` beneath a `subagents/workflows/` directory. The sibling
+/// `agent-*.jsonl` transcripts in the same workflow directory (and the
+/// `subagents/agent-*.jsonl` Task-subagent transcripts) DO carry valid
+/// `sessionId`s and remain ingestible.
+pub fn is_workflow_journal_path(path: &str) -> bool {
+    let path = Path::new(path);
+    if path.file_name().and_then(|name| name.to_str()) != Some("journal.jsonl") {
+        return false;
+    }
+
+    // Single allocation-free pass over the path's named segments, looking for
+    // an adjacent `subagents/workflows` pair. Non-`Normal` components (root,
+    // prefix) and any non-UTF-8 segment are skipped without advancing the
+    // window, so they never bridge the pair we are matching.
+    let mut prev: Option<&str> = None;
+    for component in path.components() {
+        let Component::Normal(segment) = component else {
+            continue;
+        };
+        let Some(segment) = segment.to_str() else {
+            continue;
+        };
+        if prev == Some("subagents") && segment == "workflows" {
+            return true;
+        }
+        prev = Some(segment);
+    }
+    false
+}
+
 fn default_batch_size() -> usize {
     4000
 }
@@ -1648,6 +1690,41 @@ format = "sqlite"
             map_tracked_path(SOURCE_FORMAT_CURSOR_SQLITE, "/tmp/User/notes.jsonl"),
             None
         );
+    }
+
+    #[test]
+    fn workflow_journals_are_excluded_but_real_sessions_and_subagents_are_not() {
+        let project = "/Users/x/.claude/projects/-Users-x-src-moraine";
+        let session = "7e74512d-612b-4406-ae5e-069e73d7f2dc";
+
+        // The orphan journals: only these get excluded.
+        assert!(is_workflow_journal_path(&format!(
+            "{project}/{session}/subagents/workflows/wf_12dc2994-7e9/journal.jsonl"
+        )));
+        // Relative paths and trailing-component variants still match.
+        assert!(is_workflow_journal_path(
+            "subagents/workflows/wf_abc/journal.jsonl"
+        ));
+
+        // Workflow subagent transcripts carry a sessionId — keep them.
+        assert!(!is_workflow_journal_path(&format!(
+            "{project}/{session}/subagents/workflows/wf_8dc1b543-8da/agent-a38ca143465605620.jsonl"
+        )));
+        // Task-subagent transcripts (no `workflows` segment) — keep them.
+        assert!(!is_workflow_journal_path(&format!(
+            "{project}/{session}/subagents/agent-a5a524a7f876aa747.jsonl"
+        )));
+        // The real top-level session transcript — keep it.
+        assert!(!is_workflow_journal_path(&format!(
+            "{project}/{session}.jsonl"
+        )));
+        // A `journal.jsonl` that is NOT under `subagents/workflows/` must not
+        // be swept up by the filename alone.
+        assert!(!is_workflow_journal_path(&format!(
+            "{project}/{session}/journal.jsonl"
+        )));
+        assert!(!is_workflow_journal_path("/tmp/workflows/journal.jsonl"));
+        assert!(!is_workflow_journal_path("/tmp/subagents/journal.jsonl"));
     }
 
     fn make_temp_dir(label: &str) -> PathBuf {
