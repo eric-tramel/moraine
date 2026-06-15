@@ -599,6 +599,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             name: "019_dedup_conversation_trace_final.sql",
             sql: include_str!("../../../sql/019_dedup_conversation_trace_final.sql"),
         },
+        Migration {
+            version: "020",
+            name: "020_purge_empty_session_claude_code.sql",
+            sql: include_str!("../../../sql/020_purge_empty_session_claude_code.sql"),
+        },
     ]
 }
 
@@ -1071,6 +1076,71 @@ mod tests {
                 !m.sql.is_empty(),
                 "migration {} has empty bundled sql — include_str! target may be missing",
                 m.name
+            );
+        }
+    }
+
+    #[test]
+    fn migration_020_purges_every_session_keyed_table() {
+        let migration = bundled_migrations()
+            .into_iter()
+            .find(|m| m.version == "020")
+            .expect("migration 020 must be registered");
+
+        // Materialize against a non-default database to also prove the
+        // `moraine.` prefix is rewritten everywhere (no bare table names leak).
+        let materialized =
+            materialize_migration_sql(migration.sql, "other_db").expect("materialize 020");
+        let statements = split_sql_statements(&materialized);
+
+        // Every table that can hold empty-session_id claude-code junk must be
+        // purged; a dropped table here would leave lingering junk (#386).
+        let harness_scoped = [
+            "events",
+            "raw_events",
+            "event_links",
+            "tool_io",
+            "search_documents",
+            "search_postings",
+            "search_hit_log",
+        ];
+        // No harness column on this aggregate — scoped on session_id alone.
+        let session_only = ["search_conversation_terms"];
+
+        assert_eq!(
+            statements.len(),
+            harness_scoped.len() + session_only.len(),
+            "unexpected statement count in 020: {statements:#?}"
+        );
+
+        for table in harness_scoped {
+            let expected =
+                format!("ALTER TABLE other_db.{table} DELETE WHERE session_id = '' AND harness = 'claude-code'");
+            assert!(
+                statements.iter().any(|s| s.contains(&expected)),
+                "020 missing harness-scoped purge for `{table}`"
+            );
+        }
+        for table in session_only {
+            let expected = format!("ALTER TABLE other_db.{table} DELETE WHERE session_id = ''");
+            assert!(
+                statements
+                    .iter()
+                    .any(|s| s.contains(&expected) && !s.contains("harness")),
+                "020 missing session-only purge for `{table}`"
+            );
+        }
+
+        // Every statement must complete synchronously so the migration is only
+        // recorded once the junk is actually gone.
+        for statement in &statements {
+            assert!(
+                statement.contains("mutations_sync = 1"),
+                "020 statement must run with mutations_sync = 1: {statement}"
+            );
+            assert!(
+                !statement.contains("moraine."),
+                "020 statement must not reference a bare `moraine.` after rewrite: {statement}"
             );
         }
     }
