@@ -873,6 +873,15 @@ PY
   echo "[e2e] checking turn_seq is stable against an un-merged duplicate event (#388)"
   local codex_turns_before
   codex_turns_before="$(clickhouse_scalar "$clickhouse_url" "SELECT max(turn_seq) FROM ${clickhouse_database}.v_conversation_trace WHERE session_id = '${codex_session_id}'")"
+  # Stop background merges on `events` before planting the duplicate so the two
+  # parts stay physically un-merged for the duration of these assertions. A
+  # background ReplacingMergeTree merge is the only thing that collapses the
+  # non-FINAL row count, and it fires nondeterministically — without this, the
+  # "live (un-merged)" assertion below races the merge and flakes (it has been
+  # observed to read 1 instead of 2). Observing the pre-merge state is the whole
+  # point: it is exactly what #388 guards against. FINAL still dedups at read
+  # time, so the FINAL / turn-count assertions are unaffected by the freeze.
+  clickhouse_scalar "$clickhouse_url" "SYSTEM STOP MERGES ${clickhouse_database}.events" >/dev/null
   # Plant a duplicate of the codex user message in a fresh, un-merged part:
   # SELECT * preserves ingested_at (so it lands in the same partition and shares
   # the sort key), REPLACE bumps event_version so FINAL keeps exactly one row.
@@ -881,6 +890,8 @@ PY
   assert_clickhouse_count "$clickhouse_url" "codex duplicate collapses under FINAL" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex' AND session_id = '${codex_session_id}' AND actor_kind = 'user' AND event_kind = 'message'" "1"
   assert_clickhouse_scalar "$clickhouse_url" "codex turn_seq unchanged by un-merged duplicate" "SELECT max(turn_seq) FROM ${clickhouse_database}.v_conversation_trace WHERE session_id = '${codex_session_id}'" "$codex_turns_before"
   assert_clickhouse_scalar "$clickhouse_url" "codex session summary turn count unchanged by un-merged duplicate" "SELECT total_turns FROM ${clickhouse_database}.v_session_summary WHERE session_id = '${codex_session_id}'" "$codex_turns_before"
+  # Re-enable merges now that the pre-merge assertions have passed.
+  clickhouse_scalar "$clickhouse_url" "SYSTEM START MERGES ${clickhouse_database}.events" >/dev/null
 
   echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (codex)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
