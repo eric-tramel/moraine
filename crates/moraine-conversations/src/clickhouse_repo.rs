@@ -735,9 +735,21 @@ impl ClickHouseConversationRepository {
             "file",
             "filename",
         ];
+        // A structured key matches only on a real path boundary: the stored
+        // value ends with `/<tail>` (an absolute or deeper-relative path) or
+        // equals the tail exactly (a path stored relative to its repo root).
+        // Requiring the leading slash is what stops the suffix from straddling
+        // a path component — querying `foo/bar.rs` must not match
+        // `/x/qux_foo/bar.rs` or `/x/barfoo/bar.rs`. It mirrors the shell
+        // branch, which already keys off `/<tail>`.
+        let key_match = |col: &str, key: &str| {
+            format!(
+                "(endsWith(JSONExtractString({col}, '{key}'), {slash_rel_sql}) OR JSONExtractString({col}, '{key}') = {rel_sql})"
+            )
+        };
         let ends_with_any = PATH_KEYS
             .iter()
-            .map(|key| format!("endsWith(JSONExtractString(input_json, '{key}'), {rel_sql})"))
+            .map(|key| key_match("input_json", key))
             .collect::<Vec<_>>()
             .join("\n        OR ");
         // Substring fallback is restricted to shell-command rows (`command` /
@@ -748,13 +760,14 @@ impl ClickHouseConversationRepository {
             "tool_phase = 'request'\n      AND (\n        {ends_with_any}\n        OR ((JSONHas(input_json, 'command') OR JSONHas(input_json, 'cmd')) AND position(input_json, {slash_rel_sql}) > 0)\n      )"
         );
 
-        // The structured path key that actually ends with the tail; empty for
-        // shell-substring matches. Same key list as the WHERE clause above.
+        // The structured path key that actually matched (on the same boundary
+        // rule as the WHERE clause); empty for shell-substring matches.
         let matched_path_arms = PATH_KEYS
             .iter()
             .map(|key| {
                 format!(
-                    "endsWith(JSONExtractString(ti.input_json, '{key}'), {rel_sql}), JSONExtractString(ti.input_json, '{key}')"
+                    "{}, JSONExtractString(ti.input_json, '{key}')",
+                    key_match("ti.input_json", key)
                 )
             })
             .collect::<Vec<_>>()

@@ -989,4 +989,144 @@ mod tests {
             .collect();
         assert!(labels.contains(&UNKNOWN_ROOT));
     }
+
+    #[test]
+    fn build_data_session_touched_under_two_roots_lists_both() {
+        // One session that edited the file in two worktrees (work moved between
+        // checkouts) lists both roots under that session, and the spread reads
+        // as ambiguous at the summary level.
+        let tail = resolve_tail("crates/foo/tee.rs");
+        let touches = vec![
+            touch("sess-x", "ev-2", "Edit", "path_suffix", "/repo/main", 2_000),
+            touch(
+                "sess-x",
+                "ev-1",
+                "Edit",
+                "path_suffix",
+                "/repo/worktrees/feat",
+                1_000,
+            ),
+        ];
+        let mut warnings = Vec::new();
+        let data = build_data(
+            &canonical(FileAttentionGranularity::Sessions, FileAttentionScope::All),
+            &tail,
+            touches,
+            &mut warnings,
+        );
+        assert_eq!(data["summary"]["distinct_sessions"], json!(1));
+        assert_eq!(data["summary"]["distinct_roots"], json!(2));
+        assert_eq!(data["summary"]["ambiguous"], json!(true));
+        let roots = data["sessions"][0]["session"]["worktree_roots"]
+            .as_array()
+            .expect("roots");
+        assert_eq!(roots.len(), 2);
+    }
+
+    #[test]
+    fn build_data_all_touches_missing_timestamps_null_span() {
+        // Touches that never joined an events row (event_unix_ms == 0) still
+        // appear, but the span is null — never the 1970 sentinel — and an
+        // event with no timestamp omits its turn handle.
+        let tail = resolve_tail("crates/foo/tee.rs");
+        let touches = vec![
+            touch("s1", "e1", "Edit", "path_suffix", "/r/main", 0),
+            touch("s2", "e2", "Read", "path_suffix", "/r/main", 0),
+        ];
+        let mut warnings = Vec::new();
+        let data = build_data(
+            &canonical(FileAttentionGranularity::Events, FileAttentionScope::All),
+            &tail,
+            touches,
+            &mut warnings,
+        );
+        assert_eq!(data["summary"]["total_touches"], json!(2));
+        assert!(data["summary"]["first_touch"].is_null());
+        assert!(data["summary"]["last_touch"].is_null());
+        let ev0 = &data["events"][0];
+        assert!(ev0["event"]["timestamp"].is_null());
+        assert!(ev0["open"].get("turn_id").is_none());
+    }
+
+    #[test]
+    fn action_preview_collapses_whitespace_and_truncates_by_chars() {
+        // The cap is on chars, not bytes (multibyte-safe), and runs of
+        // whitespace collapse to single spaces.
+        let mut t = touch("s", "e", "Edit", "path_suffix", "/r/main", 1);
+        t.input_preview = format!("  edit\n\t {}  ", "字".repeat(400));
+        let preview = action_preview(&t).expect("preview");
+        assert!(preview.ends_with('…'));
+        assert_eq!(preview.chars().count(), 161); // 160 content chars + ellipsis
+        assert!(!preview.contains('\n') && !preview.contains('\t'));
+        assert!(!preview.contains("  "));
+    }
+
+    #[test]
+    fn session_rollups_rank_contiguous_when_middle_row_skipped() {
+        // An un-encodable session between two valid ones is dropped without
+        // breaking rank contiguity, and is counted as skipped — not displayed.
+        let touches = vec![
+            touch("s-a", "e-a", "Edit", "path_suffix", "/r/main", 3_000),
+            touch("", "e-bad", "Edit", "path_suffix", "/r/main", 2_000),
+            touch("s-c", "e-c", "Edit", "path_suffix", "/r/main", 1_000),
+        ];
+        let (rollups, encodable, skipped) = session_rollups(&touches, 50);
+        assert_eq!(encodable, 2);
+        assert_eq!(skipped, 1);
+        assert_eq!(rollups.len(), 2);
+        assert_eq!(rollups[0]["rank"], json!(1));
+        assert_eq!(rollups[1]["rank"], json!(2));
+    }
+
+    #[test]
+    fn build_data_scan_cap_flags_truncation_with_warning() {
+        // Hitting the scan cap marks scan_truncated and warns that summary and
+        // roots are computed over a partial (capped) set.
+        let tail = resolve_tail("crates/foo/tee.rs");
+        let touches: Vec<FileAttentionTouch> = (0..(FILE_ATTENTION_SCAN_CAP + 1))
+            .map(|i| {
+                touch(
+                    &format!("s-{i}"),
+                    &format!("e-{i}"),
+                    "Edit",
+                    "path_suffix",
+                    "/r/main",
+                    (i as i64) + 1,
+                )
+            })
+            .collect();
+        let mut warnings = Vec::new();
+        let data = build_data(
+            &canonical(FileAttentionGranularity::Events, FileAttentionScope::All),
+            &tail,
+            touches,
+            &mut warnings,
+        );
+        assert_eq!(data["summary"]["scan_truncated"], json!(true));
+        assert_eq!(
+            data["summary"]["total_touches"],
+            json!(FILE_ATTENTION_SCAN_CAP)
+        );
+        assert!(warnings.iter().any(|w| w.contains("more than")));
+    }
+
+    #[test]
+    fn resolve_tail_preserves_embedded_space_and_trailing_slash() {
+        // We trim the ends and strip a leading "./" but do NOT canonicalize:
+        // an embedded space or a trailing slash survives in the tail (the
+        // caller owns path hygiene).
+        assert_eq!(resolve_tail("  crates/foo.rs  ").rel, "crates/foo.rs");
+        assert_eq!(
+            resolve_tail("crates/foo dir/x.rs").rel,
+            "crates/foo dir/x.rs"
+        );
+        assert_eq!(resolve_tail("crates/foo/").rel, "crates/foo/");
+    }
+
+    #[test]
+    fn tail_segments_zero_for_only_slashes() {
+        assert_eq!(tail_segments("////"), 0);
+        assert_eq!(tail_segments("/"), 0);
+        assert_eq!(tail_segments(""), 0);
+    }
 }
