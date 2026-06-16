@@ -60,6 +60,72 @@ pub struct McpSessionListFilter {
     pub sort: ConversationListSort,
 }
 
+/// A single file-touch query for `file_attention`: every captured tool call
+/// whose input path ends with `rel`, scoped and filtered per the request.
+#[derive(Debug, Clone)]
+pub struct FileAttentionQuery {
+    /// Repo-relative tail to suffix-match against captured file paths. The tail
+    /// is what unifies the same logical file across worktree roots.
+    pub rel: String,
+    /// When true the server's configured origin scope (`--project-only`) is
+    /// applied on top of the tail match; when false (`scope:"all"`) it is
+    /// dropped so touches in sibling and agent-isolation worktrees surface too.
+    pub apply_project_scope: bool,
+    pub start_unix_ms: Option<i64>,
+    pub end_unix_ms: Option<i64>,
+    /// Restrict to one tool name (case-insensitive); `None` matches all tools.
+    pub tool: Option<String>,
+    /// Drop pure-read touches (tools whose lowercased name is `read`).
+    pub mutations_only: bool,
+    /// Hard cap on matched rows pulled from ClickHouse. Summary, root, and
+    /// per-session rollups are computed over this scanned set; the caller flags
+    /// the result truncated when the cap is hit.
+    pub max_rows: usize,
+}
+
+/// One captured tool call that touched the queried file. Deserialized from a
+/// `tool_io` ⋈ `events` row; aggregation into summaries, roots, and per-session
+/// rollups happens in the MCP layer.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FileAttentionTouch {
+    pub session_id: String,
+    pub event_uid: String,
+    #[serde(default)]
+    pub harness: String,
+    #[serde(default)]
+    pub tool_name: String,
+    #[serde(default)]
+    pub tool_phase: String,
+    /// `path_suffix` (a structured path key ends with the tail; high
+    /// confidence), `bash_substring` (the tail appeared in a shell command), or
+    /// `json_substring` (the tail appeared in the raw input under an
+    /// unrecognized key; lowest confidence).
+    #[serde(default)]
+    pub match_kind: String,
+    /// Best-effort absolute path that matched — the structured path for
+    /// `path_suffix` matches, empty for substring matches.
+    #[serde(default)]
+    pub matched_path: String,
+    /// Worktree root: the matched path with the repo-relative tail stripped.
+    /// Empty when no clean absolute path was available (substring matches, or a
+    /// path stored relative to its repo root).
+    #[serde(default)]
+    pub worktree_root: String,
+    /// Session working directory recorded on the underlying event, if any.
+    #[serde(default)]
+    pub cwd: String,
+    /// Event timestamp in unix milliseconds; `0` when the touch has no joinable
+    /// event row.
+    #[serde(default)]
+    pub event_unix_ms: i64,
+    #[serde(default)]
+    pub turn_index: u32,
+    #[serde(default)]
+    pub input_preview: String,
+    #[serde(default)]
+    pub output_preview: String,
+}
+
 /// Restricts MCP retrieval to sessions whose origin working directory falls
 /// under one of `roots`.
 ///

@@ -20,15 +20,15 @@ use crate::cursor::{
 use crate::domain::{
     is_user_facing_content_event, Conversation, ConversationDetailOptions, ConversationListFilter,
     ConversationListSort, ConversationMode, ConversationSearchHit, ConversationSearchQuery,
-    ConversationSearchResults, ConversationSearchStats, ConversationSummary, McpEventOpen,
-    McpEventRef, McpEventSummary, McpEventType, McpSessionListFilter, McpSessionListItem,
-    McpSessionOpen, McpTurnCompact, McpTurnOpen, McpTurnRef, OpenContext, OpenEvent,
-    OpenEventRequest, Page, PageRequest, RepoConfig, SearchEventHit, SearchEventKind,
-    SearchEventsQuery, SearchEventsResult, SearchEventsStats, SearchEventsStrategy,
-    SearchMcpEventHit, SearchMcpEventsQuery, SearchMcpEventsResult, SearchMcpEventsStats,
-    SessionEventsDirection, SessionEventsQuery, SessionMetadata, SessionMetadataSearchHit,
-    SessionMetadataSearchQuery, SessionMetadataSearchResults, SessionMetadataSearchStats,
-    SessionOriginScope, TraceEvent, Turn, TurnListFilter, TurnSummary,
+    ConversationSearchResults, ConversationSearchStats, ConversationSummary, FileAttentionQuery,
+    FileAttentionTouch, McpEventOpen, McpEventRef, McpEventSummary, McpEventType,
+    McpSessionListFilter, McpSessionListItem, McpSessionOpen, McpTurnCompact, McpTurnOpen,
+    McpTurnRef, OpenContext, OpenEvent, OpenEventRequest, Page, PageRequest, RepoConfig,
+    SearchEventHit, SearchEventKind, SearchEventsQuery, SearchEventsResult, SearchEventsStats,
+    SearchEventsStrategy, SearchMcpEventHit, SearchMcpEventsQuery, SearchMcpEventsResult,
+    SearchMcpEventsStats, SessionEventsDirection, SessionEventsQuery, SessionMetadata,
+    SessionMetadataSearchHit, SessionMetadataSearchQuery, SessionMetadataSearchResults,
+    SessionMetadataSearchStats, SessionOriginScope, TraceEvent, Turn, TurnListFilter, TurnSummary,
 };
 use crate::error::{RepoError, RepoResult};
 use crate::repo::ConversationRepository;
@@ -682,6 +682,124 @@ impl ClickHouseConversationRepository {
                 .insert(session_id.to_string());
         }
         Ok(in_scope)
+    }
+
+    /// Tier-0 file-attention query: every captured tool call whose input path
+    /// ends with `query.rel`, across every worktree in the connected backend.
+    ///
+    /// Worktree unification is by construction — matching the repo-relative
+    /// tail collapses the main checkout, sibling worktrees, and agent-isolation
+    /// worktrees (which share no leading path) into one result set. We read
+    /// only the `request` phase of `tool_io` so a single call counts once
+    /// (the response phase re-carries `input_json`), and we join `events FINAL`
+    /// for the event timestamp, turn, and cwd that `tool_io` does not store.
+    ///
+    /// This is a deliberate `tool_io` scan: `input_json` is not indexed, so
+    /// Tier-0 trades exactness-of-index for working-on-existing-data with no
+    /// migration. Rows are capped at `query.max_rows + 1` so the caller can
+    /// detect (and flag) truncation.
+    pub async fn file_attention(
+        &self,
+        query: FileAttentionQuery,
+    ) -> RepoResult<Vec<FileAttentionTouch>> {
+        let rel = query.rel.trim();
+        if rel.is_empty() {
+            return Err(RepoError::invalid_argument(
+                "file_attention requires a non-empty path tail",
+            ));
+        }
+
+        let tool_io = self.table_ref("tool_io");
+        let events = self.table_ref("events");
+        let rel_sql = sql_quote(rel);
+        let slash_rel_sql = sql_quote(&format!("/{rel}"));
+        // Byte length of the tail, inlined as an integer so the worktree-root
+        // substring math needs no repeated `length(<literal>)` evaluation.
+        let rel_len = rel.len();
+
+        // Inner match filter, pushed into the `tool_io FINAL` subquery so only
+        // matched request rows reach the events join. Wrapping `FINAL` in a
+        // subquery sidesteps the `AS alias FINAL` ordering question and lets us
+        // alias the result cleanly as `ti`.
+        let match_predicate = format!(
+            "tool_phase = 'request'\n      AND (\n        endsWith(JSONExtractString(input_json, 'file_path'), {rel_sql})\n        OR endsWith(JSONExtractString(input_json, 'notebook_path'), {rel_sql})\n        OR endsWith(JSONExtractString(input_json, 'path'), {rel_sql})\n        OR position(input_json, {slash_rel_sql}) > 0\n      )"
+        );
+
+        // The structured path key that actually ends with the tail (file_path,
+        // notebook_path, or path). Empty for substring-only matches.
+        let matched_path_expr = format!(
+            "multiIf(\n      endsWith(JSONExtractString(ti.input_json, 'file_path'), {rel_sql}), JSONExtractString(ti.input_json, 'file_path'),\n      endsWith(JSONExtractString(ti.input_json, 'notebook_path'), {rel_sql}), JSONExtractString(ti.input_json, 'notebook_path'),\n      endsWith(JSONExtractString(ti.input_json, 'path'), {rel_sql}), JSONExtractString(ti.input_json, 'path'),\n      '')"
+        );
+
+        // Filters that can only be evaluated after the events join (or that are
+        // simply clearer outside the inner scan).
+        let mut outer_clauses: Vec<String> = Vec::new();
+        if query.apply_project_scope {
+            if let Some(scope_clause) = self.session_scope_clause("ti.session_id") {
+                outer_clauses.push(scope_clause);
+            }
+        }
+        if let Some(start) = query.start_unix_ms {
+            outer_clauses.push(format!("toUnixTimestamp64Milli(e.event_ts) >= {start}"));
+        }
+        if let Some(end) = query.end_unix_ms {
+            outer_clauses.push(format!("toUnixTimestamp64Milli(e.event_ts) < {end}"));
+        }
+        if let Some(tool) = query.tool.as_deref() {
+            outer_clauses.push(format!("lower(ti.tool_name) = lower({})", sql_quote(tool)));
+        }
+        if query.mutations_only {
+            outer_clauses.push("lower(ti.tool_name) != 'read'".to_string());
+        }
+        let outer_where = if outer_clauses.is_empty() {
+            "1".to_string()
+        } else {
+            outer_clauses.join("\n    AND ")
+        };
+
+        let limit_plus = query.max_rows.saturating_add(1);
+
+        let sql = format!(
+            "SELECT
+    ti.session_id AS session_id,
+    ti.event_uid AS event_uid,
+    ti.harness AS harness,
+    ti.tool_name AS tool_name,
+    ti.tool_phase AS tool_phase,
+    {matched_path_expr} AS matched_path,
+    multiIf(
+      matched_path != '', 'path_suffix',
+      JSONHas(ti.input_json, 'command') OR JSONHas(ti.input_json, 'cmd'), 'bash_substring',
+      'json_substring'
+    ) AS match_kind,
+    if(
+      matched_path != ''
+      AND length(matched_path) > {rel_len} + 1
+      AND substring(matched_path, length(matched_path) - {rel_len}, 1) = '/',
+      substring(matched_path, 1, length(matched_path) - {rel_len} - 1),
+      ''
+    ) AS worktree_root,
+    ifNull(e.cwd, '') AS cwd,
+    toInt64(ifNull(toUnixTimestamp64Milli(e.event_ts), toInt64(0))) AS event_unix_ms,
+    toUInt32(ifNull(e.turn_index, toUInt32(0))) AS turn_index,
+    ti.input_preview AS input_preview,
+    ti.output_preview AS output_preview
+  FROM (
+    SELECT session_id, event_uid, harness, tool_name, tool_phase, input_json, input_preview, output_preview
+    FROM {tool_io} FINAL
+    WHERE {match_predicate}
+  ) AS ti
+  LEFT JOIN (
+    SELECT event_uid, event_ts, turn_index, cwd
+    FROM {events} FINAL
+  ) AS e ON e.event_uid = ti.event_uid
+  WHERE {outer_where}
+  ORDER BY event_unix_ms DESC, ti.event_uid DESC
+  LIMIT {limit_plus}
+  FORMAT JSONEachRow",
+        );
+
+        self.map_backend(self.ch.query_rows(&sql, None).await)
     }
 
     pub async fn search_session_metadata(

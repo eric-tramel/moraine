@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 pub mod contract;
+mod file_attention_v1;
 mod list_sessions_v1;
 mod open_v1;
 mod search_sessions_v1;
@@ -278,6 +279,79 @@ impl AppState {
                     "annotations": {
                         "readOnlyHint": true
                     }
+                },
+                {
+                    "name": contract::FILE_ATTENTION_TOOL,
+                    "description": "Show every session that touched a file, across every worktree, drillable through open. Given a path, returns the agent-attention history of that file — edits, reads, and aborted attempts in the main checkout, sibling worktrees, and agent-isolation worktrees — as time-ordered typed session/event IDs. Unlike git blame, this includes work that never landed in git. Matching is by the repo-relative path tail; pass a path specific enough (not a bare basename) and check the surfaced roots for over-match.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "File to trace. Absolute paths are reduced to a repo-relative tail (by walking up to .moraine.toml/.git); a repo-relative path is used as the tail directly and gives the best cross-worktree coverage."
+                            },
+                            "scope": {
+                                "anyOf": [
+                                    { "type": "string", "enum": ["project", "all"] },
+                                    { "type": "null" }
+                                ],
+                                "default": "project",
+                                "description": "project (default) keeps the answer to the launch project by honoring --project-only; all drops that origin narrowing to include every worktree the backend holds."
+                            },
+                            "granularity": {
+                                "anyOf": [
+                                    { "type": "string", "enum": ["sessions", "events"] },
+                                    { "type": "null" }
+                                ],
+                                "default": "sessions",
+                                "description": "sessions (default) returns one rollup per session; events returns the flat touch-by-touch timeline."
+                            },
+                            "start_datetime": {
+                                "type": ["string", "null"],
+                                "description": "Optional inclusive lower bound (RFC 3339 with explicit timezone) on touch time."
+                            },
+                            "end_datetime": {
+                                "type": ["string", "null"],
+                                "description": "Optional exclusive upper bound (RFC 3339 with explicit timezone) on touch time; must be later than start_datetime."
+                            },
+                            "tool": {
+                                "type": ["string", "null"],
+                                "description": "Optional case-insensitive tool-name filter (e.g. Edit, Write, Read, Bash)."
+                            },
+                            "mutations_only": {
+                                "type": ["boolean", "null"],
+                                "default": false,
+                                "description": "Exclude pure reads (tools named Read) when true."
+                            },
+                            "limit": {
+                                "type": ["integer", "null"],
+                                "minimum": contract::FILE_ATTENTION_MIN_LIMIT,
+                                "maximum": self.cfg.mcp.max_results.max(contract::FILE_ATTENTION_MIN_LIMIT),
+                                "default": contract::FILE_ATTENTION_DEFAULT_LIMIT.min(self.cfg.mcp.max_results.max(contract::FILE_ATTENTION_MIN_LIMIT)),
+                                "description": "Maximum sessions (or events) returned in the body. Summary and roots are computed over all matched touches regardless."
+                            }
+                        },
+                        "required": ["path"]
+                    },
+                    "outputSchema": {
+                        "type": "object",
+                        "required": ["schema_version", "tool", "request", "data", "warnings", "performance"],
+                        "properties": {
+                            "schema_version": { "type": "string" },
+                            "tool": { "const": contract::FILE_ATTENTION_TOOL },
+                            "request": { "type": "object" },
+                            "data": {
+                                "type": "object",
+                                "required": ["tail", "scope", "granularity", "summary", "roots", "result_count", "truncated"]
+                            },
+                            "warnings": { "type": "array" },
+                            "performance": { "type": "object" }
+                        }
+                    },
+                    "annotations": {
+                        "readOnlyHint": true
+                    }
                 }
             ]
         })
@@ -288,6 +362,7 @@ impl AppState {
             contract::SEARCH_SESSIONS_TOOL => self.search_sessions_v1(params.arguments).await,
             contract::LIST_SESSIONS_TOOL => self.list_sessions_v1(params.arguments).await,
             contract::OPEN_TOOL => self.open_v1(params.arguments).await,
+            contract::FILE_ATTENTION_TOOL => self.file_attention_v1(params.arguments).await,
             other => Err(anyhow!("unknown tool: {other}")),
         }
     }
@@ -899,9 +974,12 @@ mod tests {
             .filter_map(|tool| tool["name"].as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(names, ["search_sessions", "open", "list_sessions"]);
+        assert_eq!(
+            names,
+            ["search_sessions", "open", "list_sessions", "file_attention"]
+        );
 
-        for tool_name in ["search_sessions", "open", "list_sessions"] {
+        for tool_name in ["search_sessions", "open", "list_sessions", "file_attention"] {
             let tool = tools
                 .iter()
                 .find(|tool| tool["name"].as_str() == Some(tool_name))

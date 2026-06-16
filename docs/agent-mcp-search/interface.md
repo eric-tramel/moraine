@@ -13,15 +13,16 @@ plain text `content` and machine-readable `structuredContent`. See the
 [MCP tools specification](https://modelcontextprotocol.io/specification/2025-06-18/server/tools)
 for the protocol-level model.
 
-Moraine advertises one read-only server, `moraine-mcp`, with three tools:
+Moraine advertises one read-only server, `moraine-mcp`, with four tools:
 
 | Tool | Use it for |
 | --- | --- |
 | `search_sessions` | Content search over indexed agent events. |
 | `open` | Expanding an event, turn, or session ID into structured context. |
 | `list_sessions` | Time-window browsing over sessions and active work. |
+| `file_attention` | Every session that touched a file, across every worktree. |
 
-All three tools return a short text summary for clients that display text, and
+All four tools return a short text summary for clients that display text, and
 the same result as JSON in `structuredContent` for clients that can inspect
 structured tool output.
 
@@ -173,6 +174,76 @@ Output data includes compact session records:
 
 `list_sessions` intentionally does not return transcript text. Open a listed
 session if you need to inspect its turns.
+
+## `file_attention`
+
+`file_attention` answers "show me every session that touched this file, and let
+me drill into what was done, when." Given a path, it returns the full
+agent-attention history of that file — edits, reads, and aborted attempts —
+across *every* worktree of the project: the main checkout, sibling worktrees,
+and agent-isolation worktrees, including work that never landed in git. Unlike
+`git blame`, it shows the debugging session that only read the file and the edit
+that was tried and reverted. Matching is by the repo-relative path *tail*, which
+is byte-identical across worktree roots, so the roots unify by construction.
+
+Input:
+
+```json
+{
+  "path": "crates/moraine-conversations/src/clickhouse_repo.rs",
+  "scope": "project",
+  "granularity": "sessions",
+  "start_datetime": null,
+  "end_datetime": null,
+  "tool": null,
+  "mutations_only": false,
+  "limit": 50
+}
+```
+
+`path` is required. Absolute paths are reduced to a repo-relative tail by walking
+up to a `.moraine.toml` / `.git` marker; a repo-relative path is used as the tail
+directly and gives the best cross-worktree coverage. `scope` is `project`
+(default, honoring `--project-only`) or `all` (drop the origin narrowing to
+include every worktree the backend holds). `granularity` is `sessions` (default,
+one rollup per session) or `events` (the flat touch-by-touch timeline). `tool`
+filters by tool name and `mutations_only` excludes pure reads.
+
+Output data carries a summary, the distinct worktree roots the tail matched
+(so over-match is visible, never silently merged), and either per-session
+rollups or an event timeline. Each item exposes typed `session:` / `event:` IDs
+with `open` handles:
+
+```json
+{
+  "tail": "crates/.../clickhouse_repo.rs",
+  "summary": {
+    "total_touches": 9,
+    "distinct_sessions": 4,
+    "distinct_roots": 2,
+    "first_touch": "2026-06-10T12:00:00.000Z",
+    "last_touch": "2026-06-15T09:30:00.000Z",
+    "ambiguous": true
+  },
+  "roots": [
+    { "root": "/Users/me/src/moraine", "touch_count": 7, "session_count": 3 },
+    { "root": "/Users/me/src/moraine/worktrees/feat", "touch_count": 2, "session_count": 1 }
+  ],
+  "sessions": [
+    {
+      "rank": 1,
+      "id": "session:...",
+      "session": { "harness": "claude-code", "touch_count": 5, "tools": ["Edit", "Read"] },
+      "open": { "session_id": "session:...", "event_id": "event:...", "turn_id": "turn:..." }
+    }
+  ]
+}
+```
+
+`file_attention` only *locates* touches; "what was done, when" is `open` on a
+returned `event:` / `turn:` ID, which already returns the full edit, diff, and
+surrounding reasoning. A tail with too few path segments (a bare basename) is
+inherently ambiguous and returns a warning alongside the surfaced roots.
 
 ## Response Envelope
 

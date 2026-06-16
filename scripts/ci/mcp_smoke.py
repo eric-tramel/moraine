@@ -153,7 +153,12 @@ def contains_text(value: Any, needle: str) -> bool:
 
 
 def assert_tools_surface(tool_names_ordered: list[str]) -> None:
-    if tool_names_ordered != ["search_sessions", "open", "list_sessions"]:
+    if tool_names_ordered != [
+        "search_sessions",
+        "open",
+        "list_sessions",
+        "file_attention",
+    ]:
         raise AssertionError(
             "tools/list must publish the MCP search surface exactly: "
             f"{tool_names_ordered}"

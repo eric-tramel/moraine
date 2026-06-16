@@ -30,6 +30,18 @@ pub const LIST_SESSIONS_DEFAULT_SLA_TARGET_MS: u64 = 300;
 pub const LIST_SESSIONS_BROAD_SLA_TARGET_MS: u64 = 1_000;
 pub const LIST_SESSIONS_FILTERED_BROAD_SLA_TARGET_MS: u64 = 1_200;
 pub const LIST_SESSIONS_DEADLINE_MS: u64 = 3_000;
+pub const FILE_ATTENTION_TOOL: &str = "file_attention";
+pub const FILE_ATTENTION_SCHEMA_VERSION: &str = "moraine.mcp.file_attention.v1";
+pub const FILE_ATTENTION_MIN_LIMIT: u16 = 1;
+pub const FILE_ATTENTION_DEFAULT_LIMIT: u16 = 50;
+pub const FILE_ATTENTION_DEFAULT_SLA_TARGET_MS: u64 = 600;
+pub const FILE_ATTENTION_BROAD_SLA_TARGET_MS: u64 = 1_200;
+pub const FILE_ATTENTION_DEADLINE_MS: u64 = 4_000;
+/// Minimum number of non-empty, slash-separated segments a path tail must have
+/// before it is treated as specific enough to suffix-match without a
+/// low-confidence warning. A bare basename (`mod.rs`, depth 1) warns;
+/// `src/lib.rs` (depth 2) does not.
+pub const FILE_ATTENTION_MIN_TAIL_SEGMENTS: usize = 2;
 
 pub type ContractResult<T> = Result<T, ContractError>;
 
@@ -721,6 +733,157 @@ pub struct CanonicalOpenV1Args {
     pub id: McpId,
 }
 
+/// How far `file_attention` widens its search.
+///
+/// `Project` (default) keeps the answer focused on the launch project by
+/// honoring the server's configured origin scope (`--project-only`). `All` is
+/// the deliberate widen: it drops that origin narrowing so a touch in *any*
+/// worktree the backend holds — sibling checkouts and agent-isolation
+/// worktrees included — is returned. The cross-worktree unification itself is
+/// always by the repo-relative tail; `scope` only decides whether the
+/// origin-scope floor is applied on top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileAttentionScope {
+    #[default]
+    Project,
+    All,
+}
+
+impl FileAttentionScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::All => "all",
+        }
+    }
+}
+
+impl fmt::Display for FileAttentionScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Shape of the `file_attention` result body.
+///
+/// `Sessions` (default) returns one rollup per session that touched the file;
+/// `Events` returns the flat, time-ordered touch-by-touch timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileAttentionGranularity {
+    #[default]
+    Sessions,
+    Events,
+}
+
+impl FileAttentionGranularity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sessions => "sessions",
+            Self::Events => "events",
+        }
+    }
+}
+
+impl fmt::Display for FileAttentionGranularity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileAttentionArgs {
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub scope: Option<FileAttentionScope>,
+    #[serde(default)]
+    pub granularity: Option<FileAttentionGranularity>,
+    #[serde(default)]
+    pub start_datetime: Option<String>,
+    #[serde(default)]
+    pub end_datetime: Option<String>,
+    #[serde(default)]
+    pub tool: Option<String>,
+    #[serde(default)]
+    pub mutations_only: Option<bool>,
+    #[serde(default)]
+    pub limit: Option<u16>,
+}
+
+impl FileAttentionArgs {
+    pub fn validate(self, max_results: u16) -> ContractResult<CanonicalFileAttentionArgs> {
+        let Some(path) = self.path else {
+            return Err(invalid_request_with_field("path", "path is required"));
+        };
+        let path = path.trim().to_string();
+        if path.is_empty() {
+            return Err(invalid_request_with_field(
+                "path",
+                "path must be a non-empty string",
+            ));
+        }
+
+        let max_limit = max_results.max(FILE_ATTENTION_MIN_LIMIT);
+        let limit = self
+            .limit
+            .unwrap_or(FILE_ATTENTION_DEFAULT_LIMIT.min(max_limit));
+        if !(FILE_ATTENTION_MIN_LIMIT..=max_limit).contains(&limit) {
+            return Err(invalid_request_with_field(
+                "limit",
+                format!("limit must be between 1 and {max_limit}"),
+            ));
+        }
+
+        // Both bounds are optional and independent, but if both are supplied
+        // the window must be non-empty — same contract as list_sessions.
+        let start = parse_optional_datetime("start_datetime", self.start_datetime)?;
+        let end = parse_optional_datetime("end_datetime", self.end_datetime)?;
+        if let (Some((start_ms, _)), Some((end_ms, _))) = (&start, &end) {
+            if end_ms <= start_ms {
+                return Err(invalid_request_with_field(
+                    "end_datetime",
+                    "end_datetime must be later than start_datetime",
+                ));
+            }
+        }
+
+        let tool = self
+            .tool
+            .map(|tool| tool.trim().to_string())
+            .filter(|tool| !tool.is_empty());
+
+        Ok(CanonicalFileAttentionArgs {
+            path,
+            scope: self.scope.unwrap_or_default(),
+            granularity: self.granularity.unwrap_or_default(),
+            start_datetime: start.as_ref().map(|(_, raw)| raw.clone()),
+            end_datetime: end.as_ref().map(|(_, raw)| raw.clone()),
+            start_unix_ms: start.map(|(ms, _)| ms),
+            end_unix_ms: end.map(|(ms, _)| ms),
+            tool,
+            mutations_only: self.mutations_only.unwrap_or(false),
+            limit,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalFileAttentionArgs {
+    pub path: String,
+    pub scope: FileAttentionScope,
+    pub granularity: FileAttentionGranularity,
+    pub start_datetime: Option<String>,
+    pub end_datetime: Option<String>,
+    pub start_unix_ms: Option<i64>,
+    pub end_unix_ms: Option<i64>,
+    pub tool: Option<String>,
+    pub mutations_only: bool,
+    pub limit: u16,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolErrorCode {
@@ -1002,6 +1165,24 @@ fn list_sessions_datetime_required_error() -> ContractError {
             "end_datetime": "2026-04-30T13:00:00-04:00"
         }
     }))
+}
+
+/// Parse an optional datetime bound, returning `(unix_ms, trimmed_input)`.
+/// Absent or blank input yields `None`; present input must carry an explicit
+/// timezone, matching `parse_explicit_timezone_datetime`.
+fn parse_optional_datetime(
+    field: &'static str,
+    input: Option<String>,
+) -> ContractResult<Option<(i64, String)>> {
+    let Some(raw) = input else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim().to_string();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let unix_ms = parse_explicit_timezone_datetime(field, &trimmed)?;
+    Ok(Some((unix_ms, trimmed)))
 }
 
 fn parse_explicit_timezone_datetime(field: &'static str, input: &str) -> ContractResult<i64> {
