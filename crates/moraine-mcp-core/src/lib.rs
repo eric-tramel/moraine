@@ -10,7 +10,7 @@ use anyhow::{anyhow, Context, Result};
 use moraine_clickhouse::{enforce_remote_schema_policy, ClickHouseClient};
 use moraine_config::{AppConfig, DEFAULT_BACKEND_NAME};
 pub use moraine_conversations::SessionOriginScope;
-use moraine_conversations::{ClickHouseConversationRepository, RepoConfig};
+use moraine_conversations::{ClickHouseConversationRepository, RepoConfig, RepoError};
 use serde::Deserialize;
 use serde_json::{json, Value};
 #[cfg(unix)]
@@ -410,6 +410,29 @@ fn tool_error_result(message: String) -> Value {
         ],
         "isError": true
     })
+}
+
+/// Map a repository error onto the MCP tool error contract. Shared by every
+/// retrieval tool handler so the RepoError → ToolErrorCode mapping stays in one
+/// place.
+pub(crate) fn repo_error_to_contract_error(error: RepoError) -> contract::ContractError {
+    match error {
+        RepoError::InvalidArgument(message) | RepoError::InvalidCursor(message) => {
+            contract::ContractError::new(contract::ToolErrorCode::InvalidRequest, message)
+        }
+        RepoError::Backend(message) | RepoError::Internal(message) => {
+            contract::ContractError::new(contract::ToolErrorCode::InternalError, message)
+        }
+    }
+}
+
+/// Wrap a typed-ID encoding failure on repository data (not user input) as an
+/// internal error. Shared by every retrieval tool handler.
+pub(crate) fn internal_id_error(error: contract::ContractError) -> contract::ContractError {
+    contract::ContractError::new(
+        contract::ToolErrorCode::InternalError,
+        format!("repository returned an invalid MCP identifier component: {error}"),
+    )
 }
 
 impl AppState {

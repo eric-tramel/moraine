@@ -9,7 +9,7 @@
 //! It returns typed `session:` / `event:` IDs that drill down through `open`;
 //! it never reinvents inspection.
 
-use super::{tool_ok_hybrid, AppState};
+use super::{internal_id_error, repo_error_to_contract_error, tool_ok_hybrid, AppState};
 use crate::contract::{
     format_rfc3339_utc_millis, CanonicalFileAttentionArgs, ContractError, FileAttentionArgs,
     FileAttentionGranularity, FileAttentionScope, McpEventId, McpSessionId, McpTurnId, Performance,
@@ -18,7 +18,7 @@ use crate::contract::{
     FILE_ATTENTION_MIN_TAIL_SEGMENTS, FILE_ATTENTION_TOOL,
 };
 use anyhow::{Context, Result};
-use moraine_conversations::{FileAttentionQuery, FileAttentionTouch, RepoError};
+use moraine_conversations::{FileAttentionQuery, FileAttentionTouch};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -327,18 +327,26 @@ fn build_data(
 
     // --- body: per-session rollups OR a flat event timeline ------------------
     let limit = args.limit as usize;
-    let (body_key, body, available) = match args.granularity {
+    let (body_key, body, encodable, skipped) = match args.granularity {
         FileAttentionGranularity::Sessions => {
-            let (sessions, total) = session_rollups(&touches, limit);
-            ("sessions", sessions, total)
+            let (sessions, encodable, skipped) = session_rollups(&touches, limit);
+            ("sessions", sessions, encodable, skipped)
         }
         FileAttentionGranularity::Events => {
-            let (events, total) = event_timeline(&touches, limit);
-            ("events", events, total)
+            let (events, encodable, skipped) = event_timeline(&touches, limit);
+            ("events", events, encodable, skipped)
         }
     };
     let result_count = body.len();
-    let truncated = available > result_count;
+    // `truncated` means the display limit hid encodable results — NOT that rows
+    // were dropped for un-encodable identifiers. Those are a separate, surfaced
+    // warning so the caller never reads a data fault as a limit cut.
+    let truncated = encodable > limit;
+    if skipped > 0 {
+        warnings.push(format!(
+            "dropped {skipped} touch(es) whose repository identifiers could not be encoded; they are excluded from the result and its counts."
+        ));
+    }
 
     let mut data = json!({
         "path": args.path,
@@ -372,8 +380,11 @@ fn root_label(root: &str) -> String {
 }
 
 /// Fold the newest-first touch stream into per-session rollups, preserving
-/// most-recent-first order. Returns `(displayed_rollups, total_sessions)`.
-fn session_rollups(touches: &[FileAttentionTouch], limit: usize) -> (Vec<Value>, usize) {
+/// most-recent-first order. Returns `(displayed_rollups, encodable_sessions,
+/// skipped_sessions)` where `encodable` counts every session whose identifiers
+/// encode (used for the limit-truncation signal) and `skipped` counts sessions
+/// dropped because a repository identifier could not be encoded.
+fn session_rollups(touches: &[FileAttentionTouch], limit: usize) -> (Vec<Value>, usize, usize) {
     let mut order: Vec<String> = Vec::new();
     let mut aggs: HashMap<String, SessionAgg> = HashMap::new();
     for touch in touches {
@@ -408,26 +419,31 @@ fn session_rollups(touches: &[FileAttentionTouch], limit: usize) -> (Vec<Value>,
         }
     }
 
-    let total = order.len();
     let mut sessions = Vec::new();
+    let mut encodable = 0usize;
+    let mut skipped = 0usize;
     for session_id in order {
-        if sessions.len() >= limit {
-            break;
-        }
         let agg = &aggs[&session_id];
-        // Rank advances only on a kept row so it stays contiguous when a row's
-        // identifier can't be encoded (repository data fault, not user input).
+        // Rank advances only on a kept row so it stays contiguous (1..=N).
         let rank = sessions.len() + 1;
         match session_rollup_json(rank, &session_id, agg) {
-            Ok(value) => sessions.push(value),
-            Err(error) => warn!(
-                session_id = %session_id,
-                error = %error,
-                "file_attention: skipping session rollup with an invalid identifier"
-            ),
+            Ok(value) => {
+                encodable += 1;
+                if sessions.len() < limit {
+                    sessions.push(value);
+                }
+            }
+            Err(error) => {
+                skipped += 1;
+                warn!(
+                    session_id = %session_id,
+                    error = %error,
+                    "file_attention: skipping session rollup with an invalid identifier"
+                );
+            }
         }
     }
-    (sessions, total)
+    (sessions, encodable, skipped)
 }
 
 fn session_rollup_json(
@@ -474,26 +490,33 @@ fn session_rollup_json(
     }))
 }
 
-/// The flat, newest-first touch-by-touch timeline. Returns
-/// `(displayed_events, total_events)`.
-fn event_timeline(touches: &[FileAttentionTouch], limit: usize) -> (Vec<Value>, usize) {
-    let total = touches.len();
+/// The flat, newest-first touch-by-touch timeline. Returns `(displayed_events,
+/// encodable_events, skipped_events)` — `encodable` drives limit-truncation and
+/// `skipped` counts touches dropped for un-encodable identifiers.
+fn event_timeline(touches: &[FileAttentionTouch], limit: usize) -> (Vec<Value>, usize, usize) {
     let mut events = Vec::new();
+    let mut encodable = 0usize;
+    let mut skipped = 0usize;
     for touch in touches {
-        if events.len() >= limit {
-            break;
-        }
         let rank = events.len() + 1;
         match event_json(rank, touch) {
-            Ok(value) => events.push(value),
-            Err(error) => warn!(
-                event_uid = %touch.event_uid,
-                error = %error,
-                "file_attention: skipping touch with an invalid identifier"
-            ),
+            Ok(value) => {
+                encodable += 1;
+                if events.len() < limit {
+                    events.push(value);
+                }
+            }
+            Err(error) => {
+                skipped += 1;
+                warn!(
+                    event_uid = %touch.event_uid,
+                    error = %error,
+                    "file_attention: skipping touch with an invalid identifier"
+                );
+            }
         }
     }
-    (events, total)
+    (events, encodable, skipped)
 }
 
 fn event_json(rank: usize, touch: &FileAttentionTouch) -> Result<Value, ContractError> {
@@ -686,24 +709,6 @@ fn format_error_text(payload: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("file_attention failed");
     format!("file_attention error ({code}): {message}")
-}
-
-fn repo_error_to_contract_error(error: RepoError) -> ContractError {
-    match error {
-        RepoError::InvalidArgument(message) | RepoError::InvalidCursor(message) => {
-            ContractError::new(ToolErrorCode::InvalidRequest, message)
-        }
-        RepoError::Backend(message) | RepoError::Internal(message) => {
-            ContractError::new(ToolErrorCode::InternalError, message)
-        }
-    }
-}
-
-fn internal_id_error(error: ContractError) -> ContractError {
-    ContractError::new(
-        ToolErrorCode::InternalError,
-        format!("repository returned an invalid MCP identifier component: {error}"),
-    )
 }
 
 #[cfg(test)]
@@ -921,6 +926,40 @@ mod tests {
         assert_eq!(data["truncated"], json!(true));
         // Summary still reflects all five scanned sessions.
         assert_eq!(data["summary"]["distinct_sessions"], json!(5));
+    }
+
+    #[test]
+    fn build_data_skipped_invalid_id_is_a_warning_not_truncation() {
+        // A touch whose session_id cannot be encoded (empty) is dropped, but
+        // that must NOT read as a limit-induced truncation — it is its own
+        // surfaced warning. (Regression for the truncation/skip conflation.)
+        let tail = resolve_tail("crates/foo/tee.rs");
+        let touches = vec![
+            touch(
+                "sess-ok",
+                "ev-ok",
+                "Edit",
+                "path_suffix",
+                "/repo/main",
+                2_000,
+            ),
+            touch("", "ev-bad", "Edit", "path_suffix", "/repo/main", 1_000),
+        ];
+        let mut warnings = Vec::new();
+        let data = build_data(
+            &canonical(FileAttentionGranularity::Sessions, FileAttentionScope::All),
+            &tail,
+            touches,
+            &mut warnings,
+        );
+
+        // Only the encodable session is shown, and the limit (50) was not hit.
+        assert_eq!(data["result_count"], json!(1));
+        assert_eq!(data["truncated"], json!(false));
+        assert!(
+            warnings.iter().any(|w| w.contains("could not be encoded")),
+            "expected a skipped-row warning, got {warnings:?}"
+        );
     }
 
     #[test]

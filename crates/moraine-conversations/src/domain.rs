@@ -97,9 +97,8 @@ pub struct FileAttentionTouch {
     #[serde(default)]
     pub tool_phase: String,
     /// `path_suffix` (a structured path key ends with the tail; high
-    /// confidence), `bash_substring` (the tail appeared in a shell command), or
-    /// `json_substring` (the tail appeared in the raw input under an
-    /// unrecognized key; lowest confidence).
+    /// confidence) or `bash_substring` (the tail appeared as a path inside a
+    /// shell `command` / `cmd`; lower confidence, no single resolvable path).
     #[serde(default)]
     pub match_kind: String,
     /// Best-effort absolute path that matched — the structured path for

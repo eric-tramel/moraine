@@ -696,8 +696,10 @@ impl ClickHouseConversationRepository {
     ///
     /// This is a deliberate `tool_io` scan: `input_json` is not indexed, so
     /// Tier-0 trades exactness-of-index for working-on-existing-data with no
-    /// migration. Rows are capped at `query.max_rows + 1` so the caller can
-    /// detect (and flag) truncation.
+    /// migration. The events join is bounded to the matched sessions (the
+    /// primary-key prefix of `events`) so it prunes by sparse index rather than
+    /// reading the whole table. Rows are capped at `query.max_rows + 1` so the
+    /// caller can detect (and flag) truncation.
     pub async fn file_attention(
         &self,
         query: FileAttentionQuery,
@@ -717,19 +719,47 @@ impl ClickHouseConversationRepository {
         // substring math needs no repeated `length(<literal>)` evaluation.
         let rel_len = rel.len();
 
-        // Inner match filter, pushed into the `tool_io FINAL` subquery so only
-        // matched request rows reach the events join. Wrapping `FINAL` in a
-        // subquery sidesteps the `AS alias FINAL` ordering question and lets us
-        // alias the result cleanly as `ti`.
+        // Structured path keys we extract for a high-confidence suffix match,
+        // covering the shapes the harnesses store (claude-code `file_path` /
+        // `notebook_path`; cursor `path` / `target_file` / `filepath` / `file`
+        // / `filename`). The WHERE-clause `endsWith` chain and the
+        // `matched_path` projection are both generated from this one list, so
+        // they can never drift apart. These are compile-time constants, not
+        // user input, so inlining them needs no escaping.
+        const PATH_KEYS: [&str; 7] = [
+            "file_path",
+            "notebook_path",
+            "path",
+            "target_file",
+            "filepath",
+            "file",
+            "filename",
+        ];
+        let ends_with_any = PATH_KEYS
+            .iter()
+            .map(|key| format!("endsWith(JSONExtractString(input_json, '{key}'), {rel_sql})"))
+            .collect::<Vec<_>>()
+            .join("\n        OR ");
+        // Substring fallback is restricted to shell-command rows (`command` /
+        // `cmd`): that is the only case the structured keys cannot cover, and
+        // gating the full-string `position()` on those rows keeps it off the
+        // hot path for every other matched row.
         let match_predicate = format!(
-            "tool_phase = 'request'\n      AND (\n        endsWith(JSONExtractString(input_json, 'file_path'), {rel_sql})\n        OR endsWith(JSONExtractString(input_json, 'notebook_path'), {rel_sql})\n        OR endsWith(JSONExtractString(input_json, 'path'), {rel_sql})\n        OR position(input_json, {slash_rel_sql}) > 0\n      )"
+            "tool_phase = 'request'\n      AND (\n        {ends_with_any}\n        OR ((JSONHas(input_json, 'command') OR JSONHas(input_json, 'cmd')) AND position(input_json, {slash_rel_sql}) > 0)\n      )"
         );
 
-        // The structured path key that actually ends with the tail (file_path,
-        // notebook_path, or path). Empty for substring-only matches.
-        let matched_path_expr = format!(
-            "multiIf(\n      endsWith(JSONExtractString(ti.input_json, 'file_path'), {rel_sql}), JSONExtractString(ti.input_json, 'file_path'),\n      endsWith(JSONExtractString(ti.input_json, 'notebook_path'), {rel_sql}), JSONExtractString(ti.input_json, 'notebook_path'),\n      endsWith(JSONExtractString(ti.input_json, 'path'), {rel_sql}), JSONExtractString(ti.input_json, 'path'),\n      '')"
-        );
+        // The structured path key that actually ends with the tail; empty for
+        // shell-substring matches. Same key list as the WHERE clause above.
+        let matched_path_arms = PATH_KEYS
+            .iter()
+            .map(|key| {
+                format!(
+                    "endsWith(JSONExtractString(ti.input_json, '{key}'), {rel_sql}), JSONExtractString(ti.input_json, '{key}')"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",\n      ");
+        let matched_path_expr = format!("multiIf(\n      {matched_path_arms},\n      '')");
 
         // Filters that can only be evaluated after the events join (or that are
         // simply clearer outside the inner scan).
@@ -759,19 +789,24 @@ impl ClickHouseConversationRepository {
 
         let limit_plus = query.max_rows.saturating_add(1);
 
+        // `matched` is the deliberate `tool_io` scan. The events lookup reuses
+        // it via `session_id IN (SELECT session_id FROM matched)` so the join's
+        // right side prunes to the matched sessions (the leading `events`
+        // primary-key column) instead of reading the whole table.
         let sql = format!(
-            "SELECT
+            "WITH matched AS (
+    SELECT session_id, event_uid, harness, tool_name, tool_phase, input_json, input_preview, output_preview
+    FROM {tool_io} FINAL
+    WHERE {match_predicate}
+  )
+  SELECT
     ti.session_id AS session_id,
     ti.event_uid AS event_uid,
     ti.harness AS harness,
     ti.tool_name AS tool_name,
     ti.tool_phase AS tool_phase,
     {matched_path_expr} AS matched_path,
-    multiIf(
-      matched_path != '', 'path_suffix',
-      JSONHas(ti.input_json, 'command') OR JSONHas(ti.input_json, 'cmd'), 'bash_substring',
-      'json_substring'
-    ) AS match_kind,
+    if(matched_path != '', 'path_suffix', 'bash_substring') AS match_kind,
     if(
       matched_path != ''
       AND length(matched_path) > {rel_len} + 1
@@ -784,14 +819,11 @@ impl ClickHouseConversationRepository {
     toUInt32(ifNull(e.turn_index, toUInt32(0))) AS turn_index,
     ti.input_preview AS input_preview,
     ti.output_preview AS output_preview
-  FROM (
-    SELECT session_id, event_uid, harness, tool_name, tool_phase, input_json, input_preview, output_preview
-    FROM {tool_io} FINAL
-    WHERE {match_predicate}
-  ) AS ti
+  FROM matched AS ti
   LEFT JOIN (
     SELECT event_uid, event_ts, turn_index, cwd
     FROM {events} FINAL
+    WHERE session_id IN (SELECT session_id FROM matched)
   ) AS e ON e.event_uid = ti.event_uid
   WHERE {outer_where}
   ORDER BY event_unix_ms DESC, ti.event_uid DESC
