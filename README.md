@@ -5,7 +5,7 @@
 [![Docs](https://github.com/eric-tramel/moraine/actions/workflows/docs-deploy.yml/badge.svg)](https://eric-tramel.github.io/moraine/)
 
 Moraine is a local trace stack for agent work. It indexes sessions from agent
-harnesses such as Codex, Claude Code, Kimi CLI, Hermes, and Pi Coding Agent into ClickHouse,
+harnesses such as Codex, Claude Code, Kimi CLI, OpenCode, Hermes, and Pi Coding Agent into ClickHouse,
 serves a monitor UI, and exposes MCP retrieval over the indexed history.
 
 Agents get searchable long-term memory through MCP. You get a unified local
@@ -38,6 +38,7 @@ Moraine ships session trace ingestion adapters for these agent harnesses:
 | [Codex](https://developers.openai.com/codex) | `codex` | JSONL session files under `~/.codex/sessions` |
 | [Claude Code](https://code.claude.com/docs/en/overview) | `claude-code` | JSONL project session files under `~/.claude/projects` |
 | [Kimi CLI](https://moonshotai.github.io/kimi-cli/en/) | `kimi-cli` | `wire.jsonl` session traces under `~/.kimi/sessions` |
+| [OpenCode](https://opencode.ai/) | `opencode` | SQLite session history from `~/.local/share/opencode/opencode*.db` (default on; `opencode_sqlite` format) |
 | [Cursor](https://cursor.com/docs) | `cursor` | Agent transcript JSONL under `~/.cursor/projects` (default on); Cursor IDE chat history from `state.vscdb` SQLite databases (default on; `cursor_sqlite` format) |
 | [Hermes](https://hermes-agent.nousresearch.com/docs/) | `hermes` | Live session JSON and trajectory JSONL traces |
 | [Pi Coding Agent](https://pi.dev/docs/latest) | `pi-coding-agent` | JSONL session trees under `~/.pi/agent/sessions` |

@@ -219,8 +219,8 @@ format = "jsonl"
 ```
 
 Supported `harness` values are `codex`, `claude-code`, `cursor`, `kimi-cli`,
-`hermes`, and `pi-coding-agent`. Each value maps to a registered ingest source
-adapter; see
+`opencode`, `hermes`, and `pi-coding-agent`. Each value maps to a registered
+ingest source adapter; see
 [Ingest Sources](development/ingest-sources.md) for the adapter contract and
 [Harness Author Workflow](development/harness-author-workflow.md) for source
 development steps.
@@ -233,10 +233,12 @@ for changes. `format` controls the file parser:
 | `jsonl` | Append-only newline-delimited trace records. This is the default for most sources. |
 | `session_json` | One JSON file per live session that is rewritten in place. Moraine emits only newly appended synthetic session records. |
 | `cursor_sqlite` | Cursor `state.vscdb` SQLite databases. Moraine polls the database read-only and emits synthetic records for new or changed rows. |
+| `opencode_sqlite` | OpenCode `opencode*.db` SQLite databases. Moraine polls the database read-only and emits synthetic records from conversation tables only. |
 
 When `format` is omitted, Moraine infers it. Hermes sources with a `.json` glob
-are inferred as `session_json`, a glob ending in `.vscdb` is inferred as
-`cursor_sqlite`, and otherwise sources are treated as `jsonl`.
+are inferred as `session_json`, Cursor globs ending in `.vscdb` are inferred as
+`cursor_sqlite`, OpenCode globs ending in `opencode.db` or `opencode*.db` are
+inferred as `opencode_sqlite`, and otherwise sources are treated as `jsonl`.
 
 ## Source Matrix
 
@@ -247,6 +249,7 @@ The default template in `config/moraine.toml` enables these source families:
 | Codex | `codex` | `~/.codex/sessions/**/*.jsonl` | `~/.codex/sessions` | inferred `jsonl` |
 | Claude Code | `claude-code` | `~/.claude/projects/**/*.jsonl` | `~/.claude/projects` | inferred `jsonl` |
 | Kimi CLI | `kimi-cli` | `~/.kimi/sessions/**/wire.jsonl` | `~/.kimi/sessions` | inferred `jsonl` |
+| OpenCode | `opencode` | `~/.local/share/opencode/opencode*.db` | `~/.local/share/opencode` | `opencode_sqlite` (default on) |
 | Cursor Agent | `cursor` | `~/.cursor/projects/*/agent-transcripts/**/*.jsonl` | `~/.cursor/projects` | inferred `jsonl` |
 | Cursor SQLite history | `cursor` | `~/Library/Application Support/Cursor/User/**/state.vscdb` (macOS) | `~/Library/Application Support/Cursor/User` | `cursor_sqlite` (default on) |
 | Pi Coding Agent | `pi-coding-agent` | `~/.pi/agent/sessions/**/*.jsonl` | `~/.pi/agent/sessions` | `jsonl` |
@@ -257,7 +260,9 @@ Hermes supports both live session JSON and offline trajectory JSONL because the
 harness is the same but the file format differs. Use a separate
 `[[ingest.sources]]` entry for each watched directory. Cursor likewise has two
 trace forms under one harness: Agent transcript JSONL and SQLite chat history
-(`cursor_sqlite`); both are enabled by default.
+(`cursor_sqlite`); both are enabled by default. OpenCode stores conversation
+history in default or channel-specific SQLite databases (`opencode_sqlite`),
+enabled by default.
 
 ## Source Examples
 
@@ -294,6 +299,25 @@ glob = "~/.kimi/sessions/**/wire.jsonl"
 watch_root = "~/.kimi/sessions"
 format = "jsonl"
 ```
+
+OpenCode:
+
+```toml
+[[ingest.sources]]
+name = "opencode"
+harness = "opencode"
+enabled = true
+glob = "~/.local/share/opencode/opencode*.db"
+watch_root = "~/.local/share/opencode"
+format = "opencode_sqlite"
+```
+
+This source polls OpenCode's `opencode*.db` databases read-only and ingests
+only conversation data from `session`, `message`, `part`, and
+`session_message`.
+Account, credential, and token-bearing tables are deliberately out of scope.
+Moraine also reacts to the `-wal`/`-shm` sidecar files so WAL-only writes
+trigger polls.
 
 Cursor Agent JSONL:
 
