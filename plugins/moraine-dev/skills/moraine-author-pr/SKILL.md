@@ -7,7 +7,7 @@ description: Author Moraine pull request titles and descriptions. Use when draft
 
 ## Overview
 
-Use this workflow to write PR titles and descriptions that are reviewable, evidence-backed, and consistent across agents.
+Use this workflow to write PR titles and descriptions that are reviewable, evidence-backed, and consistent across agents. Default bodies use `Description`, `Usage`, `Changelog`, and `Validation` sections.
 
 ## Title Rules
 
@@ -27,17 +27,17 @@ Do not include AI attribution in the title or body. Do not add generated-by foot
 Default to these sections:
 
 ```markdown
-## What
+## Description
 
-- ...
+**What.** [One sentence description].
 
-## Why
+**Why.** [One sentence description].
 
-- ...
+[Multi-paragraph description]
 
 ## Usage
 
-- ...
+[How users or developers will see this change]
 
 ## Changelog
 
@@ -45,43 +45,31 @@ Default to these sections:
 
 ## Validation
 
-- ...
+[Narrative description of how this was validated]
 ```
 
 Keep sections short when the PR is small. Add focused extra sections only when useful, such as `## Bug Evidence`, `## Performance`, `## Operational Impact`, or `## References`.
 
-## What
+## Description
 
-State the concrete change in reviewer-facing terms. Mention files or subsystems when that helps review scope.
+Open with bold one-line **What.** and **Why.** summaries, then expand in prose, bullets, or examples as needed.
+
+State the concrete change in reviewer-facing terms. Mention files or subsystems when that helps review scope. Explain the reason for the change, not only the implementation. Include code, commands, queries, or before/after examples when they make the motivation concrete.
 
 Good:
 
 ```markdown
-## What
+## Description
 
-- Adds a repo-local `moraine-dev` plugin.
+**What.** Adds a repo-local `moraine-dev` plugin with contributor agent skills.
+
+**Why.** Agents were repeating PR body structure differently across sessions; a shared skill gives each agent the same review contract.
+
 - Vendors `$moraine-dev:moraine-start-work`, `$moraine-dev:moraine-author-pr`, and `$moraine-dev:moraine-sandbox-qa` skills.
 - Documents local installation in `docs/development/agent-contributor-workflows.md`.
-```
-
-## Why
-
-Explain the reason for the change, not only the implementation. Include code, commands, queries, or before/after examples when they make the motivation concrete.
-
-Example:
-
-````markdown
-## Why
-
-Agents were repeating PR body structure differently across sessions. A shared
-skill gives each agent the same review contract:
-
-```text
-What -> Why -> Usage -> Changelog -> Validation
-```
 
 That makes it easier for reviewers to find behavior, impact, and test evidence.
-````
+```
 
 ## Usage
 
@@ -135,17 +123,14 @@ Good:
 
 ## Validation
 
-List exact commands and outcomes. Include skipped validation with a reason.
+Write a short narrative that names exact commands and outcomes. Include skipped validation with a reason.
 
 Example:
 
 ```markdown
 ## Validation
 
-- `python3 -m json.tool .agents/plugins/marketplace.json` passed.
-- `quick_validate.py plugins/moraine-dev/skills/moraine-author-pr` passed.
-- `make docs-build` passed.
-- Rust tests not run; docs/plugin metadata only.
+Validated plugin metadata with `python3 -m json.tool .agents/plugins/marketplace.json` and `quick_validate.py plugins/moraine-dev/skills/moraine-author-pr`. Ran `make docs-build` successfully. Rust tests were not run; change is docs and plugin metadata only.
 ```
 
 For stack-facing changes, include sandbox validation details or state why sandbox QA was not run.
