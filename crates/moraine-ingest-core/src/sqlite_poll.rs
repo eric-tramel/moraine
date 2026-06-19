@@ -42,6 +42,9 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, warn};
 
+mod opencode;
+pub(crate) use opencode::process_opencode_sqlite_db;
+
 /// Key prefixes in `cursorDiskKV` that carry transcript data. Everything else
 /// (`agentKv:blob:*` provider-wire blobs, `checkpointId:*` file snapshots,
 /// `ofsContent:*`/`composer.content.*` raw file text, and the entire
