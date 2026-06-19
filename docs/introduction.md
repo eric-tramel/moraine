@@ -49,5 +49,9 @@ local stack.
 Read [Configuration](configuration.md) when you need to change watched sources,
 ports, ClickHouse settings, MCP defaults, or runtime paths.
 
+Read [Remote ClickHouse Tutorial](remote-clickhouse.md) when you want Moraine's
+default database to live in your own Docker container or personal ClickHouse
+server.
+
 Read [Agent MCP Search](agent-mcp-search/index.md) to connect agent harnesses,
 write effective search instructions, and understand the MCP retrieval tools.
