@@ -16,8 +16,8 @@ After the start checklist and branch/worktree setup, run the rest of the contrib
 1. Use `$moraine-dev:crystallize` to turn rough or ambiguous input into a ready-to-implement local plan.
 2. Implement the scoped change from that plan or, when the task is already concrete, from the user's explicit request.
 3. Use `$moraine-dev:code-review` and iterate fixes until the review is clean or every remaining item is explicitly rejected or deferred with rationale.
-4. Use `$moraine-dev:moraine-sandbox-qa` for stack-facing changes and iterate fixes until sandbox QA is clean. For changes that do not need sandbox QA, record why it was skipped.
-5. Use `$moraine-dev:moraine-author-pr` to draft the PR title and description from the final diff, evidence, and validation results.
+4. Use `$moraine-dev:moraine-sandbox-qa` for stack-facing changes and iterate fixes until sandbox QA is clean.
+5. Use `$moraine-dev:moraine-author-pr` to create a PR.
 
 ## Start Checklist
 
@@ -31,11 +31,11 @@ git worktree list --porcelain
 find .. -name AGENTS.md -print
 ```
 
-Read every `AGENTS.md` that governs the files you will edit. If the user refers to previous work, another agent, an unexplained decision, a branch you cannot see, or a failure from another session, use the Moraine MCP tools directly before making assumptions. Prefer `search_sessions` for keyword search, `list_sessions` for time or active-session browsing, `open` for expansion, and `file_attention` for file-specific history.
+If the user refers to previous work, another agent, an unexplained decision, a branch you cannot see, or a failure from another session, use the Moraine MCP tools directly before making assumptions.
 
 ## Branch And Worktree
 
-Use an isolated branch for development work. Prefer the branch prefix requested by the user; otherwise use `codex/`.
+Use an isolated branch for development work. Choose an appropriate branch prefix (e.g. `feat/`, `bug/`, etc.)
 
 If the harness already placed you in an isolated worktree, create or verify a branch there:
 
@@ -51,15 +51,6 @@ git worktree add ../moraine-worktrees/<short-task-name> -b codex/<short-task-nam
 
 When spawned into a temporary agent worktree, compare your `HEAD` with any sibling worktree whose branch name matches the task. If the sibling has newer in-progress code, treat that sibling as authoritative and run sandbox validation from that worktree.
 
-## Validation Choice
+## Validation Description
 
-Run focused local checks for narrow docs or metadata changes. For Rust changes, default to:
-
-```bash
-cargo fmt --all -- --check
-cargo test --workspace --locked
-```
-
-For ingest, MCP, monitor, ClickHouse schema, source-format, or stack-behavior changes, use `$moraine-dev:moraine-sandbox-qa` before reporting the task complete.
-
-End with the changed paths, validation commands, and any validation you intentionally skipped.
+Favor narrative description of what you tested instead of bullet points.
