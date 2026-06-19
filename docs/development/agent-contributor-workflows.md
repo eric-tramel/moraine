@@ -37,9 +37,17 @@ From the repository root:
 make agent-plugins-install
 ```
 
-This registers the local Codex marketplace for the current checkout, replaces a
-stale marketplace entry that points at another worktree, and installs or
-refreshes every plugin listed in `.agents/plugins/marketplace.json`.
+This registers the Codex marketplace from the configured Git remote, replaces a
+stale marketplace entry, syncs the marketplace snapshot from `origin/main`, and
+installs or refreshes every plugin listed there. This intentionally uses the
+merged `main` branch as the source of truth so agents running from stale feature
+worktrees still pick up the latest developer workflows.
+
+When changing the plugin itself, test the unmerged checkout explicitly:
+
+```bash
+make agent-plugins-install AGENT_PLUGINS_SOURCE=current
+```
 
 Other agent harnesses that understand `SKILL.md` directories can consume the
 same skill folders directly.

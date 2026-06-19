@@ -1,6 +1,8 @@
 SHELL := /bin/bash
 UV ?= uv
 CODEX ?= codex
+AGENT_PLUGINS_SOURCE ?= main
+AGENT_PLUGINS_REMOTE ?= origin
 DOCS_ADDR ?= 127.0.0.1:8000
 RUSTUP ?= rustup
 RUST_TOOLCHAIN ?= stable
@@ -37,7 +39,7 @@ help:
 	@echo "  make sandbox-list   List running dev sandboxes"
 	@echo "  make hooks-install  Enable repo-managed git hooks (fmt + clippy pre-commit)"
 	@echo "  make agent-plugins-install"
-	@echo "                       Install/update developer agent Codex plugins"
+	@echo "                       Sync developer agent Codex plugins from $(AGENT_PLUGINS_REMOTE)/main"
 	@echo ""
 	@echo "Rust toolchain: $(RUST_LABEL)"
 	@echo "Cargo command: $(CARGO_CMD)"
@@ -72,7 +74,10 @@ hooks-install:
 	scripts/dev/install-hooks.sh
 
 agent-plugins-install:
-	CODEX_CMD='$(CODEX)' scripts/dev/install-agent-plugins.sh
+	CODEX_CMD='$(CODEX)' \
+		AGENT_PLUGINS_SOURCE='$(AGENT_PLUGINS_SOURCE)' \
+		AGENT_PLUGINS_REMOTE='$(AGENT_PLUGINS_REMOTE)' \
+		scripts/dev/install-agent-plugins.sh
 
 docs-build:
 	$(UV) run --with zensical zensical build
