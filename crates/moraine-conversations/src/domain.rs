@@ -64,9 +64,16 @@ pub struct McpSessionListFilter {
 /// whose input path ends with `rel`, scoped and filtered per the request.
 #[derive(Debug, Clone)]
 pub struct FileAttentionQuery {
+    /// Stable identifier assigned to the ClickHouse query so MCP deadlines can
+    /// cancel the backend scan if the client-side timeout fires.
+    pub query_id: String,
     /// Repo-relative tail to suffix-match against captured file paths. The tail
     /// is what unifies the same logical file across worktree roots.
     pub rel: String,
+    /// Whether a structured matched path should be stripped by `rel` to report
+    /// a worktree root. Disabled for arbitrary suffixes that could otherwise
+    /// mislabel a source/package directory as a repository root.
+    pub derive_worktree_roots: bool,
     /// When true the server's configured origin scope (`--project-only`) is
     /// applied on top of the tail match; when false (`scope:"all"`) it is
     /// dropped so touches in sibling and agent-isolation worktrees surface too.
@@ -81,6 +88,8 @@ pub struct FileAttentionQuery {
     /// per-session rollups are computed over this scanned set; the caller flags
     /// the result truncated when the cap is hit.
     pub max_rows: usize,
+    /// Server-side ClickHouse execution cap for this scan.
+    pub max_execution_time_secs: u64,
 }
 
 /// One captured tool call that touched the queried file. Deserialized from a
@@ -97,8 +106,9 @@ pub struct FileAttentionTouch {
     #[serde(default)]
     pub tool_phase: String,
     /// `path_suffix` (a structured path key ends with the tail; high
-    /// confidence) or `bash_substring` (the tail appeared as a path inside a
-    /// shell `command` / `cmd`; lower confidence, no single resolvable path).
+    /// confidence) or `shell_path` (the tail appeared as a path-like token
+    /// inside a shell `command` / `cmd`; lower confidence, no single resolvable
+    /// path).
     #[serde(default)]
     pub match_kind: String,
     /// Best-effort absolute path that matched — the structured path for
@@ -113,12 +123,16 @@ pub struct FileAttentionTouch {
     /// Session working directory recorded on the underlying event, if any.
     #[serde(default)]
     pub cwd: String,
-    /// Event timestamp in unix milliseconds; `0` when the touch has no joinable
-    /// event row.
+    /// Event timestamp in unix milliseconds, using the same trace timestamp
+    /// source as `open(event)`. `None` when the touch has no joinable trace row.
     #[serde(default)]
-    pub event_unix_ms: i64,
+    pub event_unix_ms: Option<i64>,
+    /// Transcript order from `v_conversation_trace`, used to break same-ms ties.
     #[serde(default)]
-    pub turn_index: u32,
+    pub event_order: u64,
+    /// Parent turn sequence accepted by `open(turn:...)`.
+    #[serde(default)]
+    pub turn_seq: Option<u32>,
     #[serde(default)]
     pub input_preview: String,
     #[serde(default)]
@@ -399,6 +413,7 @@ pub struct McpEventOpen {
     pub turn_completed: bool,
     pub turn_terminal_event_uid: Option<String>,
     pub parent_session: SessionMetadata,
+    pub parent_session_source: Option<String>,
     pub parent_turn: TurnSummary,
     pub previous_event: Option<McpEventRef>,
     pub next_event: Option<McpEventRef>,

@@ -197,17 +197,22 @@ Input:
   "end_datetime": null,
   "tool": null,
   "mutations_only": false,
-  "limit": 50
+  "limit": 25
 }
 ```
 
 `path` is required. Absolute paths are reduced to a repo-relative tail by walking
 up to a `.moraine.toml` / `.git` marker; a repo-relative path is used as the tail
-directly and gives the best cross-worktree coverage. `scope` is `project`
+directly and gives the best cross-worktree coverage. Existing relative paths are
+resolved from the server's working directory first, so nested worktree prefixes
+strip to the nested worktree root. Boundary whitespace, `file://` URIs, and
+directory-style trailing slashes are rejected rather than silently mapped to a
+different file. `scope` is `project`
 (default, honoring `--project-only`) or `all` (drop the origin narrowing to
 include every worktree the backend holds). `granularity` is `sessions` (default,
 one rollup per session) or `events` (the flat touch-by-touch timeline). `tool`
-filters by tool name and `mutations_only` excludes pure reads.
+filters by tool name and `mutations_only` excludes pure reads. The default limit
+is `min(50, mcp.max_results)` and the maximum is server-configured.
 
 Output data carries a summary, the distinct worktree roots the tail matched
 (so over-match is visible, never silently merged), and either per-session
@@ -221,10 +226,18 @@ with `open` handles:
     "total_touches": 9,
     "distinct_sessions": 4,
     "distinct_roots": 2,
+    "distinct_known_roots": 2,
+    "unknown_root_touches": 0,
     "first_touch": "2026-06-10T12:00:00.000Z",
     "last_touch": "2026-06-15T09:30:00.000Z",
-    "ambiguous": true
+    "ambiguous": true,
+    "scan_truncated": false
   },
+  "path": "crates/moraine-conversations/src/clickhouse_repo.rs",
+  "scope": "project",
+  "granularity": "sessions",
+  "limit": 25,
+  "truncated": false,
   "roots": [
     { "root": "/Users/me/src/moraine", "touch_count": 7, "session_count": 3 },
     { "root": "/Users/me/src/moraine/worktrees/feat", "touch_count": 2, "session_count": 1 }
@@ -241,9 +254,13 @@ with `open` handles:
 ```
 
 `file_attention` only *locates* touches; "what was done, when" is `open` on a
-returned `event:` / `turn:` ID, which already returns the full edit, diff, and
-surrounding reasoning. A tail with too few path segments (a bare basename) is
-inherently ambiguous and returns a warning alongside the surfaced roots.
+returned `event:` / `turn:` / `session:` ID, which already returns the full edit,
+diff, and surrounding reasoning. `turn_id` is present when the touch joins to
+the conversation trace; `event_id` and `session_id` are always present on
+displayed rows. A tail with too few path segments (a bare basename) is
+inherently ambiguous and returns a warning alongside the surfaced roots. Unknown
+roots are counted and warned because they can make an otherwise single known
+root ambiguous.
 
 ## Response Envelope
 

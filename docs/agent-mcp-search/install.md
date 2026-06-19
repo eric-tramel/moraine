@@ -43,10 +43,11 @@ the directory the server is launched in:
 claude mcp add --transport stdio --scope project moraine -- moraine run mcp --project-only
 ```
 
-With the flag set, `search_sessions`, `list_sessions`, and `open` only see
-sessions whose recorded working directory is the launch directory or a
-subdirectory of it (worktrees under a repo root count). Opening an ID from
-another project answers `not_found`, exactly as if the session did not exist.
+With the flag set, `search_sessions`, `list_sessions`, `open`, and
+`file_attention` only see sessions whose recorded working directory is the
+launch directory or a subdirectory of it (worktrees under a repo root count).
+Opening an ID from another project answers `not_found`, exactly as if the
+session did not exist.
 
 Details worth knowing:
 
@@ -196,7 +197,8 @@ Global `~/.pi/agent/mcp.json`:
 
 With the extension's default prefix, Pi exposes Moraine tools as
 `mcp_moraine_search_sessions`, `mcp_moraine_open`, and
-`mcp_moraine_list_sessions`. Use `/mcp` inside Pi to inspect server status.
+`mcp_moraine_list_sessions`, and `mcp_moraine_file_attention`. Use `/mcp` inside
+Pi to inspect server status.
 
 ## Generic MCP Clients
 

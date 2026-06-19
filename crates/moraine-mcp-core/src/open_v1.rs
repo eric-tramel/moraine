@@ -515,7 +515,7 @@ fn open_event_data(
             "tool_name": tool_name
         },
         "content": content,
-        "session": session_summary(&event.parent_session)?,
+        "session": session_summary(&event.parent_session, event.parent_session_source.as_deref())?,
         "turn": {
             "id": turn_id,
             "ordinal": event.parent_turn.turn_seq,
@@ -534,11 +534,11 @@ fn open_event_data(
     Ok((data, Vec::new()))
 }
 
-fn session_summary(metadata: &SessionMetadata) -> Result<Value> {
+fn session_summary(metadata: &SessionMetadata, source: Option<&str>) -> Result<Value> {
     Ok(json!({
         "id": encode_session_id(&metadata.session_id)?,
         "title": null,
-        "source": null,
+        "source": source,
         "started_at": format_unix_ms(metadata.first_event_unix_ms),
         "updated_at": format_unix_ms(metadata.last_event_unix_ms),
         "turn_count": metadata.total_turns,
@@ -921,6 +921,7 @@ mod tests {
             turn_completed: true,
             turn_terminal_event_uid: Some("event-final".to_string()),
             parent_session: session_metadata(),
+            parent_session_source: Some("claude".to_string()),
             parent_turn: turn_summary(),
             previous_event: Some(event_ref("event-user", 1)),
             next_event: Some(event_ref("event-final", 3)),
@@ -933,6 +934,7 @@ mod tests {
         assert_eq!(data["event"]["tool_name"], "exec_command");
         assert_eq!(data["event"]["ordinal"], 2);
         assert_eq!(data["event"]["timestamp"], "2026-04-29T12:00:01.123Z");
+        assert_eq!(data["session"]["source"], "claude");
         assert_eq!(data["event"]["model"], "gpt-5");
         assert_eq!(data["content"]["format"], "tool_call");
         assert_eq!(data["content"]["arguments"]["cmd"], "cargo test");

@@ -818,7 +818,24 @@ impl FileAttentionArgs {
         let Some(path) = self.path else {
             return Err(invalid_request_with_field("path", "path is required"));
         };
-        let path = path.trim().to_string();
+        if path != path.trim() {
+            return Err(invalid_request_with_field(
+                "path",
+                "path must not have leading or trailing whitespace",
+            ));
+        }
+        if path.starts_with("file://") {
+            return Err(invalid_request_with_field(
+                "path",
+                "file:// URIs are not supported; pass a filesystem path",
+            ));
+        }
+        if path.ends_with('/') {
+            return Err(invalid_request_with_field(
+                "path",
+                "path must name a file, not a directory-style path ending in '/'",
+            ));
+        }
         if path.is_empty() {
             return Err(invalid_request_with_field(
                 "path",
@@ -1181,8 +1198,30 @@ fn parse_optional_datetime(
     if trimmed.is_empty() {
         return Ok(None);
     }
+    validate_millisecond_precision(field, &trimmed)?;
     let unix_ms = parse_explicit_timezone_datetime(field, &trimmed)?;
     Ok(Some((unix_ms, trimmed)))
+}
+
+fn validate_millisecond_precision(field: &'static str, input: &str) -> ContractResult<()> {
+    let Some(time_start) = input.find('T').or_else(|| input.find('t')) else {
+        return Ok(());
+    };
+    let time = &input[time_start + 1..];
+    let Some(dot) = time.find('.') else {
+        return Ok(());
+    };
+    let fraction = time[dot + 1..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .count();
+    if fraction > 3 {
+        return Err(invalid_request_with_field(
+            field,
+            format!("{field} supports millisecond precision at most"),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_explicit_timezone_datetime(field: &'static str, input: &str) -> ContractResult<i64> {
@@ -1564,6 +1603,42 @@ mod tests {
         .validate()
         .expect_err("event scope");
         assert_eq!(event_scope.code(), ToolErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn file_attention_args_reject_path_hygiene_issues() {
+        for path in [
+            " crates/moraine-mcp-core/src/file_attention_v1.rs",
+            "crates/moraine-mcp-core/src/file_attention_v1.rs ",
+            "file:///Users/me/src/moraine/Cargo.toml",
+            "crates/moraine-mcp-core/src/",
+        ] {
+            let error = FileAttentionArgs {
+                path: Some(path.to_string()),
+                ..FileAttentionArgs::default()
+            }
+            .validate(25)
+            .expect_err("path should be rejected");
+            assert_eq!(error.code(), ToolErrorCode::InvalidRequest);
+            assert_eq!(error.details().expect("details")["field"], json!("path"));
+        }
+    }
+
+    #[test]
+    fn file_attention_args_reject_sub_millisecond_bounds() {
+        let error = FileAttentionArgs {
+            path: Some("Cargo.toml".to_string()),
+            start_datetime: Some("2026-06-16T07:04:22.918999999Z".to_string()),
+            end_datetime: Some("2026-06-16T07:04:22.919Z".to_string()),
+            ..FileAttentionArgs::default()
+        }
+        .validate(25)
+        .expect_err("sub-ms start should be rejected");
+        assert_eq!(error.code(), ToolErrorCode::InvalidRequest);
+        assert_eq!(
+            error.details().expect("details")["field"],
+            json!("start_datetime")
+        );
     }
 
     #[test]

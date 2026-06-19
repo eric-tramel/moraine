@@ -5,6 +5,7 @@ This document specifies the desired behavior for Moraine's MCP retrieval tools:
 - `search_sessions`
 - `open`
 - `list_sessions`
+- `file_attention`
 
 The scope of this document is the external interface contract: accepted inputs,
 output shapes, response behavior, errors, performance targets, and success
@@ -62,9 +63,9 @@ event:evt_01J9Q3Q2C4TD9K7F8M1N5R6P2A
 ```
 
 Implementations must return stable IDs for the lifetime of the indexed session
-data. An ID returned by `search_sessions`, `list_sessions`, or `open` must be
-accepted by `open` unless the underlying session data has been deleted or the
-index has been rebuilt with incompatible IDs.
+data. An ID returned by `search_sessions`, `list_sessions`, `file_attention`,
+or `open` must be accepted by `open` unless the underlying session data has been
+deleted or the index has been rebuilt with incompatible IDs.
 
 ### Time Format
 
@@ -813,6 +814,125 @@ session metadata only:
 
 `list_sessions` must not return event snippets, transcript text, or event
 payloads. To inspect a listed session, pass `open.session_id` to `open`.
+
+## Tool: `file_attention`
+
+### Purpose
+
+`file_attention` lists captured tool calls that touched a file, across the main
+checkout, sibling worktrees, and agent-isolation worktrees.
+
+It answers:
+
+```text
+Which sessions touched this file, and where do I drill in?
+```
+
+### Request Schema
+
+```json
+{
+  "path": "crates/moraine-mcp-core/src/file_attention_v1.rs",
+  "scope": "project",
+  "granularity": "sessions",
+  "start_datetime": null,
+  "end_datetime": null,
+  "tool": null,
+  "mutations_only": false,
+  "limit": 25
+}
+```
+
+Rules:
+
+- `path` is required and must name a file path string. Leading/trailing
+  whitespace, `file://` URIs, and directory-style trailing slashes are invalid.
+- Absolute paths are reduced to a repo-relative tail by walking up to
+  `.moraine.toml` or `.git`. Existing relative paths are resolved from the MCP
+  server working directory first, so nested worktree prefixes strip to the
+  nested worktree root.
+- `scope` is `project` or `all`. `project` honors `--project-only`; `all`
+  deliberately drops that origin narrowing.
+- `granularity` is `sessions` or `events`.
+- Datetime bounds are optional, inclusive at `start_datetime` and exclusive at
+  `end_datetime`. Bounds must be RFC 3339 strings with explicit timezone and at
+  most millisecond precision.
+- `tool` filters by tool name case-insensitively. `mutations_only` excludes
+  pure reads.
+- The default limit is `min(50, mcp.max_results)` and the maximum is
+  server-configured.
+
+### Response Shape
+
+Successful responses use `moraine.mcp.file_attention.v1` and return a summary,
+root buckets, and either session rollups or a flat event timeline:
+
+```json
+{
+  "schema_version": "moraine.mcp.file_attention.v1",
+  "tool": "file_attention",
+  "request": {},
+  "data": {
+    "path": "crates/moraine-mcp-core/src/file_attention_v1.rs",
+    "tail": "crates/moraine-mcp-core/src/file_attention_v1.rs",
+    "tail_is_absolute": false,
+    "stripped_root": "/Users/me/src/moraine",
+    "scope": "project",
+    "granularity": "events",
+    "summary": {
+      "total_touches": 6,
+      "distinct_sessions": 3,
+      "distinct_roots": 2,
+      "distinct_known_roots": 2,
+      "unknown_root_touches": 0,
+      "first_touch": "2026-06-10T12:00:00.000Z",
+      "last_touch": "2026-06-15T09:30:00.000Z",
+      "ambiguous": true,
+      "scan_truncated": false
+    },
+    "roots": [
+      { "root": "/Users/me/src/moraine", "touch_count": 4, "session_count": 2 },
+      { "root": "/Users/me/src/moraine/worktrees/feat", "touch_count": 2, "session_count": 1 }
+    ],
+    "result_count": 1,
+    "limit": 25,
+    "truncated": false,
+    "events": [
+      {
+        "rank": 1,
+        "id": "event:...",
+        "event": {
+          "id": "event:...",
+          "session_id": "session:...",
+          "timestamp": "2026-06-15T09:30:00.000Z",
+          "tool_name": "Edit",
+          "phase": "request",
+          "turn": 11,
+          "match_kind": "path_suffix",
+          "worktree_root": "/Users/me/src/moraine",
+          "action_preview": "{\"file_path\":\"crates/...\"}"
+        },
+        "open": {
+          "event_id": "event:...",
+          "session_id": "session:...",
+          "turn_id": "turn:..."
+        }
+      }
+    ]
+  },
+  "warnings": [],
+  "performance": {
+    "elapsed_ms": 90,
+    "sla_target_ms": 1200,
+    "met_sla": true
+  }
+}
+```
+
+`event_id` and `session_id` must be present on displayed rows. `turn_id` is
+present when the touch joins to the conversation trace. `truncated` is true when
+either displayed rows are hidden by `limit` or the scan cap is hit. Unknown roots
+are counted and warned because they can make a single known root ambiguous.
 
 ## Tool: `open`
 
@@ -1758,6 +1878,19 @@ The response `performance.sla_target_ms` advertises the applicable target:
 300 ms for typical metadata browse requests, 1000 ms for broad unfiltered
 windows, and 1200 ms for broad single-mode filtered windows.
 
+### `file_attention` Targets
+
+For file-attention requests with `limit <= 50`:
+
+| Scenario | P50 | P95 | P99 | Deadline |
+|---|---:|---:|---:|---:|
+| Specific repo-relative tail | <= 150 ms | <= 600 ms | <= 1200 ms | 4 s |
+| Broad or generic tail | <= 300 ms | <= 1200 ms | <= 2500 ms | 4 s |
+
+`file_attention` should bound ClickHouse execution with a per-query execution
+setting and query ID. If the MCP deadline fires, it should return
+`deadline_exceeded` and attempt to cancel the backend query by that ID.
+
 ### `open` Targets
 
 | Request | P50 | P95 | P99 |
@@ -1811,6 +1944,29 @@ An implementation is successful when:
 - Invalid ranges, unknown fields, bad cursors, invalid modes, and invalid sort
   values produce the specified errors.
 - Performance meets the `list_sessions` SLA for target corpus sizes.
+
+### `file_attention`
+
+An implementation is successful when:
+
+- Valid requests return the specified response envelope.
+- Invalid paths, unknown fields, bad enum values, bad datetime precision, and
+  invalid ranges produce structured errors.
+- The same logical file touched in the main checkout, a sibling worktree, and
+  an agent-isolation worktree is unified by repo-relative tail.
+- `file_attention` calls do not report themselves as file touches.
+- Returned `event_id`, `session_id`, and present `turn_id` handles are accepted
+  by `open`.
+- Timestamps and datetime filtering use the same timestamp source as
+  `open(event)`.
+- Missing trace joins produce `null` timestamps and no `turn_id`, never epoch
+  sentinel timestamps.
+- Known and unknown worktree roots are surfaced so ambiguous tails are visible.
+- Nested/array structured path values and shell path-like operands are covered
+  without treating remote URLs or prose mentions as local file touches.
+- Display truncation and scan-cap truncation are visible to generic clients via
+  `data.truncated`.
+- Performance meets the `file_attention` SLA for target corpus sizes.
 
 ### `open`
 

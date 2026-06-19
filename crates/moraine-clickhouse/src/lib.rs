@@ -85,6 +85,19 @@ impl ClickHouseClient {
         async_insert: bool,
         default_format: Option<&str>,
     ) -> Result<String> {
+        self.request_text_with_params(query, body, database, async_insert, default_format, &[])
+            .await
+    }
+
+    pub async fn request_text_with_params(
+        &self,
+        query: &str,
+        body: Option<Vec<u8>>,
+        database: Option<&str>,
+        async_insert: bool,
+        default_format: Option<&str>,
+        params: &[(&str, &str)],
+    ) -> Result<String> {
         let mut url = self.base_url()?;
         {
             let mut qp = url.query_pairs_mut();
@@ -100,6 +113,9 @@ impl ClickHouseClient {
                 if self.cfg.wait_for_async_insert {
                     qp.append_pair("wait_for_async_insert", "1");
                 }
+            }
+            for (key, value) in params {
+                qp.append_pair(key, value);
             }
         }
 
@@ -164,9 +180,19 @@ impl ClickHouseClient {
         query: &str,
         database: Option<&str>,
     ) -> Result<Vec<T>> {
+        self.query_json_each_row_with_params(query, database, &[])
+            .await
+    }
+
+    pub async fn query_json_each_row_with_params<T: DeserializeOwned>(
+        &self,
+        query: &str,
+        database: Option<&str>,
+        params: &[(&str, &str)],
+    ) -> Result<Vec<T>> {
         let database = database.or(Some(&self.cfg.database));
         let raw = self
-            .request_text(query, None, database, false, None)
+            .request_text_with_params(query, None, database, false, None, params)
             .await?;
         let mut rows = Vec::new();
 
@@ -187,9 +213,18 @@ impl ClickHouseClient {
         query: &str,
         database: Option<&str>,
     ) -> Result<Vec<T>> {
+        self.query_json_data_with_params(query, database, &[]).await
+    }
+
+    pub async fn query_json_data_with_params<T: DeserializeOwned>(
+        &self,
+        query: &str,
+        database: Option<&str>,
+        params: &[(&str, &str)],
+    ) -> Result<Vec<T>> {
         let database = database.or(Some(&self.cfg.database));
         let raw = self
-            .request_text(query, None, database, false, Some("JSON"))
+            .request_text_with_params(query, None, database, false, Some("JSON"), params)
             .await?;
         let envelope: ClickHouseEnvelope<T> = serde_json::from_str(&raw)
             .with_context(|| format!("invalid clickhouse JSON response: {}", raw))?;
@@ -201,13 +236,30 @@ impl ClickHouseClient {
         query: &str,
         database: Option<&str>,
     ) -> Result<Vec<T>> {
+        self.query_rows_with_params(query, database, &[]).await
+    }
+
+    pub async fn query_rows_with_params<T: DeserializeOwned>(
+        &self,
+        query: &str,
+        database: Option<&str>,
+        params: &[(&str, &str)],
+    ) -> Result<Vec<T>> {
         if has_explicit_json_each_row_format(query) {
-            return self.query_json_each_row(query, database).await;
+            return self
+                .query_json_each_row_with_params(query, database, params)
+                .await;
         }
 
-        match self.query_json_data(query, database).await {
+        match self
+            .query_json_data_with_params(query, database, params)
+            .await
+        {
             Ok(rows) => Ok(rows),
-            Err(_) => self.query_json_each_row(query, database).await,
+            Err(_) => {
+                self.query_json_each_row_with_params(query, database, params)
+                    .await
+            }
         }
     }
 

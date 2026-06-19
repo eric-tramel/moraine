@@ -13,6 +13,8 @@ use tokio::sync::RwLock;
 use tracing::warn;
 use uuid::Uuid;
 
+const MCP_INTERNAL_TOOL_NAMES_SQL: &str = "'search', 'open', 'list_sessions', 'file_attention'";
+
 use crate::cursor::{
     decode_cursor, encode_cursor, ConversationCursor, McpSessionListCursor, SessionEventCursor,
     TurnCursor,
@@ -610,7 +612,7 @@ impl ClickHouseConversationRepository {
         scope: &SessionOriginScope,
         session_id: Option<&str>,
     ) -> String {
-        let events_table = self.table_ref("events");
+        let events_table = format!("{} FINAL", self.table_ref("events"));
         let session_filter = session_id
             .map(|session_id| format!("session_id = {}\n      AND ", sql_quote(session_id)))
             .unwrap_or_default();
@@ -704,7 +706,7 @@ impl ClickHouseConversationRepository {
         &self,
         query: FileAttentionQuery,
     ) -> RepoResult<Vec<FileAttentionTouch>> {
-        let rel = query.rel.trim();
+        let rel = query.rel.as_str();
         if rel.is_empty() {
             return Err(RepoError::invalid_argument(
                 "file_attention requires a non-empty path tail",
@@ -713,8 +715,11 @@ impl ClickHouseConversationRepository {
 
         let tool_io = self.table_ref("tool_io");
         let events = self.table_ref("events");
+        let trace = self.table_ref("v_conversation_trace");
         let rel_sql = sql_quote(rel);
         let slash_rel_sql = sql_quote(&format!("/{rel}"));
+        let rel_regex = regex::escape(rel);
+        let slash_rel_regex = regex::escape(&format!("/{rel}"));
         // Byte length of the tail, inlined as an integer so the worktree-root
         // substring math needs no repeated `length(<literal>)` evaluation.
         let rel_len = rel.len();
@@ -726,11 +731,13 @@ impl ClickHouseConversationRepository {
         // `matched_path` projection are both generated from this one list, so
         // they can never drift apart. These are compile-time constants, not
         // user input, so inlining them needs no escaping.
-        const PATH_KEYS: [&str; 7] = [
+        const PATH_KEYS: [&str; 9] = [
             "file_path",
             "notebook_path",
             "path",
             "target_file",
+            "relativeWorkspacePath",
+            "relative_workspace_path",
             "filepath",
             "file",
             "filename",
@@ -752,16 +759,57 @@ impl ClickHouseConversationRepository {
             .map(|key| key_match("input_json", key))
             .collect::<Vec<_>>()
             .join("\n        OR ");
-        // Substring fallback is restricted to shell-command rows (`command` /
-        // `cmd`): that is the only case the structured keys cannot cover, and
-        // gating the full-string `position()` on those rows keeps it off the
-        // hot path for every other matched row.
-        let match_predicate = format!(
-            "tool_phase = 'request'\n      AND (\n        {ends_with_any}\n        OR ((JSONHas(input_json, 'command') OR JSONHas(input_json, 'cmd')) AND position(input_json, {slash_rel_sql}) > 0)\n      )"
+
+        // A second structured pass catches nested objects and arrays such as
+        // {"edits":[{"path":"/repo/crates/foo.rs"}]} and
+        // {"path":["/repo/crates/foo.rs"]}. It is still constrained to known
+        // path key names and boundary/equality suffix rules; arbitrary JSON text
+        // mentions are left to the lower-confidence shell branch.
+        let path_key_regex = PATH_KEYS.join("|");
+        let nested_scalar_path_regex = sql_quote(&format!(
+            "\"(?:{path_key_regex})\"[[:space:]]*:[[:space:]]*\"((?:[^\"\\\\]|\\\\.)*{slash_rel_regex}|{rel_regex})\""
+        ));
+        let nested_array_path_regex = sql_quote(&format!(
+            "\"(?:{path_key_regex})\"[[:space:]]*:[[:space:]]*\\[[^\\]]*\"((?:[^\"\\\\]|\\\\.)*{slash_rel_regex}|{rel_regex})\""
+        ));
+        let nested_path_expr = format!(
+            "ifNull(nullIf(extract(ti.input_json, {nested_scalar_path_regex}), ''), extract(ti.input_json, {nested_array_path_regex}))"
+        );
+        let nested_path_match = format!(
+            "(extract(input_json, {nested_scalar_path_regex}) != '' OR extract(input_json, {nested_array_path_regex}) != '')"
         );
 
+        // Shell fallback uses the extracted command string and a path-token
+        // regex. This catches relative operands (`sed web/monitor/index.html`)
+        // and absolute operands while rejecting URL/text mentions that merely
+        // contain `/<tail>` inside a larger token.
+        let command_expr = "if(JSONExtractString(input_json, 'command') != '', JSONExtractString(input_json, 'command'), JSONExtractString(input_json, 'cmd'))";
+        let shell_path_regex = sql_quote(&format!(
+            "(^|[[:space:]'\"`=(:])(/[^[:space:]'\"`<>|;&),]*{slash_rel_regex}|{rel_regex})([[:space:]'\"`,;|&<>)]|$)"
+        ));
+        let shell_match = format!(
+            "((JSONHas(input_json, 'command') OR JSONHas(input_json, 'cmd')) AND match({command_expr}, {shell_path_regex}))"
+        );
+
+        let mut inner_clauses = vec![format!(
+            "tool_phase = 'request'\n      AND lowerUTF8(tool_name) != 'file_attention'\n      AND (\n        {ends_with_any}\n        OR {nested_path_match}\n        OR {shell_match}\n      )"
+        )];
+        if let Some(tool) = query.tool.as_deref() {
+            inner_clauses.push(format!("lower(tool_name) = lower({})", sql_quote(tool)));
+        }
+        if query.mutations_only {
+            inner_clauses.push("lower(tool_name) != 'read'".to_string());
+        }
+        if query.apply_project_scope {
+            if let Some(scope_clause) = self.session_scope_clause("session_id") {
+                inner_clauses.push(scope_clause);
+            }
+        }
+        let match_predicate = inner_clauses.join("\n      AND ");
+
         // The structured path key that actually matched (on the same boundary
-        // rule as the WHERE clause); empty for shell-substring matches.
+        // rule as the WHERE clause), falling back to the nested structured
+        // extractor; empty for shell path-token matches.
         let matched_path_arms = PATH_KEYS
             .iter()
             .map(|key| {
@@ -772,27 +820,30 @@ impl ClickHouseConversationRepository {
             })
             .collect::<Vec<_>>()
             .join(",\n      ");
-        let matched_path_expr = format!("multiIf(\n      {matched_path_arms},\n      '')");
+        let matched_path_expr =
+            format!("multiIf(\n      {matched_path_arms},\n      {nested_path_expr})");
 
-        // Filters that can only be evaluated after the events join (or that are
-        // simply clearer outside the inner scan).
+        let worktree_root_expr = if query.derive_worktree_roots {
+            format!(
+                "if(
+      matched_path != ''
+      AND length(matched_path) > {rel_len} + 1
+      AND substring(matched_path, length(matched_path) - {rel_len}, 1) = '/',
+      substring(matched_path, 1, length(matched_path) - {rel_len} - 1),
+      ''
+    )"
+            )
+        } else {
+            "''".to_string()
+        };
+
+        // Filters that depend on the trace join.
         let mut outer_clauses: Vec<String> = Vec::new();
-        if query.apply_project_scope {
-            if let Some(scope_clause) = self.session_scope_clause("ti.session_id") {
-                outer_clauses.push(scope_clause);
-            }
-        }
         if let Some(start) = query.start_unix_ms {
-            outer_clauses.push(format!("toUnixTimestamp64Milli(e.event_ts) >= {start}"));
+            outer_clauses.push(format!("toUnixTimestamp64Milli(tr.event_time) >= {start}"));
         }
         if let Some(end) = query.end_unix_ms {
-            outer_clauses.push(format!("toUnixTimestamp64Milli(e.event_ts) < {end}"));
-        }
-        if let Some(tool) = query.tool.as_deref() {
-            outer_clauses.push(format!("lower(ti.tool_name) = lower({})", sql_quote(tool)));
-        }
-        if query.mutations_only {
-            outer_clauses.push("lower(ti.tool_name) != 'read'".to_string());
+            outer_clauses.push(format!("toUnixTimestamp64Milli(tr.event_time) < {end}"));
         }
         let outer_where = if outer_clauses.is_empty() {
             "1".to_string()
@@ -801,11 +852,16 @@ impl ClickHouseConversationRepository {
         };
 
         let limit_plus = query.max_rows.saturating_add(1);
+        let max_execution_time = query.max_execution_time_secs.max(1).to_string();
+        let params = [
+            ("query_id", query.query_id.as_str()),
+            ("max_execution_time", max_execution_time.as_str()),
+        ];
 
-        // `matched` is the deliberate `tool_io` scan. The events lookup reuses
-        // it via `session_id IN (SELECT session_id FROM matched)` so the join's
-        // right side prunes to the matched sessions (the leading `events`
-        // primary-key column) instead of reading the whole table.
+        // `matched` is the deliberate `tool_io` scan. The trace/events lookups
+        // filter by the exact matched `(session_id, event_uid)` pairs and join
+        // on both columns, so one session's event cannot satisfy another
+        // session's tool row and long sessions do not force a full event scan.
         let sql = format!(
             "WITH matched AS (
     SELECT session_id, event_uid, harness, tool_name, tool_phase, input_json, input_preview, output_preview
@@ -819,32 +875,43 @@ impl ClickHouseConversationRepository {
     ti.tool_name AS tool_name,
     ti.tool_phase AS tool_phase,
     {matched_path_expr} AS matched_path,
-    if(matched_path != '', 'path_suffix', 'bash_substring') AS match_kind,
-    if(
-      matched_path != ''
-      AND length(matched_path) > {rel_len} + 1
-      AND substring(matched_path, length(matched_path) - {rel_len}, 1) = '/',
-      substring(matched_path, 1, length(matched_path) - {rel_len} - 1),
-      ''
-    ) AS worktree_root,
+    if(matched_path != '', 'path_suffix', 'shell_path') AS match_kind,
+    {worktree_root_expr} AS worktree_root,
     ifNull(e.cwd, '') AS cwd,
-    toInt64(ifNull(toUnixTimestamp64Milli(e.event_ts), toInt64(0))) AS event_unix_ms,
-    toUInt32(ifNull(e.turn_index, toUInt32(0))) AS turn_index,
+    toInt64(toUnixTimestamp64Milli(tr.event_time)) AS event_unix_ms,
+    toUInt64(ifNull(tr.event_order, toUInt64(0))) AS event_order,
+    tr.turn_seq AS turn_seq,
     ti.input_preview AS input_preview,
     ti.output_preview AS output_preview
   FROM matched AS ti
-  LEFT JOIN (
-    SELECT event_uid, event_ts, turn_index, cwd
+  ANY LEFT JOIN (
+    SELECT session_id, event_uid, event_time, toUInt64(event_order) AS event_order, toUInt32(turn_seq) AS turn_seq
+    FROM {trace}
+    WHERE (session_id, event_uid) IN (SELECT session_id, event_uid FROM matched)
+  ) AS tr ON tr.session_id = ti.session_id AND tr.event_uid = ti.event_uid
+  ANY LEFT JOIN (
+    SELECT session_id, event_uid, any(cwd) AS cwd
     FROM {events} FINAL
-    WHERE session_id IN (SELECT session_id FROM matched)
-  ) AS e ON e.event_uid = ti.event_uid
+    WHERE (session_id, event_uid) IN (SELECT session_id, event_uid FROM matched)
+    GROUP BY session_id, event_uid
+  ) AS e ON e.session_id = ti.session_id AND e.event_uid = ti.event_uid
   WHERE {outer_where}
-  ORDER BY event_unix_ms DESC, ti.event_uid DESC
+  ORDER BY isNull(event_unix_ms) ASC, event_unix_ms DESC, event_order DESC, ti.event_uid DESC
   LIMIT {limit_plus}
   FORMAT JSONEachRow",
         );
 
-        self.map_backend(self.ch.query_rows(&sql, None).await)
+        self.map_backend(self.ch.query_rows_with_params(&sql, None, &params).await)
+    }
+
+    pub async fn cancel_query(&self, query_id: &str) -> RepoResult<()> {
+        let query_id = query_id.trim();
+        if query_id.is_empty() {
+            return Ok(());
+        }
+        let sql = format!("KILL QUERY WHERE query_id = {} SYNC", sql_quote(query_id));
+        self.map_backend(self.ch.request_text(&sql, None, None, false, None).await)
+            .map(|_| ())
     }
 
     pub async fn search_session_metadata(
@@ -1093,7 +1160,7 @@ impl ClickHouseConversationRepository {
       OR (payload_type = 'tool_use' AND tool_name IN ('WebSearch', 'WebFetch'))
     ) > 0,
     'web_search',
-    countIf(source_name = 'codex-mcp' OR lowerUTF8(tool_name) IN ('search', 'open', 'list_sessions')) > 0,
+    countIf(source_name = 'codex-mcp' OR lowerUTF8(tool_name) IN ({MCP_INTERNAL_TOOL_NAMES_SQL})) > 0,
     'mcp_internal',
     countIf(event_kind IN ('tool_call', 'tool_result') OR payload_type = 'tool_use') > 0,
     'tool_calling',
@@ -1101,6 +1168,13 @@ impl ClickHouseConversationRepository {
   ) AS mode
 FROM {events_table}
 GROUP BY session_id"
+        )
+    }
+
+    fn is_mcp_internal_tool_name(name: &str) -> bool {
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "search" | "open" | "list_sessions" | "file_attention"
         )
     }
 
@@ -2919,8 +2993,9 @@ GROUP BY t.event_uid)"
                     "positionCaseInsensitiveUTF8(d.payload_json, 'codex-mcp') = 0".to_string(),
                 );
             }
-            where_clauses
-                .push("lowerUTF8(d.name) NOT IN ('search', 'open', 'list_sessions')".to_string());
+            where_clauses.push(format!(
+                "lowerUTF8(d.name) NOT IN ({MCP_INTERNAL_TOOL_NAMES_SQL})"
+            ));
         }
 
         let where_sql = where_clauses.join("\n  AND ");
@@ -3300,10 +3375,7 @@ FORMAT JSONEachRow",
             if row.has_codex_mcp != 0 {
                 return false;
             }
-            if row.name.eq_ignore_ascii_case("search")
-                || row.name.eq_ignore_ascii_case("open")
-                || row.name.eq_ignore_ascii_case("list_sessions")
-            {
+            if Self::is_mcp_internal_tool_name(&row.name) {
                 return false;
             }
         }
@@ -4192,8 +4264,9 @@ FORMAT JSONEachRow",
 
         if exclude_codex_mcp {
             postings_filters.push("p.source_name != 'codex-mcp'".to_string());
-            postings_filters
-                .push("lowerUTF8(p.name) NOT IN ('search', 'open', 'list_sessions')".to_string());
+            postings_filters.push(format!(
+                "lowerUTF8(p.name) NOT IN ({MCP_INTERNAL_TOOL_NAMES_SQL})"
+            ));
         }
 
         if let Some(candidate_session_ids) = candidate_session_ids {
@@ -5940,6 +6013,8 @@ FORMAT JSONEachRow",
         else {
             return Ok(None);
         };
+        let parent_session_source =
+            non_empty_string(self.load_mcp_session_info(&session_id).await?.source);
         let Some(parent_turn) =
             Self::summarize_indexed_turn(&session_id, event.turn_seq, &indexed_events)
         else {
@@ -5984,6 +6059,7 @@ FORMAT JSONEachRow",
             turn_completed: turn_compact.completed,
             turn_terminal_event_uid: turn_compact.terminal_event_uid,
             parent_session,
+            parent_session_source,
             parent_turn,
             previous_event,
             next_event,
@@ -7028,12 +7104,15 @@ mod tests {
     #[test]
     fn search_doc_filters_exclude_codex_by_tool_name() {
         let mut row = sample_search_doc();
-        row.name = "search".to_string();
-        assert!(
-            !ClickHouseConversationRepository::passes_search_doc_filters(
-                &row, false, None, true, None, None
-            )
-        );
+        for name in ["search", "open", "list_sessions", "file_attention"] {
+            row.name = name.to_string();
+            assert!(
+                !ClickHouseConversationRepository::passes_search_doc_filters(
+                    &row, false, None, true, None, None
+                ),
+                "{name} should be treated as an internal MCP tool"
+            );
+        }
     }
 
     #[test]

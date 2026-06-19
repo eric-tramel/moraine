@@ -22,6 +22,7 @@ use moraine_conversations::{FileAttentionQuery, FileAttentionTouch};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{timeout, Duration};
 use tracing::warn;
 
@@ -48,22 +49,30 @@ impl AppState {
         };
         let canonical_request = canonical_request_json(&args);
 
-        // A full-history scan (no datetime window) is the broad case and earns a
-        // looser target than a windowed lookup.
-        let has_window = args.start_unix_ms.is_some() || args.end_unix_ms.is_some();
-        let perf = perf.with_sla_target(if has_window {
-            FILE_ATTENTION_DEFAULT_SLA_TARGET_MS
-        } else {
-            FILE_ATTENTION_BROAD_SLA_TARGET_MS
-        });
+        // The Tier-0 plan still scans `tool_io` by path even when datetime
+        // bounds are present, so report against the broad target until a future
+        // indexed path/time plan can make windowed requests truly narrow.
+        let perf = perf.with_sla_target(FILE_ATTENTION_BROAD_SLA_TARGET_MS);
 
         let mut warnings: Vec<String> = Vec::new();
         let tail = resolve_tail(&args.path);
+        if tail.normalized {
+            warnings.push(format!(
+                "normalized {:?} to {:?} before matching.",
+                args.path, tail.rel
+            ));
+        }
         if tail.tail_is_absolute {
             warnings.push(format!(
                 "could not reduce {:?} to a repo-relative tail (no .moraine.toml/.git marker found above it); matching the absolute path literally, so other worktrees of the same file will not be unified. Pass a repo-relative path for cross-worktree coverage.",
                 args.path
             ));
+        }
+        if !tail.derive_worktree_roots {
+            warnings.push(
+                "could not prove the path is a repo-relative file in this checkout; worktree_root values are reported as unknown to avoid mislabeling arbitrary suffix matches."
+                    .to_string(),
+            );
         }
         let depth = tail_segments(&tail.rel);
         if depth < FILE_ATTENTION_MIN_TAIL_SEGMENTS {
@@ -81,14 +90,18 @@ impl AppState {
             );
         }
 
+        let query_id = file_attention_query_id();
         let repo_query = FileAttentionQuery {
+            query_id: query_id.clone(),
             rel: tail.rel.clone(),
+            derive_worktree_roots: tail.derive_worktree_roots,
             apply_project_scope: args.scope == FileAttentionScope::Project,
             start_unix_ms: args.start_unix_ms,
             end_unix_ms: args.end_unix_ms,
             tool: args.tool.clone(),
             mutations_only: args.mutations_only,
             max_rows: FILE_ATTENTION_SCAN_CAP,
+            max_execution_time_secs: FILE_ATTENTION_DEADLINE_MS.div_ceil(1_000),
         };
 
         let touches = match timeout(
@@ -106,6 +119,13 @@ impl AppState {
                 )
             }
             Err(_) => {
+                if let Err(error) = self.repo.cancel_query(&query_id).await {
+                    warn!(
+                        query_id = %query_id,
+                        error = %error,
+                        "file_attention: failed to cancel timed-out ClickHouse query"
+                    );
+                }
                 return encode_error(
                     canonical_request,
                     ContractError::new(
@@ -114,7 +134,7 @@ impl AppState {
                     )
                     .with_details(json!({ "deadline_ms": FILE_ATTENTION_DEADLINE_MS })),
                     perf.finish(),
-                )
+                );
             }
         };
 
@@ -130,6 +150,14 @@ impl AppState {
     }
 }
 
+fn file_attention_query_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("moraine-file-attention-{}-{nanos}", std::process::id())
+}
+
 fn parse_file_attention_args(
     arguments: Value,
     max_results: u16,
@@ -138,7 +166,7 @@ fn parse_file_attention_args(
         .map_err(|error| {
             ContractError::new(
                 ToolErrorCode::InvalidRequest,
-                "file_attention expects a JSON object with a required path",
+                "file_attention expects a JSON object with valid fields",
             )
             .with_details(json!({ "serde_error": error.to_string() }))
         })?
@@ -167,6 +195,11 @@ struct TailResolution {
     /// The path was absolute and could not be reduced to a repo-relative tail,
     /// so `rel` is the absolute path matched literally.
     tail_is_absolute: bool,
+    /// Syntactic cleanup changed the path before matching.
+    normalized: bool,
+    /// Stripping the tail from historical matched paths is safe enough to
+    /// report a worktree root.
+    derive_worktree_roots: bool,
 }
 
 /// Reduce a query `path` to the repo-relative tail used for suffix matching.
@@ -177,32 +210,91 @@ struct TailResolution {
 ///   was deleted, or lives in a foreign root), the absolute path is matched
 ///   literally and `tail_is_absolute` is set so the caller can warn.
 fn resolve_tail(path: &str) -> TailResolution {
-    let cleaned = path.trim();
-    let cleaned = cleaned.strip_prefix("./").unwrap_or(cleaned);
-    if !cleaned.starts_with('/') {
+    let cleaned = path.strip_prefix("./").unwrap_or(path);
+    let normalized = normalize_path_text(cleaned);
+    let normalized_changed = normalized != cleaned;
+    if !normalized.starts_with('/') {
+        if let Ok(cwd) = std::env::current_dir() {
+            let candidate = cwd.join(&normalized);
+            if candidate.exists() {
+                let candidate_str = candidate.to_string_lossy().to_string();
+                if let Some(root) = find_project_root(&candidate) {
+                    if let Some(rel) = strip_root(&candidate_str, &root) {
+                        if !rel.is_empty() {
+                            return TailResolution {
+                                rel,
+                                root: Some(root),
+                                tail_is_absolute: false,
+                                normalized: normalized_changed,
+                                derive_worktree_roots: true,
+                            };
+                        }
+                    }
+                }
+            }
+        }
         return TailResolution {
-            rel: cleaned.trim_start_matches('/').to_string(),
+            rel: normalized.trim_start_matches('/').to_string(),
             root: None,
             tail_is_absolute: false,
+            normalized: normalized_changed,
+            derive_worktree_roots: false,
         };
     }
 
-    if let Some(root) = find_project_root(Path::new(cleaned)) {
-        if let Some(rel) = strip_root(cleaned, &root) {
+    if let Some(root) = find_project_root(Path::new(&normalized)) {
+        if let Some(rel) = strip_root(&normalized, &root) {
             if !rel.is_empty() {
                 return TailResolution {
                     rel,
                     root: Some(root),
                     tail_is_absolute: false,
+                    normalized: normalized_changed,
+                    derive_worktree_roots: true,
                 };
             }
         }
     }
 
     TailResolution {
-        rel: cleaned.to_string(),
+        rel: normalized,
         root: None,
         tail_is_absolute: true,
+        normalized: normalized_changed,
+        derive_worktree_roots: false,
+    }
+}
+
+fn normalize_path_text(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if let Some(last) = parts.last() {
+                    if *last != ".." {
+                        parts.pop();
+                        continue;
+                    }
+                }
+                if !absolute {
+                    parts.push(part);
+                }
+            }
+            _ => parts.push(part),
+        }
+    }
+
+    let body = parts.join("/");
+    if absolute {
+        if body.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{body}")
+        }
+    } else {
+        body
     }
 }
 
@@ -246,8 +338,8 @@ fn tail_segments(rel: &str) -> usize {
 /// Per-session accumulator built while folding the time-ordered touch stream.
 #[derive(Default)]
 struct SessionAgg {
-    first_ms: i64,
-    last_ms: i64,
+    first_ms: Option<i64>,
+    last_ms: Option<i64>,
     touch_count: u64,
     tools: BTreeSet<String>,
     roots: BTreeSet<String>,
@@ -256,8 +348,7 @@ struct SessionAgg {
     /// The most recent touch's event_uid (first seen, since rows arrive
     /// newest-first) — the handle that drills straight to the latest touch.
     latest_event_uid: String,
-    latest_turn_index: u32,
-    latest_has_ts: bool,
+    latest_turn_seq: Option<u32>,
 }
 
 fn build_data(
@@ -274,6 +365,29 @@ fn build_data(
         ));
     }
 
+    let mut valid_touches = Vec::with_capacity(touches.len());
+    let mut skipped = 0usize;
+    for touch in touches {
+        match validate_touch_identifiers(&touch) {
+            Ok(()) => valid_touches.push(touch),
+            Err(error) => {
+                skipped += 1;
+                warn!(
+                    session_id = %touch.session_id,
+                    event_uid = %touch.event_uid,
+                    error = %error,
+                    "file_attention: skipping touch with an invalid identifier"
+                );
+            }
+        }
+    }
+    let touches = valid_touches;
+    if skipped > 0 {
+        warnings.push(format!(
+            "dropped {skipped} touch(es) whose repository identifiers could not be encoded; they are excluded from the result and its counts."
+        ));
+    }
+
     // --- summary + roots, over the full scanned set --------------------------
     let total_touches = touches.len() as u64;
     let mut first_ms: Option<i64> = None;
@@ -281,9 +395,9 @@ fn build_data(
     let mut distinct_sessions: BTreeSet<&str> = BTreeSet::new();
     let mut root_stats: HashMap<String, (u64, BTreeSet<String>)> = HashMap::new();
     for touch in &touches {
-        if touch.event_unix_ms > 0 {
-            first_ms = Some(first_ms.map_or(touch.event_unix_ms, |v| v.min(touch.event_unix_ms)));
-            last_ms = Some(last_ms.map_or(touch.event_unix_ms, |v| v.max(touch.event_unix_ms)));
+        if let Some(event_unix_ms) = touch.event_unix_ms {
+            first_ms = Some(first_ms.map_or(event_unix_ms, |v| v.min(event_unix_ms)));
+            last_ms = Some(last_ms.map_or(event_unix_ms, |v| v.max(event_unix_ms)));
         }
         distinct_sessions.insert(touch.session_id.as_str());
         let key = root_label(&touch.worktree_root);
@@ -296,7 +410,16 @@ fn build_data(
         .keys()
         .filter(|root| root.as_str() != UNKNOWN_ROOT)
         .count();
-    let ambiguous = distinct_known_roots > 1;
+    let unknown_root_touches = root_stats
+        .get(UNKNOWN_ROOT)
+        .map(|(touch_count, _)| *touch_count)
+        .unwrap_or(0);
+    let ambiguous = root_stats.len() > 1 || (unknown_root_touches > 0 && total_touches > 1);
+    if unknown_root_touches > 0 {
+        warnings.push(format!(
+            "{unknown_root_touches} touch(es) have unknown worktree roots; check matched_path/open results before treating the root spread as complete."
+        ));
+    }
 
     let mut roots: Vec<Value> = root_stats
         .into_iter()
@@ -318,7 +441,9 @@ fn build_data(
     let summary = json!({
         "total_touches": total_touches,
         "distinct_sessions": distinct_sessions.len(),
-        "distinct_roots": distinct_known_roots,
+        "distinct_roots": roots.len(),
+        "distinct_known_roots": distinct_known_roots,
+        "unknown_root_touches": unknown_root_touches,
         "first_touch": first_ms.map(format_rfc3339_utc_millis),
         "last_touch": last_ms.map(format_rfc3339_utc_millis),
         "ambiguous": ambiguous,
@@ -341,7 +466,7 @@ fn build_data(
     // `truncated` means the display limit hid encodable results — NOT that rows
     // were dropped for un-encodable identifiers. Those are a separate, surfaced
     // warning so the caller never reads a data fault as a limit cut.
-    let truncated = encodable > limit;
+    let truncated = encodable > limit || scan_truncated;
     if skipped > 0 {
         warnings.push(format!(
             "dropped {skipped} touch(es) whose repository identifiers could not be encoded; they are excluded from the result and its counts."
@@ -369,6 +494,12 @@ fn build_data(
     data
 }
 
+fn validate_touch_identifiers(touch: &FileAttentionTouch) -> Result<(), ContractError> {
+    McpSessionId::from_raw_session_id(touch.session_id.as_str()).map_err(internal_id_error)?;
+    McpEventId::from_raw_event_uid(touch.event_uid.as_str()).map_err(internal_id_error)?;
+    Ok(())
+}
+
 const UNKNOWN_ROOT: &str = "(unknown)";
 
 fn root_label(root: &str) -> String {
@@ -391,11 +522,8 @@ fn session_rollups(touches: &[FileAttentionTouch], limit: usize) -> (Vec<Value>,
         let agg = aggs.entry(touch.session_id.clone()).or_insert_with(|| {
             order.push(touch.session_id.clone());
             SessionAgg {
-                first_ms: i64::MAX,
-                last_ms: i64::MIN,
                 latest_event_uid: touch.event_uid.clone(),
-                latest_turn_index: touch.turn_index,
-                latest_has_ts: touch.event_unix_ms > 0,
+                latest_turn_seq: touch.turn_seq,
                 harness: touch.harness.clone(),
                 ..SessionAgg::default()
             }
@@ -413,9 +541,15 @@ fn session_rollups(touches: &[FileAttentionTouch], limit: usize) -> (Vec<Value>,
         if agg.harness.is_empty() {
             agg.harness = touch.harness.clone();
         }
-        if touch.event_unix_ms > 0 {
-            agg.first_ms = agg.first_ms.min(touch.event_unix_ms);
-            agg.last_ms = agg.last_ms.max(touch.event_unix_ms);
+        if let Some(event_unix_ms) = touch.event_unix_ms {
+            agg.first_ms = Some(
+                agg.first_ms
+                    .map_or(event_unix_ms, |first| first.min(event_unix_ms)),
+            );
+            agg.last_ms = Some(
+                agg.last_ms
+                    .map_or(event_unix_ms, |last| last.max(event_unix_ms)),
+            );
         }
     }
 
@@ -458,17 +592,12 @@ fn session_rollup_json(
         .map(|id| id.to_string())
         .map_err(internal_id_error)?;
 
-    let first = (agg.first_ms != i64::MAX).then_some(agg.first_ms);
-    let last = (agg.last_ms != i64::MIN).then_some(agg.last_ms);
-
     let mut open = json!({
         "session_id": mcp_session_id,
         "event_id": latest_event_id,
     });
-    if agg.latest_has_ts {
-        if let Ok(turn_id) =
-            McpTurnId::from_raw_session_id_and_turn_seq(session_id, agg.latest_turn_index)
-        {
+    if let Some(turn_seq) = agg.latest_turn_seq {
+        if let Ok(turn_id) = McpTurnId::from_raw_session_id_and_turn_seq(session_id, turn_seq) {
             open["turn_id"] = json!(turn_id.to_string());
         }
     }
@@ -479,8 +608,8 @@ fn session_rollup_json(
         "session": {
             "id": mcp_session_id,
             "harness": agg.harness,
-            "first_touch": first.map(format_rfc3339_utc_millis),
-            "last_touch": last.map(format_rfc3339_utc_millis),
+            "first_touch": agg.first_ms.map(format_rfc3339_utc_millis),
+            "last_touch": agg.last_ms.map(format_rfc3339_utc_millis),
             "touch_count": agg.touch_count,
             "tools": agg.tools.iter().collect::<Vec<_>>(),
             "worktree_roots": agg.roots.iter().collect::<Vec<_>>(),
@@ -527,14 +656,13 @@ fn event_json(rank: usize, touch: &FileAttentionTouch) -> Result<Value, Contract
         .map(|id| id.to_string())
         .map_err(internal_id_error)?;
 
-    let has_ts = touch.event_unix_ms > 0;
     let mut open = json!({
         "event_id": event_id,
         "session_id": session_id,
     });
-    if has_ts {
+    if let Some(turn_seq) = touch.turn_seq {
         if let Ok(turn_id) =
-            McpTurnId::from_raw_session_id_and_turn_seq(touch.session_id.as_str(), touch.turn_index)
+            McpTurnId::from_raw_session_id_and_turn_seq(touch.session_id.as_str(), turn_seq)
         {
             open["turn_id"] = json!(turn_id.to_string());
         }
@@ -546,10 +674,10 @@ fn event_json(rank: usize, touch: &FileAttentionTouch) -> Result<Value, Contract
         "event": {
             "id": event_id,
             "session_id": session_id,
-            "timestamp": has_ts.then(|| format_rfc3339_utc_millis(touch.event_unix_ms)),
+            "timestamp": touch.event_unix_ms.map(format_rfc3339_utc_millis),
             "tool_name": touch.tool_name,
             "phase": touch.tool_phase,
-            "turn": has_ts.then_some(touch.turn_index),
+            "turn": touch.turn_seq,
             "match_kind": touch.match_kind,
             "worktree_root": (!touch.worktree_root.is_empty()).then_some(touch.worktree_root.as_str()),
             "action_preview": action_preview(touch),
@@ -737,8 +865,9 @@ mod tests {
             },
             worktree_root: root.to_string(),
             cwd: String::new(),
-            event_unix_ms: ts,
-            turn_index: 1,
+            event_unix_ms: (ts > 0).then_some(ts),
+            event_order: ts.max(0) as u64,
+            turn_seq: (ts > 0).then_some(1),
             input_preview: "{\"file_path\":\"crates/foo/tee.rs\"}".to_string(),
             output_preview: String::new(),
         }
@@ -963,12 +1092,12 @@ mod tests {
     }
 
     #[test]
-    fn unknown_root_bucket_does_not_count_toward_ambiguity() {
+    fn unknown_root_bucket_marks_ambiguity_when_mixed_with_known_roots() {
         let tail = resolve_tail("crates/foo/tee.rs");
         let touches = vec![
             touch("sess-a", "ev-a", "Edit", "path_suffix", "/repo/main", 2_000),
-            // A bash substring match with no clean root → "(unknown)" bucket.
-            touch("sess-b", "ev-b", "Bash", "bash_substring", "", 1_000),
+            // A shell path-token match with no clean root → "(unknown)" bucket.
+            touch("sess-b", "ev-b", "Bash", "shell_path", "", 1_000),
         ];
         let mut warnings = Vec::new();
         let data = build_data(
@@ -978,8 +1107,10 @@ mod tests {
             &mut warnings,
         );
 
-        assert_eq!(data["summary"]["distinct_roots"], json!(1));
-        assert_eq!(data["summary"]["ambiguous"], json!(false));
+        assert_eq!(data["summary"]["distinct_roots"], json!(2));
+        assert_eq!(data["summary"]["distinct_known_roots"], json!(1));
+        assert_eq!(data["summary"]["unknown_root_touches"], json!(1));
+        assert_eq!(data["summary"]["ambiguous"], json!(true));
         // The unknown bucket is still surfaced in roots for transparency.
         let labels: Vec<&str> = data["roots"]
             .as_array()
@@ -1025,7 +1156,7 @@ mod tests {
 
     #[test]
     fn build_data_all_touches_missing_timestamps_null_span() {
-        // Touches that never joined an events row (event_unix_ms == 0) still
+        // Touches that never joined a trace row (event_unix_ms == None) still
         // appear, but the span is null — never the 1970 sentinel — and an
         // event with no timestamp omits its turn handle.
         let tail = resolve_tail("crates/foo/tee.rs");
@@ -1108,19 +1239,20 @@ mod tests {
             json!(FILE_ATTENTION_SCAN_CAP)
         );
         assert!(warnings.iter().any(|w| w.contains("more than")));
+        assert_eq!(data["truncated"], json!(true));
     }
 
     #[test]
-    fn resolve_tail_preserves_embedded_space_and_trailing_slash() {
-        // We trim the ends and strip a leading "./" but do NOT canonicalize:
-        // an embedded space or a trailing slash survives in the tail (the
-        // caller owns path hygiene).
-        assert_eq!(resolve_tail("  crates/foo.rs  ").rel, "crates/foo.rs");
+    fn resolve_tail_normalizes_dotdot_and_repeated_slashes() {
+        assert_eq!(resolve_tail("crates/foo/../foo.rs").rel, "crates/foo.rs");
+        assert_eq!(
+            resolve_tail("crates//foo///bar.rs").rel,
+            "crates/foo/bar.rs"
+        );
         assert_eq!(
             resolve_tail("crates/foo dir/x.rs").rel,
             "crates/foo dir/x.rs"
         );
-        assert_eq!(resolve_tail("crates/foo/").rel, "crates/foo/");
     }
 
     #[test]
