@@ -4,7 +4,9 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use glob::glob;
-use moraine_config::{map_tracked_path, IngestSource, SOURCE_FORMAT_CURSOR_SQLITE};
+use moraine_config::{
+    map_tracked_path, IngestSource, SOURCE_FORMAT_CURSOR_SQLITE, SOURCE_FORMAT_OPENCODE_SQLITE,
+};
 use notify::{
     event::{EventKind, ModifyKind},
     Config as NotifyConfig, Event, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher,
@@ -153,7 +155,7 @@ fn event_tracked_paths(event: &Event, format: &str) -> Vec<String> {
     dedup.into_iter().collect()
 }
 
-/// Resolves symlinks for `cursor_sqlite` so every ingestion entry point
+/// Resolves symlinks for SQLite-polled sources so every ingestion entry point
 /// agrees on one path per database. Backfill/reconcile paths come from the
 /// config glob while watcher events report the symlink-resolved location
 /// (macOS FSEvents turns `/var/...` into `/private/var/...`); without
@@ -163,10 +165,13 @@ fn event_tracked_paths(event: &Event, format: &str) -> Vec<String> {
 /// File-backed formats keep the as-reported path: checkpoint keys and event
 /// UIDs embed `source_file`, so changing the identity of long-standing
 /// sources (e.g. dotfiles-managed symlinked session dirs) would orphan every
-/// existing checkpoint and re-ingest history under new UIDs. `cursor_sqlite`
-/// is new — no install has pre-canonicalization identities to preserve.
+/// existing checkpoint and re-ingest history under new UIDs. SQLite-polled
+/// sources are new enough that they can share this stricter identity rule.
 fn tracked_path_identity(format: &str, path: &str) -> String {
-    if format != SOURCE_FORMAT_CURSOR_SQLITE {
+    if !matches!(
+        format,
+        SOURCE_FORMAT_CURSOR_SQLITE | SOURCE_FORMAT_OPENCODE_SQLITE
+    ) {
         return path.to_string();
     }
     std::fs::canonicalize(path)
