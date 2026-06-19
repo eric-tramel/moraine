@@ -1,4 +1,4 @@
-use super::{tool_ok_hybrid, AppState};
+use super::{internal_id_error, repo_error_to_contract_error, tool_ok_hybrid, AppState};
 use crate::contract::{
     format_rfc3339_utc_millis, CanonicalSearchSessionsArgs, ContractError, McpEventId, McpId,
     McpSessionId, McpTurnId, Performance, PerformanceBuilder, SearchSessionsArgs, ToolEnvelope,
@@ -498,27 +498,9 @@ fn format_search_sessions_error_text(payload: &Value) -> String {
     format!("search_sessions error ({code}): {message}")
 }
 
-fn repo_error_to_contract_error(error: RepoError) -> ContractError {
-    match error {
-        RepoError::InvalidArgument(message) | RepoError::InvalidCursor(message) => {
-            ContractError::new(ToolErrorCode::InvalidRequest, message)
-        }
-        RepoError::Backend(message) | RepoError::Internal(message) => {
-            ContractError::new(ToolErrorCode::InternalError, message)
-        }
-    }
-}
-
 fn not_found_error(kind: &str, id: String) -> ContractError {
     ContractError::new(ToolErrorCode::NotFound, format!("{kind} not found"))
         .with_details(json!({ "kind": kind, "id": id }))
-}
-
-fn internal_id_error(error: ContractError) -> ContractError {
-    ContractError::new(
-        ToolErrorCode::InternalError,
-        format!("repository returned an invalid MCP identifier component: {error}"),
-    )
 }
 
 #[cfg(test)]

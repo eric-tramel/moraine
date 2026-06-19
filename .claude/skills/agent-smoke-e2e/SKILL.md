@@ -14,7 +14,7 @@ like a test runner with terse output and clear pass/fail signals.
 
 ## Setup Assumptions
 
-- The `moraine` MCP server is registered and exposes `mcp__moraine__search_sessions`, `mcp__moraine__open`, and `mcp__moraine__list_sessions`.
+- The `moraine` MCP server is registered and exposes `mcp__moraine__search_sessions`, `mcp__moraine__open`, `mcp__moraine__list_sessions`, and `mcp__moraine__file_attention`.
 - The stack may or may not have ingested sessions. Both cases are valid; the smoke test cares that tools respond with the contract shape.
 - Do not call any tool outside the `mcp__moraine__*` namespace.
 
@@ -70,7 +70,30 @@ If `data.sessions[0]` exists, capture:
 
 If there are no listed sessions, leave `listed_session_id` as `null`.
 
-### 3. `open(event_id)`
+### 3. `file_attention`
+
+Call `mcp__moraine__file_attention` with:
+
+```json
+{ "path": "Cargo.toml", "scope": "all", "granularity": "events", "limit": 5 }
+```
+
+PASS if the response is an object with:
+
+- `tool: "file_attention"`
+- `schema_version: "moraine.mcp.file_attention.v1"`
+- `data.events` as an array
+- `data.summary.total_touches` as a number
+
+If `data.events[0]` exists, capture:
+
+- `file_attention_event_id = data.events[0].open.event_id`
+- `file_attention_turn_id = data.events[0].open.turn_id` if present
+- `file_attention_session_id = data.events[0].open.session_id`
+
+If there are no events, leave the three file-attention IDs as `null`.
+
+### 4. `open(event_id)`
 
 If `sample_event_id` is set, call `mcp__moraine__open` with:
 
@@ -83,7 +106,7 @@ and `data.kind: "event"`.
 
 If `sample_event_id` is null, record `SKIP no search result`.
 
-### 4. `open(turn_id)`
+### 5. `open(turn_id)`
 
 If `sample_turn_id` is set, call `mcp__moraine__open` with:
 
@@ -96,7 +119,7 @@ and `data.kind: "turn"`.
 
 If `sample_turn_id` is null, record `SKIP no search result`.
 
-### 5. `open(session_id)`
+### 6. `open(session_id)`
 
 If `sample_session_id` is set, call `mcp__moraine__open` with:
 
@@ -117,7 +140,7 @@ nonexistent typed session ID:
 PASS if the tool returns cleanly without an MCP/RPC error and includes an
 `error.code` such as `not_found`.
 
-### 6. `open(listed_session_id)`
+### 7. `open(listed_session_id)`
 
 If `listed_session_id` is set, call `mcp__moraine__open` with:
 
@@ -129,6 +152,37 @@ PASS if the response is an object with `tool: "open"`, the same `request.id`,
 and `data.kind: "session"`.
 
 If `listed_session_id` is null, record `SKIP no listed session`.
+
+### 8. `open(file_attention IDs)`
+
+If `file_attention_event_id` is set, call `mcp__moraine__open` with:
+
+```json
+{ "id": "<file_attention_event_id>" }
+```
+
+PASS if the response is an object with `tool: "open"`, the same `request.id`,
+and `data.kind: "event"`.
+
+If `file_attention_turn_id` is set, call `mcp__moraine__open` with:
+
+```json
+{ "id": "<file_attention_turn_id>" }
+```
+
+PASS if the response is an object with `tool: "open"`, the same `request.id`,
+and `data.kind: "turn"`.
+
+If `file_attention_session_id` is set, call `mcp__moraine__open` with:
+
+```json
+{ "id": "<file_attention_session_id>" }
+```
+
+PASS if the response is an object with `tool: "open"`, the same `request.id`,
+and `data.kind: "session"`.
+
+If there are no file-attention IDs, record `SKIP no file_attention event`.
 
 ## FAIL Conditions
 
@@ -145,17 +199,23 @@ After all checks, emit exactly this block and stop:
 === agent-smoke-e2e ===
 search_sessions: PASS|FAIL [reason]
 list_sessions:   PASS|FAIL [reason]
+file_attention:  PASS|FAIL [reason]
 open_event_id:   PASS|FAIL|SKIP [reason]
 open_turn_id:    PASS|FAIL|SKIP [reason]
 open_session_id: PASS|FAIL [reason]
 open_listed_session_id: PASS|FAIL|SKIP [reason]
+open_file_attention_ids: PASS|FAIL|SKIP [reason]
 ---
 search_results:  <N from search_sessions>
 listed_sessions: <N from list_sessions>
+file_attention_events: <N from file_attention>
 sample_event_id: <id or null>
 sample_turn_id:  <id or null>
 sample_session_id: <id or null>
 listed_session_id: <id or null>
+file_attention_event_id: <id or null>
+file_attention_turn_id: <id or null>
+file_attention_session_id: <id or null>
 overall:         PASS|FAIL
 =======================
 ```

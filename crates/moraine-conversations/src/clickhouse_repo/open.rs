@@ -536,10 +536,7 @@ FORMAT JSONEachRow",
             return ConversationMode::WebSearch;
         }
         if events.iter().any(|event| {
-            event.source_name == "codex-mcp"
-                || event.event.name.eq_ignore_ascii_case("search")
-                || event.event.name.eq_ignore_ascii_case("open")
-                || event.event.name.eq_ignore_ascii_case("list_sessions")
+            event.source_name == "codex-mcp" || Self::is_mcp_internal_tool_name(&event.event.name)
         }) {
             return ConversationMode::McpInternal;
         }
@@ -1078,6 +1075,7 @@ FORMAT JSONEachRow",
         else {
             return Ok(None);
         };
+        let parent_session_info = self.load_mcp_session_info(&session_id).await?;
         let Some(parent_turn) =
             Self::summarize_indexed_turn(&session_id, event.turn_seq, &indexed_events)
         else {
@@ -1122,6 +1120,7 @@ FORMAT JSONEachRow",
             turn_completed: turn_compact.completed,
             turn_terminal_event_uid: turn_compact.terminal_event_uid,
             parent_session,
+            parent_session_source: non_empty_string(parent_session_info.source),
             parent_turn,
             previous_event,
             next_event,

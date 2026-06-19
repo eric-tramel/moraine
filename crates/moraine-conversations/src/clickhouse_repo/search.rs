@@ -348,8 +348,9 @@ GROUP BY t.event_uid)"
                     "positionCaseInsensitiveUTF8(d.payload_json, 'codex-mcp') = 0".to_string(),
                 );
             }
-            where_clauses
-                .push("lowerUTF8(d.name) NOT IN ('search', 'open', 'list_sessions')".to_string());
+            where_clauses.push(format!(
+                "lowerUTF8(d.name) NOT IN ({MCP_INTERNAL_TOOL_NAMES_SQL})"
+            ));
         }
 
         let where_sql = where_clauses.join("\n  AND ");
@@ -730,10 +731,7 @@ FORMAT JSONEachRow",
             if row.has_codex_mcp != 0 {
                 return false;
             }
-            if row.name.eq_ignore_ascii_case("search")
-                || row.name.eq_ignore_ascii_case("open")
-                || row.name.eq_ignore_ascii_case("list_sessions")
-            {
+            if Self::is_mcp_internal_tool_name(&row.name) {
                 return false;
             }
         }
@@ -1629,8 +1627,9 @@ FORMAT JSONEachRow",
 
         if exclude_codex_mcp {
             postings_filters.push("p.source_name != 'codex-mcp'".to_string());
-            postings_filters
-                .push("lowerUTF8(p.name) NOT IN ('search', 'open', 'list_sessions')".to_string());
+            postings_filters.push(format!(
+                "lowerUTF8(p.name) NOT IN ({MCP_INTERNAL_TOOL_NAMES_SQL})"
+            ));
         }
 
         if let Some(candidate_session_ids) = candidate_session_ids {

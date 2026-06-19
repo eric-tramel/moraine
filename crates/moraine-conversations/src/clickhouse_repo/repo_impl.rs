@@ -88,4 +88,11 @@ impl ConversationRepository for ClickHouseConversationRepository {
     ) -> RepoResult<ConversationSearchResults> {
         self.search_conversations_impl(query).await
     }
+
+    async fn file_attention(
+        &self,
+        query: FileAttentionQuery,
+    ) -> RepoResult<Vec<FileAttentionTouch>> {
+        self.file_attention_impl(query).await
+    }
 }

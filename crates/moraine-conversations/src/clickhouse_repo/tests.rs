@@ -189,12 +189,15 @@ fn search_doc_filters_exclude_codex_by_flag() {
 #[test]
 fn search_doc_filters_exclude_codex_by_tool_name() {
     let mut row = sample_search_doc();
-    row.name = "search".to_string();
-    assert!(
-        !ClickHouseConversationRepository::passes_search_doc_filters(
-            &row, false, None, true, None, None
-        )
-    );
+    for name in ["search", "open", "list_sessions", "file_attention"] {
+        row.name = name.to_string();
+        assert!(
+            !ClickHouseConversationRepository::passes_search_doc_filters(
+                &row, false, None, true, None, None
+            ),
+            "{name} should be treated as an internal MCP tool"
+        );
+    }
 }
 
 #[test]

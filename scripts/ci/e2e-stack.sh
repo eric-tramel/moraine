@@ -899,7 +899,8 @@ PY
     --config "$config_path" \
     --query "$codex_keyword" \
     --expect-session-id "$codex_session_id" \
-    --expect-open-text "$codex_trace_marker"
+    --expect-open-text "$codex_trace_marker" \
+    --file-attention-path "Cargo.toml"
 
   echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (claude)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
@@ -907,7 +908,8 @@ PY
     --config "$config_path" \
     --query "$claude_keyword" \
     --expect-session-id "$claude_session_id" \
-    --expect-open-text "$claude_trace_marker"
+    --expect-open-text "$claude_trace_marker" \
+    --file-attention-path "Cargo.toml"
 
   echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (kimi)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
@@ -915,7 +917,8 @@ PY
     --config "$config_path" \
     --query "$kimi_keyword" \
     --expect-session-id "$kimi_raw_session_id" \
-    --expect-open-text "$kimi_trace_marker"
+    --expect-open-text "$kimi_trace_marker" \
+    --file-attention-path "manifest.json"
 
   echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (cursor)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
@@ -923,7 +926,8 @@ PY
     --config "$config_path" \
     --query "$cursor_keyword" \
     --expect-session-id "$cursor_session_id" \
-    --expect-open-text "$cursor_trace_marker"
+    --expect-open-text "$cursor_trace_marker" \
+    --file-attention-path "/workspace/cursor-e2e.txt"
 
   echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (cursor sqlite)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
@@ -931,7 +935,8 @@ PY
     --config "$config_path" \
     --query "$cursor_sqlite_keyword" \
     --expect-session-id "$cursor_sqlite_session_id" \
-    --expect-open-text "$cursor_sqlite_trace_marker"
+    --expect-open-text "$cursor_sqlite_trace_marker" \
+    --file-attention-path "/workspace/cursor-sqlite-e2e.txt"
 
   echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (pi)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
@@ -939,7 +944,8 @@ PY
     --config "$config_path" \
     --query "$pi_keyword" \
     --expect-session-id "$pi_session_id" \
-    --expect-open-text "$pi_trace_marker"
+    --expect-open-text "$pi_trace_marker" \
+    --file-attention-path "Cargo.toml"
 
   # Hermes synthesizes its own `hermes:<uid>` session id, so we do not pin
   # --expect-session-id; source file + trace marker are enough to prove the

@@ -153,7 +153,12 @@ def contains_text(value: Any, needle: str) -> bool:
 
 
 def assert_tools_surface(tool_names_ordered: list[str]) -> None:
-    if tool_names_ordered != ["search_sessions", "open", "list_sessions"]:
+    if tool_names_ordered != [
+        "search_sessions",
+        "open",
+        "list_sessions",
+        "file_attention",
+    ]:
         raise AssertionError(
             "tools/list must publish the MCP search surface exactly: "
             f"{tool_names_ordered}"
@@ -259,6 +264,59 @@ def open_id_from_list_sessions_result(result: Dict[str, Any]) -> str:
     return open_id
 
 
+def open_ids_from_file_attention_item(result: Dict[str, Any]) -> list[str]:
+    handles = result.get("open")
+    if not isinstance(handles, dict):
+        raise AssertionError(f"file_attention result missing open handles: {result}")
+
+    open_ids: list[str] = []
+    for key in ["event_id", "turn_id", "session_id"]:
+        open_id = handles.get(key)
+        if isinstance(open_id, str) and open_id:
+            open_ids.append(open_id)
+    if not open_ids:
+        raise AssertionError(f"file_attention result had no openable handles: {result}")
+    return list(dict.fromkeys(open_ids))
+
+
+def select_file_attention_result(
+    payload: Dict[str, Any],
+    expect_session_id: Optional[str],
+) -> Dict[str, Any]:
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise AssertionError(f"file_attention payload missing data: {payload}")
+    events = data.get("events")
+    if not isinstance(events, list):
+        raise AssertionError(f"file_attention events response missing events array: {payload}")
+    if not events:
+        raise AssertionError(f"file_attention returned no events: {payload}")
+
+    expected_session = expected_mcp_session_id(expect_session_id)
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        session_id = nested_string(event, "event", "session_id")
+        open_session_id = nested_string(event, "open", "session_id")
+        if expected_session is None or expected_session in {session_id, open_session_id}:
+            return event
+
+    debug_events = [
+        {
+            "id": event.get("id"),
+            "session_id": nested_string(event, "event", "session_id"),
+            "open_session_id": nested_string(event, "open", "session_id"),
+            "tool_name": nested_string(event, "event", "tool_name"),
+        }
+        for event in events
+        if isinstance(event, dict)
+    ][:5]
+    raise AssertionError(
+        "file_attention did not return a touch matching expected session: "
+        f"session_id={expect_session_id}, events={debug_events}"
+    )
+
+
 def open_payload_session_id(payload: Dict[str, Any]) -> Optional[str]:
     kind = nested_string(payload, "data", "kind")
     if kind == "event":
@@ -356,6 +414,7 @@ def run_smoke(
     query: str,
     expect_session_id: Optional[str],
     expect_open_text: Optional[str],
+    file_attention_path: Optional[str] = None,
     project_dir: Optional[str] = None,
     absent_session_ids: Optional[list[str]] = None,
     expect_no_results: bool = False,
@@ -507,6 +566,34 @@ def run_smoke(
         for raw_session_id in absent_session_ids:
             next_id = assert_open_not_found(proc, next_id, raw_session_id)
 
+        if file_attention_path is not None:
+            file_attention_result = call_tool(
+                proc,
+                next_id,
+                "file_attention",
+                {
+                    "path": file_attention_path,
+                    "scope": "project" if project_dir is not None else "all",
+                    "granularity": "events",
+                    "limit": 10,
+                },
+            )
+            next_id += 1
+            file_attention_payload = assert_structured_content(
+                file_attention_result, "file_attention"
+            )
+            selected_touch = select_file_attention_result(
+                file_attention_payload,
+                expect_session_id,
+            )
+            next_id = assert_open_search_ids(
+                proc,
+                next_id,
+                open_ids_from_file_attention_item(selected_touch),
+                expect_session_id,
+                None,
+            )
+
     finally:
         if proc.stdin:
             proc.stdin.close()
@@ -525,6 +612,10 @@ def main() -> int:
     parser.add_argument("--query", required=True)
     parser.add_argument("--expect-session-id")
     parser.add_argument("--expect-open-text")
+    parser.add_argument(
+        "--file-attention-path",
+        help="also call file_attention for this path and open one returned touch",
+    )
     parser.add_argument(
         "--project-dir",
         help=(
@@ -555,6 +646,7 @@ def main() -> int:
         args.query,
         args.expect_session_id,
         args.expect_open_text,
+        file_attention_path=args.file_attention_path,
         project_dir=args.project_dir,
         absent_session_ids=args.expect_absent_session_id,
         expect_no_results=args.expect_no_results,

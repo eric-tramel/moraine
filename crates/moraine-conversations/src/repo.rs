@@ -2,10 +2,11 @@ use async_trait::async_trait;
 
 use crate::domain::{
     Conversation, ConversationDetailOptions, ConversationListFilter, ConversationSearchQuery,
-    ConversationSearchResults, McpEventOpen, McpSessionListFilter, McpSessionListItem,
-    McpSessionOpen, McpTurnOpen, OpenContext, OpenEventRequest, Page, PageRequest,
-    SearchEventsQuery, SearchEventsResult, SearchMcpEventsQuery, SearchMcpEventsResult,
-    SessionEventsQuery, SessionMetadata, TraceEvent, Turn, TurnListFilter, TurnSummary,
+    ConversationSearchResults, FileAttentionQuery, FileAttentionTouch, McpEventOpen,
+    McpSessionListFilter, McpSessionListItem, McpSessionOpen, McpTurnOpen, OpenContext,
+    OpenEventRequest, Page, PageRequest, SearchEventsQuery, SearchEventsResult,
+    SearchMcpEventsQuery, SearchMcpEventsResult, SessionEventsQuery, SessionMetadata, TraceEvent,
+    Turn, TurnListFilter, TurnSummary,
 };
 use crate::error::RepoResult;
 
@@ -69,4 +70,9 @@ pub trait ConversationRepository: Send + Sync {
         &self,
         query: ConversationSearchQuery,
     ) -> RepoResult<ConversationSearchResults>;
+
+    async fn file_attention(
+        &self,
+        query: FileAttentionQuery,
+    ) -> RepoResult<Vec<FileAttentionTouch>>;
 }

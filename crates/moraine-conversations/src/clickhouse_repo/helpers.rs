@@ -1,5 +1,8 @@
 use super::*;
 
+pub(super) const MCP_INTERNAL_TOOL_NAMES_SQL: &str =
+    "'search', 'open', 'list_sessions', 'file_attention'";
+
 impl ClickHouseConversationRepository {
     pub(super) fn mode_subquery(&self) -> String {
         let events_table = self.table_ref("events");
@@ -13,7 +16,7 @@ impl ClickHouseConversationRepository {
       OR (payload_type = 'tool_use' AND tool_name IN ('WebSearch', 'WebFetch'))
     ) > 0,
     'web_search',
-    countIf(source_name = 'codex-mcp' OR lowerUTF8(tool_name) IN ('search', 'open', 'list_sessions')) > 0,
+    countIf(source_name = 'codex-mcp' OR lowerUTF8(tool_name) IN ({MCP_INTERNAL_TOOL_NAMES_SQL})) > 0,
     'mcp_internal',
     countIf(event_kind IN ('tool_call', 'tool_result') OR payload_type = 'tool_use') > 0,
     'tool_calling',
@@ -21,6 +24,13 @@ impl ClickHouseConversationRepository {
   ) AS mode
 FROM {events_table}
 GROUP BY session_id"
+        )
+    }
+
+    pub(super) fn is_mcp_internal_tool_name(name: &str) -> bool {
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "search" | "open" | "list_sessions" | "file_attention"
         )
     }
 

@@ -1,4 +1,4 @@
-use super::{tool_ok_hybrid, AppState};
+use super::{internal_id_error, repo_error_to_contract_error, tool_ok_hybrid, AppState};
 use crate::contract::{
     format_rfc3339_utc_millis, CanonicalListSessionsArgs, ContractError, ListSessionsArgs,
     ListSessionsMode, ListSessionsSort, McpSessionId, Performance, ToolEnvelope, ToolErrorCode,
@@ -9,7 +9,7 @@ use crate::contract::{
 use anyhow::{Context, Result};
 use moraine_conversations::{
     ConversationListSort as RepoListSort, ConversationMode as RepoConversationMode,
-    ConversationRepository, McpSessionListFilter, McpSessionListItem, Page, PageRequest, RepoError,
+    ConversationRepository, McpSessionListFilter, McpSessionListItem, Page, PageRequest,
 };
 use serde_json::{json, Value};
 use tokio::time::{timeout, Duration};
@@ -316,24 +316,6 @@ fn format_list_sessions_error_text(payload: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("list_sessions failed");
     format!("list_sessions error ({code}): {message}")
-}
-
-fn repo_error_to_contract_error(error: RepoError) -> ContractError {
-    match error {
-        RepoError::InvalidArgument(message) | RepoError::InvalidCursor(message) => {
-            ContractError::new(ToolErrorCode::InvalidRequest, message)
-        }
-        RepoError::Backend(message) | RepoError::Internal(message) => {
-            ContractError::new(ToolErrorCode::InternalError, message)
-        }
-    }
-}
-
-fn internal_id_error(error: ContractError) -> ContractError {
-    ContractError::new(
-        ToolErrorCode::InternalError,
-        format!("repository returned an invalid MCP identifier component: {error}"),
-    )
 }
 
 #[cfg(test)]
