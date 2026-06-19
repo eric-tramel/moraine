@@ -32,8 +32,9 @@ pub struct IngestSource {
     /// place via atomic rename — used by live Hermes agent sessions),
     /// `"cursor_sqlite"` (polled Cursor `state.vscdb` SQLite databases), or
     /// `"opencode_sqlite"` (polled OpenCode `opencode*.db` SQLite databases).
-    /// Empty means "infer": hermes + `*.json` glob → `session_json`, otherwise
-    /// `jsonl`.
+    /// Empty means "infer": Hermes `*.json` globs use `session_json`, Cursor
+    /// `.vscdb` globs use `cursor_sqlite`, OpenCode `opencode*.db` globs use
+    /// `opencode_sqlite`, and other sources use `jsonl`.
     #[serde(default)]
     pub format: String,
 }
@@ -500,9 +501,7 @@ fn infer_source_format(harness: &str, glob: &str) -> &'static str {
     if harness == "cursor" && glob_lower.ends_with(".vscdb") {
         return SOURCE_FORMAT_CURSOR_SQLITE;
     }
-    if harness == "opencode"
-        && (glob_lower.ends_with("opencode.db") || glob_lower.ends_with("opencode*.db"))
-    {
+    if harness == "opencode" && opencode_db_name_matches(Path::new(&glob_lower)) {
         return SOURCE_FORMAT_OPENCODE_SQLITE;
     }
     let looks_like_json = !glob_lower.ends_with(".jsonl")
@@ -548,7 +547,7 @@ fn normalize_source_format(
 
 impl IngestSource {
     /// Returns the file extension (without leading `.`) this source's format
-    /// records are stored in: `jsonl`, `json`, or `vscdb`.
+    /// records are stored in: `jsonl`, `json`, `vscdb`, or `db`.
     pub fn tracked_extension(&self) -> &'static str {
         format_tracked_extension(&self.format)
     }
@@ -561,6 +560,19 @@ fn format_tracked_extension(format: &str) -> &'static str {
         SOURCE_FORMAT_OPENCODE_SQLITE => "db",
         _ => "jsonl",
     }
+}
+
+fn opencode_db_name_matches(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            let lower = name.to_ascii_lowercase();
+            lower.starts_with("opencode")
+                && lower.ends_with(".db")
+                && !lower.ends_with(".db-wal")
+                && !lower.ends_with(".db-shm")
+        })
+        .unwrap_or(false)
 }
 
 /// Maps a filesystem path seen by enumeration or the watcher to the canonical
@@ -582,14 +594,25 @@ pub fn map_tracked_path(format: &str, path: &str) -> Option<String> {
             .unwrap_or(false)
     };
 
+    if format == SOURCE_FORMAT_OPENCODE_SQLITE {
+        if opencode_db_name_matches(Path::new(path)) {
+            return Some(path.to_string());
+        }
+        for suffix in SQLITE_SIDECAR_SUFFIXES {
+            if let Some(base) = path.strip_suffix(suffix) {
+                if opencode_db_name_matches(Path::new(base)) {
+                    return Some(base.to_string());
+                }
+            }
+        }
+        return None;
+    }
+
     if has_extension(path) {
         return Some(path.to_string());
     }
 
-    if matches!(
-        format,
-        SOURCE_FORMAT_CURSOR_SQLITE | SOURCE_FORMAT_OPENCODE_SQLITE
-    ) {
+    if format == SOURCE_FORMAT_CURSOR_SQLITE {
         for suffix in SQLITE_SIDECAR_SUFFIXES {
             if let Some(base) = path.strip_suffix(suffix) {
                 if has_extension(base) {
@@ -1765,6 +1788,13 @@ format = "sqlite"
         assert_eq!(
             map_tracked_path(
                 SOURCE_FORMAT_OPENCODE_SQLITE,
+                "/tmp/opencode/opencode-local.db"
+            ),
+            Some("/tmp/opencode/opencode-local.db".to_string())
+        );
+        assert_eq!(
+            map_tracked_path(
+                SOURCE_FORMAT_OPENCODE_SQLITE,
                 "/tmp/opencode/opencode.db-wal"
             ),
             Some("/tmp/opencode/opencode.db".to_string())
@@ -1775,6 +1805,17 @@ format = "sqlite"
                 "/tmp/opencode/opencode.db-shm"
             ),
             Some("/tmp/opencode/opencode.db".to_string())
+        );
+        assert_eq!(
+            map_tracked_path(SOURCE_FORMAT_OPENCODE_SQLITE, "/tmp/opencode/unrelated.db"),
+            None
+        );
+        assert_eq!(
+            map_tracked_path(
+                SOURCE_FORMAT_OPENCODE_SQLITE,
+                "/tmp/opencode/unrelated.db-wal"
+            ),
+            None
         );
     }
 

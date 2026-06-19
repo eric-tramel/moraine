@@ -22,15 +22,25 @@ impl IngestSource for Opencode {
     fn source_metadata(&self, record: &Value) -> SourceMetadata {
         let provider = first_text([
             record.get("providerID"),
+            record.get("message_provider_id"),
             record.pointer("/model/providerID"),
+            record.pointer("/model/providerId"),
+            record.pointer("/model/provider"),
             record.pointer("/data/providerID"),
             record.pointer("/data/model/providerID"),
+            record.pointer("/data/model/providerId"),
+            record.pointer("/data/model/provider"),
         ]);
         let model = first_text([
             record.get("modelID"),
+            record.get("message_model_id"),
             record.pointer("/model/id"),
+            record.pointer("/model/modelID"),
+            record.pointer("/model/modelId"),
             record.pointer("/data/modelID"),
             record.pointer("/data/model/id"),
+            record.pointer("/data/model/modelID"),
+            record.pointer("/data/model/modelId"),
         ]);
 
         SourceMetadata {
@@ -54,10 +64,10 @@ impl IngestSource for Opencode {
 
     fn cwd(&self, record: &Value) -> String {
         first_text([
-            record.get("directory"),
             record.get("cwd"),
             record.pointer("/path/cwd"),
             record.pointer("/data/path/cwd"),
+            record.get("directory"),
         ])
     }
 
@@ -170,21 +180,18 @@ fn emit_session(record: &Value, emitter: &mut SourceEmitter<'_>) {
 fn emit_message(record: &Value, emitter: &mut SourceEmitter<'_>) {
     let data = record_data(record);
     let role = to_str(data.get("role"));
+    let text = message_text(data);
+    if text.is_empty() {
+        return;
+    }
     let actor = actor_for_role(&role);
     let uid = opencode_uid(record, "message", &compact_json(record), "message", emitter);
     let mut event = emitter
-        .event_for_json(
-            &uid,
-            "message",
-            "message",
-            actor,
-            &message_text(data),
-            record,
-        )
+        .event_for_json(&uid, "message", "message", actor, &text, record)
         .item_id(to_str(record.get("id")))
         .origin_event_id(to_str(data.get("parentID")))
         .agent_label(to_str(data.get("agent")));
-    let model = model_string(data);
+    let model = model_string(record);
     if !model.is_empty() {
         event = event.model(model);
     }
@@ -202,7 +209,8 @@ fn emit_part(record: &Value, emitter: &mut SourceEmitter<'_>) {
         return;
     }
 
-    let (event_kind, payload_type, actor) = part_event_shape(&part_type);
+    let message_role = to_str(record.get("message_role"));
+    let (event_kind, payload_type, actor) = part_event_shape(&part_type, &message_role);
     let text = part_text(data);
     let uid = opencode_uid(
         record,
@@ -224,6 +232,10 @@ fn emit_part(record: &Value, emitter: &mut SourceEmitter<'_>) {
     if let Some(tokens) = data.get("tokens") {
         event = stamp_opencode_tokens(tokens, event);
     }
+    let model = model_string(record);
+    if !model.is_empty() {
+        event = event.model(model);
+    }
     emitter.push_event(event);
 }
 
@@ -238,9 +250,10 @@ fn emit_tool_part(record: &Value, data: &Value, emitter: &mut SourceEmitter<'_>)
     let input = tool_input(data).cloned().unwrap_or(Value::Null);
     let input_json = compact_json(&input);
     let input_text = text_or_json(&input);
+    let model = model_string(record);
 
     let request_uid = emitter.uid(&identity, "tool_use");
-    let request = emitter
+    let mut request = emitter
         .event_for_json(
             &request_uid,
             "tool_call",
@@ -256,6 +269,9 @@ fn emit_tool_part(record: &Value, data: &Value, emitter: &mut SourceEmitter<'_>)
         .content_types(["tool_use"])
         .tool_call_id(call_id.clone())
         .tool_name(tool_name.clone());
+    if !model.is_empty() {
+        request = request.model(model.clone());
+    }
     emitter.push_event(request);
     emitter.push_tool_request(&request_uid, &call_id, "", &tool_name, &input_json);
 
@@ -269,7 +285,7 @@ fn emit_tool_part(record: &Value, data: &Value, emitter: &mut SourceEmitter<'_>)
     let tool_error =
         u8::from(tool_error_value(data).is_some() || (!status.is_empty() && status != "completed"));
     let result_uid = emitter.uid(&identity, "tool_result");
-    let result = emitter
+    let mut result = emitter
         .event_for_json(
             &result_uid,
             "tool_result",
@@ -286,6 +302,9 @@ fn emit_tool_part(record: &Value, data: &Value, emitter: &mut SourceEmitter<'_>)
         .tool_call_id(call_id.clone())
         .tool_name(tool_name.clone())
         .tool_error(tool_error);
+    if !model.is_empty() {
+        result = result.model(model);
+    }
     emitter.push_event(result);
     emitter.push_tool_response(
         &result_uid,
@@ -301,20 +320,25 @@ fn emit_tool_part(record: &Value, data: &Value, emitter: &mut SourceEmitter<'_>)
 
 fn emit_session_message(record: &Value, emitter: &mut SourceEmitter<'_>) {
     let data = record_data(record);
-    let payload_type = first_text([record.get("message_type"), data.get("type")]);
+    let message_type = first_text([record.get("message_type"), data.get("type")]);
+    let (event_kind, payload_type, actor) = session_message_event_shape(&message_type);
     let text = message_text(data);
     let uid = opencode_uid(
         record,
         "session_message",
         &compact_json(record),
-        &format!("session_message:{payload_type}"),
+        &format!("session_message:{message_type}"),
         emitter,
     );
-    emitter.push_event(
-        emitter
-            .event_for_json(&uid, "system", &payload_type, "system", &text, record)
-            .item_id(to_str(record.get("id"))),
-    );
+    let mut event = emitter
+        .event_for_json(&uid, event_kind, payload_type, actor, &text, record)
+        .item_id(to_str(record.get("id")))
+        .op_kind(message_type);
+    let model = model_string(record);
+    if !model.is_empty() {
+        event = event.model(model);
+    }
+    emitter.push_event(event);
 }
 
 fn emit_unknown(record: &Value, top_type: &str, base_uid: &str, emitter: &mut SourceEmitter<'_>) {
@@ -332,7 +356,17 @@ fn actor_for_role(role: &str) -> &str {
 }
 
 fn message_text(data: &Value) -> String {
-    first_text([data.get("text"), data.get("content"), data.get("summary")])
+    first_text_scalar([data.get("text"), data.get("content")])
+}
+
+fn first_text_scalar<const N: usize>(values: [Option<&Value>; N]) -> String {
+    values
+        .into_iter()
+        .find_map(|value| match value {
+            Some(Value::String(text)) if !text.is_empty() => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 fn part_text(data: &Value) -> String {
@@ -350,9 +384,12 @@ fn text_or_json(value: &Value) -> String {
     to_str(Some(value))
 }
 
-fn part_event_shape(part_type: &str) -> (&'static str, &'static str, &'static str) {
+fn part_event_shape(
+    part_type: &str,
+    message_role: &str,
+) -> (&'static str, &'static str, &'static str) {
     match part_type {
-        "text" => ("message", "text", "assistant"),
+        "text" => ("message", "text", actor_for_part_role(message_role)),
         "reasoning" => ("reasoning", "reasoning", "assistant"),
         "tool-result" => ("tool_result", "tool_result", "tool"),
         "step-start" | "step-finish" => ("progress", "progress", "system"),
@@ -362,6 +399,25 @@ fn part_event_shape(part_type: &str) -> (&'static str, &'static str, &'static st
         "compaction" => ("compacted_raw", "compacted", "system"),
         "retry" | "subtask" | "agent" => ("event_msg", "event_msg", "system"),
         _ => ("unknown", "unknown", ""),
+    }
+}
+
+fn session_message_event_shape(message_type: &str) -> (&'static str, &'static str, &'static str) {
+    match message_type {
+        "compaction" | "compacted" => ("compacted_raw", "compacted", "system"),
+        "summary" => ("summary", "summary", "system"),
+        "shell" => ("system", "system", "tool"),
+        _ => ("system", "system", "system"),
+    }
+}
+
+fn actor_for_part_role(role: &str) -> &'static str {
+    match role {
+        "user" => "user",
+        "assistant" => "assistant",
+        "tool" => "tool",
+        "system" => "system",
+        _ => "assistant",
     }
 }
 
@@ -394,7 +450,14 @@ fn tool_part_is_terminal(data: &Value, status: &str) -> bool {
 fn model_string(value: &Value) -> String {
     let raw = first_text([
         value.get("modelID"),
+        value.get("message_model_id"),
         value.pointer("/model/id"),
+        value.pointer("/model/modelID"),
+        value.pointer("/model/modelId"),
+        value.pointer("/data/modelID"),
+        value.pointer("/data/model/id"),
+        value.pointer("/data/model/modelID"),
+        value.pointer("/data/model/modelId"),
         value.get("model"),
     ]);
     canonicalize_model("opencode", &raw)
@@ -416,15 +479,34 @@ fn stamp_session_tokens(record: &Value, event: EventBuilder) -> EventBuilder {
 }
 
 fn stamp_opencode_tokens(tokens: &Value, event: EventBuilder) -> EventBuilder {
+    let input_text = to_u64(tokens.get("input").or_else(|| tokens.get("input_tokens")));
+    let output_text = to_u64(tokens.get("output").or_else(|| tokens.get("output_tokens")));
+    let cache_read = to_u64(
+        tokens
+            .pointer("/cache/read")
+            .or_else(|| tokens.pointer("/input_tokens_details/cached_tokens")),
+    );
+    let cache_write = to_u64(
+        tokens
+            .pointer("/cache/write")
+            .or_else(|| tokens.pointer("/input_tokens_details/cache_creation_tokens")),
+    );
+    let reasoning = to_u64(
+        tokens
+            .get("reasoning")
+            .or_else(|| tokens.pointer("/output_tokens_details/reasoning_tokens")),
+    );
     let usage = json!({
-        "input_tokens": to_u64(tokens.get("input").or_else(|| tokens.get("input_tokens"))),
-        "output_tokens": to_u64(tokens.get("output").or_else(|| tokens.get("output_tokens"))),
+        "input_tokens": input_text + cache_read + cache_write,
+        "output_tokens": output_text + reasoning,
         "input_tokens_details": {
-            "cached_tokens": to_u64(tokens.pointer("/cache/read").or_else(|| tokens.pointer("/input_tokens_details/cached_tokens"))),
-            "cache_creation_tokens": to_u64(tokens.pointer("/cache/write").or_else(|| tokens.pointer("/input_tokens_details/cache_creation_tokens")))
+            "text_tokens": input_text,
+            "cached_tokens": cache_read,
+            "cache_creation_tokens": cache_write
         },
         "output_tokens_details": {
-            "reasoning_tokens": to_u64(tokens.get("reasoning").or_else(|| tokens.pointer("/output_tokens_details/reasoning_tokens")))
+            "text_tokens": output_text,
+            "reasoning_tokens": reasoning
         }
     });
     event.token_accounting(TokenAccounting::openai_generation(Some(&usage)))
@@ -479,6 +561,9 @@ mod tests {
         assert_eq!(session.cwd_hint, "/work/demo");
         assert_eq!(session.event_rows[0]["event_kind"], "session_meta");
         assert_eq!(session.event_rows[0]["text_content"], "Demo session");
+        assert_eq!(session.event_rows[0]["input_tokens"], 13);
+        assert_eq!(session.event_rows[0]["output_tokens"], 6);
+        assert_eq!(session.event_rows[0]["cache_read_tokens"], 3);
 
         let message = normalize(
             json!({
@@ -500,8 +585,28 @@ mod tests {
         );
         assert_eq!(message.event_rows[0]["actor_kind"], "assistant");
         assert_eq!(message.event_rows[0]["text_content"], "I can inspect that.");
-        assert_eq!(message.event_rows[0]["input_tokens"], 20);
+        assert_eq!(message.event_rows[0]["input_tokens"], 27);
+        assert_eq!(message.event_rows[0]["output_tokens"], 6);
         assert_eq!(message.event_rows[0]["cache_read_tokens"], 7);
+
+        let summary_only_message = normalize(
+            json!({
+                "type": "opencode_message",
+                "id": "msg_summary",
+                "session_id": "ses_demo",
+                "time_created": 1780000001500_i64,
+                "data": {
+                    "role": "user",
+                    "summary": {"diffs": []}
+                }
+            }),
+            3,
+            "ses_demo",
+        );
+        assert!(
+            summary_only_message.event_rows.is_empty(),
+            "message envelope summaries are metadata, not transcript text"
+        );
 
         let part = normalize(
             json!({
@@ -518,12 +623,54 @@ mod tests {
                     "output": "/work/demo"
                 }
             }),
-            3,
+            4,
             "ses_demo",
         );
         assert_eq!(part.event_rows[0]["payload_type"], "tool_use");
         assert_eq!(part.tool_rows.len(), 2);
         assert_eq!(part.tool_rows[0]["tool_phase"], "request");
         assert_eq!(part.tool_rows[1]["tool_phase"], "response");
+
+        let model_switch = normalize(
+            json!({
+                "type": "opencode_session_message",
+                "id": "sm_model",
+                "session_id": "ses_demo",
+                "message_type": "model-switched",
+                "time_created": 1780000003000_i64,
+                "data": {
+                    "model": {"id": "glm-5.2", "providerID": "zai-coding-plan"}
+                }
+            }),
+            5,
+            "ses_demo",
+        );
+        assert_eq!(model_switch.event_rows[0]["event_kind"], "system");
+        assert_eq!(model_switch.event_rows[0]["payload_type"], "system");
+        assert_eq!(model_switch.event_rows[0]["op_kind"], "model-switched");
+        assert_eq!(model_switch.event_rows[0]["model"], "glm-5.2");
+        assert_eq!(
+            model_switch.event_rows[0]["inference_provider"],
+            "zai-coding-plan"
+        );
+
+        let shell = normalize(
+            json!({
+                "type": "opencode_session_message",
+                "id": "sm_shell",
+                "session_id": "ses_demo",
+                "message_type": "shell",
+                "time_created": 1780000003100_i64,
+                "data": {
+                    "type": "shell",
+                    "text": "shell initialized"
+                }
+            }),
+            6,
+            "ses_demo",
+        );
+        assert_eq!(shell.event_rows[0]["event_kind"], "system");
+        assert_eq!(shell.event_rows[0]["actor_kind"], "tool");
+        assert_eq!(shell.event_rows[0]["text_content"], "shell initialized");
     }
 }

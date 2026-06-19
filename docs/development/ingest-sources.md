@@ -18,7 +18,7 @@ all rows that leave the adapter.
 | `codex` | `sources/codex.rs` | `openai` | `jsonl` | OpenAI/Codex events, response items, tool calls, compaction, token counts. |
 | `claude-code` | `sources/claude_code.rs` | `anthropic` | `jsonl` | Claude Code message blocks, operational records, parent/tool external links. |
 | `kimi-cli` | `sources/kimi_cli.rs` | `moonshot` | `jsonl` | Kimi `wire.jsonl`; skips metadata headers and drops parent `SubagentEvent` rows. |
-| `opencode` | `sources/opencode.rs` | record-derived | `opencode_sqlite` | OpenCode `opencode*.db`; session, message, part, and session-message rows only. Credential/account tables are deliberately out of scope. |
+| `opencode` | `sources/opencode.rs` | record-derived | `opencode_sqlite` | OpenCode `opencode*.db`; append-only conversation events synthesized into session, message, part, and session-message records. Credential/account tables are deliberately out of scope. |
 | `cursor` | `sources/cursor.rs` | `cursor` | `jsonl` or `cursor_sqlite` | Cursor Agent transcripts under `agent-transcripts/`; text blocks, tool-use blocks, and local file references. Also normalizes the synthetic `cursor_composer`/`cursor_bubble` records produced by polling `state.vscdb` (see SQLite-Polled Sources below); composer names become `session_meta` events that carry the session title. |
 | `hermes` | `sources/hermes.rs` | record-derived | `jsonl` or `session_json` | ShareGPT trajectories and live Hermes session JSON with vendor/model splitting. |
 | `pi-coding-agent` | `sources/pi.rs` | record-derived | `jsonl` | Pi session JSONL trees, model/thinking metadata, assistant tool calls, tool results, and parent links. |
@@ -125,34 +125,40 @@ and `sources/opencode.rs` does the same for `opencode_*` rows. The
 
 Mechanics that differ from file-backed sources:
 
-- **Hash-based change cursor.** Cursor's `cursorDiskKV` table has no rowid or
+- **Hash-based Cursor cursors.** Cursor's `cursorDiskKV` table has no rowid or
   timestamp watermark, so the poll cursor is a per-key content-hash map
   persisted in the `ingest_checkpoints.cursor_json` column (migration
   `sql/015_sqlite_checkpoint_cursor.sql`). A poll emits synthetic records only
   for keys that are new or whose hash changed, and prunes deleted keys after
   each full scan.
-- **Tuple table cursors.** OpenCode's conversation tables expose
-  `time_updated` and `id`, so `opencode_sqlite` persists one
-  `(watermark_ms, tie_id)` cursor per allowlisted table: `session`, `message`,
-  `part`, and `session_message`.
+- **Append-only OpenCode cursors.** OpenCode's projection tables are mutable
+  and incomplete during streaming. The poller instead reads only `event` and
+  `event_sequence`, persists the last `seq` seen for each aggregate id, and
+  synthesizes records from new durable events. Repeated updates for the same
+  message or part coalesce to one synthetic record with a stable logical UID.
 - **Bounded prefix scans.** Only the `composerData:` and `bubbleId:` key
   prefixes are scanned, in pages, with a 10,000-key ceiling. Larger key spaces
   fail the poll instead of persisting an oversized cursor. `agentKv:*`,
   `checkpointId:*`, and the entire `ItemTable` (which holds live auth tokens)
   are deliberately out of scope for v1.
-- **Allowlisted table scans.** OpenCode scans only conversation tables listed
-  in `sqlite_poll/opencode.rs`; account, credential, and token-bearing tables
-  are deliberately out of scope.
-- **Stable logical event UIDs.** UID material derives from the kv key
-  or table row id (`<format>:<table>:<pk>`), not the mutable payload, so a row
-  that mutates in place (streaming text, tool status changes) re-emits the
-  same event UIDs with a newer `event_version` and `ReplacingMergeTree`
-  collapses them.
-- **Sidecar watching.** `moraine_config::map_tracked_path` maps
-  `state.vscdb-wal`/`state.vscdb-shm` filesystem events back to the canonical
-  `state.vscdb` path so WAL-only writes trigger polls; `state.vscdb.backup` is
-  untracked. Databases are opened read-only with a short busy timeout, and
-  Moraine never checkpoints another application's WAL.
+- **Allowlisted OpenCode surface.** OpenCode never reads account, credential,
+  or token-bearing tables. Known session, message, part, and model-switch
+  events become `opencode_*` synthetic records. Unknown event types are ignored
+  until Moraine intentionally maps them. The event cursor has a 10,000-event
+  ceiling plus row/scan byte ceilings so a large history fails the poll instead
+  of persisting an oversized checkpoint.
+- **Stable logical event UIDs.** Cursor UID material derives from the kv key,
+  not the mutable payload, so a rewritten row re-emits the same event UIDs with
+  a newer `event_version` and `ReplacingMergeTree` collapses them. OpenCode UID
+  material derives from the synthetic logical record (`session`, `message`,
+  `part`, or `session_message`) plus source id, so multiple append-only updates
+  for the same message or part coalesce to the same normalized event identity.
+- **Sidecar watching.** `moraine_config::map_tracked_path` maps SQLite
+  `-wal`/`-shm` filesystem events back to the canonical database path so
+  WAL-only writes trigger polls. Cursor tracks `state.vscdb` sidecars;
+  OpenCode tracks only `opencode*.db` sidecars; unrelated backups or SQLite
+  files are untracked. Databases are opened read-only with a short busy
+  timeout, and Moraine never checkpoints another application's WAL.
 - **Rate-limited errors.** Failures surface as `ingest_errors` rows with kinds
   `sqlite_open_error`, `sqlite_schema_mismatch`, `sqlite_cursor_too_large`, and
   `sqlite_scan_error`. The cursor records the last reported kind so a
@@ -161,7 +167,7 @@ Mechanics that differ from file-backed sources:
 
 Fixtures: `fixtures/cursor/state-vscdb-kv.jsonl` stores `cursorDiskKV` rows as
 JSONL (`key`/`value` pairs), and `fixtures/opencode/session.jsonl` stores the
-OpenCode synthetic record shapes expected from table scans. Golden contract
+OpenCode synthetic record shapes expected from event scans. Golden contract
 tests feed records through the production normalization path, so output cannot
 drift silently from adapters. Unit tests in `sqlite_poll.rs` and
 `sqlite_poll/opencode/tests.rs` build temporary `rusqlite` databases to cover

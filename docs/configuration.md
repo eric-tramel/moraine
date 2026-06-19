@@ -233,7 +233,7 @@ for changes. `format` controls the file parser:
 | `jsonl` | Append-only newline-delimited trace records. This is the default for most sources. |
 | `session_json` | One JSON file per live session that is rewritten in place. Moraine emits only newly appended synthetic session records. |
 | `cursor_sqlite` | Cursor `state.vscdb` SQLite databases. Moraine polls the database read-only and emits synthetic records for new or changed rows. |
-| `opencode_sqlite` | OpenCode `opencode*.db` SQLite databases. Moraine polls the database read-only and emits synthetic records from conversation tables only. |
+| `opencode_sqlite` | OpenCode `opencode*.db` SQLite databases. Moraine polls the database read-only and emits synthetic records from append-only conversation events. |
 
 When `format` is omitted, Moraine infers it. Hermes sources with a `.json` glob
 are inferred as `session_json`, Cursor globs ending in `.vscdb` are inferred as
@@ -242,7 +242,7 @@ inferred as `opencode_sqlite`, and otherwise sources are treated as `jsonl`.
 
 ## Source Matrix
 
-The default template in `config/moraine.toml` enables these source families:
+The default template in `config/moraine.toml` includes these source families:
 
 | Source | Harness | Default glob | Watch root | Format |
 | --- | --- | --- | --- | --- |
@@ -261,8 +261,8 @@ harness is the same but the file format differs. Use a separate
 `[[ingest.sources]]` entry for each watched directory. Cursor likewise has two
 trace forms under one harness: Agent transcript JSONL and SQLite chat history
 (`cursor_sqlite`); both are enabled by default. OpenCode stores conversation
-history in default or channel-specific SQLite databases (`opencode_sqlite`),
-enabled by default.
+history in default or channel-specific SQLite databases (`opencode_sqlite`);
+the template enables it by default.
 
 ## Source Examples
 
@@ -313,8 +313,7 @@ format = "opencode_sqlite"
 ```
 
 This source polls OpenCode's `opencode*.db` databases read-only and ingests
-only conversation data from `session`, `message`, `part`, and
-`session_message`.
+conversation records synthesized from the `event` and `event_sequence` tables.
 Account, credential, and token-bearing tables are deliberately out of scope.
 Moraine also reacts to the `-wal`/`-shm` sidecar files so WAL-only writes
 trigger polls.
