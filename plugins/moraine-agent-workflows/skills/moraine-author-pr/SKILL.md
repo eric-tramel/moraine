@@ -60,7 +60,7 @@ Good:
 ## What
 
 - Adds a repo-local `moraine-agent-workflows` plugin.
-- Vendors `$moraine-start-work`, `$moraine-author-pr`, and `$moraine-sandbox-qa` skills.
+- Vendors `$moraine-agent-workflows:moraine-start-work`, `$moraine-agent-workflows:moraine-author-pr`, and `$moraine-agent-workflows:moraine-sandbox-qa` skills.
 - Documents local installation in `docs/development/agent-contributor-workflows.md`.
 ```
 
@@ -101,7 +101,7 @@ codex plugin marketplace add .
 Then enable `moraine-agent-workflows` and invoke:
 
 ```text
-Use $moraine-author-pr to draft this PR.
+Use $moraine-agent-workflows:moraine-author-pr to draft this PR.
 ```
 ````
 

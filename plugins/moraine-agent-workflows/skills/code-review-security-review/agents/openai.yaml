@@ -1,4 +1,4 @@
 interface:
   display_name: "CodeReviewSecurityReview"
   short_description: "Review code for security risks"
-  default_prompt: "Use $code-review-security-review to review this PR for security risks."
+  default_prompt: "Use $moraine-agent-workflows:code-review-security-review to review this PR for security risks."

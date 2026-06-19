@@ -63,6 +63,6 @@ cargo fmt --all -- --check
 cargo test --workspace --locked
 ```
 
-For ingest, MCP, monitor, ClickHouse schema, source-format, or stack-behavior changes, use `$moraine-sandbox-qa` before reporting the task complete.
+For ingest, MCP, monitor, ClickHouse schema, source-format, or stack-behavior changes, use `$moraine-agent-workflows:moraine-sandbox-qa` before reporting the task complete.
 
 End with the changed paths, validation commands, and any validation you intentionally skipped.

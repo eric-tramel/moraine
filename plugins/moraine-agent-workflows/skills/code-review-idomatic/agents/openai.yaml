@@ -1,4 +1,4 @@
 interface:
   display_name: "CodeReviewIdomatic"
   short_description: "Review code for language idioms"
-  default_prompt: "Use $code-review-idomatic to review this PR for idiomatic implementation."
+  default_prompt: "Use $moraine-agent-workflows:code-review-idomatic to review this PR for idiomatic implementation."

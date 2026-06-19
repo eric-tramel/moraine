@@ -13,20 +13,20 @@ Use this skill to run one coordinated review wave across all focused review pers
 
 Launch exactly one subagent for each persona:
 
-- `$code-review-elegance`
-- `$code-review-idomatic`
-- `$code-review-correctness`
-- `$code-review-completeness`
-- `$code-review-security-review`
-- `$code-review-yagni`
-- `$code-review-scope`
+- `$moraine-agent-workflows:code-review-elegance`
+- `$moraine-agent-workflows:code-review-idomatic`
+- `$moraine-agent-workflows:code-review-correctness`
+- `$moraine-agent-workflows:code-review-completeness`
+- `$moraine-agent-workflows:code-review-security-review`
+- `$moraine-agent-workflows:code-review-yagni`
+- `$moraine-agent-workflows:code-review-scope`
 
 Give each reviewer the same raw review packet: PR description, cited issue or objective, relevant diff, changed files, validation results, and any constraints from the user. Do not include your intended fix or your private diagnosis in the prompt.
 
 Use prompts shaped like:
 
 ```text
-Use $code-review-correctness to review this PR. Focus only on your persona's facet.
+Use $moraine-agent-workflows:code-review-correctness to review this PR. Focus only on your persona's facet.
 Return findings first, with severity and file/line references when available.
 If there are no findings, say so and mention residual risk.
 

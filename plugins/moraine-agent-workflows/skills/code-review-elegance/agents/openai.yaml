@@ -1,4 +1,4 @@
 interface:
   display_name: "CodeReviewElegance"
   short_description: "Review code for elegant minimal design"
-  default_prompt: "Use $code-review-elegance to review this PR for elegant minimal design."
+  default_prompt: "Use $moraine-agent-workflows:code-review-elegance to review this PR for elegant minimal design."
