@@ -21,6 +21,7 @@ nav = [
     { "Interface Specification" = "mcp-search-interface-spec.md" },
   ] },
   { "Development" = [
+    { "Agent Contributor Workflows" = "development/agent-contributor-workflows.md" },
     { "Ingest Sources" = "development/ingest-sources.md" },
     { "Harness Author Workflow" = "development/harness-author-workflow.md" },
   ] },

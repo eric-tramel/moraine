@@ -1,0 +1,4 @@
+interface:
+  display_name: "Moraine Sandbox QA"
+  short_description: "Run isolated sandbox validation for Moraine"
+  default_prompt: "Use $moraine-dev:moraine-sandbox-qa to validate Moraine changes in the dev sandbox."
