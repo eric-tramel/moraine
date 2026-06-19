@@ -61,7 +61,8 @@ wait_for_async_insert = true
 
 For a managed local install, leave these values at their defaults. For an
 external ClickHouse instance, point `url`, credentials, and `database` at that
-server.
+server. For a complete single-user walkthrough, including Docker and personal
+server examples, see [Remote ClickHouse Tutorial](remote-clickhouse.md).
 
 `[clickhouse]` is an alias for `[backends.default]`. To mirror specific
 projects to additional servers, see

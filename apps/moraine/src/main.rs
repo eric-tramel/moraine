@@ -7,7 +7,7 @@ use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, Widget, Wrap};
-use reqwest::Client;
+use reqwest::{Client, Url};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
@@ -330,10 +330,9 @@ struct ClickhouseStatusSnapshot {
 enum StartState {
     Started,
     AlreadyRunning,
-    /// A live central MCP server already owns the socket but no fresh PID file
-    /// tracks it (e.g. the file was deleted while the daemon survived). Nothing
-    /// was spawned: a second daemon would no-op-exit, and recording its PID
-    /// would clobber the file with a dead PID, breaking `status` and `down`.
+    /// A service endpoint is already healthy but not launcher-tracked, such as
+    /// an external ClickHouse endpoint or a live central MCP server whose PID
+    /// file was lost. Nothing was spawned.
     AlreadyServing,
 }
 
@@ -715,7 +714,7 @@ fn load_cfg(raw_config: Option<PathBuf>) -> Result<(PathBuf, AppConfig)> {
 }
 
 fn clickhouse_ports_from_url(cfg: &AppConfig) -> Result<(u16, u16, u16)> {
-    let parsed = reqwest::Url::parse(&cfg.clickhouse.url)
+    let parsed = Url::parse(&cfg.clickhouse.url)
         .with_context(|| format!("invalid clickhouse.url '{}'", cfg.clickhouse.url))?;
     let http_port = parsed.port_or_known_default().ok_or_else(|| {
         anyhow!(
@@ -733,6 +732,22 @@ fn clickhouse_ports_from_url(cfg: &AppConfig) -> Result<(u16, u16, u16)> {
         )
     })?;
     Ok((http_port, tcp_port, interserver_http_port))
+}
+
+fn clickhouse_url_is_local(cfg: &AppConfig) -> Result<bool> {
+    let parsed = Url::parse(&cfg.clickhouse.url)
+        .with_context(|| format!("invalid clickhouse.url '{}'", cfg.clickhouse.url))?;
+    let Some(host) = parsed.host_str() else {
+        bail!(
+            "clickhouse.url '{}' must include a host",
+            cfg.clickhouse.url
+        );
+    };
+
+    Ok(matches!(
+        host.to_ascii_lowercase().as_str(),
+        "localhost" | "127.0.0.1" | "::1" | "[::1]" | "0.0.0.0" | "::" | "[::]"
+    ))
 }
 
 fn materialize_clickhouse_config(cfg: &AppConfig, paths: &RuntimePaths) -> Result<()> {
@@ -1211,6 +1226,26 @@ async fn start_clickhouse(cfg: &AppConfig, paths: &RuntimePaths) -> Result<Start
             pid: Some(pid),
             log_path: Some(log_path(paths, Service::ClickHouse).display().to_string()),
         });
+    }
+
+    let url_is_local = clickhouse_url_is_local(cfg)?;
+    let client = ClickHouseClient::new(cfg.clickhouse.clone())?;
+    match client.ping().await {
+        Ok(()) => {
+            return Ok(StartOutcome {
+                service: Service::ClickHouse,
+                state: StartState::AlreadyServing,
+                pid: None,
+                log_path: None,
+            });
+        }
+        Err(err) if !url_is_local => {
+            bail!(
+                "clickhouse.url '{}' points at a non-local endpoint, but the endpoint is not healthy: {err}. start or repair that ClickHouse endpoint before running `moraine up`; Moraine only starts managed ClickHouse for local URLs",
+                cfg.clickhouse.url
+            );
+        }
+        Err(_) => {}
     }
 
     cleanup_legacy_clickhouse_pipe_log(paths);
@@ -2839,6 +2874,34 @@ mod tests {
         cfg.clickhouse.url = "not-a-url".to_string();
         let err = clickhouse_ports_from_url(&cfg).expect_err("invalid url");
         assert!(err.to_string().contains("invalid clickhouse.url"));
+    }
+
+    #[test]
+    fn clickhouse_url_is_local_accepts_loopback_hosts() {
+        for url in [
+            "http://localhost:8123",
+            "http://127.0.0.1:8123",
+            "http://[::1]:8123",
+            "http://0.0.0.0:8123",
+            "http://[::]:8123",
+        ] {
+            let mut cfg = AppConfig::default();
+            cfg.clickhouse.url = url.to_string();
+            assert!(clickhouse_url_is_local(&cfg).expect(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn clickhouse_url_is_local_rejects_remote_hosts() {
+        for url in [
+            "http://clickhouse.local:8123",
+            "https://clickhouse.example.com:8443",
+            "http://192.168.1.50:8123",
+        ] {
+            let mut cfg = AppConfig::default();
+            cfg.clickhouse.url = url.to_string();
+            assert!(!clickhouse_url_is_local(&cfg).expect(url), "{url}");
+        }
     }
 
     #[test]

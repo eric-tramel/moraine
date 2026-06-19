@@ -13,6 +13,7 @@ nav = [
   { "Introduction" = "introduction.md" },
   { "Quickstart and Installation" = "quickstart.md" },
   { "Configuration" = "configuration.md" },
+  { "Remote ClickHouse" = "remote-clickhouse.md" },
   { "Agent MCP Search" = [
     { "Overview" = "agent-mcp-search/index.md" },
     { "Install by Harness" = "agent-mcp-search/install.md" },
