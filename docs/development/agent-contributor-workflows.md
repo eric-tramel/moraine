@@ -26,8 +26,9 @@ plugins/moraine-dev/
     moraine-sandbox-qa/
 ```
 
-The marketplace entry points to `./plugins/moraine-dev`, and the
-plugin manifest exposes `./skills/`.
+Both the Codex marketplace and plugin are named `moraine-dev`. The marketplace
+entry points to `./plugins/moraine-dev`, and the plugin manifest exposes
+`./skills/`.
 
 ## Install Locally
 

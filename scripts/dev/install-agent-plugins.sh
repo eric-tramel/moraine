@@ -4,6 +4,7 @@ set -euo pipefail
 CODEX_CMD="${CODEX_CMD:-codex}"
 AGENT_PLUGINS_SOURCE="${AGENT_PLUGINS_SOURCE:-main}"
 AGENT_PLUGINS_REMOTE="${AGENT_PLUGINS_REMOTE:-origin}"
+LEGACY_MARKETPLACE_NAMES=("moraine-developer-agents")
 
 die() {
     printf '[agent-plugins] error: %s\n' "$*" >&2
@@ -77,6 +78,12 @@ print(data.get("marketplaceName", ""))
 PY
 )"
 [[ -n "$marketplace_name" ]] || die "Codex did not report a marketplace name"
+
+for legacy_name in "${LEGACY_MARKETPLACE_NAMES[@]}"; do
+    if [[ "$marketplace_name" != "$legacy_name" ]]; then
+        "$CODEX_CMD" plugin marketplace remove "$legacy_name" >/dev/null 2>&1 || true
+    fi
+done
 
 if [[ "$should_upgrade" == 1 ]]; then
     printf '[agent-plugins] syncing Codex marketplace: %s\n' "$marketplace_name"
