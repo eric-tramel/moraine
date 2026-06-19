@@ -20,7 +20,10 @@ walkdir = "2.5"
 same-file = "1.0"
 moraine-config = { path = "../moraine-config" }
 moraine-clickhouse = { path = "../moraine-clickhouse" }
-rusqlite = { version = "0.40.1", features = ["bundled"] }
+# rusqlite 0.40.x pulls libsqlite3-sys 0.38.x, whose build script currently
+# uses unstable cfg_select! and fails on stable Rust. Stay on 0.39.x until the
+# upstream stable build is fixed.
+rusqlite = { version = "0.39.0", features = ["bundled"] }
 
 [dev-dependencies]
 axum = "0.7"
