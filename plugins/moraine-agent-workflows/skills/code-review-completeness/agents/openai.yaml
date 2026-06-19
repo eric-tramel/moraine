@@ -1,4 +1,0 @@
-interface:
-  display_name: "CodeReviewCompleteness"
-  short_description: "Review code against stated objectives"
-  default_prompt: "Use $moraine-agent-workflows:code-review-completeness to review whether this PR satisfies its stated goals."

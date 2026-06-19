@@ -5,10 +5,10 @@
   },
   "plugins": [
     {
-      "name": "moraine-agent-workflows",
+      "name": "moraine-dev",
       "source": {
         "source": "local",
-        "path": "./plugins/moraine-agent-workflows"
+        "path": "./plugins/moraine-dev"
       },
       "policy": {
         "installation": "AVAILABLE",

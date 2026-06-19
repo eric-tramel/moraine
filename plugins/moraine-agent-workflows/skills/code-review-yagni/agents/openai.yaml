@@ -1,4 +1,0 @@
-interface:
-  display_name: "CodeReviewYAGNI"
-  short_description: "Review code for overengineering"
-  default_prompt: "Use $moraine-agent-workflows:code-review-yagni to review this PR for YAGNI and overengineering."

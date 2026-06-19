@@ -1,4 +1,0 @@
-interface:
-  display_name: "CodeReviewScope"
-  short_description: "Review code for scope control"
-  default_prompt: "Use $moraine-agent-workflows:code-review-scope to review whether this PR stays in scope."

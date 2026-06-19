@@ -1,0 +1,4 @@
+interface:
+  display_name: "Moraine Start Work"
+  short_description: "Start isolated Moraine development work"
+  default_prompt: "Use $moraine-dev:moraine-start-work to start a Moraine development task safely."
