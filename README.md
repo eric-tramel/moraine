@@ -27,6 +27,7 @@ change across minor releases.
 - [Introduction](https://eric-tramel.github.io/moraine/introduction.html)
 - [Quickstart and Installation](https://eric-tramel.github.io/moraine/quickstart.html)
 - [Configuration](https://eric-tramel.github.io/moraine/configuration.html)
+- [Remote ClickHouse](https://eric-tramel.github.io/moraine/remote-clickhouse.html)
 - [Agent MCP Search](https://eric-tramel.github.io/moraine/agent-mcp-search/index.html)
 
 ## Supported Agent Harnesses

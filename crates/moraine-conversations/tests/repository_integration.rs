@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_if, clippy::too_many_arguments)]
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 

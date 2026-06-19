@@ -13,6 +13,7 @@ target/
 .worktrees/
 .vscode/
 .idea/
+plans/
 
 # Build and generated output
 *.log

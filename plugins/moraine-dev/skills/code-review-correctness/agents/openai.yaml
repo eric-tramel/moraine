@@ -1,0 +1,4 @@
+interface:
+  display_name: "CodeReviewCorrectness"
+  short_description: "Review code for bugs and correctness"
+  default_prompt: "Use $moraine-dev:code-review-correctness to review this PR for bugs."

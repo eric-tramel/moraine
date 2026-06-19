@@ -1,0 +1,263 @@
+mod down;
+mod logs;
+mod status;
+mod up;
+
+use anyhow::{bail, Context, Result};
+use moraine_clickhouse::{ClickHouseClient, DoctorReport};
+use moraine_config::AppConfig;
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use crate::cli::{Cli, CliCommand, ClickhouseCommand, ConfigCommand, DbCommand, RunArgs};
+use crate::managed_clickhouse::{
+    cmd_clickhouse_install, cmd_clickhouse_status, cmd_clickhouse_uninstall,
+    run_foreground_clickhouse,
+};
+use crate::paths::{load_cfg, runtime_paths};
+use crate::process::{require_service_binary, service_args_with_defaults};
+use crate::render::{
+    render_clickhouse_status, render_db_doctor, render_db_migrate, render_logs, state_label,
+    CliOutput, MigrationOutcome,
+};
+use crate::service::Service;
+
+pub(crate) async fn dispatch(cli: Cli, output: CliOutput) -> Result<ExitCode> {
+    match cli.command {
+        CliCommand::Up(args) => {
+            let (config_path, cfg) = load_cfg(cli.config.clone())?;
+            up::handle_args(&output, &config_path, &cfg, &args).await
+        }
+        CliCommand::Down => {
+            let (_, cfg) = load_cfg(cli.config.clone())?;
+            down::handle(&output, &cfg)
+        }
+        CliCommand::Status => {
+            let (_, cfg) = load_cfg(cli.config.clone())?;
+            let paths = runtime_paths(&cfg);
+            let snapshot = status::cmd_status(&paths, &cfg).await?;
+            crate::render::render_status(&output, &snapshot)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        CliCommand::Logs(args) => {
+            let (_, cfg) = load_cfg(cli.config.clone())?;
+            let paths = runtime_paths(&cfg);
+            let snapshot = logs::collect_logs(&paths, args.service, args.lines)?;
+            render_logs(&output, &snapshot)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        CliCommand::Db(args) => {
+            let (_, cfg) = load_cfg(cli.config.clone())?;
+            match args.command {
+                DbCommand::Migrate => {
+                    let outcome = cmd_db_migrate(&cfg).await?;
+                    render_db_migrate(&output, &outcome)?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                DbCommand::Doctor => {
+                    let report = cmd_db_doctor(&cfg).await?;
+                    render_db_doctor(&output, &report)?;
+                    if doctor_is_healthy(&report) {
+                        Ok(ExitCode::SUCCESS)
+                    } else {
+                        Ok(ExitCode::from(1))
+                    }
+                }
+            }
+        }
+        CliCommand::Clickhouse(args) => {
+            let (_, cfg) = load_cfg(cli.config.clone())?;
+            let paths = runtime_paths(&cfg);
+            match args.command {
+                ClickhouseCommand::Install(install) => {
+                    let version = install
+                        .version
+                        .unwrap_or_else(|| cfg.runtime.clickhouse_version.clone());
+                    let installed = cmd_clickhouse_install(&paths, &version, install.force).await?;
+                    if output.is_json() {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "installed_path": installed.display().to_string(),
+                                "version": version,
+                                "force": install.force,
+                            }))?
+                        );
+                    } else {
+                        output.section(
+                            "Managed ClickHouse Install",
+                            &[
+                                format!("installed binary: {}", installed.display()),
+                                format!("version: {version}"),
+                                format!("force: {}", state_label(install.force)),
+                            ],
+                        );
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                ClickhouseCommand::Status => {
+                    let snapshot = cmd_clickhouse_status(&cfg, &paths);
+                    render_clickhouse_status(&output, &snapshot)?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                ClickhouseCommand::Uninstall => {
+                    let removed = cmd_clickhouse_uninstall(&paths)?;
+                    if output.is_json() {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "removed_path": removed
+                            }))?
+                        );
+                    } else {
+                        output.section(
+                            "Managed ClickHouse Uninstall",
+                            &[format!("removed: {removed}")],
+                        );
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+            }
+        }
+        CliCommand::Config(args) => {
+            let (_, cfg) = load_cfg(cli.config.clone())?;
+            match args.command {
+                ConfigCommand::Get(get) => {
+                    let value = cmd_config_get(&cfg, &get.key)?;
+                    if output.is_json() {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "key": get.key,
+                                "value": value,
+                            }))?
+                        );
+                    } else {
+                        println!("{value}");
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+            }
+        }
+        CliCommand::Run(run) => run_service(cli.config.clone(), run).await,
+    }
+}
+
+async fn run_service(global_config: Option<PathBuf>, run: RunArgs) -> Result<ExitCode> {
+    let (inline_config, passthrough) = parse_config_flag(&run.args)?;
+    let raw_config = inline_config.or(global_config);
+    let (config_path, cfg) = load_cfg(raw_config)?;
+    let paths = runtime_paths(&cfg);
+    if run.service == Service::ClickHouse {
+        return run_foreground_clickhouse(&cfg, &paths).await;
+    }
+
+    let binary = require_service_binary(run.service, &paths)?;
+    let args = service_args_with_defaults(run.service, &config_path, &cfg, &paths, &passthrough);
+
+    let status = std::process::Command::new(binary)
+        .args(args)
+        .status()
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("failed to run {}", run.service.name()))?;
+
+    Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
+}
+
+async fn cmd_db_migrate(cfg: &AppConfig) -> Result<MigrationOutcome> {
+    let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
+    let applied = ch.run_migrations().await?;
+    Ok(MigrationOutcome { applied })
+}
+
+async fn cmd_db_doctor(cfg: &AppConfig) -> Result<DoctorReport> {
+    let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
+    ch.doctor_report().await
+}
+
+fn parse_config_flag(args: &[String]) -> Result<(Option<PathBuf>, Vec<String>)> {
+    let mut raw_config = None;
+    let mut rest = Vec::new();
+
+    let mut i = 0usize;
+    while i < args.len() {
+        if args[i] == "--config" {
+            if i + 1 >= args.len() {
+                bail!("--config requires a path");
+            }
+            raw_config = Some(PathBuf::from(args[i + 1].clone()));
+            i += 2;
+            continue;
+        }
+
+        rest.push(args[i].clone());
+        i += 1;
+    }
+
+    Ok((raw_config, rest))
+}
+
+fn cmd_config_get(cfg: &AppConfig, key: &str) -> Result<String> {
+    match key {
+        "clickhouse.url" => Ok(cfg.clickhouse.url.clone()),
+        "clickhouse.database" => Ok(cfg.clickhouse.database.clone()),
+        _ => bail!(
+            "unsupported config key '{}'; supported keys: clickhouse.url, clickhouse.database",
+            key
+        ),
+    }
+}
+
+fn doctor_is_healthy(report: &DoctorReport) -> bool {
+    report.clickhouse_healthy
+        && report.database_exists
+        && report.pending_migrations.is_empty()
+        && report.missing_tables.is_empty()
+        && report.errors.is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_config_flag_preserves_inline_config_and_rest() {
+        let args = vec![
+            "--config".to_string(),
+            "/tmp/moraine.toml".to_string(),
+            "--stdio".to_string(),
+        ];
+        let (config, rest) = parse_config_flag(&args).expect("parse config");
+        assert_eq!(config, Some(PathBuf::from("/tmp/moraine.toml")));
+        assert_eq!(rest, vec!["--stdio".to_string()]);
+    }
+
+    #[test]
+    fn parse_config_flag_rejects_dangling_config() {
+        let err = parse_config_flag(&["--config".to_string()]).expect_err("dangling config");
+        assert!(err.to_string().contains("--config requires a path"));
+    }
+
+    #[test]
+    fn cmd_config_get_returns_supported_keys() {
+        let mut cfg = AppConfig::default();
+        cfg.clickhouse.url = "http://127.0.0.1:18123".to_string();
+        cfg.clickhouse.database = "analytics".to_string();
+
+        assert_eq!(
+            cmd_config_get(&cfg, "clickhouse.url").expect("url"),
+            "http://127.0.0.1:18123"
+        );
+        assert_eq!(
+            cmd_config_get(&cfg, "clickhouse.database").expect("database"),
+            "analytics"
+        );
+    }
+
+    #[test]
+    fn cmd_config_get_rejects_unknown_key() {
+        let cfg = AppConfig::default();
+        let err = cmd_config_get(&cfg, "runtime.root_dir").expect_err("unknown key");
+        assert!(err.to_string().contains("unsupported config key"));
+    }
+}
