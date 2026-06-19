@@ -9,6 +9,7 @@ pub const KNOWN_INGEST_HARNESSES: &[&str] = &[
     "cursor",
     "hermes",
     "kimi-cli",
+    "opencode",
     "pi-coding-agent",
 ];
 
@@ -28,9 +29,12 @@ pub struct IngestSource {
     /// On-disk trace format: `"jsonl"` (append-only newline-delimited records,
     /// the default used by Codex, Claude Code, Kimi CLI, and Hermes ShareGPT
     /// dumps), `"session_json"` (single-file-per-session JSON rewritten in
-    /// place via atomic rename — used by live Hermes agent sessions), or
-    /// `"cursor_sqlite"` (polled Cursor `state.vscdb` SQLite databases). Empty
-    /// means "infer": hermes + `*.json` glob → `session_json`, otherwise `jsonl`.
+    /// place via atomic rename — used by live Hermes agent sessions),
+    /// `"cursor_sqlite"` (polled Cursor `state.vscdb` SQLite databases), or
+    /// `"opencode_sqlite"` (polled OpenCode `opencode*.db` SQLite databases).
+    /// Empty means "infer": Hermes `*.json` globs use `session_json`, Cursor
+    /// `.vscdb` globs use `cursor_sqlite`, OpenCode `opencode*.db` globs use
+    /// `opencode_sqlite`, and other sources use `jsonl`.
     #[serde(default)]
     pub format: String,
 }
@@ -445,6 +449,14 @@ fn default_sources() -> Vec<IngestSource> {
             format: String::new(),
         },
         IngestSource {
+            name: "opencode".to_string(),
+            harness: "opencode".to_string(),
+            enabled: true,
+            glob: "~/.local/share/opencode/opencode*.db".to_string(),
+            watch_root: "~/.local/share/opencode".to_string(),
+            format: SOURCE_FORMAT_OPENCODE_SQLITE.to_string(),
+        },
+        IngestSource {
             name: "cursor".to_string(),
             harness: "cursor".to_string(),
             enabled: true,
@@ -474,6 +486,7 @@ fn default_sources() -> Vec<IngestSource> {
 pub const SOURCE_FORMAT_JSONL: &str = "jsonl";
 pub const SOURCE_FORMAT_SESSION_JSON: &str = "session_json";
 pub const SOURCE_FORMAT_CURSOR_SQLITE: &str = "cursor_sqlite";
+pub const SOURCE_FORMAT_OPENCODE_SQLITE: &str = "opencode_sqlite";
 
 /// SQLite WAL sidecar suffixes that must map back to the canonical database
 /// path for watching/debouncing. WAL-mode writes often touch only these files,
@@ -487,6 +500,9 @@ fn infer_source_format(harness: &str, glob: &str) -> &'static str {
     // another harness would silently produce junk events.
     if harness == "cursor" && glob_lower.ends_with(".vscdb") {
         return SOURCE_FORMAT_CURSOR_SQLITE;
+    }
+    if harness == "opencode" && opencode_db_name_matches(Path::new(&glob_lower)) {
+        return SOURCE_FORMAT_OPENCODE_SQLITE;
     }
     let looks_like_json = !glob_lower.ends_with(".jsonl")
         && (glob_lower.ends_with(".json") || glob_lower.contains(".json"));
@@ -514,11 +530,15 @@ fn normalize_source_format(
         SOURCE_FORMAT_CURSOR_SQLITE if harness != "cursor" => Err(anyhow::anyhow!(
             "ingest.sources[{source_idx}].format `{SOURCE_FORMAT_CURSOR_SQLITE}` requires harness `cursor` (source `{source_name}` has harness `{harness}`); its synthetic records only normalize through the cursor adapter"
         )),
-        SOURCE_FORMAT_JSONL | SOURCE_FORMAT_SESSION_JSON | SOURCE_FORMAT_CURSOR_SQLITE => {
-            Ok(resolved)
-        }
+        SOURCE_FORMAT_OPENCODE_SQLITE if harness != "opencode" => Err(anyhow::anyhow!(
+            "ingest.sources[{source_idx}].format `{SOURCE_FORMAT_OPENCODE_SQLITE}` requires harness `opencode` (source `{source_name}` has harness `{harness}`); its synthetic records only normalize through the opencode adapter"
+        )),
+        SOURCE_FORMAT_JSONL
+        | SOURCE_FORMAT_SESSION_JSON
+        | SOURCE_FORMAT_CURSOR_SQLITE
+        | SOURCE_FORMAT_OPENCODE_SQLITE => Ok(resolved),
         _ => Err(anyhow::anyhow!(
-            "invalid ingest.sources[{source_idx}].format `{}` for source `{}`; expected one of: {SOURCE_FORMAT_JSONL}, {SOURCE_FORMAT_SESSION_JSON}, {SOURCE_FORMAT_CURSOR_SQLITE}",
+            "invalid ingest.sources[{source_idx}].format `{}` for source `{}`; expected one of: {SOURCE_FORMAT_JSONL}, {SOURCE_FORMAT_SESSION_JSON}, {SOURCE_FORMAT_CURSOR_SQLITE}, {SOURCE_FORMAT_OPENCODE_SQLITE}",
             format.trim(),
             source_name
         )),
@@ -527,7 +547,7 @@ fn normalize_source_format(
 
 impl IngestSource {
     /// Returns the file extension (without leading `.`) this source's format
-    /// records are stored in: `jsonl`, `json`, or `vscdb`.
+    /// records are stored in: `jsonl`, `json`, `vscdb`, or `db`.
     pub fn tracked_extension(&self) -> &'static str {
         format_tracked_extension(&self.format)
     }
@@ -537,8 +557,22 @@ fn format_tracked_extension(format: &str) -> &'static str {
     match format {
         SOURCE_FORMAT_SESSION_JSON => "json",
         SOURCE_FORMAT_CURSOR_SQLITE => "vscdb",
+        SOURCE_FORMAT_OPENCODE_SQLITE => "db",
         _ => "jsonl",
     }
+}
+
+fn opencode_db_name_matches(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            let lower = name.to_ascii_lowercase();
+            lower.starts_with("opencode")
+                && lower.ends_with(".db")
+                && !lower.ends_with(".db-wal")
+                && !lower.ends_with(".db-shm")
+        })
+        .unwrap_or(false)
 }
 
 /// Maps a filesystem path seen by enumeration or the watcher to the canonical
@@ -559,6 +593,20 @@ pub fn map_tracked_path(format: &str, path: &str) -> Option<String> {
             .map(|ext| ext == extension)
             .unwrap_or(false)
     };
+
+    if format == SOURCE_FORMAT_OPENCODE_SQLITE {
+        if opencode_db_name_matches(Path::new(path)) {
+            return Some(path.to_string());
+        }
+        for suffix in SQLITE_SIDECAR_SUFFIXES {
+            if let Some(base) = path.strip_suffix(suffix) {
+                if opencode_db_name_matches(Path::new(base)) {
+                    return Some(base.to_string());
+                }
+            }
+        }
+        return None;
+    }
 
     if has_extension(path) {
         return Some(path.to_string());
@@ -1436,7 +1484,7 @@ watch_root = "~/.custom/sessions"
         std::fs::remove_file(&path).ok();
         assert!(
             format!("{err:#}").contains(
-                "expected one of: codex, claude-code, cursor, hermes, kimi-cli, pi-coding-agent"
+                "expected one of: codex, claude-code, cursor, hermes, kimi-cli, opencode, pi-coding-agent"
             ),
             "unexpected error: {err:#}"
         );
@@ -1459,7 +1507,7 @@ watch_root = "~/.claude/projects"
         std::fs::remove_file(&path).ok();
         assert!(
             format!("{err:#}").contains(
-                "expected one of: codex, claude-code, cursor, hermes, kimi-cli, pi-coding-agent"
+                "expected one of: codex, claude-code, cursor, hermes, kimi-cli, opencode, pi-coding-agent"
             ),
             "unexpected error: {err:#}"
         );
@@ -1597,6 +1645,19 @@ watch_root = "~/.cursor/projects"
     }
 
     #[test]
+    fn default_sources_enable_opencode_sqlite() {
+        let sources = default_sources();
+        let source = sources
+            .iter()
+            .find(|source| source.name == "opencode")
+            .expect("defaults include an opencode source");
+        assert!(source.enabled, "opencode_sqlite is default on");
+        assert_eq!(source.harness, "opencode");
+        assert_eq!(source.format, SOURCE_FORMAT_OPENCODE_SQLITE);
+        assert_eq!(source.glob, "~/.local/share/opencode/opencode*.db");
+    }
+
+    #[test]
     fn load_config_accepts_cursor_sqlite_format() {
         let path = write_temp_config(
             r#"
@@ -1624,6 +1685,33 @@ format = "cursor_sqlite"
     }
 
     #[test]
+    fn load_config_accepts_opencode_sqlite_format() {
+        let path = write_temp_config(
+            r#"
+[[ingest.sources]]
+name = "opencode"
+harness = "opencode"
+enabled = false
+glob = "~/.local/share/opencode/opencode*.db"
+watch_root = "~/.local/share/opencode"
+format = "opencode_sqlite"
+"#,
+            "opencode-sqlite-format",
+        );
+        let cfg = load_config(&path).expect("opencode_sqlite format should be accepted");
+        std::fs::remove_file(&path).ok();
+        let source = cfg
+            .ingest
+            .sources
+            .iter()
+            .find(|source| source.name == "opencode")
+            .expect("opencode source");
+        assert_eq!(source.format, SOURCE_FORMAT_OPENCODE_SQLITE);
+        assert_eq!(source.tracked_extension(), "db");
+        assert!(!source.enabled);
+    }
+
+    #[test]
     fn load_config_rejects_unknown_format_value() {
         let path = write_temp_config(
             r#"
@@ -1640,7 +1728,8 @@ format = "sqlite"
         let err = load_config(&path).expect_err("unknown format should fail");
         std::fs::remove_file(&path).ok();
         assert!(
-            format!("{err:#}").contains("expected one of: jsonl, session_json, cursor_sqlite"),
+            format!("{err:#}")
+                .contains("expected one of: jsonl, session_json, cursor_sqlite, opencode_sqlite"),
             "unexpected error: {err:#}"
         );
     }
@@ -1688,6 +1777,44 @@ format = "sqlite"
         );
         assert_eq!(
             map_tracked_path(SOURCE_FORMAT_CURSOR_SQLITE, "/tmp/User/notes.jsonl"),
+            None
+        );
+
+        let opencode = "/tmp/opencode/opencode.db";
+        assert_eq!(
+            map_tracked_path(SOURCE_FORMAT_OPENCODE_SQLITE, opencode),
+            Some(opencode.to_string())
+        );
+        assert_eq!(
+            map_tracked_path(
+                SOURCE_FORMAT_OPENCODE_SQLITE,
+                "/tmp/opencode/opencode-local.db"
+            ),
+            Some("/tmp/opencode/opencode-local.db".to_string())
+        );
+        assert_eq!(
+            map_tracked_path(
+                SOURCE_FORMAT_OPENCODE_SQLITE,
+                "/tmp/opencode/opencode.db-wal"
+            ),
+            Some("/tmp/opencode/opencode.db".to_string())
+        );
+        assert_eq!(
+            map_tracked_path(
+                SOURCE_FORMAT_OPENCODE_SQLITE,
+                "/tmp/opencode/opencode.db-shm"
+            ),
+            Some("/tmp/opencode/opencode.db".to_string())
+        );
+        assert_eq!(
+            map_tracked_path(SOURCE_FORMAT_OPENCODE_SQLITE, "/tmp/opencode/unrelated.db"),
+            None
+        );
+        assert_eq!(
+            map_tracked_path(
+                SOURCE_FORMAT_OPENCODE_SQLITE,
+                "/tmp/opencode/unrelated.db-wal"
+            ),
             None
         );
     }
