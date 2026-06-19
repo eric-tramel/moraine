@@ -9,6 +9,16 @@ description: Start Moraine repository development work safely. Use when an agent
 
 Use this workflow to start a Moraine contributor task with the same orientation every time: verify the checkout, isolate the branch, read governing instructions, and choose the right validation path before editing.
 
+## Follow-On Workflow
+
+After the start checklist and branch/worktree setup, run the rest of the contributor workflow in this order:
+
+1. Use `$moraine-dev:crystallize` to turn rough or ambiguous input into a ready-to-implement local plan.
+2. Implement the scoped change from that plan or, when the task is already concrete, from the user's explicit request.
+3. Use `$moraine-dev:code-review` and iterate fixes until the review is clean or every remaining item is explicitly rejected or deferred with rationale.
+4. Use `$moraine-dev:moraine-sandbox-qa` for stack-facing changes and iterate fixes until sandbox QA is clean. For changes that do not need sandbox QA, record why it was skipped.
+5. Use `$moraine-dev:moraine-author-pr` to draft the PR title and description from the final diff, evidence, and validation results.
+
 ## Start Checklist
 
 Run these from the repository root unless the current harness already supplied a trusted workspace root:
