@@ -82,7 +82,7 @@ pub struct FileAttentionQuery {
     pub end_unix_ms: Option<i64>,
     /// Restrict to one tool name (case-insensitive); `None` matches all tools.
     pub tool: Option<String>,
-    /// Drop pure-read touches (tools whose lowercased name is `read`).
+    /// Drop common pure-read touches.
     pub mutations_only: bool,
     /// Hard cap on matched rows pulled from ClickHouse. Summary, root, and
     /// per-session rollups are computed over this scanned set; the caller flags

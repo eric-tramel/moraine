@@ -208,11 +208,14 @@ resolved from the server's working directory first, so nested worktree prefixes
 strip to the nested worktree root. Boundary whitespace, `file://` URIs, and
 directory-style trailing slashes are rejected rather than silently mapped to a
 different file. `scope` is `project`
-(default, honoring `--project-only`) or `all` (drop the origin narrowing to
-include every worktree the backend holds). `granularity` is `sessions` (default,
-one rollup per session) or `events` (the flat touch-by-touch timeline). `tool`
-filters by tool name and `mutations_only` excludes pure reads. The default limit
-is `min(50, mcp.max_results)` and the maximum is server-configured.
+(default, honoring `--project-only`) or `all` (drop request-level origin
+narrowing on unscoped servers to include every worktree the backend holds).
+When the server was launched with `--project-only`, that configured project
+scope remains a hard floor so returned IDs stay openable. `granularity` is
+`sessions` (default, one rollup per session) or `events` (the flat
+touch-by-touch timeline). `tool` filters by tool name and `mutations_only`
+excludes common pure-read tools. The default limit is `min(50, mcp.max_results)`
+and the maximum is server-configured.
 
 Output data carries a summary, the distinct worktree roots the tail matched
 (so over-match is visible, never silently merged), and either per-session

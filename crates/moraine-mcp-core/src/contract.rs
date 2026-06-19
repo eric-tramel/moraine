@@ -737,11 +737,10 @@ pub struct CanonicalOpenV1Args {
 ///
 /// `Project` (default) keeps the answer focused on the launch project by
 /// honoring the server's configured origin scope (`--project-only`). `All` is
-/// the deliberate widen: it drops that origin narrowing so a touch in *any*
-/// worktree the backend holds — sibling checkouts and agent-isolation
-/// worktrees included — is returned. The cross-worktree unification itself is
-/// always by the repo-relative tail; `scope` only decides whether the
-/// origin-scope floor is applied on top.
+/// the deliberate widen for unscoped servers: it drops request-level origin
+/// narrowing so a touch in any worktree the backend holds can be returned. A
+/// configured server scope remains a hard floor, so `scope` never exposes IDs
+/// that `open` would reject.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileAttentionScope {

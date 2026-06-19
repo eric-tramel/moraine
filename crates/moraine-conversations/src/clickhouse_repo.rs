@@ -14,6 +14,8 @@ use tracing::warn;
 use uuid::Uuid;
 
 const MCP_INTERNAL_TOOL_NAMES_SQL: &str = "'search', 'open', 'list_sessions', 'file_attention'";
+const FILE_ATTENTION_READ_TOOL_NAMES_SQL: &str =
+    "'read', 'readfile', 'read_file', 'notebookread', 'notebook_read', 'view', 'cat', 'grep', 'rg', 'glob', 'ls', 'list', 'find'";
 
 use crate::cursor::{
     decode_cursor, encode_cursor, ConversationCursor, McpSessionListCursor, SessionEventCursor,
@@ -785,20 +787,22 @@ impl ClickHouseConversationRepository {
         // contain `/<tail>` inside a larger token.
         let command_expr = "if(JSONExtractString(input_json, 'command') != '', JSONExtractString(input_json, 'command'), JSONExtractString(input_json, 'cmd'))";
         let shell_path_regex = sql_quote(&format!(
-            "(^|[[:space:]'\"`=(:])(/[^[:space:]'\"`<>|;&),]*{slash_rel_regex}|{rel_regex})([[:space:]'\"`,;|&<>)]|$)"
+            "(^|[[:space:]'\"`=(])(/[^/][^[:space:]'\"`<>|;&),]*{slash_rel_regex}|/{rel_regex}|{rel_regex})([[:space:]'\"`,;|&<>)]|$)"
         ));
         let shell_match = format!(
             "((JSONHas(input_json, 'command') OR JSONHas(input_json, 'cmd')) AND match({command_expr}, {shell_path_regex}))"
         );
 
         let mut inner_clauses = vec![format!(
-            "tool_phase = 'request'\n      AND lowerUTF8(tool_name) != 'file_attention'\n      AND (\n        {ends_with_any}\n        OR {nested_path_match}\n        OR {shell_match}\n      )"
+            "tool_phase = 'request'\n      AND NOT (lowerUTF8(tool_name) = 'file_attention' OR endsWith(lowerUTF8(tool_name), '_file_attention'))\n      AND (\n        {ends_with_any}\n        OR {nested_path_match}\n        OR {shell_match}\n      )"
         )];
         if let Some(tool) = query.tool.as_deref() {
             inner_clauses.push(format!("lower(tool_name) = lower({})", sql_quote(tool)));
         }
         if query.mutations_only {
-            inner_clauses.push("lower(tool_name) != 'read'".to_string());
+            inner_clauses.push(format!(
+                "lowerUTF8(tool_name) NOT IN ({FILE_ATTENTION_READ_TOOL_NAMES_SQL})"
+            ));
         }
         if query.apply_project_scope {
             if let Some(scope_clause) = self.session_scope_clause("session_id") {
@@ -823,18 +827,26 @@ impl ClickHouseConversationRepository {
         let matched_path_expr =
             format!("multiIf(\n      {matched_path_arms},\n      {nested_path_expr})");
 
+        let exact_relative_root_condition = if rel.starts_with('/') {
+            "0".to_string()
+        } else {
+            format!("matched_path = {rel_sql} AND ifNull(e.cwd, '') != ''")
+        };
+
         let worktree_root_expr = if query.derive_worktree_roots {
             format!(
-                "if(
+                "multiIf(
       matched_path != ''
       AND length(matched_path) > {rel_len} + 1
       AND substring(matched_path, length(matched_path) - {rel_len}, 1) = '/',
       substring(matched_path, 1, length(matched_path) - {rel_len} - 1),
+      {exact_relative_root_condition},
+      ifNull(e.cwd, ''),
       ''
     )"
             )
         } else {
-            "''".to_string()
+            format!("if({exact_relative_root_condition}, ifNull(e.cwd, ''), '')")
         };
 
         // Filters that depend on the trace join.
@@ -856,6 +868,7 @@ impl ClickHouseConversationRepository {
         let params = [
             ("query_id", query.query_id.as_str()),
             ("max_execution_time", max_execution_time.as_str()),
+            ("join_use_nulls", "1"),
         ];
 
         // `matched` is the deliberate `tool_io` scan. The trace/events lookups

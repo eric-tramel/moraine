@@ -852,13 +852,15 @@ Rules:
   server working directory first, so nested worktree prefixes strip to the
   nested worktree root.
 - `scope` is `project` or `all`. `project` honors `--project-only`; `all`
-  deliberately drops that origin narrowing.
+  deliberately drops request-level origin narrowing on unscoped servers. A
+  configured server scope remains a hard floor, so returned IDs must remain
+  accepted by `open`.
 - `granularity` is `sessions` or `events`.
 - Datetime bounds are optional, inclusive at `start_datetime` and exclusive at
   `end_datetime`. Bounds must be RFC 3339 strings with explicit timezone and at
   most millisecond precision.
 - `tool` filters by tool name case-insensitively. `mutations_only` excludes
-  pure reads.
+  common pure-read tools.
 - The default limit is `min(50, mcp.max_results)` and the maximum is
   server-configured.
 

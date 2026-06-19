@@ -70,7 +70,7 @@ impl AppState {
         }
         if !tail.derive_worktree_roots {
             warnings.push(
-                "could not prove the path is a repo-relative file in this checkout; worktree_root values are reported as unknown to avoid mislabeling arbitrary suffix matches."
+                "could not prove the path is a repo-relative file in this checkout; roots are derived only from exact relative captures with cwd, otherwise reported as unknown to avoid mislabeling arbitrary suffix matches."
                     .to_string(),
             );
         }
@@ -90,12 +90,20 @@ impl AppState {
             );
         }
 
+        let project_scoped_server = self.repo.config().session_scope.is_some();
+        if args.scope == FileAttentionScope::All && project_scoped_server {
+            warnings.push(
+                "scope=\"all\" requested on a project-scoped server; the server's --project-only boundary remains enforced so returned handles stay openable."
+                    .to_string(),
+            );
+        }
+
         let query_id = file_attention_query_id();
         let repo_query = FileAttentionQuery {
             query_id: query_id.clone(),
             rel: tail.rel.clone(),
             derive_worktree_roots: tail.derive_worktree_roots,
-            apply_project_scope: args.scope == FileAttentionScope::Project,
+            apply_project_scope: args.scope == FileAttentionScope::Project || project_scoped_server,
             start_unix_ms: args.start_unix_ms,
             end_unix_ms: args.end_unix_ms,
             tool: args.tool.clone(),
