@@ -53,6 +53,14 @@
     return step.kind;
   }
 
+  function stepLabel(step: Step): string {
+    if (step.kind === 'tool_call') {
+      return step.tool;
+    }
+
+    return step.kind;
+  }
+
   $: traceBounds = computeTraceBounds(turn);
 
   function computeTraceBounds(t: Turn): { start: number; span: number } {
@@ -108,7 +116,7 @@
           <div class="mv-tl-time mono">{fmtClock(step.at)}</div>
           <div class="mv-tl-body">
             <div class="mv-tl-headrow">
-              <span class="mv-tl-kind">{step.kind === 'user' ? 'user' : 'assistant'}</span>
+              <span class="mv-tl-kind">{stepLabel(step)}</span>
               {#if step.kind === 'assistant'}
                 <span class="mono mv-tl-model">{turn.model}</span>
               {/if}
@@ -137,7 +145,7 @@
       {@const leftPct = ((at - traceBounds.start) / traceBounds.span) * 100}
       {@const widthPct = Math.max(1, ((endAt - at) / traceBounds.span) * 100)}
       {@const expanded = expandedTools.has(key)}
-      {@const label = step.kind === 'tool_call' ? step.tool : step.kind === 'user' ? 'user' : 'assistant'}
+      {@const label = stepLabel(step)}
       <div class="mv-tr-row mv-tr-{step.kind}">
         <div class="mv-tr-label mono">{label}</div>
         <div class="mv-tr-track">
