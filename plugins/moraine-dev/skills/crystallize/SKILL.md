@@ -7,7 +7,7 @@ description: Turn a rough feature, bug, refactor, architecture, documentation, o
 
 ## Overview
 
-Use this skill to convert rough input into an implementation plan that another agent can execute without needing the original discussion. The output is a single untracked Markdown file under a local untracked `plans/` directory.
+Use this skill to convert rough input into an implementation plan that another agent can execute without needing the original discussion. The output is a single ignored local Markdown file under the gitignored `plans/` directory.
 
 Do not implement the plan while crystallizing. Inspect, research, and reason; only write the plan artifact.
 
@@ -26,7 +26,7 @@ Choose a unique filename:
 - Use `plans/<timestamp>-<slug>.md`.
 - If the file already exists, append `-2`, `-3`, etc.
 
-Keep `plans/` and every plan file untracked. Do not add them to git, do not create a tracked placeholder, and do not include plan files in commits.
+Keep `plans/` and every plan file ignored and untracked. Do not add them to git, do not create a tracked placeholder, and do not include plan files in commits.
 
 ## Research Wave
 
@@ -150,7 +150,7 @@ Include exact file paths where possible. Include commands with expected outcomes
 Before finishing, run:
 
 ```bash
-git status --short plans/
+git check-ignore -v plans/<plan-file>.md
 ```
 
-The expected result is that the plan file appears as untracked. In the final response, report the plan path and state that it was intentionally left untracked.
+The expected result is that root `.gitignore` ignores the plan file through the `plans/` rule. In the final response, report the plan path and state that it was intentionally left ignored and untracked.

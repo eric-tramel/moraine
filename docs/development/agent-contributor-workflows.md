@@ -47,7 +47,7 @@ Codex exposes plugin skills with the plugin namespace, so use the
 
 | Skill | Purpose |
 | --- | --- |
-| `$moraine-dev:crystallize` | Turn rough input into an untracked, ready-to-implement plan under `plans/`. |
+| `$moraine-dev:crystallize` | Turn rough input into an ignored, ready-to-implement plan under `plans/`. |
 | `$moraine-dev:code-review` | Coordinate one review wave across all code-review personas and targeted follow-up. |
 | `$moraine-dev:moraine-author-pr` | Draft PR titles and descriptions with standard evidence and validation sections. |
 | `$moraine-dev:moraine-start-work` | Start development work with branch/worktree, instruction, and validation checks. |
@@ -58,7 +58,7 @@ Codex exposes plugin skills with the plugin namespace, so use the
 Use `$moraine-dev:crystallize` when the user has a rough idea, feature sketch,
 bug report, or architecture direction that needs research and debate before
 implementation. The skill writes a uniquely named Markdown plan under a local
-`plans/` directory and leaves that directory untracked. Do not commit generated
+gitignored `plans/` directory. Do not commit generated
 plan files unless a maintainer explicitly asks for a specific plan artifact to
 be versioned.
 
