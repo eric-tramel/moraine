@@ -63,6 +63,14 @@ watch_root = "~/.kimi/sessions"
 format = "jsonl"
 
 [[ingest.sources]]
+name = "opencode"
+harness = "opencode"
+enabled = true
+glob = "~/.local/share/opencode/opencode*.db"
+watch_root = "~/.local/share/opencode"
+format = "opencode_sqlite"
+
+[[ingest.sources]]
 name = "cursor"
 harness = "cursor"
 enabled = true

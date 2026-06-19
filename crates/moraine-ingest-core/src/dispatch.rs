@@ -6,7 +6,7 @@ use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
 use anyhow::{Context, Result};
 use moraine_config::{
     is_workflow_journal_path, map_tracked_path, AppConfig, SOURCE_FORMAT_CURSOR_SQLITE,
-    SOURCE_FORMAT_SESSION_JSON,
+    SOURCE_FORMAT_OPENCODE_SQLITE, SOURCE_FORMAT_SESSION_JSON,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -426,6 +426,16 @@ pub(crate) async fn process_file(
     }
     if work.format == SOURCE_FORMAT_CURSOR_SQLITE {
         return crate::sqlite_poll::process_cursor_sqlite_db(
+            config,
+            work,
+            checkpoints,
+            sink_tx,
+            metrics,
+        )
+        .await;
+    }
+    if work.format == SOURCE_FORMAT_OPENCODE_SQLITE {
+        return crate::sqlite_poll::process_opencode_sqlite_db(
             config,
             work,
             checkpoints,
