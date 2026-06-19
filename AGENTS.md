@@ -107,6 +107,15 @@ If you were spawned into a temporary worktree (e.g. `/Users/.../.claude/worktree
 When the user asks you to take on new development work, 
 check out a fresh worktree with an appropriate name for your work to prevent multi-agent collision.
 
+## Development: Agent Contributor Workflows
+This repo vendors developer-only agent workflows as a local Codex plugin:
+
+- Marketplace: `.agents/plugins/marketplace.json`
+- Plugin: `plugins/moraine-agent-workflows/.codex-plugin/plugin.json`
+- Skills: `plugins/moraine-agent-workflows/skills/`
+
+Use `$moraine-start-work` when beginning contributor work, `$moraine-author-pr` when drafting a PR title or description, `$moraine-sandbox-qa` for ingest/MCP/monitor/schema/stack-facing validation, `$code-review` for a full multi-persona review wave, and the `$code-review-*` persona skills for focused PR review. When prior or active agent context matters, use the Moraine MCP tools directly. These skills are for repository contributors and automation agents, not end-user Moraine behavior.
+
 ## Writing PRs
 History uses concise, Conventional-Commit-like subjects such as:
 - `feat: ...`

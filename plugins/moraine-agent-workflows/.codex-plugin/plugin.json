@@ -1,0 +1,39 @@
+{
+  "name": "moraine-agent-workflows",
+  "version": "0.1.0",
+  "description": "Developer-only agent workflows for contributing to Moraine.",
+  "author": {
+    "name": "Moraine maintainers",
+    "email": "eric.tramel@gmail.com",
+    "url": "https://github.com/eric-tramel/moraine"
+  },
+  "homepage": "https://github.com/eric-tramel/moraine",
+  "repository": "https://github.com/eric-tramel/moraine",
+  "license": "Apache-2.0",
+  "keywords": [
+    "moraine",
+    "agents",
+    "developer-workflows",
+    "skills",
+    "sandbox",
+    "code-review",
+    "pull-requests"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Moraine Agent Workflows",
+    "shortDescription": "Developer skills for Moraine contributors.",
+    "longDescription": "Project-local, developer-only skills that help agents contribute to Moraine consistently: start isolated work, author reviewable pull requests, run facet-specific code review personas, and validate behavior in the dev sandbox.",
+    "developerName": "Moraine maintainers",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Use $moraine-start-work to begin a Moraine change safely.",
+      "Use $code-review to run all review personas on this PR.",
+      "Use $moraine-author-pr to draft a PR title and description."
+    ]
+  }
+}
