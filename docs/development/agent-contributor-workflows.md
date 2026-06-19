@@ -34,12 +34,15 @@ plugin manifest exposes `./skills/`.
 From the repository root:
 
 ```bash
-codex plugin marketplace add .
+make agent-plugins-install
 ```
 
-Then enable or install `moraine-dev` from the Codex plugin UI. Other
-agent harnesses that understand `SKILL.md` directories can consume the same
-skill folders directly.
+This registers the local Codex marketplace for the current checkout, replaces a
+stale marketplace entry that points at another worktree, and installs or
+refreshes every plugin listed in `.agents/plugins/marketplace.json`.
+
+Other agent harnesses that understand `SKILL.md` directories can consume the
+same skill folders directly.
 
 Codex exposes plugin skills with the plugin namespace, so use the
 `$moraine-dev:<skill-name>` form in prompts.

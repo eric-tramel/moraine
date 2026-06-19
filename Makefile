@@ -1,5 +1,6 @@
 SHELL := /bin/bash
 UV ?= uv
+CODEX ?= codex
 DOCS_ADDR ?= 127.0.0.1:8000
 RUSTUP ?= rustup
 RUST_TOOLCHAIN ?= stable
@@ -18,7 +19,7 @@ endif
 CARGO_TARGET_DIR ?= $(DEFAULT_CARGO_TARGET_DIR)
 RUST_LABEL = $(if $(filter 1,$(USE_RUSTUP)),$(RUST_TOOLCHAIN) via $(RUSTUP_BIN_DIR),host PATH)
 
-.PHONY: help fmt clippy build test ci-check install docs-build docs-serve docs-clean sandbox-up sandbox-down sandbox-list hooks-install
+.PHONY: help fmt clippy build test ci-check install docs-build docs-serve docs-clean sandbox-up sandbox-down sandbox-list hooks-install agent-plugins-install
 
 help:
 	@echo "Available targets:"
@@ -35,6 +36,8 @@ help:
 	@echo "  make sandbox-down   Tear down all dev sandboxes owned by this user"
 	@echo "  make sandbox-list   List running dev sandboxes"
 	@echo "  make hooks-install  Enable repo-managed git hooks (fmt + clippy pre-commit)"
+	@echo "  make agent-plugins-install"
+	@echo "                       Install/update developer agent Codex plugins"
 	@echo ""
 	@echo "Rust toolchain: $(RUST_LABEL)"
 	@echo "Cargo command: $(CARGO_CMD)"
@@ -67,6 +70,9 @@ install:
 
 hooks-install:
 	scripts/dev/install-hooks.sh
+
+agent-plugins-install:
+	CODEX_CMD='$(CODEX)' scripts/dev/install-agent-plugins.sh
 
 docs-build:
 	$(UV) run --with zensical zensical build
