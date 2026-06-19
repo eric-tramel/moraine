@@ -1,0 +1,4 @@
+interface:
+  display_name: "Crystallize"
+  short_description: "Turn rough ideas into implementable plans"
+  default_prompt: "Use $moraine-dev:crystallize to turn this rough idea into a ready-to-implement plan."

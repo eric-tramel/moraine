@@ -11,6 +11,7 @@ they are not part of the end-user Moraine runtime.
 plugins/moraine-dev/
   .codex-plugin/plugin.json
   skills/
+    crystallize/
     code-review/
     code-review-completeness/
     code-review-correctness/
@@ -46,10 +47,20 @@ Codex exposes plugin skills with the plugin namespace, so use the
 
 | Skill | Purpose |
 | --- | --- |
+| `$moraine-dev:crystallize` | Turn rough input into an untracked, ready-to-implement plan under `plans/`. |
 | `$moraine-dev:code-review` | Coordinate one review wave across all code-review personas and targeted follow-up. |
 | `$moraine-dev:moraine-author-pr` | Draft PR titles and descriptions with standard evidence and validation sections. |
 | `$moraine-dev:moraine-start-work` | Start development work with branch/worktree, instruction, and validation checks. |
 | `$moraine-dev:moraine-sandbox-qa` | Run stack-facing QA in the isolated dev sandbox and tear it down afterward. |
+
+## Planning
+
+Use `$moraine-dev:crystallize` when the user has a rough idea, feature sketch,
+bug report, or architecture direction that needs research and debate before
+implementation. The skill writes a uniquely named Markdown plan under a local
+`plans/` directory and leaves that directory untracked. Do not commit generated
+plan files unless a maintainer explicitly asks for a specific plan artifact to
+be versioned.
 
 ## Review Personas
 
