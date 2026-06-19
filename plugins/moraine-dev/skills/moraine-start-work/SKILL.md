@@ -51,19 +51,6 @@ git worktree add ../moraine-worktrees/<short-task-name> -b codex/<short-task-nam
 
 When spawned into a temporary agent worktree, compare your `HEAD` with any sibling worktree whose branch name matches the task. If the sibling has newer in-progress code, treat that sibling as authoritative and run sandbox validation from that worktree.
 
-## Before Editing
-
-Use `rg` and `rg --files` for repository discovery. Identify the narrowest owner boundary for the change:
-
-- Runtime binaries live under `apps/`.
-- Shared logic lives under `crates/`.
-- Schema changes live under `sql/`.
-- Runtime/config templates live under `config/`.
-- Developer docs live under `docs/development/`.
-- Static monitor UI assets live under `web/monitor/`.
-
-Do not revert changes you did not make. If `git status` shows existing edits, inspect enough to avoid overwriting them and mention any relevant overlap to the user.
-
 ## Validation Choice
 
 Run focused local checks for narrow docs or metadata changes. For Rust changes, default to:
