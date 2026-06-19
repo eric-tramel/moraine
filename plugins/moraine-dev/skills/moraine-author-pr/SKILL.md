@@ -1,13 +1,17 @@
 ---
 name: moraine-author-pr
-description: Author Moraine pull request titles and descriptions. Use when drafting, revising, or reviewing a PR body for this repository; when preparing a PR summary after local changes; when documenting user-facing features, bug fixes, performance optimizations, validation, changelog impact, or operational impact; or when ensuring PR text follows repository conventions without AI attribution.
+description: Create Moraine pull requests on GitHub. Use when the branch is ready to open a PR; when the user asks to create, push, or open a PR; after local changes are committed; or when documenting user-facing features, bug fixes, performance optimizations, validation, changelog impact, or operational impact in a PR that follows repository conventions without AI attribution.
 ---
 
 # Moraine Author PR
 
 ## Overview
 
-Use this workflow to write PR titles and descriptions that are reviewable, evidence-backed, and consistent across agents. Default bodies use `Description`, `Usage`, `Changelog`, and `Validation` sections.
+The goal is to **create the PR on GitHub**, not just draft title and body text in chat. The skill is complete when the PR exists on GitHub and you return its URL.
+
+Write PR titles and descriptions that are reviewable, evidence-backed, and consistent across agents. Default bodies use `Description`, `Usage`, `Changelog`, and `Validation` sections. Base the summary on all commits in the branch, not only the latest one.
+
+If the branch is not ready — uncommitted work, failing tests the user expects fixed first, or the user asked only to revise an existing PR description — say what is blocking creation and what remains. Do not pretend a PR was opened.
 
 ## Title Rules
 
@@ -89,7 +93,7 @@ codex plugin marketplace add .
 Then enable `moraine-dev` and invoke:
 
 ```text
-Use $moraine-dev:moraine-author-pr to draft this PR.
+Use $moraine-dev:moraine-author-pr to create this PR on GitHub.
 ```
 ````
 
