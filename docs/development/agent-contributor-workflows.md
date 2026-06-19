@@ -21,6 +21,7 @@ plugins/moraine-dev/
     code-review-security-review/
     code-review-yagni/
     moraine-author-pr/
+    release/
     moraine-start-work/
     moraine-sandbox-qa/
 ```
@@ -50,6 +51,7 @@ Codex exposes plugin skills with the plugin namespace, so use the
 | `$moraine-dev:crystallize` | Turn rough input into an ignored, ready-to-implement plan under `plans/`. |
 | `$moraine-dev:code-review` | Coordinate one review wave across all code-review personas and targeted follow-up. |
 | `$moraine-dev:moraine-author-pr` | Draft PR titles and descriptions with standard evidence and validation sections. |
+| `$moraine-dev:release` | Cut and publish a Moraine release from a target version. |
 | `$moraine-dev:moraine-start-work` | Start development work with branch/worktree, instruction, and validation checks. |
 | `$moraine-dev:moraine-sandbox-qa` | Run stack-facing QA in the isolated dev sandbox and tear it down afterward. |
 
@@ -83,6 +85,12 @@ direct blocker.
 Historical and active session lookup does not need a skill. Use the Moraine MCP
 tools directly: `search_sessions`, `list_sessions`, `open`, and
 `file_attention`.
+
+## Releases
+
+Use `$moraine-dev:release` for `/release X.Y.Z` work. It owns the release goal,
+version bump, release PR, annotated tag, GitHub release notes, tag-triggered
+workflow verification, and PyPI verification.
 
 ## Maintenance
 

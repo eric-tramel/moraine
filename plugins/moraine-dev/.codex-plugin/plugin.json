@@ -17,13 +17,14 @@
     "skills",
     "sandbox",
     "code-review",
-    "pull-requests"
+    "pull-requests",
+    "release"
   ],
   "skills": "./skills/",
   "interface": {
     "displayName": "Moraine Dev",
     "shortDescription": "Developer skills for Moraine contributors.",
-    "longDescription": "Project-local, developer-only skills that help agents contribute to Moraine consistently: start isolated work, crystallize rough ideas into implementation plans, author reviewable pull requests, run facet-specific code review personas, and validate behavior in the dev sandbox.",
+    "longDescription": "Project-local, developer-only skills that help agents contribute to Moraine consistently: start isolated work, crystallize rough ideas into implementation plans, author reviewable pull requests, run facet-specific code review personas, validate behavior in the dev sandbox, and cut releases.",
     "developerName": "Moraine maintainers",
     "category": "Productivity",
     "capabilities": [
@@ -34,7 +35,8 @@
       "Use $moraine-dev:moraine-start-work to begin a Moraine change safely.",
       "Use $moraine-dev:crystallize to turn a rough idea into a ready-to-implement plan.",
       "Use $moraine-dev:code-review to run all review personas on this PR.",
-      "Use $moraine-dev:moraine-author-pr to draft a PR title and description."
+      "Use $moraine-dev:moraine-author-pr to draft a PR title and description.",
+      "Use $moraine-dev:release to cut a Moraine release from a target version."
     ]
   }
 }
