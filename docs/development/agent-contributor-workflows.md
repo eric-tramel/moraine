@@ -26,20 +26,32 @@ plugins/moraine-dev/
     moraine-sandbox-qa/
 ```
 
-The marketplace entry points to `./plugins/moraine-dev`, and the
-plugin manifest exposes `./skills/`.
+Both the Codex marketplace and plugin are named `moraine-dev`. The marketplace
+entry points to `./plugins/moraine-dev`, and the plugin manifest exposes
+`./skills/`.
 
 ## Install Locally
 
 From the repository root:
 
 ```bash
-codex plugin marketplace add .
+make agent-plugins-install
 ```
 
-Then enable or install `moraine-dev` from the Codex plugin UI. Other
-agent harnesses that understand `SKILL.md` directories can consume the same
-skill folders directly.
+This registers the Codex marketplace from the configured Git remote, replaces a
+stale marketplace entry, syncs the marketplace snapshot from `origin/main`, and
+installs or refreshes every plugin listed there. This intentionally uses the
+merged `main` branch as the source of truth so agents running from stale feature
+worktrees still pick up the latest developer workflows.
+
+When changing the plugin itself, test the unmerged checkout explicitly:
+
+```bash
+make agent-plugins-install AGENT_PLUGINS_SOURCE=current
+```
+
+Other agent harnesses that understand `SKILL.md` directories can consume the
+same skill folders directly.
 
 Codex exposes plugin skills with the plugin namespace, so use the
 `$moraine-dev:<skill-name>` form in prompts.
