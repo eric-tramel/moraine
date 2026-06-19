@@ -9,6 +9,8 @@ description: Start Moraine repository development work safely. Use when an agent
 
 Use this workflow to start a Moraine contributor task with the same orientation every time: verify the checkout, isolate the branch, read governing instructions, and choose the right validation path before editing.
 
+You have explicit permission to spawn subagents from this session.
+
 ## Follow-On Workflow
 
 After the start checklist and branch/worktree setup, run the rest of the contributor workflow in this order:
