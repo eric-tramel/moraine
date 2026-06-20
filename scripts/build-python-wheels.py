@@ -26,6 +26,7 @@ Design notes:
 Usage:
   python scripts/build-python-wheels.py \
       --target x86_64-unknown-linux-gnu  --bundle dist/moraine-bundle-x86_64-unknown-linux-gnu.tar.gz \
+      --target x86_64-apple-darwin      --bundle dist/moraine-bundle-x86_64-apple-darwin.tar.gz \
       --target aarch64-apple-darwin      --bundle dist/moraine-bundle-aarch64-apple-darwin.tar.gz \
       --out-dir dist/wheels \
       --version 0.4.1

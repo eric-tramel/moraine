@@ -11,6 +11,7 @@ usage() {
 usage: scripts/ci/e2e-install-artifact.sh <target-triple>
 
 example:
+  scripts/ci/e2e-install-artifact.sh x86_64-apple-darwin
   scripts/ci/e2e-install-artifact.sh aarch64-apple-darwin
 EOF
 }

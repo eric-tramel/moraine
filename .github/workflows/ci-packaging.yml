@@ -43,11 +43,16 @@ jobs:
         with:
           filters: |
             packaging:
+              - '.github/workflows/release-moraine.yml'
               - '.github/workflows/ci-packaging.yml'
               - 'bindings/python/moraine-cli/**'
               - 'scripts/build-python-wheels.py'
               - 'scripts/build-python-sdist.py'
               - 'scripts/package-moraine-release.sh'
+              - 'scripts/ci/assert-release-targets.py'
+
+      - name: Assert release target coverage
+        run: python3 scripts/ci/assert-release-targets.py
 
       - name: Skip when no packaging changes
         if: github.event_name == 'pull_request' && steps.filter.outputs.packaging != 'true'

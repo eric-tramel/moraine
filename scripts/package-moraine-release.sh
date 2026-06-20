@@ -7,6 +7,7 @@ usage: scripts/package-moraine-release.sh <target-triple> [output-dir]
 
 examples:
   scripts/package-moraine-release.sh x86_64-unknown-linux-gnu dist
+  scripts/package-moraine-release.sh x86_64-apple-darwin dist
   scripts/package-moraine-release.sh aarch64-apple-darwin dist
 EOF
 }
