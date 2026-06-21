@@ -34,7 +34,7 @@
     "defaultPrompt": [
       "Use $moraine-dev:moraine-start-work to begin a Moraine change safely.",
       "Use $moraine-dev:crystallize to turn a rough idea into a ready-to-implement plan.",
-      "Use $moraine-dev:code-review to run all review personas on this PR.",
+      "Use $moraine-dev:code-review to launch delegated subagents for all review personas on this PR.",
       "Use $moraine-dev:moraine-author-pr to draft a PR title and description.",
       "Use $moraine-dev:release to cut a Moraine release from a target version."
     ]

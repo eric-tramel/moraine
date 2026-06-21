@@ -1,4 +1,4 @@
 interface:
   display_name: "Code Review"
   short_description: "Coordinate multi-persona PR review"
-  default_prompt: "Use $moraine-dev:code-review to run all code review personas on this PR."
+  default_prompt: "Use $moraine-dev:code-review to launch delegated subagents for all code review personas on this PR."
