@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-import importlib.util
+import ast
 import re
 import sys
 from pathlib import Path
@@ -70,13 +70,20 @@ def _publish_loop_targets() -> set[str]:
 
 def _wheel_builder_platforms() -> dict[str, str]:
     path = ROOT / "scripts" / "build-python-wheels.py"
-    spec = importlib.util.spec_from_file_location("moraine_build_python_wheels", path)
-    if spec is None or spec.loader is None:
-        raise AssertionError(f"could not load wheel builder from {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return dict(module.TARGET_TO_WHEEL_PLATFORM)
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "TARGET_TO_WHEEL_PLATFORM"
+            for target in node.targets
+        ):
+            value = ast.literal_eval(node.value)
+            if not isinstance(value, dict) or not all(
+                isinstance(target, str) and isinstance(platform, str)
+                for target, platform in value.items()
+            ):
+                raise AssertionError("TARGET_TO_WHEEL_PLATFORM must be a string-to-string dict")
+            return dict(value)
+    raise AssertionError(f"could not find TARGET_TO_WHEEL_PLATFORM in {path}")
 
 
 def _assert_equal(name: str, actual: set[str]) -> None:

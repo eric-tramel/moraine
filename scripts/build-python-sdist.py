@@ -90,10 +90,10 @@ prepare_metadata_for_build_wheel = _refuse
 README_TEMPLATE = """\
 # moraine (source distribution)
 
-This sdist is a stub. Moraine distributes prebuilt binary wheels only
-(macOS arm64, Linux x86_64, Linux aarch64). Installing this sdist with
-`pip install moraine --no-binary moraine` will fail with a pointer to
-the source-install instructions.
+This sdist is a stub. Moraine distributes prebuilt binary wheels only for
+macOS arm64, macOS x86_64, Linux x86_64, and Linux aarch64. Installing
+this sdist with `pip install moraine --no-binary moraine` will fail with a
+pointer to the source-install instructions.
 
 To install moraine:
 
