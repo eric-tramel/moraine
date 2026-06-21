@@ -3,8 +3,6 @@ set -euo pipefail
 
 E2E_INSTALL_SUCCESS=0
 TMP_ROOT=""
-SERVER_PID=""
-SERVER_LOG=""
 
 usage() {
   cat <<'EOF'
@@ -23,48 +21,16 @@ need_cmd() {
   fi
 }
 
-pick_open_port() {
-  local python_bin="$1"
-  "$python_bin" -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
-}
-
-wait_for_local_server() {
-  local base_url="$1"
-  local timeout_seconds="${2:-30}"
-  local started
-  started="$(date +%s)"
-
-  while true; do
-    local now
-    now="$(date +%s)"
-    if (( now - started >= timeout_seconds )); then
-      echo "timed out waiting for local artifact server: $base_url" >&2
-      return 1
-    fi
-
-    if curl -fsS --max-time 2 "$base_url/" >/dev/null 2>&1; then
-      return 0
-    fi
-
-    sleep 1
-  done
-}
-
 cleanup_e2e_install() {
-  if [[ -n "$SERVER_PID" ]]; then
-    kill "$SERVER_PID" >/dev/null 2>&1 || true
-    wait "$SERVER_PID" >/dev/null 2>&1 || true
-  fi
-
   if [[ -z "$TMP_ROOT" ]]; then
     return
   fi
 
   if [[ "$E2E_INSTALL_SUCCESS" -ne 1 ]]; then
     echo "[e2e-install] failure diagnostics (tmp root: $TMP_ROOT)" >&2
-    if [[ -n "$SERVER_LOG" && -f "$SERVER_LOG" ]]; then
-      echo "--- tail $SERVER_LOG ---" >&2
-      tail -n 120 "$SERVER_LOG" >&2 || true
+    if [[ -d "$TMP_ROOT/dist" ]]; then
+      echo "--- artifacts in $TMP_ROOT/dist ---" >&2
+      find "$TMP_ROOT/dist" -maxdepth 1 -type f -print >&2 || true
     fi
   fi
 
@@ -100,19 +66,11 @@ main() {
   TMP_ROOT="$(mktemp -d)"
   local dist_dir="$TMP_ROOT/dist"
   local isolated_home="$TMP_ROOT/home"
-  SERVER_LOG="$TMP_ROOT/artifact-server.log"
 
   echo "[e2e-install] packaging release bundle for target: $target"
   "$package_script" "$target" "$dist_dir"
 
-  local artifact_port
-  artifact_port="$(pick_open_port "$python_bin")"
-  local asset_base_url="http://127.0.0.1:${artifact_port}"
-
-  echo "[e2e-install] starting local artifact server: $asset_base_url"
-  "$python_bin" -m http.server "$artifact_port" --bind 127.0.0.1 --directory "$dist_dir" >"$SERVER_LOG" 2>&1 &
-  SERVER_PID="$!"
-  wait_for_local_server "$asset_base_url" 30
+  local asset_base_url="file://$dist_dir"
 
   echo "[e2e-install] installing via install script from local artifacts"
   export HOME="$isolated_home"
