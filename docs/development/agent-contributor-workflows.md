@@ -78,11 +78,15 @@ be versioned.
 
 ## Review Personas
 
-Use `$moraine-dev:code-review` when you want the whole review set. It launches one subagent
-per persona, tracks those sessions, integrates their feedback, and follows up
-only with the sessions that need another look. Each review persona is a focused
-skill that should report findings only for its facet unless another issue is a
-direct blocker.
+Use `$moraine-dev:code-review` when you want the whole review set. Invoking the
+skill is an explicit request for delegated multi-agent review; agents should not
+ask for separate permission to spawn reviewer subagents, and should not replace
+the review wave with a local single-agent review. If subagent tooling is
+unavailable, report the delegated review as blocked. The coordinator launches
+one subagent per persona, tracks those sessions, integrates their feedback, and
+follows up only with the sessions that need another look. Each review persona is
+a focused skill that should report findings only for its facet unless another
+issue is a direct blocker.
 
 | Persona | Skill | Review facet |
 | --- | --- | --- |

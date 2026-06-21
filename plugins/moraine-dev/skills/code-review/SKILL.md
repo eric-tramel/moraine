@@ -1,6 +1,6 @@
 ---
 name: code-review
-description: "Coordinate a full multi-persona code review for a Moraine PR or local change. Use when asked to review a PR, run the review agents, get code review feedback, or iterate on review feedback using all CodeReview personas: elegance, idiom, correctness, completeness, security, YAGNI, and scope."
+description: "Coordinate a delegated full multi-persona code review for a Moraine PR or local change. Use when asked to review a PR, run review agents, get code review feedback, or iterate on review feedback using all CodeReview personas: elegance, idiom, correctness, completeness, security, YAGNI, and scope. Invoking this skill is an explicit request to launch reviewer subagents."
 ---
 
 # Code Review
@@ -9,9 +9,11 @@ description: "Coordinate a full multi-persona code review for a Moraine PR or lo
 
 Use this skill to run one coordinated review wave across all focused review personas, merge their feedback, apply accepted fixes, and follow up only with the reviewer sessions that need another look.
 
+Invoking this skill is an explicit user request for delegated multi-agent review. Do not ask for separate permission to spawn reviewer subagents, and do not collapse the personas into a single local review. If subagent tooling is unavailable, report the delegated review as blocked.
+
 ## Review Wave
 
-Launch exactly one subagent for each persona:
+Launch exactly one delegated subagent for each persona:
 
 - `$moraine-dev:code-review-elegance`
 - `$moraine-dev:code-review-idomatic`
@@ -35,6 +37,8 @@ Review packet:
 ```
 
 Keep a mapping of persona to subagent session id. This mapping is part of the work product until review follow-up is complete.
+
+If the current harness has no callable subagent mechanism, stop before reviewing and report that the required delegated review wave is blocked by missing tooling. Do not silently substitute a manual single-agent review for this skill.
 
 ## Triage
 

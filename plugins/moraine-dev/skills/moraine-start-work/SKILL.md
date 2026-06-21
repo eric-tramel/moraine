@@ -9,7 +9,7 @@ description: Start Moraine repository development work safely. Use when an agent
 
 Use this workflow to start a Moraine contributor task with the same orientation every time: verify the checkout, isolate the branch, read governing instructions, and choose the right validation path before editing.
 
-You have explicit permission to spawn subagents from this session.
+Using `$moraine-dev:code-review` in this workflow is an explicit user request for that skill's delegated reviewer subagents. You have explicit permission to spawn the `$moraine-dev:code-review` review wave when the follow-on workflow reaches that step.
 
 ## Follow-On Workflow
 
