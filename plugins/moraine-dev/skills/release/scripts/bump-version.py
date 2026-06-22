@@ -36,9 +36,13 @@ MANAGED_PACKAGE_NAMES = {
     "moraine-monitor-core",
 }
 
-RUNTIME_PLUGIN_MANIFESTS = [
+RUNTIME_PLUGIN_JSON_MANIFESTS = [
     ("Claude", "plugins/moraine/.claude-plugin/plugin.json"),
     ("Codex", "plugins/moraine/.codex-plugin/plugin.json"),
+]
+
+RUNTIME_PLUGIN_YAML_MANIFESTS = [
+    ("Hermes", "plugins/hermes-moraine/plugin.yaml"),
 ]
 
 VERSION_RE = re.compile(r"^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$")
@@ -234,7 +238,7 @@ def bump_release_examples(
 def bump_runtime_plugin_manifests(
     repo_root: Path, current_version: str, target_version: str, *, dry_run: bool
 ) -> None:
-    for label, relpath in RUNTIME_PLUGIN_MANIFESTS:
+    for label, relpath in RUNTIME_PLUGIN_JSON_MANIFESTS:
         path = repo_root / relpath
         data = json.loads(read_text(path))
         if data.get("name") != "moraine":
@@ -248,6 +252,30 @@ def bump_runtime_plugin_manifests(
             )
         data["version"] = target_version
         write_text(path, json.dumps(data, indent=2) + "\n", dry_run=dry_run)
+        print(f"{relpath}: {current_version} -> {target_version}")
+
+    for label, relpath in RUNTIME_PLUGIN_YAML_MANIFESTS:
+        path = repo_root / relpath
+        text = read_text(path)
+        name_match = re.search(r'(?m)^name:\s*"?([^"\n]+)"?\s*$', text)
+        if not name_match or name_match.group(1) != "moraine":
+            name = name_match.group(1) if name_match else None
+            raise SystemExit(f"unexpected {label} plugin name in {path}: {name}")
+        version_match = re.search(r'(?m)^version:\s*"?([^"\n]+)"?\s*$', text)
+        if not version_match:
+            raise SystemExit(f"could not find {label} plugin version in {path}")
+        version = version_match.group(1)
+        if version != current_version:
+            raise SystemExit(
+                f"{label} plugin manifest has {version}, expected {current_version}"
+            )
+        new_text, _ = replace_single(
+            rf'^version:\s*"{re.escape(version)}"$',
+            f'version: "{target_version}"',
+            text,
+            path,
+        )
+        write_text(path, new_text, dry_run=dry_run)
         print(f"{relpath}: {current_version} -> {target_version}")
 
 

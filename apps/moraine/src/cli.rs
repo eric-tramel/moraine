@@ -211,6 +211,8 @@ mod tests {
             "pi-coding-agent",
             "--mcp-target",
             "claude-code",
+            "--mcp-target",
+            "hermes",
         ]);
         match cli.command {
             CliCommand::Setup(setup) => {
@@ -224,6 +226,7 @@ mod tests {
                         SetupMcpTarget::Cursor,
                         SetupMcpTarget::PiCodingAgent,
                         SetupMcpTarget::ClaudeCode,
+                        SetupMcpTarget::Hermes,
                     ]
                 );
             }

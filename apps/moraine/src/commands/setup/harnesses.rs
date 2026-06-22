@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+use std::env;
 use std::iter;
 use std::path::{Path, PathBuf};
 
@@ -6,6 +8,9 @@ use serde_json::{Map, Value};
 use toml_edit::{value as toml_value, Table};
 
 use super::{CommandSpec, ConfigTarget, McpPlan, McpPlanStep, SetupMcpTarget};
+
+const HERMES_PLUGIN_REMOTE_IDENTIFIER: &str = "eric-tramel/moraine/plugins/hermes-moraine";
+const HERMES_PLUGIN_RELATIVE_PATH: &str = "plugins/hermes-moraine";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct DefaultIngestSourceUpdate {
@@ -238,7 +243,7 @@ const SPECS: [HarnessSpec; 7] = [
     HarnessSpec {
         target: SetupMcpTarget::Hermes,
         label: "Hermes",
-        setup_kind: "MCP",
+        setup_kind: "plugin",
         programs: &["hermes"],
         probe_paths: ProbePaths::None,
         ingest_sources: &HERMES_INGEST,
@@ -434,20 +439,50 @@ pub(super) fn mcp_plan(
             config_writes: Vec::new(),
             manual_snippet: None,
         },
-        SetupMcpTarget::Hermes => McpPlan::replace_registration(
-            target,
-            CommandSpec::new("hermes", ["mcp", "remove", "moraine"]),
-            McpPlanStep::required_stdout(
-                CommandSpec::new("hermes", hermes_args(config_target)).with_stdin("\n"),
-                "tools enabled",
+        SetupMcpTarget::Hermes if config_target.requires_explicit_mcp_config() => {
+            let command = CommandSpec::new("hermes", hermes_args(config_target));
+            McpPlan::manual(
+                target,
+                format!(
+                    "Hermes plugin setup uses the default Moraine config. For this custom config target, use manual MCP registration:\n{}",
+                    command.display()
+                ),
             )
-            .with_progress(
-                "Registering Moraine MCP in Hermes",
-                "Hermes MCP tools enabled",
-                "Hermes MCP registration warning",
-                "Hermes MCP registration failed",
-            ),
-        ),
+        }
+        SetupMcpTarget::Hermes => McpPlan {
+            target,
+            action: super::McpAction::Execute,
+            steps: vec![
+                McpPlanStep::required(CommandSpec::new(
+                    "hermes",
+                    vec![
+                        "plugins".to_string(),
+                        "install".to_string(),
+                        hermes_plugin_identifier(),
+                        "--force".to_string(),
+                        "--enable".to_string(),
+                    ],
+                ))
+                .with_progress(
+                    "Installing Hermes Moraine plugin",
+                    "Hermes plugin installed",
+                    "Hermes plugin install warning",
+                    "Hermes plugin install failed",
+                ),
+                McpPlanStep::required_stdout(
+                    CommandSpec::new("hermes", ["moraine", "setup", "--no-test"]),
+                    "Moraine MCP setup complete",
+                )
+                .with_progress(
+                    "Configuring Hermes Moraine MCP",
+                    "Hermes MCP configured",
+                    "Hermes MCP setup warning",
+                    "Hermes MCP setup failed",
+                ),
+            ],
+            config_writes: Vec::new(),
+            manual_snippet: None,
+        },
         SetupMcpTarget::KimiCli => McpPlan::replace_registration(
             target,
             CommandSpec::new("kimi", ["mcp", "remove", "moraine"]),
@@ -662,7 +697,7 @@ fn codex_args(config_target: &ConfigTarget) -> Vec<String> {
     args
 }
 
-fn hermes_args(config_target: &ConfigTarget) -> Vec<String> {
+pub(super) fn hermes_args(config_target: &ConfigTarget) -> Vec<String> {
     let mut args = vec![
         "mcp".to_string(),
         "add".to_string(),
@@ -673,6 +708,102 @@ fn hermes_args(config_target: &ConfigTarget) -> Vec<String> {
     ];
     args.extend(mcp_run_args(config_target));
     args
+}
+
+pub(super) fn hermes_plugin_identifier() -> String {
+    if let Some(source) = env::var_os("MORAINE_HERMES_PLUGIN_SOURCE")
+        .and_then(|value| value.into_string().ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return source;
+    }
+
+    hermes_local_plugin_identifier().unwrap_or_else(|| HERMES_PLUGIN_REMOTE_IDENTIFIER.to_string())
+}
+
+fn hermes_local_plugin_identifier() -> Option<String> {
+    let mut seen = BTreeSet::new();
+    let mut candidates = Vec::new();
+
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+
+    if let Ok(exe) = env::current_exe() {
+        candidates.push(exe);
+    }
+
+    for candidate in candidates {
+        let Some(root) = find_moraine_source_root(&candidate) else {
+            continue;
+        };
+        let Ok(root) = root.canonicalize() else {
+            continue;
+        };
+        if !seen.insert(root.clone()) {
+            continue;
+        }
+        if let Some(identifier) = hermes_plugin_identifier_for_root(&root) {
+            return Some(identifier);
+        }
+    }
+
+    None
+}
+
+fn find_moraine_source_root(start: &Path) -> Option<PathBuf> {
+    let mut current = if start.is_file() {
+        start.parent()?.to_path_buf()
+    } else {
+        start.to_path_buf()
+    };
+
+    loop {
+        if current.join("Cargo.toml").is_file()
+            && current
+                .join(HERMES_PLUGIN_RELATIVE_PATH)
+                .join("plugin.yaml")
+                .is_file()
+        {
+            return Some(current);
+        }
+
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+pub(super) fn hermes_plugin_identifier_for_root(root: &Path) -> Option<String> {
+    let plugin = root.join(HERMES_PLUGIN_RELATIVE_PATH).join("plugin.yaml");
+    if !plugin.is_file() {
+        return None;
+    }
+
+    Some(format!(
+        "{}#{}",
+        file_url_for_path(root),
+        HERMES_PLUGIN_RELATIVE_PATH
+    ))
+}
+
+fn file_url_for_path(path: &Path) -> String {
+    let mut raw = path.to_string_lossy().replace('\\', "/");
+    if !raw.starts_with('/') {
+        raw.insert(0, '/');
+    }
+    format!("file://{}", percent_encode_file_path(&raw))
+}
+
+fn percent_encode_file_path(path: &str) -> String {
+    let mut encoded = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 fn kimi_args(config_target: &ConfigTarget) -> Vec<String> {

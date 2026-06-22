@@ -103,21 +103,24 @@ You can also target harnesses directly, which is useful for scripts or for
 rerunning setup after installing a new harness CLI:
 
 ```bash
-moraine setup --yes --mcp-target claude-code --mcp-target codex --mcp-target opencode --mcp-target cursor
+moraine setup --yes --mcp-target claude-code --mcp-target codex --mcp-target hermes --mcp-target opencode --mcp-target cursor
 ```
 
 Preview those changes without touching host agent config:
 
 ```bash
-moraine setup --dry-run --mcp-target claude-code --mcp-target codex --mcp-target opencode --mcp-target cursor --mcp-target pi-coding-agent
+moraine setup --dry-run --mcp-target claude-code --mcp-target codex --mcp-target hermes --mcp-target opencode --mcp-target cursor --mcp-target pi-coding-agent
 ```
 
-The Claude Code and Codex plugins bundle Moraine search guidance. `moraine
-setup` installs those plugins for default user-scoped setup, and registers MCP
-directly or writes global MCP config for supported harnesses such as Hermes,
-Kimi CLI, OpenCode, Cursor, and Pi Coding Agent. These user-scoped integrations
-can search the host-wide Moraine history visible to your user, so enable them
-only in trusted harness environments.
+The Claude Code, Codex, and Hermes plugins bundle Moraine search guidance.
+`moraine setup` installs those plugins for default user-scoped setup, and
+registers MCP directly or writes global MCP config for supported harnesses such
+as Kimi CLI, OpenCode, Cursor, and Pi Coding Agent. These user-scoped
+integrations can search the host-wide Moraine history visible to your user, so
+enable them only in trusted harness environments.
+
+The same Codex marketplace also contains the contributor-only `moraine-dev`
+plugin for Moraine maintainers; end users should install `moraine@moraine`.
 
 The MCP server uses the same config resolution rules as the rest of Moraine, with
 `MORAINE_MCP_CONFIG` taking precedence over the generic `MORAINE_CONFIG`.
