@@ -15,9 +15,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cli::{SetupArgs, SetupMcpTarget};
 use crate::render::{CliOutput, OutputMode};
-use toml_edit::{value as toml_value, ArrayOfTables, DocumentMut, Item, Table};
+use toml_edit::{ArrayOfTables, DocumentMut, Item, Table};
+
+mod harnesses;
+use harnesses::{McpConfigFormat, McpConfigWrite};
 
 const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../../../../config/moraine.toml");
+const HOST_WIDE_ACCESS_WARNING: &str =
+    "Selected harness integrations get host-wide Moraine session history access visible to your user.";
 
 pub(super) fn handle(
     output: &CliOutput,
@@ -468,11 +473,12 @@ struct IngestSelectionUpdate {
     enabled_sources: usize,
     disabled_sources: usize,
     added_sources: usize,
+    updated_sources: usize,
 }
 
 impl IngestSelectionUpdate {
     fn changed_sources(self) -> usize {
-        self.enabled_sources + self.disabled_sources + self.added_sources
+        self.enabled_sources + self.disabled_sources + self.added_sources + self.updated_sources
     }
 
     fn has_changes(self) -> bool {
@@ -499,6 +505,11 @@ impl IngestSelectionUpdate {
             parts.push("1 disabled".to_string());
         } else if self.disabled_sources > 1 {
             parts.push(format!("{} disabled", self.disabled_sources));
+        }
+        if self.updated_sources == 1 {
+            parts.push("1 repaired".to_string());
+        } else if self.updated_sources > 1 {
+            parts.push(format!("{} repaired", self.updated_sources));
         }
         format!("ingest sources updated: {}", parts.join(", "))
     }
@@ -527,37 +538,35 @@ fn apply_ingest_selections_to_document(
     let mut update = IngestSelectionUpdate::default();
 
     for selection in selections {
-        let harness = selection.target.harness_name();
         let enabled = selection.mode.configures_ingest();
-        let source_indexes = ingest_source_indexes_for_harness(document, harness)?;
 
-        if source_indexes.is_empty() {
-            if enabled {
-                let sources = ensure_ingest_sources_mut(document)?;
-                for source in default_ingest_sources_for_target(selection.target) {
-                    sources.push(source.to_table(enabled));
+        for setup_source in harnesses::default_ingest_sources(selection.target) {
+            let source_index = ingest_source_index(document, *setup_source)?;
+
+            match source_index {
+                Some(source_idx) => {
+                    let sources = ensure_ingest_sources_mut(document)?;
+                    let source_table = sources
+                        .get_mut(source_idx)
+                        .expect("source index came from the same array");
+                    let source_update = setup_source.reconcile_table(source_table, enabled);
+                    if source_update.enabled_changed {
+                        if enabled {
+                            update.enabled_sources += 1;
+                        } else {
+                            update.disabled_sources += 1;
+                        }
+                    }
+                    if source_update.metadata_changed {
+                        update.updated_sources += 1;
+                    }
+                }
+                None if enabled => {
+                    let sources = ensure_ingest_sources_mut(document)?;
+                    sources.push(setup_source.to_table(enabled));
                     update.added_sources += 1;
                 }
-            }
-            continue;
-        }
-
-        let sources = ensure_ingest_sources_mut(document)?;
-        for source_idx in source_indexes {
-            let source = sources
-                .get_mut(source_idx)
-                .expect("source index came from the same array");
-            let current_enabled = source
-                .get("enabled")
-                .and_then(Item::as_bool)
-                .unwrap_or(true);
-            if current_enabled != enabled {
-                source["enabled"] = toml_value(enabled);
-                if enabled {
-                    update.enabled_sources += 1;
-                } else {
-                    update.disabled_sources += 1;
-                }
+                None => {}
             }
         }
     }
@@ -565,20 +574,17 @@ fn apply_ingest_selections_to_document(
     Ok(update)
 }
 
-fn ingest_source_indexes_for_harness(
+fn ingest_source_index(
     document: &mut DocumentMut,
-    harness: &str,
-) -> Result<Vec<usize>> {
+    setup_source: harnesses::DefaultIngestSource,
+) -> Result<Option<usize>> {
     let Some(sources) = ingest_sources_mut(document)? else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
-    Ok(sources
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, source)| {
-            (source.get("harness").and_then(Item::as_str) == Some(harness)).then_some(idx)
-        })
-        .collect())
+    Ok(sources.iter().position(|source| {
+        source.get("name").and_then(Item::as_str) == Some(setup_source.name())
+            && source.get("harness").and_then(Item::as_str) == Some(setup_source.harness())
+    }))
 }
 
 fn ensure_ingest_sources_mut(document: &mut DocumentMut) -> Result<&mut ArrayOfTables> {
@@ -611,104 +617,6 @@ fn ingest_sources_mut(document: &mut DocumentMut) -> Result<Option<&mut ArrayOfT
     Ok(Some(sources.as_array_of_tables_mut().ok_or_else(|| {
         anyhow::anyhow!("ingest.sources must be an array of tables")
     })?))
-}
-
-#[derive(Debug, Clone, Copy)]
-struct DefaultIngestSource {
-    name: &'static str,
-    harness: &'static str,
-    glob: &'static str,
-    watch_root: &'static str,
-    format: Option<&'static str>,
-}
-
-impl DefaultIngestSource {
-    fn to_table(self, enabled: bool) -> Table {
-        let mut table = Table::new();
-        table["name"] = toml_value(self.name);
-        table["harness"] = toml_value(self.harness);
-        table["enabled"] = toml_value(enabled);
-        table["glob"] = toml_value(self.glob);
-        table["watch_root"] = toml_value(self.watch_root);
-        if let Some(format) = self.format {
-            table["format"] = toml_value(format);
-        }
-        table
-    }
-}
-
-fn default_ingest_sources_for_target(target: SetupMcpTarget) -> Vec<DefaultIngestSource> {
-    match target {
-        SetupMcpTarget::ClaudeCode => vec![DefaultIngestSource {
-            name: "claude",
-            harness: "claude-code",
-            glob: "~/.claude/projects/**/*.jsonl",
-            watch_root: "~/.claude/projects",
-            format: None,
-        }],
-        SetupMcpTarget::Codex => vec![DefaultIngestSource {
-            name: "codex",
-            harness: "codex",
-            glob: "~/.codex/sessions/**/*.jsonl",
-            watch_root: "~/.codex/sessions",
-            format: None,
-        }],
-        SetupMcpTarget::Hermes => vec![DefaultIngestSource {
-            name: "hermes",
-            harness: "hermes",
-            glob: "~/.hermes/sessions/session_*.json",
-            watch_root: "~/.hermes/sessions",
-            format: Some("session_json"),
-        }],
-        SetupMcpTarget::KimiCli => vec![DefaultIngestSource {
-            name: "kimi-cli",
-            harness: "kimi-cli",
-            glob: "~/.kimi/sessions/**/wire.jsonl",
-            watch_root: "~/.kimi/sessions",
-            format: Some("jsonl"),
-        }],
-        SetupMcpTarget::OpenCode => vec![DefaultIngestSource {
-            name: "opencode",
-            harness: "opencode",
-            glob: "~/.local/share/opencode/opencode*.db",
-            watch_root: "~/.local/share/opencode",
-            format: Some("opencode_sqlite"),
-        }],
-        SetupMcpTarget::Cursor => {
-            let cursor_state_root = if cfg!(target_os = "macos") {
-                "~/Library/Application Support/Cursor/User"
-            } else {
-                "~/.config/Cursor/User"
-            };
-            vec![
-                DefaultIngestSource {
-                    name: "cursor",
-                    harness: "cursor",
-                    glob: "~/.cursor/projects/*/agent-transcripts/**/*.jsonl",
-                    watch_root: "~/.cursor/projects",
-                    format: Some("jsonl"),
-                },
-                DefaultIngestSource {
-                    name: "cursor-sqlite",
-                    harness: "cursor",
-                    glob: if cfg!(target_os = "macos") {
-                        "~/Library/Application Support/Cursor/User/**/state.vscdb"
-                    } else {
-                        "~/.config/Cursor/User/**/state.vscdb"
-                    },
-                    watch_root: cursor_state_root,
-                    format: Some("cursor_sqlite"),
-                },
-            ]
-        }
-        SetupMcpTarget::PiCodingAgent => vec![DefaultIngestSource {
-            name: "pi",
-            harness: "pi-coding-agent",
-            glob: "~/.pi/agent/sessions/**/*.jsonl",
-            watch_root: "~/.pi/agent/sessions",
-            format: Some("jsonl"),
-        }],
-    }
 }
 
 fn write_toml_atomic(path: &Path, content: &str) -> Result<()> {
@@ -873,7 +781,8 @@ fn setup_target_selections(
         });
     }
 
-    prompt_setup_target_selector(&setup_targets(), runner)
+    let targets = harnesses::setup_targets();
+    prompt_setup_target_selector(&targets, runner)
 }
 
 fn dedup_targets(targets: &[SetupMcpTarget]) -> Vec<SetupMcpTarget> {
@@ -883,18 +792,6 @@ fn dedup_targets(targets: &[SetupMcpTarget]) -> Vec<SetupMcpTarget> {
         .copied()
         .filter(|target| seen.insert(*target))
         .collect()
-}
-
-fn setup_targets() -> [SetupMcpTarget; 7] {
-    [
-        SetupMcpTarget::ClaudeCode,
-        SetupMcpTarget::Codex,
-        SetupMcpTarget::Hermes,
-        SetupMcpTarget::KimiCli,
-        SetupMcpTarget::OpenCode,
-        SetupMcpTarget::Cursor,
-        SetupMcpTarget::PiCodingAgent,
-    ]
 }
 
 fn prompt_setup_target_selector(
@@ -992,6 +889,13 @@ fn render_setup_selector(
             .black()
             .apply_to("Space cycles none → ingest + harness → ingest only → harness only. Enter applies. Esc skips.")
     ))?;
+    term.write_line(&format!(
+        "  {}",
+        Style::new()
+            .for_stderr()
+            .yellow()
+            .apply_to(HOST_WIDE_ACCESS_WARNING)
+    ))?;
 
     for (idx, selection) in selections.iter().enumerate() {
         term.write_line(&format_setup_selector_row(
@@ -1001,7 +905,7 @@ fn render_setup_selector(
         ))?;
     }
     term.flush()?;
-    Ok(selections.len() + 2)
+    Ok(selections.len() + 3)
 }
 
 fn format_setup_selector_row(
@@ -1244,7 +1148,7 @@ impl SetupProgress {
             self.mark("→", ">", Style::new().cyan()),
             self.label(&format!(
                 "Updating {} config at {}",
-                write.kind.label(),
+                write.label(),
                 write.path().display()
             ))
         );
@@ -1567,206 +1471,7 @@ impl McpPlan {
         config_target: &ConfigTarget,
         home: Option<PathBuf>,
     ) -> Self {
-        match target {
-            SetupMcpTarget::ClaudeCode if config_target.requires_explicit_mcp_config() => {
-                let mut args = vec![
-                    "mcp".to_string(),
-                    "add".to_string(),
-                    "--transport".to_string(),
-                    "stdio".to_string(),
-                    "--scope".to_string(),
-                    "user".to_string(),
-                    "moraine".to_string(),
-                    "--".to_string(),
-                    "moraine".to_string(),
-                    "run".to_string(),
-                    "mcp".to_string(),
-                    "--config".to_string(),
-                ];
-                args.push(config_target.path.display().to_string());
-                let command = CommandSpec::new("claude", args);
-                Self::manual(
-                    target,
-                    format!(
-                        "Claude Code plugin installs use the default Moraine config. For this custom config target, use manual MCP registration:\n{}",
-                        command.display()
-                    ),
-                )
-            }
-            SetupMcpTarget::ClaudeCode => Self {
-                target,
-                action: McpAction::Execute,
-                steps: vec![
-                    McpPlanStep::warn_and_continue(
-                        CommandSpec::new(
-                            "claude",
-                            [
-                                "plugin",
-                                "marketplace",
-                                "add",
-                                "eric-tramel/moraine",
-                                "--sparse",
-                                ".claude-plugin",
-                                "plugins",
-                            ],
-                        ),
-                        "Claude marketplace add failed; continuing because the marketplace may already exist",
-                    )
-                    .with_progress(
-                        "Adding Claude Code plugin marketplace",
-                        "Claude Code marketplace ready",
-                        "Claude Code marketplace already present or unavailable",
-                        "Claude Code marketplace add failed",
-                    ),
-                    McpPlanStep::required(CommandSpec::new(
-                        "claude",
-                        ["plugin", "install", "moraine@moraine"],
-                    ))
-                    .with_progress(
-                        "Installing Claude Code Moraine plugin",
-                        "Claude Code plugin installed",
-                        "Claude Code plugin install warning",
-                        "Claude Code plugin install failed",
-                    ),
-                    McpPlanStep::warn_and_continue(
-                        CommandSpec::new(
-                            "claude",
-                            ["mcp", "remove", "moraine", "--scope", "user"],
-                        ),
-                        "Existing manual Claude Code MCP registration could not be removed; continuing in case it was absent",
-                    )
-                    .with_progress(
-                        "Cleaning up old Claude Code MCP registration",
-                        "Old Claude Code MCP registration removed or absent",
-                        "Old Claude Code MCP registration left unchanged",
-                        "Old Claude Code MCP cleanup failed",
-                    ),
-                ],
-                config_writes: Vec::new(),
-                manual_snippet: None,
-            },
-            SetupMcpTarget::Codex if config_target.requires_explicit_mcp_config() => {
-                let command = CommandSpec::new("codex", codex_args(config_target));
-                Self::manual(
-                    target,
-                    format!(
-                        "Codex plugin installs use the default Moraine config. For this custom config target, use manual MCP registration:\n{}",
-                        command.display()
-                    ),
-                )
-            }
-            SetupMcpTarget::Codex => Self {
-                target,
-                action: McpAction::Execute,
-                steps: vec![
-                    McpPlanStep::warn_and_continue(
-                        CommandSpec::new(
-                            "codex",
-                            [
-                                "plugin",
-                                "marketplace",
-                                "add",
-                                "eric-tramel/moraine",
-                                "--sparse",
-                                ".agents/plugins",
-                                "--sparse",
-                                "plugins/moraine",
-                                "--sparse",
-                                "plugins/moraine-dev",
-                            ],
-                        ),
-                        "Codex marketplace add failed; continuing because the marketplace may already exist",
-                    )
-                    .with_progress(
-                        "Adding Codex plugin marketplace",
-                        "Codex marketplace ready",
-                        "Codex marketplace already present or unavailable",
-                        "Codex marketplace add failed",
-                    ),
-                    McpPlanStep::required(CommandSpec::new(
-                        "codex",
-                        ["plugin", "add", "moraine@moraine"],
-                    ))
-                    .with_progress(
-                        "Installing Codex Moraine plugin",
-                        "Codex plugin installed",
-                        "Codex plugin install warning",
-                        "Codex plugin install failed",
-                    ),
-                    McpPlanStep::warn_and_continue(
-                        CommandSpec::new("codex", ["mcp", "remove", "moraine"]),
-                        "Existing manual Codex MCP registration could not be removed; continuing in case it was absent",
-                    )
-                    .with_progress(
-                        "Cleaning up old Codex MCP registration",
-                        "Old Codex MCP registration removed or absent",
-                        "Old Codex MCP registration left unchanged",
-                        "Old Codex MCP cleanup failed",
-                    ),
-                ],
-                config_writes: Vec::new(),
-                manual_snippet: None,
-            },
-            SetupMcpTarget::Hermes => Self::replace_registration(
-                target,
-                CommandSpec::new("hermes", ["mcp", "remove", "moraine"]),
-                McpPlanStep::required_stdout(
-                    CommandSpec::new("hermes", hermes_args(config_target)).with_stdin("\n"),
-                    "tools enabled",
-                )
-                .with_progress(
-                    "Registering Moraine MCP in Hermes",
-                    "Hermes MCP tools enabled",
-                    "Hermes MCP registration warning",
-                    "Hermes MCP registration failed",
-                ),
-            ),
-            SetupMcpTarget::KimiCli => Self::replace_registration(
-                target,
-                CommandSpec::new("kimi", ["mcp", "remove", "moraine"]),
-                McpPlanStep::required(CommandSpec::new("kimi", kimi_args(config_target)))
-                    .with_progress(
-                        "Registering Moraine MCP in Kimi CLI",
-                        "Kimi CLI MCP registered",
-                        "Kimi CLI MCP registration warning",
-                        "Kimi CLI MCP registration failed",
-                    ),
-            ),
-            SetupMcpTarget::OpenCode => Self::write_config(
-                target,
-                home
-                    .as_ref()
-                    .map(|home| McpConfigWrite::opencode(home, config_target)),
-                opencode_snippet(config_target),
-            ),
-            SetupMcpTarget::Cursor => Self::write_config(
-                target,
-                home.as_ref()
-                    .map(|home| McpConfigWrite::cursor(home, config_target)),
-                cursor_snippet(config_target),
-            ),
-            SetupMcpTarget::PiCodingAgent => {
-                let mut plan = Self::write_config(
-                    target,
-                    home.as_ref()
-                        .map(|home| McpConfigWrite::pi(home, config_target)),
-                    pi_snippet(config_target),
-                );
-                if !plan.config_writes.is_empty() {
-                    plan.steps.push(McpPlanStep::required(CommandSpec::new(
-                        "pi",
-                        ["install", "npm:pi-mcp-extension"],
-                    ))
-                    .with_progress(
-                        "Installing Pi MCP extension",
-                        "Pi MCP extension installed",
-                        "Pi MCP extension install warning",
-                        "Pi MCP extension install failed",
-                    ));
-                }
-                plan
-            }
-        }
+        harnesses::mcp_plan(target, config_target, home)
     }
 
     fn replace_registration(
@@ -1931,206 +1636,6 @@ enum CommandFailurePolicy {
     WarnAndContinue(&'static str),
 }
 
-fn mcp_run_args(config_target: &ConfigTarget) -> Vec<String> {
-    let mut args = vec!["run".to_string(), "mcp".to_string()];
-    if config_target.requires_explicit_mcp_config() {
-        args.push("--config".to_string());
-        args.push(config_target.path.display().to_string());
-    }
-    args
-}
-
-fn codex_args(config_target: &ConfigTarget) -> Vec<String> {
-    let mut args = vec![
-        "mcp".to_string(),
-        "add".to_string(),
-        "moraine".to_string(),
-        "--".to_string(),
-        "moraine".to_string(),
-    ];
-    args.extend(mcp_run_args(config_target));
-    args
-}
-
-fn hermes_args(config_target: &ConfigTarget) -> Vec<String> {
-    let mut args = vec![
-        "mcp".to_string(),
-        "add".to_string(),
-        "moraine".to_string(),
-        "--command".to_string(),
-        "moraine".to_string(),
-        "--args".to_string(),
-    ];
-    args.extend(mcp_run_args(config_target));
-    args
-}
-
-fn kimi_args(config_target: &ConfigTarget) -> Vec<String> {
-    let mut args = vec![
-        "mcp".to_string(),
-        "add".to_string(),
-        "--transport".to_string(),
-        "stdio".to_string(),
-        "moraine".to_string(),
-        "--".to_string(),
-        "moraine".to_string(),
-    ];
-    args.extend(mcp_run_args(config_target));
-    args
-}
-
-fn cursor_snippet(config_target: &ConfigTarget) -> String {
-    let snippet = serde_json::json!({
-        "mcpServers": {
-            "moraine": {
-                "type": "stdio",
-                "command": "moraine",
-                "args": mcp_run_args(config_target),
-            }
-        }
-    });
-    format!(
-        "Add this server to ~/.cursor/mcp.json for global Cursor use or .cursor/mcp.json for a project:\n{}",
-        serde_json::to_string_pretty(&snippet).unwrap_or_else(|_| snippet.to_string())
-    )
-}
-
-fn opencode_snippet(config_target: &ConfigTarget) -> String {
-    let snippet = serde_json::json!({
-        "$schema": "https://opencode.ai/config.json",
-        "mcp": {
-            "moraine": {
-                "type": "local",
-                "command": opencode_command(config_target),
-                "enabled": true,
-            }
-        }
-    });
-    format!(
-        "Add this server to ~/.config/opencode/opencode.json:\n{}",
-        serde_json::to_string_pretty(&snippet).unwrap_or_else(|_| snippet.to_string())
-    )
-}
-
-fn pi_snippet(config_target: &ConfigTarget) -> String {
-    let snippet = serde_json::json!({
-        "mcpServers": {
-            "moraine": {
-                "transport": "stdio",
-                "command": "moraine",
-                "args": mcp_run_args(config_target),
-                "lifecycle": "eager",
-            }
-        }
-    });
-    format!(
-        "Install the Pi MCP extension first:\npi install npm:pi-mcp-extension\n\nThen add this server to ~/.pi/agent/mcp.json:\n{}",
-        serde_json::to_string_pretty(&snippet).unwrap_or_else(|_| snippet.to_string())
-    )
-}
-
-fn opencode_command(config_target: &ConfigTarget) -> Vec<String> {
-    std::iter::once("moraine".to_string())
-        .chain(mcp_run_args(config_target))
-        .collect()
-}
-
-#[derive(Debug, Clone)]
-struct McpConfigWrite {
-    path: PathBuf,
-    kind: McpConfigKind,
-    command: Vec<String>,
-}
-
-impl McpConfigWrite {
-    fn cursor(home: &Path, config_target: &ConfigTarget) -> Self {
-        Self {
-            path: home.join(".cursor").join("mcp.json"),
-            kind: McpConfigKind::Cursor,
-            command: mcp_run_args(config_target),
-        }
-    }
-
-    fn pi(home: &Path, config_target: &ConfigTarget) -> Self {
-        Self {
-            path: home.join(".pi").join("agent").join("mcp.json"),
-            kind: McpConfigKind::Pi,
-            command: mcp_run_args(config_target),
-        }
-    }
-
-    fn opencode(home: &Path, config_target: &ConfigTarget) -> Self {
-        Self {
-            path: home.join(".config").join("opencode").join("opencode.json"),
-            kind: McpConfigKind::OpenCode,
-            command: opencode_command(config_target),
-        }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-
-    fn merge_into(&self, root: &mut Map<String, Value>) -> Result<()> {
-        match self.kind {
-            McpConfigKind::Cursor => {
-                let servers = object_entry_mut(root, "mcpServers")?;
-                servers.insert(
-                    "moraine".to_string(),
-                    serde_json::json!({
-                        "type": "stdio",
-                        "command": "moraine",
-                        "args": self.command.clone(),
-                    }),
-                );
-            }
-            McpConfigKind::Pi => {
-                let servers = object_entry_mut(root, "mcpServers")?;
-                servers.insert(
-                    "moraine".to_string(),
-                    serde_json::json!({
-                        "transport": "stdio",
-                        "command": "moraine",
-                        "args": self.command.clone(),
-                        "lifecycle": "eager",
-                    }),
-                );
-            }
-            McpConfigKind::OpenCode => {
-                root.entry("$schema".to_string())
-                    .or_insert_with(|| serde_json::json!("https://opencode.ai/config.json"));
-                let servers = object_entry_mut(root, "mcp")?;
-                servers.insert(
-                    "moraine".to_string(),
-                    serde_json::json!({
-                        "type": "local",
-                        "command": self.command.clone(),
-                        "enabled": true,
-                    }),
-                );
-            }
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum McpConfigKind {
-    Cursor,
-    Pi,
-    OpenCode,
-}
-
-impl McpConfigKind {
-    fn label(self) -> &'static str {
-        match self {
-            McpConfigKind::Cursor => "Cursor",
-            McpConfigKind::Pi => "Pi",
-            McpConfigKind::OpenCode => "OpenCode",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize)]
 struct McpConfigFileReport {
     path: String,
@@ -2166,13 +1671,13 @@ impl McpConfigFileReport {
 }
 
 fn apply_mcp_config_write(write: &McpConfigWrite) -> Result<McpConfigFileReport> {
-    let mut root = read_json_object_or_default(write.path())?;
+    let mut root = read_json_object_or_default(write.path(), write.format())?;
     write.merge_into(&mut root)?;
     write_json_atomic(write.path(), &Value::Object(root))?;
     Ok(McpConfigFileReport::written(write))
 }
 
-fn read_json_object_or_default(path: &Path) -> Result<Map<String, Value>> {
+fn read_json_object_or_default(path: &Path, format: McpConfigFormat) -> Result<Map<String, Value>> {
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
         Err(exc) if exc.kind() == ErrorKind::NotFound => return Ok(Map::new()),
@@ -2185,27 +1690,20 @@ fn read_json_object_or_default(path: &Path) -> Result<Map<String, Value>> {
         return Ok(Map::new());
     }
 
-    let value: Value = serde_json::from_str(&content)
-        .with_context(|| format!("{} is not valid JSON", path.display()))?;
+    let value = match format {
+        McpConfigFormat::Jsonc => read_jsonc_value(path, &content)?,
+        McpConfigFormat::Json => serde_json::from_str(&content)
+            .with_context(|| format!("{} is not valid JSON", path.display()))?,
+    };
     match value {
         Value::Object(object) => Ok(object),
         _ => bail!("{} must contain a JSON object", path.display()),
     }
 }
 
-fn object_entry_mut<'a>(
-    root: &'a mut Map<String, Value>,
-    key: &str,
-) -> Result<&'a mut Map<String, Value>> {
-    let value = root
-        .entry(key.to_string())
-        .or_insert_with(|| Value::Object(Map::new()));
-    if !value.is_object() {
-        bail!("{key} must be a JSON object");
-    }
-    Ok(value
-        .as_object_mut()
-        .expect("value was checked as a JSON object"))
+fn read_jsonc_value(path: &Path, content: &str) -> Result<Value> {
+    jsonc_parser::parse_to_serde_value::<Value>(content, &Default::default())
+        .with_context(|| format!("{} is not valid JSONC", path.display()))
 }
 
 fn write_json_atomic(path: &Path, value: &Value) -> Result<()> {
@@ -2814,36 +2312,11 @@ fn append_target_details(target: &McpTargetReport, output: &CliOutput, lines: &m
 
 impl SetupMcpTarget {
     fn label(self) -> &'static str {
-        match self {
-            SetupMcpTarget::ClaudeCode => "Claude Code",
-            SetupMcpTarget::Codex => "Codex",
-            SetupMcpTarget::Hermes => "Hermes",
-            SetupMcpTarget::KimiCli => "Kimi CLI",
-            SetupMcpTarget::OpenCode => "OpenCode",
-            SetupMcpTarget::Cursor => "Cursor",
-            SetupMcpTarget::PiCodingAgent => "Pi Coding Agent",
-        }
+        harnesses::spec(self).label()
     }
 
     fn setup_kind(self) -> &'static str {
-        match self {
-            SetupMcpTarget::ClaudeCode | SetupMcpTarget::Codex => "plugin",
-            SetupMcpTarget::Hermes | SetupMcpTarget::KimiCli => "MCP",
-            SetupMcpTarget::OpenCode | SetupMcpTarget::Cursor => "MCP config",
-            SetupMcpTarget::PiCodingAgent => "MCP extension",
-        }
-    }
-
-    fn harness_name(self) -> &'static str {
-        match self {
-            SetupMcpTarget::ClaudeCode => "claude-code",
-            SetupMcpTarget::Codex => "codex",
-            SetupMcpTarget::Hermes => "hermes",
-            SetupMcpTarget::KimiCli => "kimi-cli",
-            SetupMcpTarget::OpenCode => "opencode",
-            SetupMcpTarget::Cursor => "cursor",
-            SetupMcpTarget::PiCodingAgent => "pi-coding-agent",
-        }
+        harnesses::spec(self).setup_kind()
     }
 
     fn is_available_for_setup(self, runner: &dyn CommandRunner) -> bool {
@@ -2858,36 +2331,14 @@ impl SetupMcpTarget {
     }
 
     fn program_candidates(self) -> &'static [&'static str] {
-        match self {
-            SetupMcpTarget::ClaudeCode => &["claude"],
-            SetupMcpTarget::Codex => &["codex"],
-            SetupMcpTarget::Hermes => &["hermes"],
-            SetupMcpTarget::KimiCli => &["kimi"],
-            SetupMcpTarget::OpenCode => &["opencode"],
-            SetupMcpTarget::Cursor => &["cursor", "cursor-agent"],
-            SetupMcpTarget::PiCodingAgent => &["pi"],
-        }
+        harnesses::spec(self).program_candidates()
     }
 
     fn default_probe_paths(self) -> Vec<PathBuf> {
         let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
             return Vec::new();
         };
-        match self {
-            SetupMcpTarget::OpenCode => vec![
-                home.join(".config").join("opencode"),
-                home.join(".local").join("share").join("opencode"),
-            ],
-            SetupMcpTarget::Cursor => vec![
-                home.join(".cursor"),
-                home.join("Library")
-                    .join("Application Support")
-                    .join("Cursor"),
-                home.join(".config").join("Cursor"),
-            ],
-            SetupMcpTarget::PiCodingAgent => vec![home.join(".pi").join("agent")],
-            _ => Vec::new(),
-        }
+        harnesses::spec(self).default_probe_paths(&home)
     }
 }
 
@@ -2896,6 +2347,7 @@ mod tests {
     use super::*;
     use crate::render::OutputMode;
     use std::collections::{BTreeMap, BTreeSet};
+    use toml_edit::value as toml_value;
 
     #[derive(Default)]
     struct FakeRunner {
@@ -2987,6 +2439,37 @@ mod tests {
             .unwrap_or(true)
     }
 
+    fn source_value<'a>(document: &'a DocumentMut, name: &str, key: &str) -> Option<&'a str> {
+        document["ingest"]["sources"]
+            .as_array_of_tables()
+            .expect("ingest sources")
+            .iter()
+            .find(|source| source.get("name").and_then(Item::as_str) == Some(name))
+            .expect("source exists")
+            .get(key)
+            .and_then(Item::as_str)
+    }
+
+    fn push_source(
+        document: &mut DocumentMut,
+        name: &str,
+        harness: &str,
+        enabled: bool,
+        glob: &str,
+        watch_root: &str,
+    ) {
+        let mut table = Table::new();
+        table["name"] = toml_value(name);
+        table["harness"] = toml_value(harness);
+        table["enabled"] = toml_value(enabled);
+        table["glob"] = toml_value(glob);
+        table["watch_root"] = toml_value(watch_root);
+        document["ingest"]["sources"]
+            .as_array_of_tables_mut()
+            .expect("ingest sources")
+            .push(table);
+    }
+
     #[test]
     fn setup_config_target_prefers_cli_then_home() {
         let cli = resolve_setup_config_target_with(
@@ -3042,6 +2525,11 @@ mod tests {
     }
 
     #[test]
+    fn setup_selector_warning_discloses_host_wide_history_access() {
+        assert!(HOST_WIDE_ACCESS_WARNING.contains("host-wide Moraine session history access"));
+    }
+
+    #[test]
     fn harness_targets_include_only_modes_that_configure_harnesses() {
         let selections = SetupSelectionSet {
             targets: vec![
@@ -3077,6 +2565,14 @@ mod tests {
         let mut document = DEFAULT_CONFIG_TEMPLATE
             .parse::<DocumentMut>()
             .expect("template parses");
+        push_source(
+            &mut document,
+            "cursor-custom",
+            "cursor",
+            true,
+            "~/custom/**/*.jsonl",
+            "~/custom",
+        );
 
         let update = apply_ingest_selections_to_document(
             &mut document,
@@ -3103,11 +2599,13 @@ mod tests {
                 enabled_sources: 0,
                 disabled_sources: 3,
                 added_sources: 0,
+                updated_sources: 0,
             }
         );
         assert!(source_enabled(&document, "codex"));
         assert!(!source_enabled(&document, "cursor"));
         assert!(!source_enabled(&document, "cursor-sqlite"));
+        assert!(source_enabled(&document, "cursor-custom"));
         assert!(!source_enabled(&document, "hermes"));
     }
 
@@ -3138,6 +2636,7 @@ mod tests {
                 enabled_sources: 0,
                 disabled_sources: 0,
                 added_sources: 2,
+                updated_sources: 0,
             }
         );
         assert_eq!(sources_for_harness(&document, "cursor").len(), 2);
@@ -3149,6 +2648,65 @@ mod tests {
         fs::write(&path, document.to_string()).expect("write updated config");
         moraine_config::load_config(&path).expect("updated config loads");
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn ingest_selection_reconciles_missing_setup_owned_sources() {
+        let mut document = r#"
+[ingest]
+
+[[ingest.sources]]
+name = "cursor"
+harness = "cursor"
+enabled = false
+glob = "~/stale/**/*.jsonl"
+watch_root = "~/stale"
+format = "stale"
+
+[[ingest.sources]]
+name = "cursor-custom"
+harness = "cursor"
+enabled = false
+glob = "~/custom/**/*.jsonl"
+watch_root = "~/custom"
+"#
+        .parse::<DocumentMut>()
+        .expect("partial cursor config parses");
+
+        let update = apply_ingest_selections_to_document(
+            &mut document,
+            &[SetupTargetSelection {
+                target: SetupMcpTarget::Cursor,
+                mode: SetupSelectionMode::IngestOnly,
+            }],
+        )
+        .expect("apply ingest selections");
+
+        assert_eq!(
+            update,
+            IngestSelectionUpdate {
+                enabled_sources: 1,
+                disabled_sources: 0,
+                added_sources: 1,
+                updated_sources: 1,
+            }
+        );
+        assert!(source_enabled(&document, "cursor"));
+        assert!(source_enabled(&document, "cursor-sqlite"));
+        assert!(!source_enabled(&document, "cursor-custom"));
+        assert_eq!(
+            source_value(&document, "cursor", "glob"),
+            Some("~/.cursor/projects/*/agent-transcripts/**/*.jsonl")
+        );
+        assert_eq!(
+            source_value(&document, "cursor", "watch_root"),
+            Some("~/.cursor/projects")
+        );
+        assert_eq!(source_value(&document, "cursor", "format"), Some("jsonl"));
+        assert_eq!(
+            source_value(&document, "cursor-custom", "glob"),
+            Some("~/custom/**/*.jsonl")
+        );
     }
 
     #[test]
@@ -3448,6 +3006,50 @@ mod tests {
         assert_eq!(
             value["mcp"]["moraine"]["command"],
             serde_json::json!(["moraine", "run", "mcp", "--config", "/tmp/custom.toml"])
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn opencode_config_write_accepts_jsonc_config() {
+        let home = temp_path("opencode-jsonc-home");
+        let opencode_dir = home.join(".config").join("opencode");
+        fs::create_dir_all(&opencode_dir).expect("create opencode dir");
+        let path = opencode_dir.join("opencode.json");
+        fs::write(
+            &path,
+            r#"{
+  // OpenCode config files are JSONC.
+  "theme": "system",
+  "mcp": {
+    "other": {
+      "type": "local",
+      "command": ["node", "server.js"],
+    },
+  },
+}"#,
+        )
+        .expect("write existing opencode config");
+
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/config.toml"),
+            source: ConfigTargetSource::HomeDefault,
+        };
+        let write = McpConfigWrite::opencode(&home, &target);
+        apply_mcp_config_write(&write).expect("write opencode config");
+
+        let value: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read opencode config"))
+                .expect("opencode config json");
+        assert_eq!(value["theme"], "system");
+        assert_eq!(
+            value["mcp"]["other"]["command"],
+            serde_json::json!(["node", "server.js"])
+        );
+        assert_eq!(value["mcp"]["moraine"]["type"], "local");
+        assert_eq!(
+            value["mcp"]["moraine"]["command"],
+            serde_json::json!(["moraine", "run", "mcp"])
         );
         let _ = fs::remove_dir_all(home);
     }
