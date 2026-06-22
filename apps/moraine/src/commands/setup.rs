@@ -2599,7 +2599,9 @@ mod tests {
                 enabled_sources: 0,
                 disabled_sources: 3,
                 added_sources: 0,
-                updated_sources: 0,
+                // The bundled template carries macOS Cursor SQLite paths. On Linux,
+                // setup repairs that setup-owned source while disabling it.
+                updated_sources: if cfg!(target_os = "macos") { 0 } else { 1 },
             }
         );
         assert!(source_enabled(&document, "codex"));
