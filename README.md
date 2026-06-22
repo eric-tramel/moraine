@@ -46,54 +46,30 @@ Moraine ships session trace ingestion adapters for these agent harnesses:
 
 ## Quickstart
 
-Install from PyPI with `uv`:
-
 ```bash
 uv tool install moraine-cli
-```
-
-Or install the latest release bundle:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/eric-tramel/moraine/main/scripts/install.sh | sh
-```
-
-Start the local stack:
-
-```bash
+moraine setup
 moraine up
-moraine status
 ```
+
+`moraine setup` creates or repairs `~/.moraine/config.toml` and guides plugin or
+MCP registration for detected agent harnesses.
 
 The monitor UI runs at `http://127.0.0.1:8080` by default.
 
-## Connect Claude Code or Codex
+For release bundles, upgrades, project-scoped setup, and other harnesses, see the
+[Quickstart and Installation](https://eric-tramel.github.io/moraine/quickstart.html).
 
-After `moraine up`, install the Moraine plugin for your agent harness. The
-plugins register the MCP search server and bundle guidance for searching prior
-sessions, but they still use the `moraine` CLI on your `PATH` and the running
-local stack.
+## Connect Agent Harnesses
 
-For Claude Code:
+Use `moraine setup` to install or update the Moraine plugins for Claude Code and
+Codex, or to register Moraine MCP for supported harnesses such as OpenCode,
+Cursor, Hermes, Kimi CLI, and Pi Coding Agent. The integrations use the
+`moraine` CLI on your `PATH` and the running local stack.
 
-```bash
-claude plugin marketplace add eric-tramel/moraine --sparse .claude-plugin plugins
-claude plugin install moraine@moraine
-```
-
-For Codex:
-
-```bash
-codex plugin marketplace add eric-tramel/moraine \
-  --sparse .agents/plugins \
-  --sparse plugins/moraine \
-  --sparse plugins/moraine-dev
-codex plugin add moraine@moraine
-```
-
-Start a new agent session after installing the plugin. Claude Code sessions get
-the `moraine:session-search` and `moraine:realtime-peek` skills, and Moraine MCP
-tools are exposed as `mcp__plugin_moraine_moraine__*`. Then ask:
+Start a new agent session after installing an integration. Claude Code sessions
+get the `moraine:session-search` and `moraine:realtime-peek` skills, and Moraine
+MCP tools are exposed as `mcp__plugin_moraine_moraine__*`. Then ask:
 
 ```text
 What are my agents doing right now?
