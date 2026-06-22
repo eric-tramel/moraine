@@ -1,9 +1,5 @@
 use anyhow::{bail, Context, Result};
-use dialoguer::{
-    console::{style, Style},
-    theme::Theme,
-    MultiSelect,
-};
+use dialoguer::console::{style, Key, Style, Term};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
@@ -19,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cli::{SetupArgs, SetupMcpTarget};
 use crate::render::{CliOutput, OutputMode};
+use toml_edit::{value as toml_value, ArrayOfTables, DocumentMut, Item, Table};
 
 const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../../../../config/moraine.toml");
 
@@ -55,7 +52,7 @@ fn run_setup(
         bail!("`moraine --output json setup` requires --yes or --dry-run");
     }
 
-    let config = if args.skip_config {
+    let mut config = if args.skip_config {
         ConfigReport::skipped(&target.path, "skipped by --skip-config")
     } else {
         setup_config(args, &target, interactive)?
@@ -66,23 +63,45 @@ fn run_setup(
         let config_allows_mcp =
             args.skip_config || args.dry_run || config.status == SetupStatus::Ok;
         if config_allows_mcp {
-            let selected = selected_mcp_targets(args, interactive, runner)?;
-            let targets_confirmed_by_selection =
-                args.mcp_targets.is_empty() && interactive && !args.yes && !args.dry_run;
-            let mut progress = SetupProgress::from_output(output);
-            for mcp_target in selected {
-                let report = setup_mcp_target_with_progress(
-                    args,
-                    &target,
-                    mcp_target,
-                    interactive,
-                    targets_confirmed_by_selection,
-                    &mut progress,
-                    runner,
-                )?;
-                mcp_targets.push(report);
+            let selections = setup_target_selections(args, interactive, runner)?;
+            if selections.apply_ingest && !args.skip_config && config.status == SetupStatus::Ok {
+                match apply_ingest_selections_to_config(&target.path, &selections.targets) {
+                    Ok(update) => config.apply_ingest_update(update),
+                    Err(exc) => {
+                        config = ConfigReport::error(
+                            &target.path,
+                            "ingest_update_failed",
+                            &format!("failed to update ingest source selections: {exc}"),
+                        );
+                    }
+                }
             }
-            progress.finish();
+
+            let harness_targets = selections.harness_targets();
+            if config.status == SetupStatus::Ok || args.skip_config || args.dry_run {
+                let targets_confirmed_by_selection = selections.confirmed_harness;
+                let mut progress = SetupProgress::from_output(output);
+                for mcp_target in harness_targets {
+                    let report = setup_mcp_target_with_progress(
+                        args,
+                        &target,
+                        mcp_target,
+                        interactive,
+                        targets_confirmed_by_selection,
+                        &mut progress,
+                        runner,
+                    )?;
+                    mcp_targets.push(report);
+                }
+                progress.finish();
+            } else {
+                for mcp_target in harness_targets {
+                    mcp_targets.push(McpTargetReport::skipped(
+                        mcp_target,
+                        "config setup did not complete; skipping MCP/plugin setup",
+                    ));
+                }
+            }
         } else {
             for mcp_target in dedup_targets(&args.mcp_targets) {
                 mcp_targets.push(McpTargetReport::skipped(
@@ -444,24 +463,417 @@ fn timestamp_suffix() -> String {
     format!("{}-{}", duration.as_secs(), duration.subsec_nanos())
 }
 
-fn selected_mcp_targets(
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct IngestSelectionUpdate {
+    enabled_sources: usize,
+    disabled_sources: usize,
+    added_sources: usize,
+}
+
+impl IngestSelectionUpdate {
+    fn changed_sources(self) -> usize {
+        self.enabled_sources + self.disabled_sources + self.added_sources
+    }
+
+    fn has_changes(self) -> bool {
+        self.changed_sources() > 0
+    }
+
+    fn summary(self) -> String {
+        if !self.has_changes() {
+            return "ingest sources already matched selection".to_string();
+        }
+
+        let mut parts = Vec::new();
+        if self.added_sources == 1 {
+            parts.push("1 added".to_string());
+        } else if self.added_sources > 1 {
+            parts.push(format!("{} added", self.added_sources));
+        }
+        if self.enabled_sources == 1 {
+            parts.push("1 enabled".to_string());
+        } else if self.enabled_sources > 1 {
+            parts.push(format!("{} enabled", self.enabled_sources));
+        }
+        if self.disabled_sources == 1 {
+            parts.push("1 disabled".to_string());
+        } else if self.disabled_sources > 1 {
+            parts.push(format!("{} disabled", self.disabled_sources));
+        }
+        format!("ingest sources updated: {}", parts.join(", "))
+    }
+}
+
+fn apply_ingest_selections_to_config(
+    path: &Path,
+    selections: &[SetupTargetSelection],
+) -> Result<IngestSelectionUpdate> {
+    let content =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut document = content
+        .parse::<DocumentMut>()
+        .with_context(|| format!("{} is not valid TOML", path.display()))?;
+    let update = apply_ingest_selections_to_document(&mut document, selections)?;
+    if update.has_changes() {
+        write_toml_atomic(path, &document.to_string())?;
+    }
+    Ok(update)
+}
+
+fn apply_ingest_selections_to_document(
+    document: &mut DocumentMut,
+    selections: &[SetupTargetSelection],
+) -> Result<IngestSelectionUpdate> {
+    let mut update = IngestSelectionUpdate::default();
+
+    for selection in selections {
+        let harness = selection.target.harness_name();
+        let enabled = selection.mode.configures_ingest();
+        let source_indexes = ingest_source_indexes_for_harness(document, harness)?;
+
+        if source_indexes.is_empty() {
+            if enabled {
+                let sources = ensure_ingest_sources_mut(document)?;
+                for source in default_ingest_sources_for_target(selection.target) {
+                    sources.push(source.to_table(enabled));
+                    update.added_sources += 1;
+                }
+            }
+            continue;
+        }
+
+        let sources = ensure_ingest_sources_mut(document)?;
+        for source_idx in source_indexes {
+            let source = sources
+                .get_mut(source_idx)
+                .expect("source index came from the same array");
+            let current_enabled = source
+                .get("enabled")
+                .and_then(Item::as_bool)
+                .unwrap_or(true);
+            if current_enabled != enabled {
+                source["enabled"] = toml_value(enabled);
+                if enabled {
+                    update.enabled_sources += 1;
+                } else {
+                    update.disabled_sources += 1;
+                }
+            }
+        }
+    }
+
+    Ok(update)
+}
+
+fn ingest_source_indexes_for_harness(
+    document: &mut DocumentMut,
+    harness: &str,
+) -> Result<Vec<usize>> {
+    let Some(sources) = ingest_sources_mut(document)? else {
+        return Ok(Vec::new());
+    };
+    Ok(sources
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, source)| {
+            (source.get("harness").and_then(Item::as_str) == Some(harness)).then_some(idx)
+        })
+        .collect())
+}
+
+fn ensure_ingest_sources_mut(document: &mut DocumentMut) -> Result<&mut ArrayOfTables> {
+    if document.as_table().get("ingest").is_none() {
+        document["ingest"] = Item::Table(Table::new());
+    }
+
+    let ingest = document["ingest"]
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("ingest must be a TOML table"))?;
+    if ingest.get("sources").is_none() {
+        ingest["sources"] = Item::ArrayOfTables(ArrayOfTables::new());
+    }
+
+    ingest["sources"]
+        .as_array_of_tables_mut()
+        .ok_or_else(|| anyhow::anyhow!("ingest.sources must be an array of tables"))
+}
+
+fn ingest_sources_mut(document: &mut DocumentMut) -> Result<Option<&mut ArrayOfTables>> {
+    let Some(ingest) = document.as_table_mut().get_mut("ingest") else {
+        return Ok(None);
+    };
+    let ingest = ingest
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("ingest must be a TOML table"))?;
+    let Some(sources) = ingest.get_mut("sources") else {
+        return Ok(None);
+    };
+    Ok(Some(sources.as_array_of_tables_mut().ok_or_else(|| {
+        anyhow::anyhow!("ingest.sources must be an array of tables")
+    })?))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DefaultIngestSource {
+    name: &'static str,
+    harness: &'static str,
+    glob: &'static str,
+    watch_root: &'static str,
+    format: Option<&'static str>,
+}
+
+impl DefaultIngestSource {
+    fn to_table(self, enabled: bool) -> Table {
+        let mut table = Table::new();
+        table["name"] = toml_value(self.name);
+        table["harness"] = toml_value(self.harness);
+        table["enabled"] = toml_value(enabled);
+        table["glob"] = toml_value(self.glob);
+        table["watch_root"] = toml_value(self.watch_root);
+        if let Some(format) = self.format {
+            table["format"] = toml_value(format);
+        }
+        table
+    }
+}
+
+fn default_ingest_sources_for_target(target: SetupMcpTarget) -> Vec<DefaultIngestSource> {
+    match target {
+        SetupMcpTarget::ClaudeCode => vec![DefaultIngestSource {
+            name: "claude",
+            harness: "claude-code",
+            glob: "~/.claude/projects/**/*.jsonl",
+            watch_root: "~/.claude/projects",
+            format: None,
+        }],
+        SetupMcpTarget::Codex => vec![DefaultIngestSource {
+            name: "codex",
+            harness: "codex",
+            glob: "~/.codex/sessions/**/*.jsonl",
+            watch_root: "~/.codex/sessions",
+            format: None,
+        }],
+        SetupMcpTarget::Hermes => vec![DefaultIngestSource {
+            name: "hermes",
+            harness: "hermes",
+            glob: "~/.hermes/sessions/session_*.json",
+            watch_root: "~/.hermes/sessions",
+            format: Some("session_json"),
+        }],
+        SetupMcpTarget::KimiCli => vec![DefaultIngestSource {
+            name: "kimi-cli",
+            harness: "kimi-cli",
+            glob: "~/.kimi/sessions/**/wire.jsonl",
+            watch_root: "~/.kimi/sessions",
+            format: Some("jsonl"),
+        }],
+        SetupMcpTarget::OpenCode => vec![DefaultIngestSource {
+            name: "opencode",
+            harness: "opencode",
+            glob: "~/.local/share/opencode/opencode*.db",
+            watch_root: "~/.local/share/opencode",
+            format: Some("opencode_sqlite"),
+        }],
+        SetupMcpTarget::Cursor => {
+            let cursor_state_root = if cfg!(target_os = "macos") {
+                "~/Library/Application Support/Cursor/User"
+            } else {
+                "~/.config/Cursor/User"
+            };
+            vec![
+                DefaultIngestSource {
+                    name: "cursor",
+                    harness: "cursor",
+                    glob: "~/.cursor/projects/*/agent-transcripts/**/*.jsonl",
+                    watch_root: "~/.cursor/projects",
+                    format: Some("jsonl"),
+                },
+                DefaultIngestSource {
+                    name: "cursor-sqlite",
+                    harness: "cursor",
+                    glob: if cfg!(target_os = "macos") {
+                        "~/Library/Application Support/Cursor/User/**/state.vscdb"
+                    } else {
+                        "~/.config/Cursor/User/**/state.vscdb"
+                    },
+                    watch_root: cursor_state_root,
+                    format: Some("cursor_sqlite"),
+                },
+            ]
+        }
+        SetupMcpTarget::PiCodingAgent => vec![DefaultIngestSource {
+            name: "pi",
+            harness: "pi-coding-agent",
+            glob: "~/.pi/agent/sessions/**/*.jsonl",
+            watch_root: "~/.pi/agent/sessions",
+            format: Some("jsonl"),
+        }],
+    }
+}
+
+fn write_toml_atomic(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.toml");
+    for attempt in 0..100 {
+        let temp_path = parent.join(format!(
+            ".{file_name}.setup-{}-{}-{attempt}.tmp",
+            std::process::id(),
+            timestamp_suffix()
+        ));
+        match private_create_new_options().open(&temp_path) {
+            Ok(mut file) => {
+                let result = (|| {
+                    file.write_all(content.as_bytes())
+                        .with_context(|| format!("failed to write {}", temp_path.display()))?;
+                    file.flush()
+                        .with_context(|| format!("failed to flush {}", temp_path.display()))?;
+                    moraine_config::load_config(&temp_path).with_context(|| {
+                        format!(
+                            "updated config failed validation at {}",
+                            temp_path.display()
+                        )
+                    })?;
+                    fs::rename(&temp_path, path).with_context(|| {
+                        format!(
+                            "failed to persist {} to {}",
+                            temp_path.display(),
+                            path.display()
+                        )
+                    })?;
+                    Ok(())
+                })();
+                if result.is_err() {
+                    let _ = fs::remove_file(&temp_path);
+                }
+                return result;
+            }
+            Err(exc) if exc.kind() == ErrorKind::AlreadyExists => continue,
+            Err(exc) => {
+                return Err(exc)
+                    .with_context(|| format!("failed to create {}", temp_path.display()));
+            }
+        }
+    }
+
+    bail!(
+        "failed to create a unique temporary TOML file in {}",
+        parent.display()
+    );
+}
+
+#[derive(Debug, Clone)]
+struct SetupSelectionSet {
+    targets: Vec<SetupTargetSelection>,
+    apply_ingest: bool,
+    confirmed_harness: bool,
+}
+
+impl SetupSelectionSet {
+    fn harness_targets(&self) -> Vec<SetupMcpTarget> {
+        self.targets
+            .iter()
+            .filter(|selection| selection.mode.configures_harness())
+            .map(|selection| selection.target)
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SetupTargetSelection {
+    target: SetupMcpTarget,
+    mode: SetupSelectionMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupSelectionMode {
+    Off,
+    IngestAndHarness,
+    IngestOnly,
+    HarnessOnly,
+}
+
+impl SetupSelectionMode {
+    fn cycle(self) -> Self {
+        match self {
+            SetupSelectionMode::Off => SetupSelectionMode::IngestAndHarness,
+            SetupSelectionMode::IngestAndHarness => SetupSelectionMode::IngestOnly,
+            SetupSelectionMode::IngestOnly => SetupSelectionMode::HarnessOnly,
+            SetupSelectionMode::HarnessOnly => SetupSelectionMode::Off,
+        }
+    }
+
+    fn configures_ingest(self) -> bool {
+        matches!(
+            self,
+            SetupSelectionMode::IngestAndHarness | SetupSelectionMode::IngestOnly
+        )
+    }
+
+    fn configures_harness(self) -> bool {
+        matches!(
+            self,
+            SetupSelectionMode::IngestAndHarness | SetupSelectionMode::HarnessOnly
+        )
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            SetupSelectionMode::Off => "○",
+            SetupSelectionMode::IngestAndHarness => "●",
+            SetupSelectionMode::IngestOnly => "◐",
+            SetupSelectionMode::HarnessOnly => "◑",
+        }
+    }
+
+    fn summary(self, target: SetupMcpTarget) -> String {
+        match self {
+            SetupSelectionMode::Off => "nothing".to_string(),
+            SetupSelectionMode::IngestAndHarness => format!("ingest + {}", target.setup_kind()),
+            SetupSelectionMode::IngestOnly => "ingest only".to_string(),
+            SetupSelectionMode::HarnessOnly => format!("{} only", target.setup_kind()),
+        }
+    }
+}
+
+fn setup_target_selections(
     args: &SetupArgs,
     interactive: bool,
     runner: &dyn CommandRunner,
-) -> Result<Vec<SetupMcpTarget>> {
+) -> Result<SetupSelectionSet> {
     if !args.mcp_targets.is_empty() {
-        return Ok(dedup_targets(&args.mcp_targets));
+        return Ok(SetupSelectionSet {
+            targets: dedup_targets(&args.mcp_targets)
+                .into_iter()
+                .map(|target| SetupTargetSelection {
+                    target,
+                    mode: SetupSelectionMode::HarnessOnly,
+                })
+                .collect(),
+            apply_ingest: false,
+            confirmed_harness: false,
+        });
     }
 
     if args.yes || args.dry_run || !interactive {
-        return Ok(Vec::new());
+        return Ok(SetupSelectionSet {
+            targets: Vec::new(),
+            apply_ingest: false,
+            confirmed_harness: false,
+        });
     }
 
-    let available = setup_targets()
-        .into_iter()
-        .filter(|target| target.is_available_for_setup(runner))
-        .collect::<Vec<_>>();
-    prompt_mcp_target_checklist(&available)
+    prompt_setup_target_selector(&setup_targets(), runner)
 }
 
 fn dedup_targets(targets: &[SetupMcpTarget]) -> Vec<SetupMcpTarget> {
@@ -485,125 +897,210 @@ fn setup_targets() -> [SetupMcpTarget; 7] {
     ]
 }
 
-fn prompt_mcp_target_checklist(available: &[SetupMcpTarget]) -> Result<Vec<SetupMcpTarget>> {
-    if available.is_empty() {
-        eprintln!("No supported agent harnesses were detected.");
-        return Ok(Vec::new());
-    }
-
-    let items = available
+fn prompt_setup_target_selector(
+    targets: &[SetupMcpTarget],
+    runner: &dyn CommandRunner,
+) -> Result<SetupSelectionSet> {
+    let mut selections = targets
         .iter()
-        .map(|target| format!("{:<14} {}", target.label(), target.setup_kind()))
+        .copied()
+        .map(|target| SetupTargetSelection {
+            target,
+            mode: SetupSelectionMode::Off,
+        })
         .collect::<Vec<_>>();
-    let defaults = vec![false; items.len()];
-    let theme = SetupPromptTheme;
-    let selected = MultiSelect::with_theme(&theme)
-        .with_prompt(
-            "Agent integrations - selected harnesses get host-wide Moraine session history access (Space toggles, Enter installs selected, Esc skips)",
-        )
-        .items(&items)
-        .defaults(&defaults)
-        .max_length(items.len())
-        .interact_opt()
-        .context("failed to read setup target selection")?
-        .unwrap_or_default();
+    let mut active = 0usize;
+    let term = Term::stderr();
+    let mut rendered_lines = 0usize;
 
-    Ok(selected_mcp_targets_from_indices(available, &selected))
-}
-
-fn selected_mcp_targets_from_indices(
-    available: &[SetupMcpTarget],
-    indices: &[usize],
-) -> Vec<SetupMcpTarget> {
-    indices
-        .iter()
-        .filter_map(|idx| available.get(*idx).copied())
-        .collect()
-}
-
-struct SetupPromptTheme;
-
-impl Theme for SetupPromptTheme {
-    fn format_prompt(&self, f: &mut dyn fmt::Write, prompt: &str) -> fmt::Result {
-        write!(
-            f,
-            "{} {} {}",
-            style("?").for_stderr().yellow(),
-            Style::new().for_stderr().bold().apply_to(prompt),
-            style("›").for_stderr().bright().black()
-        )
-    }
-
-    fn format_error(&self, f: &mut dyn fmt::Write, err: &str) -> fmt::Result {
-        write!(
-            f,
-            "{} {}",
-            style("✘").for_stderr().red(),
-            Style::new().for_stderr().red().apply_to(err)
-        )
-    }
-
-    fn format_multi_select_prompt_selection(
-        &self,
-        f: &mut dyn fmt::Write,
-        prompt: &str,
-        selections: &[&str],
-    ) -> fmt::Result {
-        write!(
-            f,
-            "{} {} {} ",
-            style("✔").for_stderr().green(),
-            Style::new().for_stderr().bold().apply_to(prompt),
-            style("·").for_stderr().bright().black()
-        )?;
-        if selections.is_empty() {
-            return write!(
-                f,
-                "{}",
-                Style::new().for_stderr().bright().black().apply_to("none")
-            );
+    loop {
+        if rendered_lines > 0 {
+            term.clear_last_lines(rendered_lines).ok();
         }
-        for (idx, selection) in selections.iter().enumerate() {
-            if idx > 0 {
-                write!(f, ", ")?;
+        rendered_lines = render_setup_selector(&term, &selections, active, runner)
+            .context("failed to render setup target selector")?;
+
+        match term
+            .read_key()
+            .context("failed to read setup target selection")?
+        {
+            Key::ArrowUp => {
+                active = active.checked_sub(1).unwrap_or(selections.len() - 1);
             }
-            write!(
-                f,
-                "{}",
-                Style::new().for_stderr().green().apply_to(selection)
-            )?;
+            Key::ArrowDown => {
+                active = (active + 1) % selections.len();
+            }
+            Key::Char(' ') => {
+                selections[active].mode = selections[active].mode.cycle();
+            }
+            Key::Enter => {
+                term.clear_last_lines(rendered_lines).ok();
+                render_setup_selection_summary(&selections);
+                return Ok(SetupSelectionSet {
+                    confirmed_harness: selections
+                        .iter()
+                        .any(|selection| selection.mode.configures_harness()),
+                    targets: selections,
+                    apply_ingest: true,
+                });
+            }
+            Key::Escape => {
+                term.clear_last_lines(rendered_lines).ok();
+                eprintln!(
+                    "{} {} {} {}",
+                    style("–").for_stderr().yellow(),
+                    Style::new()
+                        .for_stderr()
+                        .bold()
+                        .apply_to("Agent integrations"),
+                    style("·").for_stderr().bright().black(),
+                    Style::new()
+                        .for_stderr()
+                        .bright()
+                        .black()
+                        .apply_to("skipped")
+                );
+                return Ok(SetupSelectionSet {
+                    targets: Vec::new(),
+                    apply_ingest: false,
+                    confirmed_harness: false,
+                });
+            }
+            Key::CtrlC => bail!("setup target selection interrupted"),
+            _ => {}
         }
-        Ok(())
     }
+}
 
-    fn format_multi_select_prompt_item(
-        &self,
-        f: &mut dyn fmt::Write,
-        text: &str,
-        checked: bool,
-        active: bool,
-    ) -> fmt::Result {
-        let arrow = if active {
-            style("❯").for_stderr().green().to_string()
+fn render_setup_selector(
+    term: &Term,
+    selections: &[SetupTargetSelection],
+    active: usize,
+    runner: &dyn CommandRunner,
+) -> Result<usize> {
+    term.write_line(&format!(
+        "{} {} {}",
+        style("?").for_stderr().yellow(),
+        Style::new().for_stderr().bold().apply_to("Agent setup"),
+        style("›").for_stderr().bright().black()
+    ))?;
+    term.write_line(&format!(
+        "  {}",
+        Style::new()
+            .for_stderr()
+            .bright()
+            .black()
+            .apply_to("Space cycles none → ingest + harness → ingest only → harness only. Enter applies. Esc skips.")
+    ))?;
+
+    for (idx, selection) in selections.iter().enumerate() {
+        term.write_line(&format_setup_selector_row(
+            *selection,
+            idx == active,
+            selection.target.is_available_for_setup(runner),
+        ))?;
+    }
+    term.flush()?;
+    Ok(selections.len() + 2)
+}
+
+fn format_setup_selector_row(
+    selection: SetupTargetSelection,
+    active: bool,
+    harness_available: bool,
+) -> String {
+    let arrow = if active {
+        style("❯").for_stderr().green().to_string()
+    } else {
+        " ".to_string()
+    };
+    let icon_style = match selection.mode {
+        SetupSelectionMode::Off => Style::new().for_stderr().bright().black(),
+        SetupSelectionMode::IngestAndHarness => Style::new().for_stderr().green().bold(),
+        SetupSelectionMode::IngestOnly => Style::new().for_stderr().green(),
+        SetupSelectionMode::HarnessOnly => Style::new().for_stderr().cyan(),
+    };
+    let label_style = if active {
+        Style::new().for_stderr().white().bold()
+    } else {
+        Style::new().for_stderr()
+    };
+    let disabled = Style::new().for_stderr().bright().black();
+    let ingest = if selection.mode.configures_ingest() {
+        Style::new().for_stderr().green().apply_to("ingest")
+    } else {
+        disabled.apply_to("·")
+    };
+    let harness_style = if selection.mode.configures_harness() {
+        if harness_available {
+            Style::new().for_stderr().cyan()
         } else {
-            " ".to_string()
-        };
-        let marker = if checked {
-            style("[x]").for_stderr().green().to_string()
-        } else {
-            style("[ ]").for_stderr().magenta().to_string()
-        };
-        if active {
-            write!(
-                f,
-                "{} {} {}",
-                arrow,
-                marker,
-                Style::new().for_stderr().cyan().bold().apply_to(text)
-            )
-        } else {
-            write!(f, "{} {} {}", arrow, marker, text)
+            Style::new().for_stderr().yellow()
         }
+    } else {
+        disabled
+    };
+    let harness = if selection.mode.configures_harness() {
+        harness_style.apply_to(selection.target.setup_kind())
+    } else {
+        harness_style.apply_to("·")
+    };
+    let availability = if selection.mode.configures_harness() && !harness_available {
+        format!(
+            " {}",
+            Style::new().for_stderr().yellow().apply_to("not detected")
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        "{} {} {:<16} {:<8} {}{}",
+        arrow,
+        icon_style.apply_to(selection.mode.icon()),
+        label_style.apply_to(selection.target.label()),
+        ingest,
+        harness,
+        availability
+    )
+}
+
+fn render_setup_selection_summary(selections: &[SetupTargetSelection]) {
+    let selected = selections
+        .iter()
+        .filter(|selection| selection.mode != SetupSelectionMode::Off)
+        .map(|selection| {
+            format!(
+                "{} {}",
+                selection.target.label(),
+                selection.mode.summary(selection.target)
+            )
+        })
+        .collect::<Vec<_>>();
+
+    eprint!(
+        "{} {} {} ",
+        style("✔").for_stderr().green(),
+        Style::new().for_stderr().bold().apply_to("Agent setup"),
+        style("·").for_stderr().bright().black()
+    );
+    if selected.is_empty() {
+        eprintln!(
+            "{}",
+            Style::new()
+                .for_stderr()
+                .bright()
+                .black()
+                .apply_to("nothing selected")
+        );
+    } else {
+        for (idx, selection) in selected.iter().enumerate() {
+            if idx > 0 {
+                eprint!(", ");
+            }
+            eprint!("{}", Style::new().for_stderr().green().apply_to(selection));
+        }
+        eprintln!();
     }
 }
 
@@ -2004,6 +2501,13 @@ impl ConfigReport {
             error: Some(error.to_string()),
         }
     }
+
+    fn apply_ingest_update(&mut self, update: IngestSelectionUpdate) {
+        if update.has_changes() && self.action == "unchanged" {
+            self.action = "updated".to_string();
+        }
+        self.message = format!("{}; {}", self.message, update.summary());
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2330,6 +2834,18 @@ impl SetupMcpTarget {
         }
     }
 
+    fn harness_name(self) -> &'static str {
+        match self {
+            SetupMcpTarget::ClaudeCode => "claude-code",
+            SetupMcpTarget::Codex => "codex",
+            SetupMcpTarget::Hermes => "hermes",
+            SetupMcpTarget::KimiCli => "kimi-cli",
+            SetupMcpTarget::OpenCode => "opencode",
+            SetupMcpTarget::Cursor => "cursor",
+            SetupMcpTarget::PiCodingAgent => "pi-coding-agent",
+        }
+    }
+
     fn is_available_for_setup(self, runner: &dyn CommandRunner) -> bool {
         if self
             .program_candidates()
@@ -2450,6 +2966,27 @@ mod tests {
         }
     }
 
+    fn sources_for_harness<'a>(document: &'a DocumentMut, harness: &str) -> Vec<&'a Table> {
+        document["ingest"]["sources"]
+            .as_array_of_tables()
+            .expect("ingest sources")
+            .iter()
+            .filter(|source| source.get("harness").and_then(Item::as_str) == Some(harness))
+            .collect()
+    }
+
+    fn source_enabled(document: &DocumentMut, name: &str) -> bool {
+        document["ingest"]["sources"]
+            .as_array_of_tables()
+            .expect("ingest sources")
+            .iter()
+            .find(|source| source.get("name").and_then(Item::as_str) == Some(name))
+            .expect("source exists")
+            .get("enabled")
+            .and_then(Item::as_bool)
+            .unwrap_or(true)
+    }
+
     #[test]
     fn setup_config_target_prefers_cli_then_home() {
         let cli = resolve_setup_config_target_with(
@@ -2485,21 +3022,133 @@ mod tests {
     }
 
     #[test]
-    fn maps_mcp_target_checklist_indices() {
-        let available = [
-            SetupMcpTarget::ClaudeCode,
-            SetupMcpTarget::Codex,
-            SetupMcpTarget::Hermes,
-        ];
+    fn setup_selection_mode_cycles_through_ingest_and_harness_states() {
+        assert_eq!(
+            SetupSelectionMode::Off.cycle(),
+            SetupSelectionMode::IngestAndHarness
+        );
+        assert_eq!(
+            SetupSelectionMode::IngestAndHarness.cycle(),
+            SetupSelectionMode::IngestOnly
+        );
+        assert_eq!(
+            SetupSelectionMode::IngestOnly.cycle(),
+            SetupSelectionMode::HarnessOnly
+        );
+        assert_eq!(
+            SetupSelectionMode::HarnessOnly.cycle(),
+            SetupSelectionMode::Off
+        );
+    }
+
+    #[test]
+    fn harness_targets_include_only_modes_that_configure_harnesses() {
+        let selections = SetupSelectionSet {
+            targets: vec![
+                SetupTargetSelection {
+                    target: SetupMcpTarget::Codex,
+                    mode: SetupSelectionMode::IngestAndHarness,
+                },
+                SetupTargetSelection {
+                    target: SetupMcpTarget::Hermes,
+                    mode: SetupSelectionMode::IngestOnly,
+                },
+                SetupTargetSelection {
+                    target: SetupMcpTarget::Cursor,
+                    mode: SetupSelectionMode::HarnessOnly,
+                },
+                SetupTargetSelection {
+                    target: SetupMcpTarget::ClaudeCode,
+                    mode: SetupSelectionMode::Off,
+                },
+            ],
+            apply_ingest: true,
+            confirmed_harness: true,
+        };
 
         assert_eq!(
-            selected_mcp_targets_from_indices(&available, &[1, 2, 9]),
-            vec![SetupMcpTarget::Codex, SetupMcpTarget::Hermes]
+            selections.harness_targets(),
+            vec![SetupMcpTarget::Codex, SetupMcpTarget::Cursor]
         );
+    }
+
+    #[test]
+    fn ingest_selection_disables_existing_sources_for_unselected_harnesses() {
+        let mut document = DEFAULT_CONFIG_TEMPLATE
+            .parse::<DocumentMut>()
+            .expect("template parses");
+
+        let update = apply_ingest_selections_to_document(
+            &mut document,
+            &[
+                SetupTargetSelection {
+                    target: SetupMcpTarget::Codex,
+                    mode: SetupSelectionMode::IngestOnly,
+                },
+                SetupTargetSelection {
+                    target: SetupMcpTarget::Cursor,
+                    mode: SetupSelectionMode::HarnessOnly,
+                },
+                SetupTargetSelection {
+                    target: SetupMcpTarget::Hermes,
+                    mode: SetupSelectionMode::Off,
+                },
+            ],
+        )
+        .expect("apply ingest selections");
+
         assert_eq!(
-            selected_mcp_targets_from_indices(&available, &[]),
-            Vec::<SetupMcpTarget>::new()
+            update,
+            IngestSelectionUpdate {
+                enabled_sources: 0,
+                disabled_sources: 3,
+                added_sources: 0,
+            }
         );
+        assert!(source_enabled(&document, "codex"));
+        assert!(!source_enabled(&document, "cursor"));
+        assert!(!source_enabled(&document, "cursor-sqlite"));
+        assert!(!source_enabled(&document, "hermes"));
+    }
+
+    #[test]
+    fn ingest_selection_adds_default_sources_when_missing() {
+        let mut document = "# minimal\n"
+            .parse::<DocumentMut>()
+            .expect("minimal config parses");
+
+        let update = apply_ingest_selections_to_document(
+            &mut document,
+            &[
+                SetupTargetSelection {
+                    target: SetupMcpTarget::Cursor,
+                    mode: SetupSelectionMode::IngestOnly,
+                },
+                SetupTargetSelection {
+                    target: SetupMcpTarget::PiCodingAgent,
+                    mode: SetupSelectionMode::HarnessOnly,
+                },
+            ],
+        )
+        .expect("apply ingest selections");
+
+        assert_eq!(
+            update,
+            IngestSelectionUpdate {
+                enabled_sources: 0,
+                disabled_sources: 0,
+                added_sources: 2,
+            }
+        );
+        assert_eq!(sources_for_harness(&document, "cursor").len(), 2);
+        assert!(source_enabled(&document, "cursor"));
+        assert!(source_enabled(&document, "cursor-sqlite"));
+        assert!(sources_for_harness(&document, "pi-coding-agent").is_empty());
+
+        let path = temp_path("ingest-added-config");
+        fs::write(&path, document.to_string()).expect("write updated config");
+        moraine_config::load_config(&path).expect("updated config loads");
+        let _ = fs::remove_file(path);
     }
 
     #[test]
