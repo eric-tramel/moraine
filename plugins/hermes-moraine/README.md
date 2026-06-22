@@ -19,7 +19,6 @@ What it adds:
   asks about prior sessions, active agents, or agent history.
 - `moraine_doctor`, a read-only tool for checking Moraine/Hermes wiring.
 - `hermes moraine status`, `hermes moraine doctor`, and `hermes moraine setup`.
-- `/moraine status`, `/moraine doctor`, and `/moraine setup` in chat.
 
 The plugin does not install the Moraine CLI and does not replace MCP. It expects
 `moraine` on `PATH` and configures Hermes to launch `moraine run mcp`.

@@ -7,7 +7,6 @@ import os
 import shlex
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +17,20 @@ except Exception:  # pragma: no cover - Hermes always provides this at runtime.
 
 
 PLUGIN_DIR = Path(__file__).resolve().parent
+MCP_SERVER_NAME = "moraine"
+MORAINE_MCP_ARGS = ["run", "mcp"]
+MORAINE_MCP_DISPLAY = "moraine run mcp"
+DIAGNOSTIC_TOOLSET = "moraine_diagnostics"
 REQUIRED_MCP_TOOLS = {"search_sessions", "open", "list_sessions", "file_attention"}
+HERMES_FAILURE_MARKERS = (
+    "error:",
+    "failed",
+    "failed to connect",
+    "server not found",
+    "could not",
+    "not found",
+    "traceback",
+)
 GUIDANCE_TRIGGERS = (
     "another agent",
     "other agent",
@@ -76,7 +88,7 @@ def register(ctx) -> None:
     )
     ctx.register_tool(
         name="moraine_doctor",
-        toolset="moraine",
+        toolset=DIAGNOSTIC_TOOLSET,
         schema=DOCTOR_SCHEMA,
         handler=_doctor_tool,
         description="Check Moraine MCP setup for the active Hermes profile.",
@@ -88,12 +100,6 @@ def register(ctx) -> None:
         setup_fn=_setup_cli,
         handler_fn=_handle_cli,
         description="Diagnose or configure Hermes' Moraine MCP integration.",
-    )
-    ctx.register_command(
-        "moraine",
-        handler=_handle_slash,
-        description="Check or set up Moraine MCP integration.",
-        args_hint="[status|doctor|setup|help]",
     )
 
 
@@ -172,32 +178,6 @@ def _handle_cli(args) -> None:
     raise SystemExit(0 if report["ok"] else 1)
 
 
-def _handle_slash(raw_args: str) -> str:
-    try:
-        parts = shlex.split(raw_args or "")
-    except ValueError as exc:
-        return f"Could not parse /moraine arguments: {exc}"
-
-    action = parts[0] if parts else "status"
-    flags = set(parts[1:])
-
-    if action in {"help", "-h", "--help"}:
-        return (
-            "/moraine status - quick setup check\n"
-            "/moraine doctor [--no-mcp-test] - diagnose setup\n"
-            "/moraine setup [--force] [--no-test] - register Moraine MCP"
-        )
-    if action == "setup":
-        return _format_result(
-            _setup_mcp(force="--force" in flags, run_test="--no-test" not in flags)
-        )
-    if action == "doctor":
-        return _format_result(_doctor_report(run_mcp_test="--no-mcp-test" not in flags))
-    if action == "status":
-        return _format_result(_doctor_report(run_mcp_test=False))
-    return f"Unknown /moraine action: {action}. Try /moraine help."
-
-
 def _setup_mcp(*, force: bool, run_test: bool) -> dict[str, Any]:
     steps: list[dict[str, Any]] = []
     hermes = _resolve_executable("hermes")
@@ -215,13 +195,30 @@ def _setup_mcp(*, force: bool, run_test: bool) -> dict[str, Any]:
             "summary": "Moraine CLI was not found on PATH.",
             "steps": [{"status": "error", "message": "Install Moraine first, then rerun setup."}],
         }
+    trust = _moraine_path_trust(moraine)
+    if trust:
+        return {
+            "ok": False,
+            "summary": "Moraine MCP setup needs attention.",
+            "steps": [
+                {
+                    "status": "error",
+                    "message": "Refusing to configure an untrusted Moraine CLI.",
+                    "detail": trust,
+                }
+            ],
+        }
 
     existing = _mcp_config_state()
-    if existing["configured"] and existing["expected"] and not force:
+    if _mcp_registration_ready(existing) and not force:
         steps.append({"status": "ok", "message": "Moraine MCP is already configured."})
     else:
         if force or existing["configured"]:
-            remove = _run_command([hermes, "mcp", "remove", "moraine"], timeout=20)
+            remove = _run_command(
+                [hermes, "mcp", "remove", MCP_SERVER_NAME],
+                timeout=20,
+                input_text="\n",
+            )
             steps.append(
                 {
                     "status": "ok" if remove["returncode"] == 0 else "warn",
@@ -233,29 +230,47 @@ def _setup_mcp(*, force: bool, run_test: bool) -> dict[str, Any]:
             )
 
         add = _run_command(
-            [hermes, "mcp", "add", "moraine", "--command", "moraine", "--args", "run", "mcp"],
+            [
+                hermes,
+                "mcp",
+                "add",
+                MCP_SERVER_NAME,
+                "--command",
+                moraine,
+                "--args",
+                *MORAINE_MCP_ARGS,
+            ],
             timeout=30,
             input_text="\n",
         )
+        after_add = _mcp_config_state()
+        add_ok = _hermes_command_succeeded(add) and _mcp_registration_ready(after_add)
         steps.append(
             {
-                "status": "ok" if add["returncode"] == 0 else "error",
+                "status": "ok" if add_ok else "error",
                 "message": "Registered Moraine MCP server."
-                if add["returncode"] == 0
+                if add_ok
                 else "Failed to register Moraine MCP server.",
-                "detail": add["summary"],
+                "detail": _join_details(add["summary"], _mcp_registration_problem(after_add)),
             }
         )
 
     if run_test:
-        test = _run_command([hermes, "mcp", "test", "moraine"], timeout=30)
+        current = _mcp_config_state()
+        if not _mcp_registration_ready(current):
+            test = {
+                "status": "error",
+                "message": "Skipped Hermes MCP test because Moraine registration is not ready.",
+                "detail": _mcp_registration_problem(current),
+            }
+        else:
+            test_result = _run_command([hermes, "mcp", "test", MCP_SERVER_NAME], timeout=30)
+            test = _mcp_test_step(test_result)
         steps.append(
             {
-                "status": "ok" if test["returncode"] == 0 else "error",
-                "message": "Hermes MCP test passed."
-                if test["returncode"] == 0
-                else "Hermes MCP test failed.",
-                "detail": test["summary"],
+                "status": test["status"],
+                "message": test["message"],
+                "detail": test["detail"],
             }
         )
 
@@ -275,19 +290,22 @@ def _doctor_report(*, run_mcp_test: bool) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
 
     moraine = _resolve_executable("moraine")
+    moraine_trusted = False
     if moraine:
-        checks.append(_check("Moraine CLI", "ok", f"Found {moraine}."))
-        version = _run_command([moraine, "--version"], timeout=8)
-        checks.append(
-            _check(
-                "Moraine version",
-                "ok" if version["returncode"] == 0 else "warn",
-                version["summary"] or "Unable to read Moraine version.",
-            )
-        )
         trust = _moraine_path_trust(moraine)
         if trust:
-            checks.append(_check("Moraine CLI trust", "warn", trust))
+            checks.append(_check("Moraine CLI", "error", trust, detail=f"Resolved path: {moraine}"))
+        else:
+            moraine_trusted = True
+            checks.append(_check("Moraine CLI", "ok", f"Found {moraine}."))
+            version = _run_command([moraine, "--version"], timeout=8)
+            checks.append(
+                _check(
+                    "Moraine version",
+                    "ok" if version["returncode"] == 0 else "warn",
+                    version["summary"] or "Unable to read Moraine version.",
+                )
+            )
     else:
         checks.append(
             _check(
@@ -327,8 +345,17 @@ def _doctor_report(*, run_mcp_test: bool) -> dict[str, Any]:
                 detail=state["detail"],
             )
         )
+    elif state["command_trust_issue"]:
+        checks.append(
+            _check(
+                "Hermes MCP registration",
+                "error",
+                "Moraine MCP registration uses an untrusted command path.",
+                detail=state["command_trust_issue"],
+            )
+        )
     else:
-        checks.append(_check("Hermes MCP registration", "ok", "Configured as `moraine run mcp`."))
+        checks.append(_check("Hermes MCP registration", "ok", f"Configured as `{MORAINE_MCP_DISPLAY}`."))
 
     if state["configured"] and state["tool_filter_issue"]:
         checks.append(
@@ -339,7 +366,7 @@ def _doctor_report(*, run_mcp_test: bool) -> dict[str, Any]:
             )
         )
 
-    if moraine:
+    if moraine_trusted:
         status = _run_command([moraine, "status"], timeout=12)
         checks.append(
             _check(
@@ -352,18 +379,19 @@ def _doctor_report(*, run_mcp_test: bool) -> dict[str, Any]:
             )
         )
 
-    if run_mcp_test and state["configured"]:
+    if run_mcp_test and _mcp_registration_ready(state) and moraine_trusted:
         hermes = _resolve_executable("hermes")
         if hermes:
-            test = _run_command([hermes, "mcp", "test", "moraine"], timeout=30)
+            test = _run_command([hermes, "mcp", "test", MCP_SERVER_NAME], timeout=30)
+            test_step = _mcp_test_step(test)
             checks.append(
                 _check(
                     "Hermes MCP live test",
-                    "ok" if test["returncode"] == 0 else "error",
+                    test_step["status"],
                     "Hermes can connect to Moraine MCP."
-                    if test["returncode"] == 0
+                    if test_step["status"] == "ok"
                     else "Hermes could not connect to Moraine MCP.",
-                    detail=test["summary"],
+                    detail=test_step["detail"],
                 )
             )
         else:
@@ -388,6 +416,7 @@ def _mcp_config_state() -> dict[str, Any]:
         "configured": False,
         "enabled": False,
         "expected": False,
+        "command_trust_issue": "",
         "detail": "",
         "tool_filter_issue": "",
     }
@@ -413,9 +442,10 @@ def _mcp_config_state() -> dict[str, Any]:
     args = server.get("args") or []
     args_list = args if isinstance(args, list) else [args]
     normalized_args = [str(arg) for arg in args_list]
-    command_name = Path(str(command)).name if command is not None else ""
-    state["expected"] = command_name == "moraine" and normalized_args[:2] == ["run", "mcp"]
+    state["expected"] = _is_expected_mcp_launch(command, normalized_args)
     state["detail"] = f"command={command!r} args={normalized_args!r}"
+    if state["expected"] and command not in {None, MCP_SERVER_NAME}:
+        state["command_trust_issue"] = _moraine_path_trust(str(command))
 
     tools = server.get("tools")
     if isinstance(tools, dict):
@@ -436,6 +466,37 @@ def _mcp_config_state() -> dict[str, Any]:
                     + ", ".join(sorted(blocked))
                 )
     return state
+
+
+def _is_expected_mcp_launch(command: Any, args: list[str]) -> bool:
+    command_name = Path(str(command)).name if command is not None else ""
+    return command_name == MCP_SERVER_NAME and args[: len(MORAINE_MCP_ARGS)] == MORAINE_MCP_ARGS
+
+
+def _mcp_registration_ready(state: dict[str, Any]) -> bool:
+    return (
+        state["configured"]
+        and state["enabled"]
+        and state["expected"]
+        and not state["command_trust_issue"]
+        and not state["tool_filter_issue"]
+    )
+
+
+def _mcp_registration_problem(state: dict[str, Any]) -> str:
+    if state["config_error"]:
+        return state["config_error"]
+    if not state["configured"]:
+        return f"No `mcp_servers.{MCP_SERVER_NAME}` entry found."
+    if not state["enabled"]:
+        return f"`mcp_servers.{MCP_SERVER_NAME}` is disabled."
+    if not state["expected"]:
+        return f"`mcp_servers.{MCP_SERVER_NAME}` does not launch `{MORAINE_MCP_DISPLAY}`. {state['detail']}"
+    if state["command_trust_issue"]:
+        return state["command_trust_issue"]
+    if state["tool_filter_issue"]:
+        return state["tool_filter_issue"]
+    return ""
 
 
 def _hermes_config_path() -> Path:
@@ -486,12 +547,44 @@ def _run_command(
         output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
         return {
             "returncode": result.returncode,
+            "output": output,
             "summary": _shorten(output),
         }
     except FileNotFoundError:
-        return {"returncode": 127, "summary": f"{command[0]} not found"}
+        output = f"{command[0]} not found"
+        return {"returncode": 127, "output": output, "summary": output}
     except subprocess.TimeoutExpired:
-        return {"returncode": 124, "summary": f"{shlex.join(command)} timed out after {timeout}s"}
+        output = f"{shlex.join(command)} timed out after {timeout}s"
+        return {"returncode": 124, "output": output, "summary": output}
+
+
+def _hermes_command_succeeded(result: dict[str, Any]) -> bool:
+    output = str(result.get("output") or "").lower()
+    return result["returncode"] == 0 and not any(marker in output for marker in HERMES_FAILURE_MARKERS)
+
+
+def _mcp_test_step(result: dict[str, Any]) -> dict[str, str]:
+    missing = sorted(tool for tool in REQUIRED_MCP_TOOLS if tool not in str(result.get("output") or ""))
+    if not _hermes_command_succeeded(result):
+        return {
+            "status": "error",
+            "message": "Hermes MCP test failed.",
+            "detail": result["summary"],
+        }
+    if missing:
+        return {
+            "status": "error",
+            "message": "Hermes MCP test did not report all required Moraine tools.",
+            "detail": _join_details(
+                result["summary"],
+                "Missing tools: " + ", ".join(missing),
+            ),
+        }
+    return {
+        "status": "ok",
+        "message": "Hermes MCP test passed.",
+        "detail": result["summary"],
+    }
 
 
 def _check(name: str, status: str, message: str, *, detail: str = "") -> dict[str, str]:
@@ -522,6 +615,10 @@ def _format_result(result: dict[str, Any]) -> str:
         lines.append("Next steps:")
         lines.extend(f"- {step}" for step in result["next_steps"])
     return "\n".join(lines)
+
+
+def _join_details(*parts: str) -> str:
+    return " ".join(part for part in parts if part)
 
 
 def _shorten(text: str, limit: int = 700) -> str:
