@@ -184,7 +184,9 @@ impl CliOutput {
 }
 
 fn render_panel(title: &str, lines: &[String], width: u16, unicode: bool) -> String {
-    let area = Rect::new(0, 0, width, (lines.len().max(1) as u16).saturating_add(2));
+    let inner_width = width.saturating_sub(2).max(1);
+    let body_height = wrapped_line_count(lines, inner_width).max(1);
+    let area = Rect::new(0, 0, width, body_height.saturating_add(2));
     let mut buffer = Buffer::empty(area);
     let mut block = Block::default()
         .title(Line::from(title.to_string()))
@@ -200,6 +202,18 @@ fn render_panel(title: &str, lines: &[String], width: u16, unicode: bool) -> Str
         .style(Style::default().fg(Color::White));
     paragraph.render(area, &mut buffer);
     buffer_to_string(&buffer)
+}
+
+fn wrapped_line_count(lines: &[String], width: u16) -> u16 {
+    let width = usize::from(width.max(1));
+    let count = lines
+        .iter()
+        .map(|line| {
+            let char_count = line.chars().count().max(1);
+            char_count.div_ceil(width)
+        })
+        .sum::<usize>();
+    count.min(usize::from(u16::MAX)) as u16
 }
 
 fn render_table(
@@ -653,5 +667,19 @@ mod tests {
         let cli = Cli::parse_from(["moraine", "--output", "json", "status"]);
         let output = CliOutput::from_cli(&cli);
         assert_eq!(output.mode, OutputMode::Json);
+    }
+
+    #[test]
+    fn rich_panel_height_accounts_for_wrapped_lines() {
+        let panel = render_panel(
+            "Preview",
+            &["abcdefghijklmnopqrstuvwxyz".to_string()],
+            12,
+            false,
+        );
+        assert!(panel.lines().count() >= 5);
+        assert!(panel.contains("abcdefghij"));
+        assert!(panel.contains("klmnopqrst"));
+        assert!(panel.contains("uvwxyz"));
     }
 }

@@ -10,6 +10,23 @@ Run `moraine up` first so ClickHouse, ingest, and the monitor are available.
 If you use a non-default Moraine config, pass it through the harness's
 environment support as `MORAINE_MCP_CONFIG=/path/to/moraine.toml`.
 
+## Guided setup (recommended)
+
+For default user-scoped setup, let Moraine create or repair its config and
+install or update supported harness integrations:
+
+```bash
+uv tool install moraine-cli
+moraine setup
+moraine up
+```
+
+`moraine setup` installs the Claude Code and Codex plugins, registers command
+based MCP clients such as Hermes and Kimi CLI, and writes global MCP config for
+OpenCode, Cursor, and Pi Coding Agent when selected. Use the manual sections
+below for project-scoped servers, `--project-only`, or custom environment
+wiring.
+
 ## Claude Code plugin marketplace (recommended)
 
 For Claude Code, the recommended user-scoped setup is the Moraine plugin. The
@@ -241,13 +258,38 @@ kimi mcp list
 kimi mcp test moraine
 ```
 
+## OpenCode
+
+OpenCode reads MCP servers from the `mcp` object in its config. For global use,
+`moraine setup --mcp-target opencode` creates or updates
+`~/.config/opencode/opencode.json`. OpenCode's docs describe local MCP servers
+with `type = "local"` and a `command` array:
+[OpenCode MCP servers](https://opencode.ai/docs/mcp-servers) and
+[OpenCode config](https://opencode.ai/docs/config/).
+
+Equivalent manual config:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "moraine": {
+      "type": "local",
+      "command": ["moraine", "run", "mcp"],
+      "enabled": true
+    }
+  }
+}
+```
+
 ## Cursor
 
-Cursor and `cursor-agent` read MCP server definitions from `mcp.json`. Cursor's
-docs describe project config at `.cursor/mcp.json`, global config at
-`~/.cursor/mcp.json`, and CLI inspection through `cursor-agent mcp`:
-[Cursor MCP guide](https://docs.cursor.com/advanced/model-context-protocol) and
-[Cursor CLI MCP guide](https://docs.cursor.com/cli/mcp).
+Cursor reads MCP server definitions from `mcp.json`. For global use,
+`moraine setup --mcp-target cursor` creates or updates `~/.cursor/mcp.json`.
+Cursor's docs describe project config at `.cursor/mcp.json`, global config at
+`~/.cursor/mcp.json`, and CLI inspection through `agent mcp`:
+[Cursor MCP guide](https://cursor.com/docs/mcp.md) and
+[Cursor CLI MCP guide](https://cursor.com/docs/cli/mcp.md).
 
 For global use, create or update `~/.cursor/mcp.json`:
 
@@ -255,6 +297,7 @@ For global use, create or update `~/.cursor/mcp.json`:
 {
   "mcpServers": {
     "moraine": {
+      "type": "stdio",
       "command": "moraine",
       "args": ["run", "mcp"]
     }
@@ -262,11 +305,11 @@ For global use, create or update `~/.cursor/mcp.json`:
 }
 ```
 
-Then verify from the CLI when `cursor-agent` is installed:
+Then verify from the Cursor CLI when it is installed:
 
 ```bash
-cursor-agent mcp list
-cursor-agent mcp list-tools moraine
+agent mcp list
+agent mcp list-tools moraine
 ```
 
 For project-only use, put the same JSON in `.cursor/mcp.json` at the project
@@ -275,9 +318,10 @@ root.
 ## Pi Coding Agent
 
 Pi uses an extension to bridge MCP servers into Pi tools. Install the MCP
-extension, then add a Moraine stdio server to Pi's MCP config. The extension
-docs describe global config at `~/.pi/agent/mcp.json`, project config at
-`.pi/mcp.json`, and stdio server fields:
+extension, then add a Moraine stdio server to Pi's MCP config.
+`moraine setup --mcp-target pi-coding-agent` runs the extension install and
+creates or updates global `~/.pi/agent/mcp.json`. The extension docs describe
+global and project `mcp.json` files plus stdio server fields:
 [Pi MCP extension](https://pi.dev/packages/pi-mcp-extension).
 
 ```bash
