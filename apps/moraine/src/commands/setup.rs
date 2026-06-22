@@ -3160,17 +3160,42 @@ watch_root = "~/custom"
         let plan = McpPlan::for_target(SetupMcpTarget::Hermes, &target);
         let commands = plan.commands();
         assert_eq!(commands.len(), 2);
-        assert_eq!(
-            commands[0].args,
-            vec![
-                "plugins",
-                "install",
-                "eric-tramel/moraine/plugins/hermes-moraine",
-                "--force",
-                "--enable",
-            ]
+        assert_eq!(commands[0].args[0], "plugins");
+        assert_eq!(commands[0].args[1], "install");
+        assert!(
+            commands[0].args[2] == "eric-tramel/moraine/plugins/hermes-moraine"
+                || (commands[0].args[2].starts_with("file://")
+                    && commands[0].args[2].ends_with("#plugins/hermes-moraine"))
         );
+        assert_eq!(commands[0].args[3], "--force");
+        assert_eq!(commands[0].args[4], "--enable");
         assert_eq!(commands[1].args, vec!["moraine", "setup", "--no-test"]);
+    }
+
+    #[test]
+    fn hermes_plugin_identifier_for_root_uses_local_checkout() {
+        let root = temp_path("hermes plugin root");
+        let plugin_dir = root.join("plugins").join("hermes-moraine");
+        fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+        fs::write(plugin_dir.join("plugin.yaml"), "name: moraine\n").expect("write plugin yaml");
+
+        let identifier =
+            harnesses::hermes_plugin_identifier_for_root(&root).expect("local identifier");
+        assert!(identifier.starts_with("file://"));
+        assert!(identifier.ends_with("#plugins/hermes-moraine"));
+        assert!(identifier.contains("hermes%20plugin%20root"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hermes_plugin_identifier_for_root_ignores_missing_plugin() {
+        let root = temp_path("missing-hermes-plugin");
+        fs::create_dir_all(&root).expect("create root");
+
+        assert!(harnesses::hermes_plugin_identifier_for_root(&root).is_none());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
