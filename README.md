@@ -67,24 +67,48 @@ moraine status
 
 The monitor UI runs at `http://127.0.0.1:8080` by default.
 
-### Claude Code Setup
+## Connect Claude Code or Codex
 
-For Claude Code, install the Moraine plugin after `moraine up`:
+After `moraine up`, install the Moraine plugin for your agent harness. The
+plugins register the MCP search server and bundle guidance for searching prior
+sessions, but they still use the `moraine` CLI on your `PATH` and the running
+local stack.
+
+For Claude Code:
 
 ```bash
 claude plugin marketplace add eric-tramel/moraine --sparse .claude-plugin plugins
 claude plugin install moraine@moraine
 ```
 
-Restart Claude Code after installing. New sessions get the
-`moraine:session-search` and `moraine:realtime-peek` skills, and Moraine MCP
-tools are exposed as `mcp__plugin_moraine_moraine__*`.
+For Codex:
+
+```bash
+codex plugin marketplace add eric-tramel/moraine \
+  --sparse .agents/plugins \
+  --sparse plugins/moraine \
+  --sparse plugins/moraine-dev
+codex plugin add moraine@moraine
+```
+
+Start a new agent session after installing the plugin. Claude Code sessions get
+the `moraine:session-search` and `moraine:realtime-peek` skills, and Moraine MCP
+tools are exposed as `mcp__plugin_moraine_moraine__*`. Then ask:
+
+```text
+What are my agents doing right now?
+```
+
+The user-scoped plugins can search the host-wide Moraine history visible to your
+user. For project-scoped setup, duplicate MCP cleanup, and other clients, see
+[Agent MCP Search](https://eric-tramel.github.io/moraine/agent-mcp-search/index.html).
 
 ## Agent Harness Guidance
 
-Moraine is most useful when your agent harness knows that it can search prior
-sessions. Add the following guidance to your global harness instructions, such
-as `~/.codex/AGENTS.md` for Codex or `~/.claude/CLAUDE.md` for Claude Code:
+The Claude Code and Codex plugins already bundle Moraine search guidance. If you
+use manual MCP registration or another harness, add the following guidance to
+your global harness instructions, such as `~/.codex/AGENTS.md` for Codex or
+`~/.claude/CLAUDE.md` for Claude Code:
 
 ```markdown
 - You have access to all past agent sessions (whether codex, claude, hermes, etc., anything) via moraine search tools.
