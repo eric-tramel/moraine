@@ -656,6 +656,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             name: "020_purge_empty_session_claude_code.sql",
             sql: include_str!("../../../sql/020_purge_empty_session_claude_code.sql"),
         },
+        Migration {
+            version: "021",
+            name: "021_file_attention_normalization.sql",
+            sql: include_str!("../../../sql/021_file_attention_normalization.sql"),
+        },
     ]
 }
 
@@ -1195,6 +1200,50 @@ mod tests {
                 "020 statement must not reference a bare `moraine.` after rewrite: {statement}"
             );
         }
+    }
+
+    #[test]
+    fn migration_021_adds_file_attention_columns_without_reordering_tables() {
+        let migration = bundled_migrations()
+            .into_iter()
+            .find(|m| m.version == "021")
+            .expect("migration 021 must be registered");
+
+        let materialized =
+            materialize_migration_sql(migration.sql, "other_db").expect("materialize 021");
+        let statements = split_sql_statements(&materialized);
+
+        assert_eq!(
+            statements.len(),
+            6,
+            "021 should only add three columns to events and tool_io"
+        );
+
+        for table in ["events", "tool_io"] {
+            for column in ["project_id", "repo_rel_path", "worktree_root"] {
+                let expected =
+                    format!("ALTER TABLE other_db.{table}\n  ADD COLUMN IF NOT EXISTS {column}");
+                assert!(
+                    statements
+                        .iter()
+                        .any(|statement| statement.contains(&expected)),
+                    "021 missing {column} on {table}: {statements:#?}"
+                );
+            }
+        }
+
+        assert!(
+            statements
+                .iter()
+                .all(|statement| !statement.contains("ORDER BY")),
+            "021 must not rewrite ReplacingMergeTree sort keys"
+        );
+        assert!(
+            statements
+                .iter()
+                .all(|statement| !statement.contains("Nullable")),
+            "021 should use non-null defaults for lookup fields"
+        );
     }
 
     #[test]

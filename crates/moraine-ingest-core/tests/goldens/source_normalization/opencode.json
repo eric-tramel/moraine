@@ -37,7 +37,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"agent\":\"build\",\"directory\":\"/work/opencode-demo\",\"id\":\"ses_demo\",\"model\":{\"id\":\"glm-5.2\",\"providerID\":\"zai-coding-plan\"},\"project_id\":\"proj_demo\",\"share_url\":\"https://opencode.example/share/ses_demo\",\"time_created\":1780000000000,\"title\":\"OpenCode fixture session\",\"tokens_cache_read\":3,\"tokens_cache_write\":1,\"tokens_input\":10,\"tokens_output\":4,\"tokens_reasoning\":2,\"type\":\"opencode_session\"}",
           "payload_type": "session_meta",
+          "project_id": "",
           "record_ts": "2026-05-28T20:26:40.000000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -81,7 +83,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -201,7 +204,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"data\":{\"text\":\"Check the package metadata.\",\"time\":{\"start\":1780000001100},\"type\":\"text\"},\"directory\":\"/work/opencode-demo\",\"id\":\"part_user_text\",\"message_id\":\"msg_user\",\"message_model_id\":\"glm-5.2\",\"message_provider_id\":\"zai-coding-plan\",\"message_role\":\"user\",\"session_id\":\"ses_demo\",\"time_created\":1780000001100,\"type\":\"opencode_part\"}",
           "payload_type": "text",
+          "project_id": "",
           "record_ts": "2026-05-28T20:26:41.100000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -245,7 +250,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -309,7 +315,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"data\":{\"text\":\"I can inspect that.\",\"time\":{\"start\":1780000002000},\"type\":\"text\"},\"directory\":\"/work/opencode-demo\",\"id\":\"part_text\",\"message_id\":\"msg_assistant\",\"message_model_id\":\"glm-5.2\",\"message_provider_id\":\"zai-coding-plan\",\"message_role\":\"assistant\",\"session_id\":\"ses_demo\",\"time_created\":1780000002000,\"type\":\"opencode_part\"}",
           "payload_type": "text",
+          "project_id": "",
           "record_ts": "2026-05-28T20:26:42.000000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -353,7 +361,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -417,7 +426,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"data\":{\"text\":\"Need to list files.\",\"time\":{\"start\":1780000002100},\"type\":\"reasoning\"},\"directory\":\"/work/opencode-demo\",\"id\":\"part_reasoning\",\"message_id\":\"msg_assistant\",\"message_model_id\":\"glm-5.2\",\"message_provider_id\":\"zai-coding-plan\",\"message_role\":\"assistant\",\"session_id\":\"ses_demo\",\"time_created\":1780000002100,\"type\":\"opencode_part\"}",
           "payload_type": "reasoning",
+          "project_id": "",
           "record_ts": "2026-05-28T20:26:42.100000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -461,7 +472,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -525,7 +537,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"callID\":\"tool_done\",\"state\":{\"input\":{\"cmd\":\"pwd\"},\"output\":\"/work/opencode-demo\",\"status\":\"completed\"},\"tool\":\"bash\",\"type\":\"tool\"}",
           "payload_type": "tool_use",
+          "project_id": "",
           "record_ts": "2026-05-28T20:26:42.200000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -569,7 +583,8 @@
           "tool_name": "bash",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         },
         {
           "actor_kind": "tool",
@@ -604,7 +619,9 @@
           "parent_tool_call_id": "",
           "payload_json": "\"/work/opencode-demo\"",
           "payload_type": "tool_result",
+          "project_id": "",
           "record_ts": "2026-05-28T20:26:42.200000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -648,7 +665,8 @@
           "tool_name": "bash",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -688,13 +706,16 @@
           "output_preview": "",
           "output_text": "",
           "parent_tool_call_id": "",
+          "project_id": "",
+          "repo_rel_path": "",
           "session_id": "ses_demo",
           "source_name": "golden-opencode",
           "source_ref": "/fixtures/opencode/session.jsonl:1:7",
           "tool_call_id": "tool_done",
           "tool_error": 0,
           "tool_name": "bash",
-          "tool_phase": "request"
+          "tool_phase": "request",
+          "worktree_root": ""
         },
         {
           "event_uid": "fb90886a0832006dba8d565b8635706846e4228133a09077e569f82bbcd28d3a",
@@ -710,13 +731,16 @@
           "output_preview": "/work/opencode-demo",
           "output_text": "/work/opencode-demo",
           "parent_tool_call_id": "",
+          "project_id": "",
+          "repo_rel_path": "",
           "session_id": "ses_demo",
           "source_name": "golden-opencode",
           "source_ref": "/fixtures/opencode/session.jsonl:1:7",
           "tool_call_id": "tool_done",
           "tool_error": 0,
           "tool_name": "bash",
-          "tool_phase": "response"
+          "tool_phase": "response",
+          "worktree_root": ""
         }
       ]
     },
@@ -757,7 +781,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"callID\":\"tool_error\",\"state\":{\"error\":\"No such file or directory\",\"input\":{\"cmd\":\"cat missing.txt\"},\"status\":\"error\"},\"tool\":\"bash\",\"type\":\"tool\"}",
           "payload_type": "tool_use",
+          "project_id": "",
           "record_ts": "2026-05-28T20:26:42.300000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -801,7 +827,8 @@
           "tool_name": "bash",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         },
         {
           "actor_kind": "tool",
@@ -836,7 +863,9 @@
           "parent_tool_call_id": "",
           "payload_json": "\"No such file or directory\"",
           "payload_type": "tool_result",
+          "project_id": "",
           "record_ts": "2026-05-28T20:26:42.300000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -880,7 +909,8 @@
           "tool_name": "bash",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -920,13 +950,16 @@
           "output_preview": "",
           "output_text": "",
           "parent_tool_call_id": "",
+          "project_id": "",
+          "repo_rel_path": "",
           "session_id": "ses_demo",
           "source_name": "golden-opencode",
           "source_ref": "/fixtures/opencode/session.jsonl:1:8",
           "tool_call_id": "tool_error",
           "tool_error": 0,
           "tool_name": "bash",
-          "tool_phase": "request"
+          "tool_phase": "request",
+          "worktree_root": ""
         },
         {
           "event_uid": "52e0078743d92344184e1f537384dc6e3cc0a85803c2173d07e0a1c876304188",
@@ -942,13 +975,16 @@
           "output_preview": "No such file or directory",
           "output_text": "No such file or directory",
           "parent_tool_call_id": "",
+          "project_id": "",
+          "repo_rel_path": "",
           "session_id": "ses_demo",
           "source_name": "golden-opencode",
           "source_ref": "/fixtures/opencode/session.jsonl:1:8",
           "tool_call_id": "tool_error",
           "tool_error": 1,
           "tool_name": "bash",
-          "tool_phase": "response"
+          "tool_phase": "response",
+          "worktree_root": ""
         }
       ]
     },
@@ -989,7 +1025,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"data\":{\"cost\":0.001,\"reason\":\"stop\",\"tokens\":{\"cache\":{\"read\":7,\"write\":0},\"input\":20,\"output\":5,\"reasoning\":1},\"type\":\"step-finish\"},\"directory\":\"/work/opencode-demo\",\"id\":\"part_step_finish\",\"message_id\":\"msg_assistant\",\"message_model_id\":\"glm-5.2\",\"message_provider_id\":\"zai-coding-plan\",\"message_role\":\"assistant\",\"session_id\":\"ses_demo\",\"time_created\":1780000002400,\"type\":\"opencode_part\"}",
           "payload_type": "progress",
+          "project_id": "",
           "record_ts": "2026-05-28T20:26:42.400000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -1033,7 +1071,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -1095,7 +1134,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"data\":{\"model\":{\"id\":\"glm-5.2\",\"providerID\":\"zai-coding-plan\"}},\"id\":\"sm_model\",\"message_type\":\"model-switched\",\"session_id\":\"ses_demo\",\"time_created\":1780000003000,\"type\":\"opencode_session_message\"}",
           "payload_type": "system",
+          "project_id": "",
           "record_ts": "2026-05-28T20:26:43.000000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -1139,7 +1180,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],

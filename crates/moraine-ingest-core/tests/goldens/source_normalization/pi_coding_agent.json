@@ -37,7 +37,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"cwd\":\"/work/pi-demo\",\"id\":\"11111111-2222-4333-8444-555555555555\",\"timestamp\":\"2026-05-08T02:00:00.000Z\",\"type\":\"session\",\"version\":3}",
           "payload_type": "session_meta",
+          "project_id": "",
           "record_ts": "2026-05-08T02:00:00.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -81,7 +83,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -143,7 +146,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"id\":\"pi-model-1\",\"modelId\":\"Arcee AI/Trinity Large Thinking\",\"parentId\":null,\"provider\":\"openrouter\",\"timestamp\":\"2026-05-08T02:00:00.100Z\",\"type\":\"model_change\"}",
           "payload_type": "system",
+          "project_id": "",
           "record_ts": "2026-05-08T02:00:00.100Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -187,7 +192,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -249,7 +255,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"id\":\"pi-thinking-1\",\"parentId\":\"pi-model-1\",\"thinkingLevel\":\"high\",\"timestamp\":\"2026-05-08T02:00:00.200Z\",\"type\":\"thinking_level_change\"}",
           "payload_type": "thinking",
+          "project_id": "",
           "record_ts": "2026-05-08T02:00:00.200Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -293,7 +301,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [
@@ -370,7 +379,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"content\":[{\"text\":\"Please inspect the manifest and summarize the package.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":1778205601000}",
           "payload_type": "user_message",
+          "project_id": "",
           "record_ts": "2026-05-08T02:00:01.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -414,7 +425,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [
@@ -491,7 +503,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"thinking\":\"I should read the manifest before answering.\",\"type\":\"thinking\"}",
           "payload_type": "thinking",
+          "project_id": "",
           "record_ts": "2026-05-08T02:00:02.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -535,7 +549,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         },
         {
           "actor_kind": "assistant",
@@ -570,7 +585,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"text\":\"I will inspect Cargo.toml first.\",\"type\":\"text\"}",
           "payload_type": "text",
+          "project_id": "",
           "record_ts": "2026-05-08T02:00:02.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -614,7 +631,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         },
         {
           "actor_kind": "assistant",
@@ -649,7 +667,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"arguments\":{\"path\":\"Cargo.toml\"},\"id\":\"pi-tool-1\",\"name\":\"read\",\"type\":\"toolCall\"}",
           "payload_type": "tool_use",
+          "project_id": "",
           "record_ts": "2026-05-08T02:00:02.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -693,7 +713,8 @@
           "tool_name": "read",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [
@@ -770,13 +791,16 @@
           "output_preview": "",
           "output_text": "",
           "parent_tool_call_id": "",
+          "project_id": "",
+          "repo_rel_path": "",
           "session_id": "11111111-2222-4333-8444-555555555555",
           "source_name": "golden-pi",
           "source_ref": "/fixtures/pi/session.jsonl:1:5",
           "tool_call_id": "pi-tool-1",
           "tool_error": 0,
           "tool_name": "read",
-          "tool_phase": "request"
+          "tool_phase": "request",
+          "worktree_root": ""
         }
       ]
     },
@@ -817,7 +841,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"content\":[{\"text\":\"[package]\\nname = \\\"moraine\\\"\",\"type\":\"text\"}],\"details\":{\"bytes\":25},\"isError\":false,\"role\":\"toolResult\",\"timestamp\":1778205603000,\"toolCallId\":\"pi-tool-1\",\"toolName\":\"read\"}",
           "payload_type": "tool_result",
+          "project_id": "",
           "record_ts": "2026-05-08T02:00:03.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -861,7 +887,8 @@
           "tool_name": "read",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [
@@ -914,13 +941,16 @@
           "output_preview": "[package]\nname = \"moraine\"",
           "output_text": "[package]\nname = \"moraine\"",
           "parent_tool_call_id": "",
+          "project_id": "",
+          "repo_rel_path": "",
           "session_id": "11111111-2222-4333-8444-555555555555",
           "source_name": "golden-pi",
           "source_ref": "/fixtures/pi/session.jsonl:1:6",
           "tool_call_id": "pi-tool-1",
           "tool_error": 0,
           "tool_name": "read",
-          "tool_phase": "response"
+          "tool_phase": "response",
+          "worktree_root": ""
         }
       ]
     },
@@ -961,7 +991,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"cancelled\":false,\"command\":\"cargo metadata --no-deps\",\"exitCode\":0,\"output\":\"{\\\"packages\\\":[]}\",\"role\":\"bashExecution\",\"timestamp\":1778205604000,\"truncated\":false}",
           "payload_type": "tool_result",
+          "project_id": "",
           "record_ts": "2026-05-08T02:00:04.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -1005,7 +1037,8 @@
           "tool_name": "bash",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [
@@ -1058,13 +1091,16 @@
           "output_preview": "",
           "output_text": "",
           "parent_tool_call_id": "",
+          "project_id": "",
+          "repo_rel_path": "",
           "session_id": "11111111-2222-4333-8444-555555555555",
           "source_name": "golden-pi",
           "source_ref": "/fixtures/pi/session.jsonl:1:7",
           "tool_call_id": "pi-bash-1",
           "tool_error": 0,
           "tool_name": "bash",
-          "tool_phase": "request"
+          "tool_phase": "request",
+          "worktree_root": ""
         },
         {
           "event_uid": "b973ebf61f6db383539ef8d23f219662932b4cda5a03ce4645888ff481132a2a",
@@ -1080,13 +1116,16 @@
           "output_preview": "{\"packages\":[]}",
           "output_text": "{\"packages\":[]}",
           "parent_tool_call_id": "",
+          "project_id": "",
+          "repo_rel_path": "",
           "session_id": "11111111-2222-4333-8444-555555555555",
           "source_name": "golden-pi",
           "source_ref": "/fixtures/pi/session.jsonl:1:7",
           "tool_call_id": "pi-bash-1",
           "tool_error": 0,
           "tool_name": "bash",
-          "tool_phase": "response"
+          "tool_phase": "response",
+          "worktree_root": ""
         }
       ]
     },
@@ -1125,7 +1164,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"firstKeptEntryId\":\"pi-user-1\",\"id\":\"pi-compact-1\",\"parentId\":\"pi-bash-1\",\"summary\":\"Earlier manifest inspection was summarized.\",\"timestamp\":\"2026-05-08T02:00:05.000Z\",\"tokensBefore\":1234,\"type\":\"compaction\"}",
           "payload_type": "compacted",
+          "project_id": "",
           "record_ts": "2026-05-08T02:00:05.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -1169,7 +1210,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [
@@ -1244,7 +1286,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"fromId\":\"pi-bash-1\",\"id\":\"pi-branch-1\",\"parentId\":\"pi-compact-1\",\"summary\":\"A side branch checked package metadata.\",\"timestamp\":\"2026-05-08T02:00:06.000Z\",\"type\":\"branch_summary\"}",
           "payload_type": "summary",
+          "project_id": "",
           "record_ts": "2026-05-08T02:00:06.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -1288,7 +1332,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [
@@ -1363,7 +1408,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"customType\":\"demo-state\",\"data\":{\"status\":\"ok\"},\"id\":\"pi-custom-1\",\"parentId\":\"pi-branch-1\",\"timestamp\":\"2026-05-08T02:00:07.000Z\",\"type\":\"custom\"}",
           "payload_type": "system",
+          "project_id": "",
           "record_ts": "2026-05-08T02:00:07.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -1407,7 +1454,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [
@@ -1484,7 +1532,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"content\":\"Injected package context.\",\"customType\":\"demo-context\",\"display\":true,\"id\":\"pi-custom-message-1\",\"parentId\":\"pi-custom-1\",\"timestamp\":\"2026-05-08T02:00:08.000Z\",\"type\":\"custom_message\"}",
           "payload_type": "message",
+          "project_id": "",
           "record_ts": "2026-05-08T02:00:08.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -1528,7 +1578,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [
@@ -1603,7 +1654,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"id\":\"pi-label-1\",\"label\":\"manifest-checkpoint\",\"parentId\":\"pi-custom-message-1\",\"targetId\":\"pi-user-1\",\"timestamp\":\"2026-05-08T02:00:09.000Z\",\"type\":\"label\"}",
           "payload_type": "system",
+          "project_id": "",
           "record_ts": "2026-05-08T02:00:09.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -1647,7 +1700,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [
@@ -1722,7 +1776,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"id\":\"pi-info-1\",\"name\":\"Pi fixture manifest review\",\"parentId\":\"pi-label-1\",\"timestamp\":\"2026-05-08T02:00:10.000Z\",\"type\":\"session_info\"}",
           "payload_type": "session_meta",
+          "project_id": "",
           "record_ts": "2026-05-08T02:00:10.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -1766,7 +1822,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [

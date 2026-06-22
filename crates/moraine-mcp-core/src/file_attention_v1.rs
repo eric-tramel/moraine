@@ -102,6 +102,7 @@ impl AppState {
         let repo_query = FileAttentionQuery {
             query_id: query_id.clone(),
             rel: tail.rel.clone(),
+            normalized_project_id: tail.project_id.clone(),
             derive_worktree_roots: tail.derive_worktree_roots,
             apply_project_scope: args.scope == FileAttentionScope::Project || project_scoped_server,
             start_unix_ms: args.start_unix_ms,
@@ -200,6 +201,7 @@ fn canonical_request_json(args: &CanonicalFileAttentionArgs) -> Value {
 struct TailResolution {
     rel: String,
     root: Option<String>,
+    project_id: Option<String>,
     /// The path was absolute and could not be reduced to a repo-relative tail,
     /// so `rel` is the absolute path matched literally.
     tail_is_absolute: bool,
@@ -231,6 +233,7 @@ fn resolve_tail(path: &str) -> TailResolution {
                         if !rel.is_empty() {
                             return TailResolution {
                                 rel,
+                                project_id: project_id_for_root(&root),
                                 root: Some(root),
                                 tail_is_absolute: false,
                                 normalized: normalized_changed,
@@ -244,6 +247,7 @@ fn resolve_tail(path: &str) -> TailResolution {
         return TailResolution {
             rel: normalized.trim_start_matches('/').to_string(),
             root: None,
+            project_id: None,
             tail_is_absolute: false,
             normalized: normalized_changed,
             derive_worktree_roots: false,
@@ -255,6 +259,7 @@ fn resolve_tail(path: &str) -> TailResolution {
             if !rel.is_empty() {
                 return TailResolution {
                     rel,
+                    project_id: project_id_for_root(&root),
                     root: Some(root),
                     tail_is_absolute: false,
                     normalized: normalized_changed,
@@ -267,6 +272,7 @@ fn resolve_tail(path: &str) -> TailResolution {
     TailResolution {
         rel: normalized,
         root: None,
+        project_id: None,
         tail_is_absolute: true,
         normalized: normalized_changed,
         derive_worktree_roots: false,
@@ -333,6 +339,14 @@ fn find_project_root(file_path: &Path) -> Option<String> {
             break;
         }
         dir = current.parent();
+    }
+    None
+}
+
+fn project_id_for_root(root: &str) -> Option<String> {
+    let root = Path::new(root);
+    if root.join(moraine_config::REPO_BACKEND_FILE).is_file() {
+        return moraine_config::find_repo_backend_ref(root);
     }
     None
 }
@@ -862,6 +876,7 @@ mod tests {
         FileAttentionTouch {
             session_id: session.to_string(),
             event_uid: event.to_string(),
+            tool_call_id: format!("call-{event}"),
             harness: "claude-code".to_string(),
             tool_name: tool.to_string(),
             tool_phase: "request".to_string(),
@@ -922,6 +937,7 @@ mod tests {
         assert_eq!(resolved.rel, "crates/foo/tee.rs");
         assert!(!resolved.tail_is_absolute);
         assert_eq!(resolved.root.as_deref(), root.to_str());
+        assert_eq!(resolved.project_id.as_deref(), Some("x"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
