@@ -4,7 +4,8 @@ set -euo pipefail
 CODEX_CMD="${CODEX_CMD:-codex}"
 AGENT_PLUGINS_SOURCE="${AGENT_PLUGINS_SOURCE:-main}"
 AGENT_PLUGINS_REMOTE="${AGENT_PLUGINS_REMOTE:-origin}"
-LEGACY_MARKETPLACE_NAMES=("moraine-developer-agents")
+INSTALL_PLUGIN_NAMES=("moraine-dev")
+LEGACY_MARKETPLACE_NAMES=("moraine-developer-agents" "moraine-dev")
 
 die() {
     printf '[agent-plugins] error: %s\n' "$*" >&2
@@ -91,23 +92,36 @@ if [[ "$should_upgrade" == 1 ]]; then
 fi
 
 plugin_list_json="$("$CODEX_CMD" plugin list --marketplace "$marketplace_name" --available --json)"
-plugin_names="$(PLUGIN_LIST_JSON="$plugin_list_json" python3 - <<'PY'
+if ! plugin_names="$(PLUGIN_LIST_JSON="$plugin_list_json" INSTALL_PLUGIN_NAMES="${INSTALL_PLUGIN_NAMES[*]}" python3 - <<'PY'
 import json
 import os
 import sys
 
 data = json.loads(os.environ["PLUGIN_LIST_JSON"])
+wanted = os.environ["INSTALL_PLUGIN_NAMES"].split()
 seen = set()
 
 for section in ("installed", "available"):
     for plugin in data.get(section, []):
         name = plugin.get("name")
-        if name and name not in seen:
+        if name:
             seen.add(name)
-            print(name)
+
+missing = [name for name in wanted if name not in seen]
+if missing:
+    print(
+        "marketplace is missing developer workflow plugin(s): " + ", ".join(missing),
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+for name in wanted:
+    print(name)
 PY
-)"
-[[ -n "$plugin_names" ]] || die "marketplace has no plugins: $marketplace_name"
+)"; then
+    die "marketplace is missing developer workflow plugin(s): ${INSTALL_PLUGIN_NAMES[*]}"
+fi
+[[ -n "$plugin_names" ]] || die "no developer workflow plugins selected for marketplace: $marketplace_name"
 
 while IFS= read -r plugin_name; do
     [[ -n "$plugin_name" ]] || continue

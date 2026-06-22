@@ -14,7 +14,7 @@ Use Moraine when the user assumes continuity that is not visible in current cont
 - Use `open` to expand any `session:`, `turn:`, or `event:` ID returned by Moraine.
 - Use `file_attention` when the clue is a file path or when you need to know which sessions read or changed a file across worktrees.
 
-In Claude Code plugin installs, the MCP tools may appear with names like `mcp__plugin_moraine_moraine__search_sessions`; use the corresponding Moraine tool available in the current harness.
+In plugin installs, the MCP tools may appear with names like `mcp__plugin_moraine_moraine__search_sessions`; use the corresponding Moraine tool available in the current harness.
 
 ## Query Shape
 

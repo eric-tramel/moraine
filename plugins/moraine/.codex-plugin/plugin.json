@@ -1,0 +1,39 @@
+{
+  "name": "moraine",
+  "version": "0.6.1",
+  "description": "Codex plugin for Moraine MCP session search and realtime agent awareness.",
+  "author": {
+    "name": "Moraine maintainers",
+    "email": "eric.tramel@gmail.com",
+    "url": "https://github.com/eric-tramel/moraine"
+  },
+  "homepage": "https://github.com/eric-tramel/moraine",
+  "repository": "https://github.com/eric-tramel/moraine",
+  "license": "Apache-2.0",
+  "keywords": [
+    "moraine",
+    "mcp",
+    "codex",
+    "agent-memory",
+    "session-search",
+    "realtime-agents"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Moraine",
+    "shortDescription": "Search local agent sessions from Codex.",
+    "longDescription": "Connects Codex to Moraine MCP session search, realtime agent awareness, and bundled guidance for recovering prior agent context.",
+    "developerName": "Moraine maintainers",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read"
+    ],
+    "defaultPrompt": [
+      "Search my past agent sessions with Moraine.",
+      "Check what another agent is doing now.",
+      "Find prior context for this issue."
+    ],
+    "brandColor": "#2F6F73"
+  }
+}

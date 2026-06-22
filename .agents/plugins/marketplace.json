@@ -1,9 +1,21 @@
 {
-  "name": "moraine-dev",
+  "name": "moraine",
   "interface": {
-    "displayName": "Moraine Developer Agent Workflows"
+    "displayName": "Moraine"
   },
   "plugins": [
+    {
+      "name": "moraine",
+      "source": {
+        "source": "local",
+        "path": "./plugins/moraine"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    },
     {
       "name": "moraine-dev",
       "source": {

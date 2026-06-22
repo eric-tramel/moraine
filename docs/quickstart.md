@@ -83,7 +83,32 @@ claude mcp remove moraine --scope user
 ```
 
 Manual registration still works and is useful for project-scoped Claude Code
-setups or other harnesses. Add Moraine to Codex globally:
+setups or other harnesses.
+
+For Codex, install the Moraine plugin marketplace entry. It registers the MCP
+server and bundles the same Moraine search skills:
+
+```bash
+codex plugin marketplace add eric-tramel/moraine --sparse .agents/plugins --sparse plugins/moraine --sparse plugins/moraine-dev
+codex plugin add moraine@moraine
+```
+
+The same marketplace also contains the contributor-only `moraine-dev` plugin for
+Moraine maintainers; end users should install `moraine@moraine`.
+
+The user-scoped plugin can search the host-wide Moraine history visible to your
+user. Enable it only in trusted Codex environments. Use manual project-scoped
+setup when you need `--project-only`.
+
+If you already added Moraine manually to Codex, remove the manual server first
+to avoid duplicate MCP tools:
+
+```bash
+codex mcp remove moraine
+```
+
+Manual registration still works and is useful for project-scoped Codex setups or
+other harnesses. Add Moraine to Codex globally:
 
 ```bash
 codex mcp add moraine -- moraine run mcp
