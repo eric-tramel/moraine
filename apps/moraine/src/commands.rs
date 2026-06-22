@@ -1,5 +1,6 @@
 mod down;
 mod logs;
+mod setup;
 mod status;
 mod up;
 
@@ -139,6 +140,7 @@ pub(crate) async fn dispatch(cli: Cli, output: CliOutput) -> Result<ExitCode> {
                 }
             }
         }
+        CliCommand::Setup(args) => setup::handle(&output, cli.config.clone(), args),
         CliCommand::Run(run) => run_service(cli.config.clone(), run).await,
     }
 }

@@ -1,4 +1,5 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde::Serialize;
 use std::path::PathBuf;
 
 use crate::service::Service;
@@ -37,6 +38,7 @@ pub(crate) enum CliCommand {
     Db(DbArgs),
     Clickhouse(ClickhouseArgs),
     Config(ConfigArgs),
+    Setup(SetupArgs),
     Run(RunArgs),
 }
 
@@ -109,6 +111,39 @@ pub(crate) struct ConfigGetArgs {
 }
 
 #[derive(Debug, Args)]
+pub(crate) struct SetupArgs {
+    /// Accept non-interactive defaults. Does not enable MCP targets by itself.
+    #[arg(long)]
+    pub(crate) yes: bool,
+    /// Show planned changes without writing files or running external commands.
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+    /// Skip config file creation, validation, and repair.
+    #[arg(long, conflicts_with = "repair_config")]
+    pub(crate) skip_config: bool,
+    /// Skip MCP/plugin registration prompts and actions.
+    #[arg(long, conflicts_with = "mcp_targets")]
+    pub(crate) skip_mcp: bool,
+    /// Repair an invalid config by backing it up and writing the default template.
+    #[arg(long)]
+    pub(crate) repair_config: bool,
+    /// MCP/plugin target to configure. Repeat to select multiple targets.
+    #[arg(long = "mcp-target", value_enum, value_name = "TARGET")]
+    pub(crate) mcp_targets: Vec<SetupMcpTarget>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum SetupMcpTarget {
+    ClaudeCode,
+    Codex,
+    Hermes,
+    KimiCli,
+    Cursor,
+    PiCodingAgent,
+}
+
+#[derive(Debug, Args)]
 pub(crate) struct RunArgs {
     #[arg(value_enum)]
     pub(crate) service: Service,
@@ -154,6 +189,38 @@ mod tests {
             }) => assert_eq!(get.key, "clickhouse.url"),
             _ => panic!("expected config get command"),
         }
+    }
+
+    #[test]
+    fn clap_parses_setup_targets() {
+        let cli = Cli::parse_from([
+            "moraine",
+            "setup",
+            "--yes",
+            "--dry-run",
+            "--mcp-target",
+            "codex",
+            "--mcp-target",
+            "claude-code",
+        ]);
+        match cli.command {
+            CliCommand::Setup(setup) => {
+                assert!(setup.yes);
+                assert!(setup.dry_run);
+                assert_eq!(
+                    setup.mcp_targets,
+                    vec![SetupMcpTarget::Codex, SetupMcpTarget::ClaudeCode]
+                );
+            }
+            _ => panic!("expected setup command"),
+        }
+    }
+
+    #[test]
+    fn clap_rejects_setup_skip_mcp_with_target() {
+        let err = Cli::try_parse_from(["moraine", "setup", "--skip-mcp", "--mcp-target", "codex"])
+            .expect_err("conflicting setup mcp flags should fail");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]

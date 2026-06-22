@@ -46,50 +46,27 @@ Moraine ships session trace ingestion adapters for these agent harnesses:
 
 ## Quickstart
 
-Install from PyPI with `uv`:
-
 ```bash
 uv tool install moraine-cli
-```
-
-Or install the latest release bundle:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/eric-tramel/moraine/main/scripts/install.sh | sh
-```
-
-Start the local stack:
-
-```bash
+moraine setup
 moraine up
-moraine status
 ```
+
+`moraine setup` creates or repairs `~/.moraine/config.toml` and guides plugin or
+MCP registration for detected agent harnesses.
 
 The monitor UI runs at `http://127.0.0.1:8080` by default.
 
+For release bundles, upgrades, project-scoped setup, and other harnesses, see the
+[Quickstart and Installation](https://eric-tramel.github.io/moraine/quickstart.html).
+
 ## Connect Claude Code or Codex
 
-After `moraine up`, install the Moraine plugin for your agent harness. The
-plugins register the MCP search server and bundle guidance for searching prior
-sessions, but they still use the `moraine` CLI on your `PATH` and the running
-local stack.
-
-For Claude Code:
-
-```bash
-claude plugin marketplace add eric-tramel/moraine --sparse .claude-plugin plugins
-claude plugin install moraine@moraine
-```
-
-For Codex:
-
-```bash
-codex plugin marketplace add eric-tramel/moraine \
-  --sparse .agents/plugins \
-  --sparse plugins/moraine \
-  --sparse plugins/moraine-dev
-codex plugin add moraine@moraine
-```
+Use `moraine setup` to install or update the Moraine plugin for Claude Code and
+Codex. The same guided selector can also register Moraine MCP for other detected
+harnesses. The plugins register the MCP search server and bundle guidance for
+searching prior sessions, but they still use the `moraine` CLI on your `PATH`
+and the running local stack.
 
 Start a new agent session after installing the plugin. Claude Code sessions get
 the `moraine:session-search` and `moraine:realtime-peek` skills, and Moraine MCP

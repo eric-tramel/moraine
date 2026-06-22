@@ -26,6 +26,34 @@ The bundle installer places binaries in `~/.local/bin` by default and writes
 `~/.moraine/config.toml` when that file does not already exist. Add
 `~/.local/bin` to `PATH` if your shell does not find `moraine`.
 
+## Guided Setup
+
+Run the guided setup once after installing, or rerun it later to repair a broken
+config and install or update agent harness integrations:
+
+```bash
+moraine setup
+```
+
+In non-interactive scripts, create a missing config without registering agent
+harnesses:
+
+```bash
+moraine setup --yes
+```
+
+To preview MCP or plugin registration without touching host agent config, pass
+explicit targets:
+
+```bash
+moraine setup --dry-run --mcp-target claude-code --mcp-target codex
+```
+
+The Claude Code and Codex plugins, plus global MCP registrations, can expose
+host-wide Moraine session history to that harness. `moraine setup` asks before
+making those changes; for project-scoped or custom harness setup, see
+[Agent MCP Search → Install](agent-mcp-search/install.md).
+
 ## Start Moraine
 
 Start the local stack:
@@ -62,67 +90,38 @@ unchanged; if the shared server is not running, `moraine run mcp` falls back to
 an embedded server automatically. See
 [Agent MCP Search → Install](agent-mcp-search/install.md#shared-central-server-default).
 
-For Claude Code, install the Moraine plugin marketplace entry. It registers the
-MCP server and bundles Moraine search skills. Upgrade Moraine first if your
-installed CLI is not current:
+Use `moraine setup` to connect your agent harnesses. In an interactive terminal,
+setup shows a selector for detected harnesses; use the arrow keys to move, Space
+to choose integrations, and Enter to install the selected plugins or MCP
+registrations:
 
 ```bash
-claude plugin marketplace add eric-tramel/moraine --sparse .claude-plugin plugins
-claude plugin install moraine@moraine
+moraine setup
 ```
 
-The user-scoped plugin can search the host-wide Moraine history visible to your
-user. Enable it only in trusted Claude Code environments. Use manual
-project-scoped setup when you need `--project-only`.
-
-If you already added Moraine manually to Claude Code, remove the manual server
-first to avoid duplicate MCP tools:
+You can also target harnesses directly, which is useful for scripts or for
+rerunning setup after installing a new harness CLI:
 
 ```bash
-claude mcp remove moraine --scope user
+moraine setup --yes --mcp-target claude-code --mcp-target codex
 ```
 
-Manual registration still works and is useful for project-scoped Claude Code
-setups or other harnesses.
-
-For Codex, install the Moraine plugin marketplace entry. It registers the MCP
-server and bundles the same Moraine search skills:
+Preview those changes without touching host agent config:
 
 ```bash
-codex plugin marketplace add eric-tramel/moraine --sparse .agents/plugins --sparse plugins/moraine --sparse plugins/moraine-dev
-codex plugin add moraine@moraine
+moraine setup --dry-run --mcp-target claude-code --mcp-target codex --mcp-target hermes
 ```
 
-The same marketplace also contains the contributor-only `moraine-dev` plugin for
-Moraine maintainers; end users should install `moraine@moraine`.
-
-The user-scoped plugin can search the host-wide Moraine history visible to your
-user. Enable it only in trusted Codex environments. Use manual project-scoped
-setup when you need `--project-only`.
-
-If you already added Moraine manually to Codex, remove the manual server first
-to avoid duplicate MCP tools:
-
-```bash
-codex mcp remove moraine
-```
-
-Manual registration still works and is useful for project-scoped Codex setups or
-other harnesses. Add Moraine to Codex globally:
-
-```bash
-codex mcp add moraine -- moraine run mcp
-```
-
-Add Moraine to Hermes:
-
-```bash
-hermes mcp add moraine --command moraine --args run mcp
-```
+The Claude Code and Codex plugins bundle Moraine search guidance. `moraine
+setup` installs those plugins for default user-scoped setup, and registers MCP
+directly for supported harnesses such as Hermes and Kimi CLI. These user-scoped
+integrations can search the host-wide Moraine history visible to your user, so
+enable them only in trusted harness environments.
 
 The MCP server uses the same config resolution rules as the rest of Moraine, with
 `MORAINE_MCP_CONFIG` taking precedence over the generic `MORAINE_CONFIG`.
-For Cursor, Kimi CLI, Pi, project-scoped Claude Code, and other clients, see
+For manual cleanup, Cursor, Pi, project-scoped Claude Code or Codex, and other
+custom setup, see
 [Agent MCP Search](agent-mcp-search/install.md).
 
 ## Common Commands
@@ -131,6 +130,7 @@ For Cursor, Kimi CLI, Pi, project-scoped Claude Code, and other clients, see
 | --- | --- |
 | `moraine up` | Start ClickHouse, ingest, the monitor UI, and the shared MCP server. |
 | `moraine up --mcp` | Force-start the shared MCP server (also on by default). |
+| `moraine setup` | Create or repair config and guide MCP/plugin registration. |
 | `moraine status` | Print service and ingest health. |
 | `moraine logs` | Show recent service logs. |
 | `moraine logs ingest --lines 500` | Show recent ingest logs. |
