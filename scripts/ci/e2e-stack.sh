@@ -882,11 +882,20 @@ PY
   # point: it is exactly what #388 guards against. FINAL still dedups at read
   # time, so the FINAL / turn-count assertions are unaffected by the freeze.
   clickhouse_scalar "$clickhouse_url" "SYSTEM STOP MERGES ${clickhouse_database}.events" >/dev/null
+  local codex_live_user_messages_before
+  codex_live_user_messages_before="$(clickhouse_scalar "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events WHERE source_name = 'ci-codex' AND session_id = '${codex_session_id}' AND actor_kind = 'user' AND event_kind = 'message'")"
+  if [[ ! "$codex_live_user_messages_before" =~ ^[0-9]+$ ]] || (( codex_live_user_messages_before < 1 )); then
+    echo "[e2e] expected at least one live codex user-message row before duplicate insert, got: ${codex_live_user_messages_before}" >&2
+    return 1
+  fi
+  local codex_live_user_messages_after
+  codex_live_user_messages_after="$((codex_live_user_messages_before + 1))"
+  assert_clickhouse_count "$clickhouse_url" "codex user-message row collapses under FINAL before duplicate insert" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex' AND session_id = '${codex_session_id}' AND actor_kind = 'user' AND event_kind = 'message'" "1"
   # Plant a duplicate of the codex user message in a fresh, un-merged part:
   # SELECT * preserves ingested_at (so it lands in the same partition and shares
   # the sort key), REPLACE bumps event_version so FINAL keeps exactly one row.
   clickhouse_scalar "$clickhouse_url" "INSERT INTO ${clickhouse_database}.events SELECT * REPLACE (event_version + 1 AS event_version) FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex' AND session_id = '${codex_session_id}' AND actor_kind = 'user' AND event_kind = 'message'" >/dev/null
-  assert_clickhouse_count "$clickhouse_url" "codex duplicate user-message row is live (un-merged)" "SELECT count() FROM ${clickhouse_database}.events WHERE source_name = 'ci-codex' AND session_id = '${codex_session_id}' AND actor_kind = 'user' AND event_kind = 'message'" "2"
+  assert_clickhouse_count "$clickhouse_url" "codex duplicate user-message row increases live physical count" "SELECT count() FROM ${clickhouse_database}.events WHERE source_name = 'ci-codex' AND session_id = '${codex_session_id}' AND actor_kind = 'user' AND event_kind = 'message'" "$codex_live_user_messages_after"
   assert_clickhouse_count "$clickhouse_url" "codex duplicate collapses under FINAL" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex' AND session_id = '${codex_session_id}' AND actor_kind = 'user' AND event_kind = 'message'" "1"
   assert_clickhouse_scalar "$clickhouse_url" "codex turn_seq unchanged by un-merged duplicate" "SELECT max(turn_seq) FROM ${clickhouse_database}.v_conversation_trace WHERE session_id = '${codex_session_id}'" "$codex_turns_before"
   assert_clickhouse_scalar "$clickhouse_url" "codex session summary turn count unchanged by un-merged duplicate" "SELECT total_turns FROM ${clickhouse_database}.v_session_summary WHERE session_id = '${codex_session_id}'" "$codex_turns_before"
