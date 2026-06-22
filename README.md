@@ -63,13 +63,14 @@ For release bundles, upgrades, project-scoped setup, and other harnesses, see th
 ## Connect Agent Harnesses
 
 Use `moraine setup` to install or update the Moraine plugins for Claude Code and
-Codex, or to register Moraine MCP for supported harnesses such as OpenCode,
-Cursor, Hermes, Kimi CLI, and Pi Coding Agent. The integrations use the
+Codex, and Hermes, or to register Moraine MCP for supported harnesses such as
+OpenCode, Cursor, Kimi CLI, and Pi Coding Agent. The integrations use the
 `moraine` CLI on your `PATH` and the running local stack.
 
-Start a new agent session after installing an integration. Claude Code sessions
-get the `moraine:session-search` and `moraine:realtime-peek` skills, and Moraine
-MCP tools are exposed as `mcp__plugin_moraine_moraine__*`. Then ask:
+Start a new agent session after installing an integration. Claude Code, Codex, and
+Hermes sessions get the `moraine:session-search` and `moraine:realtime-peek`
+guidance, and Moraine MCP tools are exposed with each harness's MCP naming
+scheme. Then ask:
 
 ```text
 What are my agents doing right now?
@@ -81,10 +82,10 @@ user. For project-scoped setup, duplicate MCP cleanup, and other clients, see
 
 ## Agent Harness Guidance
 
-The Claude Code and Codex plugins already bundle Moraine search guidance. If you
-use manual MCP registration or another harness, add the following guidance to
-your global harness instructions, such as `~/.codex/AGENTS.md` for Codex or
-`~/.claude/CLAUDE.md` for Claude Code:
+The Claude Code, Codex, and Hermes plugins already bundle Moraine search
+guidance. If you use manual MCP registration or another harness, add the
+following guidance to your global harness instructions, such as
+`~/.codex/AGENTS.md` for Codex or `~/.claude/CLAUDE.md` for Claude Code:
 
 ```markdown
 - You have access to all past agent sessions (whether codex, claude, hermes, etc., anything) via moraine search tools.
@@ -99,6 +100,7 @@ With this you can do operations like the following:
 ```
 claude -p "What are my agents doing right now?"
 codex exec "What are my agents doing right now?"
+hermes -z "What are my agents doing right now?"
 ```
 
 ## Development

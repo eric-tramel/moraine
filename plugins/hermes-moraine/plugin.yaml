@@ -1,0 +1,14 @@
+manifest_version: 1
+name: moraine
+version: "0.6.1"
+description: "Hermes integration for Moraine MCP session search, realtime agent awareness, and setup diagnostics."
+author: "Moraine maintainers"
+provides_tools:
+  - moraine_doctor
+provides_hooks:
+  - pre_llm_call
+provides_commands:
+  - moraine
+provides_skills:
+  - session-search
+  - realtime-peek

@@ -235,16 +235,31 @@ may ask you to approve project-scoped MCP servers before it uses them.
 
 ## Hermes
 
-Hermes has an MCP manager command. Add Moraine as a stdio server:
+For Hermes, the recommended user-scoped setup is the Moraine Hermes plugin. The
+plugin registers plugin-scoped Moraine search skills, injects compact guidance
+when the user asks about prior or active agent sessions, and adds setup/doctor
+commands. It still uses the `moraine` CLI on `PATH` and the running local stack.
+
+```bash
+hermes plugins install eric-tramel/moraine/plugins/hermes-moraine --enable
+hermes moraine setup
+hermes moraine doctor
+```
+
+The setup command writes a `mcp_servers.moraine` entry that launches
+`moraine run mcp`, then verifies it with `hermes mcp test moraine` unless
+`--no-test` is passed. If you run Hermes profiles, install the plugin and run
+`hermes moraine setup` in each profile that should be able to search Moraine
+history.
+
+Manual Hermes MCP registration remains useful for custom environment wiring such
+as `MORAINE_MCP_CONFIG`, or when you do not want to install the plugin:
 
 ```bash
 hermes mcp add moraine --command moraine --args run mcp
 hermes mcp list
 hermes mcp test moraine
 ```
-
-If you run Hermes profiles, add the server in each profile that should be able
-to search Moraine history.
 
 ## Kimi CLI
 
