@@ -62,7 +62,7 @@ For release bundles, upgrades, project-scoped setup, and other harnesses, see th
 
 ## Connect Agent Harnesses
 
-Use `moraine setup` to install or update the Moraine plugins for Claude Code and
+Use `moraine setup` to install or update the Moraine plugins for Claude Code,
 Codex, and Hermes, or to register Moraine MCP for supported harnesses such as
 OpenCode, Cursor, Kimi CLI, and Pi Coding Agent. The integrations use the
 `moraine` CLI on your `PATH` and the running local stack.

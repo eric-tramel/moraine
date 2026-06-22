@@ -238,7 +238,7 @@ const SPECS: [HarnessSpec; 7] = [
     HarnessSpec {
         target: SetupMcpTarget::Hermes,
         label: "Hermes",
-        setup_kind: "MCP",
+        setup_kind: "plugin",
         programs: &["hermes"],
         probe_paths: ProbePaths::None,
         ingest_sources: &HERMES_INGEST,
@@ -434,20 +434,50 @@ pub(super) fn mcp_plan(
             config_writes: Vec::new(),
             manual_snippet: None,
         },
-        SetupMcpTarget::Hermes => McpPlan::replace_registration(
-            target,
-            CommandSpec::new("hermes", ["mcp", "remove", "moraine"]),
-            McpPlanStep::required_stdout(
-                CommandSpec::new("hermes", hermes_args(config_target)).with_stdin("\n"),
-                "tools enabled",
+        SetupMcpTarget::Hermes if config_target.requires_explicit_mcp_config() => {
+            let command = CommandSpec::new("hermes", hermes_args(config_target));
+            McpPlan::manual(
+                target,
+                format!(
+                    "Hermes plugin setup uses the default Moraine config. For this custom config target, use manual MCP registration:\n{}",
+                    command.display()
+                ),
             )
-            .with_progress(
-                "Registering Moraine MCP in Hermes",
-                "Hermes MCP tools enabled",
-                "Hermes MCP registration warning",
-                "Hermes MCP registration failed",
-            ),
-        ),
+        }
+        SetupMcpTarget::Hermes => McpPlan {
+            target,
+            action: super::McpAction::Execute,
+            steps: vec![
+                McpPlanStep::required(CommandSpec::new(
+                    "hermes",
+                    [
+                        "plugins",
+                        "install",
+                        "eric-tramel/moraine/plugins/hermes-moraine",
+                        "--force",
+                        "--enable",
+                    ],
+                ))
+                .with_progress(
+                    "Installing Hermes Moraine plugin",
+                    "Hermes plugin installed",
+                    "Hermes plugin install warning",
+                    "Hermes plugin install failed",
+                ),
+                McpPlanStep::required_stdout(
+                    CommandSpec::new("hermes", ["moraine", "setup", "--no-test"]),
+                    "Moraine MCP setup complete",
+                )
+                .with_progress(
+                    "Configuring Hermes Moraine MCP",
+                    "Hermes MCP configured",
+                    "Hermes MCP setup warning",
+                    "Hermes MCP setup failed",
+                ),
+            ],
+            config_writes: Vec::new(),
+            manual_snippet: None,
+        },
         SetupMcpTarget::KimiCli => McpPlan::replace_registration(
             target,
             CommandSpec::new("kimi", ["mcp", "remove", "moraine"]),
@@ -662,7 +692,7 @@ fn codex_args(config_target: &ConfigTarget) -> Vec<String> {
     args
 }
 
-fn hermes_args(config_target: &ConfigTarget) -> Vec<String> {
+pub(super) fn hermes_args(config_target: &ConfigTarget) -> Vec<String> {
     let mut args = vec![
         "mcp".to_string(),
         "add".to_string(),

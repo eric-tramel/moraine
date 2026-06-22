@@ -1785,6 +1785,7 @@ impl CommandSpec {
         }
     }
 
+    #[cfg(test)]
     fn with_stdin(mut self, input: impl Into<String>) -> Self {
         self.stdin = Some(input.into());
         self
@@ -3151,7 +3152,7 @@ watch_root = "~/custom"
     }
 
     #[test]
-    fn hermes_add_accepts_tool_enable_prompt() {
+    fn hermes_default_config_installs_plugin_and_runs_setup() {
         let target = ConfigTarget {
             path: PathBuf::from("/tmp/config.toml"),
             source: ConfigTargetSource::HomeDefault,
@@ -3159,9 +3160,85 @@ watch_root = "~/custom"
         let plan = McpPlan::for_target(SetupMcpTarget::Hermes, &target);
         let commands = plan.commands();
         assert_eq!(commands.len(), 2);
-        assert_eq!(commands[0].args, vec!["mcp", "remove", "moraine"]);
         assert_eq!(
-            commands[1].args,
+            commands[0].args,
+            vec![
+                "plugins",
+                "install",
+                "eric-tramel/moraine/plugins/hermes-moraine",
+                "--force",
+                "--enable",
+            ]
+        );
+        assert_eq!(commands[1].args, vec!["moraine", "setup", "--no-test"]);
+    }
+
+    #[test]
+    fn hermes_custom_config_is_manual() {
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/custom.toml"),
+            source: ConfigTargetSource::Cli,
+        };
+        let plan = McpPlan::for_target(SetupMcpTarget::Hermes, &target);
+        assert_eq!(plan.action, McpAction::ManualInstructions);
+        assert!(plan
+            .manual_snippet
+            .expect("manual snippet")
+            .contains("--config /tmp/custom.toml"));
+    }
+
+    #[test]
+    fn hermes_plugin_setup_failure_is_reported() {
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/config.toml"),
+            source: ConfigTargetSource::HomeDefault,
+        };
+        let plan = McpPlan::for_target(SetupMcpTarget::Hermes, &target);
+        let commands = plan.commands();
+        let mut runner = FakeRunner::default()
+            .with_existing("hermes")
+            .with_response(commands[0].clone(), true, "")
+            .with_output_response(
+                commands[1].clone(),
+                true,
+                "Moraine MCP setup needs attention.",
+                "",
+            );
+        let report = execute_mcp_plan(plan, &mut runner).expect("execute mcp");
+        assert_eq!(report.status, SetupStatus::Error);
+        assert!(report
+            .error
+            .as_deref()
+            .expect("error")
+            .contains("did not report successful setup"));
+        assert_eq!(runner.ran, commands);
+    }
+
+    #[test]
+    fn hermes_plugin_setup_success_is_accepted() {
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/config.toml"),
+            source: ConfigTargetSource::HomeDefault,
+        };
+        let plan = McpPlan::for_target(SetupMcpTarget::Hermes, &target);
+        let commands = plan.commands();
+        let mut runner = FakeRunner::default()
+            .with_existing("hermes")
+            .with_response(commands[0].clone(), true, "")
+            .with_output_response(commands[1].clone(), true, "Moraine MCP setup complete.", "");
+        let report = execute_mcp_plan(plan, &mut runner).expect("execute mcp");
+        assert_eq!(report.status, SetupStatus::Ok);
+        assert_eq!(runner.ran, commands);
+    }
+
+    #[test]
+    fn hermes_manual_mcp_args_accept_tool_enable_prompt() {
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/config.toml"),
+            source: ConfigTargetSource::HomeDefault,
+        };
+        assert_eq!(
+            harnesses::hermes_args(&target),
             vec![
                 "mcp",
                 "add",
@@ -3173,16 +3250,22 @@ watch_root = "~/custom"
                 "mcp",
             ]
         );
-        assert_eq!(commands[1].stdin.as_deref(), Some("\n"));
     }
 
     #[test]
-    fn hermes_add_cancelled_stdout_is_error_even_with_zero_status() {
+    fn hermes_manual_mcp_cancelled_stdout_is_error_even_with_zero_status() {
         let target = ConfigTarget {
             path: PathBuf::from("/tmp/config.toml"),
             source: ConfigTargetSource::HomeDefault,
         };
-        let plan = McpPlan::for_target(SetupMcpTarget::Hermes, &target);
+        let plan = McpPlan::replace_registration(
+            SetupMcpTarget::Hermes,
+            CommandSpec::new("hermes", ["mcp", "remove", "moraine"]),
+            McpPlanStep::required_stdout(
+                CommandSpec::new("hermes", harnesses::hermes_args(&target)).with_stdin("\n"),
+                "tools enabled",
+            ),
+        );
         let commands = plan.commands();
         let mut runner = FakeRunner::default()
             .with_existing("hermes")
@@ -3196,6 +3279,29 @@ watch_root = "~/custom"
             .expect("error")
             .contains("did not report successful setup"));
         assert_eq!(runner.ran, commands);
+    }
+
+    #[test]
+    fn hermes_manual_mcp_args_include_custom_config() {
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/custom.toml"),
+            source: ConfigTargetSource::Cli,
+        };
+        assert_eq!(
+            harnesses::hermes_args(&target),
+            vec![
+                "mcp",
+                "add",
+                "moraine",
+                "--command",
+                "moraine",
+                "--args",
+                "run",
+                "mcp",
+                "--config",
+                "/tmp/custom.toml",
+            ]
+        );
     }
 
     #[test]
