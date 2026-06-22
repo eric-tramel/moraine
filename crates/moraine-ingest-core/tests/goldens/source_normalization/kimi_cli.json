@@ -47,7 +47,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"user_input\":\"Please inspect the sample project.\"}",
           "payload_type": "user_message",
+          "project_id": "",
           "record_ts": "2026-04-12T00:32:24.549974Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -91,7 +93,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -153,7 +156,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"n\":1}",
           "payload_type": "progress",
+          "project_id": "",
           "record_ts": "2026-04-12T00:32:24.550842Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -197,7 +202,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 1
+          "turn_index": 1,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -261,7 +267,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"think\":\"Need to inspect files first.\",\"type\":\"think\"}",
           "payload_type": "reasoning",
+          "project_id": "",
           "record_ts": "2026-04-12T00:32:25.100000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -305,7 +313,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -369,7 +378,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"text\":\"I will read the manifest.\",\"type\":\"text\"}",
           "payload_type": "agent_message",
+          "project_id": "",
           "record_ts": "2026-04-12T00:32:26.200000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -413,7 +424,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -477,7 +489,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"extras\":null,\"function\":{\"arguments\":\"{\\\"path\\\":\\\"manifest.json\\\"}\",\"name\":\"ReadFile\"},\"id\":\"tool_abc\",\"type\":\"function\"}",
           "payload_type": "tool_use",
+          "project_id": "",
           "record_ts": "2026-04-12T00:32:27.300000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -521,7 +535,8 @@
           "tool_name": "ReadFile",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -561,13 +576,16 @@
           "output_preview": "",
           "output_text": "",
           "parent_tool_call_id": "",
+          "project_id": "",
+          "repo_rel_path": "",
           "session_id": "kimi-cli:kimi-cli",
           "source_name": "golden-kimi-cli",
           "source_ref": "/fixtures/kimi-cli/wire.jsonl:1:6",
           "tool_call_id": "tool_abc",
           "tool_error": 0,
           "tool_name": "ReadFile",
-          "tool_phase": "request"
+          "tool_phase": "request",
+          "worktree_root": ""
         }
       ]
     },
@@ -608,7 +626,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"return_value\":{\"display\":[],\"extras\":null,\"is_error\":false,\"message\":\"Read file\",\"output\":\"{\\\"ok\\\":true}\"},\"tool_call_id\":\"tool_abc\"}",
           "payload_type": "tool_result",
+          "project_id": "",
           "record_ts": "2026-04-12T00:32:28.400000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -652,7 +672,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -692,13 +713,16 @@
           "output_preview": "{\"ok\":true}",
           "output_text": "{\"ok\":true}",
           "parent_tool_call_id": "",
+          "project_id": "",
+          "repo_rel_path": "",
           "session_id": "kimi-cli:kimi-cli",
           "source_name": "golden-kimi-cli",
           "source_ref": "/fixtures/kimi-cli/wire.jsonl:1:7",
           "tool_call_id": "tool_abc",
           "tool_error": 0,
           "tool_name": "",
-          "tool_phase": "response"
+          "tool_phase": "response",
+          "worktree_root": ""
         }
       ]
     },
@@ -737,7 +761,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"context_tokens\":100,\"context_usage\":0.1,\"max_context_tokens\":1000,\"mcp_status\":null,\"message_id\":\"chatcmpl_test\",\"plan_mode\":false,\"token_usage\":{\"input_cache_creation\":1,\"input_cache_read\":2,\"input_other\":10,\"output\":5}}",
           "payload_type": "token_count",
+          "project_id": "",
           "record_ts": "2026-04-12T00:32:29.500000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -781,7 +807,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],

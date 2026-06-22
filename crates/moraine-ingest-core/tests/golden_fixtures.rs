@@ -67,6 +67,9 @@ const EVENT_REQUIRED_STRING_FIELDS: &[&str] = &[
     "text_preview",
     "payload_json",
     "token_usage_json",
+    "project_id",
+    "repo_rel_path",
+    "worktree_root",
 ];
 
 const EVENT_REQUIRED_U64_FIELDS: &[&str] = &[
@@ -791,6 +794,9 @@ fn assert_tool_row_shape(row: &Value, context: &str, event_uids: &HashSet<String
         "output_text",
         "input_preview",
         "output_preview",
+        "project_id",
+        "repo_rel_path",
+        "worktree_root",
         "source_ref",
     ] {
         assert_string(row, field, context);

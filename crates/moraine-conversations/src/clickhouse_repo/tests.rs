@@ -1,3 +1,4 @@
+use super::file_attention::merge_file_attention_touches;
 use super::*;
 
 fn sample_search_doc() -> SearchDocExtraCacheEntry {
@@ -83,6 +84,32 @@ fn sample_mcp_search_row(event_uid: &str, raw_score: f64, event_unix_ms: i64) ->
     }
 }
 
+fn sample_file_attention_touch(
+    session_id: &str,
+    tool_call_id: &str,
+    event_uid: &str,
+    event_unix_ms: Option<i64>,
+    event_order: u64,
+) -> FileAttentionTouch {
+    FileAttentionTouch {
+        session_id: session_id.to_string(),
+        event_uid: event_uid.to_string(),
+        tool_call_id: tool_call_id.to_string(),
+        harness: "codex".to_string(),
+        tool_name: "Edit".to_string(),
+        tool_phase: "request".to_string(),
+        match_kind: "path_suffix".to_string(),
+        matched_path: "/repo/src/lib.rs".to_string(),
+        worktree_root: "/repo".to_string(),
+        cwd: "/repo".to_string(),
+        event_unix_ms,
+        event_order,
+        turn_seq: Some(1),
+        input_preview: String::new(),
+        output_preview: String::new(),
+    }
+}
+
 #[test]
 fn tokenize_query_enforces_limits_and_counts() {
     let terms = tokenize_query("Hello hello world tool_use", 3);
@@ -137,6 +164,36 @@ fn sort_mcp_search_rows_uses_timestamp_before_event_uid_tiebreaker() {
         .map(|row| row.event_uid.as_str())
         .collect::<Vec<_>>();
     assert_eq!(ids, vec!["evt-c", "evt-b", "evt-d", "evt-a"]);
+}
+
+#[test]
+fn file_attention_merge_dedupes_by_tool_row_identity_and_sorts_once() {
+    let exact = sample_file_attention_touch("s1", "call-1", "event-a", Some(100), 1);
+    let duplicate_fallback = sample_file_attention_touch("s1", "call-1", "event-a", Some(100), 1);
+    let newer_fallback = sample_file_attention_touch("s2", "call-2", "event-b", Some(200), 1);
+    let untimed = sample_file_attention_touch("s3", "call-3", "event-c", None, 0);
+
+    let merged =
+        merge_file_attention_touches(vec![exact, duplicate_fallback, untimed, newer_fallback], 10);
+    let ids = merged
+        .iter()
+        .map(|touch| touch.event_uid.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(ids, vec!["event-b", "event-a", "event-c"]);
+}
+
+#[test]
+fn file_attention_merge_preserves_exact_row_when_fallback_duplicates_it() {
+    let mut exact = sample_file_attention_touch("s1", "call-1", "event-a", Some(100), 1);
+    exact.matched_path = "/normalized/src/lib.rs".to_string();
+    let mut fallback = sample_file_attention_touch("s1", "call-1", "event-a", Some(100), 1);
+    fallback.matched_path = "/fallback/src/lib.rs".to_string();
+
+    let merged = merge_file_attention_touches(vec![exact, fallback], 10);
+
+    assert_eq!(merged.len(), 1);
+    assert_eq!(merged[0].matched_path, "/normalized/src/lib.rs");
 }
 
 #[test]

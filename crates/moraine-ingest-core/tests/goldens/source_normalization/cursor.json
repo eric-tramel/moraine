@@ -39,7 +39,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"text\":\"local fixture cursor user prompt cursor_fixture_keyword\",\"type\":\"text\"}",
           "payload_type": "user_message",
+          "project_id": "",
           "record_ts": "2026-02-16T12:00:10.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -83,7 +85,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -147,7 +150,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"text\":\"I will inspect the target file.\",\"type\":\"text\"}",
           "payload_type": "agent_message",
+          "project_id": "",
           "record_ts": "2026-02-16T12:00:11.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -191,7 +196,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         },
         {
           "actor_kind": "assistant",
@@ -226,7 +232,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"id\":\"cursor-tool-fixture\",\"input\":{\"path\":\"/workspace/src/main.rs\",\"range\":\"1:1-20:1\",\"symbol\":\"main\"},\"name\":\"Read\",\"type\":\"tool_use\"}",
           "payload_type": "tool_use",
+          "project_id": "",
           "record_ts": "2026-02-16T12:00:11.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -270,7 +278,8 @@
           "tool_name": "Read",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [
@@ -323,13 +332,16 @@
           "output_preview": "",
           "output_text": "",
           "parent_tool_call_id": "",
+          "project_id": "",
+          "repo_rel_path": "",
           "session_id": "11111111-2222-4333-8444-555555555555",
           "source_name": "golden-cursor",
           "source_ref": "/fixtures/cursor/projects/demo/agent-transcripts/11111111-2222-4333-8444-555555555555/11111111-2222-4333-8444-555555555555.jsonl:1:2",
           "tool_call_id": "cursor-tool-fixture",
           "tool_error": 0,
           "tool_name": "Read",
-          "tool_phase": "request"
+          "tool_phase": "request",
+          "worktree_root": ""
         }
       ]
     },
@@ -370,7 +382,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"content\":[{\"text\":\"fn main() { println!(\\\"cursor fixture\\\"); }\",\"type\":\"text\"}],\"is_error\":false,\"tool_use_id\":\"cursor-tool-fixture\",\"type\":\"tool_result\"}",
           "payload_type": "tool_result",
+          "project_id": "",
           "record_ts": "2026-02-16T12:00:12.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -414,7 +428,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -454,13 +469,16 @@
           "output_preview": "fn main() { println!(\"cursor fixture\"); }",
           "output_text": "fn main() { println!(\"cursor fixture\"); }",
           "parent_tool_call_id": "",
+          "project_id": "",
+          "repo_rel_path": "",
           "session_id": "11111111-2222-4333-8444-555555555555",
           "source_name": "golden-cursor",
           "source_ref": "/fixtures/cursor/projects/demo/agent-transcripts/11111111-2222-4333-8444-555555555555/11111111-2222-4333-8444-555555555555.jsonl:1:3",
           "tool_call_id": "cursor-tool-fixture",
           "tool_error": 0,
           "tool_name": "",
-          "tool_phase": "response"
+          "tool_phase": "response",
+          "worktree_root": ""
         }
       ]
     },
@@ -501,7 +519,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"text\":\"The file contains a small main function.\",\"type\":\"reasoning\"}",
           "payload_type": "reasoning",
+          "project_id": "",
           "record_ts": "2026-02-16T12:00:13.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -545,7 +565,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         },
         {
           "actor_kind": "assistant",
@@ -580,7 +601,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"text\":\"local fixture cursor assistant reply cursor_fixture_keyword cursor_fixture_trace\",\"type\":\"text\"}",
           "payload_type": "agent_message",
+          "project_id": "",
           "record_ts": "2026-02-16T12:00:13.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -624,7 +647,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -686,7 +710,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"content\":[]}",
           "payload_type": "agent_message",
+          "project_id": "",
           "record_ts": "2026-02-16T12:00:14.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -730,7 +756,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],

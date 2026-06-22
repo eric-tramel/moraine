@@ -2,12 +2,31 @@ use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
 use regex::Regex;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) const TEXT_LIMIT: usize = 200_000;
 pub(crate) const PREVIEW_LIMIT: usize = 320;
 pub(crate) const UNPARSEABLE_EVENT_TS: &str = "1970-01-01 00:00:00.000";
+const FILE_ATTENTION_PATH_KEYS: [&str; 9] = [
+    "file_path",
+    "notebook_path",
+    "path",
+    "target_file",
+    "relativeWorkspacePath",
+    "relative_workspace_path",
+    "filepath",
+    "file",
+    "filename",
+];
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FileAttentionFields {
+    project_id: String,
+    repo_rel_path: String,
+    worktree_root: String,
+}
 
 fn session_id_re() -> &'static Regex {
     static SESSION_ID_RE: OnceLock<Regex> = OnceLock::new();
@@ -854,6 +873,193 @@ fn io_hash(input_json: &str, output_json: &str) -> u64 {
     raw_hash(&format!("{}\n{}", input_json, output_json))
 }
 
+fn event_file_attention_fields(cwd: &str) -> FileAttentionFields {
+    let cwd = normalize_path_text(cwd.trim());
+    if cwd.is_empty() || !cwd.starts_with('/') {
+        return FileAttentionFields::default();
+    }
+
+    let Some(root) = find_file_attention_root(Path::new(&cwd)) else {
+        return FileAttentionFields::default();
+    };
+    let Some(project_id) = project_id_for_root(&root) else {
+        return FileAttentionFields::default();
+    };
+
+    FileAttentionFields {
+        project_id,
+        repo_rel_path: String::new(),
+        worktree_root: root,
+    }
+}
+
+fn tool_file_attention_fields(
+    cwd: &str,
+    tool_phase: &str,
+    input_json: &str,
+) -> FileAttentionFields {
+    if tool_phase != "request" {
+        return FileAttentionFields::default();
+    }
+
+    let Ok(input) = serde_json::from_str::<Value>(input_json) else {
+        return FileAttentionFields::default();
+    };
+
+    let mut candidates = Vec::<String>::new();
+    collect_structured_path_candidates(&input, &mut candidates);
+    for candidate in candidates {
+        if let Some(fields) = resolve_tool_path_fields(cwd, &candidate) {
+            return fields;
+        }
+    }
+
+    FileAttentionFields::default()
+}
+
+fn resolve_tool_path_fields(cwd: &str, raw_path: &str) -> Option<FileAttentionFields> {
+    let raw_path = raw_path.trim();
+    if raw_path.is_empty() || raw_path.contains('\0') {
+        return None;
+    }
+
+    let normalized = normalize_path_text(raw_path);
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let absolute = if normalized.starts_with('/') {
+        normalized
+    } else {
+        let cwd = normalize_path_text(cwd.trim());
+        if cwd.is_empty() || !cwd.starts_with('/') {
+            return None;
+        }
+        normalize_path_text(&format!("{}/{}", cwd.trim_end_matches('/'), normalized))
+    };
+
+    let root = find_file_attention_root(Path::new(&absolute))?;
+    let project_id = project_id_for_root(&root)?;
+    let repo_rel_path = strip_root(&absolute, &root)?;
+    if repo_rel_path.is_empty() {
+        return None;
+    }
+
+    Some(FileAttentionFields {
+        project_id,
+        repo_rel_path,
+        worktree_root: root,
+    })
+}
+
+fn collect_structured_path_candidates(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, item) in map {
+                if FILE_ATTENTION_PATH_KEYS.contains(&key.as_str()) {
+                    collect_path_values(item, out);
+                }
+                collect_structured_path_candidates(item, out);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_structured_path_candidates(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_path_values(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(path) if !path.trim().is_empty() => out.push(path.clone()),
+        Value::Array(items) => {
+            for item in items {
+                if let Value::String(path) = item {
+                    if !path.trim().is_empty() {
+                        out.push(path.clone());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_path_text(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if let Some(last) = parts.last() {
+                    if *last != ".." {
+                        parts.pop();
+                        continue;
+                    }
+                }
+                if !absolute {
+                    parts.push(part);
+                }
+            }
+            _ => parts.push(part),
+        }
+    }
+
+    let body = parts.join("/");
+    if absolute {
+        if body.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{body}")
+        }
+    } else {
+        body
+    }
+}
+
+fn find_file_attention_root(path: &Path) -> Option<String> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut dir = if path.is_dir() {
+        Some(path)
+    } else {
+        path.parent()
+    };
+    let mut git_fallback = None::<String>;
+    while let Some(current) = dir {
+        if current.join(moraine_config::REPO_BACKEND_FILE).exists() {
+            return Some(current.to_string_lossy().to_string());
+        }
+        if current.join(".git").exists() && git_fallback.is_none() {
+            git_fallback = Some(current.to_string_lossy().to_string());
+        }
+        if home.as_deref() == Some(current) {
+            break;
+        }
+        dir = current.parent();
+    }
+    git_fallback
+}
+
+fn project_id_for_root(root: &str) -> Option<String> {
+    let root = Path::new(root);
+    if root.join(moraine_config::REPO_BACKEND_FILE).is_file() {
+        return moraine_config::find_repo_backend_ref(root);
+    }
+    None
+}
+
+fn strip_root(path: &str, root: &str) -> Option<String> {
+    let root = root.trim_end_matches('/');
+    if root.is_empty() {
+        return None;
+    }
+    path.strip_prefix(&format!("{root}/"))
+        .map(|tail| tail.to_string())
+}
+
 pub(crate) struct RecordContext<'a> {
     pub(crate) source_name: &'a str,
     pub(crate) harness: &'a str,
@@ -882,6 +1088,7 @@ pub(crate) fn base_event_obj(
     let text_content = truncate_chars(text_content, TEXT_LIMIT);
     let event_kind = canonicalize_event_kind(event_kind);
     let payload_type = canonicalize_payload_type(payload_type);
+    let file_attention = event_file_attention_fields(ctx.cwd);
     let mut obj = Map::<String, Value>::new();
     obj.insert(
         "event_uid".to_string(),
@@ -1002,6 +1209,18 @@ pub(crate) fn base_event_obj(
         "token_usage_native_units".to_string(),
         token_native_units(&[]),
     );
+    obj.insert(
+        "project_id".to_string(),
+        Value::String(file_attention.project_id),
+    );
+    obj.insert(
+        "repo_rel_path".to_string(),
+        Value::String(file_attention.repo_rel_path),
+    );
+    obj.insert(
+        "worktree_root".to_string(),
+        Value::String(file_attention.worktree_root),
+    );
     obj.insert("event_version".to_string(), json!(event_version()));
     obj
 }
@@ -1075,6 +1294,7 @@ pub(crate) fn build_tool_row(
     output_json: &str,
     output_text: &str,
 ) -> Value {
+    let file_attention = tool_file_attention_fields(ctx.cwd, tool_phase, input_json);
     let input_json = truncate_chars(input_json, TEXT_LIMIT);
     let output_json = truncate_chars(output_json, TEXT_LIMIT);
     let output_text = truncate_chars(output_text, TEXT_LIMIT);
@@ -1098,6 +1318,9 @@ pub(crate) fn build_tool_row(
         "input_preview": truncate_chars(&input_json, PREVIEW_LIMIT),
         "output_preview": truncate_chars(&output_text, PREVIEW_LIMIT),
         "io_hash": io_hash(&input_json, &output_json),
+        "project_id": file_attention.project_id,
+        "repo_rel_path": file_attention.repo_rel_path,
+        "worktree_root": file_attention.worktree_root,
         "source_ref": format!("{}:{}:{}", ctx.source_file, ctx.source_generation, ctx.source_line_no),
         "event_version": event_version(),
     })
@@ -1126,15 +1349,14 @@ mod tests {
             .unwrap_or_default()
     }
 
-    #[test]
-    fn link_type_is_canonicalized_to_domain() {
-        let ctx = RecordContext {
+    fn test_record_context<'a>(cwd: &'a str) -> RecordContext<'a> {
+        RecordContext {
             source_name: "codex",
             harness: "codex",
             inference_provider: "openai",
             session_id: "s1",
             session_date: "2026-02-15",
-            cwd: "/repo",
+            cwd,
             source_file: "/tmp/s1.jsonl",
             source_inode: 1,
             source_generation: 1,
@@ -1142,7 +1364,30 @@ mod tests {
             source_offset: 1,
             record_ts: "2026-02-15T03:50:50.838Z",
             event_ts: "2026-02-15 03:50:50.838",
-        };
+        }
+    }
+
+    fn make_repo(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "moraine-file-attention-{name}-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("src")).expect("create repo dirs");
+        std::fs::write(
+            root.join(moraine_config::REPO_BACKEND_FILE),
+            "backend = \"team\"\n",
+        )
+        .expect("write repo backend marker");
+        root
+    }
+
+    #[test]
+    fn link_type_is_canonicalized_to_domain() {
+        let ctx = test_record_context("/repo");
 
         let link = build_link_row(&ctx, "e1", "e2", "", "new_link_type", "{}");
         let link_obj = link.as_object().unwrap();
@@ -1150,6 +1395,192 @@ mod tests {
             link_obj.get("link_type").unwrap().as_str().unwrap(),
             "unknown"
         );
+    }
+
+    #[test]
+    fn event_rows_capture_project_and_worktree_from_cwd() {
+        let root = make_repo("event-cwd");
+        let cwd = root.join("src");
+        let cwd_text = cwd.to_string_lossy().to_string();
+        let ctx = test_record_context(&cwd_text);
+
+        let row = Value::Object(base_event_obj(
+            &ctx,
+            "e1",
+            "message",
+            "message",
+            "assistant",
+            "hello",
+            "{}",
+        ));
+
+        assert_eq!(row["project_id"], "team");
+        assert_eq!(row["worktree_root"], root.to_string_lossy().as_ref());
+        assert_eq!(row["repo_rel_path"], "");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn event_rows_ignore_git_only_root_without_project_id() {
+        let root = std::env::temp_dir().join(format!(
+            "moraine-file-attention-git-only-{}",
+            std::process::id()
+        ));
+        let cwd = root.join("src");
+        std::fs::create_dir_all(root.join(".git")).expect("create git marker");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        let cwd_text = cwd.to_string_lossy().to_string();
+        let ctx = test_record_context(&cwd_text);
+
+        let row = Value::Object(base_event_obj(
+            &ctx,
+            "e1",
+            "message",
+            "message",
+            "assistant",
+            "hello",
+            "{}",
+        ));
+
+        assert_eq!(row["project_id"], "");
+        assert_eq!(row["worktree_root"], "");
+        assert_eq!(row["repo_rel_path"], "");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn tool_rows_capture_absolute_and_relative_structured_paths() {
+        let root = make_repo("tool-paths");
+        let cwd_text = root.to_string_lossy().to_string();
+        let ctx = test_record_context(&cwd_text);
+        let absolute = root.join("src/lib.rs").to_string_lossy().to_string();
+
+        let absolute_row = build_tool_row(
+            &ctx,
+            "e1",
+            "call-1",
+            "",
+            "Edit",
+            "request",
+            0,
+            &json!({"file_path": absolute}).to_string(),
+            "",
+            "",
+        );
+        assert_eq!(absolute_row["project_id"], "team");
+        assert_eq!(
+            absolute_row["worktree_root"],
+            root.to_string_lossy().as_ref()
+        );
+        assert_eq!(absolute_row["repo_rel_path"], "src/lib.rs");
+
+        let relative_row = build_tool_row(
+            &ctx,
+            "e2",
+            "call-2",
+            "",
+            "Read",
+            "request",
+            0,
+            r#"{"path":"./src/../src/lib.rs"}"#,
+            "",
+            "",
+        );
+        assert_eq!(relative_row["project_id"], "team");
+        assert_eq!(
+            relative_row["worktree_root"],
+            root.to_string_lossy().as_ref()
+        );
+        assert_eq!(relative_row["repo_rel_path"], "src/lib.rs");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn tool_rows_support_phase_zero_structured_path_keys() {
+        let root = make_repo("path-keys");
+        let cwd_text = root.to_string_lossy().to_string();
+        let ctx = test_record_context(&cwd_text);
+
+        for key in FILE_ATTENTION_PATH_KEYS {
+            let input = json!({ key: "src/lib.rs" }).to_string();
+            let row = build_tool_row(
+                &ctx, "e1", "call-1", "", "Edit", "request", 0, &input, "", "",
+            );
+            assert_eq!(row["project_id"], "team", "key {key}");
+            assert_eq!(row["repo_rel_path"], "src/lib.rs", "key {key}");
+        }
+
+        let nested = build_tool_row(
+            &ctx,
+            "e2",
+            "call-2",
+            "",
+            "MultiEdit",
+            "request",
+            0,
+            r#"{"edits":[{"target_file":["src/lib.rs"]}]}"#,
+            "",
+            "",
+        );
+        assert_eq!(nested["project_id"], "team");
+        assert_eq!(nested["repo_rel_path"], "src/lib.rs");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn tool_rows_leave_shell_and_unproven_paths_unnormalized() {
+        let root = make_repo("negative-paths");
+        let cwd_text = root.to_string_lossy().to_string();
+        let ctx = test_record_context(&cwd_text);
+
+        let shell = build_tool_row(
+            &ctx,
+            "e1",
+            "call-1",
+            "",
+            "Bash",
+            "request",
+            0,
+            r#"{"command":"cat src/lib.rs"}"#,
+            "",
+            "",
+        );
+        assert_eq!(shell["project_id"], "");
+        assert_eq!(shell["repo_rel_path"], "");
+        assert_eq!(shell["worktree_root"], "");
+
+        let outside = build_tool_row(
+            &ctx,
+            "e2",
+            "call-2",
+            "",
+            "Read",
+            "request",
+            0,
+            r#"{"file_path":"/tmp/outside.rs"}"#,
+            "",
+            "",
+        );
+        assert_eq!(outside["project_id"], "");
+        assert_eq!(outside["repo_rel_path"], "");
+        assert_eq!(outside["worktree_root"], "");
+
+        let response = build_tool_row(
+            &ctx,
+            "e3",
+            "call-3",
+            "",
+            "Read",
+            "response",
+            0,
+            r#"{"file_path":"src/lib.rs"}"#,
+            "",
+            "",
+        );
+        assert_eq!(response["project_id"], "");
+        assert_eq!(response["repo_rel_path"], "");
+        assert_eq!(response["worktree_root"], "");
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
