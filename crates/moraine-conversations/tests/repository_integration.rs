@@ -14,10 +14,10 @@ use moraine_clickhouse::ClickHouseClient;
 use moraine_config::ClickHouseConfig;
 use moraine_conversations::{
     ClickHouseConversationRepository, ConversationListFilter, ConversationListSort,
-    ConversationMode, ConversationRepository, ConversationSearchQuery, McpEventType,
-    McpSessionListFilter, PageRequest, RepoConfig, RepoError, SearchEventKind, SearchEventsQuery,
-    SearchMcpEventsQuery, SessionEventsDirection, SessionEventsQuery, SessionMetadataSearchQuery,
-    SessionOriginScope,
+    ConversationMode, ConversationRepository, ConversationSearchQuery, FileAttentionQuery,
+    McpEventType, McpSessionListFilter, PageRequest, RepoConfig, RepoError, SearchEventKind,
+    SearchEventsQuery, SearchMcpEventsQuery, SessionEventsDirection, SessionEventsQuery,
+    SessionMetadataSearchQuery, SessionOriginScope,
 };
 use serde_json::json;
 
@@ -170,6 +170,79 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
             return (
                 StatusCode::OK,
                 json_each_row(json!([{ "session_id": "sess-out-of-scope" }])),
+            );
+        }
+
+        if query.contains("FROM `moraine`.`tool_io` FINAL")
+            && query.contains("repo_rel_path = 'crates/foo.rs'")
+            && query.contains("project_id = 'project-a'")
+        {
+            return (
+                StatusCode::OK,
+                json_each_row(json!([
+                    {
+                        "session_id": "sess-normalized",
+                        "event_uid": "evt-normalized",
+                        "tool_call_id": "call-normalized",
+                        "harness": "codex",
+                        "tool_name": "edit",
+                        "tool_phase": "request",
+                        "matched_path": "/worktree-a/crates/foo.rs",
+                        "match_kind": "path_suffix",
+                        "worktree_root": "/worktree-a",
+                        "cwd": "/worktree-a",
+                        "event_unix_ms": 1769940100000_i64,
+                        "event_order": 20_u64,
+                        "turn_seq": 2_u32,
+                        "input_preview": "{\"not_the_path\":\"hidden\"}",
+                        "output_preview": ""
+                    }
+                ])),
+            );
+        }
+
+        if query.contains("FROM `moraine`.`tool_io` FINAL")
+            && query.contains("JSONExtractString(input_json, 'path')")
+            && query.contains("crates/foo.rs")
+        {
+            return (
+                StatusCode::OK,
+                json_each_row(json!([
+                    {
+                        "session_id": "sess-normalized",
+                        "event_uid": "evt-normalized",
+                        "tool_call_id": "call-normalized",
+                        "harness": "codex",
+                        "tool_name": "edit",
+                        "tool_phase": "request",
+                        "matched_path": "/legacy-would-have-won/crates/foo.rs",
+                        "match_kind": "path_suffix",
+                        "worktree_root": "/legacy-would-have-won",
+                        "cwd": "/legacy-would-have-won",
+                        "event_unix_ms": 1769940100000_i64,
+                        "event_order": 20_u64,
+                        "turn_seq": 2_u32,
+                        "input_preview": "{\"path\":\"/legacy-would-have-won/crates/foo.rs\"}",
+                        "output_preview": ""
+                    },
+                    {
+                        "session_id": "sess-legacy",
+                        "event_uid": "evt-legacy",
+                        "tool_call_id": "call-legacy",
+                        "harness": "codex",
+                        "tool_name": "bash",
+                        "tool_phase": "request",
+                        "matched_path": "",
+                        "match_kind": "shell_path",
+                        "worktree_root": "",
+                        "cwd": "/legacy",
+                        "event_unix_ms": 1769940000000_i64,
+                        "event_order": 10_u64,
+                        "turn_seq": 1_u32,
+                        "input_preview": "{\"command\":\"rg crates/foo.rs\"}",
+                        "output_preview": ""
+                    }
+                ])),
             );
         }
 
@@ -1704,6 +1777,57 @@ fn sql_self_aliases_aggregate(sql: &str, column: &str) -> bool {
         let tail_word = matches!(tail, Some(ch) if ch.is_ascii_alphanumeric() || ch == '_');
         !head_word && !tail_word
     })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn file_attention_merges_normalized_exact_lookup_with_suffix_fallback() {
+    let (repo, state) = build_repo().await;
+
+    let touches = repo
+        .file_attention(FileAttentionQuery {
+            query_id: "test-file-attention-normalized".to_string(),
+            rel: "crates/foo.rs".to_string(),
+            normalized_project_id: Some("project-a".to_string()),
+            derive_worktree_roots: true,
+            apply_project_scope: true,
+            start_unix_ms: None,
+            end_unix_ms: None,
+            tool: None,
+            mutations_only: false,
+            max_rows: 10,
+            max_execution_time_secs: 3,
+        })
+        .await
+        .expect("file_attention query succeeds");
+
+    assert_eq!(touches.len(), 2);
+    assert_eq!(touches[0].session_id, "sess-normalized");
+    assert_eq!(touches[0].event_uid, "evt-normalized");
+    assert_eq!(touches[0].tool_call_id, "call-normalized");
+    assert_eq!(touches[0].matched_path, "/worktree-a/crates/foo.rs");
+    assert_eq!(touches[0].worktree_root, "/worktree-a");
+    assert_eq!(touches[0].match_kind, "path_suffix");
+    assert_eq!(touches[1].session_id, "sess-legacy");
+    assert_eq!(touches[1].event_uid, "evt-legacy");
+    assert_eq!(touches[1].match_kind, "shell_path");
+
+    let queries = state.queries.lock().expect("queries lock").clone();
+    let exact_query = queries
+        .iter()
+        .find(|query| query.contains("repo_rel_path = 'crates/foo.rs'"))
+        .expect("normalized exact file_attention query should be captured");
+    assert!(exact_query.contains("project_id = 'project-a'"));
+    assert!(exact_query.contains("tool_phase = 'request'"));
+    assert!(
+        !exact_query.contains("JSONExtractString(input_json"),
+        "exact lookup should not depend on legacy JSON suffix extraction: {exact_query}"
+    );
+
+    let fallback_query = queries
+        .iter()
+        .find(|query| query.contains("JSONExtractString(input_json, 'path')"))
+        .expect("Tier-0 suffix file_attention query should be captured");
+    assert!(fallback_query.contains("crates/foo.rs"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

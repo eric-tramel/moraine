@@ -37,7 +37,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"base_url\":\"https://api.anthropic.com\",\"last_updated\":\"2026-04-18T14:23:05.000000\",\"message_count\":4,\"model\":\"claude-opus-4-6\",\"platform\":\"cli\",\"session_id\":\"20260418_142200_live01\",\"session_start\":\"2026-04-18T14:22:00.000000\",\"system_prompt\":\"You are Hermes, a helpful CLI agent.\",\"tools\":[{\"function\":{\"description\":\"Run a shell command\",\"name\":\"shell\",\"parameters\":{\"properties\":{\"cmd\":{\"type\":\"string\"}},\"required\":[\"cmd\"],\"type\":\"object\"}},\"type\":\"function\"}]}",
           "payload_type": "session_meta",
+          "project_id": "",
           "record_ts": "2026-04-18T14:22:00.000000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -81,7 +83,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -143,7 +146,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"content\":\"What's today's date?\",\"role\":\"user\"}",
           "payload_type": "user_message",
+          "project_id": "",
           "record_ts": "2026-04-18T14:23:05.000000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -187,7 +192,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 1
+          "turn_index": 1,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -251,7 +257,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"reasoning\":\"I should run `date` to be accurate.\",\"role\":\"assistant\"}",
           "payload_type": "reasoning",
+          "project_id": "",
           "record_ts": "2026-04-18T14:23:05.000000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -295,7 +303,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 2
+          "turn_index": 2,
+          "worktree_root": ""
         },
         {
           "actor_kind": "assistant",
@@ -330,7 +339,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"function\":{\"arguments\":\"{\\\"cmd\\\":\\\"date\\\"}\",\"name\":\"shell\"},\"id\":\"call_date_001\",\"type\":\"function\"}",
           "payload_type": "tool_use",
+          "project_id": "",
           "record_ts": "2026-04-18T14:23:05.000001Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -374,7 +385,8 @@
           "tool_name": "shell",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 2
+          "turn_index": 2,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -414,13 +426,16 @@
           "output_preview": "",
           "output_text": "",
           "parent_tool_call_id": "",
+          "project_id": "",
+          "repo_rel_path": "",
           "session_id": "hermes:20260418_142200_live01",
           "source_name": "golden-hermes-session",
           "source_ref": "/fixtures/hermes/sessions/session_20260418_142200_live01.json:1:2",
           "tool_call_id": "call_date_001",
           "tool_error": 0,
           "tool_name": "shell",
-          "tool_phase": "request"
+          "tool_phase": "request",
+          "worktree_root": ""
         }
       ]
     },
@@ -461,7 +476,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"content\":\"Sat Apr 18 14:23:03 EDT 2026\",\"name\":\"shell\",\"role\":\"tool\",\"tool_call_id\":\"call_date_001\"}",
           "payload_type": "tool_result",
+          "project_id": "",
           "record_ts": "2026-04-18T14:23:05.000000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -505,7 +522,8 @@
           "tool_name": "shell",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 3
+          "turn_index": 3,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -545,13 +563,16 @@
           "output_preview": "Sat Apr 18 14:23:03 EDT 2026",
           "output_text": "Sat Apr 18 14:23:03 EDT 2026",
           "parent_tool_call_id": "",
+          "project_id": "",
+          "repo_rel_path": "",
           "session_id": "hermes:20260418_142200_live01",
           "source_name": "golden-hermes-session",
           "source_ref": "/fixtures/hermes/sessions/session_20260418_142200_live01.json:1:3",
           "tool_call_id": "call_date_001",
           "tool_error": 0,
           "tool_name": "shell",
-          "tool_phase": "response"
+          "tool_phase": "response",
+          "worktree_root": ""
         }
       ]
     },
@@ -590,7 +611,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"content\":\"Today is Saturday, April 18, 2026.\",\"role\":\"assistant\"}",
           "payload_type": "agent_message",
+          "project_id": "",
           "record_ts": "2026-04-18T14:23:05.000000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -634,7 +657,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 4
+          "turn_index": 4,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],

@@ -70,6 +70,11 @@ pub struct FileAttentionQuery {
     /// Repo-relative tail to suffix-match against captured file paths. The tail
     /// is what unifies the same logical file across worktree roots.
     pub rel: String,
+    /// Best-effort project identity for exact Phase-1 normalized lookup. This
+    /// is a repo `.moraine.toml` backend name when the request path can be
+    /// resolved to one. `None` disables the exact branch and leaves Tier 0
+    /// suffix matching as the only source of results.
+    pub normalized_project_id: Option<String>,
     /// Whether a structured matched path should be stripped by `rel` to report
     /// a worktree root. Disabled for arbitrary suffixes that could otherwise
     /// mislabel a source/package directory as a repository root.
@@ -99,6 +104,8 @@ pub struct FileAttentionQuery {
 pub struct FileAttentionTouch {
     pub session_id: String,
     pub event_uid: String,
+    #[serde(default)]
+    pub tool_call_id: String,
     #[serde(default)]
     pub harness: String,
     #[serde(default)]

@@ -96,6 +96,9 @@ CREATE TABLE IF NOT EXISTS moraine.events (
     'input_images', toFloat64(0),
     'output_images', toFloat64(0)
   ),
+  project_id LowCardinality(String) DEFAULT '',
+  repo_rel_path String DEFAULT '',
+  worktree_root String DEFAULT '',
   event_version UInt64,
   CONSTRAINT events_endpoint_kind_domain CHECK endpoint_kind IN (
     'generation', 'embedding', 'rerank', 'moderation', 'image_generation',
@@ -160,6 +163,9 @@ CREATE TABLE IF NOT EXISTS moraine.tool_io (
   input_preview String,
   output_preview String,
   io_hash UInt64,
+  project_id LowCardinality(String) DEFAULT '',
+  repo_rel_path String DEFAULT '',
+  worktree_root String DEFAULT '',
   source_ref String,
   event_version UInt64
 )

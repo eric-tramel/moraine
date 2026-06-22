@@ -37,7 +37,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"api_calls\":1,\"completed\":true,\"model\":\"anthropic/claude-sonnet-4.6\",\"partial\":false,\"prompt_index\":7,\"timestamp\":\"2026-03-30T14:22:31.456789\"}",
           "payload_type": "session_meta",
+          "project_id": "",
           "record_ts": "2026-03-30T14:22:31.456789Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -81,7 +83,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         },
         {
           "actor_kind": "system",
@@ -114,7 +117,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"from\":\"system\",\"value\":\"You are a careful coding assistant.\"}",
           "payload_type": "system",
+          "project_id": "",
           "record_ts": "2026-03-30T14:22:31.456790Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -158,7 +163,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         },
         {
           "actor_kind": "user",
@@ -193,7 +199,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"from\":\"human\",\"value\":\"What is the weather in Boston right now?\"}",
           "payload_type": "message",
+          "project_id": "",
           "record_ts": "2026-03-30T14:22:31.456791Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -237,7 +245,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 1
+          "turn_index": 1,
+          "worktree_root": ""
         },
         {
           "actor_kind": "assistant",
@@ -272,7 +281,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"from\":\"gpt\",\"type\":\"thinking\",\"value\":\"I should query the weather tool before answering.\"}",
           "payload_type": "reasoning",
+          "project_id": "",
           "record_ts": "2026-03-30T14:22:31.456792Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -316,7 +327,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 1
+          "turn_index": 1,
+          "worktree_root": ""
         },
         {
           "actor_kind": "assistant",
@@ -351,7 +363,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"arguments\":{\"location\":\"Boston, MA\"},\"name\":\"weather\"}",
           "payload_type": "tool_use",
+          "project_id": "",
           "record_ts": "2026-03-30T14:22:31.456793Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -395,7 +409,8 @@
           "tool_name": "weather",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 1
+          "turn_index": 1,
+          "worktree_root": ""
         },
         {
           "actor_kind": "tool",
@@ -430,7 +445,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"content\":{\"forecast\":\"rain\",\"temperature_c\":12},\"name\":\"weather\",\"tool_call_id\":\"call_abc123\"}",
           "payload_type": "tool_result",
+          "project_id": "",
           "record_ts": "2026-03-30T14:22:31.456794Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -474,7 +491,8 @@
           "tool_name": "weather",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 1
+          "turn_index": 1,
+          "worktree_root": ""
         },
         {
           "actor_kind": "assistant",
@@ -509,7 +527,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"from\":\"gpt\",\"type\":\"text\",\"value\":\"It looks rainy in Boston, around 12 degrees Celsius.\"}",
           "payload_type": "message",
+          "project_id": "",
           "record_ts": "2026-03-30T14:22:31.456795Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -553,7 +573,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 1
+          "turn_index": 1,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -593,13 +614,16 @@
           "output_preview": "",
           "output_text": "",
           "parent_tool_call_id": "",
+          "project_id": "",
+          "repo_rel_path": "",
           "session_id": "hermes:0ca05e01889824d1362c36fb5987aaaf3f860e6321d0ffd07c4856db062d593f",
           "source_name": "golden-hermes-trajectory",
           "source_ref": "/fixtures/hermes/trajectories/001.jsonl:1:1",
           "tool_call_id": "call_abc123",
           "tool_error": 0,
           "tool_name": "weather",
-          "tool_phase": "request"
+          "tool_phase": "request",
+          "worktree_root": ""
         },
         {
           "event_uid": "f584a0bc63209a8f44dd4717e70884bc2e89a0fc6f125e0350bb3b69fd025dcc",
@@ -615,13 +639,16 @@
           "output_preview": "{\"forecast\":\"rain\",\"temperature_c\":12}",
           "output_text": "{\"forecast\":\"rain\",\"temperature_c\":12}",
           "parent_tool_call_id": "",
+          "project_id": "",
+          "repo_rel_path": "",
           "session_id": "hermes:0ca05e01889824d1362c36fb5987aaaf3f860e6321d0ffd07c4856db062d593f",
           "source_name": "golden-hermes-trajectory",
           "source_ref": "/fixtures/hermes/trajectories/001.jsonl:1:1",
           "tool_call_id": "call_abc123",
           "tool_error": 0,
           "tool_name": "weather",
-          "tool_phase": "response"
+          "tool_phase": "response",
+          "worktree_root": ""
         }
       ]
     }

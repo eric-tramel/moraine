@@ -37,7 +37,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"cli_version\":\"0.5.3\",\"cwd\":\"/repo\",\"id\":\"019c5f6a-49bd-7920-ac67-1dd8e33b0e95\"}",
           "payload_type": "session_meta",
+          "project_id": "",
           "record_ts": "2026-02-15T03:50:40.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -81,7 +83,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -143,7 +146,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"model\":\"gpt-5.3-codex\",\"turn_id\":\"019c5f6a-49bd-7920-ac67-1dd8e33b0e95\"}",
           "payload_type": "turn_context",
+          "project_id": "",
           "record_ts": "2026-02-15T03:50:42.191Z",
+          "repo_rel_path": "",
           "request_id": "019c5f6a-49bd-7920-ac67-1dd8e33b0e95",
           "retry_count": 0,
           "service_tier": "",
@@ -187,7 +192,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -251,7 +257,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"content\":[{\"text\":\"I will inspect the project.\",\"type\":\"output_text\"}],\"id\":\"msg_1\",\"phase\":\"completed\",\"role\":\"assistant\",\"type\":\"message\"}",
           "payload_type": "message",
+          "project_id": "",
           "record_ts": "2026-02-15T03:50:43.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -295,7 +303,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [
@@ -370,7 +379,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"arguments\":\"{\\\"path\\\":\\\"Cargo.toml\\\"}\",\"call_id\":\"call_read\",\"name\":\"Read\",\"type\":\"function_call\"}",
           "payload_type": "function_call",
+          "project_id": "",
           "record_ts": "2026-02-15T03:50:44.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -414,7 +425,8 @@
           "tool_name": "Read",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -454,13 +466,16 @@
           "output_preview": "",
           "output_text": "",
           "parent_tool_call_id": "",
+          "project_id": "",
+          "repo_rel_path": "",
           "session_id": "019c5f6a-49bd-7920-ac67-1dd8e33b0e95",
           "source_name": "golden-codex",
           "source_ref": "/fixtures/codex/session.jsonl:1:4",
           "tool_call_id": "call_read",
           "tool_error": 0,
           "tool_name": "Read",
-          "tool_phase": "request"
+          "tool_phase": "request",
+          "worktree_root": ""
         }
       ]
     },
@@ -499,7 +514,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"call_id\":\"call_read\",\"output\":\"workspace = true\",\"type\":\"function_call_output\"}",
           "payload_type": "function_call_output",
+          "project_id": "",
           "record_ts": "2026-02-15T03:50:45.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -543,7 +560,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -583,13 +601,16 @@
           "output_preview": "workspace = true",
           "output_text": "workspace = true",
           "parent_tool_call_id": "",
+          "project_id": "",
+          "repo_rel_path": "",
           "session_id": "019c5f6a-49bd-7920-ac67-1dd8e33b0e95",
           "source_name": "golden-codex",
           "source_ref": "/fixtures/codex/session.jsonl:1:5",
           "tool_call_id": "call_read",
           "tool_error": 0,
           "tool_name": "",
-          "tool_phase": "response"
+          "tool_phase": "response",
+          "worktree_root": ""
         }
       ]
     },
@@ -628,7 +649,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"call_id\":\"call_patch\",\"input\":\"*** Begin Patch\\n*** End Patch\\n\",\"name\":\"apply_patch\",\"status\":\"completed\",\"type\":\"custom_tool_call\"}",
           "payload_type": "custom_tool_call",
+          "project_id": "",
           "record_ts": "2026-02-15T03:50:46.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -672,7 +695,8 @@
           "tool_name": "apply_patch",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -712,13 +736,16 @@
           "output_preview": "",
           "output_text": "",
           "parent_tool_call_id": "",
+          "project_id": "",
+          "repo_rel_path": "",
           "session_id": "019c5f6a-49bd-7920-ac67-1dd8e33b0e95",
           "source_name": "golden-codex",
           "source_ref": "/fixtures/codex/session.jsonl:1:6",
           "tool_call_id": "call_patch",
           "tool_error": 0,
           "tool_name": "apply_patch",
-          "tool_phase": "request"
+          "tool_phase": "request",
+          "worktree_root": ""
         }
       ]
     },
@@ -757,7 +784,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"call_id\":\"call_patch\",\"output\":\"{\\\"ok\\\":true}\",\"status\":\"completed\",\"type\":\"custom_tool_call_output\"}",
           "payload_type": "custom_tool_call_output",
+          "project_id": "",
           "record_ts": "2026-02-15T03:50:47.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -801,7 +830,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -841,13 +871,16 @@
           "output_preview": "{\"ok\":true}",
           "output_text": "{\"ok\":true}",
           "parent_tool_call_id": "",
+          "project_id": "",
+          "repo_rel_path": "",
           "session_id": "019c5f6a-49bd-7920-ac67-1dd8e33b0e95",
           "source_name": "golden-codex",
           "source_ref": "/fixtures/codex/session.jsonl:1:7",
           "tool_call_id": "call_patch",
           "tool_error": 0,
           "tool_name": "",
-          "tool_phase": "response"
+          "tool_phase": "response",
+          "worktree_root": ""
         }
       ]
     },
@@ -886,7 +919,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"action\":{\"query\":\"moraine ingest\",\"type\":\"search\"},\"status\":\"completed\",\"type\":\"web_search_call\"}",
           "payload_type": "web_search_call",
+          "project_id": "",
           "record_ts": "2026-02-15T03:50:48.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -930,7 +965,8 @@
           "tool_name": "web_search",
           "tool_phase": "completed",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -994,7 +1030,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"id\":\"rs_1\",\"summary\":[{\"text\":\"Need to preserve token accounting and tool rows.\",\"type\":\"summary_text\"}],\"type\":\"reasoning\"}",
           "payload_type": "reasoning",
+          "project_id": "",
           "record_ts": "2026-02-15T03:50:49.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -1038,7 +1076,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -1100,7 +1139,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"info\":{\"last_token_usage\":{\"cached_input_tokens\":58624,\"input_tokens\":65323,\"input_tokens_details\":{\"audio_tokens\":3,\"image_tokens\":20},\"output_tokens\":445,\"output_tokens_details\":{\"reasoning_tokens\":100}}},\"rate_limits\":{\"limit_id\":\"codex_bengalfox\",\"limit_name\":\"GPT-5.3-Codex-Spark\",\"plan_type\":\"pro\"},\"turn_id\":\"019c5f6a-49bd-7920-ac67-1dd8e33b0e95\",\"type\":\"token_count\"}",
           "payload_type": "token_count",
+          "project_id": "",
           "record_ts": "2026-02-15T03:50:50.838Z",
+          "repo_rel_path": "",
           "request_id": "019c5f6a-49bd-7920-ac67-1dd8e33b0e95",
           "retry_count": 0,
           "service_tier": "pro",
@@ -1144,7 +1185,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -1206,7 +1248,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"replacement_history\":[{\"content\":\"Please summarize this session.\",\"role\":\"user\",\"type\":\"message\"},{\"summary\":[{\"text\":\"Compacted reasoning survives.\",\"type\":\"summary_text\"}],\"type\":\"reasoning\"},{\"arguments\":\"{\\\"path\\\":\\\"src\\\"}\",\"call_id\":\"call_compact\",\"name\":\"List\",\"type\":\"function_call\"},{\"call_id\":\"call_compact\",\"output\":\"normalize.rs\",\"type\":\"function_call_output\"}]}",
           "payload_type": "compacted",
+          "project_id": "",
           "record_ts": "2026-02-15T03:50:51.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -1250,7 +1294,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         },
         {
           "actor_kind": "user",
@@ -1283,7 +1328,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"content\":\"Please summarize this session.\",\"role\":\"user\",\"type\":\"message\"}",
           "payload_type": "message",
+          "project_id": "",
           "record_ts": "2026-02-15T03:50:51.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -1327,7 +1374,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         },
         {
           "actor_kind": "assistant",
@@ -1362,7 +1410,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"summary\":[{\"text\":\"Compacted reasoning survives.\",\"type\":\"summary_text\"}],\"type\":\"reasoning\"}",
           "payload_type": "reasoning",
+          "project_id": "",
           "record_ts": "2026-02-15T03:50:51.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -1406,7 +1456,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         },
         {
           "actor_kind": "assistant",
@@ -1439,7 +1490,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"arguments\":\"{\\\"path\\\":\\\"src\\\"}\",\"call_id\":\"call_compact\",\"name\":\"List\",\"type\":\"function_call\"}",
           "payload_type": "function_call",
+          "project_id": "",
           "record_ts": "2026-02-15T03:50:51.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -1483,7 +1536,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         },
         {
           "actor_kind": "tool",
@@ -1516,7 +1570,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"call_id\":\"call_compact\",\"output\":\"normalize.rs\",\"type\":\"function_call_output\"}",
           "payload_type": "function_call_output",
+          "project_id": "",
           "record_ts": "2026-02-15T03:50:51.000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -1560,7 +1616,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [

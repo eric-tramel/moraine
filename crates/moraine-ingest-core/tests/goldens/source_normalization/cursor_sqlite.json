@@ -37,7 +37,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"agentBackend\":\"cursor-agent\",\"contextUsagePercent\":7.76,\"createdAt\":1778205877751,\"forceMode\":\"edit\",\"lastUpdatedAt\":1778205947428,\"messageCount\":5,\"name\":\"Demo refactor session\",\"promptTokensMax\":272000,\"promptTokensUsed\":21121,\"sessionId\":\"11111111-2222-4333-8444-555555555555\",\"status\":\"completed\",\"subtitle\":\"Edited game.js\",\"timestamp\":\"2026-05-08T02:04:37.751000Z\",\"title\":\"Demo refactor session\",\"totalLinesAdded\":37,\"totalLinesRemoved\":2,\"type\":\"cursor_composer\",\"unifiedMode\":\"agent\",\"workspaceId\":\"demo-window\",\"workspacePath\":\"/Users/demo/project\"}",
           "payload_type": "session_meta",
+          "project_id": "",
           "record_ts": "2026-05-08T02:04:37.751000Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -81,7 +83,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -155,7 +158,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"text\":\"Please rename the helper and fix the loop bounds.\"}",
           "payload_type": "user_message",
+          "project_id": "",
           "record_ts": "2026-05-08T02:04:37.835Z",
+          "repo_rel_path": "",
           "request_id": "badfdd27-0a9a-497a-b959-79a5caac5fe0",
           "retry_count": 0,
           "service_tier": "",
@@ -199,7 +204,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "badfdd27-0a9a-497a-b959-79a5caac5fe0",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -263,7 +269,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"text\":\"**Planning the rename**\\n\\nThe helper is referenced in three places; I should update the call sites too.\"}",
           "payload_type": "reasoning",
+          "project_id": "",
           "record_ts": "2026-05-08T02:04:39.829Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -307,7 +315,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -371,7 +380,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"additionalData\":{\"startedAtMs\":1778205934000,\"status\":\"completed\"},\"modelCallId\":\"\",\"name\":\"edit_file_v2\",\"params\":{\"noCodeblock\":true,\"relativeWorkspacePath\":\"/Users/demo/project/game.js\"},\"rawArgs\":{},\"result\":{\"afterContentId\":\"composer.content.abcdef\"},\"status\":\"completed\",\"tool\":38,\"toolCallId\":\"call_bPJLcsryFL2Hllevss\\nctc_0cc5dfa4b63d4821\",\"toolIndex\":0,\"userDecision\":\"accepted\"}",
           "payload_type": "tool_use",
+          "project_id": "",
           "record_ts": "2026-05-08T02:05:34.020Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -415,7 +426,8 @@
           "tool_name": "edit_file_v2",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         },
         {
           "actor_kind": "tool",
@@ -450,7 +462,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"afterContentId\":\"composer.content.abcdef\"}",
           "payload_type": "tool_result",
+          "project_id": "",
           "record_ts": "2026-05-08T02:05:34.020Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -494,7 +508,8 @@
           "tool_name": "edit_file_v2",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -534,13 +549,16 @@
           "output_preview": "",
           "output_text": "",
           "parent_tool_call_id": "",
+          "project_id": "",
+          "repo_rel_path": "",
           "session_id": "11111111-2222-4333-8444-555555555555",
           "source_name": "golden-cursor-sqlite",
           "source_ref": "/fixtures/cursor/User/globalStorage/state.vscdb:1:6628439650972450124",
           "tool_call_id": "call_bPJLcsryFL2Hllevss",
           "tool_error": 0,
           "tool_name": "edit_file_v2",
-          "tool_phase": "request"
+          "tool_phase": "request",
+          "worktree_root": ""
         },
         {
           "event_uid": "a4b803c7a9e0f29a4e71f0f607ea8620ed3ec62a41bc5cd4aaeb9effc23164a4",
@@ -556,13 +574,16 @@
           "output_preview": "{\"afterContentId\":\"composer.content.abcdef\"}",
           "output_text": "{\"afterContentId\":\"composer.content.abcdef\"}",
           "parent_tool_call_id": "",
+          "project_id": "",
+          "repo_rel_path": "",
           "session_id": "11111111-2222-4333-8444-555555555555",
           "source_name": "golden-cursor-sqlite",
           "source_ref": "/fixtures/cursor/User/globalStorage/state.vscdb:1:6628439650972450124",
           "tool_call_id": "call_bPJLcsryFL2Hllevss",
           "tool_error": 0,
           "tool_name": "edit_file_v2",
-          "tool_phase": "response"
+          "tool_phase": "response",
+          "worktree_root": ""
         }
       ]
     },
@@ -603,7 +624,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"error\":{\"clientVisibleErrorMessage\":\"Command failed with exit code 1\",\"modelVisibleErrorMessage\":\"npm test exited 1\"},\"name\":\"run_terminal_command_v2\",\"params\":{\"command\":\"npm test\",\"workingDirectory\":\"/Users/demo/project\"},\"status\":\"error\",\"tool\":15,\"toolCallId\":\"call_FLtYI8rhT3xQ\\nfc_01cebed9\",\"toolIndex\":0}",
           "payload_type": "tool_use",
+          "project_id": "",
           "record_ts": "2026-05-08T02:05:41.812Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -647,7 +670,8 @@
           "tool_name": "run_terminal_command_v2",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         },
         {
           "actor_kind": "tool",
@@ -682,7 +706,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"clientVisibleErrorMessage\":\"Command failed with exit code 1\",\"modelVisibleErrorMessage\":\"npm test exited 1\"}",
           "payload_type": "tool_result",
+          "project_id": "",
           "record_ts": "2026-05-08T02:05:41.812Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -726,7 +752,8 @@
           "tool_name": "run_terminal_command_v2",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
@@ -766,13 +793,16 @@
           "output_preview": "",
           "output_text": "",
           "parent_tool_call_id": "",
+          "project_id": "",
+          "repo_rel_path": "",
           "session_id": "11111111-2222-4333-8444-555555555555",
           "source_name": "golden-cursor-sqlite",
           "source_ref": "/fixtures/cursor/User/globalStorage/state.vscdb:1:4750020261448207567",
           "tool_call_id": "call_FLtYI8rhT3xQ",
           "tool_error": 0,
           "tool_name": "run_terminal_command_v2",
-          "tool_phase": "request"
+          "tool_phase": "request",
+          "worktree_root": ""
         },
         {
           "event_uid": "be3b3bf48edfc6d5f530d0f8e0197c1c9eccb05722ee1fbfe10a181661ddd734",
@@ -788,13 +818,16 @@
           "output_preview": "{\"clientVisibleErrorMessage\":\"Command failed with exit code 1\",\"modelVisibleErrorMessage\":\"npm test exited 1\"}",
           "output_text": "{\"clientVisibleErrorMessage\":\"Command failed with exit code 1\",\"modelVisibleErrorMessage\":\"npm test exited 1\"}",
           "parent_tool_call_id": "",
+          "project_id": "",
+          "repo_rel_path": "",
           "session_id": "11111111-2222-4333-8444-555555555555",
           "source_name": "golden-cursor-sqlite",
           "source_ref": "/fixtures/cursor/User/globalStorage/state.vscdb:1:4750020261448207567",
           "tool_call_id": "call_FLtYI8rhT3xQ",
           "tool_error": 1,
           "tool_name": "run_terminal_command_v2",
-          "tool_phase": "response"
+          "tool_phase": "response",
+          "worktree_root": ""
         }
       ]
     },
@@ -835,7 +868,9 @@
           "parent_tool_call_id": "",
           "payload_json": "{\"text\":\"Renamed the helper to `spawnGoblinWave` and fixed the off-by-one in the loop. The failing test is pre-existing.\"}",
           "payload_type": "agent_message",
+          "project_id": "",
           "record_ts": "2026-05-08T02:05:58.404Z",
+          "repo_rel_path": "",
           "request_id": "",
           "retry_count": 0,
           "service_tier": "",
@@ -879,7 +914,8 @@
           "tool_name": "",
           "tool_phase": "",
           "trace_id": "",
-          "turn_index": 0
+          "turn_index": 0,
+          "worktree_root": ""
         }
       ],
       "link_rows": [],
