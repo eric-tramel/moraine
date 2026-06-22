@@ -10,6 +10,55 @@ Run `moraine up` first so ClickHouse, ingest, and the monitor are available.
 If you use a non-default Moraine config, pass it through the harness's
 environment support as `MORAINE_MCP_CONFIG=/path/to/moraine.toml`.
 
+## Claude Code plugin marketplace (recommended)
+
+For Claude Code, the recommended user-scoped setup is the Moraine plugin. The
+plugin registers the MCP server and bundles Moraine search skills, but it does
+not install Moraine itself and it does not start ClickHouse, ingest, or the
+monitor. Install the CLI first, or upgrade it if Moraine is already installed.
+Then start the stack:
+
+```bash
+uv tool install moraine-cli
+```
+
+```bash
+uv tool upgrade moraine-cli
+```
+
+```bash
+moraine up
+```
+
+Add the marketplace from this repository and install the plugin:
+
+```bash
+claude plugin marketplace add eric-tramel/moraine --sparse .claude-plugin plugins
+claude plugin install moraine@moraine
+```
+
+The plugin MCP launcher looks for `moraine` on `PATH` and then runs
+`moraine run mcp`. If the CLI is missing, it reports a `binary_missing` message
+with install guidance instead of failing as a raw command-not-found error.
+
+Security note: the user-scoped plugin launches unscoped `moraine run mcp`, so
+Claude Code can search the host-wide Moraine history visible to your user. Enable
+the plugin only in trusted Claude Code environments. For untrusted repositories,
+or when you want retrieval limited to the current project, use the manual
+project-scoped `--project-only` registration below. Also start Claude Code from a
+trusted shell where `moraine` resolves to the installed CLI, not to a repo-local
+shim or relative `PATH` entry.
+
+If you previously registered Moraine manually with `claude mcp add`, remove that
+manual entry before relying on the plugin to avoid duplicate MCP servers:
+
+```bash
+claude mcp remove moraine --scope user
+```
+
+Manual Claude MCP registration remains useful for project-scoped setup,
+`--project-only`, and custom environment wiring such as `MORAINE_MCP_CONFIG`.
+
 ## Shared central server (default)
 
 By default `moraine up` starts a single shared MCP server for the whole host,
@@ -66,7 +115,8 @@ Details worth knowing:
   view.
 
 The remaining sections register the unchanged `moraine run mcp` command with
-each harness.
+each harness, including manual Claude Code registration for project-scoped or
+custom setups.
 
 ## Global Codex
 
@@ -89,11 +139,11 @@ command = "moraine"
 args = ["run", "mcp"]
 ```
 
-## Claude Code
+## Manual Claude Code
 
-Claude Code supports stdio MCP servers through `claude mcp add`. Use user scope
-when you want Moraine available in every project; use project scope when you want
-to commit a `.mcp.json` for a repository. See the official
+Claude Code supports stdio MCP servers through `claude mcp add`. The plugin is
+the recommended user-scoped path above. Use manual registration when you want
+project scope, `--project-only`, or custom environment handling. See the official
 [Claude Code MCP docs](https://code.claude.com/docs/en/mcp).
 
 User scope:

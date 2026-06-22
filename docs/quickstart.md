@@ -62,16 +62,31 @@ unchanged; if the shared server is not running, `moraine run mcp` falls back to
 an embedded server automatically. See
 [Agent MCP Search → Install](agent-mcp-search/install.md#shared-central-server-default).
 
-Add Moraine to Codex globally:
+For Claude Code, install the Moraine plugin marketplace entry. It registers the
+MCP server and bundles Moraine search skills. Upgrade Moraine first if your
+installed CLI is not current:
+
+```bash
+claude plugin marketplace add eric-tramel/moraine --sparse .claude-plugin plugins
+claude plugin install moraine@moraine
+```
+
+The user-scoped plugin can search the host-wide Moraine history visible to your
+user. Enable it only in trusted Claude Code environments. Use manual
+project-scoped setup when you need `--project-only`.
+
+If you already added Moraine manually to Claude Code, remove the manual server
+first to avoid duplicate MCP tools:
+
+```bash
+claude mcp remove moraine --scope user
+```
+
+Manual registration still works and is useful for project-scoped Claude Code
+setups or other harnesses. Add Moraine to Codex globally:
 
 ```bash
 codex mcp add moraine -- moraine run mcp
-```
-
-Add Moraine to Claude Code for all projects:
-
-```bash
-claude mcp add --transport stdio --scope user moraine -- moraine run mcp
 ```
 
 Add Moraine to Hermes:

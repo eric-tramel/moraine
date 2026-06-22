@@ -1,0 +1,31 @@
+{
+  "name": "moraine",
+  "owner": {
+    "name": "Eric Tramel",
+    "email": "eric.tramel@gmail.com"
+  },
+  "description": "Moraine plugins for local agent-session search and realtime agent awareness.",
+  "plugins": [
+    {
+      "name": "moraine",
+      "displayName": "Moraine",
+      "source": "./plugins/moraine",
+      "description": "Connect Claude Code to Moraine MCP search and bundled session-search skills.",
+      "author": {
+        "name": "Eric Tramel",
+        "email": "eric.tramel@gmail.com"
+      },
+      "homepage": "https://github.com/eric-tramel/moraine",
+      "repository": "https://github.com/eric-tramel/moraine",
+      "license": "Apache-2.0",
+      "category": "Productivity",
+      "tags": [
+        "moraine",
+        "mcp",
+        "claude-code",
+        "agent-memory",
+        "search"
+      ]
+    }
+  ]
+}
