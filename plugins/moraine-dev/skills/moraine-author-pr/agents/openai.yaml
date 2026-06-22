@@ -1,4 +1,4 @@
 interface:
   display_name: "Moraine Author PR"
   short_description: "Author consistent Moraine pull requests"
-  default_prompt: "Use $moraine-dev:moraine-author-pr to draft a Moraine pull request title and description."
+  default_prompt: "Use $moraine-dev:moraine-author-pr to create a ready-for-review Moraine pull request."

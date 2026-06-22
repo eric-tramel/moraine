@@ -9,6 +9,8 @@ description: Create Moraine pull requests on GitHub. Use when the branch is read
 
 The goal is to **create the PR on GitHub**, not just draft title and body text in chat. The skill is complete when the PR exists on GitHub and you return its URL.
 
+Always create a ready-for-review PR. Never create a GitHub Draft PR, never pass `--draft`, never set `draft: true`, and never emit an `isDraft=true` PR directive. If the branch is not ready for reviewer attention, stop and explain what remains instead of opening a Draft PR.
+
 Write PR titles and descriptions that are reviewable, evidence-backed, and consistent across agents. Default bodies use `Description`, `Usage`, `Changelog`, and `Validation` sections. Base the summary on all commits in the branch, not only the latest one.
 
 If the branch is not ready — uncommitted work, failing tests the user expects fixed first, or the user asked only to revise an existing PR description — say what is blocking creation and what remains. Do not pretend a PR was opened.

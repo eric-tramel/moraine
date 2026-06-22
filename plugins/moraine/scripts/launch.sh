@@ -1,0 +1,62 @@
+#!/bin/sh
+set -eu
+
+moraine_bin=""
+old_ifs="$IFS"
+IFS=:
+for path_dir in $PATH; do
+  case "$path_dir" in
+    /*)
+      candidate="$path_dir/moraine"
+      ;;
+    *)
+      candidate="${path_dir:-.}/moraine"
+      if [ -x "$candidate" ] && [ ! -d "$candidate" ]; then
+        IFS="$old_ifs"
+        {
+          printf '%s\n' 'moraine plugin launch error: binary_untrusted'
+          printf '%s\n' 'Refusing to run a moraine executable resolved from a relative PATH entry.'
+          printf '%s\n' 'Restart Claude Code from a trusted shell where moraine resolves to an absolute installed path.'
+        } >&2
+        exit 126
+      fi
+      continue
+      ;;
+  esac
+
+  if [ -x "$candidate" ] && [ ! -d "$candidate" ]; then
+    moraine_bin="$candidate"
+    break
+  fi
+done
+IFS="$old_ifs"
+
+if [ -z "$moraine_bin" ]; then
+  {
+    printf '%s\n' 'moraine plugin launch error: binary_missing'
+    printf '%s\n' 'The Moraine Claude plugin requires the moraine CLI on PATH.'
+    printf '%s\n' 'Install: uv tool install moraine-cli'
+    printf '%s\n' 'Upgrade: uv tool upgrade moraine-cli'
+    printf '%s\n' 'Start the stack before using MCP search: moraine up'
+    printf '%s\n' 'If Moraine is already installed, restart Claude Code with its bin directory on PATH.'
+  } >&2
+  exit 127
+fi
+
+cwd="$(pwd -P 2>/dev/null || pwd)"
+moraine_name="${moraine_bin##*/}"
+moraine_parent="${moraine_bin%/*}"
+moraine_dir="$(CDPATH= cd -- "$moraine_parent" 2>/dev/null && pwd -P || printf '%s\n' "$moraine_parent")"
+moraine_bin="$moraine_dir/$moraine_name"
+case "$moraine_bin" in
+  "$cwd"/*)
+    {
+      printf '%s\n' 'moraine plugin launch error: binary_untrusted'
+      printf '%s\n' 'Refusing to run a moraine executable from the current project directory.'
+      printf '%s\n' 'Restart Claude Code with the installed moraine CLI earlier on a trusted PATH.'
+    } >&2
+    exit 126
+    ;;
+esac
+
+exec "$moraine_bin" run mcp

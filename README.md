@@ -67,6 +67,19 @@ moraine status
 
 The monitor UI runs at `http://127.0.0.1:8080` by default.
 
+### Claude Code Setup
+
+For Claude Code, install the Moraine plugin after `moraine up`:
+
+```bash
+claude plugin marketplace add eric-tramel/moraine --sparse .claude-plugin plugins
+claude plugin install moraine@moraine
+```
+
+Restart Claude Code after installing. New sessions get the
+`moraine:session-search` and `moraine:realtime-peek` skills, and Moraine MCP
+tools are exposed as `mcp__plugin_moraine_moraine__*`.
+
 ## Agent Harness Guidance
 
 Moraine is most useful when your agent harness knows that it can search prior

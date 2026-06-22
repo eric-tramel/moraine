@@ -86,6 +86,7 @@ Then inspect the diff. Expected version-only files are normally:
 - release-managed `crates/*/Cargo.toml`
 - `.github/workflows/release-moraine.yml` example tag, if it still contains
   the old tag
+- `plugins/moraine/.claude-plugin/plugin.json`
 - install docs only if they contain an explicit `MORAINE_INSTALL_VERSION`
   example for the old tag
 

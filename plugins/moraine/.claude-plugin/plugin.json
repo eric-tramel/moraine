@@ -1,0 +1,22 @@
+{
+  "name": "moraine",
+  "version": "0.6.1",
+  "displayName": "Moraine",
+  "description": "Claude Code plugin for Moraine MCP session search and realtime agent awareness.",
+  "author": {
+    "name": "Moraine maintainers",
+    "email": "eric.tramel@gmail.com"
+  },
+  "homepage": "https://github.com/eric-tramel/moraine",
+  "repository": "https://github.com/eric-tramel/moraine",
+  "license": "Apache-2.0",
+  "keywords": [
+    "moraine",
+    "mcp",
+    "claude-code",
+    "agent-memory",
+    "session-search",
+    "realtime-agents"
+  ],
+  "mcpServers": "./.mcp.json"
+}

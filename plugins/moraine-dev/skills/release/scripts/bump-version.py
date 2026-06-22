@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
@@ -34,6 +35,8 @@ MANAGED_PACKAGE_NAMES = {
     "moraine-monitor",
     "moraine-monitor-core",
 }
+
+CLAUDE_PLUGIN_MANIFEST = "plugins/moraine/.claude-plugin/plugin.json"
 
 VERSION_RE = re.compile(r"^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$")
 
@@ -225,6 +228,23 @@ def bump_release_examples(
     print(f"release examples: {total} replacement(s)")
 
 
+def bump_claude_plugin_manifest(
+    repo_root: Path, current_version: str, target_version: str, *, dry_run: bool
+) -> None:
+    path = repo_root / CLAUDE_PLUGIN_MANIFEST
+    data = json.loads(read_text(path))
+    if data.get("name") != "moraine":
+        raise SystemExit(f"unexpected Claude plugin name in {path}: {data.get('name')}")
+    version = data.get("version")
+    if version != current_version:
+        raise SystemExit(
+            f"Claude plugin manifest has {version}, expected {current_version}"
+        )
+    data["version"] = target_version
+    write_text(path, json.dumps(data, indent=2) + "\n", dry_run=dry_run)
+    print(f"{CLAUDE_PLUGIN_MANIFEST}: {current_version} -> {target_version}")
+
+
 def main() -> int:
     args = parse_args()
     repo_root = args.repo_root.resolve()
@@ -239,6 +259,9 @@ def main() -> int:
         repo_root, current_version, target_version, dry_run=args.dry_run
     )
     bump_release_examples(
+        repo_root, current_version, target_version, dry_run=args.dry_run
+    )
+    bump_claude_plugin_manifest(
         repo_root, current_version, target_version, dry_run=args.dry_run
     )
     if args.dry_run:
