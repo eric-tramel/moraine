@@ -17,5 +17,6 @@
     "agent-memory",
     "session-search",
     "realtime-agents"
-  ]
+  ],
+  "mcpServers": "./.mcp.json"
 }
