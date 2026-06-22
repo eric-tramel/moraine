@@ -18,7 +18,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cli::{SetupArgs, SetupMcpTarget};
-use crate::render::CliOutput;
+use crate::render::{CliOutput, OutputMode};
 
 const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../../../../config/moraine.toml");
 
@@ -69,17 +69,20 @@ fn run_setup(
             let selected = selected_mcp_targets(args, interactive, runner)?;
             let targets_confirmed_by_selection =
                 args.mcp_targets.is_empty() && interactive && !args.yes && !args.dry_run;
+            let mut progress = SetupProgress::from_output(output);
             for mcp_target in selected {
-                let report = setup_mcp_target(
+                let report = setup_mcp_target_with_progress(
                     args,
                     &target,
                     mcp_target,
                     interactive,
                     targets_confirmed_by_selection,
+                    &mut progress,
                     runner,
                 )?;
                 mcp_targets.push(report);
             }
+            progress.finish();
         } else {
             for mcp_target in dedup_targets(&args.mcp_targets) {
                 mcp_targets.push(McpTargetReport::skipped(
@@ -604,12 +607,278 @@ impl Theme for SetupPromptTheme {
     }
 }
 
+struct SetupProgress {
+    enabled: bool,
+    rich: bool,
+    unicode: bool,
+    started: bool,
+}
+
+impl SetupProgress {
+    fn from_output(output: &CliOutput) -> Self {
+        Self {
+            enabled: !output.is_json() && std::io::stderr().is_terminal(),
+            rich: output.mode == OutputMode::Rich,
+            unicode: output.unicode,
+            started: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn disabled() -> Self {
+        Self {
+            enabled: false,
+            rich: false,
+            unicode: true,
+            started: false,
+        }
+    }
+
+    fn finish(&mut self) {
+        if !self.enabled || !self.started {
+            return;
+        }
+        eprintln!(
+            "{} {}",
+            self.progress_line("╰─", "`-", Style::new().bright().black()),
+            self.dim("setup summary follows")
+        );
+    }
+
+    fn target_start(&mut self, target: SetupMcpTarget, plan: &McpPlan) {
+        if !self.enabled {
+            return;
+        }
+        self.ensure_started();
+        eprintln!(
+            "{} {} {}",
+            self.progress_line("├─", "+-", Style::new().bright().black()),
+            self.bold_label(target.label()),
+            self.dim(plan.target.setup_kind())
+        );
+    }
+
+    fn target_success(&self, target: SetupMcpTarget) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "   {} {}",
+            self.mark("✓", "[ok]", Style::new().green()),
+            self.dim(&format!("{} configured", target.label()))
+        );
+    }
+
+    fn target_error(&self, target: SetupMcpTarget) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "   {} {}",
+            self.mark("✗", "[err]", Style::new().red()),
+            self.dim(&format!("{} needs attention", target.label()))
+        );
+    }
+
+    fn target_skipped(&self, target: SetupMcpTarget, reason: &str) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "   {} {} {}",
+            self.mark("–", "[-]", Style::new().yellow()),
+            self.dim(target.label()),
+            self.dim(reason)
+        );
+    }
+
+    fn command_start(&self, step: &McpPlanStep) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "   {} {}",
+            self.mark("→", ">", Style::new().cyan()),
+            self.label(step.progress_label)
+        );
+    }
+
+    fn command_success(&self, step: &McpPlanStep) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "   {} {}",
+            self.mark("✓", "[ok]", Style::new().green()),
+            self.dim(step.success_label)
+        );
+    }
+
+    fn command_warning(&self, step: &McpPlanStep, warning: &str) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "   {} {} {}",
+            self.mark("!", "[warn]", Style::new().yellow()),
+            self.dim(step.warning_label),
+            self.dim(warning)
+        );
+    }
+
+    fn command_error(&self, step: &McpPlanStep, error: &str) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "   {} {} {}",
+            self.mark("✗", "[err]", Style::new().red()),
+            self.dim(step.error_label),
+            self.dim(error)
+        );
+    }
+
+    fn config_start(&self, write: &McpConfigWrite) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "   {} {}",
+            self.mark("→", ">", Style::new().cyan()),
+            self.label(&format!(
+                "Updating {} config at {}",
+                write.kind.label(),
+                write.path().display()
+            ))
+        );
+    }
+
+    fn config_success(&self, write: &McpConfigWrite) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "   {} {}",
+            self.mark("✓", "[ok]", Style::new().green()),
+            self.dim(&format!("Updated {}", write.path().display()))
+        );
+    }
+
+    fn config_error(&self, write: &McpConfigWrite, error: &str) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "   {} {} {}",
+            self.mark("✗", "[err]", Style::new().red()),
+            self.dim(&format!("Could not update {}", write.path().display())),
+            self.dim(error)
+        );
+    }
+
+    fn ensure_started(&mut self) {
+        if self.started {
+            return;
+        }
+        self.started = true;
+        if self.rich {
+            eprintln!();
+            eprintln!(
+                "{} {}",
+                self.progress_line("╭─", ".-", Style::new().cyan()),
+                Style::new()
+                    .cyan()
+                    .bold()
+                    .for_stderr()
+                    .apply_to("Installing agent integrations")
+            );
+        } else {
+            eprintln!("Installing agent integrations");
+        }
+    }
+
+    fn mark<'a>(&self, unicode: &'a str, ascii: &'a str, style: Style) -> impl fmt::Display + 'a {
+        if self.rich {
+            style
+                .for_stderr()
+                .apply_to(if self.unicode { unicode } else { ascii })
+        } else {
+            Style::new()
+                .for_stderr()
+                .apply_to(if self.unicode { unicode } else { ascii })
+        }
+    }
+
+    fn label<'a>(&self, value: &'a str) -> impl fmt::Display + 'a {
+        if self.rich {
+            Style::new().white().for_stderr().apply_to(value)
+        } else {
+            Style::new().for_stderr().apply_to(value)
+        }
+    }
+
+    fn bold_label<'a>(&self, value: &'a str) -> impl fmt::Display + 'a {
+        if self.rich {
+            Style::new().white().bold().for_stderr().apply_to(value)
+        } else {
+            Style::new().for_stderr().apply_to(value)
+        }
+    }
+
+    fn dim<'a>(&self, value: &'a str) -> impl fmt::Display + 'a {
+        if self.rich {
+            Style::new().bright().black().for_stderr().apply_to(value)
+        } else {
+            Style::new().for_stderr().apply_to(value)
+        }
+    }
+
+    fn progress_line<'a>(
+        &self,
+        unicode: &'a str,
+        ascii: &'a str,
+        style: Style,
+    ) -> impl fmt::Display + 'a {
+        if self.rich {
+            style
+                .for_stderr()
+                .apply_to(if self.unicode { unicode } else { ascii })
+        } else {
+            Style::new()
+                .for_stderr()
+                .apply_to(if self.unicode { unicode } else { ascii })
+        }
+    }
+}
+
+#[cfg(test)]
 fn setup_mcp_target(
     args: &SetupArgs,
     config_target: &ConfigTarget,
     target: SetupMcpTarget,
     interactive: bool,
     already_confirmed: bool,
+    runner: &mut dyn CommandRunner,
+) -> Result<McpTargetReport> {
+    let mut progress = SetupProgress::disabled();
+    setup_mcp_target_with_progress(
+        args,
+        config_target,
+        target,
+        interactive,
+        already_confirmed,
+        &mut progress,
+        runner,
+    )
+}
+
+fn setup_mcp_target_with_progress(
+    args: &SetupArgs,
+    config_target: &ConfigTarget,
+    target: SetupMcpTarget,
+    interactive: bool,
+    already_confirmed: bool,
+    progress: &mut SetupProgress,
     runner: &mut dyn CommandRunner,
 ) -> Result<McpTargetReport> {
     let plan = McpPlan::for_target(target, config_target);
@@ -639,17 +908,32 @@ fn setup_mcp_target(
         ));
     }
 
-    execute_mcp_plan(plan, runner)
+    execute_mcp_plan_with_progress(plan, runner, progress)
 }
 
+#[cfg(test)]
 fn execute_mcp_plan(plan: McpPlan, runner: &mut dyn CommandRunner) -> Result<McpTargetReport> {
+    let mut progress = SetupProgress::disabled();
+    execute_mcp_plan_with_progress(plan, runner, &mut progress)
+}
+
+fn execute_mcp_plan_with_progress(
+    plan: McpPlan,
+    runner: &mut dyn CommandRunner,
+    progress: &mut SetupProgress,
+) -> Result<McpTargetReport> {
     if plan.steps.is_empty() && plan.config_writes.is_empty() {
         return Ok(McpTargetReport::manual(plan));
     }
     let commands = plan.commands();
+    progress.target_start(plan.target, &plan);
 
     if let Some(first_step) = plan.steps.first() {
         if !runner.command_exists(&first_step.command.program) {
+            progress.target_skipped(
+                plan.target,
+                &format!("{} was not found on PATH", first_step.command.program),
+            );
             return Ok(McpTargetReport::skipped(
                 plan.target,
                 &format!("{} was not found on PATH", first_step.command.program),
@@ -662,16 +946,29 @@ fn execute_mcp_plan(plan: McpPlan, runner: &mut dyn CommandRunner) -> Result<Mcp
     let mut failed = None;
 
     for step in &plan.steps {
-        let result = runner.run(&step.command)?;
+        progress.command_start(step);
+        let result = match runner.run(&step.command) {
+            Ok(result) => result,
+            Err(exc) => {
+                let error = exc.to_string();
+                progress.command_error(step, &error);
+                progress.target_error(plan.target);
+                return Err(exc);
+            }
+        };
         if let Some(command_failure) = step.command_failure(&result) {
             match step.failure_policy {
                 CommandFailurePolicy::WarnAndContinue(message) => {
+                    progress.command_warning(step, message);
                     warnings.push(message.to_string())
                 }
                 CommandFailurePolicy::Required => {
+                    progress.command_error(step, &command_failure);
                     failed = Some(command_failure);
                 }
             }
+        } else {
+            progress.command_success(step);
         }
         command_results.push(result);
 
@@ -683,10 +980,15 @@ fn execute_mcp_plan(plan: McpPlan, runner: &mut dyn CommandRunner) -> Result<Mcp
     let mut config_files = Vec::new();
     if failed.is_none() {
         for write in &plan.config_writes {
+            progress.config_start(write);
             match apply_mcp_config_write(write) {
-                Ok(report) => config_files.push(report),
+                Ok(report) => {
+                    progress.config_success(write);
+                    config_files.push(report);
+                }
                 Err(exc) => {
                     let error = format!("failed to update {}: {exc}", write.path().display());
+                    progress.config_error(write, &exc.to_string());
                     config_files.push(McpConfigFileReport::error(write, &exc.to_string()));
                     failed = Some(error);
                     break;
@@ -696,6 +998,7 @@ fn execute_mcp_plan(plan: McpPlan, runner: &mut dyn CommandRunner) -> Result<Mcp
     }
 
     if let Some(error) = failed {
+        progress.target_error(plan.target);
         Ok(McpTargetReport {
             target: plan.target,
             action: plan.action,
@@ -709,6 +1012,7 @@ fn execute_mcp_plan(plan: McpPlan, runner: &mut dyn CommandRunner) -> Result<Mcp
             command_results,
         })
     } else {
+        progress.target_success(plan.target);
         Ok(McpTargetReport {
             target: plan.target,
             action: plan.action,
@@ -810,17 +1114,35 @@ impl McpPlan {
                             ],
                         ),
                         "Claude marketplace add failed; continuing because the marketplace may already exist",
+                    )
+                    .with_progress(
+                        "Adding Claude Code plugin marketplace",
+                        "Claude Code marketplace ready",
+                        "Claude Code marketplace already present or unavailable",
+                        "Claude Code marketplace add failed",
                     ),
                     McpPlanStep::required(CommandSpec::new(
                         "claude",
                         ["plugin", "install", "moraine@moraine"],
-                    )),
+                    ))
+                    .with_progress(
+                        "Installing Claude Code Moraine plugin",
+                        "Claude Code plugin installed",
+                        "Claude Code plugin install warning",
+                        "Claude Code plugin install failed",
+                    ),
                     McpPlanStep::warn_and_continue(
                         CommandSpec::new(
                             "claude",
                             ["mcp", "remove", "moraine", "--scope", "user"],
                         ),
                         "Existing manual Claude Code MCP registration could not be removed; continuing in case it was absent",
+                    )
+                    .with_progress(
+                        "Cleaning up old Claude Code MCP registration",
+                        "Old Claude Code MCP registration removed or absent",
+                        "Old Claude Code MCP registration left unchanged",
+                        "Old Claude Code MCP cleanup failed",
                     ),
                 ],
                 config_writes: Vec::new(),
@@ -857,14 +1179,32 @@ impl McpPlan {
                             ],
                         ),
                         "Codex marketplace add failed; continuing because the marketplace may already exist",
+                    )
+                    .with_progress(
+                        "Adding Codex plugin marketplace",
+                        "Codex marketplace ready",
+                        "Codex marketplace already present or unavailable",
+                        "Codex marketplace add failed",
                     ),
                     McpPlanStep::required(CommandSpec::new(
                         "codex",
                         ["plugin", "add", "moraine@moraine"],
-                    )),
+                    ))
+                    .with_progress(
+                        "Installing Codex Moraine plugin",
+                        "Codex plugin installed",
+                        "Codex plugin install warning",
+                        "Codex plugin install failed",
+                    ),
                     McpPlanStep::warn_and_continue(
                         CommandSpec::new("codex", ["mcp", "remove", "moraine"]),
                         "Existing manual Codex MCP registration could not be removed; continuing in case it was absent",
+                    )
+                    .with_progress(
+                        "Cleaning up old Codex MCP registration",
+                        "Old Codex MCP registration removed or absent",
+                        "Old Codex MCP registration left unchanged",
+                        "Old Codex MCP cleanup failed",
                     ),
                 ],
                 config_writes: Vec::new(),
@@ -876,12 +1216,24 @@ impl McpPlan {
                 McpPlanStep::required_stdout(
                     CommandSpec::new("hermes", hermes_args(config_target)).with_stdin("\n"),
                     "tools enabled",
+                )
+                .with_progress(
+                    "Registering Moraine MCP in Hermes",
+                    "Hermes MCP tools enabled",
+                    "Hermes MCP registration warning",
+                    "Hermes MCP registration failed",
                 ),
             ),
             SetupMcpTarget::KimiCli => Self::replace_registration(
                 target,
                 CommandSpec::new("kimi", ["mcp", "remove", "moraine"]),
-                McpPlanStep::required(CommandSpec::new("kimi", kimi_args(config_target))),
+                McpPlanStep::required(CommandSpec::new("kimi", kimi_args(config_target)))
+                    .with_progress(
+                        "Registering Moraine MCP in Kimi CLI",
+                        "Kimi CLI MCP registered",
+                        "Kimi CLI MCP registration warning",
+                        "Kimi CLI MCP registration failed",
+                    ),
             ),
             SetupMcpTarget::OpenCode => Self::write_config(
                 target,
@@ -907,7 +1259,13 @@ impl McpPlan {
                     plan.steps.push(McpPlanStep::required(CommandSpec::new(
                         "pi",
                         ["install", "npm:pi-mcp-extension"],
-                    )));
+                    ))
+                    .with_progress(
+                        "Installing Pi MCP extension",
+                        "Pi MCP extension installed",
+                        "Pi MCP extension install warning",
+                        "Pi MCP extension install failed",
+                    ));
                 }
                 plan
             }
@@ -926,6 +1284,12 @@ impl McpPlan {
                 McpPlanStep::warn_and_continue(
                     remove_command,
                     "Existing MCP registration could not be removed; continuing in case it was absent",
+                )
+                .with_progress(
+                    "Removing existing Moraine MCP registration",
+                    "Existing MCP registration removed or absent",
+                    "Existing MCP registration left unchanged",
+                    "Existing MCP cleanup failed",
                 ),
                 add_step,
             ],
@@ -982,6 +1346,10 @@ struct McpPlanStep {
     command: CommandSpec,
     failure_policy: CommandFailurePolicy,
     success_stdout_contains: Option<&'static str>,
+    progress_label: &'static str,
+    success_label: &'static str,
+    warning_label: &'static str,
+    error_label: &'static str,
 }
 
 impl McpPlanStep {
@@ -990,6 +1358,10 @@ impl McpPlanStep {
             command,
             failure_policy: CommandFailurePolicy::Required,
             success_stdout_contains: None,
+            progress_label: "Running setup command",
+            success_label: "Command completed",
+            warning_label: "Command completed with warning",
+            error_label: "Command failed",
         }
     }
 
@@ -998,6 +1370,10 @@ impl McpPlanStep {
             command,
             failure_policy: CommandFailurePolicy::Required,
             success_stdout_contains: Some(marker),
+            progress_label: "Running setup command",
+            success_label: "Command completed",
+            warning_label: "Command completed with warning",
+            error_label: "Command failed",
         }
     }
 
@@ -1006,7 +1382,25 @@ impl McpPlanStep {
             command,
             failure_policy: CommandFailurePolicy::WarnAndContinue(message),
             success_stdout_contains: None,
+            progress_label: "Running optional setup command",
+            success_label: "Optional command completed",
+            warning_label: "Optional command skipped",
+            error_label: "Optional command failed",
         }
+    }
+
+    fn with_progress(
+        mut self,
+        progress_label: &'static str,
+        success_label: &'static str,
+        warning_label: &'static str,
+        error_label: &'static str,
+    ) -> Self {
+        self.progress_label = progress_label;
+        self.success_label = success_label;
+        self.warning_label = warning_label;
+        self.error_label = error_label;
+        self
     }
 
     fn command_failure(&self, result: &CommandRunReport) -> Option<String> {
@@ -1228,6 +1622,16 @@ enum McpConfigKind {
     Cursor,
     Pi,
     OpenCode,
+}
+
+impl McpConfigKind {
+    fn label(self) -> &'static str {
+        match self {
+            McpConfigKind::Cursor => "Cursor",
+            McpConfigKind::Pi => "Pi",
+            McpConfigKind::OpenCode => "OpenCode",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
