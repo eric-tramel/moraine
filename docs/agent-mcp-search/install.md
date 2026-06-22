@@ -59,6 +59,58 @@ claude mcp remove moraine --scope user
 Manual Claude MCP registration remains useful for project-scoped setup,
 `--project-only`, and custom environment wiring such as `MORAINE_MCP_CONFIG`.
 
+## Codex plugin marketplace (recommended)
+
+For Codex, the recommended user-scoped setup is the Moraine plugin. The plugin
+registers the MCP server and bundles Moraine search skills, but it does not
+install Moraine itself and it does not start ClickHouse, ingest, or the monitor.
+Install or upgrade the CLI first, then start the stack:
+
+```bash
+uv tool install moraine-cli
+```
+
+```bash
+uv tool upgrade moraine-cli
+```
+
+```bash
+moraine up
+```
+
+Add the marketplace from this repository and install the end-user plugin:
+
+```bash
+codex plugin marketplace add eric-tramel/moraine --sparse .agents/plugins --sparse plugins/moraine --sparse plugins/moraine-dev
+codex plugin add moraine@moraine
+```
+
+The same marketplace also exposes the contributor-only `moraine-dev` plugin for
+Moraine maintainers; end users should install `moraine@moraine`.
+
+The plugin MCP launcher looks for `moraine` on `PATH` and then runs
+`moraine run mcp`. If the CLI is missing, it reports a `binary_missing` message
+with install guidance instead of failing as a raw command-not-found error.
+
+Security note: the user-scoped plugin launches unscoped `moraine run mcp`, so
+Codex can search the host-wide Moraine history visible to your user. Enable the
+plugin only in trusted Codex environments. For untrusted repositories, or when
+you want retrieval limited to the current project, use the manual
+project-scoped `--project-only` registration below. Also start Codex from a
+trusted shell where `moraine` resolves to the installed CLI, not to a repo-local
+shim or relative `PATH` entry.
+
+If you previously registered Moraine manually with `codex mcp add`, remove that
+manual entry before relying on the plugin to avoid duplicate MCP servers:
+
+```bash
+codex mcp list
+codex mcp remove moraine
+```
+
+Manual Codex MCP registration remains useful for project-scoped setup,
+`--project-only`, and custom environment wiring such as `MORAINE_MCP_CONFIG`.
+
 ## Shared central server (default)
 
 By default `moraine up` starts a single shared MCP server for the whole host,
@@ -115,13 +167,15 @@ Details worth knowing:
   view.
 
 The remaining sections register the unchanged `moraine run mcp` command with
-each harness, including manual Claude Code registration for project-scoped or
-custom setups.
+each harness, including manual Codex and Claude Code registration for
+project-scoped or custom setups.
 
-## Global Codex
+## Manual Codex
 
 Codex stores user-level configuration in `~/.codex/config.toml`, and the Codex
-CLI can add MCP servers directly. OpenAI's Codex docs note that the CLI and IDE
+CLI can add MCP servers directly. The plugin is the recommended user-scoped path
+above. Use manual registration when you want project scope, `--project-only`, or
+custom environment handling. OpenAI's Codex docs note that the CLI and IDE
 extension share MCP configuration, so a CLI install is enough for both clients:
 [Codex MCP docs](https://developers.openai.com/codex/mcp) and
 [Codex configuration reference](https://developers.openai.com/codex/config-reference).

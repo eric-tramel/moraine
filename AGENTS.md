@@ -22,7 +22,7 @@ Prefer adding new runtime logic under `apps/` + `crates/` (not legacy `rust/` or
 - `make install`: build the current checkout for the host target and install it over the active `moraine` on your PATH (release bundle → the same `scripts/install.sh` path users get; ClickHouse skipped by default, `INSTALL_ARGS="--with-clickhouse"` to include it). Use this to test tip-of-branch on the host instead of waiting for a tagged release. See `scripts/dev/install-host.sh --help`.
 - `make docs-build` / `make docs-serve`: MkDocs build/serve.
 - `make hooks-install`: enable the repo-managed git hooks (`.githooks/pre-commit` runs `cargo fmt --check` and the same clippy strict baseline CI uses). One-time per clone; bypass a single commit with `SKIP_PRECOMMIT=1 git commit ...` or `git commit --no-verify`.
-- `make agent-plugins-install`: register the Codex developer plugin marketplace from the configured `main` branch and install/update its contributor plugins. Use `AGENT_PLUGINS_SOURCE=current` only when testing unmerged plugin changes from the current checkout.
+- `make agent-plugins-install`: register the Codex Moraine marketplace from the configured `main` branch and install/update the `moraine-dev` contributor workflow plugin. Use `AGENT_PLUGINS_SOURCE=current` only when testing unmerged plugin changes from the current checkout.
 
 ## Coding Style & Naming Conventions
 Use Rust 2021 idioms and keep code `rustfmt`-clean.
@@ -114,6 +114,9 @@ This repo vendors developer-only agent workflows as a local Codex plugin:
 - Marketplace: `.agents/plugins/marketplace.json`
 - Plugin: `plugins/moraine-dev/.codex-plugin/plugin.json`
 - Skills: `plugins/moraine-dev/skills/`
+
+The marketplace is named `moraine` and also exposes the end-user `moraine`
+runtime plugin; contributor automation should install only `moraine-dev`.
 
 Use `$moraine-dev:moraine-start-work` when beginning contributor work, `$moraine-dev:crystallize` when turning rough input into an ignored ready-to-implement plan under `plans/`, `$moraine-dev:moraine-author-pr` when drafting a PR title or description, `$moraine-dev:moraine-sandbox-qa` for ingest/MCP/monitor/schema/stack-facing validation, `$moraine-dev:code-review` for a full multi-persona review wave, and the `$moraine-dev:code-review-*` persona skills for focused PR review. Using `$moraine-dev:code-review` is an explicit request for its delegated reviewer subagents. When prior or active agent context matters, use the Moraine MCP tools directly. These skills are for repository contributors and automation agents, not end-user Moraine behavior.
 Use `$moraine-dev:release` when cutting and publishing a Moraine release from a target version.

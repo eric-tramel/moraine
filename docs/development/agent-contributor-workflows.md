@@ -26,9 +26,13 @@ plugins/moraine-dev/
     moraine-sandbox-qa/
 ```
 
-Both the Codex marketplace and plugin are named `moraine-dev`. The marketplace
-entry points to `./plugins/moraine-dev`, and the plugin manifest exposes
-`./skills/`.
+The Codex marketplace is named `moraine`. It exposes the end-user `moraine`
+runtime plugin and the contributor-only `moraine-dev` workflow plugin. The
+developer helper installs only `moraine-dev`; it does not automatically install
+the end-user runtime MCP plugin.
+
+The `moraine-dev` marketplace entry points to `./plugins/moraine-dev`, and the
+plugin manifest exposes `./skills/`.
 
 ## Install Locally
 
@@ -40,9 +44,9 @@ make agent-plugins-install
 
 This registers the Codex marketplace from the configured Git remote, replaces a
 stale marketplace entry, syncs the marketplace snapshot from `origin/main`, and
-installs or refreshes every plugin listed there. This intentionally uses the
-merged `main` branch as the source of truth so agents running from stale feature
-worktrees still pick up the latest developer workflows.
+installs or refreshes the `moraine-dev` plugin listed there. This intentionally
+uses the merged `main` branch as the source of truth so agents running from
+stale feature worktrees still pick up the latest developer workflows.
 
 When changing the plugin itself, test the unmerged checkout explicitly:
 
