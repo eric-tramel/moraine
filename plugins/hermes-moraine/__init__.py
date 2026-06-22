@@ -22,6 +22,7 @@ MORAINE_MCP_ARGS = ["run", "mcp"]
 MORAINE_MCP_DISPLAY = "moraine run mcp"
 DIAGNOSTIC_TOOLSET = "moraine_diagnostics"
 REQUIRED_MCP_TOOLS = {"search_sessions", "open", "list_sessions", "file_attention"}
+TRUTHY_STRINGS = {"1", "true", "yes", "on"}
 HERMES_FAILURE_MARKERS = (
     "error:",
     "failed",
@@ -437,7 +438,7 @@ def _mcp_config_state() -> dict[str, Any]:
         return state
 
     state["configured"] = True
-    state["enabled"] = server.get("enabled", True) is not False
+    state["enabled"] = _truthy_value(server.get("enabled"), default=True)
     command = server.get("command")
     args = server.get("args") or []
     args_list = args if isinstance(args, list) else [args]
@@ -446,20 +447,22 @@ def _mcp_config_state() -> dict[str, Any]:
     state["detail"] = f"command={command!r} args={normalized_args!r}"
     if state["expected"] and command not in {None, MCP_SERVER_NAME}:
         state["command_trust_issue"] = _moraine_path_trust(str(command))
+        if not state["command_trust_issue"]:
+            state["command_trust_issue"] = _moraine_command_mismatch(str(command))
 
     tools = server.get("tools")
     if isinstance(tools, dict):
-        include = tools.get("include")
-        exclude = tools.get("exclude")
-        if isinstance(include, list):
-            missing = REQUIRED_MCP_TOOLS.difference(str(item) for item in include)
+        include = _string_list(tools.get("include"))
+        exclude = _string_list(tools.get("exclude"))
+        if include is not None:
+            missing = REQUIRED_MCP_TOOLS.difference(include)
             if missing:
                 state["tool_filter_issue"] = (
                     "Moraine MCP include filter hides required tools: "
                     + ", ".join(sorted(missing))
                 )
-        if isinstance(exclude, list):
-            blocked = REQUIRED_MCP_TOOLS.intersection(str(item) for item in exclude)
+        if exclude is not None:
+            blocked = REQUIRED_MCP_TOOLS.intersection(exclude)
             if blocked:
                 state["tool_filter_issue"] = (
                     "Moraine MCP exclude filter blocks required tools: "
@@ -471,6 +474,42 @@ def _mcp_config_state() -> dict[str, Any]:
 def _is_expected_mcp_launch(command: Any, args: list[str]) -> bool:
     command_name = Path(str(command)).name if command is not None else ""
     return command_name == MCP_SERVER_NAME and args[: len(MORAINE_MCP_ARGS)] == MORAINE_MCP_ARGS
+
+
+def _truthy_value(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in TRUTHY_STRINGS
+    return bool(value)
+
+
+def _string_list(value: Any) -> list[str] | None:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    return None
+
+
+def _moraine_command_mismatch(command: str) -> str:
+    trusted = _resolve_executable(MCP_SERVER_NAME)
+    if not trusted:
+        return "Could not find a trusted Moraine CLI on PATH to compare with the MCP registration."
+    trusted_issue = _moraine_path_trust(trusted)
+    if trusted_issue:
+        return trusted_issue
+    try:
+        if Path(command).resolve() != Path(trusted).resolve():
+            return (
+                "Moraine MCP registration command does not match the trusted "
+                f"Moraine CLI on PATH: {command} != {trusted}"
+            )
+    except OSError as exc:
+        return f"Could not compare Moraine MCP registration command to PATH: {exc}"
+    return ""
 
 
 def _mcp_registration_ready(state: dict[str, Any]) -> bool:
