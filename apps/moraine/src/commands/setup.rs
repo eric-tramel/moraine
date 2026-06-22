@@ -5,6 +5,7 @@ use dialoguer::{
     MultiSelect,
 };
 use serde::Serialize;
+use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use std::env;
 use std::fmt;
@@ -453,9 +454,9 @@ fn selected_mcp_targets(
         return Ok(Vec::new());
     }
 
-    let available = executable_targets()
+    let available = setup_targets()
         .into_iter()
-        .filter(|target| runner.command_exists(target.program()))
+        .filter(|target| target.is_available_for_setup(runner))
         .collect::<Vec<_>>();
     prompt_mcp_target_checklist(&available)
 }
@@ -469,18 +470,21 @@ fn dedup_targets(targets: &[SetupMcpTarget]) -> Vec<SetupMcpTarget> {
         .collect()
 }
 
-fn executable_targets() -> [SetupMcpTarget; 4] {
+fn setup_targets() -> [SetupMcpTarget; 7] {
     [
         SetupMcpTarget::ClaudeCode,
         SetupMcpTarget::Codex,
         SetupMcpTarget::Hermes,
         SetupMcpTarget::KimiCli,
+        SetupMcpTarget::OpenCode,
+        SetupMcpTarget::Cursor,
+        SetupMcpTarget::PiCodingAgent,
     ]
 }
 
 fn prompt_mcp_target_checklist(available: &[SetupMcpTarget]) -> Result<Vec<SetupMcpTarget>> {
     if available.is_empty() {
-        eprintln!("No supported agent harness CLIs were found on PATH.");
+        eprintln!("No supported agent harnesses were detected.");
         return Ok(Vec::new());
     }
 
@@ -622,10 +626,7 @@ fn setup_mcp_target(
             "Moraine MCP gives {name} access to host-wide Moraine session history visible to your user.",
             name = target.label()
         );
-        if !prompt_yes_no(
-            &format!("Run setup commands for {}?", target.label()),
-            false,
-        )? {
+        if !prompt_yes_no(&format!("Configure {} integration?", target.label()), false)? {
             return Ok(McpTargetReport::skipped(
                 target,
                 "user declined MCP/plugin setup",
@@ -642,16 +643,18 @@ fn setup_mcp_target(
 }
 
 fn execute_mcp_plan(plan: McpPlan, runner: &mut dyn CommandRunner) -> Result<McpTargetReport> {
-    let Some(first_step) = plan.steps.first() else {
+    if plan.steps.is_empty() && plan.config_writes.is_empty() {
         return Ok(McpTargetReport::manual(plan));
-    };
+    }
     let commands = plan.commands();
 
-    if !runner.command_exists(&first_step.command.program) {
-        return Ok(McpTargetReport::skipped(
-            plan.target,
-            &format!("{} was not found on PATH", first_step.command.program),
-        ));
+    if let Some(first_step) = plan.steps.first() {
+        if !runner.command_exists(&first_step.command.program) {
+            return Ok(McpTargetReport::skipped(
+                plan.target,
+                &format!("{} was not found on PATH", first_step.command.program),
+            ));
+        }
     }
 
     let mut command_results = Vec::new();
@@ -677,12 +680,28 @@ fn execute_mcp_plan(plan: McpPlan, runner: &mut dyn CommandRunner) -> Result<Mcp
         }
     }
 
+    let mut config_files = Vec::new();
+    if failed.is_none() {
+        for write in &plan.config_writes {
+            match apply_mcp_config_write(write) {
+                Ok(report) => config_files.push(report),
+                Err(exc) => {
+                    let error = format!("failed to update {}: {exc}", write.path().display());
+                    config_files.push(McpConfigFileReport::error(write, &exc.to_string()));
+                    failed = Some(error);
+                    break;
+                }
+            }
+        }
+    }
+
     if let Some(error) = failed {
         Ok(McpTargetReport {
             target: plan.target,
             action: plan.action,
             status: SetupStatus::Error,
             commands,
+            config_files,
             manual_snippet: plan.manual_snippet,
             skipped_reason: None,
             warnings,
@@ -695,6 +714,7 @@ fn execute_mcp_plan(plan: McpPlan, runner: &mut dyn CommandRunner) -> Result<Mcp
             action: plan.action,
             status: SetupStatus::Ok,
             commands,
+            config_files,
             manual_snippet: plan.manual_snippet,
             skipped_reason: None,
             warnings,
@@ -728,11 +748,24 @@ struct McpPlan {
     target: SetupMcpTarget,
     action: McpAction,
     steps: Vec<McpPlanStep>,
+    config_writes: Vec<McpConfigWrite>,
     manual_snippet: Option<String>,
 }
 
 impl McpPlan {
     fn for_target(target: SetupMcpTarget, config_target: &ConfigTarget) -> Self {
+        Self::for_target_with_home(
+            target,
+            config_target,
+            env::var_os("HOME").map(PathBuf::from),
+        )
+    }
+
+    fn for_target_with_home(
+        target: SetupMcpTarget,
+        config_target: &ConfigTarget,
+        home: Option<PathBuf>,
+    ) -> Self {
         match target {
             SetupMcpTarget::ClaudeCode if config_target.requires_explicit_mcp_config() => {
                 let mut args = vec![
@@ -790,6 +823,7 @@ impl McpPlan {
                         "Existing manual Claude Code MCP registration could not be removed; continuing in case it was absent",
                     ),
                 ],
+                config_writes: Vec::new(),
                 manual_snippet: None,
             },
             SetupMcpTarget::Codex if config_target.requires_explicit_mcp_config() => {
@@ -833,6 +867,7 @@ impl McpPlan {
                         "Existing manual Codex MCP registration could not be removed; continuing in case it was absent",
                     ),
                 ],
+                config_writes: Vec::new(),
                 manual_snippet: None,
             },
             SetupMcpTarget::Hermes => Self::replace_registration(
@@ -848,8 +883,34 @@ impl McpPlan {
                 CommandSpec::new("kimi", ["mcp", "remove", "moraine"]),
                 McpPlanStep::required(CommandSpec::new("kimi", kimi_args(config_target))),
             ),
-            SetupMcpTarget::Cursor => Self::manual(target, cursor_snippet(config_target)),
-            SetupMcpTarget::PiCodingAgent => Self::manual(target, pi_snippet(config_target)),
+            SetupMcpTarget::OpenCode => Self::write_config(
+                target,
+                home
+                    .as_ref()
+                    .map(|home| McpConfigWrite::opencode(home, config_target)),
+                opencode_snippet(config_target),
+            ),
+            SetupMcpTarget::Cursor => Self::write_config(
+                target,
+                home.as_ref()
+                    .map(|home| McpConfigWrite::cursor(home, config_target)),
+                cursor_snippet(config_target),
+            ),
+            SetupMcpTarget::PiCodingAgent => {
+                let mut plan = Self::write_config(
+                    target,
+                    home.as_ref()
+                        .map(|home| McpConfigWrite::pi(home, config_target)),
+                    pi_snippet(config_target),
+                );
+                if !plan.config_writes.is_empty() {
+                    plan.steps.push(McpPlanStep::required(CommandSpec::new(
+                        "pi",
+                        ["install", "npm:pi-mcp-extension"],
+                    )));
+                }
+                plan
+            }
         }
     }
 
@@ -868,6 +929,7 @@ impl McpPlan {
                 ),
                 add_step,
             ],
+            config_writes: Vec::new(),
             manual_snippet: None,
         }
     }
@@ -877,12 +939,41 @@ impl McpPlan {
             target,
             action: McpAction::ManualInstructions,
             steps: Vec::new(),
+            config_writes: Vec::new(),
             manual_snippet: Some(snippet),
+        }
+    }
+
+    fn write_config(
+        target: SetupMcpTarget,
+        write: Option<McpConfigWrite>,
+        fallback_snippet: String,
+    ) -> Self {
+        let Some(write) = write else {
+            return Self::manual(
+                target,
+                format!("HOME is not set, so Moraine cannot choose a global MCP config path.\n{fallback_snippet}"),
+            );
+        };
+
+        Self {
+            target,
+            action: McpAction::WriteConfig,
+            steps: Vec::new(),
+            config_writes: vec![write],
+            manual_snippet: None,
         }
     }
 
     fn commands(&self) -> Vec<CommandSpec> {
         self.steps.iter().map(|step| step.command.clone()).collect()
+    }
+
+    fn planned_config_files(&self) -> Vec<McpConfigFileReport> {
+        self.config_writes
+            .iter()
+            .map(McpConfigFileReport::planned)
+            .collect()
     }
 }
 
@@ -1001,6 +1092,7 @@ fn cursor_snippet(config_target: &ConfigTarget) -> String {
     let snippet = serde_json::json!({
         "mcpServers": {
             "moraine": {
+                "type": "stdio",
                 "command": "moraine",
                 "args": mcp_run_args(config_target),
             }
@@ -1008,6 +1100,23 @@ fn cursor_snippet(config_target: &ConfigTarget) -> String {
     });
     format!(
         "Add this server to ~/.cursor/mcp.json for global Cursor use or .cursor/mcp.json for a project:\n{}",
+        serde_json::to_string_pretty(&snippet).unwrap_or_else(|_| snippet.to_string())
+    )
+}
+
+fn opencode_snippet(config_target: &ConfigTarget) -> String {
+    let snippet = serde_json::json!({
+        "$schema": "https://opencode.ai/config.json",
+        "mcp": {
+            "moraine": {
+                "type": "local",
+                "command": opencode_command(config_target),
+                "enabled": true,
+            }
+        }
+    });
+    format!(
+        "Add this server to ~/.config/opencode/opencode.json:\n{}",
         serde_json::to_string_pretty(&snippet).unwrap_or_else(|_| snippet.to_string())
     )
 }
@@ -1027,6 +1136,233 @@ fn pi_snippet(config_target: &ConfigTarget) -> String {
         "Install the Pi MCP extension first:\npi install npm:pi-mcp-extension\n\nThen add this server to ~/.pi/agent/mcp.json:\n{}",
         serde_json::to_string_pretty(&snippet).unwrap_or_else(|_| snippet.to_string())
     )
+}
+
+fn opencode_command(config_target: &ConfigTarget) -> Vec<String> {
+    std::iter::once("moraine".to_string())
+        .chain(mcp_run_args(config_target))
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct McpConfigWrite {
+    path: PathBuf,
+    kind: McpConfigKind,
+    command: Vec<String>,
+}
+
+impl McpConfigWrite {
+    fn cursor(home: &Path, config_target: &ConfigTarget) -> Self {
+        Self {
+            path: home.join(".cursor").join("mcp.json"),
+            kind: McpConfigKind::Cursor,
+            command: mcp_run_args(config_target),
+        }
+    }
+
+    fn pi(home: &Path, config_target: &ConfigTarget) -> Self {
+        Self {
+            path: home.join(".pi").join("agent").join("mcp.json"),
+            kind: McpConfigKind::Pi,
+            command: mcp_run_args(config_target),
+        }
+    }
+
+    fn opencode(home: &Path, config_target: &ConfigTarget) -> Self {
+        Self {
+            path: home.join(".config").join("opencode").join("opencode.json"),
+            kind: McpConfigKind::OpenCode,
+            command: opencode_command(config_target),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn merge_into(&self, root: &mut Map<String, Value>) -> Result<()> {
+        match self.kind {
+            McpConfigKind::Cursor => {
+                let servers = object_entry_mut(root, "mcpServers")?;
+                servers.insert(
+                    "moraine".to_string(),
+                    serde_json::json!({
+                        "type": "stdio",
+                        "command": "moraine",
+                        "args": self.command.clone(),
+                    }),
+                );
+            }
+            McpConfigKind::Pi => {
+                let servers = object_entry_mut(root, "mcpServers")?;
+                servers.insert(
+                    "moraine".to_string(),
+                    serde_json::json!({
+                        "transport": "stdio",
+                        "command": "moraine",
+                        "args": self.command.clone(),
+                        "lifecycle": "eager",
+                    }),
+                );
+            }
+            McpConfigKind::OpenCode => {
+                root.entry("$schema".to_string())
+                    .or_insert_with(|| serde_json::json!("https://opencode.ai/config.json"));
+                let servers = object_entry_mut(root, "mcp")?;
+                servers.insert(
+                    "moraine".to_string(),
+                    serde_json::json!({
+                        "type": "local",
+                        "command": self.command.clone(),
+                        "enabled": true,
+                    }),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum McpConfigKind {
+    Cursor,
+    Pi,
+    OpenCode,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct McpConfigFileReport {
+    path: String,
+    action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl McpConfigFileReport {
+    fn planned(write: &McpConfigWrite) -> Self {
+        Self {
+            path: write.path().display().to_string(),
+            action: "would_update".to_string(),
+            error: None,
+        }
+    }
+
+    fn written(write: &McpConfigWrite) -> Self {
+        Self {
+            path: write.path().display().to_string(),
+            action: "updated".to_string(),
+            error: None,
+        }
+    }
+
+    fn error(write: &McpConfigWrite, error: &str) -> Self {
+        Self {
+            path: write.path().display().to_string(),
+            action: "error".to_string(),
+            error: Some(error.to_string()),
+        }
+    }
+}
+
+fn apply_mcp_config_write(write: &McpConfigWrite) -> Result<McpConfigFileReport> {
+    let mut root = read_json_object_or_default(write.path())?;
+    write.merge_into(&mut root)?;
+    write_json_atomic(write.path(), &Value::Object(root))?;
+    Ok(McpConfigFileReport::written(write))
+}
+
+fn read_json_object_or_default(path: &Path) -> Result<Map<String, Value>> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(exc) if exc.kind() == ErrorKind::NotFound => return Ok(Map::new()),
+        Err(exc) => {
+            return Err(exc).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+
+    if content.trim().is_empty() {
+        return Ok(Map::new());
+    }
+
+    let value: Value = serde_json::from_str(&content)
+        .with_context(|| format!("{} is not valid JSON", path.display()))?;
+    match value {
+        Value::Object(object) => Ok(object),
+        _ => bail!("{} must contain a JSON object", path.display()),
+    }
+}
+
+fn object_entry_mut<'a>(
+    root: &'a mut Map<String, Value>,
+    key: &str,
+) -> Result<&'a mut Map<String, Value>> {
+    let value = root
+        .entry(key.to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !value.is_object() {
+        bail!("{key} must be a JSON object");
+    }
+    Ok(value
+        .as_object_mut()
+        .expect("value was checked as a JSON object"))
+}
+
+fn write_json_atomic(path: &Path, value: &Value) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("mcp.json");
+    for attempt in 0..100 {
+        let temp_path = parent.join(format!(
+            ".{file_name}.setup-{}-{}-{attempt}.tmp",
+            std::process::id(),
+            timestamp_suffix()
+        ));
+        match private_create_new_options().open(&temp_path) {
+            Ok(mut file) => {
+                let result = (|| {
+                    serde_json::to_writer_pretty(&mut file, value).with_context(|| {
+                        format!("failed to serialize JSON for {}", path.display())
+                    })?;
+                    file.write_all(b"\n")
+                        .with_context(|| format!("failed to write {}", temp_path.display()))?;
+                    file.flush()
+                        .with_context(|| format!("failed to flush {}", temp_path.display()))?;
+                    fs::rename(&temp_path, path).with_context(|| {
+                        format!(
+                            "failed to persist {} to {}",
+                            temp_path.display(),
+                            path.display()
+                        )
+                    })?;
+                    Ok(())
+                })();
+                if result.is_err() {
+                    let _ = fs::remove_file(&temp_path);
+                }
+                return result;
+            }
+            Err(exc) if exc.kind() == ErrorKind::AlreadyExists => continue,
+            Err(exc) => {
+                return Err(exc)
+                    .with_context(|| format!("failed to create {}", temp_path.display()));
+            }
+        }
+    }
+
+    bail!(
+        "failed to create a unique temporary JSON file in {}",
+        parent.display()
+    );
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1173,6 +1509,7 @@ enum SetupStatus {
 #[serde(rename_all = "snake_case")]
 enum McpAction {
     Execute,
+    WriteConfig,
     ManualInstructions,
 }
 
@@ -1272,6 +1609,8 @@ struct McpTargetReport {
     status: SetupStatus,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     commands: Vec<CommandSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    config_files: Vec<McpConfigFileReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     manual_snippet: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1291,6 +1630,7 @@ impl McpTargetReport {
             action: plan.action,
             status: SetupStatus::Planned,
             commands: plan.commands(),
+            config_files: plan.planned_config_files(),
             manual_snippet: plan.manual_snippet,
             skipped_reason: None,
             warnings: Vec::new(),
@@ -1305,6 +1645,7 @@ impl McpTargetReport {
             action: plan.action,
             status: SetupStatus::Skipped,
             commands: Vec::new(),
+            config_files: Vec::new(),
             manual_snippet: plan.manual_snippet,
             skipped_reason: Some("manual instructions only".to_string()),
             warnings: Vec::new(),
@@ -1319,6 +1660,7 @@ impl McpTargetReport {
             action: McpAction::Execute,
             status: SetupStatus::Skipped,
             commands: Vec::new(),
+            config_files: Vec::new(),
             manual_snippet: None,
             skipped_reason: Some(reason.to_string()),
             warnings: Vec::new(),
@@ -1333,6 +1675,7 @@ impl McpTargetReport {
             action: McpAction::Execute,
             status: SetupStatus::Error,
             commands: Vec::new(),
+            config_files: Vec::new(),
             manual_snippet: None,
             skipped_reason: None,
             warnings: Vec::new(),
@@ -1442,23 +1785,32 @@ fn target_detail(target: &McpTargetReport) -> String {
         return truncate_for_table(reason);
     }
     let command_count = target.commands.len();
-    let commands = if command_count == 0 {
+    let config_count = target.config_files.len();
+    let mut parts = Vec::new();
+    if command_count == 1 {
+        parts.push("1 command".to_string());
+    } else if command_count > 1 {
+        parts.push(format!("{command_count} commands"));
+    }
+    if config_count == 1 {
+        parts.push("1 config file".to_string());
+    } else if config_count > 1 {
+        parts.push(format!("{config_count} config files"));
+    }
+    if parts.is_empty() {
         return match target.status {
             SetupStatus::Ok => "ready".to_string(),
             SetupStatus::Planned => "no commands would run".to_string(),
             SetupStatus::Skipped => "no commands run".to_string(),
             SetupStatus::Error => "no commands completed".to_string(),
         };
-    } else if command_count == 1 {
-        "1 command".to_string()
-    } else {
-        format!("{command_count} commands")
-    };
+    }
+    let work = parts.join(" + ");
     match target.status {
-        SetupStatus::Ok => format!("{commands} completed"),
-        SetupStatus::Planned => format!("{commands} would run"),
-        SetupStatus::Skipped => format!("{commands} skipped"),
-        SetupStatus::Error => format!("{commands} attempted"),
+        SetupStatus::Ok => format!("{work} completed"),
+        SetupStatus::Planned => format!("{work} would update"),
+        SetupStatus::Skipped => format!("{work} skipped"),
+        SetupStatus::Error => format!("{work} attempted"),
     }
 }
 
@@ -1481,8 +1833,14 @@ fn append_target_details(target: &McpTargetReport, output: &CliOutput, lines: &m
         || target.status == SetupStatus::Planned
         || target.status == SetupStatus::Error
         || !target.warnings.is_empty();
+    let show_config_files = !target.config_files.is_empty()
+        && (output.verbose
+            || target.status == SetupStatus::Ok
+            || target.status == SetupStatus::Planned
+            || target.status == SetupStatus::Error);
     let show_command_output = output.verbose && !target.command_results.is_empty();
     if !show_commands
+        && !show_config_files
         && !show_command_output
         && target.manual_snippet.is_none()
         && target.warnings.is_empty()
@@ -1498,6 +1856,21 @@ fn append_target_details(target: &McpTargetReport, output: &CliOutput, lines: &m
     if show_commands {
         for command in &target.commands {
             lines.push(format!("  $ {}", command.display()));
+        }
+    }
+    if show_config_files {
+        for config_file in &target.config_files {
+            if let Some(error) = &config_file.error {
+                lines.push(format!(
+                    "  file: {} ({}, {error})",
+                    config_file.path, config_file.action
+                ));
+            } else {
+                lines.push(format!(
+                    "  file: {} ({})",
+                    config_file.path, config_file.action
+                ));
+            }
         }
     }
     if let Some(snippet) = &target.manual_snippet {
@@ -1538,6 +1911,7 @@ impl SetupMcpTarget {
             SetupMcpTarget::Codex => "Codex",
             SetupMcpTarget::Hermes => "Hermes",
             SetupMcpTarget::KimiCli => "Kimi CLI",
+            SetupMcpTarget::OpenCode => "OpenCode",
             SetupMcpTarget::Cursor => "Cursor",
             SetupMcpTarget::PiCodingAgent => "Pi Coding Agent",
         }
@@ -1547,18 +1921,52 @@ impl SetupMcpTarget {
         match self {
             SetupMcpTarget::ClaudeCode | SetupMcpTarget::Codex => "plugin",
             SetupMcpTarget::Hermes | SetupMcpTarget::KimiCli => "MCP",
-            SetupMcpTarget::Cursor | SetupMcpTarget::PiCodingAgent => "manual",
+            SetupMcpTarget::OpenCode | SetupMcpTarget::Cursor => "MCP config",
+            SetupMcpTarget::PiCodingAgent => "MCP extension",
         }
     }
 
-    fn program(self) -> &'static str {
+    fn is_available_for_setup(self, runner: &dyn CommandRunner) -> bool {
+        if self
+            .program_candidates()
+            .iter()
+            .any(|program| runner.command_exists(program))
+        {
+            return true;
+        }
+        self.default_probe_paths().iter().any(|path| path.exists())
+    }
+
+    fn program_candidates(self) -> &'static [&'static str] {
         match self {
-            SetupMcpTarget::ClaudeCode => "claude",
-            SetupMcpTarget::Codex => "codex",
-            SetupMcpTarget::Hermes => "hermes",
-            SetupMcpTarget::KimiCli => "kimi",
-            SetupMcpTarget::Cursor => "cursor",
-            SetupMcpTarget::PiCodingAgent => "pi",
+            SetupMcpTarget::ClaudeCode => &["claude"],
+            SetupMcpTarget::Codex => &["codex"],
+            SetupMcpTarget::Hermes => &["hermes"],
+            SetupMcpTarget::KimiCli => &["kimi"],
+            SetupMcpTarget::OpenCode => &["opencode"],
+            SetupMcpTarget::Cursor => &["cursor", "cursor-agent"],
+            SetupMcpTarget::PiCodingAgent => &["pi"],
+        }
+    }
+
+    fn default_probe_paths(self) -> Vec<PathBuf> {
+        let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
+            return Vec::new();
+        };
+        match self {
+            SetupMcpTarget::OpenCode => vec![
+                home.join(".config").join("opencode"),
+                home.join(".local").join("share").join("opencode"),
+            ],
+            SetupMcpTarget::Cursor => vec![
+                home.join(".cursor"),
+                home.join("Library")
+                    .join("Application Support")
+                    .join("Cursor"),
+                home.join(".config").join("Cursor"),
+            ],
+            SetupMcpTarget::PiCodingAgent => vec![home.join(".pi").join("agent")],
+            _ => Vec::new(),
         }
     }
 }
@@ -1915,6 +2323,177 @@ mod tests {
     }
 
     #[test]
+    fn cursor_config_write_merges_global_mcp_json() {
+        let home = temp_path("cursor-home");
+        let cursor_dir = home.join(".cursor");
+        fs::create_dir_all(&cursor_dir).expect("create cursor dir");
+        let path = cursor_dir.join("mcp.json");
+        fs::write(
+            &path,
+            r#"{"mcpServers":{"other":{"command":"node"}},"enabled":true}"#,
+        )
+        .expect("write existing cursor config");
+
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/config.toml"),
+            source: ConfigTargetSource::HomeDefault,
+        };
+        let write = McpConfigWrite::cursor(&home, &target);
+        let report = apply_mcp_config_write(&write).expect("write cursor config");
+        assert_eq!(report.action, "updated");
+
+        let value: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read cursor config"))
+                .expect("cursor config json");
+        assert_eq!(value["enabled"], true);
+        assert_eq!(value["mcpServers"]["other"]["command"], "node");
+        assert_eq!(value["mcpServers"]["moraine"]["type"], "stdio");
+        assert_eq!(value["mcpServers"]["moraine"]["command"], "moraine");
+        assert_eq!(
+            value["mcpServers"]["moraine"]["args"],
+            serde_json::json!(["run", "mcp"])
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("cursor metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn opencode_config_write_merges_global_config_with_custom_moraine_config() {
+        let home = temp_path("opencode-home");
+        let opencode_dir = home.join(".config").join("opencode");
+        fs::create_dir_all(&opencode_dir).expect("create opencode dir");
+        let path = opencode_dir.join("opencode.json");
+        fs::write(
+            &path,
+            r#"{"theme":"system","mcp":{"other":{"type":"local","command":["node","server.js"]}}}"#,
+        )
+        .expect("write existing opencode config");
+
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/custom.toml"),
+            source: ConfigTargetSource::Cli,
+        };
+        let write = McpConfigWrite::opencode(&home, &target);
+        apply_mcp_config_write(&write).expect("write opencode config");
+
+        let value: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read opencode config"))
+                .expect("opencode config json");
+        assert_eq!(value["theme"], "system");
+        assert_eq!(value["$schema"], "https://opencode.ai/config.json");
+        assert_eq!(value["mcp"]["other"]["type"], "local");
+        assert_eq!(value["mcp"]["moraine"]["type"], "local");
+        assert_eq!(value["mcp"]["moraine"]["enabled"], true);
+        assert_eq!(
+            value["mcp"]["moraine"]["command"],
+            serde_json::json!(["moraine", "run", "mcp", "--config", "/tmp/custom.toml"])
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn pi_plan_installs_extension_then_writes_config() {
+        let home = temp_path("pi-home");
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/config.toml"),
+            source: ConfigTargetSource::HomeDefault,
+        };
+        let plan = McpPlan::for_target_with_home(
+            SetupMcpTarget::PiCodingAgent,
+            &target,
+            Some(home.clone()),
+        );
+        assert_eq!(plan.action, McpAction::WriteConfig);
+        let commands = plan.commands();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].program, "pi");
+        assert_eq!(commands[0].args, vec!["install", "npm:pi-mcp-extension"]);
+
+        let mut runner =
+            FakeRunner::default()
+                .with_existing("pi")
+                .with_response(commands[0].clone(), true, "");
+        let report = execute_mcp_plan(plan, &mut runner).expect("execute pi plan");
+        assert_eq!(report.status, SetupStatus::Ok);
+        assert_eq!(runner.ran, commands);
+        assert_eq!(report.config_files.len(), 1);
+
+        let path = home.join(".pi").join("agent").join("mcp.json");
+        let value: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read pi config"))
+                .expect("pi config json");
+        assert_eq!(value["mcpServers"]["moraine"]["transport"], "stdio");
+        assert_eq!(value["mcpServers"]["moraine"]["command"], "moraine");
+        assert_eq!(
+            value["mcpServers"]["moraine"]["args"],
+            serde_json::json!(["run", "mcp"])
+        );
+        assert_eq!(value["mcpServers"]["moraine"]["lifecycle"], "eager");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn invalid_json_config_write_reports_error() {
+        let home = temp_path("bad-cursor-home");
+        let cursor_dir = home.join(".cursor");
+        fs::create_dir_all(&cursor_dir).expect("create cursor dir");
+        let path = cursor_dir.join("mcp.json");
+        fs::write(&path, "not json").expect("write bad cursor config");
+
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/config.toml"),
+            source: ConfigTargetSource::HomeDefault,
+        };
+        let plan =
+            McpPlan::for_target_with_home(SetupMcpTarget::Cursor, &target, Some(home.clone()));
+        let mut runner = FakeRunner::default();
+        let report = execute_mcp_plan(plan, &mut runner).expect("execute cursor plan");
+        assert_eq!(report.status, SetupStatus::Error);
+        assert!(report
+            .error
+            .as_deref()
+            .expect("error")
+            .contains("not valid JSON"));
+        assert_eq!(report.config_files.len(), 1);
+        assert_eq!(report.config_files[0].action, "error");
+        assert!(runner.ran.is_empty());
+        assert_eq!(
+            fs::read_to_string(&path).expect("bad config content"),
+            "not json"
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn dry_run_reports_planned_config_file_without_writing() {
+        let home = temp_path("cursor-dry-run");
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/config.toml"),
+            source: ConfigTargetSource::HomeDefault,
+        };
+        let plan =
+            McpPlan::for_target_with_home(SetupMcpTarget::Cursor, &target, Some(home.clone()));
+        let report = McpTargetReport::planned(plan);
+        assert_eq!(report.status, SetupStatus::Planned);
+        assert_eq!(report.action, McpAction::WriteConfig);
+        assert_eq!(report.config_files.len(), 1);
+        assert_eq!(report.config_files[0].action, "would_update");
+        assert_eq!(
+            report.config_files[0].path,
+            home.join(".cursor").join("mcp.json").display().to_string()
+        );
+        assert!(!home.exists());
+    }
+
+    #[test]
     fn hermes_add_accepts_tool_enable_prompt() {
         let target = ConfigTarget {
             path: PathBuf::from("/tmp/config.toml"),
@@ -2093,6 +2672,7 @@ mod tests {
                 action: McpAction::Execute,
                 status: SetupStatus::Ok,
                 commands: vec![command.clone()],
+                config_files: Vec::new(),
                 manual_snippet: None,
                 skipped_reason: None,
                 warnings: Vec::new(),

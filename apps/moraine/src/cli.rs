@@ -139,6 +139,9 @@ pub(crate) enum SetupMcpTarget {
     Codex,
     Hermes,
     KimiCli,
+    #[serde(rename = "opencode")]
+    #[value(name = "opencode")]
+    OpenCode,
     Cursor,
     PiCodingAgent,
 }
@@ -201,6 +204,12 @@ mod tests {
             "--mcp-target",
             "codex",
             "--mcp-target",
+            "opencode",
+            "--mcp-target",
+            "cursor",
+            "--mcp-target",
+            "pi-coding-agent",
+            "--mcp-target",
             "claude-code",
         ]);
         match cli.command {
@@ -209,7 +218,13 @@ mod tests {
                 assert!(setup.dry_run);
                 assert_eq!(
                     setup.mcp_targets,
-                    vec![SetupMcpTarget::Codex, SetupMcpTarget::ClaudeCode]
+                    vec![
+                        SetupMcpTarget::Codex,
+                        SetupMcpTarget::OpenCode,
+                        SetupMcpTarget::Cursor,
+                        SetupMcpTarget::PiCodingAgent,
+                        SetupMcpTarget::ClaudeCode,
+                    ]
                 );
             }
             _ => panic!("expected setup command"),

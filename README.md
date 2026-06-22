@@ -60,17 +60,16 @@ The monitor UI runs at `http://127.0.0.1:8080` by default.
 For release bundles, upgrades, project-scoped setup, and other harnesses, see the
 [Quickstart and Installation](https://eric-tramel.github.io/moraine/quickstart.html).
 
-## Connect Claude Code or Codex
+## Connect Agent Harnesses
 
-Use `moraine setup` to install or update the Moraine plugin for Claude Code and
-Codex. The same guided selector can also register Moraine MCP for other detected
-harnesses. The plugins register the MCP search server and bundle guidance for
-searching prior sessions, but they still use the `moraine` CLI on your `PATH`
-and the running local stack.
+Use `moraine setup` to install or update the Moraine plugins for Claude Code and
+Codex, or to register Moraine MCP for supported harnesses such as OpenCode,
+Cursor, Hermes, Kimi CLI, and Pi Coding Agent. The integrations use the
+`moraine` CLI on your `PATH` and the running local stack.
 
-Start a new agent session after installing the plugin. Claude Code sessions get
-the `moraine:session-search` and `moraine:realtime-peek` skills, and Moraine MCP
-tools are exposed as `mcp__plugin_moraine_moraine__*`. Then ask:
+Start a new agent session after installing an integration. Claude Code sessions
+get the `moraine:session-search` and `moraine:realtime-peek` skills, and Moraine
+MCP tools are exposed as `mcp__plugin_moraine_moraine__*`. Then ask:
 
 ```text
 What are my agents doing right now?
