@@ -2348,6 +2348,8 @@ mod tests {
     use super::*;
     use crate::render::OutputMode;
     use std::collections::{BTreeMap, BTreeSet};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use toml_edit::value as toml_value;
 
     #[derive(Default)]
@@ -2408,6 +2410,32 @@ mod tests {
             std::process::id(),
             timestamp_suffix()
         ))
+    }
+
+    fn repo_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("repo root")
+            .to_path_buf()
+    }
+
+    fn shared_plugin_mcp_config() -> Value {
+        let shared_mcp_path = repo_root()
+            .join("plugins")
+            .join("moraine")
+            .join(".mcp.json");
+        serde_json::from_str(
+            &fs::read_to_string(&shared_mcp_path).expect("read shared plugin mcp config"),
+        )
+        .expect("shared plugin mcp json")
+    }
+
+    fn shared_plugin_launcher() -> String {
+        shared_plugin_mcp_config()["mcpServers"]["moraine"]["args"][2]
+            .as_str()
+            .expect("shared inline launcher script")
+            .to_string()
     }
 
     fn plain_output() -> CliOutput {
@@ -2906,6 +2934,137 @@ watch_root = "~/custom"
             commands[2].args,
             vec!["mcp", "remove", "moraine", "--scope", "user"]
         );
+    }
+
+    #[test]
+    fn plugin_mcp_configs_are_client_specific() {
+        let repo_root = repo_root();
+
+        let shared_mcp = shared_plugin_mcp_config();
+        let shared_server = shared_mcp["mcpServers"]["moraine"]
+            .as_object()
+            .expect("shared moraine server object");
+        assert_eq!(
+            shared_server.get("command"),
+            Some(&serde_json::json!("/bin/sh"))
+        );
+        assert!(shared_server.get("cwd").is_none());
+        let shared_args = shared_server["args"].as_array().expect("shared args array");
+        assert_eq!(shared_args.first(), Some(&serde_json::json!("-eu")));
+        let shared_launcher = shared_args
+            .get(2)
+            .and_then(Value::as_str)
+            .expect("shared inline launcher script");
+        assert!(shared_launcher.contains("moraine plugin launch error: binary_untrusted"));
+        assert!(shared_launcher.contains("exec \"$moraine_bin\" run mcp"));
+        assert!(!shared_launcher.contains("scripts/launch.sh"));
+
+        let codex_manifest_path = repo_root
+            .join("plugins")
+            .join("moraine")
+            .join(".codex-plugin")
+            .join("plugin.json");
+        let codex_manifest: Value = serde_json::from_str(
+            &fs::read_to_string(&codex_manifest_path).expect("read codex plugin manifest"),
+        )
+        .expect("codex plugin manifest json");
+        assert_eq!(codex_manifest["mcpServers"], "./.mcp.json");
+
+        let claude_manifest_path = repo_root
+            .join("plugins")
+            .join("moraine")
+            .join(".claude-plugin")
+            .join("plugin.json");
+        let claude_manifest: Value = serde_json::from_str(
+            &fs::read_to_string(&claude_manifest_path).expect("read claude plugin manifest"),
+        )
+        .expect("claude plugin manifest json");
+        assert_eq!(claude_manifest["mcpServers"], "./.claude-mcp.json");
+
+        let claude_mcp_path = repo_root
+            .join("plugins")
+            .join("moraine")
+            .join(".claude-mcp.json");
+        let claude_mcp: Value = serde_json::from_str(
+            &fs::read_to_string(&claude_mcp_path).expect("read claude plugin mcp config"),
+        )
+        .expect("claude plugin mcp json");
+        assert_eq!(
+            claude_mcp["mcpServers"]["moraine"]["command"],
+            "${CLAUDE_PLUGIN_ROOT}/scripts/launch.sh"
+        );
+        assert_eq!(
+            claude_mcp["mcpServers"]["moraine"]["args"],
+            serde_json::json!([])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_plugin_launcher_rejects_relative_path_moraine() {
+        let dir = temp_path("relative-path-launcher");
+        let rel_bin = dir.join("rel-bin");
+        fs::create_dir_all(&rel_bin).expect("create relative bin dir");
+        let fake_moraine = rel_bin.join("moraine");
+        fs::write(&fake_moraine, "#!/bin/sh\nexit 99\n").expect("write fake moraine");
+        let mut permissions = fs::metadata(&fake_moraine)
+            .expect("fake metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_moraine, permissions).expect("chmod fake moraine");
+
+        let output = Command::new("/bin/sh")
+            .arg("-eu")
+            .arg("-c")
+            .arg(shared_plugin_launcher())
+            .current_dir(&dir)
+            .env("PATH", "rel-bin")
+            .output()
+            .expect("run shared plugin launcher");
+
+        assert_eq!(output.status.code(), Some(126));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("binary_untrusted"));
+        assert!(stderr.contains("relative PATH entry"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_plugin_launcher_execs_trusted_absolute_moraine() {
+        let dir = temp_path("trusted-launcher");
+        let project = dir.join("project");
+        let bin = dir.join("bin");
+        fs::create_dir_all(&project).expect("create project dir");
+        fs::create_dir_all(&bin).expect("create bin dir");
+        let fake_moraine = bin.join("moraine");
+        fs::write(
+            &fake_moraine,
+            "#!/bin/sh\nprintf 'fake-moraine:%s:%s\\n' \"$1\" \"$2\"\n",
+        )
+        .expect("write fake moraine");
+        let mut permissions = fs::metadata(&fake_moraine)
+            .expect("fake metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_moraine, permissions).expect("chmod fake moraine");
+
+        let output = Command::new("/bin/sh")
+            .arg("-eu")
+            .arg("-c")
+            .arg(shared_plugin_launcher())
+            .current_dir(&project)
+            .env("PATH", &bin)
+            .output()
+            .expect("run shared plugin launcher");
+
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "fake-moraine:run:mcp\n"
+        );
+        assert!(output.stderr.is_empty());
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

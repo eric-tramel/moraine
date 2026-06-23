@@ -18,5 +18,5 @@
     "session-search",
     "realtime-agents"
   ],
-  "mcpServers": "./.mcp.json"
+  "mcpServers": "./.claude-mcp.json"
 }
