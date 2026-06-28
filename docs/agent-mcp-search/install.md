@@ -30,10 +30,10 @@ wiring.
 ## Claude Code plugin marketplace (recommended)
 
 For Claude Code, the recommended user-scoped setup is the Moraine plugin. The
-plugin registers the MCP server and bundles Moraine search skills, but it does
-not install Moraine itself and it does not start ClickHouse, ingest, or the
-monitor. Install the CLI first, or upgrade it if Moraine is already installed.
-Then start the stack:
+plugin registers the MCP server and bundles Moraine search, realtime, and
+bug-report skills, but it does not install Moraine itself and it does not start
+ClickHouse, ingest, or the monitor. Install the CLI first, or upgrade it if
+Moraine is already installed. Then start the stack:
 
 ```bash
 uv tool install moraine-cli
@@ -79,8 +79,9 @@ Manual Claude MCP registration remains useful for project-scoped setup,
 ## Codex plugin marketplace (recommended)
 
 For Codex, the recommended user-scoped setup is the Moraine plugin. The plugin
-registers the MCP server and bundles Moraine search skills, but it does not
-install Moraine itself and it does not start ClickHouse, ingest, or the monitor.
+registers the MCP server and bundles Moraine search, realtime, and bug-report
+skills, but it does not install Moraine itself and it does not start ClickHouse,
+ingest, or the monitor.
 Install or upgrade the CLI first, then start the stack:
 
 ```bash
@@ -237,10 +238,11 @@ may ask you to approve project-scoped MCP servers before it uses them.
 
 For Hermes, the recommended user-scoped setup is `moraine setup`, which installs
 and enables the Moraine Hermes plugin, then asks the plugin to register MCP for
-the active Hermes profile. The plugin registers plugin-scoped Moraine search
-skills, injects compact guidance when the user asks about prior or active agent
-sessions, and adds setup/doctor commands. It still uses the `moraine` CLI on
-`PATH` and the running local stack.
+the active Hermes profile. The plugin registers plugin-scoped Moraine search,
+realtime, and bug-report skills, injects compact guidance when the user asks
+about prior or active agent sessions or Moraine bug reports, and adds
+setup/doctor commands. It still uses the `moraine` CLI on `PATH` and the running
+local stack.
 
 ```bash
 moraine setup --mcp-target hermes

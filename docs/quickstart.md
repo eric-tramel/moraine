@@ -112,12 +112,13 @@ Preview those changes without touching host agent config:
 moraine setup --dry-run --mcp-target claude-code --mcp-target codex --mcp-target hermes --mcp-target opencode --mcp-target cursor --mcp-target pi-coding-agent
 ```
 
-The Claude Code, Codex, and Hermes plugins bundle Moraine search guidance.
-`moraine setup` installs those plugins for default user-scoped setup, and
-registers MCP directly or writes global MCP config for supported harnesses such
-as Kimi CLI, OpenCode, Cursor, and Pi Coding Agent. These user-scoped
-integrations can search the host-wide Moraine history visible to your user, so
-enable them only in trusted harness environments.
+The Claude Code, Codex, and Hermes plugins bundle Moraine search, realtime, and
+sanitized bug-report guidance. `moraine setup` installs those plugins for
+default user-scoped setup, and registers MCP directly or writes global MCP
+config for supported harnesses such as Kimi CLI, OpenCode, Cursor, and Pi
+Coding Agent. These user-scoped integrations can search the host-wide Moraine
+history visible to your user, so enable them only in trusted harness
+environments.
 
 The same Codex marketplace also contains the contributor-only `moraine-dev`
 plugin for Moraine maintainers; end users should install `moraine@moraine`.

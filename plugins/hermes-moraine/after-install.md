@@ -24,5 +24,6 @@ Start a new Hermes session after setup. Ask:
 What are my agents doing right now?
 ```
 
-The plugin adds Moraine guidance and diagnostics, but the search tools still
-come from the MCP server launched as `moraine run mcp`.
+The plugin adds Moraine guidance, sanitized bug-report help, and diagnostics,
+but the search tools still come from the MCP server launched as
+`moraine run mcp`.

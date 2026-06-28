@@ -14,9 +14,11 @@ hermes moraine doctor
 
 What it adds:
 
-- `moraine:session-search` and `moraine:realtime-peek` plugin skills.
+- `moraine:session-search`, `moraine:realtime-peek`, and
+  `moraine:bug-report` plugin skills.
 - A compact context hook that reminds Hermes how to use Moraine when a turn
-  asks about prior sessions, active agents, or agent history.
+  asks about prior sessions, active agents, agent history, or Moraine bug
+  reports.
 - `moraine_doctor`, a read-only tool for checking Moraine/Hermes wiring.
 - `hermes moraine status`, `hermes moraine doctor`, and `hermes moraine setup`.
 
