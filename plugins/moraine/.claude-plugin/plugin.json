@@ -19,5 +19,5 @@
     "realtime-agents",
     "bug-report"
   ],
-  "mcpServers": "./.mcp.json"
+  "mcpServers": "./.claude-mcp.json"
 }

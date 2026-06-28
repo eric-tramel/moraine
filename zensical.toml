@@ -14,6 +14,7 @@ nav = [
   { "Quickstart and Installation" = "quickstart.md" },
   { "Configuration" = "configuration.md" },
   { "Remote ClickHouse" = "remote-clickhouse.md" },
+  { "Analytics Export" = "export.md" },
   { "Agent MCP Search" = [
     { "Overview" = "agent-mcp-search/index.md" },
     { "Install by Harness" = "agent-mcp-search/install.md" },

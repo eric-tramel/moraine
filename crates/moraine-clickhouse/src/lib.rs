@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use moraine_config::ClickHouseConfig;
 use reqwest::{
     header::{CONTENT_LENGTH, CONTENT_TYPE},
-    Client, Url,
+    Client, RequestBuilder, Url,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -16,6 +16,30 @@ use std::time::Duration;
 pub struct ClickHouseClient {
     cfg: ClickHouseConfig,
     http: Client,
+}
+
+#[derive(Debug)]
+pub struct ClickHouseByteStream {
+    response: reqwest::Response,
+}
+
+impl ClickHouseByteStream {
+    pub async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
+        let chunk = self
+            .response
+            .chunk()
+            .await
+            .context("failed to read clickhouse response chunk")?;
+        Ok(chunk.map(|bytes| bytes.to_vec()))
+    }
+}
+
+struct ClickHouseRequestOptions<'a> {
+    database: Option<&'a str>,
+    async_insert: bool,
+    default_format: Option<&'a str>,
+    params: &'a [(&'a str, &'a str)],
+    request_timeout: Option<Duration>,
 }
 
 #[derive(Deserialize)]
@@ -77,6 +101,70 @@ impl ClickHouseClient {
         Url::parse(&self.cfg.url).context("invalid ClickHouse URL")
     }
 
+    fn request_builder(
+        &self,
+        query: &str,
+        body: Vec<u8>,
+        options: ClickHouseRequestOptions<'_>,
+    ) -> Result<RequestBuilder> {
+        let mut url = self.base_url()?;
+        {
+            let mut qp = url.query_pairs_mut();
+            qp.append_pair("query", query);
+            if let Some(database) = options.database {
+                qp.append_pair("database", database);
+            }
+            if let Some(default_format) = options.default_format {
+                qp.append_pair("default_format", default_format);
+            }
+            if options.async_insert && self.cfg.async_insert {
+                qp.append_pair("async_insert", "1");
+                if self.cfg.wait_for_async_insert {
+                    qp.append_pair("wait_for_async_insert", "1");
+                }
+            }
+            for (key, value) in options.params {
+                qp.append_pair(key, value);
+            }
+        }
+
+        // ClickHouse HTTP treats GET as readonly, so use POST for both reads and writes.
+        let payload_len = body.len();
+        let mut req = self
+            .http
+            .post(url)
+            .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+            // Some ClickHouse builds require an explicit Content-Length on POST.
+            .header(CONTENT_LENGTH, payload_len)
+            .body(body);
+
+        if let Some(timeout) = options.request_timeout {
+            req = req.timeout(timeout);
+        }
+
+        if !self.cfg.username.is_empty() {
+            req = req.basic_auth(self.cfg.username.clone(), Some(self.cfg.password.clone()));
+        }
+
+        Ok(req)
+    }
+
+    async fn send_checked_response(&self, req: RequestBuilder) -> Result<reqwest::Response> {
+        let response = req.send().await.context("clickhouse request failed")?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.with_context(|| {
+                format!(
+                    "failed to read clickhouse response body (status {})",
+                    status
+                )
+            })?;
+            return Err(anyhow!("clickhouse returned {}: {}", status, text));
+        }
+
+        Ok(response)
+    }
+
     pub async fn request_text(
         &self,
         query: &str,
@@ -98,44 +186,18 @@ impl ClickHouseClient {
         default_format: Option<&str>,
         params: &[(&str, &str)],
     ) -> Result<String> {
-        let mut url = self.base_url()?;
-        {
-            let mut qp = url.query_pairs_mut();
-            qp.append_pair("query", query);
-            if let Some(database) = database {
-                qp.append_pair("database", database);
-            }
-            if let Some(default_format) = default_format {
-                qp.append_pair("default_format", default_format);
-            }
-            if async_insert && self.cfg.async_insert {
-                qp.append_pair("async_insert", "1");
-                if self.cfg.wait_for_async_insert {
-                    qp.append_pair("wait_for_async_insert", "1");
-                }
-            }
-            for (key, value) in params {
-                qp.append_pair(key, value);
-            }
-        }
-
-        // ClickHouse HTTP treats GET as readonly, so use POST for both reads and writes.
-        let payload = body.unwrap_or_default();
-        let payload_len = payload.len();
-
-        let mut req = self
-            .http
-            .post(url)
-            .header(CONTENT_TYPE, "text/plain; charset=utf-8")
-            // Some ClickHouse builds require an explicit Content-Length on POST.
-            .header(CONTENT_LENGTH, payload_len)
-            .body(payload);
-
-        if !self.cfg.username.is_empty() {
-            req = req.basic_auth(self.cfg.username.clone(), Some(self.cfg.password.clone()));
-        }
-
-        let response = req.send().await.context("clickhouse request failed")?;
+        let req = self.request_builder(
+            query,
+            body.unwrap_or_default(),
+            ClickHouseRequestOptions {
+                database,
+                async_insert,
+                default_format,
+                params,
+                request_timeout: None,
+            },
+        )?;
+        let response = self.send_checked_response(req).await?;
         let status = response.status();
         let text = response.text().await.with_context(|| {
             format!(
@@ -144,11 +206,31 @@ impl ClickHouseClient {
             )
         })?;
 
-        if !status.is_success() {
-            return Err(anyhow!("clickhouse returned {}: {}", status, text));
-        }
-
         Ok(text)
+    }
+
+    pub async fn request_stream_with_params(
+        &self,
+        query: &str,
+        database: Option<&str>,
+        default_format: Option<&str>,
+        params: &[(&str, &str)],
+        request_timeout: Option<Duration>,
+    ) -> Result<ClickHouseByteStream> {
+        let req = self.request_builder(
+            query,
+            Vec::new(),
+            ClickHouseRequestOptions {
+                database,
+                async_insert: false,
+                default_format,
+                params,
+                request_timeout,
+            },
+        )?;
+        let response = self.send_checked_response(req).await?;
+
+        Ok(ClickHouseByteStream { response })
     }
 
     pub async fn ping(&self) -> Result<()> {
@@ -942,6 +1024,50 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct StreamCaptureState {
+        params: Arc<Mutex<Vec<HashMap<String, String>>>>,
+        content_lengths: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    async fn spawn_stream_capture_server(state: StreamCaptureState) -> String {
+        async fn handler(
+            State(state): State<StreamCaptureState>,
+            Query(params): Query<HashMap<String, String>>,
+            headers: HeaderMap,
+        ) -> (StatusCode, &'static str) {
+            state
+                .params
+                .lock()
+                .expect("stream params mutex poisoned")
+                .push(params);
+            state
+                .content_lengths
+                .lock()
+                .expect("stream headers mutex poisoned")
+                .push(
+                    headers
+                        .get("content-length")
+                        .and_then(|value| value.to_str().ok())
+                        .map(ToString::to_string),
+                );
+
+            (StatusCode::OK, "{\"value\":1}\n{\"value\":2}\n")
+        }
+
+        let app = Router::new().route("/", post(handler)).with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stream capture listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        format!("http://{}", addr)
+    }
+
+    #[derive(Clone)]
     struct SkewMockState {
         ledger_exists: bool,
         versions: Vec<String>,
@@ -1451,6 +1577,84 @@ mod tests {
             lengths.iter().all(|len| *len < MAX_INSERT_PAYLOAD_BYTES),
             "each captured payload should stay below the byte cap: {lengths:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn request_stream_with_params_sends_read_settings_and_streams_chunks() {
+        let params = Arc::new(Mutex::new(Vec::<HashMap<String, String>>::new()));
+        let content_lengths = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let base_url = spawn_stream_capture_server(StreamCaptureState {
+            params: params.clone(),
+            content_lengths: content_lengths.clone(),
+        })
+        .await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+
+        let mut stream = client
+            .request_stream_with_params(
+                "SELECT value FROM events FORMAT JSONEachRow",
+                Some("moraine"),
+                None,
+                &[
+                    ("query_id", "qid-test"),
+                    ("readonly", "1"),
+                    ("max_execution_time", "600"),
+                ],
+                Some(Duration::from_secs(630)),
+            )
+            .await
+            .expect("stream request");
+
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next_chunk().await.expect("chunk") {
+            body.extend_from_slice(&chunk);
+        }
+
+        assert_eq!(
+            String::from_utf8(body).expect("utf8"),
+            "{\"value\":1}\n{\"value\":2}\n"
+        );
+
+        let params = params.lock().expect("stream params mutex poisoned");
+        assert_eq!(params.len(), 1);
+        assert_eq!(
+            params[0].get("query").map(String::as_str),
+            Some("SELECT value FROM events FORMAT JSONEachRow")
+        );
+        assert_eq!(
+            params[0].get("database").map(String::as_str),
+            Some("moraine")
+        );
+        assert_eq!(
+            params[0].get("query_id").map(String::as_str),
+            Some("qid-test")
+        );
+        assert_eq!(params[0].get("readonly").map(String::as_str), Some("1"));
+        assert_eq!(
+            params[0].get("max_execution_time").map(String::as_str),
+            Some("600")
+        );
+
+        let content_lengths = content_lengths
+            .lock()
+            .expect("stream headers mutex poisoned");
+        assert_eq!(content_lengths.as_slice(), &[Some("0".to_string())]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn request_stream_with_params_includes_status_and_body_on_http_failure() {
+        let base_url = spawn_mock_server().await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+
+        let err = client
+            .request_stream_with_params("SELECT FAIL", None, None, &[], None)
+            .await
+            .expect_err("expected HTTP failure");
+
+        let msg = err.to_string();
+        assert!(msg.contains("clickhouse returned"));
+        assert!(msg.contains("500"));
+        assert!(msg.contains("boom"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

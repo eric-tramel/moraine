@@ -1,5 +1,7 @@
 mod down;
+mod export;
 mod logs;
+mod schema;
 mod setup;
 mod status;
 mod up;
@@ -10,7 +12,10 @@ use moraine_config::AppConfig;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use crate::cli::{Cli, CliCommand, ClickhouseCommand, ConfigCommand, DbCommand, RunArgs};
+use crate::cli::{
+    Cli, CliCommand, ClickhouseCommand, ConfigCommand, DbCommand, ExportCommand, OutputFormat,
+    RunArgs, SchemaCommand,
+};
 use crate::managed_clickhouse::{
     cmd_clickhouse_install, cmd_clickhouse_status, cmd_clickhouse_uninstall,
     run_foreground_clickhouse,
@@ -47,6 +52,23 @@ pub(crate) async fn dispatch(cli: Cli, output: CliOutput) -> Result<ExitCode> {
             render_logs(&output, &snapshot)?;
             Ok(ExitCode::SUCCESS)
         }
+        CliCommand::Export(args) => {
+            if cli.output != OutputFormat::Auto {
+                bail!(
+                    "moraine export always writes JSONL row data to stdout and metadata to stderr; use --format jsonl instead of global --output"
+                );
+            }
+            let (_, cfg) = load_cfg(cli.config.clone())?;
+            match args.command {
+                ExportCommand::Events(events) => export::events(&cfg, events).await,
+            }
+        }
+        CliCommand::Schema(args) => match args.command {
+            SchemaCommand::Analytics(analytics) => {
+                schema::render_analytics(&analytics)?;
+                Ok(ExitCode::SUCCESS)
+            }
+        },
         CliCommand::Db(args) => {
             let (_, cfg) = load_cfg(cli.config.clone())?;
             match args.command {
@@ -221,6 +243,16 @@ fn doctor_is_healthy(report: &DoctorReport) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::OutputMode;
+
+    fn plain_output() -> CliOutput {
+        CliOutput {
+            mode: OutputMode::Plain,
+            verbose: false,
+            unicode: false,
+            width: 100,
+        }
+    }
 
     #[test]
     fn parse_config_flag_preserves_inline_config_and_rest() {
@@ -261,5 +293,60 @@ mod tests {
         let cfg = AppConfig::default();
         let err = cmd_config_get(&cfg, "runtime.root_dir").expect_err("unknown key");
         assert!(err.to_string().contains("unsupported config key"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dispatch_rejects_global_output_for_export_before_loading_config() {
+        let cli = Cli {
+            config: Some(PathBuf::from("/definitely/missing/moraine.toml")),
+            output: OutputFormat::Json,
+            verbose: false,
+            command: CliCommand::Export(Box::new(crate::cli::ExportArgs {
+                command: ExportCommand::Events(crate::cli::ExportEventsArgs {
+                    format: crate::cli::ExportRowFormat::Jsonl,
+                    columns: None,
+                    include_sensitive: false,
+                    limit: None,
+                    all: true,
+                    since: None,
+                    until: None,
+                    session_id: Vec::new(),
+                    harness: Vec::new(),
+                    source_name: Vec::new(),
+                    project_id: Vec::new(),
+                    cwd_prefix: Vec::new(),
+                    worktree_root: Vec::new(),
+                    repo_rel_path: Vec::new(),
+                    event_kind: Vec::new(),
+                    payload_type: Vec::new(),
+                    actor_kind: Vec::new(),
+                    model_name: Vec::new(),
+                    tool_name: Vec::new(),
+                    tool_error_only: false,
+                }),
+            })),
+        };
+
+        let err = dispatch(cli, plain_output())
+            .await
+            .expect_err("export must reject explicit output");
+        assert!(err.to_string().contains("use --format"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dispatch_schema_analytics_is_config_free() {
+        let cli = Cli {
+            config: Some(PathBuf::from("/definitely/missing/moraine.toml")),
+            output: OutputFormat::Auto,
+            verbose: false,
+            command: CliCommand::Schema(crate::cli::SchemaArgs {
+                command: SchemaCommand::Analytics(crate::cli::SchemaAnalyticsArgs { json: true }),
+            }),
+        };
+
+        let code = dispatch(cli, plain_output())
+            .await
+            .expect("schema command should not load config");
+        assert_eq!(code, ExitCode::SUCCESS);
     }
 }

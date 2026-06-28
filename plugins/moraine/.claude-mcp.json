@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "moraine": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/scripts/launch.sh",
+      "args": []
+    }
+  }
+}

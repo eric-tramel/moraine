@@ -1140,6 +1140,7 @@ name = "moraine"
 version = "0.6.2"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "dialoguer",
  "jsonc-parser",
@@ -1152,6 +1153,7 @@ dependencies = [
  "sha2",
  "tokio",
  "toml_edit",
+ "uuid",
 ]
 
 [[package]]
