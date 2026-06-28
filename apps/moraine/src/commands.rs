@@ -55,7 +55,7 @@ pub(crate) async fn dispatch(cli: Cli, output: CliOutput) -> Result<ExitCode> {
         CliCommand::Export(args) => {
             if cli.output != OutputFormat::Auto {
                 bail!(
-                    "moraine export writes row data to stdout; use --format for export row format instead of global --output"
+                    "moraine export always writes JSONL row data to stdout and metadata to stderr; use --format jsonl instead of global --output"
                 );
             }
             let (_, cfg) = load_cfg(cli.config.clone())?;
@@ -303,14 +303,11 @@ mod tests {
             verbose: false,
             command: CliCommand::Export(Box::new(crate::cli::ExportArgs {
                 command: ExportCommand::Events(crate::cli::ExportEventsArgs {
-                    format: Some(crate::cli::ExportRowFormat::Jsonl),
+                    format: crate::cli::ExportRowFormat::Jsonl,
                     columns: None,
                     include_sensitive: false,
-                    metadata: crate::cli::ExportMetadataMode::Stderr,
-                    metadata_file: None,
                     limit: None,
                     all: true,
-                    max_execution_seconds: 600,
                     since: None,
                     until: None,
                     session_id: Vec::new(),

@@ -335,9 +335,9 @@
       "type": "string"
     },
     {
-      "default": true,
+      "default": false,
       "name": "text_preview",
-      "sensitive": false,
+      "sensitive": true,
       "source_expression": "e.text_preview",
       "type": "string"
     },
@@ -400,8 +400,7 @@
     "tool_phase",
     "tool_error",
     "model",
-    "project_id",
-    "text_preview"
+    "project_id"
   ],
   "export_kind": "events",
   "filters": [
@@ -514,12 +513,8 @@
   "formats": [
     "jsonl"
   ],
-  "metadata_modes": [
-    "stderr",
-    "none",
-    "file"
-  ],
   "metadata_schema_version": "moraine.analytics.export_metadata.v1",
+  "metadata_target": "stderr",
   "schema_version": "moraine.analytics.schema.v1",
   "scope": {
     "excluded": [
@@ -541,6 +536,7 @@
     "repo_rel_path",
     "worktree_root",
     "cwd",
+    "text_preview",
     "text_content",
     "payload_json",
     "token_usage_json"

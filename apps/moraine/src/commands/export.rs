@@ -5,9 +5,7 @@ use moraine_config::AppConfig;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::io::{ErrorKind, Write};
-use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -16,15 +14,15 @@ use super::schema::{
     all_non_sensitive_event_columns, default_event_columns, event_column, EventColumn,
     EVENTS_SCHEMA_VERSION, EXPORT_METADATA_SCHEMA_VERSION,
 };
-use crate::cli::{ExportEventsArgs, ExportMetadataMode, ExportRowFormat};
+use crate::cli::{ExportEventsArgs, ExportRowFormat};
 
 const EXPORT_KIND_EVENTS: &str = "events";
 const DEFAULT_BACKEND: &str = "default";
-const MAX_DISABLED_CLIENT_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
+const DEFAULT_MAX_EXECUTION_SECONDS: u64 = 600;
+const EXPORT_REQUEST_TIMEOUT_GRACE_SECONDS: u64 = 30;
 
 pub(crate) async fn events(cfg: &AppConfig, args: ExportEventsArgs) -> Result<ExitCode> {
     let prepared = prepare_export(cfg, args)?;
-    preflight_metadata_file(&prepared.metadata)?;
 
     let client = ClickHouseClient::new(cfg.clickhouse.clone())?;
     ensure_schema_ready(&client).await?;
@@ -41,10 +39,7 @@ pub(crate) async fn events(cfg: &AppConfig, args: ExportEventsArgs) -> Result<Ex
             Some(&cfg.clickhouse.database),
             None,
             &params,
-            Some(request_timeout(
-                cfg.clickhouse.timeout_seconds,
-                prepared.max_execution_seconds,
-            )),
+            Some(request_timeout(cfg.clickhouse.timeout_seconds)),
         )
         .await?;
 
@@ -74,7 +69,7 @@ pub(crate) async fn events(cfg: &AppConfig, args: ExportEventsArgs) -> Result<Ex
         elapsed_ms: started.elapsed().as_millis() as u64,
         sensitive_columns_requested: prepared.sensitive_columns_requested,
     };
-    write_completion_metadata(&prepared.metadata, &metadata)?;
+    write_completion_metadata(&metadata)?;
 
     Ok(ExitCode::SUCCESS)
 }
@@ -83,20 +78,11 @@ pub(crate) async fn events(cfg: &AppConfig, args: ExportEventsArgs) -> Result<Ex
 struct PreparedExport {
     columns: Vec<&'static EventColumn>,
     sensitive_columns_requested: Vec<String>,
-    metadata: MetadataTarget,
     limit: Option<usize>,
-    max_execution_seconds: u64,
     query_id: String,
     query_params: Vec<(String, String)>,
     query: String,
     filters_metadata: BTreeMap<String, Value>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum MetadataTarget {
-    Stderr,
-    None,
-    File(PathBuf),
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -123,9 +109,8 @@ struct CompletionMetadata<'a> {
 }
 
 fn prepare_export(cfg: &AppConfig, args: ExportEventsArgs) -> Result<PreparedExport> {
-    validate_format(args.format)?;
     validate_limit(args.limit)?;
-    let metadata = metadata_target(args.metadata, args.metadata_file.clone())?;
+    validate_format(args.format)?;
     let columns = select_columns(args.columns.as_deref(), args.include_sensitive)?;
     let sensitive_columns_requested = columns
         .iter()
@@ -139,14 +124,12 @@ fn prepare_export(cfg: &AppConfig, args: ExportEventsArgs) -> Result<PreparedExp
 
     let query_id = Uuid::new_v4().to_string();
     let query = build_events_query(&cfg.clickhouse.database, &columns, &filters, args.limit)?;
-    let query_params = build_query_params(&query_id, args.max_execution_seconds);
+    let query_params = build_query_params(&query_id);
 
     Ok(PreparedExport {
         columns,
         sensitive_columns_requested,
-        metadata,
         limit: args.limit,
-        max_execution_seconds: args.max_execution_seconds,
         query_id,
         query_params,
         query,
@@ -154,10 +137,9 @@ fn prepare_export(cfg: &AppConfig, args: ExportEventsArgs) -> Result<PreparedExp
     })
 }
 
-fn validate_format(format: Option<ExportRowFormat>) -> Result<()> {
+fn validate_format(format: ExportRowFormat) -> Result<()> {
     match format {
-        Some(ExportRowFormat::Jsonl) => Ok(()),
-        None => bail!("moraine export events requires --format jsonl"),
+        ExportRowFormat::Jsonl => Ok(()),
     }
 }
 
@@ -166,18 +148,6 @@ fn validate_limit(limit: Option<usize>) -> Result<()> {
         bail!("--limit must be a positive integer");
     }
     Ok(())
-}
-
-fn metadata_target(mode: ExportMetadataMode, path: Option<PathBuf>) -> Result<MetadataTarget> {
-    match (mode, path) {
-        (ExportMetadataMode::Stderr, None) => Ok(MetadataTarget::Stderr),
-        (ExportMetadataMode::None, None) => Ok(MetadataTarget::None),
-        (ExportMetadataMode::File, Some(path)) => Ok(MetadataTarget::File(path)),
-        (ExportMetadataMode::File, None) => {
-            bail!("--metadata file requires --metadata-file <path>")
-        }
-        (_, Some(_)) => bail!("--metadata-file requires --metadata file"),
-    }
 }
 
 fn select_columns(raw: Option<&str>, include_sensitive: bool) -> Result<Vec<&'static EventColumn>> {
@@ -222,27 +192,21 @@ fn select_columns(raw: Option<&str>, include_sensitive: bool) -> Result<Vec<&'st
     Ok(columns)
 }
 
-fn build_query_params(query_id: &str, max_execution_seconds: u64) -> Vec<(String, String)> {
-    let mut params = vec![
+fn build_query_params(query_id: &str) -> Vec<(String, String)> {
+    vec![
         ("query_id".to_string(), query_id.to_string()),
         ("readonly".to_string(), "1".to_string()),
-    ];
-    if max_execution_seconds > 0 {
-        params.push((
+        (
             "max_execution_time".to_string(),
-            max_execution_seconds.to_string(),
-        ));
-    }
-    params
+            DEFAULT_MAX_EXECUTION_SECONDS.to_string(),
+        ),
+    ]
 }
 
-fn request_timeout(config_timeout_seconds: f64, max_execution_seconds: u64) -> Duration {
+fn request_timeout(config_timeout_seconds: f64) -> Duration {
     let configured = config_timeout_seconds.max(1.0).ceil() as u64;
-    let seconds = if max_execution_seconds == 0 {
-        configured.max(MAX_DISABLED_CLIENT_TIMEOUT_SECONDS)
-    } else {
-        configured.max(max_execution_seconds.saturating_add(30))
-    };
+    let seconds = configured
+        .max(DEFAULT_MAX_EXECUTION_SECONDS.saturating_add(EXPORT_REQUEST_TIMEOUT_GRACE_SECONDS));
     Duration::from_secs(seconds)
 }
 
@@ -569,15 +533,15 @@ async fn stream_jsonl_rows<W: Write>(
     let mut result = StreamRowsResult::default();
 
     while let Some(chunk) = stream.next_chunk().await? {
-        for line in framer.push_chunk(&chunk) {
-            if process_export_line(&line, writer, columns, limit, &mut result)? {
-                return Ok(result);
-            }
+        if framer.push_chunk(&chunk, |line| {
+            process_export_line(line, writer, columns, limit, &mut result)
+        })? {
+            return Ok(result);
         }
     }
 
-    if let Some(line) = framer.finish() {
-        process_export_line(&line, writer, columns, limit, &mut result)?;
+    if framer.finish(|line| process_export_line(line, writer, columns, limit, &mut result))? {
+        return Ok(result);
     }
 
     if let Err(err) = writer.flush() {
@@ -602,15 +566,15 @@ fn stream_jsonl_chunks<W: Write>(
     let mut result = StreamRowsResult::default();
 
     for chunk in chunks {
-        for line in framer.push_chunk(chunk) {
-            if process_export_line(&line, writer, columns, limit, &mut result)? {
-                return Ok(result);
-            }
+        if framer.push_chunk(chunk, |line| {
+            process_export_line(line, writer, columns, limit, &mut result)
+        })? {
+            return Ok(result);
         }
     }
 
-    if let Some(line) = framer.finish() {
-        process_export_line(&line, writer, columns, limit, &mut result)?;
+    if framer.finish(|line| process_export_line(line, writer, columns, limit, &mut result))? {
+        return Ok(result);
     }
     writer.flush().context("failed to flush export writer")?;
 
@@ -705,56 +669,71 @@ struct LineFramer {
 }
 
 impl LineFramer {
-    fn push_chunk(&mut self, chunk: &[u8]) -> Vec<Vec<u8>> {
-        self.pending.extend_from_slice(chunk);
-        let mut lines = Vec::new();
-        while let Some(pos) = self.pending.iter().position(|byte| *byte == b'\n') {
-            let mut line = self.pending.drain(..=pos).collect::<Vec<u8>>();
-            if line.ends_with(b"\n") {
-                line.pop();
+    fn push_chunk<F>(&mut self, chunk: &[u8], mut on_line: F) -> Result<bool>
+    where
+        F: FnMut(&[u8]) -> Result<bool>,
+    {
+        let mut start = 0;
+
+        if !self.pending.is_empty() {
+            let Some(pos) = chunk.iter().position(|byte| *byte == b'\n') else {
+                self.pending.extend_from_slice(chunk);
+                return Ok(false);
+            };
+
+            self.pending.extend_from_slice(&chunk[..pos]);
+            if self.emit_pending(&mut on_line)? {
+                return Ok(true);
             }
-            if line.ends_with(b"\r") {
-                line.pop();
-            }
-            lines.push(line);
+            start = pos + 1;
         }
-        lines
+
+        while let Some(offset) = chunk[start..].iter().position(|byte| *byte == b'\n') {
+            let end = start + offset;
+            let line = trim_cr(&chunk[start..end]);
+            if on_line(line)? {
+                return Ok(true);
+            }
+            start = end + 1;
+        }
+
+        if start < chunk.len() {
+            self.pending.extend_from_slice(&chunk[start..]);
+        }
+        Ok(false)
     }
 
-    fn finish(mut self) -> Option<Vec<u8>> {
+    fn finish<F>(&mut self, mut on_line: F) -> Result<bool>
+    where
+        F: FnMut(&[u8]) -> Result<bool>,
+    {
         if self.pending.is_empty() {
-            None
-        } else {
-            Some(std::mem::take(&mut self.pending))
+            return Ok(false);
         }
+        self.emit_pending(&mut on_line)
+    }
+
+    fn emit_pending<F>(&mut self, on_line: &mut F) -> Result<bool>
+    where
+        F: FnMut(&[u8]) -> Result<bool>,
+    {
+        let stop = {
+            let line = trim_cr(&self.pending);
+            on_line(line)?
+        };
+        self.pending.clear();
+        Ok(stop)
     }
 }
 
-fn preflight_metadata_file(target: &MetadataTarget) -> Result<()> {
-    if let MetadataTarget::File(path) = target {
-        fs::File::create(path)
-            .with_context(|| format!("failed to preflight metadata file {}", path.display()))?;
-    }
-    Ok(())
+fn trim_cr(line: &[u8]) -> &[u8] {
+    line.strip_suffix(b"\r").unwrap_or(line)
 }
 
-fn write_completion_metadata(
-    target: &MetadataTarget,
-    metadata: &CompletionMetadata<'_>,
-) -> Result<()> {
-    match target {
-        MetadataTarget::Stderr => {
-            let mut stderr = std::io::stderr().lock();
-            write_completion_metadata_line(&mut stderr, metadata)
-                .context("failed to write export metadata to stderr")
-        }
-        MetadataTarget::None => Ok(()),
-        MetadataTarget::File(path) => {
-            let json = completion_metadata_json(metadata)?;
-            fs::write(path, format!("{json}\n"))
-                .with_context(|| format!("failed to write export metadata file {}", path.display()))
-        }
-    }
+fn write_completion_metadata(metadata: &CompletionMetadata<'_>) -> Result<()> {
+    let mut stderr = std::io::stderr().lock();
+    write_completion_metadata_line(&mut stderr, metadata)
+        .context("failed to write export metadata to stderr")
 }
 
 fn completion_metadata_json(metadata: &CompletionMetadata<'_>) -> Result<String> {
@@ -772,19 +751,16 @@ fn write_completion_metadata_line<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{ExportMetadataMode, ExportRowFormat};
+    use crate::cli::ExportRowFormat;
     use serde_json::json;
 
     fn base_args() -> ExportEventsArgs {
         ExportEventsArgs {
-            format: Some(ExportRowFormat::Jsonl),
+            format: ExportRowFormat::Jsonl,
             columns: None,
             include_sensitive: false,
-            metadata: ExportMetadataMode::Stderr,
-            metadata_file: None,
             limit: None,
             all: false,
-            max_execution_seconds: 600,
             since: None,
             until: None,
             session_id: Vec::new(),
@@ -811,10 +787,12 @@ mod tests {
             Some("session_id")
         );
         assert!(defaults.iter().all(|column| !column.sensitive));
+        assert!(defaults.iter().all(|column| column.name != "text_preview"));
 
         let all = select_columns(Some("all"), true).expect("all columns");
         assert!(all.iter().any(|column| column.name == "event_unix_ms"));
         assert!(all.iter().all(|column| !column.sensitive));
+        assert!(all.iter().all(|column| column.name != "text_preview"));
     }
 
     #[test]
@@ -943,14 +921,6 @@ mod tests {
     fn prepare_export_requires_format_filter_and_positive_limit() {
         let cfg = AppConfig::default();
         let mut args = base_args();
-        args.format = None;
-        args.all = true;
-        assert!(prepare_export(&cfg, args)
-            .expect_err("missing format")
-            .to_string()
-            .contains("--format jsonl"));
-
-        let mut args = base_args();
         args.all = true;
         args.limit = Some(0);
         assert!(prepare_export(&cfg, args)
@@ -966,25 +936,25 @@ mod tests {
     }
 
     #[test]
-    fn query_params_omit_max_execution_time_when_disabled() {
-        let params = build_query_params("qid", 0);
+    fn query_params_use_readonly_and_internal_execution_limit() {
+        let params = build_query_params("qid");
         assert_eq!(
             params,
             vec![
                 ("query_id".to_string(), "qid".to_string()),
                 ("readonly".to_string(), "1".to_string()),
+                (
+                    "max_execution_time".to_string(),
+                    DEFAULT_MAX_EXECUTION_SECONDS.to_string()
+                ),
             ]
         );
     }
 
     #[test]
-    fn request_timeout_outlives_clickhouse_execution_setting() {
-        assert_eq!(request_timeout(30.0, 600), Duration::from_secs(630));
-        assert_eq!(
-            request_timeout(30.0, 0),
-            Duration::from_secs(MAX_DISABLED_CLIENT_TIMEOUT_SECONDS)
-        );
-        assert_eq!(request_timeout(900.0, 600), Duration::from_secs(900));
+    fn request_timeout_outlives_internal_execution_setting() {
+        assert_eq!(request_timeout(30.0), Duration::from_secs(630));
+        assert_eq!(request_timeout(900.0), Duration::from_secs(900));
     }
 
     #[test]
@@ -1024,6 +994,31 @@ mod tests {
         assert!(rows.contains("\"tool_error\":false"));
         assert!(rows.contains("\"tool_error\":true"));
         assert!(!rows.contains("sentinel"));
+    }
+
+    #[test]
+    fn stream_chunks_frames_multiple_rows_from_one_chunk() {
+        let columns = select_columns(Some("event_uid,event_ts"), false).expect("columns");
+        let chunks = [br#"{"event_uid":"a","event_ts":1780317296789}
+{"event_uid":"b","event_ts":1780317296790}
+{"event_uid":"c","event_ts":1780317296791}
+"#
+        .as_slice()];
+        let mut out = Vec::new();
+        let result = stream_jsonl_chunks(&chunks, &mut out, &columns, None).expect("stream chunks");
+
+        assert_eq!(
+            result,
+            StreamRowsResult {
+                row_count: 3,
+                truncated: false,
+                broken_pipe: false,
+            }
+        );
+        let rows = String::from_utf8(out).expect("utf8");
+        assert!(rows.contains("\"event_uid\":\"a\""));
+        assert!(rows.contains("\"event_uid\":\"b\""));
+        assert!(rows.contains("\"event_uid\":\"c\""));
     }
 
     struct BrokenPipeWriter;
@@ -1078,17 +1073,6 @@ mod tests {
         }
     }
 
-    fn temp_metadata_path(label: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "moraine-export-{label}-{}-{nanos}.json",
-            std::process::id()
-        ))
-    }
-
     #[test]
     fn metadata_json_line_matches_stderr_payload() {
         let metadata = sample_metadata();
@@ -1107,31 +1091,5 @@ mod tests {
             Value::String("codex".to_string())
         );
         assert!(String::from_utf8(out).expect("utf8").ends_with('\n'));
-    }
-
-    #[test]
-    fn metadata_targets_write_file_and_allow_none() {
-        let metadata = sample_metadata();
-        let path = temp_metadata_path("target");
-        let target = MetadataTarget::File(path.clone());
-
-        preflight_metadata_file(&target).expect("metadata file preflight");
-        write_completion_metadata(&target, &metadata).expect("metadata file write");
-
-        let contents = fs::read_to_string(&path).expect("metadata file contents");
-        let value: Value = serde_json::from_str(contents.trim_end()).expect("metadata file json");
-        assert_eq!(value["query_id"], Value::String("qid-test".to_string()));
-        assert!(contents.ends_with('\n'));
-        let _ = fs::remove_file(path);
-
-        write_completion_metadata(&MetadataTarget::None, &metadata).expect("none metadata target");
-    }
-
-    #[test]
-    fn metadata_file_preflight_fails_for_missing_parent() {
-        let target = MetadataTarget::File(PathBuf::from(
-            "/definitely/missing/moraine-export-metadata.json",
-        ));
-        assert!(preflight_metadata_file(&target).is_err());
     }
 }

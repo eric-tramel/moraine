@@ -37,8 +37,6 @@ database = "moraine"
             "--format",
             "jsonl",
             "--all",
-            "--metadata",
-            "stderr",
             "--columns",
             "payload_json",
         ])

@@ -23,7 +23,6 @@ pub(super) const DEFAULT_EVENT_COLUMNS: &[&str] = &[
     "tool_error",
     "model",
     "project_id",
-    "text_preview",
 ];
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -412,8 +411,8 @@ pub(super) const EVENT_COLUMNS: &[EventColumn] = &[
         "e.text_preview",
         "e.text_preview",
         "string",
-        true,
         false,
+        true,
     ),
     col(
         "text_content",
@@ -629,7 +628,7 @@ fn analytics_schema() -> serde_json::Value {
             "booleans": "emitted as JSON booleans"
         },
         "metadata_schema_version": EXPORT_METADATA_SCHEMA_VERSION,
-        "metadata_modes": ["stderr", "none", "file"],
+        "metadata_target": "stderr",
         "scope": {
             "included": ["events"],
             "excluded": ["sessions", "turns", "tool-io", "raw-events", "csv", "http", "mcp-batch-open"]
@@ -689,6 +688,7 @@ mod tests {
                 "repo_rel_path",
                 "worktree_root",
                 "cwd",
+                "text_preview",
                 "text_content",
                 "payload_json",
                 "token_usage_json",

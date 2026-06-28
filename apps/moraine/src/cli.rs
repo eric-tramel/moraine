@@ -75,22 +75,16 @@ pub(crate) enum ExportCommand {
 
 #[derive(Debug, Args)]
 pub(crate) struct ExportEventsArgs {
-    #[arg(long, value_enum)]
-    pub(crate) format: Option<ExportRowFormat>,
+    #[arg(long, value_enum, required = true)]
+    pub(crate) format: ExportRowFormat,
     #[arg(long)]
     pub(crate) columns: Option<String>,
     #[arg(long, default_value_t = false)]
     pub(crate) include_sensitive: bool,
-    #[arg(long, value_enum, default_value_t = ExportMetadataMode::Stderr)]
-    pub(crate) metadata: ExportMetadataMode,
-    #[arg(long, value_name = "PATH")]
-    pub(crate) metadata_file: Option<PathBuf>,
     #[arg(long)]
     pub(crate) limit: Option<usize>,
     #[arg(long, default_value_t = false)]
     pub(crate) all: bool,
-    #[arg(long, default_value_t = 600)]
-    pub(crate) max_execution_seconds: u64,
     #[arg(long)]
     pub(crate) since: Option<String>,
     #[arg(long)]
@@ -126,13 +120,6 @@ pub(crate) struct ExportEventsArgs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum ExportRowFormat {
     Jsonl,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub(crate) enum ExportMetadataMode {
-    Stderr,
-    None,
-    File,
 }
 
 #[derive(Debug, Args)]
@@ -307,35 +294,30 @@ mod tests {
             "--columns",
             "session_id,event_uid,event_ts,payload_json",
             "--include-sensitive",
-            "--metadata",
-            "file",
-            "--metadata-file",
-            "/tmp/export-meta.json",
             "--limit",
             "100",
-            "--max-execution-seconds",
-            "30",
         ]);
         match cli.command {
             CliCommand::Export(args) => match args.command {
                 ExportCommand::Events(events) => {
-                    assert_eq!(events.format, Some(ExportRowFormat::Jsonl));
+                    assert_eq!(events.format, ExportRowFormat::Jsonl);
                     assert_eq!(events.since.as_deref(), Some("2026-06-01T00:00:00Z"));
                     assert_eq!(events.until.as_deref(), Some("2026-06-15T00:00:00Z"));
                     assert_eq!(events.harness, vec!["codex", "hermes"]);
                     assert_eq!(events.project_id, vec!["agent-stuff"]);
                     assert!(events.include_sensitive);
-                    assert_eq!(events.metadata, ExportMetadataMode::File);
-                    assert_eq!(
-                        events.metadata_file,
-                        Some(PathBuf::from("/tmp/export-meta.json"))
-                    );
                     assert_eq!(events.limit, Some(100));
-                    assert_eq!(events.max_execution_seconds, 30);
                 }
             },
             _ => panic!("expected export events command"),
         }
+    }
+
+    #[test]
+    fn clap_rejects_export_events_without_format() {
+        let err = Cli::try_parse_from(["moraine", "export", "events", "--all"])
+            .expect_err("export row format is required");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 
     #[test]

@@ -40,7 +40,7 @@ moraine schema analytics --json
 The v1 data schema is `moraine.analytics.events.v1`. Default event columns are:
 
 ```text
-session_id,event_uid,event_ts,turn_seq,event_order,harness,source_name,event_kind,payload_type,actor_kind,tool_name,tool_phase,tool_error,model,project_id,text_preview
+session_id,event_uid,event_ts,turn_seq,event_order,harness,source_name,event_kind,payload_type,actor_kind,tool_name,tool_phase,tool_error,model,project_id
 ```
 
 `--columns all` means all non-sensitive public v1 columns. It is not physical
@@ -48,16 +48,16 @@ session_id,event_uid,event_ts,turn_seq,event_order,harness,source_name,event_kin
 
 ## Sensitive Columns
 
-The default export omits sensitive full text, payloads, token usage JSON, source
-references, and path-like fields. These columns require `--include-sensitive`
-when named in `--columns`:
+The default export omits sensitive previews, full text, payloads, token usage
+JSON, source references, and path-like fields. These columns require
+`--include-sensitive` when named in `--columns`:
 
 ```text
-source_file,source_ref,repo_rel_path,worktree_root,cwd,text_content,payload_json,token_usage_json
+source_file,source_ref,repo_rel_path,worktree_root,cwd,text_preview,text_content,payload_json,token_usage_json
 ```
 
 Metadata is out of band, but it can still include the filter values supplied on
-the command line, including path filters. Treat metadata files and stderr logs as
+the command line, including path filters. Treat stderr metadata as
 trace-adjacent data.
 
 ## Filters
@@ -93,15 +93,11 @@ millisecond precision, for example `2026-06-01T12:34:56.789Z`.
 
 ## Metadata
 
-Completion metadata is one JSON object. By default it is written to stderr:
+Completion metadata is one JSON object written to stderr:
 
 ```json
 {"schema_version":"moraine.analytics.export_metadata.v1","data_schema_version":"moraine.analytics.events.v1","export_kind":"events","backend":"default","query_id":"...","columns":["session_id","event_uid"],"filters":{"harness":["codex"]},"limit":1000,"row_count":1000,"truncated":true,"elapsed_ms":1234,"sensitive_columns_requested":[]}
 ```
-
-Use `--metadata none` to suppress it, or `--metadata file --metadata-file <path>`
-to write it to a file. Metadata files are created before streaming starts so
-path errors fail before any data rows are emitted.
 
 Stream, preflight, and query failures exit nonzero and do not emit completion
 metadata. If stdout is closed by a downstream consumer, such as `head`, Moraine
@@ -111,10 +107,6 @@ stops streaming, suppresses completion metadata, and exits successfully.
 
 `--limit <n>` writes at most `n` rows. Moraine asks ClickHouse for `n + 1` rows
 and drops the sentinel row, so `truncated` metadata is exact.
-
-`--max-execution-seconds <n>` controls ClickHouse `max_execution_time` and
-defaults to 600 seconds. Set it to `0` to omit the ClickHouse execution-time
-setting; Moraine still uses a long client-side timeout for the streaming request.
 
 Exports run against the default `[clickhouse]` backend only. Before streaming,
 Moraine checks the backend migration ledger and refuses to export if the server
