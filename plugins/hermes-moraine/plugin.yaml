@@ -1,6 +1,6 @@
 manifest_version: 1
 name: moraine
-version: "0.6.2"
+version: "0.6.3"
 description: "Hermes integration for Moraine MCP session search, realtime agent awareness, sanitized bug reports, and setup diagnostics."
 author: "Moraine maintainers"
 provides_tools:
