@@ -1,5 +1,5 @@
 use crate::checkpoint::checkpoint_key;
-use crate::model::{Checkpoint, RowBatch};
+use crate::model::{Checkpoint, NormalizedRecord, RowBatch};
 use crate::normalize::{normalize_record, normalize_record_with_ts_hint};
 use crate::sources::shared::{format_record_ts, parse_record_ts};
 use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
@@ -32,6 +32,14 @@ use std::time::UNIX_EPOCH;
 /// the checkpoint key and `event_uid` derivation stay stable across saves.
 const SESSION_JSON_INODE: u64 = 0;
 const SESSION_JSON_GENERATION: u32 = 1;
+const CLICKHOUSE_JSON_OBJECT_BYTE_LIMIT: usize = 10 * 1024 * 1024;
+/// Keep per-line JSONL rows below ClickHouse's hard JSONEachRow object limit
+/// after Moraine wraps the source record into raw/event rows. The default
+/// ingest batch byte budget is 8 MiB; capping source lines there leaves room
+/// for the row envelope and escaped `raw_json` string.
+const DEFAULT_JSONL_SOURCE_LINE_BYTE_LIMIT: usize = 8 * 1024 * 1024;
+const ERROR_KIND_SOURCE_LINE_TOO_LARGE: &str = "jsonl_source_line_too_large";
+const ERROR_KIND_NORMALIZED_ROW_TOO_LARGE: &str = "jsonl_normalized_row_too_large";
 
 /// A work item is processable only when its path is already the canonical
 /// tracked path for its format (sidecar paths are canonicalized at the
@@ -109,6 +117,206 @@ fn compose_hermes_model(model: &str, base_url: &str) -> String {
     } else {
         format!("{}/{}", vendor, trimmed)
     }
+}
+
+fn jsonl_source_line_byte_limit(config: &AppConfig) -> usize {
+    config
+        .ingest
+        .max_batch_bytes
+        .clamp(1, DEFAULT_JSONL_SOURCE_LINE_BYTE_LIMIT)
+}
+
+fn oversized_source_line_error_row(
+    work: &WorkItem,
+    source_file: &str,
+    source_inode: u64,
+    source_generation: u32,
+    source_line_no: u64,
+    source_offset: u64,
+    line_bytes: usize,
+    limit_bytes: usize,
+) -> Value {
+    json!({
+        "source_name": work.source_name,
+        "harness": work.harness,
+        "source_file": source_file,
+        "source_inode": source_inode,
+        "source_generation": source_generation,
+        "source_line_no": source_line_no,
+        "source_offset": source_offset,
+        "error_kind": ERROR_KIND_SOURCE_LINE_TOO_LARGE,
+        "error_text": format!(
+            "source line is {line_bytes} bytes, exceeding the {limit_bytes} byte JSONL ingest limit; skipped before normalization"
+        ),
+        "raw_fragment": json!({
+            "action": "skipped",
+            "line_bytes": line_bytes,
+            "limit_bytes": limit_bytes,
+        }).to_string(),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SerializedRowSize {
+    table: &'static str,
+    bytes: usize,
+}
+
+fn oversized_normalized_row_error_row(
+    work: &WorkItem,
+    source_file: &str,
+    source_inode: u64,
+    source_generation: u32,
+    source_line_no: u64,
+    source_offset: u64,
+    line_bytes: usize,
+    row_size: &SerializedRowSize,
+) -> Value {
+    json!({
+        "source_name": work.source_name,
+        "harness": work.harness,
+        "source_file": source_file,
+        "source_inode": source_inode,
+        "source_generation": source_generation,
+        "source_line_no": source_line_no,
+        "source_offset": source_offset,
+        "error_kind": ERROR_KIND_NORMALIZED_ROW_TOO_LARGE,
+        "error_text": format!(
+            "{} row serializes to {} bytes, exceeding the {} byte ClickHouse JSON object limit; skipped before insert",
+            row_size.table,
+            row_size.bytes,
+            CLICKHOUSE_JSON_OBJECT_BYTE_LIMIT
+        ),
+        "raw_fragment": json!({
+            "action": "skipped",
+            "line_bytes": line_bytes,
+            "serialized_row_table": row_size.table,
+            "serialized_row_bytes": row_size.bytes,
+            "limit_bytes": CLICKHOUSE_JSON_OBJECT_BYTE_LIMIT,
+        }).to_string(),
+    })
+}
+
+fn serialized_json_object_bytes(row: &Value) -> usize {
+    serde_json::to_vec(row)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX)
+}
+
+fn largest_serialized_normalized_row(normalized: &NormalizedRecord) -> Option<SerializedRowSize> {
+    let mut largest: Option<SerializedRowSize> = None;
+
+    let mut observe = |table: &'static str, row: &Value| {
+        if row.is_null() {
+            return;
+        }
+        let bytes = serialized_json_object_bytes(row);
+        if largest.as_ref().is_none_or(|current| bytes > current.bytes) {
+            largest = Some(SerializedRowSize { table, bytes });
+        }
+    };
+
+    observe("raw_events", &normalized.raw_row);
+    for row in &normalized.event_rows {
+        observe("events", row);
+    }
+    for row in &normalized.link_rows {
+        observe("event_links", row);
+    }
+    for row in &normalized.tool_rows {
+        observe("tool_io", row);
+    }
+    for row in &normalized.error_rows {
+        observe("ingest_errors", row);
+    }
+
+    largest
+}
+
+enum JsonlLineRead {
+    Eof,
+    Normal { buf: Vec<u8>, bytes_read: usize },
+    Oversized { bytes_read: usize },
+}
+
+fn read_bounded_jsonl_line<R: BufRead>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> std::io::Result<JsonlLineRead> {
+    let mut buf = Vec::<u8>::new();
+    let mut bytes_read = 0usize;
+    let mut oversized = false;
+
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if bytes_read == 0 {
+                return Ok(JsonlLineRead::Eof);
+            }
+            return if oversized {
+                Ok(JsonlLineRead::Oversized { bytes_read })
+            } else {
+                Ok(JsonlLineRead::Normal { buf, bytes_read })
+            };
+        }
+
+        let newline_pos = available.iter().position(|byte| *byte == b'\n');
+        let take = newline_pos.map_or(available.len(), |pos| pos + 1);
+        let crosses_limit = !oversized && bytes_read.saturating_add(take) > max_bytes;
+
+        if crosses_limit {
+            oversized = true;
+            buf.clear();
+        } else if !oversized {
+            buf.extend_from_slice(&available[..take]);
+        }
+
+        reader.consume(take);
+        bytes_read = bytes_read.saturating_add(take);
+
+        if newline_pos.is_some() {
+            return if oversized {
+                Ok(JsonlLineRead::Oversized { bytes_read })
+            } else {
+                Ok(JsonlLineRead::Normal { buf, bytes_read })
+            };
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_chunk_if_batch_exceeds_limits(
+    batch: &mut RowBatch,
+    config: &AppConfig,
+    sink_tx: &mpsc::Sender<SinkMessage>,
+    work: &WorkItem,
+    source_file: &str,
+    source_inode: u64,
+    source_generation: u32,
+    offset: u64,
+    line_no: u64,
+    context: &'static str,
+) -> Result<()> {
+    if !batch.exceeds_limits(config.ingest.batch_size, config.ingest.max_batch_bytes) {
+        return Ok(());
+    }
+
+    let mut chunk = batch.drain_to_chunk();
+    chunk.checkpoint = Some(Checkpoint {
+        source_name: work.source_name.clone(),
+        source_file: source_file.to_string(),
+        source_inode,
+        source_generation,
+        last_offset: offset,
+        last_line_no: line_no,
+        status: "active".to_string(),
+        ..Default::default()
+    });
+
+    sink_tx
+        .send(SinkMessage::Batch(chunk))
+        .await
+        .with_context(|| format!("sink channel closed while sending {context}"))
 }
 
 /// Per-session cursor used to derive model-side latency for Claude Code
@@ -508,20 +716,58 @@ pub(crate) async fn process_file(
     let mut session_cursors: HashMap<String, SessionCursor> = HashMap::new();
 
     let mut batch = RowBatch::default();
+    let source_line_byte_limit = jsonl_source_line_byte_limit(config);
 
     loop {
         let start_offset = offset;
-        let mut buf = Vec::<u8>::new();
-        let bytes_read = reader
-            .read_until(b'\n', &mut buf)
+        let read = read_bounded_jsonl_line(&mut reader, source_line_byte_limit)
             .with_context(|| format!("failed reading {}", source_file))?;
-
-        if bytes_read == 0 {
-            break;
-        }
+        let (buf, bytes_read) = match read {
+            JsonlLineRead::Eof => break,
+            JsonlLineRead::Normal { buf, bytes_read } => (Some(buf), bytes_read),
+            JsonlLineRead::Oversized { bytes_read } => (None, bytes_read),
+        };
 
         offset = offset.saturating_add(bytes_read as u64);
         line_no = line_no.saturating_add(1);
+
+        let Some(buf) = buf else {
+            warn!(
+                source_file,
+                source_line_no = line_no,
+                source_offset = start_offset,
+                line_bytes = bytes_read,
+                limit_bytes = source_line_byte_limit,
+                "skipping oversized JSONL source line before normalization"
+            );
+            batch.push_error_row(oversized_source_line_error_row(
+                work,
+                source_file,
+                inode,
+                checkpoint.source_generation,
+                line_no,
+                start_offset,
+                bytes_read,
+                source_line_byte_limit,
+            ));
+            batch.lines_processed = batch.lines_processed.saturating_add(1);
+
+            send_chunk_if_batch_exceeds_limits(
+                &mut batch,
+                config,
+                &sink_tx,
+                work,
+                source_file,
+                inode,
+                checkpoint.source_generation,
+                offset,
+                line_no,
+                "oversized-line chunk",
+            )
+            .await?;
+
+            continue;
+        };
 
         let mut text = String::from_utf8_lossy(&buf).to_string();
         if text.ends_with('\n') {
@@ -598,6 +844,48 @@ pub(crate) async fn process_file(
             }
         };
 
+        if let Some(row_size) = largest_serialized_normalized_row(&normalized) {
+            if row_size.bytes > CLICKHOUSE_JSON_OBJECT_BYTE_LIMIT {
+                warn!(
+                    source_file,
+                    source_line_no = line_no,
+                    source_offset = start_offset,
+                    line_bytes = bytes_read,
+                    serialized_row_table = row_size.table,
+                    serialized_row_bytes = row_size.bytes,
+                    limit_bytes = CLICKHOUSE_JSON_OBJECT_BYTE_LIMIT,
+                    "skipping JSONL source line whose normalized row is too large for ClickHouse"
+                );
+                batch.push_error_row(oversized_normalized_row_error_row(
+                    work,
+                    source_file,
+                    inode,
+                    checkpoint.source_generation,
+                    line_no,
+                    start_offset,
+                    bytes_read,
+                    &row_size,
+                ));
+                batch.lines_processed = batch.lines_processed.saturating_add(1);
+
+                send_chunk_if_batch_exceeds_limits(
+                    &mut batch,
+                    config,
+                    &sink_tx,
+                    work,
+                    source_file,
+                    inode,
+                    checkpoint.source_generation,
+                    offset,
+                    line_no,
+                    "oversized-normalized-row chunk",
+                )
+                .await?;
+
+                continue;
+            }
+        }
+
         if let Some(record_ts) = normalized.raw_row.get("record_ts").and_then(Value::as_str) {
             if parse_record_ts(record_ts).is_some() {
                 record_ts_hint = record_ts.to_string();
@@ -621,24 +909,19 @@ pub(crate) async fn process_file(
         batch.extend_normalized(normalized);
         batch.lines_processed = batch.lines_processed.saturating_add(1);
 
-        if batch.exceeds_limits(config.ingest.batch_size, config.ingest.max_batch_bytes) {
-            let mut chunk = batch.drain_to_chunk();
-            chunk.checkpoint = Some(Checkpoint {
-                source_name: work.source_name.clone(),
-                source_file: source_file.to_string(),
-                source_inode: inode,
-                source_generation: checkpoint.source_generation,
-                last_offset: offset,
-                last_line_no: line_no,
-                status: "active".to_string(),
-                ..Default::default()
-            });
-
-            sink_tx
-                .send(SinkMessage::Batch(chunk))
-                .await
-                .context("sink channel closed while sending chunk")?;
-        }
+        send_chunk_if_batch_exceeds_limits(
+            &mut batch,
+            config,
+            &sink_tx,
+            work,
+            source_file,
+            inode,
+            checkpoint.source_generation,
+            offset,
+            line_no,
+            "chunk",
+        )
+        .await?;
     }
 
     let final_checkpoint = Checkpoint {
@@ -1055,8 +1338,10 @@ fn truncate(input: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         complete_work, compose_hermes_model, enqueue_work, enrich_claude_model_latency,
-        infer_vendor_from_base_url, process_file, process_session_json_file, run_work_item,
-        source_inode_for_file, work_item_is_ingestable, work_path_is_canonical, SessionCursor,
+        infer_vendor_from_base_url, jsonl_source_line_byte_limit, process_file,
+        process_session_json_file, run_work_item, source_inode_for_file, work_item_is_ingestable,
+        work_path_is_canonical, SessionCursor, CLICKHOUSE_JSON_OBJECT_BYTE_LIMIT,
+        ERROR_KIND_NORMALIZED_ROW_TOO_LARGE, ERROR_KIND_SOURCE_LINE_TOO_LARGE,
         SESSION_JSON_GENERATION, SESSION_JSON_INODE,
     };
     use crate::model::Checkpoint;
@@ -1741,6 +2026,300 @@ mod tests {
             batch.raw_rows[0].get("harness").and_then(Value::as_str),
             Some("pi-coding-agent")
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_file_quarantines_oversized_jsonl_line_and_continues() {
+        let path = unique_test_file("codex-oversized-line");
+        let first = json!({
+            "type": "session_meta",
+            "timestamp": "2026-06-27T10:00:00.000Z",
+            "payload": {
+                "id": "codex-oversized-line-session",
+                "cwd": "/repo"
+            }
+        })
+        .to_string();
+        let line_limit = 4096usize;
+        let oversized_output = "x".repeat(line_limit + 1024);
+        let oversized = json!({
+            "type": "response_item",
+            "timestamp": "2026-06-27T10:00:01.000Z",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call_too_large",
+                "output": oversized_output,
+            }
+        })
+        .to_string();
+        let third = json!({
+            "type": "response_item",
+            "timestamp": "2026-06-27T10:00:02.000Z",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "after the oversized line"
+                    }
+                ]
+            }
+        })
+        .to_string();
+        let body = format!("{first}\n{oversized}\n{third}\n");
+        let oversized_offset = (first.len() + 1) as u64;
+        let oversized_line_bytes = oversized.len() + 1;
+        let final_offset = body.len() as u64;
+        fs::write(&path, body).expect("write oversized codex fixture");
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.max_batch_bytes = line_limit;
+        assert_eq!(jsonl_source_line_byte_limit(&config), line_limit);
+
+        let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(16);
+        let source_file = path.to_string_lossy().to_string();
+        let work = WorkItem {
+            source_name: "codex".to_string(),
+            harness: "codex".to_string(),
+            format: "jsonl".to_string(),
+            path: source_file.clone(),
+        };
+
+        process_file(&config, &work, checkpoints, sink_tx, &metrics)
+            .await
+            .expect("oversized codex file should process around the large line");
+
+        let batches = drain_batches(&mut sink_rx).await;
+        assert!(!batches.is_empty(), "expected at least one sink batch");
+        let raw_rows: Vec<&Value> = batches
+            .iter()
+            .flat_map(|batch| batch.raw_rows.iter())
+            .collect();
+        let event_rows: Vec<&Value> = batches
+            .iter()
+            .flat_map(|batch| batch.event_rows.iter())
+            .collect();
+        let error_rows: Vec<&Value> = batches
+            .iter()
+            .flat_map(|batch| batch.error_rows.iter())
+            .collect();
+
+        assert_eq!(raw_rows.len(), 2, "the oversized line emits no raw row");
+        assert!(
+            raw_rows
+                .iter()
+                .all(|row| row.get("source_line_no").and_then(Value::as_u64) != Some(2)),
+            "line 2 must be quarantined instead of normalized"
+        );
+        assert_eq!(
+            raw_rows[1].get("source_line_no").and_then(Value::as_u64),
+            Some(3),
+            "the line after the oversized record must still normalize"
+        );
+        assert!(
+            event_rows
+                .iter()
+                .any(|row| row.get("text_content").and_then(Value::as_str)
+                    == Some("after the oversized line")),
+            "subsequent JSONL lines must continue processing"
+        );
+
+        assert_eq!(error_rows.len(), 1);
+        let error = error_rows[0];
+        assert_eq!(
+            error.get("error_kind").and_then(Value::as_str),
+            Some(ERROR_KIND_SOURCE_LINE_TOO_LARGE)
+        );
+        assert_eq!(
+            error.get("source_file").and_then(Value::as_str),
+            Some(source_file.as_str())
+        );
+        assert_eq!(error.get("source_line_no").and_then(Value::as_u64), Some(2));
+        assert_eq!(
+            error.get("source_offset").and_then(Value::as_u64),
+            Some(oversized_offset)
+        );
+        assert!(error
+            .get("error_text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains(&oversized_line_bytes.to_string())));
+        let raw_fragment = error
+            .get("raw_fragment")
+            .and_then(Value::as_str)
+            .expect("oversized line error should include compact metadata");
+        assert!(
+            raw_fragment.len() < 256,
+            "oversized quarantine metadata must stay compact"
+        );
+        let fragment: Value =
+            serde_json::from_str(raw_fragment).expect("raw_fragment should be JSON metadata");
+        assert_eq!(
+            fragment.get("line_bytes").and_then(Value::as_u64),
+            Some(oversized_line_bytes as u64)
+        );
+        assert_eq!(
+            fragment.get("limit_bytes").and_then(Value::as_u64),
+            Some(line_limit as u64)
+        );
+        assert_eq!(
+            fragment.get("action").and_then(Value::as_str),
+            Some("skipped")
+        );
+
+        let final_checkpoint = batches
+            .iter()
+            .filter_map(|batch| batch.checkpoint.as_ref())
+            .max_by_key(|checkpoint| checkpoint.last_offset)
+            .expect("oversized line processing should emit a checkpoint");
+        assert_eq!(final_checkpoint.last_offset, final_offset);
+        assert_eq!(final_checkpoint.last_line_no, 3);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_file_quarantines_rows_that_expand_past_clickhouse_object_limit() {
+        let path = unique_test_file("codex-expanded-row-too-large");
+        let first = json!({
+            "type": "session_meta",
+            "timestamp": "2026-06-27T10:00:00.000Z",
+            "payload": {
+                "id": "codex-expanded-row-too-large-session",
+                "cwd": "/repo"
+            }
+        })
+        .to_string();
+        let backslash_count = (CLICKHOUSE_JSON_OBJECT_BYTE_LIMIT / 4) + 200_000;
+        let escaped_heavy_output = "\\".repeat(backslash_count);
+        let expanded = json!({
+            "type": "response_item",
+            "timestamp": "2026-06-27T10:00:01.000Z",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call_expands_too_large",
+                "output": escaped_heavy_output,
+            }
+        })
+        .to_string();
+        assert!(
+            expanded.len() < jsonl_source_line_byte_limit(&moraine_config::AppConfig::default()),
+            "fixture must stay below the source-line cap to exercise serialized row sizing"
+        );
+        let third = json!({
+            "type": "response_item",
+            "timestamp": "2026-06-27T10:00:02.000Z",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "after the expanded row"
+                    }
+                ]
+            }
+        })
+        .to_string();
+        let body = format!("{first}\n{expanded}\n{third}\n");
+        let expanded_offset = (first.len() + 1) as u64;
+        let expanded_line_bytes = expanded.len() + 1;
+        let final_offset = body.len() as u64;
+        fs::write(&path, body).expect("write expanded-row codex fixture");
+
+        let config = moraine_config::AppConfig::default();
+        let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(16);
+        let source_file = path.to_string_lossy().to_string();
+        let work = WorkItem {
+            source_name: "codex".to_string(),
+            harness: "codex".to_string(),
+            format: "jsonl".to_string(),
+            path: source_file.clone(),
+        };
+
+        process_file(&config, &work, checkpoints, sink_tx, &metrics)
+            .await
+            .expect("expanded-row codex file should process around the unsafe row");
+
+        let batches = drain_batches(&mut sink_rx).await;
+        assert!(!batches.is_empty(), "expected at least one sink batch");
+        let raw_rows: Vec<&Value> = batches
+            .iter()
+            .flat_map(|batch| batch.raw_rows.iter())
+            .collect();
+        let event_rows: Vec<&Value> = batches
+            .iter()
+            .flat_map(|batch| batch.event_rows.iter())
+            .collect();
+        let error_rows: Vec<&Value> = batches
+            .iter()
+            .flat_map(|batch| batch.error_rows.iter())
+            .collect();
+
+        assert_eq!(raw_rows.len(), 2, "the expanded row emits no raw row");
+        assert!(
+            raw_rows
+                .iter()
+                .all(|row| row.get("source_line_no").and_then(Value::as_u64) != Some(2)),
+            "line 2 must be quarantined instead of inserted"
+        );
+        assert!(
+            event_rows
+                .iter()
+                .any(|row| row.get("text_content").and_then(Value::as_str)
+                    == Some("after the expanded row")),
+            "subsequent JSONL lines must continue processing"
+        );
+
+        assert_eq!(error_rows.len(), 1);
+        let error = error_rows[0];
+        assert_eq!(
+            error.get("error_kind").and_then(Value::as_str),
+            Some(ERROR_KIND_NORMALIZED_ROW_TOO_LARGE)
+        );
+        assert_eq!(
+            error.get("source_offset").and_then(Value::as_u64),
+            Some(expanded_offset)
+        );
+        let raw_fragment = error
+            .get("raw_fragment")
+            .and_then(Value::as_str)
+            .expect("expanded row error should include compact metadata");
+        assert!(
+            raw_fragment.len() < 320,
+            "expanded-row quarantine metadata must stay compact"
+        );
+        let fragment: Value =
+            serde_json::from_str(raw_fragment).expect("raw_fragment should be JSON metadata");
+        assert_eq!(
+            fragment.get("line_bytes").and_then(Value::as_u64),
+            Some(expanded_line_bytes as u64)
+        );
+        assert!(
+            fragment
+                .get("serialized_row_bytes")
+                .and_then(Value::as_u64)
+                .is_some_and(|bytes| bytes > CLICKHOUSE_JSON_OBJECT_BYTE_LIMIT as u64),
+            "quarantine should record the unsafe serialized row size"
+        );
+        assert_eq!(
+            fragment.get("limit_bytes").and_then(Value::as_u64),
+            Some(CLICKHOUSE_JSON_OBJECT_BYTE_LIMIT as u64)
+        );
+
+        let final_checkpoint = batches
+            .iter()
+            .filter_map(|batch| batch.checkpoint.as_ref())
+            .max_by_key(|checkpoint| checkpoint.last_offset)
+            .expect("expanded-row processing should emit a checkpoint");
+        assert_eq!(final_checkpoint.last_offset, final_offset);
+        assert_eq!(final_checkpoint.last_line_no, 3);
+
+        let _ = fs::remove_file(&path);
     }
 
     #[tokio::test(flavor = "multi_thread")]
