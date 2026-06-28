@@ -157,6 +157,327 @@ fn compute_append_to_visible_stats(
     Some((saturating_u64_to_u32(p50), saturating_u64_to_u32(p95)))
 }
 
+const SINK_JSON_OBJECT_TOO_LARGE: &str = "sink_json_object_too_large";
+const MAX_SINK_ERROR_TEXT_CHARS: usize = 1_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SinkStage {
+    RawEvents,
+    Events,
+    EventLinks,
+    ToolIo,
+    IngestErrors,
+    IngestCheckpoints,
+}
+
+impl SinkStage {
+    fn table(self) -> &'static str {
+        match self {
+            Self::RawEvents => "raw_events",
+            Self::Events => "events",
+            Self::EventLinks => "event_links",
+            Self::ToolIo => "tool_io",
+            Self::IngestErrors => "ingest_errors",
+            Self::IngestCheckpoints => "ingest_checkpoints",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SinkFlushFailure {
+    stage: SinkStage,
+    error_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SinkFlushErrorKey {
+    stage: SinkStage,
+    error_kind: &'static str,
+    source_name: String,
+    source_file: String,
+    source_generation: u32,
+    source_line_no: u64,
+    source_offset: u64,
+}
+
+#[derive(Debug, Clone)]
+struct SinkFlushError {
+    stage: SinkStage,
+    rows_pending: usize,
+    source_name: String,
+    harness: String,
+    inference_provider: String,
+    source_file: String,
+    source_inode: u64,
+    source_generation: u32,
+    source_line_no: u64,
+    source_offset: u64,
+    error_kind: &'static str,
+    error_text: String,
+}
+
+impl SinkFlushError {
+    fn key(&self) -> SinkFlushErrorKey {
+        SinkFlushErrorKey {
+            stage: self.stage,
+            error_kind: self.error_kind,
+            source_name: self.source_name.clone(),
+            source_file: self.source_file.clone(),
+            source_generation: self.source_generation,
+            source_line_no: self.source_line_no,
+            source_offset: self.source_offset,
+        }
+    }
+
+    fn into_row(self) -> Value {
+        let table = self.stage.table();
+        json!({
+            "source_name": self.source_name,
+            "harness": self.harness,
+            "inference_provider": self.inference_provider,
+            "source_file": self.source_file,
+            "source_inode": self.source_inode,
+            "source_generation": self.source_generation,
+            "source_line_no": self.source_line_no,
+            "source_offset": self.source_offset,
+            "error_kind": self.error_kind,
+            "error_text": self.error_text,
+            "raw_fragment": format!(
+                "sink_stage={}; rows_pending={}; original_payload_omitted=true",
+                table, self.rows_pending
+            ),
+        })
+    }
+}
+
+fn classify_sink_flush_error(error_text: &str) -> Option<&'static str> {
+    let lower = error_text.to_ascii_lowercase();
+    if lower.contains("json object extremely large") {
+        Some(SINK_JSON_OBJECT_TOO_LARGE)
+    } else {
+        None
+    }
+}
+
+fn concise_sink_error_text(table: &str, error_text: &str) -> String {
+    let mut out = format!("ClickHouse {table} JSONEachRow flush failed: ");
+    let mut last_was_space = false;
+
+    for ch in error_text.chars() {
+        let ch = if ch.is_whitespace() { ' ' } else { ch };
+        if ch == ' ' {
+            if last_was_space {
+                continue;
+            }
+            last_was_space = true;
+        } else {
+            last_was_space = false;
+        }
+
+        if out.len().saturating_add(ch.len_utf8()) > MAX_SINK_ERROR_TEXT_CHARS {
+            out.push_str("...");
+            return out;
+        }
+        out.push(ch);
+    }
+
+    out
+}
+
+fn row_string(row: &Value, key: &str) -> String {
+    row.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn row_u64(row: &Value, key: &str) -> u64 {
+    row.get(key).and_then(Value::as_u64).unwrap_or_default()
+}
+
+fn row_u32(row: &Value, key: &str) -> u32 {
+    row_u64(row, key).min(u32::MAX as u64) as u32
+}
+
+fn sink_flush_error_from_row(
+    stage: SinkStage,
+    rows: &[Value],
+    error_kind: &'static str,
+    raw_error_text: &str,
+) -> Option<SinkFlushError> {
+    let row = rows.first()?;
+    Some(SinkFlushError {
+        stage,
+        rows_pending: rows.len(),
+        source_name: row_string(row, "source_name"),
+        harness: row_string(row, "harness"),
+        inference_provider: row_string(row, "inference_provider"),
+        source_file: row_string(row, "source_file"),
+        source_inode: row_u64(row, "source_inode"),
+        source_generation: row_u32(row, "source_generation"),
+        source_line_no: row_u64(row, "source_line_no"),
+        source_offset: row_u64(row, "source_offset"),
+        error_kind,
+        error_text: concise_sink_error_text(stage.table(), raw_error_text),
+    })
+}
+
+fn sink_flush_error_from_checkpoint(
+    stage: SinkStage,
+    checkpoint_updates: &HashMap<String, Checkpoint>,
+    error_kind: &'static str,
+    raw_error_text: &str,
+) -> Option<SinkFlushError> {
+    let checkpoint = checkpoint_updates.values().next()?;
+    Some(SinkFlushError {
+        stage,
+        rows_pending: checkpoint_updates.len(),
+        source_name: checkpoint.source_name.clone(),
+        harness: String::new(),
+        inference_provider: String::new(),
+        source_file: checkpoint.source_file.clone(),
+        source_inode: checkpoint.source_inode,
+        source_generation: checkpoint.source_generation,
+        source_line_no: checkpoint.last_line_no,
+        source_offset: checkpoint.last_offset,
+        error_kind,
+        error_text: concise_sink_error_text(stage.table(), raw_error_text),
+    })
+}
+
+fn pending_sink_flush_error(
+    failure: &SinkFlushFailure,
+    rows: &[Value],
+    checkpoint_updates: &HashMap<String, Checkpoint>,
+    error_kind: &'static str,
+) -> Option<SinkFlushError> {
+    match failure.stage {
+        SinkStage::RawEvents
+        | SinkStage::Events
+        | SinkStage::EventLinks
+        | SinkStage::ToolIo
+        | SinkStage::IngestErrors => {
+            sink_flush_error_from_row(failure.stage, rows, error_kind, &failure.error_text)
+        }
+        SinkStage::IngestCheckpoints => sink_flush_error_from_checkpoint(
+            failure.stage,
+            checkpoint_updates,
+            error_kind,
+            &failure.error_text,
+        ),
+    }
+}
+
+fn pending_rows_for_stage<'a>(
+    stage: SinkStage,
+    raw_rows: &'a [Value],
+    event_rows: &'a [Value],
+    link_rows: &'a [Value],
+    tool_rows: &'a [Value],
+    error_rows: &'a [Value],
+) -> &'a [Value] {
+    match stage {
+        SinkStage::RawEvents => raw_rows,
+        SinkStage::Events => event_rows,
+        SinkStage::EventLinks => link_rows,
+        SinkStage::ToolIo => tool_rows,
+        SinkStage::IngestErrors => error_rows,
+        SinkStage::IngestCheckpoints => &[],
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_classified_sink_flush_error(
+    clickhouse: &ClickHouseClient,
+    metrics: &Arc<Metrics>,
+    raw_rows: &[Value],
+    event_rows: &[Value],
+    link_rows: &[Value],
+    tool_rows: &[Value],
+    error_rows: &[Value],
+    checkpoint_updates: &HashMap<String, Checkpoint>,
+    failure: &SinkFlushFailure,
+    last_reported: &mut Option<SinkFlushErrorKey>,
+) {
+    let Some(error_kind) = classify_sink_flush_error(&failure.error_text) else {
+        return;
+    };
+    let rows = pending_rows_for_stage(
+        failure.stage,
+        raw_rows,
+        event_rows,
+        link_rows,
+        tool_rows,
+        error_rows,
+    );
+    let Some(error) = pending_sink_flush_error(failure, rows, checkpoint_updates, error_kind)
+    else {
+        return;
+    };
+
+    let key = error.key();
+    if last_reported.as_ref() == Some(&key) {
+        return;
+    }
+
+    let table = error.stage.table();
+    let row = error.into_row();
+    match clickhouse.insert_json_rows("ingest_errors", &[row]).await {
+        Ok(()) => {
+            metrics.err_rows_written.fetch_add(1, Ordering::Relaxed);
+            *last_reported = Some(key);
+            warn!(
+                sink_stage = table,
+                error_kind, "recorded durable ingest_errors row for sink flush failure"
+            );
+        }
+        Err(exc) => {
+            warn!(
+                sink_stage = table,
+                error_kind,
+                "failed to record durable ingest_errors row for sink flush failure: {exc}"
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_flush_outcome(
+    clickhouse: &ClickHouseClient,
+    checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
+    metrics: &Arc<Metrics>,
+    role: &SinkRole,
+    flush_result: &std::result::Result<(), SinkFlushFailure>,
+    queue_drained: bool,
+    raw_rows: &[Value],
+    event_rows: &[Value],
+    link_rows: &[Value],
+    tool_rows: &[Value],
+    error_rows: &[Value],
+    checkpoint_updates: &HashMap<String, Checkpoint>,
+    last_reported_sink_error: &mut Option<SinkFlushErrorKey>,
+) {
+    let flush_ok = flush_result.is_ok();
+    note_flush_outcome(role, checkpoints, flush_ok, queue_drained).await;
+    if let Err(failure) = flush_result {
+        record_classified_sink_flush_error(
+            clickhouse,
+            metrics,
+            raw_rows,
+            event_rows,
+            link_rows,
+            tool_rows,
+            error_rows,
+            checkpoint_updates,
+            failure,
+            last_reported_sink_error,
+        )
+        .await;
+    } else {
+        *last_reported_sink_error = None;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_sink_task(
     config: moraine_config::AppConfig,
@@ -175,6 +496,7 @@ pub(crate) fn spawn_sink_task(
         let mut error_rows = Vec::<Value>::new();
         let mut checkpoint_updates = HashMap::<String, Checkpoint>::new();
         let mut pending_batch_bytes = 0usize;
+        let mut last_reported_sink_error = None::<SinkFlushErrorKey>;
 
         // Mirror sinks share one ingest_checkpoints table per team backend,
         // so their rows are scoped per host (migration 018; guaranteed
@@ -217,7 +539,7 @@ pub(crate) fn spawn_sink_task(
                     &checkpoint_updates,
                 )
             {
-                let flush_ok = flush_pending(
+                let flush_result = flush_pending(
                     &clickhouse,
                     &checkpoints,
                     &metrics,
@@ -231,8 +553,23 @@ pub(crate) fn spawn_sink_task(
                     &checkpoint_host,
                 )
                 .await;
-                note_flush_outcome(&role, &checkpoints, flush_ok, rx.is_empty()).await;
-                if flush_ok {
+                handle_flush_outcome(
+                    &clickhouse,
+                    &checkpoints,
+                    &metrics,
+                    &role,
+                    &flush_result,
+                    rx.is_empty(),
+                    &raw_rows,
+                    &event_rows,
+                    &link_rows,
+                    &tool_rows,
+                    &error_rows,
+                    &checkpoint_updates,
+                    &mut last_reported_sink_error,
+                )
+                .await;
+                if flush_result.is_ok() {
                     pending_batch_bytes = 0;
                     throttling_flush_retries = false;
                     info!("flush retry succeeded; resuming sink intake");
@@ -276,7 +613,7 @@ pub(crate) fn spawn_sink_task(
                             if total_rows >= config.ingest.batch_size
                                 || pending_batch_bytes >= config.ingest.max_batch_bytes.max(1)
                             {
-                                let flush_ok = flush_pending(
+                                let flush_result = flush_pending(
                                     &clickhouse,
                                     &checkpoints,
                                     &metrics,
@@ -289,8 +626,22 @@ pub(crate) fn spawn_sink_task(
                                     checkpoint_cursor_columns,
                                     &checkpoint_host,
                                 ).await;
-                                note_flush_outcome(&role, &checkpoints, flush_ok, rx.is_empty()).await;
-                                if !flush_ok {
+                                handle_flush_outcome(
+                                    &clickhouse,
+                                    &checkpoints,
+                                    &metrics,
+                                    &role,
+                                    &flush_result,
+                                    rx.is_empty(),
+                                    &raw_rows,
+                                    &event_rows,
+                                    &link_rows,
+                                    &tool_rows,
+                                    &error_rows,
+                                    &checkpoint_updates,
+                                    &mut last_reported_sink_error,
+                                ).await;
+                                if flush_result.is_err() {
                                     if !throttling_flush_retries {
                                         warn!(
                                             "flush failed; pausing sink intake and retrying pending rows every {} ms",
@@ -308,7 +659,7 @@ pub(crate) fn spawn_sink_task(
                 }
                 _ = flush_tick.tick() => {
                     if has_pending_data(&raw_rows, &event_rows, &link_rows, &tool_rows, &error_rows, &checkpoint_updates) {
-                        let flush_ok = flush_pending(
+                        let flush_result = flush_pending(
                             &clickhouse,
                             &checkpoints,
                             &metrics,
@@ -321,8 +672,22 @@ pub(crate) fn spawn_sink_task(
                             checkpoint_cursor_columns,
                             &checkpoint_host,
                         ).await;
-                        note_flush_outcome(&role, &checkpoints, flush_ok, rx.is_empty()).await;
-                        if !flush_ok {
+                        handle_flush_outcome(
+                            &clickhouse,
+                            &checkpoints,
+                            &metrics,
+                            &role,
+                            &flush_result,
+                            rx.is_empty(),
+                            &raw_rows,
+                            &event_rows,
+                            &link_rows,
+                            &tool_rows,
+                            &error_rows,
+                            &checkpoint_updates,
+                            &mut last_reported_sink_error,
+                        ).await;
+                        if flush_result.is_err() {
                             if !throttling_flush_retries {
                                 warn!(
                                     "flush failed; pausing sink intake and retrying pending rows every {} ms",
@@ -349,7 +714,7 @@ pub(crate) fn spawn_sink_task(
             &error_rows,
             &checkpoint_updates,
         ) {
-            let flush_ok = flush_pending(
+            let flush_result = flush_pending(
                 &clickhouse,
                 &checkpoints,
                 &metrics,
@@ -363,7 +728,22 @@ pub(crate) fn spawn_sink_task(
                 &checkpoint_host,
             )
             .await;
-            note_flush_outcome(&role, &checkpoints, flush_ok, true).await;
+            handle_flush_outcome(
+                &clickhouse,
+                &checkpoints,
+                &metrics,
+                &role,
+                &flush_result,
+                true,
+                &raw_rows,
+                &event_rows,
+                &link_rows,
+                &tool_rows,
+                &error_rows,
+                &checkpoint_updates,
+                &mut last_reported_sink_error,
+            )
+            .await;
         }
     })
 }
@@ -462,7 +842,7 @@ async fn flush_pending(
     checkpoint_updates: &mut HashMap<String, Checkpoint>,
     checkpoint_cursor_columns: bool,
     checkpoint_host: &str,
-) -> bool {
+) -> std::result::Result<(), SinkFlushFailure> {
     let started = Instant::now();
 
     let checkpoint_rows: Vec<Value> = checkpoint_updates
@@ -505,7 +885,13 @@ async fn flush_pending(
 
     let flush_result = async {
         if !raw_rows.is_empty() {
-            clickhouse.insert_json_rows("raw_events", raw_rows).await?;
+            clickhouse
+                .insert_json_rows("raw_events", raw_rows)
+                .await
+                .map_err(|exc| SinkFlushFailure {
+                    stage: SinkStage::RawEvents,
+                    error_text: exc.to_string(),
+                })?;
             metrics
                 .raw_rows_written
                 .fetch_add(raw_rows.len() as u64, Ordering::Relaxed);
@@ -521,7 +907,13 @@ async fn flush_pending(
         }
 
         if !event_rows.is_empty() {
-            clickhouse.insert_json_rows("events", event_rows).await?;
+            clickhouse
+                .insert_json_rows("events", event_rows)
+                .await
+                .map_err(|exc| SinkFlushFailure {
+                    stage: SinkStage::Events,
+                    error_text: exc.to_string(),
+                })?;
             metrics
                 .event_rows_written
                 .fetch_add(event_rows.len() as u64, Ordering::Relaxed);
@@ -531,19 +923,33 @@ async fn flush_pending(
         if !link_rows.is_empty() {
             clickhouse
                 .insert_json_rows("event_links", link_rows)
-                .await?;
+                .await
+                .map_err(|exc| SinkFlushFailure {
+                    stage: SinkStage::EventLinks,
+                    error_text: exc.to_string(),
+                })?;
             link_rows.clear();
         }
 
         if !tool_rows.is_empty() {
-            clickhouse.insert_json_rows("tool_io", tool_rows).await?;
+            clickhouse
+                .insert_json_rows("tool_io", tool_rows)
+                .await
+                .map_err(|exc| SinkFlushFailure {
+                    stage: SinkStage::ToolIo,
+                    error_text: exc.to_string(),
+                })?;
             tool_rows.clear();
         }
 
         if !error_rows.is_empty() {
             clickhouse
                 .insert_json_rows("ingest_errors", error_rows)
-                .await?;
+                .await
+                .map_err(|exc| SinkFlushFailure {
+                    stage: SinkStage::IngestErrors,
+                    error_text: exc.to_string(),
+                })?;
             metrics
                 .err_rows_written
                 .fetch_add(error_rows.len() as u64, Ordering::Relaxed);
@@ -553,7 +959,11 @@ async fn flush_pending(
         if !checkpoint_rows.is_empty() {
             clickhouse
                 .insert_json_rows("ingest_checkpoints", &checkpoint_rows)
-                .await?;
+                .await
+                .map_err(|exc| SinkFlushFailure {
+                    stage: SinkStage::IngestCheckpoints,
+                    error_text: exc.to_string(),
+                })?;
 
             {
                 // Offset-monotone merge, not a blind insert: a backend map
@@ -572,20 +982,23 @@ async fn flush_pending(
         metrics
             .last_flush_ms
             .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
-        anyhow::Result::<()>::Ok(())
+        std::result::Result::<(), SinkFlushFailure>::Ok(())
     }
     .await;
 
     match flush_result {
-        Ok(()) => true,
-        Err(exc) => {
+        Ok(()) => Ok(()),
+        Err(failure) => {
             metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
             *metrics
                 .last_error
                 .lock()
-                .expect("metrics last_error mutex poisoned") = exc.to_string();
-            warn!("flush failed: {exc}");
-            false
+                .expect("metrics last_error mutex poisoned") = failure.error_text.clone();
+            warn!(
+                sink_stage = failure.stage.table(),
+                "flush failed: {}", failure.error_text
+            );
+            Err(failure)
         }
     }
 }
@@ -610,16 +1023,26 @@ mod tests {
         calls_by_table: Arc<Mutex<HashMap<String, usize>>>,
         rows_by_table: Arc<Mutex<HashMap<String, Vec<Value>>>>,
         fail_once_by_table: Arc<Mutex<HashMap<String, usize>>>,
+        failure_body_by_table: Arc<Mutex<HashMap<String, String>>>,
     }
 
     impl MockClickHouseState {
         fn with_single_failure(table: &str) -> Self {
+            Self::with_single_failure_body(table, format!("intentional failure for {table}"))
+        }
+
+        fn with_single_failure_body(table: &str, body: impl Into<String>) -> Self {
             let state = Self::default();
             state
                 .fail_once_by_table
                 .lock()
                 .expect("mock fail_once mutex poisoned")
                 .insert(table.to_string(), 1);
+            state
+                .failure_body_by_table
+                .lock()
+                .expect("mock failure body mutex poisoned")
+                .insert(table.to_string(), body.into());
             state
         }
 
@@ -639,6 +1062,15 @@ mod tests {
                 .get(table)
                 .cloned()
                 .unwrap_or_default()
+        }
+
+        fn failure_body(&self, table: &str) -> String {
+            self.failure_body_by_table
+                .lock()
+                .expect("mock failure body mutex poisoned")
+                .get(table)
+                .cloned()
+                .unwrap_or_else(|| format!("intentional failure for {table}"))
         }
     }
 
@@ -688,10 +1120,7 @@ mod tests {
             if let Some(remaining) = fail_once.get_mut(table) {
                 if *remaining > 0 {
                     *remaining -= 1;
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("intentional failure for {table}"),
-                    );
+                    return (StatusCode::INTERNAL_SERVER_ERROR, state.failure_body(table));
                 }
             }
         }
@@ -716,6 +1145,20 @@ mod tests {
         fail_once_table: &str,
     ) -> (ClickHouseClient, MockClickHouseState) {
         let state = MockClickHouseState::with_single_failure(fail_once_table);
+        spawn_mock_clickhouse_with_state(state).await
+    }
+
+    async fn spawn_mock_clickhouse_with_failure_body(
+        fail_once_table: &str,
+        body: impl Into<String>,
+    ) -> (ClickHouseClient, MockClickHouseState) {
+        let state = MockClickHouseState::with_single_failure_body(fail_once_table, body);
+        spawn_mock_clickhouse_with_state(state).await
+    }
+
+    async fn spawn_mock_clickhouse_with_state(
+        state: MockClickHouseState,
+    ) -> (ClickHouseClient, MockClickHouseState) {
         let app = Router::new()
             .route("/", post(mock_clickhouse_handler))
             .with_state(state.clone());
@@ -841,7 +1284,10 @@ mod tests {
             "",
         )
         .await;
-        assert!(!first_attempt, "first flush should fail at events stage");
+        assert!(
+            first_attempt.is_err(),
+            "first flush should fail at events stage"
+        );
 
         assert!(raw_rows.is_empty(), "raw rows should not be retried");
         assert_eq!(
@@ -873,7 +1319,7 @@ mod tests {
         )
         .await;
         assert!(
-            second_attempt,
+            second_attempt.is_ok(),
             "second flush should complete remaining stages"
         );
 
@@ -893,6 +1339,176 @@ mod tests {
             state.contains_key(&checkpoint_key_value),
             "checkpoint cache should advance after checkpoint stage succeeds"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn classified_sink_flush_failure_records_compact_ingest_error_once() {
+        let clickhouse_error = format!(
+            "Code: 117. DB::Exception: JSON object extremely large, expected <=10485760 bytes. {}",
+            "detail ".repeat(300)
+        );
+        let (clickhouse, mock_state) =
+            spawn_mock_clickhouse_with_failure_body("raw_events", clickhouse_error).await;
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+
+        let mut raw_rows = vec![json!({
+            "source_name": "codex-jsonl",
+            "harness": "codex",
+            "inference_provider": "openai",
+            "source_file": "/tmp/codex-session.jsonl",
+            "source_inode": 77u64,
+            "source_generation": 2u32,
+            "source_line_no": 9u64,
+            "source_offset": 1234u64,
+            "record_ts": "2026-02-17T00:00:01.000Z",
+            "raw_json": "payload-marker-that-must-not-be-copied",
+            "event_uid": "evt-oversized",
+        })];
+        let mut event_rows = Vec::<Value>::new();
+        let mut link_rows = Vec::<Value>::new();
+        let mut tool_rows = Vec::<Value>::new();
+        let mut error_rows = Vec::<Value>::new();
+        let mut checkpoint_updates = HashMap::new();
+
+        let flush_result = flush_pending(
+            &clickhouse,
+            &checkpoints,
+            &metrics,
+            &mut raw_rows,
+            &mut event_rows,
+            &mut link_rows,
+            &mut tool_rows,
+            &mut error_rows,
+            &mut checkpoint_updates,
+            true,
+            "",
+        )
+        .await;
+        let failure = flush_result.expect_err("raw_events flush should fail");
+        assert_eq!(failure.stage, SinkStage::RawEvents);
+
+        let mut last_reported = None;
+        record_classified_sink_flush_error(
+            &clickhouse,
+            &metrics,
+            &raw_rows,
+            &event_rows,
+            &link_rows,
+            &tool_rows,
+            &error_rows,
+            &checkpoint_updates,
+            &failure,
+            &mut last_reported,
+        )
+        .await;
+        record_classified_sink_flush_error(
+            &clickhouse,
+            &metrics,
+            &raw_rows,
+            &event_rows,
+            &link_rows,
+            &tool_rows,
+            &error_rows,
+            &checkpoint_updates,
+            &failure,
+            &mut last_reported,
+        )
+        .await;
+
+        let error_rows = mock_state.rows("ingest_errors");
+        assert_eq!(
+            error_rows.len(),
+            1,
+            "same pending sink failure should be reported once"
+        );
+        let row = &error_rows[0];
+        assert_eq!(
+            row.get("source_name").and_then(Value::as_str),
+            Some("codex-jsonl")
+        );
+        assert_eq!(row.get("harness").and_then(Value::as_str), Some("codex"));
+        assert_eq!(
+            row.get("inference_provider").and_then(Value::as_str),
+            Some("openai")
+        );
+        assert_eq!(
+            row.get("source_file").and_then(Value::as_str),
+            Some("/tmp/codex-session.jsonl")
+        );
+        assert_eq!(row.get("source_inode").and_then(Value::as_u64), Some(77));
+        assert_eq!(
+            row.get("source_generation").and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(row.get("source_line_no").and_then(Value::as_u64), Some(9));
+        assert_eq!(row.get("source_offset").and_then(Value::as_u64), Some(1234));
+        assert_eq!(
+            row.get("error_kind").and_then(Value::as_str),
+            Some(SINK_JSON_OBJECT_TOO_LARGE)
+        );
+
+        let recorded_text = row
+            .get("error_text")
+            .and_then(Value::as_str)
+            .expect("error_text");
+        assert!(recorded_text.contains("Code: 117"));
+        assert!(recorded_text.len() <= MAX_SINK_ERROR_TEXT_CHARS + 3);
+        assert_eq!(
+            row.get("raw_fragment").and_then(Value::as_str),
+            Some("sink_stage=raw_events; rows_pending=1; original_payload_omitted=true")
+        );
+        assert!(
+            !serde_json::to_string(row)
+                .expect("serialize recorded row")
+                .contains("payload-marker-that-must-not-be-copied"),
+            "durable sink error must not copy the rejected source payload"
+        );
+        assert_eq!(metrics.err_rows_written.load(Ordering::Relaxed), 1);
+        assert_eq!(mock_state.call_count("ingest_errors"), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn generic_clickhouse_code_117_is_not_labeled_as_oversized_json() {
+        let (clickhouse, mock_state) = spawn_mock_clickhouse("unused-table").await;
+        let metrics = Arc::new(Metrics::default());
+        let raw_rows = vec![json!({
+            "source_name": "codex-jsonl",
+            "harness": "codex",
+            "source_file": "/tmp/codex-session.jsonl",
+            "source_inode": 77u64,
+            "source_generation": 2u32,
+            "source_line_no": 9u64,
+            "source_offset": 1234u64,
+        })];
+        let checkpoint_updates = HashMap::new();
+        let failure = SinkFlushFailure {
+            stage: SinkStage::RawEvents,
+            error_text: "Code: 117. DB::Exception: Unknown field found while parsing JSONEachRow"
+                .to_string(),
+        };
+        let mut last_reported = None;
+
+        record_classified_sink_flush_error(
+            &clickhouse,
+            &metrics,
+            &raw_rows,
+            &[],
+            &[],
+            &[],
+            &[],
+            &checkpoint_updates,
+            &failure,
+            &mut last_reported,
+        )
+        .await;
+
+        assert!(
+            mock_state.rows("ingest_errors").is_empty(),
+            "generic Code 117 errors should not be mislabeled as oversized JSON"
+        );
+        assert_eq!(metrics.err_rows_written.load(Ordering::Relaxed), 0);
+        assert!(last_reported.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -996,22 +1612,21 @@ mod tests {
         for cp in [ahead, behind] {
             let mut checkpoint_updates = HashMap::new();
             checkpoint_updates.insert(key.clone(), cp);
-            assert!(
-                flush_pending(
-                    &clickhouse,
-                    &checkpoints,
-                    &metrics,
-                    &mut raw_rows,
-                    &mut event_rows,
-                    &mut link_rows,
-                    &mut tool_rows,
-                    &mut error_rows,
-                    &mut checkpoint_updates,
-                    true,
-                    "",
-                )
-                .await
-            );
+            assert!(flush_pending(
+                &clickhouse,
+                &checkpoints,
+                &metrics,
+                &mut raw_rows,
+                &mut event_rows,
+                &mut link_rows,
+                &mut tool_rows,
+                &mut error_rows,
+                &mut checkpoint_updates,
+                true,
+                "",
+            )
+            .await
+            .is_ok());
         }
 
         // A backend map has two producers (live router batches and replay),
