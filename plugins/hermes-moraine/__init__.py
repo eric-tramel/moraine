@@ -7,6 +7,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -210,14 +211,6 @@ def _handle_cli(args) -> None:
 
 def _setup_mcp(*, force: bool, run_test: bool) -> dict[str, Any]:
     steps: list[dict[str, Any]] = []
-    hermes = _resolve_executable("hermes")
-    if not hermes:
-        return {
-            "ok": False,
-            "summary": "Hermes executable was not found on PATH.",
-            "steps": [{"status": "error", "message": "Cannot run `hermes mcp add`."}],
-        }
-
     moraine = _resolve_executable("moraine")
     if not moraine:
         return {
@@ -243,49 +236,48 @@ def _setup_mcp(*, force: bool, run_test: bool) -> dict[str, Any]:
     if _mcp_registration_ready(existing) and not force:
         steps.append({"status": "ok", "message": "Moraine MCP is already configured."})
     else:
-        if force or existing["configured"]:
-            remove = _run_command(
-                [hermes, "mcp", "remove", MCP_SERVER_NAME],
-                timeout=20,
-                input_text="\n",
-            )
-            steps.append(
-                {
-                    "status": "ok" if remove["returncode"] == 0 else "warn",
-                    "message": "Removed existing Moraine MCP registration."
-                    if remove["returncode"] == 0
-                    else "Existing Moraine MCP registration was absent or could not be removed.",
-                    "detail": remove["summary"],
-                }
-            )
-
-        add = _run_command(
-            [
-                hermes,
-                "mcp",
-                "add",
-                MCP_SERVER_NAME,
-                "--command",
-                moraine,
-                "--args",
-                *MORAINE_MCP_ARGS,
-            ],
-            timeout=30,
-            input_text="\n",
-        )
-        after_add = _mcp_config_state()
-        add_ok = _hermes_command_succeeded(add) and _mcp_registration_ready(after_add)
+        # `hermes mcp add` probes the server before saving; --no-test setup
+        # should not require the Moraine stack to be live.
+        write = _write_mcp_registration(moraine)
+        after_write = _mcp_config_state()
+        write_ok = write["ok"] and _mcp_registration_ready(after_write)
+        if existing["configured"]:
+            success_message = "Updated Moraine MCP registration."
+        else:
+            success_message = "Registered Moraine MCP server."
         steps.append(
             {
-                "status": "ok" if add_ok else "error",
-                "message": "Registered Moraine MCP server."
-                if add_ok
+                "status": "ok" if write_ok else "error",
+                "message": success_message
+                if write_ok
                 else "Failed to register Moraine MCP server.",
-                "detail": _join_details(add["summary"], _mcp_registration_problem(after_add)),
+                "detail": _join_details(
+                    write["summary"],
+                    _mcp_registration_problem(after_write),
+                ),
             }
         )
 
     if run_test:
+        hermes = _resolve_executable("hermes")
+        if not hermes:
+            steps.append(
+                {
+                    "status": "error",
+                    "message": "Hermes MCP test failed.",
+                    "detail": "Hermes executable was not found on PATH.",
+                }
+            )
+            ok = False
+            return {
+                "ok": ok,
+                "summary": "Moraine MCP setup needs attention.",
+                "steps": steps,
+                "next_steps": [
+                    "Start or restart Hermes so the MCP tool list is refreshed.",
+                    "Run `hermes moraine doctor` if the tools are still missing.",
+                ],
+            }
         current = _mcp_config_state()
         if not _mcp_registration_ready(current):
             test = {
@@ -314,6 +306,69 @@ def _setup_mcp(*, force: bool, run_test: bool) -> dict[str, Any]:
             "Run `hermes moraine doctor` if the tools are still missing.",
         ],
     }
+
+
+def _write_mcp_registration(moraine: str) -> dict[str, Any]:
+    config_path = _hermes_config_path()
+    server_config = {
+        "command": moraine,
+        "args": list(MORAINE_MCP_ARGS),
+        "enabled": True,
+    }
+    try:
+        _save_hermes_config_section(config_path, server_config)
+        return {
+            "ok": True,
+            "summary": f"file: {config_path} (updated)",
+        }
+    except Exception as exc:
+        return {"ok": False, "summary": str(exc)}
+
+
+def _save_hermes_config_section(config_path: Path, server_config: dict[str, Any]) -> None:
+    try:
+        from hermes_cli.config import load_config, save_config
+
+        config = load_config()
+        if not isinstance(config, dict):
+            raise ValueError("Hermes config root must be a mapping.")
+        servers = config.get("mcp_servers")
+        if not isinstance(servers, dict):
+            servers = {}
+            config["mcp_servers"] = servers
+        servers[MCP_SERVER_NAME] = server_config
+        save_config(config)
+        return
+    except ImportError:
+        pass
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    data: dict[str, Any] = {}
+    if config_path.exists():
+        import yaml
+
+        loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        if not isinstance(loaded, dict):
+            raise ValueError("Hermes config root must be a mapping.")
+        data = loaded
+
+    servers = data.get("mcp_servers")
+    if not isinstance(servers, dict):
+        servers = {}
+        data["mcp_servers"] = servers
+    servers[MCP_SERVER_NAME] = server_config
+
+    import yaml
+
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=str(config_path.parent),
+        delete=False,
+    ) as tmp:
+        yaml.safe_dump(data, tmp, sort_keys=False)
+        tmp_path = Path(tmp.name)
+    tmp_path.replace(config_path)
 
 
 def _doctor_report(*, run_mcp_test: bool) -> dict[str, Any]:
