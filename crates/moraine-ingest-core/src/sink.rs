@@ -1,6 +1,7 @@
 use crate::checkpoint::merge_checkpoint;
 use crate::heartbeat::host_name;
 use crate::model::Checkpoint;
+use crate::sources::shared::truncate_chars;
 use crate::tee::{
     backend_sinks_json, filter_batch_for_backend, BackendSinkCell, ReplayFloor,
     SharedRouteResolver, StatusRegistry,
@@ -9,6 +10,7 @@ use crate::{
     DispatchState, Metrics, SinkMessage, WATCHER_BACKEND_MIXED, WATCHER_BACKEND_NATIVE,
     WATCHER_BACKEND_POLL,
 };
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use moraine_clickhouse::ClickHouseClient;
 use serde_json::{json, Value};
@@ -19,6 +21,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
+
+const CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES: usize = 10 * 1024 * 1024;
+const OVERSIZED_ROW_FRAGMENT_CHARS: usize = 20_000;
 
 /// What a sink task is writing for. The flush/checkpoint/retry machinery is
 /// identical for both; the role decides intake filtering, heartbeats, and
@@ -384,6 +389,95 @@ fn has_pending_data(
         && checkpoint_updates.is_empty())
 }
 
+fn quarantine_oversized_rows(
+    table: &str,
+    rows: &mut Vec<Value>,
+    error_rows: &mut Vec<Value>,
+) -> anyhow::Result<usize> {
+    let mut kept = Vec::with_capacity(rows.len());
+    let mut quarantined = 0usize;
+
+    for row in std::mem::take(rows) {
+        let row_bytes = serde_json::to_vec(&row)
+            .with_context(|| format!("failed to encode {table} row for oversized-row guard"))?
+            .len();
+        if row_bytes > CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES {
+            error_rows.push(oversized_row_error(table, &row, row_bytes));
+            quarantined = quarantined.saturating_add(1);
+        } else {
+            kept.push(row);
+        }
+    }
+
+    *rows = kept;
+    Ok(quarantined)
+}
+
+fn oversized_row_error(table: &str, row: &Value, row_bytes: usize) -> Value {
+    let source_ref = parse_source_ref(row);
+    json!({
+        "source_name": row_str(row, "source_name").unwrap_or_default(),
+        "harness": row_str(row, "harness").unwrap_or_default(),
+        "source_file": row_str(row, "source_file")
+            .or_else(|| source_ref.as_ref().map(|parts| parts.0.clone()))
+            .unwrap_or_default(),
+        "source_inode": row_u64(row, "source_inode").unwrap_or_default(),
+        "source_generation": row_u64(row, "source_generation")
+            .or_else(|| source_ref.as_ref().map(|parts| parts.1))
+            .unwrap_or_default(),
+        "source_line_no": row_u64(row, "source_line_no")
+            .or_else(|| source_ref.as_ref().map(|parts| parts.2))
+            .unwrap_or_default(),
+        "source_offset": row_u64(row, "source_offset").unwrap_or_default(),
+        "error_kind": "oversized_json_row",
+        "error_text": format!(
+            "skipped {table} row: serialized JSONEachRow object is {row_bytes} bytes, above ClickHouse limit of {CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES} bytes"
+        ),
+        "raw_fragment": oversized_row_fragment(row),
+    })
+}
+
+fn parse_source_ref(row: &Value) -> Option<(String, u64, u64)> {
+    let source_ref = row.get("source_ref").and_then(Value::as_str)?;
+    let mut parts = source_ref.rsplitn(3, ':');
+    let line_no = parts.next()?.parse::<u64>().ok()?;
+    let source_generation = parts.next()?.parse::<u64>().ok()?;
+    let source_file = parts.next()?.to_string();
+    Some((source_file, source_generation, line_no))
+}
+
+fn row_str(row: &Value, key: &str) -> Option<String> {
+    row.get(key).and_then(Value::as_str).map(ToOwned::to_owned)
+}
+
+fn row_u64(row: &Value, key: &str) -> Option<u64> {
+    row.get(key).and_then(Value::as_u64)
+}
+
+fn oversized_row_fragment(row: &Value) -> String {
+    for key in [
+        "raw_json",
+        "payload_json",
+        "output_json",
+        "input_json",
+        "output_text",
+        "text_content",
+        "metadata_json",
+    ] {
+        if let Some(value) = row
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            return truncate_chars(value, OVERSIZED_ROW_FRAGMENT_CHARS);
+        }
+    }
+
+    serde_json::to_string(row)
+        .map(|value| truncate_chars(&value, OVERSIZED_ROW_FRAGMENT_CHARS))
+        .unwrap_or_default()
+}
+
 /// Default-role only: mirror sinks write rows into databases this host does
 /// not own, so the ingest heartbeat (including per-backend mirror status)
 /// always lands in the default backend.
@@ -504,6 +598,18 @@ async fn flush_pending(
         .collect();
 
     let flush_result = async {
+        let quarantined = quarantine_oversized_rows("raw_events", raw_rows, error_rows)?
+            + quarantine_oversized_rows("events", event_rows, error_rows)?
+            + quarantine_oversized_rows("event_links", link_rows, error_rows)?
+            + quarantine_oversized_rows("tool_io", tool_rows, error_rows)?;
+        if quarantined > 0 {
+            warn!(
+                rows = quarantined,
+                max_bytes = CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES,
+                "quarantined oversized rows before ClickHouse insert"
+            );
+        }
+
         if !raw_rows.is_empty() {
             clickhouse.insert_json_rows("raw_events", raw_rows).await?;
             metrics
@@ -893,6 +999,157 @@ mod tests {
             state.contains_key(&checkpoint_key_value),
             "checkpoint cache should advance after checkpoint stage succeeds"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flush_pending_quarantines_oversized_raw_rows() {
+        let (clickhouse, mock_state) = spawn_mock_clickhouse("unused-table").await;
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+
+        let checkpoint = sample_checkpoint();
+        let checkpoint_key_value = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
+        let mut checkpoint_updates = HashMap::from([(checkpoint_key_value.clone(), checkpoint)]);
+        let mut raw_rows = vec![json!({
+            "source_name": "source-a",
+            "harness": "codex",
+            "source_file": "/tmp/source-a.jsonl",
+            "source_inode": 42u64,
+            "source_generation": 1u32,
+            "source_line_no": 7u64,
+            "source_offset": 2048u64,
+            "record_ts": "2026-02-17T00:00:01.000Z",
+            "top_type": "response_item",
+            "session_id": "session-a",
+            "raw_json": "x".repeat(CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES),
+            "raw_json_hash": 1u64,
+            "event_uid": "evt-oversized",
+        })];
+        let mut event_rows = Vec::<Value>::new();
+        let mut link_rows = Vec::<Value>::new();
+        let mut tool_rows = Vec::<Value>::new();
+        let mut error_rows = Vec::<Value>::new();
+
+        assert!(
+            flush_pending(
+                &clickhouse,
+                &checkpoints,
+                &metrics,
+                &mut raw_rows,
+                &mut event_rows,
+                &mut link_rows,
+                &mut tool_rows,
+                &mut error_rows,
+                &mut checkpoint_updates,
+                true,
+                "",
+            )
+            .await,
+            "oversized rows should be quarantined without failing the flush"
+        );
+
+        assert!(
+            mock_state.rows("raw_events").is_empty(),
+            "oversized raw row must not be sent to raw_events"
+        );
+        let error_rows = mock_state.rows("ingest_errors");
+        assert_eq!(error_rows.len(), 1, "one compact ingest error is written");
+        let error = &error_rows[0];
+        assert_eq!(
+            error.get("error_kind").and_then(Value::as_str),
+            Some("oversized_json_row")
+        );
+        assert_eq!(
+            error.get("source_file").and_then(Value::as_str),
+            Some("/tmp/source-a.jsonl")
+        );
+        assert_eq!(error.get("source_line_no").and_then(Value::as_u64), Some(7));
+        assert_eq!(
+            error.get("source_offset").and_then(Value::as_u64),
+            Some(2048)
+        );
+        assert_eq!(
+            error
+                .get("raw_fragment")
+                .and_then(Value::as_str)
+                .map(str::len),
+            Some(OVERSIZED_ROW_FRAGMENT_CHARS)
+        );
+        assert_eq!(mock_state.rows("ingest_checkpoints").len(), 1);
+        assert!(checkpoint_updates.is_empty());
+        assert_eq!(metrics.raw_rows_written.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.err_rows_written.load(Ordering::Relaxed), 1);
+
+        let state = checkpoints.read().await;
+        assert!(
+            state.contains_key(&checkpoint_key_value),
+            "checkpoint cache should advance after quarantining the row"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flush_pending_quarantines_oversized_tool_rows() {
+        let (clickhouse, mock_state) = spawn_mock_clickhouse("unused-table").await;
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+
+        let mut raw_rows = Vec::<Value>::new();
+        let mut event_rows = Vec::<Value>::new();
+        let mut link_rows = Vec::<Value>::new();
+        let mut tool_rows = vec![json!({
+            "event_uid": "evt-tool",
+            "session_id": "session-a",
+            "harness": "codex",
+            "source_name": "source-a",
+            "tool_call_id": "call-1",
+            "tool_name": "shell",
+            "tool_phase": "response",
+            "output_json": "x".repeat(CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES),
+            "source_ref": "/tmp/source-a.jsonl:3:17",
+            "event_version": 1u64,
+        })];
+        let mut error_rows = Vec::<Value>::new();
+        let mut checkpoint_updates = HashMap::new();
+
+        assert!(
+            flush_pending(
+                &clickhouse,
+                &checkpoints,
+                &metrics,
+                &mut raw_rows,
+                &mut event_rows,
+                &mut link_rows,
+                &mut tool_rows,
+                &mut error_rows,
+                &mut checkpoint_updates,
+                true,
+                "",
+            )
+            .await,
+            "oversized tool rows should be quarantined without failing the flush"
+        );
+
+        assert!(
+            mock_state.rows("tool_io").is_empty(),
+            "oversized tool row must not be sent to tool_io"
+        );
+        let error_rows = mock_state.rows("ingest_errors");
+        assert_eq!(error_rows.len(), 1, "one compact ingest error is written");
+        let error = &error_rows[0];
+        assert_eq!(
+            error.get("source_file").and_then(Value::as_str),
+            Some("/tmp/source-a.jsonl")
+        );
+        assert_eq!(
+            error.get("source_generation").and_then(Value::as_u64),
+            Some(3)
+        );
+        assert_eq!(
+            error.get("source_line_no").and_then(Value::as_u64),
+            Some(17)
+        );
+        assert_eq!(error.get("source_inode").and_then(Value::as_u64), Some(0));
+        assert_eq!(metrics.err_rows_written.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
