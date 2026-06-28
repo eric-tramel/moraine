@@ -798,6 +798,22 @@ pub fn enforce_remote_schema_policy(
     Ok(())
 }
 
+pub fn is_oversized_json_each_row_insert_error(error: &anyhow::Error) -> bool {
+    let message = error
+        .chain()
+        .map(|cause| cause.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_ascii_lowercase();
+
+    let has_code_117 = message.contains("code: 117") || message.contains("code 117");
+    let has_large_json_object = message.contains("size of json object")
+        && message.contains("extremely large")
+        && message.contains("expected not greater than");
+
+    has_code_117 && has_large_json_object
+}
+
 fn truncate_for_error(statement: &str) -> String {
     const LIMIT: usize = 240;
     let compact = statement.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1187,6 +1203,38 @@ mod tests {
         ));
         assert!(!has_explicit_json_each_row_format("SELECT 1"));
         assert!(!has_explicit_json_each_row_format("SELECT 1 FORMAT JSON"));
+    }
+
+    #[test]
+    fn classifier_matches_clickhouse_oversized_json_each_row_error() {
+        let error = anyhow!(
+            "clickhouse returned 400 Bad Request: Code: 117. DB::Exception: \
+             Size of JSON object at position 104890103 is extremely large. \
+             Expected not greater than 10485760 bytes, but current is 104890103 bytes per row. \
+             While executing ParallelParsingBlockInputFormat."
+        );
+
+        assert!(is_oversized_json_each_row_insert_error(&error));
+    }
+
+    #[test]
+    fn classifier_rejects_other_code_117_errors() {
+        let error = anyhow!(
+            "clickhouse returned 400 Bad Request: Code: 117. DB::Exception: \
+             Unknown field found while parsing JSONEachRow: unexpected_column"
+        );
+
+        assert!(!is_oversized_json_each_row_insert_error(&error));
+    }
+
+    #[test]
+    fn classifier_requires_clickhouse_code_117() {
+        let error = anyhow!(
+            "clickhouse returned 400 Bad Request: Size of JSON object at position 42 \
+             is extremely large. Expected not greater than 10485760 bytes."
+        );
+
+        assert!(!is_oversized_json_each_row_insert_error(&error));
     }
 
     fn is_migration_filename(name: &str) -> bool {
