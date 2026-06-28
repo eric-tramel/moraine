@@ -1,0 +1,550 @@
+{
+  "column_semantics": {
+    "booleans": "emitted as JSON booleans",
+    "numbers": "unknown numeric values follow storage defaults",
+    "strings": "unknown or unavailable values are emitted as empty strings"
+  },
+  "columns": [
+    {
+      "default": true,
+      "name": "session_id",
+      "sensitive": false,
+      "source_expression": "e.session_id",
+      "type": "string"
+    },
+    {
+      "default": true,
+      "name": "event_uid",
+      "sensitive": false,
+      "source_expression": "e.event_uid",
+      "type": "string"
+    },
+    {
+      "default": true,
+      "name": "event_ts",
+      "sensitive": false,
+      "source_expression": "CLI format of e.event_unix_ms",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "name": "event_unix_ms",
+      "sensitive": false,
+      "source_expression": "e.event_unix_ms",
+      "type": "integer"
+    },
+    {
+      "default": true,
+      "name": "event_order",
+      "sensitive": false,
+      "source_expression": "e.event_order",
+      "type": "integer"
+    },
+    {
+      "default": true,
+      "name": "turn_seq",
+      "sensitive": false,
+      "source_expression": "e.turn_seq",
+      "type": "integer"
+    },
+    {
+      "default": true,
+      "name": "harness",
+      "sensitive": false,
+      "source_expression": "e.harness",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "name": "inference_provider",
+      "sensitive": false,
+      "source_expression": "e.inference_provider",
+      "type": "string"
+    },
+    {
+      "default": true,
+      "name": "source_name",
+      "sensitive": false,
+      "source_expression": "e.source_name",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "name": "source_generation",
+      "sensitive": false,
+      "source_expression": "e.source_generation",
+      "type": "integer"
+    },
+    {
+      "default": false,
+      "name": "source_line_no",
+      "sensitive": false,
+      "source_expression": "e.source_line_no",
+      "type": "integer"
+    },
+    {
+      "default": false,
+      "name": "source_offset",
+      "sensitive": false,
+      "source_expression": "e.source_offset",
+      "type": "integer"
+    },
+    {
+      "default": false,
+      "name": "source_file",
+      "sensitive": true,
+      "source_expression": "e.source_file",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "name": "source_ref",
+      "sensitive": true,
+      "source_expression": "e.source_ref",
+      "type": "string"
+    },
+    {
+      "default": true,
+      "name": "event_kind",
+      "sensitive": false,
+      "source_expression": "e.event_kind",
+      "type": "string"
+    },
+    {
+      "default": true,
+      "name": "payload_type",
+      "sensitive": false,
+      "source_expression": "e.payload_type",
+      "type": "string"
+    },
+    {
+      "default": true,
+      "name": "actor_kind",
+      "sensitive": false,
+      "source_expression": "e.actor_kind",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "name": "op_kind",
+      "sensitive": false,
+      "source_expression": "e.op_kind",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "name": "op_status",
+      "sensitive": false,
+      "source_expression": "e.op_status",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "name": "request_id",
+      "sensitive": false,
+      "source_expression": "e.request_id",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "name": "trace_id",
+      "sensitive": false,
+      "source_expression": "e.trace_id",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "name": "item_id",
+      "sensitive": false,
+      "source_expression": "e.item_id",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "name": "tool_call_id",
+      "sensitive": false,
+      "source_expression": "e.tool_call_id",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "name": "parent_tool_call_id",
+      "sensitive": false,
+      "source_expression": "e.parent_tool_call_id",
+      "type": "string"
+    },
+    {
+      "default": true,
+      "name": "tool_name",
+      "sensitive": false,
+      "source_expression": "e.tool_name",
+      "type": "string"
+    },
+    {
+      "default": true,
+      "name": "tool_phase",
+      "sensitive": false,
+      "source_expression": "e.tool_phase",
+      "type": "string"
+    },
+    {
+      "default": true,
+      "name": "tool_error",
+      "sensitive": false,
+      "source_expression": "e.tool_error != 0",
+      "type": "boolean"
+    },
+    {
+      "default": false,
+      "name": "agent_run_id",
+      "sensitive": false,
+      "source_expression": "e.agent_run_id",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "name": "agent_label",
+      "sensitive": false,
+      "source_expression": "e.agent_label",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "name": "coord_group_id",
+      "sensitive": false,
+      "source_expression": "e.coord_group_id",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "name": "coord_group_label",
+      "sensitive": false,
+      "source_expression": "e.coord_group_label",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "name": "is_substream",
+      "sensitive": false,
+      "source_expression": "e.is_substream != 0",
+      "type": "boolean"
+    },
+    {
+      "default": true,
+      "name": "model",
+      "sensitive": false,
+      "source_expression": "e.model",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "name": "endpoint_kind",
+      "sensitive": false,
+      "source_expression": "e.endpoint_kind",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "name": "input_tokens",
+      "sensitive": false,
+      "source_expression": "e.input_tokens",
+      "type": "integer"
+    },
+    {
+      "default": false,
+      "name": "output_tokens",
+      "sensitive": false,
+      "source_expression": "e.output_tokens",
+      "type": "integer"
+    },
+    {
+      "default": false,
+      "name": "cache_read_tokens",
+      "sensitive": false,
+      "source_expression": "e.cache_read_tokens",
+      "type": "integer"
+    },
+    {
+      "default": false,
+      "name": "cache_write_tokens",
+      "sensitive": false,
+      "source_expression": "e.cache_write_tokens",
+      "type": "integer"
+    },
+    {
+      "default": false,
+      "name": "latency_ms",
+      "sensitive": false,
+      "source_expression": "e.latency_ms",
+      "type": "integer"
+    },
+    {
+      "default": false,
+      "name": "retry_count",
+      "sensitive": false,
+      "source_expression": "e.retry_count",
+      "type": "integer"
+    },
+    {
+      "default": false,
+      "name": "service_tier",
+      "sensitive": false,
+      "source_expression": "e.service_tier",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "name": "content_types",
+      "sensitive": false,
+      "source_expression": "e.content_types",
+      "type": "array<string>"
+    },
+    {
+      "default": false,
+      "name": "has_reasoning",
+      "sensitive": false,
+      "source_expression": "e.has_reasoning != 0",
+      "type": "boolean"
+    },
+    {
+      "default": true,
+      "name": "project_id",
+      "sensitive": false,
+      "source_expression": "e.project_id",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "name": "repo_rel_path",
+      "sensitive": true,
+      "source_expression": "e.repo_rel_path",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "name": "worktree_root",
+      "sensitive": true,
+      "source_expression": "e.worktree_root",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "name": "cwd",
+      "sensitive": true,
+      "source_expression": "e.cwd",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "name": "text_preview",
+      "sensitive": true,
+      "source_expression": "e.text_preview",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "name": "text_content",
+      "sensitive": true,
+      "source_expression": "e.text_content",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "name": "payload_json",
+      "sensitive": true,
+      "source_expression": "e.payload_json",
+      "type": "JSON string"
+    },
+    {
+      "default": false,
+      "name": "token_usage_json",
+      "sensitive": true,
+      "source_expression": "e.token_usage_json",
+      "type": "JSON string"
+    },
+    {
+      "default": false,
+      "name": "token_usage_buckets",
+      "sensitive": false,
+      "source_expression": "e.token_usage_buckets",
+      "type": "object"
+    },
+    {
+      "default": false,
+      "name": "token_usage_native_units",
+      "sensitive": false,
+      "source_expression": "e.token_usage_native_units",
+      "type": "object"
+    },
+    {
+      "default": false,
+      "name": "event_version",
+      "sensitive": false,
+      "source_expression": "e.event_version",
+      "type": "integer"
+    }
+  ],
+  "data_schema_version": "moraine.analytics.events.v1",
+  "default_columns": [
+    "session_id",
+    "event_uid",
+    "event_ts",
+    "turn_seq",
+    "event_order",
+    "harness",
+    "source_name",
+    "event_kind",
+    "payload_type",
+    "actor_kind",
+    "tool_name",
+    "tool_phase",
+    "tool_error",
+    "model",
+    "project_id"
+  ],
+  "export_kind": "events",
+  "filters": [
+    {
+      "arity": "single",
+      "empty_value": "invalid timestamp fails",
+      "flag": "--since",
+      "name": "since",
+      "source": "canonical event time >= value"
+    },
+    {
+      "arity": "single",
+      "empty_value": "invalid timestamp fails",
+      "flag": "--until",
+      "name": "until",
+      "source": "canonical event time < value"
+    },
+    {
+      "arity": "repeatable",
+      "empty_value": "rejected",
+      "flag": "--session-id",
+      "name": "session_id",
+      "source": "session_id = value"
+    },
+    {
+      "arity": "repeatable",
+      "empty_value": "rejected",
+      "flag": "--harness",
+      "name": "harness",
+      "source": "harness = value"
+    },
+    {
+      "arity": "repeatable",
+      "empty_value": "rejected",
+      "flag": "--source-name",
+      "name": "source_name",
+      "source": "source_name = value"
+    },
+    {
+      "arity": "repeatable",
+      "empty_value": "rejected",
+      "flag": "--project-id",
+      "name": "project_id",
+      "source": "project_id = value"
+    },
+    {
+      "arity": "repeatable",
+      "empty_value": "rejected",
+      "flag": "--cwd-prefix",
+      "name": "cwd_prefix",
+      "source": "cwd = value OR startsWith(cwd, value + \"/\")"
+    },
+    {
+      "arity": "repeatable",
+      "empty_value": "rejected",
+      "flag": "--worktree-root",
+      "name": "worktree_root",
+      "source": "worktree_root = value"
+    },
+    {
+      "arity": "repeatable",
+      "empty_value": "rejected",
+      "flag": "--repo-rel-path",
+      "name": "repo_rel_path",
+      "source": "repo_rel_path = value"
+    },
+    {
+      "arity": "repeatable",
+      "empty_value": "rejected",
+      "flag": "--event-kind",
+      "name": "event_kind",
+      "source": "event_kind = value"
+    },
+    {
+      "arity": "repeatable",
+      "empty_value": "rejected",
+      "flag": "--payload-type",
+      "name": "payload_type",
+      "source": "payload_type = value"
+    },
+    {
+      "arity": "repeatable",
+      "empty_value": "rejected",
+      "flag": "--actor-kind",
+      "name": "actor_kind",
+      "source": "actor_kind = value"
+    },
+    {
+      "arity": "repeatable",
+      "empty_value": "rejected",
+      "flag": "--model-name",
+      "name": "model_name",
+      "source": "model = value"
+    },
+    {
+      "arity": "repeatable",
+      "empty_value": "rejected",
+      "flag": "--tool-name",
+      "name": "tool_name",
+      "source": "tool_name = value"
+    },
+    {
+      "arity": "single boolean",
+      "empty_value": "not applicable",
+      "flag": "--tool-error-only",
+      "name": "tool_error_only",
+      "source": "tool_error = 1"
+    }
+  ],
+  "formats": [
+    "jsonl"
+  ],
+  "metadata_schema_version": "moraine.analytics.export_metadata.v1",
+  "metadata_target": "stderr",
+  "schema_version": "moraine.analytics.schema.v1",
+  "scope": {
+    "excluded": [
+      "sessions",
+      "turns",
+      "tool-io",
+      "raw-events",
+      "csv",
+      "http",
+      "mcp-batch-open"
+    ],
+    "included": [
+      "events"
+    ]
+  },
+  "sensitive_columns": [
+    "source_file",
+    "source_ref",
+    "repo_rel_path",
+    "worktree_root",
+    "cwd",
+    "text_preview",
+    "text_content",
+    "payload_json",
+    "token_usage_json"
+  ],
+  "timestamp_semantics": {
+    "event_ts": "UTC RFC3339 string with millisecond precision",
+    "since": "inclusive",
+    "source": "ifNull(parseDateTime64BestEffortOrNull(record_ts), ingested_at)",
+    "until": "exclusive"
+  }
+}

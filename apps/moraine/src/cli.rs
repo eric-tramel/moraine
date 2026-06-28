@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use crate::service::Service;
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum OutputFormat {
     Auto,
     Rich,
@@ -35,6 +35,8 @@ pub(crate) enum CliCommand {
     Down,
     Status,
     Logs(LogsArgs),
+    Export(Box<ExportArgs>),
+    Schema(SchemaArgs),
     Db(DbArgs),
     Clickhouse(ClickhouseArgs),
     Config(ConfigArgs),
@@ -58,6 +60,83 @@ pub(crate) struct LogsArgs {
     pub(crate) service: Option<Service>,
     #[arg(long, default_value_t = 200)]
     pub(crate) lines: usize,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ExportArgs {
+    #[command(subcommand)]
+    pub(crate) command: ExportCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ExportCommand {
+    Events(ExportEventsArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ExportEventsArgs {
+    #[arg(long, value_enum, required = true)]
+    pub(crate) format: ExportRowFormat,
+    #[arg(long)]
+    pub(crate) columns: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub(crate) include_sensitive: bool,
+    #[arg(long)]
+    pub(crate) limit: Option<usize>,
+    #[arg(long, default_value_t = false)]
+    pub(crate) all: bool,
+    #[arg(long)]
+    pub(crate) since: Option<String>,
+    #[arg(long)]
+    pub(crate) until: Option<String>,
+    #[arg(long)]
+    pub(crate) session_id: Vec<String>,
+    #[arg(long)]
+    pub(crate) harness: Vec<String>,
+    #[arg(long)]
+    pub(crate) source_name: Vec<String>,
+    #[arg(long)]
+    pub(crate) project_id: Vec<String>,
+    #[arg(long)]
+    pub(crate) cwd_prefix: Vec<String>,
+    #[arg(long)]
+    pub(crate) worktree_root: Vec<String>,
+    #[arg(long)]
+    pub(crate) repo_rel_path: Vec<String>,
+    #[arg(long)]
+    pub(crate) event_kind: Vec<String>,
+    #[arg(long)]
+    pub(crate) payload_type: Vec<String>,
+    #[arg(long)]
+    pub(crate) actor_kind: Vec<String>,
+    #[arg(long)]
+    pub(crate) model_name: Vec<String>,
+    #[arg(long)]
+    pub(crate) tool_name: Vec<String>,
+    #[arg(long, default_value_t = false)]
+    pub(crate) tool_error_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ExportRowFormat {
+    Jsonl,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct SchemaArgs {
+    #[command(subcommand)]
+    pub(crate) command: SchemaCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum SchemaCommand {
+    Analytics(SchemaAnalyticsArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct SchemaAnalyticsArgs {
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -191,6 +270,64 @@ mod tests {
                 command: ConfigCommand::Get(get),
             }) => assert_eq!(get.key, "clickhouse.url"),
             _ => panic!("expected config get command"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_export_events_flags() {
+        let cli = Cli::parse_from([
+            "moraine",
+            "export",
+            "events",
+            "--format",
+            "jsonl",
+            "--since",
+            "2026-06-01T00:00:00Z",
+            "--until",
+            "2026-06-15T00:00:00Z",
+            "--harness",
+            "codex",
+            "--harness",
+            "hermes",
+            "--project-id",
+            "agent-stuff",
+            "--columns",
+            "session_id,event_uid,event_ts,payload_json",
+            "--include-sensitive",
+            "--limit",
+            "100",
+        ]);
+        match cli.command {
+            CliCommand::Export(args) => match args.command {
+                ExportCommand::Events(events) => {
+                    assert_eq!(events.format, ExportRowFormat::Jsonl);
+                    assert_eq!(events.since.as_deref(), Some("2026-06-01T00:00:00Z"));
+                    assert_eq!(events.until.as_deref(), Some("2026-06-15T00:00:00Z"));
+                    assert_eq!(events.harness, vec!["codex", "hermes"]);
+                    assert_eq!(events.project_id, vec!["agent-stuff"]);
+                    assert!(events.include_sensitive);
+                    assert_eq!(events.limit, Some(100));
+                }
+            },
+            _ => panic!("expected export events command"),
+        }
+    }
+
+    #[test]
+    fn clap_rejects_export_events_without_format() {
+        let err = Cli::try_parse_from(["moraine", "export", "events", "--all"])
+            .expect_err("export row format is required");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn clap_parses_schema_analytics_json() {
+        let cli = Cli::parse_from(["moraine", "schema", "analytics", "--json"]);
+        match cli.command {
+            CliCommand::Schema(SchemaArgs {
+                command: SchemaCommand::Analytics(analytics),
+            }) => assert!(analytics.json),
+            _ => panic!("expected schema analytics command"),
         }
     }
 
