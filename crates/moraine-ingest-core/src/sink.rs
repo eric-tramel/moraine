@@ -12,7 +12,7 @@ use crate::{
 };
 use anyhow::Context;
 use chrono::{DateTime, Utc};
-use moraine_clickhouse::ClickHouseClient;
+use moraine_clickhouse::{is_oversized_json_each_row_insert_error, ClickHouseClient};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -24,6 +24,8 @@ use tracing::{info, warn};
 
 const CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES: usize = 10 * 1024 * 1024;
 const OVERSIZED_ROW_FRAGMENT_CHARS: usize = 20_000;
+const SINK_JSON_OBJECT_TOO_LARGE: &str = "sink_json_object_too_large";
+const MAX_SINK_ERROR_TEXT_CHARS: usize = 1_000;
 
 /// What a sink task is writing for. The flush/checkpoint/retry machinery is
 /// identical for both; the role decides intake filtering, heartbeats, and
@@ -414,21 +416,15 @@ fn quarantine_oversized_rows(
 }
 
 fn oversized_row_error(table: &str, row: &Value, row_bytes: usize) -> Value {
-    let source_ref = parse_source_ref(row);
+    let source = ingest_error_source_from_row(row);
     json!({
-        "source_name": row_str(row, "source_name").unwrap_or_default(),
-        "harness": row_str(row, "harness").unwrap_or_default(),
-        "source_file": row_str(row, "source_file")
-            .or_else(|| source_ref.as_ref().map(|parts| parts.0.clone()))
-            .unwrap_or_default(),
-        "source_inode": row_u64(row, "source_inode").unwrap_or_default(),
-        "source_generation": row_u64(row, "source_generation")
-            .or_else(|| source_ref.as_ref().map(|parts| parts.1))
-            .unwrap_or_default(),
-        "source_line_no": row_u64(row, "source_line_no")
-            .or_else(|| source_ref.as_ref().map(|parts| parts.2))
-            .unwrap_or_default(),
-        "source_offset": row_u64(row, "source_offset").unwrap_or_default(),
+        "source_name": source.source_name,
+        "harness": source.harness,
+        "source_file": source.source_file,
+        "source_inode": source.source_inode,
+        "source_generation": source.source_generation,
+        "source_line_no": source.source_line_no,
+        "source_offset": source.source_offset,
         "error_kind": "oversized_json_row",
         "error_text": format!(
             "skipped {table} row: serialized JSONEachRow object is {row_bytes} bytes, above ClickHouse limit of {CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES} bytes"
@@ -476,6 +472,230 @@ fn oversized_row_fragment(row: &Value) -> String {
     serde_json::to_string(row)
         .map(|value| truncate_chars(&value, OVERSIZED_ROW_FRAGMENT_CHARS))
         .unwrap_or_default()
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SinkStage {
+    RawEvents,
+    Events,
+    EventLinks,
+    ToolIo,
+    IngestErrors,
+    IngestCheckpoints,
+}
+
+impl SinkStage {
+    fn table(self) -> &'static str {
+        match self {
+            Self::RawEvents => "raw_events",
+            Self::Events => "events",
+            Self::EventLinks => "event_links",
+            Self::ToolIo => "tool_io",
+            Self::IngestErrors => "ingest_errors",
+            Self::IngestCheckpoints => "ingest_checkpoints",
+        }
+    }
+}
+
+struct SinkFlushFailure {
+    stage: SinkStage,
+    error: anyhow::Error,
+}
+
+impl SinkFlushFailure {
+    fn new(stage: SinkStage, error: anyhow::Error) -> Self {
+        Self { stage, error }
+    }
+}
+
+#[derive(Default)]
+struct IngestErrorSource {
+    source_name: String,
+    harness: String,
+    source_file: String,
+    source_inode: u64,
+    source_generation: u64,
+    source_line_no: u64,
+    source_offset: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PendingSinkData<'a> {
+    raw_rows: &'a [Value],
+    event_rows: &'a [Value],
+    link_rows: &'a [Value],
+    tool_rows: &'a [Value],
+    error_rows: &'a [Value],
+    checkpoint_updates: &'a HashMap<String, Checkpoint>,
+}
+
+impl PendingSinkData<'_> {
+    fn source_for(self, stage: SinkStage) -> (IngestErrorSource, &'static str) {
+        let stage_rows = match stage {
+            SinkStage::RawEvents => self.raw_rows,
+            SinkStage::Events => self.event_rows,
+            SinkStage::EventLinks => self.link_rows,
+            SinkStage::ToolIo => self.tool_rows,
+            SinkStage::IngestErrors => self.error_rows,
+            SinkStage::IngestCheckpoints => &[],
+        };
+
+        if let [row] = stage_rows {
+            return (ingest_error_source_from_row(row), "row");
+        }
+
+        if let Some(source) = self
+            .checkpoint_updates
+            .values()
+            .next()
+            .map(ingest_error_source_from_checkpoint)
+        {
+            return (source, "checkpoint");
+        }
+
+        (IngestErrorSource::default(), "batch")
+    }
+
+    fn stage_len(self, stage: SinkStage) -> usize {
+        match stage {
+            SinkStage::RawEvents => self.raw_rows.len(),
+            SinkStage::Events => self.event_rows.len(),
+            SinkStage::EventLinks => self.link_rows.len(),
+            SinkStage::ToolIo => self.tool_rows.len(),
+            SinkStage::IngestErrors => self.error_rows.len(),
+            SinkStage::IngestCheckpoints => self.checkpoint_updates.len(),
+        }
+    }
+
+    fn total_len(self) -> usize {
+        self.raw_rows.len()
+            + self.event_rows.len()
+            + self.link_rows.len()
+            + self.tool_rows.len()
+            + self.error_rows.len()
+            + self.checkpoint_updates.len()
+    }
+}
+
+fn ingest_error_source_from_row(row: &Value) -> IngestErrorSource {
+    let source_ref = parse_source_ref(row);
+    IngestErrorSource {
+        source_name: row_str(row, "source_name").unwrap_or_default(),
+        harness: row_str(row, "harness").unwrap_or_default(),
+        source_file: row_str(row, "source_file")
+            .or_else(|| source_ref.as_ref().map(|parts| parts.0.clone()))
+            .unwrap_or_default(),
+        source_inode: row_u64(row, "source_inode").unwrap_or_default(),
+        source_generation: row_u64(row, "source_generation")
+            .or_else(|| source_ref.as_ref().map(|parts| parts.1))
+            .unwrap_or_default(),
+        source_line_no: row_u64(row, "source_line_no")
+            .or_else(|| source_ref.as_ref().map(|parts| parts.2))
+            .unwrap_or_default(),
+        source_offset: row_u64(row, "source_offset").unwrap_or_default(),
+    }
+}
+
+fn ingest_error_source_from_checkpoint(checkpoint: &Checkpoint) -> IngestErrorSource {
+    IngestErrorSource {
+        source_name: checkpoint.source_name.clone(),
+        source_file: checkpoint.source_file.clone(),
+        source_inode: checkpoint.source_inode,
+        source_generation: checkpoint.source_generation as u64,
+        source_line_no: checkpoint.last_line_no,
+        source_offset: checkpoint.last_offset,
+        ..Default::default()
+    }
+}
+
+fn non_retryable_sink_error_row(
+    stage: SinkStage,
+    error_text: &str,
+    pending: PendingSinkData<'_>,
+) -> Value {
+    let (source, source_scope) = pending.source_for(stage);
+    let stage_pending_rows = pending.stage_len(stage);
+    let total_pending_rows = pending.total_len();
+
+    json!({
+        "source_name": source.source_name,
+        "harness": source.harness,
+        "source_file": source.source_file,
+        "source_inode": source.source_inode,
+        "source_generation": source.source_generation,
+        "source_line_no": source.source_line_no,
+        "source_offset": source.source_offset,
+        "error_kind": SINK_JSON_OBJECT_TOO_LARGE,
+        "error_text": truncate_chars(error_text, MAX_SINK_ERROR_TEXT_CHARS),
+        "raw_fragment": format!(
+            "source_scope={source_scope}; sink_stage={}; stage_pending_rows={stage_pending_rows}; total_pending_rows={total_pending_rows}; checkpoint_updates={}; original_payload_omitted=true",
+            stage.table(),
+            pending.checkpoint_updates.len()
+        ),
+    })
+}
+
+async fn record_non_retryable_sink_error(
+    clickhouse: &ClickHouseClient,
+    metrics: &Arc<Metrics>,
+    stage: SinkStage,
+    error_text: &str,
+    pending: PendingSinkData<'_>,
+) -> anyhow::Result<()> {
+    let row = non_retryable_sink_error_row(stage, error_text, pending);
+
+    clickhouse
+        .insert_json_rows("ingest_errors", &[row])
+        .await
+        .with_context(|| {
+            format!(
+                "failed to record non-retryable sink error for {}",
+                stage.table()
+            )
+        })?;
+    metrics.err_rows_written.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+fn clear_pending_sink_data(
+    raw_rows: &mut Vec<Value>,
+    event_rows: &mut Vec<Value>,
+    link_rows: &mut Vec<Value>,
+    tool_rows: &mut Vec<Value>,
+    error_rows: &mut Vec<Value>,
+    checkpoint_updates: &mut HashMap<String, Checkpoint>,
+) {
+    raw_rows.clear();
+    event_rows.clear();
+    link_rows.clear();
+    tool_rows.clear();
+    error_rows.clear();
+    checkpoint_updates.clear();
+}
+
+async fn commit_checkpoint_updates(
+    clickhouse: &ClickHouseClient,
+    checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
+    checkpoint_rows: &[Value],
+    checkpoint_updates: &HashMap<String, Checkpoint>,
+) -> anyhow::Result<()> {
+    if checkpoint_rows.is_empty() {
+        return Ok(());
+    }
+
+    clickhouse
+        .insert_json_rows("ingest_checkpoints", checkpoint_rows)
+        .await
+        .context("failed to insert ingest checkpoint rows")?;
+
+    // Offset-monotone merge, not a blind insert: a backend map has two
+    // producers (live router batches and catch-up replay), so an out-of-order
+    // flush must never regress what the map already committed.
+    let mut state = checkpoints.write().await;
+    for cp in checkpoint_updates.values() {
+        merge_checkpoint(&mut state, cp.clone());
+    }
+    Ok(())
 }
 
 /// Default-role only: mirror sinks write rows into databases this host does
@@ -597,21 +817,39 @@ async fn flush_pending(
         })
         .collect();
 
-    let flush_result = async {
-        let quarantined = quarantine_oversized_rows("raw_events", raw_rows, error_rows)?
-            + quarantine_oversized_rows("events", event_rows, error_rows)?
-            + quarantine_oversized_rows("event_links", link_rows, error_rows)?
-            + quarantine_oversized_rows("tool_io", tool_rows, error_rows)?;
-        if quarantined > 0 {
-            warn!(
-                rows = quarantined,
-                max_bytes = CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES,
-                "quarantined oversized rows before ClickHouse insert"
-            );
+    let quarantined = match (|| -> anyhow::Result<usize> {
+        Ok(
+            quarantine_oversized_rows("raw_events", raw_rows, error_rows)?
+                + quarantine_oversized_rows("events", event_rows, error_rows)?
+                + quarantine_oversized_rows("event_links", link_rows, error_rows)?
+                + quarantine_oversized_rows("tool_io", tool_rows, error_rows)?,
+        )
+    })() {
+        Ok(quarantined) => quarantined,
+        Err(exc) => {
+            metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
+            *metrics
+                .last_error
+                .lock()
+                .expect("metrics last_error mutex poisoned") = exc.to_string();
+            warn!("flush failed during oversized-row guard: {exc}");
+            return false;
         }
+    };
+    if quarantined > 0 {
+        warn!(
+            rows = quarantined,
+            max_bytes = CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES,
+            "quarantined oversized rows before ClickHouse insert"
+        );
+    }
 
+    let flush_result = async {
         if !raw_rows.is_empty() {
-            clickhouse.insert_json_rows("raw_events", raw_rows).await?;
+            clickhouse
+                .insert_json_rows("raw_events", raw_rows)
+                .await
+                .map_err(|error| SinkFlushFailure::new(SinkStage::RawEvents, error))?;
             metrics
                 .raw_rows_written
                 .fetch_add(raw_rows.len() as u64, Ordering::Relaxed);
@@ -627,7 +865,10 @@ async fn flush_pending(
         }
 
         if !event_rows.is_empty() {
-            clickhouse.insert_json_rows("events", event_rows).await?;
+            clickhouse
+                .insert_json_rows("events", event_rows)
+                .await
+                .map_err(|error| SinkFlushFailure::new(SinkStage::Events, error))?;
             metrics
                 .event_rows_written
                 .fetch_add(event_rows.len() as u64, Ordering::Relaxed);
@@ -637,19 +878,24 @@ async fn flush_pending(
         if !link_rows.is_empty() {
             clickhouse
                 .insert_json_rows("event_links", link_rows)
-                .await?;
+                .await
+                .map_err(|error| SinkFlushFailure::new(SinkStage::EventLinks, error))?;
             link_rows.clear();
         }
 
         if !tool_rows.is_empty() {
-            clickhouse.insert_json_rows("tool_io", tool_rows).await?;
+            clickhouse
+                .insert_json_rows("tool_io", tool_rows)
+                .await
+                .map_err(|error| SinkFlushFailure::new(SinkStage::ToolIo, error))?;
             tool_rows.clear();
         }
 
         if !error_rows.is_empty() {
             clickhouse
                 .insert_json_rows("ingest_errors", error_rows)
-                .await?;
+                .await
+                .map_err(|error| SinkFlushFailure::new(SinkStage::IngestErrors, error))?;
             metrics
                 .err_rows_written
                 .fetch_add(error_rows.len() as u64, Ordering::Relaxed);
@@ -657,40 +903,119 @@ async fn flush_pending(
         }
 
         if !checkpoint_rows.is_empty() {
-            clickhouse
-                .insert_json_rows("ingest_checkpoints", &checkpoint_rows)
-                .await?;
-
-            {
-                // Offset-monotone merge, not a blind insert: a backend map
-                // has two producers (live router batches and catch-up
-                // replay), so an out-of-order flush must never regress —
-                // or, for replay overlapping fresher live data, rewind —
-                // what the map already committed.
-                let mut state = checkpoints.write().await;
-                for cp in checkpoint_updates.values() {
-                    merge_checkpoint(&mut state, cp.clone());
-                }
-            }
+            commit_checkpoint_updates(
+                clickhouse,
+                checkpoints,
+                &checkpoint_rows,
+                checkpoint_updates,
+            )
+            .await
+            .map_err(|error| SinkFlushFailure::new(SinkStage::IngestCheckpoints, error))?;
             checkpoint_updates.clear();
         }
 
         metrics
             .last_flush_ms
             .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
-        anyhow::Result::<()>::Ok(())
+        Ok::<(), SinkFlushFailure>(())
     }
     .await;
 
     match flush_result {
         Ok(()) => true,
-        Err(exc) => {
+        Err(failure) => {
             metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
+            let error_text = failure.error.to_string();
+            if is_oversized_json_each_row_insert_error(&failure.error) {
+                let last_error = format!(
+                    "non-retryable sink flush failure at {}: {error_text}",
+                    failure.stage.table()
+                );
+                *metrics
+                    .last_error
+                    .lock()
+                    .expect("metrics last_error mutex poisoned") = last_error;
+                warn!(
+                    sink_stage = failure.stage.table(),
+                    "non-retryable oversized JSONEachRow insert failure; recording compact ingest error, committing checkpoint, and dropping pending batch: {}",
+                    failure.error
+                );
+                if let Err(error) = record_non_retryable_sink_error(
+                    clickhouse,
+                    metrics,
+                    failure.stage,
+                    &error_text,
+                    PendingSinkData {
+                        raw_rows,
+                        event_rows,
+                        link_rows,
+                        tool_rows,
+                        error_rows,
+                        checkpoint_updates,
+                    },
+                )
+                .await
+                {
+                    let last_error = format!(
+                        "failed to record non-retryable sink error at {}: {error}",
+                        failure.stage.table()
+                    );
+                    *metrics
+                        .last_error
+                        .lock()
+                        .expect("metrics last_error mutex poisoned") = last_error.clone();
+                    warn!(
+                        sink_stage = failure.stage.table(),
+                        original_error = %failure.error,
+                        "{last_error}"
+                    );
+                    return false;
+                }
+                if let Err(error) = commit_checkpoint_updates(
+                    clickhouse,
+                    checkpoints,
+                    &checkpoint_rows,
+                    checkpoint_updates,
+                )
+                .await
+                {
+                    let last_error = format!(
+                        "failed to checkpoint after non-retryable sink failure at {}: {error}",
+                        failure.stage.table()
+                    );
+                    *metrics
+                        .last_error
+                        .lock()
+                        .expect("metrics last_error mutex poisoned") = last_error.clone();
+                    warn!(
+                        sink_stage = failure.stage.table(),
+                        original_error = %failure.error,
+                        "{last_error}"
+                    );
+                    return false;
+                }
+                metrics
+                    .last_flush_ms
+                    .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                clear_pending_sink_data(
+                    raw_rows,
+                    event_rows,
+                    link_rows,
+                    tool_rows,
+                    error_rows,
+                    checkpoint_updates,
+                );
+                return true;
+            }
+
             *metrics
                 .last_error
                 .lock()
-                .expect("metrics last_error mutex poisoned") = exc.to_string();
-            warn!("flush failed: {exc}");
+                .expect("metrics last_error mutex poisoned") = error_text;
+            warn!(
+                sink_stage = failure.stage.table(),
+                "flush failed: {}", failure.error
+            );
             false
         }
     }
@@ -716,6 +1041,7 @@ mod tests {
         calls_by_table: Arc<Mutex<HashMap<String, usize>>>,
         rows_by_table: Arc<Mutex<HashMap<String, Vec<Value>>>>,
         fail_once_by_table: Arc<Mutex<HashMap<String, usize>>>,
+        fail_always_by_table: Arc<Mutex<HashMap<String, String>>>,
     }
 
     impl MockClickHouseState {
@@ -727,6 +1053,19 @@ mod tests {
                 .expect("mock fail_once mutex poisoned")
                 .insert(table.to_string(), 1);
             state
+        }
+
+        fn with_permanent_failure(table: &str, body: &str) -> Self {
+            let state = Self::default();
+            state.fail_permanently(table, body);
+            state
+        }
+
+        fn fail_permanently(&self, table: &str, body: &str) {
+            self.fail_always_by_table
+                .lock()
+                .expect("mock fail_always mutex poisoned")
+                .insert(table.to_string(), body.to_string());
         }
 
         fn call_count(&self, table: &str) -> usize {
@@ -801,6 +1140,15 @@ mod tests {
                 }
             }
         }
+        {
+            let fail_always = state
+                .fail_always_by_table
+                .lock()
+                .expect("mock fail_always mutex poisoned");
+            if let Some(body) = fail_always.get(table) {
+                return (StatusCode::BAD_REQUEST, body.clone());
+            }
+        }
 
         {
             let mut rows = state
@@ -822,6 +1170,12 @@ mod tests {
         fail_once_table: &str,
     ) -> (ClickHouseClient, MockClickHouseState) {
         let state = MockClickHouseState::with_single_failure(fail_once_table);
+        spawn_mock_clickhouse_with_state(state).await
+    }
+
+    async fn spawn_mock_clickhouse_with_state(
+        state: MockClickHouseState,
+    ) -> (ClickHouseClient, MockClickHouseState) {
         let app = Router::new()
             .route("/", post(mock_clickhouse_handler))
             .with_state(state.clone());
@@ -870,6 +1224,11 @@ mod tests {
             backend_sinks_column: false,
         }
     }
+
+    const CLICKHOUSE_OVERSIZED_JSON_OBJECT_ERROR: &str =
+        "Code: 117. DB::Exception: Size of JSON object at position 104890103 is extremely large. \
+         Expected not greater than 10485760 bytes, but current is 104890103 bytes per row. \
+         While executing ParallelParsingBlockInputFormat.";
 
     #[tokio::test]
     async fn failed_flush_throttles_sink_consumption() {
@@ -999,6 +1358,411 @@ mod tests {
             state.contains_key(&checkpoint_key_value),
             "checkpoint cache should advance after checkpoint stage succeeds"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flush_pending_records_non_retryable_sink_oversized_json_and_clears_batch() {
+        let (clickhouse, mock_state) =
+            spawn_mock_clickhouse_with_state(MockClickHouseState::with_permanent_failure(
+                "raw_events",
+                CLICKHOUSE_OVERSIZED_JSON_OBJECT_ERROR,
+            ))
+            .await;
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+
+        let checkpoint = sample_checkpoint();
+        let checkpoint_key_value = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
+        let mut checkpoint_updates = HashMap::from([(checkpoint_key_value.clone(), checkpoint)]);
+        let mut raw_rows = vec![json!({
+            "source_name": "source-a",
+            "harness": "codex",
+            "source_file": "/tmp/source-a.jsonl",
+            "source_inode": 42u64,
+            "source_generation": 1u32,
+            "source_line_no": 7u64,
+            "source_offset": 2048u64,
+            "record_ts": "2026-02-17T00:00:01.000Z",
+            "top_type": "response_item",
+            "session_id": "session-a",
+            "raw_json": "payload-marker-that-must-not-be-copied",
+            "raw_json_hash": 1u64,
+            "event_uid": "evt-fallback",
+        })];
+        let mut event_rows = vec![json!({"event_uid": "evt-fallback"})];
+        let mut link_rows = Vec::<Value>::new();
+        let mut tool_rows = Vec::<Value>::new();
+        let mut error_rows = Vec::<Value>::new();
+
+        assert!(
+            flush_pending(
+                &clickhouse,
+                &checkpoints,
+                &metrics,
+                &mut raw_rows,
+                &mut event_rows,
+                &mut link_rows,
+                &mut tool_rows,
+                &mut error_rows,
+                &mut checkpoint_updates,
+                true,
+                "",
+            )
+            .await,
+            "non-retryable oversized JSONEachRow failures should clear the stuck batch"
+        );
+
+        assert!(raw_rows.is_empty());
+        assert!(event_rows.is_empty());
+        assert!(checkpoint_updates.is_empty());
+        assert_eq!(mock_state.call_count("raw_events"), 1);
+        assert_eq!(
+            mock_state.call_count("events"),
+            0,
+            "the failed stage stops the normal flush sequence"
+        );
+        assert_eq!(mock_state.call_count("ingest_errors"), 1);
+        assert_eq!(
+            mock_state.call_count("ingest_checkpoints"),
+            1,
+            "the skipped batch checkpoint should commit after the compact error row"
+        );
+
+        let persisted_errors = mock_state.rows("ingest_errors");
+        assert_eq!(persisted_errors.len(), 1);
+        let error = &persisted_errors[0];
+        assert_eq!(
+            error.get("error_kind").and_then(Value::as_str),
+            Some(SINK_JSON_OBJECT_TOO_LARGE)
+        );
+        assert_eq!(
+            error.get("source_file").and_then(Value::as_str),
+            Some("/tmp/source-a.jsonl")
+        );
+        assert_eq!(error.get("source_line_no").and_then(Value::as_u64), Some(7));
+        assert_eq!(
+            error.get("source_offset").and_then(Value::as_u64),
+            Some(2048)
+        );
+        assert!(error
+            .get("error_text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains("Size of JSON object")));
+        let raw_fragment = error
+            .get("raw_fragment")
+            .and_then(Value::as_str)
+            .expect("fallback error should carry a compact fragment");
+        assert!(raw_fragment.contains("sink_stage=raw_events"));
+        assert!(raw_fragment.contains("source_scope=row"));
+        assert!(raw_fragment.contains("original_payload_omitted=true"));
+        assert!(
+            !raw_fragment.contains("payload-marker"),
+            "fallback error must not copy the original row payload"
+        );
+        assert_eq!(metrics.err_rows_written.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.flush_failures.load(Ordering::Relaxed), 1);
+
+        let last_error = metrics
+            .last_error
+            .lock()
+            .expect("metrics last_error mutex poisoned")
+            .clone();
+        assert!(last_error.contains("non-retryable sink flush failure"));
+        assert!(last_error.contains("raw_events"));
+
+        let state = checkpoints.read().await;
+        assert!(
+            state.contains_key(&checkpoint_key_value),
+            "the fallback should advance the checkpoint after recording the compact sink error"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flush_pending_keeps_non_retryable_batch_when_error_record_fails() {
+        let mock_state = MockClickHouseState::default();
+        mock_state.fail_permanently("raw_events", CLICKHOUSE_OVERSIZED_JSON_OBJECT_ERROR);
+        mock_state.fail_permanently("ingest_errors", "intentional ingest_errors failure");
+        let (clickhouse, mock_state) = spawn_mock_clickhouse_with_state(mock_state).await;
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+
+        let checkpoint = sample_checkpoint();
+        let checkpoint_key_value = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
+        let mut checkpoint_updates = HashMap::from([(checkpoint_key_value, checkpoint)]);
+        let mut raw_rows = vec![json!({
+            "source_name": "source-a",
+            "source_file": "/tmp/source-a.jsonl",
+            "source_line_no": 7u64,
+            "source_offset": 2048u64,
+            "record_ts": "2026-02-17T00:00:01.000Z",
+            "top_type": "response_item",
+            "session_id": "session-a",
+            "raw_json": "{}",
+            "raw_json_hash": 1u64,
+            "event_uid": "evt-error-record-fails",
+        })];
+        let mut event_rows = vec![json!({"event_uid": "evt-error-record-fails"})];
+        let mut link_rows = Vec::<Value>::new();
+        let mut tool_rows = Vec::<Value>::new();
+        let mut error_rows = Vec::<Value>::new();
+
+        assert!(
+            !flush_pending(
+                &clickhouse,
+                &checkpoints,
+                &metrics,
+                &mut raw_rows,
+                &mut event_rows,
+                &mut link_rows,
+                &mut tool_rows,
+                &mut error_rows,
+                &mut checkpoint_updates,
+                true,
+                "",
+            )
+            .await,
+            "fallback should remain retryable when the compact error row cannot be written"
+        );
+
+        assert_eq!(raw_rows.len(), 1);
+        assert_eq!(event_rows.len(), 1);
+        assert_eq!(checkpoint_updates.len(), 1);
+        assert_eq!(mock_state.call_count("ingest_errors"), 1);
+        assert_eq!(mock_state.call_count("ingest_checkpoints"), 0);
+        assert!(mock_state.rows("ingest_errors").is_empty());
+        assert_eq!(metrics.err_rows_written.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.flush_failures.load(Ordering::Relaxed), 1);
+
+        let last_error = metrics
+            .last_error
+            .lock()
+            .expect("metrics last_error mutex poisoned")
+            .clone();
+        assert!(last_error.contains("failed to record non-retryable sink error"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flush_pending_checkpoints_after_later_stage_non_retryable_fallback() {
+        let (clickhouse, mock_state) =
+            spawn_mock_clickhouse_with_state(MockClickHouseState::with_permanent_failure(
+                "events",
+                CLICKHOUSE_OVERSIZED_JSON_OBJECT_ERROR,
+            ))
+            .await;
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+
+        let checkpoint = sample_checkpoint();
+        let checkpoint_key_value = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
+        let mut checkpoint_updates = HashMap::from([(checkpoint_key_value.clone(), checkpoint)]);
+        let mut raw_rows = vec![json!({
+            "record_ts": "2026-02-17T00:00:01.000Z",
+            "event_uid": "evt-later-stage",
+            "raw_json": "{}",
+        })];
+        let mut event_rows = vec![json!({
+            "event_uid": "evt-later-stage",
+            "source_name": "source-a",
+            "source_file": "/tmp/source-a.jsonl",
+            "source_line_no": 17u64,
+            "source_offset": 4096u64,
+        })];
+        let mut link_rows = Vec::<Value>::new();
+        let mut tool_rows = Vec::<Value>::new();
+        let mut error_rows = Vec::<Value>::new();
+
+        assert!(
+            flush_pending(
+                &clickhouse,
+                &checkpoints,
+                &metrics,
+                &mut raw_rows,
+                &mut event_rows,
+                &mut link_rows,
+                &mut tool_rows,
+                &mut error_rows,
+                &mut checkpoint_updates,
+                true,
+                "",
+            )
+            .await,
+            "non-retryable fallback after a partial commit should finish by checkpointing"
+        );
+
+        assert!(raw_rows.is_empty());
+        assert!(event_rows.is_empty());
+        assert!(checkpoint_updates.is_empty());
+        assert_eq!(mock_state.rows("raw_events").len(), 1);
+        assert!(mock_state.rows("events").is_empty());
+        assert_eq!(mock_state.rows("ingest_errors").len(), 1);
+        assert_eq!(mock_state.rows("ingest_checkpoints").len(), 1);
+        assert_eq!(metrics.raw_rows_written.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.event_rows_written.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.err_rows_written.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.flush_failures.load(Ordering::Relaxed), 1);
+
+        let error = &mock_state.rows("ingest_errors")[0];
+        assert_eq!(
+            error.get("source_line_no").and_then(Value::as_u64),
+            Some(17)
+        );
+        assert!(error
+            .get("raw_fragment")
+            .and_then(Value::as_str)
+            .is_some_and(|fragment| fragment.contains("source_scope=row")
+                && fragment.contains("sink_stage=events")));
+
+        let state = checkpoints.read().await;
+        assert!(
+            state.contains_key(&checkpoint_key_value),
+            "checkpoint cache should advance after later-stage fallback"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flush_pending_uses_checkpoint_source_for_multi_row_non_retryable_fallback() {
+        let (clickhouse, mock_state) =
+            spawn_mock_clickhouse_with_state(MockClickHouseState::with_permanent_failure(
+                "raw_events",
+                CLICKHOUSE_OVERSIZED_JSON_OBJECT_ERROR,
+            ))
+            .await;
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+
+        let mut checkpoint = sample_checkpoint();
+        checkpoint.last_line_no = 99;
+        checkpoint.last_offset = 8192;
+        let checkpoint_key_value = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
+        let mut checkpoint_updates = HashMap::from([(checkpoint_key_value, checkpoint)]);
+        let mut raw_rows = vec![
+            json!({
+                "source_name": "source-a",
+                "source_file": "/tmp/source-a.jsonl",
+                "source_line_no": 7u64,
+                "source_offset": 2048u64,
+                "record_ts": "2026-02-17T00:00:01.000Z",
+                "event_uid": "evt-first",
+                "raw_json": "{}",
+            }),
+            json!({
+                "source_name": "source-a",
+                "source_file": "/tmp/source-a.jsonl",
+                "source_line_no": 8u64,
+                "source_offset": 4096u64,
+                "record_ts": "2026-02-17T00:00:02.000Z",
+                "event_uid": "evt-second",
+                "raw_json": "{}",
+            }),
+        ];
+        let mut event_rows = Vec::<Value>::new();
+        let mut link_rows = Vec::<Value>::new();
+        let mut tool_rows = Vec::<Value>::new();
+        let mut error_rows = Vec::<Value>::new();
+
+        assert!(
+            flush_pending(
+                &clickhouse,
+                &checkpoints,
+                &metrics,
+                &mut raw_rows,
+                &mut event_rows,
+                &mut link_rows,
+                &mut tool_rows,
+                &mut error_rows,
+                &mut checkpoint_updates,
+                true,
+                "",
+            )
+            .await,
+            "multi-row non-retryable fallback should be batch-handled"
+        );
+
+        let persisted_errors = mock_state.rows("ingest_errors");
+        assert_eq!(persisted_errors.len(), 1);
+        let error = &persisted_errors[0];
+        assert_eq!(
+            error.get("source_line_no").and_then(Value::as_u64),
+            Some(99)
+        );
+        assert_eq!(
+            error.get("source_offset").and_then(Value::as_u64),
+            Some(8192)
+        );
+        assert!(error
+            .get("raw_fragment")
+            .and_then(Value::as_str)
+            .is_some_and(|fragment| fragment.contains("source_scope=checkpoint")
+                && fragment.contains("stage_pending_rows=2")));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flush_pending_retries_other_code_117_failures() {
+        let (clickhouse, mock_state) =
+            spawn_mock_clickhouse_with_state(MockClickHouseState::with_permanent_failure(
+                "raw_events",
+                "Code: 117. DB::Exception: Unknown field found while parsing JSONEachRow: \
+                 unexpected_column",
+            ))
+            .await;
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+
+        let checkpoint = sample_checkpoint();
+        let checkpoint_key_value = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
+        let mut checkpoint_updates = HashMap::from([(checkpoint_key_value, checkpoint)]);
+        let mut raw_rows = vec![json!({
+            "source_name": "source-a",
+            "harness": "codex",
+            "source_file": "/tmp/source-a.jsonl",
+            "source_inode": 42u64,
+            "source_generation": 1u32,
+            "source_line_no": 7u64,
+            "source_offset": 2048u64,
+            "record_ts": "2026-02-17T00:00:01.000Z",
+            "top_type": "response_item",
+            "session_id": "session-a",
+            "raw_json": "{}",
+            "raw_json_hash": 1u64,
+            "event_uid": "evt-retry",
+        })];
+        let mut event_rows = vec![json!({"event_uid": "evt-retry"})];
+        let mut link_rows = Vec::<Value>::new();
+        let mut tool_rows = Vec::<Value>::new();
+        let mut error_rows = Vec::<Value>::new();
+
+        assert!(
+            !flush_pending(
+                &clickhouse,
+                &checkpoints,
+                &metrics,
+                &mut raw_rows,
+                &mut event_rows,
+                &mut link_rows,
+                &mut tool_rows,
+                &mut error_rows,
+                &mut checkpoint_updates,
+                true,
+                "",
+            )
+            .await,
+            "other ClickHouse Code 117 failures should remain retryable"
+        );
+
+        assert_eq!(raw_rows.len(), 1);
+        assert_eq!(event_rows.len(), 1);
+        assert_eq!(checkpoint_updates.len(), 1);
+        assert!(mock_state.rows("ingest_errors").is_empty());
+        assert_eq!(mock_state.call_count("ingest_errors"), 0);
+        assert_eq!(metrics.err_rows_written.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.flush_failures.load(Ordering::Relaxed), 1);
+
+        let last_error = metrics
+            .last_error
+            .lock()
+            .expect("metrics last_error mutex poisoned")
+            .clone();
+        assert!(last_error.contains("Unknown field"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
