@@ -32,7 +32,7 @@ HERMES_FAILURE_MARKERS = (
     "not found",
     "traceback",
 )
-GUIDANCE_TRIGGERS = (
+SESSION_GUIDANCE_TRIGGERS = (
     "another agent",
     "other agent",
     "agents doing",
@@ -51,6 +51,14 @@ GUIDANCE_TRIGGERS = (
     "search sessions",
     "session history",
     "who touched",
+)
+BUG_REPORT_GUIDANCE_TRIGGERS = (
+    "bug report",
+    "file a bug",
+    "file an issue",
+    "github issue",
+    "report a bug",
+    "report an issue",
 )
 
 DOCTOR_SCHEMA = {
@@ -87,6 +95,11 @@ def register(ctx) -> None:
         PLUGIN_DIR / "skills" / "realtime-peek" / "SKILL.md",
         "Inspect active or very recent agent sessions through Moraine.",
     )
+    ctx.register_skill(
+        "bug-report",
+        PLUGIN_DIR / "skills" / "bug-report" / "SKILL.md",
+        "Prepare a sanitized Moraine bug report with explicit user approval.",
+    )
     ctx.register_tool(
         name="moraine_doctor",
         toolset=DIAGNOSTIC_TOOLSET,
@@ -114,15 +127,23 @@ def _doctor_tool(args: dict[str, Any], **_kwargs: Any) -> str:
 
 
 def _pre_llm_call(user_message: str = "", **_kwargs: Any) -> dict[str, str] | None:
-    """Inject compact Moraine guidance only on turns that imply session recall."""
+    """Inject compact Moraine guidance only on turns that imply it."""
     text = (user_message or "").lower()
     if "moraine guidance for hermes" in text:
         return None
-    if "moraine" not in text and not any(trigger in text for trigger in GUIDANCE_TRIGGERS):
+    mentions_moraine = "moraine" in text
+    wants_bug_report = mentions_moraine and any(
+        trigger in text for trigger in BUG_REPORT_GUIDANCE_TRIGGERS
+    )
+    wants_session_guidance = any(trigger in text for trigger in SESSION_GUIDANCE_TRIGGERS) or (
+        mentions_moraine and not wants_bug_report
+    )
+    if not wants_session_guidance and not wants_bug_report:
         return None
 
-    return {
-        "context": (
+    guidance: list[str] = []
+    if wants_session_guidance:
+        guidance.append(
             "Moraine guidance for Hermes: when the user asks about prior work, "
             "agent history, active agents, or files touched by other agents, use "
             "the Moraine MCP tools registered as `mcp_moraine_search_sessions`, "
@@ -135,7 +156,15 @@ def _pre_llm_call(user_message: str = "", **_kwargs: Any) -> dict[str, str] | No
             "missing, ask the user to run `hermes moraine doctor` or "
             "`hermes moraine setup`."
         )
-    }
+    if wants_bug_report:
+        guidance.append(
+            "Moraine bug-report guidance for Hermes: load "
+            "`skill_view(\"moraine:bug-report\")`, keep the report limited to "
+            "reproducible Moraine defects, redact private data and exact host "
+            "details, and ask for explicit posting confirmation before creating "
+            "or uploading a GitHub issue."
+        )
+    return {"context": " ".join(guidance)}
 
 
 def _setup_cli(parser) -> None:
@@ -403,7 +432,11 @@ def _doctor_report(*, run_mcp_test: bool) -> dict[str, Any]:
         "ok": ok,
         "summary": "Moraine is ready for Hermes." if ok else "Moraine needs attention before Hermes can search it.",
         "checks": checks,
-        "skills": ["moraine:session-search", "moraine:realtime-peek"],
+        "skills": [
+            "moraine:session-search",
+            "moraine:realtime-peek",
+            "moraine:bug-report",
+        ],
         "expected_tools": sorted(f"mcp_moraine_{tool}" for tool in REQUIRED_MCP_TOOLS),
     }
 

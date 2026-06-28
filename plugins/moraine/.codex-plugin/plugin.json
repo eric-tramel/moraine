@@ -1,7 +1,7 @@
 {
   "name": "moraine",
   "version": "0.6.2",
-  "description": "Codex plugin for Moraine MCP session search and realtime agent awareness.",
+  "description": "Codex plugin for Moraine MCP session search, realtime agent awareness, and sanitized bug reports.",
   "author": {
     "name": "Moraine maintainers",
     "email": "eric.tramel@gmail.com",
@@ -16,14 +16,15 @@
     "codex",
     "agent-memory",
     "session-search",
-    "realtime-agents"
+    "realtime-agents",
+    "bug-report"
   ],
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Moraine",
-    "shortDescription": "Search local agent sessions from Codex.",
-    "longDescription": "Connects Codex to Moraine MCP session search, realtime agent awareness, and bundled guidance for recovering prior agent context.",
+    "shortDescription": "Use Moraine guidance from Codex.",
+    "longDescription": "Connects Codex to Moraine MCP session search, realtime agent awareness, and bundled guidance for recovering prior agent context or preparing sanitized Moraine bug reports.",
     "developerName": "Moraine maintainers",
     "category": "Developer Tools",
     "capabilities": [
@@ -32,7 +33,8 @@
     "defaultPrompt": [
       "Search my past agent sessions with Moraine.",
       "Check what another agent is doing now.",
-      "Find prior context for this issue."
+      "Find prior context for this issue.",
+      "Prepare a sanitized Moraine bug report."
     ],
     "brandColor": "#2F6F73"
   }

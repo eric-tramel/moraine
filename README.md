@@ -67,10 +67,10 @@ Codex, and Hermes, or to register Moraine MCP for supported harnesses such as
 OpenCode, Cursor, Kimi CLI, and Pi Coding Agent. The integrations use the
 `moraine` CLI on your `PATH` and the running local stack.
 
-Start a new agent session after installing an integration. Claude Code, Codex, and
-Hermes sessions get the `moraine:session-search` and `moraine:realtime-peek`
-guidance, and Moraine MCP tools are exposed with each harness's MCP naming
-scheme. Then ask:
+Start a new agent session after installing an integration. Claude Code, Codex,
+and Hermes sessions get `moraine:session-search`, `moraine:realtime-peek`, and
+`moraine:bug-report` guidance, and Moraine MCP tools are exposed with each
+harness's MCP naming scheme. Then ask:
 
 ```text
 What are my agents doing right now?
