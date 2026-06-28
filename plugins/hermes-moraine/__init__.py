@@ -211,14 +211,13 @@ def _handle_cli(args) -> None:
 
 def _setup_mcp(*, force: bool, run_test: bool) -> dict[str, Any]:
     steps: list[dict[str, Any]] = []
-    moraine = _resolve_executable("moraine")
+    moraine, trust = _resolve_trusted_moraine()
     if not moraine:
         return {
             "ok": False,
             "summary": "Moraine CLI was not found on PATH.",
             "steps": [{"status": "error", "message": "Install Moraine first, then rerun setup."}],
         }
-    trust = _moraine_path_trust(moraine)
     if trust:
         return {
             "ok": False,
@@ -374,10 +373,9 @@ def _save_hermes_config_section(config_path: Path, server_config: dict[str, Any]
 def _doctor_report(*, run_mcp_test: bool) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
 
-    moraine = _resolve_executable("moraine")
+    moraine, trust = _resolve_trusted_moraine()
     moraine_trusted = False
     if moraine:
-        trust = _moraine_path_trust(moraine)
         if trust:
             checks.append(_check("Moraine CLI", "error", trust, detail=f"Resolved path: {moraine}"))
         else:
@@ -583,12 +581,9 @@ def _string_list(value: Any) -> list[str] | None:
 
 
 def _moraine_command_mismatch(command: str) -> str:
-    trusted = _resolve_executable(MCP_SERVER_NAME)
+    trusted, trust = _resolve_trusted_moraine()
     if not trusted:
-        return "Could not find a trusted Moraine CLI on PATH to compare with the MCP registration."
-    trusted_issue = _moraine_path_trust(trusted)
-    if trusted_issue:
-        return trusted_issue
+        return trust or "Could not find a trusted Moraine CLI on PATH to compare with the MCP registration."
     try:
         if Path(command).resolve() != Path(trusted).resolve():
             return (
@@ -637,23 +632,100 @@ def _resolve_executable(name: str) -> str | None:
     return found if found else None
 
 
-def _moraine_path_trust(path: str) -> str:
+def _resolve_trusted_moraine() -> tuple[str | None, str]:
+    candidates = _resolve_executable_candidates(MCP_SERVER_NAME)
+    if not candidates:
+        return None, "Moraine CLI was not found on PATH."
+
+    first_issue = ""
+    for candidate in candidates:
+        issue = _moraine_path_trust(candidate, allow_source_checkout=False)
+        if not issue:
+            return candidate, ""
+        if not first_issue:
+            first_issue = issue
+
+    for candidate in candidates:
+        issue = _moraine_path_trust(candidate, allow_source_checkout=True)
+        if not issue:
+            return candidate, ""
+        if not first_issue:
+            first_issue = issue
+
+    return candidates[0], first_issue
+
+
+def _resolve_executable_candidates(name: str) -> list[str]:
+    paths = os.environ.get("PATH", "")
+    if not paths:
+        return []
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for directory in paths.split(os.pathsep):
+        if not directory:
+            continue
+        candidate = Path(directory) / name
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+            continue
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(key)
+    return candidates
+
+
+def _moraine_path_trust(path: str, *, allow_source_checkout: bool = True) -> str:
     candidate = Path(path)
     if not candidate.is_absolute():
         return "Moraine resolved to a non-absolute PATH entry; start Hermes from a trusted shell."
 
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        return "Could not resolve Moraine CLI path for trust checks."
+
+    if allow_source_checkout and _is_moraine_source_checkout_cli(resolved):
+        return ""
+
     cwd = Path.cwd().resolve()
     try:
-        if candidate.resolve().is_relative_to(cwd):
+        if resolved.is_relative_to(cwd):
             return "Moraine resolves inside the current project directory; prefer an installed CLI earlier on PATH."
     except OSError:
         return "Could not resolve Moraine CLI path for trust checks."
 
-    scan = candidate.resolve().parent
+    scan = resolved.parent
     for parent in [scan, *scan.parents]:
         if (parent / ".git").exists():
             return "Moraine resolves inside a Git worktree; prefer an installed CLI earlier on PATH."
     return ""
+
+
+def _is_moraine_source_checkout_cli(candidate: Path) -> bool:
+    for root in [candidate.parent, *candidate.parents]:
+        if not _looks_like_moraine_source_root(root):
+            continue
+        try:
+            relative = candidate.relative_to(root)
+        except ValueError:
+            continue
+        parts = relative.parts
+        if parts == ("bin", MCP_SERVER_NAME):
+            return True
+        if len(parts) >= 2 and parts[0] == "target" and parts[-1] == MCP_SERVER_NAME:
+            return True
+    return False
+
+
+def _looks_like_moraine_source_root(root: Path) -> bool:
+    return (
+        (root / "Cargo.toml").is_file()
+        and (root / "apps" / "moraine" / "Cargo.toml").is_file()
+        and (root / "crates" / "moraine-mcp-core" / "Cargo.toml").is_file()
+        and (root / "plugins" / "hermes-moraine" / "plugin.yaml").is_file()
+    )
 
 
 def _run_command(
