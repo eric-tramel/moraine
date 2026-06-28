@@ -1,6 +1,6 @@
 {
   "name": "moraine",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "displayName": "Moraine",
   "description": "Claude Code plugin for Moraine MCP session search, realtime agent awareness, and sanitized bug reports.",
   "author": {
