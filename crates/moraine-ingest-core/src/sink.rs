@@ -10,7 +10,7 @@ use crate::{
     WATCHER_BACKEND_POLL,
 };
 use chrono::{DateTime, Utc};
-use moraine_clickhouse::ClickHouseClient;
+use moraine_clickhouse::{is_non_retryable_json_each_row_insert_error, ClickHouseClient};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -47,6 +47,22 @@ pub(crate) enum SinkRole {
         /// here, inside the sink task, and not when the supervisor wakes).
         replay_floor: ReplayFloor,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlushOutcome {
+    Success,
+    RetryableFailure,
+    PermanentFailure,
+}
+
+impl FlushOutcome {
+    fn backend_health_signal(self) -> Option<bool> {
+        match self {
+            Self::Success | Self::PermanentFailure => Some(true),
+            Self::RetryableFailure => Some(false),
+        }
+    }
 }
 
 /// Backend-role health bookkeeping after a flush attempt; no-op for the
@@ -94,6 +110,55 @@ async fn note_flush_outcome(
             "backend drained after lagging/unreachable; scheduling catch-up replay"
         );
         replay_notify.notify_one();
+    }
+}
+
+async fn note_flush_outcome_for_result(
+    role: &SinkRole,
+    checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
+    outcome: FlushOutcome,
+    queue_drained: bool,
+) {
+    if let Some(flush_ok) = outcome.backend_health_signal() {
+        note_flush_outcome(role, checkpoints, flush_ok, queue_drained).await;
+    }
+}
+
+async fn apply_flush_outcome(
+    role: &SinkRole,
+    checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
+    outcome: FlushOutcome,
+    queue_drained: bool,
+    pending_batch_bytes: &mut usize,
+    throttling_flush_retries: &mut bool,
+    retry_backoff: Duration,
+) -> bool {
+    note_flush_outcome_for_result(role, checkpoints, outcome, queue_drained).await;
+
+    match outcome {
+        FlushOutcome::Success => {
+            *pending_batch_bytes = 0;
+            if *throttling_flush_retries {
+                info!("flush retry succeeded; resuming sink intake");
+            }
+            *throttling_flush_retries = false;
+            false
+        }
+        FlushOutcome::PermanentFailure => {
+            *pending_batch_bytes = 0;
+            *throttling_flush_retries = false;
+            false
+        }
+        FlushOutcome::RetryableFailure => {
+            if !*throttling_flush_retries {
+                warn!(
+                    "flush failed; pausing sink intake and retrying pending rows every {} ms",
+                    retry_backoff.as_millis()
+                );
+            }
+            *throttling_flush_retries = true;
+            true
+        }
     }
 }
 
@@ -217,7 +282,7 @@ pub(crate) fn spawn_sink_task(
                     &checkpoint_updates,
                 )
             {
-                let flush_ok = flush_pending(
+                let outcome = flush_pending(
                     &clickhouse,
                     &checkpoints,
                     &metrics,
@@ -231,12 +296,17 @@ pub(crate) fn spawn_sink_task(
                     &checkpoint_host,
                 )
                 .await;
-                note_flush_outcome(&role, &checkpoints, flush_ok, rx.is_empty()).await;
-                if flush_ok {
-                    pending_batch_bytes = 0;
-                    throttling_flush_retries = false;
-                    info!("flush retry succeeded; resuming sink intake");
-                } else {
+                if apply_flush_outcome(
+                    &role,
+                    &checkpoints,
+                    outcome,
+                    rx.is_empty(),
+                    &mut pending_batch_bytes,
+                    &mut throttling_flush_retries,
+                    retry_backoff,
+                )
+                .await
+                {
                     tokio::select! {
                         _ = tokio::time::sleep(retry_backoff) => {}
                         _ = heartbeat_tick.tick() => {
@@ -276,7 +346,7 @@ pub(crate) fn spawn_sink_task(
                             if total_rows >= config.ingest.batch_size
                                 || pending_batch_bytes >= config.ingest.max_batch_bytes.max(1)
                             {
-                                let flush_ok = flush_pending(
+                                let outcome = flush_pending(
                                     &clickhouse,
                                     &checkpoints,
                                     &metrics,
@@ -289,18 +359,15 @@ pub(crate) fn spawn_sink_task(
                                     checkpoint_cursor_columns,
                                     &checkpoint_host,
                                 ).await;
-                                note_flush_outcome(&role, &checkpoints, flush_ok, rx.is_empty()).await;
-                                if !flush_ok {
-                                    if !throttling_flush_retries {
-                                        warn!(
-                                            "flush failed; pausing sink intake and retrying pending rows every {} ms",
-                                            retry_backoff.as_millis()
-                                        );
-                                    }
-                                    throttling_flush_retries = true;
-                                } else {
-                                    pending_batch_bytes = 0;
-                                }
+                                apply_flush_outcome(
+                                    &role,
+                                    &checkpoints,
+                                    outcome,
+                                    rx.is_empty(),
+                                    &mut pending_batch_bytes,
+                                    &mut throttling_flush_retries,
+                                    retry_backoff,
+                                ).await;
                             }
                         }
                         None => break,
@@ -308,7 +375,7 @@ pub(crate) fn spawn_sink_task(
                 }
                 _ = flush_tick.tick() => {
                     if has_pending_data(&raw_rows, &event_rows, &link_rows, &tool_rows, &error_rows, &checkpoint_updates) {
-                        let flush_ok = flush_pending(
+                        let outcome = flush_pending(
                             &clickhouse,
                             &checkpoints,
                             &metrics,
@@ -321,18 +388,15 @@ pub(crate) fn spawn_sink_task(
                             checkpoint_cursor_columns,
                             &checkpoint_host,
                         ).await;
-                        note_flush_outcome(&role, &checkpoints, flush_ok, rx.is_empty()).await;
-                        if !flush_ok {
-                            if !throttling_flush_retries {
-                                warn!(
-                                    "flush failed; pausing sink intake and retrying pending rows every {} ms",
-                                    retry_backoff.as_millis()
-                                );
-                            }
-                            throttling_flush_retries = true;
-                        } else {
-                            pending_batch_bytes = 0;
-                        }
+                        apply_flush_outcome(
+                            &role,
+                            &checkpoints,
+                            outcome,
+                            rx.is_empty(),
+                            &mut pending_batch_bytes,
+                            &mut throttling_flush_retries,
+                            retry_backoff,
+                        ).await;
                     }
                 }
                 _ = heartbeat_tick.tick() => {
@@ -349,7 +413,7 @@ pub(crate) fn spawn_sink_task(
             &error_rows,
             &checkpoint_updates,
         ) {
-            let flush_ok = flush_pending(
+            let outcome = flush_pending(
                 &clickhouse,
                 &checkpoints,
                 &metrics,
@@ -363,7 +427,7 @@ pub(crate) fn spawn_sink_task(
                 &checkpoint_host,
             )
             .await;
-            note_flush_outcome(&role, &checkpoints, flush_ok, true).await;
+            note_flush_outcome_for_result(&role, &checkpoints, outcome, true).await;
         }
     })
 }
@@ -462,7 +526,7 @@ async fn flush_pending(
     checkpoint_updates: &mut HashMap<String, Checkpoint>,
     checkpoint_cursor_columns: bool,
     checkpoint_host: &str,
-) -> bool {
+) -> FlushOutcome {
     let started = Instant::now();
 
     let checkpoint_rows: Vec<Value> = checkpoint_updates
@@ -577,15 +641,34 @@ async fn flush_pending(
     .await;
 
     match flush_result {
-        Ok(()) => true,
+        Ok(()) => FlushOutcome::Success,
         Err(exc) => {
             metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
-            *metrics
-                .last_error
-                .lock()
-                .expect("metrics last_error mutex poisoned") = exc.to_string();
-            warn!("flush failed: {exc}");
-            false
+            let error_message = exc.to_string();
+            if is_non_retryable_json_each_row_insert_error(&exc) {
+                raw_rows.clear();
+                event_rows.clear();
+                link_rows.clear();
+                tool_rows.clear();
+                error_rows.clear();
+                checkpoint_updates.clear();
+                *metrics
+                    .last_error
+                    .lock()
+                    .expect("metrics last_error mutex poisoned") =
+                    format!("non-retryable flush failure: {error_message}");
+                warn!(
+                    "non-retryable flush failure; dropping pending rows so sink intake can continue: {exc}"
+                );
+                FlushOutcome::PermanentFailure
+            } else {
+                *metrics
+                    .last_error
+                    .lock()
+                    .expect("metrics last_error mutex poisoned") = error_message;
+                warn!("flush failed: {exc}");
+                FlushOutcome::RetryableFailure
+            }
         }
     }
 }
@@ -610,6 +693,7 @@ mod tests {
         calls_by_table: Arc<Mutex<HashMap<String, usize>>>,
         rows_by_table: Arc<Mutex<HashMap<String, Vec<Value>>>>,
         fail_once_by_table: Arc<Mutex<HashMap<String, usize>>>,
+        permanent_failure_by_table: Arc<Mutex<HashMap<String, String>>>,
     }
 
     impl MockClickHouseState {
@@ -620,6 +704,16 @@ mod tests {
                 .lock()
                 .expect("mock fail_once mutex poisoned")
                 .insert(table.to_string(), 1);
+            state
+        }
+
+        fn with_permanent_failure(table: &str, body: &str) -> Self {
+            let state = Self::default();
+            state
+                .permanent_failure_by_table
+                .lock()
+                .expect("mock permanent failure mutex poisoned")
+                .insert(table.to_string(), body.to_string());
             state
         }
 
@@ -681,6 +775,15 @@ mod tests {
             *calls.entry(table.to_string()).or_insert(0) += 1;
         }
         {
+            let permanent_failures = state
+                .permanent_failure_by_table
+                .lock()
+                .expect("mock permanent failure mutex poisoned");
+            if let Some(body) = permanent_failures.get(table) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, body.clone());
+            }
+        }
+        {
             let mut fail_once = state
                 .fail_once_by_table
                 .lock()
@@ -712,10 +815,9 @@ mod tests {
         (StatusCode::OK, String::new())
     }
 
-    async fn spawn_mock_clickhouse(
-        fail_once_table: &str,
+    async fn spawn_mock_clickhouse_with_state(
+        state: MockClickHouseState,
     ) -> (ClickHouseClient, MockClickHouseState) {
-        let state = MockClickHouseState::with_single_failure(fail_once_table);
         let app = Router::new()
             .route("/", post(mock_clickhouse_handler))
             .with_state(state.clone());
@@ -736,6 +838,25 @@ mod tests {
             .expect("mock clickhouse client should initialize");
 
         (clickhouse, state)
+    }
+
+    async fn spawn_mock_clickhouse(
+        fail_once_table: &str,
+    ) -> (ClickHouseClient, MockClickHouseState) {
+        spawn_mock_clickhouse_with_state(MockClickHouseState::with_single_failure(fail_once_table))
+            .await
+    }
+
+    async fn spawn_permanent_failure_clickhouse(
+        table: &str,
+    ) -> (ClickHouseClient, MockClickHouseState) {
+        spawn_mock_clickhouse_with_state(MockClickHouseState::with_permanent_failure(
+            table,
+            "Code: 117. DB::Exception: Size of JSON object is extremely large. \
+             Expected not greater than 10485760 bytes, but current is 104900000 \
+             bytes per row. While executing ParallelParsingBlockInputFormat.",
+        ))
+        .await
     }
 
     fn sample_checkpoint() -> Checkpoint {
@@ -841,7 +962,11 @@ mod tests {
             "",
         )
         .await;
-        assert!(!first_attempt, "first flush should fail at events stage");
+        assert_eq!(
+            first_attempt,
+            FlushOutcome::RetryableFailure,
+            "first flush should fail at events stage"
+        );
 
         assert!(raw_rows.is_empty(), "raw rows should not be retried");
         assert_eq!(
@@ -872,8 +997,9 @@ mod tests {
             "",
         )
         .await;
-        assert!(
+        assert_eq!(
             second_attempt,
+            FlushOutcome::Success,
             "second flush should complete remaining stages"
         );
 
@@ -893,6 +1019,105 @@ mod tests {
             state.contains_key(&checkpoint_key_value),
             "checkpoint cache should advance after checkpoint stage succeeds"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn permanent_oversized_flush_failure_clears_pending_batch() {
+        let (clickhouse, mock_state) = spawn_permanent_failure_clickhouse("raw_events").await;
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+
+        let mut raw_rows = vec![json!({
+            "record_ts": "2026-02-17T00:00:01.000Z",
+            "event_uid": "evt-1"
+        })];
+        let mut event_rows = vec![json!({"event_uid": "evt-1"})];
+        let mut link_rows = Vec::<Value>::new();
+        let mut tool_rows = Vec::<Value>::new();
+        let mut error_rows = Vec::<Value>::new();
+        let mut checkpoint_updates = HashMap::new();
+        let checkpoint = sample_checkpoint();
+        let checkpoint_key_value = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
+        checkpoint_updates.insert(checkpoint_key_value.clone(), checkpoint);
+
+        let outcome = flush_pending(
+            &clickhouse,
+            &checkpoints,
+            &metrics,
+            &mut raw_rows,
+            &mut event_rows,
+            &mut link_rows,
+            &mut tool_rows,
+            &mut error_rows,
+            &mut checkpoint_updates,
+            true,
+            "",
+        )
+        .await;
+
+        assert_eq!(outcome, FlushOutcome::PermanentFailure);
+        assert!(raw_rows.is_empty());
+        assert!(event_rows.is_empty());
+        assert!(checkpoint_updates.is_empty());
+        assert_eq!(mock_state.call_count("raw_events"), 1);
+        assert_eq!(metrics.raw_rows_written.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.event_rows_written.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.flush_failures.load(Ordering::Relaxed), 1);
+        assert!(
+            !checkpoints.read().await.contains_key(&checkpoint_key_value),
+            "a dropped permanent-failure batch must not advance the checkpoint"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn permanent_oversized_flush_failure_does_not_throttle_sink_consumption() {
+        let (clickhouse, mock_state) = spawn_permanent_failure_clickhouse("raw_events").await;
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.batch_size = 1;
+        config.ingest.flush_interval_seconds = 0.05;
+        config.ingest.heartbeat_interval_seconds = 60.0;
+
+        let (tx, rx) = mpsc::channel(1);
+        let handle = spawn_sink_task(
+            config,
+            clickhouse,
+            checkpoints,
+            metrics.clone(),
+            rx,
+            true,
+            default_role(),
+        );
+
+        tx.send(single_row_batch(1))
+            .await
+            .expect("first send should succeed");
+        tx.send(single_row_batch(2))
+            .await
+            .expect("second send should succeed");
+
+        timeout(Duration::from_millis(350), tx.send(single_row_batch(3)))
+            .await
+            .expect("permanent failures should not block sink intake")
+            .expect("third send should succeed");
+        drop(tx);
+
+        timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("sink should finish after channel closes")
+            .expect("sink task should not panic");
+
+        assert_eq!(mock_state.call_count("raw_events"), 3);
+        assert_eq!(mock_state.rows("raw_events").len(), 0);
+        assert_eq!(metrics.flush_failures.load(Ordering::Relaxed), 3);
+        let last_error = metrics
+            .last_error
+            .lock()
+            .expect("metrics last_error mutex poisoned")
+            .clone();
+        assert!(last_error.contains("non-retryable flush failure"));
+        assert!(last_error.contains("Code: 117"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -996,7 +1221,7 @@ mod tests {
         for cp in [ahead, behind] {
             let mut checkpoint_updates = HashMap::new();
             checkpoint_updates.insert(key.clone(), cp);
-            assert!(
+            assert_eq!(
                 flush_pending(
                     &clickhouse,
                     &checkpoints,
@@ -1010,7 +1235,8 @@ mod tests {
                     true,
                     "",
                 )
-                .await
+                .await,
+                FlushOutcome::Success
             );
         }
 
@@ -1083,6 +1309,58 @@ mod tests {
                 .await
                 .is_ok(),
             "recovery must schedule a replay pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn permanent_backend_failure_recovers_after_retryable_failure() {
+        let cell = Arc::new(BackendSinkCell::new("team-ch"));
+        cell.set_status(crate::tee::BackendSinkStatus::Ok);
+        let replay_notify = Arc::new(Notify::new());
+        let replay_floor: ReplayFloor = Arc::new(Mutex::new(None));
+        let role = SinkRole::Backend {
+            cell: cell.clone(),
+            resolver: Arc::new(Mutex::new(crate::tee::RouteResolver::new(Arc::new(
+                moraine_config::AppConfig::default(),
+            )))),
+            replay_notify: replay_notify.clone(),
+            replay_floor: replay_floor.clone(),
+        };
+
+        let checkpoint = sample_checkpoint();
+        let key = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
+        let checkpoints = Arc::new(RwLock::new(HashMap::from([(
+            key.clone(),
+            checkpoint.clone(),
+        )])));
+
+        note_flush_outcome_for_result(&role, &checkpoints, FlushOutcome::RetryableFailure, false)
+            .await;
+        assert_eq!(
+            cell.status(),
+            crate::tee::BackendSinkStatus::Unreachable,
+            "retryable failures pause live mirroring"
+        );
+
+        note_flush_outcome_for_result(&role, &checkpoints, FlushOutcome::PermanentFailure, true)
+            .await;
+        assert_eq!(
+            cell.status(),
+            crate::tee::BackendSinkStatus::Ok,
+            "a permanent data failure clears the impossible batch, not the backend"
+        );
+
+        let floor = replay_floor
+            .lock()
+            .expect("replay floor mutex poisoned")
+            .take()
+            .expect("permanent recovery must capture a replay floor");
+        assert_eq!(floor.get(&key).map(|cp| cp.last_offset), Some(100));
+        assert!(
+            timeout(Duration::from_millis(100), replay_notify.notified())
+                .await
+                .is_ok(),
+            "permanent recovery must schedule a replay pass for dropped mirror rows"
         );
     }
 

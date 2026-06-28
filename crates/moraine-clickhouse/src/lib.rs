@@ -46,6 +46,21 @@ impl SchemaSkew {
     }
 }
 
+pub fn is_non_retryable_json_each_row_insert_error(error: &anyhow::Error) -> bool {
+    let mut has_code_117 = false;
+    let mut has_large_json_object = false;
+
+    for cause in error.chain() {
+        let message = cause.to_string().to_ascii_lowercase();
+        has_code_117 |= message.contains("code: 117") || message.contains("code 117");
+        has_large_json_object |= message.contains("size of json object")
+            && message.contains("extremely large")
+            && (message.contains("expected not greater than") || message.contains("expected <="));
+    }
+
+    has_code_117 && has_large_json_object
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DoctorReport {
     pub clickhouse_healthy: bool,
@@ -1298,6 +1313,36 @@ mod tests {
         let skew = compute_schema_skew(&bundled, &Vec::<String>::new());
         assert_eq!(skew.missing_on_server.len(), bundled.len());
         assert!(skew.unknown_on_server.is_empty());
+    }
+
+    #[test]
+    fn non_retryable_json_each_row_insert_error_matches_oversized_code_117() {
+        let error = anyhow::anyhow!(
+            "clickhouse returned 500 Internal Server Error: Code: 117. DB::Exception: \
+             Size of JSON object is extremely large. Expected not greater than 10485760 \
+             bytes, but current is 104900000 bytes per row. While executing \
+             ParallelParsingBlockInputFormat"
+        );
+
+        assert!(is_non_retryable_json_each_row_insert_error(&error));
+    }
+
+    #[test]
+    fn non_retryable_json_each_row_insert_error_requires_specific_signature() {
+        let transient = anyhow::anyhow!("clickhouse returned 500 Internal Server Error: boom");
+        let other_code_117 =
+            anyhow::anyhow!("clickhouse returned 500 Internal Server Error: Code: 117. timeout");
+        let large_json_without_code = anyhow::anyhow!(
+            "Size of JSON object is extremely large. Expected not greater than 10485760 bytes"
+        );
+
+        assert!(!is_non_retryable_json_each_row_insert_error(&transient));
+        assert!(!is_non_retryable_json_each_row_insert_error(
+            &other_code_117
+        ));
+        assert!(!is_non_retryable_json_each_row_insert_error(
+            &large_json_without_code
+        ));
     }
 
     #[test]
