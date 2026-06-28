@@ -54,7 +54,7 @@ claude plugin marketplace add eric-tramel/moraine --sparse .claude-plugin plugin
 claude plugin install moraine@moraine
 ```
 
-The plugin MCP launcher looks for `moraine` on `PATH` and then runs
+The Claude plugin MCP launcher looks for `moraine` on `PATH` and then runs
 `moraine run mcp`. If the CLI is missing, it reports a `binary_missing` message
 with install guidance instead of failing as a raw command-not-found error.
 
@@ -105,9 +105,11 @@ codex plugin add moraine@moraine
 The same marketplace also exposes the contributor-only `moraine-dev` plugin for
 Moraine maintainers; end users should install `moraine@moraine`.
 
-The plugin MCP launcher looks for `moraine` on `PATH` and then runs
-`moraine run mcp`. If the CLI is missing, it reports a `binary_missing` message
-with install guidance instead of failing as a raw command-not-found error.
+The Codex plugin registers a hardened stdio launcher that finds an installed
+`moraine` on `PATH` and then runs `moraine run mcp`. If the CLI is missing, the
+launcher reports `binary_missing`; reinstall or upgrade it with
+`uv tool install moraine-cli` or `uv tool upgrade moraine-cli`, then restart
+Codex from a shell where `moraine` is on `PATH`.
 
 Security note: the user-scoped plugin launches unscoped `moraine run mcp`, so
 Codex can search the host-wide Moraine history visible to your user. Enable the
@@ -340,6 +342,11 @@ agent mcp list-tools moraine
 
 For project-only use, put the same JSON in `.cursor/mcp.json` at the project
 root.
+
+If Cursor reports a spawn error for a path such as
+`/path/to/project/scripts/launch.sh`, replace that stale server entry with the
+JSON above. That launcher path belongs to the Claude plugin bundle and is not a
+valid Cursor command.
 
 ## Pi Coding Agent
 
