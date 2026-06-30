@@ -1,0 +1,310 @@
+# Fully commented Moraine configuration reference.
+#
+# Runtime installs normally read ~/.moraine/config.toml. You can also point any
+# command at another file with --config, or set MORAINE_CONFIG. Service-specific
+# binaries also accept MORAINE_INGEST_CONFIG, MORAINE_MCP_CONFIG, or
+# MORAINE_MONITOR_CONFIG.
+#
+# The shipped runtime template is config/moraine.toml. This file is a more
+# verbose documentation reference: it includes every supported key, comments
+# for what each key does, and commented examples for optional named backends,
+# routes, and extra ingest sources.
+
+[clickhouse]
+# HTTP URL for the default ClickHouse backend. Moraine starts managed
+# ClickHouse only for local URLs; remote URLs must already be reachable.
+url = "http://127.0.0.1:8123"
+
+# Database Moraine reads and writes inside the default backend.
+database = "moraine"
+
+# ClickHouse username used by ingest, monitor, MCP, and migrations.
+username = "default"
+
+# ClickHouse password. Leave empty for the managed local default user.
+password = ""
+
+# Per-request ClickHouse HTTP timeout, in seconds.
+timeout_seconds = 30.0
+
+# Add async_insert=1 to writes so ClickHouse can acknowledge batched inserts
+# before fully flushing them.
+async_insert = true
+
+# Add wait_for_async_insert=1 so async inserts still report write errors before
+# Moraine advances checkpoints.
+wait_for_async_insert = true
+
+# Accept a server whose schema_migrations ledger is ahead of this Moraine
+# build. This is only meaningful for non-default backends; the default backend
+# is migrated by Moraine itself.
+allow_newer_server = false
+
+# Optional named ClickHouse backends for per-project mirroring and routed MCP.
+# The [clickhouse] block above is the "default" backend. Do not declare both
+# [clickhouse] and [backends.default] in the same file.
+#
+# [backends.team-ch]
+# url = "https://ch.team.example:8443"
+# database = "moraine_team"
+# username = "svc-moraine"
+# password = ""
+# timeout_seconds = 30.0
+# async_insert = true
+# wait_for_async_insert = true
+# allow_newer_server = false
+
+# Optional ordered routing rules. The first matching rule wins. Routed ingest
+# is mirrored to the named backend in addition to the default backend.
+#
+# [[routes]]
+# # Directory glob matched against the session's absolute working directory.
+# # "~" expands while loading config. A trailing "/**" matches the base
+# # directory itself and everything below it.
+# dir = "~/src/teamproject/**"
+#
+# # Name of a configured [backends.<name>] entry. "default" is accepted but is
+# # a no-op because the default backend already receives every session.
+# backend = "team-ch"
+#
+# # Routing mode. "mirror" is currently the only supported value.
+# mode = "mirror"
+
+[ingest]
+# Maximum rows collected before a sink flushes a batch to ClickHouse.
+batch_size = 4000
+
+# Maximum serialized JSONEachRow batch size, in bytes, before flushing.
+max_batch_bytes = 8388608
+
+# Maximum time, in seconds, that a non-empty sink batch waits before flushing.
+flush_interval_seconds = 0.5
+
+# Directory for ingest checkpoints and local ingestor state.
+state_dir = "~/.moraine/ingestor"
+
+# On service start, enumerate matching files and ingest anything newer than
+# stored checkpoints before continuing with live watch events.
+backfill_on_start = true
+
+# Maximum number of source files processed concurrently during enumeration,
+# backfill, and replay work.
+max_file_workers = 8
+
+# Maximum number of pending batches allowed between processors and sink tasks.
+max_inflight_batches = 16
+
+# Milliseconds to coalesce filesystem notifications for the same tracked file.
+debounce_ms = 50
+
+# Seconds between reconciliation scans that catch missed watcher events,
+# deleted files, and lagging backend replay opportunities.
+reconcile_interval_seconds = 30.0
+
+# Seconds between ingest heartbeat writes.
+heartbeat_interval_seconds = 5.0
+
+[[ingest.sources]]
+# Stable source name shown in logs, checkpoints, heartbeats, and health output.
+name = "codex"
+
+# Normalizer to use for records from this source.
+harness = "codex"
+
+# Set false to keep the source configured but skip ingesting it.
+enabled = true
+
+# Glob for files this source ingests. "~" expands while loading config.
+glob = "~/.codex/sessions/**/*.jsonl"
+
+# Directory watched for filesystem changes. If empty, Moraine derives it from
+# the glob prefix before the first wildcard.
+watch_root = "~/.codex/sessions"
+
+# On-disk format. Use "jsonl", "session_json", "cursor_sqlite", or
+# "opencode_sqlite". Empty or omitted means Moraine infers from harness+glob.
+format = "jsonl"
+
+[[ingest.sources]]
+# Claude Code JSONL project session files.
+name = "claude"
+harness = "claude-code"
+enabled = true
+glob = "~/.claude/projects/**/*.jsonl"
+watch_root = "~/.claude/projects"
+format = "jsonl"
+
+[[ingest.sources]]
+# Kimi CLI wire JSONL session files.
+name = "kimi-cli"
+harness = "kimi-cli"
+enabled = true
+glob = "~/.kimi/sessions/**/wire.jsonl"
+watch_root = "~/.kimi/sessions"
+format = "jsonl"
+
+[[ingest.sources]]
+# OpenCode SQLite conversation databases, read-only.
+name = "opencode"
+harness = "opencode"
+enabled = true
+glob = "~/.local/share/opencode/opencode*.db"
+watch_root = "~/.local/share/opencode"
+format = "opencode_sqlite"
+
+[[ingest.sources]]
+# Cursor Agent JSONL transcripts.
+name = "cursor"
+harness = "cursor"
+enabled = true
+glob = "~/.cursor/projects/*/agent-transcripts/**/*.jsonl"
+watch_root = "~/.cursor/projects"
+format = "jsonl"
+
+[[ingest.sources]]
+# Cursor IDE chat history stored in state.vscdb SQLite databases. On Linux,
+# use ~/.config/Cursor/User for glob and watch_root.
+name = "cursor-sqlite"
+harness = "cursor"
+enabled = true
+glob = "~/Library/Application Support/Cursor/User/**/state.vscdb"
+watch_root = "~/Library/Application Support/Cursor/User"
+format = "cursor_sqlite"
+
+[[ingest.sources]]
+# Pi Coding Agent JSONL session files.
+name = "pi"
+harness = "pi-coding-agent"
+enabled = true
+glob = "~/.pi/agent/sessions/**/*.jsonl"
+watch_root = "~/.pi/agent/sessions"
+format = "jsonl"
+
+[[ingest.sources]]
+# Hermes live session JSON files rewritten in place.
+name = "hermes"
+harness = "hermes"
+enabled = true
+glob = "~/.hermes/sessions/session_*.json"
+watch_root = "~/.hermes/sessions"
+format = "session_json"
+
+# Optional Hermes offline trajectory JSONL source. Uncomment and adjust the
+# path when a trajectory batch runner writes ShareGPT-compatible JSONL.
+#
+# [[ingest.sources]]
+# name = "hermes-trajectories"
+# harness = "hermes"
+# enabled = true
+# glob = "~/trajectories/**/*.jsonl"
+# watch_root = "~/trajectories"
+# format = "jsonl"
+
+[mcp]
+# Default maximum number of search/list rows returned by MCP tools when a
+# request does not provide an explicit limit.
+max_results = 25
+
+# Characters of text preview included per result row.
+preview_chars = 320
+
+# Default number of records included before a matched event when opening or
+# searching context.
+default_context_before = 3
+
+# Default number of records included after a matched event when opening or
+# searching context.
+default_context_after = 3
+
+# Include tool-call and tool-result events by default in MCP responses.
+default_include_tool_events = false
+
+# Exclude Moraine's own Codex MCP traffic by default to reduce self-noise.
+default_exclude_codex_mcp = true
+
+# Warm query metadata during MCP initialize. This can lower first-search
+# latency but increases startup work.
+prewarm_on_initialize = false
+
+# Write MCP request logs asynchronously. This keeps tool calls responsive while
+# still recording observability rows.
+async_log_writes = true
+
+# MCP protocol version advertised by the server.
+protocol_version = "2024-11-05"
+
+# Prefer the shared central MCP server when running "moraine run mcp". If the
+# socket is unavailable, Moraine falls back to an embedded stdio server.
+use_central_server = true
+
+# Launch the shared central MCP server when "moraine up" starts services.
+start_central_on_up = true
+
+# Unix socket path for the central MCP server. A bare filename resolves under
+# runtime.pids_dir; an absolute path is used as-is.
+central_socket_path = "mcp.sock"
+
+# Milliseconds a proxy client waits for the central socket before falling back
+# to embedded mode.
+central_connect_timeout_ms = 250
+
+[bm25]
+# BM25 term-frequency saturation. Larger values give repeated terms more
+# influence; most installs should keep the default.
+k1 = 1.2
+
+# BM25 length normalization. 0 disables length normalization; 1 applies full
+# normalization.
+b = 0.75
+
+# Default minimum BM25 score used when a request omits min_score.
+default_min_score = 0.0
+
+# Default minimum number of query terms that should match.
+default_min_should_match = 1
+
+# Maximum query terms kept after tokenization.
+max_query_terms = 32
+
+[monitor]
+# Interface the monitor HTTP server binds. Use 127.0.0.1 for local-only access.
+host = "127.0.0.1"
+
+# Monitor HTTP port.
+port = 8080
+
+[runtime]
+# Root directory for Moraine runtime state.
+root_dir = "~/.moraine"
+
+# Log directory. Relative paths resolve under runtime.root_dir.
+logs_dir = "logs"
+
+# PID and socket directory. Relative paths resolve under runtime.root_dir.
+pids_dir = "run"
+
+# Directory containing service binaries such as moraine-ingest,
+# moraine-monitor, and moraine-mcp.
+service_bin_dir = "~/.local/bin"
+
+# Directory for the managed ClickHouse installation.
+managed_clickhouse_dir = "~/.local/lib/moraine/clickhouse/current"
+
+# Seconds to wait for managed ClickHouse to become healthy during startup.
+clickhouse_start_timeout_seconds = 30.0
+
+# Milliseconds between service health checks while waiting for startup.
+healthcheck_interval_ms = 500
+
+# Automatically install the managed ClickHouse binary when needed.
+clickhouse_auto_install = true
+
+# Managed ClickHouse release tag expected by this Moraine build.
+clickhouse_version = "v25.12.5.44-stable"
+
+# Launch the monitor service when "moraine up" starts services.
+start_monitor_on_up = true
+
+# Deprecated compatibility flag. Existing configs may keep it; new configs
+# should use mcp.start_central_on_up.
+start_mcp_on_up = false
