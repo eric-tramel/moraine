@@ -70,8 +70,13 @@ fn run_setup(
         if config_allows_mcp {
             let selections = setup_target_selections(args, interactive, runner)?;
             if selections.apply_ingest && !args.skip_config && config.status == SetupStatus::Ok {
-                match apply_ingest_selections_to_config(&target.path, &selections.targets) {
-                    Ok(update) => config.apply_ingest_update(update),
+                let ingest_update = if args.dry_run {
+                    preview_ingest_selections_for_config(&target.path, &selections.targets)
+                } else {
+                    apply_ingest_selections_to_config(&target.path, &selections.targets)
+                };
+                match ingest_update {
+                    Ok(update) => config.apply_ingest_update(update, args.dry_run),
                     Err(exc) => {
                         config = ConfigReport::error(
                             &target.path,
@@ -489,7 +494,17 @@ impl IngestSelectionUpdate {
         if !self.has_changes() {
             return "ingest sources already matched selection".to_string();
         }
+        format!("ingest sources updated: {}", self.change_summary())
+    }
 
+    fn planned_summary(self) -> String {
+        if !self.has_changes() {
+            return "ingest sources already matched selection".to_string();
+        }
+        format!("ingest sources would be updated: {}", self.change_summary())
+    }
+
+    fn change_summary(self) -> String {
         let mut parts = Vec::new();
         if self.added_sources == 1 {
             parts.push("1 added".to_string());
@@ -511,24 +526,36 @@ impl IngestSelectionUpdate {
         } else if self.updated_sources > 1 {
             parts.push(format!("{} repaired", self.updated_sources));
         }
-        format!("ingest sources updated: {}", parts.join(", "))
+        parts.join(", ")
     }
+}
+
+fn preview_ingest_selections_for_config(
+    path: &Path,
+    selections: &[SetupTargetSelection],
+) -> Result<IngestSelectionUpdate> {
+    let mut document = read_config_document(path)?;
+    apply_ingest_selections_to_document(&mut document, selections)
 }
 
 fn apply_ingest_selections_to_config(
     path: &Path,
     selections: &[SetupTargetSelection],
 ) -> Result<IngestSelectionUpdate> {
-    let content =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let mut document = content
-        .parse::<DocumentMut>()
-        .with_context(|| format!("{} is not valid TOML", path.display()))?;
+    let mut document = read_config_document(path)?;
     let update = apply_ingest_selections_to_document(&mut document, selections)?;
     if update.has_changes() {
         write_toml_atomic(path, &document.to_string())?;
     }
     Ok(update)
+}
+
+fn read_config_document(path: &Path) -> Result<DocumentMut> {
+    let content =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    content
+        .parse::<DocumentMut>()
+        .with_context(|| format!("{} is not valid TOML", path.display()))
 }
 
 fn apply_ingest_selections_to_document(
@@ -773,7 +800,15 @@ fn setup_target_selections(
         });
     }
 
-    if args.yes || args.dry_run || !interactive {
+    if args.yes || args.dry_run {
+        return Ok(SetupSelectionSet {
+            targets: default_setup_target_selections(),
+            apply_ingest: true,
+            confirmed_harness: true,
+        });
+    }
+
+    if !interactive {
         return Ok(SetupSelectionSet {
             targets: Vec::new(),
             apply_ingest: false,
@@ -783,6 +818,22 @@ fn setup_target_selections(
 
     let targets = harnesses::setup_targets();
     prompt_setup_target_selector(&targets, runner)
+}
+
+fn default_setup_target_selections() -> Vec<SetupTargetSelection> {
+    setup_target_selection_rows(harnesses::setup_targets())
+}
+
+fn setup_target_selection_rows(
+    targets: impl IntoIterator<Item = SetupMcpTarget>,
+) -> Vec<SetupTargetSelection> {
+    targets
+        .into_iter()
+        .map(|target| SetupTargetSelection {
+            target,
+            mode: SetupSelectionMode::IngestAndHarness,
+        })
+        .collect()
 }
 
 fn dedup_targets(targets: &[SetupMcpTarget]) -> Vec<SetupMcpTarget> {
@@ -798,14 +849,7 @@ fn prompt_setup_target_selector(
     targets: &[SetupMcpTarget],
     runner: &dyn CommandRunner,
 ) -> Result<SetupSelectionSet> {
-    let mut selections = targets
-        .iter()
-        .copied()
-        .map(|target| SetupTargetSelection {
-            target,
-            mode: SetupSelectionMode::Off,
-        })
-        .collect::<Vec<_>>();
+    let mut selections = setup_target_selection_rows(targets.iter().copied());
     let mut active = 0usize;
     let term = Term::stderr();
     let mut rendered_lines = 0usize;
@@ -887,7 +931,7 @@ fn render_setup_selector(
             .for_stderr()
             .bright()
             .black()
-            .apply_to("Space cycles none → ingest + harness → ingest only → harness only. Enter applies. Esc skips.")
+            .apply_to("All harnesses start selected. Space cycles ingest + harness → ingest only → harness only → none. Enter applies. Esc skips.")
     ))?;
     term.write_line(&format!(
         "  {}",
@@ -2001,9 +2045,22 @@ impl ConfigReport {
         }
     }
 
-    fn apply_ingest_update(&mut self, update: IngestSelectionUpdate) {
-        if update.has_changes() && self.action == "unchanged" {
-            self.action = "updated".to_string();
+    fn apply_ingest_update(&mut self, update: IngestSelectionUpdate, dry_run: bool) {
+        if update.has_changes() {
+            if dry_run || self.status == SetupStatus::Planned {
+                if self.action == "unchanged" {
+                    self.action = "would_update".to_string();
+                }
+                if self.status == SetupStatus::Ok {
+                    self.status = SetupStatus::Planned;
+                }
+                self.message = format!("{}; {}", self.message, update.planned_summary());
+                return;
+            }
+
+            if self.action == "unchanged" {
+                self.action = "updated".to_string();
+            }
         }
         self.message = format!("{}; {}", self.message, update.summary());
     }
@@ -2556,6 +2613,43 @@ mod tests {
     #[test]
     fn setup_selector_warning_discloses_host_wide_history_access() {
         assert!(HOST_WIDE_ACCESS_WARNING.contains("host-wide Moraine session history access"));
+    }
+
+    #[test]
+    fn default_target_selections_enable_ingest_and_harnesses() {
+        let selections = default_setup_target_selections();
+        assert_eq!(
+            selections
+                .iter()
+                .map(|selection| selection.target)
+                .collect::<Vec<_>>(),
+            harnesses::setup_targets()
+        );
+        assert!(selections
+            .iter()
+            .all(|selection| selection.mode == SetupSelectionMode::IngestAndHarness));
+    }
+
+    #[test]
+    fn yes_without_explicit_targets_selects_all_default_harnesses() {
+        let args = SetupArgs {
+            yes: true,
+            dry_run: false,
+            skip_config: false,
+            skip_mcp: false,
+            repair_config: false,
+            mcp_targets: Vec::new(),
+        };
+        let selections =
+            setup_target_selections(&args, false, &FakeRunner::default()).expect("selections");
+
+        assert!(selections.apply_ingest);
+        assert!(selections.confirmed_harness);
+        assert_eq!(selections.harness_targets(), harnesses::setup_targets(),);
+        assert!(selections
+            .targets
+            .iter()
+            .all(|selection| selection.mode == SetupSelectionMode::IngestAndHarness));
     }
 
     #[test]
@@ -3308,6 +3402,104 @@ watch_root = "~/custom"
             home.join(".cursor").join("mcp.json").display().to_string()
         );
         assert!(!home.exists());
+    }
+
+    #[test]
+    fn dry_run_without_explicit_targets_plans_all_default_harnesses() {
+        let args = SetupArgs {
+            yes: false,
+            dry_run: true,
+            skip_config: true,
+            skip_mcp: false,
+            repair_config: false,
+            mcp_targets: Vec::new(),
+        };
+        let mut runner = FakeRunner::default();
+        let report = run_setup(
+            &plain_output(),
+            &args,
+            ConfigTarget {
+                path: PathBuf::from("/tmp/config.toml"),
+                source: ConfigTargetSource::HomeDefault,
+            },
+            false,
+            &mut runner,
+        )
+        .expect("setup report");
+
+        assert_eq!(
+            report
+                .mcp_targets
+                .iter()
+                .map(|target| target.target)
+                .collect::<Vec<_>>(),
+            harnesses::setup_targets()
+        );
+        assert!(report
+            .mcp_targets
+            .iter()
+            .all(|target| target.status == SetupStatus::Planned));
+        assert!(runner.ran.is_empty());
+    }
+
+    #[test]
+    fn dry_run_previews_ingest_config_updates_without_writing_existing_config() {
+        let dir = temp_path("dry-run-ingest-preview");
+        fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("config.toml");
+        let original = r#"
+[ingest]
+
+[[ingest.sources]]
+name = "codex"
+harness = "codex"
+enabled = false
+glob = "~/.codex/sessions/**/*.jsonl"
+watch_root = "~/.codex/sessions"
+"#;
+        fs::write(&path, original).expect("write config");
+        let args = SetupArgs {
+            yes: false,
+            dry_run: true,
+            skip_config: false,
+            skip_mcp: false,
+            repair_config: false,
+            mcp_targets: Vec::new(),
+        };
+        let mut runner = FakeRunner::default();
+        let report = run_setup(
+            &plain_output(),
+            &args,
+            ConfigTarget {
+                path: path.clone(),
+                source: ConfigTargetSource::HomeDefault,
+            },
+            false,
+            &mut runner,
+        )
+        .expect("setup report");
+
+        assert_eq!(report.config.status, SetupStatus::Planned);
+        assert_eq!(report.config.action, "would_update");
+        assert!(report
+            .config
+            .message
+            .contains("ingest sources would be updated"));
+        assert_eq!(fs::read_to_string(&path).expect("config content"), original);
+        assert_eq!(
+            report
+                .mcp_targets
+                .iter()
+                .map(|target| target.target)
+                .collect::<Vec<_>>(),
+            harnesses::setup_targets()
+        );
+        assert!(report
+            .mcp_targets
+            .iter()
+            .all(|target| target.status == SetupStatus::Planned));
+        assert!(runner.ran.is_empty());
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

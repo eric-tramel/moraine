@@ -191,7 +191,7 @@ pub(crate) struct ConfigGetArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct SetupArgs {
-    /// Accept non-interactive defaults. Does not enable MCP targets by itself.
+    /// Accept non-interactive defaults, including all supported MCP/plugin targets.
     #[arg(long)]
     pub(crate) yes: bool,
     /// Show planned changes without writing files or running external commands.
