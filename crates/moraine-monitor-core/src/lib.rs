@@ -755,21 +755,35 @@ struct SessionEventRow {
     tool_args_json: String,
 }
 
-async fn build_sessions_payload(state: &AppState, limit: u32, since_seconds: u64) -> Result<Value> {
-    let database = &state.clickhouse.config().database;
-    let events_table = format!(
+fn events_table_ref(database: &str) -> String {
+    format!(
         "{}.{}",
         escape_identifier(database),
         escape_identifier("events")
-    );
+    )
+}
 
+fn deduped_events_source(events_table: &str, filter: &str) -> String {
+    let filter = filter.trim();
+    debug_assert!(!filter.is_empty());
+
+    format!(
+        "(SELECT * FROM {events_table} WHERE {filter} \
+         ORDER BY event_uid ASC, event_version DESC, ingested_at DESC \
+         LIMIT 1 BY event_uid)"
+    )
+}
+
+fn session_summary_query(events_table: &str, limit: u32, since_seconds: u64) -> String {
     let recency_filter = if since_seconds == 0 {
         String::new()
     } else {
         format!(" AND event_ts >= now() - INTERVAL {} SECOND", since_seconds)
     };
+    let source_filter = format!("length(trim(BOTH ' ' FROM session_id)) > 0{recency_filter}");
+    let events_source = deduped_events_source(events_table, &source_filter);
 
-    let summary_query = format!(
+    format!(
         "SELECT \
             session_id, \
             any(harness) AS harness, \
@@ -786,30 +800,24 @@ async fn build_sessions_payload(state: &AppState, limit: u32, since_seconds: u64
                 if(length(text_content) > 0, substring(text_content, 1, 400), substring(text_preview, 1, 400)), \
                 if(event_kind = 'message' AND actor_kind = 'user', event_ts, toDateTime64('2099-01-01', 3)) \
             ) AS first_user_text \
-         FROM {events_table} \
-         WHERE length(trim(BOTH ' ' FROM session_id)) > 0{recency_filter} \
+         FROM {events_source} AS deduped_events \
          GROUP BY session_id \
          ORDER BY ended_at_ms DESC \
          LIMIT {limit}"
-    );
+    )
+}
 
-    let summary_rows = state
-        .clickhouse
-        .query_rows::<SessionSummaryRow>(&summary_query, None)
-        .await?;
-
-    if summary_rows.is_empty() {
-        return Ok(json!({"ok": true, "sessions": []}));
-    }
-
-    let session_ids: Vec<String> = summary_rows.iter().map(|r| r.session_id.clone()).collect();
+fn session_events_query(events_table: &str, session_ids: &[String]) -> String {
+    debug_assert!(!session_ids.is_empty());
     let id_list = session_ids
         .iter()
         .map(|id| format!("'{}'", escape_literal(id)))
         .collect::<Vec<_>>()
         .join(",");
+    let source_filter = format!("session_id IN ({id_list})");
+    let events_source = deduped_events_source(events_table, &source_filter);
 
-    let events_query = format!(
+    format!(
         "SELECT \
             session_id, \
             toInt64(toUnixTimestamp64Milli(event_ts)) AS event_ts_ms, \
@@ -831,10 +839,27 @@ async fn build_sessions_payload(state: &AppState, limit: u32, since_seconds: u64
             substring(text_preview, 1, 2000) AS text_preview, \
             substring(text_content, 1, 2000) AS text_content, \
             if(event_kind = 'tool_call', substring(JSONExtractRaw(payload_json, 'input'), 1, 2000), '') AS tool_args_json \
-         FROM {events_table} \
-         WHERE session_id IN ({id_list}) \
-         ORDER BY session_id, event_ts, source_file, source_generation, source_offset, source_line_no"
-    );
+         FROM {events_source} AS deduped_events \
+         ORDER BY session_id, event_ts, source_file, source_generation, source_offset, source_line_no, event_uid"
+    )
+}
+
+async fn build_sessions_payload(state: &AppState, limit: u32, since_seconds: u64) -> Result<Value> {
+    let database = &state.clickhouse.config().database;
+    let events_table = events_table_ref(database);
+    let summary_query = session_summary_query(&events_table, limit, since_seconds);
+
+    let summary_rows = state
+        .clickhouse
+        .query_rows::<SessionSummaryRow>(&summary_query, None)
+        .await?;
+
+    if summary_rows.is_empty() {
+        return Ok(json!({"ok": true, "sessions": []}));
+    }
+
+    let session_ids: Vec<String> = summary_rows.iter().map(|r| r.session_id.clone()).collect();
+    let events_query = session_events_query(&events_table, &session_ids);
 
     let event_rows = state
         .clickhouse
@@ -1682,6 +1707,10 @@ mod tests {
         }
     }
 
+    fn compact_sql(query: &str) -> String {
+        query.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
     #[test]
     fn identifier_safety_helper() {
         assert!(is_safe_identifier("events"));
@@ -1723,6 +1752,46 @@ mod tests {
     fn escaping_helpers() {
         assert_eq!(escape_literal("a'b"), "a''b");
         assert_eq!(escape_identifier("ev`ents"), "`ev``ents`");
+    }
+
+    #[test]
+    fn events_table_ref_escapes_database_identifier() {
+        assert_eq!(events_table_ref("mor`aine"), "`mor``aine`.`events`");
+    }
+
+    #[test]
+    fn session_summary_query_dedups_by_latest_event_uid_with_recency() {
+        let query = compact_sql(&session_summary_query("`moraine`.`events`", 50, 86_400));
+
+        assert!(query.contains(
+            "FROM (SELECT * FROM `moraine`.`events` WHERE length(trim(BOTH ' ' FROM session_id)) > 0 AND event_ts >= now() - INTERVAL 86400 SECOND ORDER BY event_uid ASC, event_version DESC, ingested_at DESC LIMIT 1 BY event_uid) AS deduped_events"
+        ));
+        assert!(query.contains("GROUP BY session_id ORDER BY ended_at_ms DESC LIMIT 50"));
+    }
+
+    #[test]
+    fn session_summary_query_since_all_omits_recency_filter() {
+        let query = compact_sql(&session_summary_query("`moraine`.`events`", 25, 0));
+
+        assert!(query.contains(
+            "FROM (SELECT * FROM `moraine`.`events` WHERE length(trim(BOTH ' ' FROM session_id)) > 0 ORDER BY event_uid ASC, event_version DESC, ingested_at DESC LIMIT 1 BY event_uid) AS deduped_events"
+        ));
+        assert!(!query.contains("INTERVAL"));
+    }
+
+    #[test]
+    fn session_events_query_dedups_and_escapes_session_ids() {
+        let query = compact_sql(&session_events_query(
+            "`moraine`.`events`",
+            &["session-1".to_string(), "quote's".to_string()],
+        ));
+
+        assert!(query.contains(
+            "FROM (SELECT * FROM `moraine`.`events` WHERE session_id IN ('session-1','quote''s') ORDER BY event_uid ASC, event_version DESC, ingested_at DESC LIMIT 1 BY event_uid) AS deduped_events"
+        ));
+        assert!(query.contains(
+            "ORDER BY session_id, event_ts, source_file, source_generation, source_offset, source_line_no, event_uid"
+        ));
     }
 
     #[test]
