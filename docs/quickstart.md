@@ -35,18 +35,20 @@ config and install or update agent harness integrations:
 moraine setup
 ```
 
-In non-interactive scripts, create a missing config without registering agent
-harnesses:
+In non-interactive scripts, accept the default config and all supported agent
+harness integrations:
 
 ```bash
 moraine setup --yes
 ```
 
-To preview MCP or plugin registration without touching host agent config, pass
-explicit targets:
+Pass `--skip-mcp` when you only want config creation or repair.
+
+Preview the default config and all supported harness integrations without
+writing files or touching host agent config:
 
 ```bash
-moraine setup --dry-run --mcp-target claude-code --mcp-target codex
+moraine setup --dry-run
 ```
 
 The Claude Code and Codex plugins, plus global MCP registrations, can expose
@@ -91,25 +93,26 @@ an embedded server automatically. See
 [Agent MCP Search → Install](agent-mcp-search/install.md#shared-central-server-default).
 
 Use `moraine setup` to connect your agent harnesses. In an interactive terminal,
-setup shows a selector for detected harnesses; use the arrow keys to move, Space
-to choose integrations, and Enter to install the selected plugins or MCP
-registrations:
+setup shows all supported harnesses selected by default; use the arrow keys to
+move, Space to cycle a harness through ingest/plugin-MCP/off choices, and Enter
+to apply the selected integrations:
 
 ```bash
 moraine setup
 ```
 
-You can also target harnesses directly, which is useful for scripts or for
-rerunning setup after installing a new harness CLI:
+You can also target harness MCP/plugin setup directly, which is useful for
+rerunning setup after installing a new harness CLI. Direct targets do not change
+ingest source selections:
 
 ```bash
-moraine setup --yes --mcp-target claude-code --mcp-target codex --mcp-target hermes --mcp-target opencode --mcp-target cursor
+moraine setup --yes --mcp-target claude-code --mcp-target codex --mcp-target hermes --mcp-target kimi-cli --mcp-target opencode --mcp-target cursor --mcp-target pi-coding-agent
 ```
 
-Preview those changes without touching host agent config:
+Preview targeted MCP/plugin changes without touching host agent config:
 
 ```bash
-moraine setup --dry-run --mcp-target claude-code --mcp-target codex --mcp-target hermes --mcp-target opencode --mcp-target cursor --mcp-target pi-coding-agent
+moraine setup --dry-run --mcp-target claude-code --mcp-target codex --mcp-target hermes --mcp-target kimi-cli --mcp-target opencode --mcp-target cursor --mcp-target pi-coding-agent
 ```
 
 The Claude Code, Codex, and Hermes plugins bundle Moraine search, realtime, and
