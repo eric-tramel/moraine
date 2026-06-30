@@ -21,11 +21,11 @@ moraine setup
 moraine up
 ```
 
-`moraine setup` installs the Claude Code and Codex plugins, registers command
-based MCP clients such as Hermes and Kimi CLI, and writes global MCP config for
-OpenCode, Cursor, and Pi Coding Agent when selected. Use the manual sections
-below for project-scoped servers, `--project-only`, or custom environment
-wiring.
+`moraine setup` starts with all supported harnesses selected for ingest plus
+plugin or MCP setup. In the interactive selector, turn off any harnesses you do
+not want before applying. Use `moraine setup --dry-run` to preview the default
+setup without writing files. Use the manual sections below for project-scoped
+servers, `--project-only`, or custom environment wiring.
 
 ## Claude Code plugin marketplace (recommended)
 
