@@ -147,7 +147,7 @@ pub struct McpConfig {
     pub default_exclude_codex_mcp: bool,
     #[serde(default = "default_false")]
     pub prewarm_on_initialize: bool,
-    #[serde(default = "default_false")]
+    #[serde(default = "default_true")]
     pub async_log_writes: bool,
     #[serde(default = "default_protocol_version")]
     pub protocol_version: String,
@@ -1587,6 +1587,7 @@ max_results = 25
         let cfg = load_config(&path).expect("legacy mcp config should load");
         std::fs::remove_file(&path).ok();
         assert_eq!(cfg.mcp.max_results, 25);
+        assert!(cfg.mcp.async_log_writes);
         assert!(cfg.mcp.use_central_server);
         assert!(cfg.mcp.start_central_on_up);
     }

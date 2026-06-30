@@ -4,6 +4,11 @@ Moraine reads TOML configuration. The default template is
 `config/moraine.toml`, and runtime installs normally use
 `~/.moraine/config.toml`.
 
+For a copyable, full-file reference with comments beside every supported key,
+see [Fully Commented Configuration TOML](full-config.toml). That file is
+intended as a documentation reference; the shipped runtime template stays more
+compact.
+
 ## Resolution Order
 
 The top-level `moraine` command resolves config in this order:
@@ -22,6 +27,25 @@ service-specific environment variables:
 | MCP | `MORAINE_MCP_CONFIG`, then `MORAINE_CONFIG` |
 | Monitor | `MORAINE_MONITOR_CONFIG`, then `MORAINE_CONFIG` |
 | Ingest | `MORAINE_INGEST_CONFIG`, then `MORAINE_CONFIG` |
+
+Unknown top-level sections and unknown keys inside normal config tables are
+rejected at load time. The only intentionally loose file is a repo-level
+`.moraine.toml`, which is a name-only backend reference and ignores unknown
+future keys.
+
+## Top-Level Sections
+
+| Section | Purpose |
+| --- | --- |
+| `[clickhouse]` | Default ClickHouse backend used by local ingest, monitor, MCP, and migrations. |
+| `[backends.<name>]` | Optional named ClickHouse backend for project mirroring and routed MCP. |
+| `[[routes]]` | Optional ordered working-directory routes to named backends. |
+| `[ingest]` | Ingest batching, backfill, watcher, checkpoint, and heartbeat settings. |
+| `[[ingest.sources]]` | Watched agent trace sources. |
+| `[mcp]` | MCP retrieval defaults and shared central server settings. |
+| `[bm25]` | Search ranking defaults. |
+| `[monitor]` | Monitor HTTP bind settings. |
+| `[runtime]` | Runtime directories, service startup behavior, and managed ClickHouse settings. |
 
 ## Minimal Example
 
@@ -57,6 +81,7 @@ password = ""
 timeout_seconds = 30.0
 async_insert = true
 wait_for_async_insert = true
+allow_newer_server = false
 ```
 
 For a managed local install, leave these values at their defaults. For an
@@ -67,6 +92,17 @@ server examples, see [Remote ClickHouse Tutorial](remote-clickhouse.md).
 `[clickhouse]` is an alias for `[backends.default]`. To mirror specific
 projects to additional servers, see
 [Backends and Per-Project Routing](#backends-and-per-project-routing).
+
+| Field | Default | Purpose |
+| --- | --- | --- |
+| `url` | `http://127.0.0.1:8123` | ClickHouse HTTP endpoint. Managed ClickHouse is started only for local URLs; remote endpoints must already be running. |
+| `database` | `moraine` | Database containing Moraine tables. |
+| `username` | `default` | ClickHouse user for ingest, monitor, MCP, and migrations. |
+| `password` | empty | ClickHouse password. |
+| `timeout_seconds` | `30.0` | Per-request ClickHouse HTTP timeout. |
+| `async_insert` | `true` | Enables ClickHouse async insert mode on writes. |
+| `wait_for_async_insert` | `true` | Waits for async insert completion before advancing checkpoints, so write failures are visible. |
+| `allow_newer_server` | `false` | Allows a non-default backend whose migration ledger is ahead of this Moraine build. The default backend is migrated by Moraine itself, so this is only useful on `[backends.<name>]`. |
 
 ## Backends and Per-Project Routing
 
@@ -247,6 +283,15 @@ glob = "~/.claude/projects/**/*.jsonl"
 watch_root = "~/.claude/projects"
 format = "jsonl"
 ```
+
+| Field | Default | Purpose |
+| --- | --- | --- |
+| `name` | empty string | Stable source name used in logs, checkpoints, heartbeats, and health output. |
+| `harness` | empty string | Source normalizer. Must be one of the supported harness values below. |
+| `enabled` | `true` | Keeps a source configured while allowing it to be skipped. |
+| `glob` | empty string | Files this source ingests. `~` expands during config load. |
+| `watch_root` | derived from `glob` when empty | Directory watched for changes. Set it explicitly when the glob root is ambiguous or platform-specific. |
+| `format` | inferred from `harness` and `glob` | On-disk parser: `jsonl`, `session_json`, `cursor_sqlite`, or `opencode_sqlite`. |
 
 Supported `harness` values are `codex`, `claude-code`, `cursor`, `kimi-cli`,
 `opencode`, `hermes`, and `pi-coding-agent`. Each value maps to a registered
@@ -462,7 +507,23 @@ state_dir = "~/.moraine/ingestor"
 backfill_on_start = true
 max_file_workers = 8
 max_inflight_batches = 16
+debounce_ms = 50
+reconcile_interval_seconds = 30.0
+heartbeat_interval_seconds = 5.0
 ```
+
+| Field | Default | Purpose |
+| --- | --- | --- |
+| `batch_size` | `4000` | Maximum rows collected before a sink flushes to ClickHouse. |
+| `max_batch_bytes` | `8388608` | Maximum serialized JSONEachRow batch size, in bytes, before flushing. |
+| `flush_interval_seconds` | `0.5` | Maximum time a non-empty batch waits before flushing. |
+| `state_dir` | `~/.moraine/ingestor` | Directory for ingest checkpoints and local ingestor state. |
+| `backfill_on_start` | `true` | Enumerates matching files at startup and ingests records newer than stored checkpoints. |
+| `max_file_workers` | `8` | Maximum source files processed concurrently during enumeration, backfill, and replay. |
+| `max_inflight_batches` | `16` | Maximum pending batches between processors and sink tasks. |
+| `debounce_ms` | `50` | Milliseconds to coalesce repeated filesystem notifications for the same tracked file. |
+| `reconcile_interval_seconds` | `30.0` | Seconds between reconciliation scans for missed watcher events, deleted files, and lagging backend replay. |
+| `heartbeat_interval_seconds` | `5.0` | Seconds between ingest heartbeat writes. |
 
 ## MCP
 
@@ -484,6 +545,22 @@ start_central_on_up = true
 central_socket_path = "mcp.sock"
 central_connect_timeout_ms = 250
 ```
+
+| Field | Default | Purpose |
+| --- | --- | --- |
+| `max_results` | `25` | Default result limit for MCP tools when a request omits an explicit limit. |
+| `preview_chars` | `320` | Text preview characters included per result row. |
+| `default_context_before` | `3` | Default number of records included before a matched event. |
+| `default_context_after` | `3` | Default number of records included after a matched event. |
+| `default_include_tool_events` | `false` | Includes tool-call and tool-result events in MCP responses by default. |
+| `default_exclude_codex_mcp` | `true` | Filters Moraine's own Codex MCP traffic by default to reduce self-noise. |
+| `prewarm_on_initialize` | `false` | Warms query metadata during MCP initialize, trading startup work for lower first-search latency. |
+| `async_log_writes` | `true` | Writes MCP observability rows asynchronously so tool calls stay responsive. |
+| `protocol_version` | `2024-11-05` | MCP protocol version advertised by the server. |
+| `use_central_server` | `true` | Makes `moraine run mcp` prefer the shared central server socket, with embedded fallback. |
+| `start_central_on_up` | `true` | Starts the shared central MCP server when `moraine up` starts services. |
+| `central_socket_path` | `mcp.sock` | Unix socket path. Bare filenames resolve under `runtime.pids_dir`; absolute paths are used verbatim. |
+| `central_connect_timeout_ms` | `250` | Milliseconds a proxy client waits for the central socket before falling back to embedded mode. |
 
 Raise `max_results` only when clients need larger result windows. Increase
 context defaults when retrieval snippets are too narrow.
@@ -543,6 +620,29 @@ max_query_terms = 32
 
 Most installations should keep these defaults.
 
+| Field | Default | Purpose |
+| --- | --- | --- |
+| `k1` | `1.2` | BM25 term-frequency saturation. Larger values give repeated terms more influence. |
+| `b` | `0.75` | BM25 length normalization. `0` disables length normalization; `1` applies full normalization. |
+| `default_min_score` | `0.0` | Default minimum BM25 score when a request omits `min_score`. |
+| `default_min_should_match` | `1` | Default minimum number of query terms that should match. |
+| `max_query_terms` | `32` | Maximum query terms kept after tokenization. |
+
+## Monitor
+
+`[monitor]` controls the monitor HTTP server:
+
+```toml
+[monitor]
+host = "127.0.0.1"
+port = 8080
+```
+
+| Field | Default | Purpose |
+| --- | --- | --- |
+| `host` | `127.0.0.1` | Interface the monitor binds. Keep the default for local-only access. |
+| `port` | `8080` | Monitor HTTP port. |
+
 ## Runtime Paths
 
 `[runtime]` controls where Moraine keeps state and where it finds service
@@ -555,11 +655,29 @@ logs_dir = "logs"
 pids_dir = "run"
 service_bin_dir = "~/.local/bin"
 managed_clickhouse_dir = "~/.local/lib/moraine/clickhouse/current"
+clickhouse_start_timeout_seconds = 30.0
+healthcheck_interval_ms = 500
 clickhouse_auto_install = true
+clickhouse_version = "v25.12.5.44-stable"
 start_monitor_on_up = true
+start_mcp_on_up = false
 ```
 
 Relative `logs_dir` and `pids_dir` values are resolved under `root_dir`.
 `service_bin_dir` must contain `moraine-ingest`, `moraine-monitor`, and
 `moraine-mcp`, unless `MORAINE_SERVICE_BIN_DIR` is set or source-tree mode is
 enabled.
+
+| Field | Default | Purpose |
+| --- | --- | --- |
+| `root_dir` | `~/.moraine` | Root directory for Moraine runtime state. |
+| `logs_dir` | `logs` | Log directory. Relative paths resolve under `root_dir`. |
+| `pids_dir` | `run` | PID and socket directory. Relative paths resolve under `root_dir`. |
+| `service_bin_dir` | `~/.local/bin` | Directory containing installed service binaries. |
+| `managed_clickhouse_dir` | `~/.local/lib/moraine/clickhouse/current` | Directory for the managed ClickHouse installation. |
+| `clickhouse_start_timeout_seconds` | `30.0` | Seconds to wait for managed ClickHouse to become healthy during startup. |
+| `healthcheck_interval_ms` | `500` | Milliseconds between service health checks while waiting for startup. |
+| `clickhouse_auto_install` | `true` | Automatically installs the managed ClickHouse binary when needed. |
+| `clickhouse_version` | `v25.12.5.44-stable` | Managed ClickHouse release tag expected by this Moraine build. |
+| `start_monitor_on_up` | `true` | Starts the monitor service when `moraine up` starts services. |
+| `start_mcp_on_up` | `false` | Deprecated compatibility flag. Existing configs may keep it; new configs should use `mcp.start_central_on_up`. |
