@@ -1215,6 +1215,7 @@ dependencies = [
 name = "moraine-ingest-core"
 version = "0.6.3"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "axum",
  "chrono",

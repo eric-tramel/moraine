@@ -241,6 +241,35 @@ backend's health/schema first. As with ingest routes, a repo `.moraine.toml`
 naming an unconfigured backend logs a warning and keeps the default
 behavior.
 
+## Secret Redaction
+
+Secret redaction is enabled by default for every ingested row. Moraine scans
+the secret-bearing string fields in raw events, normalized events, and tool
+I/O, then replaces matched secrets with typed placeholders such as
+`[REDACTED:github-token]`. Derived previews and hashes are recomputed from
+the redacted content.
+
+```toml
+[redaction]
+ruleset = "builtin"
+# extra_patterns = ["acme_internal_[A-Za-z0-9]{32}"]
+# dangerously_skip_secret_redaction = true
+```
+
+`dangerously_skip_secret_redaction = true` is honored only from
+`$HOME/.moraine/config.toml`. It disables redaction for the local/default
+backend only; mirror egress to named backends is always redacted. The same
+flag in a repo or checkout config is ignored with a warning so a cloned
+repository cannot weaken local capture settings.
+
+The builtin ruleset covers common API keys, provider tokens, private-key
+blocks, JWTs, and high-entropy generic credential assignments. `extra_patterns`
+adds local Rust regular expressions that redact the full matched span with
+`[REDACTED:extra-pattern-N]`; invalid patterns are a startup error. Redaction
+counts are written to ingest heartbeats in `redactions_total` after migration
+022; before that migration, redaction still runs and ingest logs that the
+heartbeat audit column is not available.
+
 ## Ingest Sources
 
 Each `[[ingest.sources]]` entry describes one watched source:

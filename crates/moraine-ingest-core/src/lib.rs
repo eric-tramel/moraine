@@ -4,6 +4,7 @@ mod heartbeat;
 pub mod model;
 pub mod normalize;
 mod reconcile;
+mod redaction;
 mod sink;
 mod sources;
 pub mod sqlite_poll;
@@ -14,8 +15,11 @@ use crate::checkpoint::checkpoint_key;
 use crate::dispatch::{enqueue_work, run_work_item, spawn_debounce_task};
 use crate::model::RowBatch;
 use crate::reconcile::spawn_reconcile_task;
+use crate::redaction::{RedactionAudit, SecretRedactor};
 use crate::sink::{spawn_sink_task, SinkRole};
-use crate::tee::{spawn_tee_router, RouteResolver, SharedRouteResolver, StatusRegistry};
+use crate::tee::{
+    spawn_tee_router, RedactionContext, RouteResolver, SharedRouteResolver, StatusRegistry,
+};
 use crate::watch::{enumerate_tracked_files, spawn_watcher_threads};
 use anyhow::{Context, Result};
 use moraine_clickhouse::ClickHouseClient;
@@ -123,7 +127,7 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         .keys()
         .any(|name| name != DEFAULT_BACKEND_NAME);
     let heartbeat_backend_column = if has_named_backends {
-        let available = heartbeat_backend_sinks_column_available(&clickhouse)
+        let available = heartbeat_column_available(&clickhouse, "backend_sinks")
             .await
             .context("failed to inspect ingest_heartbeats columns")?;
         if !available {
@@ -137,10 +141,35 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
     } else {
         false
     };
+    let heartbeat_redactions_column = heartbeat_column_available(&clickhouse, "redactions_total")
+        .await
+        .context("failed to inspect ingest_heartbeats redaction columns")?;
+    if !heartbeat_redactions_column {
+        warn!(
+            "ingest_heartbeats is missing the redactions_total column (migration 022); \
+             redaction audit counts will not appear in heartbeats until \
+             `moraine db migrate` runs and this ingest service restarts"
+        );
+    }
 
     let checkpoints = Arc::new(RwLock::new(checkpoint_map));
     let dispatch = Arc::new(Mutex::new(DispatchState::default()));
     let metrics = Arc::new(Metrics::default());
+    let redactor = Arc::new(
+        SecretRedactor::new(&config.redaction).context("failed to initialize secret redaction")?,
+    );
+    let redaction_audit = Arc::new(RedactionAudit::default());
+    if config.redaction.dangerously_skip_secret_redaction_ignored {
+        warn!(
+            "ignoring redaction.dangerously_skip_secret_redaction from non-home config; only \
+             $HOME/.moraine/config.toml may disable local secret redaction"
+        );
+    }
+    if config.redaction.dangerously_skip_secret_redaction {
+        warn!(
+            "local/default secret redaction disabled by home config; mirror backend egress remains redacted"
+        );
+    }
 
     let process_queue_capacity = config
         .ingest
@@ -174,6 +203,8 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
             dispatch: dispatch.clone(),
             backends: backend_statuses.clone(),
             backend_sinks_column: heartbeat_backend_column,
+            redactions_column: heartbeat_redactions_column,
+            redactions: redaction_audit.clone(),
         },
     );
 
@@ -184,6 +215,7 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         default_sink_tx,
         resolver,
         backend_statuses,
+        RedactionContext::new(redactor, redaction_audit),
     );
 
     let sem = Arc::new(Semaphore::new(config.ingest.max_file_workers.max(1)));
@@ -345,10 +377,10 @@ async fn checkpoint_cursor_columns_available(clickhouse: &ClickHouseClient) -> R
         .unwrap_or(false))
 }
 
-/// Returns whether `ingest_heartbeats` carries the `backend_sinks` column
-/// added by migration 017. Inserting it unconditionally would break every
-/// heartbeat on a database that has not run `moraine db migrate` yet.
-async fn heartbeat_backend_sinks_column_available(clickhouse: &ClickHouseClient) -> Result<bool> {
+/// Returns whether `ingest_heartbeats` carries an optional heartbeat column.
+/// Inserting optional columns unconditionally would break every heartbeat on a
+/// database that has not run the corresponding `moraine db migrate` yet.
+async fn heartbeat_column_available(clickhouse: &ClickHouseClient, column: &str) -> Result<bool> {
     #[derive(Deserialize)]
     struct CountRow {
         column_count: u64,
@@ -357,8 +389,9 @@ async fn heartbeat_backend_sinks_column_available(clickhouse: &ClickHouseClient)
     let query = format!(
         "SELECT toUInt64(count()) AS column_count \
          FROM system.columns \
-         WHERE database = '{}' AND table = 'ingest_heartbeats' AND name = 'backend_sinks'",
-        clickhouse.config().database.replace('\'', "\\'")
+         WHERE database = '{}' AND table = 'ingest_heartbeats' AND name = '{}'",
+        clickhouse.config().database.replace('\'', "\\'"),
+        column.replace('\'', "\\'")
     );
     let rows: Vec<CountRow> = clickhouse.query_rows(&query, None).await?;
     Ok(rows

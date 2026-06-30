@@ -15,6 +15,7 @@
 use crate::dispatch::process_file;
 use crate::heartbeat::host_name;
 use crate::model::{Checkpoint, RowBatch};
+use crate::redaction::{RedactionAudit, SecretRedactor};
 use crate::sink::{spawn_sink_task, SinkRole};
 use crate::watch::enumerate_tracked_files;
 use crate::{Metrics, SinkMessage, WorkItem};
@@ -363,6 +364,27 @@ struct BackendHandle {
     cell: Arc<BackendSinkCell>,
 }
 
+#[derive(Clone)]
+pub(crate) struct RedactionContext {
+    redactor: Arc<SecretRedactor>,
+    audit: Arc<RedactionAudit>,
+}
+
+impl RedactionContext {
+    pub(crate) fn new(redactor: Arc<SecretRedactor>, audit: Arc<RedactionAudit>) -> Self {
+        Self { redactor, audit }
+    }
+}
+
+#[derive(Clone)]
+struct TeeRouterContext {
+    config: Arc<AppConfig>,
+    sources: Arc<Vec<IngestSource>>,
+    resolver: SharedRouteResolver,
+    registry: StatusRegistry,
+    redaction: RedactionContext,
+}
+
 /// Routes every batch from the processors to the default sink (always,
 /// awaited — the existing backpressure) and tees full batches toward mirror
 /// backends via `try_send` (never awaited — a slow remote cannot stall the
@@ -375,8 +397,16 @@ pub(crate) fn spawn_tee_router(
     default_tx: mpsc::Sender<SinkMessage>,
     resolver: SharedRouteResolver,
     registry: StatusRegistry,
+    redaction: RedactionContext,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let context = TeeRouterContext {
+            config,
+            sources: Arc::new(sources),
+            resolver,
+            registry,
+            redaction,
+        };
         let mut handles = HashMap::<String, BackendHandle>::new();
 
         // Backends named by home-config routes start eagerly so handshake
@@ -385,26 +415,30 @@ pub(crate) fn spawn_tee_router(
         // cannot know at startup which configured backends repos will name,
         // and eagerly replaying never-routed backends would write
         // checkpoints into databases the user never routed to.
-        let eager: BTreeSet<String> = config
+        let eager: BTreeSet<String> = context
+            .config
             .routes
             .iter()
             .map(|route| route.backend.clone())
             .filter(|name| name != DEFAULT_BACKEND_NAME)
             .collect();
         for name in eager {
-            ensure_backend(&name, &config, &sources, &resolver, &registry, &mut handles);
+            ensure_backend(&name, &context, &mut handles);
         }
 
-        while let Some(SinkMessage::Batch(batch)) = rx.recv().await {
+        while let Some(SinkMessage::Batch(mut batch)) = rx.recv().await {
+            redact_default_batch_if_enabled(&context.config, &context.redaction, &mut batch);
+
             let targets = {
-                let mut resolver = resolver.lock().expect("route resolver mutex poisoned");
+                let mut resolver = context
+                    .resolver
+                    .lock()
+                    .expect("route resolver mutex poisoned");
                 collect_targets(&batch, &mut resolver)
             };
 
             for name in &targets {
-                if let Some(handle) =
-                    ensure_backend(name, &config, &sources, &resolver, &registry, &mut handles)
-                {
+                if let Some(handle) = ensure_backend(name, &context, &mut handles) {
                     forward_to_backend(handle, &batch);
                 }
             }
@@ -416,37 +450,46 @@ pub(crate) fn spawn_tee_router(
     })
 }
 
+fn redact_default_batch_if_enabled(
+    config: &AppConfig,
+    redaction: &RedactionContext,
+    batch: &mut RowBatch,
+) {
+    if config.redaction.dangerously_skip_secret_redaction {
+        return;
+    }
+
+    let report = redaction.redactor.redact_batch(batch);
+    redaction.audit.record(&report);
+}
+
 /// Looks up (or lazily constructs) the handle for a named backend. Returns
 /// `None` only for names without a `[backends.*]` entry, which the resolver
 /// already refuses to produce — this is a defensive double-check.
 fn ensure_backend<'a>(
     name: &str,
-    config: &Arc<AppConfig>,
-    sources: &[IngestSource],
-    resolver: &SharedRouteResolver,
-    registry: &StatusRegistry,
+    context: &TeeRouterContext,
     handles: &'a mut HashMap<String, BackendHandle>,
 ) -> Option<&'a BackendHandle> {
     if !handles.contains_key(name) {
-        let backend_cfg = config.backends.get(name)?.clone();
+        let backend_cfg = context.config.backends.get(name)?.clone();
         let cell = Arc::new(BackendSinkCell::new(name));
-        let queue_capacity = config.ingest.max_inflight_batches.max(1);
+        let queue_capacity = context.config.ingest.max_inflight_batches.max(1);
         let (tx, backend_rx) = mpsc::channel::<SinkMessage>(queue_capacity);
 
-        registry
+        context
+            .registry
             .lock()
             .expect("backend registry mutex poisoned")
             .insert(name.to_string(), cell.clone());
 
         info!(backend = name, "starting mirror sink for backend");
         spawn_backend_supervisor(
-            config.clone(),
             backend_cfg,
-            sources.to_vec(),
             cell.clone(),
             tx.clone(),
             backend_rx,
-            resolver.clone(),
+            context.clone(),
         );
 
         handles.insert(name.to_string(), BackendHandle { tx, cell });
@@ -491,13 +534,11 @@ fn forward_to_backend(handle: &BackendHandle, batch: &RowBatch) {
 /// load from the backend's own database, sink task spawn, then catch-up
 /// replay passes re-armed on every recovery.
 fn spawn_backend_supervisor(
-    config: Arc<AppConfig>,
     backend_cfg: ClickHouseConfig,
-    sources: Vec<IngestSource>,
     cell: Arc<BackendSinkCell>,
     replay_tx: mpsc::Sender<SinkMessage>,
     backend_rx: mpsc::Receiver<SinkMessage>,
-    resolver: SharedRouteResolver,
+    context: TeeRouterContext,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let name = cell.name().to_string();
@@ -568,7 +609,7 @@ fn spawn_backend_supervisor(
         let replay_notify = Arc::new(Notify::new());
         let replay_floor: ReplayFloor = Arc::new(Mutex::new(None));
         spawn_sink_task(
-            config.as_ref().clone(),
+            context.config.as_ref().clone(),
             client,
             checkpoints.clone(),
             metrics.clone(),
@@ -576,9 +617,11 @@ fn spawn_backend_supervisor(
             true,
             SinkRole::Backend {
                 cell: cell.clone(),
-                resolver,
+                resolver: context.resolver.clone(),
                 replay_notify: replay_notify.clone(),
                 replay_floor: replay_floor.clone(),
+                redactor: context.redaction.redactor.clone(),
+                redactions: context.redaction.audit.clone(),
             },
         );
 
@@ -595,8 +638,8 @@ fn spawn_backend_supervisor(
         let mut reported_lost = HashSet::<String>::new();
         loop {
             run_replay_pass(
-                &config,
-                &sources,
+                &context.config,
+                context.sources.as_slice(),
                 &floor,
                 &replay_tx,
                 &metrics,
@@ -721,8 +764,10 @@ mod tests {
 
     fn team_config() -> Arc<AppConfig> {
         let mut config = AppConfig::default();
-        let mut team = ClickHouseConfig::default();
-        team.database = "moraine_team".to_string();
+        let team = ClickHouseConfig {
+            database: "moraine_team".to_string(),
+            ..Default::default()
+        };
         config.backends.insert("team-ch".to_string(), team);
         config.routes.push(moraine_config::RouteConfig {
             dir: "/work/team/**".to_string(),
@@ -1044,26 +1089,97 @@ mod tests {
     }
 
     fn backend_cfg_for(url: String) -> ClickHouseConfig {
-        let mut cfg = ClickHouseConfig::default();
-        cfg.url = url;
-        cfg.timeout_seconds = 1.0;
-        cfg
+        ClickHouseConfig {
+            url,
+            timeout_seconds: 1.0,
+            ..Default::default()
+        }
+    }
+
+    fn test_redactor() -> Arc<SecretRedactor> {
+        Arc::new(
+            SecretRedactor::new(&moraine_config::RedactionConfig::default())
+                .expect("test redactor compiles"),
+        )
+    }
+
+    fn test_redaction_audit() -> Arc<RedactionAudit> {
+        Arc::new(RedactionAudit::default())
+    }
+
+    fn test_router_context(
+        config: Arc<AppConfig>,
+        resolver: SharedRouteResolver,
+    ) -> TeeRouterContext {
+        TeeRouterContext {
+            config,
+            sources: Arc::new(Vec::new()),
+            resolver,
+            registry: Arc::new(Mutex::new(BTreeMap::new())),
+            redaction: RedactionContext::new(test_redactor(), test_redaction_audit()),
+        }
+    }
+
+    fn secret_batch() -> RowBatch {
+        let mut batch = RowBatch::default();
+        batch.push_raw_row(serde_json::json!({
+            "session_id": "session-a",
+            "cwd": "/work/team/project",
+            "raw_json": "{\"token\":\"ghp_abcdefghijklmnopqrstuvwxyzABCDE12345\"}",
+            "raw_json_hash": 1u64,
+        }));
+        batch
+    }
+
+    #[test]
+    fn default_gate_redacts_when_enabled() {
+        let config = AppConfig::default();
+        let redactor = test_redactor();
+        let redactions = test_redaction_audit();
+        let redaction = RedactionContext::new(redactor, redactions.clone());
+        let mut batch = secret_batch();
+
+        redact_default_batch_if_enabled(&config, &redaction, &mut batch);
+
+        assert_eq!(
+            batch.raw_rows[0].get("raw_json").and_then(Value::as_str),
+            Some("{\"token\":\"[REDACTED:github-token]\"}")
+        );
+        assert_eq!(redactions.snapshot().get("github-token"), Some(&1));
+    }
+
+    #[test]
+    fn default_gate_honors_local_skip() {
+        let mut config = AppConfig::default();
+        config.redaction.dangerously_skip_secret_redaction = true;
+        let redactor = test_redactor();
+        let redactions = test_redaction_audit();
+        let redaction = RedactionContext::new(redactor, redactions.clone());
+        let mut batch = secret_batch();
+
+        redact_default_batch_if_enabled(&config, &redaction, &mut batch);
+
+        assert_eq!(
+            batch.raw_rows[0].get("raw_json").and_then(Value::as_str),
+            Some("{\"token\":\"ghp_abcdefghijklmnopqrstuvwxyzABCDE12345\"}")
+        );
+        assert!(redactions.snapshot().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn supervisor_marks_unreachable_backend_without_going_live() {
         let cell = Arc::new(BackendSinkCell::new("team-ch"));
         let (tx, rx) = mpsc::channel::<SinkMessage>(1);
-        let resolver: SharedRouteResolver = Arc::new(Mutex::new(RouteResolver::new(team_config())));
+        let config = team_config();
+        let resolver: SharedRouteResolver =
+            Arc::new(Mutex::new(RouteResolver::new(config.clone())));
 
         let handle = spawn_backend_supervisor(
-            team_config(),
             backend_cfg_for("http://127.0.0.1:1".to_string()),
-            Vec::new(),
             cell.clone(),
             tx,
             rx,
-            resolver,
+            test_router_context(config, resolver),
         );
 
         assert!(
@@ -1132,16 +1248,16 @@ mod tests {
 
         let cell = Arc::new(BackendSinkCell::new("team-ch"));
         let (tx, rx) = mpsc::channel::<SinkMessage>(1);
-        let resolver: SharedRouteResolver = Arc::new(Mutex::new(RouteResolver::new(team_config())));
+        let config = team_config();
+        let resolver: SharedRouteResolver =
+            Arc::new(Mutex::new(RouteResolver::new(config.clone())));
 
         let handle = spawn_backend_supervisor(
-            team_config(),
             backend_cfg_for(format!("http://{}", addr)), // allow_newer_server = false
-            Vec::new(),
             cell.clone(),
             tx,
             rx,
-            resolver,
+            test_router_context(config, resolver),
         );
 
         assert!(

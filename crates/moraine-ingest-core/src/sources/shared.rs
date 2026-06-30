@@ -869,7 +869,7 @@ pub(crate) fn raw_hash(raw_json: &str) -> u64 {
     u64::from_str_radix(&hex[..16], 16).unwrap_or(0)
 }
 
-fn io_hash(input_json: &str, output_json: &str) -> u64 {
+pub(crate) fn io_hash(input_json: &str, output_json: &str) -> u64 {
     raw_hash(&format!("{}\n{}", input_json, output_json))
 }
 

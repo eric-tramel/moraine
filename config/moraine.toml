@@ -28,6 +28,14 @@ wait_for_async_insert = true
 # backend = "team-ch"
 # mode = "mirror"               # default; the only supported mode
 
+[redaction]
+# Secret redaction is default-on for all ingestion. This flag is honored only
+# from $HOME/.moraine/config.toml, and only for the local/default backend;
+# mirror egress to named backends is always redacted.
+# dangerously_skip_secret_redaction = true
+ruleset = "builtin"
+# extra_patterns = ["acme_internal_[A-Za-z0-9]{32}"]
+
 [ingest]
 batch_size = 4000
 max_batch_bytes = 8388608
