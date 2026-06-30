@@ -92,6 +92,19 @@ pub struct RouteConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct RedactionConfig {
+    #[serde(default)]
+    pub dangerously_skip_secret_redaction: bool,
+    #[serde(default = "default_redaction_ruleset")]
+    pub ruleset: String,
+    #[serde(default)]
+    pub extra_patterns: Vec<String>,
+    #[serde(skip)]
+    pub dangerously_skip_secret_redaction_ignored: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IngestConfig {
     #[serde(default = "default_sources")]
     pub sources: Vec<IngestSource>,
@@ -233,6 +246,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
     #[serde(default)]
+    pub redaction: RedactionConfig,
+    #[serde(default)]
     pub ingest: IngestConfig,
     #[serde(default)]
     pub mcp: McpConfig,
@@ -302,6 +317,7 @@ impl Default for AppConfig {
             clickhouse,
             backends,
             routes: Vec::new(),
+            redaction: RedactionConfig::default(),
             ingest: IngestConfig::default(),
             mcp: McpConfig::default(),
             bm25: Bm25Config::default(),
@@ -325,6 +341,17 @@ impl Default for IngestConfig {
             debounce_ms: default_debounce_ms(),
             reconcile_interval_seconds: default_reconcile_interval_seconds(),
             heartbeat_interval_seconds: default_heartbeat_interval_seconds(),
+        }
+    }
+}
+
+impl Default for RedactionConfig {
+    fn default() -> Self {
+        Self {
+            dangerously_skip_secret_redaction: false,
+            ruleset: default_redaction_ruleset(),
+            extra_patterns: Vec::new(),
+            dangerously_skip_secret_redaction_ignored: false,
         }
     }
 }
@@ -735,6 +762,10 @@ fn default_route_mode() -> String {
     ROUTE_MODE_MIRROR.to_string()
 }
 
+fn default_redaction_ruleset() -> String {
+    "builtin".to_string()
+}
+
 fn default_k1() -> f64 {
     1.2
 }
@@ -1056,14 +1087,49 @@ fn normalize_config(mut cfg: AppConfig) -> Result<AppConfig> {
         resolve_runtime_subdir(&cfg.runtime.pids_dir, &cfg.mcp.central_socket_path);
 
     normalize_backends_and_routes(&mut cfg)?;
+    normalize_redaction(&mut cfg)?;
 
     Ok(cfg)
 }
 
-pub fn load_config(path: impl AsRef<Path>) -> Result<AppConfig> {
-    let content = std::fs::read_to_string(path.as_ref())
-        .with_context(|| format!("failed to read config {}", path.as_ref().display()))?;
-    let cfg: AppConfig = toml::from_str(&content).context("failed to parse TOML config")?;
+fn normalize_redaction(cfg: &mut AppConfig) -> Result<()> {
+    cfg.redaction.ruleset = cfg.redaction.ruleset.trim().to_ascii_lowercase();
+    if cfg.redaction.ruleset.is_empty() {
+        cfg.redaction.ruleset = default_redaction_ruleset();
+    }
+    if cfg.redaction.ruleset != "builtin" {
+        return Err(anyhow::anyhow!(
+            "invalid redaction.ruleset `{}`; only `builtin` is supported",
+            cfg.redaction.ruleset
+        ));
+    }
+    cfg.redaction.extra_patterns = cfg
+        .redaction
+        .extra_patterns
+        .iter()
+        .map(|pattern| pattern.trim().to_string())
+        .filter(|pattern| !pattern.is_empty())
+        .collect();
+    Ok(())
+}
+
+fn paths_refer_to_same_file(path: &Path, other: &Path) -> bool {
+    match (std::fs::canonicalize(path), std::fs::canonicalize(other)) {
+        (Ok(path), Ok(other)) => path == other,
+        _ => path == other,
+    }
+}
+
+fn path_is_home_config(path: &Path, home_path: Option<&Path>) -> bool {
+    home_path
+        .map(|home| paths_refer_to_same_file(path, home))
+        .unwrap_or(false)
+}
+
+fn load_config_with_home_path(path: &Path, home_path: Option<PathBuf>) -> Result<AppConfig> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read config {}", path.display()))?;
+    let mut cfg: AppConfig = toml::from_str(&content).context("failed to parse TOML config")?;
     // The struct-level parse cannot tell an explicit `[clickhouse]` block
     // from its serde default, so the both-declared ambiguity is detected on
     // the raw TOML document instead.
@@ -1078,7 +1144,19 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<AppConfig> {
             "config declares both [clickhouse] and [backends.default]; they are aliases for the same backend — keep exactly one"
         ));
     }
+
+    if cfg.redaction.dangerously_skip_secret_redaction
+        && !path_is_home_config(path, home_path.as_deref())
+    {
+        cfg.redaction.dangerously_skip_secret_redaction = false;
+        cfg.redaction.dangerously_skip_secret_redaction_ignored = true;
+    }
+
     normalize_config(cfg)
+}
+
+pub fn load_config(path: impl AsRef<Path>) -> Result<AppConfig> {
+    load_config_with_home_path(path.as_ref(), home_config_path())
 }
 
 /// Name of the optional repo-level backend reference file. It carries a
@@ -1147,6 +1225,94 @@ mod tests {
         ));
         std::fs::write(&path, contents).expect("write temp config");
         path
+    }
+
+    #[test]
+    fn redaction_defaults_to_enabled() {
+        let path = write_temp_config("", "redaction-defaults");
+        let cfg = load_config(&path).expect("empty config should load with defaults");
+
+        assert!(!cfg.redaction.dangerously_skip_secret_redaction);
+        assert_eq!(cfg.redaction.ruleset, "builtin");
+        assert!(cfg.redaction.extra_patterns.is_empty());
+        assert!(!cfg.redaction.dangerously_skip_secret_redaction_ignored);
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn redaction_skip_is_honored_from_home_config_path() {
+        let path = write_temp_config(
+            r#"
+[redaction]
+dangerously_skip_secret_redaction = true
+"#,
+            "redaction-home-skip",
+        );
+        let cfg = load_config_with_home_path(&path, Some(path.clone()))
+            .expect("home config skip should load");
+
+        assert!(cfg.redaction.dangerously_skip_secret_redaction);
+        assert!(!cfg.redaction.dangerously_skip_secret_redaction_ignored);
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn redaction_skip_is_ignored_outside_home_config_path() {
+        let path = write_temp_config(
+            r#"
+[redaction]
+dangerously_skip_secret_redaction = true
+"#,
+            "redaction-repo-skip",
+        );
+        let home = std::env::temp_dir().join("moraine-config-home-does-not-match.toml");
+        let cfg = load_config_with_home_path(&path, Some(home))
+            .expect("non-home config skip should be ignored");
+
+        assert!(!cfg.redaction.dangerously_skip_secret_redaction);
+        assert!(cfg.redaction.dangerously_skip_secret_redaction_ignored);
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn redaction_rejects_allowlist_policy_key() {
+        let path = write_temp_config(
+            r#"
+[redaction]
+allowlist = ["AKIAEXAMPLEEXAMPLE12"]
+"#,
+            "redaction-allowlist",
+        );
+        let err = load_config(&path).expect_err("unknown redaction keys should fail");
+
+        assert!(
+            format!("{err:#}").contains("unknown field `allowlist`"),
+            "error names unknown redaction key: {err:#}"
+        );
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn redaction_rejects_unknown_ruleset() {
+        let path = write_temp_config(
+            r#"
+[redaction]
+ruleset = "custom"
+"#,
+            "redaction-ruleset",
+        );
+        let err = load_config(&path).expect_err("unknown ruleset should fail");
+
+        assert!(
+            format!("{err:#}").contains("invalid redaction.ruleset"),
+            "error names redaction ruleset: {err:#}"
+        );
+
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

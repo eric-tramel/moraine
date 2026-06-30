@@ -1,6 +1,7 @@
 use crate::checkpoint::merge_checkpoint;
 use crate::heartbeat::host_name;
 use crate::model::Checkpoint;
+use crate::redaction::{RedactionAudit, SecretRedactor};
 use crate::sources::shared::truncate_chars;
 use crate::tee::{
     backend_sinks_json, filter_batch_for_backend, BackendSinkCell, ReplayFloor,
@@ -40,6 +41,10 @@ pub(crate) enum SinkRole {
         /// (migration 017). Pre-017 schemas reject unknown columns at insert
         /// time, so the field is attached only when the column exists.
         backend_sinks_column: bool,
+        /// Whether `ingest_heartbeats` carries the `redactions_total` column
+        /// (migration 022). Redaction still runs without this audit surface.
+        redactions_column: bool,
+        redactions: Arc<RedactionAudit>,
     },
     /// A mirror sink for one named backend: filters intake down to the
     /// sessions routed to it and reports flush health on its status cell.
@@ -53,6 +58,8 @@ pub(crate) enum SinkRole {
         /// transition (see `note_flush_outcome` for why it must be taken
         /// here, inside the sink task, and not when the supervisor wakes).
         replay_floor: ReplayFloor,
+        redactor: Arc<SecretRedactor>,
+        redactions: Arc<RedactionAudit>,
     },
 }
 
@@ -261,10 +268,20 @@ pub(crate) fn spawn_sink_task(
                             // Mirror sinks only buffer the sessions routed to
                             // them; the default sink takes batches whole.
                             let batch = match &role {
-                                SinkRole::Backend { cell, resolver, .. } => {
+                                SinkRole::Backend {
+                                    cell,
+                                    resolver,
+                                    redactor,
+                                    redactions,
+                                    ..
+                                } => {
                                     let mut resolver =
                                         resolver.lock().expect("route resolver mutex poisoned");
-                                    filter_batch_for_backend(&batch, cell.name(), &mut resolver)
+                                    let mut batch =
+                                        filter_batch_for_backend(&batch, cell.name(), &mut resolver);
+                                    let report = redactor.redact_batch(&mut batch);
+                                    redactions.record(&report);
+                                    batch
                                 }
                                 SinkRole::Default { .. } => batch,
                             };
@@ -706,6 +723,8 @@ async fn emit_heartbeat(clickhouse: &ClickHouseClient, metrics: &Arc<Metrics>, r
         dispatch,
         backends,
         backend_sinks_column,
+        redactions_column,
+        redactions,
     } = role
     else {
         return;
@@ -751,6 +770,16 @@ async fn emit_heartbeat(clickhouse: &ClickHouseClient, metrics: &Arc<Metrics>, r
         if let Some(statuses) = backend_sinks_json(backends) {
             if let Some(obj) = heartbeat.as_object_mut() {
                 obj.insert("backend_sinks".to_string(), json!(statuses));
+            }
+        }
+    }
+
+    if *redactions_column {
+        let counts = redactions.snapshot();
+        if !counts.is_empty() {
+            if let Some(obj) = heartbeat.as_object_mut() {
+                let counts_json = serde_json::to_string(&counts).unwrap_or_default();
+                obj.insert("redactions_total".to_string(), Value::String(counts_json));
             }
         }
     }
@@ -1098,6 +1127,8 @@ mod tests {
             Some("ingest_errors")
         } else if query.contains("`ingest_checkpoints`") {
             Some("ingest_checkpoints")
+        } else if query.contains("`ingest_heartbeats`") {
+            Some("ingest_heartbeats")
         } else if query.contains("`events`") {
             Some("events")
         } else {
@@ -1217,11 +1248,24 @@ mod tests {
         SinkMessage::Batch(batch)
     }
 
+    fn test_redactor() -> Arc<SecretRedactor> {
+        Arc::new(
+            SecretRedactor::new(&moraine_config::RedactionConfig::default())
+                .expect("test redactor compiles"),
+        )
+    }
+
+    fn test_redaction_audit() -> Arc<RedactionAudit> {
+        Arc::new(RedactionAudit::default())
+    }
+
     fn default_role() -> SinkRole {
         SinkRole::Default {
             dispatch: Arc::new(Mutex::new(DispatchState::default())),
             backends: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             backend_sinks_column: false,
+            redactions_column: false,
+            redactions: test_redaction_audit(),
         }
     }
 
@@ -1938,6 +1982,7 @@ mod tests {
         config.ingest.heartbeat_interval_seconds = 60.0;
         let checkpoints = Arc::new(RwLock::new(HashMap::new()));
         let metrics = Arc::new(Metrics::default());
+        let redactions = test_redaction_audit();
         let (tx, rx) = mpsc::channel::<SinkMessage>(8);
 
         let handle = spawn_sink_task(
@@ -1952,19 +1997,26 @@ mod tests {
                 resolver,
                 replay_notify: Arc::new(Notify::new()),
                 replay_floor: Arc::new(Mutex::new(None)),
+                redactor: test_redactor(),
+                redactions: redactions.clone(),
             },
         );
 
+        let raw_secret = "ghp_abcdefghijklmnopqrstuvwxyzABCDE12345";
         let mut batch = RowBatch::default();
         batch.push_raw_row(json!({
             "session_id": "team-session",
             "cwd": "/work/team/project",
             "record_ts": "2026-02-17T00:00:01.000Z",
+            "raw_json": format!("{{\"token\":\"{raw_secret}\"}}"),
+            "raw_json_hash": 1u64,
         }));
         batch.push_raw_row(json!({
             "session_id": "other-session",
             "cwd": "/home/other",
             "record_ts": "2026-02-17T00:00:01.000Z",
+            "raw_json": format!("{{\"token\":\"{raw_secret}\"}}"),
+            "raw_json_hash": 1u64,
         }));
         batch.checkpoint = Some(sample_checkpoint());
         tx.send(SinkMessage::Batch(batch))
@@ -1982,6 +2034,16 @@ mod tests {
         assert_eq!(
             raw_rows[0].get("session_id").and_then(Value::as_str),
             Some("team-session")
+        );
+        assert_eq!(
+            raw_rows[0].get("raw_json").and_then(Value::as_str),
+            Some("{\"token\":\"[REDACTED:github-token]\"}"),
+            "backend sink backstop redacts the remote copy after route filtering"
+        );
+        assert_eq!(
+            redactions.snapshot().get("github-token"),
+            Some(&1),
+            "backend redactions are counted without secret values"
         );
         let checkpoint_rows = mock_state.rows("ingest_checkpoints");
         assert_eq!(
@@ -2070,6 +2132,8 @@ mod tests {
             )))),
             replay_notify: replay_notify.clone(),
             replay_floor: replay_floor.clone(),
+            redactor: test_redactor(),
+            redactions: test_redaction_audit(),
         };
 
         let checkpoint = sample_checkpoint(); // offset 100

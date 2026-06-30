@@ -743,6 +743,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             name: "021_file_attention_normalization.sql",
             sql: include_str!("../../../sql/021_file_attention_normalization.sql"),
         },
+        Migration {
+            version: "022",
+            name: "022_heartbeat_redaction_counts.sql",
+            sql: include_str!("../../../sql/022_heartbeat_redaction_counts.sql"),
+        },
     ]
 }
 

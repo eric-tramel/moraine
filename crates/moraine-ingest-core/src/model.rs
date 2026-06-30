@@ -91,6 +91,11 @@ impl RowBatch {
                 .sum::<usize>()
     }
 
+    pub(crate) fn recompute_approx_bytes(&mut self) {
+        self.approx_bytes = 0;
+        self.approx_bytes = self.approx_bytes();
+    }
+
     pub fn push_raw_row(&mut self, row: Value) {
         self.approx_bytes = self
             .approx_bytes
