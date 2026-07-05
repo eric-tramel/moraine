@@ -911,6 +911,52 @@ async fn opencode_sqlite_unchanged_db_is_a_noop_then_mutation_reemits_row() {
     cleanup(&path);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn opencode_sqlite_irrelevant_write_persists_no_checkpoint() {
+    let path = unique_opencode_db_path("noop-checkpoint");
+    let db = seed_opencode_db(&path);
+    let work = opencode_sqlite_work(&path);
+    let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+
+    let first = run_opencode_poll(&work, &checkpoints).await;
+    assert!(!first.is_empty());
+    let cp_key = checkpoint_key(&work.source_name, &work.path);
+    let baseline = checkpoints
+        .read()
+        .await
+        .get(&cp_key)
+        .cloned()
+        .expect("committed checkpoint after first poll");
+
+    // A write that never touches the event tables (issue #443): the stat
+    // fingerprint moves but the event cursor cannot advance.
+    db.execute(
+        "INSERT INTO credential (id, value, time_created, time_updated) \
+         VALUES ('cred_noise', 'rotated', 1780000004000, 1780000004000)",
+        [],
+    )
+    .expect("write non-event row");
+
+    let second = run_opencode_poll(&work, &checkpoints).await;
+    assert!(
+        second.is_empty(),
+        "a no-op scan must send nothing durable; got {} batches",
+        second.len()
+    );
+    let after = checkpoints
+        .read()
+        .await
+        .get(&cp_key)
+        .cloned()
+        .expect("checkpoint survives no-op poll");
+    assert_eq!(
+        baseline.last_offset, after.last_offset,
+        "no-op scan must not advance the poll sequence"
+    );
+
+    cleanup(&path);
+}
+
 #[test]
 fn opencode_sqlite_scan_paginates_past_single_event_page() {
     let path = unique_opencode_db_path("many-events");

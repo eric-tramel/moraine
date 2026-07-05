@@ -38,7 +38,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, warn};
 
@@ -129,6 +130,102 @@ impl CursorState {
 
     fn serialize(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
+    }
+}
+
+/// After this many consecutive no-op scans, a database is considered
+/// stat-noisy and rescans are throttled to `NOOP_RESCAN_MIN_INTERVAL`.
+/// Below the threshold every stat change scans immediately, so ordinary
+/// write→poll flows (and tests) never wait on the throttle.
+const NOOP_SCAN_BACKOFF_THRESHOLD: u32 = 3;
+
+/// Minimum interval between full scans of a stat-noisy database. This bounds
+/// pickup latency: after an idle stretch the first relevant write can wait up
+/// to this long, but the scan it triggers resets the streak, so an actively
+/// streaming session tails in real time again.
+const NOOP_RESCAN_MIN_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Volatile per-database poll state (issue #443). Cursor touches its DB, WAL,
+/// and SHM sidecars continuously (heartbeats, `ItemTable` writes) without
+/// changing any transcript-relevant key. Persisting a durable checkpoint — or
+/// even re-hashing every relevant value — on each touch pins ingest and
+/// ClickHouse CPU at idle, so scans that change nothing durable record the
+/// stat fingerprint they covered here instead of in `ingest_checkpoints`.
+/// Losing this map on restart costs one redundant no-op scan per database.
+struct VolatilePollState {
+    source_generation: u32,
+    stat: StatFingerprint,
+    consecutive_noop_scans: u32,
+    last_scan_at: Instant,
+}
+
+static VOLATILE_POLL_STATE: LazyLock<Mutex<HashMap<String, VolatilePollState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn volatile_poll_state() -> std::sync::MutexGuard<'static, HashMap<String, VolatilePollState>> {
+    VOLATILE_POLL_STATE
+        .lock()
+        .expect("volatile poll state mutex poisoned")
+}
+
+/// True when a poll should be skipped without scanning: either the last no-op
+/// scan already covered the current stat fingerprint (the durable checkpoint
+/// is intentionally stale after a no-op scan), or the database is stat-noisy
+/// and still inside its rescan backoff window.
+fn should_skip_noop_poll(
+    cp_key: &str,
+    source_generation: u32,
+    current_stat: &StatFingerprint,
+) -> bool {
+    let map = volatile_poll_state();
+    let Some(entry) = map.get(cp_key) else {
+        return false;
+    };
+    if entry.source_generation != source_generation {
+        return false;
+    }
+    if entry.stat == *current_stat {
+        return true;
+    }
+    entry.consecutive_noop_scans >= NOOP_SCAN_BACKOFF_THRESHOLD
+        && entry.last_scan_at.elapsed() < NOOP_RESCAN_MIN_INTERVAL
+}
+
+/// Record a scan that changed nothing durable: remember the stat fingerprint
+/// it covered and extend the no-op streak.
+fn record_noop_scan(cp_key: &str, source_generation: u32, stat: StatFingerprint) {
+    let mut map = volatile_poll_state();
+    let consecutive_noop_scans = match map.get(cp_key) {
+        Some(entry) if entry.source_generation == source_generation => {
+            entry.consecutive_noop_scans.saturating_add(1)
+        }
+        _ => 1,
+    };
+    map.insert(
+        cp_key.to_string(),
+        VolatilePollState {
+            source_generation,
+            stat,
+            consecutive_noop_scans,
+            last_scan_at: Instant::now(),
+        },
+    );
+}
+
+/// Forget volatile state after a scan that persisted a durable checkpoint:
+/// the checkpoint now carries the authoritative cursor, and crash recovery
+/// must never be suppressed by stale volatile state.
+fn clear_noop_poll_state(cp_key: &str) {
+    volatile_poll_state().remove(cp_key);
+}
+
+/// A failed scan refreshes the backoff clock of an existing no-op streak so a
+/// persistently failing stat-noisy database retries on the throttled cadence
+/// instead of every reconcile tick. Without a streak this is a no-op and the
+/// failure retries exactly as before.
+fn record_failed_scan(cp_key: &str) {
+    if let Some(entry) = volatile_poll_state().get_mut(cp_key) {
+        entry.last_scan_at = Instant::now();
     }
 }
 
@@ -239,6 +336,7 @@ pub(crate) async fn process_cursor_sqlite_db(
 
     let cp_key = checkpoint_key(&work.source_name, &source_file);
     let committed = { checkpoints.read().await.get(&cp_key).cloned() };
+    let had_committed = committed.is_some();
 
     let mut checkpoint = committed.unwrap_or(Checkpoint {
         source_name: work.source_name.clone(),
@@ -254,7 +352,8 @@ pub(crate) async fn process_cursor_sqlite_db(
     // A replaced database file is a new generation: every logical identity
     // (and therefore every event UID) starts over, and the hash cursor is
     // meaningless for the new file's contents.
-    if checkpoint.source_inode != inode {
+    let generation_changed = checkpoint.source_inode != inode;
+    if generation_changed {
         checkpoint.source_inode = inode;
         checkpoint.source_generation = checkpoint.source_generation.saturating_add(1).max(1);
         state = CursorState::fresh();
@@ -263,6 +362,12 @@ pub(crate) async fn process_cursor_sqlite_db(
     // Cheap no-change short-circuit: nothing touched the database or its WAL
     // sidecars since the last successful poll.
     if state.stat == current_stat && state.last_error.is_empty() {
+        return Ok(());
+    }
+
+    // Volatile short-circuit + rescan backoff (issue #443): no-op scans leave
+    // the durable checkpoint untouched, so their coverage lives here instead.
+    if should_skip_noop_poll(&cp_key, checkpoint.source_generation, &current_stat) {
         return Ok(());
     }
 
@@ -279,8 +384,27 @@ pub(crate) async fn process_cursor_sqlite_db(
             schema_fingerprint,
             relevant_keys,
         } => {
-            new_state.stat = current_stat;
+            new_state.stat = current_stat.clone();
             new_state.last_error = String::new();
+
+            // A no-op scan: only the stat fingerprint moved — no record was
+            // emitted and nothing the durable checkpoint carries (hash
+            // cursor, schema, key count, error marker) changed. Persisting a
+            // checkpoint here would append an `ingest_checkpoints` row per
+            // WAL touch forever (issue #443); record the covered stat in
+            // volatile state instead and send nothing.
+            let scan_is_noop = had_committed
+                && !generation_changed
+                && records.is_empty()
+                && state.last_error.is_empty()
+                && checkpoint.status == "active"
+                && new_state.kv_hashes == state.kv_hashes
+                && schema_fingerprint == checkpoint.schema_fingerprint
+                && relevant_keys == checkpoint.last_line_no;
+            if scan_is_noop {
+                record_noop_scan(&cp_key, checkpoint.source_generation, new_state.stat);
+                return Ok(());
+            }
 
             let mut batch = RowBatch::default();
             for synthetic in &records {
@@ -355,6 +479,7 @@ pub(crate) async fn process_cursor_sqlite_db(
                 .send(SinkMessage::Batch(batch))
                 .await
                 .context("sink channel closed while sending final cursor_sqlite batch")?;
+            clear_noop_poll_state(&cp_key);
 
             if emitted > 0 {
                 debug!(
@@ -369,6 +494,8 @@ pub(crate) async fn process_cursor_sqlite_db(
             error_kind,
             error_text,
         } => {
+            record_failed_scan(&cp_key);
+
             // A repeat of the failure already marked in the committed
             // checkpoint sends nothing: the marker is durable, and reconcile
             // re-polls every tick — re-sending an identical checkpoint would
@@ -1442,6 +1569,106 @@ mod tests {
         );
 
         cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn irrelevant_write_scans_but_persists_no_checkpoint() {
+        let path = unique_db_path("noop-checkpoint");
+        let db = seed_fixture_db(&path);
+        let work = sqlite_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+
+        let first = run_poll(&work, &checkpoints).await;
+        assert!(!first.is_empty());
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+        let baseline = checkpoints
+            .read()
+            .await
+            .get(&cp_key)
+            .cloned()
+            .expect("committed checkpoint after first poll");
+
+        // Cursor constantly rewrites non-transcript keys (issue #443): the
+        // stat fingerprint moves but no relevant key changes.
+        put(&db, "agentKv:blob:0000", &json!({"opaque": "blob"}));
+
+        let second = run_poll(&work, &checkpoints).await;
+        assert!(
+            second.is_empty(),
+            "a no-op scan must send nothing durable; got {} batches",
+            second.len()
+        );
+
+        // The same stat fingerprint is now covered by volatile state, so a
+        // re-poll without further writes also sends nothing.
+        let third = run_poll(&work, &checkpoints).await;
+        assert!(
+            third.is_empty(),
+            "volatile stat coverage must short-circuit"
+        );
+
+        // A relevant write below the backoff threshold is picked up
+        // immediately and persists a durable checkpoint again.
+        put(
+            &db,
+            &format!("bubbleId:{COMPOSER_ID}:{TOOL_BUBBLE_ID}"),
+            &tool_bubble_value("completed", true),
+        );
+        let fourth = run_poll(&work, &checkpoints).await;
+        let rows = all_event_rows(&fourth);
+        assert_eq!(event_uid_by_kind(&rows, "tool_result").len(), 1);
+        let cp = fourth
+            .last()
+            .and_then(|batch| batch.checkpoint.clone())
+            .expect("relevant change persists a checkpoint");
+        assert_eq!(
+            cp.last_offset,
+            baseline.last_offset + 1,
+            "poll sequence advances once for the relevant change, not per WAL touch"
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn noop_backoff_state_machine() {
+        let key = "cursor-sqlite-test:noop-backoff-state-machine";
+        let stat = |db_len: u64| StatFingerprint {
+            db_len,
+            ..Default::default()
+        };
+
+        assert!(
+            !should_skip_noop_poll(key, 1, &stat(1)),
+            "no volatile state yet"
+        );
+
+        record_noop_scan(key, 1, stat(1));
+        assert!(
+            should_skip_noop_poll(key, 1, &stat(1)),
+            "covered stat skips without a scan"
+        );
+        assert!(
+            !should_skip_noop_poll(key, 1, &stat(2)),
+            "below the streak threshold a fresh stat scans immediately"
+        );
+
+        record_noop_scan(key, 1, stat(2));
+        record_noop_scan(key, 1, stat(3));
+        assert!(
+            should_skip_noop_poll(key, 1, &stat(4)),
+            "at the streak threshold fresh stats are throttled"
+        );
+        assert!(
+            !should_skip_noop_poll(key, 2, &stat(4)),
+            "a new generation ignores stale volatile state"
+        );
+
+        clear_noop_poll_state(key);
+        assert!(
+            !should_skip_noop_poll(key, 1, &stat(4)),
+            "a durable checkpoint write clears the throttle"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
