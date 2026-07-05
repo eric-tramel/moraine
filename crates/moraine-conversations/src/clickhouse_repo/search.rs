@@ -565,39 +565,20 @@ FORMAT JSONEachRow",
         }
         let documents_table = self.table_ref("search_documents");
         let event_uids_array = sql_array_strings(event_uids);
-        let codex_expr = if use_document_codex_flag {
-            "d.has_codex_mcp"
-        } else {
-            "toUInt8(positionCaseInsensitiveUTF8(d.payload_json, 'codex-mcp') > 0)"
-        };
         let text_content_limit = usize::from(self.cfg.preview_chars).saturating_mul(4);
         let payload_json_limit = usize::from(self.cfg.preview_chars).saturating_mul(8);
-        let documents_source_sql = if use_document_codex_flag {
-            format!(
-                "(SELECT
-  t.event_uid AS event_uid,
-  any(t.session_id) AS session_id,
-  any(t.record_ts) AS event_time,
-  any(t.source_name) AS source_name,
-  any(t.harness) AS harness,
-  any(t.inference_provider) AS inference_provider,
-  any(t.event_class) AS event_class,
-  any(t.payload_type) AS payload_type,
-  any(t.actor_role) AS actor_role,
-  any(t.name) AS name,
-  any(t.phase) AS phase,
-  any(t.source_ref) AS source_ref,
-  any(t.doc_len) AS doc_len,
-  any(t.text_content) AS text_content,
-  any(t.payload_json) AS payload_json,
-  toUInt8(any(t.has_codex_mcp)) AS has_codex_mcp
-FROM {documents_table} AS t
-WHERE t.event_uid IN {event_uids_array}
-GROUP BY t.event_uid)"
-            )
+        // Truncate the fat columns inside the aggregation (issue #443): the
+        // GROUP BY state then holds at most `*_limit` characters per uid
+        // instead of full multi-MB payload blobs. The codex fallback still
+        // scans every full payload value, but as a boolean aggregate rather
+        // than a held string.
+        let codex_inner_expr = if use_document_codex_flag {
+            "toUInt8(any(t.has_codex_mcp))"
         } else {
-            format!(
-                "(SELECT
+            "toUInt8(max(toUInt8(positionCaseInsensitiveUTF8(t.payload_json, 'codex-mcp') > 0)))"
+        };
+        let documents_source_sql = format!(
+            "(SELECT
   t.event_uid AS event_uid,
   any(t.session_id) AS session_id,
   any(t.record_ts) AS event_time,
@@ -611,14 +592,13 @@ GROUP BY t.event_uid)"
   any(t.phase) AS phase,
   any(t.source_ref) AS source_ref,
   any(t.doc_len) AS doc_len,
-  any(t.text_content) AS text_content,
-  any(t.payload_json) AS payload_json,
-  toUInt8(0) AS has_codex_mcp
+  any(leftUTF8(t.text_content, {text_content_limit})) AS text_content,
+  any(leftUTF8(t.payload_json, {payload_json_limit})) AS payload_json,
+  {codex_inner_expr} AS has_codex_mcp
 FROM {documents_table} AS t
 WHERE t.event_uid IN {event_uids_array}
 GROUP BY t.event_uid)"
-            )
-        };
+        );
 
         Ok(format!(
             "SELECT
@@ -636,15 +616,12 @@ GROUP BY t.event_uid)"
   d.source_ref AS source_ref,
   d.doc_len AS doc_len,
   leftUTF8(d.text_content, {preview}) AS text_preview,
-  leftUTF8(d.text_content, {text_content_limit}) AS text_content,
-  leftUTF8(d.payload_json, {payload_json_limit}) AS payload_json,
-  {codex_expr} AS has_codex_mcp
+  d.text_content AS text_content,
+  d.payload_json AS payload_json,
+  d.has_codex_mcp AS has_codex_mcp
 FROM {documents_source_sql} AS d
 FORMAT JSONEachRow",
             preview = self.cfg.preview_chars,
-            text_content_limit = text_content_limit,
-            payload_json_limit = payload_json_limit,
-            codex_expr = codex_expr,
             documents_source_sql = documents_source_sql,
         ))
     }
@@ -2099,19 +2076,21 @@ FORMAT JSONEachRow",
         let event_uids_sql = sql_array_strings(event_uids);
         let text_content_limit = usize::from(self.cfg.preview_chars).saturating_mul(4);
         let payload_json_limit = usize::from(self.cfg.preview_chars).saturating_mul(8);
+        // Truncate inside the aggregation (issue #443) so the GROUP BY state
+        // holds bounded strings, not full payload blobs.
         let sql = format!(
             "SELECT
   event_uid,
   leftUTF8(text_content_raw, {preview}) AS snippet,
-  leftUTF8(text_content_raw, {text_content_limit}) AS text_content,
-  leftUTF8(payload_json_raw, {payload_json_limit}) AS payload_json,
+  text_content_raw AS text_content,
+  payload_json_raw AS payload_json,
   event_class_raw AS event_class,
   actor_role_raw AS actor_role
 FROM (
   SELECT
     event_uid,
-    any(text_content) AS text_content_raw,
-    any(payload_json) AS payload_json_raw,
+    any(leftUTF8(text_content, {text_content_limit})) AS text_content_raw,
+    any(leftUTF8(payload_json, {payload_json_limit})) AS payload_json_raw,
     any(event_class) AS event_class_raw,
     any(actor_role) AS actor_role_raw
   FROM {documents_table}
