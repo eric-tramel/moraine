@@ -164,6 +164,20 @@ Mechanics that differ from file-backed sources:
   `sqlite_scan_error`. The cursor records the last reported kind so a
   persistent failure is emitted once rather than on every reconcile tick, and
   the data cursor is left untouched so the next poll retries.
+- **Volatile no-op poll state (issue #443).** Cursor touches its DB/WAL/SHM
+  sidecars continuously without changing any transcript-relevant key. A scan
+  that emits no records and changes nothing else the durable checkpoint
+  carries persists *nothing*: the stat fingerprint it covered is recorded
+  only in a per-pipeline in-memory map (`sqlite_poll::VolatilePollMap`), so
+  the durable checkpoint's `cursor_json` stat is expected to lag the file on
+  a quiet database — that staleness is intentional, not a bug. After three
+  consecutive no-op scans the database is treated as stat-noisy and rescans
+  are throttled to one per 15 s (a failed scan refreshes that clock); any
+  scan that finds real changes persists a checkpoint, clears the volatile
+  entry, and restores immediate pickup. Worst-case pickup latency for the
+  first relevant write after an idle stretch is one throttle window
+  (~15–30 s including the reconcile tick); a process restart merely costs
+  one redundant no-op scan per database.
 
 Fixtures: `fixtures/cursor/state-vscdb-kv.jsonl` stores `cursorDiskKV` rows as
 JSONL (`key`/`value` pairs), and `fixtures/opencode/session.jsonl` stores the

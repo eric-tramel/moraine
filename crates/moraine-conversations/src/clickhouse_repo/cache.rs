@@ -15,7 +15,12 @@ pub(super) const TERM_POSTINGS_FAST_PATH_MAX_ROWS_PER_TERM: u64 =
 pub(super) const TERM_POSTINGS_FAST_PATH_RATIO_MIN_DOCS: u64 = 10_000;
 pub(super) const TERM_POSTINGS_FAST_PATH_MAX_DOC_RATIO_NUMERATOR: u64 = 1;
 pub(super) const TERM_POSTINGS_FAST_PATH_MAX_DOC_RATIO_DENOMINATOR: u64 = 4;
-pub(super) const SEARCH_DOC_EXTRA_CACHE_TTL: Duration = Duration::from_secs(15);
+// 60s (issue #443): hydrated doc rows are near-immutable — an event_uid's
+// content only moves when a mutable source (cursor bubble) re-emits it — and
+// agents issue bursts of overlapping searches, so a short TTL re-reads the
+// same fat search_documents granules over and over. The cost of staleness is
+// a preview up to a minute old, never a wrong hit.
+pub(super) const SEARCH_DOC_EXTRA_CACHE_TTL: Duration = Duration::from_secs(60);
 pub(super) const SEARCH_DOC_EXTRA_CACHE_MAX_ENTRIES: usize = 65536;
 
 #[derive(Debug, Clone)]

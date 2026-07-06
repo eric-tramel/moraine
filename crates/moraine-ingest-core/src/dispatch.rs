@@ -2,6 +2,7 @@ use crate::checkpoint::checkpoint_key;
 use crate::model::{Checkpoint, NormalizedRecord, RowBatch};
 use crate::normalize::{normalize_record, normalize_record_with_ts_hint};
 use crate::sources::shared::{format_record_ts, parse_record_ts};
+use crate::sqlite_poll::VolatilePollMap;
 use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
 use anyhow::{Context, Result};
 use moraine_config::{
@@ -591,6 +592,7 @@ pub(crate) async fn run_work_item(
     work: WorkItem,
     permit: OwnedSemaphorePermit,
     checkpoints: Arc<RwLock<HashMap<String, Checkpoint>>>,
+    poll_state: VolatilePollMap,
     sink_tx: mpsc::Sender<crate::SinkMessage>,
     process_tx: mpsc::Sender<WorkItem>,
     dispatch: Arc<Mutex<DispatchState>>,
@@ -598,7 +600,9 @@ pub(crate) async fn run_work_item(
 ) {
     let key = work.key();
 
-    if let Err(exc) = process_file(&config, &work, checkpoints, sink_tx, &metrics).await {
+    if let Err(exc) =
+        process_file(&config, &work, checkpoints, &poll_state, sink_tx, &metrics).await
+    {
         error!(
             "failed processing {}:{}: {exc}",
             work.source_name, work.path
@@ -626,6 +630,7 @@ pub(crate) async fn process_file(
     config: &AppConfig,
     work: &WorkItem,
     checkpoints: Arc<RwLock<HashMap<String, Checkpoint>>>,
+    poll_state: &VolatilePollMap,
     sink_tx: mpsc::Sender<SinkMessage>,
     metrics: &Arc<Metrics>,
 ) -> Result<()> {
@@ -637,6 +642,7 @@ pub(crate) async fn process_file(
             config,
             work,
             checkpoints,
+            poll_state,
             sink_tx,
             metrics,
         )
@@ -647,6 +653,7 @@ pub(crate) async fn process_file(
             config,
             work,
             checkpoints,
+            poll_state,
             sink_tx,
             metrics,
         )
@@ -1345,6 +1352,7 @@ mod tests {
         SESSION_JSON_GENERATION, SESSION_JSON_INODE,
     };
     use crate::model::Checkpoint;
+    use crate::sqlite_poll::VolatilePollMap;
     use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
     use serde_json::{json, Value};
     use std::collections::HashMap;
@@ -1523,6 +1531,7 @@ mod tests {
             work,
             permit,
             checkpoints,
+            VolatilePollMap::new(),
             sink_tx,
             process_tx,
             dispatch,
@@ -1788,9 +1797,16 @@ mod tests {
             path: source_file,
         };
 
-        process_file(&config, &work, checkpoints, sink_tx, &metrics)
-            .await
-            .expect("legacy codex file should process");
+        process_file(
+            &config,
+            &work,
+            checkpoints,
+            &VolatilePollMap::new(),
+            sink_tx,
+            &metrics,
+        )
+        .await
+        .expect("legacy codex file should process");
 
         let batches = drain_batches(&mut sink_rx).await;
         assert_eq!(batches.len(), 1);
@@ -1880,9 +1896,16 @@ mod tests {
         let metrics = Arc::new(Metrics::default());
         let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(16);
 
-        process_file(&config, &work, checkpoints, sink_tx, &metrics)
-            .await
-            .expect("resumed codex file should process");
+        process_file(
+            &config,
+            &work,
+            checkpoints,
+            &VolatilePollMap::new(),
+            sink_tx,
+            &metrics,
+        )
+        .await
+        .expect("resumed codex file should process");
 
         let batches = drain_batches(&mut sink_rx).await;
         assert_eq!(batches.len(), 1);
@@ -1945,9 +1968,16 @@ mod tests {
             path: source_file,
         };
 
-        process_file(&config, &work, checkpoints, sink_tx, &metrics)
-            .await
-            .expect("claude file should process");
+        process_file(
+            &config,
+            &work,
+            checkpoints,
+            &VolatilePollMap::new(),
+            sink_tx,
+            &metrics,
+        )
+        .await
+        .expect("claude file should process");
 
         let batches = drain_batches(&mut sink_rx).await;
         assert_eq!(batches.len(), 1);
@@ -2006,9 +2036,16 @@ mod tests {
             path: source_file,
         };
 
-        process_file(&config, &work, checkpoints, sink_tx, &metrics)
-            .await
-            .expect("pi fixture should process around malformed line");
+        process_file(
+            &config,
+            &work,
+            checkpoints,
+            &VolatilePollMap::new(),
+            sink_tx,
+            &metrics,
+        )
+        .await
+        .expect("pi fixture should process around malformed line");
 
         let batches = drain_batches(&mut sink_rx).await;
         assert_eq!(batches.len(), 1);
@@ -2088,9 +2125,16 @@ mod tests {
             path: source_file.clone(),
         };
 
-        process_file(&config, &work, checkpoints, sink_tx, &metrics)
-            .await
-            .expect("oversized codex file should process around the large line");
+        process_file(
+            &config,
+            &work,
+            checkpoints,
+            &VolatilePollMap::new(),
+            sink_tx,
+            &metrics,
+        )
+        .await
+        .expect("oversized codex file should process around the large line");
 
         let batches = drain_batches(&mut sink_rx).await;
         assert!(!batches.is_empty(), "expected at least one sink batch");
@@ -2241,9 +2285,16 @@ mod tests {
             path: source_file.clone(),
         };
 
-        process_file(&config, &work, checkpoints, sink_tx, &metrics)
-            .await
-            .expect("expanded-row codex file should process around the unsafe row");
+        process_file(
+            &config,
+            &work,
+            checkpoints,
+            &VolatilePollMap::new(),
+            sink_tx,
+            &metrics,
+        )
+        .await
+        .expect("expanded-row codex file should process around the unsafe row");
 
         let batches = drain_batches(&mut sink_rx).await;
         assert!(!batches.is_empty(), "expected at least one sink batch");

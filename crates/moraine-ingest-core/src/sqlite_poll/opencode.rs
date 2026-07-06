@@ -15,8 +15,8 @@ use tracing::{debug, warn};
 
 use super::{
     hash_str, open_read_only, stat_fingerprint, truncate_chars_local, StatFingerprint,
-    SyntheticRecord, CURSOR_STATE_VERSION, ERROR_KIND_OPEN, ERROR_KIND_SCAN, ERROR_KIND_SCHEMA,
-    ERROR_KIND_TOO_LARGE, SCAN_PAGE_MAX_BYTES, SCAN_PAGE_SIZE,
+    SyntheticRecord, VolatilePollMap, CURSOR_STATE_VERSION, ERROR_KIND_OPEN, ERROR_KIND_SCAN,
+    ERROR_KIND_SCHEMA, ERROR_KIND_TOO_LARGE, SCAN_PAGE_MAX_BYTES, SCAN_PAGE_SIZE,
 };
 
 const MAX_OPENCODE_RELEVANT_ROWS: u64 = 10_000;
@@ -46,7 +46,7 @@ struct OpenCodeMessageContext {
     directory: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 struct OpenCodeState {
     version: u32,
     format: String,
@@ -151,6 +151,7 @@ pub(crate) async fn process_opencode_sqlite_db(
     config: &AppConfig,
     work: &WorkItem,
     checkpoints: Arc<RwLock<HashMap<String, Checkpoint>>>,
+    poll_state: &VolatilePollMap,
     sink_tx: mpsc::Sender<SinkMessage>,
     metrics: &Arc<Metrics>,
 ) -> Result<()> {
@@ -172,6 +173,7 @@ pub(crate) async fn process_opencode_sqlite_db(
 
     let cp_key = checkpoint_key(&work.source_name, &source_file);
     let committed = { checkpoints.read().await.get(&cp_key).cloned() };
+    let had_committed = committed.is_some();
 
     let mut checkpoint = committed.unwrap_or(Checkpoint {
         source_name: work.source_name.clone(),
@@ -186,7 +188,8 @@ pub(crate) async fn process_opencode_sqlite_db(
 
     // A replaced database file is a new generation: logical identities (and so
     // event UIDs) restart, and the old event cursor no longer applies.
-    if checkpoint.source_inode != inode {
+    let generation_changed = checkpoint.source_inode != inode;
+    if generation_changed {
         checkpoint.source_inode = inode;
         checkpoint.source_generation = checkpoint.source_generation.saturating_add(1).max(1);
         state = OpenCodeState::fresh();
@@ -196,6 +199,12 @@ pub(crate) async fn process_opencode_sqlite_db(
     // sidecars since the last poll. `event_scan_complete` also forces one real
     // scan after upgrading from the earlier projection cursor state.
     if state.stat == current_stat && state.last_error.is_empty() && state.event_scan_complete {
+        return Ok(());
+    }
+
+    // Volatile short-circuit + rescan backoff (issue #443): no-op scans leave
+    // the durable checkpoint untouched, so their coverage lives here instead.
+    if poll_state.should_skip_poll(&cp_key, checkpoint.source_generation, &current_stat) {
         return Ok(());
     }
 
@@ -215,6 +224,29 @@ pub(crate) async fn process_opencode_sqlite_db(
         } => {
             new_state.stat = current_stat;
             new_state.last_error = String::new();
+
+            // A no-op scan: only the stat fingerprint moved — no record was
+            // emitted and nothing the durable checkpoint carries changed.
+            // Persisting a checkpoint here would append an
+            // `ingest_checkpoints` row per WAL touch forever (issue #443);
+            // record the covered stat in volatile state instead and send
+            // nothing. The comparison is structural (stat normalized away)
+            // so any future `OpenCodeState` field is durable by default.
+            let prior_state_covered = {
+                let mut prior = state.clone();
+                prior.stat = new_state.stat;
+                prior
+            };
+            let scan_is_noop = had_committed
+                && !generation_changed
+                && records.is_empty()
+                && checkpoint.status == "active"
+                && new_state == prior_state_covered
+                && schema_fingerprint == checkpoint.schema_fingerprint;
+            if scan_is_noop {
+                poll_state.record_noop_scan(&cp_key, checkpoint.source_generation, new_state.stat);
+                return Ok(());
+            }
 
             let mut batch = RowBatch::default();
             for synthetic in &records {
@@ -280,6 +312,7 @@ pub(crate) async fn process_opencode_sqlite_db(
                 .send(SinkMessage::Batch(batch))
                 .await
                 .context("sink channel closed while sending final opencode_sqlite batch")?;
+            poll_state.clear(&cp_key);
 
             if emitted > 0 {
                 debug!(
@@ -294,6 +327,8 @@ pub(crate) async fn process_opencode_sqlite_db(
             error_kind,
             error_text,
         } => {
+            poll_state.record_failed_scan(&cp_key);
+
             // Emit each failure mode once per state change, not once per
             // reconcile tick: the marker is durable and reconcile re-polls every
             // tick, so re-sending it would append an identical error forever.

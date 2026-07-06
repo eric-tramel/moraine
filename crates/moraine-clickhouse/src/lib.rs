@@ -748,6 +748,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             name: "022_heartbeat_redaction_counts.sql",
             sql: include_str!("../../../sql/022_heartbeat_redaction_counts.sql"),
         },
+        Migration {
+            version: "023",
+            name: "023_search_documents_event_uid_bloom.sql",
+            sql: include_str!("../../../sql/023_search_documents_event_uid_bloom.sql"),
+        },
     ]
 }
 

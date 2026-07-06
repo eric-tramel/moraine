@@ -506,13 +506,28 @@ async fn run_opencode_poll(
     work: &WorkItem,
     checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
 ) -> Vec<RowBatch> {
+    run_opencode_poll_with_state(work, checkpoints, &VolatilePollMap::new()).await
+}
+
+async fn run_opencode_poll_with_state(
+    work: &WorkItem,
+    checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
+    poll_state: &VolatilePollMap,
+) -> Vec<RowBatch> {
     let config = moraine_config::AppConfig::default();
     let metrics = Arc::new(Metrics::default());
     let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(64);
 
-    process_opencode_sqlite_db(&config, work, checkpoints.clone(), sink_tx, &metrics)
-        .await
-        .expect("opencode_sqlite poll should succeed");
+    process_opencode_sqlite_db(
+        &config,
+        work,
+        checkpoints.clone(),
+        poll_state,
+        sink_tx,
+        &metrics,
+    )
+    .await
+    .expect("opencode_sqlite poll should succeed");
     let batches = drain_batches(&mut sink_rx).await;
 
     if let Some(cp) = batches.last().and_then(|batch| batch.checkpoint.clone()) {
@@ -906,6 +921,52 @@ async fn opencode_sqlite_unchanged_db_is_a_noop_then_mutation_reemits_row() {
             .and_then(Value::as_i64),
         Some(next_seq),
         "checkpoint records the last observed event row, not a sequence index that is ahead"
+    );
+
+    cleanup(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn opencode_sqlite_irrelevant_write_persists_no_checkpoint() {
+    let path = unique_opencode_db_path("noop-checkpoint");
+    let db = seed_opencode_db(&path);
+    let work = opencode_sqlite_work(&path);
+    let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+
+    let first = run_opencode_poll(&work, &checkpoints).await;
+    assert!(!first.is_empty());
+    let cp_key = checkpoint_key(&work.source_name, &work.path);
+    let baseline = checkpoints
+        .read()
+        .await
+        .get(&cp_key)
+        .cloned()
+        .expect("committed checkpoint after first poll");
+
+    // A write that never touches the event tables (issue #443): the stat
+    // fingerprint moves but the event cursor cannot advance.
+    db.execute(
+        "INSERT INTO credential (id, value, time_created, time_updated) \
+         VALUES ('cred_noise', 'rotated', 1780000004000, 1780000004000)",
+        [],
+    )
+    .expect("write non-event row");
+
+    let second = run_opencode_poll(&work, &checkpoints).await;
+    assert!(
+        second.is_empty(),
+        "a no-op scan must send nothing durable; got {} batches",
+        second.len()
+    );
+    let after = checkpoints
+        .read()
+        .await
+        .get(&cp_key)
+        .cloned()
+        .expect("checkpoint survives no-op poll");
+    assert_eq!(
+        baseline.last_offset, after.last_offset,
+        "no-op scan must not advance the poll sequence"
     );
 
     cleanup(&path);
