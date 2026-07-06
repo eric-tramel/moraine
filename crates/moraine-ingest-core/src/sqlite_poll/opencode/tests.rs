@@ -506,13 +506,28 @@ async fn run_opencode_poll(
     work: &WorkItem,
     checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
 ) -> Vec<RowBatch> {
+    run_opencode_poll_with_state(work, checkpoints, &VolatilePollMap::new()).await
+}
+
+async fn run_opencode_poll_with_state(
+    work: &WorkItem,
+    checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
+    poll_state: &VolatilePollMap,
+) -> Vec<RowBatch> {
     let config = moraine_config::AppConfig::default();
     let metrics = Arc::new(Metrics::default());
     let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(64);
 
-    process_opencode_sqlite_db(&config, work, checkpoints.clone(), sink_tx, &metrics)
-        .await
-        .expect("opencode_sqlite poll should succeed");
+    process_opencode_sqlite_db(
+        &config,
+        work,
+        checkpoints.clone(),
+        poll_state,
+        sink_tx,
+        &metrics,
+    )
+    .await
+    .expect("opencode_sqlite poll should succeed");
     let batches = drain_batches(&mut sink_rx).await;
 
     if let Some(cp) = batches.last().and_then(|batch| batch.checkpoint.clone()) {

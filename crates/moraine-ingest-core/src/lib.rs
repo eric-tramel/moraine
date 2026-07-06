@@ -219,10 +219,15 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
     );
 
     let sem = Arc::new(Semaphore::new(config.ingest.max_file_workers.max(1)));
+    // Per-pipeline volatile sqlite poll state (issue #443): shared by every
+    // work item, dropped with the pipeline so restarts start from durable
+    // state only.
+    let sqlite_poll_state = crate::sqlite_poll::VolatilePollMap::new();
     let processor_handle = {
         let process_tx_clone = process_tx.clone();
         let sink_tx_clone = sink_tx.clone();
         let checkpoints_clone = checkpoints.clone();
+        let poll_state_clone = sqlite_poll_state.clone();
         let dispatch_clone = dispatch.clone();
         let sem_clone = sem.clone();
         let metrics_clone = metrics.clone();
@@ -249,6 +254,7 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
                     work,
                     permit,
                     checkpoints_clone.clone(),
+                    poll_state_clone.clone(),
                     sink_tx_clone.clone(),
                     process_tx_clone.clone(),
                     dispatch_clone.clone(),

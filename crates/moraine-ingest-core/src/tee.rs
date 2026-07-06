@@ -722,6 +722,9 @@ async fn run_replay_pass(
             }
         }
 
+        // Replay reads against this backend's own floor, not the live
+        // pipeline's, so it gets a fresh volatile map: every file scans.
+        let poll_state = crate::sqlite_poll::VolatilePollMap::new();
         for path in files {
             let work = WorkItem {
                 source_name: source.name.clone(),
@@ -731,7 +734,15 @@ async fn run_replay_pass(
             };
             // Sends are awaited: replay backpressure is bounded by the
             // backend's own queue and never touches the default path.
-            if let Err(exc) = process_file(config, &work, floor.clone(), tx.clone(), metrics).await
+            if let Err(exc) = process_file(
+                config,
+                &work,
+                floor.clone(),
+                &poll_state,
+                tx.clone(),
+                metrics,
+            )
+            .await
             {
                 warn!(
                     backend,

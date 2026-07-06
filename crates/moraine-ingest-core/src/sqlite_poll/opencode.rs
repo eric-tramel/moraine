@@ -14,10 +14,9 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, warn};
 
 use super::{
-    clear_noop_poll_state, hash_str, open_read_only, record_failed_scan, record_noop_scan,
-    should_skip_noop_poll, stat_fingerprint, truncate_chars_local, StatFingerprint,
-    SyntheticRecord, CURSOR_STATE_VERSION, ERROR_KIND_OPEN, ERROR_KIND_SCAN, ERROR_KIND_SCHEMA,
-    ERROR_KIND_TOO_LARGE, SCAN_PAGE_MAX_BYTES, SCAN_PAGE_SIZE,
+    hash_str, open_read_only, stat_fingerprint, truncate_chars_local, StatFingerprint,
+    SyntheticRecord, VolatilePollMap, CURSOR_STATE_VERSION, ERROR_KIND_OPEN, ERROR_KIND_SCAN,
+    ERROR_KIND_SCHEMA, ERROR_KIND_TOO_LARGE, SCAN_PAGE_MAX_BYTES, SCAN_PAGE_SIZE,
 };
 
 const MAX_OPENCODE_RELEVANT_ROWS: u64 = 10_000;
@@ -47,7 +46,7 @@ struct OpenCodeMessageContext {
     directory: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 struct OpenCodeState {
     version: u32,
     format: String,
@@ -152,6 +151,7 @@ pub(crate) async fn process_opencode_sqlite_db(
     config: &AppConfig,
     work: &WorkItem,
     checkpoints: Arc<RwLock<HashMap<String, Checkpoint>>>,
+    poll_state: &VolatilePollMap,
     sink_tx: mpsc::Sender<SinkMessage>,
     metrics: &Arc<Metrics>,
 ) -> Result<()> {
@@ -204,7 +204,7 @@ pub(crate) async fn process_opencode_sqlite_db(
 
     // Volatile short-circuit + rescan backoff (issue #443): no-op scans leave
     // the durable checkpoint untouched, so their coverage lives here instead.
-    if should_skip_noop_poll(&cp_key, checkpoint.source_generation, &current_stat) {
+    if poll_state.should_skip_poll(&cp_key, checkpoint.source_generation, &current_stat) {
         return Ok(());
     }
 
@@ -222,25 +222,29 @@ pub(crate) async fn process_opencode_sqlite_db(
             schema_fingerprint,
             relevant_rows,
         } => {
-            new_state.stat = current_stat.clone();
+            new_state.stat = current_stat;
             new_state.last_error = String::new();
 
             // A no-op scan: only the stat fingerprint moved — no record was
-            // emitted and nothing the durable checkpoint carries (event
-            // cursor, schema, error marker) changed. Persisting a checkpoint
-            // here would append an `ingest_checkpoints` row per WAL touch
-            // forever (issue #443); record the covered stat in volatile
-            // state instead and send nothing.
+            // emitted and nothing the durable checkpoint carries changed.
+            // Persisting a checkpoint here would append an
+            // `ingest_checkpoints` row per WAL touch forever (issue #443);
+            // record the covered stat in volatile state instead and send
+            // nothing. The comparison is structural (stat normalized away)
+            // so any future `OpenCodeState` field is durable by default.
+            let prior_state_covered = {
+                let mut prior = state.clone();
+                prior.stat = new_state.stat;
+                prior
+            };
             let scan_is_noop = had_committed
                 && !generation_changed
                 && records.is_empty()
-                && state.last_error.is_empty()
                 && checkpoint.status == "active"
-                && state.event_scan_complete
-                && new_state.aggregate_sequences == state.aggregate_sequences
+                && new_state == prior_state_covered
                 && schema_fingerprint == checkpoint.schema_fingerprint;
             if scan_is_noop {
-                record_noop_scan(&cp_key, checkpoint.source_generation, new_state.stat);
+                poll_state.record_noop_scan(&cp_key, checkpoint.source_generation, new_state.stat);
                 return Ok(());
             }
 
@@ -308,7 +312,7 @@ pub(crate) async fn process_opencode_sqlite_db(
                 .send(SinkMessage::Batch(batch))
                 .await
                 .context("sink channel closed while sending final opencode_sqlite batch")?;
-            clear_noop_poll_state(&cp_key);
+            poll_state.clear(&cp_key);
 
             if emitted > 0 {
                 debug!(
@@ -323,7 +327,7 @@ pub(crate) async fn process_opencode_sqlite_db(
             error_kind,
             error_text,
         } => {
-            record_failed_scan(&cp_key);
+            poll_state.record_failed_scan(&cp_key);
 
             // Emit each failure mode once per state change, not once per
             // reconcile tick: the marker is durable and reconcile re-polls every
