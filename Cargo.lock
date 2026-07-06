@@ -1137,7 +1137,7 @@ dependencies = [
 
 [[package]]
 name = "moraine"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1158,7 +1158,7 @@ dependencies = [
 
 [[package]]
 name = "moraine-clickhouse"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -1172,7 +1172,7 @@ dependencies = [
 
 [[package]]
 name = "moraine-config"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "anyhow",
  "glob",
@@ -1182,7 +1182,7 @@ dependencies = [
 
 [[package]]
 name = "moraine-conversations"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "ahash",
  "anyhow",
@@ -1202,7 +1202,7 @@ dependencies = [
 
 [[package]]
 name = "moraine-ingest"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "anyhow",
  "moraine-config",
@@ -1213,7 +1213,7 @@ dependencies = [
 
 [[package]]
 name = "moraine-ingest-core"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -1237,7 +1237,7 @@ dependencies = [
 
 [[package]]
 name = "moraine-mcp"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "anyhow",
  "moraine-config",
@@ -1248,7 +1248,7 @@ dependencies = [
 
 [[package]]
 name = "moraine-mcp-core"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1263,7 +1263,7 @@ dependencies = [
 
 [[package]]
 name = "moraine-monitor"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "anyhow",
  "moraine-config",
@@ -1273,7 +1273,7 @@ dependencies = [
 
 [[package]]
 name = "moraine-monitor-core"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "anyhow",
  "axum",
