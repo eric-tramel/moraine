@@ -100,17 +100,10 @@ pub struct IdentityConfig {
     /// enforced). One person uses the same value on all their machines;
     /// `host` remains the per-machine identity. Empty means unset: fine for
     /// local-only use, but mirror sinks to non-default backends refuse to
-    /// start without it.
+    /// start without it. Trimmed at config load, so whitespace-only values
+    /// read as unset everywhere.
     #[serde(default)]
     pub author: String,
-}
-
-impl IdentityConfig {
-    /// The identity actually stamped and gated on: whitespace-only values
-    /// count as unset.
-    pub fn resolved_author(&self) -> &str {
-        self.author.trim()
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1112,6 +1105,10 @@ fn normalize_config(mut cfg: AppConfig) -> Result<AppConfig> {
     cfg.mcp.central_socket_path =
         resolve_runtime_subdir(&cfg.runtime.pids_dir, &cfg.mcp.central_socket_path);
 
+    // Whitespace-only identity means unset; trimming once here keeps every
+    // consumer (mirror gate, row stamping) reading the field directly.
+    cfg.identity.author = cfg.identity.author.trim().to_string();
+
     normalize_backends_and_routes(&mut cfg)?;
     normalize_redaction(&mut cfg)?;
 
@@ -1259,7 +1256,6 @@ mod tests {
         let cfg = load_config(&path).expect("config without [identity] should load");
 
         assert_eq!(cfg.identity.author, "");
-        assert_eq!(cfg.identity.resolved_author(), "");
 
         std::fs::remove_file(path).ok();
     }
@@ -1276,13 +1272,23 @@ author = "alice@example.com"
         let cfg = load_config(&path).expect("config with [identity] should load");
 
         assert_eq!(cfg.identity.author, "alice@example.com");
-        assert_eq!(cfg.identity.resolved_author(), "alice@example.com");
 
         std::fs::remove_file(path).ok();
     }
 
     #[test]
-    fn identity_author_treats_whitespace_as_unset() {
+    fn identity_author_normalizes_whitespace_to_unset_at_load() {
+        let path = write_temp_config(
+            r#"
+[identity]
+author = "  alice@example.com  "
+"#,
+            "identity-trim",
+        );
+        let cfg = load_config(&path).expect("padded author should load");
+        assert_eq!(cfg.identity.author, "alice@example.com");
+        std::fs::remove_file(path).ok();
+
         let path = write_temp_config(
             r#"
 [identity]
@@ -1291,9 +1297,10 @@ author = "   "
             "identity-whitespace",
         );
         let cfg = load_config(&path).expect("whitespace author should load");
-
-        assert_eq!(cfg.identity.resolved_author(), "");
-
+        assert_eq!(
+            cfg.identity.author, "",
+            "whitespace-only identity must normalize to unset"
+        );
         std::fs::remove_file(path).ok();
     }
 

@@ -152,6 +152,22 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         );
     }
 
+    let author_column = if config.identity.author.is_empty() {
+        false
+    } else {
+        let available = event_author_columns_available(&clickhouse)
+            .await
+            .context("failed to inspect raw_events/events author columns")?;
+        if !available {
+            warn!(
+                "[identity].author is set but raw_events/events are missing the author column \
+                 (migration 024); rows will ingest WITHOUT attribution until \
+                 `moraine db migrate` runs and this ingest service restarts"
+            );
+        }
+        available
+    };
+
     let checkpoints = Arc::new(RwLock::new(checkpoint_map));
     let dispatch = Arc::new(Mutex::new(DispatchState::default()));
     let metrics = Arc::new(Metrics::default());
@@ -204,6 +220,7 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
             backends: backend_statuses.clone(),
             backend_sinks_column: heartbeat_backend_column,
             redactions_column: heartbeat_redactions_column,
+            author_column,
             redactions: redaction_audit.clone(),
         },
     );
@@ -403,6 +420,31 @@ async fn heartbeat_column_available(clickhouse: &ClickHouseClient, column: &str)
     Ok(rows
         .first()
         .map(|row| row.column_count > 0)
+        .unwrap_or(false))
+}
+
+/// Returns whether `raw_events` AND `events` carry the `author` column
+/// (migration 024). Stamping a configured author against a database missing
+/// the column would make every row insert fail on the unknown field, wedging
+/// the default sink in retry — so the stamp is withheld (with a loud startup
+/// warning) until the migration has run. Only consulted when an author is
+/// configured; backend mirror sinks rely on the schema handshake instead.
+async fn event_author_columns_available(clickhouse: &ClickHouseClient) -> Result<bool> {
+    #[derive(Deserialize)]
+    struct CountRow {
+        column_count: u64,
+    }
+
+    let query = format!(
+        "SELECT toUInt64(count()) AS column_count \
+         FROM system.columns \
+         WHERE database = '{}' AND table IN ('raw_events', 'events') AND name = 'author'",
+        clickhouse.config().database.replace('\'', "\\'")
+    );
+    let rows: Vec<CountRow> = clickhouse.query_rows(&query, None).await?;
+    Ok(rows
+        .first()
+        .map(|row| row.column_count >= 2)
         .unwrap_or(false))
 }
 

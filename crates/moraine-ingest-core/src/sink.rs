@@ -44,6 +44,12 @@ pub(crate) enum SinkRole {
         /// Whether `ingest_heartbeats` carries the `redactions_total` column
         /// (migration 022). Redaction still runs without this audit surface.
         redactions_column: bool,
+        /// Whether `raw_events`/`events` carry the `author` column
+        /// (migration 024). Pre-024 default schemas reject unknown fields
+        /// at insert time, so a configured author is stamped only when the
+        /// column exists; backend sinks skip this flag because their schema
+        /// handshake already guarantees every bundled migration.
+        author_column: bool,
         redactions: Arc<RedactionAudit>,
     },
     /// A mirror sink for one named backend: filters intake down to the
@@ -203,8 +209,18 @@ pub(crate) fn spawn_sink_task(
         // Person identity stamped on every raw/event row (issue #381). A
         // process constant resolved once at startup: the sink intake below
         // is the single choke point every row passes through — live default,
-        // live mirror, and catch-up replay batches alike.
-        let author = config.identity.resolved_author().to_string();
+        // live mirror, and catch-up replay batches alike. The default sink
+        // withholds the stamp while its database still lacks the
+        // migration-024 column (probed at startup) so a config change can
+        // never wedge local ingest; mirror sinks only exist post-handshake,
+        // which guarantees the column.
+        let author = match &role {
+            SinkRole::Default {
+                author_column: false,
+                ..
+            } => String::new(),
+            _ => config.identity.author.clone(),
+        };
 
         let flush_interval = duration_from_config_seconds(
             config.ingest.flush_interval_seconds,
@@ -731,6 +747,7 @@ async fn emit_heartbeat(clickhouse: &ClickHouseClient, metrics: &Arc<Metrics>, r
         backends,
         backend_sinks_column,
         redactions_column,
+        author_column: _,
         redactions,
     } = role
     else {
@@ -1267,11 +1284,16 @@ mod tests {
     }
 
     fn default_role() -> SinkRole {
+        default_role_with_author_column(true)
+    }
+
+    fn default_role_with_author_column(author_column: bool) -> SinkRole {
         SinkRole::Default {
             dispatch: Arc::new(Mutex::new(DispatchState::default())),
             backends: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             backend_sinks_column: false,
             redactions_column: false,
+            author_column,
             redactions: test_redaction_audit(),
         }
     }
@@ -1391,6 +1413,120 @@ mod tests {
             "tool_io has no author column; stamping it would reject the insert"
         );
 
+        handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn default_sink_withholds_author_when_column_is_missing() {
+        let (clickhouse, mock_state) =
+            spawn_mock_clickhouse_with_state(MockClickHouseState::default()).await;
+        let mut config = moraine_config::AppConfig::default();
+        config.identity.author = "alice@example.com".to_string();
+        config.ingest.batch_size = 1;
+        config.ingest.flush_interval_seconds = 0.05;
+        config.ingest.heartbeat_interval_seconds = 60.0;
+
+        let (tx, rx) = mpsc::channel(4);
+        let handle = spawn_sink_task(
+            config,
+            clickhouse,
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(Metrics::default()),
+            rx,
+            true,
+            default_role_with_author_column(false),
+        );
+
+        let mut batch = RowBatch::default();
+        batch.push_raw_row(json!({ "event_uid": "evt-1" }));
+        tx.send(SinkMessage::Batch(batch)).await.expect("send");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && mock_state.rows("raw_events").is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let raw = mock_state.rows("raw_events");
+        assert!(
+            raw.first()
+                .map(|row| row.get("author").is_none())
+                .unwrap_or(false),
+            "a pre-024 default schema must keep receiving unstamped rows \
+             even when an author is configured"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backend_sink_intake_stamps_author_on_mirrored_rows() {
+        let (clickhouse, mock_state) =
+            spawn_mock_clickhouse_with_state(MockClickHouseState::default()).await;
+        let mut config = moraine_config::AppConfig::default();
+        config.identity.author = "alice@example.com".to_string();
+        config.backends.insert(
+            "team-ch".to_string(),
+            moraine_config::ClickHouseConfig::default(),
+        );
+        config.routes.push(moraine_config::RouteConfig {
+            dir: "/work/team/**".to_string(),
+            backend: "team-ch".to_string(),
+            mode: moraine_config::ROUTE_MODE_MIRROR.to_string(),
+        });
+        config.ingest.batch_size = 1;
+        config.ingest.flush_interval_seconds = 0.05;
+        config.ingest.heartbeat_interval_seconds = 60.0;
+
+        let resolver: SharedRouteResolver = Arc::new(Mutex::new(crate::tee::RouteResolver::new(
+            Arc::new(config.clone()),
+        )));
+        let cell = Arc::new(BackendSinkCell::new("team-ch"));
+        let role = SinkRole::Backend {
+            cell,
+            resolver,
+            replay_notify: Arc::new(Notify::new()),
+            replay_floor: Arc::new(Mutex::new(None)),
+            redactor: test_redactor(),
+            redactions: test_redaction_audit(),
+        };
+
+        let (tx, rx) = mpsc::channel(4);
+        let handle = spawn_sink_task(
+            config,
+            clickhouse,
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(Metrics::default()),
+            rx,
+            true,
+            role,
+        );
+
+        // One routed row (kept + stamped) and one unrouted row (filtered) —
+        // the same intake path catch-up replay batches take.
+        let mut batch = RowBatch::default();
+        batch.push_raw_row(json!({
+            "session_id": "team-session",
+            "cwd": "/work/team/project",
+            "event_uid": "evt-1"
+        }));
+        batch.push_raw_row(json!({
+            "session_id": "other-session",
+            "cwd": "/home/other",
+            "event_uid": "evt-2"
+        }));
+        tx.send(SinkMessage::Batch(batch)).await.expect("send");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && mock_state.rows("raw_events").is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let raw = mock_state.rows("raw_events");
+        assert_eq!(raw.len(), 1, "only the routed session is mirrored");
+        assert_eq!(
+            raw[0].get("author").and_then(Value::as_str),
+            Some("alice@example.com"),
+            "mirrored rows must carry the configured author"
+        );
         handle.abort();
     }
 

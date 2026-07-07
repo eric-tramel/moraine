@@ -231,6 +231,16 @@ the local session files, so nothing routed while the sink was disabled is
 lost (the usual caveat applies: files deleted before catch-up are lost to
 that backend).
 
+Two operational notes. First, the `author` column arrives with migration
+024: `moraine up` applies it to the default database automatically, but if
+you run services yourself, run `moraine db migrate` before restarting —
+with the column missing, ingest warns at startup and keeps writing rows
+*without* attribution until the migration runs and ingest restarts.
+Second, backfill attributes every local session file still on disk —
+including sessions recorded before any identity was configured — to the
+newly set author. On a shared or handed-down machine, review local history
+before enabling a mirror.
+
 ### Schema version handshake
 
 Moraine migrates only the default backend (`moraine db migrate`, or

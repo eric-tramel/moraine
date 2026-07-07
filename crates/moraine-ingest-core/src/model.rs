@@ -106,12 +106,33 @@ impl RowBatch {
         if author.is_empty() {
             return;
         }
+        // Serialized cost of inserting `"author":"<value>",` into a
+        // non-empty object. Exact for the rows the normalizers build, and
+        // the cache is approximate by contract — a per-row delta keeps this
+        // hot path free of the whole-batch re-serialization that
+        // `recompute_approx_bytes` would do.
+        let per_row_bytes = r#""author":"","#.len() + author.len();
+        let mut stamped = 0usize;
         for row in self.raw_rows.iter_mut().chain(self.event_rows.iter_mut()) {
-            if let Value::Object(obj) = row {
-                obj.insert("author".to_string(), Value::String(author.to_string()));
+            // Rows are always JSON objects by construction (anything else
+            // could never insert via JSONEachRow).
+            if let Some(obj) = row.as_object_mut() {
+                if obj
+                    .insert("author".to_string(), Value::String(author.to_string()))
+                    .is_none()
+                {
+                    stamped += 1;
+                }
             }
         }
-        self.recompute_approx_bytes();
+        // A zero cache means "not computed yet" (rows pushed via the struct
+        // fields directly); leave it lazy — the eventual compute already
+        // sees the stamped rows.
+        if self.approx_bytes > 0 {
+            self.approx_bytes = self
+                .approx_bytes
+                .saturating_add(stamped.saturating_mul(per_row_bytes));
+        }
     }
 
     pub fn push_raw_row(&mut self, row: Value) {
@@ -249,14 +270,19 @@ mod tests {
     }
 
     #[test]
-    fn stamp_author_recomputes_the_cached_batch_size() {
+    fn stamp_author_advances_the_cached_batch_size_by_the_exact_delta() {
+        let author = "alice@example.com";
         let mut batch = batch_with_all_row_kinds();
         let before = batch.approx_bytes();
 
-        batch.stamp_author("alice@example.com");
+        batch.stamp_author(author);
 
-        assert!(
-            batch.approx_bytes() > before,
+        // One raw row + one event row stamped; each grows by the serialized
+        // `"author":"<value>",` entry.
+        let expected_delta = 2 * (r#""author":"","#.len() + author.len());
+        assert_eq!(
+            batch.approx_bytes(),
+            before + expected_delta,
             "stamped rows are larger; the cached size drives batching and must follow"
         );
     }

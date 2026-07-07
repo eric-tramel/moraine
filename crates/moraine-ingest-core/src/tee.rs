@@ -555,7 +555,7 @@ fn spawn_backend_supervisor(
         // network contact; terminal until restart, like schema skew. The
         // default sink is unaffected, and catch-up replay backfills this
         // backend once an author is configured.
-        if context.config.identity.resolved_author().is_empty() {
+        if context.config.identity.author.is_empty() {
             cell.set_status(BackendSinkStatus::DisabledMissingIdentity);
             error!(
                 backend = %name,
@@ -1125,6 +1125,65 @@ mod tests {
             BackendSinkStatus::Connecting,
             "dropping while connecting is not an overflow"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn router_keeps_default_path_flowing_while_identity_gate_disables_mirror() {
+        let mut config = (*team_config()).clone();
+        config.identity.author = String::new();
+        let config = Arc::new(config);
+        let resolver: SharedRouteResolver =
+            Arc::new(Mutex::new(RouteResolver::new(config.clone())));
+        let registry: StatusRegistry = Arc::new(Mutex::new(BTreeMap::new()));
+        let (router_tx, router_rx) = mpsc::channel::<SinkMessage>(4);
+        let (default_tx, mut default_rx) = mpsc::channel::<SinkMessage>(4);
+
+        let handle = spawn_tee_router(
+            config,
+            Vec::new(),
+            router_rx,
+            default_tx,
+            resolver,
+            registry.clone(),
+            RedactionContext::new(test_redactor(), test_redaction_audit()),
+        );
+
+        router_tx
+            .send(SinkMessage::Batch(mixed_session_batch()))
+            .await
+            .expect("send batch to router");
+
+        let SinkMessage::Batch(batch) = timeout(Duration::from_secs(5), default_rx.recv())
+            .await
+            .expect("default batch within timeout")
+            .expect("default batch present");
+        assert_eq!(
+            batch.raw_rows.len(),
+            2,
+            "the default sink receives the full batch while the mirror is gated"
+        );
+
+        let cell = registry
+            .lock()
+            .expect("registry mutex poisoned")
+            .get("team-ch")
+            .cloned()
+            .expect("routed backend is registered even when gated");
+        assert!(
+            wait_for_status(
+                &cell,
+                BackendSinkStatus::DisabledMissingIdentity,
+                Duration::from_secs(5)
+            )
+            .await,
+            "the routed backend must surface disabled_missing_identity"
+        );
+        assert!(
+            cell.dropped_batches() >= 1,
+            "the routed copy is dropped, not queued, while disabled"
+        );
+
+        handle.abort();
     }
 
     async fn wait_for_status(
