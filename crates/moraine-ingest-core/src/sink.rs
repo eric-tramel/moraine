@@ -200,6 +200,12 @@ pub(crate) fn spawn_sink_task(
             SinkRole::Default { .. } => String::new(),
         };
 
+        // Person identity stamped on every raw/event row (issue #381). A
+        // process constant resolved once at startup: the sink intake below
+        // is the single choke point every row passes through — live default,
+        // live mirror, and catch-up replay batches alike.
+        let author = config.identity.resolved_author().to_string();
+
         let flush_interval = duration_from_config_seconds(
             config.ingest.flush_interval_seconds,
             0.05,
@@ -267,7 +273,7 @@ pub(crate) fn spawn_sink_task(
                         Some(SinkMessage::Batch(batch)) => {
                             // Mirror sinks only buffer the sessions routed to
                             // them; the default sink takes batches whole.
-                            let batch = match &role {
+                            let mut batch = match &role {
                                 SinkRole::Backend {
                                     cell,
                                     resolver,
@@ -285,6 +291,7 @@ pub(crate) fn spawn_sink_task(
                                 }
                                 SinkRole::Default { .. } => batch,
                             };
+                            batch.stamp_author(&author);
                             pending_batch_bytes =
                                 pending_batch_bytes.saturating_add(batch.approx_bytes());
                             raw_rows.extend(batch.raw_rows);
@@ -1310,6 +1317,78 @@ mod tests {
         assert!(
             third_send.is_err(),
             "third send should block while sink retries failed flushes"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sink_intake_stamps_author_on_raw_and_event_rows() {
+        let (clickhouse, mock_state) =
+            spawn_mock_clickhouse_with_state(MockClickHouseState::default()).await;
+        let mut config = moraine_config::AppConfig::default();
+        config.identity.author = "alice@example.com".to_string();
+        config.ingest.batch_size = 1;
+        config.ingest.flush_interval_seconds = 0.05;
+        config.ingest.heartbeat_interval_seconds = 60.0;
+
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (tx, rx) = mpsc::channel(4);
+
+        let handle = spawn_sink_task(
+            config,
+            clickhouse,
+            checkpoints,
+            metrics,
+            rx,
+            true,
+            default_role(),
+        );
+
+        let mut batch = RowBatch::default();
+        batch.push_raw_row(json!({ "event_uid": "evt-1" }));
+        batch.extend_event_rows(vec![json!({ "event_uid": "evt-1" })]);
+        batch.extend_tool_rows(vec![json!({ "event_uid": "evt-1" })]);
+        tx.send(SinkMessage::Batch(batch))
+            .await
+            .expect("send batch");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if !mock_state.rows("raw_events").is_empty()
+                && !mock_state.rows("events").is_empty()
+                && !mock_state.rows("tool_io").is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let raw = mock_state.rows("raw_events");
+        let events = mock_state.rows("events");
+        let tools = mock_state.rows("tool_io");
+        assert_eq!(
+            raw.first()
+                .and_then(|row| row.get("author"))
+                .and_then(Value::as_str),
+            Some("alice@example.com"),
+            "raw rows must carry the configured author"
+        );
+        assert_eq!(
+            events
+                .first()
+                .and_then(|row| row.get("author"))
+                .and_then(Value::as_str),
+            Some("alice@example.com"),
+            "event rows must carry the configured author"
+        );
+        assert!(
+            tools
+                .first()
+                .map(|row| row.get("author").is_none())
+                .unwrap_or(false),
+            "tool_io has no author column; stamping it would reject the insert"
         );
 
         handle.abort();

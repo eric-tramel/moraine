@@ -40,6 +40,7 @@ future keys.
 | `[clickhouse]` | Default ClickHouse backend used by local ingest, monitor, MCP, and migrations. |
 | `[backends.<name>]` | Optional named ClickHouse backend for project mirroring and routed MCP. |
 | `[[routes]]` | Optional ordered working-directory routes to named backends. |
+| `[identity]` | Optional per-person author identity stamped on ingested rows; required to mirror to non-default backends. |
 | `[ingest]` | Ingest batching, backfill, watcher, checkpoint, and heartbeat settings. |
 | `[[ingest.sources]]` | Watched agent trace sources. |
 | `[mcp]` | MCP retrieval defaults and shared central server settings. |
@@ -195,11 +196,40 @@ window effectively empty (the working directory rides the records
 themselves, or is recovered from the session header), so in practice it
 only affects traces that carry no working directory at all.
 
-Per-backend mirror status — `connecting`, `ok`, `lagging`, `unreachable`, or
-`disabled_skew` — is written to ingest heartbeats as a `backend_sinks` map
-and surfaced through the monitor's `/api/health`. This uses a column added by
-migration 017; until `moraine db migrate` runs (and ingest restarts), ingest
-warns and omits the field rather than failing heartbeats.
+Per-backend mirror status — `connecting`, `ok`, `lagging`, `unreachable`,
+`disabled_skew`, or `disabled_missing_identity` — is written to ingest
+heartbeats as a `backend_sinks` map and surfaced through the monitor's
+`/api/status`. This uses a column added by migration 017; until
+`moraine db migrate` runs (and ingest restarts), ingest warns and omits the
+field rather than failing heartbeats.
+
+### Identity and attribution
+
+Once several people mirror into one backend, nothing in the data says who
+produced which session. `[identity].author` fixes that: a free-form,
+per-person identifier (email-shaped by convention, not enforced) stamped on
+every ingested `raw_events`/`events` row in the `author` column (migration
+024). Use the same value on every machine you work from; the `host` column
+already tells your machines apart. Moraine never infers identity — not from
+git, not from `$USER` — because a wrong-but-plausible identity on a shared
+machine is worse than none.
+
+```toml
+[identity]
+author = "alice@example.com"
+```
+
+For local-only installs the author is optional; unset means rows carry an
+empty author and nothing changes. Mirroring is different: shared data with
+anonymous rows can't be attributed, scoped, or (later) access-controlled, so
+a route to a non-default backend **requires** an author. If one is missing,
+that mirror sink refuses to start — it logs an error at ingest startup and
+reports `disabled_missing_identity` in the heartbeat `backend_sinks` map —
+while the default backend keeps ingesting normally. Set the author and
+restart the ingest service; catch-up replay then backfills the mirror from
+the local session files, so nothing routed while the sink was disabled is
+lost (the usual caveat applies: files deleted before catch-up are lost to
+that backend).
 
 ### Schema version handshake
 
@@ -215,7 +245,7 @@ build — a strictly read-only probe — and enforces:
 | Server ahead (server-applied migrations unknown to this build) | Mirror disabled unless that backend sets `allow_newer_server = true`. Upgrade Moraine, or opt in. |
 
 For ingest mirroring, a skew failure disables that one mirror until the
-ingest service restarts and shows as `disabled_skew` in `/api/health`; the
+ingest service restarts and shows as `disabled_skew` in `/api/status`; the
 default backend is unaffected. A backend that simply does not answer retries
 the handshake periodically and shows as `unreachable`. The same handshake
 also runs when `moraine run mcp` starts in a routed directory, where it

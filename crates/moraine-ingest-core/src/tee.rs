@@ -46,6 +46,11 @@ pub(crate) enum BackendSinkStatus {
     Unreachable,
     /// Schema skew policy rejected the backend; terminal until restart.
     DisabledSkew,
+    /// `[identity].author` is unset but this backend is a mirror target;
+    /// terminal until an author is configured and ingest restarts. Rows
+    /// keep landing on the default sink and catch-up replay backfills the
+    /// backend once it starts (issue #381).
+    DisabledMissingIdentity,
 }
 
 impl BackendSinkStatus {
@@ -56,6 +61,7 @@ impl BackendSinkStatus {
             Self::Lagging => "lagging",
             Self::Unreachable => "unreachable",
             Self::DisabledSkew => "disabled_skew",
+            Self::DisabledMissingIdentity => "disabled_missing_identity",
         }
     }
 }
@@ -542,6 +548,25 @@ fn spawn_backend_supervisor(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let name = cell.name().to_string();
+
+        // Identity is required to mirror (issue #381): rows on a shared
+        // backend that nobody can attribute would silently anonymize team
+        // data, which is worse than refusing to send it. Gated before any
+        // network contact; terminal until restart, like schema skew. The
+        // default sink is unaffected, and catch-up replay backfills this
+        // backend once an author is configured.
+        if context.config.identity.resolved_author().is_empty() {
+            cell.set_status(BackendSinkStatus::DisabledMissingIdentity);
+            error!(
+                backend = %name,
+                "mirror sink disabled: [identity].author is not set in the moraine config; \
+                 routed sessions still ingest into the default backend, and catch-up replay \
+                 will backfill this backend after you set an author and restart the ingest \
+                 service"
+            );
+            return;
+        }
+
         let allow_newer_server = backend_cfg.allow_newer_server;
         let client = match ClickHouseClient::new(backend_cfg) {
             Ok(client) => client,
@@ -785,6 +810,9 @@ mod tests {
             backend: "team-ch".to_string(),
             mode: moraine_config::ROUTE_MODE_MIRROR.to_string(),
         });
+        // Mirror targets require an identity (issue #381); supervisor tests
+        // that exercise post-gate behavior must get past the gate.
+        config.identity.author = "alice@example.com".to_string();
         Arc::new(config)
     }
 
@@ -1016,6 +1044,21 @@ mod tests {
         assert!(!cell.mark_flush_failure());
         assert!(!cell.mark_recovered());
         assert_eq!(cell.status(), BackendSinkStatus::DisabledSkew);
+    }
+
+    #[test]
+    fn disabled_missing_identity_is_terminal_and_named() {
+        let cell = BackendSinkCell::new("team-ch");
+        cell.set_status(BackendSinkStatus::DisabledMissingIdentity);
+
+        assert!(!cell.mark_overflow());
+        assert!(!cell.mark_flush_failure());
+        assert!(!cell.mark_recovered());
+        assert_eq!(cell.status(), BackendSinkStatus::DisabledMissingIdentity);
+        assert_eq!(
+            BackendSinkStatus::DisabledMissingIdentity.as_str(),
+            "disabled_missing_identity"
+        );
     }
 
     #[test]
@@ -1289,6 +1332,60 @@ mod tests {
                 .is_empty(),
             "a disabled backend must never receive writes"
         );
+        handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn supervisor_disables_backend_without_identity_before_any_contact() {
+        let state = SkewMockState::default();
+        let app = Router::new()
+            .route("/", post(skew_mock_handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind identity mock listener");
+        let addr = listener.local_addr().expect("identity mock addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut config = (*team_config()).clone();
+        config.identity.author = String::new();
+        let config = Arc::new(config);
+        let cell = Arc::new(BackendSinkCell::new("team-ch"));
+        let (tx, rx) = mpsc::channel::<SinkMessage>(1);
+        let resolver: SharedRouteResolver =
+            Arc::new(Mutex::new(RouteResolver::new(config.clone())));
+
+        let handle = spawn_backend_supervisor(
+            backend_cfg_for(format!("http://{}", addr)),
+            cell.clone(),
+            tx,
+            rx,
+            test_router_context(config, resolver),
+        );
+
+        assert!(
+            wait_for_status(
+                &cell,
+                BackendSinkStatus::DisabledMissingIdentity,
+                Duration::from_secs(5)
+            )
+            .await,
+            "an empty [identity].author with a mirror target must disable the sink"
+        );
+        assert!(!cell.is_live());
+        assert_eq!(
+            state.queries.load(Ordering::Relaxed),
+            0,
+            "a sink disabled for missing identity must never contact the backend \
+             (a checkpoint written while disabled would make later catch-up skip data)"
+        );
+        assert!(state
+            .write_statements
+            .lock()
+            .expect("mock writes mutex poisoned")
+            .is_empty());
         handle.abort();
     }
 

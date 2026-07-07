@@ -90,6 +90,29 @@ pub struct RouteConfig {
     pub mode: String,
 }
 
+/// Per-person identity stamped on ingested rows (issue #381). Explicit
+/// only: never inferred from git or the environment — a wrong-but-plausible
+/// identity on a shared machine is worse than none.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdentityConfig {
+    /// Free-form person identifier (email-shaped by convention, not
+    /// enforced). One person uses the same value on all their machines;
+    /// `host` remains the per-machine identity. Empty means unset: fine for
+    /// local-only use, but mirror sinks to non-default backends refuse to
+    /// start without it.
+    #[serde(default)]
+    pub author: String,
+}
+
+impl IdentityConfig {
+    /// The identity actually stamped and gated on: whitespace-only values
+    /// count as unset.
+    pub fn resolved_author(&self) -> &str {
+        self.author.trim()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RedactionConfig {
@@ -246,6 +269,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
     #[serde(default)]
+    pub identity: IdentityConfig,
+    #[serde(default)]
     pub redaction: RedactionConfig,
     #[serde(default)]
     pub ingest: IngestConfig,
@@ -317,6 +342,7 @@ impl Default for AppConfig {
             clickhouse,
             backends,
             routes: Vec::new(),
+            identity: IdentityConfig::default(),
             redaction: RedactionConfig::default(),
             ingest: IngestConfig::default(),
             mcp: McpConfig::default(),
@@ -1225,6 +1251,50 @@ mod tests {
         ));
         std::fs::write(&path, contents).expect("write temp config");
         path
+    }
+
+    #[test]
+    fn identity_author_defaults_to_empty_when_absent() {
+        let path = write_temp_config("", "identity-absent");
+        let cfg = load_config(&path).expect("config without [identity] should load");
+
+        assert_eq!(cfg.identity.author, "");
+        assert_eq!(cfg.identity.resolved_author(), "");
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn identity_author_parses_when_set() {
+        let path = write_temp_config(
+            r#"
+[identity]
+author = "alice@example.com"
+"#,
+            "identity-set",
+        );
+        let cfg = load_config(&path).expect("config with [identity] should load");
+
+        assert_eq!(cfg.identity.author, "alice@example.com");
+        assert_eq!(cfg.identity.resolved_author(), "alice@example.com");
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn identity_author_treats_whitespace_as_unset() {
+        let path = write_temp_config(
+            r#"
+[identity]
+author = "   "
+"#,
+            "identity-whitespace",
+        );
+        let cfg = load_config(&path).expect("whitespace author should load");
+
+        assert_eq!(cfg.identity.resolved_author(), "");
+
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

@@ -96,6 +96,24 @@ impl RowBatch {
         self.approx_bytes = self.approx_bytes();
     }
 
+    /// Stamps the configured author identity onto every raw and event row —
+    /// the only row kinds whose tables carry the migration-024 `author`
+    /// column. Empty author is a no-op rather than an empty-string stamp so
+    /// identity-less installs keep inserting into default databases that
+    /// have not run migration 024 yet (the column's DEFAULT supplies the
+    /// empty value).
+    pub(crate) fn stamp_author(&mut self, author: &str) {
+        if author.is_empty() {
+            return;
+        }
+        for row in self.raw_rows.iter_mut().chain(self.event_rows.iter_mut()) {
+            if let Value::Object(obj) = row {
+                obj.insert("author".to_string(), Value::String(author.to_string()));
+            }
+        }
+        self.recompute_approx_bytes();
+    }
+
     pub fn push_raw_row(&mut self, row: Value) {
         self.approx_bytes = self
             .approx_bytes
@@ -192,4 +210,70 @@ fn approx_json_row_bytes(row: &Value) -> usize {
     serde_json::to_vec(row)
         .map(|bytes| bytes.len().saturating_add(1))
         .unwrap_or(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn batch_with_all_row_kinds() -> RowBatch {
+        let mut batch = RowBatch::default();
+        batch.push_raw_row(json!({ "session_id": "s1" }));
+        batch.extend_event_rows(vec![json!({ "session_id": "s1" })]);
+        batch.extend_link_rows(vec![json!({ "session_id": "s1" })]);
+        batch.extend_tool_rows(vec![json!({ "session_id": "s1" })]);
+        batch.push_error_row(json!({ "error_kind": "json_parse_error" }));
+        batch
+    }
+
+    #[test]
+    fn stamp_author_covers_raw_and_event_rows_only() {
+        let mut batch = batch_with_all_row_kinds();
+
+        batch.stamp_author("alice@example.com");
+
+        assert_eq!(
+            batch.raw_rows[0].get("author").and_then(Value::as_str),
+            Some("alice@example.com")
+        );
+        assert_eq!(
+            batch.event_rows[0].get("author").and_then(Value::as_str),
+            Some("alice@example.com")
+        );
+        // link/tool/error tables carry no author column (migration 024);
+        // stamping them would make their inserts reject unknown fields.
+        assert!(batch.link_rows[0].get("author").is_none());
+        assert!(batch.tool_rows[0].get("author").is_none());
+        assert!(batch.error_rows[0].get("author").is_none());
+    }
+
+    #[test]
+    fn stamp_author_recomputes_the_cached_batch_size() {
+        let mut batch = batch_with_all_row_kinds();
+        let before = batch.approx_bytes();
+
+        batch.stamp_author("alice@example.com");
+
+        assert!(
+            batch.approx_bytes() > before,
+            "stamped rows are larger; the cached size drives batching and must follow"
+        );
+    }
+
+    #[test]
+    fn stamp_author_with_empty_identity_is_a_no_op() {
+        let mut batch = batch_with_all_row_kinds();
+        let before_bytes = batch.approx_bytes();
+
+        batch.stamp_author("");
+
+        assert!(
+            batch.raw_rows[0].get("author").is_none(),
+            "an empty identity must not stamp an empty string: default databases \
+             without migration 024 must keep accepting identity-less rows"
+        );
+        assert!(batch.event_rows[0].get("author").is_none());
+        assert_eq!(batch.approx_bytes(), before_bytes);
+    }
 }

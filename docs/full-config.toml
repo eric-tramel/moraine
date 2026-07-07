@@ -70,6 +70,23 @@ allow_newer_server = false
 # # Routing mode. "mirror" is currently the only supported value.
 # mode = "mirror"
 
+# Optional per-person identity. When set, every ingested raw_events/events row
+# carries this value in its `author` column so a shared team backend can
+# attribute sessions to the person who produced them. Free-form (email-shaped
+# by convention, not enforced); use the SAME value on every machine you work
+# from — the `host` column already distinguishes machines. Moraine never
+# infers identity from git or the environment.
+#
+# Optional for local-only installs (rows carry an empty author). REQUIRED to
+# mirror to a non-default backend: a route to a named backend with no author
+# configured disables that mirror sink (status `disabled_missing_identity` in
+# heartbeat `backend_sinks`) until the author is set and the ingest service
+# restarts; the default backend keeps ingesting normally and catch-up replay
+# backfills the mirror once identity is configured.
+#
+# [identity]
+# author = "alice@example.com"
+
 [ingest]
 # Maximum rows collected before a sink flushes a batch to ClickHouse.
 batch_size = 4000

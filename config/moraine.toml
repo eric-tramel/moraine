@@ -28,6 +28,15 @@ wait_for_async_insert = true
 # backend = "team-ch"
 # mode = "mirror"               # default; the only supported mode
 
+# Per-person identity stamped on every ingested row as the `author` column.
+# Free-form (email-shaped by convention); use the SAME value on all your
+# machines. Never inferred from git or the environment. Optional for
+# local-only use, but REQUIRED to mirror to a non-default backend — a route
+# to a named backend with no author disables that mirror sink until the
+# author is set and the ingest service restarts.
+# [identity]
+# author = "alice@example.com"
+
 [redaction]
 # Secret redaction is default-on for all ingestion. This flag is honored only
 # from $HOME/.moraine/config.toml, and only for the local/default backend;
