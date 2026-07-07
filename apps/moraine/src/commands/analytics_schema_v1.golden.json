@@ -20,6 +20,13 @@
       "type": "string"
     },
     {
+      "default": false,
+      "name": "author",
+      "sensitive": false,
+      "source_expression": "e.author",
+      "type": "string"
+    },
+    {
       "default": true,
       "name": "event_ts",
       "sensitive": false,

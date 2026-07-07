@@ -70,6 +70,12 @@ allow_newer_server = false
 # # Routing mode. "mirror" is currently the only supported value.
 # mode = "mirror"
 
+[identity]
+# Stable person identity stamped on raw_events/events. Leave empty for
+# local-only installs. Required for mirroring to non-default backends; when
+# empty, routed mirror sinks report disabled_missing_identity_author.
+author = ""
+
 [ingest]
 # Maximum rows collected before a sink flushes a batch to ClickHouse.
 batch_size = 4000

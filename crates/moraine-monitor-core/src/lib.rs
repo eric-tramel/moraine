@@ -148,6 +148,7 @@ async fn api_health(State(state): State<AppState>) -> Response {
     match state.clickhouse.ping().await {
         Ok(()) => match state.clickhouse.version().await {
             Ok(version) => {
+                let ingestor = query_health_heartbeat_or_absent(&state).await;
                 let body = json!({
                     "ok": true,
                     "url": state.clickhouse.config().url,
@@ -155,6 +156,7 @@ async fn api_health(State(state): State<AppState>) -> Response {
                     "version": version,
                     "ping_ms": (Instant::elapsed(&start).as_secs_f64() * 1000.0),
                     "connections": connection_stats,
+                    "ingestor": ingestor,
                 });
                 json_response(body, StatusCode::OK)
             }
@@ -214,11 +216,9 @@ async fn api_status(State(state): State<AppState>) -> Response {
 
     let estimated_total_rows = tables.iter().map(|table| table.rows).sum::<u64>();
     let heartbeat = if db_exists {
-        query_heartbeat(&state).await.unwrap_or_else(|_| {
-            json!({"present": false, "alive": false, "latest": Value::Null, "age_seconds": Value::Null})
-        })
+        query_heartbeat_or_absent(&state).await
     } else {
-        json!({"present": false, "alive": false, "latest": Value::Null, "age_seconds": Value::Null})
+        heartbeat_absent()
     };
 
     let clickhouse_ping = if db_exists {
@@ -1402,6 +1402,53 @@ async fn query_heartbeat(state: &AppState) -> Result<Value> {
     }))
 }
 
+fn heartbeat_absent() -> Value {
+    json!({
+        "present": false,
+        "alive": false,
+        "latest": Value::Null,
+        "age_seconds": Value::Null,
+    })
+}
+
+async fn query_heartbeat_or_absent(state: &AppState) -> Value {
+    query_heartbeat(state)
+        .await
+        .unwrap_or_else(|_| heartbeat_absent())
+}
+
+fn health_heartbeat(heartbeat: Value) -> Value {
+    let latest = heartbeat
+        .get("latest")
+        .and_then(Value::as_object)
+        .map(|obj| {
+            json!({
+                "backend_sinks": obj
+                    .get("backend_sinks")
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+            })
+        })
+        .unwrap_or(Value::Null);
+
+    json!({
+        "present": heartbeat
+            .get("present")
+            .cloned()
+            .unwrap_or(Value::Bool(false)),
+        "alive": heartbeat
+            .get("alive")
+            .cloned()
+            .unwrap_or(Value::Bool(false)),
+        "latest": latest,
+        "age_seconds": heartbeat.get("age_seconds").cloned().unwrap_or(Value::Null),
+    })
+}
+
+async fn query_health_heartbeat_or_absent(state: &AppState) -> Value {
+    health_heartbeat(query_heartbeat_or_absent(state).await)
+}
+
 async fn query_clickhouse_connections(state: &AppState) -> Result<Value> {
     #[derive(serde::Deserialize)]
     struct MetricRow {
@@ -1662,6 +1709,10 @@ fn value_to_i64(value: &Value) -> Option<i64> {
 mod tests {
     use super::*;
     use anyhow::anyhow;
+    use axum::{body::to_bytes, extract::Query, http::StatusCode, routing::post};
+    use moraine_clickhouse::ClickHouseClient;
+    use moraine_config::ClickHouseConfig;
+    use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1709,6 +1760,70 @@ mod tests {
 
     fn compact_sql(query: &str) -> String {
         query.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    async fn health_mock_handler(Query(params): Query<HashMap<String, String>>) -> String {
+        let query = params.get("query").cloned().unwrap_or_default();
+        if query.trim() == "SELECT 1" {
+            return "1".to_string();
+        }
+        if query.contains("version()") {
+            return json!({"data": [{"version": "25.1.1"}]}).to_string();
+        }
+        if query.contains("system.metrics") {
+            return json!({"data": []}).to_string();
+        }
+        if query.contains("system.columns") && query.contains("ingest_heartbeats") {
+            return json!({"data": [{"name": "backend_sinks"}]}).to_string();
+        }
+        if query.contains("ingest_heartbeats") {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_millis() as u64;
+            return json!({
+                "data": [{
+                    "ts": "2026-07-07 20:00:00.000",
+                    "ts_unix_ms": now_ms,
+                    "host": "host-a",
+                    "service_version": "0.6.4",
+                    "queue_depth": 0,
+                    "files_active": 0,
+                    "files_watched": 1,
+                    "rows_raw_written": 2,
+                    "rows_events_written": 2,
+                    "rows_errors_written": 0,
+                    "flush_latency_ms": 1,
+                    "append_to_visible_p50_ms": 1,
+                    "append_to_visible_p95_ms": 2,
+                    "last_error": "",
+                    "backend_sinks": "{\"team-ch\":\"disabled_missing_identity_author\"}"
+                }]
+            })
+            .to_string();
+        }
+        json!({"data": []}).to_string()
+    }
+
+    async fn mock_health_state() -> AppState {
+        let app = Router::new().route("/", post(health_mock_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock clickhouse");
+        let addr = listener.local_addr().expect("mock addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let cfg = ClickHouseConfig {
+            url: format!("http://{}", addr),
+            timeout_seconds: 1.0,
+            ..Default::default()
+        };
+        AppState {
+            clickhouse: ClickHouseClient::new(cfg).expect("mock client"),
+            static_dir: PathBuf::new(),
+        }
     }
 
     #[test]
@@ -1859,6 +1974,47 @@ mod tests {
         assert_eq!(payload["version"], json!("24.8"));
         assert_eq!(payload["ping_ms"], json!(8.25));
         assert_eq!(payload["error"], json!("ping failed"));
+    }
+
+    #[tokio::test]
+    async fn query_heartbeat_decodes_disabled_backend_status() {
+        let state = mock_health_state().await;
+        let heartbeat = query_heartbeat(&state).await.expect("heartbeat");
+
+        assert_eq!(
+            heartbeat["latest"]["backend_sinks"]["team-ch"],
+            json!("disabled_missing_identity_author")
+        );
+        assert_eq!(heartbeat["present"], json!(true));
+        assert_eq!(heartbeat["alive"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn api_health_includes_ingestor_without_affecting_health_status() {
+        let state = mock_health_state().await;
+        let response = api_health(axum::extract::State(state)).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: Value = serde_json::from_slice(&body).expect("health json");
+        assert_eq!(payload["ok"], json!(true));
+        assert_eq!(
+            payload["ingestor"]["latest"]["backend_sinks"]["team-ch"],
+            json!("disabled_missing_identity_author")
+        );
+        let latest = payload["ingestor"]["latest"]
+            .as_object()
+            .expect("latest object");
+        assert!(
+            !latest.contains_key("last_error"),
+            "/api/health should expose mirror status without full heartbeat internals"
+        );
+        assert!(
+            !latest.contains_key("host"),
+            "/api/health should expose mirror status without full heartbeat internals"
+        );
     }
 
     #[test]

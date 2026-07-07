@@ -16,7 +16,7 @@ use crate::dispatch::{enqueue_work, run_work_item, spawn_debounce_task};
 use crate::model::RowBatch;
 use crate::reconcile::spawn_reconcile_task;
 use crate::redaction::{RedactionAudit, SecretRedactor};
-use crate::sink::{spawn_sink_task, SinkRole};
+use crate::sink::{spawn_sink_task, SinkAuthorConfig, SinkRole};
 use crate::tee::{
     spawn_tee_router, RedactionContext, RouteResolver, SharedRouteResolver, StatusRegistry,
 };
@@ -126,6 +126,21 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         .backends
         .keys()
         .any(|name| name != DEFAULT_BACKEND_NAME);
+    let raw_events_author_column = table_column_available(&clickhouse, "raw_events", "author")
+        .await
+        .context("failed to inspect raw_events author column")?;
+    let events_author_column = table_column_available(&clickhouse, "events", "author")
+        .await
+        .context("failed to inspect events author column")?;
+    if !raw_events_author_column || !events_author_column {
+        warn!(
+            raw_events_author_column,
+            events_author_column,
+            "raw_events/events are missing the author column (migration 024); \
+             author attribution will be omitted for missing local/default columns until \
+             `moraine db migrate` runs and this ingest service restarts"
+        );
+    }
     let heartbeat_backend_column = if has_named_backends {
         let available = heartbeat_column_available(&clickhouse, "backend_sinks")
             .await
@@ -199,6 +214,11 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         metrics.clone(),
         default_sink_rx,
         checkpoint_cursor_columns,
+        SinkAuthorConfig::new(
+            config.identity.author.clone(),
+            raw_events_author_column,
+            events_author_column,
+        ),
         SinkRole::Default {
             dispatch: dispatch.clone(),
             backends: backend_statuses.clone(),
@@ -365,28 +385,23 @@ struct CheckpointRow {
 /// added by migration 015. Selecting them unconditionally would abort startup
 /// for every source on a database that has not run `moraine db migrate` yet.
 async fn checkpoint_cursor_columns_available(clickhouse: &ClickHouseClient) -> Result<bool> {
-    #[derive(Deserialize)]
-    struct CountRow {
-        column_count: u64,
-    }
-
-    let query = format!(
-        "SELECT toUInt64(count()) AS column_count \
-         FROM system.columns \
-         WHERE database = '{}' AND table = 'ingest_checkpoints' AND name = 'cursor_json'",
-        clickhouse.config().database.replace('\'', "\\'")
-    );
-    let rows: Vec<CountRow> = clickhouse.query_rows(&query, None).await?;
-    Ok(rows
-        .first()
-        .map(|row| row.column_count > 0)
-        .unwrap_or(false))
+    table_column_available(clickhouse, "ingest_checkpoints", "cursor_json").await
 }
 
 /// Returns whether `ingest_heartbeats` carries an optional heartbeat column.
 /// Inserting optional columns unconditionally would break every heartbeat on a
 /// database that has not run the corresponding `moraine db migrate` yet.
 async fn heartbeat_column_available(clickhouse: &ClickHouseClient, column: &str) -> Result<bool> {
+    table_column_available(clickhouse, "ingest_heartbeats", column).await
+}
+
+/// Returns whether a table carries a column. Optional-write paths use this at
+/// startup because ClickHouse JSONEachRow rejects unknown fields at insert time.
+async fn table_column_available(
+    clickhouse: &ClickHouseClient,
+    table: &str,
+    column: &str,
+) -> Result<bool> {
     #[derive(Deserialize)]
     struct CountRow {
         column_count: u64,
@@ -395,8 +410,9 @@ async fn heartbeat_column_available(clickhouse: &ClickHouseClient, column: &str)
     let query = format!(
         "SELECT toUInt64(count()) AS column_count \
          FROM system.columns \
-         WHERE database = '{}' AND table = 'ingest_heartbeats' AND name = '{}'",
+         WHERE database = '{}' AND table = '{}' AND name = '{}'",
         clickhouse.config().database.replace('\'', "\\'"),
+        table.replace('\'', "\\'"),
         column.replace('\'', "\\'")
     );
     let rows: Vec<CountRow> = clickhouse.query_rows(&query, None).await?;

@@ -63,6 +63,50 @@ pub(crate) enum SinkRole {
     },
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct SinkAuthorConfig {
+    author: String,
+    raw_events_column: bool,
+    events_column: bool,
+}
+
+impl SinkAuthorConfig {
+    pub(crate) fn new(author: String, raw_events_column: bool, events_column: bool) -> Self {
+        Self {
+            author,
+            raw_events_column,
+            events_column,
+        }
+    }
+
+    pub(crate) fn fully_supported(author: String) -> Self {
+        Self::new(author, true, true)
+    }
+}
+
+fn stamp_author_rows(rows: &mut [Value], author: &str, column_supported: bool) {
+    for row in rows {
+        let Some(obj) = row.as_object_mut() else {
+            continue;
+        };
+        if column_supported {
+            obj.insert("author".to_string(), Value::String(author.to_string()));
+        } else {
+            obj.remove("author");
+        }
+    }
+}
+
+fn apply_author_to_batch(batch: &mut crate::model::RowBatch, author: &SinkAuthorConfig) {
+    stamp_author_rows(
+        &mut batch.raw_rows,
+        &author.author,
+        author.raw_events_column,
+    );
+    stamp_author_rows(&mut batch.event_rows, &author.author, author.events_column);
+    batch.recompute_approx_bytes();
+}
+
 /// Backend-role health bookkeeping after a flush attempt; no-op for the
 /// default sink. Recovery requires a drained queue so one successful flush
 /// mid-backlog does not trigger a replay storm.
@@ -179,6 +223,7 @@ pub(crate) fn spawn_sink_task(
     metrics: Arc<Metrics>,
     mut rx: mpsc::Receiver<SinkMessage>,
     checkpoint_cursor_columns: bool,
+    author: SinkAuthorConfig,
     role: SinkRole,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -267,7 +312,7 @@ pub(crate) fn spawn_sink_task(
                         Some(SinkMessage::Batch(batch)) => {
                             // Mirror sinks only buffer the sessions routed to
                             // them; the default sink takes batches whole.
-                            let batch = match &role {
+                            let mut batch = match &role {
                                 SinkRole::Backend {
                                     cell,
                                     resolver,
@@ -285,6 +330,7 @@ pub(crate) fn spawn_sink_task(
                                 }
                                 SinkRole::Default { .. } => batch,
                             };
+                            apply_author_to_batch(&mut batch, &author);
                             pending_batch_bytes =
                                 pending_batch_bytes.saturating_add(batch.approx_bytes());
                             raw_rows.extend(batch.raw_rows);
@@ -1269,6 +1315,72 @@ mod tests {
         }
     }
 
+    #[test]
+    fn author_is_stamped_only_on_raw_and_event_rows() {
+        let mut batch = RowBatch::default();
+        batch.push_raw_row(json!({"event_uid": "raw-1"}));
+        batch.extend_event_rows(vec![json!({"event_uid": "event-1"})]);
+        batch.extend_link_rows(vec![json!({"event_uid": "link-1"})]);
+        batch.extend_tool_rows(vec![json!({"event_uid": "tool-1"})]);
+        batch.push_error_row(json!({"error_kind": "parse"}));
+
+        apply_author_to_batch(
+            &mut batch,
+            &SinkAuthorConfig::fully_supported("alice@example.com".to_string()),
+        );
+
+        assert_eq!(
+            batch.raw_rows[0].get("author").and_then(Value::as_str),
+            Some("alice@example.com")
+        );
+        assert_eq!(
+            batch.event_rows[0].get("author").and_then(Value::as_str),
+            Some("alice@example.com")
+        );
+        assert!(batch.link_rows[0].get("author").is_none());
+        assert!(batch.tool_rows[0].get("author").is_none());
+        assert!(batch.error_rows[0].get("author").is_none());
+    }
+
+    #[test]
+    fn author_is_stripped_per_table_when_default_schema_lacks_column() {
+        let mut batch = RowBatch::default();
+        batch.push_raw_row(json!({"event_uid": "raw-1", "author": "old"}));
+        batch.extend_event_rows(vec![json!({"event_uid": "event-1", "author": "old"})]);
+
+        apply_author_to_batch(
+            &mut batch,
+            &SinkAuthorConfig::new("alice@example.com".to_string(), false, true),
+        );
+
+        assert!(batch.raw_rows[0].get("author").is_none());
+        assert_eq!(
+            batch.event_rows[0].get("author").and_then(Value::as_str),
+            Some("alice@example.com")
+        );
+    }
+
+    #[test]
+    fn empty_author_is_stamped_when_schema_supports_it() {
+        let mut batch = RowBatch::default();
+        batch.push_raw_row(json!({"event_uid": "raw-1"}));
+        batch.extend_event_rows(vec![json!({"event_uid": "event-1"})]);
+
+        apply_author_to_batch(
+            &mut batch,
+            &SinkAuthorConfig::fully_supported(String::new()),
+        );
+
+        assert_eq!(
+            batch.raw_rows[0].get("author").and_then(Value::as_str),
+            Some("")
+        );
+        assert_eq!(
+            batch.event_rows[0].get("author").and_then(Value::as_str),
+            Some("")
+        );
+    }
+
     const CLICKHOUSE_OVERSIZED_JSON_OBJECT_ERROR: &str =
         "Code: 117. DB::Exception: Size of JSON object at position 104890103 is extremely large. \
          Expected not greater than 10485760 bytes, but current is 104890103 bytes per row. \
@@ -1296,6 +1408,7 @@ mod tests {
             metrics,
             rx,
             true,
+            SinkAuthorConfig::fully_supported(String::new()),
             default_role(),
         );
 
@@ -1992,6 +2105,7 @@ mod tests {
             metrics,
             rx,
             true,
+            SinkAuthorConfig::fully_supported(String::new()),
             SinkRole::Backend {
                 cell: Arc::new(BackendSinkCell::new("team-ch")),
                 resolver,
