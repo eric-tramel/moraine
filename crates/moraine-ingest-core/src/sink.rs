@@ -1,6 +1,6 @@
 use crate::checkpoint::merge_checkpoint;
 use crate::heartbeat::host_name;
-use crate::model::Checkpoint;
+use crate::model::{Checkpoint, RowBatch};
 use crate::redaction::{RedactionAudit, SecretRedactor};
 use crate::sources::shared::truncate_chars;
 use crate::tee::{
@@ -82,29 +82,10 @@ impl SinkAuthorConfig {
     pub(crate) fn fully_supported(author: String) -> Self {
         Self::new(author, true, true)
     }
-}
 
-fn stamp_author_rows(rows: &mut [Value], author: &str, column_supported: bool) {
-    for row in rows {
-        let Some(obj) = row.as_object_mut() else {
-            continue;
-        };
-        if column_supported {
-            obj.insert("author".to_string(), Value::String(author.to_string()));
-        } else {
-            obj.remove("author");
-        }
+    fn apply_to_batch(&self, batch: &mut RowBatch) {
+        batch.stamp_author(&self.author, self.raw_events_column, self.events_column);
     }
-}
-
-fn apply_author_to_batch(batch: &mut crate::model::RowBatch, author: &SinkAuthorConfig) {
-    stamp_author_rows(
-        &mut batch.raw_rows,
-        &author.author,
-        author.raw_events_column,
-    );
-    stamp_author_rows(&mut batch.event_rows, &author.author, author.events_column);
-    batch.recompute_approx_bytes();
 }
 
 /// Backend-role health bookkeeping after a flush attempt; no-op for the
@@ -330,7 +311,7 @@ pub(crate) fn spawn_sink_task(
                                 }
                                 SinkRole::Default { .. } => batch,
                             };
-                            apply_author_to_batch(&mut batch, &author);
+                            author.apply_to_batch(&mut batch);
                             pending_batch_bytes =
                                 pending_batch_bytes.saturating_add(batch.approx_bytes());
                             raw_rows.extend(batch.raw_rows);
@@ -1324,10 +1305,7 @@ mod tests {
         batch.extend_tool_rows(vec![json!({"event_uid": "tool-1"})]);
         batch.push_error_row(json!({"error_kind": "parse"}));
 
-        apply_author_to_batch(
-            &mut batch,
-            &SinkAuthorConfig::fully_supported("alice@example.com".to_string()),
-        );
+        batch.stamp_author("alice@example.com", true, true);
 
         assert_eq!(
             batch.raw_rows[0].get("author").and_then(Value::as_str),
@@ -1348,10 +1326,7 @@ mod tests {
         batch.push_raw_row(json!({"event_uid": "raw-1", "author": "old"}));
         batch.extend_event_rows(vec![json!({"event_uid": "event-1", "author": "old"})]);
 
-        apply_author_to_batch(
-            &mut batch,
-            &SinkAuthorConfig::new("alice@example.com".to_string(), false, true),
-        );
+        batch.stamp_author("alice@example.com", false, true);
 
         assert!(batch.raw_rows[0].get("author").is_none());
         assert_eq!(
@@ -1361,24 +1336,15 @@ mod tests {
     }
 
     #[test]
-    fn empty_author_is_stamped_when_schema_supports_it() {
+    fn empty_author_is_a_no_op_even_when_schema_supports_it() {
         let mut batch = RowBatch::default();
         batch.push_raw_row(json!({"event_uid": "raw-1"}));
         batch.extend_event_rows(vec![json!({"event_uid": "event-1"})]);
 
-        apply_author_to_batch(
-            &mut batch,
-            &SinkAuthorConfig::fully_supported(String::new()),
-        );
+        batch.stamp_author("", true, true);
 
-        assert_eq!(
-            batch.raw_rows[0].get("author").and_then(Value::as_str),
-            Some("")
-        );
-        assert_eq!(
-            batch.event_rows[0].get("author").and_then(Value::as_str),
-            Some("")
-        );
+        assert!(batch.raw_rows[0].get("author").is_none());
+        assert!(batch.event_rows[0].get("author").is_none());
     }
 
     const CLICKHOUSE_OVERSIZED_JSON_OBJECT_ERROR: &str =

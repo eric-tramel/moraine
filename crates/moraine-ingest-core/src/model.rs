@@ -96,6 +96,47 @@ impl RowBatch {
         self.approx_bytes = self.approx_bytes();
     }
 
+    /// Stamp the configured author onto raw/event rows, the only event tables
+    /// carrying migration-024 `author` columns.
+    pub(crate) fn stamp_author(
+        &mut self,
+        author: &str,
+        raw_events_column: bool,
+        events_column: bool,
+    ) {
+        if author.is_empty() {
+            return;
+        }
+
+        let mut stamped = 0usize;
+        let mut recompute = false;
+
+        if raw_events_column {
+            let stats = stamp_author_rows(&mut self.raw_rows, author);
+            stamped = stamped.saturating_add(stats.inserted);
+            recompute |= stats.replaced;
+        } else {
+            recompute |= strip_author_rows(&mut self.raw_rows);
+        }
+
+        if events_column {
+            let stats = stamp_author_rows(&mut self.event_rows, author);
+            stamped = stamped.saturating_add(stats.inserted);
+            recompute |= stats.replaced;
+        } else {
+            recompute |= strip_author_rows(&mut self.event_rows);
+        }
+
+        if recompute {
+            self.recompute_approx_bytes();
+        } else if self.approx_bytes > 0 {
+            let per_row_bytes = r#""author":"","#.len().saturating_add(author.len());
+            self.approx_bytes = self
+                .approx_bytes
+                .saturating_add(stamped.saturating_mul(per_row_bytes));
+        }
+    }
+
     pub fn push_raw_row(&mut self, row: Value) {
         self.approx_bytes = self
             .approx_bytes
@@ -192,4 +233,117 @@ fn approx_json_row_bytes(row: &Value) -> usize {
     serde_json::to_vec(row)
         .map(|bytes| bytes.len().saturating_add(1))
         .unwrap_or(1)
+}
+
+struct AuthorStampStats {
+    inserted: usize,
+    replaced: bool,
+}
+
+fn stamp_author_rows(rows: &mut [Value], author: &str) -> AuthorStampStats {
+    let mut stats = AuthorStampStats {
+        inserted: 0,
+        replaced: false,
+    };
+
+    for row in rows {
+        let Some(obj) = row.as_object_mut() else {
+            continue;
+        };
+        if obj
+            .insert("author".to_string(), Value::String(author.to_string()))
+            .is_some()
+        {
+            stats.replaced = true;
+        } else {
+            stats.inserted = stats.inserted.saturating_add(1);
+        }
+    }
+
+    stats
+}
+
+fn strip_author_rows(rows: &mut [Value]) -> bool {
+    let mut removed = false;
+    for row in rows {
+        let Some(obj) = row.as_object_mut() else {
+            continue;
+        };
+        removed |= obj.remove("author").is_some();
+    }
+    removed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn batch_with_all_row_kinds() -> RowBatch {
+        let mut batch = RowBatch::default();
+        batch.push_raw_row(json!({"event_uid": "raw-1"}));
+        batch.extend_event_rows(vec![json!({"event_uid": "event-1"})]);
+        batch.extend_link_rows(vec![json!({"event_uid": "link-1"})]);
+        batch.extend_tool_rows(vec![json!({"event_uid": "tool-1"})]);
+        batch.push_error_row(json!({"error_kind": "parse"}));
+        batch
+    }
+
+    #[test]
+    fn stamp_author_covers_raw_and_event_rows_only() {
+        let mut batch = batch_with_all_row_kinds();
+
+        batch.stamp_author("alice@example.com", true, true);
+
+        assert_eq!(
+            batch.raw_rows[0].get("author").and_then(Value::as_str),
+            Some("alice@example.com")
+        );
+        assert_eq!(
+            batch.event_rows[0].get("author").and_then(Value::as_str),
+            Some("alice@example.com")
+        );
+        assert!(batch.link_rows[0].get("author").is_none());
+        assert!(batch.tool_rows[0].get("author").is_none());
+        assert!(batch.error_rows[0].get("author").is_none());
+    }
+
+    #[test]
+    fn stamp_author_strips_per_table_when_default_schema_lacks_column() {
+        let mut batch = RowBatch::default();
+        batch.push_raw_row(json!({"event_uid": "raw-1", "author": "old"}));
+        batch.extend_event_rows(vec![json!({"event_uid": "event-1", "author": "old"})]);
+
+        batch.stamp_author("alice@example.com", false, true);
+
+        assert!(batch.raw_rows[0].get("author").is_none());
+        assert_eq!(
+            batch.event_rows[0].get("author").and_then(Value::as_str),
+            Some("alice@example.com")
+        );
+    }
+
+    #[test]
+    fn stamp_author_with_empty_identity_is_a_no_op() {
+        let mut batch = batch_with_all_row_kinds();
+        let before_bytes = batch.approx_bytes();
+
+        batch.stamp_author("", true, true);
+
+        assert!(batch.raw_rows[0].get("author").is_none());
+        assert!(batch.event_rows[0].get("author").is_none());
+        assert_eq!(batch.approx_bytes(), before_bytes);
+    }
+
+    #[test]
+    fn stamp_author_advances_cached_batch_size_by_insert_delta() {
+        let author = "alice@example.com";
+        let mut batch = batch_with_all_row_kinds();
+        let before = batch.approx_bytes();
+
+        batch.stamp_author(author, true, true);
+
+        let expected_delta = 2 * (r#""author":"","#.len() + author.len());
+        assert_eq!(batch.approx_bytes(), before + expected_delta);
+    }
 }
