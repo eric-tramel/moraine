@@ -334,6 +334,7 @@ mod tests {
             harness: "codex",
             inference_provider: "openai",
             session_id: "session-1",
+            session_hint: "",
             session_date: "2026-05-07",
             cwd: "",
             source_file: "/fixtures/dummy/session.jsonl",

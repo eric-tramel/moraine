@@ -1,0 +1,3 @@
+{"type":"metadata","protocol_version":"1.9"}
+{"timestamp":1775954000.100000,"message":{"type":"TurnBegin","payload":{"user_input":"Coordinate the delegated investigation."}}}
+{"timestamp":1775954001.200000,"message":{"type":"ContentPart","payload":{"type":"text","text":"Delegation is in progress."}}}

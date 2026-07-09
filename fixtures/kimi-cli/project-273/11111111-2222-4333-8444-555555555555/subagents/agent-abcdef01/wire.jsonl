@@ -1,0 +1,6 @@
+{"type":"metadata","protocol_version":"1.9"}
+
+{"timestamp":1775954002.300000,"message":{"type":"TurnBegin","payload":{"user_input":"Inspect the delegated subsystem."}}}
+{"timestamp":1775954003.400000,"message":{"type":"ContentPart","payload":{"type":"text","text":"The delegated subsystem is healthy."}}}
+{"timestamp":1775954004.500000,"message":{"type":"TurnBegin","payload":{"user_input":"Review the delegated findings."}}}
+{"timestamp":1775954005.600000,"message":{"type":"ContentPart","payload":{"type":"text","text":"The second turn is complete."}}}

@@ -4,6 +4,7 @@ use super::{
     SourceRecordContext,
 };
 use serde_json::{json, Map, Value};
+use std::io::{BufRead, BufReader, Read};
 
 pub(crate) static KIMI_CLI: KimiCli = KimiCli;
 
@@ -74,6 +75,81 @@ fn kimi_session_id(source_file: &str, session_hint: &str) -> String {
     infer_session_id_from_file(source_file)
 }
 
+fn kimi_subagent_parent_session_id(source_file: &str) -> Option<String> {
+    let path = std::path::Path::new(source_file);
+    if path.file_name()?.to_str()? != "wire.jsonl" {
+        return None;
+    }
+
+    let agent_dir = path.parent()?;
+    let subagents_dir = agent_dir.parent()?;
+    if subagents_dir.file_name()?.to_str()? != "subagents" {
+        return None;
+    }
+
+    let parent_session_id = subagents_dir.parent()?.file_name()?.to_str()?;
+    if parent_session_id.is_empty() {
+        return None;
+    }
+
+    Some(format!("kimi-cli:{parent_session_id}"))
+}
+
+fn has_prior_kimi_turn_begin(source_file: &str, source_offset: u64) -> bool {
+    let Ok(file) = std::fs::File::open(source_file) else {
+        return false;
+    };
+
+    BufReader::new(file)
+        .take(source_offset)
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+        .any(|record| {
+            record
+                .get("message")
+                .and_then(|message| message.get("type"))
+                .and_then(Value::as_str)
+                == Some("TurnBegin")
+        })
+}
+
+fn link_kimi_subagent_to_parent(
+    ctx: &RecordContext<'_>,
+    wire: &KimiWireRecord<'_>,
+    partials: &mut NormalizedPartials,
+) {
+    // A Kimi wire file can contain multiple turns. Inspect only the already
+    // consumed prefix so this relationship is attached to the stream's first
+    // TurnBegin across blank lines, skipped records, and incremental resumes.
+    if wire.msg_type() != "TurnBegin"
+        || !ctx.session_hint.is_empty()
+        || has_prior_kimi_turn_begin(ctx.source_file, ctx.source_offset)
+    {
+        return;
+    }
+
+    let Some(parent_session_id) = kimi_subagent_parent_session_id(ctx.source_file) else {
+        return;
+    };
+    let Some(event_uid) = partials.event_rows.first().and_then(|event| {
+        event
+            .get("event_uid")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }) else {
+        return;
+    };
+
+    partials.link_rows.push(build_external_link_row(
+        ctx,
+        &event_uid,
+        &parent_session_id,
+        "subagent_parent",
+        "{}",
+    ));
+}
+
 /// Kimi wire records carry `timestamp` as a unix-seconds float
 /// (e.g. `1775953944.549974`). Convert to the RFC3339 string the shared
 /// `parse_event_ts` path expects; return "" when the field is absent so
@@ -118,6 +194,7 @@ fn normalize_kimi_cli_wire_event(
     dispatch_kimi_wire_record(&wire, &mut emitter);
 
     let mut partials = emitter.finish();
+    link_kimi_subagent_to_parent(ctx, &wire, &mut partials);
     stamp_kimi_placeholder_model(&mut partials.event_rows);
     partials
 }
