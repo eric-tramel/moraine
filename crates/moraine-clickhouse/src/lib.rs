@@ -753,6 +753,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             name: "023_search_documents_event_uid_bloom.sql",
             sql: include_str!("../../../sql/023_search_documents_event_uid_bloom.sql"),
         },
+        Migration {
+            version: "024",
+            name: "024_kimi_subagent_parent_links.sql",
+            sql: include_str!("../../../sql/024_kimi_subagent_parent_links.sql"),
+        },
     ]
 }
 

@@ -143,6 +143,7 @@ pub(crate) fn normalize_record_with_ts_hint(
         harness: harness_name,
         inference_provider: &metadata.inference_provider,
         session_id: &session_id,
+        session_hint,
         session_date: &session_date,
         cwd: &cwd,
         source_file,

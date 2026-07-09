@@ -17,11 +17,28 @@ all rows that leave the adapter.
 | --- | --- | --- | --- | --- |
 | `codex` | `sources/codex.rs` | `openai` | `jsonl` | OpenAI/Codex events, response items, tool calls, compaction, token counts. |
 | `claude-code` | `sources/claude_code.rs` | `anthropic` | `jsonl` | Claude Code message blocks, operational records, parent/tool external links. |
-| `kimi-cli` | `sources/kimi_cli.rs` | `moonshot` | `jsonl` | Kimi `wire.jsonl`; skips metadata headers and drops parent `SubagentEvent` rows. |
+| `kimi-cli` | `sources/kimi_cli.rs` | `moonshot` | `jsonl` | Kimi `wire.jsonl`; skips metadata headers and keeps parent `SubagentEvent` envelopes raw-only. |
 | `opencode` | `sources/opencode.rs` | record-derived | `opencode_sqlite` | OpenCode `opencode*.db`; append-only conversation events synthesized into session, message, part, and session-message records. Credential/account tables are deliberately out of scope. |
 | `cursor` | `sources/cursor.rs` | `cursor` | `jsonl` or `cursor_sqlite` | Cursor Agent transcripts under `agent-transcripts/`; text blocks, tool-use blocks, and local file references. Also normalizes the synthetic `cursor_composer`/`cursor_bubble` records produced by polling `state.vscdb` (see SQLite-Polled Sources below); composer names become `session_meta` events that carry the session title. |
 | `hermes` | `sources/hermes.rs` | record-derived | `jsonl` or `session_json` | ShareGPT trajectories and live Hermes session JSON with vendor/model splitting. |
 | `pi-coding-agent` | `sources/pi.rs` | record-derived | `jsonl` | Pi session JSONL trees, model/thinking metadata, assistant tool calls, tool results, and parent links. |
+
+### Kimi parent and sub-agent streams
+
+Kimi treats every `wire.jsonl` as its own session boundary. A parent stream at
+`<session_id>/wire.jsonl` maps to `kimi-cli:<session_id>`, while
+`<session_id>/subagents/<agent_id>/wire.jsonl` remains a first-class standalone
+session named `kimi-cli:<agent_id>` rather than being folded into its parent.
+The first normalized event from the sub-agent stream carries a
+`subagent_parent` external link whose `linked_external_id` is
+`kimi-cli:<session_id>`. This preserves the parent relationship without
+combining the two event streams.
+
+Kimi also writes each sub-agent event as a `SubagentEvent` envelope on the
+parent wire. That envelope remains available in `raw_events`, but it does not
+emit a normalized event; the event from the sub-agent's own `wire.jsonl` is the
+single normalized copy. This prevents sub-agent activity from being counted
+once in the standalone sub-agent session and again as parent-session progress.
 
 ## Adapter Contract
 

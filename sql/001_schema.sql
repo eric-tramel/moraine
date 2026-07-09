@@ -136,7 +136,7 @@ CREATE TABLE IF NOT EXISTS moraine.event_links (
   event_version UInt64,
   CONSTRAINT event_links_link_type_domain CHECK link_type IN (
     'parent_event', 'compacted_parent', 'parent_uuid', 'tool_use_id', 'source_tool_assistant',
-    'unknown'
+    'subagent_parent', 'unknown'
   )
 )
 ENGINE = ReplacingMergeTree(event_version)

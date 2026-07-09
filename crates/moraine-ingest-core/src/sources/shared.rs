@@ -807,6 +807,7 @@ fn link_type_in_domain(value: &str) -> bool {
             | "parent_uuid"
             | "tool_use_id"
             | "source_tool_assistant"
+            | "subagent_parent"
             | "unknown"
     )
 }
@@ -1065,6 +1066,7 @@ pub(crate) struct RecordContext<'a> {
     pub(crate) harness: &'a str,
     pub(crate) inference_provider: &'a str,
     pub(crate) session_id: &'a str,
+    pub(crate) session_hint: &'a str,
     pub(crate) session_date: &'a str,
     pub(crate) cwd: &'a str,
     pub(crate) source_file: &'a str,
@@ -1355,6 +1357,7 @@ mod tests {
             harness: "codex",
             inference_provider: "openai",
             session_id: "s1",
+            session_hint: "",
             session_date: "2026-02-15",
             cwd,
             source_file: "/tmp/s1.jsonl",
