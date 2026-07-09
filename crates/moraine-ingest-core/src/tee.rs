@@ -16,7 +16,7 @@ use crate::dispatch::process_file;
 use crate::heartbeat::host_name;
 use crate::model::{Checkpoint, RowBatch};
 use crate::redaction::{RedactionAudit, SecretRedactor};
-use crate::sink::{spawn_sink_task, SinkRole};
+use crate::sink::{spawn_sink_task, SinkAuthorConfig, SinkRole};
 use crate::watch::enumerate_tracked_files;
 use crate::{Metrics, SinkMessage, WorkItem};
 use moraine_clickhouse::{enforce_remote_schema_policy, ClickHouseClient};
@@ -46,6 +46,8 @@ pub(crate) enum BackendSinkStatus {
     Unreachable,
     /// Schema skew policy rejected the backend; terminal until restart.
     DisabledSkew,
+    /// Identity is required before mirroring to a non-default backend.
+    DisabledMissingIdentityAuthor,
 }
 
 impl BackendSinkStatus {
@@ -56,6 +58,7 @@ impl BackendSinkStatus {
             Self::Lagging => "lagging",
             Self::Unreachable => "unreachable",
             Self::DisabledSkew => "disabled_skew",
+            Self::DisabledMissingIdentityAuthor => "disabled_missing_identity_author",
         }
     }
 }
@@ -359,9 +362,14 @@ pub(crate) fn filter_batch_for_backend(
     out
 }
 
-struct BackendHandle {
-    tx: mpsc::Sender<SinkMessage>,
-    cell: Arc<BackendSinkCell>,
+enum BackendHandle {
+    Active {
+        tx: mpsc::Sender<SinkMessage>,
+        cell: Arc<BackendSinkCell>,
+    },
+    Disabled {
+        cell: Arc<BackendSinkCell>,
+    },
 }
 
 #[derive(Clone)]
@@ -410,18 +418,18 @@ pub(crate) fn spawn_tee_router(
         let mut handles = HashMap::<String, BackendHandle>::new();
 
         // Backends named by home-config routes start eagerly so handshake
-        // failures surface at startup. Backends referenced only by repo
-        // `.moraine.toml` files are constructed on first resolution — we
-        // cannot know at startup which configured backends repos will name,
-        // and eagerly replaying never-routed backends would write
-        // checkpoints into databases the user never routed to.
-        let eager: BTreeSet<String> = context
+        // failures surface at startup. Repo `.moraine.toml` routes are
+        // discovered with a read-only source pass first: this lets retained
+        // files trigger backend replay after identity is configured, without
+        // writing checkpoints to every configured-but-never-routed backend.
+        let mut eager: BTreeSet<String> = context
             .config
             .routes
             .iter()
             .map(|route| route.backend.clone())
             .filter(|name| name != DEFAULT_BACKEND_NAME)
             .collect();
+        eager.extend(discover_startup_backend_targets(&context).await);
         for name in eager {
             ensure_backend(&name, &context, &mut handles);
         }
@@ -463,6 +471,94 @@ fn redact_default_batch_if_enabled(
     redaction.audit.record(&report);
 }
 
+async fn discover_startup_backend_targets(context: &TeeRouterContext) -> BTreeSet<String> {
+    let mut targets = BTreeSet::new();
+    if !context
+        .config
+        .backends
+        .keys()
+        .any(|name| name != DEFAULT_BACKEND_NAME)
+    {
+        return targets;
+    }
+
+    let metrics = Arc::new(Metrics::default());
+    for source in context.sources.iter() {
+        let files = match enumerate_tracked_files(&source.glob, &source.format) {
+            Ok(files) => files,
+            Err(exc) => {
+                warn!(
+                    source = %source.name,
+                    "startup backend discovery enumerate failed: {exc}"
+                );
+                continue;
+            }
+        };
+
+        for path in files {
+            match discover_file_backend_targets(context, source, path, metrics.clone()).await {
+                Ok(file_targets) => targets.extend(file_targets),
+                Err(exc) => warn!(
+                    source = %source.name,
+                    "startup backend discovery failed: {exc}"
+                ),
+            }
+        }
+    }
+    targets
+}
+
+async fn discover_file_backend_targets(
+    context: &TeeRouterContext,
+    source: &IngestSource,
+    path: String,
+    metrics: Arc<Metrics>,
+) -> Result<BTreeSet<String>, anyhow::Error> {
+    let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+    let poll_state = crate::sqlite_poll::VolatilePollMap::new();
+    let (tx, mut rx) = mpsc::channel::<SinkMessage>(16);
+    let work = WorkItem {
+        source_name: source.name.clone(),
+        harness: source.harness.clone(),
+        format: source.format.clone(),
+        path,
+    };
+    let process = process_file(
+        &context.config,
+        &work,
+        checkpoints,
+        &poll_state,
+        tx,
+        &metrics,
+    );
+    tokio::pin!(process);
+
+    let mut targets = BTreeSet::new();
+    let process_result = loop {
+        tokio::select! {
+            result = &mut process => break result,
+            Some(SinkMessage::Batch(batch)) = rx.recv() => {
+                let mut resolver = context
+                    .resolver
+                    .lock()
+                    .expect("route resolver mutex poisoned");
+                targets.extend(collect_targets(&batch, &mut resolver));
+            }
+        }
+    };
+
+    while let Ok(SinkMessage::Batch(batch)) = rx.try_recv() {
+        let mut resolver = context
+            .resolver
+            .lock()
+            .expect("route resolver mutex poisoned");
+        targets.extend(collect_targets(&batch, &mut resolver));
+    }
+
+    process_result?;
+    Ok(targets)
+}
+
 /// Looks up (or lazily constructs) the handle for a named backend. Returns
 /// `None` only for names without a `[backends.*]` entry, which the resolver
 /// already refuses to produce — this is a defensive double-check.
@@ -472,16 +568,31 @@ fn ensure_backend<'a>(
     handles: &'a mut HashMap<String, BackendHandle>,
 ) -> Option<&'a BackendHandle> {
     if !handles.contains_key(name) {
-        let backend_cfg = context.config.backends.get(name)?.clone();
         let cell = Arc::new(BackendSinkCell::new(name));
+        if !context.config.backends.contains_key(name) {
+            return None;
+        }
+
         let queue_capacity = context.config.ingest.max_inflight_batches.max(1);
-        let (tx, backend_rx) = mpsc::channel::<SinkMessage>(queue_capacity);
 
         context
             .registry
             .lock()
             .expect("backend registry mutex poisoned")
             .insert(name.to_string(), cell.clone());
+
+        if context.config.identity.author.is_empty() {
+            cell.set_status(BackendSinkStatus::DisabledMissingIdentityAuthor);
+            warn!(
+                backend = name,
+                "mirror sink disabled: [identity].author is required for non-default backends"
+            );
+            handles.insert(name.to_string(), BackendHandle::Disabled { cell });
+            return handles.get(name);
+        }
+
+        let backend_cfg = context.config.backends.get(name)?.clone();
+        let (tx, backend_rx) = mpsc::channel::<SinkMessage>(queue_capacity);
 
         info!(backend = name, "starting mirror sink for backend");
         spawn_backend_supervisor(
@@ -492,36 +603,46 @@ fn ensure_backend<'a>(
             context.clone(),
         );
 
-        handles.insert(name.to_string(), BackendHandle { tx, cell });
+        handles.insert(name.to_string(), BackendHandle::Active { tx, cell });
     }
     handles.get(name)
 }
 
 fn forward_to_backend(handle: &BackendHandle, batch: &RowBatch) {
-    if !handle.cell.is_live() || handle.cell.status() != BackendSinkStatus::Ok {
+    let BackendHandle::Active { tx, cell } = handle else {
+        if let BackendHandle::Disabled { cell } = handle {
+            debug_assert_eq!(
+                cell.status(),
+                BackendSinkStatus::DisabledMissingIdentityAuthor
+            );
+        }
+        return;
+    };
+
+    if !cell.is_live() || cell.status() != BackendSinkStatus::Ok {
         // Not accepting (connecting / lagging / unreachable / disabled):
         // drop the mirror copy. Replay recovers it from the source file.
-        handle.cell.record_drop();
+        cell.record_drop();
         return;
     }
 
-    match handle.tx.try_send(SinkMessage::Batch(batch.clone())) {
+    match tx.try_send(SinkMessage::Batch(batch.clone())) {
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Full(_)) => {
-            handle.cell.record_drop();
-            if handle.cell.mark_overflow() {
+            cell.record_drop();
+            if cell.mark_overflow() {
                 warn!(
-                    backend = handle.cell.name(),
+                    backend = cell.name(),
                     "mirror queue full; backend marked lagging and live mirroring paused \
                      (catch-up replay will recover the gap once it drains)"
                 );
             }
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {
-            handle.cell.record_drop();
-            if handle.cell.mark_flush_failure() {
+            cell.record_drop();
+            if cell.mark_flush_failure() {
                 warn!(
-                    backend = handle.cell.name(),
+                    backend = cell.name(),
                     "mirror sink channel closed unexpectedly; backend marked unreachable"
                 );
             }
@@ -615,6 +736,7 @@ fn spawn_backend_supervisor(
             metrics.clone(),
             backend_rx,
             true,
+            SinkAuthorConfig::fully_supported(context.config.identity.author.clone()),
             SinkRole::Backend {
                 cell: cell.clone(),
                 resolver: context.resolver.clone(),
@@ -827,6 +949,57 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_discovery_finds_repo_referenced_backend_without_home_route() {
+        let path = unique_replay_file("repo-discovery");
+        fs::write(
+            &path,
+            json!({
+                "type": "user",
+                "timestamp": "2026-04-18T20:43:51.069Z",
+                "uuid": "u1",
+                "sessionId": "repo-session",
+                "cwd": "/elsewhere/project",
+                "message": {"role": "user", "content": "hello"}
+            })
+            .to_string(),
+        )
+        .expect("write discovery fixture");
+
+        let mut config = (*team_config()).clone();
+        config.routes.clear();
+        let config = Arc::new(config);
+        let resolver: SharedRouteResolver =
+            Arc::new(Mutex::new(resolver_with_lookup(config.clone(), |dir| {
+                assert_eq!(dir, "/elsewhere/project");
+                Some("team-ch".to_string())
+            })));
+        let context = TeeRouterContext {
+            config,
+            sources: Arc::new(vec![IngestSource {
+                name: "claude".to_string(),
+                harness: "claude-code".to_string(),
+                enabled: true,
+                glob: path.to_string_lossy().to_string(),
+                watch_root: std::env::temp_dir().to_string_lossy().to_string(),
+                format: "jsonl".to_string(),
+            }]),
+            resolver,
+            registry: Arc::new(Mutex::new(BTreeMap::new())),
+            redaction: RedactionContext::new(test_redactor(), test_redaction_audit()),
+        };
+
+        let targets = discover_startup_backend_targets(&context).await;
+
+        assert_eq!(
+            targets,
+            BTreeSet::from(["team-ch".to_string()]),
+            "startup discovery starts repo-routed backends so replay can backfill retained files"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
     #[test]
     fn unknown_repo_backend_warns_once_and_resolves_to_default_only() {
         let mut resolver =
@@ -1019,23 +1192,43 @@ mod tests {
     }
 
     #[test]
+    fn disabled_missing_identity_author_is_terminal() {
+        let cell = BackendSinkCell::new("team-ch");
+        cell.set_status(BackendSinkStatus::DisabledMissingIdentityAuthor);
+
+        assert!(!cell.mark_overflow());
+        assert!(!cell.mark_flush_failure());
+        assert!(!cell.mark_recovered());
+        assert_eq!(
+            cell.status(),
+            BackendSinkStatus::DisabledMissingIdentityAuthor
+        );
+        assert_eq!(cell.status().as_str(), "disabled_missing_identity_author");
+    }
+
+    #[test]
     fn backend_sinks_json_is_deterministic_and_absent_when_empty() {
         let registry: StatusRegistry = Arc::new(Mutex::new(BTreeMap::new()));
         assert_eq!(backend_sinks_json(&registry), None);
 
         let lagging = Arc::new(BackendSinkCell::new("b-lagging"));
         lagging.set_status(BackendSinkStatus::Lagging);
+        let disabled = Arc::new(BackendSinkCell::new("c-disabled"));
+        disabled.set_status(BackendSinkStatus::DisabledMissingIdentityAuthor);
         let ok = Arc::new(BackendSinkCell::new("a-ok"));
         ok.set_status(BackendSinkStatus::Ok);
         {
             let mut cells = registry.lock().expect("registry mutex poisoned");
             cells.insert("b-lagging".to_string(), lagging);
+            cells.insert("c-disabled".to_string(), disabled);
             cells.insert("a-ok".to_string(), ok);
         }
 
         assert_eq!(
             backend_sinks_json(&registry).as_deref(),
-            Some(r#"{"a-ok":"ok","b-lagging":"lagging"}"#)
+            Some(
+                r#"{"a-ok":"ok","b-lagging":"lagging","c-disabled":"disabled_missing_identity_author"}"#
+            )
         );
     }
 
@@ -1045,7 +1238,7 @@ mod tests {
         let cell = Arc::new(BackendSinkCell::new("team-ch"));
         cell.set_status(BackendSinkStatus::Ok);
         cell.mark_live();
-        let handle = BackendHandle {
+        let handle = BackendHandle::Active {
             tx,
             cell: cell.clone(),
         };
@@ -1068,7 +1261,7 @@ mod tests {
     async fn forward_skips_backends_that_are_not_live() {
         let (tx, mut backend_rx) = mpsc::channel::<SinkMessage>(4);
         let cell = Arc::new(BackendSinkCell::new("team-ch"));
-        let handle = BackendHandle {
+        let handle = BackendHandle::Active {
             tx,
             cell: cell.clone(),
         };
@@ -1082,6 +1275,49 @@ mod tests {
             BackendSinkStatus::Connecting,
             "dropping while connecting is not an overflow"
         );
+    }
+
+    #[test]
+    fn forward_disabled_backend_is_noop_without_drop_accounting() {
+        let cell = Arc::new(BackendSinkCell::new("team-ch"));
+        cell.set_status(BackendSinkStatus::DisabledMissingIdentityAuthor);
+        let handle = BackendHandle::Disabled { cell: cell.clone() };
+
+        forward_to_backend(&handle, &mixed_session_batch());
+
+        assert_eq!(cell.dropped_batches(), 0);
+        assert_eq!(
+            cell.status(),
+            BackendSinkStatus::DisabledMissingIdentityAuthor
+        );
+    }
+
+    #[test]
+    fn ensure_backend_caches_disabled_missing_author_handle() {
+        let config = team_config();
+        assert!(config.identity.author.is_empty());
+        let resolver: SharedRouteResolver =
+            Arc::new(Mutex::new(RouteResolver::new(config.clone())));
+        let context = test_router_context(config, resolver);
+        let mut handles = HashMap::<String, BackendHandle>::new();
+
+        let first = ensure_backend("team-ch", &context, &mut handles)
+            .expect("configured backend should produce a disabled handle");
+        assert!(matches!(first, BackendHandle::Disabled { .. }));
+        assert_eq!(handles.len(), 1);
+
+        let second = ensure_backend("team-ch", &context, &mut handles)
+            .expect("cached disabled handle should be returned");
+        assert!(matches!(second, BackendHandle::Disabled { .. }));
+        assert_eq!(handles.len(), 1);
+
+        let registry = context.registry.lock().expect("registry mutex poisoned");
+        let cell = registry.get("team-ch").expect("registered disabled cell");
+        assert_eq!(
+            cell.status(),
+            BackendSinkStatus::DisabledMissingIdentityAuthor
+        );
+        assert!(!cell.is_live());
     }
 
     async fn wait_for_status(

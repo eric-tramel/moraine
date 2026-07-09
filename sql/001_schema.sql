@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS moraine.raw_events (
   record_ts String,
   top_type LowCardinality(String),
   session_id String,
+  author String DEFAULT '',
   raw_json String,
   raw_json_hash UInt64,
   event_uid String
@@ -25,6 +26,7 @@ CREATE TABLE IF NOT EXISTS moraine.events (
   ingested_at DateTime64(3) DEFAULT now64(3),
   event_uid String,
   session_id String,
+  author String DEFAULT '',
   session_date Date,
   source_name LowCardinality(String),
   harness LowCardinality(String),

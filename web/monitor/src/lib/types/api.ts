@@ -16,6 +16,7 @@ export interface HealthResponse {
   version?: string | null;
   ping_ms?: number | null;
   connections?: ConnectionStats;
+  ingestor?: IngestorStatus;
   error?: string;
 }
 

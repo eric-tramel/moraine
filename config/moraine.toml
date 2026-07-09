@@ -28,6 +28,11 @@ wait_for_async_insert = true
 # backend = "team-ch"
 # mode = "mirror"               # default; the only supported mode
 
+[identity]
+# Stable person identity stamped on raw_events/events. Leave empty for
+# local-only installs. Required for mirroring to non-default backends.
+author = ""
+
 [redaction]
 # Secret redaction is default-on for all ingestion. This flag is honored only
 # from $HOME/.moraine/config.toml, and only for the local/default backend;

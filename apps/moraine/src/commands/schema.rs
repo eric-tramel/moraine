@@ -81,6 +81,7 @@ pub(super) const EVENT_COLUMNS: &[EventColumn] = &[
         true,
         false,
     ),
+    col("author", "e.author", "e.author", "string", false, false),
     col(
         "event_ts",
         "CLI format of e.event_unix_ms",
