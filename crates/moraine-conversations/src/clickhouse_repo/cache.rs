@@ -186,12 +186,9 @@ impl ClickHouseConversationRepository {
         let now = Instant::now();
         {
             let cache = self.search_cache.read().await;
-            if let Some(entry) = cache.get(key) {
-                if now.duration_since(entry.fetched_at) <= SEARCH_RESULT_CACHE_TTL {
-                    return Some(entry.hits.clone());
-                }
-            } else {
-                return None;
+            let entry = cache.get(key)?;
+            if now.duration_since(entry.fetched_at) <= SEARCH_RESULT_CACHE_TTL {
+                return Some(entry.hits.clone());
             }
         }
 
