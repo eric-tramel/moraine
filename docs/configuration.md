@@ -40,6 +40,7 @@ future keys.
 | `[clickhouse]` | Default ClickHouse backend used by local ingest, monitor, MCP, and migrations. |
 | `[backends.<name>]` | Optional named ClickHouse backend for project mirroring and routed MCP. |
 | `[[routes]]` | Optional ordered working-directory routes to named backends. |
+| `[identity]` | Explicit person identity stamped on ingested raw/events rows. |
 | `[ingest]` | Ingest batching, backfill, watcher, checkpoint, and heartbeat settings. |
 | `[[ingest.sources]]` | Watched agent trace sources. |
 | `[mcp]` | MCP retrieval defaults and shared central server settings. |
@@ -67,6 +68,28 @@ enabled = true
 glob = "~/.codex/sessions/**/*.jsonl"
 watch_root = "~/.codex/sessions"
 ```
+
+## Identity
+
+`[identity]` configures the stable person identity stamped on newly ingested
+`raw_events` and `events` rows:
+
+```toml
+[identity]
+author = "alice@example.com"
+```
+
+The value is free-form by design; email-shaped strings are conventional but
+not enforced. Moraine never infers this identity from git, `$USER`,
+`$HOSTNAME`, the machine host, or the working directory. Missing and
+whitespace-only values normalize to empty.
+
+Local/default-only installs may leave `author` empty. If any route targets a
+non-default backend and `author` is empty, that mirror is disabled for the
+process and reported as `disabled_missing_identity_author`; default ingest
+continues. After setting `author`, restart the ingest service. Retained source
+files are then replayed to the mirror using the configured author; files
+deleted before the mirror catches up cannot be recovered by this replay path.
 
 ## ClickHouse
 
@@ -195,11 +218,14 @@ window effectively empty (the working directory rides the records
 themselves, or is recovered from the session header), so in practice it
 only affects traces that carry no working directory at all.
 
-Per-backend mirror status — `connecting`, `ok`, `lagging`, `unreachable`, or
-`disabled_skew` — is written to ingest heartbeats as a `backend_sinks` map
-and surfaced through the monitor's `/api/health`. This uses a column added by
-migration 017; until `moraine db migrate` runs (and ingest restarts), ingest
-warns and omits the field rather than failing heartbeats.
+Per-backend mirror status — `connecting`, `ok`, `lagging`, `unreachable`,
+`disabled_skew`, or `disabled_missing_identity_author` — is written to ingest
+heartbeats as a `backend_sinks` map and surfaced through the monitor's
+`/api/health`. This uses a column added by migration 017; until
+`moraine db migrate` runs (and ingest restarts), ingest warns and omits the
+field rather than failing heartbeats. `disabled_missing_identity_author` means
+`[identity].author` is empty; set it and restart ingest before mirroring to
+team backends.
 
 ### Schema version handshake
 

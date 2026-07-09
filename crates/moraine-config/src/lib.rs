@@ -103,6 +103,13 @@ pub struct RedactionConfig {
     pub dangerously_skip_secret_redaction_ignored: bool,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdentityConfig {
+    #[serde(default)]
+    pub author: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IngestConfig {
@@ -246,6 +253,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
     #[serde(default)]
+    pub identity: IdentityConfig,
+    #[serde(default)]
     pub redaction: RedactionConfig,
     #[serde(default)]
     pub ingest: IngestConfig,
@@ -317,6 +326,7 @@ impl Default for AppConfig {
             clickhouse,
             backends,
             routes: Vec::new(),
+            identity: IdentityConfig::default(),
             redaction: RedactionConfig::default(),
             ingest: IngestConfig::default(),
             mcp: McpConfig::default(),
@@ -1088,8 +1098,13 @@ fn normalize_config(mut cfg: AppConfig) -> Result<AppConfig> {
 
     normalize_backends_and_routes(&mut cfg)?;
     normalize_redaction(&mut cfg)?;
+    normalize_identity(&mut cfg);
 
     Ok(cfg)
+}
+
+fn normalize_identity(cfg: &mut AppConfig) {
+    cfg.identity.author = cfg.identity.author.trim().to_string();
 }
 
 fn normalize_redaction(cfg: &mut AppConfig) -> Result<()> {
@@ -1511,8 +1526,48 @@ ruleset = "custom"
         let cfg = load_config(&path).expect("minimal config should load with defaults");
         std::fs::remove_file(&path).ok();
         assert_eq!(cfg.clickhouse.url, "http://127.0.0.1:8123");
+        assert_eq!(cfg.identity.author, "");
         assert!(!cfg.mcp.prewarm_on_initialize);
         assert!(!cfg.ingest.sources.is_empty());
+    }
+
+    #[test]
+    fn identity_author_defaults_to_empty() {
+        let path = write_temp_config("", "identity-defaults");
+        let cfg = load_config(&path).expect("empty config should load with defaults");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(cfg.identity.author, "");
+    }
+
+    #[test]
+    fn identity_author_parses_and_trims() {
+        let path = write_temp_config(
+            r#"
+[identity]
+author = "  alice@example.com  "
+"#,
+            "identity-author",
+        );
+        let cfg = load_config(&path).expect("identity config should load");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(cfg.identity.author, "alice@example.com");
+    }
+
+    #[test]
+    fn identity_author_whitespace_only_normalizes_to_empty() {
+        let path = write_temp_config(
+            r#"
+[identity]
+author = "    "
+"#,
+            "identity-author-empty",
+        );
+        let cfg = load_config(&path).expect("whitespace identity should load");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(cfg.identity.author, "");
     }
 
     #[test]
