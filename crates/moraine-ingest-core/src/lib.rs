@@ -23,7 +23,7 @@ use crate::tee::{
 use crate::watch::{enumerate_tracked_files, spawn_watcher_threads};
 use anyhow::{Context, Result};
 use moraine_clickhouse::ClickHouseClient;
-use moraine_config::{AppConfig, IngestSource, DEFAULT_BACKEND_NAME};
+use moraine_config::{AppConfig, ClickHouseConfig, IngestSource, DEFAULT_BACKEND_NAME};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -81,6 +81,15 @@ pub(crate) enum SinkMessage {
     Batch(RowBatch),
 }
 
+fn build_ingest_clickhouse_client(config: ClickHouseConfig) -> Result<ClickHouseClient> {
+    let user_agent = format!(
+        "moraine-ingest/{} (pid={})",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id()
+    );
+    ClickHouseClient::new_with_user_agent(config, user_agent)
+}
+
 pub async fn run_ingestor(config: AppConfig) -> Result<()> {
     let enabled_sources: Vec<IngestSource> = config
         .ingest
@@ -96,7 +105,7 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         ));
     }
 
-    let clickhouse = ClickHouseClient::new(config.clickhouse.clone())?;
+    let clickhouse = build_ingest_clickhouse_client(config.clickhouse.clone())?;
     clickhouse.ping().await.context("clickhouse ping failed")?;
 
     let checkpoint_cursor_columns = checkpoint_cursor_columns_available(&clickhouse)
@@ -496,7 +505,59 @@ async fn load_checkpoints(
 
 #[cfg(test)]
 mod tests {
-    use super::checkpoints_query;
+    use super::{build_ingest_clickhouse_client, checkpoints_query};
+    use axum::{extract::State, http::HeaderMap, routing::post, Router};
+    use std::sync::{Arc, Mutex};
+    #[tokio::test]
+    async fn ingest_clickhouse_requests_carry_process_identity() {
+        async fn handler(
+            State(user_agents): State<Arc<Mutex<Vec<String>>>>,
+            headers: HeaderMap,
+        ) -> &'static str {
+            let user_agent = headers
+                .get("user-agent")
+                .expect("ingest request must carry a user-agent")
+                .to_str()
+                .expect("user-agent must be text")
+                .to_string();
+            user_agents
+                .lock()
+                .expect("user-agent capture mutex poisoned")
+                .push(user_agent);
+            "1"
+        }
+
+        let user_agents = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/", post(handler))
+            .with_state(user_agents.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind user-agent capture listener");
+        let address = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let clickhouse = build_ingest_clickhouse_client(moraine_config::ClickHouseConfig {
+            url: format!("http://{address}"),
+            ..moraine_config::ClickHouseConfig::default()
+        })
+        .expect("construct ingest ClickHouse client");
+        clickhouse.ping().await.expect("ingest ClickHouse ping");
+
+        assert_eq!(
+            user_agents
+                .lock()
+                .expect("user-agent capture mutex poisoned")
+                .as_slice(),
+            &[format!(
+                "moraine-ingest/{} (pid={})",
+                env!("CARGO_PKG_VERSION"),
+                std::process::id()
+            )]
+        );
+    }
 
     #[test]
     fn checkpoints_query_without_host_keeps_legacy_shape() {

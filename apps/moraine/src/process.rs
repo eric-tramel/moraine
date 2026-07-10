@@ -1,6 +1,8 @@
 use anyhow::{bail, Context, Result};
 use moraine_config::AppConfig;
 use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -8,14 +10,17 @@ use std::time::Duration;
 use crate::paths::RuntimePaths;
 use crate::service::Service;
 
+pub(crate) const LEGACY_MONITOR_PID_FILE: &str = "monitor.pid";
+pub(crate) const LEGACY_MCP_PID_FILE: &str = "mcp.pid";
+
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum StartState {
     Started,
     AlreadyRunning,
-    /// A service endpoint is already healthy but not launcher-tracked, such as
-    /// an external ClickHouse endpoint or a live central MCP server whose PID
-    /// file was lost. Nothing was spawned.
+    /// A complete service endpoint is healthy but not launcher-tracked, such as
+    /// an external ClickHouse endpoint or a backend whose PID file was lost.
+    /// Nothing was spawned.
     AlreadyServing,
 }
 
@@ -61,7 +66,7 @@ pub(crate) fn cleanup_legacy_clickhouse_pipe_log(paths: &RuntimePaths) {
 pub(crate) fn log_path(paths: &RuntimePaths, service: Service) -> PathBuf {
     match service {
         Service::ClickHouse => clickhouse_internal_log_path(paths),
-        Service::Ingest | Service::Monitor | Service::Mcp => {
+        Service::Ingest | Service::Backend | Service::Mcp => {
             paths.logs_dir.join(service.log_file())
         }
     }
@@ -113,6 +118,13 @@ pub(crate) fn service_running(paths: &RuntimePaths, service: Service) -> Option<
     }
 }
 
+pub(crate) fn legacy_service_running(paths: &RuntimePaths, pid_file: &str) -> Option<u32> {
+    let path = paths.pids_dir.join(pid_file);
+    ensure_pid_fresh(&path);
+    let pid = read_pid(&path)?;
+    is_pid_running(pid).then_some(pid)
+}
+
 /// True when something is currently accepting connections on the central MCP
 /// socket. Used alongside (not instead of) the PID file: the daemon can
 /// outlive a deleted or stale PID file, and acting on the file alone either
@@ -130,9 +142,63 @@ pub(crate) fn central_socket_live(socket_path: &str) -> bool {
     }
 }
 
-pub(crate) fn stop_service(paths: &RuntimePaths, service: Service) -> Result<bool> {
-    let path = pid_path(paths, service);
-    let Some(pid) = read_pid(&path) else {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BackendEndpointStatus {
+    pub(crate) socket_listening: bool,
+    pub(crate) http_listening: bool,
+}
+
+fn backend_http_connect_host(host: &str) -> &str {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    match host {
+        "0.0.0.0" => "127.0.0.1",
+        "::" => "::1",
+        _ => host,
+    }
+}
+
+pub(crate) fn backend_http_live(host: &str, port: u16) -> bool {
+    let connect_host = backend_http_connect_host(host);
+    let authority = if connect_host.contains(':') {
+        format!("[{connect_host}]:{port}")
+    } else {
+        format!("{connect_host}:{port}")
+    };
+    let Ok(addresses) = (connect_host, port).to_socket_addrs() else {
+        return false;
+    };
+
+    for address in addresses {
+        let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(200))
+        else {
+            continue;
+        };
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+        let request = format!("GET / HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+        if stream.write_all(request.as_bytes()).is_err() {
+            continue;
+        }
+        let mut prefix = [0_u8; 5];
+        if stream.read_exact(&mut prefix).is_ok() && prefix == *b"HTTP/" {
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn backend_endpoint_status(cfg: &AppConfig) -> BackendEndpointStatus {
+    BackendEndpointStatus {
+        socket_listening: central_socket_live(&cfg.mcp.central_socket_path),
+        http_listening: backend_http_live(&cfg.monitor.host, cfg.monitor.port),
+    }
+}
+
+fn stop_pid_path(path: &Path, wait_attempts: usize) -> Result<bool> {
+    let Some(pid) = read_pid(path) else {
         return Ok(false);
     };
 
@@ -147,14 +213,9 @@ pub(crate) fn stop_service(paths: &RuntimePaths, service: Service) -> Result<boo
         .stderr(Stdio::null())
         .status();
 
-    let wait_attempts = if service == Service::ClickHouse {
-        50
-    } else {
-        20
-    };
     for _ in 0..wait_attempts {
         if !is_pid_running(pid) {
-            let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(path);
             return Ok(true);
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -168,6 +229,19 @@ pub(crate) fn stop_service(paths: &RuntimePaths, service: Service) -> Result<boo
         .status();
     let _ = fs::remove_file(path);
     Ok(true)
+}
+
+pub(crate) fn stop_service(paths: &RuntimePaths, service: Service) -> Result<bool> {
+    let wait_attempts = if service == Service::ClickHouse {
+        50
+    } else {
+        20
+    };
+    stop_pid_path(&pid_path(paths, service), wait_attempts)
+}
+
+pub(crate) fn stop_legacy_service(paths: &RuntimePaths, pid_file: &str) -> Result<bool> {
+    stop_pid_path(&paths.pids_dir.join(pid_file), 20)
 }
 
 fn env_flag_enabled(key: &str) -> bool {
@@ -307,7 +381,12 @@ pub(crate) fn preflight_required_service_binaries(
 }
 
 fn contains_flag(args: &[String], flag: &str) -> bool {
-    args.iter().any(|arg| arg == flag)
+    args.iter().any(|arg| {
+        arg == flag
+            || arg
+                .strip_prefix(flag)
+                .is_some_and(|rest| rest.starts_with('='))
+    })
 }
 
 fn monitor_dist_candidate(root: &Path) -> PathBuf {
@@ -378,7 +457,15 @@ pub(crate) fn service_args_with_defaults(
         args.push(cfg_path.to_string_lossy().to_string());
     }
 
-    if service == Service::Monitor {
+    if service == Service::Backend {
+        if !contains_flag(passthrough, "--serve") {
+            args.push("--serve".to_string());
+            args.push("socket".to_string());
+        }
+        if !contains_flag(passthrough, "--socket") {
+            args.push("--socket".to_string());
+            args.push(cfg.mcp.central_socket_path.clone());
+        }
         if !contains_flag(passthrough, "--host") {
             args.push("--host".to_string());
             args.push(cfg.monitor.host.clone());
@@ -419,18 +506,39 @@ pub(crate) fn start_background_service(
         });
     }
 
-    // The central MCP server can outlive its PID file (e.g. the file was
-    // deleted while the daemon survived). Probe the socket before spawning:
-    // a second daemon would just no-op-exit, and the write_pid below would
-    // then record that dead PID, breaking `status` and `down` for the live
-    // server.
-    if service == Service::Mcp && central_socket_live(&cfg.mcp.central_socket_path) {
-        return Ok(StartOutcome {
-            service,
-            state: StartState::AlreadyServing,
-            pid: None,
-            log_path: Some(log_path(paths, service).display().to_string()),
-        });
+    if service == Service::Backend {
+        let tracked_legacy = [
+            ("monitor", LEGACY_MONITOR_PID_FILE),
+            ("mcp", LEGACY_MCP_PID_FILE),
+        ]
+        .into_iter()
+        .filter_map(|(name, pid_file)| {
+            legacy_service_running(paths, pid_file).map(|pid| format!("{name} (pid {pid})"))
+        })
+        .collect::<Vec<_>>();
+        if !tracked_legacy.is_empty() {
+            bail!(
+                "cannot start backend while legacy managed service(s) are still running: {}; run `moraine down` first",
+                tracked_legacy.join(", ")
+            );
+        }
+
+        let endpoints = backend_endpoint_status(cfg);
+        if endpoints.socket_listening && endpoints.http_listening {
+            return Ok(StartOutcome {
+                service,
+                state: StartState::AlreadyServing,
+                pid: None,
+                log_path: Some(log_path(paths, service).display().to_string()),
+            });
+        }
+        if endpoints.socket_listening || endpoints.http_listening {
+            bail!(
+                "cannot start backend while only part of its endpoint pair is already serving (MCP socket: {}, monitor HTTP: {}); stop the conflicting process and re-run `moraine up`",
+                endpoints.socket_listening,
+                endpoints.http_listening
+            );
+        }
     }
 
     let binary = require_service_binary(service, paths)?;
@@ -449,8 +557,7 @@ pub(crate) fn start_background_service(
     let child = Command::new(&binary)
         .args(args)
         // Background services never read stdin; closing it avoids inheriting the
-        // launcher's terminal/pipe fd (and a SIGHUP/blocking-read footgun for the
-        // central MCP server, which would otherwise hold an unused stdin handle).
+        // launcher's terminal or pipe descriptors.
         .stdin(Stdio::null())
         .stdout(Stdio::from(logfile))
         .stderr(Stdio::from(logfile_err))
@@ -472,7 +579,7 @@ mod tests {
     use moraine_config::AppConfig;
     use std::ffi::OsString;
     use std::sync::{Mutex, MutexGuard};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     static ENV_VAR_LOCK: Mutex<()> = Mutex::new(());
 
@@ -618,7 +725,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_service_binary_reports_missing_without_path_fallback() {
+    fn resolve_backend_binary_reports_moraine_mcp_without_path_fallback() {
         let _env_lock = lock_env_vars();
         let _service_bin_dir_guard = EnvVarGuard::capture("MORAINE_SERVICE_BIN_DIR");
         let _source_tree_mode_guard = EnvVarGuard::capture("MORAINE_SOURCE_TREE_MODE");
@@ -630,7 +737,7 @@ mod tests {
 
         std::env::remove_var("MORAINE_SERVICE_BIN_DIR");
         std::env::remove_var("MORAINE_SOURCE_TREE_MODE");
-        let resolved = resolve_service_binary(Service::Mcp, &paths);
+        let resolved = resolve_service_binary(Service::Backend, &paths);
         assert_eq!(resolved.binary_name, "moraine-mcp");
         assert!(resolved.resolved_path.is_none());
         assert!(resolved
@@ -667,13 +774,14 @@ mod tests {
     }
 
     #[test]
-    fn service_args_with_defaults_preserves_config_and_monitor_defaults() {
+    fn service_args_with_defaults_injects_complete_backend_daemon_args() {
         let root = temp_dir("service-args");
         let config_path = root.join("moraine.toml");
         let static_dir = root.join("static");
         fs::create_dir_all(&static_dir).expect("static dir");
 
         let mut cfg = AppConfig::default();
+        cfg.mcp.central_socket_path = "/tmp/moraine-test.sock".to_string();
         cfg.monitor.host = "127.0.0.1".to_string();
         cfg.monitor.port = 18080;
         cfg.runtime.service_bin_dir = root.join("bin").to_string_lossy().to_string();
@@ -683,12 +791,16 @@ mod tests {
         let _monitor_dist_guard = EnvVarGuard::capture("MORAINE_MONITOR_DIST");
         std::env::set_var("MORAINE_MONITOR_DIST", &static_dir);
 
-        let args = service_args_with_defaults(Service::Monitor, &config_path, &cfg, &paths, &[]);
+        let args = service_args_with_defaults(Service::Backend, &config_path, &cfg, &paths, &[]);
         assert_eq!(
             args,
             vec![
                 "--config".to_string(),
                 config_path.to_string_lossy().to_string(),
+                "--serve".to_string(),
+                "socket".to_string(),
+                "--socket".to_string(),
+                "/tmp/moraine-test.sock".to_string(),
                 "--host".to_string(),
                 "127.0.0.1".to_string(),
                 "--port".to_string(),
@@ -739,10 +851,47 @@ mod tests {
 
         let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind socket");
         assert!(central_socket_live(&sock_str));
+        let (accepted, _) = listener.accept().expect("accept liveness probe");
+        drop(accepted);
 
         drop(listener);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while central_socket_live(&sock_str) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(!central_socket_live(&sock_str));
 
         let _ = fs::remove_file(&sock);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_only_backend_endpoint_is_partial_not_already_serving() {
+        let root = PathBuf::from(format!("/tmp/moraine-bso-{}", std::process::id()));
+        let socket = root.join("b.sock");
+        fs::create_dir_all(&root).expect("create short socket directory");
+        let _listener =
+            std::os::unix::net::UnixListener::bind(&socket).expect("bind backend socket");
+
+        let mut cfg = AppConfig::default();
+        cfg.mcp.central_socket_path = socket.display().to_string();
+        cfg.monitor.host = "127.0.0.1".to_string();
+        cfg.monitor.port = 0;
+        cfg.runtime.pids_dir = root.join("run").display().to_string();
+        cfg.runtime.logs_dir = root.join("logs").display().to_string();
+        cfg.runtime.service_bin_dir = root.join("bin").display().to_string();
+        let paths = crate::paths::runtime_paths(&cfg);
+
+        let err = start_background_service(
+            Service::Backend,
+            &root.join("config.toml"),
+            &cfg,
+            &paths,
+            &[],
+        )
+        .expect_err("partial endpoint pair must not be accepted as a complete backend");
+        assert!(err.to_string().contains("only part of its endpoint pair"));
+
+        let _ = fs::remove_dir_all(root);
     }
 }

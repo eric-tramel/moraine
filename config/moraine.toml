@@ -149,16 +149,19 @@ default_exclude_codex_mcp = true
 prewarm_on_initialize = false
 async_log_writes = true
 protocol_version = "2024-11-05"
-# Shared central MCP server (default ON). One `moraine up`-managed server owns
-# the ClickHouse client, caches, and runtime; every `moraine run mcp` becomes a
-# thin stdio<->socket proxy to it, instead of booting a full server per agent
-# session. If the socket is absent/unreachable, `moraine run mcp` transparently
-# falls back to an embedded server, so unconfigured setups keep working.
+# MCP clients first try the unified backend's Unix socket, then transparently
+# fall back to an embedded server when the socket is absent or unreachable.
+# This proxy preference is independent of whether `moraine up` launches the
+# backend.
 use_central_server = true
-start_central_on_up = true
 # Bare filename resolves under the runtime pids dir -> ~/.moraine/run/mcp.sock.
 central_socket_path = "mcp.sock"
 central_connect_timeout_ms = 250
+
+[backend]
+# Launch the unified MCP socket + monitor HTTP backend from `moraine up`.
+# Keep this opt-in for the first backend-daemon release.
+start_on_up = false
 
 [bm25]
 k1 = 1.2
@@ -181,4 +184,3 @@ clickhouse_start_timeout_seconds = 30.0
 healthcheck_interval_ms = 500
 clickhouse_auto_install = true
 clickhouse_version = "v25.12.5.44-stable"
-start_monitor_on_up = true

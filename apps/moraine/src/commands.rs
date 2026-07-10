@@ -238,10 +238,11 @@ fn parse_config_flag(args: &[String]) -> Result<(Option<PathBuf>, Vec<String>)> 
 
 fn cmd_config_get(cfg: &AppConfig, key: &str) -> Result<String> {
     match key {
+        "backend.start_on_up" => Ok(cfg.backend.start_on_up.to_string()),
         "clickhouse.url" => Ok(cfg.clickhouse.url.clone()),
         "clickhouse.database" => Ok(cfg.clickhouse.database.clone()),
         _ => bail!(
-            "unsupported config key '{}'; supported keys: clickhouse.url, clickhouse.database",
+            "unsupported config key '{}'; supported keys: backend.start_on_up, clickhouse.url, clickhouse.database",
             key
         ),
     }
@@ -300,6 +301,11 @@ mod tests {
         assert_eq!(
             cmd_config_get(&cfg, "clickhouse.database").expect("database"),
             "analytics"
+        );
+        cfg.backend.start_on_up = true;
+        assert_eq!(
+            cmd_config_get(&cfg, "backend.start_on_up").expect("backend switch"),
+            "true"
         );
     }
 

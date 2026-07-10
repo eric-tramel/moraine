@@ -8,14 +8,16 @@ mod search_sessions_v1;
 
 use anyhow::{anyhow, Context, Result};
 use moraine_config::{AppConfig, DEFAULT_BACKEND_NAME};
-pub use moraine_conversations::SessionOriginScope;
 use moraine_conversations::{
-    build_clickhouse_repository, validate_remote_clickhouse_schema, ConversationRepository,
-    RepoConfig, RepoError,
+    build_clickhouse_repository, build_clickhouse_repository_with_user_agent,
+    validate_remote_clickhouse_schema, RepoConfig, RepoError,
 };
+pub use moraine_conversations::{ConversationRepository, SessionOriginScope};
 use serde::Deserialize;
 use serde_json::{json, Value};
-#[cfg(unix)]
+#[cfg(all(test, unix))]
+use std::future::pending;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -437,43 +439,77 @@ pub(crate) fn internal_id_error(error: contract::ContractError) -> contract::Con
     )
 }
 
+fn repository_config(cfg: &AppConfig, session_scope: Option<SessionOriginScope>) -> RepoConfig {
+    RepoConfig {
+        max_results: cfg.mcp.max_results,
+        preview_chars: cfg.mcp.preview_chars,
+        default_context_before: cfg.mcp.default_context_before,
+        default_context_after: cfg.mcp.default_context_after,
+        default_include_tool_events: cfg.mcp.default_include_tool_events,
+        default_exclude_codex_mcp: cfg.mcp.default_exclude_codex_mcp,
+        async_log_writes: cfg.mcp.async_log_writes,
+        bm25_k1: cfg.bm25.k1,
+        bm25_b: cfg.bm25.b,
+        bm25_default_min_score: cfg.bm25.default_min_score,
+        bm25_default_min_should_match: cfg.bm25.default_min_should_match,
+        bm25_max_query_terms: cfg.bm25.max_query_terms,
+        session_scope,
+    }
+}
+
+/// Build the production conversation repository with the default reader
+/// identity. Embedded stdio serving uses this factory for its per-process
+/// repository and optional project scope.
+pub fn build_repository(
+    cfg: &AppConfig,
+    session_scope: Option<SessionOriginScope>,
+) -> Result<Arc<dyn ConversationRepository>> {
+    build_clickhouse_repository(
+        cfg.clickhouse.clone(),
+        repository_config(cfg, session_scope),
+    )
+}
+
+/// Build the production repository with the owning process's HTTP identity.
+///
+/// The unified backend calls this factory exactly once, then injects clones of
+/// the returned `Arc` into both cores. That makes the ClickHouse connection
+/// pool and repository caches process-wide rather than per listener while
+/// allowing diagnostics to attribute that pool to the backend role.
+pub fn build_repository_with_user_agent(
+    cfg: &AppConfig,
+    session_scope: Option<SessionOriginScope>,
+    user_agent: impl AsRef<str>,
+) -> Result<Arc<dyn ConversationRepository>> {
+    build_clickhouse_repository_with_user_agent(
+        cfg.clickhouse.clone(),
+        repository_config(cfg, session_scope),
+        user_agent,
+    )
+}
+
 impl AppState {
+    fn with_repository(cfg: AppConfig, repo: Arc<dyn ConversationRepository>) -> Arc<AppState> {
+        Arc::new(AppState {
+            cfg,
+            repo,
+            prewarm_started: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
     /// Build the shared MCP application state: one ClickHouse client (and its
     /// reqwest connection pool) and one conversation repository (and its
-    /// caches). A single instance is shared across every connection a central
-    /// server handles, so the heavy state is allocated once per host rather
-    /// than once per agent session.
+    /// caches). Embedded stdio serving owns this state directly; the unified
+    /// backend uses [`build_repository`] and [`run_socket_with_repository`] so
+    /// the monitor and MCP listeners share the same repository.
     ///
     /// `session_scope` restricts every retrieval tool to sessions originating
     /// under the given roots (`--project-only`). Scoped states are only ever
     /// built for embedded per-session servers — the central server is shared
     /// across projects and must stay unscoped.
-    pub fn build(
-        cfg: AppConfig,
-        session_scope: Option<SessionOriginScope>,
-    ) -> Result<Arc<AppState>> {
-        let repo_cfg = RepoConfig {
-            max_results: cfg.mcp.max_results,
-            preview_chars: cfg.mcp.preview_chars,
-            default_context_before: cfg.mcp.default_context_before,
-            default_context_after: cfg.mcp.default_context_after,
-            default_include_tool_events: cfg.mcp.default_include_tool_events,
-            default_exclude_codex_mcp: cfg.mcp.default_exclude_codex_mcp,
-            async_log_writes: cfg.mcp.async_log_writes,
-            bm25_k1: cfg.bm25.k1,
-            bm25_b: cfg.bm25.b,
-            bm25_default_min_score: cfg.bm25.default_min_score,
-            bm25_default_min_should_match: cfg.bm25.default_min_should_match,
-            bm25_max_query_terms: cfg.bm25.max_query_terms,
-            session_scope,
-        };
-
-        let repo = build_clickhouse_repository(cfg.clickhouse.clone(), repo_cfg)?;
-        Ok(Arc::new(AppState {
-            cfg,
-            repo,
-            prewarm_started: Arc::new(AtomicBool::new(false)),
-        }))
+    fn build(cfg: AppConfig, session_scope: Option<SessionOriginScope>) -> Result<Arc<AppState>> {
+        let repo = build_repository(&cfg, session_scope)?;
+        Ok(Self::with_repository(cfg, repo))
     }
 }
 
@@ -535,21 +571,29 @@ pub async fn run_stdio(cfg: AppConfig, session_scope: Option<SessionOriginScope>
     .await
 }
 
-/// Run the shared central MCP server, listening on a Unix domain socket.
+/// Run the shared MCP server on a Unix domain socket using an injected
+/// repository.
 ///
-/// Builds the heavy `AppState` exactly once, then accepts connections and
-/// serves each on its own task sharing that single state. One bad client never
-/// takes down the server; transient `accept` errors back off and retry. A
-/// SIGTERM/SIGINT handler unlinks the socket so a clean `moraine down` leaves
-/// no stale socket behind.
+/// The caller owns process supervision and supplies `shutdown`; this core
+/// never installs signal handlers or terminates the process. Every accepted
+/// connection shares the exact repository `Arc` supplied by the composition
+/// root. When shutdown resolves, accepting stops, connection tasks are
+/// cancelled, and the public socket path is unlinked before this future
+/// returns.
 #[cfg(unix)]
-pub async fn run_socket(cfg: AppConfig, socket_path: PathBuf) -> Result<()> {
+pub async fn run_socket_with_repository<S>(
+    cfg: AppConfig,
+    repository: Arc<dyn ConversationRepository>,
+    socket_path: PathBuf,
+    shutdown: S,
+) -> Result<()>
+where
+    S: Future<Output = ()> + Send,
+{
     use tokio::net::{UnixListener, UnixStream};
+    use tokio::task::JoinSet;
 
-    // The central server is shared by sessions from every project on the
-    // host, so it always runs unscoped; `--project-only` sessions run
-    // embedded instead (see `apps/moraine-mcp`).
-    let state = AppState::build(cfg, None)?;
+    let state = AppState::with_repository(cfg, repository);
 
     if let Some(parent) = socket_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         use std::os::unix::fs::DirBuilderExt;
@@ -564,25 +608,61 @@ pub async fn run_socket(cfg: AppConfig, socket_path: PathBuf) -> Result<()> {
             .with_context(|| format!("failed to create socket directory {}", parent.display()))?;
     }
 
-    // Stale-socket dance: if a live server already owns the path, this start is
-    // a no-op (idempotent `moraine up`). A dead socket file needs no removal —
-    // the rename below atomically replaces it.
-    if socket_path.exists() && UnixStream::connect(&socket_path).await.is_ok() {
-        warn!(
-            "central MCP server already listening at {}; nothing to do",
-            socket_path.display()
-        );
-        return Ok(());
+    // A live listener is a startup failure for the unified backend: returning
+    // success here would leave its HTTP sibling running without the MCP half.
+    // Remove a dead socket only if the path still names the inode that failed
+    // the connection probe; a concurrently published replacement makes this
+    // start fail rather than being unlinked.
+    match std::fs::symlink_metadata(&socket_path) {
+        Ok(stale) => {
+            use std::os::unix::fs::MetadataExt;
+            let stale_identity = (stale.dev(), stale.ino());
+            if UnixStream::connect(&socket_path).await.is_ok() {
+                return Err(anyhow!(
+                    "failed to bind MCP socket {}: another backend is already listening",
+                    socket_path.display()
+                ));
+            }
+            match std::fs::symlink_metadata(&socket_path) {
+                Ok(current) if (current.dev(), current.ino()) == stale_identity => {
+                    std::fs::remove_file(&socket_path).with_context(|| {
+                        format!(
+                            "failed to remove stale MCP socket {}",
+                            socket_path.display()
+                        )
+                    })?;
+                }
+                Ok(_) => {
+                    return Err(anyhow!(
+                        "failed to bind MCP socket {}: socket path changed during startup",
+                        socket_path.display()
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to inspect MCP socket {}", socket_path.display())
+                    });
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect MCP socket {}", socket_path.display())
+            });
+        }
     }
 
     // Bind on a private temp path, restrict it, then atomically rename into
     // place. The socket is therefore never connectable at the public path with
-    // umask-derived (possibly world-connectable) permissions — there is no
-    // bind-then-chmod window. Unix sockets are bound to the inode, so the
-    // listener keeps accepting through the renamed path.
+    // umask-derived (possibly world-connectable) permissions.
     let tmp_path = socket_path.with_extension(format!("{}.tmp", std::process::id()));
     let _ = std::fs::remove_file(&tmp_path);
     let listener = UnixListener::bind(&tmp_path)
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp_path);
+        })
         .with_context(|| format!("failed to bind MCP socket {}", tmp_path.display()))?;
 
     {
@@ -599,39 +679,177 @@ pub async fn run_socket(cfg: AppConfig, socket_path: PathBuf) -> Result<()> {
             })?;
     }
 
-    std::fs::rename(&tmp_path, &socket_path)
+    // Capture the inode before publication. Cleanup only unlinks this inode,
+    // so a concurrently started backend that later wins the public path can
+    // never have its socket removed by this server's shutdown guard.
+    let socket_identity = {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(&tmp_path)
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&tmp_path);
+            })
+            .with_context(|| {
+                format!(
+                    "failed to inspect MCP socket before publishing {}",
+                    tmp_path.display()
+                )
+            })?;
+        (metadata.dev(), metadata.ino())
+    };
+
+    rename_socket_noreplace(&tmp_path, &socket_path)
         .inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp_path);
         })
         .with_context(|| {
             format!(
-                "failed to move MCP socket into place at {}",
+                "failed to publish MCP socket at {} without replacing another backend",
                 socket_path.display()
             )
         })?;
-
-    spawn_socket_cleanup_on_signal(socket_path.clone());
+    let _socket_cleanup = SocketCleanup::new(socket_path.clone(), socket_identity);
 
     debug!("central MCP server listening on {}", socket_path.display());
 
+    let mut connections = JoinSet::new();
+    tokio::pin!(shutdown);
     loop {
-        match listener.accept().await {
-            Ok((stream, _addr)) => {
-                let conn_state = state.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = serve_socket_connection(conn_state, stream).await {
-                        debug!("mcp connection ended: {}", err);
+        tokio::select! {
+            _ = &mut shutdown => break,
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((stream, _addr)) => {
+                        let conn_state = state.clone();
+                        connections.spawn(async move {
+                            serve_socket_connection(conn_state, stream).await
+                        });
                     }
-                });
+                    Err(err) => {
+                        // e.g. EMFILE under fd pressure: log and keep serving
+                        // rather than tearing down every existing session.
+                        warn!("mcp accept error: {}", err);
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                }
             }
-            Err(err) => {
-                // e.g. EMFILE under fd pressure: log and keep serving rather
-                // than tearing down every other session's connection.
-                warn!("mcp accept error: {}", err);
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Some(completed) = connections.join_next(), if !connections.is_empty() => {
+                match completed {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => debug!("mcp connection ended: {}", err),
+                    Err(err) => debug!("mcp connection task ended unexpectedly: {}", err),
+                }
             }
         }
     }
+
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+    Ok(())
+}
+
+#[cfg(unix)]
+struct SocketCleanup {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+impl SocketCleanup {
+    fn new(path: PathBuf, (device, inode): (u64, u64)) -> Self {
+        Self {
+            path,
+            device,
+            inode,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SocketCleanup {
+    fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+
+        let Ok(metadata) = std::fs::symlink_metadata(&self.path) else {
+            return;
+        };
+        if metadata.dev() == self.device && metadata.ino() == self.inode {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+fn socket_path_cstring(path: &std::path::Path) -> std::io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+
+    std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Unix socket path contains a NUL byte",
+        )
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_socket_noreplace(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    let from = socket_path_cstring(from)?;
+    let to = socket_path_cstring(to)?;
+    // SAFETY: both C strings are alive for the call, contain no interior NUL,
+    // and the directory descriptors are the platform's current-directory
+    // sentinel.
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn rename_socket_noreplace(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    let from = socket_path_cstring(from)?;
+    let to = socket_path_cstring(to)?;
+    // SAFETY: both C strings are alive for the call and contain no interior
+    // NUL. RENAME_EXCL makes publication fail if `to` already exists.
+    let result = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))
+))]
+fn rename_socket_noreplace(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    if to.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "Unix socket path already exists",
+        ));
+    }
+    std::fs::rename(from, to)
 }
 
 #[cfg(unix)]
@@ -641,36 +859,6 @@ async fn serve_socket_connection(
 ) -> Result<()> {
     let (read_half, write_half) = stream.into_split();
     serve_connection(state, BufReader::new(read_half), write_half).await
-}
-
-#[cfg(unix)]
-fn spawn_socket_cleanup_on_signal(socket_path: PathBuf) {
-    use tokio::signal::unix::{signal, SignalKind};
-
-    tokio::spawn(async move {
-        let mut term = match signal(SignalKind::terminate()) {
-            Ok(sig) => sig,
-            Err(err) => {
-                warn!("failed to install SIGTERM handler: {}", err);
-                return;
-            }
-        };
-        let mut int = match signal(SignalKind::interrupt()) {
-            Ok(sig) => sig,
-            Err(err) => {
-                warn!("failed to install SIGINT handler: {}", err);
-                return;
-            }
-        };
-
-        tokio::select! {
-            _ = term.recv() => {}
-            _ = int.recv() => {}
-        }
-
-        let _ = std::fs::remove_file(&socket_path);
-        std::process::exit(0);
-    });
 }
 
 /// Run a near-zero-cost stdio<->socket proxy for a single agent session.
@@ -910,11 +1098,18 @@ pub fn project_scope_from_launch_dir() -> Result<SessionOriginScope> {
     })
 }
 
-/// Non-Unix platforms do not support the Unix-socket central server. The
-/// `moraine run mcp` entry point still works (embedded only) via the
-/// `run_mcp_entry` fallback above.
+/// Non-Unix platforms expose the same injected API so composition roots can
+/// compile portably, but attempting to start the socket listener fails.
 #[cfg(not(unix))]
-pub async fn run_socket(_cfg: AppConfig, _socket_path: std::path::PathBuf) -> Result<()> {
+pub async fn run_socket_with_repository<S>(
+    _cfg: AppConfig,
+    _repository: Arc<dyn ConversationRepository>,
+    _socket_path: PathBuf,
+    _shutdown: S,
+) -> Result<()>
+where
+    S: Future<Output = ()> + Send,
+{
     anyhow::bail!("the central MCP socket server is only supported on Unix platforms")
 }
 
@@ -1115,6 +1310,15 @@ mod tests {
         assert!(!state.prewarm_started.load(Ordering::Acquire));
     }
 
+    #[test]
+    fn app_state_injection_preserves_repository_arc() {
+        let repository: Arc<dyn ConversationRepository> =
+            Arc::new(InMemoryConversationRepository::default());
+        let state = AppState::with_repository(AppConfig::default(), repository.clone());
+
+        assert!(Arc::ptr_eq(&state.repo, &repository));
+    }
+
     /// Config with one non-default backend (`team-ch`) and a single home
     /// route mapping `/work/team/**` to it.
     fn routed_config() -> AppConfig {
@@ -1303,17 +1507,84 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn socket_publication_never_replaces_an_existing_path() {
+        let from = unique_socket_path("publish-from");
+        let to = unique_socket_path("publish-to");
+        std::fs::write(&from, b"new").expect("write source");
+        std::fs::write(&to, b"existing").expect("write destination");
+
+        let error = rename_socket_noreplace(&from, &to)
+            .expect_err("atomic publication must not replace a destination");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(&from).expect("source retained"),
+            b"new".to_vec()
+        );
+        assert_eq!(
+            std::fs::read(&to).expect("destination retained"),
+            b"existing".to_vec()
+        );
+
+        let _ = std::fs::remove_file(from);
+        let _ = std::fs::remove_file(to);
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
-    async fn run_socket_serves_initialize_over_unix_socket() {
+    async fn live_socket_collision_is_an_error_and_preserves_owner() {
+        use tokio::net::{UnixListener, UnixStream};
+
+        let sock = unique_socket_path("live");
+        let _ = std::fs::remove_file(&sock);
+        let owner = UnixListener::bind(&sock).expect("bind existing owner");
+        let repository: Arc<dyn ConversationRepository> =
+            Arc::new(InMemoryConversationRepository::default());
+
+        let error =
+            run_socket_with_repository(AppConfig::default(), repository, sock.clone(), pending())
+                .await
+                .expect_err("second backend must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("another backend is already listening"),
+            "unexpected error: {error:#}"
+        );
+        assert!(sock.exists(), "losing backend must preserve owner's socket");
+        UnixStream::connect(&sock)
+            .await
+            .expect("owner remains connectable");
+
+        drop(owner);
+        let _ = std::fs::remove_file(sock);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn injected_socket_serves_and_cancellation_cleans_up() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         use tokio::net::UnixStream;
+        use tokio::sync::oneshot;
 
         let sock = unique_socket_path("serve");
         let _ = std::fs::remove_file(&sock);
+        let repository: Arc<dyn ConversationRepository> =
+            Arc::new(InMemoryConversationRepository::default());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
         let server_sock = sock.clone();
+        let server_repository = repository.clone();
         let server = tokio::spawn(async move {
-            let _ = run_socket(AppConfig::default(), server_sock).await;
+            run_socket_with_repository(
+                AppConfig::default(),
+                server_repository,
+                server_sock,
+                async {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
         });
 
         // Connect with a few retries while the listener comes up.
@@ -1352,8 +1623,15 @@ mod tests {
         assert_eq!(resp["id"], json!(7));
         assert_eq!(resp["result"]["serverInfo"]["name"], json!("moraine-mcp"));
 
-        server.abort();
-        let _ = std::fs::remove_file(&sock);
+        shutdown_tx.send(()).expect("request server shutdown");
+        server
+            .await
+            .expect("server task")
+            .expect("clean server shutdown");
+        assert!(
+            !sock.exists(),
+            "socket path must be removed before shutdown completes"
+        );
     }
 
     #[cfg(unix)]

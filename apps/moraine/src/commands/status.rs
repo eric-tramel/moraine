@@ -3,8 +3,11 @@ use crate::managed_clickhouse::{
     managed_clickhouse_version,
 };
 use crate::paths::RuntimePaths;
-use crate::process::service_running;
-use crate::render::{HeartbeatSnapshot, ServiceRuntimeStatus, StatusSnapshot};
+use crate::process::{
+    backend_endpoint_status, legacy_service_running, service_running, BackendEndpointStatus,
+    LEGACY_MCP_PID_FILE, LEGACY_MONITOR_PID_FILE,
+};
+use crate::render::{HeartbeatSnapshot, ServiceRuntimeState, ServiceRuntimeStatus, StatusSnapshot};
 use crate::service::Service;
 use anyhow::Result;
 use moraine_clickhouse::DoctorReport;
@@ -23,8 +26,41 @@ fn clickhouse_runtime_running(services: &[ServiceRuntimeStatus]) -> bool {
     service_runtime_running(services, Service::ClickHouse)
 }
 
-fn monitor_runtime_running(services: &[ServiceRuntimeStatus]) -> bool {
-    service_runtime_running(services, Service::Monitor)
+fn managed_runtime_status(service: Service, pid: Option<u32>) -> ServiceRuntimeStatus {
+    ServiceRuntimeStatus {
+        service,
+        pid,
+        state: if pid.is_some() {
+            ServiceRuntimeState::Running
+        } else {
+            ServiceRuntimeState::Stopped
+        },
+        socket_listening: None,
+        http_listening: None,
+    }
+}
+
+fn backend_runtime_status(
+    pid: Option<u32>,
+    endpoints: BackendEndpointStatus,
+) -> ServiceRuntimeStatus {
+    let state = match (
+        pid.is_some(),
+        endpoints.socket_listening,
+        endpoints.http_listening,
+    ) {
+        (true, true, true) => ServiceRuntimeState::Running,
+        (false, true, true) => ServiceRuntimeState::Unmanaged,
+        (false, false, false) => ServiceRuntimeState::Stopped,
+        _ => ServiceRuntimeState::Partial,
+    };
+    ServiceRuntimeStatus {
+        service: Service::Backend,
+        pid,
+        state,
+        socket_listening: Some(endpoints.socket_listening),
+        http_listening: Some(endpoints.http_listening),
+    }
 }
 
 fn format_http_url(host: &str, port: u16) -> String {
@@ -59,6 +95,26 @@ fn build_status_notes(
         ));
     }
 
+    if let Some(backend) = services
+        .iter()
+        .find(|service| service.service == Service::Backend)
+    {
+        match backend.state {
+            ServiceRuntimeState::Partial => notes.push(format!(
+                "backend is partially available (managed pid: {}, MCP socket: {}, monitor HTTP: {})",
+                backend
+                    .pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                backend.socket_listening.unwrap_or(false),
+                backend.http_listening.unwrap_or(false)
+            )),
+            ServiceRuntimeState::Unmanaged => notes.push(
+                "backend endpoints are serving, but no managed backend PID is tracked".to_string(),
+            ),
+            ServiceRuntimeState::Running | ServiceRuntimeState::Stopped => {}
+        }
+    }
     notes
 }
 
@@ -110,25 +166,33 @@ pub(super) async fn cmd_status(
     cfg: &AppConfig,
     repository: &dyn ConversationRepository,
 ) -> Result<StatusSnapshot> {
-    let services = [
-        Service::ClickHouse,
-        Service::Ingest,
-        Service::Monitor,
-        Service::Mcp,
-    ]
-    .iter()
-    .copied()
-    .map(|service| ServiceRuntimeStatus {
-        service,
-        pid: service_running(paths, service),
-    })
-    .collect::<Vec<_>>();
+    let backend_endpoints = backend_endpoint_status(cfg);
+    let services = vec![
+        managed_runtime_status(
+            Service::ClickHouse,
+            service_running(paths, Service::ClickHouse),
+        ),
+        managed_runtime_status(Service::Ingest, service_running(paths, Service::Ingest)),
+        backend_runtime_status(service_running(paths, Service::Backend), backend_endpoints),
+    ];
     let managed_server = managed_clickhouse_bin(paths, "clickhouse-server");
     let (source, source_path) = active_clickhouse_source(paths);
     let (report, heartbeat) = read_repository_status(repository).await?;
     let clickhouse_health_url = cfg.clickhouse.url.clone();
-    let status_notes = build_status_notes(&services, &report, &clickhouse_health_url);
-    let monitor_url = monitor_runtime_running(&services).then(|| monitor_runtime_url(cfg));
+    let mut status_notes = build_status_notes(&services, &report, &clickhouse_health_url);
+    for (name, pid_file) in [
+        ("monitor", LEGACY_MONITOR_PID_FILE),
+        ("MCP", LEGACY_MCP_PID_FILE),
+    ] {
+        if let Some(pid) = legacy_service_running(paths, pid_file) {
+            status_notes.push(format!(
+                "legacy managed {name} process (pid {pid}) is still tracked; run `moraine down` before starting the unified backend"
+            ));
+        }
+    }
+    let monitor_url = backend_endpoints
+        .http_listening
+        .then(|| monitor_runtime_url(cfg));
 
     Ok(StatusSnapshot {
         services,
@@ -167,6 +231,9 @@ mod tests {
         cfg.runtime.pids_dir = test_root.join("run").display().to_string();
         cfg.runtime.service_bin_dir = test_root.join("services").display().to_string();
         cfg.runtime.managed_clickhouse_dir = test_root.join("managed").display().to_string();
+        cfg.mcp.central_socket_path = test_root.join("mcp.sock").display().to_string();
+        cfg.monitor.host = "127.0.0.1".to_string();
+        cfg.monitor.port = 9;
         let paths = crate::paths::runtime_paths(&cfg);
         let repository = InMemoryConversationRepository::with_responses(
             RepoConfig::default(),
@@ -282,10 +349,7 @@ mod tests {
 
     #[test]
     fn build_status_notes_flags_healthy_external_clickhouse() {
-        let services = vec![ServiceRuntimeStatus {
-            service: Service::ClickHouse,
-            pid: None,
-        }];
+        let services = vec![managed_runtime_status(Service::ClickHouse, None)];
         let report = test_doctor_report(true);
         let notes = build_status_notes(&services, &report, "http://127.0.0.1:8123");
         assert_eq!(notes.len(), 1);
@@ -297,10 +361,7 @@ mod tests {
 
     #[test]
     fn build_status_notes_flags_unhealthy_managed_clickhouse() {
-        let services = vec![ServiceRuntimeStatus {
-            service: Service::ClickHouse,
-            pid: Some(4242),
-        }];
+        let services = vec![managed_runtime_status(Service::ClickHouse, Some(4242))];
         let report = test_doctor_report(false);
         let notes = build_status_notes(&services, &report, "http://127.0.0.1:8123");
         assert_eq!(notes.len(), 1);
@@ -326,23 +387,22 @@ mod tests {
     }
 
     #[test]
-    fn monitor_runtime_running_checks_monitor_pid() {
-        let services = vec![
-            ServiceRuntimeStatus {
-                service: Service::ClickHouse,
-                pid: Some(100),
-            },
-            ServiceRuntimeStatus {
-                service: Service::Monitor,
-                pid: Some(200),
-            },
-        ];
-        assert!(monitor_runtime_running(&services));
+    fn backend_runtime_state_uses_pid_and_both_endpoints() {
+        let status = |pid, socket_listening, http_listening| {
+            backend_runtime_status(
+                pid,
+                BackendEndpointStatus {
+                    socket_listening,
+                    http_listening,
+                },
+            )
+            .state
+        };
 
-        let stopped_monitor = vec![ServiceRuntimeStatus {
-            service: Service::Monitor,
-            pid: None,
-        }];
-        assert!(!monitor_runtime_running(&stopped_monitor));
+        assert_eq!(status(Some(200), true, true), ServiceRuntimeState::Running);
+        assert_eq!(status(None, true, true), ServiceRuntimeState::Unmanaged);
+        assert_eq!(status(None, false, false), ServiceRuntimeState::Stopped);
+        assert_eq!(status(Some(200), true, false), ServiceRuntimeState::Partial);
+        assert_eq!(status(None, false, true), ServiceRuntimeState::Partial);
     }
 }

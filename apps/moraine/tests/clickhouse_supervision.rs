@@ -47,8 +47,10 @@ database = "moraine"
 timeout_seconds = 1.0
 
 [mcp]
-start_central_on_up = false
 central_socket_path = "{}"
+
+[backend]
+start_on_up = false
 
 [runtime]
 root_dir = "{}"
@@ -59,8 +61,6 @@ managed_clickhouse_dir = "{}"
 clickhouse_start_timeout_seconds = 1.0
 healthcheck_interval_ms = 100
 clickhouse_auto_install = false
-start_monitor_on_up = false
-start_mcp_on_up = false
 "#,
             root.join("mcp.sock").display(),
             runtime.display(),
@@ -162,7 +162,7 @@ fn failed_initial_readiness_rolls_back_supervisor_child_and_pid() {
     );
     let run_dir = root.join("runtime/run");
     assert!(!run_dir.join("clickhouse.pid").exists());
-    for service in ["ingest.pid", "monitor.pid", "mcp.pid"] {
+    for service in ["ingest.pid", "backend.pid", "monitor.pid", "mcp.pid"] {
         assert!(
             !run_dir.join(service).exists(),
             "{service} should not start"

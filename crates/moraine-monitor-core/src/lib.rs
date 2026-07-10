@@ -16,6 +16,7 @@ use moraine_conversations::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::future::{pending, Future};
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
@@ -54,42 +55,56 @@ struct MonitorTableSummary {
     rows: u64,
 }
 
+/// Run the monitor with its own production repository.
+///
+/// This compatibility entry point remains for standalone callers. The unified
+/// backend uses [`run_server_with_repository`] so its monitor and MCP
+/// listeners share one repository, connection pool, and cache set.
 pub async fn run_server(
     cfg: AppConfig,
     host: String,
     port: u16,
     static_dir: PathBuf,
 ) -> Result<()> {
-    validate_static_dir(&static_dir)?;
-
-    let clickhouse_url = cfg.clickhouse.url.clone();
-    let clickhouse_database = cfg.clickhouse.database.clone();
     let repository = build_clickhouse_repository(cfg.clickhouse.clone(), repository_config(&cfg))?;
-    let state = Arc::new(AppState {
-        repository,
-        static_dir,
-        clickhouse_url,
-        clickhouse_database,
-    });
-    let app = monitor_router(Arc::clone(&state));
+    run_server_with_repository(cfg, repository, host, port, static_dir, pending()).await
+}
 
+/// Run the monitor HTTP server using a repository owned by the composition
+/// root. The supplied shutdown future stops the listener gracefully.
+pub async fn run_server_with_repository<S>(
+    cfg: AppConfig,
+    repository: Arc<dyn ConversationRepository>,
+    host: String,
+    port: u16,
+    static_dir: PathBuf,
+    shutdown: S,
+) -> Result<()>
+where
+    S: Future<Output = ()> + Send + 'static,
+{
+    let static_dir_display = static_dir.display().to_string();
+    let app = router_with_repository(&cfg, repository, static_dir)?;
     let bind = format!("{host}:{port}")
         .parse::<SocketAddr>()
         .map_err(|err| anyhow!("invalid bind address: {err}"))?;
 
-    println!("moraine-monitor running at http://{bind}");
-    println!("serving UI from {}", state.static_dir.display());
-
     let listener = tokio::net::TcpListener::bind(bind).await.map_err(|error| {
         if error.kind() == ErrorKind::AddrInUse {
             anyhow!(
-                "failed to bind {bind}: address already in use. another monitor may already be running (including legacy cortex-monitor). stop it or rerun with `moraine run monitor -- --port <free-port>`"
+                "failed to bind {bind}: address already in use. another backend or legacy monitor may already be running; stop it or choose a free --port"
             )
         } else {
             anyhow!("failed to bind {bind}: {error}")
         }
     })?;
-    axum::serve(listener, app).await?;
+
+    println!("moraine-monitor running at http://{bind}");
+    println!("serving UI from {static_dir_display}");
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
     Ok(())
 }
 
@@ -111,6 +126,25 @@ fn repository_config(cfg: &AppConfig) -> RepoConfig {
     }
 }
 
+/// Build the complete monitor router around an injected repository.
+///
+/// All API routes and static-file behavior live here so composition roots can
+/// host the monitor without constructing a second storage client.
+pub fn router_with_repository(
+    cfg: &AppConfig,
+    repository: Arc<dyn ConversationRepository>,
+    static_dir: PathBuf,
+) -> Result<Router> {
+    validate_static_dir(&static_dir)?;
+    let state = Arc::new(AppState {
+        repository,
+        static_dir,
+        clickhouse_url: cfg.clickhouse.url.clone(),
+        clickhouse_database: cfg.clickhouse.database.clone(),
+    });
+    Ok(monitor_router(state))
+}
+
 fn monitor_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/health", get(api_health))
@@ -122,6 +156,64 @@ fn monitor_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions", get(api_sessions))
         .fallback(get(static_fallback))
         .with_state(state)
+}
+
+const MONITOR_DIST_ENV_KEYS: &[&str] = &["MORAINE_MONITOR_DIST", "MORAINE_MONITOR_STATIC_DIR"];
+
+fn monitor_dist_candidate(root: &FsPath) -> PathBuf {
+    root.join("web").join("monitor").join("dist")
+}
+
+fn find_monitor_dir(root: &FsPath) -> Option<PathBuf> {
+    let candidate = monitor_dist_candidate(root);
+    candidate.exists().then_some(candidate)
+}
+
+fn source_tree_static_dir() -> PathBuf {
+    let manifest_dir = FsPath::new(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .parent()
+        .and_then(FsPath::parent)
+        .expect("workspace root")
+        .join("web")
+        .join("monitor")
+        .join("dist")
+}
+
+fn env_override_static_dir_with_keys(keys: &[&str]) -> Option<PathBuf> {
+    keys.iter().find_map(|key| {
+        let value = std::env::var(key).ok()?;
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+        let configured = PathBuf::from(value);
+        configured.exists().then_some(configured)
+    })
+}
+
+/// Resolve the monitor distribution directory.
+///
+/// An explicit CLI override wins, followed by the established environment
+/// variables, an installed bundle beside the current executable, and finally
+/// the source-tree `web/monitor/dist` path. Availability and `index.html` are
+/// validated when the router is built.
+pub fn resolve_static_dir(override_path: Option<PathBuf>) -> PathBuf {
+    if let Some(path) = override_path {
+        return path;
+    }
+    if let Some(configured) = env_override_static_dir_with_keys(MONITOR_DIST_ENV_KEYS) {
+        return configured;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let exe = exe.canonicalize().unwrap_or(exe);
+        if let Some(bundle_root) = exe.parent().and_then(FsPath::parent) {
+            if let Some(found) = find_monitor_dir(bundle_root) {
+                return found;
+            }
+        }
+    }
+    source_tree_static_dir()
 }
 
 fn validate_static_dir(static_dir: &FsPath) -> Result<()> {
@@ -925,7 +1017,7 @@ async fn static_fallback(State(state): State<Arc<AppState>>, uri: Uri) -> Respon
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::to_bytes;
+    use axum::{body::to_bytes, http::Request};
     use moraine_conversations::{
         AnalyticsConcurrencyPoint, AnalyticsSnapshot, AnalyticsTokenPoint, AnalyticsTurnPoint,
         AnalyticsWindow, ConversationMode, ConversationSummary, InMemoryConversationRepository,
@@ -934,6 +1026,7 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use std::fs;
+    use tower::ServiceExt;
 
     fn temp_path(suffix: &str) -> PathBuf {
         let stamp = SystemTime::now()
@@ -1399,6 +1492,70 @@ mod tests {
         let latest = status["ingestor"]["latest"].as_object().expect("latest");
         assert!(!latest.contains_key("backend_sinks"));
         assert!(!latest.contains_key("watcher_backend"));
+    }
+
+    #[tokio::test]
+    async fn injected_router_preserves_routes_repository_and_static_bytes() {
+        const INDEX_BYTES: &[u8] = b"<!doctype html><title>shared-backend</title>\n";
+        let root = temp_path("injected-router");
+        fs::create_dir_all(&root).expect("create static root");
+        fs::write(root.join("index.html"), INDEX_BYTES).expect("write index");
+
+        let repository = Arc::new(InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            InMemoryConversationResponses {
+                read_store_health: Some(Ok(sample_health())),
+                latest_ingest_heartbeat: Some(Ok(sample_heartbeat())),
+                ..Default::default()
+            },
+        ));
+        let injected: Arc<dyn ConversationRepository> = repository.clone();
+        let app = router_with_repository(&AppConfig::default(), injected, root.clone())
+            .expect("build injected router");
+
+        let static_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("static request"),
+            )
+            .await
+            .expect("static response");
+        assert_eq!(static_response.status(), StatusCode::OK);
+        assert_eq!(
+            static_response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/html"))
+        );
+        let static_body = to_bytes(static_response.into_body(), usize::MAX)
+            .await
+            .expect("static body");
+        assert_eq!(&static_body[..], INDEX_BYTES);
+
+        let health_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .expect("health request"),
+            )
+            .await
+            .expect("health response");
+        assert_eq!(health_response.status(), StatusCode::OK);
+        let health = response_json(health_response).await;
+        assert_eq!(health["ok"], json!(true));
+        let calls = repository.calls();
+        assert_eq!(calls.read_store_health, 1);
+        assert_eq!(calls.latest_ingest_heartbeat, 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_static_dir_override_is_authoritative() {
+        let path = temp_path("explicit-static");
+        assert_eq!(resolve_static_dir(Some(path.clone())), path);
     }
 
     #[test]

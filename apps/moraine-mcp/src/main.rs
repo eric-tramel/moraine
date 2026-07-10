@@ -33,6 +33,10 @@ fn main() -> Result<()> {
         .init();
 
     let args = cli::parse_args()?;
+    if args.help {
+        cli::usage();
+        return Ok(());
+    }
     let mut cfg = moraine_config::load_config(&args.config_path)
         .with_context(|| format!("failed to load config {}", args.config_path.display()))?;
 
@@ -50,5 +54,14 @@ fn main() -> Result<()> {
         None
     };
 
-    rpc::run(cfg, args.serve_mode, session_scope)
+    rpc::run(
+        cfg,
+        args.serve_mode,
+        session_scope,
+        rpc::BackendOptions {
+            host: args.host,
+            port: args.port,
+            static_dir: args.static_dir,
+        },
+    )
 }
