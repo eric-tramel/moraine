@@ -99,8 +99,8 @@ impl ClickHouseConversationRepository {
                     include_tool_events: None,
                     event_kinds: None,
                     exclude_codex_mcp: None,
-                    disable_cache: Some(false),
-                    search_strategy: Some(SearchEventsStrategy::Optimized),
+                    bypass_cache: Some(false),
+                    strategy_hint: Some(SearchStrategyHint::PreferPerformance),
                 })
                 .await
             {
@@ -146,7 +146,7 @@ impl ClickHouseConversationRepository {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn search_events_cache_key(
         terms: &[String],
-        search_strategy: SearchEventsStrategy,
+        strategy_hint: SearchStrategyHint,
         include_tool_events: bool,
         event_kinds: Option<&[SearchEventKind]>,
         exclude_codex_mcp: bool,
@@ -176,7 +176,7 @@ impl ClickHouseConversationRepository {
             .unwrap_or_default();
         format!(
             "strategy={};incl_tools={include_tool_events};event_kinds={event_kind_sig};excl_codex={exclude_codex_mcp};session={};sessions={session_ids_sig};msm={min_should_match};min_score={min_score:.12};limit={limit};terms={}",
-            search_strategy.as_str(),
+            strategy_hint.as_str(),
             session_id.unwrap_or(""),
             cache_terms.join(",")
         )

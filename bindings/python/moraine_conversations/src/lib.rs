@@ -3,7 +3,7 @@ use moraine_config::ClickHouseConfig;
 use moraine_conversations::{
     ClickHouseConversationRepository, ConversationDetailOptions, ConversationListFilter,
     ConversationMode, ConversationRepository, ConversationSearchQuery, PageRequest, RepoConfig,
-    SearchEventsQuery, SearchEventsStrategy,
+    SearchEventsQuery, SearchStrategyHint,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -165,7 +165,7 @@ impl ConversationClient {
         source: Option<String>,
         search_strategy: Option<&str>,
     ) -> PyResult<String> {
-        let parsed_search_strategy = parse_search_strategy(search_strategy)?;
+        let parsed_strategy_hint = parse_strategy_hint(search_strategy)?;
         let results = self
             .rt
             .block_on(self.repo.search_events(SearchEventsQuery {
@@ -173,13 +173,14 @@ impl ConversationClient {
                 source,
                 limit,
                 session_id,
+                session_ids: None,
                 min_score,
                 min_should_match,
                 include_tool_events,
                 event_kinds: None,
                 exclude_codex_mcp,
-                disable_cache,
-                search_strategy: parsed_search_strategy,
+                bypass_cache: disable_cache,
+                strategy_hint: parsed_strategy_hint,
             }))
             .map_err(py_runtime_err)?;
 
@@ -203,14 +204,14 @@ fn parse_mode(raw: Option<&str>) -> PyResult<Option<ConversationMode>> {
     }
 }
 
-fn parse_search_strategy(raw: Option<&str>) -> PyResult<Option<SearchEventsStrategy>> {
+fn parse_strategy_hint(raw: Option<&str>) -> PyResult<Option<SearchStrategyHint>> {
     let Some(raw) = raw else {
         return Ok(None);
     };
 
     match raw {
-        "optimized" => Ok(Some(SearchEventsStrategy::Optimized)),
-        "oracle_exact" => Ok(Some(SearchEventsStrategy::OracleExact)),
+        "optimized" => Ok(Some(SearchStrategyHint::PreferPerformance)),
+        "oracle_exact" => Ok(Some(SearchStrategyHint::Exact)),
         _ => Err(PyValueError::new_err(
             "search_strategy must be one of: optimized, oracle_exact",
         )),

@@ -13,8 +13,8 @@ pub use domain::{
     McpSessionListFilter, McpSessionListItem, McpSessionOpen, McpTurnCompact, McpTurnOpen,
     McpTurnRef, OpenContext, OpenEvent, OpenEventRequest, Page, PageRequest, RepoConfig,
     SearchEventHit, SearchEventKind, SearchEventsQuery, SearchEventsResult, SearchEventsStats,
-    SearchEventsStrategy, SearchMcpEventHit, SearchMcpEventsQuery, SearchMcpEventsResult,
-    SearchMcpEventsStats, SessionEventsDirection, SessionEventsQuery, SessionMetadata,
+    SearchMcpEventHit, SearchMcpEventsQuery, SearchMcpEventsResult, SearchMcpEventsStats,
+    SearchStrategyHint, SessionEventsDirection, SessionEventsQuery, SessionMetadata,
     SessionMetadataSearchHit, SessionMetadataSearchQuery, SessionMetadataSearchResults,
     SessionMetadataSearchStats, SessionOriginScope, TraceEvent, Turn, TurnListFilter, TurnSummary,
 };
