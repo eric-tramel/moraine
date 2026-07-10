@@ -1,17 +1,20 @@
 use anyhow::{anyhow, Result};
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
-    http::{header, HeaderValue, StatusCode, Uri},
+    extract::{Extension, Path, Query, State},
+    http::{header, HeaderValue, Request, StatusCode, Uri},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
+#[cfg(test)]
 use moraine_config::AppConfig;
 use moraine_conversations::{
-    AnalyticsRange, ConversationRepository, IngestHeartbeat, IngestHeartbeatRead, RepoError,
-    SessionAnalytics, SessionAnalyticsQuery, SessionLookback, SessionStep, SessionTurn,
-    StoreConnectionMetrics, StoreHealth, StoreProbe, TablePreviewQuery, TableSummaries,
+    AnalyticsRange, BackendRepository, BackendRepositoryRouter, IngestHeartbeat,
+    IngestHeartbeatRead, RepoError, SessionAnalytics, SessionAnalyticsQuery, SessionLookback,
+    SessionStep, SessionTurn, StoreConnectionMetrics, StoreHealth, StoreProbe, TablePreviewQuery,
+    TableSummaries,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -22,12 +25,11 @@ use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
+use tracing::warn;
 
 struct AppState {
-    repository: Arc<dyn ConversationRepository>,
+    backend_router: Arc<BackendRepositoryRouter>,
     static_dir: PathBuf,
-    clickhouse_url: String,
-    clickhouse_database: String,
 }
 
 #[derive(Deserialize)]
@@ -54,11 +56,11 @@ struct MonitorTableSummary {
     rows: u64,
 }
 
-/// Run the monitor HTTP server using a repository owned by the composition
-/// root. The supplied shutdown future stops the listener gracefully.
-pub async fn run_server_with_repository<S>(
-    cfg: AppConfig,
-    repository: Arc<dyn ConversationRepository>,
+/// Run the monitor HTTP server using the daemon-owned backend router.
+///
+/// The supplied shutdown future stops the listener gracefully.
+pub async fn run_server_with_router<S>(
+    backend_router: Arc<BackendRepositoryRouter>,
     host: String,
     port: u16,
     static_dir: PathBuf,
@@ -68,7 +70,7 @@ where
     S: Future<Output = ()> + Send + 'static,
 {
     let static_dir_display = static_dir.display().to_string();
-    let app = router_with_repository(&cfg, repository, static_dir)?;
+    let app = router_with_backend_router(backend_router, static_dir)?;
     let bind = format!("{host}:{port}")
         .parse::<SocketAddr>()
         .map_err(|err| anyhow!("invalid bind address: {err}"))?;
@@ -92,33 +94,36 @@ where
     Ok(())
 }
 
-/// Build the complete monitor router around an injected repository.
-///
-/// All API routes and static-file behavior live here so the server can use the
-/// injected repository without constructing a second storage client.
-fn router_with_repository(
-    cfg: &AppConfig,
-    repository: Arc<dyn ConversationRepository>,
+/// Build the complete monitor router around the daemon-owned backend router.
+fn router_with_backend_router(
+    backend_router: Arc<BackendRepositoryRouter>,
     static_dir: PathBuf,
 ) -> Result<Router> {
     validate_static_dir(&static_dir)?;
     let state = Arc::new(AppState {
-        repository,
+        backend_router,
         static_dir,
-        clickhouse_url: cfg.clickhouse.url.clone(),
-        clickhouse_database: cfg.clickhouse.database.clone(),
     });
     Ok(monitor_router(state))
 }
 
 fn monitor_router(state: Arc<AppState>) -> Router {
-    let versioned_routes = dashboard_routes().route("/capabilities", get(api_capabilities));
+    let data_routes = dashboard_routes().route_layer(middleware::from_fn_with_state(
+        state.backend_router.clone(),
+        select_backend_repository,
+    ));
+    // Capabilities is daemon/default-global metadata, not a project-routed data
+    // endpoint. It intentionally remains outside project selection middleware.
+    let versioned_routes = data_routes
+        .clone()
+        .route("/capabilities", get(api_capabilities));
 
     Router::new()
         .nest("/api/v1", versioned_routes)
         // One-release compatibility surface. These are direct aliases so
-        // status codes, query handling, and response payloads remain identical.
-        .nest("/api", dashboard_routes())
+        // status codes, query handling, response payloads, and backend
+        // selection remain identical.
+        .nest("/api", data_routes)
         .fallback(get(static_fallback))
         .with_state(state)
 }
@@ -132,6 +137,71 @@ fn dashboard_routes() -> Router<Arc<AppState>> {
         .route("/web-searches", get(api_web_searches))
         .route("/tables/:table", get(api_table_rows))
         .route("/sessions", get(api_sessions))
+}
+
+/// Optional project context for repository-backed data endpoints. The value is
+/// resolved only through configured cwd routes/repo references; it never names
+/// a backend endpoint or credentials. Capabilities and static routes ignore it.
+const PROJECT_DIR_HEADER: &str = "x-moraine-project-dir";
+
+fn project_dir_header(
+    headers: &axum::http::HeaderMap,
+) -> std::result::Result<Option<&str>, &'static str> {
+    let mut values = headers.get_all(PROJECT_DIR_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err("X-Moraine-Project-Dir must be provided exactly once");
+    }
+    let value = value
+        .to_str()
+        .map_err(|_| "X-Moraine-Project-Dir must be valid UTF-8")?
+        .trim();
+    if value.is_empty() {
+        return Err("X-Moraine-Project-Dir must not be empty");
+    }
+    if !FsPath::new(value).is_absolute() {
+        return Err("X-Moraine-Project-Dir must be an absolute path");
+    }
+    Ok(Some(value))
+}
+
+async fn select_backend_repository(
+    State(backend_router): State<Arc<BackendRepositoryRouter>>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
+    let selected = match project_dir_header(request.headers()) {
+        Ok(None) => backend_router.default_repository().await,
+        Ok(Some(project_dir)) => {
+            backend_router
+                .repository_for_project_dir(Some(project_dir))
+                .await
+        }
+        Err(error) => {
+            return json_response(
+                json!({"ok": false, "error": error}),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+    };
+
+    let backend = match selected {
+        Ok(backend) => backend,
+        Err(_) => {
+            warn!("backend project route selection failed; selected backend unavailable or schema-incompatible");
+            return json_response(
+                json!({
+                    "ok": false,
+                    "error": "selected backend is unavailable or schema-incompatible"
+                }),
+                StatusCode::SERVICE_UNAVAILABLE,
+            );
+        }
+    };
+    request.extensions_mut().insert(backend);
+    next.run(request).await
 }
 
 const MONITOR_DIST_ENV_KEYS: &[&str] = &["MORAINE_MONITOR_DIST", "MORAINE_MONITOR_STATIC_DIR"];
@@ -223,13 +293,20 @@ fn json_response<T: Serialize>(payload: T, status: StatusCode) -> Response {
     *response.status_mut() = status;
     response
 }
+/// Daemon-wide capabilities intentionally report the owned default backend's
+/// schema level. Project routing selects externally managed data stores, not a
+/// different daemon protocol or feature set, so this endpoint ignores
+/// `X-Moraine-Project-Dir` and remains outside routing middleware.
 async fn api_capabilities(State(state): State<Arc<AppState>>) -> Response {
-    let schema_migration_level = state
-        .repository
-        .read_store_diagnostics()
-        .await
-        .ok()
-        .and_then(|diagnostics| diagnostics.applied_schema_versions.into_iter().max());
+    let schema_migration_level = match state.backend_router.default_repository().await {
+        Ok(default_backend) => default_backend
+            .repository()
+            .read_store_diagnostics()
+            .await
+            .ok()
+            .and_then(|diagnostics| diagnostics.applied_schema_versions.into_iter().max()),
+        Err(_) => None,
+    };
 
     json_response(
         json!({
@@ -247,10 +324,10 @@ async fn api_capabilities(State(state): State<Arc<AppState>>) -> Response {
     )
 }
 
-async fn api_health(State(state): State<Arc<AppState>>) -> Response {
+async fn api_health(Extension(backend): Extension<Arc<BackendRepository>>) -> Response {
     let (health, heartbeat) = tokio::join!(
-        state.repository.read_store_health(),
-        state.repository.latest_ingest_heartbeat()
+        backend.repository().read_store_health(),
+        backend.repository().latest_ingest_heartbeat()
     );
     let health = match health {
         Ok(health) => health,
@@ -259,8 +336,8 @@ async fn api_health(State(state): State<Arc<AppState>>) -> Response {
             return json_response(
                 json!({
                     "ok": false,
-                    "url": state.clickhouse_url,
-                    "database": state.clickhouse_database,
+                    "url": backend.clickhouse_url(),
+                    "database": backend.clickhouse_database(),
                     "error": message,
                     "connections": {"total": Value::Null, "error": message},
                 }),
@@ -273,13 +350,13 @@ async fn api_health(State(state): State<Arc<AppState>>) -> Response {
     let ping_ms = match &health.ping {
         StoreProbe::Available(value) => *value,
         StoreProbe::Failed { message } => {
-            return health_failure_response(&state, message, connections);
+            return health_failure_response(&backend, message, connections);
         }
     };
     let version = match &health.version {
         StoreProbe::Available(value) => value,
         StoreProbe::Failed { message } => {
-            return health_failure_response(&state, message, connections);
+            return health_failure_response(&backend, message, connections);
         }
     };
     let heartbeat = heartbeat.map(monitor_heartbeat_status).unwrap_or_default();
@@ -287,8 +364,8 @@ async fn api_health(State(state): State<Arc<AppState>>) -> Response {
     json_response(
         json!({
             "ok": true,
-            "url": state.clickhouse_url,
-            "database": state.clickhouse_database,
+            "url": backend.clickhouse_url(),
+            "database": backend.clickhouse_database(),
             "version": version,
             "ping_ms": ping_ms,
             "connections": connections,
@@ -298,12 +375,16 @@ async fn api_health(State(state): State<Arc<AppState>>) -> Response {
     )
 }
 
-fn health_failure_response(state: &AppState, message: &str, connections: Value) -> Response {
+fn health_failure_response(
+    backend: &BackendRepository,
+    message: &str,
+    connections: Value,
+) -> Response {
     json_response(
         json!({
             "ok": false,
-            "url": state.clickhouse_url,
-            "database": state.clickhouse_database,
+            "url": backend.clickhouse_url(),
+            "database": backend.clickhouse_database(),
             "error": message,
             "connections": connections,
         }),
@@ -311,9 +392,9 @@ fn health_failure_response(state: &AppState, message: &str, connections: Value) 
     )
 }
 
-async fn api_status(State(state): State<Arc<AppState>>) -> Response {
-    let health = state
-        .repository
+async fn api_status(Extension(backend): Extension<Arc<BackendRepository>>) -> Response {
+    let health = backend
+        .repository()
         .read_store_health()
         .await
         .unwrap_or_else(|error| unavailable_store_health(error.to_string()));
@@ -321,8 +402,8 @@ async fn api_status(State(state): State<Arc<AppState>>) -> Response {
 
     let (tables, heartbeat) = if database_exists {
         let (tables, heartbeat) = tokio::join!(
-            state.repository.list_table_summaries(),
-            state.repository.latest_ingest_heartbeat()
+            backend.repository().list_table_summaries(),
+            backend.repository().latest_ingest_heartbeat()
         );
         let tables = match tables {
             Ok(tables) => monitor_table_summaries(tables),
@@ -340,7 +421,7 @@ async fn api_status(State(state): State<Arc<AppState>>) -> Response {
     };
 
     let estimated_total_rows = tables.iter().map(|table| table.rows).sum::<u64>();
-    let clickhouse = status_clickhouse_payload(&state, &health, database_exists);
+    let clickhouse = status_clickhouse_payload(&backend, &health, database_exists);
 
     json_response(
         json!({
@@ -381,14 +462,14 @@ fn probe_bool(probe: &StoreProbe<bool>) -> Option<bool> {
 }
 
 fn status_clickhouse_payload(
-    state: &AppState,
+    backend: &BackendRepository,
     health: &StoreHealth,
     database_exists: bool,
 ) -> Value {
     if !database_exists {
         return json!({
-            "url": state.clickhouse_url,
-            "database": state.clickhouse_database,
+            "url": backend.clickhouse_url(),
+            "database": backend.clickhouse_database(),
             "healthy": false,
             "version": Value::Null,
             "ping_ms": Value::Null,
@@ -406,8 +487,8 @@ fn status_clickhouse_payload(
     };
 
     json!({
-        "url": state.clickhouse_url,
-        "database": state.clickhouse_database,
+        "url": backend.clickhouse_url(),
+        "database": backend.clickhouse_database(),
         "healthy": healthy,
         "version": version,
         "ping_ms": ping_ms,
@@ -425,8 +506,8 @@ fn connection_payload(probe: &StoreProbe<StoreConnectionMetrics>) -> Value {
     }
 }
 
-async fn api_tables(State(state): State<Arc<AppState>>) -> Response {
-    match state.repository.list_table_summaries().await {
+async fn api_tables(Extension(backend): Extension<Arc<BackendRepository>>) -> Response {
+    match backend.repository().list_table_summaries().await {
         Ok(tables) => json_response(
             json!({"ok": true, "tables": monitor_table_summaries(tables)}),
             StatusCode::OK,
@@ -453,10 +534,10 @@ fn monitor_table_summaries(summaries: TableSummaries) -> Vec<MonitorTableSummary
 
 async fn api_web_searches(
     Query(params): Query<LimitQuery>,
-    State(state): State<Arc<AppState>>,
+    Extension(backend): Extension<Arc<BackendRepository>>,
 ) -> Response {
     let limit = params.limit.unwrap_or(100).clamp(1, 1000) as u16;
-    let rows = match state.repository.list_web_searches(limit).await {
+    let rows = match backend.repository().list_web_searches(limit).await {
         Ok(rows) => rows,
         Err(error) => {
             return json_response(
@@ -490,10 +571,10 @@ async fn api_web_searches(
 
 async fn api_analytics(
     Query(params): Query<AnalyticsQuery>,
-    State(state): State<Arc<AppState>>,
+    Extension(backend): Extension<Arc<BackendRepository>>,
 ) -> Response {
     let range = resolve_analytics_range(params.range.as_deref());
-    let snapshot = match state.repository.analytics_series(range).await {
+    let snapshot = match backend.repository().analytics_series(range).await {
         Ok(snapshot) => snapshot,
         Err(error) => {
             return json_response(
@@ -538,13 +619,13 @@ fn resolve_analytics_range(value: Option<&str>) -> AnalyticsRange {
 
 async fn api_sessions(
     Query(params): Query<SessionsQuery>,
-    State(state): State<Arc<AppState>>,
+    Extension(backend): Extension<Arc<BackendRepository>>,
 ) -> Response {
     let query = SessionAnalyticsQuery {
         lookback: resolve_session_lookback(params.since.as_deref()),
         limit: params.limit.unwrap_or(50).clamp(1, 200) as u16,
     };
-    let sessions = match state.repository.list_session_analytics(query).await {
+    let sessions = match backend.repository().list_session_analytics(query).await {
         Ok(sessions) => sessions,
         Err(error) => {
             return json_response(
@@ -898,11 +979,11 @@ fn unix_now_ms() -> i64 {
 async fn api_table_rows(
     Path(table): Path<String>,
     Query(params): Query<LimitQuery>,
-    State(state): State<Arc<AppState>>,
+    Extension(backend): Extension<Arc<BackendRepository>>,
 ) -> Response {
     let limit = params.limit.unwrap_or(25).clamp(1, 500) as u16;
-    match state
-        .repository
+    match backend
+        .repository()
         .preview_table(TablePreviewQuery {
             table: table.clone(),
             limit,
@@ -1016,12 +1097,14 @@ async fn static_fallback(State(state): State<Arc<AppState>>, uri: Uri) -> Respon
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::to_bytes, http::Request};
+    use axum::body::to_bytes;
+    use moraine_config::{ClickHouseConfig, RouteConfig, DEFAULT_BACKEND_NAME, ROUTE_MODE_MIRROR};
     use moraine_conversations::{
         AnalyticsConcurrencyPoint, AnalyticsSnapshot, AnalyticsTokenPoint, AnalyticsTurnPoint,
-        AnalyticsWindow, ConversationMode, ConversationSummary, InMemoryConversationRepository,
-        InMemoryConversationResponses, IngestHeartbeat, RepoConfig, SessionStep, StoreDiagnostics,
-        TableColumn, TablePreview, TableSummary, ToolResult, TurnSummary, WebSearchEvent,
+        AnalyticsWindow, ConversationMode, ConversationRepository, ConversationSummary,
+        InMemoryConversationRepository, InMemoryConversationResponses, IngestHeartbeat, RepoConfig,
+        SessionStep, StoreDiagnostics, TableColumn, TablePreview, TableSummary, ToolResult,
+        TurnSummary, WebSearchEvent,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -1038,6 +1121,26 @@ mod tests {
         ))
     }
 
+    async fn fake_backend(
+        responses: InMemoryConversationResponses,
+    ) -> (Arc<BackendRepository>, Arc<InMemoryConversationRepository>) {
+        let repository = Arc::new(InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            responses,
+        ));
+        let injected: Arc<dyn ConversationRepository> = repository.clone();
+        let router = BackendRepositoryRouter::from_preloaded_for_testing(
+            Arc::new(AppConfig::default()),
+            [(DEFAULT_BACKEND_NAME.to_string(), injected)],
+        )
+        .expect("preloaded default router");
+        let backend = router
+            .default_repository()
+            .await
+            .expect("preloaded default backend");
+        (backend, repository)
+    }
+
     fn fake_state(
         responses: InMemoryConversationResponses,
     ) -> (Arc<AppState>, Arc<InMemoryConversationRepository>) {
@@ -1045,13 +1148,92 @@ mod tests {
             RepoConfig::default(),
             responses,
         ));
-        let state = Arc::new(AppState {
-            repository: repository.clone(),
-            static_dir: PathBuf::new(),
-            clickhouse_url: "http://127.0.0.1:8123".to_string(),
-            clickhouse_database: "moraine".to_string(),
-        });
-        (state, repository)
+        let injected: Arc<dyn ConversationRepository> = repository.clone();
+        let backend_router = Arc::new(
+            BackendRepositoryRouter::from_preloaded_for_testing(
+                Arc::new(AppConfig::default()),
+                [(DEFAULT_BACKEND_NAME.to_string(), injected)],
+            )
+            .expect("preloaded default router"),
+        );
+        (
+            Arc::new(AppState {
+                backend_router,
+                static_dir: PathBuf::new(),
+            }),
+            repository,
+        )
+    }
+
+    fn routing_config() -> AppConfig {
+        let mut config = AppConfig::default();
+        config.clickhouse.url = "http://default.example:8123".to_string();
+        config.clickhouse.database = "moraine_default".to_string();
+        config
+            .backends
+            .insert(DEFAULT_BACKEND_NAME.to_string(), config.clickhouse.clone());
+        config.backends.insert(
+            "team-ch".to_string(),
+            ClickHouseConfig {
+                url: "http://team.example:8123".to_string(),
+                database: "moraine_team".to_string(),
+                ..ClickHouseConfig::default()
+            },
+        );
+        config.routes = vec![
+            RouteConfig {
+                dir: "/work/team/**".to_string(),
+                backend: "team-ch".to_string(),
+                mode: ROUTE_MODE_MIRROR.to_string(),
+            },
+            RouteConfig {
+                dir: "/work/ghost/**".to_string(),
+                backend: "not-configured".to_string(),
+                mode: ROUTE_MODE_MIRROR.to_string(),
+            },
+        ];
+        config
+    }
+
+    fn preloaded_backend_router(
+        config: AppConfig,
+        default_repository: Arc<InMemoryConversationRepository>,
+        named_repository: Arc<InMemoryConversationRepository>,
+    ) -> Arc<BackendRepositoryRouter> {
+        let default_repository: Arc<dyn ConversationRepository> = default_repository;
+        let named_repository: Arc<dyn ConversationRepository> = named_repository;
+        Arc::new(
+            BackendRepositoryRouter::from_preloaded_for_testing(
+                Arc::new(config),
+                [
+                    (DEFAULT_BACKEND_NAME.to_string(), default_repository),
+                    ("team-ch".to_string(), named_repository),
+                ],
+            )
+            .expect("preloaded routing backend"),
+        )
+    }
+
+    fn static_root(suffix: &str, index: &[u8]) -> PathBuf {
+        let root = temp_path(suffix);
+        fs::create_dir_all(&root).expect("create static root");
+        fs::write(root.join("index.html"), index).expect("write index");
+        root
+    }
+
+    async fn get_with_project_dir(
+        app: &Router,
+        uri: &str,
+        project_dir: Option<HeaderValue>,
+    ) -> Response {
+        let mut request = Request::builder().uri(uri);
+        if let Some(project_dir) = project_dir {
+            request = request.header(PROJECT_DIR_HEADER, project_dir);
+        }
+        app.clone()
+            .oneshot(request.body(Body::empty()).expect("request"))
+            .await
+            .expect("response")
     }
 
     async fn response_json(response: Response) -> Value {
@@ -1347,9 +1529,9 @@ mod tests {
 
     #[tokio::test]
     async fn handlers_delegate_to_shared_repository_and_preserve_json_contracts() {
-        let (state, repository) = fake_state(successful_responses());
+        let (backend, repository) = fake_backend(successful_responses()).await;
 
-        let response = api_health(State(state.clone())).await;
+        let response = api_health(Extension(backend.clone())).await;
         assert_eq!(response.status(), StatusCode::OK);
         let health = response_json(response).await;
         assert_eq!(health["ok"], json!(true));
@@ -1360,7 +1542,7 @@ mod tests {
             json!({"backend_sinks": {"team-ch": "healthy"}})
         );
 
-        let response = api_status(State(state.clone())).await;
+        let response = api_status(Extension(backend.clone())).await;
         assert_eq!(response.status(), StatusCode::OK);
         let status = response_json(response).await;
         assert_eq!(status["database"]["exists"], json!(true));
@@ -1375,14 +1557,14 @@ mod tests {
         assert!(!status_latest.contains_key("watcher_reset_count"));
         assert!(!status_latest.contains_key("watcher_last_reset_unix_ms"));
 
-        let response = api_tables(State(state.clone())).await;
+        let response = api_tables(Extension(backend.clone())).await;
         assert_eq!(response.status(), StatusCode::OK);
         let tables = response_json(response).await;
         assert_eq!(tables["tables"][0]["is_temporary"], json!(0));
 
         let response = api_web_searches(
             Query(LimitQuery { limit: Some(2_500) }),
-            State(state.clone()),
+            Extension(backend.clone()),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1395,7 +1577,7 @@ mod tests {
             Query(AnalyticsQuery {
                 range: Some("7d".to_string()),
             }),
-            State(state.clone()),
+            Extension(backend.clone()),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1409,7 +1591,7 @@ mod tests {
                 limit: Some(0),
                 since: Some("not-a-window".to_string()),
             }),
-            State(state.clone()),
+            Extension(backend.clone()),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1430,7 +1612,7 @@ mod tests {
         let response = api_table_rows(
             Path("events".to_string()),
             Query(LimitQuery { limit: Some(999) }),
-            State(state),
+            Extension(backend),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1463,7 +1645,7 @@ mod tests {
 
     #[tokio::test]
     async fn repository_failures_keep_existing_http_status_envelopes() {
-        let (state, _) = fake_state(InMemoryConversationResponses {
+        let (backend, _) = fake_backend(InMemoryConversationResponses {
             list_session_analytics: Some(Err(RepoError::backend("sessions unavailable"))),
             analytics_series: Some(Err(RepoError::backend("analytics unavailable"))),
             list_web_searches: Some(Err(RepoError::backend("web unavailable"))),
@@ -1476,17 +1658,21 @@ mod tests {
                 ..sample_health()
             })),
             ..Default::default()
-        });
+        })
+        .await;
 
-        let health = api_health(State(state.clone())).await;
+        let health = api_health(Extension(backend.clone())).await;
         assert_eq!(health.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             response_json(health).await["error"],
             json!("ping unavailable")
         );
 
-        let analytics =
-            api_analytics(Query(AnalyticsQuery { range: None }), State(state.clone())).await;
+        let analytics = api_analytics(
+            Query(AnalyticsQuery { range: None }),
+            Extension(backend.clone()),
+        )
+        .await;
         assert_eq!(analytics.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response_json(analytics).await["ok"], json!(false));
 
@@ -1495,21 +1681,25 @@ mod tests {
                 limit: None,
                 since: None,
             }),
-            State(state.clone()),
+            Extension(backend.clone()),
         )
         .await;
         assert_eq!(sessions.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-        let web = api_web_searches(Query(LimitQuery { limit: None }), State(state.clone())).await;
+        let web = api_web_searches(
+            Query(LimitQuery { limit: None }),
+            Extension(backend.clone()),
+        )
+        .await;
         assert_eq!(web.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-        let tables = api_tables(State(state.clone())).await;
+        let tables = api_tables(Extension(backend.clone())).await;
         assert_eq!(tables.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         let preview = api_table_rows(
             Path("events;drop".to_string()),
             Query(LimitQuery { limit: None }),
-            State(state),
+            Extension(backend),
         )
         .await;
         assert_eq!(preview.status(), StatusCode::BAD_REQUEST);
@@ -1557,12 +1747,13 @@ mod tests {
 
     #[tokio::test]
     async fn api_health_redacts_full_heartbeat_internals() {
-        let (state, _) = fake_state(InMemoryConversationResponses {
+        let (backend, _) = fake_backend(InMemoryConversationResponses {
             read_store_health: Some(Ok(sample_health())),
             latest_ingest_heartbeat: Some(Ok(sample_heartbeat())),
             ..Default::default()
-        });
-        let payload = response_json(api_health(State(state)).await).await;
+        })
+        .await;
+        let payload = response_json(api_health(Extension(backend)).await).await;
         let latest = payload["ingestor"]["latest"].as_object().expect("latest");
 
         assert_eq!(latest.len(), 1);
@@ -1576,16 +1767,17 @@ mod tests {
         let mut heartbeat = sample_heartbeat();
         let latest = heartbeat.latest.as_mut().expect("latest heartbeat");
         latest.backend_sinks = None;
-        let (state, _) = fake_state(InMemoryConversationResponses {
+        let (backend, _) = fake_backend(InMemoryConversationResponses {
             read_store_health: Some(Ok(sample_health())),
             latest_ingest_heartbeat: Some(Ok(heartbeat)),
             ..Default::default()
-        });
+        })
+        .await;
 
-        let health = response_json(api_health(State(state.clone())).await).await;
+        let health = response_json(api_health(Extension(backend.clone())).await).await;
         assert_eq!(health["ingestor"]["latest"]["backend_sinks"], json!({}));
 
-        let status = response_json(api_status(State(state)).await).await;
+        let status = response_json(api_status(Extension(backend)).await).await;
         let latest = status["ingestor"]["latest"].as_object().expect("latest");
         assert!(!latest.contains_key("backend_sinks"));
         assert!(!latest.contains_key("watcher_backend"));
@@ -1612,19 +1804,22 @@ mod tests {
             responses,
         ));
         let injected: Arc<dyn ConversationRepository> = repository.clone();
-        let app = router_with_repository(&AppConfig::default(), injected, root.clone())
+        let backend_router = Arc::new(
+            BackendRepositoryRouter::from_preloaded_for_testing(
+                Arc::new(AppConfig::default()),
+                [(DEFAULT_BACKEND_NAME.to_string(), injected)],
+            )
+            .expect("preloaded default router"),
+        );
+        let app = router_with_backend_router(backend_router, root.clone())
             .expect("build injected router");
 
-        let static_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/")
-                    .body(Body::empty())
-                    .expect("static request"),
-            )
-            .await
-            .expect("static response");
+        let static_response = get_with_project_dir(
+            &app,
+            "/",
+            Some(HeaderValue::from_static("malformed-relative-path")),
+        )
+        .await;
         assert_eq!(static_response.status(), StatusCode::OK);
         assert_eq!(
             static_response.headers().get(header::CONTENT_TYPE),
@@ -1680,7 +1875,6 @@ mod tests {
         let (status, missing) = router_json(&app, "/api/v1/not-a-route").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(missing, json!({"ok": false, "error": "not found"}));
-
         let calls = repository.calls();
         assert_eq!(calls.read_store_health, 4);
         assert_eq!(calls.read_store_diagnostics, 1);
@@ -1716,6 +1910,263 @@ mod tests {
                     limit: 500,
                 },
             ]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn data_routes_select_default_named_unknown_and_reuse_repositories() {
+        let root = static_root("routing-selection", b"<!doctype html>");
+        let default_repository = Arc::new(InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            successful_responses(),
+        ));
+        let named_repository = Arc::new(InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            successful_responses(),
+        ));
+        let backend_router = preloaded_backend_router(
+            routing_config(),
+            default_repository.clone(),
+            named_repository.clone(),
+        );
+        let app =
+            router_with_backend_router(backend_router, root.clone()).expect("routing test app");
+
+        let default = response_json(get_with_project_dir(&app, "/api/v1/tables", None).await).await;
+        assert_eq!(default_repository.calls().list_table_summaries, 1);
+        assert_eq!(named_repository.calls().list_table_summaries, 0);
+
+        let named = response_json(
+            get_with_project_dir(
+                &app,
+                "/api/v1/tables",
+                Some(HeaderValue::from_static("  /work/team/project  ")),
+            )
+            .await,
+        )
+        .await;
+        let unknown = response_json(
+            get_with_project_dir(
+                &app,
+                "/api/tables",
+                Some(HeaderValue::from_static("/work/ghost/project")),
+            )
+            .await,
+        )
+        .await;
+        let named_again = response_json(
+            get_with_project_dir(
+                &app,
+                "/api/tables",
+                Some(HeaderValue::from_static("/work/team/other")),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(default, named);
+        assert_eq!(default, unknown);
+        assert_eq!(default, named_again);
+        assert_eq!(default_repository.calls().list_table_summaries, 2);
+        assert_eq!(named_repository.calls().list_table_summaries, 2);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn capabilities_ignore_project_selector_and_use_default_schema() {
+        let root = static_root("routing-capabilities", b"<!doctype html>");
+        let mut default_responses = successful_responses();
+        default_responses.read_store_diagnostics = Some(Ok(StoreDiagnostics {
+            applied_schema_versions: vec!["025".to_string()],
+            ..Default::default()
+        }));
+        let mut named_responses = successful_responses();
+        named_responses.read_store_diagnostics = Some(Ok(StoreDiagnostics {
+            applied_schema_versions: vec!["999".to_string()],
+            ..Default::default()
+        }));
+        let default_repository = Arc::new(InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            default_responses,
+        ));
+        let named_repository = Arc::new(InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            named_responses,
+        ));
+        let backend_router = preloaded_backend_router(
+            routing_config(),
+            default_repository.clone(),
+            named_repository.clone(),
+        );
+        let app = router_with_backend_router(backend_router, root.clone())
+            .expect("capabilities routing test app");
+
+        for header in [
+            None,
+            Some(HeaderValue::from_static("/work/team/project")),
+            Some(HeaderValue::from_static("malformed-relative-path")),
+        ] {
+            let response = get_with_project_dir(&app, "/api/v1/capabilities", header).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let payload = response_json(response).await;
+            assert_eq!(payload["schema_migration_level"], json!("025"));
+        }
+        assert_eq!(default_repository.calls().read_store_diagnostics, 3);
+        assert_eq!(named_repository.calls().read_store_diagnostics, 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn health_and_status_report_selected_backend_metadata() {
+        let root = static_root("routing-metadata", b"<!doctype html>");
+        let default_repository = Arc::new(InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            successful_responses(),
+        ));
+        let named_repository = Arc::new(InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            successful_responses(),
+        ));
+        let mut config = routing_config();
+        config
+            .backends
+            .get_mut("team-ch")
+            .expect("named backend")
+            .url = "http://user:secret@team.example:8123/path?token=secret#fragment".to_string();
+        let backend_router = preloaded_backend_router(config, default_repository, named_repository);
+        let app =
+            router_with_backend_router(backend_router, root.clone()).expect("metadata test app");
+
+        let default_health =
+            response_json(get_with_project_dir(&app, "/api/health", None).await).await;
+        assert_eq!(default_health["url"], json!("http://default.example:8123"));
+        assert_eq!(default_health["database"], json!("moraine_default"));
+
+        let named_header = HeaderValue::from_static("/work/team/project");
+        let named_health = response_json(
+            get_with_project_dir(&app, "/api/health", Some(named_header.clone())).await,
+        )
+        .await;
+        assert_eq!(named_health["url"], json!("http://team.example:8123"));
+        assert_eq!(named_health["database"], json!("moraine_team"));
+
+        let named_status =
+            response_json(get_with_project_dir(&app, "/api/status", Some(named_header)).await)
+                .await;
+        assert_eq!(
+            named_status["clickhouse"]["url"],
+            json!("http://team.example:8123")
+        );
+        assert_eq!(
+            named_status["clickhouse"]["database"],
+            json!("moraine_team")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn project_dir_header_validation_rejects_bad_data_requests() {
+        let root = static_root("routing-validation", b"<!doctype html>");
+        let default_repository =
+            Arc::new(InMemoryConversationRepository::new(RepoConfig::default()));
+        let named_repository = Arc::new(InMemoryConversationRepository::new(RepoConfig::default()));
+        let backend_router = preloaded_backend_router(
+            routing_config(),
+            default_repository.clone(),
+            named_repository.clone(),
+        );
+        let app =
+            router_with_backend_router(backend_router, root.clone()).expect("validation test app");
+
+        let mut repeated = Request::builder()
+            .uri("/api/health")
+            .body(Body::empty())
+            .expect("repeated header request");
+        repeated.headers_mut().append(
+            PROJECT_DIR_HEADER,
+            HeaderValue::from_static("/work/team/one"),
+        );
+        repeated.headers_mut().append(
+            PROJECT_DIR_HEADER,
+            HeaderValue::from_static("/work/team/two"),
+        );
+        let requests = vec![
+            repeated,
+            Request::builder()
+                .uri("/api/health")
+                .header(PROJECT_DIR_HEADER, HeaderValue::from_static("   "))
+                .body(Body::empty())
+                .expect("empty header request"),
+            Request::builder()
+                .uri("/api/health")
+                .header(
+                    PROJECT_DIR_HEADER,
+                    HeaderValue::from_static("relative/project"),
+                )
+                .body(Body::empty())
+                .expect("relative header request"),
+            Request::builder()
+                .uri("/api/health")
+                .header(
+                    PROJECT_DIR_HEADER,
+                    HeaderValue::from_bytes(&[0xff]).expect("opaque header"),
+                )
+                .body(Body::empty())
+                .expect("non-UTF-8 header request"),
+        ];
+
+        for request in requests {
+            let response = app.clone().oneshot(request).await.expect("response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let payload = response_json(response).await;
+            assert_eq!(payload["ok"], json!(false));
+            assert!(payload["error"]
+                .as_str()
+                .is_some_and(|error| !error.is_empty()));
+        }
+        assert_eq!(default_repository.calls().read_store_health, 0);
+        assert_eq!(named_repository.calls().read_store_health, 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn named_backend_construction_errors_return_service_unavailable() {
+        let root = static_root("routing-construction-error", b"<!doctype html>");
+        let mut config = routing_config();
+        config
+            .backends
+            .get_mut("team-ch")
+            .expect("named backend")
+            .url = "://invalid".to_string();
+        let backend_router = Arc::new(
+            BackendRepositoryRouter::new(
+                Arc::new(config),
+                RepoConfig::default(),
+                "moraine-monitor-core/test",
+            )
+            .expect("lazy backend router"),
+        );
+        let app = router_with_backend_router(backend_router, root.clone())
+            .expect("construction error test app");
+
+        let response = get_with_project_dir(
+            &app,
+            "/api/health",
+            Some(HeaderValue::from_static("/work/team/project")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let payload = response_json(response).await;
+        assert_eq!(payload["ok"], json!(false));
+        assert_eq!(
+            payload["error"],
+            json!("selected backend is unavailable or schema-incompatible")
         );
 
         let _ = fs::remove_dir_all(root);
