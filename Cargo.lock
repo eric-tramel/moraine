@@ -1254,7 +1254,6 @@ version = "0.6.4"
 dependencies = [
  "anyhow",
  "chrono",
- "moraine-clickhouse",
  "moraine-config",
  "moraine-conversations",
  "serde",
