@@ -229,6 +229,15 @@ fn parse_config_flag(args: &[String]) -> Result<(Option<PathBuf>, Vec<String>)> 
             continue;
         }
 
+        if let Some(path) = args[i].strip_prefix("--config=") {
+            if path.is_empty() {
+                bail!("--config requires a path");
+            }
+            raw_config = Some(PathBuf::from(path));
+            i += 1;
+            continue;
+        }
+
         rest.push(args[i].clone());
         i += 1;
     }
@@ -238,10 +247,11 @@ fn parse_config_flag(args: &[String]) -> Result<(Option<PathBuf>, Vec<String>)> 
 
 fn cmd_config_get(cfg: &AppConfig, key: &str) -> Result<String> {
     match key {
+        "backend.start_on_up" => Ok(cfg.backend.start_on_up.to_string()),
         "clickhouse.url" => Ok(cfg.clickhouse.url.clone()),
         "clickhouse.database" => Ok(cfg.clickhouse.database.clone()),
         _ => bail!(
-            "unsupported config key '{}'; supported keys: clickhouse.url, clickhouse.database",
+            "unsupported config key '{}'; supported keys: backend.start_on_up, clickhouse.url, clickhouse.database",
             key
         ),
     }
@@ -282,6 +292,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_config_flag_supports_equals_form_and_argument_order() {
+        let args = vec![
+            "--config=/tmp/first.toml".to_string(),
+            "--config".to_string(),
+            "/tmp/second.toml".to_string(),
+            "--host=127.0.0.1".to_string(),
+        ];
+        let (config, rest) = parse_config_flag(&args).expect("parse config");
+        assert_eq!(config, Some(PathBuf::from("/tmp/second.toml")));
+        assert_eq!(rest, vec!["--host=127.0.0.1".to_string()]);
+
+        let err = parse_config_flag(&["--config=".to_string()]).expect_err("empty equals config");
+        assert!(err.to_string().contains("--config requires a path"));
+    }
+
+    #[test]
     fn parse_config_flag_rejects_dangling_config() {
         let err = parse_config_flag(&["--config".to_string()]).expect_err("dangling config");
         assert!(err.to_string().contains("--config requires a path"));
@@ -300,6 +326,11 @@ mod tests {
         assert_eq!(
             cmd_config_get(&cfg, "clickhouse.database").expect("database"),
             "analytics"
+        );
+        cfg.backend.start_on_up = true;
+        assert_eq!(
+            cmd_config_get(&cfg, "backend.start_on_up").expect("backend switch"),
+            "true"
         );
     }
 

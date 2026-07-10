@@ -1244,6 +1244,7 @@ dependencies = [
  "anyhow",
  "moraine-config",
  "moraine-mcp-core",
+ "moraine-monitor-core",
  "tokio",
  "tracing-subscriber",
 ]
@@ -1254,6 +1255,7 @@ version = "0.6.4"
 dependencies = [
  "anyhow",
  "chrono",
+ "libc",
  "moraine-config",
  "moraine-conversations",
  "serde",
@@ -1265,12 +1267,6 @@ dependencies = [
 [[package]]
 name = "moraine-monitor"
 version = "0.6.4"
-dependencies = [
- "anyhow",
- "moraine-config",
- "moraine-monitor-core",
- "tokio",
-]
 
 [[package]]
 name = "moraine-monitor-core"
@@ -1284,6 +1280,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tower",
 ]
 
 [[package]]

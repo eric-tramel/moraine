@@ -7,8 +7,9 @@ pub(crate) enum Service {
     ClickHouse,
     #[value(name = "ingest")]
     Ingest,
-    #[value(name = "monitor")]
-    Monitor,
+    #[value(name = "backend")]
+    Backend,
+    /// Foreground MCP stdio/proxy service retained for `moraine run mcp`.
     #[value(name = "mcp")]
     Mcp,
 }
@@ -18,7 +19,7 @@ impl Service {
         match self {
             Self::ClickHouse => "clickhouse",
             Self::Ingest => "ingest",
-            Self::Monitor => "monitor",
+            Self::Backend => "backend",
             Self::Mcp => "mcp",
         }
     }
@@ -27,7 +28,7 @@ impl Service {
         match self {
             Self::ClickHouse => "clickhouse.pid",
             Self::Ingest => "ingest.pid",
-            Self::Monitor => "monitor.pid",
+            Self::Backend => "backend.pid",
             Self::Mcp => "mcp.pid",
         }
     }
@@ -36,7 +37,7 @@ impl Service {
         match self {
             Self::ClickHouse => "clickhouse.log",
             Self::Ingest => "ingest.log",
-            Self::Monitor => "monitor.log",
+            Self::Backend => "backend.log",
             Self::Mcp => "mcp.log",
         }
     }
@@ -45,8 +46,7 @@ impl Service {
         match self {
             Self::ClickHouse => None,
             Self::Ingest => Some("moraine-ingest"),
-            Self::Monitor => Some("moraine-monitor"),
-            Self::Mcp => Some("moraine-mcp"),
+            Self::Backend | Self::Mcp => Some("moraine-mcp"),
         }
     }
 }

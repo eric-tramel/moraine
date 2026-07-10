@@ -66,6 +66,7 @@ main() {
   TMP_ROOT="$(mktemp -d)"
   local dist_dir="$TMP_ROOT/dist"
   local isolated_home="$TMP_ROOT/home"
+  local installed_bin_dir="$isolated_home/.local/bin"
 
   echo "[e2e-install] packaging release bundle for target: $target"
   "$package_script" "$target" "$dist_dir"
@@ -80,11 +81,11 @@ main() {
   MORAINE_INSTALL_ASSET_BASE_URL="$asset_base_url" \
     MORAINE_INSTALL_VERSION="$bundle_version" \
     MORAINE_INSTALL_SKIP_CLICKHOUSE=1 \
-    MORAINE_INSTALL_DIR="$HOME/.local/bin" \
+    MORAINE_INSTALL_DIR="$installed_bin_dir" \
     bash "$install_script"
 
-  export PATH="$HOME/.local/bin:$PATH"
-  local installed_moraine="$HOME/.local/bin/moraine"
+  export PATH="$installed_bin_dir:$PATH"
+  local installed_moraine="$installed_bin_dir/moraine"
   if [[ ! -x "$installed_moraine" ]]; then
     echo "missing installed moraine binary: $installed_moraine" >&2
     exit 1
@@ -103,7 +104,10 @@ main() {
 
   echo "[e2e-install] running functional stack + MCP smoke with installed moraine"
   unset MORAINE_SOURCE_TREE_MODE
-  MORAINECTL_BIN="$installed_moraine" PYTHON_BIN="$python_bin" bash "$e2e_script"
+  MORAINECTL_BIN="$installed_moraine" \
+    MORAINE_SERVICE_BIN_DIR="$installed_bin_dir" \
+    PYTHON_BIN="$python_bin" \
+    bash "$e2e_script"
   E2E_INSTALL_SUCCESS=1
 }
 

@@ -171,8 +171,8 @@ pub struct McpConfig {
     /// An absolute path is used verbatim.
     #[serde(default = "default_mcp_socket")]
     pub central_socket_path: String,
-    /// When true, `moraine up` launches the shared central MCP server as a
-    /// background daemon (Service::Mcp in `--serve socket` mode).
+    /// Primary deprecated compatibility key. When `[backend].start_on_up` is
+    /// absent, an explicitly configured `true` value maps to the unified backend.
     #[serde(default = "default_true")]
     pub start_central_on_up: bool,
     /// Upper bound, in milliseconds, on how long a proxy client waits to
@@ -195,6 +195,15 @@ pub struct Bm25Config {
     pub default_min_should_match: u16,
     #[serde(default = "default_max_query_terms")]
     pub max_query_terms: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BackendConfig {
+    /// Launch the unified MCP socket + monitor HTTP daemon from `moraine up`.
+    /// This remains off by default for the first backend-daemon release.
+    #[serde(default = "default_false")]
+    pub start_on_up: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -227,13 +236,13 @@ pub struct RuntimeConfig {
     pub clickhouse_auto_install: bool,
     #[serde(default = "default_clickhouse_version")]
     pub clickhouse_version: String,
+    /// Primary deprecated compatibility key. When `[backend].start_on_up` is
+    /// absent, an explicitly configured `true` value maps to the unified backend.
     #[serde(default = "default_true")]
     pub start_monitor_on_up: bool,
-    /// Deprecated (v0.6.0): the up-managed MCP service is always the shared
-    /// central server now, controlled by `mcp.start_central_on_up`. This key
-    /// is still parsed (existing configs must keep loading under
-    /// `deny_unknown_fields`) and acts as a force-on alias, like
-    /// `moraine up --mcp`.
+    /// Tertiary deprecated compatibility alias retained for configs written by
+    /// v0.6.0. It maps to the unified backend only when explicitly set to `true`
+    /// and `[backend].start_on_up` is absent.
     #[serde(default = "default_false")]
     pub start_mcp_on_up: bool,
 }
@@ -260,6 +269,8 @@ pub struct AppConfig {
     pub ingest: IngestConfig,
     #[serde(default)]
     pub mcp: McpConfig,
+    #[serde(default)]
+    pub backend: BackendConfig,
     #[serde(default)]
     pub bm25: Bm25Config,
     #[serde(default)]
@@ -330,6 +341,7 @@ impl Default for AppConfig {
             redaction: RedactionConfig::default(),
             ingest: IngestConfig::default(),
             mcp: McpConfig::default(),
+            backend: BackendConfig::default(),
             bm25: Bm25Config::default(),
             monitor: MonitorConfig::default(),
             runtime: RuntimeConfig::default(),
@@ -1141,6 +1153,39 @@ fn path_is_home_config(path: &Path, home_path: Option<&Path>) -> bool {
         .unwrap_or(false)
 }
 
+fn raw_config_bool(raw: &toml::Value, section: &str, field: &str) -> Option<bool> {
+    raw.get(section)
+        .and_then(|section| section.get(field))
+        .and_then(toml::Value::as_bool)
+}
+
+fn normalize_backend_start_on_up(cfg: &mut AppConfig, raw: &toml::Value) {
+    // The canonical field is authoritative whenever present, including when
+    // explicitly false. AppConfig deserialization has already validated its
+    // type, so presence in the raw document is the distinction that matters.
+    if raw
+        .get("backend")
+        .and_then(|backend| backend.get("start_on_up"))
+        .is_some()
+    {
+        return;
+    }
+
+    // These two launch keys are the primary compatibility inputs. Inspect the
+    // raw document so their historical serde defaults do not opt in a config
+    // that omitted them.
+    let primary_legacy_start_on_up = raw_config_bool(raw, "runtime", "start_monitor_on_up")
+        .unwrap_or(false)
+        || raw_config_bool(raw, "mcp", "start_central_on_up").unwrap_or(false);
+
+    // start_mcp_on_up predates start_central_on_up and remains a separately
+    // named tertiary alias for configs written during that release window.
+    let tertiary_legacy_start_on_up =
+        raw_config_bool(raw, "runtime", "start_mcp_on_up").unwrap_or(false);
+
+    cfg.backend.start_on_up = primary_legacy_start_on_up || tertiary_legacy_start_on_up;
+}
+
 fn load_config_with_home_path(path: &Path, home_path: Option<PathBuf>) -> Result<AppConfig> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config {}", path.display()))?;
@@ -1159,6 +1204,7 @@ fn load_config_with_home_path(path: &Path, home_path: Option<PathBuf>) -> Result
             "config declares both [clickhouse] and [backends.default]; they are aliases for the same backend — keep exactly one"
         ));
     }
+    normalize_backend_start_on_up(&mut cfg, &raw);
 
     if cfg.redaction.dangerously_skip_secret_redaction
         && !path_is_home_config(path, home_path.as_deref())
@@ -1240,6 +1286,13 @@ mod tests {
         ));
         std::fs::write(&path, contents).expect("write temp config");
         path
+    }
+
+    fn assert_backend_start_on_up(label: &str, contents: &str, expected: bool) {
+        let path = write_temp_config(contents, label);
+        let cfg = load_config(&path).expect("backend launch config should load");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(cfg.backend.start_on_up, expected, "case `{label}`");
     }
 
     #[test]
@@ -1594,6 +1647,111 @@ prewarm_on_initialize = true
     }
 
     #[test]
+    fn backend_start_on_up_defaults_and_missing_states_are_off() {
+        assert!(!BackendConfig::default().start_on_up);
+        assert!(!AppConfig::default().backend.start_on_up);
+
+        for (label, contents) in [
+            ("backend-empty-config", ""),
+            ("backend-empty-table", "[backend]\n"),
+            (
+                "backend-canonical-false",
+                "[backend]\nstart_on_up = false\n",
+            ),
+            (
+                "backend-monitor-false",
+                "[runtime]\nstart_monitor_on_up = false\n",
+            ),
+            (
+                "backend-central-false",
+                "[mcp]\nstart_central_on_up = false\n",
+            ),
+            (
+                "backend-tertiary-false",
+                "[runtime]\nstart_mcp_on_up = false\n",
+            ),
+            (
+                "backend-all-legacy-false",
+                "[runtime]\nstart_monitor_on_up = false\nstart_mcp_on_up = false\n\n[mcp]\nstart_central_on_up = false\n",
+            ),
+        ] {
+            assert_backend_start_on_up(label, contents, false);
+        }
+    }
+
+    #[test]
+    fn backend_start_on_up_maps_all_primary_legacy_alias_states() {
+        for monitor in [false, true] {
+            for central in [false, true] {
+                let content = format!(
+                    "[runtime]\nstart_monitor_on_up = {monitor}\n\n[mcp]\nstart_central_on_up = {central}\n"
+                );
+                assert_backend_start_on_up(
+                    &format!("backend-primary-{monitor}-{central}"),
+                    &content,
+                    monitor || central,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn backend_start_on_up_maps_tertiary_runtime_mcp_alias_only_when_true() {
+        for start_mcp in [false, true] {
+            let content = format!("[runtime]\nstart_mcp_on_up = {start_mcp}\n");
+            assert_backend_start_on_up(
+                &format!("backend-tertiary-{start_mcp}"),
+                &content,
+                start_mcp,
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_backend_start_on_up_wins_over_all_legacy_alias_states() {
+        for explicit in [false, true] {
+            for monitor in [false, true] {
+                for central in [false, true] {
+                    for start_mcp in [false, true] {
+                        let content = format!(
+                            "[backend]\nstart_on_up = {explicit}\n\n[runtime]\nstart_monitor_on_up = {monitor}\nstart_mcp_on_up = {start_mcp}\n\n[mcp]\nstart_central_on_up = {central}\n"
+                        );
+                        assert_backend_start_on_up(
+                            &format!(
+                                "backend-precedence-{explicit}-{monitor}-{central}-{start_mcp}"
+                            ),
+                            &content,
+                            explicit,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_backend_fields_are_load_errors() {
+        for (label, contents) in [
+            (
+                "backend-string-value",
+                "[backend]\nstart_on_up = \"false\"\n",
+            ),
+            ("backend-integer-value", "[backend]\nstart_on_up = 0\n"),
+            ("backend-unknown-field", "[backend]\nstart_on_upp = false\n"),
+            ("backend-not-a-table", "backend = false\n"),
+        ] {
+            let path = write_temp_config(contents, label);
+            let result = load_config(&path);
+            std::fs::remove_file(&path).ok();
+            let error = result.expect_err("malformed backend config must not load");
+            assert!(
+                format!("{error:#}").contains("failed to parse TOML config"),
+                "case `{label}` returned an unexpected error: {error:#}"
+            );
+        }
+    }
+
+    #[test]
     fn central_socket_path_resolves_relative_to_pids_dir() {
         let path = write_temp_config(
             r#"
@@ -1852,6 +2010,47 @@ watch_root = "~/.cursor/projects"
         assert!(source.enabled, "cursor_sqlite is default on");
         assert_eq!(source.format, SOURCE_FORMAT_CURSOR_SQLITE);
         assert_eq!(source.harness, "cursor");
+    }
+
+    #[test]
+    fn shipped_template_explicitly_keeps_backend_off_without_legacy_launch_keys() {
+        let contents = include_str!("../../../config/moraine.toml");
+        let raw: toml::Value = toml::from_str(contents).expect("shipped template must be TOML");
+
+        assert_eq!(
+            raw_config_bool(&raw, "backend", "start_on_up"),
+            Some(false),
+            "template must explicitly opt out of backend launch"
+        );
+        assert_eq!(
+            raw_config_bool(&raw, "mcp", "use_central_server"),
+            Some(true),
+            "MCP clients should keep using the central socket when available"
+        );
+        assert!(
+            raw.get("mcp")
+                .and_then(|mcp| mcp.get("start_central_on_up"))
+                .is_none(),
+            "template must not ship the obsolete MCP launch key"
+        );
+        assert!(
+            raw.get("runtime")
+                .and_then(|runtime| runtime.get("start_monitor_on_up"))
+                .is_none(),
+            "template must not ship the obsolete monitor launch key"
+        );
+        assert!(
+            raw.get("runtime")
+                .and_then(|runtime| runtime.get("start_mcp_on_up"))
+                .is_none(),
+            "template must not ship the tertiary MCP launch key"
+        );
+
+        let path = write_temp_config(contents, "shipped-template-backend-off");
+        let cfg = load_config(&path).expect("shipped template must load");
+        std::fs::remove_file(&path).ok();
+        assert!(!cfg.backend.start_on_up);
+        assert!(cfg.mcp.use_central_server);
     }
 
     #[test]

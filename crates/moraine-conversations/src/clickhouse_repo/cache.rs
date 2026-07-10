@@ -8,6 +8,8 @@ pub(super) const TERM_DF_CACHE_TTL: Duration = Duration::from_secs(300);
 pub(super) const SEARCH_SCHEMA_CACHE_TTL: Duration = Duration::from_secs(60);
 pub(super) const SEARCH_RESULT_CACHE_TTL: Duration = Duration::from_secs(15);
 pub(super) const SEARCH_RESULT_CACHE_MAX_ENTRIES: usize = 256;
+pub(super) const MCP_SEARCH_RESULT_CACHE_TTL: Duration = Duration::from_secs(15);
+pub(super) const MCP_SEARCH_RESULT_CACHE_MAX_ENTRIES: usize = 256;
 pub(super) const TERM_POSTINGS_CACHE_TTL: Duration = Duration::from_secs(15);
 pub(super) const TERM_POSTINGS_CACHE_MAX_ENTRIES: usize = 2048;
 pub(super) const TERM_POSTINGS_CACHE_MAX_ROWS_PER_TERM: usize = 131_072;
@@ -73,6 +75,13 @@ pub(super) struct SearchStatsCache {
 #[derive(Debug, Clone)]
 pub(super) struct SearchEventsCacheEntry {
     pub(super) hits: Vec<SearchEventHit>,
+    pub(super) fetched_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct SearchMcpEventsCacheEntry {
+    pub(super) hits: Vec<SearchMcpEventHit>,
+    pub(super) truncated: bool,
     pub(super) fetched_at: Instant,
 }
 
@@ -248,6 +257,86 @@ impl ClickHouseConversationRepository {
             key,
             SearchEventsCacheEntry {
                 hits: hits.to_vec(),
+                fetched_at: now,
+            },
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn search_mcp_events_cache_key(
+        terms: &[String],
+        event_types: &[McpEventType],
+        session_id: Option<&str>,
+        turn_seq: Option<u32>,
+        min_should_match: u16,
+        min_score: f64,
+        effective_n_hits: u16,
+    ) -> String {
+        let mut cache_terms = terms.to_vec();
+        cache_terms.sort_unstable();
+        let event_type_sig = event_types
+            .iter()
+            .map(|event_type| event_type.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "event_types={event_type_sig};session={};turn_seq={};msm={min_should_match};min_score={:016x};limit={effective_n_hits};terms={}",
+            session_id.unwrap_or(""),
+            turn_seq.unwrap_or(0),
+            min_score.to_bits(),
+            cache_terms.join(",")
+        )
+    }
+
+    pub(super) async fn search_mcp_events_cache_get(
+        &self,
+        key: &str,
+    ) -> Option<(Vec<SearchMcpEventHit>, bool)> {
+        let now = Instant::now();
+        {
+            let cache = self.mcp_search_cache.read().await;
+            let entry = cache.get(key)?;
+            if now.duration_since(entry.fetched_at) <= MCP_SEARCH_RESULT_CACHE_TTL {
+                return Some((entry.hits.clone(), entry.truncated));
+            }
+        }
+
+        let mut cache = self.mcp_search_cache.write().await;
+        if let Some(entry) = cache.get(key) {
+            if now.duration_since(entry.fetched_at) <= MCP_SEARCH_RESULT_CACHE_TTL {
+                return Some((entry.hits.clone(), entry.truncated));
+            }
+        }
+        cache.remove(key);
+        None
+    }
+
+    pub(super) async fn search_mcp_events_cache_put(
+        &self,
+        key: String,
+        hits: &[SearchMcpEventHit],
+        truncated: bool,
+    ) {
+        let now = Instant::now();
+        let mut cache = self.mcp_search_cache.write().await;
+        cache
+            .retain(|_, entry| now.duration_since(entry.fetched_at) <= MCP_SEARCH_RESULT_CACHE_TTL);
+
+        if cache.len() >= MCP_SEARCH_RESULT_CACHE_MAX_ENTRIES {
+            if let Some(oldest_key) = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.fetched_at)
+                .map(|(key, _)| key.clone())
+            {
+                cache.remove(&oldest_key);
+            }
+        }
+
+        cache.insert(
+            key,
+            SearchMcpEventsCacheEntry {
+                hits: hits.to_vec(),
+                truncated,
                 fetched_at: now,
             },
         );

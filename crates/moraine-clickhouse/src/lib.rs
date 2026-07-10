@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use moraine_config::ClickHouseConfig;
 use reqwest::{
-    header::{CONTENT_LENGTH, CONTENT_TYPE},
+    header::{HeaderValue, CONTENT_LENGTH, CONTENT_TYPE, USER_AGENT},
     Client, RequestBuilder, Url,
 };
 use serde::de::DeserializeOwned;
@@ -11,6 +11,7 @@ use serde_json::Value;
 const MAX_INSERT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 use std::collections::{BTreeSet, HashSet};
 use std::time::Duration;
+const DEFAULT_USER_AGENT_ROLE: &str = "moraine-clickhouse";
 
 #[derive(Clone)]
 pub struct ClickHouseClient {
@@ -84,9 +85,25 @@ pub struct DoctorReport {
 
 impl ClickHouseClient {
     pub fn new(cfg: ClickHouseConfig) -> Result<Self> {
+        let user_agent = format!(
+            "{DEFAULT_USER_AGENT_ROLE}/{} (pid={})",
+            env!("CARGO_PKG_VERSION"),
+            std::process::id()
+        );
+        Self::new_with_user_agent(cfg, user_agent)
+    }
+
+    /// Construct a client whose every HTTP request carries the supplied
+    /// prevalidated-at-construction User-Agent.
+    pub fn new_with_user_agent(cfg: ClickHouseConfig, user_agent: impl AsRef<str>) -> Result<Self> {
         let timeout = Duration::from_secs_f64(cfg.timeout_seconds.max(1.0));
+        let user_agent = HeaderValue::try_from(user_agent.as_ref())
+            .context("invalid ClickHouse HTTP User-Agent")?;
+        let mut default_headers = reqwest::header::HeaderMap::with_capacity(1);
+        default_headers.insert(USER_AGENT, user_agent);
         let http = Client::builder()
             .timeout(timeout)
+            .default_headers(default_headers)
             .build()
             .context("failed to construct reqwest client")?;
 
@@ -1043,6 +1060,40 @@ mod tests {
         format!("http://{}", addr)
     }
 
+    async fn spawn_user_agent_capture_server(
+        user_agents: Arc<Mutex<Vec<Option<String>>>>,
+    ) -> String {
+        async fn handler(
+            State(user_agents): State<Arc<Mutex<Vec<Option<String>>>>>,
+            headers: HeaderMap,
+        ) -> (StatusCode, &'static str) {
+            user_agents
+                .lock()
+                .expect("user-agent capture mutex poisoned")
+                .push(
+                    headers
+                        .get("user-agent")
+                        .and_then(|value| value.to_str().ok())
+                        .map(ToString::to_string),
+                );
+            (StatusCode::OK, "1")
+        }
+
+        let app = Router::new()
+            .route("/", post(handler))
+            .with_state(user_agents);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind user-agent capture listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        format!("http://{}", addr)
+    }
+
     #[derive(Clone)]
     struct StreamCaptureState {
         params: Arc<Mutex<Vec<HashMap<String, String>>>>,
@@ -1553,6 +1604,72 @@ mod tests {
         let statement = format!("{}é{}", "a".repeat(239), "b".repeat(10));
         let truncated = truncate_for_error(&statement);
         assert_eq!(truncated, format!("{}...", "a".repeat(239)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn supplied_user_agent_is_reused_for_every_request() {
+        let user_agents = Arc::new(Mutex::new(Vec::new()));
+        let base_url = spawn_user_agent_capture_server(user_agents.clone()).await;
+        let identity = "moraine-backend/0.6.4 (pid=4242)";
+        let client =
+            ClickHouseClient::new_with_user_agent(test_clickhouse_config(base_url), identity)
+                .expect("new attributed client");
+
+        client
+            .request_text("SELECT 1", None, None, false, None)
+            .await
+            .expect("first attributed request");
+        client
+            .request_text("SELECT 1", None, None, false, None)
+            .await
+            .expect("second attributed request");
+
+        assert_eq!(
+            user_agents
+                .lock()
+                .expect("user-agent capture mutex poisoned")
+                .as_slice(),
+            &[Some(identity.to_string()), Some(identity.to_string())]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compatibility_constructor_sends_default_process_identity() {
+        let user_agents = Arc::new(Mutex::new(Vec::new()));
+        let base_url = spawn_user_agent_capture_server(user_agents.clone()).await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url))
+            .expect("compatibility constructor");
+
+        client
+            .request_text("SELECT 1", None, None, false, None)
+            .await
+            .expect("request from compatibility client");
+
+        let expected = format!(
+            "{DEFAULT_USER_AGENT_ROLE}/{} (pid={})",
+            env!("CARGO_PKG_VERSION"),
+            std::process::id()
+        );
+        assert_eq!(
+            user_agents
+                .lock()
+                .expect("user-agent capture mutex poisoned")
+                .as_slice(),
+            &[Some(expected)]
+        );
+    }
+
+    #[test]
+    fn invalid_user_agent_is_rejected_during_construction() {
+        let result = ClickHouseClient::new_with_user_agent(
+            test_clickhouse_config("http://127.0.0.1:8123".to_string()),
+            "moraine-backend/0.6.4\ninjected: true",
+        );
+
+        assert!(
+            result.is_err(),
+            "invalid identity must fail before a request can be built"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

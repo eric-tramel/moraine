@@ -37,13 +37,12 @@ async fn start_selected_services(
 
     let mut started_services = Vec::new();
     for service in services_to_start {
-        let extra_args = up_service_extra_args(service, cfg);
         started_services.push(start_background_service(
             service,
             config_path,
             cfg,
             paths,
-            &extra_args,
+            &[],
         )?);
     }
 
@@ -64,26 +63,10 @@ fn selected_up_services(args: &UpArgs, cfg: &AppConfig) -> Vec<Service> {
     if !args.no_ingest {
         services.push(Service::Ingest);
     }
-    if args.monitor || cfg.runtime.start_monitor_on_up {
-        services.push(Service::Monitor);
-    }
-    if args.mcp || cfg.runtime.start_mcp_on_up || cfg.mcp.start_central_on_up {
-        services.push(Service::Mcp);
+    if args.backend || args.monitor || args.mcp || cfg.backend.start_on_up {
+        services.push(Service::Backend);
     }
     services
-}
-
-fn up_service_extra_args(service: Service, cfg: &AppConfig) -> Vec<String> {
-    if service == Service::Mcp {
-        vec![
-            "--serve".to_string(),
-            "socket".to_string(),
-            "--socket".to_string(),
-            cfg.mcp.central_socket_path.clone(),
-        ]
-    } else {
-        Vec::new()
-    }
 }
 
 #[cfg(test)]
@@ -91,16 +74,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn selected_up_services_preserves_order_and_flags() {
+    fn selected_up_services_uses_only_normalized_backend_switch_and_deduplicates_aliases() {
         let mut cfg = AppConfig::default();
-        cfg.runtime.start_monitor_on_up = false;
-        cfg.runtime.start_mcp_on_up = false;
-        cfg.mcp.start_central_on_up = false;
+        cfg.backend.start_on_up = false;
+        cfg.runtime.start_monitor_on_up = true;
+        cfg.runtime.start_mcp_on_up = true;
+        cfg.mcp.start_central_on_up = true;
 
         assert_eq!(
             selected_up_services(
                 &UpArgs {
                     no_ingest: false,
+                    backend: false,
                     monitor: false,
                     mcp: false,
                 },
@@ -109,33 +94,39 @@ mod tests {
             vec![Service::Ingest]
         );
 
+        for (backend, monitor, mcp) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, true),
+        ] {
+            assert_eq!(
+                selected_up_services(
+                    &UpArgs {
+                        no_ingest: true,
+                        backend,
+                        monitor,
+                        mcp,
+                    },
+                    &cfg
+                ),
+                vec![Service::Backend],
+                "backend={backend} monitor={monitor} mcp={mcp}"
+            );
+        }
+
+        cfg.backend.start_on_up = true;
         assert_eq!(
             selected_up_services(
                 &UpArgs {
-                    no_ingest: true,
-                    monitor: true,
-                    mcp: true,
+                    no_ingest: false,
+                    backend: false,
+                    monitor: false,
+                    mcp: false,
                 },
                 &cfg
             ),
-            vec![Service::Monitor, Service::Mcp]
+            vec![Service::Ingest, Service::Backend]
         );
-    }
-
-    #[test]
-    fn up_injects_mcp_socket_server_args_only_for_mcp() {
-        let mut cfg = AppConfig::default();
-        cfg.mcp.central_socket_path = "/tmp/moraine-test.sock".to_string();
-
-        assert_eq!(
-            up_service_extra_args(Service::Mcp, &cfg),
-            vec![
-                "--serve".to_string(),
-                "socket".to_string(),
-                "--socket".to_string(),
-                "/tmp/moraine-test.sock".to_string(),
-            ]
-        );
-        assert!(up_service_extra_args(Service::Ingest, &cfg).is_empty());
     }
 }

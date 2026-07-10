@@ -2829,24 +2829,44 @@ FORMAT JSONEachRow",
         }
 
         let avgdl = (total_doc_len as f64 / docs as f64).max(1.0);
-        let mut rows = self
-            .search_mcp_event_rows(
-                &terms,
-                docs,
-                avgdl,
-                &event_types,
-                query.session_id.as_deref(),
-                query.turn_seq,
-                min_should_match,
-                min_score,
-                fetch_limit,
-            )
-            .await?;
-        let truncated = rows.len() > effective_n_hits as usize;
-        if truncated {
-            rows.truncate(effective_n_hits as usize);
-        }
-        let hits = self.map_search_mcp_rows_to_hits(rows).await?;
+        let cache_key = Self::search_mcp_events_cache_key(
+            &terms,
+            &event_types,
+            query.session_id.as_deref(),
+            query.turn_seq,
+            min_should_match,
+            min_score,
+            effective_n_hits,
+        );
+        let cached_result = self.search_mcp_events_cache_get(&cache_key).await;
+        let cache_hit = cached_result.is_some();
+        tracing::info!(cache_hit, "mcp_search_cache");
+
+        let (hits, truncated) = if let Some(cached_result) = cached_result {
+            cached_result
+        } else {
+            let mut rows = self
+                .search_mcp_event_rows(
+                    &terms,
+                    docs,
+                    avgdl,
+                    &event_types,
+                    query.session_id.as_deref(),
+                    query.turn_seq,
+                    min_should_match,
+                    min_score,
+                    fetch_limit,
+                )
+                .await?;
+            let truncated = rows.len() > effective_n_hits as usize;
+            if truncated {
+                rows.truncate(effective_n_hits as usize);
+            }
+            let hits = self.map_search_mcp_rows_to_hits(rows).await?;
+            self.search_mcp_events_cache_put(cache_key, &hits, truncated)
+                .await;
+            (hits, truncated)
+        };
         let took_ms = started.elapsed().as_millis() as u32;
 
         Ok(SearchMcpEventsResult {

@@ -3662,6 +3662,78 @@ async fn search_mcp_events_fetches_limit_plus_one_for_truncation() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn search_mcp_events_result_cache_reuses_repository_across_requests() {
+    let (repo, state) = build_repo().await;
+    let query = SearchMcpEventsQuery {
+        query: "hello world".to_string(),
+        n_hits: Some(2),
+        session_id: Some("sess_c".to_string()),
+        event_types: Some(vec![
+            McpEventType::UserInput,
+            McpEventType::AssistantResponse,
+            McpEventType::ToolResponse,
+        ]),
+        min_score: Some(0.0),
+        min_should_match: Some(1),
+        ..SearchMcpEventsQuery::default()
+    };
+
+    let first = repo
+        .search_mcp_events(query.clone())
+        .await
+        .expect("first MCP event search");
+    assert!(first.truncated);
+    assert!(first.stats.truncated);
+    let requests_after_first = state.queries.lock().expect("queries lock").len();
+    assert!(requests_after_first > 0);
+
+    let second = repo
+        .search_mcp_events(query.clone())
+        .await
+        .expect("cached MCP event search");
+    assert_ne!(first.query_id, second.query_id);
+    assert!(second.truncated);
+    assert!(second.stats.truncated);
+    assert_eq!(
+        state.queries.lock().expect("queries lock").len(),
+        requests_after_first,
+        "identical MCP search should issue no additional ClickHouse requests"
+    );
+
+    let mut first_payload = serde_json::to_value(&first).expect("serialize first result");
+    first_payload
+        .as_object_mut()
+        .expect("result object")
+        .remove("query_id");
+    first_payload["stats"]
+        .as_object_mut()
+        .expect("stats object")
+        .remove("took_ms");
+    let mut second_payload = serde_json::to_value(&second).expect("serialize second result");
+    second_payload
+        .as_object_mut()
+        .expect("result object")
+        .remove("query_id");
+    second_payload["stats"]
+        .as_object_mut()
+        .expect("stats object")
+        .remove("took_ms");
+    assert_eq!(first_payload, second_payload);
+
+    let requests_before_changed_option = state.queries.lock().expect("queries lock").len();
+    repo.search_mcp_events(SearchMcpEventsQuery {
+        turn_seq: Some(2),
+        ..query
+    })
+    .await
+    .expect("MCP event search with changed turn scope");
+    assert!(
+        state.queries.lock().expect("queries lock").len() > requests_before_changed_option,
+        "changed normalized search semantics must miss the result cache"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn search_mcp_events_reports_event_ordinal_within_turn() {
     let (repo, _state) = build_repo().await;
 

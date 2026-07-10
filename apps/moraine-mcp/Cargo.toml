@@ -2,7 +2,7 @@
 name = "moraine-mcp"
 version = "0.6.4"
 edition = "2021"
-description = "Moraine MCP stdio server"
+description = "Moraine MCP stdio entry and unified backend daemon"
 
 [dependencies]
 anyhow = "1.0"
@@ -11,9 +11,13 @@ tokio = { version = "1.40", features = [
     "rt-multi-thread",
     "io-std",
     "io-util",
+    "macros",
     "net",
+    "signal",
+    "sync",
     "time",
 ] }
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 moraine-config = { path = "../../crates/moraine-config" }
 moraine-mcp-core = { path = "../../crates/moraine-mcp-core" }
+moraine-monitor-core = { path = "../../crates/moraine-monitor-core" }

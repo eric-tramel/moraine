@@ -79,6 +79,10 @@ fn service_log_paths(paths: &RuntimePaths, service: Service) -> Vec<PathBuf> {
     }
 }
 
+fn default_log_services() -> [Service; 3] {
+    [Service::ClickHouse, Service::Ingest, Service::Backend]
+}
+
 pub(super) fn collect_logs(
     paths: &RuntimePaths,
     service: Option<Service>,
@@ -86,12 +90,7 @@ pub(super) fn collect_logs(
 ) -> Result<LogsSnapshot> {
     let targets = match service {
         Some(svc) => vec![svc],
-        None => vec![
-            Service::ClickHouse,
-            Service::Ingest,
-            Service::Monitor,
-            Service::Mcp,
-        ],
+        None => default_log_services().to_vec(),
     };
 
     let mut sections = Vec::new();
@@ -191,5 +190,13 @@ mod tests {
         assert_eq!(snapshot.sections[1].path, server.display().to_string());
         assert_eq!(snapshot.sections[1].lines, ["server line"]);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn default_logs_follow_managed_topology_order() {
+        assert_eq!(
+            default_log_services(),
+            [Service::ClickHouse, Service::Ingest, Service::Backend]
+        );
     }
 }

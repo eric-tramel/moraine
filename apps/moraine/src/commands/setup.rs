@@ -69,7 +69,9 @@ fn run_setup(
             args.skip_config || args.dry_run || config.status == SetupStatus::Ok;
         if config_allows_mcp {
             let selections = setup_target_selections(args, interactive, runner)?;
-            if selections.apply_ingest && !args.skip_config && config.status == SetupStatus::Ok {
+            let config_allows_ingest = config.status == SetupStatus::Ok
+                || (args.dry_run && config.action == "would_migrate");
+            if selections.apply_ingest && !args.skip_config && config_allows_ingest {
                 let ingest_update = if args.dry_run {
                     preview_ingest_selections_for_config(&target.path, &selections.targets)
                 } else {
@@ -229,11 +231,9 @@ fn setup_config(
                 "default config written",
             ))
         }
-        ConfigState::Valid => Ok(ConfigReport::ok(
-            &target.path,
-            "unchanged",
-            "existing config loads successfully",
-        )),
+        ConfigState::Valid {
+            backend_start_on_up,
+        } => migrate_backend_launch_config(&target.path, backend_start_on_up, args.dry_run),
         ConfigState::Invalid(message) => {
             if args.dry_run {
                 let action = if args.repair_config {
@@ -281,7 +281,7 @@ fn setup_config(
 
 enum ConfigState {
     Missing,
-    Valid,
+    Valid { backend_start_on_up: bool },
     Invalid(String),
     Unreadable(String),
 }
@@ -304,7 +304,9 @@ fn inspect_config(path: &Path) -> ConfigState {
         return ConfigState::Unreadable(exc.to_string());
     }
     match moraine_config::load_config(path) {
-        Ok(_) => ConfigState::Valid,
+        Ok(config) => ConfigState::Valid {
+            backend_start_on_up: config.backend.start_on_up,
+        },
         Err(exc) => ConfigState::Invalid(exc.to_string()),
     }
 }
@@ -471,6 +473,134 @@ fn timestamp_suffix() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     format!("{}-{}", duration.as_secs(), duration.subsec_nanos())
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BackendLaunchMigration {
+    materialized_start_on_up: bool,
+    removed_monitor_alias: bool,
+    removed_mcp_alias: bool,
+    removed_central_alias: bool,
+    start_on_up: bool,
+}
+
+impl BackendLaunchMigration {
+    fn has_changes(self) -> bool {
+        self.materialized_start_on_up || self.removed_alias_count() > 0
+    }
+
+    fn removed_alias_count(self) -> usize {
+        self.removed_monitor_alias as usize
+            + self.removed_mcp_alias as usize
+            + self.removed_central_alias as usize
+    }
+
+    fn summary(self, dry_run: bool) -> String {
+        let mut changes = Vec::new();
+        if self.materialized_start_on_up {
+            changes.push(format!(
+                "backend.start_on_up={} {}",
+                self.start_on_up,
+                if dry_run {
+                    "would be materialized"
+                } else {
+                    "materialized"
+                }
+            ));
+        }
+
+        let removed = self.removed_alias_count();
+        if removed > 0 {
+            changes.push(format!(
+                "{removed} obsolete launch {} {}",
+                if removed == 1 { "key" } else { "keys" },
+                if dry_run {
+                    "would be removed"
+                } else {
+                    "removed"
+                }
+            ));
+        }
+        changes.join("; ")
+    }
+}
+
+fn migrate_backend_launch_config(
+    path: &Path,
+    backend_start_on_up: bool,
+    dry_run: bool,
+) -> Result<ConfigReport> {
+    let mut document = read_config_document(path)?;
+    let migration = apply_backend_launch_migration_to_document(&mut document, backend_start_on_up)?;
+    if !migration.has_changes() {
+        return Ok(ConfigReport::ok(
+            path,
+            "unchanged",
+            "existing config loads successfully; backend launch config is canonical",
+        ));
+    }
+
+    if dry_run {
+        return Ok(ConfigReport::planned(
+            path,
+            "would_migrate",
+            &migration.summary(true),
+        ));
+    }
+
+    write_toml_atomic(path, &document.to_string())?;
+    Ok(ConfigReport::ok(
+        path,
+        "migrated",
+        &migration.summary(false),
+    ))
+}
+
+fn apply_backend_launch_migration_to_document(
+    document: &mut DocumentMut,
+    backend_start_on_up: bool,
+) -> Result<BackendLaunchMigration> {
+    let backend_start_explicit = document
+        .as_table()
+        .get("backend")
+        .and_then(Item::as_table_like)
+        .and_then(|backend| backend.get("start_on_up"))
+        .is_some();
+
+    if !backend_start_explicit {
+        if document.as_table().get("backend").is_none() {
+            document["backend"] = Item::Table(Table::new());
+        }
+        let backend = document
+            .as_table_mut()
+            .get_mut("backend")
+            .and_then(Item::as_table_like_mut)
+            .ok_or_else(|| anyhow::anyhow!("backend must be a TOML table"))?;
+        let _ = backend.insert("start_on_up", toml_edit::value(backend_start_on_up));
+    }
+
+    let removed_monitor_alias =
+        remove_config_table_key(document, "runtime", "start_monitor_on_up")?;
+    let removed_mcp_alias = remove_config_table_key(document, "runtime", "start_mcp_on_up")?;
+    let removed_central_alias = remove_config_table_key(document, "mcp", "start_central_on_up")?;
+
+    Ok(BackendLaunchMigration {
+        materialized_start_on_up: !backend_start_explicit,
+        removed_monitor_alias,
+        removed_mcp_alias,
+        removed_central_alias,
+        start_on_up: backend_start_on_up,
+    })
+}
+
+fn remove_config_table_key(document: &mut DocumentMut, table: &str, key: &str) -> Result<bool> {
+    let Some(item) = document.as_table_mut().get_mut(table) else {
+        return Ok(false);
+    };
+    let table = item
+        .as_table_like_mut()
+        .ok_or_else(|| anyhow::anyhow!("{table} must be a TOML table"))?;
+    Ok(table.remove(key).is_some())
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2469,6 +2599,41 @@ mod tests {
         ))
     }
 
+    fn setup_config_for_test(path: &Path, dry_run: bool, repair_config: bool) -> ConfigReport {
+        let args = SetupArgs {
+            yes: true,
+            dry_run,
+            skip_config: false,
+            skip_mcp: true,
+            repair_config,
+            mcp_targets: Vec::new(),
+        };
+        setup_config(
+            &args,
+            &ConfigTarget {
+                path: path.to_path_buf(),
+                source: ConfigTargetSource::Cli,
+            },
+            false,
+        )
+        .expect("setup config")
+    }
+
+    fn read_toml_document(path: &Path) -> DocumentMut {
+        fs::read_to_string(path)
+            .expect("read config")
+            .parse::<DocumentMut>()
+            .expect("parse config")
+    }
+
+    fn config_item<'a>(document: &'a DocumentMut, table: &str, key: &str) -> Option<&'a Item> {
+        document
+            .as_table()
+            .get(table)
+            .and_then(Item::as_table_like)
+            .and_then(|table| table.get(key))
+    }
+
     fn repo_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -2944,7 +3109,8 @@ watch_root = "~/custom"
         let dir = temp_path("valid-no-repair");
         fs::create_dir_all(&dir).expect("create dir");
         let path = dir.join("config.toml");
-        fs::write(&path, "# minimal\n").expect("write config");
+        let original = "# minimal\n\n[backend]\nstart_on_up = false\n";
+        fs::write(&path, original).expect("write config");
         let args = SetupArgs {
             yes: true,
             dry_run: false,
@@ -2964,11 +3130,286 @@ watch_root = "~/custom"
         .expect("valid config");
         assert_eq!(report.action, "unchanged");
         assert!(report.backup_path.is_none());
-        assert_eq!(
-            fs::read_to_string(path).expect("config content"),
-            "# minimal\n"
-        );
+        assert_eq!(fs::read_to_string(path).expect("config content"), original);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn setup_migrates_monitor_and_central_backend_launch_aliases() {
+        for (label, table, key) in [
+            ("monitor", "runtime", "start_monitor_on_up"),
+            ("central", "mcp", "start_central_on_up"),
+        ] {
+            let path = temp_path(&format!("legacy-backend-{label}"));
+            let original = format!("# preserved heading\n\n[{table}]\n{key} = true\n");
+            fs::write(&path, &original).expect("write legacy config");
+
+            let report = setup_config_for_test(&path, false, false);
+
+            assert_eq!(report.status, SetupStatus::Ok);
+            assert_eq!(report.action, "migrated");
+            assert!(report.backup_path.is_none());
+            let document = read_toml_document(&path);
+            assert_eq!(
+                config_item(&document, "backend", "start_on_up").and_then(Item::as_bool),
+                Some(true)
+            );
+            assert!(config_item(&document, "runtime", "start_monitor_on_up").is_none());
+            assert!(config_item(&document, "runtime", "start_mcp_on_up").is_none());
+            assert!(config_item(&document, "mcp", "start_central_on_up").is_none());
+            assert!(fs::read_to_string(&path)
+                .expect("migrated config")
+                .contains("# preserved heading"));
+            assert!(
+                moraine_config::load_config(&path)
+                    .expect("migrated config loads")
+                    .backend
+                    .start_on_up
+            );
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn setup_migrates_deprecated_runtime_mcp_launch_alias() {
+        let path = temp_path("legacy-backend-runtime-mcp");
+        fs::write(&path, "[runtime]\nstart_mcp_on_up = true\n")
+            .expect("write deprecated alias config");
+
+        let report = setup_config_for_test(&path, false, false);
+
+        assert_eq!(report.status, SetupStatus::Ok);
+        assert_eq!(report.action, "migrated");
+        let document = read_toml_document(&path);
+        assert_eq!(
+            config_item(&document, "backend", "start_on_up").and_then(Item::as_bool),
+            Some(true)
+        );
+        assert!(config_item(&document, "runtime", "start_mcp_on_up").is_none());
+        assert!(
+            moraine_config::load_config(&path)
+                .expect("migrated config loads")
+                .backend
+                .start_on_up
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn setup_materializes_backend_off_without_legacy_keys() {
+        let path = temp_path("backend-no-legacy");
+        let original =
+            "# minimal config\n\n[monitor]\n# preserve host comment\nhost = \"127.0.0.1\"\n";
+        fs::write(&path, original).expect("write minimal config");
+
+        let report = setup_config_for_test(&path, false, false);
+
+        assert_eq!(report.action, "migrated");
+        assert!(report.message.contains("backend.start_on_up=false"));
+        let content = fs::read_to_string(&path).expect("migrated config");
+        assert!(content.contains("# minimal config"));
+        assert!(content.contains("# preserve host comment"));
+        assert!(content.contains("host = \"127.0.0.1\""));
+        let document = content
+            .parse::<DocumentMut>()
+            .expect("parse migrated config");
+        assert_eq!(
+            config_item(&document, "backend", "start_on_up").and_then(Item::as_bool),
+            Some(false)
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn setup_materializes_backend_off_when_all_legacy_aliases_are_false() {
+        let path = temp_path("backend-all-aliases-false");
+        fs::write(
+            &path,
+            "[runtime]\nstart_monitor_on_up = false\nstart_mcp_on_up = false\n\n[mcp]\nstart_central_on_up = false\n",
+        )
+        .expect("write legacy config");
+
+        let report = setup_config_for_test(&path, false, false);
+
+        assert_eq!(report.action, "migrated");
+        let document = read_toml_document(&path);
+        assert_eq!(
+            config_item(&document, "backend", "start_on_up").and_then(Item::as_bool),
+            Some(false)
+        );
+        assert!(config_item(&document, "runtime", "start_monitor_on_up").is_none());
+        assert!(config_item(&document, "runtime", "start_mcp_on_up").is_none());
+        assert!(config_item(&document, "mcp", "start_central_on_up").is_none());
+        assert!(
+            !moraine_config::load_config(&path)
+                .expect("migrated config loads")
+                .backend
+                .start_on_up
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn setup_preserves_explicit_backend_and_removes_conflicting_aliases() {
+        for explicit in [false, true] {
+            let legacy = !explicit;
+            let path = temp_path(&format!("backend-explicit-{explicit}"));
+            fs::write(
+                &path,
+                format!(
+                    "[backend]\nstart_on_up = {explicit}\n\n[runtime]\nstart_monitor_on_up = {legacy}\nstart_mcp_on_up = {legacy}\n\n[mcp]\nstart_central_on_up = {legacy}\n"
+                ),
+            )
+            .expect("write conflicting config");
+
+            let report = setup_config_for_test(&path, false, false);
+
+            assert_eq!(report.action, "migrated");
+            assert!(!report.message.contains("materialized"));
+            assert!(report.message.contains("3 obsolete launch keys removed"));
+            let document = read_toml_document(&path);
+            assert_eq!(
+                config_item(&document, "backend", "start_on_up").and_then(Item::as_bool),
+                Some(explicit)
+            );
+            assert!(config_item(&document, "runtime", "start_monitor_on_up").is_none());
+            assert!(config_item(&document, "runtime", "start_mcp_on_up").is_none());
+            assert!(config_item(&document, "mcp", "start_central_on_up").is_none());
+            assert_eq!(
+                moraine_config::load_config(&path)
+                    .expect("migrated config loads")
+                    .backend
+                    .start_on_up,
+                explicit
+            );
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn setup_materializes_start_on_up_in_empty_backend_table() {
+        let path = temp_path("backend-empty-table");
+        fs::write(
+            &path,
+            "[backend] # preserve backend heading\n# preserve backend note\n",
+        )
+        .expect("write empty backend config");
+
+        let report = setup_config_for_test(&path, false, false);
+
+        assert_eq!(report.action, "migrated");
+        let content = fs::read_to_string(&path).expect("migrated config");
+        assert!(content.contains("[backend] # preserve backend heading"));
+        assert!(content.contains("# preserve backend note"));
+        let document = content
+            .parse::<DocumentMut>()
+            .expect("parse migrated config");
+        assert_eq!(
+            config_item(&document, "backend", "start_on_up").and_then(Item::as_bool),
+            Some(false)
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn setup_backend_migration_dry_run_reports_without_writing() {
+        let path = temp_path("backend-migration-dry-run");
+        let original = "[runtime]\nstart_monitor_on_up = true\n";
+        fs::write(&path, original).expect("write legacy config");
+
+        let report = setup_config_for_test(&path, true, false);
+
+        assert_eq!(report.status, SetupStatus::Planned);
+        assert_eq!(report.action, "would_migrate");
+        assert!(report.message.contains("would be materialized"));
+        assert!(report.message.contains("would be removed"));
+        assert_eq!(fs::read_to_string(&path).expect("config content"), original);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn setup_backend_migration_is_comment_preserving_and_idempotent() {
+        let path = temp_path("backend-migration-idempotent");
+        let original = r#"# top-level comment
+
+[runtime] # runtime heading
+# preserve logs comment
+logs_dir = "/tmp/moraine-logs"
+start_monitor_on_up = true
+
+[monitor]
+# preserve monitor comment
+host = "127.0.0.1"
+"#;
+        fs::write(&path, original).expect("write legacy config");
+
+        let first = setup_config_for_test(&path, false, false);
+        let first_content = fs::read_to_string(&path).expect("first config content");
+        let second = setup_config_for_test(&path, false, false);
+        let second_content = fs::read_to_string(&path).expect("second config content");
+
+        assert_eq!(first.action, "migrated");
+        assert!(first.backup_path.is_none());
+        assert_eq!(second.action, "unchanged");
+        assert_eq!(first_content, second_content);
+        assert!(second.backup_path.is_none());
+        assert!(first_content.contains("# top-level comment"));
+        assert!(first_content.contains("[runtime] # runtime heading"));
+        assert!(first_content.contains("# preserve logs comment"));
+        assert!(first_content.contains("logs_dir = \"/tmp/moraine-logs\""));
+        assert!(first_content.contains("# preserve monitor comment"));
+        assert!(!first_content.contains("start_monitor_on_up"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn write_toml_atomic_validation_failure_preserves_original_and_cleans_temp_file() {
+        let path = temp_path("backend-atomic-validation-failure");
+        let original = "[backend]\nstart_on_up = false\n";
+        fs::write(&path, original).expect("write original config");
+
+        let result = write_toml_atomic(&path, "[backend]\nstart_on_up = [\n");
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(&path).expect("original config"),
+            original
+        );
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("config file name");
+        let temp_prefix = format!(".{file_name}.setup-");
+        let leftovers = fs::read_dir(path.parent().expect("config parent"))
+            .expect("read config parent")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&temp_prefix)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "temporary config files must be removed after validation failure"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn dry_run_invalid_config_repair_does_not_write() {
+        let path = temp_path("invalid-repair-dry-run");
+        let original = "not = [valid";
+        fs::write(&path, original).expect("write invalid config");
+
+        let report = setup_config_for_test(&path, true, true);
+
+        assert_eq!(report.status, SetupStatus::Planned);
+        assert_eq!(report.action, "would_repair");
+        assert!(report.backup_path.is_none());
+        assert_eq!(fs::read_to_string(&path).expect("config content"), original);
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -3480,11 +3921,15 @@ watch_root = "~/.codex/sessions"
         .expect("setup report");
 
         assert_eq!(report.config.status, SetupStatus::Planned);
-        assert_eq!(report.config.action, "would_update");
+        assert_eq!(report.config.action, "would_migrate");
         assert!(report
             .config
             .message
             .contains("ingest sources would be updated"));
+        assert!(report
+            .config
+            .message
+            .contains("backend.start_on_up=false would be materialized"));
         assert_eq!(fs::read_to_string(&path).expect("config content"), original);
         assert_eq!(
             report

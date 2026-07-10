@@ -453,6 +453,9 @@ ${cursor_sqlite_src_block}
 host = "0.0.0.0"
 port = 8080
 
+[backend]
+start_on_up = true
+
 [runtime]
 root_dir = "/home/moraine/.moraine"
 service_bin_dir = "/opt/moraine/bin"
@@ -462,7 +465,6 @@ managed_clickhouse_dir = "/home/moraine/.moraine/clickhouse"
 # pid so 'moraine up' never attempts its own CH install/start.
 clickhouse_auto_install = false
 clickhouse_version = "${ch_version}"
-start_monitor_on_up = true
 EOF
     log "wrote config ${toml_path}"
 }
