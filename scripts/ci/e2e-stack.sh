@@ -537,6 +537,7 @@ main() {
   local hermes_keyword="${base_keyword}_hermes_trajectory_${run_stamp}"
   local hermes_session_keyword="${base_keyword}_hermes_session_${run_stamp}"
   local clickhouse_database="moraine"
+  local routed_clickhouse_database="moraine_routed"
   local codex_session_suffix
   codex_session_suffix="$(printf '%06x%06x' "$RANDOM" "$RANDOM")"
   local codex_session_id="00000000-0000-4000-8000-${codex_session_suffix}"
@@ -618,6 +619,7 @@ main() {
   local fixtures_root="$tmp_root/fixtures"
   local runtime_root="$tmp_root/runtime"
   local config_path="$tmp_root/moraine-ci.toml"
+  local routed_bootstrap_config_path="$tmp_root/moraine-routed-bootstrap.toml"
   local codex_fixture_file="$fixtures_root/codex/sessions/2026/02/16/session-${codex_session_id}.jsonl"
   local claude_fixture_file="$fixtures_root/claude/projects/e2e/session-${claude_session_id}.jsonl"
   local kimi_fixture_file="$fixtures_root/kimi/sessions/${kimi_session_id}/wire.jsonl"
@@ -633,11 +635,6 @@ main() {
   # MCP server from inside it.
   local claude_project_dir="$tmp_root/claude-project"
   mkdir -p "$claude_project_dir"
-  # A client-only launch directory routed to a named read backend. No fixture
-  # session originates here, so ingest never mirrors duplicate rows when this
-  # test points the named backend at the same isolated ClickHouse database.
-  local routed_project_dir="$tmp_root/routed-project"
-  mkdir -p "$routed_project_dir"
 
   mkdir -p "$(dirname "$codex_fixture_file")"
   mkdir -p "$(dirname "$claude_fixture_file")"
@@ -896,18 +893,22 @@ database = "${clickhouse_database}"
 
 [backends.routed]
 url = "${clickhouse_url}"
-database = "${clickhouse_database}"
+database = "${routed_clickhouse_database}"
 
 [[routes]]
-dir = "${routed_project_dir}/**"
+dir = "${claude_project_dir}/**"
 backend = "routed"
 mode = "mirror"
+
 [backend]
 bind = "127.0.0.1"
 start_on_up = true
 
 [monitor]
 port = ${monitor_port}
+
+[identity]
+author = "routed-e2e"
 
 [ingest]
 backfill_on_start = true
@@ -995,6 +996,24 @@ clickhouse_auto_install = true
 clickhouse_start_timeout_seconds = 90.0
 EOF
 
+  cat > "$routed_bootstrap_config_path" <<EOF
+[clickhouse]
+url = "${clickhouse_url}"
+database = "${routed_clickhouse_database}"
+
+[backend]
+start_on_up = false
+
+[runtime]
+root_dir = "${runtime_root}"
+logs_dir = "logs"
+pids_dir = "run"
+service_bin_dir = "${service_bin_dir}"
+managed_clickhouse_dir = "${runtime_root}/managed-clickhouse"
+clickhouse_auto_install = true
+clickhouse_start_timeout_seconds = 90.0
+EOF
+
   trap "cleanup_e2e \"$moraine_bin\" \"$config_path\" \"$runtime_root\" \"$tmp_root\"" EXIT
 
   echo "[e2e] run id: ${run_stamp}"
@@ -1015,6 +1034,9 @@ EOF
 
   echo "[e2e] ensuring monitor frontend assets"
   ensure_monitor_frontend "$repo_root"
+
+  echo "[e2e] bootstrapping distinct named-backend schema"
+  "$moraine_bin" up --config "$routed_bootstrap_config_path" --no-ingest
 
   echo "[e2e] starting stack"
   "$moraine_bin" up --config "$config_path"
@@ -1061,6 +1083,8 @@ EOF
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${codex_keyword}'" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${claude_keyword}') > 0" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${claude_keyword}'" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${routed_clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${claude_keyword}') > 0" 120
+  assert_clickhouse_count "$clickhouse_url" "named backend excludes default-only codex session" "SELECT count() FROM ${routed_clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${codex_keyword}') > 0" "0"
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${kimi_keyword}') > 0" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${kimi_keyword}'" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${cursor_keyword}') > 0" 120
@@ -1400,26 +1424,40 @@ PY
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
     --moraine "$moraine_bin" \
     --config "$config_path" \
-    --working-dir "$routed_project_dir" \
-    --query "$codex_keyword" \
-    --expect-session-id "$codex_session_id" \
-    --expect-open-text "$codex_trace_marker"
+    --working-dir "$claude_project_dir" \
+    --query "$claude_keyword" \
+    --expect-session-id "$claude_session_id" \
+    --expect-open-text "$claude_trace_marker"
 
   echo "[e2e] checking named-backend HTTP route through shared daemon router"
   routed_sessions_body="$(curl -fsS \
-    -H "X-Moraine-Project-Dir: ${routed_project_dir}" \
+    -H "X-Moraine-Project-Dir: ${claude_project_dir}" \
     "http://127.0.0.1:${monitor_port}/api/v1/sessions?since=all&limit=200")"
-  printf '%s' "$routed_sessions_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; sys.exit(0 if any(row.get("id")==sid for row in data.get("sessions", [])) else 1)' "$codex_session_id"
+  printf '%s' "$routed_sessions_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); present=sys.argv[1]; absent=sys.argv[2]; ids={row.get("id") for row in data.get("sessions", [])}; sys.exit(0 if present in ids and absent not in ids else 1)' "$claude_session_id" "$codex_session_id"
+  routed_health_body="$(curl -fsS \
+    -H "X-Moraine-Project-Dir: ${claude_project_dir}" \
+    "http://127.0.0.1:${monitor_port}/api/v1/health")"
+  printf '%s' "$routed_health_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sys.exit(0 if data.get("database")==sys.argv[1] else 1)' "$routed_clickhouse_database"
 
   echo "[e2e] checking named-backend repository/cache reuse on second MCP route"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
     --moraine "$moraine_bin" \
     --config "$config_path" \
-    --working-dir "$routed_project_dir" \
-    --query "$codex_keyword" \
-    --expect-session-id "$codex_session_id" \
-    --expect-open-text "$codex_trace_marker"
+    --working-dir "$claude_project_dir" \
+    --query "$claude_keyword" \
+    --expect-session-id "$claude_session_id" \
+    --expect-open-text "$claude_trace_marker"
   wait_for_mcp_cache_sequence "$python_bin" "$backend_log" "$routed_cache_log_baseline" 20
+
+  echo "[e2e] checking named route excludes default-only content"
+  "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --working-dir "$claude_project_dir" \
+    --query "$codex_keyword" \
+    --expect-no-results \
+    --expect-session-id "$claude_session_id" \
+    --expect-absent-session-id "$codex_session_id"
 
   # The ingest heartbeat interval is one second. Leave enough room inside this
   # same bounded window for a fresh ingest INSERT, then force query_log durable
@@ -1624,10 +1662,11 @@ PY
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
     --moraine "$moraine_bin" \
     --config "$config_path" \
-    --working-dir "$routed_project_dir" \
-    --query "$codex_keyword" \
-    --expect-session-id "$codex_session_id" \
-    --expect-open-text "$codex_trace_marker" \
+    --working-dir "$claude_project_dir" \
+    --query "$claude_keyword" \
+    --expect-session-id "$claude_session_id" \
+    --expect-open-text "$claude_trace_marker" \
+    --expect-absent-session-id "$codex_session_id" \
     --require-embedded-fallback
 
   echo "[e2e] comparing daemon and embedded canonical tools/list snapshots"

@@ -6,11 +6,22 @@ use moraine_clickhouse::{enforce_remote_schema_policy, ClickHouseClient};
 use moraine_config::{AppConfig, ClickHouseConfig, DEFAULT_BACKEND_NAME};
 use tokio::sync::{watch, Mutex};
 use tracing::warn;
+use url::Url;
 
 use crate::{
     build_clickhouse_repository_with_user_agent, ClickHouseConversationRepository,
     ConversationRepository, RepoConfig,
 };
+
+fn clickhouse_display_url(raw_url: &str) -> Arc<str> {
+    let Ok(url) = Url::parse(raw_url) else {
+        return Arc::from("<invalid ClickHouse URL>");
+    };
+    if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
+        return Arc::from("<invalid ClickHouse URL>");
+    }
+    Arc::from(url.origin().ascii_serialization())
+}
 
 /// An immutable repository handle together with the configured backend identity
 /// that produced it.
@@ -33,7 +44,7 @@ impl BackendRepository {
         Self {
             backend_name,
             repository,
-            clickhouse_url: Arc::from(clickhouse.url.as_str()),
+            clickhouse_url: clickhouse_display_url(&clickhouse.url),
             clickhouse_database: Arc::from(clickhouse.database.as_str()),
         }
     }
@@ -135,10 +146,18 @@ impl BackendSlot {
                     let slot = self.clone();
                     let published_attempt = attempt.clone();
                     tokio::spawn(async move {
-                        let result = slot
-                            .build(repo_config, &user_agent)
-                            .await
-                            .map_err(|error| Arc::<str>::from(format!("{error:#}")));
+                        let build_slot = slot.clone();
+                        let build = tokio::spawn(async move {
+                            build_slot.build(repo_config, &user_agent).await
+                        });
+                        let result = match build.await {
+                            Ok(result) => {
+                                result.map_err(|error| Arc::<str>::from(error.to_string()))
+                            }
+                            Err(error) => Err(Arc::<str>::from(format!(
+                                "backend repository initialization task failed: {error}"
+                            ))),
+                        };
 
                         // Retain the result even if every initiating caller was
                         // cancelled before subscribing to this attempt.
@@ -355,7 +374,7 @@ impl BackendRepositoryRouter {
 ///
 /// The same attributed client performs the skew probe and is then moved into
 /// the repository. Named backends are never migrated here.
-pub async fn build_checked_clickhouse_repository_with_user_agent(
+async fn build_checked_clickhouse_repository_with_user_agent(
     backend_name: &str,
     clickhouse: ClickHouseConfig,
     config: RepoConfig,
@@ -727,7 +746,9 @@ mod tests {
                 .expect("caller task")
                 .err()
                 .expect("shared attempt must fail");
-            assert!(format!("{error:#}").contains("temporary schema probe failure"));
+            let message = error.to_string();
+            assert!(message.contains("schema handshake failed"));
+            assert!(!message.contains("temporary schema probe failure"));
         }
         assert_eq!(state.requests.load(Ordering::SeqCst), 1);
 
@@ -741,6 +762,36 @@ mod tests {
             .expect("successful slot is cached");
         assert!(Arc::ptr_eq(&recovered, &cached));
         assert_eq!(state.requests.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn panicked_build_attempt_releases_waiters_and_retries() {
+        let mut config = (*routed_config("http://127.0.0.1:1".to_string(), false)).clone();
+        config
+            .backends
+            .get_mut("team-ch")
+            .expect("named backend")
+            .timeout_seconds = f64::INFINITY;
+        let router = BackendRepositoryRouter::new(
+            Arc::new(config),
+            RepoConfig::default(),
+            "moraine-backend/test",
+        )
+        .expect("router");
+
+        for _ in 0..2 {
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                router.repository_for_project_dir(Some("/work/team/project")),
+            )
+            .await
+            .expect("panicked build attempt must publish instead of hanging");
+            let error = match result {
+                Ok(_) => panic!("invalid timeout must fail construction"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("initialization task failed"));
+        }
     }
 
     fn panicking_lookup(dir: String) -> Option<String> {
@@ -866,14 +917,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_metadata_matches_selected_backend_config() {
-        let router = preloaded_router(routed_config("http://team.invalid".to_string(), false));
+    async fn route_metadata_redacts_credentials_and_query_parameters() {
+        let router = preloaded_router(routed_config(
+            "https://user:secret@team.invalid:8443\\signed\\secret?token=secret#fragment"
+                .to_string(),
+            false,
+        ));
         let selected = router
             .repository_for_project_dir(Some("/work/team/project"))
             .await
             .expect("preloaded named route");
         assert_eq!(selected.backend_name(), "team-ch");
-        assert_eq!(selected.clickhouse_url(), "http://team.invalid");
+        assert_eq!(selected.clickhouse_url(), "https://team.invalid:8443");
         assert_eq!(selected.clickhouse_database(), "moraine_team");
     }
 

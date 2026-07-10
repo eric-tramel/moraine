@@ -440,7 +440,6 @@ pub(crate) fn internal_id_error(error: contract::ContractError) -> contract::Con
     )
 }
 
-
 impl AppState {
     fn with_repository(
         cfg: Arc<AppConfig>,
@@ -871,7 +870,7 @@ async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStr
 
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
-    let Some(first_line) = private_proxy::read_bounded_line(&mut reader).await? else {
+    let Some(first_line) = private_proxy::read_server_first_line(&mut reader).await? else {
         return Ok(());
     };
 
@@ -1520,6 +1519,49 @@ mod tests {
             !sock.exists(),
             "socket path must be removed before shutdown completes"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn router_socket_preserves_oversized_legacy_first_request() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let (cfg, router) = default_test_router();
+        let (sock, shutdown_tx, server) = spawn_test_socket("oversized-legacy", cfg, router).await;
+        let mut stream = connect_to_test_socket(&sock).await;
+        let mut request = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "initialize",
+            "params": {
+                "padding": "x".repeat(private_proxy::PRIVATE_ROUTE_MAX_LINE_BYTES + 1)
+            },
+        }))
+        .expect("oversized raw request JSON");
+        request.push(b'\n');
+        assert!(request.len() > private_proxy::PRIVATE_ROUTE_MAX_LINE_BYTES);
+        stream
+            .write_all(&request)
+            .await
+            .expect("write oversized legacy request");
+
+        let mut response = String::new();
+        BufReader::new(stream)
+            .read_line(&mut response)
+            .await
+            .expect("read oversized legacy response");
+        let response: Value = serde_json::from_str(response.trim()).expect("response JSON");
+        assert_eq!(response["id"], json!(9));
+        assert_eq!(
+            response["result"]["serverInfo"]["name"],
+            json!("moraine-mcp")
+        );
+
+        shutdown_tx.send(()).expect("request server shutdown");
+        server
+            .await
+            .expect("server task")
+            .expect("clean server shutdown");
     }
 
     #[cfg(unix)]

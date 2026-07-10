@@ -265,6 +265,9 @@ pub(crate) enum ServerFirstLine {
 
 #[cfg(unix)]
 pub(crate) fn classify_server_first_line(line: &[u8]) -> ServerFirstLine {
+    if line.len() > PRIVATE_ROUTE_MAX_LINE_BYTES {
+        return ServerFirstLine::Raw;
+    }
     let request: Value = match serde_json::from_slice(line) {
         Ok(request) => request,
         Err(_) => return ServerFirstLine::Raw,
@@ -386,6 +389,19 @@ where
     writer.write_all(&payload).await?;
     writer.flush().await?;
     Ok(())
+}
+
+/// Read the first daemon-side line with the public MCP transport's historical
+/// unbounded framing. Oversized lines are classified as raw MCP rather than as
+/// private control messages, so the 64-KiB control bound never truncates a
+/// legacy client's first request.
+pub(crate) async fn read_server_first_line<R>(reader: &mut R) -> Result<Option<Vec<u8>>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut line = Vec::new();
+    let bytes = reader.read_until(b'\n', &mut line).await?;
+    Ok((bytes != 0).then_some(line))
 }
 
 /// Read one line without ever allowing its allocation to exceed the private

@@ -6,9 +6,7 @@ mod error;
 mod in_memory_repo;
 mod repo;
 
-pub use backend_router::{
-    build_checked_clickhouse_repository_with_user_agent, BackendRepository, BackendRepositoryRouter,
-};
+pub use backend_router::{BackendRepository, BackendRepositoryRouter};
 pub use clickhouse_repo::ClickHouseConversationRepository;
 pub use domain::{
     is_user_facing_content_event, Conversation, ConversationDetailOptions, ConversationListFilter,

@@ -2,7 +2,9 @@ use crate::cli::ServeMode;
 use anyhow::{anyhow, bail, Context, Result};
 use moraine_config::AppConfig;
 use moraine_conversations::{BackendRepositoryRouter, RepoConfig};
-use moraine_mcp_core::{PrivateRouteNegotiation, SessionOriginScope};
+#[cfg(unix)]
+use moraine_mcp_core::PrivateRouteNegotiation;
+use moraine_mcp_core::SessionOriginScope;
 use std::{net::IpAddr, path::PathBuf, sync::Arc};
 use tokio::runtime::Builder;
 use tokio::sync::watch;
@@ -187,11 +189,10 @@ async fn run_stdio_entry(cfg: AppConfig, session_scope: Option<SessionOriginScop
         .repository_for_project_dir(Some(&cwd))
         .await
         .context("failed to construct embedded conversation repository")?;
-    moraine_mcp_core::run_stdio_with_repository(
-        Arc::unwrap_or_clone(cfg),
-        backend.repository().clone(),
-    )
-    .await
+    let repository = backend.repository().clone();
+    drop(backend);
+    drop(router);
+    moraine_mcp_core::run_stdio_with_repository(Arc::unwrap_or_clone(cfg), repository).await
 }
 
 async fn run_backend(

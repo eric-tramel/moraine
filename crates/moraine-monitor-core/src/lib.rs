@@ -25,6 +25,7 @@ use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
+use tracing::warn;
 
 struct AppState {
     backend_router: Arc<BackendRepositoryRouter>,
@@ -94,7 +95,7 @@ where
 }
 
 /// Build the complete monitor router around the daemon-owned backend router.
-pub fn router_with_backend_router(
+fn router_with_backend_router(
     backend_router: Arc<BackendRepositoryRouter>,
     static_dir: PathBuf,
 ) -> Result<Router> {
@@ -188,9 +189,13 @@ async fn select_backend_repository(
 
     let backend = match selected {
         Ok(backend) => backend,
-        Err(error) => {
+        Err(_) => {
+            warn!("backend project route selection failed; selected backend unavailable or schema-incompatible");
             return json_response(
-                json!({"ok": false, "error": format!("backend selection failed: {error}")}),
+                json!({
+                    "ok": false,
+                    "error": "selected backend is unavailable or schema-incompatible"
+                }),
                 StatusCode::SERVICE_UNAVAILABLE,
             );
         }
@@ -1929,8 +1934,7 @@ mod tests {
         let app =
             router_with_backend_router(backend_router, root.clone()).expect("routing test app");
 
-        let default =
-            response_json(get_with_project_dir(&app, "/api/v1/tables", None).await).await;
+        let default = response_json(get_with_project_dir(&app, "/api/v1/tables", None).await).await;
         assert_eq!(default_repository.calls().list_table_summaries, 1);
         assert_eq!(named_repository.calls().list_table_summaries, 0);
 
@@ -2005,8 +2009,7 @@ mod tests {
             Some(HeaderValue::from_static("/work/team/project")),
             Some(HeaderValue::from_static("malformed-relative-path")),
         ] {
-            let response =
-                get_with_project_dir(&app, "/api/v1/capabilities", header).await;
+            let response = get_with_project_dir(&app, "/api/v1/capabilities", header).await;
             assert_eq!(response.status(), StatusCode::OK);
             let payload = response_json(response).await;
             assert_eq!(payload["schema_migration_level"], json!("025"));
@@ -2028,8 +2031,13 @@ mod tests {
             RepoConfig::default(),
             successful_responses(),
         ));
-        let backend_router =
-            preloaded_backend_router(routing_config(), default_repository, named_repository);
+        let mut config = routing_config();
+        config
+            .backends
+            .get_mut("team-ch")
+            .expect("named backend")
+            .url = "http://user:secret@team.example:8123/path?token=secret#fragment".to_string();
+        let backend_router = preloaded_backend_router(config, default_repository, named_repository);
         let app =
             router_with_backend_router(backend_router, root.clone()).expect("metadata test app");
 
@@ -2156,9 +2164,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let payload = response_json(response).await;
         assert_eq!(payload["ok"], json!(false));
-        assert!(payload["error"]
-            .as_str()
-            .is_some_and(|error| error.contains("team-ch")));
+        assert_eq!(
+            payload["error"],
+            json!("selected backend is unavailable or schema-incompatible")
+        );
 
         let _ = fs::remove_dir_all(root);
     }
