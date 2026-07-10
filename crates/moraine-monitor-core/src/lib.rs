@@ -1021,8 +1021,7 @@ mod tests {
         AnalyticsConcurrencyPoint, AnalyticsSnapshot, AnalyticsTokenPoint, AnalyticsTurnPoint,
         AnalyticsWindow, ConversationMode, ConversationSummary, InMemoryConversationRepository,
         InMemoryConversationResponses, IngestHeartbeat, RepoConfig, SessionStep, StoreDiagnostics,
-        TableColumn,
-        TablePreview, TableSummary, ToolResult, TurnSummary, WebSearchEvent,
+        TableColumn, TablePreview, TableSummary, ToolResult, TurnSummary, WebSearchEvent,
     };
     use std::collections::BTreeMap;
     use std::fs;
