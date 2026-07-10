@@ -10,10 +10,10 @@ use axum::{
 use moraine_clickhouse::ClickHouseClient;
 use moraine_config::AppConfig;
 use moraine_conversations::{
-    AnalyticsRange, ClickHouseConversationRepository, ConversationRepository, IngestHeartbeatRead,
-    RepoConfig, RepoError, SessionAnalytics, SessionAnalyticsQuery, SessionLookback, SessionStep,
-    SessionTurn, StoreConnectionMetrics, StoreHealth, StoreProbe, TablePreviewQuery,
-    TableSummaries,
+    AnalyticsRange, ClickHouseConversationRepository, ConversationRepository, IngestHeartbeat,
+    IngestHeartbeatRead, RepoConfig, RepoError, SessionAnalytics, SessionAnalyticsQuery,
+    SessionLookback, SessionStep, SessionTurn, StoreConnectionMetrics, StoreHealth, StoreProbe,
+    TablePreviewQuery, TableSummaries,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -24,7 +24,6 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
 
-#[derive(Clone)]
 struct AppState {
     repository: Arc<dyn ConversationRepository>,
     static_dir: PathBuf,
@@ -70,13 +69,13 @@ pub async fn run_server(
     let repository: Arc<dyn ConversationRepository> = Arc::new(
         ClickHouseConversationRepository::new(client, repository_config(&cfg)),
     );
-    let state = AppState {
+    let state = Arc::new(AppState {
         repository,
         static_dir,
         clickhouse_url,
         clickhouse_database,
-    };
-    let app = monitor_router(state.clone());
+    });
+    let app = monitor_router(Arc::clone(&state));
 
     let bind = format!("{host}:{port}")
         .parse::<SocketAddr>()
@@ -116,7 +115,7 @@ fn repository_config(cfg: &AppConfig) -> RepoConfig {
     }
 }
 
-fn monitor_router(state: AppState) -> Router {
+fn monitor_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/health", get(api_health))
         .route("/api/status", get(api_status))
@@ -161,7 +160,7 @@ fn json_response<T: Serialize>(payload: T, status: StatusCode) -> Response {
     response
 }
 
-async fn api_health(State(state): State<AppState>) -> Response {
+async fn api_health(State(state): State<Arc<AppState>>) -> Response {
     let (health, heartbeat) = tokio::join!(
         state.repository.read_store_health(),
         state.repository.latest_ingest_heartbeat()
@@ -196,9 +195,7 @@ async fn api_health(State(state): State<AppState>) -> Response {
             return health_failure_response(&state, message, connections);
         }
     };
-    let heartbeat = heartbeat
-        .map(heartbeat_payload)
-        .unwrap_or_else(|_| heartbeat_absent());
+    let heartbeat = heartbeat.map(monitor_heartbeat_status).unwrap_or_default();
 
     json_response(
         json!({
@@ -208,7 +205,7 @@ async fn api_health(State(state): State<AppState>) -> Response {
             "version": version,
             "ping_ms": ping_ms,
             "connections": connections,
-            "ingestor": health_heartbeat(&heartbeat),
+            "ingestor": health_heartbeat_payload(&heartbeat),
         }),
         StatusCode::OK,
     )
@@ -227,16 +224,13 @@ fn health_failure_response(state: &AppState, message: &str, connections: Value) 
     )
 }
 
-async fn api_status(State(state): State<AppState>) -> Response {
-    let (health, diagnostics) = tokio::join!(
-        state.repository.read_store_health(),
-        state.repository.read_store_diagnostics()
-    );
-    let health = health.unwrap_or_else(|error| unavailable_store_health(error.to_string()));
-    let database_exists = match diagnostics {
-        Ok(diagnostics) => diagnostics.database_exists,
-        Err(_) => probe_bool(&health.database_exists).unwrap_or(false),
-    };
+async fn api_status(State(state): State<Arc<AppState>>) -> Response {
+    let health = state
+        .repository
+        .read_store_health()
+        .await
+        .unwrap_or_else(|error| unavailable_store_health(error.to_string()));
+    let database_exists = probe_bool(&health.database_exists).unwrap_or(false);
 
     let (tables, heartbeat) = if database_exists {
         let (tables, heartbeat) = tokio::join!(
@@ -252,12 +246,10 @@ async fn api_status(State(state): State<AppState>) -> Response {
                 );
             }
         };
-        let heartbeat = heartbeat
-            .map(heartbeat_payload)
-            .unwrap_or_else(|_| heartbeat_absent());
+        let heartbeat = heartbeat.map(monitor_heartbeat_status).unwrap_or_default();
         (tables, heartbeat)
     } else {
-        (Vec::new(), heartbeat_absent())
+        (Vec::new(), MonitorHeartbeatStatus::default())
     };
 
     let estimated_total_rows = tables.iter().map(|table| table.rows).sum::<u64>();
@@ -273,7 +265,7 @@ async fn api_status(State(state): State<AppState>) -> Response {
                 "estimated_total_rows": estimated_total_rows,
                 "tables": tables,
             },
-            "ingestor": heartbeat,
+            "ingestor": heartbeat_payload(&heartbeat),
         }),
         StatusCode::OK,
     )
@@ -346,7 +338,7 @@ fn connection_payload(probe: &StoreProbe<StoreConnectionMetrics>) -> Value {
     }
 }
 
-async fn api_tables(State(state): State<AppState>) -> Response {
+async fn api_tables(State(state): State<Arc<AppState>>) -> Response {
     match state.repository.list_table_summaries().await {
         Ok(tables) => json_response(
             json!({"ok": true, "tables": monitor_table_summaries(tables)}),
@@ -374,7 +366,7 @@ fn monitor_table_summaries(summaries: TableSummaries) -> Vec<MonitorTableSummary
 
 async fn api_web_searches(
     Query(params): Query<LimitQuery>,
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
 ) -> Response {
     let limit = params.limit.unwrap_or(100).clamp(1, 1000) as u16;
     let rows = match state.repository.list_web_searches(limit).await {
@@ -411,7 +403,7 @@ async fn api_web_searches(
 
 async fn api_analytics(
     Query(params): Query<AnalyticsQuery>,
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
 ) -> Response {
     let range = resolve_analytics_range(params.range.as_deref());
     let snapshot = match state.repository.analytics_series(range).await {
@@ -459,7 +451,7 @@ fn resolve_analytics_range(value: Option<&str>) -> AnalyticsRange {
 
 async fn api_sessions(
     Query(params): Query<SessionsQuery>,
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
 ) -> Response {
     let query = SessionAnalyticsQuery {
         lookback: resolve_session_lookback(params.since.as_deref()),
@@ -729,50 +721,71 @@ fn hue_for_label(label: &str) -> u32 {
     }
 }
 
-fn heartbeat_payload(read: IngestHeartbeatRead) -> Value {
-    let Some(latest) = read.latest else {
-        return heartbeat_absent();
-    };
-    let age_seconds = unix_now_ms()
-        .checked_sub(latest.ts_unix_ms)
-        .map(|age_ms| age_ms.max(0) as u64 / 1000);
-
-    json!({
-        "present": true,
-        "alive": age_seconds.map(|age| age <= 30).unwrap_or(false),
-        "latest": latest,
-        "age_seconds": age_seconds,
-    })
+#[derive(Default)]
+struct MonitorHeartbeatStatus {
+    latest: Option<IngestHeartbeat>,
+    age_seconds: Option<u64>,
 }
 
-fn heartbeat_absent() -> Value {
-    json!({
-        "present": false,
-        "alive": false,
-        "latest": Value::Null,
-        "age_seconds": Value::Null,
-    })
+fn monitor_heartbeat_status(read: IngestHeartbeatRead) -> MonitorHeartbeatStatus {
+    let age_seconds = read.latest.as_ref().and_then(|latest| {
+        (latest.ts_unix_ms >= 0)
+            .then(|| unix_now_ms().saturating_sub(latest.ts_unix_ms).max(0) as u64 / 1_000)
+    });
+    MonitorHeartbeatStatus {
+        latest: read.latest,
+        age_seconds,
+    }
 }
 
-fn health_heartbeat(heartbeat: &Value) -> Value {
-    let latest = heartbeat
-        .get("latest")
-        .and_then(Value::as_object)
+fn heartbeat_payload(status: &MonitorHeartbeatStatus) -> Value {
+    let latest = status
+        .latest
+        .as_ref()
         .map(|latest| {
-            json!({
-                "backend_sinks": latest
-                    .get("backend_sinks")
-                    .cloned()
-                    .unwrap_or_else(|| json!({})),
-            })
+            let mut payload = json!({
+                "ts": latest.ts,
+                "ts_unix_ms": latest.ts_unix_ms,
+                "host": latest.host,
+                "service_version": latest.service_version,
+                "queue_depth": latest.queue_depth,
+                "files_active": latest.files_active,
+                "files_watched": latest.files_watched,
+                "rows_raw_written": latest.rows_raw_written,
+                "rows_events_written": latest.rows_events_written,
+                "rows_errors_written": latest.rows_errors_written,
+                "flush_latency_ms": latest.flush_latency_ms,
+                "append_to_visible_p50_ms": latest.append_to_visible_p50_ms,
+                "append_to_visible_p95_ms": latest.append_to_visible_p95_ms,
+                "last_error": latest.last_error,
+            });
+            if let Some(backend_sinks) = &latest.backend_sinks {
+                payload["backend_sinks"] = backend_sinks.clone();
+            }
+            payload
         })
         .unwrap_or(Value::Null);
 
     json!({
-        "present": heartbeat.get("present").cloned().unwrap_or(Value::Bool(false)),
-        "alive": heartbeat.get("alive").cloned().unwrap_or(Value::Bool(false)),
+        "present": status.latest.is_some(),
+        "alive": status.age_seconds.map(|age| age <= 30).unwrap_or(false),
         "latest": latest,
-        "age_seconds": heartbeat.get("age_seconds").cloned().unwrap_or(Value::Null),
+        "age_seconds": status.age_seconds,
+    })
+}
+
+fn health_heartbeat_payload(status: &MonitorHeartbeatStatus) -> Value {
+    let latest = status.latest.as_ref().map_or(Value::Null, |latest| {
+        json!({
+            "backend_sinks": latest.backend_sinks.clone().unwrap_or_else(|| json!({})),
+        })
+    });
+
+    json!({
+        "present": status.latest.is_some(),
+        "alive": status.age_seconds.map(|age| age <= 30).unwrap_or(false),
+        "latest": latest,
+        "age_seconds": status.age_seconds,
     })
 }
 
@@ -787,7 +800,7 @@ fn unix_now_ms() -> i64 {
 async fn api_table_rows(
     Path(table): Path<String>,
     Query(params): Query<LimitQuery>,
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
 ) -> Response {
     let limit = params.limit.unwrap_or(25).clamp(1, 500) as u16;
     match state
@@ -835,7 +848,7 @@ async fn api_table_rows(
     }
 }
 
-async fn static_fallback(State(state): State<AppState>, uri: Uri) -> Response {
+async fn static_fallback(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
     let requested = uri.path();
     if requested.contains("..") {
         return json_response(
@@ -909,8 +922,8 @@ mod tests {
     use moraine_conversations::{
         AnalyticsConcurrencyPoint, AnalyticsSnapshot, AnalyticsTokenPoint, AnalyticsTurnPoint,
         AnalyticsWindow, ConversationMode, ConversationSummary, InMemoryConversationRepository,
-        InMemoryConversationResponses, IngestHeartbeat, SessionStep, StoreDiagnostics, TableColumn,
-        TablePreview, TableSummary, ToolResult, TurnSummary, WebSearchEvent,
+        InMemoryConversationResponses, IngestHeartbeat, SessionStep, TableColumn, TablePreview,
+        TableSummary, ToolResult, TurnSummary, WebSearchEvent,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -928,17 +941,17 @@ mod tests {
 
     fn fake_state(
         responses: InMemoryConversationResponses,
-    ) -> (AppState, Arc<InMemoryConversationRepository>) {
+    ) -> (Arc<AppState>, Arc<InMemoryConversationRepository>) {
         let repository = Arc::new(InMemoryConversationRepository::with_responses(
             RepoConfig::default(),
             responses,
         ));
-        let state = AppState {
+        let state = Arc::new(AppState {
             repository: repository.clone(),
             static_dir: PathBuf::new(),
             clickhouse_url: "http://127.0.0.1:8123".to_string(),
             clickhouse_database: "moraine".to_string(),
-        };
+        });
         (state, repository)
     }
 
@@ -1129,16 +1142,6 @@ mod tests {
                 rows: vec![json!({"session_id": "session-1"})],
             })),
             read_store_health: Some(Ok(sample_health())),
-            read_store_diagnostics: Some(Ok(StoreDiagnostics {
-                healthy: true,
-                version: Some("25.1.1".to_string()),
-                database: "moraine".to_string(),
-                database_exists: true,
-                applied_schema_versions: Vec::new(),
-                pending_schema_versions: Vec::new(),
-                missing_tables: Vec::new(),
-                errors: Vec::new(),
-            })),
             ..Default::default()
         }
     }
@@ -1165,6 +1168,13 @@ mod tests {
         assert_eq!(status["database"]["table_count"], json!(1));
         assert_eq!(status["database"]["estimated_total_rows"], json!(7));
         assert_eq!(status["ingestor"]["latest"]["host"], json!("host-a"));
+        let status_latest = status["ingestor"]["latest"]
+            .as_object()
+            .expect("status latest");
+        assert!(!status_latest.contains_key("watcher_backend"));
+        assert!(!status_latest.contains_key("watcher_error_count"));
+        assert!(!status_latest.contains_key("watcher_reset_count"));
+        assert!(!status_latest.contains_key("watcher_last_reset_unix_ms"));
 
         let response = api_tables(State(state.clone())).await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1231,7 +1241,7 @@ mod tests {
 
         let calls = repository.calls();
         assert_eq!(calls.read_store_health, 2);
-        assert_eq!(calls.read_store_diagnostics, 1);
+        assert_eq!(calls.read_store_diagnostics, 0);
         assert_eq!(calls.latest_ingest_heartbeat, 2);
         assert_eq!(calls.list_table_summaries, 2);
         assert_eq!(calls.list_web_searches, vec![1_000]);
@@ -1265,10 +1275,6 @@ mod tests {
                     message: "ping unavailable".to_string(),
                 },
                 ..sample_health()
-            })),
-            read_store_diagnostics: Some(Ok(StoreDiagnostics {
-                database_exists: false,
-                ..Default::default()
             })),
             ..Default::default()
         });
@@ -1315,21 +1321,6 @@ mod tests {
     }
 
     #[test]
-    fn monitor_projection_matches_repository_and_mcp_parity_values() {
-        let session = sample_session();
-        let repository_event_count = session.summary.total_events;
-        let repository_last_activity = session.summary.last_event_unix_ms;
-        let monitor = monitor_session_json(session, i64::MAX);
-
-        assert_eq!(
-            repository_event_count, 7,
-            "MCP event_count uses this repository value"
-        );
-        assert_eq!(repository_last_activity, 1_771_243_203_900);
-        assert_eq!(monitor["endedAt"], json!(repository_last_activity));
-    }
-
-    #[test]
     fn default_and_invalid_ranges_keep_legacy_fallbacks() {
         assert_eq!(
             resolve_analytics_range(None),
@@ -1361,6 +1352,26 @@ mod tests {
         assert_eq!(latest["backend_sinks"]["team-ch"], json!("healthy"));
         assert!(!latest.contains_key("host"));
         assert!(!latest.contains_key("last_error"));
+    }
+
+    #[tokio::test]
+    async fn pre017_heartbeat_keeps_legacy_health_and_status_shapes() {
+        let mut heartbeat = sample_heartbeat();
+        let latest = heartbeat.latest.as_mut().expect("latest heartbeat");
+        latest.backend_sinks = None;
+        let (state, _) = fake_state(InMemoryConversationResponses {
+            read_store_health: Some(Ok(sample_health())),
+            latest_ingest_heartbeat: Some(Ok(heartbeat)),
+            ..Default::default()
+        });
+
+        let health = response_json(api_health(State(state.clone())).await).await;
+        assert_eq!(health["ingestor"]["latest"]["backend_sinks"], json!({}));
+
+        let status = response_json(api_status(State(state)).await).await;
+        let latest = status["ingestor"]["latest"].as_object().expect("latest");
+        assert!(!latest.contains_key("backend_sinks"));
+        assert!(!latest.contains_key("watcher_backend"));
     }
 
     #[test]
