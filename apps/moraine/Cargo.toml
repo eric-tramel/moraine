@@ -20,3 +20,4 @@ toml_edit = "0.22"
 uuid = { version = "1.11", features = ["v4"] }
 moraine-config = { path = "../../crates/moraine-config" }
 moraine-clickhouse = { path = "../../crates/moraine-clickhouse" }
+moraine-conversations = { path = "../../crates/moraine-conversations" }
