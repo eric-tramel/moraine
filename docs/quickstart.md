@@ -107,6 +107,10 @@ After starting the backend, open the monitor UI:
 http://127.0.0.1:8080
 ```
 
+The backend HTTP listener binds to `127.0.0.1` by default. Before changing the
+bind, read the [experimental HTTP bind guard](configuration.md#experimental-http-bind-guard);
+it is startup groundwork, not HTTP request authentication.
+
 Run agent sessions normally. As Moraine indexes session files, the monitor and
 status output should show fresh ingest activity.
 

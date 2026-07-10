@@ -193,7 +193,7 @@ pub(crate) fn backend_http_live(host: &str, port: u16) -> bool {
 pub(crate) fn backend_endpoint_status(cfg: &AppConfig) -> BackendEndpointStatus {
     BackendEndpointStatus {
         socket_listening: central_socket_live(&cfg.mcp.central_socket_path),
-        http_listening: backend_http_live(&cfg.monitor.host, cfg.monitor.port),
+        http_listening: backend_http_live(&cfg.backend.bind, cfg.monitor.port),
     }
 }
 
@@ -468,7 +468,7 @@ pub(crate) fn service_args_with_defaults(
         }
         if !contains_flag(passthrough, "--host") {
             args.push("--host".to_string());
-            args.push(cfg.monitor.host.clone());
+            args.push(cfg.backend.bind.clone());
         }
         if !contains_flag(passthrough, "--port") {
             args.push("--port".to_string());
@@ -779,7 +779,7 @@ mod tests {
 
         let mut cfg = AppConfig::default();
         cfg.mcp.central_socket_path = "/tmp/moraine-test.sock".to_string();
-        cfg.monitor.host = "127.0.0.1".to_string();
+        cfg.backend.bind = "127.0.0.1".to_string();
         cfg.monitor.port = 18080;
         cfg.runtime.service_bin_dir = root.join("bin").to_string_lossy().to_string();
         let paths = crate::paths::runtime_paths(&cfg);
@@ -872,7 +872,7 @@ mod tests {
 
         let mut cfg = AppConfig::default();
         cfg.mcp.central_socket_path = socket.display().to_string();
-        cfg.monitor.host = "127.0.0.1".to_string();
+        cfg.backend.bind = "127.0.0.1".to_string();
         cfg.monitor.port = 0;
         cfg.runtime.pids_dir = root.join("run").display().to_string();
         cfg.runtime.logs_dir = root.join("logs").display().to_string();
@@ -921,7 +921,7 @@ mod tests {
 
         let mut cfg = AppConfig::default();
         cfg.mcp.central_socket_path = socket.display().to_string();
-        cfg.monitor.host = "127.0.0.1".to_string();
+        cfg.backend.bind = "127.0.0.1".to_string();
         cfg.monitor.port = http_port;
         cfg.runtime.pids_dir = root.join("run").display().to_string();
         cfg.runtime.logs_dir = root.join("logs").display().to_string();

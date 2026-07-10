@@ -341,6 +341,18 @@ mod tests {
         assert!(err.to_string().contains("unsupported config key"));
     }
 
+    #[test]
+    fn cmd_config_get_rejects_backend_auth_token_without_exposing_value() {
+        const TOKEN_SENTINEL: &str = "moraine-secret-token-sentinel-462";
+        let mut cfg = AppConfig::default();
+        cfg.backend.auth_token = Some(TOKEN_SENTINEL.to_string());
+
+        let err = cmd_config_get(&cfg, "backend.auth_token").expect_err("secret key");
+        let message = err.to_string();
+        assert!(message.contains("unsupported config key"));
+        assert!(!message.contains(TOKEN_SENTINEL));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn dispatch_rejects_global_output_for_export_before_loading_config() {
         let cli = Cli {

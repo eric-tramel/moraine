@@ -889,12 +889,12 @@ EOF
 url = "${clickhouse_url}"
 database = "${clickhouse_database}"
 
-[monitor]
-host = "127.0.0.1"
-port = ${monitor_port}
-
 [backend]
+bind = "127.0.0.1"
 start_on_up = true
+
+[monitor]
+port = ${monitor_port}
 
 [ingest]
 backfill_on_start = true
