@@ -2,6 +2,7 @@ mod clickhouse_repo;
 mod cursor;
 mod domain;
 mod error;
+mod in_memory_repo;
 mod repo;
 
 pub use clickhouse_repo::ClickHouseConversationRepository;
@@ -19,4 +20,7 @@ pub use domain::{
     SessionMetadataSearchStats, SessionOriginScope, TraceEvent, Turn, TurnListFilter, TurnSummary,
 };
 pub use error::{RepoError, RepoResult};
+pub use in_memory_repo::{
+    InMemoryConversationCalls, InMemoryConversationRepository, InMemoryConversationResponses,
+};
 pub use repo::ConversationRepository;

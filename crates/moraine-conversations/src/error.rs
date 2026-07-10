@@ -2,7 +2,7 @@ use thiserror::Error;
 
 pub type RepoResult<T> = Result<T, RepoError>;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum RepoError {
     #[error("invalid argument: {0}")]
     InvalidArgument(String),

@@ -6,8 +6,8 @@ use crate::contract::{
 };
 use anyhow::{Context, Result};
 use moraine_conversations::{
-    ConversationRepository, McpEventType as RepoMcpEventType, McpTurnOpen, RepoError,
-    SearchMcpEventHit, SearchMcpEventsQuery, SearchMcpEventsResult, SessionMetadata,
+    McpEventType as RepoMcpEventType, McpTurnOpen, RepoError, SearchMcpEventHit,
+    SearchMcpEventsQuery, SearchMcpEventsResult, SessionMetadata,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;

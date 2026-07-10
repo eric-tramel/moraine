@@ -2,6 +2,14 @@ use super::*;
 
 #[async_trait]
 impl ConversationRepository for ClickHouseConversationRepository {
+    fn config(&self) -> &RepoConfig {
+        ClickHouseConversationRepository::config(self)
+    }
+
+    async fn prewarm_mcp_search_state(&self) -> RepoResult<()> {
+        ClickHouseConversationRepository::prewarm_mcp_search_state(self).await
+    }
+
     async fn list_conversations(
         &self,
         filter: ConversationListFilter,
@@ -89,10 +97,21 @@ impl ConversationRepository for ClickHouseConversationRepository {
         self.search_conversations_impl(query).await
     }
 
+    async fn search_session_metadata(
+        &self,
+        query: SessionMetadataSearchQuery,
+    ) -> RepoResult<SessionMetadataSearchResults> {
+        ClickHouseConversationRepository::search_session_metadata(self, query).await
+    }
+
     async fn file_attention(
         &self,
         query: FileAttentionQuery,
     ) -> RepoResult<Vec<FileAttentionTouch>> {
         self.file_attention_impl(query).await
+    }
+
+    async fn cancel_query(&self, query_id: &str) -> RepoResult<()> {
+        ClickHouseConversationRepository::cancel_query(self, query_id).await
     }
 }
