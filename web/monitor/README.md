@@ -41,7 +41,7 @@ bun run build
 bun run preview -- --host 127.0.0.1 --port 4173
 ```
 
-Note: the app calls `/api/*` on the same origin. When running `bun run dev`, API calls fail unless you provide a same-origin proxy/backend.
+Note: the app calls `/api/v1/*` on the same origin. When running `bun run dev`, API calls fail unless you provide a same-origin proxy/backend.
 
 ## Test Workflow
 

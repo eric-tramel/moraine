@@ -112,16 +112,26 @@ fn router_with_repository(
 }
 
 fn monitor_router(state: Arc<AppState>) -> Router {
+    let versioned_routes = dashboard_routes().route("/capabilities", get(api_capabilities));
+
     Router::new()
-        .route("/api/health", get(api_health))
-        .route("/api/status", get(api_status))
-        .route("/api/analytics", get(api_analytics))
-        .route("/api/tables", get(api_tables))
-        .route("/api/web-searches", get(api_web_searches))
-        .route("/api/tables/:table", get(api_table_rows))
-        .route("/api/sessions", get(api_sessions))
+        .nest("/api/v1", versioned_routes)
+        // One-release compatibility surface. These are direct aliases so
+        // status codes, query handling, and response payloads remain identical.
+        .nest("/api", dashboard_routes())
         .fallback(get(static_fallback))
         .with_state(state)
+}
+
+fn dashboard_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/health", get(api_health))
+        .route("/status", get(api_status))
+        .route("/analytics", get(api_analytics))
+        .route("/tables", get(api_tables))
+        .route("/web-searches", get(api_web_searches))
+        .route("/tables/:table", get(api_table_rows))
+        .route("/sessions", get(api_sessions))
 }
 
 const MONITOR_DIST_ENV_KEYS: &[&str] = &["MORAINE_MONITOR_DIST", "MORAINE_MONITOR_STATIC_DIR"];
@@ -212,6 +222,29 @@ fn json_response<T: Serialize>(payload: T, status: StatusCode) -> Response {
     let mut response = Json(payload).into_response();
     *response.status_mut() = status;
     response
+}
+async fn api_capabilities(State(state): State<Arc<AppState>>) -> Response {
+    let schema_migration_level = state
+        .repository
+        .read_store_diagnostics()
+        .await
+        .ok()
+        .and_then(|diagnostics| diagnostics.applied_schema_versions.into_iter().max());
+
+    json_response(
+        json!({
+            "ok": true,
+            "server_version": env!("CARGO_PKG_VERSION"),
+            "schema_migration_level": schema_migration_level,
+            "features": {
+                "analytics": true,
+                "sessions": true,
+                "table_inspection": true,
+                "web_searches": true,
+            },
+        }),
+        StatusCode::OK,
+    )
 }
 
 async fn api_health(State(state): State<Arc<AppState>>) -> Response {
@@ -987,7 +1020,8 @@ mod tests {
     use moraine_conversations::{
         AnalyticsConcurrencyPoint, AnalyticsSnapshot, AnalyticsTokenPoint, AnalyticsTurnPoint,
         AnalyticsWindow, ConversationMode, ConversationSummary, InMemoryConversationRepository,
-        InMemoryConversationResponses, IngestHeartbeat, RepoConfig, SessionStep, TableColumn,
+        InMemoryConversationResponses, IngestHeartbeat, RepoConfig, SessionStep, StoreDiagnostics,
+        TableColumn,
         TablePreview, TableSummary, ToolResult, TurnSummary, WebSearchEvent,
     };
     use std::collections::BTreeMap;
@@ -1026,6 +1060,21 @@ mod tests {
             .await
             .expect("body bytes");
         serde_json::from_slice(&body).expect("response json")
+    }
+
+    async fn router_json(app: &Router, uri: &str) -> (StatusCode, Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("API request"),
+            )
+            .await
+            .expect("API response");
+        let status = response.status();
+        (status, response_json(response).await)
     }
 
     fn sample_health() -> StoreHealth {
@@ -1212,6 +1261,89 @@ mod tests {
             read_store_health: Some(Ok(sample_health())),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn capabilities_report_runtime_schema_and_feature_facts() {
+        let (state, repository) = fake_state(InMemoryConversationResponses {
+            read_store_diagnostics: Some(Ok(StoreDiagnostics {
+                applied_schema_versions: vec![
+                    "003".to_string(),
+                    "025".to_string(),
+                    "017".to_string(),
+                ],
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+
+        let response = api_capabilities(State(state)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(response).await,
+            json!({
+                "ok": true,
+                "server_version": env!("CARGO_PKG_VERSION"),
+                "schema_migration_level": "025",
+                "features": {
+                    "analytics": true,
+                    "sessions": true,
+                    "table_inspection": true,
+                    "web_searches": true,
+                },
+            })
+        );
+        assert_eq!(repository.calls().read_store_diagnostics, 1);
+    }
+
+    #[tokio::test]
+    async fn capabilities_keep_schema_level_null_when_diagnostics_are_unavailable() {
+        for response in [
+            Ok(StoreDiagnostics::default()),
+            Err(RepoError::backend("migration ledger unavailable")),
+        ] {
+            let (state, repository) = fake_state(InMemoryConversationResponses {
+                read_store_diagnostics: Some(response),
+                ..Default::default()
+            });
+
+            let response = api_capabilities(State(state)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let payload = response_json(response).await;
+            assert_eq!(payload["ok"], json!(true));
+            assert_eq!(payload["schema_migration_level"], Value::Null);
+            assert_eq!(repository.calls().read_store_diagnostics, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn versioned_route_errors_keep_existing_status_and_envelope() {
+        let (state, _) = fake_state(InMemoryConversationResponses {
+            analytics_series: Some(Err(RepoError::backend("analytics unavailable"))),
+            ..Default::default()
+        });
+        let app = monitor_router(state);
+
+        let canonical = router_json(&app, "/api/v1/analytics?range=24h").await;
+        let legacy = router_json(&app, "/api/analytics?range=24h").await;
+        assert_eq!(canonical, legacy);
+        assert_eq!(canonical.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(canonical.1["ok"], json!(false));
+        assert_eq!(
+            canonical.1["error"],
+            json!("analytics query failed: backend error: analytics unavailable")
+        );
+
+        let malformed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/sessions?limit=not-a-number")
+                    .body(Body::empty())
+                    .expect("malformed query request"),
+            )
+            .await
+            .expect("malformed query response");
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1461,19 +1593,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn injected_router_preserves_routes_repository_and_static_bytes() {
+    async fn versioned_routes_alias_legacy_payloads_and_preserve_static_assets() {
         const INDEX_BYTES: &[u8] = b"<!doctype html><title>shared-backend</title>\n";
-        let root = temp_path("injected-router");
+        let root = temp_path("versioned-router");
         fs::create_dir_all(&root).expect("create static root");
         fs::write(root.join("index.html"), INDEX_BYTES).expect("write index");
 
+        let mut responses = successful_responses();
+        responses.latest_ingest_heartbeat = Some(Ok(IngestHeartbeatRead {
+            table_present: true,
+            latest: None,
+        }));
+        responses.read_store_diagnostics = Some(Ok(StoreDiagnostics {
+            applied_schema_versions: vec!["001".to_string(), "025".to_string()],
+            ..Default::default()
+        }));
         let repository = Arc::new(InMemoryConversationRepository::with_responses(
             RepoConfig::default(),
-            InMemoryConversationResponses {
-                read_store_health: Some(Ok(sample_health())),
-                latest_ingest_heartbeat: Some(Ok(sample_heartbeat())),
-                ..Default::default()
-            },
+            responses,
         ));
         let injected: Arc<dyn ConversationRepository> = repository.clone();
         let app = router_with_repository(&AppConfig::default(), injected, root.clone())
@@ -1499,21 +1636,88 @@ mod tests {
             .expect("static body");
         assert_eq!(&static_body[..], INDEX_BYTES);
 
-        let health_response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/health")
-                    .body(Body::empty())
-                    .expect("health request"),
-            )
-            .await
-            .expect("health response");
-        assert_eq!(health_response.status(), StatusCode::OK);
-        let health = response_json(health_response).await;
-        assert_eq!(health["ok"], json!(true));
+        let route_matrix = [
+            ("/api/v1/health", "/api/health"),
+            ("/api/v1/status", "/api/status"),
+            ("/api/v1/analytics?range=7d", "/api/analytics?range=7d"),
+            ("/api/v1/tables", "/api/tables"),
+            (
+                "/api/v1/web-searches?limit=1000",
+                "/api/web-searches?limit=1000",
+            ),
+            (
+                "/api/v1/tables/events?limit=500",
+                "/api/tables/events?limit=500",
+            ),
+            (
+                "/api/v1/sessions?since=30d&limit=1",
+                "/api/sessions?since=30d&limit=1",
+            ),
+        ];
+        for (canonical_path, legacy_path) in route_matrix {
+            let canonical = router_json(&app, canonical_path).await;
+            let legacy = router_json(&app, legacy_path).await;
+            assert_eq!(
+                canonical, legacy,
+                "{legacy_path} must directly alias {canonical_path}"
+            );
+            assert_eq!(canonical.0, StatusCode::OK);
+        }
+
+        let (status, capabilities) = router_json(&app, "/api/v1/capabilities").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(capabilities["server_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(capabilities["schema_migration_level"], json!("025"));
+        assert_eq!(
+            capabilities["features"],
+            json!({
+                "analytics": true,
+                "sessions": true,
+                "table_inspection": true,
+                "web_searches": true,
+            })
+        );
+
+        let (status, missing) = router_json(&app, "/api/v1/not-a-route").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing, json!({"ok": false, "error": "not found"}));
+
         let calls = repository.calls();
-        assert_eq!(calls.read_store_health, 1);
-        assert_eq!(calls.latest_ingest_heartbeat, 1);
+        assert_eq!(calls.read_store_health, 4);
+        assert_eq!(calls.read_store_diagnostics, 1);
+        assert_eq!(calls.latest_ingest_heartbeat, 4);
+        assert_eq!(calls.list_table_summaries, 4);
+        assert_eq!(calls.list_web_searches, vec![1_000, 1_000]);
+        assert_eq!(
+            calls.analytics_series,
+            vec![AnalyticsRange::SevenDays, AnalyticsRange::SevenDays]
+        );
+        assert_eq!(
+            calls.list_session_analytics,
+            vec![
+                SessionAnalyticsQuery {
+                    lookback: SessionLookback::ThirtyDays,
+                    limit: 1,
+                },
+                SessionAnalyticsQuery {
+                    lookback: SessionLookback::ThirtyDays,
+                    limit: 1,
+                },
+            ]
+        );
+        assert_eq!(
+            calls.preview_table,
+            vec![
+                TablePreviewQuery {
+                    table: "events".to_string(),
+                    limit: 500,
+                },
+                TablePreviewQuery {
+                    table: "events".to_string(),
+                    limit: 500,
+                },
+            ]
+        );
 
         let _ = fs::remove_dir_all(root);
     }

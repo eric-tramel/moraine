@@ -31,13 +31,13 @@ async function requestJson<T>(path: string): Promise<T> {
 }
 
 export function fetchHealth(): Promise<HealthResponse> {
-  return requestJson<HealthResponse>('/api/health');
+  return requestJson<HealthResponse>('/api/v1/health');
 }
 
 export function fetchStatus(): Promise<StatusResponse> {
-  return requestJson<StatusResponse>('/api/status');
+  return requestJson<StatusResponse>('/api/v1/status');
 }
 
 export function fetchAnalytics(range: AnalyticsRangeKey): Promise<AnalyticsResponse> {
-  return requestJson<AnalyticsResponse>(`/api/analytics?range=${encodeURIComponent(range)}`);
+  return requestJson<AnalyticsResponse>(`/api/v1/analytics?range=${encodeURIComponent(range)}`);
 }

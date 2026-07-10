@@ -9,7 +9,7 @@ export async function fetchSessions(options: FetchSessionsOptions = {}): Promise
   const { allowMock = true } = options;
 
   try {
-    const response = await fetch('/api/sessions', {
+    const response = await fetch('/api/v1/sessions', {
       headers: { Accept: 'application/json' },
     });
 
@@ -31,22 +31,4 @@ export async function fetchSessions(options: FetchSessionsOptions = {}): Promise
   }
 
   return generateMockSessions();
-}
-
-export async function fetchSessionDetail(id: string): Promise<Session | null> {
-  try {
-    const response = await fetch(`/api/sessions/${encodeURIComponent(id)}`, {
-      headers: { Accept: 'application/json' },
-    });
-    if (!response.ok) {
-      return null;
-    }
-    const data = (await response.json()) as { ok: boolean; session?: Session; error?: string };
-    if (data.ok && data.session) {
-      return data.session;
-    }
-  } catch {
-    // fall through
-  }
-  return null;
 }

@@ -13,6 +13,7 @@ nav = [
   { "Introduction" = "introduction.md" },
   { "Quickstart and Installation" = "quickstart.md" },
   { "Configuration" = "configuration.md" },
+  { "Monitor HTTP API" = "monitor-http-api.md" },
   { "Remote ClickHouse" = "remote-clickhouse.md" },
   { "Analytics Export" = "export.md" },
   { "Agent MCP Search" = [

@@ -698,7 +698,7 @@ cmd_up() {
     dc "$project" "$mount_sessions" up -d
 
     # Wait for health. The first boot of a sandbox runs `cargo build
-    # --workspace --locked` inside the container before moraine's /api/health
+    # --workspace --locked` inside the container before moraine's /api/v1/health
     # comes online. With a cold sccache a from-scratch workspace build can
     # take ~10 minutes; with the host's sccache warm it's seconds. Budget
     # 900s and surface progress via the log hint so operators don't worry.

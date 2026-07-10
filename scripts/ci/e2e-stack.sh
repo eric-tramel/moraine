@@ -98,6 +98,57 @@ json_ok_true() {
   "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sys.exit(0 if data.get("ok") is True else 1)'
 }
 
+assert_monitor_api_alias() {
+  local python_bin="$1"
+  local base_url="$2"
+  local tmp_root="$3"
+  local canonical_path="$4"
+  local legacy_path="$5"
+  local canonical_body_file
+  local legacy_body_file
+  canonical_body_file="$(mktemp "$tmp_root/canonical-api.XXXXXX")"
+  legacy_body_file="$(mktemp "$tmp_root/legacy-api.XXXXXX")"
+
+  local canonical_status
+  local legacy_status
+  # Deliberately omit --location: compatibility aliases must respond directly,
+  # not pass by redirecting curl to the canonical route.
+  if ! canonical_status="$(curl -sS --max-time 30 -o "$canonical_body_file" -w '%{http_code}' -- "${base_url}${canonical_path}")"; then
+    echo "[e2e] canonical monitor request failed: ${canonical_path}" >&2
+    rm -f "$canonical_body_file" "$legacy_body_file"
+    return 1
+  fi
+  if ! legacy_status="$(curl -sS --max-time 30 -o "$legacy_body_file" -w '%{http_code}' -- "${base_url}${legacy_path}")"; then
+    echo "[e2e] legacy monitor request failed: ${legacy_path}" >&2
+    rm -f "$canonical_body_file" "$legacy_body_file"
+    return 1
+  fi
+
+  if [[ "$canonical_status" != "$legacy_status" ]]; then
+    echo "[e2e] monitor alias status mismatch: ${legacy_path} (${legacy_status}) != ${canonical_path} (${canonical_status})" >&2
+    rm -f "$canonical_body_file" "$legacy_body_file"
+    return 1
+  fi
+
+  if [[ "$canonical_status" != "200" ]]; then
+    echo "[e2e] monitor alias returned unexpected status: ${canonical_path} (${canonical_status})" >&2
+    rm -f "$canonical_body_file" "$legacy_body_file"
+    return 1
+  fi
+  if ! json_ok_true "$python_bin" <"$canonical_body_file"; then
+    echo "[e2e] canonical monitor response is not successful JSON: ${canonical_path}" >&2
+    rm -f "$canonical_body_file" "$legacy_body_file"
+    return 1
+  fi
+  if ! json_ok_true "$python_bin" <"$legacy_body_file"; then
+    echo "[e2e] legacy monitor response is not successful JSON: ${legacy_path}" >&2
+    rm -f "$canonical_body_file" "$legacy_body_file"
+    return 1
+  fi
+
+  rm -f "$canonical_body_file" "$legacy_body_file"
+}
+
 wait_for_endpoint_ok() {
   local python_bin="$1"
   local url="$2"
@@ -986,7 +1037,7 @@ EOF
   local expected_ingest_ua="moraine-ingest/${moraine_version} (pid=${ingest_pid})"
 
   echo "[e2e] waiting for monitor health"
-  wait_for_endpoint_ok "$python_bin" "http://127.0.0.1:${monitor_port}/api/health" 120
+  wait_for_endpoint_ok "$python_bin" "http://127.0.0.1:${monitor_port}/api/v1/health" 120
 
   echo "[e2e] checking unified backend HTML + referenced static asset"
   assert_frontend_asset_served "$python_bin" "http://127.0.0.1:${monitor_port}" "$tmp_root"
@@ -1145,14 +1196,86 @@ PY
     return 1
   fi
 
-  echo "[e2e] checking monitor API routes"
-  for path in /api/health /api/status /api/analytics /api/web-searches /api/sessions; do
+  echo "[e2e] checking canonical monitor API routes"
+  local path
+  for path in \
+    "/api/v1/health" \
+    "/api/v1/status" \
+    "/api/v1/analytics?range=24h" \
+    "/api/v1/tables" \
+    "/api/v1/web-searches?limit=25" \
+    "/api/v1/tables/v_conversation_trace?limit=500" \
+    "/api/v1/sessions?since=all&limit=200"; do
     local body
     body="$(curl -fsS "http://127.0.0.1:${monitor_port}${path}")"
     printf '%s' "$body" | json_ok_true "$python_bin"
   done
+
+  echo "[e2e] checking monitor API capabilities"
+  local applied_schema_level
+  applied_schema_level="$(clickhouse_scalar "$clickhouse_url" "SELECT max(version) FROM ${clickhouse_database}.schema_migrations")"
+  local expected_server_version
+  expected_server_version="$("$moraine_bin" --version)"
+  expected_server_version="${expected_server_version##* }"
+  local capabilities_body
+  capabilities_body="$(curl -fsS "http://127.0.0.1:${monitor_port}/api/v1/capabilities")"
+  printf '%s' "$capabilities_body" | "$python_bin" -c '
+import json
+import sys
+
+data = json.load(sys.stdin)
+expected_server_version, expected_schema_level = sys.argv[1:]
+expected_features = {
+    "analytics": True,
+    "sessions": True,
+    "table_inspection": True,
+    "web_searches": True,
+}
+valid = (
+    isinstance(data, dict)
+    and set(data) == {
+        "ok",
+        "server_version",
+        "schema_migration_level",
+        "features",
+    }
+    and data.get("ok") is True
+    and data.get("server_version") == expected_server_version
+    and data.get("schema_migration_level") == expected_schema_level
+    and data.get("features") == expected_features
+)
+if not valid:
+    print(
+        "unexpected monitor capabilities payload: "
+        f"expected server_version={expected_server_version!r}, "
+        f"schema_migration_level={expected_schema_level!r}, "
+        f"features={expected_features!r}; got {data!r}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+' "$expected_server_version" "$applied_schema_level"
+
+  local monitor_api_url="http://127.0.0.1:${monitor_port}"
+  echo "[e2e] checking one-release monitor API aliases"
+  assert_monitor_api_alias "$python_bin" "$monitor_api_url" "$tmp_root" \
+    "/api/v1/health" "/api/health"
+  assert_monitor_api_alias "$python_bin" "$monitor_api_url" "$tmp_root" \
+    "/api/v1/status" "/api/status"
+  assert_monitor_api_alias "$python_bin" "$monitor_api_url" "$tmp_root" \
+    "/api/v1/analytics?range=24h" "/api/analytics?range=24h"
+  assert_monitor_api_alias "$python_bin" "$monitor_api_url" "$tmp_root" \
+    "/api/v1/tables" "/api/tables"
+  assert_monitor_api_alias "$python_bin" "$monitor_api_url" "$tmp_root" \
+    "/api/v1/web-searches?limit=25" "/api/web-searches?limit=25"
+  assert_monitor_api_alias "$python_bin" "$monitor_api_url" "$tmp_root" \
+    "/api/v1/tables/v_conversation_trace?limit=500" \
+    "/api/tables/v_conversation_trace?limit=500"
+  assert_monitor_api_alias "$python_bin" "$monitor_api_url" "$tmp_root" \
+    "/api/v1/sessions?since=all&limit=200" \
+    "/api/sessions?since=all&limit=200"
+
   local sessions_body
-  sessions_body="$(curl -fsS "http://127.0.0.1:${monitor_port}/api/sessions?since=all&limit=200")"
+  sessions_body="$(curl -fsS "http://127.0.0.1:${monitor_port}/api/v1/sessions?since=all&limit=200")"
   printf '%s' "$sessions_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; ok=any(s.get("id")==sid and s.get("harness",{}).get("id")=="cursor" for s in data.get("sessions", [])); sys.exit(0 if ok else 1)' "$cursor_session_id"
   printf '%s' "$sessions_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; ok=any(s.get("id")==sid and s.get("harness",{}).get("id")=="pi-coding-agent" for s in data.get("sessions", [])); sys.exit(0 if ok else 1)' "$pi_session_id"
 
@@ -1196,14 +1319,15 @@ PY
   # Re-enable merges now that the pre-merge assertions have passed.
   clickhouse_scalar "$clickhouse_url" "SYSTEM START MERGES ${clickhouse_database}.events" >/dev/null
 
-  # `/api/sessions` intentionally keeps its legacy shape without eventCount.
-  # Derive the monitor-side canonical count through the existing trace preview
-  # route, then compare both that count and sessions.endedAt with MCP below.
+  # `/api/v1/sessions` intentionally keeps its dashboard shape without
+  # eventCount. Derive the monitor-side canonical count through the existing
+  # trace preview route, then compare both that count and sessions.endedAt with
+  # MCP below.
   echo "[e2e] checking monitor/repository session count + last-activity parity"
-  sessions_body="$(curl -fsS "http://127.0.0.1:${monitor_port}/api/sessions?since=all&limit=200")"
+  sessions_body="$(curl -fsS "http://127.0.0.1:${monitor_port}/api/v1/sessions?since=all&limit=200")"
   printf '%s' "$sessions_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; expected=int(sys.argv[2]); session=next((s for s in data.get("sessions", []) if s.get("id")==sid), None); ok=session is not None and session.get("endedAt")==expected; sys.exit(0 if ok else 1)' "$codex_session_id" "1771243203900"
   local trace_body
-  trace_body="$(curl -fsS "http://127.0.0.1:${monitor_port}/api/tables/v_conversation_trace?limit=500")"
+  trace_body="$(curl -fsS "http://127.0.0.1:${monitor_port}/api/v1/tables/v_conversation_trace?limit=500")"
   printf '%s' "$trace_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; expected=int(sys.argv[2]); count=sum(1 for row in data.get("rows", []) if row.get("session_id")==sid); sys.exit(0 if count==expected else 1)' "$codex_session_id" "7"
 
   # Capture a server-clock-bounded query_log window after `moraine up` and its

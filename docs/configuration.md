@@ -224,7 +224,7 @@ only affects traces that carry no working directory at all.
 Per-backend mirror status — `connecting`, `ok`, `lagging`, `unreachable`,
 `disabled_skew`, or `disabled_missing_identity_author` — is written to ingest
 heartbeats as a `backend_sinks` map and surfaced through the monitor's
-`/api/health`. This uses a column added by migration 017; until
+`/api/v1/health`. This uses a column added by migration 017; until
 `moraine db migrate` runs (and ingest restarts), ingest warns and omits the
 field rather than failing heartbeats. `disabled_missing_identity_author` means
 `[identity].author` is empty; set it and restart ingest before mirroring to
@@ -244,7 +244,7 @@ build — a strictly read-only probe — and enforces:
 | Server ahead (server-applied migrations unknown to this build) | Mirror disabled unless that backend sets `allow_newer_server = true`. Upgrade Moraine, or opt in. |
 
 For ingest mirroring, a skew failure disables that one mirror until the
-ingest service restarts and shows as `disabled_skew` in `/api/health`; the
+ingest service restarts and shows as `disabled_skew` in `/api/v1/health`; the
 default backend is unaffected. A backend that simply does not answer retries
 the handshake periodically and shows as `unreachable`. The same handshake
 also runs when `moraine run mcp` starts in a routed directory, where it

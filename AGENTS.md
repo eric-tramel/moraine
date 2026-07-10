@@ -60,7 +60,7 @@ scripts/dev/sandbox/moraine-sandbox shell "$id"
 
 # 3. Validate behavior against the printed monitor URL.
 port=$(scripts/dev/sandbox/moraine-sandbox status "$id" | awk -F: '/^\[sandbox\] monitor/{print $NF}')
-curl -fsS "http://127.0.0.1:${port}/api/health"
+curl -fsS "http://127.0.0.1:${port}/api/v1/health"
 
 # 4. Tear down before reporting task complete. Leftover sandboxes leak
 #    ClickHouse data and consume host ports.

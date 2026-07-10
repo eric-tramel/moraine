@@ -56,7 +56,7 @@ Check the monitor health endpoint using the sandbox-reported port:
 
 ```bash
 port=$(scripts/dev/sandbox/moraine-sandbox status "$id" | awk -F: '/^\[sandbox\] monitor/{print $NF}')
-curl -fsS "http://127.0.0.1:${port}/api/health"
+curl -fsS "http://127.0.0.1:${port}/api/v1/health"
 ```
 
 For MCP tool surface changes or release-level confidence, consider `scripts/dev/sandbox/agent-smoke-e2e --help`. It requires `ANTHROPIC_API_KEY`.
