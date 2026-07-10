@@ -1490,6 +1490,50 @@ PY
       --dry-run
   fi
 
+  echo "[e2e] checking full-stack status prefers the daemon v1 API"
+  local daemon_status_path="$tmp_root/daemon-status.json"
+  "$moraine_bin" --output json --config "$config_path" status > "$daemon_status_path"
+  "$python_bin" - "$daemon_status_path" "$backend_pid" "$monitor_port" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+status = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+expected_backend_pid = int(sys.argv[2])
+expected_monitor_url = f"http://127.0.0.1:{int(sys.argv[3])}"
+services = {
+    row.get("service"): row
+    for row in status.get("services", [])
+    if isinstance(row, dict) and isinstance(row.get("service"), str)
+}
+
+if status.get("data_source") != "daemon_api":
+    raise SystemExit(f"full-stack status did not prefer daemon API: {status.get('data_source')!r}")
+backend = services.get("backend")
+if (
+    not isinstance(backend, dict)
+    or backend.get("state") != "running"
+    or backend.get("pid") != expected_backend_pid
+    or backend.get("socket_listening") is not True
+    or backend.get("http_listening") is not True
+):
+    raise SystemExit(f"full-stack status did not report the backend running: {backend!r}")
+doctor = status.get("doctor")
+if (
+    not isinstance(doctor, dict)
+    or doctor.get("clickhouse_healthy") is not True
+    or doctor.get("database_exists") is not True
+):
+    raise SystemExit(f"full-stack API status did not report a healthy database: {doctor!r}")
+heartbeat = status.get("heartbeat")
+if not isinstance(heartbeat, dict) or heartbeat.get("state") != "available":
+    raise SystemExit(f"full-stack API status did not report an available heartbeat: {heartbeat!r}")
+if status.get("monitor_url") != expected_monitor_url:
+    raise SystemExit(
+        f"full-stack status monitor URL mismatch: {status.get('monitor_url')!r}"
+    )
+PY
+
   echo "[e2e] killing only the unified backend (crash/fallback scenario)"
   kill -KILL "$backend_pid"
   wait_for_backend_crash \
@@ -1553,6 +1597,10 @@ from pathlib import Path
 import sys
 
 status = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if status.get("data_source") != "direct_db":
+    raise SystemExit(
+        f"backend-down status did not use direct DB fallback: {status.get('data_source')!r}"
+    )
 expected_ingest_pid = int(sys.argv[2])
 expected_clickhouse_pid = int(sys.argv[3])
 services = {
@@ -1604,6 +1652,44 @@ if status.get("monitor_url") is not None:
     raise SystemExit(f"final status retained a stopped monitor URL: {status.get('monitor_url')!r}")
 PY
   cat "$final_status_path"
+  echo "[e2e] stopping remaining services and checking all-down status"
+  local all_down_transition_path="$tmp_root/all-down-transition.json"
+  local all_down_status_path="$tmp_root/all-down-status.json"
+  "$moraine_bin" --output json --config "$config_path" down > "$all_down_transition_path"
+  "$moraine_bin" --output json --config "$config_path" status > "$all_down_status_path"
+  "$python_bin" - "$all_down_status_path" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+status = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+services = {
+    row.get("service"): row
+    for row in status.get("services", [])
+    if isinstance(row, dict) and isinstance(row.get("service"), str)
+}
+
+if status.get("data_source") != "direct_db":
+    raise SystemExit(f"all-down status did not use direct DB: {status.get('data_source')!r}")
+for service in ("backend", "ingest", "clickhouse"):
+    row = services.get(service)
+    if (
+        not isinstance(row, dict)
+        or row.get("state") != "stopped"
+        or row.get("pid") is not None
+    ):
+        raise SystemExit(f"all-down status did not report {service} stopped: {row!r}")
+doctor = status.get("doctor")
+if not isinstance(doctor, dict) or doctor.get("clickhouse_healthy") is not False:
+    raise SystemExit(f"all-down status did not preserve database diagnosis: {doctor!r}")
+heartbeat = status.get("heartbeat")
+if not isinstance(heartbeat, dict) or heartbeat.get("state") != "error":
+    raise SystemExit(f"all-down status did not preserve heartbeat failure: {heartbeat!r}")
+if status.get("monitor_url") is not None:
+    raise SystemExit(f"all-down status retained a monitor URL: {status.get('monitor_url')!r}")
+PY
+  cat "$all_down_status_path"
+
   E2E_SUCCESS=1
 }
 
