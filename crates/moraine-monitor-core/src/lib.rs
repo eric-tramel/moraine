@@ -7,10 +7,9 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use moraine_clickhouse::ClickHouseClient;
 use moraine_config::AppConfig;
 use moraine_conversations::{
-    AnalyticsRange, ClickHouseConversationRepository, ConversationRepository, IngestHeartbeat,
+    build_clickhouse_repository, AnalyticsRange, ConversationRepository, IngestHeartbeat,
     IngestHeartbeatRead, RepoConfig, RepoError, SessionAnalytics, SessionAnalyticsQuery,
     SessionLookback, SessionStep, SessionTurn, StoreConnectionMetrics, StoreHealth, StoreProbe,
     TablePreviewQuery, TableSummaries,
@@ -65,10 +64,7 @@ pub async fn run_server(
 
     let clickhouse_url = cfg.clickhouse.url.clone();
     let clickhouse_database = cfg.clickhouse.database.clone();
-    let client = ClickHouseClient::new(cfg.clickhouse.clone())?;
-    let repository: Arc<dyn ConversationRepository> = Arc::new(
-        ClickHouseConversationRepository::new(client, repository_config(&cfg)),
-    );
+    let repository = build_clickhouse_repository(cfg.clickhouse.clone(), repository_config(&cfg))?;
     let state = Arc::new(AppState {
         repository,
         static_dir,

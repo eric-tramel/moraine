@@ -1280,7 +1280,6 @@ dependencies = [
  "anyhow",
  "axum",
  "mime_guess",
- "moraine-clickhouse",
  "moraine-config",
  "moraine-conversations",
  "serde",

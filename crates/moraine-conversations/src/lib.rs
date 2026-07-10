@@ -31,3 +31,34 @@ pub use in_memory_repo::{
     InMemoryConversationCalls, InMemoryConversationRepository, InMemoryConversationResponses,
 };
 pub use repo::ConversationRepository;
+
+/// Build the production ClickHouse repository behind its backend-neutral read
+/// trait. Consumers provide configuration, but never construct or retain the
+/// storage client themselves.
+pub fn build_clickhouse_repository(
+    clickhouse: moraine_config::ClickHouseConfig,
+    config: RepoConfig,
+) -> anyhow::Result<std::sync::Arc<dyn ConversationRepository>> {
+    let client = moraine_clickhouse::ClickHouseClient::new(clickhouse)?;
+    Ok(std::sync::Arc::new(ClickHouseConversationRepository::new(
+        client, config,
+    )))
+}
+
+#[cfg(test)]
+mod construction_tests {
+    use super::{build_clickhouse_repository, RepoConfig};
+
+    #[test]
+    fn clickhouse_factory_returns_configured_trait_object() {
+        let config = RepoConfig {
+            max_results: 73,
+            ..RepoConfig::default()
+        };
+        let repository =
+            build_clickhouse_repository(moraine_config::ClickHouseConfig::default(), config)
+                .expect("valid ClickHouse configuration");
+
+        assert_eq!(repository.config().max_results, 73);
+    }
+}
