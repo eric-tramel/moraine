@@ -19,6 +19,13 @@ pub use domain::{
     SessionMetadataSearchHit, SessionMetadataSearchQuery, SessionMetadataSearchResults,
     SessionMetadataSearchStats, SessionOriginScope, TraceEvent, Turn, TurnListFilter, TurnSummary,
 };
+pub use domain::{
+    AnalyticsConcurrencyPoint, AnalyticsRange, AnalyticsSnapshot, AnalyticsTokenPoint,
+    AnalyticsTurnPoint, AnalyticsWindow, IngestHeartbeat, IngestHeartbeatRead, SessionAnalytics,
+    SessionAnalyticsQuery, SessionLookback, SessionStep, SessionTurn, StoreConnectionMetrics,
+    StoreDiagnostics, StoreHealth, StoreProbe, TableColumn, TablePreview, TablePreviewQuery,
+    TableSummaries, TableSummary, ToolResult, WebSearchEvent,
+};
 pub use error::{RepoError, RepoResult};
 pub use in_memory_repo::{
     InMemoryConversationCalls, InMemoryConversationRepository, InMemoryConversationResponses,

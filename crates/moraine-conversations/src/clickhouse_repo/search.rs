@@ -103,7 +103,7 @@ impl ClickHouseConversationRepository {
             ));
         }
 
-        let events_table = self.table_ref("events");
+        let events_source = canonical_events_source(&self.table_ref("events"));
         let session_summary_table = self.table_ref("v_session_summary");
         let mode_subquery = self.mode_subquery();
         let terms_array_sql = sql_array_strings(terms);
@@ -211,7 +211,7 @@ FROM (
           ''
         ) AS session_summary,
         argMax(e.payload_json, tuple(e.event_ts, e.event_uid)) AS metadata_text
-      FROM {events_table} AS e
+      FROM {events_source} AS e
       WHERE e.event_kind = 'session_meta'
       GROUP BY e.session_id
     ) AS base
@@ -224,7 +224,7 @@ ORDER BY meta.score DESC, meta.session_id ASC
 LIMIT {limit}
 FORMAT JSONEachRow",
             terms_array_sql = terms_array_sql,
-            events_table = events_table,
+            events_source = events_source,
             session_summary_table = session_summary_table,
             mode_subquery = mode_subquery,
             where_sql = where_sql,
@@ -2136,18 +2136,17 @@ FORMAT JSONEachRow",
             return Ok(HashMap::new());
         }
 
-        let events_table = self.table_ref("events");
+        let session_summary_table = self.table_ref("v_session_summary");
         let session_ids_sql = sql_array_strings(&unique_session_ids);
         let sql = format!(
             "SELECT
   session_id,
-  toString(min(event_ts)) AS first_event_time,
-  toString(max(event_ts)) AS last_event_time
-FROM {events_table}
+  toString(first_event_time) AS first_event_time,
+  toString(last_event_time) AS last_event_time
+FROM {session_summary_table}
 WHERE session_id IN {session_ids_sql}
-GROUP BY session_id
 FORMAT JSONEachRow",
-            events_table = events_table,
+            session_summary_table = session_summary_table,
             session_ids_sql = session_ids_sql,
         );
 
@@ -2247,7 +2246,7 @@ FORMAT JSONEachRow",
         session_ids.dedup();
 
         let trace_table = self.table_ref("v_conversation_trace");
-        let events_table = self.table_ref("events");
+        let events_source = canonical_events_source(&self.table_ref("events"));
         let event_uids_sql = sql_array_strings(&event_uids);
         let session_ids_sql = sql_array_strings(&session_ids);
         let sql = format!(
@@ -2282,15 +2281,15 @@ FROM (
 ANY LEFT JOIN (
   SELECT
     event_uid,
-    argMax(model, event_version) AS model
-  FROM {events_table}
+    argMax(model, tuple(event_ts, event_uid)) AS model
+  FROM {events_source}
   WHERE event_uid IN {event_uids_sql}
   GROUP BY event_uid
 ) AS e ON e.event_uid = tr.event_uid
 WHERE tr.event_uid IN {event_uids_sql}
 FORMAT JSONEachRow",
             trace_table = trace_table,
-            events_table = events_table,
+            events_source = events_source,
             session_ids_sql = session_ids_sql,
             event_uids_sql = event_uids_sql,
         );
@@ -2425,7 +2424,7 @@ FORMAT JSONEachRow",
             return Ok(HashMap::new());
         }
 
-        let events_table = self.table_ref("events");
+        let events_source = canonical_events_source(&self.table_ref("events"));
         let session_ids_sql = sql_array_strings(session_ids);
         let sql = format!(
             "SELECT
@@ -2444,12 +2443,12 @@ FORMAT JSONEachRow",
     ),
     ''
   ) AS session_summary
-FROM {events_table}
+FROM {events_source}
 WHERE event_kind = 'session_meta'
   AND session_id IN {session_ids_sql}
 GROUP BY session_id
 FORMAT JSONEachRow",
-            events_table = events_table,
+            events_source = events_source,
             session_ids_sql = session_ids_sql,
         );
 

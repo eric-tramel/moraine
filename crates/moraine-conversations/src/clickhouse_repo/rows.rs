@@ -163,49 +163,6 @@ pub(super) struct EventSessionRow {
 }
 
 #[derive(Debug, Deserialize)]
-pub(super) struct SessionEventSourceRow {
-    pub(super) session_id: String,
-    pub(super) event_uid: String,
-    pub(super) event_time: String,
-    pub(super) event_unix_ms: i64,
-    pub(super) source_name: String,
-    pub(super) turn_index: u32,
-    pub(super) actor_role: String,
-    pub(super) event_class: String,
-    pub(super) payload_type: String,
-    #[serde(default)]
-    pub(super) call_id: String,
-    #[serde(default)]
-    pub(super) name: String,
-    #[serde(default)]
-    pub(super) phase: String,
-    #[serde(default)]
-    pub(super) item_id: String,
-    #[serde(default)]
-    pub(super) source_ref: String,
-    #[serde(default)]
-    pub(super) text_content: String,
-    #[serde(default)]
-    pub(super) payload_json: String,
-    #[serde(default)]
-    pub(super) token_usage_json: String,
-    #[serde(default)]
-    pub(super) endpoint_kind: String,
-    #[serde(default)]
-    pub(super) token_usage_buckets: BTreeMap<String, u64>,
-    #[serde(default)]
-    pub(super) token_usage_native_units: BTreeMap<String, f64>,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct IndexedTraceEvent {
-    pub(super) event: TraceEvent,
-    pub(super) event_unix_ms: i64,
-    pub(super) turn_id: String,
-    pub(super) source_name: String,
-}
-
-#[derive(Debug, Deserialize)]
 pub(super) struct OpenTargetRow {
     pub(super) session_id: String,
     pub(super) event_order: u64,
@@ -585,52 +542,5 @@ impl ClickHouseConversationRepository {
             token_usage_buckets: row.token_usage_buckets,
             token_usage_native_units: row.token_usage_native_units,
         }
-    }
-
-    pub(super) fn map_indexed_session_events(
-        rows: Vec<SessionEventSourceRow>,
-    ) -> Vec<IndexedTraceEvent> {
-        let mut fallback_turn_seq = 0u32;
-        rows.into_iter()
-            .enumerate()
-            .map(|(idx, row)| {
-                if row.actor_role == "user" && row.event_class == "message" {
-                    fallback_turn_seq = fallback_turn_seq.saturating_add(1);
-                }
-                let turn_seq = if row.turn_index > 0 {
-                    row.turn_index
-                } else {
-                    fallback_turn_seq.max(1)
-                };
-                let turn_id = row.turn_index.to_string();
-                let event = TraceEvent {
-                    session_id: row.session_id,
-                    event_uid: row.event_uid,
-                    event_order: (idx + 1) as u64,
-                    turn_seq,
-                    event_time: row.event_time,
-                    actor_role: row.actor_role,
-                    event_class: row.event_class,
-                    payload_type: row.payload_type,
-                    call_id: row.call_id,
-                    name: row.name,
-                    phase: row.phase,
-                    item_id: row.item_id,
-                    source_ref: row.source_ref,
-                    text_content: row.text_content,
-                    payload_json: row.payload_json,
-                    token_usage_json: row.token_usage_json,
-                    endpoint_kind: row.endpoint_kind,
-                    token_usage_buckets: row.token_usage_buckets,
-                    token_usage_native_units: row.token_usage_native_units,
-                };
-                IndexedTraceEvent {
-                    event,
-                    event_unix_ms: row.event_unix_ms,
-                    turn_id,
-                    source_name: row.source_name,
-                }
-            })
-            .collect()
     }
 }

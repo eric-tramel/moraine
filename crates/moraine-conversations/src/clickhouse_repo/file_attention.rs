@@ -62,7 +62,7 @@ impl ClickHouseConversationRepository {
         let rel = query.rel.as_str();
 
         let tool_io = self.table_ref("tool_io");
-        let events = self.table_ref("events");
+        let events_source = canonical_events_source(&self.table_ref("events"));
         let trace = self.table_ref("v_conversation_trace");
         let rel_sql = sql_quote(rel);
         let project_predicate = if query.apply_project_scope {
@@ -150,7 +150,7 @@ impl ClickHouseConversationRepository {
   ) AS tr ON tr.session_id = ti.session_id AND tr.event_uid = ti.event_uid
   ANY LEFT JOIN (
     SELECT session_id, event_uid, any(cwd) AS cwd
-    FROM {events} FINAL
+    FROM {events_source}
     WHERE (session_id, event_uid) IN (SELECT session_id, event_uid FROM matched)
     GROUP BY session_id, event_uid
   ) AS e ON e.session_id = ti.session_id AND e.event_uid = ti.event_uid
@@ -170,7 +170,7 @@ impl ClickHouseConversationRepository {
         let rel = query.rel.as_str();
 
         let tool_io = self.table_ref("tool_io");
-        let events = self.table_ref("events");
+        let events_source = canonical_events_source(&self.table_ref("events"));
         let trace = self.table_ref("v_conversation_trace");
         let rel_sql = sql_quote(rel);
         let slash_rel_sql = sql_quote(&format!("/{rel}"));
@@ -327,7 +327,7 @@ impl ClickHouseConversationRepository {
   ) AS tr ON tr.session_id = ti.session_id AND tr.event_uid = ti.event_uid
   ANY LEFT JOIN (
     SELECT session_id, event_uid, any(cwd) AS cwd
-    FROM {events} FINAL
+    FROM {events_source}
     WHERE (session_id, event_uid) IN (SELECT session_id, event_uid FROM matched)
     GROUP BY session_id, event_uid
   ) AS e ON e.session_id = ti.session_id AND e.event_uid = ti.event_uid

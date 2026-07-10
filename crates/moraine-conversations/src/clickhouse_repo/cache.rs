@@ -1,6 +1,8 @@
 use super::*;
 
 pub(super) const BENCHMARK_REPLAY_SOURCE: &str = "benchmark-replay";
+pub(super) const ANALYTICS_CACHE_TTL: Duration = Duration::from_secs(30);
+pub(super) const ANALYTICS_RANGE_COUNT: usize = AnalyticsRange::ALL.len();
 pub(super) const CORPUS_STATS_CACHE_TTL: Duration = Duration::from_secs(30);
 pub(super) const TERM_DF_CACHE_TTL: Duration = Duration::from_secs(300);
 pub(super) const SEARCH_SCHEMA_CACHE_TTL: Duration = Duration::from_secs(60);
@@ -22,6 +24,31 @@ pub(super) const TERM_POSTINGS_FAST_PATH_MAX_DOC_RATIO_DENOMINATOR: u64 = 4;
 // a preview up to a minute old, never a wrong hit.
 pub(super) const SEARCH_DOC_EXTRA_CACHE_TTL: Duration = Duration::from_secs(60);
 pub(super) const SEARCH_DOC_EXTRA_CACHE_MAX_ENTRIES: usize = 65536;
+
+#[derive(Debug, Clone)]
+pub(super) struct AnalyticsCacheEntry {
+    pub(super) snapshot: AnalyticsSnapshot,
+    pub(super) fetched_at: Instant,
+}
+
+impl AnalyticsCacheEntry {
+    pub(super) fn is_fresh(&self, now: Instant) -> bool {
+        now.checked_duration_since(self.fetched_at)
+            .unwrap_or_default()
+            <= ANALYTICS_CACHE_TTL
+    }
+}
+
+pub(super) const fn analytics_range_index(range: AnalyticsRange) -> usize {
+    match range {
+        AnalyticsRange::FifteenMinutes => 0,
+        AnalyticsRange::OneHour => 1,
+        AnalyticsRange::SixHours => 2,
+        AnalyticsRange::TwentyFourHours => 3,
+        AnalyticsRange::SevenDays => 4,
+        AnalyticsRange::ThirtyDays => 5,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct CorpusStatsCacheEntry {

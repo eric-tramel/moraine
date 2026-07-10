@@ -30,7 +30,7 @@ impl ClickHouseConversationRepository {
         };
 
         let session_summary = self.table_ref("v_session_summary");
-        let events_table = self.table_ref("events");
+        let events_source = canonical_events_source(&self.table_ref("events"));
         let mode_subquery = self.mode_subquery();
 
         let mut where_clauses = vec!["1 = 1".to_string()];
@@ -101,7 +101,7 @@ LEFT JOIN (
       ),
       ''
     ) AS session_summary
-  FROM {events_table}
+  FROM {events_source}
   WHERE event_kind = 'session_meta'
   GROUP BY session_id
 ) AS meta ON meta.session_id = s.session_id
@@ -110,7 +110,7 @@ ORDER BY s.last_event_time {order_dir}, s.session_id {order_dir}
 LIMIT {limit_plus}
 FORMAT JSONEachRow",
             session_summary = session_summary,
-            events_table = events_table,
+            events_source = events_source,
             mode_subquery = mode_subquery,
             where_sql = where_sql,
             order_dir = order_dir,
@@ -177,7 +177,7 @@ FORMAT JSONEachRow",
         };
 
         let session_summary = self.table_ref("v_session_summary");
-        let events_table = self.table_ref("events");
+        let events_source = canonical_events_source(&self.table_ref("events"));
         let mode_subquery = self.mode_subquery();
 
         let mut where_clauses = vec![
@@ -251,7 +251,7 @@ LEFT JOIN (
       argMaxIf(payload_type, tuple(event_ts, event_uid), payload_type IN ('task_complete', 'turn_aborted')),
       ''
     ) AS latest_terminal_payload_type
-  FROM {events_table}
+  FROM {events_source}
   GROUP BY session_id
 ) AS status ON status.session_id = s.session_id
 LEFT JOIN (
@@ -290,7 +290,7 @@ LEFT JOIN (
       ),
       ''
     ) AS session_summary
-  FROM {events_table}
+  FROM {events_source}
   WHERE event_kind = 'session_meta'
   GROUP BY session_id
 ) AS meta ON meta.session_id = s.session_id
@@ -299,7 +299,7 @@ ORDER BY s.last_event_time {order_dir}, s.session_id {order_dir}
 LIMIT {limit_plus}
 FORMAT JSONEachRow",
             session_summary = session_summary,
-            events_table = events_table,
+            events_source = events_source,
             mode_subquery = mode_subquery,
             where_sql = where_sql,
             order_dir = order_dir,

@@ -3,6 +3,11 @@ use std::sync::{Mutex, MutexGuard};
 use async_trait::async_trait;
 
 use crate::domain::{
+    AnalyticsRange, AnalyticsSnapshot, AnalyticsWindow, IngestHeartbeatRead, SessionAnalytics,
+    SessionAnalyticsQuery, StoreDiagnostics, StoreHealth, TablePreview, TablePreviewQuery,
+    TableSummaries, WebSearchEvent,
+};
+use crate::domain::{
     Conversation, ConversationDetailOptions, ConversationListFilter, ConversationSearchQuery,
     ConversationSearchResults, ConversationSearchStats, ConversationSummary, FileAttentionQuery,
     FileAttentionTouch, McpEventOpen, McpEventType, McpSessionListFilter, McpSessionListItem,
@@ -40,6 +45,14 @@ pub struct InMemoryConversationResponses {
     pub file_attention: Option<RepoResult<Vec<FileAttentionTouch>>>,
     pub prewarm_mcp_search_state: Option<RepoResult<()>>,
     pub cancel_query: Option<RepoResult<()>>,
+    pub list_session_analytics: Option<RepoResult<Vec<SessionAnalytics>>>,
+    pub analytics_series: Option<RepoResult<AnalyticsSnapshot>>,
+    pub list_web_searches: Option<RepoResult<Vec<WebSearchEvent>>>,
+    pub latest_ingest_heartbeat: Option<RepoResult<IngestHeartbeatRead>>,
+    pub list_table_summaries: Option<RepoResult<TableSummaries>>,
+    pub preview_table: Option<RepoResult<TablePreview>>,
+    pub read_store_health: Option<RepoResult<StoreHealth>>,
+    pub read_store_diagnostics: Option<RepoResult<StoreDiagnostics>>,
 }
 
 /// Arguments observed by an [`InMemoryConversationRepository`].
@@ -63,6 +76,14 @@ pub struct InMemoryConversationCalls {
     pub file_attention: Vec<FileAttentionQuery>,
     pub prewarm_mcp_search_state: usize,
     pub cancel_query: Vec<String>,
+    pub list_session_analytics: Vec<SessionAnalyticsQuery>,
+    pub analytics_series: Vec<AnalyticsRange>,
+    pub list_web_searches: Vec<u16>,
+    pub latest_ingest_heartbeat: usize,
+    pub list_table_summaries: usize,
+    pub preview_table: Vec<TablePreviewQuery>,
+    pub read_store_health: usize,
+    pub read_store_diagnostics: usize,
 }
 
 /// In-memory, programmable implementation of [`ConversationRepository`].
@@ -208,6 +229,77 @@ impl ConversationRepository for InMemoryConversationRepository {
     async fn prewarm_mcp_search_state(&self) -> RepoResult<()> {
         self.record(|calls| calls.prewarm_mcp_search_state += 1);
         response_or!(self, prewarm_mcp_search_state, ())
+    }
+    async fn list_session_analytics(
+        &self,
+        query: SessionAnalyticsQuery,
+    ) -> RepoResult<Vec<SessionAnalytics>> {
+        self.record(|calls| calls.list_session_analytics.push(query));
+        response_or!(self, list_session_analytics, Vec::new())
+    }
+
+    async fn analytics_series(&self, range: AnalyticsRange) -> RepoResult<AnalyticsSnapshot> {
+        self.record(|calls| calls.analytics_series.push(range));
+        response_or!(
+            self,
+            analytics_series,
+            AnalyticsSnapshot {
+                window: AnalyticsWindow {
+                    range,
+                    window_seconds: range.window_seconds(),
+                    bucket_seconds: range.bucket_seconds(),
+                    from_unix: 0,
+                    to_unix: 0,
+                },
+                tokens: Vec::new(),
+                turns: Vec::new(),
+                concurrent_sessions: Vec::new(),
+            }
+        )
+    }
+
+    async fn list_web_searches(&self, limit: u16) -> RepoResult<Vec<WebSearchEvent>> {
+        self.record(|calls| calls.list_web_searches.push(limit));
+        response_or!(self, list_web_searches, Vec::new())
+    }
+
+    async fn latest_ingest_heartbeat(&self) -> RepoResult<IngestHeartbeatRead> {
+        self.record(|calls| calls.latest_ingest_heartbeat += 1);
+        response_or!(
+            self,
+            latest_ingest_heartbeat,
+            IngestHeartbeatRead::default()
+        )
+    }
+
+    async fn list_table_summaries(&self) -> RepoResult<TableSummaries> {
+        self.record(|calls| calls.list_table_summaries += 1);
+        response_or!(self, list_table_summaries, TableSummaries::default())
+    }
+
+    async fn preview_table(&self, query: TablePreviewQuery) -> RepoResult<TablePreview> {
+        self.record(|calls| calls.preview_table.push(query.clone()));
+        let normalized_limit = query.normalized_limit();
+        response_or!(
+            self,
+            preview_table,
+            TablePreview {
+                table: query.table,
+                limit: normalized_limit,
+                schema: Vec::new(),
+                rows: Vec::new(),
+            }
+        )
+    }
+
+    async fn read_store_health(&self) -> RepoResult<StoreHealth> {
+        self.record(|calls| calls.read_store_health += 1);
+        response_or!(self, read_store_health, StoreHealth::default())
+    }
+
+    async fn read_store_diagnostics(&self) -> RepoResult<StoreDiagnostics> {
+        self.record(|calls| calls.read_store_diagnostics += 1);
+        response_or!(self, read_store_diagnostics, StoreDiagnostics::default())
     }
 
     async fn list_conversations(
@@ -394,4 +486,148 @@ fn mutex_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::domain::{
+        AnalyticsRange, SessionAnalyticsQuery, SessionLookback, StoreProbe, TablePreviewQuery,
+    };
+    use crate::error::RepoError;
+
+    use super::{
+        ConversationRepository, InMemoryConversationRepository, InMemoryConversationResponses,
+    };
+
+    #[tokio::test]
+    async fn analytics_contract_defaults_and_calls_work_through_trait_object() {
+        let fake = Arc::new(InMemoryConversationRepository::default());
+        let repo: Arc<dyn ConversationRepository> = fake.clone();
+        let session_query = SessionAnalyticsQuery {
+            lookback: SessionLookback::SevenDays,
+            limit: 0,
+        };
+        let preview_query = TablePreviewQuery {
+            table: "events".to_string(),
+            limit: 0,
+        };
+
+        assert!(repo
+            .list_session_analytics(session_query.clone())
+            .await
+            .expect("default session analytics")
+            .is_empty());
+        let snapshot = repo
+            .analytics_series(AnalyticsRange::ThirtyDays)
+            .await
+            .expect("default analytics series");
+        assert_eq!(snapshot.window.range, AnalyticsRange::ThirtyDays);
+        assert_eq!(snapshot.window.window_seconds, 2_592_000);
+        assert_eq!(snapshot.window.bucket_seconds, 86_400);
+        assert!(snapshot.tokens.is_empty());
+        assert!(repo
+            .list_web_searches(0)
+            .await
+            .expect("default web searches")
+            .is_empty());
+        assert_eq!(
+            repo.latest_ingest_heartbeat()
+                .await
+                .expect("default heartbeat"),
+            Default::default()
+        );
+        assert_eq!(
+            repo.list_table_summaries()
+                .await
+                .expect("default table summaries"),
+            Default::default()
+        );
+        let preview = repo
+            .preview_table(preview_query.clone())
+            .await
+            .expect("default table preview");
+        assert_eq!(preview.table, "events");
+        assert_eq!(preview.limit, 1);
+        assert!(preview.schema.is_empty());
+        assert!(preview.rows.is_empty());
+        let health = repo
+            .read_store_health()
+            .await
+            .expect("default store health");
+        assert!(matches!(health.ping, StoreProbe::Failed { .. }));
+        assert_eq!(
+            repo.read_store_diagnostics()
+                .await
+                .expect("default store diagnostics"),
+            Default::default()
+        );
+
+        let calls = fake.calls();
+        assert_eq!(calls.list_session_analytics, vec![session_query]);
+        assert_eq!(calls.analytics_series, vec![AnalyticsRange::ThirtyDays]);
+        assert_eq!(calls.list_web_searches, vec![0]);
+        assert_eq!(calls.latest_ingest_heartbeat, 1);
+        assert_eq!(calls.list_table_summaries, 1);
+        assert_eq!(calls.preview_table, vec![preview_query]);
+        assert_eq!(calls.read_store_health, 1);
+        assert_eq!(calls.read_store_diagnostics, 1);
+    }
+
+    #[tokio::test]
+    async fn analytics_contract_returns_each_configured_error_through_trait_object() {
+        let responses = InMemoryConversationResponses {
+            list_session_analytics: Some(Err(RepoError::backend("sessions"))),
+            analytics_series: Some(Err(RepoError::backend("analytics"))),
+            list_web_searches: Some(Err(RepoError::backend("web"))),
+            latest_ingest_heartbeat: Some(Err(RepoError::backend("heartbeat"))),
+            list_table_summaries: Some(Err(RepoError::backend("tables"))),
+            preview_table: Some(Err(RepoError::backend("preview"))),
+            read_store_health: Some(Err(RepoError::backend("health"))),
+            read_store_diagnostics: Some(Err(RepoError::backend("diagnostics"))),
+            ..InMemoryConversationResponses::default()
+        };
+        let repo: Arc<dyn ConversationRepository> = Arc::new(
+            InMemoryConversationRepository::with_responses(Default::default(), responses),
+        );
+
+        assert!(matches!(
+            repo.list_session_analytics(SessionAnalyticsQuery::default())
+                .await,
+            Err(RepoError::Backend(message)) if message == "sessions"
+        ));
+        assert!(matches!(
+            repo.analytics_series(AnalyticsRange::default()).await,
+            Err(RepoError::Backend(message)) if message == "analytics"
+        ));
+        assert!(matches!(
+            repo.list_web_searches(100).await,
+            Err(RepoError::Backend(message)) if message == "web"
+        ));
+        assert!(matches!(
+            repo.latest_ingest_heartbeat().await,
+            Err(RepoError::Backend(message)) if message == "heartbeat"
+        ));
+        assert!(matches!(
+            repo.list_table_summaries().await,
+            Err(RepoError::Backend(message)) if message == "tables"
+        ));
+        assert!(matches!(
+            repo.preview_table(TablePreviewQuery {
+                table: "events".to_string(),
+                limit: 25,
+            })
+            .await,
+            Err(RepoError::Backend(message)) if message == "preview"
+        ));
+        assert!(matches!(
+            repo.read_store_health().await,
+            Err(RepoError::Backend(message)) if message == "health"
+        ));
+        assert!(matches!(
+            repo.read_store_diagnostics().await,
+            Err(RepoError::Backend(message)) if message == "diagnostics"
+        ));
+    }
 }
