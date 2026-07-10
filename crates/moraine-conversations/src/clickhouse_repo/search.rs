@@ -62,7 +62,7 @@ impl ClickHouseConversationRepository {
         )?;
 
         let rows: Vec<SessionMetadataSearchRow> =
-            self.map_backend(self.ch.query_rows(&sql, None).await)?;
+            self.map_backend(self.query_rows(&sql, None).await)?;
         let hits = rows
             .into_iter()
             .enumerate()
@@ -103,7 +103,7 @@ impl ClickHouseConversationRepository {
             ));
         }
 
-        let events_table = self.table_ref("events");
+        let events_source = canonical_events_source(&self.table_ref("events"));
         let session_summary_table = self.table_ref("v_session_summary");
         let mode_subquery = self.mode_subquery();
         let terms_array_sql = sql_array_strings(terms);
@@ -211,7 +211,7 @@ FROM (
           ''
         ) AS session_summary,
         argMax(e.payload_json, tuple(e.event_ts, e.event_uid)) AS metadata_text
-      FROM {events_table} AS e
+      FROM {events_source} AS e
       WHERE e.event_kind = 'session_meta'
       GROUP BY e.session_id
     ) AS base
@@ -224,7 +224,7 @@ ORDER BY meta.score DESC, meta.session_id ASC
 LIMIT {limit}
 FORMAT JSONEachRow",
             terms_array_sql = terms_array_sql,
-            events_table = events_table,
+            events_source = events_source,
             session_summary_table = session_summary_table,
             mode_subquery = mode_subquery,
             where_sql = where_sql,
@@ -647,8 +647,7 @@ WHERE database = {}
 FORMAT JSONEachRow",
             sql_quote(&self.ch.config().database)
         );
-        let rows: Vec<ColumnExistsRow> =
-            self.map_backend(self.ch.query_rows(&query, None).await)?;
+        let rows: Vec<ColumnExistsRow> = self.map_backend(self.query_rows(&query, None).await)?;
         let exists = rows.first().map(|row| row.exists != 0).unwrap_or(false);
 
         let mut cache = self.stats_cache.write().await;
@@ -792,7 +791,7 @@ FORMAT JSONEachRow",
             );
 
             let fetched_rows: Vec<FetchedPostingRow> =
-                self.map_backend(self.ch.query_rows(&query, None).await)?;
+                self.map_backend(self.query_rows(&query, None).await)?;
             let mut grouped = HashMap::<String, Vec<CachedPostingRow>>::new();
             for row in fetched_rows {
                 grouped.entry(row.term).or_default().push(CachedPostingRow {
@@ -871,7 +870,7 @@ FORMAT JSONEachRow",
             let query =
                 self.build_search_events_hydrate_sql(&missing_uids, use_document_codex_flag)?;
             let fetched_rows: Vec<SearchDocExtraRow> =
-                self.map_backend(self.ch.query_rows(&query, None).await)?;
+                self.map_backend(self.query_rows(&query, None).await)?;
 
             let mut cache = self.search_doc_extra_cache.write().await;
 
@@ -1005,7 +1004,7 @@ FORMAT JSONEachRow",
         )?;
 
         let mut fallback_rows: Vec<SearchRow> =
-            self.map_backend(self.ch.query_rows(&fallback_sql, None).await)?;
+            self.map_backend(self.query_rows(&fallback_sql, None).await)?;
         fallback_rows.sort_by(|a, b| {
             b.score
                 .total_cmp(&a.score)
@@ -1120,7 +1119,7 @@ FORMAT JSONEachRow",
             limit,
         )?;
         let mut rows: Vec<SearchMcpEventRow> =
-            self.map_backend(self.ch.query_rows(&sql, None).await)?;
+            self.map_backend(self.query_rows(&sql, None).await)?;
         Self::sort_search_mcp_event_rows(&mut rows);
         Ok(rows)
     }
@@ -1842,7 +1841,7 @@ FORMAT JSONEachRow",
             mode,
         )?;
         let mut persistent_rows: Vec<ConversationCandidateRow> =
-            self.map_backend(self.ch.query_rows(&persistent_sql, None).await)?;
+            self.map_backend(self.query_rows(&persistent_sql, None).await)?;
         let truncated = persistent_rows.len() >= candidate_limit;
         if truncated {
             return Ok(ConversationCandidateSet {
@@ -1863,7 +1862,7 @@ FORMAT JSONEachRow",
             mode,
         )?;
         let recent_rows: Vec<ConversationCandidateRow> =
-            self.map_backend(self.ch.query_rows(&recent_sql, None).await)?;
+            self.map_backend(self.query_rows(&recent_sql, None).await)?;
 
         let mut by_session = HashMap::<String, (f64, u16)>::new();
         for row in persistent_rows.drain(..) {
@@ -2105,7 +2104,7 @@ FORMAT JSONEachRow",
             event_uids_sql = event_uids_sql,
         );
         let rows: Vec<ConversationSnippetRow> =
-            self.map_backend(self.ch.query_rows(&sql, None).await)?;
+            self.map_backend(self.query_rows(&sql, None).await)?;
         let mut by_uid = HashMap::new();
         for row in rows {
             let is_user_facing = is_user_facing_content_event(&row.event_class, &row.actor_role);
@@ -2136,23 +2135,22 @@ FORMAT JSONEachRow",
             return Ok(HashMap::new());
         }
 
-        let events_table = self.table_ref("events");
+        let session_summary_table = self.table_ref("v_session_summary");
         let session_ids_sql = sql_array_strings(&unique_session_ids);
         let sql = format!(
             "SELECT
   session_id,
-  toString(min(event_ts)) AS first_event_time,
-  toString(max(event_ts)) AS last_event_time
-FROM {events_table}
+  toString(first_event_time) AS first_event_time,
+  toString(last_event_time) AS last_event_time
+FROM {session_summary_table}
 WHERE session_id IN {session_ids_sql}
-GROUP BY session_id
 FORMAT JSONEachRow",
-            events_table = events_table,
+            session_summary_table = session_summary_table,
             session_ids_sql = session_ids_sql,
         );
 
         let rows: Vec<SessionTimeBoundsRow> =
-            match self.map_backend(self.ch.query_rows(&sql, None).await) {
+            match self.map_backend(self.query_rows(&sql, None).await) {
                 Ok(rows) => rows,
                 Err(err) => {
                     warn!("failed to load session time bounds: {}", err);
@@ -2247,7 +2245,7 @@ FORMAT JSONEachRow",
         session_ids.dedup();
 
         let trace_table = self.table_ref("v_conversation_trace");
-        let events_table = self.table_ref("events");
+        let events_source = canonical_events_source(&self.table_ref("events"));
         let event_uids_sql = sql_array_strings(&event_uids);
         let session_ids_sql = sql_array_strings(&session_ids);
         let sql = format!(
@@ -2280,23 +2278,20 @@ FROM (
   WHERE session_id IN {session_ids_sql}
 ) AS tr
 ANY LEFT JOIN (
-  SELECT
-    event_uid,
-    argMax(model, event_version) AS model
-  FROM {events_table}
+  SELECT event_uid, model
+  FROM {events_source}
   WHERE event_uid IN {event_uids_sql}
-  GROUP BY event_uid
 ) AS e ON e.event_uid = tr.event_uid
 WHERE tr.event_uid IN {event_uids_sql}
 FORMAT JSONEachRow",
             trace_table = trace_table,
-            events_table = events_table,
+            events_source = events_source,
             session_ids_sql = session_ids_sql,
             event_uids_sql = event_uids_sql,
         );
 
         let rows: Vec<SearchMcpEventEnrichmentRow> =
-            self.map_backend(self.ch.query_rows(&sql, None).await)?;
+            self.map_backend(self.query_rows(&sql, None).await)?;
         let mut by_uid = HashMap::new();
         for row in rows {
             by_uid.insert(row.event_uid.clone(), row);
@@ -2425,7 +2420,7 @@ FORMAT JSONEachRow",
             return Ok(HashMap::new());
         }
 
-        let events_table = self.table_ref("events");
+        let events_source = canonical_events_source(&self.table_ref("events"));
         let session_ids_sql = sql_array_strings(session_ids);
         let sql = format!(
             "SELECT
@@ -2444,17 +2439,17 @@ FORMAT JSONEachRow",
     ),
     ''
   ) AS session_summary
-FROM {events_table}
+FROM {events_source}
 WHERE event_kind = 'session_meta'
   AND session_id IN {session_ids_sql}
 GROUP BY session_id
 FORMAT JSONEachRow",
-            events_table = events_table,
+            events_source = events_source,
             session_ids_sql = session_ids_sql,
         );
 
         let rows: Vec<ConversationSessionMetadataRow> =
-            self.map_backend(self.ch.query_rows(&sql, None).await)?;
+            self.map_backend(self.query_rows(&sql, None).await)?;
         let mut by_session = HashMap::new();
         for row in rows {
             by_session.insert(row.session_id.clone(), row);
@@ -3000,7 +2995,7 @@ FORMAT JSONEachRow",
         )?;
 
         let rows: Vec<ConversationSearchRow> =
-            self.map_backend(self.ch.query_rows(&sql, None).await)?;
+            self.map_backend(self.query_rows(&sql, None).await)?;
         let best_event_uids = rows
             .iter()
             .filter_map(|row| {

@@ -15,7 +15,7 @@ impl ClickHouseConversationRepository {
         scope: &SessionOriginScope,
         session_id: Option<&str>,
     ) -> String {
-        let events_table = self.table_ref("events");
+        let events_source = canonical_events_source(&self.table_ref("events"));
         let session_filter = session_id
             .map(|session_id| format!("session_id = {}\n      AND ", sql_quote(session_id)))
             .unwrap_or_default();
@@ -35,7 +35,7 @@ impl ClickHouseConversationRepository {
     SELECT
       session_id,
       argMin(cwd, tuple(event_ts, event_uid)) AS origin_cwd
-    FROM {events_table}
+    FROM {events_source}
     WHERE {session_filter}cwd != ''
     GROUP BY session_id
   )
@@ -78,7 +78,7 @@ impl ClickHouseConversationRepository {
             session_id: String,
         }
 
-        let rows: Vec<SessionIdRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
+        let rows: Vec<SessionIdRow> = self.map_backend(self.query_rows(&query, None).await)?;
         let in_scope = !rows.is_empty();
         if in_scope {
             self.scoped_session_cache

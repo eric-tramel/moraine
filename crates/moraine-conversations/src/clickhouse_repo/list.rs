@@ -30,7 +30,7 @@ impl ClickHouseConversationRepository {
         };
 
         let session_summary = self.table_ref("v_session_summary");
-        let events_table = self.table_ref("events");
+        let events_source = canonical_events_source(&self.table_ref("events"));
         let mode_subquery = self.mode_subquery();
 
         let mut where_clauses = vec!["1 = 1".to_string()];
@@ -101,7 +101,7 @@ LEFT JOIN (
       ),
       ''
     ) AS session_summary
-  FROM {events_table}
+  FROM {events_source}
   WHERE event_kind = 'session_meta'
   GROUP BY session_id
 ) AS meta ON meta.session_id = s.session_id
@@ -110,7 +110,7 @@ ORDER BY s.last_event_time {order_dir}, s.session_id {order_dir}
 LIMIT {limit_plus}
 FORMAT JSONEachRow",
             session_summary = session_summary,
-            events_table = events_table,
+            events_source = events_source,
             mode_subquery = mode_subquery,
             where_sql = where_sql,
             order_dir = order_dir,
@@ -118,7 +118,7 @@ FORMAT JSONEachRow",
         );
 
         let rows: Vec<ConversationSummaryRow> =
-            self.map_backend(self.ch.query_rows(&query, None).await)?;
+            self.map_backend(self.query_rows(&query, None).await)?;
 
         let mut items: Vec<ConversationSummary> = rows
             .iter()
@@ -177,7 +177,7 @@ FORMAT JSONEachRow",
         };
 
         let session_summary = self.table_ref("v_session_summary");
-        let events_table = self.table_ref("events");
+        let events_source = canonical_events_source(&self.table_ref("events"));
         let mode_subquery = self.mode_subquery();
 
         let mut where_clauses = vec![
@@ -251,7 +251,7 @@ LEFT JOIN (
       argMaxIf(payload_type, tuple(event_ts, event_uid), payload_type IN ('task_complete', 'turn_aborted')),
       ''
     ) AS latest_terminal_payload_type
-  FROM {events_table}
+  FROM {events_source}
   GROUP BY session_id
 ) AS status ON status.session_id = s.session_id
 LEFT JOIN (
@@ -290,7 +290,7 @@ LEFT JOIN (
       ),
       ''
     ) AS session_summary
-  FROM {events_table}
+  FROM {events_source}
   WHERE event_kind = 'session_meta'
   GROUP BY session_id
 ) AS meta ON meta.session_id = s.session_id
@@ -299,15 +299,14 @@ ORDER BY s.last_event_time {order_dir}, s.session_id {order_dir}
 LIMIT {limit_plus}
 FORMAT JSONEachRow",
             session_summary = session_summary,
-            events_table = events_table,
+            events_source = events_source,
             mode_subquery = mode_subquery,
             where_sql = where_sql,
             order_dir = order_dir,
             limit_plus = (limit as usize) + 1,
         );
 
-        let rows: Vec<McpSessionListRow> =
-            self.map_backend(self.ch.query_rows(&query, None).await)?;
+        let rows: Vec<McpSessionListRow> = self.map_backend(self.query_rows(&query, None).await)?;
 
         let mut items: Vec<McpSessionListItem> = rows
             .iter()
@@ -405,7 +404,7 @@ FORMAT JSONEachRow",
             limit_plus = (limit as usize) + 1,
         );
 
-        let rows: Vec<TurnSummaryRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
+        let rows: Vec<TurnSummaryRow> = self.map_backend(self.query_rows(&query, None).await)?;
         let items: Vec<TurnSummary> = rows
             .iter()
             .take(limit as usize)
@@ -533,8 +532,7 @@ FORMAT JSONEachRow",
             limit_plus = (limit as usize) + 1,
         );
 
-        let mut rows: Vec<TraceEventRow> =
-            self.map_backend(self.ch.query_rows(&query, None).await)?;
+        let mut rows: Vec<TraceEventRow> = self.map_backend(self.query_rows(&query, None).await)?;
         let has_more = rows.len() > limit as usize;
         if has_more {
             rows.truncate(limit as usize);

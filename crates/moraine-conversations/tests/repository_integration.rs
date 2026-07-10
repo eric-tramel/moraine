@@ -1,7 +1,8 @@
 #![allow(clippy::collapsible_if, clippy::too_many_arguments)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::{
     extract::{Query, State},
@@ -13,23 +14,84 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use moraine_clickhouse::ClickHouseClient;
 use moraine_config::ClickHouseConfig;
 use moraine_conversations::{
-    ClickHouseConversationRepository, ConversationListFilter, ConversationListSort,
+    AnalyticsRange, ClickHouseConversationRepository, ConversationListFilter, ConversationListSort,
     ConversationMode, ConversationRepository, ConversationSearchQuery, FileAttentionQuery,
     McpEventType, McpSessionListFilter, PageRequest, RepoConfig, RepoError, SearchEventKind,
-    SearchEventsQuery, SearchMcpEventsQuery, SessionEventsDirection, SessionEventsQuery,
-    SessionMetadataSearchQuery, SessionOriginScope,
+    SearchEventsQuery, SearchMcpEventsQuery, SessionAnalyticsQuery, SessionEventsDirection,
+    SessionEventsQuery, SessionLookback, SessionMetadataSearchQuery, SessionOriginScope,
+    SessionStep, StoreProbe, TablePreviewQuery,
 };
 use serde_json::json;
+use tokio::sync::Notify;
+
+#[derive(Clone)]
+struct ScriptedBarrier {
+    reached: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[derive(Clone)]
+struct ScriptedResponse {
+    required: Vec<&'static str>,
+    forbidden: Vec<&'static str>,
+    status: StatusCode,
+    body: String,
+    barrier: Option<ScriptedBarrier>,
+}
+
+impl ScriptedResponse {
+    fn rows(required: &[&'static str], rows: serde_json::Value) -> Self {
+        Self {
+            required: required.to_vec(),
+            forbidden: Vec::new(),
+            status: StatusCode::OK,
+            barrier: None,
+            body: json_each_row(rows),
+        }
+    }
+
+    fn raw(required: &[&'static str], body: impl Into<String>) -> Self {
+        Self {
+            required: required.to_vec(),
+            forbidden: Vec::new(),
+            status: StatusCode::OK,
+            barrier: None,
+            body: body.into(),
+        }
+    }
+
+    fn failure(required: &[&'static str], message: &'static str) -> Self {
+        Self {
+            required: required.to_vec(),
+            forbidden: Vec::new(),
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            barrier: None,
+            body: message.to_string(),
+        }
+    }
+
+    fn forbidding(mut self, forbidden: &[&'static str]) -> Self {
+        self.forbidden = forbidden.to_vec();
+        self
+    }
+
+    fn blocked(mut self, reached: Arc<Notify>, release: Arc<Notify>) -> Self {
+        self.barrier = Some(ScriptedBarrier { reached, release });
+        self
+    }
+}
 
 #[derive(Clone, Default)]
 struct MockOptions {
     omit_second_snippet_row: bool,
+    scripted_responses: Vec<ScriptedResponse>,
 }
 
 #[derive(Default)]
 struct MockState {
     queries: Mutex<Vec<String>>,
     options: MockOptions,
+    scripted_responses: Mutex<Option<VecDeque<ScriptedResponse>>>,
 }
 
 fn test_clickhouse_config(url: String) -> ClickHouseConfig {
@@ -57,6 +119,339 @@ fn json_each_row(rows: serde_json::Value) -> String {
         }
         value => format!("{value}\n"),
     }
+}
+
+fn json_envelope(rows: serde_json::Value) -> String {
+    json!({ "data": rows }).to_string()
+}
+
+fn session_analytics_summary_row() -> serde_json::Value {
+    json!({
+        "session_id": "analytics-session",
+        "first_event_time": "2026-06-01 10:00:00.000",
+        "first_event_unix_ms": 1780308000000_i64,
+        "last_event_time": "2026-06-01 10:05:00.000",
+        "last_event_unix_ms": 1780308300000_i64,
+        "total_turns": 2_u32,
+        "total_events": 6_u64,
+        "user_messages": 1_u64,
+        "assistant_messages": 2_u64,
+        "tool_calls": 1_u64,
+        "tool_results": 1_u64,
+        "mode": "tool_calling",
+        "session_slug": "analytics-slug",
+        "session_summary": "Analytics fixture session"
+    })
+}
+
+fn session_analytics_turn_rows() -> serde_json::Value {
+    json!([
+        {
+            "session_id": "analytics-session",
+            "turn_seq": 1_u32,
+            "turn_id": "turn-one",
+            "started_at": "2026-06-01 10:00:00.000",
+            "started_at_unix_ms": 1780308000000_i64,
+            "ended_at": "2026-06-01 10:04:00.000",
+            "ended_at_unix_ms": 1780308240000_i64,
+            "total_events": 5_u64,
+            "user_messages": 1_u64,
+            "assistant_messages": 1_u64,
+            "tool_calls": 1_u64,
+            "tool_results": 1_u64,
+            "reasoning_items": 1_u64
+        },
+        {
+            "session_id": "analytics-session",
+            "turn_seq": 2_u32,
+            "turn_id": "turn-two",
+            "started_at": "2026-06-01 10:05:00.000",
+            "started_at_unix_ms": 1780308300000_i64,
+            "ended_at": "2026-06-01 10:05:00.000",
+            "ended_at_unix_ms": 1780308300000_i64,
+            "total_events": 1_u64,
+            "user_messages": 0_u64,
+            "assistant_messages": 1_u64,
+            "tool_calls": 0_u64,
+            "tool_results": 0_u64,
+            "reasoning_items": 0_u64
+        }
+    ])
+}
+
+fn session_analytics_event_rows() -> serde_json::Value {
+    json!([
+        {
+            "session_id": "analytics-session",
+            "event_order": 1_u64,
+            "turn_seq": 1_u32,
+            "event_unix_ms": 1780308000000_i64,
+            "event_class": "message",
+            "actor_role": "user",
+            "payload_type": "text",
+            "call_id": "",
+            "tool_name": "",
+            "tool_error": 0_u8,
+            "latency_ms": 0_u32,
+            "model": " GPT-X ",
+            "endpoint_kind": "",
+            "input_tokens": 5_u32,
+            "output_tokens": 2_u32,
+            "cache_read_tokens": 0_u32,
+            "cache_write_tokens": 0_u32,
+            "token_usage_buckets": {},
+            "token_usage_native_units": {},
+            "text_preview": "first user fallback",
+            "text_content": " ",
+            "tool_args_json": "",
+            "harness": "codex",
+            "source_name": "codex-jsonl",
+            "trace_id": "trace-454"
+        },
+        {
+            "session_id": "analytics-session",
+            "event_order": 2_u64,
+            "turn_seq": 1_u32,
+            "event_unix_ms": 1780308000100_i64,
+            "event_class": "message",
+            "actor_role": "assistant",
+            "payload_type": "text",
+            "call_id": "",
+            "tool_name": "",
+            "tool_error": 0_u8,
+            "latency_ms": 42_u32,
+            "model": "GPT-X",
+            "endpoint_kind": "generation",
+            "input_tokens": 99_u32,
+            "output_tokens": 99_u32,
+            "cache_read_tokens": 99_u32,
+            "cache_write_tokens": 99_u32,
+            "token_usage_buckets": { "reasoning": 7_u64 },
+            "token_usage_native_units": { "usd": 0.5, "zero": 0.0 },
+            "text_preview": "clipped answer",
+            "text_content": "full answer",
+            "tool_args_json": "",
+            "harness": "",
+            "source_name": "",
+            "trace_id": ""
+        },
+        {
+            "session_id": "analytics-session",
+            "event_order": 3_u64,
+            "turn_seq": 1_u32,
+            "event_unix_ms": 1780308000200_i64,
+            "event_class": "tool_call",
+            "actor_role": "assistant",
+            "payload_type": "tool_use",
+            "call_id": "call-read",
+            "tool_name": "Read",
+            "tool_error": 1_u8,
+            "latency_ms": 17_u32,
+            "model": "GPT-X",
+            "endpoint_kind": "",
+            "input_tokens": 0_u32,
+            "output_tokens": 0_u32,
+            "cache_read_tokens": 0_u32,
+            "cache_write_tokens": 0_u32,
+            "token_usage_buckets": {},
+            "token_usage_native_units": {},
+            "text_preview": "",
+            "text_content": "",
+            "tool_args_json": "{\"path\":\"src/lib.rs\"}",
+            "harness": "",
+            "source_name": "",
+            "trace_id": ""
+        },
+        {
+            "session_id": "analytics-session",
+            "event_order": 4_u64,
+            "turn_seq": 1_u32,
+            "event_unix_ms": 1780308000800_i64,
+            "event_class": "tool_result",
+            "actor_role": "tool",
+            "payload_type": "tool_result",
+            "call_id": "call-read",
+            "tool_name": "Read",
+            "tool_error": 1_u8,
+            "latency_ms": 999_u32,
+            "model": "",
+            "endpoint_kind": "",
+            "input_tokens": 0_u32,
+            "output_tokens": 0_u32,
+            "cache_read_tokens": 0_u32,
+            "cache_write_tokens": 0_u32,
+            "token_usage_buckets": {},
+            "token_usage_native_units": {},
+            "text_preview": "",
+            "text_content": "read failed",
+            "tool_args_json": "",
+            "harness": "",
+            "source_name": "",
+            "trace_id": ""
+        },
+        {
+            "session_id": "analytics-session",
+            "event_order": 5_u64,
+            "turn_seq": 1_u32,
+            "event_unix_ms": 1780308000900_i64,
+            "event_class": "reasoning",
+            "actor_role": "assistant",
+            "payload_type": "thinking",
+            "call_id": "",
+            "tool_name": "",
+            "tool_error": 0_u8,
+            "latency_ms": 0_u32,
+            "model": "GPT-X",
+            "endpoint_kind": "",
+            "input_tokens": 0_u32,
+            "output_tokens": 0_u32,
+            "cache_read_tokens": 0_u32,
+            "cache_write_tokens": 0_u32,
+            "token_usage_buckets": {},
+            "token_usage_native_units": {},
+            "text_preview": "",
+            "text_content": "consider the result",
+            "tool_args_json": "",
+            "harness": "",
+            "source_name": "",
+            "trace_id": ""
+        },
+        {
+            "session_id": "analytics-session",
+            "event_order": 6_u64,
+            "turn_seq": 2_u32,
+            "event_unix_ms": 1780308300000_i64,
+            "event_class": "message",
+            "actor_role": "assistant",
+            "payload_type": "text",
+            "call_id": "",
+            "tool_name": "",
+            "tool_error": 0_u8,
+            "latency_ms": 0_u32,
+            "model": "Other",
+            "endpoint_kind": "generation",
+            "input_tokens": 0_u32,
+            "output_tokens": 3_u32,
+            "cache_read_tokens": 0_u32,
+            "cache_write_tokens": 0_u32,
+            "token_usage_buckets": {},
+            "token_usage_native_units": {},
+            "text_preview": "",
+            "text_content": "second turn",
+            "tool_args_json": "",
+            "harness": "",
+            "source_name": "",
+            "trace_id": ""
+        }
+    ])
+}
+
+fn analytics_responses(
+    window_literal: &'static str,
+    interval_literal: &'static str,
+    tokens: serde_json::Value,
+    turns: serde_json::Value,
+    concurrency: serde_json::Value,
+) -> Vec<ScriptedResponse> {
+    vec![
+        ScriptedResponse::rows(
+            &[
+                "toInt64(toUnixTimestamp(now())) AS database_now_unix",
+                window_literal,
+                "FROM (SELECT * FROM `moraine`.`events` FINAL) AS e",
+                "AND notEmpty(trimBoth(e.model))",
+                "FORMAT JSONEachRow",
+            ],
+            json!([{
+                "scan_from_unix": 100_000_u64,
+                "scan_to_unix": 200_000_u64,
+                "display_to_unix": 200_000_u64
+            }]),
+        ),
+        ScriptedResponse::rows(
+            &[
+                interval_literal,
+                "FROM (SELECT * FROM `moraine`.`events` FINAL) AS e",
+                "intDiv(toUnixTimestamp64Milli(e.event_ts), 1000) >= 100000",
+                "intDiv(toUnixTimestamp64Milli(e.event_ts), 1000) <= 200000",
+                "ARRAY JOIN mapKeys(e.token_usage_buckets)",
+                "ORDER BY bucket_unix ASC, model ASC, endpoint_kind ASC, bucket ASC",
+                "FORMAT JSONEachRow",
+            ],
+            tokens,
+        ),
+        ScriptedResponse::rows(
+            &[
+                interval_literal,
+                "toUInt64(uniqExact(tuple(e.session_id, e.request_id))) AS turns",
+                "FROM (SELECT * FROM `moraine`.`events` FINAL) AS e",
+                "intDiv(toUnixTimestamp64Milli(e.event_ts), 1000) >= 100000",
+                "ORDER BY bucket_unix ASC, model ASC",
+                "FORMAT JSONEachRow",
+            ],
+            turns,
+        ),
+        ScriptedResponse::rows(
+            &[
+                interval_literal,
+                "toUInt64(uniqExact(session_stream_key)) AS concurrent_sessions",
+                "FROM (SELECT * FROM `moraine`.`events` FINAL) AS e",
+                "intDiv(toUnixTimestamp64Milli(e.event_ts), 1000) >= 100000",
+                "ORDER BY bucket_unix ASC",
+                "FORMAT JSONEachRow",
+            ],
+            concurrency,
+        ),
+    ]
+}
+
+fn heartbeat_columns(optional: &[&str]) -> serde_json::Value {
+    let mut names = vec![
+        "ts",
+        "host",
+        "service_version",
+        "queue_depth",
+        "files_active",
+        "files_watched",
+        "rows_raw_written",
+        "rows_events_written",
+        "rows_errors_written",
+        "flush_latency_ms",
+        "append_to_visible_p50_ms",
+        "append_to_visible_p95_ms",
+        "last_error",
+    ];
+    names.extend_from_slice(optional);
+    serde_json::Value::Array(
+        names
+            .into_iter()
+            .map(|name| json!({ "name": name }))
+            .collect(),
+    )
+}
+
+fn heartbeat_row() -> serde_json::Value {
+    json!({
+        "ts": "2026-06-01 10:00:00.000",
+        "ts_unix_ms": 1780308000000_i64,
+        "host": "ingest-host",
+        "service_version": "0.17.1",
+        "queue_depth": 4_u64,
+        "files_active": 2_u32,
+        "files_watched": 9_u32,
+        "rows_raw_written": 100_u64,
+        "rows_events_written": 90_u64,
+        "rows_errors_written": 1_u64,
+        "flush_latency_ms": 12_u32,
+        "append_to_visible_p50_ms": 20_u32,
+        "append_to_visible_p95_ms": 40_u32,
+        "last_error": "",
+        "watcher_backend": null,
+        "watcher_error_count": null,
+        "watcher_reset_count": null,
+        "watcher_last_reset_unix_ms": null,
+        "backend_sinks": null
+    })
 }
 
 fn turn_summary_row(
@@ -141,6 +536,47 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
             .lock()
             .expect("query lock")
             .push(query.clone());
+
+        let scripted_response = {
+            let mut scripted = state
+                .scripted_responses
+                .lock()
+                .expect("scripted response lock");
+            scripted.as_mut().map(|responses| responses.pop_front())
+        };
+        if let Some(scripted_response) = scripted_response {
+            let Some(response) = scripted_response else {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("unexpected extra query: {query}"),
+                );
+            };
+            let missing = response
+                .required
+                .iter()
+                .filter(|required| !query.contains(**required))
+                .copied()
+                .collect::<Vec<_>>();
+            let forbidden = response
+                .forbidden
+                .iter()
+                .filter(|forbidden| query.contains(**forbidden))
+                .copied()
+                .collect::<Vec<_>>();
+            if !missing.is_empty() || !forbidden.is_empty() {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "script mismatch; missing={missing:?}; forbidden={forbidden:?}; query={query}"
+                    ),
+                );
+            }
+            if let Some(barrier) = response.barrier {
+                barrier.reached.notify_one();
+                barrier.release.notified().await;
+            }
+            return (response.status, response.body);
+        }
 
         // --project-only origin-scope gate: the point lookup issued by
         // `session_in_scope`. Sessions whose ID contains "out-of-scope" are
@@ -510,7 +946,7 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
             );
         }
 
-        if query.contains("FROM `moraine`.`events`")
+        if query.contains("FROM (SELECT * FROM `moraine`.`events` FINAL)")
             && query.contains("WHERE session_id = 'sess-open'")
             && query.contains("AS title")
             && query.contains("AS session_summary")
@@ -604,10 +1040,10 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
             );
         }
 
-        if query.contains("FROM `moraine`.`events`")
+        if query.contains("FROM `moraine`.`v_session_summary`")
             && query.contains("WHERE session_id IN")
-            && query.contains("toString(min(event_ts)) AS first_event_time")
-            && query.contains("toString(max(event_ts)) AS last_event_time")
+            && query.contains("toString(first_event_time) AS first_event_time")
+            && query.contains("toString(last_event_time) AS last_event_time")
         {
             return (
                 StatusCode::OK,
@@ -964,7 +1400,7 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
         }
 
         if query.contains("WITH\n  ['rare','summary'] AS q_terms")
-            && query.contains("FROM `moraine`.`events` AS e")
+            && query.contains("FROM (SELECT * FROM `moraine`.`events` FINAL) AS e")
             && query.contains("WHERE e.event_kind = 'session_meta'")
             && query.contains("AS meta_event_uid")
             && query.contains("AS matched_terms")
@@ -1097,10 +1533,8 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
             );
         }
 
-        if ((query.contains("FROM `moraine`.`v_conversation_trace`")
-            && query.contains("ORDER BY event_order ASC"))
-            || (query.contains("FROM `moraine`.`events`")
-                && query.contains("ORDER BY resolved_event_time")))
+        if query.contains("FROM `moraine`.`v_conversation_trace`")
+            && query.contains("ORDER BY event_order ASC, event_uid ASC")
             && query.contains("WHERE session_id = 'sess-open'")
             && !query.contains("turn_seq =")
         {
@@ -1216,6 +1650,19 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
         }
 
         if query.contains("FROM `moraine`.`v_turn_summary`")
+            && query.contains("WHERE session_id = 'sess-incomplete'")
+            && query.contains("ORDER BY turn_seq ASC")
+        {
+            return (
+                StatusCode::OK,
+                json_each_row(json!([
+                    turn_summary_row("sess-incomplete", 1, 2, 1, 1, 0, 0, 0),
+                    turn_summary_row("sess-incomplete", 2, 3, 1, 0, 1, 1, 0)
+                ])),
+            );
+        }
+
+        if query.contains("FROM `moraine`.`v_turn_summary`")
             && query.contains("WHERE session_id = 'sess-incomplete' AND turn_seq = 2")
             && query.contains("LIMIT 1")
         {
@@ -1234,9 +1681,10 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
             );
         }
 
-        if query.contains("FROM `moraine`.`events`")
+        if query.contains("FROM `moraine`.`v_conversation_trace`")
             && query.contains("WHERE session_id = 'sess-incomplete'")
-            && query.contains("ORDER BY resolved_event_time")
+            && query.contains("ORDER BY event_order ASC, event_uid ASC")
+            && !query.contains("turn_seq =")
         {
             return (
                 StatusCode::OK,
@@ -1371,6 +1819,19 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
             return (StatusCode::OK, json_each_row(json!([])));
         }
 
+        if query.contains("FROM `moraine`.`v_turn_summary`")
+            && query.contains("WHERE session_id = 'sess-event'")
+            && query.contains("ORDER BY turn_seq ASC")
+        {
+            return (
+                StatusCode::OK,
+                json_each_row(json!([
+                    turn_summary_row("sess-event", 1, 3, 1, 1, 0, 0, 0),
+                    turn_summary_row("sess-event", 2, 1, 0, 1, 0, 0, 0)
+                ])),
+            );
+        }
+
         if query.contains("FROM `moraine`.`v_conversation_trace`")
             && query.contains("WHERE event_uid = 'evt-open-full'")
             && query.contains("ORDER BY event_order DESC")
@@ -1474,9 +1935,9 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
             );
         }
 
-        if query.contains("FROM `moraine`.`events`")
+        if query.contains("FROM `moraine`.`v_conversation_trace`")
             && query.contains("WHERE session_id = 'sess-event'")
-            && query.contains("ORDER BY resolved_event_time")
+            && query.contains("ORDER BY event_order ASC, event_uid ASC")
         {
             return (
                 StatusCode::OK,
@@ -1694,9 +2155,12 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
         (StatusCode::OK, json_each_row(json!([])))
     }
 
+    let scripted_responses = (!options.scripted_responses.is_empty())
+        .then(|| options.scripted_responses.iter().cloned().collect());
     let state = Arc::new(MockState {
         queries: Mutex::default(),
         options,
+        scripted_responses: Mutex::new(scripted_responses),
     });
     let app = Router::new()
         .route("/", get(handler).post(handler))
@@ -1737,6 +2201,39 @@ async fn build_repo_with_options(
     );
 
     (repo, state)
+}
+
+async fn build_scripted_repo(
+    scripted_responses: Vec<ScriptedResponse>,
+) -> (ClickHouseConversationRepository, Arc<MockState>) {
+    build_repo_with_options(
+        100,
+        MockOptions {
+            scripted_responses,
+            ..MockOptions::default()
+        },
+    )
+    .await
+}
+
+fn assert_script_consumed(state: &MockState, expected_requests: usize) {
+    let queries = state.queries.lock().expect("queries lock");
+    assert_eq!(
+        queries.len(),
+        expected_requests,
+        "captured queries: {queries:#?}"
+    );
+    drop(queries);
+    let scripted = state
+        .scripted_responses
+        .lock()
+        .expect("scripted response lock");
+    assert!(
+        scripted
+            .as_ref()
+            .is_some_and(std::collections::VecDeque::is_empty),
+        "unconsumed scripted responses remain"
+    );
 }
 
 async fn build_repo() -> (ClickHouseConversationRepository, Arc<MockState>) {
@@ -2431,9 +2928,9 @@ async fn get_mcp_session_includes_turn_summaries_and_latest_completion() {
 
     let queries = state.queries.lock().expect("queries lock").clone();
     assert!(queries.iter().any(|query| {
-        query.contains("FROM `moraine`.`events`")
+        query.contains("FROM `moraine`.`v_conversation_trace`")
             && query.contains("WHERE session_id = 'sess-open'")
-            && query.contains("ORDER BY resolved_event_time")
+            && query.contains("ORDER BY event_order ASC, event_uid ASC")
     }));
 }
 
@@ -2612,7 +3109,7 @@ async fn search_session_metadata_applies_time_mode_filters_and_caps_limit() {
     let metadata_search_query = queries
         .iter()
         .find(|q| {
-            q.contains("FROM `moraine`.`events` AS e")
+            q.contains("FROM (SELECT * FROM `moraine`.`events` FINAL) AS e")
                 && q.contains("WHERE e.event_kind = 'session_meta'")
                 && q.contains("AS meta_event_uid")
         })
@@ -2741,6 +3238,7 @@ async fn search_conversations_falls_back_to_row_snippet_for_text_preview() {
         100,
         MockOptions {
             omit_second_snippet_row: true,
+            ..MockOptions::default()
         },
     )
     .await;
@@ -3363,4 +3861,1435 @@ async fn list_session_events_rejects_cursor_with_mismatched_direction() {
         "invalid cursor: cursor direction does not match requested direction"
     );
     assert!(state.queries.lock().expect("queries lock").is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_analytics_assembles_canonical_views_and_public_steps() {
+    let responses = vec![
+        ScriptedResponse::rows(
+            &[
+                "FROM `moraine`.`v_session_summary` AS s",
+                "FROM (SELECT * FROM `moraine`.`events` FINAL) AS meta_events",
+                "WHERE meta_events.event_kind = 'session_meta'",
+                "WHERE notEmpty(trimBoth(s.session_id))",
+                "ORDER BY s.last_event_time DESC, s.session_id DESC",
+                "LIMIT 1",
+                "FORMAT JSONEachRow",
+            ],
+            json!([session_analytics_summary_row()]),
+        )
+        .forbidding(&["now() - INTERVAL"]),
+        ScriptedResponse::rows(
+            &[
+                "FROM `moraine`.`v_turn_summary`",
+                "WHERE session_id IN ['analytics-session']",
+                "ORDER BY session_id ASC, turn_seq ASC",
+                "FORMAT JSONEachRow",
+            ],
+            session_analytics_turn_rows(),
+        ),
+        ScriptedResponse::rows(
+            &[
+                "FROM `moraine`.`v_conversation_trace` AS t",
+                "LEFT JOIN (SELECT * FROM `moraine`.`events` FINAL) AS e ON e.event_uid = t.event_uid",
+                "WHERE t.session_id IN ['analytics-session']",
+                "ORDER BY t.session_id ASC, t.event_order ASC",
+                "FORMAT JSONEachRow",
+            ],
+            session_analytics_event_rows(),
+        ),
+    ];
+    let (repo, state) = build_scripted_repo(responses).await;
+    let repo: Arc<dyn ConversationRepository> = Arc::new(repo);
+
+    let sessions = repo
+        .list_session_analytics(SessionAnalyticsQuery {
+            lookback: SessionLookback::All,
+            limit: 0,
+        })
+        .await
+        .expect("session analytics succeeds");
+
+    assert_eq!(sessions.len(), 1);
+    let session = &sessions[0];
+    assert_eq!(session.summary.session_id, "analytics-session");
+    assert_eq!(session.summary.total_turns, 2);
+    assert_eq!(session.summary.mode, ConversationMode::ToolCalling);
+    assert_eq!(
+        session.summary.session_slug.as_deref(),
+        Some("analytics-slug")
+    );
+    assert_eq!(
+        session.summary.session_summary.as_deref(),
+        Some("Analytics fixture session")
+    );
+    assert_eq!(session.harness, "codex");
+    assert_eq!(session.source_name, "codex-jsonl");
+    assert_eq!(session.trace_id, "trace-454");
+    assert_eq!(session.first_user_text, "first user fallback");
+    assert_eq!(session.models, vec!["gpt-x", "other"]);
+    assert_eq!(
+        session
+            .turns
+            .iter()
+            .map(|turn| turn.summary.turn_seq)
+            .collect::<Vec<_>>(),
+        vec![1, 2],
+        "canonical view turn numbers remain one-based"
+    );
+
+    let first_turn = &session.turns[0];
+    assert_eq!(first_turn.model, "GPT-X");
+    assert_eq!(first_turn.token_usage_buckets.get("input_text"), Some(&5));
+    assert_eq!(first_turn.token_usage_buckets.get("output_text"), Some(&2));
+    assert_eq!(first_turn.token_usage_buckets.get("reasoning"), Some(&7));
+    assert_eq!(first_turn.steps.len(), 4);
+    assert!(matches!(
+        &first_turn.steps[0],
+        SessionStep::User { text, .. } if text == "first user fallback"
+    ));
+    match &first_turn.steps[1] {
+        SessionStep::Assistant {
+            text,
+            endpoint_kind,
+            latency_ms,
+            token_usage_buckets,
+            token_usage_native_units,
+            ..
+        } => {
+            assert_eq!(text, "full answer");
+            assert_eq!(endpoint_kind, "generation");
+            assert_eq!(*latency_ms, Some(42));
+            assert_eq!(token_usage_buckets.get("reasoning"), Some(&7));
+            assert!(!token_usage_buckets.contains_key("input_text"));
+            assert_eq!(token_usage_native_units.get("usd"), Some(&0.5));
+            assert!(!token_usage_native_units.contains_key("zero"));
+        }
+        other => panic!("expected assistant step, got {other:?}"),
+    }
+    match &first_turn.steps[2] {
+        SessionStep::ToolCall {
+            tool_name,
+            call_id,
+            arguments,
+            latency_ms,
+            is_error,
+            result,
+            ..
+        } => {
+            assert_eq!(tool_name, "Read");
+            assert_eq!(call_id, "call-read");
+            assert_eq!(arguments, &json!({ "path": "src/lib.rs" }));
+            assert_eq!(*latency_ms, Some(17));
+            assert!(*is_error);
+            let result = result.as_ref().expect("paired tool result");
+            assert_eq!(result.text, "read failed");
+            assert_eq!(result.latency_ms, 600);
+            assert!(result.is_error);
+        }
+        other => panic!("expected tool call step, got {other:?}"),
+    }
+    assert!(matches!(
+        &first_turn.steps[3],
+        SessionStep::Thinking { text, .. } if text == "consider the result"
+    ));
+    assert_eq!(
+        session.turns[1].token_usage_buckets.get("output_text"),
+        Some(&3)
+    );
+    assert_script_consumed(&state, 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_analytics_empty_and_timed_limit_sql_are_deterministic() {
+    let (repo, state) = build_scripted_repo(vec![ScriptedResponse::rows(
+        &[
+            "FROM `moraine`.`v_session_summary` AS s",
+            "AND s.last_event_time >= now() - INTERVAL 86400 SECOND",
+            "ORDER BY s.last_event_time DESC, s.session_id DESC",
+            "LIMIT 200",
+            "FORMAT JSONEachRow",
+        ],
+        json!([]),
+    )])
+    .await;
+
+    let sessions = repo
+        .list_session_analytics(SessionAnalyticsQuery {
+            lookback: SessionLookback::TwentyFourHours,
+            limit: u16::MAX,
+        })
+        .await
+        .expect("empty analytics succeeds");
+    assert!(sessions.is_empty());
+    assert_script_consumed(&state, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_analytics_propagates_each_wire_stage_error() {
+    let scenarios = vec![
+        vec![ScriptedResponse::failure(
+            &["FROM `moraine`.`v_session_summary` AS s"],
+            "session stage summary failed",
+        )],
+        vec![
+            ScriptedResponse::rows(
+                &["FROM `moraine`.`v_session_summary` AS s"],
+                json!([session_analytics_summary_row()]),
+            ),
+            ScriptedResponse::failure(
+                &["FROM `moraine`.`v_turn_summary`"],
+                "session stage turns failed",
+            ),
+        ],
+        vec![
+            ScriptedResponse::rows(
+                &["FROM `moraine`.`v_session_summary` AS s"],
+                json!([session_analytics_summary_row()]),
+            ),
+            ScriptedResponse::rows(
+                &["FROM `moraine`.`v_turn_summary`"],
+                session_analytics_turn_rows(),
+            ),
+            ScriptedResponse::failure(
+                &["FROM `moraine`.`v_conversation_trace` AS t"],
+                "session stage events failed",
+            ),
+        ],
+    ];
+
+    for (stage, responses) in scenarios.into_iter().enumerate() {
+        let (repo, state) = build_scripted_repo(responses).await;
+        let error = repo
+            .list_session_analytics(SessionAnalyticsQuery {
+                lookback: SessionLookback::All,
+                limit: 1,
+            })
+            .await
+            .expect_err("wire stage error propagates");
+        assert!(
+            error.to_string().contains("session stage"),
+            "stage {stage} error: {error}"
+        );
+        assert_script_consumed(&state, stage + 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn analytics_24h_uses_exact_four_request_canonical_wire_contract() {
+    let responses = analytics_responses(
+        "toInt64(86400)",
+        "INTERVAL 3600 SECOND",
+        json!([
+            {
+                "bucket_unix": 150_000_u64,
+                "model": "gpt-5.3-codex-xhigh",
+                "endpoint_kind": "responses",
+                "bucket": "input_text",
+                "tokens": 12_u64
+            },
+            {
+                "bucket_unix": 153_600_u64,
+                "model": "other",
+                "endpoint_kind": "messages",
+                "bucket": "output_text",
+                "tokens": 8_u64
+            }
+        ]),
+        json!([{
+            "bucket_unix": 150_000_u64,
+            "model": "gpt-5.3-codex-xhigh",
+            "turns": 3_u64
+        }]),
+        json!([{
+            "bucket_unix": 150_000_u64,
+            "concurrent_sessions": 2_u64
+        }]),
+    );
+    let (repo, state) = build_scripted_repo(responses).await;
+
+    let snapshot = repo
+        .analytics_series(AnalyticsRange::TwentyFourHours)
+        .await
+        .expect("24h analytics succeeds");
+
+    assert_eq!(snapshot.window.range, AnalyticsRange::TwentyFourHours);
+    assert_eq!(snapshot.window.window_seconds, 86_400);
+    assert_eq!(snapshot.window.bucket_seconds, 3_600);
+    assert_eq!(snapshot.window.from_unix, 113_600);
+    assert_eq!(snapshot.window.to_unix, 200_000);
+    assert_eq!(snapshot.tokens.len(), 2);
+    assert_eq!(snapshot.tokens[0].model, "gpt-5.3-codex-xhigh");
+    assert_eq!(snapshot.tokens[0].tokens, 12);
+    assert_eq!(snapshot.tokens[1].bucket, "output_text");
+    assert_eq!(snapshot.turns[0].turns, 3);
+    assert_eq!(snapshot.concurrent_sessions[0].concurrent_sessions, 2);
+    assert_script_consumed(&state, 4);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn analytics_all_six_ranges_use_distinct_wire_keys() {
+    let cases = [
+        (
+            AnalyticsRange::FifteenMinutes,
+            "toInt64(900)",
+            "INTERVAL 60 SECOND",
+        ),
+        (
+            AnalyticsRange::OneHour,
+            "toInt64(3600)",
+            "INTERVAL 300 SECOND",
+        ),
+        (
+            AnalyticsRange::SixHours,
+            "toInt64(21600)",
+            "INTERVAL 900 SECOND",
+        ),
+        (
+            AnalyticsRange::TwentyFourHours,
+            "toInt64(86400)",
+            "INTERVAL 3600 SECOND",
+        ),
+        (
+            AnalyticsRange::SevenDays,
+            "toInt64(604800)",
+            "INTERVAL 21600 SECOND",
+        ),
+        (
+            AnalyticsRange::ThirtyDays,
+            "toInt64(2592000)",
+            "INTERVAL 86400 SECOND",
+        ),
+    ];
+    let mut responses = Vec::new();
+    for (_, window, interval) in cases {
+        responses.extend(analytics_responses(
+            window,
+            interval,
+            json!([]),
+            json!([]),
+            json!([]),
+        ));
+    }
+    let (repo, state) = build_scripted_repo(responses).await;
+
+    for (range, _, _) in cases {
+        let snapshot = repo
+            .analytics_series(range)
+            .await
+            .expect("distinct analytics range succeeds");
+        assert_eq!(snapshot.window.range, range);
+    }
+    assert_script_consumed(&state, 24);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn analytics_cache_hit_and_distinct_key_are_request_count_proven() {
+    let mut responses = analytics_responses(
+        "toInt64(86400)",
+        "INTERVAL 3600 SECOND",
+        json!([]),
+        json!([]),
+        json!([]),
+    );
+    responses.extend(analytics_responses(
+        "toInt64(3600)",
+        "INTERVAL 300 SECOND",
+        json!([]),
+        json!([]),
+        json!([]),
+    ));
+    let (repo, state) = build_scripted_repo(responses).await;
+    let clone = repo.clone();
+
+    let first = repo
+        .analytics_series(AnalyticsRange::TwentyFourHours)
+        .await
+        .expect("cache miss succeeds");
+    let hit = clone
+        .analytics_series(AnalyticsRange::TwentyFourHours)
+        .await
+        .expect("same-key cache hit succeeds");
+    assert_eq!(first, hit);
+    assert_eq!(state.queries.lock().expect("queries lock").len(), 4);
+
+    let distinct = repo
+        .analytics_series(AnalyticsRange::OneHour)
+        .await
+        .expect("distinct-key cache miss succeeds");
+    assert_eq!(distinct.window.range, AnalyticsRange::OneHour);
+    assert_eq!(distinct.window.window_seconds, 3_600);
+    assert_eq!(distinct.window.bucket_seconds, 300);
+    assert_script_consumed(&state, 8);
+}
+
+#[tokio::test]
+async fn analytics_expired_entry_refills_from_the_repository() {
+    let mut responses = analytics_responses(
+        "toInt64(86400)",
+        "INTERVAL 3600 SECOND",
+        json!([{
+            "bucket_unix": 100_000_u64,
+            "model": "model",
+            "endpoint_kind": "generation",
+            "bucket": "input_text",
+            "tokens": 1_u64
+        }]),
+        json!([]),
+        json!([]),
+    );
+    responses.extend(analytics_responses(
+        "toInt64(86400)",
+        "INTERVAL 3600 SECOND",
+        json!([{
+            "bucket_unix": 100_000_u64,
+            "model": "model",
+            "endpoint_kind": "generation",
+            "bucket": "input_text",
+            "tokens": 2_u64
+        }]),
+        json!([]),
+        json!([]),
+    ));
+    let (repo, state) = build_scripted_repo(responses).await;
+
+    let first = repo
+        .analytics_series(AnalyticsRange::TwentyFourHours)
+        .await
+        .expect("initial cache fill succeeds");
+    assert_eq!(first.tokens[0].tokens, 1);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    tokio::time::resume();
+    let refilled = repo
+        .analytics_series(AnalyticsRange::TwentyFourHours)
+        .await
+        .expect("stale cache entry refills");
+    assert_eq!(refilled.tokens[0].tokens, 2);
+    assert_script_consumed(&state, 8);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn analytics_stage_error_is_not_cached_and_empty_retry_succeeds() {
+    let success = analytics_responses(
+        "toInt64(86400)",
+        "INTERVAL 3600 SECOND",
+        json!([]),
+        json!([]),
+        json!([]),
+    );
+    let mut responses = vec![
+        success[0].clone(),
+        ScriptedResponse::failure(
+            &[
+                "ARRAY JOIN mapKeys(e.token_usage_buckets)",
+                "FORMAT JSONEachRow",
+            ],
+            "analytics token stage failed",
+        ),
+    ];
+    responses.extend(success);
+    let (repo, state) = build_scripted_repo(responses).await;
+
+    let error = repo
+        .analytics_series(AnalyticsRange::TwentyFourHours)
+        .await
+        .expect_err("token stage failure propagates");
+    assert!(error.to_string().contains("analytics token stage failed"));
+
+    let retry = repo
+        .analytics_series(AnalyticsRange::TwentyFourHours)
+        .await
+        .expect("failed load is not cached");
+    assert!(retry.tokens.is_empty());
+    assert!(retry.turns.is_empty());
+    assert!(retry.concurrent_sessions.is_empty());
+    assert_script_consumed(&state, 6);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn analytics_anchor_decode_and_late_stage_errors_are_not_cached() {
+    let success = analytics_responses(
+        "toInt64(86400)",
+        "INTERVAL 3600 SECOND",
+        json!([]),
+        json!([]),
+        json!([]),
+    );
+    let scenarios = [
+        (
+            "anchor",
+            vec![ScriptedResponse::failure(
+                &["database_now_unix", "FORMAT JSONEachRow"],
+                "analytics anchor stage failed",
+            )],
+            5,
+        ),
+        (
+            "decode",
+            vec![ScriptedResponse::raw(
+                &["database_now_unix", "FORMAT JSONEachRow"],
+                "not-json\n",
+            )],
+            5,
+        ),
+        (
+            "turn",
+            vec![
+                success[0].clone(),
+                success[1].clone(),
+                ScriptedResponse::failure(
+                    &[
+                        "uniqExact(tuple(e.session_id, e.request_id))",
+                        "FORMAT JSONEachRow",
+                    ],
+                    "analytics turn stage failed",
+                ),
+            ],
+            7,
+        ),
+        (
+            "concurrency",
+            vec![
+                success[0].clone(),
+                success[1].clone(),
+                success[2].clone(),
+                ScriptedResponse::failure(
+                    &["uniqExact(session_stream_key)", "FORMAT JSONEachRow"],
+                    "analytics concurrency stage failed",
+                ),
+            ],
+            8,
+        ),
+    ];
+
+    for (stage, mut responses, expected_requests) in scenarios {
+        responses.extend(success.clone());
+        let (repo, state) = build_scripted_repo(responses).await;
+        repo.analytics_series(AnalyticsRange::TwentyFourHours)
+            .await
+            .expect_err(stage);
+        let retry = repo
+            .analytics_series(AnalyticsRange::TwentyFourHours)
+            .await
+            .unwrap_or_else(|error| panic!("{stage} retry failed: {error}"));
+        assert!(retry.tokens.is_empty());
+        assert!(retry.turns.is_empty());
+        assert!(retry.concurrent_sessions.is_empty());
+        assert_script_consumed(&state, expected_requests);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn analytics_same_key_concurrency_coalesces_to_one_wire_load() {
+    let (repo, state) = build_scripted_repo(analytics_responses(
+        "toInt64(86400)",
+        "INTERVAL 3600 SECOND",
+        json!([]),
+        json!([]),
+        json!([]),
+    ))
+    .await;
+    let repo = Arc::new(repo);
+
+    let (left, right) = tokio::join!(
+        repo.analytics_series(AnalyticsRange::TwentyFourHours),
+        repo.analytics_series(AnalyticsRange::TwentyFourHours)
+    );
+    assert_eq!(
+        left.expect("first concurrent load"),
+        right.expect("coalesced load")
+    );
+    assert_script_consumed(&state, 4);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn analytics_different_ranges_fill_concurrently() {
+    let first_anchor_reached = Arc::new(Notify::new());
+    let first_anchor_release = Arc::new(Notify::new());
+    let second_anchor_reached = Arc::new(Notify::new());
+    let second_anchor_release = Arc::new(Notify::new());
+    let first_fill_reached_last_stage = Arc::new(Notify::new());
+    let first_fill_release_last_stage = Arc::new(Notify::new());
+    let anchor_row = json!([{
+        "scan_from_unix": 100_000_u64,
+        "scan_to_unix": 200_000_u64,
+        "display_to_unix": 200_000_u64
+    }]);
+    let generic_anchor = |reached: Arc<Notify>, release: Arc<Notify>| {
+        ScriptedResponse::rows(
+            &[
+                "toInt64(toUnixTimestamp(now())) AS database_now_unix",
+                "FROM (SELECT * FROM `moraine`.`events` FINAL) AS e",
+            ],
+            anchor_row.clone(),
+        )
+        .blocked(reached, release)
+    };
+    let token = || {
+        ScriptedResponse::rows(
+            &[
+                "ARRAY JOIN mapKeys(e.token_usage_buckets)",
+                "FORMAT JSONEachRow",
+            ],
+            json!([]),
+        )
+    };
+    let turns = || {
+        ScriptedResponse::rows(
+            &[
+                "uniqExact(tuple(e.session_id, e.request_id))",
+                "FORMAT JSONEachRow",
+            ],
+            json!([]),
+        )
+    };
+    let concurrency = || {
+        ScriptedResponse::rows(
+            &["uniqExact(session_stream_key)", "FORMAT JSONEachRow"],
+            json!([]),
+        )
+    };
+    let responses = vec![
+        generic_anchor(first_anchor_reached.clone(), first_anchor_release.clone()),
+        generic_anchor(second_anchor_reached.clone(), second_anchor_release.clone()),
+        token(),
+        turns(),
+        concurrency().blocked(
+            first_fill_reached_last_stage.clone(),
+            first_fill_release_last_stage.clone(),
+        ),
+        token(),
+        turns(),
+        concurrency(),
+    ];
+    let (repo, state) = build_scripted_repo(responses).await;
+    let repo = Arc::new(repo);
+
+    let one_hour_repo = repo.clone();
+    let one_hour = tokio::spawn(async move {
+        one_hour_repo
+            .analytics_series(AnalyticsRange::OneHour)
+            .await
+    });
+    let day_repo = repo.clone();
+    let day = tokio::spawn(async move {
+        day_repo
+            .analytics_series(AnalyticsRange::TwentyFourHours)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), first_anchor_reached.notified())
+        .await
+        .expect("first range reached its anchor");
+    tokio::time::timeout(Duration::from_secs(2), second_anchor_reached.notified())
+        .await
+        .expect("second range reached its anchor before the first was released");
+
+    first_anchor_release.notify_one();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        first_fill_reached_last_stage.notified(),
+    )
+    .await
+    .expect("first range reached its final stage");
+    first_fill_release_last_stage.notify_one();
+    second_anchor_release.notify_one();
+
+    let (one_hour, day) = tokio::join!(one_hour, day);
+    assert_eq!(
+        one_hour
+            .expect("one-hour task joined")
+            .expect("one-hour fill succeeds")
+            .window
+            .range,
+        AnalyticsRange::OneHour
+    );
+    assert_eq!(
+        day.expect("day task joined")
+            .expect("day fill succeeds")
+            .window
+            .range,
+        AnalyticsRange::TwentyFourHours
+    );
+    assert_script_consumed(&state, 8);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn analytics_cancelled_fill_releases_slot_and_recovery_is_cached() {
+    let success = analytics_responses(
+        "toInt64(86400)",
+        "INTERVAL 3600 SECOND",
+        json!([]),
+        json!([]),
+        json!([]),
+    );
+    let reached = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mut responses = vec![success[0].clone().blocked(reached.clone(), release.clone())];
+    responses.extend(success);
+    let (repo, state) = build_scripted_repo(responses).await;
+    let repo = Arc::new(repo);
+
+    let first_repo = repo.clone();
+    let first = tokio::spawn(async move {
+        first_repo
+            .analytics_series(AnalyticsRange::TwentyFourHours)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), reached.notified())
+        .await
+        .expect("scripted analytics load reached the wire barrier");
+    first.abort();
+    release.notify_one();
+    assert!(first
+        .await
+        .expect_err("fill task was aborted")
+        .is_cancelled());
+
+    let recovered = tokio::time::timeout(
+        Duration::from_secs(2),
+        repo.analytics_series(AnalyticsRange::TwentyFourHours),
+    )
+    .await
+    .expect("cancelled fill released the range slot")
+    .expect("recovery fill succeeds");
+    let hit = repo
+        .analytics_series(AnalyticsRange::TwentyFourHours)
+        .await
+        .expect("recovery result was cached");
+    assert_eq!(recovered, hit);
+    assert_script_consumed(&state, 5);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn web_feed_covers_variants_precedence_limit_order_and_canonical_source() {
+    let response = ScriptedResponse::rows(
+        &[
+            "FROM (SELECT * FROM `moraine`.`events` FINAL) AS e",
+            "e.payload_type = 'web_search_call'",
+            "e.payload_type = 'tool_use' AND e.tool_name IN ('WebSearch', 'WebFetch')",
+            "e.payload_type = 'search_results_received'",
+            "JSONExtractString(e.payload_json, 'action', 'query')",
+            "JSONExtractString(e.payload_json, 'input', 'query')",
+            "JSONExtractString(e.payload_json, 'data', 'query')",
+            "JSONExtractString(e.payload_json, 'action', 'url')",
+            "JSONExtractString(e.payload_json, 'input', 'url')",
+            "ORDER BY e.event_ts DESC, e.event_uid DESC",
+            "LIMIT 1000",
+            "FORMAT JSONEachRow",
+        ],
+        json!([
+            {
+                "event_time": "2026-06-01 12:03:00",
+                "harness": "codex",
+                "source_name": "codex-jsonl",
+                "session_id": "web-3",
+                "model": "gpt-5",
+                "action": "search_results_received",
+                "search_query": "data query",
+                "result_url": "",
+                "source_ref": "/tmp/web:3"
+            },
+            {
+                "event_time": "2026-06-01 12:02:00",
+                "harness": "claude-code",
+                "source_name": "claude-jsonl",
+                "session_id": "web-2",
+                "model": "claude",
+                "action": "open_page",
+                "search_query": "",
+                "result_url": "https://example.test/page",
+                "source_ref": "/tmp/web:2"
+            },
+            {
+                "event_time": "2026-06-01 12:01:00",
+                "harness": "codex",
+                "source_name": "codex-jsonl",
+                "session_id": "web-1",
+                "model": "gpt-5",
+                "action": "search",
+                "search_query": "action path wins",
+                "result_url": "https://example.test/result",
+                "source_ref": "/tmp/web:1"
+            }
+        ]),
+    );
+    let (repo, state) = build_scripted_repo(vec![response]).await;
+
+    let events = repo
+        .list_web_searches(u16::MAX)
+        .await
+        .expect("web feed succeeds");
+
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].session_id, "web-3");
+    assert_eq!(events[0].search_query, "data query");
+    assert_eq!(events[1].action, "open_page");
+    assert_eq!(events[1].result_url, "https://example.test/page");
+    assert_eq!(events[2].search_query, "action path wins");
+    assert_eq!(events[2].source_ref, "/tmp/web:1");
+    assert_script_consumed(&state, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn web_feed_propagates_backend_and_json_each_row_decode_errors() {
+    let scenarios = [
+        ScriptedResponse::failure(
+            &["FROM (SELECT * FROM `moraine`.`events` FINAL) AS e"],
+            "web feed backend failed",
+        ),
+        ScriptedResponse::raw(
+            &[
+                "FROM (SELECT * FROM `moraine`.`events` FINAL) AS e",
+                "FORMAT JSONEachRow",
+            ],
+            "not-json\n",
+        ),
+    ];
+
+    for (index, response) in scenarios.into_iter().enumerate() {
+        let (repo, state) = build_scripted_repo(vec![response]).await;
+        let error = repo
+            .list_web_searches(0)
+            .await
+            .expect_err("web feed failure propagates");
+        if index == 0 {
+            assert!(error.to_string().contains("web feed backend failed"));
+        } else {
+            assert!(error.to_string().contains("failed to parse JSONEachRow"));
+        }
+        assert_script_consumed(&state, 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn heartbeat_reports_missing_table_without_read_query() {
+    let (repo, state) = build_scripted_repo(vec![ScriptedResponse::rows(
+        &[
+            "SELECT name",
+            "FROM system.columns",
+            "WHERE database = 'moraine' AND table = 'ingest_heartbeats'",
+            "ORDER BY position ASC",
+            "FORMAT JSONEachRow",
+        ],
+        json!([]),
+    )])
+    .await;
+
+    let heartbeat = repo
+        .latest_ingest_heartbeat()
+        .await
+        .expect("missing heartbeat table is optional");
+    assert!(!heartbeat.table_present);
+    assert!(heartbeat.latest.is_none());
+    assert_script_consumed(&state, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn heartbeat_reports_present_but_empty_table() {
+    let responses = vec![
+        ScriptedResponse::rows(
+            &["FROM system.columns", "FORMAT JSONEachRow"],
+            heartbeat_columns(&[]),
+        ),
+        ScriptedResponse::rows(
+            &[
+                "FROM `moraine`.`ingest_heartbeats`",
+                "ORDER BY `ts` DESC, `host` DESC",
+                "LIMIT 1",
+                "FORMAT JSONEachRow",
+            ],
+            json!([]),
+        ),
+    ];
+    let (repo, state) = build_scripted_repo(responses).await;
+
+    let heartbeat = repo
+        .latest_ingest_heartbeat()
+        .await
+        .expect("empty heartbeat table succeeds");
+    assert!(heartbeat.table_present);
+    assert!(heartbeat.latest.is_none());
+    assert_script_consumed(&state, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn heartbeat_pre_017_row_uses_null_projections_for_absent_columns() {
+    let mut row = heartbeat_row();
+    row["service_version"] = json!("0.16.9");
+    let responses = vec![
+        ScriptedResponse::rows(
+            &["FROM system.columns", "FORMAT JSONEachRow"],
+            heartbeat_columns(&[]),
+        ),
+        ScriptedResponse::rows(
+            &[
+                "FROM `moraine`.`ingest_heartbeats`",
+                "CAST(NULL, 'Nullable(String)') AS `watcher_backend`",
+                "CAST(NULL, 'Nullable(UInt64)') AS `watcher_error_count`",
+                "CAST(NULL, 'Nullable(UInt64)') AS `watcher_reset_count`",
+                "CAST(NULL, 'Nullable(UInt64)') AS `watcher_last_reset_unix_ms`",
+                "CAST(NULL, 'Nullable(String)') AS `backend_sinks`",
+                "FORMAT JSONEachRow",
+            ],
+            json!([row]),
+        ),
+    ];
+    let (repo, state) = build_scripted_repo(responses).await;
+
+    let heartbeat = repo
+        .latest_ingest_heartbeat()
+        .await
+        .expect("pre-0.17 heartbeat succeeds");
+    let latest = heartbeat.latest.expect("heartbeat row");
+    assert_eq!(latest.service_version, "0.16.9");
+    assert_eq!(latest.queue_depth, 4);
+    assert!(latest.watcher_backend.is_none());
+    assert!(latest.watcher_error_count.is_none());
+    assert!(latest.watcher_reset_count.is_none());
+    assert!(latest.watcher_last_reset_unix_ms.is_none());
+    assert!(latest.backend_sinks.is_none());
+
+    let queries = state.queries.lock().expect("queries lock");
+    let read_query = &queries[1];
+    for absent in [
+        "`watcher_backend`,",
+        "`watcher_error_count`,",
+        "`watcher_reset_count`,",
+        "`watcher_last_reset_unix_ms`,",
+        "`backend_sinks`",
+    ] {
+        assert!(
+            !read_query.lines().any(|line| line.trim() == absent),
+            "absent column projected directly: {absent}\n{read_query}"
+        );
+    }
+    drop(queries);
+    assert_script_consumed(&state, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn heartbeat_partial_watcher_schema_reads_only_present_optional_columns() {
+    let mut row = heartbeat_row();
+    row["watcher_backend"] = json!("fsevents");
+    row["watcher_error_count"] = json!(3_u64);
+    let responses = vec![
+        ScriptedResponse::rows(
+            &["FROM system.columns", "FORMAT JSONEachRow"],
+            heartbeat_columns(&["watcher_backend", "watcher_error_count"]),
+        ),
+        ScriptedResponse::rows(
+            &[
+                "`watcher_backend`,",
+                "`watcher_error_count`,",
+                "CAST(NULL, 'Nullable(UInt64)') AS `watcher_reset_count`",
+                "CAST(NULL, 'Nullable(UInt64)') AS `watcher_last_reset_unix_ms`",
+                "CAST(NULL, 'Nullable(String)') AS `backend_sinks`",
+                "FROM `moraine`.`ingest_heartbeats`",
+                "FORMAT JSONEachRow",
+            ],
+            json!([row]),
+        ),
+    ];
+    let (repo, state) = build_scripted_repo(responses).await;
+
+    let latest = repo
+        .latest_ingest_heartbeat()
+        .await
+        .expect("partial watcher heartbeat succeeds")
+        .latest
+        .expect("heartbeat row");
+    assert_eq!(latest.watcher_backend.as_deref(), Some("fsevents"));
+    assert_eq!(latest.watcher_error_count, Some(3));
+    assert!(latest.watcher_reset_count.is_none());
+    assert!(latest.backend_sinks.is_none());
+    assert_script_consumed(&state, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn heartbeat_post_017_backend_sinks_handles_blank_valid_and_malformed_values() {
+    let cases = [
+        ("", json!({})),
+        (
+            "{\"clickhouse\":{\"healthy\":true},\"sqlite\":{\"healthy\":false}}",
+            json!({
+                "clickhouse": { "healthy": true },
+                "sqlite": { "healthy": false }
+            }),
+        ),
+        ("malformed-backend-sinks", json!("malformed-backend-sinks")),
+    ];
+    let optional = [
+        "watcher_backend",
+        "watcher_error_count",
+        "watcher_reset_count",
+        "watcher_last_reset_unix_ms",
+        "backend_sinks",
+    ];
+
+    for (raw, expected) in cases {
+        let mut row = heartbeat_row();
+        row["watcher_backend"] = json!("fsevents");
+        row["watcher_error_count"] = json!(1_u64);
+        row["watcher_reset_count"] = json!(2_u64);
+        row["watcher_last_reset_unix_ms"] = json!(1780307999000_u64);
+        row["backend_sinks"] = json!(raw);
+        let responses = vec![
+            ScriptedResponse::rows(
+                &["FROM system.columns", "FORMAT JSONEachRow"],
+                heartbeat_columns(&optional),
+            ),
+            ScriptedResponse::rows(
+                &[
+                    "`watcher_backend`,",
+                    "`watcher_error_count`,",
+                    "`watcher_reset_count`,",
+                    "`watcher_last_reset_unix_ms`,",
+                    "`backend_sinks`",
+                    "FROM `moraine`.`ingest_heartbeats`",
+                    "FORMAT JSONEachRow",
+                ],
+                json!([row]),
+            ),
+        ];
+        let (repo, state) = build_scripted_repo(responses).await;
+
+        let latest = repo
+            .latest_ingest_heartbeat()
+            .await
+            .expect("post-0.17 heartbeat succeeds")
+            .latest
+            .expect("heartbeat row");
+        assert_eq!(latest.watcher_backend.as_deref(), Some("fsevents"));
+        assert_eq!(latest.watcher_reset_count, Some(2));
+        assert_eq!(latest.backend_sinks, Some(expected));
+        assert_script_consumed(&state, 2);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn heartbeat_propagates_column_probe_and_latest_read_errors() {
+    let (probe_repo, probe_state) = build_scripted_repo(vec![ScriptedResponse::failure(
+        &["FROM system.columns", "FORMAT JSONEachRow"],
+        "heartbeat column probe failed",
+    )])
+    .await;
+    let probe_error = probe_repo
+        .latest_ingest_heartbeat()
+        .await
+        .expect_err("column probe failure propagates");
+    assert!(probe_error
+        .to_string()
+        .contains("heartbeat column probe failed"));
+    assert_script_consumed(&probe_state, 1);
+
+    let (read_repo, read_state) = build_scripted_repo(vec![
+        ScriptedResponse::rows(
+            &["FROM system.columns", "FORMAT JSONEachRow"],
+            heartbeat_columns(&[]),
+        ),
+        ScriptedResponse::failure(
+            &["FROM `moraine`.`ingest_heartbeats`", "FORMAT JSONEachRow"],
+            "heartbeat latest read failed",
+        ),
+    ])
+    .await;
+    let read_error = read_repo
+        .latest_ingest_heartbeat()
+        .await
+        .expect_err("heartbeat read failure propagates");
+    assert!(read_error
+        .to_string()
+        .contains("heartbeat latest read failed"));
+    assert_script_consumed(&read_state, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn table_summaries_map_metadata_and_active_part_counts() {
+    let responses = vec![
+        ScriptedResponse::rows(
+            &[
+                "SELECT name, engine, toUInt8(is_temporary) AS is_temporary",
+                "FROM system.tables",
+                "WHERE database = 'moraine'",
+                "ORDER BY name ASC",
+                "FORMAT JSONEachRow",
+            ],
+            json!([
+                {
+                    "name": "events",
+                    "engine": "ReplacingMergeTree",
+                    "is_temporary": 0_u8
+                },
+                {
+                    "name": "scratch",
+                    "engine": "Memory",
+                    "is_temporary": 1_u8
+                },
+                {
+                    "name": "v_session_summary",
+                    "engine": "View",
+                    "is_temporary": 0_u8
+                }
+            ]),
+        ),
+        ScriptedResponse::rows(
+            &[
+                "SELECT table, toUInt64(sum(rows)) AS rows",
+                "FROM system.parts",
+                "WHERE database = 'moraine' AND active",
+                "GROUP BY table",
+                "ORDER BY table ASC",
+                "FORMAT JSONEachRow",
+            ],
+            json!([
+                { "table": "events", "rows": 42_u64 },
+                { "table": "scratch", "rows": 7_u64 }
+            ]),
+        ),
+    ];
+    let (repo, state) = build_scripted_repo(responses).await;
+
+    let summaries = repo
+        .list_table_summaries()
+        .await
+        .expect("table summaries succeed");
+
+    assert!(summaries.row_counts_error.is_none());
+    assert_eq!(summaries.tables.len(), 3);
+    assert_eq!(summaries.tables[0].name, "events");
+    assert_eq!(summaries.tables[0].engine, "ReplacingMergeTree");
+    assert!(!summaries.tables[0].is_temporary);
+    assert_eq!(summaries.tables[0].rows, 42);
+    assert!(summaries.tables[1].is_temporary);
+    assert_eq!(summaries.tables[1].rows, 7);
+    assert_eq!(summaries.tables[2].rows, 0);
+    assert_script_consumed(&state, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn table_summaries_return_metadata_when_parts_probe_fails() {
+    let responses = vec![
+        ScriptedResponse::rows(
+            &["FROM system.tables", "FORMAT JSONEachRow"],
+            json!([{
+                "name": "events",
+                "engine": "ReplacingMergeTree",
+                "is_temporary": 0_u8
+            }]),
+        ),
+        ScriptedResponse::failure(
+            &["FROM system.parts", "FORMAT JSONEachRow"],
+            "active parts probe failed",
+        ),
+    ];
+    let (repo, state) = build_scripted_repo(responses).await;
+
+    let summaries = repo
+        .list_table_summaries()
+        .await
+        .expect("parts failure is partial");
+    assert_eq!(summaries.tables.len(), 1);
+    assert_eq!(summaries.tables[0].rows, 0);
+    assert!(summaries
+        .row_counts_error
+        .as_deref()
+        .is_some_and(|message| message.contains("active parts probe failed")));
+    assert_script_consumed(&state, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn preview_rejects_invalid_identifier_before_any_http_call() {
+    let (repo, state) = build_repo().await;
+
+    let error = repo
+        .preview_table(TablePreviewQuery {
+            table: "events; DROP TABLE events".to_string(),
+            limit: 25,
+        })
+        .await
+        .expect_err("invalid table identifier is rejected");
+
+    assert!(error
+        .to_string()
+        .contains("table must match [A-Za-z_][A-Za-z0-9_]*"));
+    assert!(state.queries.lock().expect("queries lock").is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn preview_clamps_limit_and_maps_ordered_schema_and_json_values() {
+    let responses = vec![
+        ScriptedResponse::rows(
+            &[
+                "SELECT name, type AS type_name, default_expression",
+                "FROM system.columns",
+                "WHERE database = 'moraine' AND table = 'events'",
+                "ORDER BY position ASC",
+                "FORMAT JSONEachRow",
+            ],
+            json!([
+                {
+                    "name": "id",
+                    "type_name": "UInt64",
+                    "default_expression": ""
+                },
+                {
+                    "name": "name",
+                    "type_name": "String",
+                    "default_expression": "'anonymous'"
+                }
+            ]),
+        ),
+        ScriptedResponse::rows(
+            &[
+                "SELECT * FROM `moraine`.`events`",
+                "ORDER BY `id`, `name`",
+                "LIMIT 500",
+                "FORMAT JSONEachRow",
+            ],
+            json!([
+                { "id": 1_u64, "name": "alpha", "nested": { "ok": true } },
+                { "id": 2_u64, "name": "beta", "nullable": null }
+            ]),
+        ),
+    ];
+    let (repo, state) = build_scripted_repo(responses).await;
+
+    let preview = repo
+        .preview_table(TablePreviewQuery {
+            table: "events".to_string(),
+            limit: u16::MAX,
+        })
+        .await
+        .expect("table preview succeeds");
+
+    assert_eq!(preview.table, "events");
+    assert_eq!(preview.limit, 500);
+    assert_eq!(preview.schema.len(), 2);
+    assert_eq!(preview.schema[0].name, "id");
+    assert_eq!(preview.schema[0].type_name, "UInt64");
+    assert_eq!(preview.schema[1].default_expression, "'anonymous'");
+    assert_eq!(preview.rows[0]["nested"]["ok"], json!(true));
+    assert_eq!(preview.rows[1]["nullable"], serde_json::Value::Null);
+    assert_script_consumed(&state, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn preview_propagates_schema_and_row_stage_errors() {
+    let (schema_repo, schema_state) = build_scripted_repo(vec![ScriptedResponse::failure(
+        &["FROM system.columns", "FORMAT JSONEachRow"],
+        "preview schema failed",
+    )])
+    .await;
+    let schema_error = schema_repo
+        .preview_table(TablePreviewQuery {
+            table: "events".to_string(),
+            limit: 10,
+        })
+        .await
+        .expect_err("schema failure propagates");
+    assert!(schema_error.to_string().contains("preview schema failed"));
+    assert_script_consumed(&schema_state, 1);
+
+    let (row_repo, row_state) = build_scripted_repo(vec![
+        ScriptedResponse::rows(
+            &["FROM system.columns", "FORMAT JSONEachRow"],
+            json!([{
+                "name": "id",
+                "type_name": "UInt64",
+                "default_expression": ""
+            }]),
+        ),
+        ScriptedResponse::failure(
+            &["SELECT * FROM `moraine`.`events` ORDER BY `id` LIMIT 10 FORMAT JSONEachRow"],
+            "preview row read failed",
+        ),
+    ])
+    .await;
+    let row_error = row_repo
+        .preview_table(TablePreviewQuery {
+            table: "events".to_string(),
+            limit: 10,
+        })
+        .await
+        .expect_err("row failure propagates");
+    assert!(row_error.to_string().contains("preview row read failed"));
+    assert_script_consumed(&row_state, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn store_health_maps_all_successful_probe_facts() {
+    let responses = vec![
+        ScriptedResponse::raw(&["SELECT 1"], "1\n"),
+        ScriptedResponse::raw(
+            &["SELECT version() AS version"],
+            json_envelope(json!([{ "version": "25.8.1.1" }])),
+        ),
+        ScriptedResponse::rows(
+            &[
+                "FROM system.databases",
+                "WHERE name = 'moraine'",
+                "FORMAT JSONEachRow",
+            ],
+            json!([{ "exists": 1_u8 }]),
+        ),
+        ScriptedResponse::rows(
+            &[
+                "FROM system.metrics",
+                "WHERE metric IN ('TCPConnection', 'HTTPConnection', 'MySQLConnection', 'PostgreSQLConnection', 'InterserverConnection')",
+                "ORDER BY metric ASC",
+                "FORMAT JSONEachRow",
+            ],
+            json!([
+                { "metric": "HTTPConnection", "value": 2_u64 },
+                { "metric": "InterserverConnection", "value": 5_u64 },
+                { "metric": "MySQLConnection", "value": 3_u64 },
+                { "metric": "PostgreSQLConnection", "value": 4_u64 },
+                { "metric": "TCPConnection", "value": 7_u64 },
+                { "metric": "TCPConnection", "value": 1_u64 }
+            ]),
+        ),
+    ];
+    let (repo, state) = build_scripted_repo(responses).await;
+
+    let health = repo
+        .read_store_health()
+        .await
+        .expect("health probes succeed");
+
+    assert!(matches!(health.ping, StoreProbe::Available(ms) if ms >= 0.0));
+    assert_eq!(
+        health.version,
+        StoreProbe::Available("25.8.1.1".to_string())
+    );
+    assert_eq!(health.database_exists, StoreProbe::Available(true));
+    match health.connections {
+        StoreProbe::Available(metrics) => {
+            assert_eq!(metrics.tcp, 8);
+            assert_eq!(metrics.http, 2);
+            assert_eq!(metrics.mysql, 3);
+            assert_eq!(metrics.postgres, 4);
+            assert_eq!(metrics.interserver, 5);
+            assert_eq!(metrics.total, 22);
+        }
+        other => panic!("expected connection metrics, got {other:?}"),
+    }
+    assert_script_consumed(&state, 4);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn store_health_keeps_each_probe_failure_independent() {
+    let responses = vec![
+        ScriptedResponse::failure(&["SELECT 1"], "health ping failed"),
+        ScriptedResponse::failure(&["SELECT version() AS version"], "health version failed"),
+        ScriptedResponse::failure(&["FROM system.databases"], "health database failed"),
+        ScriptedResponse::failure(&["FROM system.metrics"], "health connections failed"),
+    ];
+    let (repo, state) = build_scripted_repo(responses).await;
+
+    let health = repo
+        .read_store_health()
+        .await
+        .expect("probe failures are facts, not method errors");
+
+    assert!(matches!(
+        health.ping,
+        StoreProbe::Failed { ref message } if message.contains("health ping failed")
+    ));
+    assert!(matches!(
+        health.version,
+        StoreProbe::Failed { ref message } if message.contains("health version failed")
+    ));
+    assert!(matches!(
+        health.database_exists,
+        StoreProbe::Failed { ref message } if message.contains("health database failed")
+    ));
+    assert!(matches!(
+        health.connections,
+        StoreProbe::Failed { ref message } if message.contains("health connections failed")
+    ));
+    assert_script_consumed(&state, 4);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn diagnostics_maps_doctor_partial_report_and_ping_short_circuit() {
+    let required_tables = json!([
+        { "name": "raw_events" },
+        { "name": "events" },
+        { "name": "event_links" },
+        { "name": "tool_io" },
+        { "name": "ingest_checkpoints" },
+        { "name": "ingest_heartbeats" },
+        { "name": "search_documents" },
+        { "name": "search_postings" },
+        { "name": "search_conversation_terms" },
+        { "name": "search_term_stats" },
+        { "name": "search_corpus_stats" },
+        { "name": "search_query_log" },
+        { "name": "search_hit_log" },
+        { "name": "search_interaction_log" },
+        { "name": "schema_migrations" }
+    ]);
+    let responses = vec![
+        ScriptedResponse::raw(&["SELECT 1"], "1\n"),
+        ScriptedResponse::failure(
+            &["SELECT version() AS version"],
+            "doctor version probe failed",
+        ),
+        ScriptedResponse::raw(
+            &[
+                "SELECT toUInt8(count() > 0) AS exists FROM system.databases WHERE name = 'moraine'",
+            ],
+            json_envelope(json!([{ "exists": 1_u8 }])),
+        ),
+        ScriptedResponse::failure(
+            &["SELECT version FROM `moraine`.schema_migrations GROUP BY version"],
+            "doctor ledger read failed",
+        ),
+        ScriptedResponse::raw(
+            &["SELECT name FROM system.tables WHERE database = 'moraine'"],
+            json_envelope(required_tables),
+        ),
+    ];
+    let (repo, state) = build_scripted_repo(responses).await;
+
+    let diagnostics = repo
+        .read_store_diagnostics()
+        .await
+        .expect("doctor partial report maps");
+
+    assert!(diagnostics.healthy);
+    assert!(diagnostics.version.is_none());
+    assert_eq!(diagnostics.database, "moraine");
+    assert!(diagnostics.database_exists);
+    assert!(diagnostics.applied_schema_versions.is_empty());
+    assert!(!diagnostics.pending_schema_versions.is_empty());
+    assert_eq!(diagnostics.missing_tables, vec!["ingest_errors"]);
+    assert_eq!(diagnostics.errors.len(), 2);
+    assert!(diagnostics.errors[0].contains("version query failed"));
+    assert!(diagnostics.errors[0].contains("doctor version probe failed"));
+    assert!(diagnostics.errors[1].contains("failed to read migration ledger"));
+    assert!(diagnostics.errors[1].contains("doctor ledger read failed"));
+    assert_script_consumed(&state, 5);
+
+    let (down_repo, down_state) = build_scripted_repo(vec![ScriptedResponse::failure(
+        &["SELECT 1"],
+        "doctor ping unavailable",
+    )])
+    .await;
+    let down = down_repo
+        .read_store_diagnostics()
+        .await
+        .expect("doctor ping failure returns partial report");
+    assert!(!down.healthy);
+    assert!(down.version.is_none());
+    assert!(!down.database_exists);
+    assert_eq!(down.database, "moraine");
+    assert!(down.applied_schema_versions.is_empty());
+    assert!(down.pending_schema_versions.is_empty());
+    assert!(down.missing_tables.is_empty());
+    assert_eq!(down.errors.len(), 1);
+    assert!(down.errors[0].contains("ping failed"));
+    assert!(down.errors[0].contains("doctor ping unavailable"));
+    assert_script_consumed(&down_state, 1);
 }

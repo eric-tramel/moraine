@@ -1,6 +1,11 @@
 use async_trait::async_trait;
 
 use crate::domain::{
+    AnalyticsRange, AnalyticsSnapshot, IngestHeartbeatRead, SessionAnalytics,
+    SessionAnalyticsQuery, StoreDiagnostics, StoreHealth, TablePreview, TablePreviewQuery,
+    TableSummaries, WebSearchEvent,
+};
+use crate::domain::{
     Conversation, ConversationDetailOptions, ConversationListFilter, ConversationSearchQuery,
     ConversationSearchResults, FileAttentionQuery, FileAttentionTouch, McpEventOpen,
     McpSessionListFilter, McpSessionListItem, McpSessionOpen, McpTurnOpen, OpenContext,
@@ -16,6 +21,24 @@ pub trait ConversationRepository: Send + Sync {
     fn config(&self) -> &RepoConfig;
 
     async fn prewarm_mcp_search_state(&self) -> RepoResult<()>;
+    async fn list_session_analytics(
+        &self,
+        query: SessionAnalyticsQuery,
+    ) -> RepoResult<Vec<SessionAnalytics>>;
+
+    async fn analytics_series(&self, range: AnalyticsRange) -> RepoResult<AnalyticsSnapshot>;
+
+    async fn list_web_searches(&self, limit: u16) -> RepoResult<Vec<WebSearchEvent>>;
+
+    async fn latest_ingest_heartbeat(&self) -> RepoResult<IngestHeartbeatRead>;
+
+    async fn list_table_summaries(&self) -> RepoResult<TableSummaries>;
+
+    async fn preview_table(&self, query: TablePreviewQuery) -> RepoResult<TablePreview>;
+
+    async fn read_store_health(&self) -> RepoResult<StoreHealth>;
+
+    async fn read_store_diagnostics(&self) -> RepoResult<StoreDiagnostics>;
 
     async fn list_conversations(
         &self,

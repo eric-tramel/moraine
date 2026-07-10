@@ -5,7 +5,7 @@ pub(super) const MCP_INTERNAL_TOOL_NAMES_SQL: &str =
 
 impl ClickHouseConversationRepository {
     pub(super) fn mode_subquery(&self) -> String {
-        let events_table = self.table_ref("events");
+        let events_source = canonical_events_source(&self.table_ref("events"));
         format!(
             "SELECT
   session_id,
@@ -22,7 +22,7 @@ impl ClickHouseConversationRepository {
     'tool_calling',
     'chat'
   ) AS mode
-FROM {events_table}
+FROM {events_source}
 GROUP BY session_id"
         )
     }

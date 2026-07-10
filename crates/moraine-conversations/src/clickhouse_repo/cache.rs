@@ -1,6 +1,8 @@
 use super::*;
 
 pub(super) const BENCHMARK_REPLAY_SOURCE: &str = "benchmark-replay";
+pub(super) const ANALYTICS_CACHE_TTL: Duration = Duration::from_secs(30);
+pub(super) const ANALYTICS_RANGE_COUNT: usize = AnalyticsRange::ALL.len();
 pub(super) const CORPUS_STATS_CACHE_TTL: Duration = Duration::from_secs(30);
 pub(super) const TERM_DF_CACHE_TTL: Duration = Duration::from_secs(300);
 pub(super) const SEARCH_SCHEMA_CACHE_TTL: Duration = Duration::from_secs(60);
@@ -22,6 +24,31 @@ pub(super) const TERM_POSTINGS_FAST_PATH_MAX_DOC_RATIO_DENOMINATOR: u64 = 4;
 // a preview up to a minute old, never a wrong hit.
 pub(super) const SEARCH_DOC_EXTRA_CACHE_TTL: Duration = Duration::from_secs(60);
 pub(super) const SEARCH_DOC_EXTRA_CACHE_MAX_ENTRIES: usize = 65536;
+
+#[derive(Debug, Clone)]
+pub(super) struct AnalyticsCacheEntry {
+    pub(super) snapshot: AnalyticsSnapshot,
+    pub(super) fetched_at: Instant,
+}
+
+impl AnalyticsCacheEntry {
+    pub(super) fn is_fresh(&self, now: Instant) -> bool {
+        now.checked_duration_since(self.fetched_at)
+            .unwrap_or_default()
+            <= ANALYTICS_CACHE_TTL
+    }
+}
+
+pub(super) const fn analytics_range_index(range: AnalyticsRange) -> usize {
+    match range {
+        AnalyticsRange::FifteenMinutes => 0,
+        AnalyticsRange::OneHour => 1,
+        AnalyticsRange::SixHours => 2,
+        AnalyticsRange::TwentyFourHours => 3,
+        AnalyticsRange::SevenDays => 4,
+        AnalyticsRange::ThirtyDays => 5,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct CorpusStatsCacheEntry {
@@ -243,7 +270,7 @@ impl ClickHouseConversationRepository {
         );
 
         let from_stats: Vec<CorpusStatsRow> =
-            self.map_backend(self.ch.query_rows(&from_stats_query, None).await)?;
+            self.map_backend(self.query_rows(&from_stats_query, None).await)?;
 
         if let Some(row) = from_stats.first() {
             if row.docs > 0 {
@@ -258,7 +285,7 @@ impl ClickHouseConversationRepository {
             self.table_ref("search_documents")
         );
         let fallback: Vec<CorpusStatsRow> =
-            self.map_backend(self.ch.query_rows(&fallback_query, None).await)?;
+            self.map_backend(self.query_rows(&fallback_query, None).await)?;
         let resolved = if let Some(row) = fallback.first() {
             (row.docs, row.total_doc_len)
         } else {
@@ -326,7 +353,7 @@ FORMAT JSONEachRow",
             self.table_ref("search_query_log"),
             limit
         );
-        let rows: Vec<HotQueryRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
+        let rows: Vec<HotQueryRow> = self.map_backend(self.query_rows(&query, None).await)?;
         Ok(rows.into_iter().map(|row| row.raw_query).collect())
     }
 
@@ -358,7 +385,7 @@ FORMAT JSONEachRow",
         let df_query = format!(
             "SELECT term, toUInt64(uniqExact(doc_id)) AS df FROM {postings_table} WHERE term IN {missing_terms_array} GROUP BY term FORMAT JSONEachRow",
         );
-        let rows: Vec<DfRow> = self.map_backend(self.ch.query_rows(&df_query, None).await)?;
+        let rows: Vec<DfRow> = self.map_backend(self.query_rows(&df_query, None).await)?;
         for row in rows {
             map.insert(row.term, row.df);
         }
