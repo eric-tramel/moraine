@@ -33,6 +33,10 @@ pub(crate) fn pid_path(paths: &RuntimePaths, service: Service) -> PathBuf {
     paths.pids_dir.join(service.pid_file())
 }
 
+pub(crate) fn clickhouse_supervisor_log_path(paths: &RuntimePaths) -> PathBuf {
+    paths.logs_dir.join("clickhouse-supervisor.log")
+}
+
 fn clickhouse_internal_log_path(paths: &RuntimePaths) -> PathBuf {
     paths
         .clickhouse_root
@@ -71,6 +75,12 @@ fn read_pid(path: &Path) -> Option<u32> {
 pub(crate) fn write_pid(path: &Path, pid: u32) -> Result<()> {
     fs::write(path, format!("{}\n", pid))
         .with_context(|| format!("failed to write pid file {}", path.display()))
+}
+
+pub(crate) fn remove_pid_if_matches(path: &Path, expected_pid: u32) {
+    if read_pid(path) == Some(expected_pid) {
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn is_pid_running(pid: u32) -> bool {
@@ -137,7 +147,12 @@ pub(crate) fn stop_service(paths: &RuntimePaths, service: Service) -> Result<boo
         .stderr(Stdio::null())
         .status();
 
-    for _ in 0..20 {
+    let wait_attempts = if service == Service::ClickHouse {
+        50
+    } else {
+        20
+    };
+    for _ in 0..wait_attempts {
         if !is_pid_running(pid) {
             let _ = fs::remove_file(&path);
             return Ok(true);
@@ -519,10 +534,31 @@ mod tests {
             root.join("clickhouse/log/clickhouse-server.log")
         );
         assert_eq!(
+            clickhouse_supervisor_log_path(&paths),
+            logs_dir.join("clickhouse-supervisor.log")
+        );
+        assert_eq!(
             log_path(&paths, Service::Ingest),
             logs_dir.join("ingest.log")
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remove_pid_if_matches_preserves_new_owner() {
+        let root = temp_dir("compare-remove-pid");
+        let path = root.join("service.pid");
+        write_pid(&path, 42).expect("write pid");
+
+        remove_pid_if_matches(&path, 41);
+        assert_eq!(
+            fs::read_to_string(&path).expect("preserved pid").trim(),
+            "42"
+        );
+
+        remove_pid_if_matches(&path, 42);
+        assert!(!path.exists());
         let _ = fs::remove_dir_all(root);
     }
 

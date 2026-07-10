@@ -70,6 +70,17 @@ Check service health:
 moraine status
 ```
 
+For a local ClickHouse process started by `moraine up`, Moraine keeps a small
+supervisor running after startup. If ClickHouse exits unexpectedly, the
+supervisor waits 1, 2, 4, 8, then 16 seconds between at most five consecutive
+replacement attempts. Each replacement must become query-ready before recovery
+is recorded. A generation that remains ready for five uninterrupted minutes
+resets the consecutive-failure budget. After the retry budget is exhausted,
+`moraine status` reports ClickHouse stopped/unhealthy; run
+`moraine logs clickhouse` for the exit and retry history, then `moraine up` to
+start a fresh recovery budget. External ClickHouse
+endpoints are never adopted or restarted.
+
 Open the monitor UI:
 
 ```text
@@ -141,6 +152,7 @@ For manual cleanup, project-scoped setup, and other custom setup, see
 | `moraine status` | Print service and ingest health. |
 | `moraine logs` | Show recent service logs. |
 | `moraine logs ingest --lines 500` | Show recent ingest logs. |
+| `moraine logs clickhouse` | Show managed ClickHouse supervisor and server logs. |
 | `moraine db migrate` | Apply database migrations. |
 | `moraine db doctor` | Check ClickHouse connectivity and schema health. |
 | `moraine down` | Stop managed services. |
