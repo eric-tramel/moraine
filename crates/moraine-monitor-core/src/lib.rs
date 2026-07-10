@@ -9,14 +9,13 @@ use axum::{
 };
 use moraine_config::AppConfig;
 use moraine_conversations::{
-    build_clickhouse_repository, AnalyticsRange, ConversationRepository, IngestHeartbeat,
-    IngestHeartbeatRead, RepoConfig, RepoError, SessionAnalytics, SessionAnalyticsQuery,
-    SessionLookback, SessionStep, SessionTurn, StoreConnectionMetrics, StoreHealth, StoreProbe,
-    TablePreviewQuery, TableSummaries,
+    AnalyticsRange, ConversationRepository, IngestHeartbeat, IngestHeartbeatRead, RepoError,
+    SessionAnalytics, SessionAnalyticsQuery, SessionLookback, SessionStep, SessionTurn,
+    StoreConnectionMetrics, StoreHealth, StoreProbe, TablePreviewQuery, TableSummaries,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::future::{pending, Future};
+use std::future::Future;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
@@ -53,21 +52,6 @@ struct MonitorTableSummary {
     engine: String,
     is_temporary: u8,
     rows: u64,
-}
-
-/// Run the monitor with its own production repository.
-///
-/// This compatibility entry point remains for standalone callers. The unified
-/// backend uses [`run_server_with_repository`] so its monitor and MCP
-/// listeners share one repository, connection pool, and cache set.
-pub async fn run_server(
-    cfg: AppConfig,
-    host: String,
-    port: u16,
-    static_dir: PathBuf,
-) -> Result<()> {
-    let repository = build_clickhouse_repository(cfg.clickhouse.clone(), repository_config(&cfg))?;
-    run_server_with_repository(cfg, repository, host, port, static_dir, pending()).await
 }
 
 /// Run the monitor HTTP server using a repository owned by the composition
@@ -108,29 +92,11 @@ where
     Ok(())
 }
 
-fn repository_config(cfg: &AppConfig) -> RepoConfig {
-    RepoConfig {
-        max_results: cfg.mcp.max_results,
-        preview_chars: cfg.mcp.preview_chars,
-        default_context_before: cfg.mcp.default_context_before,
-        default_context_after: cfg.mcp.default_context_after,
-        default_include_tool_events: cfg.mcp.default_include_tool_events,
-        default_exclude_codex_mcp: cfg.mcp.default_exclude_codex_mcp,
-        async_log_writes: cfg.mcp.async_log_writes,
-        bm25_k1: cfg.bm25.k1,
-        bm25_b: cfg.bm25.b,
-        bm25_default_min_score: cfg.bm25.default_min_score,
-        bm25_default_min_should_match: cfg.bm25.default_min_should_match,
-        bm25_max_query_terms: cfg.bm25.max_query_terms,
-        session_scope: None,
-    }
-}
-
 /// Build the complete monitor router around an injected repository.
 ///
-/// All API routes and static-file behavior live here so composition roots can
-/// host the monitor without constructing a second storage client.
-pub fn router_with_repository(
+/// All API routes and static-file behavior live here so the server can use the
+/// injected repository without constructing a second storage client.
+fn router_with_repository(
     cfg: &AppConfig,
     repository: Arc<dyn ConversationRepository>,
     static_dir: PathBuf,
@@ -1021,8 +987,8 @@ mod tests {
     use moraine_conversations::{
         AnalyticsConcurrencyPoint, AnalyticsSnapshot, AnalyticsTokenPoint, AnalyticsTurnPoint,
         AnalyticsWindow, ConversationMode, ConversationSummary, InMemoryConversationRepository,
-        InMemoryConversationResponses, IngestHeartbeat, SessionStep, TableColumn, TablePreview,
-        TableSummary, ToolResult, TurnSummary, WebSearchEvent,
+        InMemoryConversationResponses, IngestHeartbeat, RepoConfig, SessionStep, TableColumn,
+        TablePreview, TableSummary, ToolResult, TurnSummary, WebSearchEvent,
     };
     use std::collections::BTreeMap;
     use std::fs;

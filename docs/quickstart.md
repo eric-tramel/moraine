@@ -58,10 +58,24 @@ making those changes; for project-scoped or custom harness setup, see
 
 ## Start Moraine
 
-Start the local stack:
+Start ClickHouse and ingest:
 
 ```bash
 moraine up
+```
+
+For this release, bare `moraine up` intentionally leaves the unified backend
+off. To also serve the monitor UI and shared MCP socket, start it explicitly:
+
+```bash
+moraine up --backend
+```
+
+To include the backend in every subsequent `moraine up` instead, set:
+
+```toml
+[backend]
+start_on_up = true
 ```
 
 Check service health:
@@ -81,7 +95,7 @@ resets the consecutive-failure budget. After the retry budget is exhausted,
 start a fresh recovery budget. External ClickHouse
 endpoints are never adopted or restarted.
 
-Open the monitor UI:
+After starting the backend, open the monitor UI:
 
 ```text
 http://127.0.0.1:8080
@@ -92,15 +106,15 @@ status output should show fresh ingest activity.
 
 ## Add MCP Retrieval
 
-Moraine MCP search runs as a local stdio MCP server. Each agent harness starts
-`moraine run mcp` when it needs the tools, so keep the Moraine stack running
-with `moraine up`.
+Moraine MCP search uses a local stdio launcher. Each agent harness starts
+`moraine run mcp` when it needs the tools, so keep ClickHouse available with
+`moraine up`.
 
-By default `moraine up` also starts a single **shared** MCP server for the host,
-and each `moraine run mcp` proxies to it instead of booting a full server per
-session — this is what keeps many concurrent agents cheap. Registration is
-unchanged; if the shared server is not running, `moraine run mcp` falls back to
-an embedded server automatically. See
+Bare `moraine up` does not start the shared backend in this release. Run
+`moraine up --backend` or set `backend.start_on_up = true` to let each
+`moraine run mcp` proxy to one shared server instead of booting a full server
+per session. Registration is unchanged; when the shared backend is not running,
+`moraine run mcp` falls back to an embedded server automatically. See
 [Agent MCP Search → Install](agent-mcp-search/install.md#shared-central-server-default).
 
 Use `moraine setup` to connect your agent harnesses. In an interactive terminal,
@@ -146,8 +160,9 @@ For manual cleanup, project-scoped setup, and other custom setup, see
 
 | Command | Purpose |
 | --- | --- |
-| `moraine up` | Start ClickHouse, ingest, the monitor UI, and the shared MCP server. |
-| `moraine up --mcp` | Force-start the shared MCP server (also on by default). |
+| `moraine up` | Start ClickHouse and ingest; the backend also starts only when `backend.start_on_up = true`. |
+| `moraine up --backend` | Start ClickHouse, ingest, and the unified MCP/HTTP/static backend for the shared MCP socket and monitor UI. |
+| `moraine up --monitor` / `moraine up --mcp` | Deprecated aliases for `--backend`; both start the same unified backend. |
 | `moraine setup` | Create or repair config and guide MCP/plugin registration. |
 | `moraine status` | Print service and ingest health. |
 | `moraine logs` | Show recent service logs. |
@@ -165,13 +180,15 @@ Source builds are useful for development and local testing:
 git clone https://github.com/eric-tramel/moraine.git
 cd moraine
 cargo build --workspace --locked
-MORAINE_SOURCE_TREE_MODE=1 cargo run -p moraine -- up
+MORAINE_SOURCE_TREE_MODE=1 cargo run -p moraine -- up --backend
 ```
 
 `MORAINE_SOURCE_TREE_MODE=1` tells the control command to run service binaries
-from `target/debug`. For installed binaries, keep the service binaries together
-or set `MORAINE_SERVICE_BIN_DIR` to the directory containing `moraine-ingest`,
-`moraine-monitor`, and `moraine-mcp`.
+from `target/debug`. A source install requires the `moraine-ingest` and
+`moraine-mcp` service binaries; `moraine-monitor` is an optional deprecated
+compatibility alias and is not required. For installed binaries, keep
+`moraine-ingest` and `moraine-mcp` beside the `moraine` control binary, or set
+`MORAINE_SERVICE_BIN_DIR` to the directory containing those service binaries.
 
 ## Stop
 

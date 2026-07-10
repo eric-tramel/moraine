@@ -243,8 +243,6 @@ protocol_version = "2024-11-05"
 # socket is unavailable, Moraine falls back to an embedded stdio server.
 use_central_server = true
 
-# Launch the shared central MCP server when "moraine up" starts services.
-start_central_on_up = true
 
 # Unix socket path for the central MCP server. A bare filename resolves under
 # runtime.pids_dir; an absolute path is used as-is.
@@ -271,6 +269,11 @@ default_min_should_match = 1
 
 # Maximum query terms kept after tokenization.
 max_query_terms = 32
+
+[backend]
+# Start the unified MCP + monitor backend daemon with "moraine up". This is
+# intentionally off by default for the first compatibility release.
+start_on_up = false
 
 [monitor]
 # Interface the monitor HTTP server binds. Use 127.0.0.1 for local-only access.
@@ -310,9 +313,3 @@ clickhouse_auto_install = true
 # Managed ClickHouse release tag expected by this Moraine build.
 clickhouse_version = "v25.12.5.44-stable"
 
-# Launch the monitor service when "moraine up" starts services.
-start_monitor_on_up = true
-
-# Deprecated compatibility flag. Existing configs may keep it; new configs
-# should use mcp.start_central_on_up.
-start_mcp_on_up = false

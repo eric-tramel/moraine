@@ -1,6 +1,6 @@
 # Moraine Monitor
 
-Local UI to inspect the `moraine` ClickHouse database, now backed by a Rust server.
+The unified Rust backend serves the MCP socket, monitor HTTP API, and static UI together from one shared repository and cache set.
 
 Note: `moraine-monitor/backend` is a legacy reference-only tree. Authoritative monitor runtime code is in `apps/moraine-monitor` and `crates/moraine-monitor-core`.
 
@@ -8,8 +8,11 @@ Note: `moraine-monitor/backend` is a legacy reference-only tree. Authoritative m
 
 ```bash
 cd /Users/eric/src/moraine
-bin/moraine run monitor -- --host 127.0.0.1 --port 8080
+bin/moraine run backend -- --host 127.0.0.1 --port 8080
 ```
+
+The `moraine-monitor` executable is a deprecated compatibility alias for the
+same unified backend process. It does not start a separate monitor service.
 
 Open:
 

@@ -458,9 +458,8 @@ fn repository_config(cfg: &AppConfig, session_scope: Option<SessionOriginScope>)
 }
 
 /// Build the production conversation repository with the default reader
-/// identity. Embedded stdio serving uses this factory for its per-process
-/// repository and optional project scope.
-pub fn build_repository(
+/// identity for embedded stdio serving.
+fn build_repository(
     cfg: &AppConfig,
     session_scope: Option<SessionOriginScope>,
 ) -> Result<Arc<dyn ConversationRepository>> {
@@ -500,7 +499,7 @@ impl AppState {
     /// Build the shared MCP application state: one ClickHouse client (and its
     /// reqwest connection pool) and one conversation repository (and its
     /// caches). Embedded stdio serving owns this state directly; the unified
-    /// backend uses [`build_repository`] and [`run_socket_with_repository`] so
+    /// backend uses [`build_repository_with_user_agent`] and
     /// the monitor and MCP listeners share the same repository.
     ///
     /// `session_scope` restricts every retrieval tool to sessions originating
@@ -842,14 +841,11 @@ fn rename_socket_noreplace(from: &std::path::Path, to: &std::path::Path) -> std:
         target_os = "ios"
     ))
 ))]
-fn rename_socket_noreplace(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
-    if to.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "Unix socket path already exists",
-        ));
-    }
-    std::fs::rename(from, to)
+fn rename_socket_noreplace(_from: &std::path::Path, _to: &std::path::Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace Unix socket publication is unsupported on this platform",
+    ))
 }
 
 #[cfg(unix)]
@@ -1506,7 +1502,12 @@ mod tests {
         ))
     }
 
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     #[test]
     fn socket_publication_never_replaces_an_existing_path() {
         let from = unique_socket_path("publish-from");
@@ -1528,6 +1529,38 @@ mod tests {
 
         let _ = std::fs::remove_file(from);
         let _ = std::fs::remove_file(to);
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        ))
+    ))]
+    #[test]
+    fn socket_publication_fails_when_atomic_noreplace_is_unsupported() {
+        let from = unique_socket_path("unsupported-from");
+        let to = unique_socket_path("unsupported-to");
+        std::fs::write(&from, b"new").expect("write source");
+        let _ = std::fs::remove_file(&to);
+
+        let error = rename_socket_noreplace(&from, &to)
+            .expect_err("publication must fail without an atomic no-replace primitive");
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert_eq!(
+            error.to_string(),
+            "atomic no-replace Unix socket publication is unsupported on this platform"
+        );
+        assert_eq!(
+            std::fs::read(&from).expect("source retained"),
+            b"new".to_vec()
+        );
+        assert!(!to.exists(), "destination must not be published");
+
+        let _ = std::fs::remove_file(from);
     }
 
     #[cfg(unix)]

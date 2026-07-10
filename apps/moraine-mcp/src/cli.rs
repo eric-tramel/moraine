@@ -55,6 +55,22 @@ pub(crate) fn usage() {
     );
 }
 
+fn parse_serve_mode(value: &str) -> Result<ServeMode> {
+    match value {
+        "stdio" => Ok(ServeMode::Stdio),
+        "socket" => Ok(ServeMode::Socket),
+        // Reject unknown modes loudly rather than silently ignoring them, so a
+        // partial or mismatched upgrade fails visibly.
+        other => bail!("unknown --serve mode `{other}` (expected stdio or socket)"),
+    }
+}
+
+fn parse_port(value: &str) -> Result<u16> {
+    value
+        .parse::<u16>()
+        .map_err(|_| anyhow!("invalid --port `{value}` (expected 0-65535)"))
+}
+
 fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<CliArgs> {
     let mut config_path: Option<PathBuf> = None;
     let mut serve_mode = ServeMode::Stdio;
@@ -77,13 +93,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<CliArgs> {
                 let value = args
                     .next()
                     .ok_or_else(|| anyhow!("--serve requires a mode (stdio|socket)"))?;
-                serve_mode = match value.as_str() {
-                    "stdio" => ServeMode::Stdio,
-                    "socket" => ServeMode::Socket,
-                    // Reject unknown modes loudly rather than silently ignoring
-                    // them, so a partial/mismatched upgrade fails visibly.
-                    other => bail!("unknown --serve mode `{other}` (expected stdio or socket)"),
-                };
+                serve_mode = parse_serve_mode(&value)?;
             }
             "--socket" => {
                 let value = args
@@ -101,11 +111,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<CliArgs> {
                 let value = args
                     .next()
                     .ok_or_else(|| anyhow!("--port requires a value"))?;
-                port = Some(
-                    value
-                        .parse::<u16>()
-                        .map_err(|_| anyhow!("invalid --port `{value}` (expected 0-65535)"))?,
-                );
+                port = Some(parse_port(&value)?);
             }
             "--static-dir" => {
                 static_dir = Some(PathBuf::from(
@@ -120,7 +126,21 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<CliArgs> {
                 help = true;
                 break;
             }
-            _ => {}
+            _ => {
+                if let Some(value) = arg.strip_prefix("--config=") {
+                    config_path = Some(PathBuf::from(value));
+                } else if let Some(value) = arg.strip_prefix("--serve=") {
+                    serve_mode = parse_serve_mode(value)?;
+                } else if let Some(value) = arg.strip_prefix("--socket=") {
+                    socket_override = Some(PathBuf::from(value));
+                } else if let Some(value) = arg.strip_prefix("--host=") {
+                    host = Some(value.to_string());
+                } else if let Some(value) = arg.strip_prefix("--port=") {
+                    port = Some(parse_port(value)?);
+                } else if let Some(value) = arg.strip_prefix("--static-dir=") {
+                    static_dir = Some(PathBuf::from(value));
+                }
+            }
         }
     }
 
@@ -198,6 +218,73 @@ mod tests {
             parsed.socket_override,
             Some(PathBuf::from("/tmp/custom.sock"))
         );
+    }
+
+    #[test]
+    fn parse_args_accepts_all_launcher_equals_forms() {
+        let parsed = parse_args_from(
+            [
+                "--config=/tmp/mcp.toml",
+                "--serve=socket",
+                "--socket=/tmp/custom.sock",
+                "--host=0.0.0.0",
+                "--port=9090",
+                "--static-dir=/tmp/monitor-dist",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .expect("launcher equals forms should parse");
+
+        assert_eq!(parsed.config_path, PathBuf::from("/tmp/mcp.toml"));
+        assert_eq!(parsed.serve_mode, ServeMode::Socket);
+        assert_eq!(
+            parsed.socket_override,
+            Some(PathBuf::from("/tmp/custom.sock"))
+        );
+        assert_eq!(parsed.host.as_deref(), Some("0.0.0.0"));
+        assert_eq!(parsed.port, Some(9090));
+        assert_eq!(parsed.static_dir, Some(PathBuf::from("/tmp/monitor-dist")));
+    }
+
+    #[test]
+    fn parse_args_applies_split_and_equals_forms_in_argument_order() {
+        let parsed = parse_args_from(
+            [
+                "--serve=socket",
+                "--host=equals-first",
+                "--host",
+                "split-last",
+                "--port",
+                "8080",
+                "--port=9090",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .expect("mixed launcher forms should parse");
+
+        assert_eq!(parsed.host.as_deref(), Some("split-last"));
+        assert_eq!(parsed.port, Some(9090));
+    }
+
+    #[test]
+    fn parse_args_rejects_malformed_equals_values() {
+        let cases: &[(&[&str], &str)] = &[
+            (&["--serve=http"], "unknown --serve mode `http`"),
+            (&["--serve="], "unknown --serve mode ``"),
+            (&["--port=70000"], "invalid --port `70000`"),
+            (&["--port="], "invalid --port ``"),
+        ];
+
+        for (args, expected) in cases {
+            let err = parse_args_from(args.iter().map(|arg| (*arg).to_string()))
+                .expect_err("malformed equals value should fail");
+            assert!(
+                err.to_string().contains(expected),
+                "unexpected error for {args:?}: {err}"
+            );
+        }
     }
 
     #[test]

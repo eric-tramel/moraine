@@ -6,9 +6,13 @@ Moraine MCP search is a stdio MCP server. Configure your harness to launch:
 moraine run mcp
 ```
 
-Run `moraine up` first so ClickHouse, ingest, and the monitor are available.
-If you use a non-default Moraine config, pass it through the harness's
-environment support as `MORAINE_MCP_CONFIG=/path/to/moraine.toml`.
+Run `moraine up` first so ClickHouse and ingest are available. For this release,
+bare `moraine up` intentionally leaves the unified backend off; use
+`moraine up --backend` or set `backend.start_on_up = true` for the monitor UI
+and shared MCP socket. Without that backend, `moraine run mcp` automatically
+falls back to an embedded server. If you use a non-default Moraine config, pass
+it through the harness's environment support as
+`MORAINE_MCP_CONFIG=/path/to/moraine.toml`.
 
 ## Guided setup (recommended)
 
@@ -32,8 +36,8 @@ servers, `--project-only`, or custom environment wiring.
 For Claude Code, the recommended user-scoped setup is the Moraine plugin. The
 plugin registers the MCP server and bundles Moraine search, realtime, and
 bug-report skills, but it does not install Moraine itself and it does not start
-ClickHouse, ingest, or the monitor. Install the CLI first, or upgrade it if
-Moraine is already installed. Then start the stack:
+ClickHouse, ingest, or the unified backend. Install the CLI first, or upgrade it
+if Moraine is already installed. Then start the core stack:
 
 ```bash
 uv tool install moraine-cli
@@ -81,8 +85,8 @@ Manual Claude MCP registration remains useful for project-scoped setup,
 For Codex, the recommended user-scoped setup is the Moraine plugin. The plugin
 registers the MCP server and bundles Moraine search, realtime, and bug-report
 skills, but it does not install Moraine itself and it does not start ClickHouse,
-ingest, or the monitor.
-Install or upgrade the CLI first, then start the stack:
+ingest, or the unified backend.
+Install or upgrade the CLI first, then start the core stack:
 
 ```bash
 uv tool install moraine-cli
@@ -131,28 +135,34 @@ codex mcp remove moraine
 Manual Codex MCP registration remains useful for project-scoped setup,
 `--project-only`, and custom environment wiring such as `MORAINE_MCP_CONFIG`.
 
-## Shared central server (default)
+<a id="shared-central-server-default"></a>
+## Shared central server (opt-in daemon for this release)
 
-By default `moraine up` starts a single shared MCP server for the whole host,
-and every `moraine run mcp` becomes a thin stdio↔socket proxy to it. This
-replaces the previous model of booting a full MCP server (its own ClickHouse
-client, caches, and runtime threads) inside every agent session, and is what
-keeps hundreds of concurrent sessions cheap.
+`moraine run mcp` tries the shared socket by default, but bare `moraine up`
+intentionally leaves the unified backend off in this release. Start it with
+`moraine up --backend`, or set `backend.start_on_up = true` to include it in
+every `moraine up`. When the backend is running, every `moraine run mcp` becomes
+a thin stdio↔socket proxy to its shared repository, ClickHouse client, caches,
+and runtime threads. The same process also serves the monitor HTTP API and
+static UI.
 
 What this means for you:
 
 - **Registration is unchanged.** Keep registering `moraine run mcp` exactly as
   shown below. The proxy-vs-embedded choice is made internally.
-- **`moraine up` is required** for the shared server. The daemon listens on a
-  Unix socket at `~/.moraine/run/mcp.sock` (mode `0o600`, so it is scoped to
-  your user). `moraine down` stops it and removes the socket.
-- **Automatic fallback.** If the central server is not running (you skipped
-  `moraine up`, or it crashed), `moraine run mcp` transparently falls back to an
-  embedded server after ~250&nbsp;ms, so retrieval keeps working either way.
-- **Crash blast radius.** A central-server crash drops all live sessions' MCP
+- **The backend is required for the shared server.** Start it explicitly with
+  `moraine up --backend`, or set `backend.start_on_up = true` before running
+  bare `moraine up`. It listens on a Unix socket at
+  `~/.moraine/run/mcp.sock` (mode `0o600`, so it is scoped to your user).
+  `moraine down` stops it and removes the socket.
+- **Automatic fallback.** If the backend was not started or it crashed,
+  `moraine run mcp` transparently falls back to an embedded server after
+  ~250&nbsp;ms, so retrieval keeps working either way.
+- **Crash blast radius.** A backend crash drops all live sessions' MCP
   connections at once; harnesses re-establish the connection on their next tool
-  use, and `moraine up` restarts the daemon. To opt out and return to a server
-  per session, set `use_central_server = false` (see
+  use. Restart it with `moraine up --backend` (or bare `moraine up` when
+  `backend.start_on_up = true`). To opt out and return to a server per session,
+  set `use_central_server = false` (see
   [Configuration → MCP](../configuration.md#shared-central-mcp-server)).
 
 ## Project-scoped retrieval (`--project-only`)

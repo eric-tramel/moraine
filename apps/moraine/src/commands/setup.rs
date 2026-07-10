@@ -3363,6 +3363,41 @@ host = "127.0.0.1"
     }
 
     #[test]
+    fn write_toml_atomic_validation_failure_preserves_original_and_cleans_temp_file() {
+        let path = temp_path("backend-atomic-validation-failure");
+        let original = "[backend]\nstart_on_up = false\n";
+        fs::write(&path, original).expect("write original config");
+
+        let result = write_toml_atomic(&path, "[backend]\nstart_on_up = [\n");
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(&path).expect("original config"),
+            original
+        );
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("config file name");
+        let temp_prefix = format!(".{file_name}.setup-");
+        let leftovers = fs::read_dir(path.parent().expect("config parent"))
+            .expect("read config parent")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&temp_prefix)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "temporary config files must be removed after validation failure"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn dry_run_invalid_config_repair_does_not_write() {
         let path = temp_path("invalid-repair-dry-run");
         let original = "not = [valid";

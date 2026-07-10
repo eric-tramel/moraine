@@ -164,6 +164,26 @@ def assert_tools_surface(tool_names_ordered: list[str]) -> None:
             f"{tool_names_ordered}"
         )
 
+def write_tools_snapshot(path: str, tools_result: Dict[str, Any]) -> None:
+    canonical = json.dumps(
+        tools_result,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    with open(path, "w", encoding="utf-8", newline="\n") as snapshot:
+        snapshot.write(canonical)
+        snapshot.write("\n")
+
+
+def assert_embedded_fallback(stderr: str) -> None:
+    if "central MCP server" not in stderr or "using embedded server" not in stderr:
+        raise AssertionError(
+            "MCP stderr missing the central-server embedded fallback warning; "
+            f"stderr={stderr.strip()!r}"
+        )
+
+
 
 def select_search_sessions_result(
     results: list[Any],
@@ -420,6 +440,8 @@ def run_smoke(
     expect_no_results: bool = False,
     expect_event_count: Optional[int] = None,
     expect_updated_at: Optional[str] = None,
+    require_embedded_fallback: bool = False,
+    tools_snapshot: Optional[str] = None,
 ) -> None:
     absent_session_ids = absent_session_ids or []
     argv = [moraine, "run", "mcp", "--config", config]
@@ -486,6 +508,8 @@ def run_smoke(
         ):
             raise AssertionError(f"tools/list returned duplicate or invalid tool names: {tools}")
         assert_tools_surface(tool_names_ordered)
+        if tools_snapshot is not None:
+            write_tools_snapshot(tools_snapshot, tools_result)
 
         next_id = 3
         search_result = call_tool(
@@ -619,6 +643,11 @@ def run_smoke(
                 None,
             )
 
+        if require_embedded_fallback:
+            assert_embedded_fallback(
+                collect_stderr(proc, wait_seconds=0.5, max_bytes=65_536)
+            )
+
     finally:
         if proc.stdin:
             proc.stdin.close()
@@ -672,6 +701,21 @@ def main() -> int:
         "--expect-updated-at",
         help="expected RFC3339 updated_at for the selected list_sessions fixture",
     )
+    parser.add_argument(
+        "--require-embedded-fallback",
+        action="store_true",
+        help=(
+            "require stderr to report that the unreachable central MCP server "
+            "fell back to an embedded server"
+        ),
+    )
+    parser.add_argument(
+        "--write-tools-snapshot",
+        help=(
+            "write the tools/list result as canonical deterministic JSON "
+            "(sorted object keys, compact separators, one trailing newline)"
+        ),
+    )
     args = parser.parse_args()
 
     run_smoke(
@@ -686,6 +730,8 @@ def main() -> int:
         expect_no_results=args.expect_no_results,
         expect_event_count=args.expect_event_count,
         expect_updated_at=args.expect_updated_at,
+        require_embedded_fallback=args.require_embedded_fallback,
+        tools_snapshot=args.write_tools_snapshot,
     )
     print("mcp smoke passed")
     return 0

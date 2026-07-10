@@ -525,12 +525,9 @@ pub(crate) fn start_background_service(
 
         let endpoints = backend_endpoint_status(cfg);
         if endpoints.socket_listening && endpoints.http_listening {
-            return Ok(StartOutcome {
-                service,
-                state: StartState::AlreadyServing,
-                pid: None,
-                log_path: Some(log_path(paths, service).display().to_string()),
-            });
+            bail!(
+                "cannot start backend because both configured endpoints are already serving without a live managed backend PID; stop the conflicting process(es) and re-run `moraine up`"
+            );
         }
         if endpoints.socket_listening || endpoints.http_listening {
             bail!(
@@ -891,6 +888,59 @@ mod tests {
         )
         .expect_err("partial endpoint pair must not be accepted as a complete backend");
         assert!(err.to_string().contains("only part of its endpoint pair"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unmanaged_backend_endpoint_pair_is_rejected_as_a_conflict() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = PathBuf::from(format!("/tmp/moraine-bep-{}-{stamp}", std::process::id()));
+        let socket = root.join("b.sock");
+        fs::create_dir_all(&root).expect("create short socket directory");
+        let _socket_listener =
+            std::os::unix::net::UnixListener::bind(&socket).expect("bind backend socket");
+        let http_listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind monitor HTTP listener");
+        let http_port = http_listener
+            .local_addr()
+            .expect("HTTP listener address")
+            .port();
+        let http_probe = std::thread::spawn(move || {
+            let (mut stream, _) = http_listener.accept().expect("accept HTTP liveness probe");
+            std::io::Write::write_all(
+                &mut stream,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .expect("respond to HTTP liveness probe");
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.mcp.central_socket_path = socket.display().to_string();
+        cfg.monitor.host = "127.0.0.1".to_string();
+        cfg.monitor.port = http_port;
+        cfg.runtime.pids_dir = root.join("run").display().to_string();
+        cfg.runtime.logs_dir = root.join("logs").display().to_string();
+        cfg.runtime.service_bin_dir = root.join("bin").display().to_string();
+        let paths = crate::paths::runtime_paths(&cfg);
+
+        let err = start_background_service(
+            Service::Backend,
+            &root.join("config.toml"),
+            &cfg,
+            &paths,
+            &[],
+        )
+        .expect_err("unmanaged endpoint pair must not satisfy the backend topology");
+        http_probe.join().expect("HTTP probe responder");
+
+        let message = err.to_string();
+        assert!(message.contains("without a live managed backend PID"));
+        assert!(message.contains("re-run `moraine up`"));
 
         let _ = fs::remove_dir_all(root);
     }
