@@ -418,6 +418,8 @@ def run_smoke(
     project_dir: Optional[str] = None,
     absent_session_ids: Optional[list[str]] = None,
     expect_no_results: bool = False,
+    expect_event_count: Optional[int] = None,
+    expect_updated_at: Optional[str] = None,
 ) -> None:
     absent_session_ids = absent_session_ids or []
     argv = [moraine, "run", "mcp", "--config", config]
@@ -553,6 +555,29 @@ def run_smoke(
                     "list_sessions returned no sessions for the in-scope fixture window"
                 )
             selected_session = select_list_sessions_result(sessions, expect_session_id)
+            session_metadata = selected_session.get("session")
+            if not isinstance(session_metadata, dict):
+                raise AssertionError(
+                    f"list_sessions result missing session metadata: {selected_session}"
+                )
+            if (
+                expect_event_count is not None
+                and session_metadata.get("event_count") != expect_event_count
+            ):
+                raise AssertionError(
+                    "list_sessions event_count parity failed: "
+                    f"got {session_metadata.get('event_count')}, "
+                    f"wanted {expect_event_count}"
+                )
+            if (
+                expect_updated_at is not None
+                and session_metadata.get("updated_at") != expect_updated_at
+            ):
+                raise AssertionError(
+                    "list_sessions updated_at parity failed: "
+                    f"got {session_metadata.get('updated_at')!r}, "
+                    f"wanted {expect_updated_at!r}"
+                )
             next_id = assert_open_search_ids(
                 proc,
                 next_id,
@@ -638,6 +663,15 @@ def main() -> int:
         action="store_true",
         help="assert search_sessions returns zero results for the query",
     )
+    parser.add_argument(
+        "--expect-event-count",
+        type=int,
+        help="expected canonical event_count for the selected list_sessions fixture",
+    )
+    parser.add_argument(
+        "--expect-updated-at",
+        help="expected RFC3339 updated_at for the selected list_sessions fixture",
+    )
     args = parser.parse_args()
 
     run_smoke(
@@ -650,6 +684,8 @@ def main() -> int:
         project_dir=args.project_dir,
         absent_session_ids=args.expect_absent_session_id,
         expect_no_results=args.expect_no_results,
+        expect_event_count=args.expect_event_count,
+        expect_updated_at=args.expect_updated_at,
     )
     print("mcp smoke passed")
     return 0
