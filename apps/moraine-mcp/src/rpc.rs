@@ -1,11 +1,13 @@
 use crate::cli::ServeMode;
 use anyhow::{anyhow, bail, Context, Result};
 use moraine_config::AppConfig;
-use moraine_mcp_core::SessionOriginScope;
-use std::{net::IpAddr, path::PathBuf};
+use moraine_conversations::{BackendRepositoryRouter, RepoConfig};
+use moraine_mcp_core::{PrivateRouteNegotiation, SessionOriginScope};
+use std::{net::IpAddr, path::PathBuf, sync::Arc};
 use tokio::runtime::Builder;
 use tokio::sync::watch;
 use tokio::task::{JoinError, JoinSet};
+use tracing::{debug, warn};
 
 #[derive(Debug, Default)]
 pub struct BackendOptions {
@@ -81,22 +83,115 @@ pub fn run(
             runtime.block_on(run_backend(cfg, socket_path, host, port, static_dir))
         }
         // Only the unscoped, central-enabled path can become a thin proxy, so
-        // it is the only one that gets the lightweight current-thread runtime.
         ServeMode::Stdio if session_scope.is_none() && cfg.mcp.use_central_server => {
             let runtime = Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .context("failed to build current-thread runtime")?;
-            runtime.block_on(moraine_mcp_core::run_mcp_entry(cfg, None))
+            runtime.block_on(run_stdio_entry(cfg, None))
         }
         ServeMode::Stdio => {
             let runtime = Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .context("failed to build multi-threaded runtime")?;
-            runtime.block_on(moraine_mcp_core::run_mcp_entry(cfg, session_scope))
+            runtime.block_on(run_stdio_entry(cfg, session_scope))
         }
     }
+}
+
+fn repository_config(cfg: &AppConfig, session_scope: Option<SessionOriginScope>) -> RepoConfig {
+    RepoConfig {
+        max_results: cfg.mcp.max_results,
+        preview_chars: cfg.mcp.preview_chars,
+        default_context_before: cfg.mcp.default_context_before,
+        default_context_after: cfg.mcp.default_context_after,
+        default_include_tool_events: cfg.mcp.default_include_tool_events,
+        default_exclude_codex_mcp: cfg.mcp.default_exclude_codex_mcp,
+        async_log_writes: cfg.mcp.async_log_writes,
+        bm25_k1: cfg.bm25.k1,
+        bm25_b: cfg.bm25.b,
+        bm25_default_min_score: cfg.bm25.default_min_score,
+        bm25_default_min_should_match: cfg.bm25.default_min_should_match,
+        bm25_max_query_terms: cfg.bm25.max_query_terms,
+        session_scope,
+    }
+}
+
+fn backend_router(
+    cfg: Arc<AppConfig>,
+    session_scope: Option<SessionOriginScope>,
+    role: &str,
+) -> Result<Arc<BackendRepositoryRouter>> {
+    let user_agent = format!(
+        "{role}/{} (pid={})",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id()
+    );
+    Ok(Arc::new(BackendRepositoryRouter::new(
+        cfg.clone(),
+        repository_config(&cfg, session_scope),
+        user_agent,
+    )?))
+}
+
+async fn run_stdio_entry(cfg: AppConfig, session_scope: Option<SessionOriginScope>) -> Result<()> {
+    let cwd = std::env::current_dir()
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    #[cfg(unix)]
+    if session_scope.is_none() && cfg.mcp.use_central_server {
+        use tokio::net::UnixStream;
+
+        let socket_path = PathBuf::from(&cfg.mcp.central_socket_path);
+        let connect_deadline = std::time::Duration::from_millis(cfg.mcp.central_connect_timeout_ms);
+        match tokio::time::timeout(connect_deadline, UnixStream::connect(&socket_path)).await {
+            Ok(Ok(stream)) => {
+                let route_deadline = moraine_mcp_core::private_route_deadline(&cfg)?;
+                match moraine_mcp_core::negotiate_private_route(stream, &cwd, route_deadline).await {
+                    PrivateRouteNegotiation::Accepted(connection) => {
+                        debug!(
+                            "proxying stdio to central MCP server at {}",
+                            socket_path.display()
+                        );
+                        return moraine_mcp_core::run_proxy(connection).await;
+                    }
+                    PrivateRouteNegotiation::Rejected { message } => {
+                        return Err(anyhow!(message))
+                            .context("central backend rejected the project route");
+                    }
+                    PrivateRouteNegotiation::Incompatible { reason } => warn!(
+                        "central MCP server at {} cannot negotiate project routing ({}); using embedded server",
+                        socket_path.display(),
+                        reason
+                    ),
+                }
+            }
+            Ok(Err(error)) => warn!(
+                "central MCP server unreachable at {} ({}); using embedded server",
+                socket_path.display(),
+                error
+            ),
+            Err(_) => warn!(
+                "central MCP server connect timed out at {} after {}ms; using embedded server",
+                socket_path.display(),
+                cfg.mcp.central_connect_timeout_ms
+            ),
+        }
+    }
+
+    let cfg = Arc::new(cfg);
+    let router = backend_router(cfg.clone(), session_scope, "moraine-mcp")?;
+    let backend = router
+        .repository_for_project_dir(Some(&cwd))
+        .await
+        .context("failed to construct embedded conversation repository")?;
+    moraine_mcp_core::run_stdio_with_repository(
+        Arc::unwrap_or_clone(cfg),
+        backend.repository().clone(),
+    )
+    .await
 }
 
 async fn run_backend(
@@ -108,26 +203,27 @@ async fn run_backend(
 ) -> Result<()> {
     validate_backend_bind_policy(&host, cfg.backend.auth_token.as_deref())?;
     let host = normalize_listener_bind(host);
-    // This is the daemon mode's sole repository factory call. Both services
-    // receive clones of this exact Arc, sharing its HTTP pool and caches.
-    let user_agent = format!(
-        "moraine-backend/{} (pid={})",
-        env!("CARGO_PKG_VERSION"),
-        std::process::id()
-    );
-    let repository = moraine_mcp_core::build_repository_with_user_agent(&cfg, None, user_agent)
-        .context("failed to build backend conversation repository")?;
-    let socket_repository = repository.clone();
+    // This is the daemon mode's sole routing/factory owner. Both services
+    // receive clones of this exact router Arc; each selected backend therefore
+    // shares one checked client, repository, and cache set across MCP and HTTP.
+    let cfg = Arc::new(cfg);
+    let router = backend_router(cfg.clone(), None, "moraine-backend")
+        .context("failed to build backend repository router")?;
+    router
+        .default_repository()
+        .await
+        .context("failed to build default backend conversation repository")?;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut services = JoinSet::new();
 
     let socket_cfg = cfg.clone();
+    let socket_router = router.clone();
     let socket_shutdown = shutdown_rx.clone();
     services.spawn(async move {
-        let result = moraine_mcp_core::run_socket_with_repository(
+        let result = moraine_mcp_core::run_socket_with_router(
             socket_cfg,
-            socket_repository,
+            socket_router,
             socket_path,
             wait_for_shutdown(socket_shutdown),
         )
@@ -136,9 +232,8 @@ async fn run_backend(
     });
 
     services.spawn(async move {
-        let result = moraine_monitor_core::run_server_with_repository(
-            cfg,
-            repository,
+        let result = moraine_monitor_core::run_server_with_router(
+            router,
             host,
             port,
             static_dir,

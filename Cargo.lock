@@ -1243,9 +1243,11 @@ version = "0.6.4"
 dependencies = [
  "anyhow",
  "moraine-config",
+ "moraine-conversations",
  "moraine-mcp-core",
  "moraine-monitor-core",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 

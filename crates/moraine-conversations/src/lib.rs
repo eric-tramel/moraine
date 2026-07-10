@@ -1,5 +1,4 @@
-use anyhow::Context as _;
-
+mod backend_router;
 mod clickhouse_repo;
 mod cursor;
 mod domain;
@@ -7,6 +6,9 @@ mod error;
 mod in_memory_repo;
 mod repo;
 
+pub use backend_router::{
+    build_checked_clickhouse_repository_with_user_agent, BackendRepository, BackendRepositoryRouter,
+};
 pub use clickhouse_repo::ClickHouseConversationRepository;
 pub use domain::{
     is_user_facing_content_event, Conversation, ConversationDetailOptions, ConversationListFilter,
@@ -61,20 +63,6 @@ pub fn build_clickhouse_repository_with_user_agent(
     Ok(std::sync::Arc::new(ClickHouseConversationRepository::new(
         client, config,
     )))
-}
-/// Validate that a non-default ClickHouse backend's migration ledger is
-/// compatible with this Moraine build. Storage construction and schema reads
-/// stay behind the conversations boundary.
-pub async fn validate_remote_clickhouse_schema(
-    backend_name: &str,
-    clickhouse: moraine_config::ClickHouseConfig,
-) -> anyhow::Result<()> {
-    let allow_newer_server = clickhouse.allow_newer_server;
-    let client = moraine_clickhouse::ClickHouseClient::new(clickhouse)?;
-    let skew = client.schema_skew().await.with_context(|| {
-        format!("backend '{backend_name}': schema handshake failed (is the server reachable?)")
-    })?;
-    moraine_clickhouse::enforce_remote_schema_policy(backend_name, &skew, allow_newer_server)
 }
 
 #[cfg(test)]

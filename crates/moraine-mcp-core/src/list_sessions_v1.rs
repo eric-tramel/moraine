@@ -325,7 +325,7 @@ mod tests {
     use moraine_conversations::{
         ConversationMode, InMemoryConversationRepository, InMemoryConversationResponses, RepoConfig,
     };
-    use std::sync::{atomic::AtomicBool, Arc};
+    use std::sync::Arc;
 
     #[test]
     fn parses_and_canonicalizes_list_sessions_args() {
@@ -428,11 +428,7 @@ mod tests {
                 ..InMemoryConversationResponses::default()
             },
         ));
-        let state = AppState {
-            cfg: AppConfig::default(),
-            repo: repository.clone(),
-            prewarm_started: Arc::new(AtomicBool::new(false)),
-        };
+        let state = AppState::embedded(AppConfig::default(), repository.clone());
 
         let result = state
             .list_sessions_v1(json!({
