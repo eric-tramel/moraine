@@ -39,7 +39,7 @@ Moraine ships session trace ingestion adapters for these agent harnesses:
 | [Kimi CLI](https://moonshotai.github.io/kimi-cli/en/) | `kimi-cli` | `wire.jsonl` session traces under `~/.kimi/sessions` |
 | [Cursor](https://cursor.com/docs) | `cursor` | Agent transcript JSONL under `~/.cursor/projects` (default on); Cursor IDE chat history from `state.vscdb` SQLite databases (default on; `cursor_sqlite` format) |
 | [Hermes](https://hermes-agent.nousresearch.com/docs/) | `hermes` | Live session JSON and trajectory JSONL traces |
-| [Pi Coding Agent](https://pi.dev/docs/latest) | `pi-coding-agent` | JSONL session trees under `~/.pi/agent/sessions` |
+| [Pi Coding Agent](https://pi.dev/docs/latest) / OMP | `pi-coding-agent` | JSONL session trees under `~/.pi/agent/sessions` and `~/.omp/agent/sessions` |
 
 ## Where To Start
 

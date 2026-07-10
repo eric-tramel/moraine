@@ -215,13 +215,22 @@ const CURSOR_INGEST: [DefaultIngestSource; 2] = [
     },
 ];
 
-const PI_INGEST: [DefaultIngestSource; 1] = [DefaultIngestSource {
-    name: "pi",
-    harness: "pi-coding-agent",
-    glob: "~/.pi/agent/sessions/**/*.jsonl",
-    watch_root: "~/.pi/agent/sessions",
-    format: Some("jsonl"),
-}];
+const PI_INGEST: [DefaultIngestSource; 2] = [
+    DefaultIngestSource {
+        name: "pi",
+        harness: "pi-coding-agent",
+        glob: "~/.pi/agent/sessions/**/*.jsonl",
+        watch_root: "~/.pi/agent/sessions",
+        format: Some("jsonl"),
+    },
+    DefaultIngestSource {
+        name: "omp",
+        harness: "pi-coding-agent",
+        glob: "~/.omp/agent/sessions/**/*.jsonl",
+        watch_root: "~/.omp/agent/sessions",
+        format: Some("jsonl"),
+    },
+];
 
 const SPECS: [HarnessSpec; 7] = [
     HarnessSpec {

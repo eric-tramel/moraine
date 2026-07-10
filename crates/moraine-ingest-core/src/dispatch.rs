@@ -376,23 +376,35 @@ fn infer_initial_record_ts_hint(source_file: &str, offset: u64) -> Option<String
         })
 }
 
-/// Best-effort session-level cwd recovered from the head of a file that is
-/// being resumed mid-stream. Harnesses like codex and pi only carry the
-/// working directory on the session header (line 1); after a restart the
-/// resumed tail would otherwise stamp empty `cwd` values and leave backend
-/// route resolution blind to the session's directory. Bounded so the peek
-/// stays cheap on every resumed-file processing pass.
-fn infer_initial_cwd_hint(source_file: &str, harness: &str) -> Option<String> {
+#[derive(Default)]
+struct InitialSourceHints {
+    session_id: String,
+    cwd: String,
+}
+
+/// Best-effort session-level identity recovered from the bounded file head.
+/// Resumed files restart after their session header, while OMP subagent files
+/// use descriptive filenames and begin with a title record before the session
+/// header. Priming both hints prevents resumed rows from losing cwd and leading
+/// OMP rows from creating an empty-ID pseudo-session.
+fn infer_initial_source_hints(source_file: &str, harness: &str) -> InitialSourceHints {
     const MAX_HEAD_LINES: usize = 25;
     const MAX_HEAD_BYTES: u64 = 512 * 1024;
 
-    let source = crate::sources::registry().get(harness)?;
-    let file = std::fs::File::open(source_file).ok()?;
+    let Some(source) = crate::sources::registry().get(harness) else {
+        return InitialSourceHints::default();
+    };
+    let Ok(file) = std::fs::File::open(source_file) else {
+        return InitialSourceHints::default();
+    };
     let mut reader = BufReader::new(file.take(MAX_HEAD_BYTES));
+    let mut hints = InitialSourceHints::default();
 
     for _ in 0..MAX_HEAD_LINES {
         let mut buf = Vec::<u8>::new();
-        let bytes_read = reader.read_until(b'\n', &mut buf).ok()?;
+        let Ok(bytes_read) = reader.read_until(b'\n', &mut buf) else {
+            break;
+        };
         if bytes_read == 0 {
             break;
         }
@@ -401,14 +413,33 @@ fn infer_initial_cwd_hint(source_file: &str, harness: &str) -> Option<String> {
         let Ok(record) = serde_json::from_str::<Value>(text.trim()) else {
             continue;
         };
-        let cwd = source.cwd(&record);
-        let trimmed = cwd.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
+        if hints.session_id.is_empty() {
+            let top_type = source.top_type(&record);
+            let session_id = source.session_id(
+                &record,
+                &crate::sources::SourceRecordContext {
+                    source_file,
+                    session_hint: "",
+                    top_type: &top_type,
+                    base_uid: "",
+                },
+            );
+            if !session_id.trim().is_empty() {
+                hints.session_id = session_id;
+            }
+        }
+        if hints.cwd.is_empty() {
+            let cwd = source.cwd(&record);
+            if !cwd.trim().is_empty() {
+                hints.cwd = cwd;
+            }
+        }
+        if !hints.session_id.is_empty() && !hints.cwd.is_empty() {
+            break;
         }
     }
 
-    None
+    hints
 }
 
 /// Post-process event rows from a single Claude Code record:
@@ -709,15 +740,14 @@ pub(crate) async fn process_file(
     let mut reader = BufReader::new(file);
     let mut offset = checkpoint.last_offset;
     let mut line_no = checkpoint.last_line_no;
-    let mut session_hint = String::new();
-    let mut model_hint = String::new();
-    // Resuming mid-file restarts the hint chain after the session header,
-    // so recover the session-level cwd from the file head when needed.
-    let mut cwd_hint = if checkpoint.last_offset > 0 {
-        infer_initial_cwd_hint(source_file, &work.harness).unwrap_or_default()
+    let initial_hints = if checkpoint.last_offset > 0 || work.harness == "pi-coding-agent" {
+        infer_initial_source_hints(source_file, &work.harness)
     } else {
-        String::new()
+        InitialSourceHints::default()
     };
+    let mut session_hint = initial_hints.session_id;
+    let mut model_hint = String::new();
+    let mut cwd_hint = initial_hints.cwd;
     let mut record_ts_hint =
         infer_initial_record_ts_hint(source_file, checkpoint.last_offset).unwrap_or_default();
     let mut session_cursors: HashMap<String, SessionCursor> = HashMap::new();
@@ -1916,6 +1946,85 @@ mod tests {
             Some("/repo"),
             "resumed records inherit the session cwd from the file head"
         );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_file_primes_omp_subagent_session_id_before_leading_title() {
+        let path = unique_test_file("omp-named-subagent");
+        let session_id = "019f4be3-7d9d-7005-85e0-d9527b0aad24";
+        fs::write(
+            &path,
+            [
+                json!({
+                    "type": "title",
+                    "v": 1,
+                    "title": "ReviewCorrectness",
+                    "updatedAt": "2026-07-10T11:57:07.869Z"
+                })
+                .to_string(),
+                json!({
+                    "type": "session",
+                    "version": 3,
+                    "id": session_id,
+                    "timestamp": "2026-07-10T11:57:07.869Z",
+                    "cwd": "/work/omp-project"
+                })
+                .to_string(),
+                json!({
+                    "type": "mode_change",
+                    "id": "mode-1",
+                    "parentId": null,
+                    "timestamp": "2026-07-10T11:57:07.870Z",
+                    "mode": "goal"
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("write OMP subagent fixture");
+
+        let source_file = path.to_string_lossy().to_string();
+        let work = WorkItem {
+            source_name: "omp".to_string(),
+            harness: "pi-coding-agent".to_string(),
+            format: "jsonl".to_string(),
+            path: source_file,
+        };
+        let config = moraine_config::AppConfig::default();
+        let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(16);
+
+        process_file(
+            &config,
+            &work,
+            checkpoints,
+            &VolatilePollMap::new(),
+            sink_tx,
+            &metrics,
+        )
+        .await
+        .expect("OMP subagent file should process");
+
+        let batches = drain_batches(&mut sink_rx).await;
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.raw_rows.len(), 3);
+        assert_eq!(batch.event_rows.len(), 3);
+        assert!(batch
+            .raw_rows
+            .iter()
+            .all(|row| { row.get("session_id").and_then(Value::as_str) == Some(session_id) }));
+        assert!(batch
+            .event_rows
+            .iter()
+            .all(|row| { row.get("session_id").and_then(Value::as_str) == Some(session_id) }));
+        assert!(batch
+            .raw_rows
+            .iter()
+            .all(|row| { row.get("cwd").and_then(Value::as_str) == Some("/work/omp-project") }));
 
         let _ = fs::remove_file(&path);
     }

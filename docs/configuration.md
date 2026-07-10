@@ -353,7 +353,8 @@ The default template in `config/moraine.toml` includes these source families:
 | OpenCode | `opencode` | `~/.local/share/opencode/opencode*.db` | `~/.local/share/opencode` | `opencode_sqlite` (default on) |
 | Cursor Agent | `cursor` | `~/.cursor/projects/*/agent-transcripts/**/*.jsonl` | `~/.cursor/projects` | inferred `jsonl` |
 | Cursor SQLite history | `cursor` | `~/Library/Application Support/Cursor/User/**/state.vscdb` (macOS) | `~/Library/Application Support/Cursor/User` | `cursor_sqlite` (default on) |
-| Pi Coding Agent | `pi-coding-agent` | `~/.pi/agent/sessions/**/*.jsonl` | `~/.pi/agent/sessions` | `jsonl` |
+| Pi Coding Agent (historical) | `pi-coding-agent` | `~/.pi/agent/sessions/**/*.jsonl` | `~/.pi/agent/sessions` | `jsonl` |
+| OMP (oh-my-pi) | `pi-coding-agent` | `~/.omp/agent/sessions/**/*.jsonl` | `~/.omp/agent/sessions` | `jsonl` |
 | Hermes live sessions | `hermes` | `~/.hermes/sessions/session_*.json` | `~/.hermes/sessions` | `session_json` |
 | Hermes trajectories | `hermes` | user-provided trajectory JSONL | trajectory output directory | `jsonl` |
 
@@ -473,7 +474,7 @@ drift is Moraine's job. When the schema drifts, Moraine reports rate-limited
 until the normalizer is updated to follow the new format. Set `enabled = false`
 if you don't want IDE chat history ingested.
 
-Pi Coding Agent:
+Pi Coding Agent and OMP:
 
 ```toml
 [[ingest.sources]]
@@ -483,7 +484,19 @@ enabled = true
 glob = "~/.pi/agent/sessions/**/*.jsonl"
 watch_root = "~/.pi/agent/sessions"
 format = "jsonl"
+
+[[ingest.sources]]
+name = "omp"
+harness = "pi-coding-agent"
+enabled = true
+glob = "~/.omp/agent/sessions/**/*.jsonl"
+watch_root = "~/.omp/agent/sessions"
+format = "jsonl"
 ```
+
+OMP uses the Pi session schema, so both sources share the `pi-coding-agent`
+adapter. Separate source names preserve historical `~/.pi` checkpoints while
+allowing startup backfill and live watching of current `~/.omp` sessions.
 
 Hermes live sessions:
 

@@ -1424,6 +1424,98 @@ fn pi_session_header_cwd_is_extracted() {
 }
 
 #[test]
+fn current_omp_event_types_normalize_with_pi_adapter() {
+    let cases = [
+        (
+            json!({
+                "type": "custom",
+                "customType": "tool_execution_start",
+                "data": {"toolCallId": "call-1", "toolName": "read"},
+                "id": "custom-1",
+                "parentId": "parent-1",
+                "timestamp": "2026-07-10T02:45:40.169Z"
+            }),
+            "system",
+        ),
+        (
+            json!({
+                "type": "mode_change",
+                "id": "mode-1",
+                "parentId": "custom-1",
+                "timestamp": "2026-07-10T02:45:40.170Z",
+                "mode": "goal",
+                "data": {"goal": {"status": "active"}}
+            }),
+            "unknown",
+        ),
+        (
+            json!({
+                "type": "custom_message",
+                "customType": "irc:incoming",
+                "content": "peer update",
+                "display": true,
+                "id": "custom-message-1",
+                "parentId": "mode-1",
+                "timestamp": "2026-07-10T02:45:40.171Z"
+            }),
+            "message",
+        ),
+        (
+            json!({
+                "type": "mcp_tool_selection",
+                "id": "selection-1",
+                "parentId": "custom-message-1",
+                "timestamp": "2026-07-10T02:45:40.172Z",
+                "selectedToolNames": ["mcp__example"]
+            }),
+            "unknown",
+        ),
+        (
+            json!({
+                "type": "compaction",
+                "id": "compaction-1",
+                "parentId": "selection-1",
+                "timestamp": "2026-07-10T02:45:40.173Z",
+                "summary": "Earlier context",
+                "firstKeptEntryId": "kept-1"
+            }),
+            "summary",
+        ),
+    ];
+
+    for (record, expected_event_kind) in cases {
+        let out = normalize_record(
+            &record,
+            "omp",
+            "pi-coding-agent",
+            "/Users/demo/.omp/agent/sessions/project/2026-07-10T02-43-10-562Z_11111111-2222-4333-8444-555555555555.jsonl",
+            1,
+            1,
+            2,
+            0,
+            "11111111-2222-4333-8444-555555555555",
+            "",
+            "/work/omp-demo",
+        )
+        .expect("OMP record should normalize with the Pi adapter");
+
+        assert_eq!(
+            out.raw_row.get("source_name").and_then(Value::as_str),
+            Some("omp")
+        );
+        assert_eq!(
+            out.raw_row.get("harness").and_then(Value::as_str),
+            Some("pi-coding-agent")
+        );
+        assert_eq!(out.event_rows.len(), 1);
+        assert_eq!(
+            out.event_rows[0].get("event_kind").and_then(Value::as_str),
+            Some(expected_event_kind)
+        );
+    }
+}
+
+#[test]
 fn harnesses_without_cwd_emit_empty_cwd() {
     let kimi = json!({
         "timestamp": 1775953946.2_f64,
