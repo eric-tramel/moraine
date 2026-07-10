@@ -21,6 +21,7 @@
 
   <max_connections>2048</max_connections>
   <max_concurrent_queries>500</max_concurrent_queries>
+  <max_thread_pool_free_size>64</max_thread_pool_free_size>
   <uncompressed_cache_size>536870912</uncompressed_cache_size>
   <mark_cache_size>536870912</mark_cache_size>
 

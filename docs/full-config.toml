@@ -296,10 +296,12 @@ service_bin_dir = "~/.local/bin"
 # Directory for the managed ClickHouse installation.
 managed_clickhouse_dir = "~/.local/lib/moraine/clickhouse/current"
 
-# Seconds to wait for managed ClickHouse to become healthy during startup.
+# Seconds to wait for each managed ClickHouse process generation to become
+# healthy, both initially and after an automatic restart.
 clickhouse_start_timeout_seconds = 30.0
 
-# Milliseconds between service health checks while waiting for startup.
+# Milliseconds between readiness checks while a managed ClickHouse process
+# generation starts. This is not permanent health polling after readiness.
 healthcheck_interval_ms = 500
 
 # Automatically install the managed ClickHouse binary when needed.

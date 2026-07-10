@@ -32,7 +32,7 @@ async fn start_selected_services(
     preflight_required_service_binaries(&services_to_start, paths)?;
     ensure_runtime_dirs(paths)?;
 
-    let clickhouse = start_clickhouse(cfg, paths).await?;
+    let clickhouse = start_clickhouse(config_path, cfg, paths).await?;
     let migrations = cmd_db_migrate(cfg).await?;
 
     let mut started_services = Vec::new();

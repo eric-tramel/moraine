@@ -18,7 +18,7 @@ use crate::cli::{
 };
 use crate::managed_clickhouse::{
     cmd_clickhouse_install, cmd_clickhouse_status, cmd_clickhouse_uninstall,
-    run_foreground_clickhouse,
+    run_foreground_clickhouse, run_supervised_clickhouse,
 };
 use crate::paths::{load_cfg, runtime_paths};
 use crate::process::{require_service_binary, service_args_with_defaults};
@@ -123,6 +123,7 @@ pub(crate) async fn dispatch(cli: Cli, output: CliOutput) -> Result<ExitCode> {
                     render_clickhouse_status(&output, &snapshot)?;
                     Ok(ExitCode::SUCCESS)
                 }
+                ClickhouseCommand::Supervise => run_supervised_clickhouse(&cfg, &paths).await,
                 ClickhouseCommand::Uninstall => {
                     let removed = cmd_clickhouse_uninstall(&paths)?;
                     if output.is_json() {

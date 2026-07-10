@@ -701,8 +701,8 @@ enabled.
 | `pids_dir` | `run` | PID and socket directory. Relative paths resolve under `root_dir`. |
 | `service_bin_dir` | `~/.local/bin` | Directory containing installed service binaries. |
 | `managed_clickhouse_dir` | `~/.local/lib/moraine/clickhouse/current` | Directory for the managed ClickHouse installation. |
-| `clickhouse_start_timeout_seconds` | `30.0` | Seconds to wait for managed ClickHouse to become healthy during startup. |
-| `healthcheck_interval_ms` | `500` | Milliseconds between service health checks while waiting for startup. |
+| `clickhouse_start_timeout_seconds` | `30.0` | Seconds to wait for each managed ClickHouse process generation to become healthy, both initially and after an automatic restart. |
+| `healthcheck_interval_ms` | `500` | Milliseconds between readiness checks while a managed ClickHouse process generation starts. This is not a permanent health-poll interval after readiness. |
 | `clickhouse_auto_install` | `true` | Automatically installs the managed ClickHouse binary when needed. |
 | `clickhouse_version` | `v25.12.5.44-stable` | Managed ClickHouse release tag expected by this Moraine build. |
 | `start_monitor_on_up` | `true` | Starts the monitor service when `moraine up` starts services. |

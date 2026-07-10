@@ -162,6 +162,8 @@ pub(crate) enum ClickhouseCommand {
     Install(ClickhouseInstallArgs),
     Status,
     Uninstall,
+    #[command(hide = true)]
+    Supervise,
 }
 
 #[derive(Debug, Args)]
@@ -260,6 +262,17 @@ mod tests {
             }
             _ => panic!("expected clickhouse install command"),
         }
+    }
+
+    #[test]
+    fn clap_parses_internal_clickhouse_supervisor() {
+        let cli = Cli::parse_from(["moraine", "clickhouse", "supervise"]);
+        assert!(matches!(
+            cli.command,
+            CliCommand::Clickhouse(ClickhouseArgs {
+                command: ClickhouseCommand::Supervise,
+            })
+        ));
     }
 
     #[test]
