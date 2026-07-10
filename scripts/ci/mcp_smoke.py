@@ -436,6 +436,7 @@ def run_smoke(
     expect_open_text: Optional[str],
     file_attention_path: Optional[str] = None,
     project_dir: Optional[str] = None,
+    working_dir: Optional[str] = None,
     absent_session_ids: Optional[list[str]] = None,
     expect_no_results: bool = False,
     expect_event_count: Optional[int] = None,
@@ -446,13 +447,15 @@ def run_smoke(
     absent_session_ids = absent_session_ids or []
     argv = [moraine, "run", "mcp", "--config", config]
     popen_kwargs: Dict[str, Any] = {}
+    launch_dir = project_dir or working_dir
     if project_dir is not None:
         argv.append("--project-only")
+    if launch_dir is not None:
         # Mimic a shell launching from the project directory: cwd is the
         # physical path and PWD carries the logical spelling, which may
         # differ through symlinks (e.g. /var vs /private/var on macOS).
-        popen_kwargs["cwd"] = project_dir
-        popen_kwargs["env"] = {**os.environ, "PWD": project_dir}
+        popen_kwargs["cwd"] = launch_dir
+        popen_kwargs["env"] = {**os.environ, "PWD": launch_dir}
 
     proc = subprocess.Popen(
         argv,
@@ -678,6 +681,13 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--working-dir",
+        help=(
+            "launch `moraine run mcp` from this directory without enabling "
+            "--project-only (used to exercise daemon-owned backend routing)"
+        ),
+    )
+    parser.add_argument(
         "--expect-absent-session-id",
         action="append",
         default=[],
@@ -717,6 +727,8 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
+    if args.project_dir and args.working_dir:
+        parser.error("--project-dir and --working-dir are mutually exclusive")
 
     run_smoke(
         args.moraine,
@@ -726,6 +738,7 @@ def main() -> int:
         args.expect_open_text,
         file_attention_path=args.file_attention_path,
         project_dir=args.project_dir,
+        working_dir=args.working_dir,
         absent_session_ids=args.expect_absent_session_id,
         expect_no_results=args.expect_no_results,
         expect_event_count=args.expect_event_count,

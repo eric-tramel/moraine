@@ -633,6 +633,11 @@ main() {
   # MCP server from inside it.
   local claude_project_dir="$tmp_root/claude-project"
   mkdir -p "$claude_project_dir"
+  # A client-only launch directory routed to a named read backend. No fixture
+  # session originates here, so ingest never mirrors duplicate rows when this
+  # test points the named backend at the same isolated ClickHouse database.
+  local routed_project_dir="$tmp_root/routed-project"
+  mkdir -p "$routed_project_dir"
 
   mkdir -p "$(dirname "$codex_fixture_file")"
   mkdir -p "$(dirname "$claude_fixture_file")"
@@ -885,10 +890,18 @@ EOF
 EOF
 
   cat > "$config_path" <<EOF
-[clickhouse]
+[backends.default]
 url = "${clickhouse_url}"
 database = "${clickhouse_database}"
 
+[backends.routed]
+url = "${clickhouse_url}"
+database = "${clickhouse_database}"
+
+[[routes]]
+dir = "${routed_project_dir}/**"
+backend = "routed"
+mode = "mirror"
 [backend]
 bind = "127.0.0.1"
 start_on_up = true
@@ -1373,6 +1386,41 @@ PY
   echo "[e2e] checking shared-daemon MCP cache miss -> hit markers"
   wait_for_mcp_cache_sequence "$python_bin" "$backend_log" "$cache_log_baseline" 20
 
+  local routed_cache_log_baseline
+  routed_cache_log_baseline="$("$python_bin" - "$backend_log" <<'PY'
+from pathlib import Path
+import sys
+
+log_path = Path(sys.argv[1])
+print(log_path.stat().st_size if log_path.is_file() else 0)
+PY
+)"
+
+  echo "[e2e] checking first named-backend MCP route through daemon"
+  "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --working-dir "$routed_project_dir" \
+    --query "$codex_keyword" \
+    --expect-session-id "$codex_session_id" \
+    --expect-open-text "$codex_trace_marker"
+
+  echo "[e2e] checking named-backend HTTP route through shared daemon router"
+  routed_sessions_body="$(curl -fsS \
+    -H "X-Moraine-Project-Dir: ${routed_project_dir}" \
+    "http://127.0.0.1:${monitor_port}/api/v1/sessions?since=all&limit=200")"
+  printf '%s' "$routed_sessions_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; sys.exit(0 if any(row.get("id")==sid for row in data.get("sessions", [])) else 1)' "$codex_session_id"
+
+  echo "[e2e] checking named-backend repository/cache reuse on second MCP route"
+  "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --working-dir "$routed_project_dir" \
+    --query "$codex_keyword" \
+    --expect-session-id "$codex_session_id" \
+    --expect-open-text "$codex_trace_marker"
+  wait_for_mcp_cache_sequence "$python_bin" "$backend_log" "$routed_cache_log_baseline" 20
+
   # The ingest heartbeat interval is one second. Leave enough room inside this
   # same bounded window for a fresh ingest INSERT, then force query_log durable
   # before asserting exact role + PID attribution.
@@ -1386,6 +1434,7 @@ PY
   echo "[e2e] checking bounded ClickHouse query ownership"
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND ${query_log_window} AND query_kind = 'Select' AND http_user_agent = '${expected_backend_ua}'" 30
   assert_clickhouse_count "$clickhouse_url" "all service SELECTs use the backend UA/PID" "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND ${query_log_window} AND query_kind = 'Select' AND (${attributed_service_filter}) AND http_user_agent != '${expected_backend_ua}'" "0"
+  assert_clickhouse_count "$clickhouse_url" "named read schema handshake runs once despite MCP/HTTP reuse" "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND ${query_log_window} AND http_user_agent = '${expected_backend_ua}' AND position(query, 'system.tables') > 0 AND position(query, 'schema_migrations') > 0" "1"
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND ${query_log_window} AND query_kind = 'Insert' AND http_user_agent = '${expected_ingest_ua}'" 30
   assert_clickhouse_count "$clickhouse_url" "all service INSERTs use the ingest UA/PID" "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND ${query_log_window} AND query_kind = 'Insert' AND (${attributed_service_filter}) AND http_user_agent != '${expected_ingest_ua}'" "0"
 
@@ -1570,6 +1619,16 @@ PY
     --file-attention-path "Cargo.toml" \
     --require-embedded-fallback \
     --write-tools-snapshot "$embedded_tools_snapshot"
+
+  echo "[e2e] checking named-backend MCP route through embedded fallback"
+  "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --working-dir "$routed_project_dir" \
+    --query "$codex_keyword" \
+    --expect-session-id "$codex_session_id" \
+    --expect-open-text "$codex_trace_marker" \
+    --require-embedded-fallback
 
   echo "[e2e] comparing daemon and embedded canonical tools/list snapshots"
   "$python_bin" - "$daemon_tools_snapshot" "$embedded_tools_snapshot" <<'PY'
