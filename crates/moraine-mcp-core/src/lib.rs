@@ -7,11 +7,11 @@ mod open_v1;
 mod search_sessions_v1;
 
 use anyhow::{anyhow, Context, Result};
-use moraine_clickhouse::{enforce_remote_schema_policy, ClickHouseClient};
 use moraine_config::{AppConfig, DEFAULT_BACKEND_NAME};
 pub use moraine_conversations::SessionOriginScope;
 use moraine_conversations::{
-    ClickHouseConversationRepository, ConversationRepository, RepoConfig, RepoError,
+    build_clickhouse_repository, validate_remote_clickhouse_schema, ConversationRepository,
+    RepoConfig, RepoError,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -452,8 +452,6 @@ impl AppState {
         cfg: AppConfig,
         session_scope: Option<SessionOriginScope>,
     ) -> Result<Arc<AppState>> {
-        let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
-
         let repo_cfg = RepoConfig {
             max_results: cfg.mcp.max_results,
             preview_chars: cfg.mcp.preview_chars,
@@ -470,8 +468,7 @@ impl AppState {
             session_scope,
         };
 
-        let repo: Arc<dyn ConversationRepository> =
-            Arc::new(ClickHouseConversationRepository::new(ch, repo_cfg));
+        let repo = build_clickhouse_repository(cfg.clickhouse.clone(), repo_cfg)?;
         Ok(Arc::new(AppState {
             cfg,
             repo,
@@ -803,11 +800,7 @@ async fn run_stdio_for_backend(
         .cloned()
         .ok_or_else(|| anyhow!("backend '{backend}' is not configured"))?;
 
-    let client = ClickHouseClient::new(backend_cfg.clone())?;
-    let skew = client.schema_skew().await.with_context(|| {
-        format!("backend '{backend}': schema handshake failed (is the server reachable?)")
-    })?;
-    enforce_remote_schema_policy(backend, &skew, backend_cfg.allow_newer_server)?;
+    validate_remote_clickhouse_schema(backend, backend_cfg.clone()).await?;
 
     cfg.clickhouse = backend_cfg;
     run_stdio(cfg, session_scope).await

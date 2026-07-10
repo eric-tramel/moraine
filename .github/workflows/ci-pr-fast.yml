@@ -25,6 +25,9 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Phase 1 dependency policy
+        run: make dependency-policy USE_RUSTUP=0
+
       - name: Format check
         run: cargo fmt --all -- --check
 
