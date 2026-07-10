@@ -113,9 +113,9 @@ impl BenchmarkContext {
             .build()
             .context("failed to construct monitor HTTP client")?;
         let monitor_analytics_url =
-            monitor_endpoint(&config.monitor_url, "/api/analytics?range=24h")?;
+            monitor_endpoint(&config.monitor_url, "/api/v1/analytics?range=24h")?;
         let monitor_sessions_url =
-            monitor_endpoint(&config.monitor_url, "/api/sessions?since=30d&limit=50")?;
+            monitor_endpoint(&config.monitor_url, "/api/v1/sessions?since=30d&limit=50")?;
         let clickhouse = ClickHouseClient::new(config.clickhouse_config())
             .context("failed to construct ClickHouse client")?;
 

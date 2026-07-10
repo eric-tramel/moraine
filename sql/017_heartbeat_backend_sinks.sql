@@ -1,6 +1,6 @@
 -- Per-backend mirror sink status on ingest heartbeats: a JSON-encoded
 -- `{backend_name: status}` map (statuses: connecting / ok / lagging /
--- unreachable / disabled_skew) written by the default sink so /api/health
+-- unreachable / disabled_skew) written by the default sink so /api/v1/health
 -- can surface the health of every named-backend tee. Empty for installs
 -- without named backends.
 --

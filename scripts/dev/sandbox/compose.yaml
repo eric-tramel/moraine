@@ -105,7 +105,7 @@ services:
       - "cargo-target:/home/moraine/target"
       - "state:/home/moraine/.moraine"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/api/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/api/v1/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 60
