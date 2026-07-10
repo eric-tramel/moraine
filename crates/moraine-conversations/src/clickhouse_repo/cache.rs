@@ -270,7 +270,7 @@ impl ClickHouseConversationRepository {
         );
 
         let from_stats: Vec<CorpusStatsRow> =
-            self.map_backend(self.ch.query_rows(&from_stats_query, None).await)?;
+            self.map_backend(self.query_rows(&from_stats_query, None).await)?;
 
         if let Some(row) = from_stats.first() {
             if row.docs > 0 {
@@ -285,7 +285,7 @@ impl ClickHouseConversationRepository {
             self.table_ref("search_documents")
         );
         let fallback: Vec<CorpusStatsRow> =
-            self.map_backend(self.ch.query_rows(&fallback_query, None).await)?;
+            self.map_backend(self.query_rows(&fallback_query, None).await)?;
         let resolved = if let Some(row) = fallback.first() {
             (row.docs, row.total_doc_len)
         } else {
@@ -353,7 +353,7 @@ FORMAT JSONEachRow",
             self.table_ref("search_query_log"),
             limit
         );
-        let rows: Vec<HotQueryRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
+        let rows: Vec<HotQueryRow> = self.map_backend(self.query_rows(&query, None).await)?;
         Ok(rows.into_iter().map(|row| row.raw_query).collect())
     }
 
@@ -385,7 +385,7 @@ FORMAT JSONEachRow",
         let df_query = format!(
             "SELECT term, toUInt64(uniqExact(doc_id)) AS df FROM {postings_table} WHERE term IN {missing_terms_array} GROUP BY term FORMAT JSONEachRow",
         );
-        let rows: Vec<DfRow> = self.map_backend(self.ch.query_rows(&df_query, None).await)?;
+        let rows: Vec<DfRow> = self.map_backend(self.query_rows(&df_query, None).await)?;
         for row in rows {
             map.insert(row.term, row.df);
         }

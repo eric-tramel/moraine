@@ -78,7 +78,7 @@ impl ClickHouseConversationRepository {
             session_id: String,
         }
 
-        let rows: Vec<SessionIdRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
+        let rows: Vec<SessionIdRow> = self.map_backend(self.query_rows(&query, None).await)?;
         let in_scope = !rows.is_empty();
         if in_scope {
             self.scoped_session_cache

@@ -75,7 +75,7 @@ impl ClickHouseConversationRepository {
              FORMAT JSONEachRow"
         );
         let columns: Vec<HeartbeatColumnRow> =
-            self.map_backend(self.ch.query_rows(&columns_query, Some("system")).await)?;
+            self.map_backend(self.query_rows(&columns_query, Some("system")).await)?;
 
         if columns.is_empty() {
             return Ok(IngestHeartbeatRead {
@@ -129,7 +129,7 @@ impl ClickHouseConversationRepository {
              FORMAT JSONEachRow"
         );
         let rows: Vec<HeartbeatRow> =
-            self.map_backend(self.ch.query_rows(&heartbeat_query, None).await)?;
+            self.map_backend(self.query_rows(&heartbeat_query, None).await)?;
         let latest = rows.into_iter().next().map(|row| IngestHeartbeat {
             ts: row.ts,
             ts_unix_ms: row.ts_unix_ms,
@@ -168,7 +168,7 @@ impl ClickHouseConversationRepository {
              FORMAT JSONEachRow"
         );
         let tables: Vec<TableMetadataRow> =
-            self.map_backend(self.ch.query_rows(&tables_query, Some("system")).await)?;
+            self.map_backend(self.query_rows(&tables_query, Some("system")).await)?;
 
         let parts_query = format!(
             "SELECT table, toUInt64(sum(rows)) AS rows\n\
@@ -233,7 +233,7 @@ impl ClickHouseConversationRepository {
              FORMAT JSONEachRow"
         );
         let schema_rows: Vec<TableSchemaRow> =
-            self.map_backend(self.ch.query_rows(&schema_query, Some("system")).await)?;
+            self.map_backend(self.query_rows(&schema_query, Some("system")).await)?;
 
         let order_by = schema_rows
             .iter()
@@ -248,7 +248,7 @@ impl ClickHouseConversationRepository {
                 "SELECT * FROM {table_ref} ORDER BY {order_by} LIMIT {limit} FORMAT JSONEachRow"
             )
         };
-        let rows: Vec<Value> = self.map_backend(self.ch.query_rows(&rows_query, None).await)?;
+        let rows: Vec<Value> = self.map_backend(self.query_rows(&rows_query, None).await)?;
         let schema = schema_rows
             .into_iter()
             .map(|column| TableColumn {

@@ -7,9 +7,9 @@ use moraine_conversations::{
 };
 use reqwest::{Client, Url};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 use std::env;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_SAMPLES: usize = 60;
 const DEFAULT_WARMUPS: usize = 5;
@@ -143,6 +143,15 @@ fn monitor_endpoint(base: &str, path_and_query: &str) -> Result<Url> {
     Url::parse(&endpoint).with_context(|| format!("invalid monitor endpoint URL: {endpoint}"))
 }
 
+fn report_origin(raw: &str, label: &str) -> Result<String> {
+    let url = Url::parse(raw).with_context(|| format!("{label} is not a valid URL"))?;
+    let origin = url.origin().ascii_serialization();
+    if origin == "null" {
+        bail!("{label} must have an HTTP(S) origin");
+    }
+    Ok(format!("{origin}/"))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Arm {
@@ -187,6 +196,83 @@ enum Cardinality {
     },
 }
 
+fn normalized_digest(value: &Value) -> Result<String> {
+    let bytes = serde_json::to_vec(&canonicalize_json(value))
+        .context("failed to serialize normalized benchmark payload")?;
+    let hash = bytes
+        .into_iter()
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            hash.wrapping_mul(0x100000001b3) ^ u64::from(byte)
+        });
+    Ok(format!("fnv1a64:{hash:016x}"))
+}
+
+fn canonicalize_json(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => {
+            let mut values = values.iter().map(canonicalize_json).collect::<Vec<_>>();
+            values.sort_by_cached_key(|value| serde_json::to_string(value).unwrap_or_default());
+            Value::Array(values)
+        }
+        Value::Object(object) => {
+            let mut entries = object.iter().collect::<Vec<_>>();
+            entries.sort_unstable_by_key(|(key, _)| *key);
+            let mut normalized = Map::new();
+            for (key, value) in entries {
+                normalized.insert(key.clone(), canonicalize_json(value));
+            }
+            Value::Object(normalized)
+        }
+        scalar => scalar.clone(),
+    }
+}
+
+fn monitor_session_projection(session: &Value) -> Result<Value> {
+    let session_id = session
+        .get("id")
+        .and_then(Value::as_str)
+        .context("monitor session missing string id")?;
+    let harness = session
+        .pointer("/harness/id")
+        .and_then(Value::as_str)
+        .context("monitor session missing harness.id")?;
+    let started_at = session
+        .get("startedAt")
+        .and_then(Value::as_i64)
+        .context("monitor session missing startedAt")?;
+    let ended_at = session
+        .get("endedAt")
+        .and_then(Value::as_i64)
+        .context("monitor session missing endedAt")?;
+    let models = session
+        .get("models")
+        .and_then(Value::as_array)
+        .context("monitor session missing models")?;
+    let trace_id = session
+        .get("traceId")
+        .and_then(Value::as_str)
+        .context("monitor session missing traceId")?;
+    let turns = session
+        .get("turns")
+        .and_then(Value::as_array)
+        .context("monitor session missing turns")?;
+    let tool_calls = session
+        .get("totalToolCalls")
+        .and_then(Value::as_u64)
+        .context("monitor session missing totalToolCalls")?;
+
+    Ok(json!({
+        "session_id": session_id,
+        "harness": harness,
+        "started_at_unix_ms": started_at,
+        "ended_at_unix_ms": ended_at,
+        "models": models,
+        "trace_id": trace_id,
+        "turns": turns.len(),
+        "tool_calls": tool_calls,
+    }))
+}
+
 #[derive(Deserialize)]
 struct MonitorAnalyticsResponse {
     ok: bool,
@@ -213,11 +299,11 @@ struct MonitorSessionsResponse {
 }
 
 trait MonitorResponse: DeserializeOwned {
-    fn into_cardinality(self) -> Result<Cardinality>;
+    fn into_semantics(self) -> Result<(Cardinality, String)>;
 }
 
 impl MonitorResponse for MonitorAnalyticsResponse {
-    fn into_cardinality(self) -> Result<Cardinality> {
+    fn into_semantics(self) -> Result<(Cardinality, String)> {
         if !self.ok {
             bail!(
                 "monitor analytics response had ok=false: {}",
@@ -227,16 +313,22 @@ impl MonitorResponse for MonitorAnalyticsResponse {
         let series = self
             .series
             .context("monitor analytics response had ok=true but no series")?;
-        Ok(Cardinality::AnalyticsSeries {
+        let cardinality = Cardinality::AnalyticsSeries {
             tokens: series.tokens.len(),
             turns: series.turns.len(),
             concurrent_sessions: series.concurrent_sessions.len(),
-        })
+        };
+        let payload = json!({
+            "tokens": series.tokens,
+            "turns": series.turns,
+            "concurrent_sessions": series.concurrent_sessions,
+        });
+        Ok((cardinality, normalized_digest(&payload)?))
     }
 }
 
 impl MonitorResponse for MonitorSessionsResponse {
-    fn into_cardinality(self) -> Result<Cardinality> {
+    fn into_semantics(self) -> Result<(Cardinality, String)> {
         if !self.ok {
             bail!(
                 "monitor sessions response had ok=false: {}",
@@ -246,15 +338,23 @@ impl MonitorResponse for MonitorSessionsResponse {
         let sessions = self
             .sessions
             .context("monitor sessions response had ok=true but no sessions")?;
-        Ok(Cardinality::Sessions {
+        let cardinality = Cardinality::Sessions {
             sessions: sessions.len(),
-        })
+        };
+        let payload = Value::Array(
+            sessions
+                .iter()
+                .map(monitor_session_projection)
+                .collect::<Result<Vec<_>>>()?,
+        );
+        Ok((cardinality, normalized_digest(&payload)?))
     }
 }
 
 struct TimedSample {
     elapsed: Duration,
     cardinality: Cardinality,
+    normalized_digest: String,
 }
 
 async fn sample_monitor<T>(client: &Client, url: &Url, label: &str) -> Result<TimedSample>
@@ -284,11 +384,12 @@ where
             String::from_utf8_lossy(&body)
         );
     }
-    let cardinality = payload.into_cardinality()?;
+    let (cardinality, normalized_digest) = payload.into_semantics()?;
 
     Ok(TimedSample {
         elapsed: started.elapsed(),
         cardinality,
+        normalized_digest,
     })
 }
 
@@ -301,13 +402,22 @@ async fn sample_direct_analytics(
         .await
         .context("direct analytics repository request failed")?;
 
+    let payload = json!({
+        "tokens": snapshot.tokens,
+        "turns": snapshot.turns,
+        "concurrent_sessions": snapshot.concurrent_sessions,
+    });
+    let cardinality = Cardinality::AnalyticsSeries {
+        tokens: payload["tokens"].as_array().map_or(0, Vec::len),
+        turns: payload["turns"].as_array().map_or(0, Vec::len),
+        concurrent_sessions: payload["concurrent_sessions"]
+            .as_array()
+            .map_or(0, Vec::len),
+    };
     Ok(TimedSample {
         elapsed: started.elapsed(),
-        cardinality: Cardinality::AnalyticsSeries {
-            tokens: snapshot.tokens.len(),
-            turns: snapshot.turns.len(),
-            concurrent_sessions: snapshot.concurrent_sessions.len(),
-        },
+        cardinality,
+        normalized_digest: normalized_digest(&payload)?,
     })
 }
 
@@ -323,11 +433,30 @@ async fn sample_direct_sessions(
         .await
         .context("direct sessions repository request failed")?;
 
+    let cardinality = Cardinality::Sessions {
+        sessions: sessions.len(),
+    };
+    let payload = Value::Array(
+        sessions
+            .iter()
+            .map(|session| {
+                json!({
+                    "session_id": session.summary.session_id,
+                    "harness": session.harness,
+                    "started_at_unix_ms": session.summary.first_event_unix_ms,
+                    "ended_at_unix_ms": session.summary.last_event_unix_ms,
+                    "models": session.models,
+                    "trace_id": session.trace_id,
+                    "turns": session.turns.len(),
+                    "tool_calls": session.summary.tool_calls,
+                })
+            })
+            .collect(),
+    );
     Ok(TimedSample {
         elapsed: started.elapsed(),
-        cardinality: Cardinality::Sessions {
-            sessions: sessions.len(),
-        },
+        cardinality,
+        normalized_digest: normalized_digest(&payload)?,
     })
 }
 
@@ -368,25 +497,45 @@ async fn take_sample(
 struct Measurements {
     elapsed: Vec<Duration>,
     cardinality: Option<Cardinality>,
+    normalized_digest: Option<String>,
 }
 
 impl Measurements {
     fn record(&mut self, sample: TimedSample, scenario: Scenario, arm: Arm) -> Result<()> {
+        let TimedSample {
+            elapsed,
+            cardinality,
+            normalized_digest,
+        } = sample;
         if let Some(expected) = &self.cardinality {
-            if expected != &sample.cardinality {
+            if expected != &cardinality {
                 bail!(
                     "{} {:?} cardinality changed after {} successful samples: expected {:?}, got {:?}",
                     scenario.name(),
                     arm,
                     self.elapsed.len(),
                     expected,
-                    sample.cardinality
+                    cardinality
                 );
             }
         } else {
-            self.cardinality = Some(sample.cardinality.clone());
+            self.cardinality = Some(cardinality);
         }
-        self.elapsed.push(sample.elapsed);
+        if let Some(expected) = &self.normalized_digest {
+            if expected != &normalized_digest {
+                bail!(
+                    "{} {:?} normalized digest changed after {} successful samples: expected {}, got {}",
+                    scenario.name(),
+                    arm,
+                    self.elapsed.len(),
+                    expected,
+                    normalized_digest
+                );
+            }
+        } else {
+            self.normalized_digest = Some(normalized_digest);
+        }
+        self.elapsed.push(elapsed);
         Ok(())
     }
 
@@ -410,10 +559,15 @@ impl Measurements {
             .cardinality
             .clone()
             .context("successful samples had no cardinality")?;
+        let normalized_digest = self
+            .normalized_digest
+            .clone()
+            .context("successful samples had no normalized digest")?;
 
         Ok(ArmReport {
             successful_samples: self.elapsed.len(),
             cardinality,
+            normalized_digest,
             p50_ms,
             p95_ms,
         })
@@ -424,6 +578,7 @@ impl Measurements {
 struct ArmReport {
     successful_samples: usize,
     cardinality: Cardinality,
+    normalized_digest: String,
     p50_ms: f64,
     p95_ms: f64,
 }
@@ -432,6 +587,12 @@ struct ArmReport {
 struct CardinalityDifference {
     monitor_http: Cardinality,
     direct_repository: Cardinality,
+}
+
+#[derive(Serialize)]
+struct DigestDifference {
+    monitor_http: String,
+    direct_repository: String,
 }
 
 #[derive(Serialize)]
@@ -452,7 +613,9 @@ struct ScenarioReport {
     monitor_http: ArmReport,
     direct_repository_cold: ArmReport,
     cardinality_match: bool,
+    normalized_digest_match: bool,
     semantic_cardinality_difference: Option<CardinalityDifference>,
+    normalized_digest_difference: Option<DigestDifference>,
     p95_comparison: P95Comparison,
     passed: bool,
 }
@@ -523,6 +686,12 @@ async fn run_scenario(
         monitor_http: monitor_http.cardinality.clone(),
         direct_repository: direct_repository_cold.cardinality.clone(),
     });
+    let normalized_digest_match =
+        monitor_http.normalized_digest == direct_repository_cold.normalized_digest;
+    let normalized_digest_difference = (!normalized_digest_match).then(|| DigestDifference {
+        monitor_http: monitor_http.normalized_digest.clone(),
+        direct_repository: direct_repository_cold.normalized_digest.clone(),
+    });
     let ratio = ratio_assessment(
         monitor_http.p95_ms,
         direct_repository_cold.p95_ms,
@@ -553,7 +722,9 @@ async fn run_scenario(
         direct_repository_cold,
         cardinality_match,
         semantic_cardinality_difference,
-        passed: p95_comparison.passed,
+        normalized_digest_match,
+        normalized_digest_difference,
+        passed: cardinality_match && normalized_digest_match && p95_comparison.passed,
         p95_comparison,
     })
 }
@@ -562,6 +733,7 @@ async fn run_scenario(
 struct WarmAnalyticsReport {
     successful_samples: usize,
     cardinality: Cardinality,
+    normalized_digest: String,
     p95_ms: f64,
 }
 
@@ -595,6 +767,7 @@ async fn run_warm_analytics_cache(
     Ok(WarmAnalyticsReport {
         successful_samples: report.successful_samples,
         cardinality: report.cardinality,
+        normalized_digest: report.normalized_digest,
         p95_ms: report.p95_ms,
     })
 }
@@ -640,8 +813,8 @@ async fn live_monitor_vs_repository_latency() -> Result<()> {
     let passed = analytics.passed && sessions.passed;
     let report = BenchmarkReport {
         benchmark: "monitor_http_vs_direct_clickhouse_conversation_repository",
-        monitor_url: config.monitor_url,
-        clickhouse_url: config.clickhouse_url,
+        monitor_url: report_origin(&config.monitor_url, "MORAINE_BENCH_MONITOR_URL")?,
+        clickhouse_url: report_origin(&config.clickhouse_url, "MORAINE_BENCH_CLICKHOUSE_URL")?,
         clickhouse_database: config.clickhouse_database,
         warmups: config.warmups,
         samples_per_arm: config.samples,
@@ -657,9 +830,204 @@ async fn live_monitor_vs_repository_latency() -> Result<()> {
     );
 
     if !report.passed {
-        bail!("one or more cold scenarios exceeded the 20% p95 regression ceiling");
+        bail!("one or more scenarios failed semantic parity or the 20% p95 regression ceiling");
     }
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "creates and tears down a temporary database on a live ClickHouse sandbox"]
+async fn live_schema_semantics_and_teardown() -> Result<()> {
+    let config = BenchmarkConfig::from_env()?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock predates Unix epoch")?
+        .as_millis();
+    let database = format!("moraine_issue454_schema_{}_{}", std::process::id(), suffix);
+    let mut clickhouse_config = config.clickhouse_config();
+    clickhouse_config.database = database.clone();
+    let clickhouse = ClickHouseClient::new(clickhouse_config)
+        .context("failed to construct live-schema ClickHouse client")?;
+
+    let outcome = async {
+        clickhouse
+            .run_migrations()
+            .await
+            .context("failed to migrate temporary live-schema database")?;
+        let repository = ClickHouseConversationRepository::new(
+            clickhouse.clone(),
+            RepoConfig::default(),
+        );
+
+        let empty = repository
+            .analytics_series(AnalyticsRange::FifteenMinutes)
+            .await
+            .context("empty-window analytics read failed")?;
+        assert!(empty.tokens.is_empty());
+        assert!(empty.turns.is_empty());
+        assert!(empty.concurrent_sessions.is_empty());
+        let empty_heartbeat = repository
+            .latest_ingest_heartbeat()
+            .await
+            .context("empty heartbeat read failed")?;
+        assert!(empty_heartbeat.table_present);
+        assert!(empty_heartbeat.latest.is_none());
+
+        clickhouse
+            .request_text(
+                &format!(
+                    "ALTER TABLE `{database}`.`ingest_heartbeats` DROP COLUMN IF EXISTS backend_sinks"
+                ),
+                None,
+                Some(&database),
+                false,
+                None,
+            )
+            .await
+            .context("failed to remove optional heartbeat column")?;
+        let legacy_repository = ClickHouseConversationRepository::new(
+            clickhouse.clone(),
+            RepoConfig::default(),
+        );
+        let legacy_heartbeat = legacy_repository
+            .latest_ingest_heartbeat()
+            .await
+            .context("legacy heartbeat read failed")?;
+        assert!(legacy_heartbeat.table_present);
+        assert!(legacy_heartbeat.latest.is_none());
+
+        let insert = format!(
+            r#"INSERT INTO `{database}`.`events`
+(
+  ingested_at, event_uid, session_id, session_date, source_name, harness, source_file,
+  source_ref, event_ts, event_kind, actor_kind, payload_type, op_kind, request_id,
+  trace_id, turn_index, model, input_tokens, output_tokens, text_content, payload_json,
+  event_version
+)
+VALUES
+(
+  addMonths(now64(3), -1), 'issue454-dedup', 'issue454-dedup-session', today(),
+  'fixture', 'codex', 'fixture-dedup', 'fixture-old', now64(3), 'message',
+  'assistant', 'text', '', 'issue454-request', 'issue454-trace', 1, 'old-model',
+  11, 0, 'old', '{{}}', 1
+),
+(
+  now64(3), 'issue454-dedup', 'issue454-dedup-session', today(), 'fixture', 'codex',
+  'fixture-dedup', 'fixture-new', now64(3), 'message', 'assistant', 'text', '',
+  'issue454-request', 'issue454-trace', 1, 'new-model', 13, 0, 'new', '{{}}', 2
+),
+(
+  now64(3), 'issue454-web-a', 'issue454-web-session', today(), 'fixture', 'codex',
+  'fixture-web', 'issue454-web-a', now64(3), 'tool_call', 'assistant',
+  'web_search_call', 'search', '', 'issue454-trace', 1, '', 0, 0, '',
+  '{{"action":{{"query":"a"}}}}', 1
+),
+(
+  now64(3), 'issue454-web-z', 'issue454-web-session', today(), 'fixture', 'codex',
+  'fixture-web', 'issue454-web-z', now64(3), 'tool_call', 'assistant',
+  'web_search_call', 'search', '', 'issue454-trace', 1, '', 0, 0, '',
+  '{{"action":{{"query":"z"}}}}', 1
+)"#
+        );
+        clickhouse
+            .request_text(&insert, None, Some(&database), false, None)
+            .await
+            .context("failed to insert live-schema fixtures")?;
+
+        #[derive(Deserialize)]
+        struct ModelRow {
+            model: String,
+        }
+        let canonical: Vec<ModelRow> = clickhouse
+            .query_rows(
+                &format!(
+                    "SELECT model FROM (SELECT * FROM `{database}`.`events` FINAL \
+                     SETTINGS do_not_merge_across_partitions_select_final = 0) \
+                     WHERE event_uid = 'issue454-dedup' FORMAT JSONEachRow"
+                ),
+                Some(&database),
+            )
+            .await
+            .context("canonical cross-partition fixture query failed")?;
+        assert_eq!(canonical.len(), 1);
+        assert_eq!(canonical[0].model, "new-model");
+        let stale_predicate: Vec<ModelRow> = clickhouse
+            .query_rows(
+                &format!(
+                    "SELECT model FROM (SELECT * FROM `{database}`.`events` FINAL \
+                     SETTINGS do_not_merge_across_partitions_select_final = 0) \
+                     WHERE event_uid = 'issue454-dedup' AND model = 'old-model' \
+                     FORMAT JSONEachRow"
+                ),
+                Some(&database),
+            )
+            .await
+            .context("canonical outer-predicate query failed")?;
+        assert!(stale_predicate.is_empty());
+
+        let populated_repository = ClickHouseConversationRepository::new(
+            clickhouse.clone(),
+            RepoConfig::default(),
+        );
+        let analytics = populated_repository
+            .analytics_series(AnalyticsRange::FifteenMinutes)
+            .await
+            .context("populated analytics read failed")?;
+        assert!(analytics.tokens.iter().any(|point| point.model == "new-model"));
+        assert!(!analytics.tokens.iter().any(|point| point.model == "old-model"));
+        let sessions = populated_repository
+            .list_session_analytics(SessionAnalyticsQuery {
+                lookback: SessionLookback::All,
+                limit: 50,
+            })
+            .await
+            .context("populated session analytics read failed")?;
+        let deduped = sessions
+            .iter()
+            .find(|session| session.summary.session_id == "issue454-dedup-session")
+            .context("deduped fixture session missing")?;
+        assert_eq!(deduped.summary.total_events, 1);
+        assert_eq!(deduped.models, vec!["new-model"]);
+        let turn = populated_repository
+            .get_turn("issue454-dedup-session", 1)
+            .await
+            .context("view-only turn read failed")?
+            .context("view-only fixture turn missing")?;
+        assert_eq!(turn.summary.total_events, 1);
+        assert_eq!(turn.events.len(), 1);
+        assert_eq!(turn.events[0].text_content, "new");
+        let web = populated_repository
+            .list_web_searches(1000)
+            .await
+            .context("same-millisecond web feed read failed")?;
+        let fixture_refs = web
+            .iter()
+            .filter(|event| event.session_id == "issue454-web-session")
+            .map(|event| event.source_ref.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(fixture_refs, vec!["issue454-web-z", "issue454-web-a"]);
+
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+
+    let cleanup = clickhouse
+        .request_text(
+            &format!("DROP DATABASE IF EXISTS `{database}` SYNC"),
+            None,
+            Some("system"),
+            false,
+            None,
+        )
+        .await;
+    match (outcome, cleanup) {
+        (Ok(()), Ok(_)) => Ok(()),
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(()), Err(cleanup_error)) => Err(cleanup_error.context("live-schema teardown failed")),
+        (Err(error), Err(cleanup_error)) => Err(anyhow!(
+            "{error:#}; live-schema teardown also failed: {cleanup_error:#}"
+        )),
+    }
 }
 
 fn type7_percentile(samples: &[f64], probability: f64) -> Option<f64> {
@@ -720,7 +1088,8 @@ fn ratio_assessment(
 
 #[cfg(test)]
 mod tests {
-    use super::{ratio_assessment, type7_percentile};
+    use super::{normalized_digest, ratio_assessment, report_origin, type7_percentile};
+    use serde_json::json;
 
     fn assert_close(actual: f64, expected: f64) {
         assert!(
@@ -768,5 +1137,50 @@ mod tests {
     fn ratio_gate_rejects_only_regressions_over_twenty_percent() {
         assert!(ratio_assessment(10.0, 7.999, 0.20).unwrap().passed);
         assert!(!ratio_assessment(10.0, 12.001, 0.20).unwrap().passed);
+    }
+    #[test]
+    fn normalized_digest_ignores_object_and_collection_order_but_detects_content_changes() {
+        let left = json!({
+            "series": [
+                {"bucket": 2, "tokens": 7},
+                {"bucket": 1, "tokens": 3}
+            ],
+            "range": "24h"
+        });
+        let reordered = json!({
+            "range": "24h",
+            "series": [
+                {"tokens": 3, "bucket": 1},
+                {"tokens": 7, "bucket": 2}
+            ]
+        });
+        let changed = json!({
+            "range": "24h",
+            "series": [
+                {"bucket": 1, "tokens": 3},
+                {"bucket": 2, "tokens": 8}
+            ]
+        });
+
+        assert_eq!(
+            normalized_digest(&left).unwrap(),
+            normalized_digest(&reordered).unwrap()
+        );
+        assert_ne!(
+            normalized_digest(&left).unwrap(),
+            normalized_digest(&changed).unwrap()
+        );
+    }
+
+    #[test]
+    fn report_origin_strips_credentials_paths_and_queries() {
+        assert_eq!(
+            report_origin(
+                "https://user:secret@example.test:9443/signed/path?token=secret",
+                "test URL"
+            )
+            .unwrap(),
+            "https://example.test:9443/"
+        );
     }
 }

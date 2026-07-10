@@ -929,7 +929,7 @@ pub enum AnalyticsRange {
 }
 
 impl AnalyticsRange {
-    pub const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::FifteenMinutes,
         Self::OneHour,
         Self::SixHours,
@@ -949,7 +949,7 @@ impl AnalyticsRange {
         }
     }
 
-    pub const fn window_seconds(self) -> u32 {
+    pub(crate) const fn window_seconds(self) -> u32 {
         match self {
             Self::FifteenMinutes => 15 * 60,
             Self::OneHour => 60 * 60,
@@ -960,7 +960,7 @@ impl AnalyticsRange {
         }
     }
 
-    pub const fn bucket_seconds(self) -> u32 {
+    pub(crate) const fn bucket_seconds(self) -> u32 {
         match self {
             Self::FifteenMinutes => 60,
             Self::OneHour => 5 * 60,
@@ -1031,19 +1031,7 @@ pub enum SessionLookback {
 }
 
 impl SessionLookback {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::OneHour => "1h",
-            Self::SixHours => "6h",
-            Self::TwentyFourHours => "24h",
-            Self::SevenDays => "7d",
-            Self::ThirtyDays => "30d",
-            Self::NinetyDays => "90d",
-            Self::All => "all",
-        }
-    }
-
-    pub const fn window_seconds(self) -> Option<u32> {
+    pub(crate) const fn window_seconds(self) -> Option<u32> {
         match self {
             Self::OneHour => Some(60 * 60),
             Self::SixHours => Some(6 * 60 * 60),
@@ -1074,7 +1062,7 @@ impl Default for SessionAnalyticsQuery {
 }
 
 impl SessionAnalyticsQuery {
-    pub fn normalized_limit(&self) -> u16 {
+    pub(crate) fn normalized_limit(&self) -> u16 {
         self.limit.clamp(1, 200)
     }
 }
@@ -1111,6 +1099,8 @@ pub enum SessionStep {
         tool_name: String,
         call_id: String,
         arguments: Value,
+        latency_ms: Option<u32>,
+        is_error: bool,
         result: Option<ToolResult>,
     },
 }
@@ -1203,7 +1193,7 @@ pub struct TablePreviewQuery {
 }
 
 impl TablePreviewQuery {
-    pub fn normalized_limit(&self) -> u16 {
+    pub(crate) fn normalized_limit(&self) -> u16 {
         self.limit.clamp(1, 500)
     }
 }
@@ -1434,7 +1424,6 @@ mod tests {
             (SessionLookback::NinetyDays, "90d", Some(7_776_000)),
             (SessionLookback::All, "all", None),
         ] {
-            assert_eq!(lookback.as_str(), wire);
             assert_eq!(lookback.window_seconds(), window_seconds);
             assert_eq!(
                 serde_json::to_string(&lookback).expect("serialize session lookback"),

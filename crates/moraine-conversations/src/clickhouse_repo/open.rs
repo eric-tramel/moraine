@@ -28,7 +28,7 @@ FORMAT JSONEachRow",
             sql_quote(session_id),
         );
 
-        let rows: Vec<TurnSummaryRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
+        let rows: Vec<TurnSummaryRow> = self.map_backend(self.query_rows(&query, None).await)?;
         Ok(rows.into_iter().map(Self::map_turn_row).collect())
     }
 
@@ -61,7 +61,7 @@ FORMAT JSONEachRow",
         );
 
         let rows: Vec<ConversationSummaryRow> =
-            self.map_backend(self.ch.query_rows(&query, None).await)?;
+            self.map_backend(self.query_rows(&query, None).await)?;
         Ok(rows.into_iter().next().map(Self::map_conversation_row))
     }
 
@@ -111,7 +111,7 @@ FORMAT JSONEachRow",
         );
 
         let rows: Vec<SessionMetadataRow> =
-            self.map_backend(self.ch.query_rows(&query, None).await)?;
+            self.map_backend(self.query_rows(&query, None).await)?;
         Ok(rows.into_iter().next().map(Self::map_session_metadata_row))
     }
 
@@ -148,8 +148,7 @@ FORMAT JSONEachRow",
             sql_quote(session_id),
         );
 
-        let rows: Vec<McpSessionInfoRow> =
-            self.map_backend(self.ch.query_rows(&query, None).await)?;
+        let rows: Vec<McpSessionInfoRow> = self.map_backend(self.query_rows(&query, None).await)?;
         Ok(rows.into_iter().next().unwrap_or_default())
     }
 
@@ -182,7 +181,7 @@ FORMAT JSONEachRow",
             turn_seq,
         );
 
-        let rows: Vec<TurnSummaryRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
+        let rows: Vec<TurnSummaryRow> = self.map_backend(self.query_rows(&query, None).await)?;
         Ok(rows.into_iter().next().map(Self::map_turn_row))
     }
 
@@ -220,7 +219,7 @@ FORMAT JSONEachRow",
             sql_quote(event_uid),
         );
 
-        let rows: Vec<TraceEventRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
+        let rows: Vec<TraceEventRow> = self.map_backend(self.query_rows(&query, None).await)?;
         Ok(rows.into_iter().next().map(Self::map_trace_event))
     }
 
@@ -240,7 +239,7 @@ FORMAT JSONEachRow",
             sql_quote(event_uid),
         );
         let rows: Vec<EventSessionRow> =
-            self.map_backend(self.ch.query_rows(&docs_query, None).await)?;
+            self.map_backend(self.query_rows(&docs_query, None).await)?;
         if let Some(row) = rows.into_iter().next() {
             if !row.session_id.is_empty() {
                 return Ok(Some(row.session_id));
@@ -258,7 +257,7 @@ FORMAT JSONEachRow",
             sql_quote(event_uid),
         );
         let rows: Vec<EventSessionRow> =
-            self.map_backend(self.ch.query_rows(&trace_query, None).await)?;
+            self.map_backend(self.query_rows(&trace_query, None).await)?;
         Ok(rows
             .into_iter()
             .next()
@@ -317,7 +316,7 @@ FORMAT JSONEachRow",
             sql_quote(session_id),
         );
 
-        let rows: Vec<TraceEventRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
+        let rows: Vec<TraceEventRow> = self.map_backend(self.query_rows(&query, None).await)?;
         Ok(rows.into_iter().map(Self::map_trace_event).collect())
     }
 
@@ -356,7 +355,7 @@ FORMAT JSONEachRow",
             turn_seq,
         );
 
-        let rows: Vec<TraceEventRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
+        let rows: Vec<TraceEventRow> = self.map_backend(self.query_rows(&query, None).await)?;
         Ok(rows.into_iter().map(Self::map_trace_event).collect())
     }
 
@@ -643,10 +642,14 @@ FORMAT JSONEachRow",
             return Ok(None);
         }
 
-        let Some(summary) = self.load_turn_summary(session_id, turn_seq).await? else {
+        let turn_summaries = self.load_turns_for_session(session_id).await?;
+        let Some(summary) = turn_summaries
+            .iter()
+            .find(|summary| summary.turn_seq == turn_seq)
+            .cloned()
+        else {
             return Ok(None);
         };
-        let turn_summaries = self.load_turns_for_session(session_id).await?;
         let previous_turn = turn_summaries
             .iter()
             .rev()
@@ -687,7 +690,7 @@ FORMAT JSONEachRow",
         );
 
         let targets: Vec<OpenTargetRow> =
-            self.map_backend(self.ch.query_rows(&target_query, None).await)?;
+            self.map_backend(self.query_rows(&target_query, None).await)?;
         let Some(target) = targets.first() else {
             return Ok(OpenContext {
                 found: false,
@@ -766,7 +769,7 @@ FORMAT JSONEachRow",
                 before,
             );
 
-            self.map_backend(self.ch.query_rows(&before_query, None).await)?
+            self.map_backend(self.query_rows(&before_query, None).await)?
         };
         if !include_system_events {
             before_rows.retain(|row| {
@@ -776,7 +779,7 @@ FORMAT JSONEachRow",
         before_rows.reverse();
 
         let target_rows: Vec<TraceEventRow> =
-            self.map_backend(self.ch.query_rows(&target_row_query, None).await)?;
+            self.map_backend(self.query_rows(&target_row_query, None).await)?;
 
         let mut after_rows: Vec<TraceEventRow> = if after == 0 {
             Vec::new()
@@ -813,7 +816,7 @@ FORMAT JSONEachRow",
                 after,
             );
 
-            self.map_backend(self.ch.query_rows(&after_query, None).await)?
+            self.map_backend(self.query_rows(&after_query, None).await)?
         };
         if !include_system_events {
             after_rows.retain(|row| {
@@ -899,10 +902,14 @@ FORMAT JSONEachRow",
             return Ok(None);
         };
         let parent_session_info = self.load_mcp_session_info(&session_id).await?;
-        let Some(parent_turn) = self.load_turn_summary(&session_id, event.turn_seq).await? else {
+        let turn_summaries = self.load_turns_for_session(&session_id).await?;
+        let Some(parent_turn) = turn_summaries
+            .iter()
+            .find(|summary| summary.turn_seq == event.turn_seq)
+            .cloned()
+        else {
             return Ok(None);
         };
-        let turn_summaries = self.load_turns_for_session(&session_id).await?;
         let previous_turn = turn_summaries
             .iter()
             .rev()

@@ -1,43 +1,6 @@
 use super::*;
 
 #[derive(Debug, Deserialize)]
-struct SessionAnalyticsSummaryRow {
-    session_id: String,
-    first_event_time: String,
-    first_event_unix_ms: i64,
-    last_event_time: String,
-    last_event_unix_ms: i64,
-    total_turns: u32,
-    total_events: u64,
-    user_messages: u64,
-    assistant_messages: u64,
-    tool_calls: u64,
-    tool_results: u64,
-    mode: String,
-    #[serde(default)]
-    session_slug: String,
-    #[serde(default)]
-    session_summary: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct SessionAnalyticsTurnRow {
-    session_id: String,
-    turn_seq: u32,
-    turn_id: String,
-    started_at: String,
-    started_at_unix_ms: i64,
-    ended_at: String,
-    ended_at_unix_ms: i64,
-    total_events: u64,
-    user_messages: u64,
-    assistant_messages: u64,
-    tool_calls: u64,
-    tool_results: u64,
-    reasoning_items: u64,
-}
-
-#[derive(Debug, Deserialize)]
 struct SessionAnalyticsEventRow {
     session_id: String,
     event_order: u64,
@@ -171,8 +134,8 @@ ORDER BY s.last_event_time DESC, s.session_id DESC
 LIMIT {limit}
 FORMAT JSONEachRow"
         );
-        let summary_rows: Vec<SessionAnalyticsSummaryRow> =
-            self.map_backend(self.ch.query_rows(&summary_query, None).await)?;
+        let summary_rows: Vec<ConversationSummaryRow> =
+            self.map_backend(self.query_rows(&summary_query, None).await)?;
         if summary_rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -203,8 +166,8 @@ WHERE session_id IN {session_ids_sql}
 ORDER BY session_id ASC, turn_seq ASC
 FORMAT JSONEachRow"
         );
-        let turn_rows: Vec<SessionAnalyticsTurnRow> =
-            self.map_backend(self.ch.query_rows(&turns_query, None).await)?;
+        let turn_rows: Vec<TurnSummaryRow> =
+            self.map_backend(self.query_rows(&turns_query, None).await)?;
 
         let events_query = format!(
             "SELECT
@@ -227,9 +190,9 @@ FORMAT JSONEachRow"
   toUInt32(ifNull(e.cache_write_tokens, 0)) AS cache_write_tokens,
   t.token_usage_buckets AS token_usage_buckets,
   t.token_usage_native_units AS token_usage_native_units,
-  substring(ifNull(e.text_preview, ''), 1, 2000) AS text_preview,
-  substring(ifNull(t.text_content, ''), 1, 2000) AS text_content,
-  if(t.event_class = 'tool_call', substring(JSONExtractRaw(t.payload_json, 'input'), 1, 2000), '') AS tool_args_json,
+  substringUTF8(ifNull(e.text_preview, ''), 1, 2000) AS text_preview,
+  substringUTF8(ifNull(t.text_content, ''), 1, 2000) AS text_content,
+  if(t.event_class = 'tool_call', substringUTF8(JSONExtractRaw(t.payload_json, 'input'), 1, 2000), '') AS tool_args_json,
   ifNull(e.harness, '') AS harness,
   ifNull(e.source_name, '') AS source_name,
   ifNull(e.trace_id, '') AS trace_id
@@ -240,7 +203,7 @@ ORDER BY t.session_id ASC, t.event_order ASC
 FORMAT JSONEachRow"
         );
         let event_rows: Vec<SessionAnalyticsEventRow> =
-            self.map_backend(self.ch.query_rows(&events_query, None).await)?;
+            self.map_backend(self.query_rows(&events_query, None).await)?;
 
         Ok(assemble_sessions(summary_rows, turn_rows, event_rows))
     }
@@ -285,7 +248,7 @@ WHERE intDiv(toUnixTimestamp64Milli(e.event_ts), 1000) >= greatest(database_now_
 FORMAT JSONEachRow"
         );
         let anchors: Vec<AnalyticsAnchorRow> =
-            self.map_backend(self.ch.query_rows(&anchor_query, None).await)?;
+            self.map_backend(self.query_rows(&anchor_query, None).await)?;
         let anchor = anchors
             .into_iter()
             .next()
@@ -349,7 +312,7 @@ ORDER BY bucket_unix ASC, model ASC, endpoint_kind ASC, bucket ASC
 FORMAT JSONEachRow"
         );
         let token_rows: Vec<AnalyticsTokenRow> =
-            self.map_backend(self.ch.query_rows(&token_query, None).await)?;
+            self.map_backend(self.query_rows(&token_query, None).await)?;
 
         let turns_query = format!(
             "SELECT
@@ -365,7 +328,7 @@ ORDER BY bucket_unix ASC, model ASC
 FORMAT JSONEachRow"
         );
         let turn_rows: Vec<AnalyticsTurnRow> =
-            self.map_backend(self.ch.query_rows(&turns_query, None).await)?;
+            self.map_backend(self.query_rows(&turns_query, None).await)?;
 
         let concurrency_query = format!(
             "SELECT
@@ -389,7 +352,7 @@ ORDER BY bucket_unix ASC
 FORMAT JSONEachRow"
         );
         let concurrency_rows: Vec<AnalyticsConcurrencyRow> =
-            self.map_backend(self.ch.query_rows(&concurrency_query, None).await)?;
+            self.map_backend(self.query_rows(&concurrency_query, None).await)?;
 
         Ok(AnalyticsSnapshot {
             window: AnalyticsWindow {
@@ -470,11 +433,11 @@ FROM {canonical_events} AS e
 WHERE e.payload_type = 'web_search_call'
    OR (e.payload_type = 'tool_use' AND e.tool_name IN ('WebSearch', 'WebFetch'))
    OR e.payload_type = 'search_results_received'
-ORDER BY e.event_ts DESC
+ORDER BY e.event_ts DESC, e.event_uid DESC
 LIMIT {limit}
 FORMAT JSONEachRow"
         );
-        let rows: Vec<WebSearchRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
+        let rows: Vec<WebSearchRow> = self.map_backend(self.query_rows(&query, None).await)?;
         Ok(rows
             .into_iter()
             .map(|row| WebSearchEvent {
@@ -493,11 +456,11 @@ FORMAT JSONEachRow"
 }
 
 fn assemble_sessions(
-    summary_rows: Vec<SessionAnalyticsSummaryRow>,
-    turn_rows: Vec<SessionAnalyticsTurnRow>,
+    summary_rows: Vec<ConversationSummaryRow>,
+    turn_rows: Vec<TurnSummaryRow>,
     event_rows: Vec<SessionAnalyticsEventRow>,
 ) -> Vec<SessionAnalytics> {
-    let mut turns_by_session = HashMap::<String, Vec<SessionAnalyticsTurnRow>>::new();
+    let mut turns_by_session = HashMap::<String, Vec<TurnSummaryRow>>::new();
     for turn in turn_rows {
         turns_by_session
             .entry(turn.session_id.clone())
@@ -516,9 +479,8 @@ fn assemble_sessions(
     summary_rows
         .into_iter()
         .map(|row| {
-            let mut events = events_by_session
-                .remove(&row.session_id)
-                .unwrap_or_default();
+            let session_id = row.session_id.clone();
+            let mut events = events_by_session.remove(&session_id).unwrap_or_default();
             events.sort_by_key(|event| event.event_order);
             let harness = first_nonempty(&events, |event| &event.harness);
             let source_name = first_nonempty(&events, |event| &event.source_name);
@@ -536,7 +498,7 @@ fn assemble_sessions(
             models.sort_unstable();
             models.dedup();
 
-            let mut session_turns = turns_by_session.remove(&row.session_id).unwrap_or_default();
+            let mut session_turns = turns_by_session.remove(&session_id).unwrap_or_default();
             session_turns.sort_by_key(|turn| turn.turn_seq);
             let mut events_by_turn = HashMap::<u32, Vec<SessionAnalyticsEventRow>>::new();
             for event in events {
@@ -554,22 +516,7 @@ fn assemble_sessions(
                 .collect();
 
             SessionAnalytics {
-                summary: ConversationSummary {
-                    session_id: row.session_id,
-                    first_event_time: row.first_event_time,
-                    first_event_unix_ms: row.first_event_unix_ms,
-                    last_event_time: row.last_event_time,
-                    last_event_unix_ms: row.last_event_unix_ms,
-                    total_turns: row.total_turns,
-                    total_events: row.total_events,
-                    user_messages: row.user_messages,
-                    assistant_messages: row.assistant_messages,
-                    tool_calls: row.tool_calls,
-                    tool_results: row.tool_results,
-                    mode: ClickHouseConversationRepository::parse_mode(&row.mode),
-                    session_slug: non_empty_string(row.session_slug),
-                    session_summary: non_empty_string(row.session_summary),
-                },
+                summary: ClickHouseConversationRepository::map_conversation_row(row),
                 harness,
                 source_name,
                 models,
@@ -581,10 +528,8 @@ fn assemble_sessions(
         .collect()
 }
 
-fn assemble_turn(
-    row: SessionAnalyticsTurnRow,
-    mut events: Vec<SessionAnalyticsEventRow>,
-) -> SessionTurn {
+fn assemble_turn(row: TurnSummaryRow, mut events: Vec<SessionAnalyticsEventRow>) -> SessionTurn {
+    let summary = ClickHouseConversationRepository::map_turn_row(row);
     events.sort_by_key(|event| event.event_order);
     let model = events
         .iter()
@@ -648,6 +593,8 @@ fn assemble_turn(
                 } else {
                     event.tool_name.clone()
                 },
+                latency_ms: (event.latency_ms > 0).then_some(event.latency_ms),
+                is_error: event.tool_error != 0,
                 call_id: event.call_id,
                 arguments: parse_tool_arguments(&event.tool_args_json),
                 result: None,
@@ -680,21 +627,7 @@ fn assemble_turn(
     }
 
     SessionTurn {
-        summary: TurnSummary {
-            session_id: row.session_id,
-            turn_seq: row.turn_seq,
-            turn_id: row.turn_id,
-            started_at: row.started_at,
-            started_at_unix_ms: row.started_at_unix_ms,
-            ended_at: row.ended_at,
-            ended_at_unix_ms: row.ended_at_unix_ms,
-            total_events: row.total_events,
-            user_messages: row.user_messages,
-            assistant_messages: row.assistant_messages,
-            tool_calls: row.tool_calls,
-            tool_results: row.tool_results,
-            reasoning_items: row.reasoning_items,
-        },
+        summary,
         model,
         token_usage_buckets: turn_buckets,
         steps,
@@ -813,8 +746,8 @@ mod tests {
         }
     }
 
-    fn turn_row() -> SessionAnalyticsTurnRow {
-        SessionAnalyticsTurnRow {
+    fn turn_row() -> TurnSummaryRow {
+        TurnSummaryRow {
             session_id: "session".to_string(),
             turn_seq: 1,
             turn_id: "turn".to_string(),
@@ -842,6 +775,24 @@ mod tests {
         row.token_usage_buckets.insert("reasoning".to_string(), 7);
         assert_eq!(event_token_buckets(&row).get("reasoning"), Some(&7));
         assert!(!event_token_buckets(&row).contains_key("input_text"));
+    }
+
+    #[test]
+    fn unmatched_tool_call_preserves_call_latency_and_error() {
+        let mut call = event(1, "tool_call", "call");
+        call.latency_ms = 17;
+        call.tool_error = 1;
+
+        let turn = assemble_turn(turn_row(), vec![call]);
+        assert!(matches!(
+            &turn.steps[0],
+            SessionStep::ToolCall {
+                latency_ms: Some(17),
+                is_error: true,
+                result: None,
+                ..
+            }
+        ));
     }
 
     #[test]

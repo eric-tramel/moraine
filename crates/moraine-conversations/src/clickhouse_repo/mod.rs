@@ -1,17 +1,21 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ahash::AHashMap as HashMap;
 use anyhow::Result as AnyResult;
 use async_trait::async_trait;
 use moraine_clickhouse::ClickHouseClient;
 use regex::Regex;
-use serde::Deserialize;
+use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
 use tokio::sync::{Mutex, RwLock};
+use tokio::time::Instant;
 use tracing::warn;
 use uuid::Uuid;
+
+const REPOSITORY_READ_SETTINGS: [(&str, &str); 1] =
+    [("do_not_merge_across_partitions_select_final", "0")];
 
 use crate::cursor::{
     decode_cursor, encode_cursor, ConversationCursor, McpSessionListCursor, SessionEventCursor,
@@ -98,6 +102,30 @@ impl ClickHouseConversationRepository {
             sql_identifier(&self.ch.config().database),
             sql_identifier(table)
         )
+    }
+
+    pub(super) async fn query_rows<T: DeserializeOwned>(
+        &self,
+        query: &str,
+        database: Option<&str>,
+    ) -> AnyResult<Vec<T>> {
+        self.ch
+            .query_rows_with_params(query, database, &REPOSITORY_READ_SETTINGS)
+            .await
+    }
+
+    pub(super) async fn query_rows_with_params<T: DeserializeOwned>(
+        &self,
+        query: &str,
+        database: Option<&str>,
+        params: &[(&str, &str)],
+    ) -> AnyResult<Vec<T>> {
+        let mut request_params = Vec::with_capacity(params.len() + REPOSITORY_READ_SETTINGS.len());
+        request_params.extend_from_slice(params);
+        request_params.extend_from_slice(&REPOSITORY_READ_SETTINGS);
+        self.ch
+            .query_rows_with_params(query, database, &request_params)
+            .await
     }
 
     pub(super) fn map_backend<T>(&self, result: AnyResult<T>) -> RepoResult<T> {

@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::{
     extract::{Query, State},
@@ -21,6 +22,13 @@ use moraine_conversations::{
     SessionStep, StoreProbe, TablePreviewQuery,
 };
 use serde_json::json;
+use tokio::sync::Notify;
+
+#[derive(Clone)]
+struct ScriptedBarrier {
+    reached: Arc<Notify>,
+    release: Arc<Notify>,
+}
 
 #[derive(Clone)]
 struct ScriptedResponse {
@@ -28,6 +36,7 @@ struct ScriptedResponse {
     forbidden: Vec<&'static str>,
     status: StatusCode,
     body: String,
+    barrier: Option<ScriptedBarrier>,
 }
 
 impl ScriptedResponse {
@@ -36,6 +45,7 @@ impl ScriptedResponse {
             required: required.to_vec(),
             forbidden: Vec::new(),
             status: StatusCode::OK,
+            barrier: None,
             body: json_each_row(rows),
         }
     }
@@ -45,6 +55,7 @@ impl ScriptedResponse {
             required: required.to_vec(),
             forbidden: Vec::new(),
             status: StatusCode::OK,
+            barrier: None,
             body: body.into(),
         }
     }
@@ -54,12 +65,18 @@ impl ScriptedResponse {
             required: required.to_vec(),
             forbidden: Vec::new(),
             status: StatusCode::INTERNAL_SERVER_ERROR,
+            barrier: None,
             body: message.to_string(),
         }
     }
 
     fn forbidding(mut self, forbidden: &[&'static str]) -> Self {
         self.forbidden = forbidden.to_vec();
+        self
+    }
+
+    fn blocked(mut self, reached: Arc<Notify>, release: Arc<Notify>) -> Self {
+        self.barrier = Some(ScriptedBarrier { reached, release });
         self
     }
 }
@@ -228,8 +245,8 @@ fn session_analytics_event_rows() -> serde_json::Value {
             "payload_type": "tool_use",
             "call_id": "call-read",
             "tool_name": "Read",
-            "tool_error": 0_u8,
-            "latency_ms": 0_u32,
+            "tool_error": 1_u8,
+            "latency_ms": 17_u32,
             "model": "GPT-X",
             "endpoint_kind": "",
             "input_tokens": 0_u32,
@@ -553,6 +570,10 @@ async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
                         "script mismatch; missing={missing:?}; forbidden={forbidden:?}; query={query}"
                     ),
                 );
+            }
+            if let Some(barrier) = response.barrier {
+                barrier.reached.notify_one();
+                barrier.release.notified().await;
             }
             return (response.status, response.body);
         }
@@ -3951,12 +3972,16 @@ async fn session_analytics_assembles_canonical_views_and_public_steps() {
             tool_name,
             call_id,
             arguments,
+            latency_ms,
+            is_error,
             result,
             ..
         } => {
             assert_eq!(tool_name, "Read");
             assert_eq!(call_id, "call-read");
             assert_eq!(arguments, &json!({ "path": "src/lib.rs" }));
+            assert_eq!(*latency_ms, Some(17));
+            assert!(*is_error);
             let result = result.as_ref().expect("paired tool result");
             assert_eq!(result.text, "read failed");
             assert_eq!(result.latency_ms, 600);
@@ -4050,27 +4075,6 @@ async fn session_analytics_propagates_each_wire_stage_error() {
     }
 }
 
-#[test]
-fn analytics_range_wire_mapping_is_complete_and_stable() {
-    let expected = [
-        (AnalyticsRange::FifteenMinutes, "15m", 900, 60),
-        (AnalyticsRange::OneHour, "1h", 3_600, 300),
-        (AnalyticsRange::SixHours, "6h", 21_600, 900),
-        (AnalyticsRange::TwentyFourHours, "24h", 86_400, 3_600),
-        (AnalyticsRange::SevenDays, "7d", 604_800, 21_600),
-        (AnalyticsRange::ThirtyDays, "30d", 2_592_000, 86_400),
-    ];
-    assert_eq!(AnalyticsRange::ALL.len(), expected.len());
-    for ((actual, (range, label, window, bucket)), index) in
-        AnalyticsRange::ALL.into_iter().zip(expected).zip(0usize..)
-    {
-        assert_eq!(actual, range, "range index {index}");
-        assert_eq!(range.as_str(), label, "range index {index}");
-        assert_eq!(range.window_seconds(), window, "range index {index}");
-        assert_eq!(range.bucket_seconds(), bucket, "range index {index}");
-    }
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn analytics_24h_uses_exact_four_request_canonical_wire_contract() {
     let responses = analytics_responses(
@@ -4124,6 +4128,62 @@ async fn analytics_24h_uses_exact_four_request_canonical_wire_contract() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn analytics_all_six_ranges_use_distinct_wire_keys() {
+    let cases = [
+        (
+            AnalyticsRange::FifteenMinutes,
+            "toInt64(900)",
+            "INTERVAL 60 SECOND",
+        ),
+        (
+            AnalyticsRange::OneHour,
+            "toInt64(3600)",
+            "INTERVAL 300 SECOND",
+        ),
+        (
+            AnalyticsRange::SixHours,
+            "toInt64(21600)",
+            "INTERVAL 900 SECOND",
+        ),
+        (
+            AnalyticsRange::TwentyFourHours,
+            "toInt64(86400)",
+            "INTERVAL 3600 SECOND",
+        ),
+        (
+            AnalyticsRange::SevenDays,
+            "toInt64(604800)",
+            "INTERVAL 21600 SECOND",
+        ),
+        (
+            AnalyticsRange::ThirtyDays,
+            "toInt64(2592000)",
+            "INTERVAL 86400 SECOND",
+        ),
+    ];
+    let mut responses = Vec::new();
+    for (_, window, interval) in cases {
+        responses.extend(analytics_responses(
+            window,
+            interval,
+            json!([]),
+            json!([]),
+            json!([]),
+        ));
+    }
+    let (repo, state) = build_scripted_repo(responses).await;
+
+    for (range, _, _) in cases {
+        let snapshot = repo
+            .analytics_series(range)
+            .await
+            .expect("distinct analytics range succeeds");
+        assert_eq!(snapshot.window.range, range);
+    }
+    assert_script_consumed(&state, 24);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn analytics_cache_hit_and_distinct_key_are_request_count_proven() {
     let mut responses = analytics_responses(
         "toInt64(86400)",
@@ -4140,13 +4200,13 @@ async fn analytics_cache_hit_and_distinct_key_are_request_count_proven() {
         json!([]),
     ));
     let (repo, state) = build_scripted_repo(responses).await;
-    let repo: Arc<dyn ConversationRepository> = Arc::new(repo);
+    let clone = repo.clone();
 
     let first = repo
         .analytics_series(AnalyticsRange::TwentyFourHours)
         .await
         .expect("cache miss succeeds");
-    let hit = repo
+    let hit = clone
         .analytics_series(AnalyticsRange::TwentyFourHours)
         .await
         .expect("same-key cache hit succeeds");
@@ -4160,6 +4220,52 @@ async fn analytics_cache_hit_and_distinct_key_are_request_count_proven() {
     assert_eq!(distinct.window.range, AnalyticsRange::OneHour);
     assert_eq!(distinct.window.window_seconds, 3_600);
     assert_eq!(distinct.window.bucket_seconds, 300);
+    assert_script_consumed(&state, 8);
+}
+
+#[tokio::test]
+async fn analytics_expired_entry_refills_from_the_repository() {
+    let mut responses = analytics_responses(
+        "toInt64(86400)",
+        "INTERVAL 3600 SECOND",
+        json!([{
+            "bucket_unix": 100_000_u64,
+            "model": "model",
+            "endpoint_kind": "generation",
+            "bucket": "input_text",
+            "tokens": 1_u64
+        }]),
+        json!([]),
+        json!([]),
+    );
+    responses.extend(analytics_responses(
+        "toInt64(86400)",
+        "INTERVAL 3600 SECOND",
+        json!([{
+            "bucket_unix": 100_000_u64,
+            "model": "model",
+            "endpoint_kind": "generation",
+            "bucket": "input_text",
+            "tokens": 2_u64
+        }]),
+        json!([]),
+        json!([]),
+    ));
+    let (repo, state) = build_scripted_repo(responses).await;
+
+    let first = repo
+        .analytics_series(AnalyticsRange::TwentyFourHours)
+        .await
+        .expect("initial cache fill succeeds");
+    assert_eq!(first.tokens[0].tokens, 1);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    tokio::time::resume();
+    let refilled = repo
+        .analytics_series(AnalyticsRange::TwentyFourHours)
+        .await
+        .expect("stale cache entry refills");
+    assert_eq!(refilled.tokens[0].tokens, 2);
     assert_script_consumed(&state, 8);
 }
 
@@ -4202,6 +4308,79 @@ async fn analytics_stage_error_is_not_cached_and_empty_retry_succeeds() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn analytics_anchor_decode_and_late_stage_errors_are_not_cached() {
+    let success = analytics_responses(
+        "toInt64(86400)",
+        "INTERVAL 3600 SECOND",
+        json!([]),
+        json!([]),
+        json!([]),
+    );
+    let scenarios = [
+        (
+            "anchor",
+            vec![ScriptedResponse::failure(
+                &["database_now_unix", "FORMAT JSONEachRow"],
+                "analytics anchor stage failed",
+            )],
+            5,
+        ),
+        (
+            "decode",
+            vec![ScriptedResponse::raw(
+                &["database_now_unix", "FORMAT JSONEachRow"],
+                "not-json\n",
+            )],
+            5,
+        ),
+        (
+            "turn",
+            vec![
+                success[0].clone(),
+                success[1].clone(),
+                ScriptedResponse::failure(
+                    &[
+                        "uniqExact(tuple(e.session_id, e.request_id))",
+                        "FORMAT JSONEachRow",
+                    ],
+                    "analytics turn stage failed",
+                ),
+            ],
+            7,
+        ),
+        (
+            "concurrency",
+            vec![
+                success[0].clone(),
+                success[1].clone(),
+                success[2].clone(),
+                ScriptedResponse::failure(
+                    &["uniqExact(session_stream_key)", "FORMAT JSONEachRow"],
+                    "analytics concurrency stage failed",
+                ),
+            ],
+            8,
+        ),
+    ];
+
+    for (stage, mut responses, expected_requests) in scenarios {
+        responses.extend(success.clone());
+        let (repo, state) = build_scripted_repo(responses).await;
+        repo.analytics_series(AnalyticsRange::TwentyFourHours)
+            .await
+            .expect_err(stage);
+        let retry = repo
+            .analytics_series(AnalyticsRange::TwentyFourHours)
+            .await
+            .unwrap_or_else(|error| panic!("{stage} retry failed: {error}"));
+        assert!(retry.tokens.is_empty());
+        assert!(retry.turns.is_empty());
+        assert!(retry.concurrent_sessions.is_empty());
+        assert_script_consumed(&state, expected_requests);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn analytics_same_key_concurrency_coalesces_to_one_wire_load() {
     let (repo, state) = build_scripted_repo(analytics_responses(
         "toInt64(86400)",
@@ -4225,6 +4404,164 @@ async fn analytics_same_key_concurrency_coalesces_to_one_wire_load() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn analytics_different_ranges_fill_concurrently() {
+    let first_anchor_reached = Arc::new(Notify::new());
+    let first_anchor_release = Arc::new(Notify::new());
+    let second_anchor_reached = Arc::new(Notify::new());
+    let second_anchor_release = Arc::new(Notify::new());
+    let first_fill_reached_last_stage = Arc::new(Notify::new());
+    let first_fill_release_last_stage = Arc::new(Notify::new());
+    let anchor_row = json!([{
+        "scan_from_unix": 100_000_u64,
+        "scan_to_unix": 200_000_u64,
+        "display_to_unix": 200_000_u64
+    }]);
+    let generic_anchor = |reached: Arc<Notify>, release: Arc<Notify>| {
+        ScriptedResponse::rows(
+            &[
+                "toInt64(toUnixTimestamp(now())) AS database_now_unix",
+                "FROM (SELECT * FROM `moraine`.`events` FINAL) AS e",
+            ],
+            anchor_row.clone(),
+        )
+        .blocked(reached, release)
+    };
+    let token = || {
+        ScriptedResponse::rows(
+            &[
+                "ARRAY JOIN mapKeys(e.token_usage_buckets)",
+                "FORMAT JSONEachRow",
+            ],
+            json!([]),
+        )
+    };
+    let turns = || {
+        ScriptedResponse::rows(
+            &[
+                "uniqExact(tuple(e.session_id, e.request_id))",
+                "FORMAT JSONEachRow",
+            ],
+            json!([]),
+        )
+    };
+    let concurrency = || {
+        ScriptedResponse::rows(
+            &["uniqExact(session_stream_key)", "FORMAT JSONEachRow"],
+            json!([]),
+        )
+    };
+    let responses = vec![
+        generic_anchor(first_anchor_reached.clone(), first_anchor_release.clone()),
+        generic_anchor(second_anchor_reached.clone(), second_anchor_release.clone()),
+        token(),
+        turns(),
+        concurrency().blocked(
+            first_fill_reached_last_stage.clone(),
+            first_fill_release_last_stage.clone(),
+        ),
+        token(),
+        turns(),
+        concurrency(),
+    ];
+    let (repo, state) = build_scripted_repo(responses).await;
+    let repo = Arc::new(repo);
+
+    let one_hour_repo = repo.clone();
+    let one_hour = tokio::spawn(async move {
+        one_hour_repo
+            .analytics_series(AnalyticsRange::OneHour)
+            .await
+    });
+    let day_repo = repo.clone();
+    let day = tokio::spawn(async move {
+        day_repo
+            .analytics_series(AnalyticsRange::TwentyFourHours)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), first_anchor_reached.notified())
+        .await
+        .expect("first range reached its anchor");
+    tokio::time::timeout(Duration::from_secs(2), second_anchor_reached.notified())
+        .await
+        .expect("second range reached its anchor before the first was released");
+
+    first_anchor_release.notify_one();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        first_fill_reached_last_stage.notified(),
+    )
+    .await
+    .expect("first range reached its final stage");
+    first_fill_release_last_stage.notify_one();
+    second_anchor_release.notify_one();
+
+    let (one_hour, day) = tokio::join!(one_hour, day);
+    assert_eq!(
+        one_hour
+            .expect("one-hour task joined")
+            .expect("one-hour fill succeeds")
+            .window
+            .range,
+        AnalyticsRange::OneHour
+    );
+    assert_eq!(
+        day.expect("day task joined")
+            .expect("day fill succeeds")
+            .window
+            .range,
+        AnalyticsRange::TwentyFourHours
+    );
+    assert_script_consumed(&state, 8);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn analytics_cancelled_fill_releases_slot_and_recovery_is_cached() {
+    let success = analytics_responses(
+        "toInt64(86400)",
+        "INTERVAL 3600 SECOND",
+        json!([]),
+        json!([]),
+        json!([]),
+    );
+    let reached = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mut responses = vec![success[0].clone().blocked(reached.clone(), release.clone())];
+    responses.extend(success);
+    let (repo, state) = build_scripted_repo(responses).await;
+    let repo = Arc::new(repo);
+
+    let first_repo = repo.clone();
+    let first = tokio::spawn(async move {
+        first_repo
+            .analytics_series(AnalyticsRange::TwentyFourHours)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), reached.notified())
+        .await
+        .expect("scripted analytics load reached the wire barrier");
+    first.abort();
+    release.notify_one();
+    assert!(first
+        .await
+        .expect_err("fill task was aborted")
+        .is_cancelled());
+
+    let recovered = tokio::time::timeout(
+        Duration::from_secs(2),
+        repo.analytics_series(AnalyticsRange::TwentyFourHours),
+    )
+    .await
+    .expect("cancelled fill released the range slot")
+    .expect("recovery fill succeeds");
+    let hit = repo
+        .analytics_series(AnalyticsRange::TwentyFourHours)
+        .await
+        .expect("recovery result was cached");
+    assert_eq!(recovered, hit);
+    assert_script_consumed(&state, 5);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn web_feed_covers_variants_precedence_limit_order_and_canonical_source() {
     let response = ScriptedResponse::rows(
         &[
@@ -4237,7 +4574,7 @@ async fn web_feed_covers_variants_precedence_limit_order_and_canonical_source() 
             "JSONExtractString(e.payload_json, 'data', 'query')",
             "JSONExtractString(e.payload_json, 'action', 'url')",
             "JSONExtractString(e.payload_json, 'input', 'url')",
-            "ORDER BY e.event_ts DESC",
+            "ORDER BY e.event_ts DESC, e.event_uid DESC",
             "LIMIT 1000",
             "FORMAT JSONEachRow",
         ],

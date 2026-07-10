@@ -493,7 +493,10 @@ mod tests {
     use std::sync::Arc;
 
     use crate::domain::{
-        AnalyticsRange, SessionAnalyticsQuery, SessionLookback, StoreProbe, TablePreviewQuery,
+        AnalyticsRange, AnalyticsSnapshot, AnalyticsWindow, ConversationMode, ConversationSummary,
+        IngestHeartbeatRead, SessionAnalytics, SessionAnalyticsQuery, SessionLookback,
+        StoreConnectionMetrics, StoreDiagnostics, StoreHealth, StoreProbe, TablePreview,
+        TablePreviewQuery, TableSummaries, WebSearchEvent,
     };
     use crate::error::RepoError;
 
@@ -573,6 +576,173 @@ mod tests {
         assert_eq!(calls.preview_table, vec![preview_query]);
         assert_eq!(calls.read_store_health, 1);
         assert_eq!(calls.read_store_diagnostics, 1);
+    }
+
+    #[tokio::test]
+    async fn analytics_contract_returns_configured_successes_and_accumulates_calls() {
+        let session = SessionAnalytics {
+            summary: ConversationSummary {
+                session_id: "session".to_string(),
+                first_event_time: "2026-01-01 00:00:00".to_string(),
+                first_event_unix_ms: 1,
+                last_event_time: "2026-01-01 00:00:01".to_string(),
+                last_event_unix_ms: 2,
+                total_turns: 1,
+                total_events: 2,
+                user_messages: 1,
+                assistant_messages: 1,
+                tool_calls: 0,
+                tool_results: 0,
+                mode: ConversationMode::Chat,
+                session_slug: None,
+                session_summary: None,
+            },
+            harness: "codex".to_string(),
+            source_name: "codex-jsonl".to_string(),
+            models: vec!["gpt-5".to_string()],
+            trace_id: "trace".to_string(),
+            first_user_text: "hello".to_string(),
+            turns: Vec::new(),
+        };
+        let analytics = AnalyticsSnapshot {
+            window: AnalyticsWindow {
+                range: AnalyticsRange::OneHour,
+                window_seconds: 3_600,
+                bucket_seconds: 300,
+                from_unix: 1,
+                to_unix: 2,
+            },
+            tokens: Vec::new(),
+            turns: Vec::new(),
+            concurrent_sessions: Vec::new(),
+        };
+        let web_search = WebSearchEvent {
+            event_time: "2026-01-01 00:00:00".to_string(),
+            harness: "codex".to_string(),
+            source_name: "codex-jsonl".to_string(),
+            session_id: "session".to_string(),
+            model: "gpt-5".to_string(),
+            action: "search".to_string(),
+            search_query: "rust".to_string(),
+            result_url: String::new(),
+            source_ref: "source".to_string(),
+        };
+        let heartbeat = IngestHeartbeatRead {
+            table_present: true,
+            latest: None,
+        };
+        let tables = TableSummaries {
+            tables: Vec::new(),
+            row_counts_error: Some("partial".to_string()),
+        };
+        let preview = TablePreview {
+            table: "events".to_string(),
+            limit: 7,
+            schema: Vec::new(),
+            rows: Vec::new(),
+        };
+        let health = StoreHealth {
+            ping: StoreProbe::Available(1.5),
+            version: StoreProbe::Available("25.1".to_string()),
+            database_exists: StoreProbe::Available(true),
+            connections: StoreProbe::Available(StoreConnectionMetrics::default()),
+        };
+        let diagnostics = StoreDiagnostics {
+            healthy: true,
+            database: "moraine".to_string(),
+            ..StoreDiagnostics::default()
+        };
+        let responses = InMemoryConversationResponses {
+            list_session_analytics: Some(Ok(vec![session])),
+            analytics_series: Some(Ok(analytics.clone())),
+            list_web_searches: Some(Ok(vec![web_search.clone()])),
+            latest_ingest_heartbeat: Some(Ok(heartbeat.clone())),
+            list_table_summaries: Some(Ok(tables.clone())),
+            preview_table: Some(Ok(preview.clone())),
+            read_store_health: Some(Ok(health.clone())),
+            read_store_diagnostics: Some(Ok(diagnostics.clone())),
+            ..InMemoryConversationResponses::default()
+        };
+        let fake = Arc::new(InMemoryConversationRepository::with_responses(
+            Default::default(),
+            responses,
+        ));
+        let repo: Arc<dyn ConversationRepository> = fake.clone();
+        let session_query = SessionAnalyticsQuery {
+            lookback: SessionLookback::OneHour,
+            limit: 7,
+        };
+        let preview_query = TablePreviewQuery {
+            table: "events".to_string(),
+            limit: 7,
+        };
+
+        for _ in 0..2 {
+            let sessions = repo
+                .list_session_analytics(session_query.clone())
+                .await
+                .expect("configured sessions");
+            assert_eq!(sessions[0].summary.session_id, "session");
+            assert_eq!(
+                repo.analytics_series(AnalyticsRange::OneHour)
+                    .await
+                    .expect("configured analytics"),
+                analytics
+            );
+            assert_eq!(
+                repo.list_web_searches(7)
+                    .await
+                    .expect("configured web searches"),
+                vec![web_search.clone()]
+            );
+            assert_eq!(
+                repo.latest_ingest_heartbeat()
+                    .await
+                    .expect("configured heartbeat"),
+                heartbeat
+            );
+            assert_eq!(
+                repo.list_table_summaries()
+                    .await
+                    .expect("configured table summaries"),
+                tables
+            );
+            assert_eq!(
+                repo.preview_table(preview_query.clone())
+                    .await
+                    .expect("configured preview"),
+                preview
+            );
+            assert_eq!(
+                repo.read_store_health().await.expect("configured health"),
+                health
+            );
+            assert_eq!(
+                repo.read_store_diagnostics()
+                    .await
+                    .expect("configured diagnostics"),
+                diagnostics
+            );
+        }
+
+        let calls = fake.calls();
+        assert_eq!(
+            calls.list_session_analytics,
+            vec![session_query.clone(), session_query]
+        );
+        assert_eq!(
+            calls.analytics_series,
+            vec![AnalyticsRange::OneHour, AnalyticsRange::OneHour]
+        );
+        assert_eq!(calls.list_web_searches, vec![7, 7]);
+        assert_eq!(calls.latest_ingest_heartbeat, 2);
+        assert_eq!(calls.list_table_summaries, 2);
+        assert_eq!(
+            calls.preview_table,
+            vec![preview_query.clone(), preview_query]
+        );
+        assert_eq!(calls.read_store_health, 2);
+        assert_eq!(calls.read_store_diagnostics, 2);
     }
 
     #[tokio::test]

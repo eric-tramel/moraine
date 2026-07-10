@@ -160,7 +160,7 @@ impl ClickHouseConversationRepository {
   FORMAT JSONEachRow",
         );
 
-        self.map_backend(self.ch.query_rows_with_params(&sql, None, &params).await)
+        self.map_backend(self.query_rows_with_params(&sql, None, &params).await)
     }
 
     async fn file_attention_suffix_impl(
@@ -337,7 +337,7 @@ impl ClickHouseConversationRepository {
   FORMAT JSONEachRow",
         );
 
-        self.map_backend(self.ch.query_rows_with_params(&sql, None, &params).await)
+        self.map_backend(self.query_rows_with_params(&sql, None, &params).await)
     }
 
     pub async fn cancel_query(&self, query_id: &str) -> RepoResult<()> {

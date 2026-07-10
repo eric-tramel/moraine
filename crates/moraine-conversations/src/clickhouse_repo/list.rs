@@ -118,7 +118,7 @@ FORMAT JSONEachRow",
         );
 
         let rows: Vec<ConversationSummaryRow> =
-            self.map_backend(self.ch.query_rows(&query, None).await)?;
+            self.map_backend(self.query_rows(&query, None).await)?;
 
         let mut items: Vec<ConversationSummary> = rows
             .iter()
@@ -306,8 +306,7 @@ FORMAT JSONEachRow",
             limit_plus = (limit as usize) + 1,
         );
 
-        let rows: Vec<McpSessionListRow> =
-            self.map_backend(self.ch.query_rows(&query, None).await)?;
+        let rows: Vec<McpSessionListRow> = self.map_backend(self.query_rows(&query, None).await)?;
 
         let mut items: Vec<McpSessionListItem> = rows
             .iter()
@@ -405,7 +404,7 @@ FORMAT JSONEachRow",
             limit_plus = (limit as usize) + 1,
         );
 
-        let rows: Vec<TurnSummaryRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
+        let rows: Vec<TurnSummaryRow> = self.map_backend(self.query_rows(&query, None).await)?;
         let items: Vec<TurnSummary> = rows
             .iter()
             .take(limit as usize)
@@ -533,8 +532,7 @@ FORMAT JSONEachRow",
             limit_plus = (limit as usize) + 1,
         );
 
-        let mut rows: Vec<TraceEventRow> =
-            self.map_backend(self.ch.query_rows(&query, None).await)?;
+        let mut rows: Vec<TraceEventRow> = self.map_backend(self.query_rows(&query, None).await)?;
         let has_more = rows.len() > limit as usize;
         if has_more {
             rows.truncate(limit as usize);
