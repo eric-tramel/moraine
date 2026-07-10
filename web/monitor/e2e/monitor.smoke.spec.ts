@@ -84,7 +84,50 @@ async function setupMockMonitorApi(page: Page): Promise<void> {
   });
 
   await page.route('**/api/sessions', async (route) => {
-    await route.fulfill({ status: 404, body: 'not found' });
+    await route.fulfill({
+      json: {
+        ok: true,
+        sessions: [
+          {
+            id: 'session-monitor-fixture',
+            title: 'Inspect the repository',
+            harness: { id: 'codex', label: 'codex', short: 'C', hue: 150 },
+            startedAt: 1_700_000_000_000,
+            endedAt: 1_700_000_003_900,
+            durationMs: 3_900,
+            status: 'completed',
+            models: ['gpt-5.3-codex'],
+            turns: [
+              {
+                idx: 0,
+                model: 'gpt-5.3-codex',
+                startedAt: 1_700_000_000_000,
+                endedAt: 1_700_000_003_900,
+                durationMs: 3_900,
+                promptTokens: 10,
+                completionTokens: 6,
+                totalTokens: 16,
+                toolCalls: 0,
+                steps: [
+                  { kind: 'user', at: 1_700_000_000_000, text: 'Inspect the repository' },
+                  {
+                    kind: 'assistant',
+                    at: 1_700_000_003_900,
+                    text: 'Repository inspection complete',
+                    tokens: 6,
+                    durationMs: 3_900,
+                  },
+                ],
+              },
+            ],
+            totalTokens: 16,
+            totalToolCalls: 0,
+            tags: [],
+            traceId: 'trace-monitor-fixture',
+          },
+        ],
+      },
+    });
   });
 
   await page.route('**/api/analytics?range=*', async (route) => {
@@ -131,8 +174,9 @@ test('loads dashboard and handles core interactions', async ({ page }) => {
   await page.locator('#analyticsRanges').getByRole('button', { name: '7d' }).click();
   await expect(page.locator('#analyticsMeta')).toContainText('Last 7d');
 
-  // Sessions panel (mock fallback) renders cards
+  // Sessions panel consumes the monitor API response rather than mock fallback data.
   await expect(page.locator('#sessionsPanel')).toBeVisible();
+  await expect(page.locator('.mv-card-title').first()).toHaveText('Inspect the repository');
   await expect(page.locator('.mv-card').first()).toBeVisible();
 
   // Clicking a card opens the side panel with detail (transcript is default)

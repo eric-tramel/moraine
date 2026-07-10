@@ -902,6 +902,16 @@ PY
   # Re-enable merges now that the pre-merge assertions have passed.
   clickhouse_scalar "$clickhouse_url" "SYSTEM START MERGES ${clickhouse_database}.events" >/dev/null
 
+  # `/api/sessions` intentionally keeps its legacy shape without eventCount.
+  # Derive the monitor-side canonical count through the existing trace preview
+  # route, then compare both that count and sessions.endedAt with MCP below.
+  echo "[e2e] checking monitor/repository session count + last-activity parity"
+  sessions_body="$(curl -fsS "http://127.0.0.1:${monitor_port}/api/sessions?since=all&limit=200")"
+  printf '%s' "$sessions_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; expected=int(sys.argv[2]); session=next((s for s in data.get("sessions", []) if s.get("id")==sid), None); ok=session is not None and session.get("endedAt")==expected; sys.exit(0 if ok else 1)' "$codex_session_id" "1771243203900"
+  local trace_body
+  trace_body="$(curl -fsS "http://127.0.0.1:${monitor_port}/api/tables/v_conversation_trace?limit=500")"
+  printf '%s' "$trace_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; expected=int(sys.argv[2]); count=sum(1 for row in data.get("rows", []) if row.get("session_id")==sid); sys.exit(0 if count==expected else 1)' "$codex_session_id" "7"
+
   echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (codex)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
     --moraine "$moraine_bin" \
@@ -909,6 +919,8 @@ PY
     --query "$codex_keyword" \
     --expect-session-id "$codex_session_id" \
     --expect-open-text "$codex_trace_marker" \
+    --expect-event-count "7" \
+    --expect-updated-at "2026-02-16T12:00:03.900Z" \
     --file-attention-path "Cargo.toml"
 
   echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (claude)"

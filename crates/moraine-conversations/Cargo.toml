@@ -17,9 +17,9 @@ tokio = { version = "1.40", features = ["macros", "rt", "sync"] }
 tracing = "0.1"
 uuid = { version = "1.11", features = ["v4"] }
 moraine-clickhouse = { path = "../moraine-clickhouse" }
+moraine-config = { path = "../moraine-config" }
 
 [dev-dependencies]
 axum = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "net", "time", "test-util"] }
-moraine-config = { path = "../moraine-config" }
