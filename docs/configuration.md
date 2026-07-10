@@ -45,8 +45,8 @@ future keys.
 | `[[ingest.sources]]` | Watched agent trace sources. |
 | `[mcp]` | MCP retrieval defaults and shared backend socket settings. |
 | `[bm25]` | Search ranking defaults. |
-| `[monitor]` | Backend HTTP bind settings. |
-| `[backend]` | Unified MCP socket and monitor HTTP daemon startup behavior. |
+| `[monitor]` | Monitor HTTP port. |
+| `[backend]` | Unified MCP socket and monitor HTTP daemon startup, HTTP bind, and experimental non-loopback guard. |
 | `[runtime]` | Runtime directories and managed ClickHouse settings. |
 
 ## Minimal Example
@@ -54,12 +54,12 @@ future keys.
 Most users only need to override paths, ports, or watched sources:
 
 ```toml
-[monitor]
-host = "127.0.0.1"
-port = 8080
-
 [backend]
+bind = "127.0.0.1"
 start_on_up = false
+
+[monitor]
+port = 8080
 
 [runtime]
 root_dir = "~/.moraine"
@@ -662,16 +662,19 @@ Most installations should keep these defaults.
 
 ## Backend Daemon
 
-`[backend]` controls whether the unified backend is part of the default
-`moraine up` topology:
+`[backend]` controls the unified daemon's startup behavior and HTTP listener:
 
 ```toml
 [backend]
+bind = "127.0.0.1"
+# auth_token = "<generate-a-random-guard-token>"
 start_on_up = false
 ```
 
 | Field | Default | Purpose |
 | --- | --- | --- |
+| `bind` | `127.0.0.1` | Interface for the monitor HTTP listener. Keep the loopback default for local-only access. |
+| `auth_token` | unset | Experimental startup prerequisite for a non-loopback effective bind. It does not authenticate HTTP requests. |
 | `start_on_up` | `false` | Starts one `moraine-mcp --serve socket` backend process that serves the MCP socket, monitor HTTP API, and static UI from one shared repository/cache set. |
 
 Use `moraine up --backend` for an explicit one-time start without changing the
@@ -679,19 +682,33 @@ configuration. `moraine up --monitor` and `moraine up --mcp` remain deprecated
 CLI aliases for the same single backend process; they never launch separate
 services.
 
+### Experimental HTTP bind guard
+
+`backend.bind` defaults to the loopback interface. When the effective bind is
+non-loopback, `backend.auth_token` must contain at least one non-whitespace
+character or backend startup fails before creating any listener.
+
+This is experimental configuration groundwork and a startup prerequisite only.
+It does not authenticate HTTP requests: the monitor API and UI remain
+unauthenticated, and exposing them to an untrusted network remains unsafe. Real
+monitor authentication is tracked in
+[issue #383, Phase 3](https://github.com/eric-tramel/moraine/issues/383).
+
+The guard does not change the MCP transport. The MCP server continues to use
+the same per-user Unix socket and proxy/embedded fallback behavior described in
+[Shared central MCP server](#shared-central-mcp-server).
+
 ## Monitor
 
-`[monitor]` controls the monitor HTTP server:
+`[monitor]` controls the monitor HTTP port:
 
 ```toml
 [monitor]
-host = "127.0.0.1"
 port = 8080
 ```
 
 | Field | Default | Purpose |
 | --- | --- | --- |
-| `host` | `127.0.0.1` | Interface the monitor binds. Keep the default for local-only access. |
 | `port` | `8080` | Monitor HTTP port. |
 
 ## Runtime Paths

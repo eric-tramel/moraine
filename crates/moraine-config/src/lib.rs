@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{de::DeserializeOwned, Deserialize};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
 pub const KNOWN_INGEST_HARNESSES: &[&str] = &[
@@ -197,18 +198,29 @@ pub struct Bm25Config {
     pub max_query_terms: usize,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+const REDACTED_AUTH_TOKEN: &str = "[REDACTED]";
+
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackendConfig {
     /// Launch the unified MCP socket + monitor HTTP daemon from `moraine up`.
     /// This remains off by default for the first backend-daemon release.
     #[serde(default = "default_false")]
     pub start_on_up: bool,
+    /// Host or interface for the monitor HTTP listener; `monitor.port`
+    /// remains the port configuration.
+    #[serde(default = "default_backend_bind")]
+    pub bind: String,
+    /// Startup prerequisite for non-loopback binds. Request authentication
+    /// is intentionally outside this config-groundwork change.
+    #[serde(default)]
+    pub auth_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MonitorConfig {
+    /// Legacy loader compatibility input for `backend.bind`.
     #[serde(default = "default_monitor_host")]
     pub host: String,
     #[serde(default = "default_monitor_port")]
@@ -322,6 +334,29 @@ impl Default for ClickHouseConfig {
             async_insert: true,
             wait_for_async_insert: true,
             allow_newer_server: false,
+        }
+    }
+}
+
+impl fmt::Debug for BackendConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BackendConfig")
+            .field("start_on_up", &self.start_on_up)
+            .field("bind", &self.bind)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| REDACTED_AUTH_TOKEN),
+            )
+            .finish()
+    }
+}
+
+impl Default for BackendConfig {
+    fn default() -> Self {
+        Self {
+            start_on_up: false,
+            bind: default_backend_bind(),
+            auth_token: None,
         }
     }
 }
@@ -808,8 +843,12 @@ fn default_max_query_terms() -> usize {
     32
 }
 
-fn default_monitor_host() -> String {
+fn default_backend_bind() -> String {
     "127.0.0.1".to_string()
+}
+
+fn default_monitor_host() -> String {
+    default_backend_bind()
 }
 
 fn default_monitor_port() -> u16 {
@@ -1186,14 +1225,52 @@ fn normalize_backend_start_on_up(cfg: &mut AppConfig, raw: &toml::Value) {
     cfg.backend.start_on_up = primary_legacy_start_on_up || tertiary_legacy_start_on_up;
 }
 
+fn normalize_backend_bind(cfg: &mut AppConfig, raw: &toml::Value) {
+    if raw
+        .get("backend")
+        .and_then(|backend| backend.get("bind"))
+        .is_some()
+    {
+        return;
+    }
+
+    if raw
+        .get("monitor")
+        .and_then(|monitor| monitor.get("host"))
+        .is_some()
+    {
+        cfg.backend.bind.clone_from(&cfg.monitor.host);
+    }
+}
+
+fn parse_config_toml<T: DeserializeOwned>(content: &str) -> Result<T> {
+    toml::from_str(content).map_err(|error| {
+        let location = error
+            .span()
+            .map(|span| {
+                let offset = span.start.min(content.len());
+                let prefix = &content[..offset];
+                let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+                let column = prefix
+                    .rsplit('\n')
+                    .next()
+                    .map(|line| line.chars().count() + 1)
+                    .unwrap_or(1);
+                format!(" at line {line}, column {column}")
+            })
+            .unwrap_or_default();
+        anyhow::anyhow!("failed to parse TOML config{location}: {}", error.message())
+    })
+}
+
 fn load_config_with_home_path(path: &Path, home_path: Option<PathBuf>) -> Result<AppConfig> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config {}", path.display()))?;
-    let mut cfg: AppConfig = toml::from_str(&content).context("failed to parse TOML config")?;
+    let mut cfg: AppConfig = parse_config_toml(&content)?;
     // The struct-level parse cannot tell an explicit `[clickhouse]` block
     // from its serde default, so the both-declared ambiguity is detected on
     // the raw TOML document instead.
-    let raw: toml::Value = toml::from_str(&content).context("failed to parse TOML config")?;
+    let raw: toml::Value = parse_config_toml(&content)?;
     if raw.get("clickhouse").is_some()
         && raw
             .get("backends")
@@ -1205,6 +1282,7 @@ fn load_config_with_home_path(path: &Path, home_path: Option<PathBuf>) -> Result
         ));
     }
     normalize_backend_start_on_up(&mut cfg, &raw);
+    normalize_backend_bind(&mut cfg, &raw);
 
     if cfg.redaction.dangerously_skip_secret_redaction
         && !path_is_home_config(path, home_path.as_deref())
@@ -1646,6 +1724,119 @@ prewarm_on_initialize = true
         assert_eq!(cfg.central_socket_path, "mcp.sock");
     }
 
+    fn assert_backend_defaults(backend: &BackendConfig) {
+        assert!(!backend.start_on_up);
+        assert_eq!(backend.bind, "127.0.0.1");
+        assert_eq!(backend.auth_token, None);
+    }
+
+    #[test]
+    fn backend_defaults_match_programmatic_deserialized_and_file_configs() {
+        assert_backend_defaults(&BackendConfig::default());
+        assert_backend_defaults(&AppConfig::default().backend);
+
+        let deserialized_backend: BackendConfig =
+            toml::from_str("").expect("empty backend config should deserialize");
+        assert_backend_defaults(&deserialized_backend);
+
+        let deserialized_app: AppConfig =
+            toml::from_str("").expect("empty app config should deserialize");
+        assert_backend_defaults(&deserialized_app.backend);
+
+        let path = write_temp_config("", "backend-file-defaults");
+        let loaded = load_config(&path).expect("empty config file should load");
+        std::fs::remove_file(path).ok();
+        assert_backend_defaults(&loaded.backend);
+    }
+
+    #[test]
+    fn backend_bind_and_auth_token_parse_exact_values_including_empty_token() {
+        let configured: BackendConfig = toml::from_str(
+            r#"
+start_on_up = true
+bind = "0.0.0.0"
+auth_token = "  exact token value  "
+"#,
+        )
+        .expect("backend config should deserialize");
+        assert!(configured.start_on_up);
+        assert_eq!(configured.bind, "0.0.0.0");
+        assert_eq!(
+            configured.auth_token.as_deref(),
+            Some("  exact token value  ")
+        );
+
+        let empty_token: BackendConfig =
+            toml::from_str("auth_token = \"\"\n").expect("empty token should deserialize");
+        assert_eq!(empty_token.auth_token.as_deref(), Some(""));
+        assert_eq!(
+            format!("{empty_token:?}"),
+            r#"BackendConfig { start_on_up: false, bind: "127.0.0.1", auth_token: Some("[REDACTED]") }"#
+        );
+    }
+
+    #[test]
+    fn backend_debug_redacts_auth_token_and_shows_other_fields() {
+        let backend = BackendConfig {
+            start_on_up: true,
+            bind: "0.0.0.0".to_string(),
+            auth_token: Some("unique-secret-token".to_string()),
+        };
+
+        let debug = format!("{backend:?}");
+        assert_eq!(
+            debug,
+            r#"BackendConfig { start_on_up: true, bind: "0.0.0.0", auth_token: Some("[REDACTED]") }"#
+        );
+        assert!(!debug.contains("unique-secret-token"));
+        let pretty_debug = format!("{backend:#?}");
+        assert!(pretty_debug.contains("[REDACTED]"));
+        assert!(!pretty_debug.contains("unique-secret-token"));
+    }
+
+    #[test]
+    fn app_config_debug_uses_redacted_backend_debug() {
+        let mut cfg = AppConfig::default();
+        cfg.backend.start_on_up = true;
+        cfg.backend.bind = "192.0.2.10".to_string();
+        cfg.backend.auth_token = Some("app-config-secret-token".to_string());
+
+        let debug = format!("{cfg:?}");
+        assert!(debug.contains(
+            r#"backend: BackendConfig { start_on_up: true, bind: "192.0.2.10", auth_token: Some("[REDACTED]") }"#
+        ));
+        assert!(!debug.contains("app-config-secret-token"));
+        let pretty_debug = format!("{cfg:#?}");
+        assert!(pretty_debug.contains("[REDACTED]"));
+        assert!(!pretty_debug.contains("app-config-secret-token"));
+    }
+
+    #[test]
+    fn explicit_legacy_monitor_host_maps_to_backend_bind() {
+        let path = write_temp_config(
+            "[monitor]\nhost = \"192.0.2.20\"\n",
+            "backend-legacy-monitor-host",
+        );
+        let cfg = load_config(&path).expect("legacy monitor host should load");
+        std::fs::remove_file(path).ok();
+
+        assert_eq!(cfg.monitor.host, "192.0.2.20");
+        assert_eq!(cfg.backend.bind, "192.0.2.20");
+    }
+
+    #[test]
+    fn explicit_backend_bind_wins_over_legacy_monitor_host() {
+        let path = write_temp_config(
+            "[backend]\nbind = \"0.0.0.0\"\n\n[monitor]\nhost = \"192.0.2.20\"\n",
+            "backend-bind-precedence",
+        );
+        let cfg = load_config(&path).expect("canonical and legacy bind config should load");
+        std::fs::remove_file(path).ok();
+
+        assert_eq!(cfg.monitor.host, "192.0.2.20");
+        assert_eq!(cfg.backend.bind, "0.0.0.0");
+    }
+
     #[test]
     fn backend_start_on_up_defaults_and_missing_states_are_off() {
         assert!(!BackendConfig::default().start_on_up);
@@ -1738,6 +1929,11 @@ prewarm_on_initialize = true
             ),
             ("backend-integer-value", "[backend]\nstart_on_up = 0\n"),
             ("backend-unknown-field", "[backend]\nstart_on_upp = false\n"),
+            ("backend-bind-not-a-string", "[backend]\nbind = 8080\n"),
+            (
+                "backend-auth-token-not-a-string",
+                "[backend]\nauth_token = false\n",
+            ),
             ("backend-not-a-table", "backend = false\n"),
         ] {
             let path = write_temp_config(contents, label);
@@ -1748,6 +1944,39 @@ prewarm_on_initialize = true
                 format!("{error:#}").contains("failed to parse TOML config"),
                 "case `{label}` returned an unexpected error: {error:#}"
             );
+        }
+    }
+
+    #[test]
+    fn malformed_config_errors_do_not_expose_auth_tokens() {
+        const SECRET: &str = "issue-462-parse-error-secret";
+        for (label, contents) in [
+            (
+                "backend-secret-neighbor-error",
+                format!("[backend]\nauth_token = \"{SECRET}\"\nbind = 8080\n"),
+            ),
+            (
+                "backend-inline-secret-neighbor-error",
+                format!("backend = {{ auth_token = \"{SECRET}\", bind = 8080 }}\n"),
+            ),
+            (
+                "backend-secret-syntax-error",
+                format!("[backend]\nauth_token = \"{SECRET}\",\n"),
+            ),
+        ] {
+            let path = write_temp_config(&contents, label);
+            let error = load_config(&path).expect_err("malformed secret config must fail");
+            std::fs::remove_file(path).ok();
+
+            for rendered in [format!("{error:#}"), format!("{error:?}")] {
+                assert!(
+                    !rendered.contains(SECRET),
+                    "config error leaked auth token: {rendered}"
+                );
+                assert!(rendered.contains("failed to parse TOML config"));
+                assert!(rendered.contains("line"));
+                assert!(rendered.contains("column"));
+            }
         }
     }
 
@@ -2013,7 +2242,7 @@ watch_root = "~/.cursor/projects"
     }
 
     #[test]
-    fn shipped_template_explicitly_keeps_backend_off_without_legacy_launch_keys() {
+    fn shipped_template_uses_canonical_backend_config_without_legacy_keys() {
         let contents = include_str!("../../../config/moraine.toml");
         let raw: toml::Value = toml::from_str(contents).expect("shipped template must be TOML");
 
@@ -2021,6 +2250,25 @@ watch_root = "~/.cursor/projects"
             raw_config_bool(&raw, "backend", "start_on_up"),
             Some(false),
             "template must explicitly opt out of backend launch"
+        );
+        assert_eq!(
+            raw.get("backend")
+                .and_then(|backend| backend.get("bind"))
+                .and_then(toml::Value::as_str),
+            Some("127.0.0.1"),
+            "template must explicitly declare the canonical loopback bind"
+        );
+        assert!(
+            raw.get("backend")
+                .and_then(|backend| backend.get("auth_token"))
+                .is_none(),
+            "template must not ship a concrete backend auth token"
+        );
+        assert!(
+            raw.get("monitor")
+                .and_then(|monitor| monitor.get("host"))
+                .is_none(),
+            "template must not ship the legacy monitor host key"
         );
         assert_eq!(
             raw_config_bool(&raw, "mcp", "use_central_server"),
@@ -2050,6 +2298,8 @@ watch_root = "~/.cursor/projects"
         let cfg = load_config(&path).expect("shipped template must load");
         std::fs::remove_file(&path).ok();
         assert!(!cfg.backend.start_on_up);
+        assert_eq!(cfg.backend.bind, "127.0.0.1");
+        assert_eq!(cfg.backend.auth_token, None);
         assert!(cfg.mcp.use_central_server);
     }
 

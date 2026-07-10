@@ -2,7 +2,7 @@ use crate::cli::ServeMode;
 use anyhow::{anyhow, bail, Context, Result};
 use moraine_config::AppConfig;
 use moraine_mcp_core::SessionOriginScope;
-use std::path::PathBuf;
+use std::{net::IpAddr, path::PathBuf};
 use tokio::runtime::Builder;
 use tokio::sync::watch;
 use tokio::task::{JoinError, JoinSet};
@@ -12,6 +12,38 @@ pub struct BackendOptions {
     pub host: Option<String>,
     pub port: Option<u16>,
     pub static_dir: Option<PathBuf>,
+}
+
+fn is_explicit_loopback_bind(bind: &str) -> bool {
+    let ip_literal = bind
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(bind);
+    ip_literal
+        .parse::<IpAddr>()
+        .map(|address| address.is_loopback())
+        .unwrap_or(false)
+}
+
+fn normalize_listener_bind(bind: String) -> String {
+    if bind.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{bind}]")
+    } else {
+        bind
+    }
+}
+
+fn validate_backend_bind_policy(bind: &str, auth_token: Option<&str>) -> Result<()> {
+    let has_nonempty_token = auth_token
+        .map(|token| !token.trim().is_empty())
+        .unwrap_or(false);
+    if is_explicit_loopback_bind(bind) || has_nonempty_token {
+        return Ok(());
+    }
+
+    bail!(
+        "refusing backend startup before binding: effective HTTP bind `{bind}` is not an explicit loopback IP and backend.auth_token is missing or empty; configure backend.auth_token for experimental non-loopback binding (HTTP request authentication is not enabled)"
+    )
 }
 
 type ServiceExit = (&'static str, Result<()>);
@@ -39,7 +71,7 @@ pub fn run(
                 bail!("--project-only cannot be combined with --serve socket: the shared central server serves sessions from every project");
             }
             let socket_path = PathBuf::from(&cfg.mcp.central_socket_path);
-            let host = options.host.unwrap_or_else(|| cfg.monitor.host.clone());
+            let host = options.host.unwrap_or_else(|| cfg.backend.bind.clone());
             let port = options.port.unwrap_or(cfg.monitor.port);
             let static_dir = moraine_monitor_core::resolve_static_dir(options.static_dir);
             let runtime = Builder::new_multi_thread()
@@ -74,6 +106,8 @@ async fn run_backend(
     port: u16,
     static_dir: PathBuf,
 ) -> Result<()> {
+    validate_backend_bind_policy(&host, cfg.backend.auth_token.as_deref())?;
+    let host = normalize_listener_bind(host);
     // This is the daemon mode's sole repository factory call. Both services
     // receive clones of this exact Arc, sharing its HTTP pool and caches.
     let user_agent = format!(
@@ -219,6 +253,115 @@ mod tests {
             "/tmp/moraine-mcp-{}-{stamp}.sock",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn backend_bind_policy_allows_explicit_loopback_without_token() {
+        for bind in ["127.0.0.1", "127.42.0.9", "::1", "[::1]"] {
+            validate_backend_bind_policy(bind, None)
+                .unwrap_or_else(|error| panic!("loopback `{bind}` rejected: {error:#}"));
+        }
+    }
+
+    #[test]
+    fn listener_bind_normalizes_bare_ipv6_without_changing_other_hosts() {
+        assert_eq!(normalize_listener_bind("::1".to_string()), "[::1]");
+        assert_eq!(normalize_listener_bind("::".to_string()), "[::]");
+        assert_eq!(normalize_listener_bind("[::1]".to_string()), "[::1]");
+        assert_eq!(
+            normalize_listener_bind("127.0.0.1".to_string()),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            normalize_listener_bind("localhost".to_string()),
+            "localhost"
+        );
+    }
+
+    #[test]
+    fn backend_bind_policy_rejects_non_loopback_and_ambiguous_hosts_without_token() {
+        for bind in [
+            "0.0.0.0",
+            "::",
+            "[::]",
+            "192.168.1.20",
+            "203.0.113.10",
+            "2001:db8::1",
+            "::ffff:127.0.0.1",
+            "localhost",
+            "example.test",
+            "",
+            "[::1",
+            "::1]",
+            "127.0.0.1 ",
+        ] {
+            let error = validate_backend_bind_policy(bind, None)
+                .expect_err("non-loopback or ambiguous bind must require a token");
+            let message = error.to_string();
+            assert!(message.contains(bind), "bind missing from error: {message}");
+            assert!(
+                message.contains("backend.auth_token"),
+                "token key missing from error: {message}"
+            );
+            assert!(
+                message.contains("before binding"),
+                "pre-bind refusal missing from error: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_bind_policy_treats_empty_and_whitespace_tokens_as_missing() {
+        for token in [None, Some(""), Some(" "), Some(" \t\n")] {
+            validate_backend_bind_policy("0.0.0.0", token)
+                .expect_err("empty token must not permit a non-loopback bind");
+        }
+    }
+
+    #[test]
+    fn backend_bind_policy_accepts_nonempty_token_as_startup_prerequisite() {
+        for bind in ["0.0.0.0", "::", "192.0.2.10", "localhost"] {
+            validate_backend_bind_policy(bind, Some("sandbox-only-guard-token"))
+                .unwrap_or_else(|error| panic!("guarded bind `{bind}` rejected: {error:#}"));
+        }
+    }
+
+    #[test]
+    fn non_loopback_without_token_refuses_before_backend_services_start() {
+        let probe = TcpListener::bind(("127.0.0.1", 0)).expect("reserve probe port");
+        let port = probe.local_addr().expect("probe address").port();
+        drop(probe);
+        let socket_path = short_socket_path();
+        let _ = fs::remove_file(&socket_path);
+        let static_dir = temp_path("pre-bind-refusal-static");
+
+        let runtime = Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let mut cfg = AppConfig::default();
+        cfg.backend.bind = "0.0.0.0".to_string();
+        let error = runtime
+            .block_on(run_backend(
+                cfg,
+                socket_path.clone(),
+                "0.0.0.0".to_string(),
+                port,
+                static_dir,
+            ))
+            .expect_err("unguarded non-loopback bind must refuse startup");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("0.0.0.0"));
+        assert!(message.contains("backend.auth_token"));
+        assert!(message.contains("before binding"));
+        assert!(
+            !socket_path.exists(),
+            "MCP socket must not be created before policy refusal"
+        );
+        let rebound = TcpListener::bind(("0.0.0.0", port))
+            .expect("HTTP port must remain available after pre-bind refusal");
+        drop(rebound);
     }
 
     #[test]

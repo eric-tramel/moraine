@@ -43,10 +43,10 @@ timeout_seconds = 1.0
 central_socket_path = "{}"
 
 [monitor]
-host = "127.0.0.1"
 port = {monitor_port}
 
 [backend]
+bind = "127.0.0.1"
 start_on_up = false
 
 [runtime]

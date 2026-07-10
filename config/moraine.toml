@@ -159,6 +159,12 @@ central_socket_path = "mcp.sock"
 central_connect_timeout_ms = 250
 
 [backend]
+# Interface for the monitor HTTP listener. Keep the loopback default unless you
+# understand the experimental non-loopback startup guard documented below.
+bind = "127.0.0.1"
+# A non-loopback bind requires a non-whitespace startup guard token. This does
+# not authenticate HTTP requests.
+# auth_token = "<generate-a-random-guard-token>"
 # Launch the unified MCP socket + monitor HTTP backend from `moraine up`.
 # Keep this opt-in for the first backend-daemon release.
 start_on_up = false
@@ -171,7 +177,6 @@ default_min_should_match = 1
 max_query_terms = 32
 
 [monitor]
-host = "127.0.0.1"
 port = 8080
 
 [runtime]

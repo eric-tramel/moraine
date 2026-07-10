@@ -271,14 +271,18 @@ default_min_should_match = 1
 max_query_terms = 32
 
 [backend]
+# Interface for the monitor HTTP listener.
+bind = "127.0.0.1"
+
+# Experimental startup guard for a non-loopback bind. This is not HTTP request
+# authentication; requests remain unauthenticated.
+# auth_token = "<generate-a-random-guard-token>"
+
 # Start the unified MCP + monitor backend daemon with "moraine up". This is
 # intentionally off by default for the first compatibility release.
 start_on_up = false
 
 [monitor]
-# Interface the monitor HTTP server binds. Use 127.0.0.1 for local-only access.
-host = "127.0.0.1"
-
 # Monitor HTTP port.
 port = 8080
 

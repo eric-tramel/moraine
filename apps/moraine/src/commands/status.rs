@@ -125,7 +125,7 @@ fn format_http_url(host: &str, port: u16) -> String {
 }
 
 fn monitor_runtime_url(cfg: &AppConfig) -> String {
-    format_http_url(&cfg.monitor.host, cfg.monitor.port)
+    format_http_url(&cfg.backend.bind, cfg.monitor.port)
 }
 fn monitor_api_status_url(cfg: &AppConfig) -> String {
     format!(
@@ -515,7 +515,7 @@ mod tests {
         cfg.runtime.service_bin_dir = test_root.join("services").display().to_string();
         cfg.runtime.managed_clickhouse_dir = test_root.join("managed").display().to_string();
         cfg.mcp.central_socket_path = test_root.join("mcp.sock").display().to_string();
-        cfg.monitor.host = "127.0.0.1".to_string();
+        cfg.backend.bind = "127.0.0.1".to_string();
         cfg.monitor.port = 9;
         let paths = crate::paths::runtime_paths(&cfg);
         let repository = InMemoryConversationRepository::with_responses(
@@ -834,7 +834,7 @@ mod tests {
     #[test]
     fn monitor_runtime_url_uses_configured_bind() {
         let mut cfg = AppConfig::default();
-        cfg.monitor.host = "127.0.0.1".to_string();
+        cfg.backend.bind = "127.0.0.1".to_string();
         cfg.monitor.port = 18080;
         assert_eq!(monitor_runtime_url(&cfg), "http://127.0.0.1:18080");
     }
@@ -842,7 +842,7 @@ mod tests {
     #[test]
     fn monitor_runtime_url_wraps_ipv6_host() {
         let mut cfg = AppConfig::default();
-        cfg.monitor.host = "::1".to_string();
+        cfg.backend.bind = "::1".to_string();
         cfg.monitor.port = 18080;
         assert_eq!(monitor_runtime_url(&cfg), "http://[::1]:18080");
     }
