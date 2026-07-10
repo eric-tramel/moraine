@@ -621,6 +621,8 @@ fn monitor_step_json(step: SessionStep) -> Value {
             tool_name,
             call_id,
             arguments,
+            latency_ms: call_latency_ms,
+            is_error: call_is_error,
             result,
         } => {
             let (latency_ms, result_text, result_at, status) = match result {
@@ -628,9 +630,18 @@ fn monitor_step_json(step: SessionStep) -> Value {
                     result.latency_ms,
                     result.text,
                     result.event_unix_ms,
-                    if result.is_error { "error" } else { "ok" },
+                    if call_is_error || result.is_error {
+                        "error"
+                    } else {
+                        "ok"
+                    },
                 ),
-                None => (0, String::new(), event_unix_ms, "ok"),
+                None => (
+                    call_latency_ms.unwrap_or_default(),
+                    String::new(),
+                    event_unix_ms,
+                    if call_is_error { "error" } else { "ok" },
+                ),
             };
             json!({
                 "kind": "tool_call",
@@ -1066,6 +1077,8 @@ mod tests {
                         tool_name: "Read".to_string(),
                         call_id: "call-1".to_string(),
                         arguments: json!({"path": "Cargo.toml"}),
+                        latency_ms: Some(250),
+                        is_error: false,
                         result: Some(ToolResult {
                             event_unix_ms: 1_771_243_203_000,
                             text: "workspace".to_string(),
@@ -1332,6 +1345,24 @@ mod tests {
             SessionLookback::ThirtyDays
         );
         assert_eq!(resolve_session_lookback(Some("all")), SessionLookback::All);
+    }
+
+    #[test]
+    fn unmatched_tool_call_preserves_call_latency_and_error() {
+        let step = monitor_step_json(SessionStep::ToolCall {
+            event_unix_ms: 1_000,
+            tool_name: "Read".to_string(),
+            call_id: "call-unmatched".to_string(),
+            arguments: json!({"path": "Cargo.toml"}),
+            latency_ms: Some(321),
+            is_error: true,
+            result: None,
+        });
+
+        assert_eq!(step["latencyMs"], json!(321));
+        assert_eq!(step["status"], json!("error"));
+        assert_eq!(step["result"], json!(""));
+        assert_eq!(step["resultAt"], json!(1_000));
     }
 
     #[tokio::test]
