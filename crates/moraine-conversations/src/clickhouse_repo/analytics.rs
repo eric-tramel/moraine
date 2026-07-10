@@ -272,15 +272,13 @@ FORMAT JSONEachRow"
         let window_seconds = range.window_seconds();
         let bucket_seconds = range.bucket_seconds();
         let anchor_query = format!(
-            "WITH
-  toInt64(toUnixTimestamp(now())) AS database_now_unix,
-  greatest(database_now_unix - toInt64({window_seconds}), toInt64(0)) AS scan_from_unix
+            "WITH toInt64(toUnixTimestamp(now())) AS database_now_unix
 SELECT
-  toUInt64(scan_from_unix) AS scan_from_unix,
+  toUInt64(greatest(database_now_unix - toInt64({window_seconds}), toInt64(0))) AS scan_from_unix,
   toUInt64(database_now_unix) AS scan_to_unix,
   toUInt64(if(count() = 0, database_now_unix, max(intDiv(toUnixTimestamp64Milli(e.event_ts), 1000)))) AS display_to_unix
 FROM {canonical_events} AS e
-WHERE intDiv(toUnixTimestamp64Milli(e.event_ts), 1000) >= scan_from_unix
+WHERE intDiv(toUnixTimestamp64Milli(e.event_ts), 1000) >= greatest(database_now_unix - toInt64({window_seconds}), toInt64(0))
   AND intDiv(toUnixTimestamp64Milli(e.event_ts), 1000) <= database_now_unix
   AND notEmpty(trimBoth(e.model))
   AND lowerUTF8(trimBoth(e.model)) != '<synthetic>'

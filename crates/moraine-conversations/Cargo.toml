@@ -20,5 +20,6 @@ moraine-clickhouse = { path = "../moraine-clickhouse" }
 
 [dev-dependencies]
 axum = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "net"] }
 moraine-config = { path = "../moraine-config" }
