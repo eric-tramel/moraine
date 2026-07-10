@@ -9,6 +9,7 @@ mod up;
 use anyhow::{bail, Context, Result};
 use moraine_clickhouse::{ClickHouseClient, DoctorReport};
 use moraine_config::AppConfig;
+use moraine_conversations::{ClickHouseConversationRepository, RepoConfig};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -41,7 +42,8 @@ pub(crate) async fn dispatch(cli: Cli, output: CliOutput) -> Result<ExitCode> {
         CliCommand::Status => {
             let (_, cfg) = load_cfg(cli.config.clone())?;
             let paths = runtime_paths(&cfg);
-            let snapshot = status::cmd_status(&paths, &cfg).await?;
+            let repository = conversation_repository(&cfg)?;
+            let snapshot = status::cmd_status(&paths, &cfg, &repository).await?;
             crate::render::render_status(&output, &snapshot)?;
             Ok(ExitCode::SUCCESS)
         }
@@ -188,6 +190,18 @@ async fn run_service(global_config: Option<PathBuf>, run: RunArgs) -> Result<Exi
 
     Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
 }
+
+fn conversation_repository(cfg: &AppConfig) -> Result<ClickHouseConversationRepository> {
+    let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
+    Ok(ClickHouseConversationRepository::new(
+        ch,
+        RepoConfig::default(),
+    ))
+}
+
+// Deliberate shared-read-layer exception: `db *`/`doctor` are storage administration,
+// while `export` owns a versioned row contract and schema-skew gate. Those paths keep
+// direct ClickHouse access; operational status reads go through ConversationRepository.
 
 async fn cmd_db_migrate(cfg: &AppConfig) -> Result<MigrationOutcome> {
     let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;

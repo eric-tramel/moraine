@@ -9,7 +9,7 @@ use crate::process::{preflight_required_service_binaries, start_background_servi
 use crate::render::{render_up, CliOutput, UpSnapshot};
 use crate::service::Service;
 
-use super::{cmd_db_migrate, status::cmd_status};
+use super::{cmd_db_migrate, conversation_repository, status::cmd_status};
 
 pub(super) async fn handle_args(
     output: &CliOutput,
@@ -47,7 +47,8 @@ async fn start_selected_services(
         )?);
     }
 
-    let status = cmd_status(paths, cfg).await?;
+    let repository = conversation_repository(cfg)?;
+    let status = cmd_status(paths, cfg, &repository).await?;
     let snapshot = UpSnapshot {
         clickhouse,
         migrations,

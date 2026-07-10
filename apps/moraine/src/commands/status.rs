@@ -1,9 +1,3 @@
-use anyhow::Result;
-use moraine_clickhouse::{ClickHouseClient, DoctorReport};
-use moraine_config::AppConfig;
-use serde::Deserialize;
-
-use super::cmd_db_doctor;
 use crate::managed_clickhouse::{
     active_clickhouse_source, managed_clickhouse_bin, managed_clickhouse_checksum_state,
     managed_clickhouse_version,
@@ -12,67 +6,10 @@ use crate::paths::RuntimePaths;
 use crate::process::service_running;
 use crate::render::{HeartbeatSnapshot, ServiceRuntimeStatus, StatusSnapshot};
 use crate::service::Service;
-
-#[derive(Debug, Deserialize)]
-struct HeartbeatRow {
-    latest: String,
-    queue_depth: u64,
-    files_active: u64,
-    #[serde(default)]
-    watcher_backend: String,
-    #[serde(default)]
-    watcher_error_count: u64,
-    #[serde(default)]
-    watcher_reset_count: u64,
-    #[serde(default)]
-    watcher_last_reset_unix_ms: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct LegacyHeartbeatRow {
-    latest: String,
-    queue_depth: u64,
-    files_active: u64,
-}
-
-async fn query_heartbeat(cfg: &AppConfig) -> Result<Option<HeartbeatRow>> {
-    let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
-    let db = quote_identifier(&cfg.clickhouse.database);
-    let query = format!(
-        "SELECT \
-            toString(max(ts)) AS latest, \
-            toUInt64(argMax(queue_depth, ts)) AS queue_depth, \
-            toUInt64(argMax(files_active, ts)) AS files_active, \
-            toString(argMax(watcher_backend, ts)) AS watcher_backend, \
-            toUInt64(argMax(watcher_error_count, ts)) AS watcher_error_count, \
-            toUInt64(argMax(watcher_reset_count, ts)) AS watcher_reset_count, \
-            toUInt64(argMax(watcher_last_reset_unix_ms, ts)) AS watcher_last_reset_unix_ms \
-         FROM {db}.ingest_heartbeats"
-    );
-
-    match ch.query_json_data::<HeartbeatRow>(&query, None).await {
-        Ok(rows) => Ok(rows.into_iter().next()),
-        Err(_) => {
-            let legacy_query = format!(
-                "SELECT toString(max(ts)) AS latest, toUInt64(argMax(queue_depth, ts)) AS queue_depth, toUInt64(argMax(files_active, ts)) AS files_active FROM {db}.ingest_heartbeats"
-            );
-            let rows: Vec<LegacyHeartbeatRow> = ch.query_json_data(&legacy_query, None).await?;
-            Ok(rows.into_iter().next().map(|row| HeartbeatRow {
-                latest: row.latest,
-                queue_depth: row.queue_depth,
-                files_active: row.files_active,
-                watcher_backend: "unknown".to_string(),
-                watcher_error_count: 0,
-                watcher_reset_count: 0,
-                watcher_last_reset_unix_ms: 0,
-            }))
-        }
-    }
-}
-
-fn quote_identifier(value: &str) -> String {
-    format!("`{}`", value.replace('`', "``"))
-}
+use anyhow::Result;
+use moraine_clickhouse::DoctorReport;
+use moraine_config::AppConfig;
+use moraine_conversations::{ConversationRepository, IngestHeartbeatRead, StoreDiagnostics};
 
 fn service_runtime_running(services: &[ServiceRuntimeStatus], service: Service) -> bool {
     services
@@ -125,7 +62,54 @@ fn build_status_notes(
     notes
 }
 
-pub(super) async fn cmd_status(paths: &RuntimePaths, cfg: &AppConfig) -> Result<StatusSnapshot> {
+fn doctor_report(diagnostics: StoreDiagnostics) -> DoctorReport {
+    DoctorReport {
+        clickhouse_healthy: diagnostics.healthy,
+        clickhouse_version: diagnostics.version,
+        database: diagnostics.database,
+        database_exists: diagnostics.database_exists,
+        applied_migrations: diagnostics.applied_schema_versions,
+        pending_migrations: diagnostics.pending_schema_versions,
+        missing_tables: diagnostics.missing_tables,
+        errors: diagnostics.errors,
+    }
+}
+
+fn heartbeat_snapshot(read: IngestHeartbeatRead) -> HeartbeatSnapshot {
+    match read.latest {
+        Some(heartbeat) => HeartbeatSnapshot::Available {
+            latest: heartbeat.ts,
+            queue_depth: heartbeat.queue_depth,
+            files_active: u64::from(heartbeat.files_active),
+            watcher_backend: heartbeat
+                .watcher_backend
+                .unwrap_or_else(|| "unknown".to_string()),
+            watcher_error_count: heartbeat.watcher_error_count.unwrap_or(0),
+            watcher_reset_count: heartbeat.watcher_reset_count.unwrap_or(0),
+            watcher_last_reset_unix_ms: heartbeat.watcher_last_reset_unix_ms.unwrap_or(0),
+        },
+        None => HeartbeatSnapshot::Unavailable,
+    }
+}
+
+async fn read_repository_status(
+    repository: &dyn ConversationRepository,
+) -> Result<(DoctorReport, HeartbeatSnapshot)> {
+    let report = doctor_report(repository.read_store_diagnostics().await?);
+    let heartbeat = match repository.latest_ingest_heartbeat().await {
+        Ok(read) => heartbeat_snapshot(read),
+        Err(err) => HeartbeatSnapshot::Error {
+            message: err.to_string(),
+        },
+    };
+    Ok((report, heartbeat))
+}
+
+pub(super) async fn cmd_status(
+    paths: &RuntimePaths,
+    cfg: &AppConfig,
+    repository: &dyn ConversationRepository,
+) -> Result<StatusSnapshot> {
     let services = [
         Service::ClickHouse,
         Service::Ingest,
@@ -141,25 +125,10 @@ pub(super) async fn cmd_status(paths: &RuntimePaths, cfg: &AppConfig) -> Result<
     .collect::<Vec<_>>();
     let managed_server = managed_clickhouse_bin(paths, "clickhouse-server");
     let (source, source_path) = active_clickhouse_source(paths);
-    let report = cmd_db_doctor(cfg).await?;
+    let (report, heartbeat) = read_repository_status(repository).await?;
     let clickhouse_health_url = cfg.clickhouse.url.clone();
     let status_notes = build_status_notes(&services, &report, &clickhouse_health_url);
     let monitor_url = monitor_runtime_running(&services).then(|| monitor_runtime_url(cfg));
-    let heartbeat = match query_heartbeat(cfg).await {
-        Ok(Some(row)) => HeartbeatSnapshot::Available {
-            latest: row.latest,
-            queue_depth: row.queue_depth,
-            files_active: row.files_active,
-            watcher_backend: row.watcher_backend,
-            watcher_error_count: row.watcher_error_count,
-            watcher_reset_count: row.watcher_reset_count,
-            watcher_last_reset_unix_ms: row.watcher_last_reset_unix_ms,
-        },
-        Ok(None) => HeartbeatSnapshot::Unavailable,
-        Err(err) => HeartbeatSnapshot::Error {
-            message: err.to_string(),
-        },
-    };
 
     Ok(StatusSnapshot {
         services,
@@ -180,6 +149,123 @@ pub(super) async fn cmd_status(paths: &RuntimePaths, cfg: &AppConfig) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use moraine_conversations::{
+        InMemoryConversationRepository, InMemoryConversationResponses, IngestHeartbeat, RepoConfig,
+        RepoResult,
+    };
+    use serde_json::{json, Value};
+
+    async fn status_json(heartbeat: RepoResult<IngestHeartbeatRead>) -> Value {
+        let mut cfg = AppConfig::default();
+        let test_root = std::env::temp_dir().join(format!(
+            "moraine-status-unit-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        cfg.runtime.root_dir = test_root.display().to_string();
+        cfg.runtime.logs_dir = test_root.join("logs").display().to_string();
+        cfg.runtime.pids_dir = test_root.join("run").display().to_string();
+        cfg.runtime.service_bin_dir = test_root.join("services").display().to_string();
+        cfg.runtime.managed_clickhouse_dir = test_root.join("managed").display().to_string();
+        let paths = crate::paths::runtime_paths(&cfg);
+        let repository = InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            InMemoryConversationResponses {
+                latest_ingest_heartbeat: Some(heartbeat),
+                read_store_diagnostics: Some(Ok(StoreDiagnostics {
+                    healthy: true,
+                    version: Some("25.8.1.1".to_string()),
+                    database: "moraine".to_string(),
+                    database_exists: true,
+                    applied_schema_versions: vec!["001".to_string()],
+                    pending_schema_versions: Vec::new(),
+                    missing_tables: Vec::new(),
+                    errors: Vec::new(),
+                })),
+                ..InMemoryConversationResponses::default()
+            },
+        );
+        let snapshot = cmd_status(&paths, &cfg, &repository)
+            .await
+            .expect("collect status");
+        serde_json::to_value(snapshot).expect("serialize status")
+    }
+
+    fn stale_heartbeat() -> IngestHeartbeat {
+        IngestHeartbeat {
+            ts: "2000-01-01 00:00:00.000".to_string(),
+            ts_unix_ms: 946_684_800_000,
+            host: "old-host".to_string(),
+            service_version: "0.1.0".to_string(),
+            queue_depth: 7,
+            files_active: 3,
+            files_watched: 9,
+            rows_raw_written: 11,
+            rows_events_written: 10,
+            rows_errors_written: 1,
+            flush_latency_ms: 12,
+            append_to_visible_p50_ms: 13,
+            append_to_visible_p95_ms: 14,
+            last_error: String::new(),
+            watcher_backend: None,
+            watcher_error_count: None,
+            watcher_reset_count: None,
+            watcher_last_reset_unix_ms: None,
+            backend_sinks: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn healthy_status_preserves_stale_heartbeat_json_output() {
+        let status = status_json(Ok(IngestHeartbeatRead {
+            table_present: true,
+            latest: Some(stale_heartbeat()),
+        }))
+        .await;
+
+        assert_eq!(
+            status["doctor"],
+            json!({
+                "clickhouse_healthy": true,
+                "clickhouse_version": "25.8.1.1",
+                "database": "moraine",
+                "database_exists": true,
+                "applied_migrations": ["001"],
+                "pending_migrations": [],
+                "missing_tables": [],
+                "errors": []
+            })
+        );
+        assert_eq!(
+            status["heartbeat"],
+            json!({
+                "state": "available",
+                "latest": "2000-01-01 00:00:00.000",
+                "queue_depth": 7,
+                "files_active": 3,
+                "watcher_backend": "unknown",
+                "watcher_error_count": 0,
+                "watcher_reset_count": 0,
+                "watcher_last_reset_unix_ms": 0
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_heartbeat_preserves_unavailable_json_output() {
+        for table_present in [false, true] {
+            let status = status_json(Ok(IngestHeartbeatRead {
+                table_present,
+                latest: None,
+            }))
+            .await;
+            assert_eq!(
+                status["heartbeat"],
+                json!({"state": "unavailable"}),
+                "table_present={table_present}"
+            );
+        }
+    }
 
     fn test_doctor_report(clickhouse_healthy: bool) -> DoctorReport {
         DoctorReport {

@@ -1146,6 +1146,7 @@ dependencies = [
  "jsonc-parser",
  "moraine-clickhouse",
  "moraine-config",
+ "moraine-conversations",
  "ratatui",
  "reqwest",
  "serde",
