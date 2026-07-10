@@ -5,8 +5,8 @@ use crate::contract::{
 use crate::AppState;
 use anyhow::{Context, Result};
 use moraine_conversations::{
-    ConversationRepository, McpEventOpen, McpEventRef, McpEventSummary, McpSessionOpen,
-    McpTurnCompact, McpTurnOpen, McpTurnRef, SessionMetadata, TraceEvent,
+    McpEventOpen, McpEventRef, McpEventSummary, McpSessionOpen, McpTurnCompact, McpTurnOpen,
+    McpTurnRef, SessionMetadata, TraceEvent,
 };
 use serde_json::{json, Map, Value};
 use std::time::Instant;

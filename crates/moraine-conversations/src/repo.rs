@@ -4,14 +4,19 @@ use crate::domain::{
     Conversation, ConversationDetailOptions, ConversationListFilter, ConversationSearchQuery,
     ConversationSearchResults, FileAttentionQuery, FileAttentionTouch, McpEventOpen,
     McpSessionListFilter, McpSessionListItem, McpSessionOpen, McpTurnOpen, OpenContext,
-    OpenEventRequest, Page, PageRequest, SearchEventsQuery, SearchEventsResult,
-    SearchMcpEventsQuery, SearchMcpEventsResult, SessionEventsQuery, SessionMetadata, TraceEvent,
-    Turn, TurnListFilter, TurnSummary,
+    OpenEventRequest, Page, PageRequest, RepoConfig, SearchEventsQuery, SearchEventsResult,
+    SearchMcpEventsQuery, SearchMcpEventsResult, SessionEventsQuery, SessionMetadata,
+    SessionMetadataSearchQuery, SessionMetadataSearchResults, TraceEvent, Turn, TurnListFilter,
+    TurnSummary,
 };
 use crate::error::RepoResult;
 
 #[async_trait]
 pub trait ConversationRepository: Send + Sync {
+    fn config(&self) -> &RepoConfig;
+
+    async fn prewarm_mcp_search_state(&self) -> RepoResult<()>;
+
     async fn list_conversations(
         &self,
         filter: ConversationListFilter,
@@ -71,8 +76,15 @@ pub trait ConversationRepository: Send + Sync {
         query: ConversationSearchQuery,
     ) -> RepoResult<ConversationSearchResults>;
 
+    async fn search_session_metadata(
+        &self,
+        query: SessionMetadataSearchQuery,
+    ) -> RepoResult<SessionMetadataSearchResults>;
+
     async fn file_attention(
         &self,
         query: FileAttentionQuery,
     ) -> RepoResult<Vec<FileAttentionTouch>>;
+
+    async fn cancel_query(&self, query_id: &str) -> RepoResult<()>;
 }

@@ -10,7 +10,9 @@ use anyhow::{anyhow, Context, Result};
 use moraine_clickhouse::{enforce_remote_schema_policy, ClickHouseClient};
 use moraine_config::{AppConfig, DEFAULT_BACKEND_NAME};
 pub use moraine_conversations::SessionOriginScope;
-use moraine_conversations::{ClickHouseConversationRepository, RepoConfig, RepoError};
+use moraine_conversations::{
+    ClickHouseConversationRepository, ConversationRepository, RepoConfig, RepoError,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 #[cfg(unix)]
@@ -41,7 +43,7 @@ struct ToolCallParams {
 #[derive(Clone)]
 struct AppState {
     cfg: AppConfig,
-    repo: ClickHouseConversationRepository,
+    repo: Arc<dyn ConversationRepository>,
     prewarm_started: Arc<AtomicBool>,
 }
 
@@ -468,7 +470,8 @@ impl AppState {
             session_scope,
         };
 
-        let repo = ClickHouseConversationRepository::new(ch, repo_cfg);
+        let repo: Arc<dyn ConversationRepository> =
+            Arc::new(ClickHouseConversationRepository::new(ch, repo_cfg));
         Ok(Arc::new(AppState {
             cfg,
             repo,
@@ -925,11 +928,12 @@ pub async fn run_socket(_cfg: AppConfig, _socket_path: std::path::PathBuf) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use moraine_conversations::InMemoryConversationRepository;
 
     fn test_state() -> AppState {
         let cfg = AppConfig::default();
-        let ch = ClickHouseClient::new(cfg.clickhouse.clone()).expect("clickhouse client");
-        let repo = ClickHouseConversationRepository::new(ch, RepoConfig::default());
+        let repo: Arc<dyn ConversationRepository> =
+            Arc::new(InMemoryConversationRepository::default());
         AppState {
             cfg,
             repo,
