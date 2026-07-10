@@ -113,9 +113,9 @@ impl ClickHouseConversationRepository {
         };
 
         let limit_plus = query.max_rows.saturating_add(1);
-        let max_execution_time = query.max_execution_time_secs.max(1).to_string();
+        let max_execution_time = query.execution_budget_secs.max(1).to_string();
         let params = [
-            ("query_id", query.query_id.as_str()),
+            ("query_id", query.cancellation_token.as_str()),
             ("max_execution_time", max_execution_time.as_str()),
             ("join_use_nulls", "1"),
         ];
@@ -290,9 +290,9 @@ impl ClickHouseConversationRepository {
         };
 
         let limit_plus = query.max_rows.saturating_add(1);
-        let max_execution_time = query.max_execution_time_secs.max(1).to_string();
+        let max_execution_time = query.execution_budget_secs.max(1).to_string();
         let params = [
-            ("query_id", query.query_id.as_str()),
+            ("query_id", query.cancellation_token.as_str()),
             ("max_execution_time", max_execution_time.as_str()),
             ("join_use_nulls", "1"),
         ];

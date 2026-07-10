@@ -1785,7 +1785,7 @@ async fn file_attention_merges_normalized_exact_lookup_with_suffix_fallback() {
 
     let touches = repo
         .file_attention(FileAttentionQuery {
-            query_id: "test-file-attention-normalized".to_string(),
+            cancellation_token: "test-file-attention-normalized".to_string(),
             rel: "crates/foo.rs".to_string(),
             normalized_project_id: Some("project-a".to_string()),
             derive_worktree_roots: true,
@@ -1795,7 +1795,7 @@ async fn file_attention_merges_normalized_exact_lookup_with_suffix_fallback() {
             tool: None,
             mutations_only: false,
             max_rows: 10,
-            max_execution_time_secs: 3,
+            execution_budget_secs: 3,
         })
         .await
         .expect("file_attention query succeeds");
@@ -2888,8 +2888,8 @@ async fn search_events_includes_session_time_bounds() {
             include_tool_events: Some(true),
             event_kinds: None,
             exclude_codex_mcp: Some(false),
-            disable_cache: Some(true),
-            search_strategy: None,
+            bypass_cache: Some(true),
+            strategy_hint: None,
         })
         .await
         .expect("search events");
@@ -2927,8 +2927,8 @@ async fn search_events_documents_subquery_avoids_self_aliased_aggregates() {
             include_tool_events: Some(true),
             event_kinds: None,
             exclude_codex_mcp: Some(false),
-            disable_cache: Some(true),
-            search_strategy: None,
+            bypass_cache: Some(true),
+            strategy_hint: None,
         })
         .await
         .expect("search events");

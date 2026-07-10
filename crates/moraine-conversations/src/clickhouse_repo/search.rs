@@ -1017,7 +1017,7 @@ FORMAT JSONEachRow",
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn search_events_rows_by_strategy(
         &self,
-        strategy: SearchEventsStrategy,
+        strategy_hint: SearchStrategyHint,
         terms: &[String],
         docs: u64,
         avgdl: f64,
@@ -1030,8 +1030,8 @@ FORMAT JSONEachRow",
         min_score: f64,
         limit: u16,
     ) -> RepoResult<Vec<SearchRow>> {
-        match strategy {
-            SearchEventsStrategy::Optimized => {
+        match strategy_hint {
+            SearchStrategyHint::PreferPerformance => {
                 self.search_events_rows(
                     terms,
                     docs,
@@ -1047,7 +1047,7 @@ FORMAT JSONEachRow",
                 )
                 .await
             }
-            SearchEventsStrategy::OracleExact => {
+            SearchStrategyHint::Exact => {
                 self.search_events_rows_exact_sql(
                     terms,
                     docs,
@@ -2614,8 +2614,8 @@ FORMAT JSONEachRow",
         let exclude_codex_mcp = query
             .exclude_codex_mcp
             .unwrap_or(self.cfg.default_exclude_codex_mcp);
-        let disable_cache = query.disable_cache.unwrap_or(false);
-        let effective_strategy = query.search_strategy.unwrap_or_default();
+        let bypass_cache = query.bypass_cache.unwrap_or(false);
+        let effective_strategy_hint = query.strategy_hint.unwrap_or_default();
 
         let session_id = query.session_id.clone();
         if let Some(session_id) = session_id.as_deref() {
@@ -2663,10 +2663,10 @@ FORMAT JSONEachRow",
         let avgdl = (total_doc_len as f64 / docs as f64).max(1.0);
         let fetch_limit = Self::dedupe_fetch_limit(limit);
 
-        let hits = if disable_cache {
+        let hits = if bypass_cache {
             let rows = self
                 .search_events_rows_by_strategy(
-                    effective_strategy,
+                    effective_strategy_hint,
                     &terms,
                     docs,
                     avgdl,
@@ -2685,7 +2685,7 @@ FORMAT JSONEachRow",
         } else {
             let cache_key = Self::search_events_cache_key(
                 &terms,
-                effective_strategy,
+                effective_strategy_hint,
                 include_tool_events,
                 event_kinds.as_deref(),
                 exclude_codex_mcp,
@@ -2701,7 +2701,7 @@ FORMAT JSONEachRow",
             } else {
                 let fresh_rows = self
                     .search_events_rows_by_strategy(
-                        effective_strategy,
+                        effective_strategy_hint,
                         &terms,
                         docs,
                         avgdl,

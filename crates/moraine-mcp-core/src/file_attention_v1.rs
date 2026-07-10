@@ -100,7 +100,7 @@ impl AppState {
 
         let query_id = file_attention_query_id();
         let repo_query = FileAttentionQuery {
-            query_id: query_id.clone(),
+            cancellation_token: query_id.clone(),
             rel: tail.rel.clone(),
             normalized_project_id: tail.project_id.clone(),
             derive_worktree_roots: tail.derive_worktree_roots,
@@ -110,7 +110,7 @@ impl AppState {
             tool: args.tool.clone(),
             mutations_only: args.mutations_only,
             max_rows: FILE_ATTENTION_SCAN_CAP,
-            max_execution_time_secs: FILE_ATTENTION_DEADLINE_MS.div_ceil(1_000),
+            execution_budget_secs: FILE_ATTENTION_DEADLINE_MS.div_ceil(1_000),
         };
 
         let touches = match timeout(

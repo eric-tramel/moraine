@@ -64,9 +64,9 @@ pub struct McpSessionListFilter {
 /// whose input path ends with `rel`, scoped and filtered per the request.
 #[derive(Debug, Clone)]
 pub struct FileAttentionQuery {
-    /// Stable identifier assigned to the ClickHouse query so MCP deadlines can
-    /// cancel the backend scan if the client-side timeout fires.
-    pub query_id: String,
+    /// Opaque cancellation token assigned by the caller so timed-out requests
+    /// can cancel in-flight backend work.
+    pub cancellation_token: String,
     /// Repo-relative tail to suffix-match against captured file paths. The tail
     /// is what unifies the same logical file across worktree roots.
     pub rel: String,
@@ -89,12 +89,12 @@ pub struct FileAttentionQuery {
     pub tool: Option<String>,
     /// Drop common pure-read touches.
     pub mutations_only: bool,
-    /// Hard cap on matched rows pulled from ClickHouse. Summary, root, and
+    /// Hard cap on matched rows returned by the backend. Summary, root, and
     /// per-session rollups are computed over this scanned set; the caller flags
     /// the result truncated when the cap is hit.
     pub max_rows: usize,
-    /// Server-side ClickHouse execution cap for this scan.
-    pub max_execution_time_secs: u64,
+    /// Execution budget available to the backend for this scan.
+    pub execution_budget_secs: u64,
 }
 
 /// One captured tool call that touched the queried file. Deserialized from a
@@ -508,25 +508,27 @@ pub struct SearchEventsQuery {
     pub event_kinds: Option<Vec<SearchEventKind>>,
     #[serde(default)]
     pub exclude_codex_mcp: Option<bool>,
-    #[serde(default)]
-    pub disable_cache: Option<bool>,
-    #[serde(default)]
-    pub search_strategy: Option<SearchEventsStrategy>,
+    #[serde(default, rename = "disable_cache")]
+    pub bypass_cache: Option<bool>,
+    /// Preferred tradeoff for this search. Backends may treat this as a hint.
+    #[serde(default, rename = "search_strategy")]
+    pub strategy_hint: Option<SearchStrategyHint>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SearchEventsStrategy {
+pub enum SearchStrategyHint {
     #[default]
-    Optimized,
-    OracleExact,
+    #[serde(rename = "optimized")]
+    PreferPerformance,
+    #[serde(rename = "oracle_exact")]
+    Exact,
 }
 
-impl SearchEventsStrategy {
+impl SearchStrategyHint {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Optimized => "optimized",
-            Self::OracleExact => "oracle_exact",
+            Self::PreferPerformance => "optimized",
+            Self::Exact => "oracle_exact",
         }
     }
 }
@@ -954,7 +956,47 @@ fn default_page_limit() -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::SessionOriginScope;
+    use super::{SearchEventKind, SearchEventsQuery, SearchStrategyHint, SessionOriginScope};
+
+    #[test]
+    fn search_events_query_preserves_wire_contract() {
+        const WIRE_JSON: &str = r#"{"query":"needle","source":"mcp","limit":7,"session_id":"session-a","session_ids":["session-a","session-b"],"min_score":0.25,"min_should_match":2,"include_tool_events":true,"event_kinds":["message","tool_call"],"exclude_codex_mcp":false,"disable_cache":true,"search_strategy":"optimized"}"#;
+
+        let query: SearchEventsQuery =
+            serde_json::from_str(WIRE_JSON).expect("deserialize existing MCP query contract");
+
+        assert_eq!(query.bypass_cache, Some(true));
+        assert_eq!(
+            query.strategy_hint,
+            Some(SearchStrategyHint::PreferPerformance)
+        );
+        assert_eq!(
+            query.event_kinds.as_deref(),
+            Some(&[SearchEventKind::Message, SearchEventKind::ToolCall][..])
+        );
+        assert_eq!(
+            serde_json::to_string(&query).expect("serialize MCP query contract"),
+            WIRE_JSON
+        );
+    }
+
+    #[test]
+    fn search_strategy_hint_preserves_wire_values() {
+        for (hint, wire_value) in [
+            (SearchStrategyHint::PreferPerformance, r#""optimized""#),
+            (SearchStrategyHint::Exact, r#""oracle_exact""#),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&hint).expect("serialize strategy hint"),
+                wire_value
+            );
+            assert_eq!(
+                serde_json::from_str::<SearchStrategyHint>(wire_value)
+                    .expect("deserialize strategy hint"),
+                hint
+            );
+        }
+    }
 
     #[test]
     fn from_roots_normalizes_and_dedupes() {
