@@ -115,6 +115,16 @@ glob = "~/.pi/agent/sessions/**/*.jsonl"
 watch_root = "~/.pi/agent/sessions"
 format = "jsonl"
 
+# OMP (oh-my-pi) uses the same session schema as Pi but writes to ~/.omp.
+# Keep this source separate so historical ~/.pi sessions remain available.
+[[ingest.sources]]
+name = "omp"
+harness = "pi-coding-agent"
+enabled = true
+glob = "~/.omp/agent/sessions/**/*.jsonl"
+watch_root = "~/.omp/agent/sessions"
+format = "jsonl"
+
 # Hermes Agent LIVE sessions: one JSON file per conversation under
 # ~/.hermes/sessions/ that the agent rewrites in place every turn.
 # `format = "session_json"` opts into the rewrite-aware processor that emits

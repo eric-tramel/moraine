@@ -187,6 +187,16 @@ watch_root = "~/.pi/agent/sessions"
 format = "jsonl"
 
 [[ingest.sources]]
+# OMP (oh-my-pi) JSONL session files. OMP uses the Pi session schema but
+# stores current sessions separately; keep the historical Pi source above.
+name = "omp"
+harness = "pi-coding-agent"
+enabled = true
+glob = "~/.omp/agent/sessions/**/*.jsonl"
+watch_root = "~/.omp/agent/sessions"
+format = "jsonl"
+
+[[ingest.sources]]
 # Hermes live session JSON files rewritten in place.
 name = "hermes"
 harness = "hermes"

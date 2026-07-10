@@ -564,6 +564,14 @@ fn default_sources() -> Vec<IngestSource> {
             watch_root: "~/.pi/agent/sessions".to_string(),
             format: String::new(),
         },
+        IngestSource {
+            name: "omp".to_string(),
+            harness: "pi-coding-agent".to_string(),
+            enabled: true,
+            glob: "~/.omp/agent/sessions/**/*.jsonl".to_string(),
+            watch_root: "~/.omp/agent/sessions".to_string(),
+            format: String::new(),
+        },
     ]
 }
 
@@ -1114,7 +1122,47 @@ fn normalize_backends_and_routes(cfg: &mut AppConfig) -> Result<()> {
     Ok(())
 }
 
+fn migrate_legacy_pi_source(sources: &mut Vec<IngestSource>) {
+    if sources.iter().any(|source| source.name.trim() == "omp") {
+        return;
+    }
+
+    let Some(enabled) = sources
+        .iter()
+        .find(|source| {
+            source.name.trim() == "pi"
+                && source.harness.trim() == "pi-coding-agent"
+                && source.glob.trim() == "~/.pi/agent/sessions/**/*.jsonl"
+                && source.watch_root.trim() == "~/.pi/agent/sessions"
+                && (source.format.trim().is_empty()
+                    || source
+                        .format
+                        .trim()
+                        .eq_ignore_ascii_case(SOURCE_FORMAT_JSONL))
+        })
+        .map(|source| source.enabled)
+    else {
+        return;
+    };
+
+    // Configs created before OMP moved its session tree explicitly list only
+    // the setup-owned Pi source, so Serde defaults cannot add the new source.
+    // Migrate that exact legacy source in memory without rewriting user config
+    // or changing customized Pi sources. A distinct source name gives OMP a
+    // fresh checkpoint namespace, causing the first post-upgrade startup to
+    // backfill the full ~/.omp tree.
+    sources.push(IngestSource {
+        name: "omp".to_string(),
+        harness: "pi-coding-agent".to_string(),
+        enabled,
+        glob: "~/.omp/agent/sessions/**/*.jsonl".to_string(),
+        watch_root: "~/.omp/agent/sessions".to_string(),
+        format: String::new(),
+    });
+}
+
 fn normalize_config(mut cfg: AppConfig) -> Result<AppConfig> {
+    migrate_legacy_pi_source(&mut cfg.ingest.sources);
     for (source_idx, source) in cfg.ingest.sources.iter_mut().enumerate() {
         source.harness = normalize_harness(&source.harness, source_idx, &source.name)?;
         source.glob = expand_path(&source.glob);
@@ -2304,6 +2352,39 @@ watch_root = "~/.cursor/projects"
     }
 
     #[test]
+    fn shipped_template_enables_pi_and_omp_sources_by_default() {
+        let path = write_temp_config(
+            include_str!("../../../config/moraine.toml"),
+            "shipped-template-pi-omp",
+        );
+        let cfg = load_config(&path).expect("shipped template must parse");
+        std::fs::remove_file(&path).ok();
+
+        let pi = cfg
+            .ingest
+            .sources
+            .iter()
+            .find(|source| source.name == "pi")
+            .expect("template retains the historical pi source");
+        let omp = cfg
+            .ingest
+            .sources
+            .iter()
+            .find(|source| source.name == "omp")
+            .expect("template ships an omp source");
+
+        for source in [pi, omp] {
+            assert!(source.enabled);
+            assert_eq!(source.harness, "pi-coding-agent");
+            assert_eq!(source.format, SOURCE_FORMAT_JSONL);
+        }
+        assert!(pi.glob.ends_with("/.pi/agent/sessions/**/*.jsonl"));
+        assert!(pi.watch_root.ends_with("/.pi/agent/sessions"));
+        assert!(omp.glob.ends_with("/.omp/agent/sessions/**/*.jsonl"));
+        assert!(omp.watch_root.ends_with("/.omp/agent/sessions"));
+    }
+
+    #[test]
     fn default_sources_enable_cursor_sqlite() {
         let sources = default_sources();
         let source = sources
@@ -2313,6 +2394,80 @@ watch_root = "~/.cursor/projects"
         assert!(source.enabled, "cursor_sqlite is default on");
         assert_eq!(source.format, SOURCE_FORMAT_CURSOR_SQLITE);
         assert!(source.glob.ends_with("/**/state.vscdb"));
+    }
+
+    #[test]
+    fn default_sources_cover_pi_and_omp_session_trees() {
+        let sources = default_sources();
+        let pi = sources
+            .iter()
+            .find(|source| source.name == "pi")
+            .expect("defaults retain the historical pi source");
+        let omp = sources
+            .iter()
+            .find(|source| source.name == "omp")
+            .expect("defaults include an omp source");
+
+        for source in [pi, omp] {
+            assert!(source.enabled);
+            assert_eq!(source.harness, "pi-coding-agent");
+            assert!(source.format.is_empty());
+        }
+        assert_eq!(pi.glob, "~/.pi/agent/sessions/**/*.jsonl");
+        assert_eq!(pi.watch_root, "~/.pi/agent/sessions");
+        assert_eq!(omp.glob, "~/.omp/agent/sessions/**/*.jsonl");
+        assert_eq!(omp.watch_root, "~/.omp/agent/sessions");
+    }
+
+    #[test]
+    fn load_config_migrates_only_the_legacy_default_pi_source() {
+        let legacy_path = write_temp_config(
+            r#"
+[[ingest.sources]]
+name = "pi"
+harness = "pi-coding-agent"
+enabled = true
+glob = "~/.pi/agent/sessions/**/*.jsonl"
+watch_root = "~/.pi/agent/sessions"
+format = "jsonl"
+"#,
+            "legacy-pi-source",
+        );
+        let legacy = load_config(&legacy_path).expect("legacy Pi config should load");
+        std::fs::remove_file(&legacy_path).ok();
+        let omp = legacy
+            .ingest
+            .sources
+            .iter()
+            .find(|source| source.name == "omp")
+            .expect("legacy default Pi config should gain OMP");
+        assert!(omp.enabled);
+        assert_eq!(omp.harness, "pi-coding-agent");
+        assert_eq!(omp.format, SOURCE_FORMAT_JSONL);
+        assert!(omp.glob.ends_with("/.omp/agent/sessions/**/*.jsonl"));
+
+        let custom_path = write_temp_config(
+            r#"
+[[ingest.sources]]
+name = "pi"
+harness = "pi-coding-agent"
+enabled = true
+glob = "~/custom/pi/**/*.jsonl"
+watch_root = "~/custom/pi"
+format = "jsonl"
+"#,
+            "custom-pi-source",
+        );
+        let custom = load_config(&custom_path).expect("custom Pi config should load");
+        std::fs::remove_file(&custom_path).ok();
+        assert!(
+            custom
+                .ingest
+                .sources
+                .iter()
+                .all(|source| source.name != "omp"),
+            "custom Pi sources must not opt into OMP implicitly"
+        );
     }
 
     #[test]

@@ -3030,6 +3030,58 @@ mod tests {
     }
 
     #[test]
+    fn ingest_selection_adds_omp_source_to_existing_pi_config() {
+        let mut document = r#"
+[ingest]
+
+[[ingest.sources]]
+name = "pi"
+harness = "pi-coding-agent"
+enabled = true
+glob = "~/.pi/agent/sessions/**/*.jsonl"
+watch_root = "~/.pi/agent/sessions"
+format = "jsonl"
+"#
+        .parse::<DocumentMut>()
+        .expect("existing pi config parses");
+
+        let update = apply_ingest_selections_to_document(
+            &mut document,
+            &[SetupTargetSelection {
+                target: SetupMcpTarget::PiCodingAgent,
+                mode: SetupSelectionMode::IngestOnly,
+            }],
+        )
+        .expect("apply pi ingest selection");
+
+        assert_eq!(
+            update,
+            IngestSelectionUpdate {
+                enabled_sources: 0,
+                disabled_sources: 0,
+                added_sources: 1,
+                updated_sources: 0,
+            }
+        );
+        assert!(source_enabled(&document, "pi"));
+        assert!(source_enabled(&document, "omp"));
+        assert_eq!(
+            source_value(&document, "omp", "glob"),
+            Some("~/.omp/agent/sessions/**/*.jsonl")
+        );
+        assert_eq!(
+            source_value(&document, "omp", "watch_root"),
+            Some("~/.omp/agent/sessions")
+        );
+        assert_eq!(source_value(&document, "omp", "format"), Some("jsonl"));
+
+        let path = temp_path("ingest-adds-omp-to-pi-config");
+        fs::write(&path, document.to_string()).expect("write updated config");
+        moraine_config::load_config(&path).expect("updated config loads");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn ingest_selection_reconciles_missing_setup_owned_sources() {
         let mut document = r#"
 [ingest]
