@@ -4,15 +4,68 @@ use crate::managed_clickhouse::{
 };
 use crate::paths::RuntimePaths;
 use crate::process::{
-    backend_endpoint_status, legacy_service_running, service_running, BackendEndpointStatus,
-    LEGACY_MCP_PID_FILE, LEGACY_MONITOR_PID_FILE,
+    backend_endpoint_status, backend_http_connect_host, legacy_service_running, service_running,
+    BackendEndpointStatus, LEGACY_MCP_PID_FILE, LEGACY_MONITOR_PID_FILE,
 };
-use crate::render::{HeartbeatSnapshot, ServiceRuntimeState, ServiceRuntimeStatus, StatusSnapshot};
+use crate::render::{
+    HeartbeatSnapshot, ServiceRuntimeState, ServiceRuntimeStatus, StatusDataSource, StatusSnapshot,
+};
 use crate::service::Service;
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use moraine_clickhouse::DoctorReport;
 use moraine_config::AppConfig;
 use moraine_conversations::{ConversationRepository, IngestHeartbeatRead, StoreDiagnostics};
+use std::time::Duration;
+
+const STATUS_API_TIMEOUT: Duration = Duration::from_secs(2);
+const STATUS_API_MAX_RESPONSE_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(transparent)]
+struct RequiredNullable<T>(Option<T>);
+
+#[derive(Debug, serde::Deserialize)]
+struct DaemonStatusResponse {
+    ok: bool,
+    clickhouse: DaemonClickhouseStatus,
+    database: DaemonDatabaseStatus,
+    ingestor: DaemonIngestorStatus,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DaemonClickhouseStatus {
+    url: String,
+    database: String,
+    healthy: bool,
+    version: RequiredNullable<String>,
+    error: RequiredNullable<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DaemonDatabaseStatus {
+    exists: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DaemonIngestorStatus {
+    present: bool,
+    latest: RequiredNullable<DaemonHeartbeat>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DaemonHeartbeat {
+    ts: String,
+    queue_depth: u64,
+    files_active: u64,
+}
+
+struct StatusData {
+    report: DoctorReport,
+    heartbeat: HeartbeatSnapshot,
+    source: StatusDataSource,
+    fallback_note: Option<String>,
+    clickhouse_health_url: String,
+}
 
 fn service_runtime_running(services: &[ServiceRuntimeStatus], service: Service) -> bool {
     services
@@ -73,6 +126,107 @@ fn format_http_url(host: &str, port: u16) -> String {
 
 fn monitor_runtime_url(cfg: &AppConfig) -> String {
     format_http_url(&cfg.monitor.host, cfg.monitor.port)
+}
+fn monitor_api_status_url(cfg: &AppConfig) -> String {
+    format!(
+        "{}/api/v1/status",
+        format_http_url(
+            backend_http_connect_host(&cfg.monitor.host),
+            cfg.monitor.port
+        )
+    )
+}
+
+fn daemon_status_data(payload: DaemonStatusResponse) -> Result<StatusData> {
+    if !payload.ok {
+        bail!("daemon API reported ok=false");
+    }
+    let version_present = payload.clickhouse.version.0.is_some();
+    let error_present = payload.clickhouse.error.0.is_some();
+    if payload.clickhouse.healthy && (!payload.database.exists || !version_present || error_present)
+    {
+        bail!("daemon API returned contradictory healthy ClickHouse fields");
+    }
+    if !payload.clickhouse.healthy && !error_present {
+        bail!("daemon API returned an unhealthy ClickHouse without an error");
+    }
+
+    let latest = payload.ingestor.latest.0;
+    if payload.ingestor.present != latest.is_some() {
+        bail!("daemon API returned inconsistent ingestor presence");
+    }
+    let heartbeat = match latest {
+        Some(latest) => HeartbeatSnapshot::Available {
+            latest: latest.ts,
+            queue_depth: latest.queue_depth,
+            files_active: latest.files_active,
+            watcher_backend: "unknown".to_string(),
+            watcher_error_count: 0,
+            watcher_reset_count: 0,
+            watcher_last_reset_unix_ms: 0,
+        },
+        None => HeartbeatSnapshot::Unavailable,
+    };
+    let report = DoctorReport {
+        clickhouse_healthy: payload.clickhouse.healthy,
+        clickhouse_version: payload.clickhouse.version.0,
+        database: payload.clickhouse.database,
+        database_exists: payload.database.exists,
+        applied_migrations: Vec::new(),
+        pending_migrations: Vec::new(),
+        missing_tables: Vec::new(),
+        errors: payload.clickhouse.error.0.into_iter().collect(),
+    };
+
+    Ok(StatusData {
+        report,
+        heartbeat,
+        source: StatusDataSource::DaemonApi,
+        fallback_note: None,
+        clickhouse_health_url: payload.clickhouse.url,
+    })
+}
+
+async fn read_daemon_status(cfg: &AppConfig, timeout: Duration) -> Result<StatusData> {
+    let api_url = monitor_api_status_url(cfg);
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(timeout)
+        .timeout(timeout)
+        .build()
+        .context("build daemon status API client")?;
+    let mut response = client
+        .get(&api_url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .with_context(|| format!("request {api_url}"))?
+        .error_for_status()
+        .with_context(|| format!("request {api_url}"))?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > STATUS_API_MAX_RESPONSE_BYTES as u64)
+    {
+        bail!("daemon status API response exceeds {STATUS_API_MAX_RESPONSE_BYTES} bytes");
+    }
+    let capacity = response
+        .content_length()
+        .unwrap_or_default()
+        .min(STATUS_API_MAX_RESPONSE_BYTES as u64) as usize;
+    let mut body = Vec::with_capacity(capacity);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("read {api_url} response"))?
+    {
+        if chunk.len() > STATUS_API_MAX_RESPONSE_BYTES - body.len() {
+            bail!("daemon status API response exceeds {STATUS_API_MAX_RESPONSE_BYTES} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let payload = serde_json::from_slice(&body)
+        .with_context(|| format!("decode {api_url} response as JSON"))?;
+    daemon_status_data(payload)
 }
 
 fn build_status_notes(
@@ -160,6 +314,39 @@ async fn read_repository_status(
     };
     Ok((report, heartbeat))
 }
+async fn read_preferred_status(
+    cfg: &AppConfig,
+    repository: &dyn ConversationRepository,
+    api_available: bool,
+    timeout: Duration,
+) -> Result<StatusData> {
+    if api_available {
+        match read_daemon_status(cfg, timeout).await {
+            Ok(status) => return Ok(status),
+            Err(error) => {
+                let (report, heartbeat) = read_repository_status(repository).await?;
+                return Ok(StatusData {
+                    report,
+                    heartbeat,
+                    source: StatusDataSource::DirectDb,
+                    fallback_note: Some(format!(
+                        "daemon status API failed ({error:#}); using direct DB fallback"
+                    )),
+                    clickhouse_health_url: cfg.clickhouse.url.clone(),
+                });
+            }
+        }
+    }
+
+    let (report, heartbeat) = read_repository_status(repository).await?;
+    Ok(StatusData {
+        report,
+        heartbeat,
+        source: StatusDataSource::DirectDb,
+        fallback_note: None,
+        clickhouse_health_url: cfg.clickhouse.url.clone(),
+    })
+}
 
 pub(super) async fn cmd_status(
     paths: &RuntimePaths,
@@ -177,9 +364,23 @@ pub(super) async fn cmd_status(
     ];
     let managed_server = managed_clickhouse_bin(paths, "clickhouse-server");
     let (source, source_path) = active_clickhouse_source(paths);
-    let (report, heartbeat) = read_repository_status(repository).await?;
-    let clickhouse_health_url = cfg.clickhouse.url.clone();
+    let StatusData {
+        report,
+        heartbeat,
+        source: data_source,
+        fallback_note,
+        clickhouse_health_url,
+    } = read_preferred_status(
+        cfg,
+        repository,
+        backend_endpoints.http_listening,
+        STATUS_API_TIMEOUT,
+    )
+    .await?;
     let mut status_notes = build_status_notes(&services, &report, &clickhouse_health_url);
+    if let Some(note) = fallback_note {
+        status_notes.push(note);
+    }
     for (name, pid_file) in [
         ("monitor", LEGACY_MONITOR_PID_FILE),
         ("MCP", LEGACY_MCP_PID_FILE),
@@ -197,6 +398,7 @@ pub(super) async fn cmd_status(
     Ok(StatusSnapshot {
         services,
         monitor_url,
+        data_source,
         managed_clickhouse_installed: managed_server.exists(),
         managed_clickhouse_path: managed_server.display().to_string(),
         managed_clickhouse_version: managed_clickhouse_version(paths),
@@ -218,6 +420,87 @@ mod tests {
         RepoResult,
     };
     use serde_json::{json, Value};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Instant;
+
+    fn test_config(monitor_port: u16) -> AppConfig {
+        let mut cfg = AppConfig::default();
+        cfg.monitor.host = "127.0.0.1".to_string();
+        cfg.monitor.port = monitor_port;
+        cfg
+    }
+
+    fn test_repository() -> InMemoryConversationRepository {
+        InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            InMemoryConversationResponses {
+                latest_ingest_heartbeat: Some(Ok(IngestHeartbeatRead::default())),
+                read_store_diagnostics: Some(Ok(StoreDiagnostics {
+                    healthy: true,
+                    version: Some("direct-db-version".to_string()),
+                    database: "direct_db".to_string(),
+                    database_exists: true,
+                    applied_schema_versions: vec!["001".to_string()],
+                    pending_schema_versions: Vec::new(),
+                    missing_tables: Vec::new(),
+                    errors: Vec::new(),
+                })),
+                ..InMemoryConversationResponses::default()
+            },
+        )
+    }
+
+    fn daemon_status_body(healthy: bool) -> String {
+        json!({
+            "ok": true,
+            "clickhouse": {
+                "url": "http://api-clickhouse:8123",
+                "database": "api_db",
+                "healthy": healthy,
+                "version": "26.1.2.3",
+                "error": if healthy {
+                    Value::Null
+                } else {
+                    Value::String("API-reported database failure".to_string())
+                }
+            },
+            "database": {"exists": true},
+            "ingestor": {
+                "present": true,
+                "latest": {
+                    "ts": "2026-07-10 12:34:56.789",
+                    "queue_depth": 17,
+                    "files_active": 2
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn spawn_api_response(body: &str, delay: Duration) -> (u16, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind daemon API fixture");
+        let port = listener.local_addr().expect("daemon API address").port();
+        let body = body.to_string();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept daemon API request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("set request timeout");
+            let mut request = [0_u8; 2048];
+            let request_len = stream.read(&mut request).expect("read daemon API request");
+            thread::sleep(delay);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            String::from_utf8_lossy(&request[..request_len]).into_owned()
+        });
+        (port, worker)
+    }
 
     async fn status_json(heartbeat: RepoResult<IngestHeartbeatRead>) -> Value {
         let mut cfg = AppConfig::default();
@@ -283,6 +566,183 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn daemon_api_precedes_direct_db_even_when_api_reports_unhealthy() {
+        let repository = test_repository();
+        let (port, worker) =
+            spawn_api_response(&daemon_status_body(false), Duration::from_millis(0));
+        let status = read_preferred_status(
+            &test_config(port),
+            &repository,
+            true,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("read preferred daemon status");
+
+        assert_eq!(status.source, StatusDataSource::DaemonApi);
+        assert_eq!(status.clickhouse_health_url, "http://api-clickhouse:8123");
+        assert!(!status.report.clickhouse_healthy);
+        assert_eq!(status.report.database, "api_db");
+        assert_eq!(status.report.errors, vec!["API-reported database failure"]);
+        assert!(matches!(
+            status.heartbeat,
+            HeartbeatSnapshot::Available {
+                ref latest,
+                queue_depth: 17,
+                files_active: 2,
+                ..
+            } if latest == "2026-07-10 12:34:56.789"
+        ));
+        let calls = repository.calls();
+        assert_eq!(calls.read_store_diagnostics, 0);
+        assert_eq!(calls.latest_ingest_heartbeat, 0);
+        let request = worker.join().expect("daemon API worker");
+        assert!(
+            request.starts_with("GET /api/v1/status HTTP/1.1"),
+            "{request}"
+        );
+        assert!(request.contains("accept: application/json"), "{request}");
+    }
+
+    #[tokio::test]
+    async fn malformed_and_partial_api_responses_fall_back_to_direct_db() {
+        for body in ["{", r#"{"ok":true}"#] {
+            let repository = test_repository();
+            let (port, worker) = spawn_api_response(body, Duration::from_millis(0));
+            let status = read_preferred_status(
+                &test_config(port),
+                &repository,
+                true,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("fall back after invalid daemon response");
+
+            assert_eq!(status.source, StatusDataSource::DirectDb);
+            assert_eq!(status.report.database, "direct_db");
+            assert!(
+                status
+                    .fallback_note
+                    .as_deref()
+                    .is_some_and(|note| note.contains("using direct DB fallback")),
+                "{:?}",
+                status.fallback_note
+            );
+            let calls = repository.calls();
+            assert_eq!(calls.read_store_diagnostics, 1);
+            assert_eq!(calls.latest_ingest_heartbeat, 1);
+            let request = worker.join().expect("daemon API worker");
+            assert!(request.starts_with("GET /api/v1/status HTTP/1.1"));
+        }
+    }
+    #[tokio::test]
+    async fn contradictory_api_health_fields_fall_back_to_direct_db() {
+        let mut missing_version: Value =
+            serde_json::from_str(&daemon_status_body(true)).expect("valid fixture");
+        missing_version["clickhouse"]["version"] = Value::Null;
+        let mut healthy_with_error: Value =
+            serde_json::from_str(&daemon_status_body(true)).expect("valid fixture");
+        healthy_with_error["clickhouse"]["error"] = Value::String("contradiction".to_string());
+        let mut unhealthy_without_error: Value =
+            serde_json::from_str(&daemon_status_body(false)).expect("valid fixture");
+        unhealthy_without_error["clickhouse"]["error"] = Value::Null;
+
+        for payload in [missing_version, healthy_with_error, unhealthy_without_error] {
+            let repository = test_repository();
+            let (port, worker) = spawn_api_response(&payload.to_string(), Duration::from_millis(0));
+            let status = read_preferred_status(
+                &test_config(port),
+                &repository,
+                true,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("fall back after contradictory daemon response");
+
+            assert_eq!(status.source, StatusDataSource::DirectDb);
+            let calls = repository.calls();
+            assert_eq!(calls.read_store_diagnostics, 1);
+            assert_eq!(calls.latest_ingest_heartbeat, 1);
+            worker.join().expect("daemon API worker");
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_api_response_falls_back_before_buffering_the_body() {
+        let repository = test_repository();
+        let body = "x".repeat(STATUS_API_MAX_RESPONSE_BYTES + 1);
+        let (port, worker) = spawn_api_response(&body, Duration::from_millis(0));
+        let status = read_preferred_status(
+            &test_config(port),
+            &repository,
+            true,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("fall back after oversized daemon response");
+
+        assert_eq!(status.source, StatusDataSource::DirectDb);
+        assert!(
+            status
+                .fallback_note
+                .as_deref()
+                .is_some_and(|note| note.contains("exceeds 262144 bytes")),
+            "{:?}",
+            status.fallback_note
+        );
+        let calls = repository.calls();
+        assert_eq!(calls.read_store_diagnostics, 1);
+        assert_eq!(calls.latest_ingest_heartbeat, 1);
+        worker.join().expect("daemon API worker");
+    }
+
+    #[tokio::test]
+    async fn daemon_api_timeout_is_bounded_and_falls_back() {
+        let repository = test_repository();
+        let (port, worker) =
+            spawn_api_response(&daemon_status_body(true), Duration::from_millis(300));
+        let started = Instant::now();
+        let status = read_preferred_status(
+            &test_config(port),
+            &repository,
+            true,
+            Duration::from_millis(20),
+        )
+        .await
+        .expect("fall back after daemon timeout");
+        let elapsed = started.elapsed();
+
+        assert_eq!(status.source, StatusDataSource::DirectDb);
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "API timeout took {elapsed:?}"
+        );
+        let calls = repository.calls();
+        assert_eq!(calls.read_store_diagnostics, 1);
+        assert_eq!(calls.latest_ingest_heartbeat, 1);
+        worker.join().expect("daemon API worker");
+    }
+
+    #[tokio::test]
+    async fn unavailable_daemon_uses_direct_db_without_api_failure_warning() {
+        let repository = test_repository();
+        let status = read_preferred_status(
+            &test_config(9),
+            &repository,
+            false,
+            Duration::from_millis(20),
+        )
+        .await
+        .expect("read direct fallback status");
+
+        assert_eq!(status.source, StatusDataSource::DirectDb);
+        assert!(status.fallback_note.is_none());
+        let calls = repository.calls();
+        assert_eq!(calls.read_store_diagnostics, 1);
+        assert_eq!(calls.latest_ingest_heartbeat, 1);
+    }
+
+    #[tokio::test]
     async fn healthy_status_preserves_stale_heartbeat_json_output() {
         let status = status_json(Ok(IngestHeartbeatRead {
             table_present: true,
@@ -290,6 +750,7 @@ mod tests {
         }))
         .await;
 
+        assert_eq!(status["data_source"], "direct_db");
         assert_eq!(
             status["doctor"],
             json!({

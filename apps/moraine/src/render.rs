@@ -53,6 +53,22 @@ pub(crate) struct ServiceRuntimeStatus {
     pub(crate) http_listening: Option<bool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StatusDataSource {
+    DaemonApi,
+    DirectDb,
+}
+
+impl StatusDataSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::DaemonApi => "daemon API",
+            Self::DirectDb => "direct DB",
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub(crate) enum HeartbeatSnapshot {
@@ -75,6 +91,7 @@ pub(crate) enum HeartbeatSnapshot {
 pub(crate) struct StatusSnapshot {
     pub(crate) services: Vec<ServiceRuntimeStatus>,
     pub(crate) monitor_url: Option<String>,
+    pub(crate) data_source: StatusDataSource,
     pub(crate) managed_clickhouse_installed: bool,
     pub(crate) managed_clickhouse_path: String,
     pub(crate) managed_clickhouse_version: Option<String>,
@@ -429,6 +446,7 @@ pub(crate) fn render_status(output: &CliOutput, snapshot: &StatusSnapshot) -> Re
     if let Some(version) = &snapshot.doctor.clickhouse_version {
         doctor_lines[0].push_str(&format!("  (v{version})"));
     }
+    doctor_lines.push(format!("source: {}", snapshot.data_source.label()));
     if !snapshot.doctor.pending_migrations.is_empty() {
         doctor_lines.push(format!(
             "  pending migrations: {}",

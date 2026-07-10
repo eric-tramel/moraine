@@ -84,6 +84,12 @@ Check service health:
 moraine status
 ```
 
+`moraine status` prefers the live backend's `/api/v1/status` response and
+automatically falls back to a direct database read when the backend is
+unreachable. Human output labels the source as `daemon API` or `direct DB`;
+JSON output adds the compatible top-level `data_source` field with
+`daemon_api` or `direct_db`.
+
 For a local ClickHouse process started by `moraine up`, Moraine keeps a small
 supervisor running after startup. If ClickHouse exits unexpectedly, the
 supervisor waits 1, 2, 4, 8, then 16 seconds between at most five consecutive

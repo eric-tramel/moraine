@@ -148,7 +148,7 @@ pub(crate) struct BackendEndpointStatus {
     pub(crate) http_listening: bool,
 }
 
-fn backend_http_connect_host(host: &str) -> &str {
+pub(crate) fn backend_http_connect_host(host: &str) -> &str {
     let host = host
         .strip_prefix('[')
         .and_then(|host| host.strip_suffix(']'))
