@@ -1,0 +1,1130 @@
+{
+  "dependency_policy": {
+    "command": "python3 scripts/ci/dependency_policy.py",
+    "exit_code": 0,
+    "reference": "Makefile dependency-policy target; direct enforcement command only (not its unit-test preflight)",
+    "result": "pass",
+    "stderr": [],
+    "stdout": [
+      "[dependency-policy] direct moraine-clickhouse dependents: moraine, moraine-conversations, moraine-ingest-core",
+      "[dependency-policy] moraine-monitor-core non-test Rust sources contain no SELECT or INSERT INTO statement literals",
+      "[dependency-policy] PASS: epic #451 Phase 1 dependency rule"
+    ]
+  },
+  "format_version": 1,
+  "metadata_command": "cargo metadata --format-version 1 --locked --no-deps",
+  "packages": [
+    {
+      "dependencies": [
+        {
+          "features": [],
+          "name": "anyhow",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [
+            "std"
+          ],
+          "name": "chrono",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^0.4",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [
+            "derive"
+          ],
+          "name": "clap",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^4.5",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "dialoguer",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^0.11",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [
+            "serde"
+          ],
+          "name": "jsonc-parser",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^0.32",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "moraine-clickhouse",
+          "optional": false,
+          "path": "crates/moraine-clickhouse",
+          "rename": null,
+          "req": "*",
+          "source": null,
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "moraine-config",
+          "optional": false,
+          "path": "crates/moraine-config",
+          "rename": null,
+          "req": "*",
+          "source": null,
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "moraine-conversations",
+          "optional": false,
+          "path": "crates/moraine-conversations",
+          "rename": null,
+          "req": "*",
+          "source": null,
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "ratatui",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^0.29",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [
+            "rustls-tls"
+          ],
+          "name": "reqwest",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^0.12",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [
+            "derive"
+          ],
+          "name": "serde",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "serde_json",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "sha2",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^0.10",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [
+            "macros",
+            "process",
+            "rt-multi-thread",
+            "signal",
+            "time"
+          ],
+          "name": "tokio",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.40",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "toml_edit",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^0.22",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [
+            "v4"
+          ],
+          "name": "uuid",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.11",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "manifest_path": "apps/moraine/Cargo.toml",
+      "name": "moraine"
+    },
+    {
+      "dependencies": [
+        {
+          "features": [],
+          "name": "anyhow",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "moraine-config",
+          "optional": false,
+          "path": "crates/moraine-config",
+          "rename": null,
+          "req": "*",
+          "source": null,
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [
+            "json",
+            "rustls-tls"
+          ],
+          "name": "reqwest",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^0.12",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [
+            "derive"
+          ],
+          "name": "serde",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "serde_json",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "url",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^2.5",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "manifest_path": "crates/moraine-clickhouse/Cargo.toml",
+      "name": "moraine-clickhouse"
+    },
+    {
+      "dependencies": [
+        {
+          "features": [],
+          "name": "anyhow",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "glob",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^0.3",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [
+            "derive"
+          ],
+          "name": "serde",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "toml",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^0.8",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "manifest_path": "crates/moraine-config/Cargo.toml",
+      "name": "moraine-config"
+    },
+    {
+      "dependencies": [
+        {
+          "features": [],
+          "name": "ahash",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^0.8",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "anyhow",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "async-trait",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^0.1",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "base64",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^0.22",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "moraine-clickhouse",
+          "optional": false,
+          "path": "crates/moraine-clickhouse",
+          "rename": null,
+          "req": "*",
+          "source": null,
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "moraine-config",
+          "optional": false,
+          "path": "crates/moraine-config",
+          "rename": null,
+          "req": "*",
+          "source": null,
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "regex",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.11",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [
+            "derive"
+          ],
+          "name": "serde",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "serde_json",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "thiserror",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^2.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [
+            "macros",
+            "rt",
+            "sync"
+          ],
+          "name": "tokio",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.40",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "tracing",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^0.1",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "url",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^2.5",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [
+            "v4"
+          ],
+          "name": "uuid",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.11",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "manifest_path": "crates/moraine-conversations/Cargo.toml",
+      "name": "moraine-conversations"
+    },
+    {
+      "dependencies": [
+        {
+          "features": [],
+          "name": "anyhow",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "moraine-config",
+          "optional": false,
+          "path": "crates/moraine-config",
+          "rename": null,
+          "req": "*",
+          "source": null,
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "moraine-ingest-core",
+          "optional": false,
+          "path": "crates/moraine-ingest-core",
+          "rename": null,
+          "req": "*",
+          "source": null,
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [
+            "macros",
+            "rt-multi-thread"
+          ],
+          "name": "tokio",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.40",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [
+            "env-filter",
+            "fmt"
+          ],
+          "name": "tracing-subscriber",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^0.3",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "manifest_path": "apps/moraine-ingest/Cargo.toml",
+      "name": "moraine-ingest"
+    },
+    {
+      "dependencies": [
+        {
+          "features": [],
+          "name": "aho-corasick",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.1",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "anyhow",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [
+            "clock"
+          ],
+          "name": "chrono",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^0.4",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "name": "glob",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^0.3",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "moraine-clickhouse",
+          "optional": false,
+          "path": "crates/moraine-clickhouse",
+          "rename": null,
+          "req": "*",
+          "source": null,
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "moraine-config",
+          "optional": false,
+          "path": "crates/moraine-config",
+          "rename": null,
+          "req": "*",
+          "source": null,
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "notify",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^7.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "regex",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.11",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [
+            "bundled"
+          ],
+          "name": "rusqlite",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^0.39.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "same-file",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [
+            "derive"
+          ],
+          "name": "serde",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "serde_json",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "sha2",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^0.10",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [
+            "macros",
+            "rt-multi-thread",
+            "signal",
+            "sync",
+            "time"
+          ],
+          "name": "tokio",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.40",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "tracing",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^0.1",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "urlencoding",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^2.1",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "walkdir",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^2.5",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "manifest_path": "crates/moraine-ingest-core/Cargo.toml",
+      "name": "moraine-ingest-core"
+    },
+    {
+      "dependencies": [
+        {
+          "features": [],
+          "name": "anyhow",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "moraine-config",
+          "optional": false,
+          "path": "crates/moraine-config",
+          "rename": null,
+          "req": "*",
+          "source": null,
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "moraine-conversations",
+          "optional": false,
+          "path": "crates/moraine-conversations",
+          "rename": null,
+          "req": "*",
+          "source": null,
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "moraine-mcp-core",
+          "optional": false,
+          "path": "crates/moraine-mcp-core",
+          "rename": null,
+          "req": "*",
+          "source": null,
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "moraine-monitor-core",
+          "optional": false,
+          "path": "crates/moraine-monitor-core",
+          "rename": null,
+          "req": "*",
+          "source": null,
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [
+            "io-std",
+            "io-util",
+            "macros",
+            "net",
+            "rt",
+            "rt-multi-thread",
+            "signal",
+            "sync",
+            "time"
+          ],
+          "name": "tokio",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.40",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "tracing",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^0.1",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [
+            "env-filter",
+            "fmt"
+          ],
+          "name": "tracing-subscriber",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^0.3",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "manifest_path": "apps/moraine-mcp/Cargo.toml",
+      "name": "moraine-mcp"
+    },
+    {
+      "dependencies": [
+        {
+          "features": [],
+          "name": "anyhow",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [
+            "std"
+          ],
+          "name": "chrono",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^0.4",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "name": "libc",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^0.2",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": "cfg(unix)",
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "moraine-config",
+          "optional": false,
+          "path": "crates/moraine-config",
+          "rename": null,
+          "req": "*",
+          "source": null,
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "moraine-conversations",
+          "optional": false,
+          "path": "crates/moraine-conversations",
+          "rename": null,
+          "req": "*",
+          "source": null,
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [
+            "derive"
+          ],
+          "name": "serde",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "serde_json",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [
+            "io-std",
+            "io-util",
+            "macros",
+            "net",
+            "rt",
+            "sync",
+            "time"
+          ],
+          "name": "tokio",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.40",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "tracing",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^0.1",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "manifest_path": "crates/moraine-mcp-core/Cargo.toml",
+      "name": "moraine-mcp-core"
+    },
+    {
+      "dependencies": [],
+      "manifest_path": "apps/moraine-monitor/Cargo.toml",
+      "name": "moraine-monitor"
+    },
+    {
+      "dependencies": [
+        {
+          "features": [],
+          "name": "anyhow",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "axum",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^0.7",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "mime_guess",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^2.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "moraine-config",
+          "optional": false,
+          "path": "crates/moraine-config",
+          "rename": null,
+          "req": "*",
+          "source": null,
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "moraine-conversations",
+          "optional": false,
+          "path": "crates/moraine-conversations",
+          "rename": null,
+          "req": "*",
+          "source": null,
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [
+            "derive"
+          ],
+          "name": "serde",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "serde_json",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [
+            "fs",
+            "macros",
+            "net",
+            "rt-multi-thread"
+          ],
+          "name": "tokio",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^1.40",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "name": "tracing",
+          "optional": false,
+          "path": null,
+          "rename": null,
+          "req": "^0.1",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "manifest_path": "crates/moraine-monitor-core/Cargo.toml",
+      "name": "moraine-monitor-core"
+    }
+  ],
+  "selection": "workspace-member Cargo dependencies whose metadata kind is null/normal",
+  "source": "current working tree"
+}
