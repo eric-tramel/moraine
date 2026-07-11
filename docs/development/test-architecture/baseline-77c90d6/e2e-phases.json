@@ -1,0 +1,322 @@
+{
+  "format_version": 1,
+  "method": "ordered non-diagnostic phase echo statements from canonical shell harnesses",
+  "phases": [
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "installing managed ClickHouse",
+      "line": 1032,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "ensuring monitor frontend assets",
+      "line": 1035,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "bootstrapping distinct named-backend schema",
+      "line": 1038,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "starting stack",
+      "line": 1041,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking canonical managed process topology",
+      "line": 1044,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking managed service executable paths",
+      "line": 1060,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "waiting for monitor health",
+      "line": 1074,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking unified backend HTML + referenced static asset",
+      "line": 1077,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "waiting for ingest heartbeat + indexed content",
+      "line": 1080,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking ClickHouse normalized ingest rows",
+      "line": 1106,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "cursor sqlite live update: appending an assistant bubble",
+      "line": 1158,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking canonical monitor API routes",
+      "line": 1236,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking monitor API capabilities",
+      "line": 1251,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking one-release monitor API aliases",
+      "line": 1296,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking turn_seq is stable against an un-merged duplicate event (#388)",
+      "line": 1327,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking monitor/repository session count + last-activity parity",
+      "line": 1363,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking first fresh stdio MCP process (codex cache miss)",
+      "line": 1386,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking second fresh stdio MCP process (identical codex cache hit)",
+      "line": 1398,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking shared-daemon MCP cache miss -> hit markers",
+      "line": 1410,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking first named-backend MCP route through daemon",
+      "line": 1423,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking named-backend HTTP route through shared daemon router",
+      "line": 1432,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking named-backend repository/cache reuse on second MCP route",
+      "line": 1442,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking named route excludes default-only content",
+      "line": 1452,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking bounded ClickHouse query ownership",
+      "line": 1472,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking MCP initialize/tools/search_sessions/open/list_sessions (claude)",
+      "line": 1479,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking MCP initialize/tools/search_sessions/open/list_sessions (kimi)",
+      "line": 1488,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking MCP initialize/tools/search_sessions/open/list_sessions (cursor)",
+      "line": 1497,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking MCP initialize/tools/search_sessions/open/list_sessions (cursor sqlite)",
+      "line": 1506,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking MCP initialize/tools/search_sessions/open/list_sessions (pi)",
+      "line": 1515,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking MCP initialize/tools/search_sessions/open/list_sessions (hermes)",
+      "line": 1527,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking MCP initialize/tools/search_sessions/open/list_sessions (hermes session_json)",
+      "line": 1535,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking MCP --project-only serves in-scope session and hides others",
+      "line": 1547,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking MCP --project-only returns no hits for out-of-scope keyword",
+      "line": 1561,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": true,
+      "label": "checking replay benchmark script (dry-run)",
+      "line": 1572,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking full-stack status prefers the daemon v1 API",
+      "line": 1580,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "killing only the unified backend (crash/fallback scenario)",
+      "line": 1624,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking database + ingest survived backend termination",
+      "line": 1633,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking full MCP smoke through embedded fallback",
+      "line": 1648,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking named-backend MCP route through embedded fallback",
+      "line": 1661,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "comparing daemon and embedded canonical tools/list snapshots",
+      "line": 1672,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "checking final JSON status after abrupt backend loss",
+      "line": 1689,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e",
+      "conditional": false,
+      "label": "stopping remaining services and checking all-down status",
+      "line": 1753,
+      "source": "scripts/ci/e2e-stack.sh"
+    },
+    {
+      "channel": "e2e-install",
+      "conditional": false,
+      "label": "packaging release bundle for target: $target",
+      "line": 71,
+      "source": "scripts/ci/e2e-install-artifact.sh"
+    },
+    {
+      "channel": "e2e-install",
+      "conditional": false,
+      "label": "installing via install script from local artifacts",
+      "line": 76,
+      "source": "scripts/ci/e2e-install-artifact.sh"
+    },
+    {
+      "channel": "e2e-install",
+      "conditional": false,
+      "label": "running functional stack + MCP smoke with installed moraine",
+      "line": 105,
+      "source": "scripts/ci/e2e-install-artifact.sh"
+    }
+  ],
+  "source_commit": "77c90d6c572ba71bcfaa0362f7ead2cfa5e6712a"
+}

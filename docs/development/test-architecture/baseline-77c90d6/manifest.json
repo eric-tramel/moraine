@@ -1,0 +1,201 @@
+{
+  "artifact_sha256": {
+    "benchmark-scenarios.json": "6706273ea023fdd12bab331bc4b73c57edf6958b53f83e7c89e1dac2253e7811",
+    "cargo-targets.json": "53afccbd888267b5cd63f43dd8299336c3ea4c24d6c8074587d9bb5cbd536757",
+    "e2e-phases.json": "a7ae4c19ac70b34d9e3932cf75a0033d2d1353b30b671a233199a3421d10812e",
+    "ecosystem-collections.json": "a3440086ec927930bf879e4a6410cbecd492255497364da899bc7d106bc8cb45",
+    "fixture-checksums.tsv": "9907bcb325f1e269f64d6f509775dfb366e595a4ae6d733f4b4237db8ead181a",
+    "fixture-families.json": "408c62b5ac72db814dc41afe0b1b42cb08b78da4690cfffc6c8c03ea67e07a80",
+    "package-isolation.json": "ee31b633dfe3d1469e58246d00b4a6d73f3921c1ee2df37ecc43519f47eaec72",
+    "rust-libtest-darwin-arm64.json": "fecf9c499488a01f2256400c4dae6ef7f4d71b3f6f902cc2fd46d1b6099eab12",
+    "rust-libtest-linux-aarch64.json": "ef7022e948c36a2d1b264b36b8055adb740a5547c9bca2f9b2a0332d69b525c6",
+    "rust-test-summary.json": "c24134a362b346a0a3929318ed8914b68daef2fc9cd9d42fd6a2f537c100a556"
+  },
+  "baseline_commit": "77c90d6c572ba71bcfaa0362f7ead2cfa5e6712a",
+  "baseline_short": "77c90d6",
+  "baseline_subject": "feat(backend): consolidate read paths behind unified daemon (#476)",
+  "baseline_tree": "0ae5df87300c6748161f2035394b6e0b9a92e627",
+  "ecosystem_collection_commands": {
+    "browser_playwright": {
+      "argv": [
+        "playwright",
+        "test",
+        "--config",
+        "playwright.config.cjs",
+        "--list",
+        "--reporter=json"
+      ],
+      "cwd": "web/monitor",
+      "timeout_seconds": 300
+    },
+    "frontend_vitest": {
+      "argv": [
+        "vitest",
+        "run",
+        "--config",
+        "vitest.config.ts",
+        "--reporter=json"
+      ],
+      "cwd": "web/monitor",
+      "timeout_seconds": 300
+    },
+    "python_pytest_unittest": {
+      "argv": [
+        "pytest",
+        "--collect-only",
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        "bindings/python/moraine_conversations/tests/test_smoke.py",
+        "scripts/ci/test_dependency_policy.py",
+        "-p",
+        "issue477_pytest_collector"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 300
+    }
+  },
+  "format_version": 1,
+  "generated_artifacts": [
+    "benchmark-scenarios.json",
+    "cargo-targets.json",
+    "e2e-phases.json",
+    "ecosystem-collections.json",
+    "fixture-checksums.tsv",
+    "fixture-families.json",
+    "package-isolation.json",
+    "rust-libtest-darwin-arm64.json",
+    "rust-libtest-linux-aarch64.json",
+    "rust-test-summary.json"
+  ],
+  "generator": "docs/development/test-architecture/generate_baseline.py",
+  "generator_sha256": "8979bfd33a5833eb08733a86fd0123e5b49d2466c1cd9536d2edaa7b533f2685",
+  "libtest_collection": {
+    "inventories": [
+      {
+        "artifact": "rust-libtest-darwin-arm64.json",
+        "artifact_sha256": "fecf9c499488a01f2256400c4dae6ef7f4d71b3f6f902cc2fd46d1b6099eab12",
+        "expected_host": "darwin-arm64",
+        "expected_sha256": "fecf9c499488a01f2256400c4dae6ef7f4d71b3f6f902cc2fd46d1b6099eab12",
+        "mode": "explicit_import",
+        "native_commands": [
+          {
+            "argv": [
+              "cargo",
+              "test",
+              "--workspace",
+              "--locked",
+              "--no-run",
+              "--message-format=json"
+            ],
+            "cwd": ".",
+            "timeout_seconds": 900
+          },
+          {
+            "argv": [
+              "<cargo-test-executable>",
+              "--list",
+              "--format",
+              "terse"
+            ],
+            "cwd": ".",
+            "timeout_seconds": 300
+          },
+          {
+            "argv": [
+              "<cargo-test-executable>",
+              "--list",
+              "--ignored",
+              "--format",
+              "terse"
+            ],
+            "cwd": ".",
+            "timeout_seconds": 300
+          }
+        ],
+        "source_file": "rust-libtest-darwin-arm64.json",
+        "validation": [
+          "explicit path",
+          "trusted SHA-256",
+          "source commit",
+          "host",
+          "format version",
+          "structural invariants"
+        ]
+      },
+      {
+        "artifact": "rust-libtest-linux-aarch64.json",
+        "artifact_sha256": "ef7022e948c36a2d1b264b36b8055adb740a5547c9bca2f9b2a0332d69b525c6",
+        "expected_host": "linux-aarch64",
+        "expected_sha256": "ef7022e948c36a2d1b264b36b8055adb740a5547c9bca2f9b2a0332d69b525c6",
+        "mode": "explicit_import",
+        "native_commands": [
+          {
+            "argv": [
+              "cargo",
+              "test",
+              "--workspace",
+              "--locked",
+              "--no-run",
+              "--message-format=json"
+            ],
+            "cwd": ".",
+            "timeout_seconds": 900
+          },
+          {
+            "argv": [
+              "<cargo-test-executable>",
+              "--list",
+              "--format",
+              "terse"
+            ],
+            "cwd": ".",
+            "timeout_seconds": 300
+          },
+          {
+            "argv": [
+              "<cargo-test-executable>",
+              "--list",
+              "--ignored",
+              "--format",
+              "terse"
+            ],
+            "cwd": ".",
+            "timeout_seconds": 300
+          }
+        ],
+        "source_file": "rust-libtest-linux-aarch64.json",
+        "validation": [
+          "explicit path",
+          "trusted SHA-256",
+          "source commit",
+          "host",
+          "format version",
+          "structural invariants"
+        ]
+      }
+    ],
+    "status": "collected"
+  },
+  "reproduce": {
+    "argv": [
+      "python3",
+      "<issue-477-checkout>/docs/development/test-architecture/generate_baseline.py",
+      "--repo-root",
+      "<exact-77c90d6-source>",
+      "--source-commit",
+      "77c90d6c572ba71bcfaa0362f7ead2cfa5e6712a",
+      "--node-bin-dir",
+      "<baseline-lock-node_modules>/.bin",
+      "--pytest-executable",
+      "<pytest-environment>/bin/pytest",
+      "--output",
+      "<absent-or-empty-output-directory>",
+      "--import-libtest",
+      "darwin-arm64=<authenticated-rust-libtest-darwin-arm64.json>@sha256:fecf9c499488a01f2256400c4dae6ef7f4d71b3f6f902cc2fd46d1b6099eab12",
+      "--import-libtest",
+      "linux-aarch64=<authenticated-rust-libtest-linux-aarch64.json>@sha256:ef7022e948c36a2d1b264b36b8055adb740a5547c9bca2f9b2a0332d69b525c6"
+    ],
+    "environment": {}
+  }
+}

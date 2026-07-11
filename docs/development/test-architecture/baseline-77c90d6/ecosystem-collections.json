@@ -1,0 +1,278 @@
+{
+  "browser_playwright": {
+    "case_total": 3,
+    "cases": [
+      {
+        "expected_status": "skipped",
+        "name": "live monitor UI reflects ingested fixture data",
+        "path": "web/monitor/e2e/monitor.live.spec.ts",
+        "project": "chromium",
+        "qualified_name": "chromium::web/monitor/e2e/monitor.live.spec.ts::live monitor UI reflects ingested fixture data",
+        "state": "skipped"
+      },
+      {
+        "expected_status": "passed",
+        "name": "keeps dashboard and detail views inside the mobile viewport",
+        "path": "web/monitor/e2e/monitor.smoke.spec.ts",
+        "project": "chromium",
+        "qualified_name": "chromium::web/monitor/e2e/monitor.smoke.spec.ts::keeps dashboard and detail views inside the mobile viewport",
+        "state": "selected"
+      },
+      {
+        "expected_status": "passed",
+        "name": "loads dashboard and handles core interactions",
+        "path": "web/monitor/e2e/monitor.smoke.spec.ts",
+        "project": "chromium",
+        "qualified_name": "chromium::web/monitor/e2e/monitor.smoke.spec.ts::loads dashboard and handles core interactions",
+        "state": "selected"
+      }
+    ],
+    "collector": "playwright-json-reporter",
+    "command": {
+      "argv": [
+        "playwright",
+        "test",
+        "--config",
+        "playwright.config.cjs",
+        "--list",
+        "--reporter=json"
+      ],
+      "cwd": "web/monitor",
+      "timeout_seconds": 300
+    },
+    "mode": "collected",
+    "selected": 2,
+    "skipped": 1
+  },
+  "collection_method": "native framework collection and execution output",
+  "format_version": 1,
+  "frontend_vitest": {
+    "case_total": 17,
+    "cases": [
+      {
+        "name": "request errors > falls back to status-based errors when failure payload is non-json",
+        "path": "web/monitor/src/lib/api/client.test.ts",
+        "qualified_name": "web/monitor/src/lib/api/client.test.ts::request errors > falls back to status-based errors when failure payload is non-json",
+        "result": "passed",
+        "state": "selected"
+      },
+      {
+        "name": "request errors > uses API error text from json error payloads",
+        "path": "web/monitor/src/lib/api/client.test.ts",
+        "qualified_name": "web/monitor/src/lib/api/client.test.ts::request errors > uses API error text from json error payloads",
+        "result": "passed",
+        "state": "selected"
+      },
+      {
+        "name": "versioned monitor requests > fetches 'analytics' with the canonical URL and JSON header",
+        "path": "web/monitor/src/lib/api/client.test.ts",
+        "qualified_name": "web/monitor/src/lib/api/client.test.ts::versioned monitor requests > fetches 'analytics' with the canonical URL and JSON header",
+        "result": "passed",
+        "state": "selected"
+      },
+      {
+        "name": "versioned monitor requests > fetches 'health' with the canonical URL and JSON header",
+        "path": "web/monitor/src/lib/api/client.test.ts",
+        "qualified_name": "web/monitor/src/lib/api/client.test.ts::versioned monitor requests > fetches 'health' with the canonical URL and JSON header",
+        "result": "passed",
+        "state": "selected"
+      },
+      {
+        "name": "versioned monitor requests > fetches 'status' with the canonical URL and JSON header",
+        "path": "web/monitor/src/lib/api/client.test.ts",
+        "qualified_name": "web/monitor/src/lib/api/client.test.ts::versioned monitor requests > fetches 'status' with the canonical URL and JSON header",
+        "result": "passed",
+        "state": "selected"
+      },
+      {
+        "name": "fetches sessions from the canonical URL with the JSON header",
+        "path": "web/monitor/src/lib/api/sessions.test.ts",
+        "qualified_name": "web/monitor/src/lib/api/sessions.test.ts::fetches sessions from the canonical URL with the JSON header",
+        "result": "passed",
+        "state": "selected"
+      },
+      {
+        "name": "buildAnalyticsView > builds chart datasets and metadata",
+        "path": "web/monitor/src/lib/charts/analytics.test.ts",
+        "qualified_name": "web/monitor/src/lib/charts/analytics.test.ts::buildAnalyticsView > builds chart datasets and metadata",
+        "result": "passed",
+        "state": "selected"
+      },
+      {
+        "name": "buildAnalyticsView > uses wider tick limit for 30d ranges",
+        "path": "web/monitor/src/lib/charts/analytics.test.ts",
+        "qualified_name": "web/monitor/src/lib/charts/analytics.test.ts::buildAnalyticsView > uses wider tick limit for 30d ranges",
+        "result": "passed",
+        "state": "selected"
+      },
+      {
+        "name": "TurnViz > labels thinking and assistant as distinct nodes in timeline view",
+        "path": "web/monitor/src/lib/components/sessions/TurnViz.test.ts",
+        "qualified_name": "web/monitor/src/lib/components/sessions/TurnViz.test.ts::TurnViz > labels thinking and assistant as distinct nodes in timeline view",
+        "result": "passed",
+        "state": "selected"
+      },
+      {
+        "name": "TurnViz > labels thinking and assistant as distinct rows in trace view",
+        "path": "web/monitor/src/lib/components/sessions/TurnViz.test.ts",
+        "qualified_name": "web/monitor/src/lib/components/sessions/TurnViz.test.ts::TurnViz > labels thinking and assistant as distinct rows in trace view",
+        "result": "passed",
+        "state": "selected"
+      },
+      {
+        "name": "buildBucketAxis > keeps unix epoch zero as a valid boundary",
+        "path": "web/monitor/src/lib/utils/format.test.ts",
+        "qualified_name": "web/monitor/src/lib/utils/format.test.ts::buildBucketAxis > keeps unix epoch zero as a valid boundary",
+        "result": "passed",
+        "state": "selected"
+      },
+      {
+        "name": "buildBucketAxis > returns an empty axis when timestamps are missing",
+        "path": "web/monitor/src/lib/utils/format.test.ts",
+        "qualified_name": "web/monitor/src/lib/utils/format.test.ts::buildBucketAxis > returns an empty axis when timestamps are missing",
+        "result": "passed",
+        "state": "selected"
+      },
+      {
+        "name": "url utils > builds duckduckgo query URLs",
+        "path": "web/monitor/src/lib/utils/url.test.ts",
+        "qualified_name": "web/monitor/src/lib/utils/url.test.ts::url utils > builds duckduckgo query URLs",
+        "result": "passed",
+        "state": "selected"
+      },
+      {
+        "name": "url utils > detects http and https URLs",
+        "path": "web/monitor/src/lib/utils/url.test.ts",
+        "qualified_name": "web/monitor/src/lib/utils/url.test.ts::url utils > detects http and https URLs",
+        "result": "passed",
+        "state": "selected"
+      },
+      {
+        "name": "url utils > returns untruncated previews for short text",
+        "path": "web/monitor/src/lib/utils/url.test.ts",
+        "qualified_name": "web/monitor/src/lib/utils/url.test.ts::url utils > returns untruncated previews for short text",
+        "result": "passed",
+        "state": "selected"
+      },
+      {
+        "name": "url utils > stringifies primitive and object cell values",
+        "path": "web/monitor/src/lib/utils/url.test.ts",
+        "qualified_name": "web/monitor/src/lib/utils/url.test.ts::url utils > stringifies primitive and object cell values",
+        "result": "passed",
+        "state": "selected"
+      },
+      {
+        "name": "url utils > truncates long previews with an ellipsis",
+        "path": "web/monitor/src/lib/utils/url.test.ts",
+        "qualified_name": "web/monitor/src/lib/utils/url.test.ts::url utils > truncates long previews with an ellipsis",
+        "result": "passed",
+        "state": "selected"
+      }
+    ],
+    "collector": "vitest-json-reporter",
+    "command": {
+      "argv": [
+        "vitest",
+        "run",
+        "--config",
+        "vitest.config.ts",
+        "--reporter=json"
+      ],
+      "cwd": "web/monitor",
+      "timeout_seconds": 300
+    },
+    "mode": "executed",
+    "selected": 17,
+    "skipped": 0
+  },
+  "python_pytest_unittest": {
+    "case_total": 13,
+    "cases": [
+      {
+        "framework": "pytest",
+        "qualified_name": "bindings/python/moraine_conversations/tests/test_smoke.py::test_conversation_client_smoke",
+        "state": "selected"
+      },
+      {
+        "framework": "unittest",
+        "qualified_name": "scripts/ci/test_dependency_policy.py::ClickHouseDependencyPolicyTests::test_exact_allowlist_is_accepted",
+        "state": "selected"
+      },
+      {
+        "framework": "unittest",
+        "qualified_name": "scripts/ci/test_dependency_policy.py::ClickHouseDependencyPolicyTests::test_forbidden_direct_edge_is_rejected_with_epic_rule_and_offender",
+        "state": "selected"
+      },
+      {
+        "framework": "unittest",
+        "qualified_name": "scripts/ci/test_dependency_policy.py::MonitorSqlPolicyTests::test_cfg_any_test_or_feature_remains_production",
+        "state": "selected"
+      },
+      {
+        "framework": "unittest",
+        "qualified_name": "scripts/ci/test_dependency_policy.py::MonitorSqlPolicyTests::test_comment_separated_insert_into_is_rejected",
+        "state": "selected"
+      },
+      {
+        "framework": "unittest",
+        "qualified_name": "scripts/ci/test_dependency_policy.py::MonitorSqlPolicyTests::test_comments_and_standard_test_sources_are_ignored",
+        "state": "selected"
+      },
+      {
+        "framework": "unittest",
+        "qualified_name": "scripts/ci/test_dependency_policy.py::MonitorSqlPolicyTests::test_escaped_production_select_is_rejected",
+        "state": "selected"
+      },
+      {
+        "framework": "unittest",
+        "qualified_name": "scripts/ci/test_dependency_policy.py::MonitorSqlPolicyTests::test_nested_cfg_that_can_run_without_test_is_scanned",
+        "state": "selected"
+      },
+      {
+        "framework": "unittest",
+        "qualified_name": "scripts/ci/test_dependency_policy.py::MonitorSqlPolicyTests::test_production_include_str_sql_is_rejected",
+        "state": "selected"
+      },
+      {
+        "framework": "unittest",
+        "qualified_name": "scripts/ci/test_dependency_policy.py::MonitorSqlPolicyTests::test_production_insert_into_literal_is_rejected",
+        "state": "selected"
+      },
+      {
+        "framework": "unittest",
+        "qualified_name": "scripts/ci/test_dependency_policy.py::MonitorSqlPolicyTests::test_production_select_literal_is_rejected",
+        "state": "selected"
+      },
+      {
+        "framework": "unittest",
+        "qualified_name": "scripts/ci/test_dependency_policy.py::MonitorSqlPolicyTests::test_production_select_token_forms_are_rejected",
+        "state": "selected"
+      },
+      {
+        "framework": "unittest",
+        "qualified_name": "scripts/ci/test_dependency_policy.py::MonitorSqlPolicyTests::test_unresolved_production_include_str_is_rejected",
+        "state": "selected"
+      }
+    ],
+    "collector": "pytest-collection-hook",
+    "command": {
+      "argv": [
+        "pytest",
+        "--collect-only",
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        "bindings/python/moraine_conversations/tests/test_smoke.py",
+        "scripts/ci/test_dependency_policy.py",
+        "-p",
+        "issue477_pytest_collector"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 300
+    },
+    "mode": "collected",
+    "selected": 13,
+    "skipped": 0
+  },
+  "source_commit": "77c90d6c572ba71bcfaa0362f7ead2cfa5e6712a"
+}
