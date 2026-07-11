@@ -2,8 +2,8 @@ use moraine_clickhouse::ClickHouseClient;
 use moraine_config::ClickHouseConfig;
 use moraine_conversations::{
     ClickHouseConversationRepository, ConversationDetailOptions, ConversationListFilter,
-    ConversationMode, ConversationRepository, ConversationSearchQuery, PageRequest, RepoConfig,
-    SearchEventsQuery, SearchStrategyHint,
+    ConversationListSort, ConversationMode, ConversationRepository, ConversationSearchQuery,
+    PageRequest, RepoConfig, SearchEventsQuery, SearchStrategyHint,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -41,6 +41,7 @@ impl ConversationClient {
             timeout_seconds,
             async_insert: true,
             wait_for_async_insert: true,
+            allow_newer_server: false,
         })
         .map_err(py_runtime_err)?;
 
@@ -77,6 +78,7 @@ impl ConversationClient {
                     from_unix_ms,
                     to_unix_ms,
                     mode: parsed_mode,
+                    sort: ConversationListSort::Desc,
                 },
                 PageRequest { limit, cursor },
             ))

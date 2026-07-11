@@ -132,7 +132,7 @@ def _run_mock_clickhouse(port_queue: mp.Queue) -> None:
             parsed = urlparse(self.path)
             query = parse_qs(parsed.query).get("query", [""])[0]
             rows = _rows_for_query(query)
-            body = json.dumps({"data": rows}).encode("utf-8")
+            body = "".join(f"{json.dumps(row)}\n" for row in rows).encode("utf-8")
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
