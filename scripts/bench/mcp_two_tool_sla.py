@@ -77,6 +77,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Query to benchmark. May be repeated.",
     )
     parser.add_argument(
+        "--oracle-json",
+        help=(
+            "Owned seed oracle JSON. Required when search or list_sessions is measured; "
+            "declares expected query results, open IDs, and list-window results."
+        ),
+    )
+    parser.add_argument(
         "--top-n-log-queries",
         type=non_negative_int,
         default=0,
@@ -110,7 +117,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         choices=["event", "turn", "session", "none"],
         default=[],
         help=(
-            "Open ID kind from the first search hit. May be repeated. "
+            "Open ID kind declared by the query oracle. May be repeated. "
             "Defaults to event, turn, and session."
         ),
     )
@@ -619,40 +626,250 @@ def structured_data(sample: Any, tool_name: str) -> dict[str, Any]:
     return data
 
 
-def first_hit_open_ids(search_data: dict[str, Any]) -> dict[str, str]:
-    results = search_data.get("results", [])
-    if not isinstance(results, list) or not results:
-        return {}
-    first = results[0]
-    if not isinstance(first, dict):
-        return {}
-    open_block = first.get("open")
-    if not isinstance(open_block, dict):
-        return {}
-    keys = {
-        "event": "event_id",
-        "turn": "turn_id",
-        "session": "session_id",
-    }
-    return {
-        kind: value
-        for kind, key in keys.items()
-        if isinstance((value := open_block.get(key)), str) and value
+class OracleConfigurationError(RuntimeError):
+    def __init__(self, diagnostic_code: str, message: str) -> None:
+        super().__init__(message)
+        self.diagnostic_code = diagnostic_code
+
+
+def normalize_query(value: str) -> str:
+    return " ".join(value.split()).casefold()
+
+
+def load_benchmark_oracles(
+    path_value: Optional[str],
+    queries: list[str],
+    open_kinds: list[str],
+    require_list_sessions: bool,
+) -> tuple[dict[str, dict[str, Any]], Optional[dict[str, Any]]]:
+    if not queries and not require_list_sessions:
+        return {}, None
+    if not path_value:
+        code = "missing-search-oracle" if queries else "missing-list-oracle"
+        raise OracleConfigurationError(
+            code, "--oracle-json is required when search or list_sessions is measured"
+        )
+
+    path = Path(path_value).expanduser().resolve()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise OracleConfigurationError(
+            "invalid-benchmark-oracle", f"cannot read benchmark oracle {path}: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise OracleConfigurationError(
+            "invalid-benchmark-oracle", "benchmark oracle root must be an object"
+        )
+    if payload.get("schema_version") != "moraine-mcp-two-tool-oracle-v1":
+        raise OracleConfigurationError(
+            "invalid-benchmark-oracle",
+            "benchmark oracle schema_version must be 'moraine-mcp-two-tool-oracle-v1'",
+        )
+    entries = payload.get("queries")
+    if not isinstance(entries, list):
+        raise OracleConfigurationError(
+            "invalid-benchmark-oracle", "benchmark oracle queries must be an array"
+        )
+
+    by_query: dict[str, dict[str, Any]] = {}
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise RuntimeError(f"query oracle entry {index} must be an object")
+        raw_query = entry.get("query")
+        if not isinstance(raw_query, str) or not normalize_query(raw_query):
+            raise RuntimeError(f"query oracle entry {index} must have a non-empty query")
+        query_key = normalize_query(raw_query)
+        if query_key in by_query:
+            raise RuntimeError(f"query oracle contains duplicate query at entry {index}")
+
+        expected = entry.get("expected")
+        if not isinstance(expected, dict):
+            raise RuntimeError(f"query oracle entry {index} expected must be an object")
+        result_count = expected.get("result_count")
+        if result_count is not None and (
+            isinstance(result_count, bool)
+            or not isinstance(result_count, int)
+            or result_count < 0
+        ):
+            raise RuntimeError(
+                f"query oracle entry {index} expected.result_count must be a non-negative integer"
+            )
+        open_ids = expected.get("open_ids", {})
+        if not isinstance(open_ids, dict):
+            raise RuntimeError(f"query oracle entry {index} expected.open_ids must be an object")
+        unknown_kinds = set(open_ids) - {"event", "turn", "session"}
+        if unknown_kinds:
+            raise RuntimeError(
+                f"query oracle entry {index} has unknown open ID kinds: {sorted(unknown_kinds)}"
+            )
+        for kind, entity_id in open_ids.items():
+            if not isinstance(entity_id, str) or not entity_id:
+                raise RuntimeError(
+                    f"query oracle entry {index} expected.open_ids.{kind} must be non-empty"
+                )
+        marker = expected.get("result_marker")
+        if marker is not None and (not isinstance(marker, dict) or not marker):
+            raise RuntimeError(
+                f"query oracle entry {index} expected.result_marker must be a non-empty object"
+            )
+        if result_count is None and not open_ids and marker is None:
+            raise RuntimeError(
+                f"query oracle entry {index} must declare result_count, open_ids, or result_marker"
+            )
+        missing_kinds = [kind for kind in open_kinds if kind not in open_ids]
+        if missing_kinds:
+            raise RuntimeError(
+                f"query oracle entry {index} lacks open IDs for kinds: {missing_kinds}"
+            )
+        by_query[query_key] = {
+            "result_count": result_count,
+            "open_ids": dict(open_ids),
+            "result_marker": marker,
+        }
+
+    missing_queries = [query for query in queries if normalize_query(query) not in by_query]
+    if missing_queries:
+        raise OracleConfigurationError(
+            "missing-search-oracle",
+            f"query oracle has no entry for {len(missing_queries)} selected quer"
+            f"{'y' if len(missing_queries) == 1 else 'ies'}",
+        )
+    query_oracles = {query: by_query[normalize_query(query)] for query in queries}
+
+    if not require_list_sessions:
+        return query_oracles, None
+    list_oracle = payload.get("list_sessions")
+    if not isinstance(list_oracle, dict):
+        raise OracleConfigurationError(
+            "missing-list-oracle",
+            "benchmark oracle must declare list_sessions for the measured window",
+        )
+    result_count = list_oracle.get("result_count")
+    if result_count is not None and (
+        isinstance(result_count, bool)
+        or not isinstance(result_count, int)
+        or result_count < 0
+    ):
+        raise OracleConfigurationError(
+            "invalid-benchmark-oracle",
+            "list_sessions.result_count must be a non-negative integer",
+        )
+    session_ids = list_oracle.get("session_ids", [])
+    if (
+        not isinstance(session_ids, list)
+        or any(not isinstance(value, str) or not value for value in session_ids)
+        or len(session_ids) != len(set(session_ids))
+    ):
+        raise OracleConfigurationError(
+            "invalid-benchmark-oracle",
+            "list_sessions.session_ids must be an array of unique non-empty strings",
+        )
+    marker = list_oracle.get("result_marker")
+    if marker is not None and (not isinstance(marker, dict) or not marker):
+        raise OracleConfigurationError(
+            "invalid-benchmark-oracle",
+            "list_sessions.result_marker must be a non-empty object",
+        )
+    if result_count is None and not session_ids and marker is None:
+        raise OracleConfigurationError(
+            "missing-list-oracle",
+            "list_sessions must declare result_count, session_ids, or result_marker",
+        )
+    return query_oracles, {
+        "result_count": result_count,
+        "session_ids": list(session_ids),
+        "result_marker": marker,
     }
 
 
-def first_list_session_open_id(list_data: dict[str, Any]) -> Optional[str]:
-    sessions = list_data.get("sessions", [])
-    if not isinstance(sessions, list) or not sessions:
-        return None
-    first = sessions[0]
-    if not isinstance(first, dict):
-        return None
-    open_block = first.get("open")
-    if not isinstance(open_block, dict):
-        return None
-    value = open_block.get("session_id")
-    return value if isinstance(value, str) and value else None
+def contains_marker(value: Any, marker: Any) -> bool:
+    if isinstance(marker, dict):
+        return isinstance(value, dict) and all(
+            key in value and contains_marker(value[key], expected)
+            for key, expected in marker.items()
+        )
+    if isinstance(marker, list):
+        return (
+            isinstance(value, list)
+            and len(value) == len(marker)
+            and all(contains_marker(actual, expected) for actual, expected in zip(value, marker))
+        )
+    return value == marker
+
+
+def validate_search_oracle(
+    search_data: dict[str, Any],
+    oracle: dict[str, Any],
+) -> None:
+    results = search_data.get("results")
+    if not isinstance(results, list):
+        raise RuntimeError("search_sessions data.results must be an array")
+
+    result_count = oracle["result_count"]
+    if result_count is not None and len(results) != result_count:
+        raise RuntimeError(
+            f"search_sessions returned {len(results)} results, expected {result_count}"
+        )
+
+    open_ids = oracle["open_ids"]
+    marker = oracle["result_marker"]
+    if open_ids or marker is not None:
+        matched = False
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            open_block = result.get("open")
+            ids_match = not open_ids or (
+                isinstance(open_block, dict)
+                and all(
+                    open_block.get(f"{kind}_id") == entity_id
+                    for kind, entity_id in open_ids.items()
+                )
+            )
+            marker_matches = marker is None or contains_marker(result, marker)
+            if ids_match and marker_matches:
+                matched = True
+                break
+        if not matched:
+            raise RuntimeError("search_sessions did not return the oracle-selected result")
+
+
+def validate_list_oracle(
+    list_data: dict[str, Any],
+    oracle: dict[str, Any],
+) -> None:
+    sessions = list_data.get("sessions")
+    if not isinstance(sessions, list):
+        raise RuntimeError("list_sessions data.sessions must be an array")
+
+    result_count = oracle["result_count"]
+    if result_count is not None and len(sessions) != result_count:
+        raise RuntimeError(
+            f"list_sessions returned {len(sessions)} sessions, expected {result_count}"
+        )
+
+    expected_ids = set(oracle["session_ids"])
+    if expected_ids:
+        observed_ids = {
+            open_block["session_id"]
+            for session in sessions
+            if isinstance(session, dict)
+            and isinstance((open_block := session.get("open")), dict)
+            and isinstance(open_block.get("session_id"), str)
+        }
+        missing_ids = expected_ids - observed_ids
+        if missing_ids:
+            raise RuntimeError(
+                f"list_sessions omitted {len(missing_ids)} oracle session IDs"
+            )
+
+    marker = oracle["result_marker"]
+    if marker is not None and not any(
+        isinstance(session, dict) and contains_marker(session, marker)
+        for session in sessions
+    ):
+        raise RuntimeError("list_sessions did not return the oracle semantic marker")
 
 
 def validate_open_oracle(
@@ -988,8 +1205,45 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     oracle_mismatches = 0
     warmup_failures = 0
     init_ms: Optional[float] = None
-    search_oracles: dict[int, tuple[tuple[str, str], ...]] = {}
-    list_oracle: Optional[str] = None
+    try:
+        query_oracles, list_sessions_oracle = load_benchmark_oracles(
+            args.oracle_json,
+            queries,
+            open_kinds,
+            list_sessions_args is not None,
+        )
+    except Exception as exc:
+        diagnostic_codes.append(
+            getattr(exc, "diagnostic_code", "invalid-benchmark-oracle")
+        )
+        oracle_mismatches += 1
+        failures.append(f"benchmark oracle prerequisite failed: {exc}")
+        try:
+            payload = build_artifact(
+                args=args,
+                counts=counts,
+                corpus_identity=corpus_identity,
+                queries=queries,
+                open_kinds=open_kinds,
+                list_sessions_args=list_sessions_args,
+                samples=samples,
+                planned=planned,
+                attempted=attempted,
+                errors=errors,
+                initialization_ms=init_ms,
+                diagnostic_codes=diagnostic_codes,
+                oracle_mismatches=oracle_mismatches,
+                warmup_failures=warmup_failures,
+            )
+            benchmark_protocol.write_artifact(Path(args.output_json).expanduser(), payload)
+        except Exception as artifact_exc:
+            print(
+                f"fatal: benchmark artifact validation/write failed: {artifact_exc}",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"fatal: {failures[-1]}", file=sys.stderr)
+        return 1
     service_bin_dir = resolve_service_bin_dir(args.moraine_bin, args.service_bin_dir)
 
     try:
@@ -1058,34 +1312,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     )
                     continue
 
-                open_ids = first_hit_open_ids(search_data)
-                if measured and open_kinds and all(kind in open_ids for kind in open_kinds):
-                    signature = tuple((kind, open_ids[kind]) for kind in open_kinds)
-                    expected_signature = search_oracles.setdefault(query_index, signature)
-                    if signature != expected_signature:
+                oracle = query_oracles[query]
+                try:
+                    validate_search_oracle(search_data, oracle)
+                except Exception as exc:
+                    if measured:
                         oracle_mismatches += 1
-                        diagnostic_codes.append("oracle-instability")
-                        failures.append(
-                            f"query_index={query_index} returned unstable search-to-open ids"
-                        )
+                    else:
+                        warmup_failures += 1
+                        diagnostic_codes.append("warmup-error")
+                    diagnostic_codes.append("search-oracle-mismatch")
+                    failures.append(
+                        f"query_index={query_index} run={run_idx} search_sessions: {exc}"
+                    )
                 if measured:
                     sample = dict(search_sample)
                     sample.pop("structured", None)
                     samples.append(sample)
 
                 for kind in open_kinds:
-                    target_id = open_ids.get(kind)
-                    if not target_id:
-                        if measured:
-                            oracle_mismatches += 1
-                            diagnostic_codes.append("missing-open-id")
-                        else:
-                            warmup_failures += 1
-                            diagnostic_codes.extend(["missing-open-id", "warmup-error"])
-                        failures.append(
-                            f"query_index={query_index} produced no {kind} id to open"
-                        )
-                        continue
+                    target_id = oracle["open_ids"][kind]
                     if measured:
                         attempted += 1
                     try:
@@ -1161,22 +1407,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         diagnostic_codes.extend(["malformed-tool-data", "warmup-error"])
                     failures.append(f"list_sessions run={run_idx}: {exc}")
                     continue
-                current_list_oracle = first_list_session_open_id(list_data)
-                if measured and current_list_oracle is not None:
-                    if list_oracle is None:
-                        list_oracle = current_list_oracle
-                    elif current_list_oracle != list_oracle:
-                        oracle_mismatches += 1
-                        diagnostic_codes.append("oracle-instability")
-                        failures.append("list_sessions returned an unstable open.session_id")
-                if current_list_oracle is None:
+                try:
+                    validate_list_oracle(list_data, list_sessions_oracle)
+                except Exception as exc:
                     if measured:
                         oracle_mismatches += 1
-                        diagnostic_codes.append("list-oracle-mismatch")
                     else:
                         warmup_failures += 1
-                        diagnostic_codes.extend(["list-oracle-mismatch", "warmup-error"])
-                    failures.append("list_sessions returned no open.session_id")
+                        diagnostic_codes.append("warmup-error")
+                    diagnostic_codes.append("list-oracle-mismatch")
+                    failures.append(f"list_sessions run={run_idx}: {exc}")
                 if measured:
                     sample = dict(list_sample)
                     sample.pop("structured", None)
