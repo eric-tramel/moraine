@@ -4,26 +4,37 @@ on:
   pull_request:
     paths:
       - '.github/workflows/ci-test-architecture.yml'
+      # Protocol, producer, schema, fixture, and adapter-test changes share one Python lane.
       - 'scripts/bench/**'
-      - 'scripts/dev/sandbox/run-live-test'
-      - 'scripts/dev/sandbox/tests/**'
+      # Wrapper tests exercise both lifecycle scripts and their adjacent Compose/image support.
+      - 'scripts/dev/sandbox/**'
       - 'docs/development/test-architecture/package_isolation.py'
+      # Root metadata and the lockfile control every --locked Cargo invocation below.
       - 'Cargo.toml'
       - 'Cargo.lock'
-      - 'apps/moraine/Cargo.toml'
-      - 'apps/moraine-ingest/Cargo.toml'
-      - 'apps/moraine-mcp/Cargo.toml'
-      - 'apps/moraine-monitor/Cargo.toml'
-      - 'crates/moraine-clickhouse/Cargo.toml'
-      - 'crates/moraine-config/Cargo.toml'
-      - 'crates/moraine-conversations/Cargo.toml'
-      - 'crates/moraine-ingest-core/Cargo.toml'
-      - 'crates/moraine-mcp-core/Cargo.toml'
-      - 'crates/moraine-monitor-core/Cargo.toml'
-      - 'crates/moraine-conversations/benches/**'
-      - 'crates/moraine-conversations/tests/live_clickhouse.rs'
-      - 'crates/moraine-conversations/tests/analytics_benchmark_support.rs'
-      - 'crates/moraine-conversations/tests/repository_integration/support/**'
+      # Any workspace member manifest can alter metadata-derived package isolation.
+      - 'apps/*/Cargo.toml'
+      - 'crates/*/Cargo.toml'
+      # Cargo auto-discovers these targets; conversation benches/tests also own live producers and oracles.
+      - 'apps/*/build.rs'
+      - 'crates/*/build.rs'
+      - 'apps/*/tests/**'
+      - 'crates/*/tests/**'
+      - 'apps/*/benches/**'
+      - 'crates/*/benches/**'
+      - 'apps/*/examples/**'
+      - 'crates/*/examples/**'
+      # Sandbox/live targets consume checked-in runtime defaults, including ClickHouse settings.
+      - 'config/**'
+      # The ClickHouse client embeds this SQL migration/schema set into live and benchmark builds.
+      - 'sql/**'
+      # Analytics/live compilation uses these client and configuration implementations directly.
+      - 'crates/moraine-clickhouse/src/**'
+      - 'crates/moraine-config/src/**'
+      # Repository queries and row decoding are the production side of analytics/live assertions.
+      - 'crates/moraine-conversations/src/**'
+      # Live parity starts the production monitor handlers and validates their decoded responses.
+      - 'crates/moraine-monitor-core/src/**'
   workflow_dispatch:
 
 permissions:
@@ -49,21 +60,20 @@ jobs:
             package_isolation:
               - '.github/workflows/ci-test-architecture.yml'
               - 'docs/development/test-architecture/package_isolation.py'
+              # Cargo metadata and --locked resolution depend on every workspace manifest and lock.
               - 'Cargo.toml'
               - 'Cargo.lock'
-              - 'apps/moraine/Cargo.toml'
-              - 'apps/moraine-ingest/Cargo.toml'
-              - 'apps/moraine-mcp/Cargo.toml'
-              - 'apps/moraine-monitor/Cargo.toml'
-              - 'crates/moraine-clickhouse/Cargo.toml'
-              - 'crates/moraine-config/Cargo.toml'
-              - 'crates/moraine-conversations/Cargo.toml'
-              - 'crates/moraine-ingest-core/Cargo.toml'
-              - 'crates/moraine-mcp-core/Cargo.toml'
-              - 'crates/moraine-monitor-core/Cargo.toml'
-              - 'crates/moraine-conversations/benches/analytics_latency/support.rs'
-              - 'crates/moraine-conversations/tests/analytics_benchmark_support.rs'
-              - 'crates/moraine-conversations/tests/repository_integration/support/**'
+              - 'apps/*/Cargo.toml'
+              - 'crates/*/Cargo.toml'
+              # Auto-discovered build scripts and test/bench/example targets alter package topology.
+              - 'apps/*/build.rs'
+              - 'crates/*/build.rs'
+              - 'apps/*/tests/**'
+              - 'crates/*/tests/**'
+              - 'apps/*/benches/**'
+              - 'crates/*/benches/**'
+              - 'apps/*/examples/**'
+              - 'crates/*/examples/**'
 
       - name: Setup Python 3.12
         uses: actions/setup-python@v5
@@ -127,4 +137,4 @@ jobs:
 
       - name: Report package isolation not selected
         if: github.event_name == 'pull_request' && steps.changes.outputs.package_isolation != 'true'
-        run: echo 'Package isolation not selected because no workspace manifest, dev-dependency, or shared support path changed.'
+        run: echo 'Package isolation not selected because no workspace manifest, lockfile, Cargo target-topology, or shared support path changed.'
