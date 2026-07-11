@@ -10,22 +10,26 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import math
 import os
+import platform
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
+
+import benchmark_protocol
 
 try:  # pragma: no cover - import path is runtime-dependent
     import resource
@@ -39,8 +43,17 @@ except Exception:  # pragma: no cover - import path is runtime-dependent
 
 WINDOW_RE = re.compile(r"^\s*(\d+)\s*([smhdw])\s*$", re.IGNORECASE)
 SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 BENCHMARK_REPLAY_SOURCE = "benchmark-replay"
 QUERY_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
+BENCHMARK_SCHEMA_VERSION = "moraine-benchmark-v1"
+BENCHMARK_ID = "replay-search-latency"
+SCENARIO_ID = "python-package-search-replay"
+MEASURED_BOUNDARY = "python-package-search-events-json"
+PROFILE_DEFAULTS = {
+    "smoke": {"top_n": 2, "warmup": 0, "repeats": 1},
+    "full": {"top_n": 20, "warmup": 1, "repeats": 5},
+}
 
 
 @dataclass
@@ -148,7 +161,7 @@ def parse_window_interval(value: str) -> str:
     return f"INTERVAL {amount} {unit_map[unit]}"
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Replay top-N slow search requests from moraine.search_query_log via the "
@@ -156,17 +169,27 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--config", required=True, help="Path to moraine.toml")
-    parser.add_argument("--window", default="24h", help="Selection window (e.g. 24h, 7d)")
-    parser.add_argument("--top-n", type=positive_int, default=20, help="Top N rows by response_ms")
-    parser.add_argument("--warmup", type=non_negative_int, default=1, help="Warmup runs per query")
     parser.add_argument(
-        "--repeats", type=positive_int, default=5, help="Measured replay runs per query"
+        "--profile",
+        choices=sorted(PROFILE_DEFAULTS),
+        default="full",
+        help="Workload profile; full preserves the historical defaults and smoke is a tiny check",
     )
+    parser.add_argument("--window", default="24h", help="Selection window (e.g. 24h, 7d)")
+    parser.add_argument("--top-n", type=positive_int, help="Top N rows by response_ms")
+    parser.add_argument("--warmup", type=non_negative_int, help="Warmup runs per query")
+    parser.add_argument("--repeats", type=positive_int, help="Measured replay runs per query")
     parser.add_argument(
         "--timeout-seconds",
         type=positive_int,
         default=20,
         help="Timeout per search request (seconds)",
+    )
+    parser.add_argument(
+        "--build-timeout-seconds",
+        type=positive_int,
+        default=600,
+        help="Timeout for the owned maturin build child (seconds)",
     )
     parser.add_argument(
         "--skip-maturin-develop",
@@ -267,7 +290,15 @@ def parse_args() -> argparse.Namespace:
         "--print-sql", action="store_true", help="Print selection SQL before execution"
     )
     parser.add_argument("--dry-run", action="store_true", help="Select rows but skip replay")
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    profile_defaults = PROFILE_DEFAULTS[args.profile]
+    for field in ("top_n", "warmup", "repeats"):
+        if getattr(args, field) is None:
+            setattr(args, field, profile_defaults[field])
+    args.request_source = args.request_source.strip()
+    if SLUG_RE.fullmatch(args.request_source) is None:
+        parser.error("--request-source must be a lowercase protocol slug")
+    return args
 
 
 def strip_inline_comment(value: str) -> str:
@@ -366,17 +397,76 @@ def read_config(path: Path) -> ClickHouseSettings:
     )
 
 
-def git_sha() -> str:
-    try:
-        proc = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
+def git_metadata(repo_root: Path) -> dict[str, Any]:
+    commit_proc = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    commit = commit_proc.stdout.strip().lower()
+    if commit_proc.returncode != 0 or re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+        raise RuntimeError("could not determine a 40-character git commit")
+    status_proc = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=normal"],
+        cwd=repo_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if status_proc.returncode != 0:
+        raise RuntimeError("could not determine git dirty state")
+    return {"commit": commit, "dirty": bool(status_proc.stdout.strip())}
+
+
+def build_search_corpus_fingerprint_sql(database: str) -> str:
+    row_hash = (
+        "cityHash64(toJSONString(tuple("
+        "event_uid, doc_version, session_id, source_name, harness, record_ts, "
+        "event_class, payload_type, actor_role, name, phase, source_ref, "
+        "doc_len, text_content, payload_json"
+        ")))"
+    )
+    return (
+        "SELECT\n"
+        "  toUInt64(count()) AS cardinality,\n"
+        "  toString(groupBitXor(row_hash)) AS content_xor,\n"
+        "  toString(sumWithOverflow(row_hash)) AS content_sum\n"
+        "FROM (\n"
+        f"  SELECT {row_hash} AS row_hash\n"
+        f"  FROM {database}.search_documents FINAL\n"
+        ")\n"
+        "FORMAT JSONEachRow"
+    )
+
+
+def search_corpus_fingerprint(cfg: ClickHouseSettings) -> dict[str, Any]:
+    rows = clickhouse_query_json_each_row(
+        cfg, build_search_corpus_fingerprint_sql(cfg.database)
+    )
+    if len(rows) != 1:
+        raise RuntimeError(
+            f"search corpus fingerprint expected one row, received {len(rows)}"
         )
-        return proc.stdout.strip()
-    except Exception:
-        return "unknown"
+    row = rows[0]
+    cardinality = parse_int_like(row.get("cardinality"), "corpus cardinality")
+    content_sum = parse_int_like(row.get("content_sum"), "corpus content sum")
+    content_xor = parse_int_like(row.get("content_xor"), "corpus content xor")
+    if cardinality < 0 or content_sum < 0 or content_xor < 0:
+        raise RuntimeError("search corpus fingerprint values must be nonnegative")
+    canonical_identity = {
+        "cardinality": cardinality,
+        "content_sum": content_sum,
+        "content_xor": content_xor,
+    }
+    encoded = json.dumps(
+        canonical_identity, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return {
+        "fingerprint": f"sha256:{hashlib.sha256(encoded).hexdigest()}",
+        "cardinality": cardinality,
+    }
 
 
 def collapse_whitespace(text: str) -> str:
@@ -749,6 +839,43 @@ def parse_search_payload(payload: str) -> dict[str, Any]:
     return parsed
 
 
+def validate_search_response(payload: Any) -> dict[str, Any]:
+    parsed = parse_search_payload(payload) if isinstance(payload, str) else payload
+    if not isinstance(parsed, dict):
+        raise RuntimeError(
+            f"search_events_json returned non-object payload: {type(parsed).__name__}"
+        )
+    if parsed.get("ok") is False:
+        raise RuntimeError("search_events_json returned an unsuccessful response")
+    if "error" in parsed and parsed["error"] not in (None, "", {}, []):
+        raise RuntimeError("search_events_json returned an error payload")
+    if "errors" in parsed and parsed["errors"] not in (None, "", {}, []):
+        raise RuntimeError("search_events_json returned an errors payload")
+    status = parsed.get("status")
+    if isinstance(status, str) and status.strip().lower() in {
+        "error",
+        "failed",
+        "failure",
+    }:
+        raise RuntimeError("search_events_json returned an error status")
+
+    stats = parsed.get("stats")
+    if not isinstance(stats, dict):
+        raise RuntimeError("search_events_json response missing object field 'stats'")
+    hits = parsed.get("hits")
+    if not isinstance(hits, list):
+        raise RuntimeError("search_events_json response missing array field 'hits'")
+    for index, hit in enumerate(hits):
+        if not isinstance(hit, dict):
+            raise RuntimeError(f"search_events_json hit {index} is not an object")
+        event_uid = hit.get("event_uid")
+        if not isinstance(event_uid, str) or not event_uid.strip():
+            raise RuntimeError(
+                f"search_events_json hit {index} missing non-empty event_uid"
+            )
+    return parsed
+
+
 def top_ranked_event_uids(payload: dict[str, Any], top_k: int) -> list[str]:
     if top_k <= 0:
         return []
@@ -1022,7 +1149,88 @@ def summarize_oracle_quality(
     }
 
 
-def ensure_local_python_binding(repo_root: Path) -> None:
+class OwnedChildCleanupError(RuntimeError):
+    def __init__(self, primary_error: BaseException, cleanup_error: BaseException) -> None:
+        self.primary_error = primary_error
+        self.cleanup_error = cleanup_error
+        super().__init__(
+            "owned child operation failed "
+            f"({type(primary_error).__name__}); cleanup failed "
+            f"({type(cleanup_error).__name__}: {cleanup_error})"
+        )
+
+
+def stop_owned_child(proc: subprocess.Popen[str], grace_seconds: float = 5.0) -> None:
+    cleanup_errors: list[BaseException] = []
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal.SIGTERM)
+        else:  # pragma: no cover - Windows is not a supported Moraine target
+            proc.terminate()
+    except ProcessLookupError:
+        pass
+    except BaseException as exc:
+        cleanup_errors.append(exc)
+
+    try:
+        proc.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        pass
+    except BaseException as exc:
+        cleanup_errors.append(exc)
+
+    # The session leader may exit before its descendants. Signal the process
+    # group again even after wait() returns so no owned build subprocess leaks.
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal.SIGKILL)
+        elif proc.poll() is None:  # pragma: no cover - unsupported Windows path
+            proc.kill()
+    except ProcessLookupError:
+        pass
+    except BaseException as exc:
+        cleanup_errors.append(exc)
+
+    try:
+        if proc.poll() is None:
+            proc.wait(timeout=grace_seconds)
+    except BaseException as exc:
+        cleanup_errors.append(exc)
+
+    if proc.poll() is None:
+        cleanup_errors.append(RuntimeError("owned child was not reaped"))
+    if cleanup_errors:
+        summary = "; ".join(
+            f"{type(error).__name__}: {error}" for error in cleanup_errors
+        )
+        raise RuntimeError(f"owned child cleanup failed: {summary}") from cleanup_errors[0]
+
+
+def run_owned_child(
+    command: Sequence[str], cwd: Path, timeout_seconds: int
+) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.Popen(
+        list(command),
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=os.name == "posix",
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_seconds)
+    except BaseException as exc:
+        try:
+            stop_owned_child(proc)
+        except BaseException as cleanup_exc:
+            raise OwnedChildCleanupError(exc, cleanup_exc) from exc
+        if isinstance(exc, subprocess.TimeoutExpired):
+            raise RuntimeError("owned child timed out and was stopped") from exc
+        raise
+    return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+
+
+def ensure_local_python_binding(repo_root: Path, timeout_seconds: int = 600) -> None:
     manifest_path = repo_root / "bindings" / "python" / "moraine_conversations" / "Cargo.toml"
     if not manifest_path.exists():
         raise RuntimeError(f"python binding manifest not found: {manifest_path}")
@@ -1034,7 +1242,7 @@ def ensure_local_python_binding(repo_root: Path) -> None:
             "its self-declared dependencies are installed"
         )
 
-    result = subprocess.run(
+    result = run_owned_child(
         [
             maturin_bin,
             "develop",
@@ -1044,15 +1252,10 @@ def ensure_local_python_binding(repo_root: Path) -> None:
             "--release",
         ],
         cwd=repo_root,
-        check=False,
-        capture_output=True,
-        text=True,
+        timeout_seconds=timeout_seconds,
     )
     if result.returncode != 0:
-        stderr = (result.stderr or "").strip()
-        stdout = (result.stdout or "").strip()
-        detail = stderr or stdout or f"exit code {result.returncode}"
-        raise RuntimeError(f"maturin develop failed: {detail}")
+        raise RuntimeError(f"maturin develop failed with exit code {result.returncode}")
 
 
 def ensure_binding_python_source_on_syspath(repo_root: Path) -> None:
@@ -1123,12 +1326,11 @@ class PackageSearchClient:
             search_strategy=search_strategy,
         )
 
-    def search(self, arguments: dict[str, Any]) -> Optional[dict[str, Any]]:
+    def search(self, arguments: dict[str, Any]) -> Any:
         payload = self.search_payload(arguments, search_strategy="optimized")
-        if not self.parse_json_response:
-            return None
-
-        return parse_search_payload(payload)
+        if self.parse_json_response:
+            return parse_search_payload(payload)
+        return payload
 
 
 def classify_failure(exc: Exception) -> str:
@@ -1314,54 +1516,201 @@ def print_oracle_quality_summary(quality: dict[str, Any]) -> None:
         )
 
 
+def protocol_slug(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9._-]+", "-", value.strip().lower()).strip(".-")
+    if not slug:
+        return "unknown"
+    return slug[:128]
+
+
 def build_output_json(
     args: argparse.Namespace,
-    config_path: Path,
-    selected_rows: list[dict[str, Any]],
+    replay_specs: Sequence[ReplaySpec],
     replay_results: list[dict[str, Any]],
     aggregate: dict[str, Any],
     failures: dict[str, int],
     dry_run: bool,
+    corpus_fingerprint: dict[str, Any],
+    repo_root: Optional[Path] = None,
 ) -> dict[str, Any]:
+    latency_ms = [
+        float(sample)
+        for result in replay_results
+        for sample in result.get("measured_samples_ms", [])
+    ]
+    if any(not math.isfinite(sample) or sample < 0 for sample in latency_ms):
+        raise RuntimeError("successful latency samples must be finite and nonnegative")
+
+    measured_errors = sum(
+        1
+        for result in replay_results
+        for failure in result.get("failures", [])
+        if failure.get("phase") == "measured"
+    )
+    successful = len(latency_ms)
+    attempted = successful + measured_errors
+    planned = max(1, len(replay_specs) * args.repeats)
+    if attempted > planned:
+        raise RuntimeError("sample count invariant violated: attempted exceeds planned")
+
+    quality = aggregate.get("quality")
+    if not isinstance(quality, dict):
+        quality = {}
+    oracle_errors = int(quality.get("error_count", 0))
+    oracle_regressions = int(quality.get("regression_count", 0))
+    oracle_unstable = int(quality.get("unstable_case_count", 0))
+    oracle_passes = int(quality.get("pass_count", 0))
+    oracle_failures = oracle_errors + oracle_regressions
+    runtime_failures = sum(int(value) for value in failures.values())
+    semantic_pass = (
+        not dry_run
+        and successful > 0
+        and successful == planned
+        and runtime_failures == 0
+        and (not args.oracle_quality_check or (bool(quality.get("enabled")) and oracle_failures == 0))
+    )
+
+    diagnostics: list[dict[str, str]] = []
+
+    def add_diagnostic(code: str) -> None:
+        if not any(item["code"] == code for item in diagnostics):
+            diagnostics.append({"code": code})
+
+    if dry_run:
+        add_diagnostic("dry-run-not-executed")
+    if successful < planned:
+        add_diagnostic("insufficient-successful-samples")
+    if failures.get("timeouts", 0):
+        add_diagnostic("request-timeout")
+    if failures.get("errors", 0):
+        add_diagnostic("request-error")
+    if failures.get("child_timeouts", 0):
+        add_diagnostic("child-timeout")
+    if failures.get("child_errors", 0):
+        add_diagnostic("child-error")
+    if failures.get("setup_errors", 0):
+        add_diagnostic("setup-error")
+    if failures.get("selection_errors", 0):
+        add_diagnostic("dataset-selection-error")
+    if oracle_errors:
+        add_diagnostic("oracle-error")
+    if oracle_regressions:
+        add_diagnostic("oracle-regression")
+    if oracle_unstable:
+        add_diagnostic("oracle-unstable")
+
+    error_rate = measured_errors / float(attempted) if attempted else 0.0
+    success_rate = successful / float(attempted) if attempted else 0.0
+    quality_metrics: dict[str, Any] = {
+        "success_rate": success_rate,
+        "error_rate": error_rate,
+    }
+    if args.oracle_quality_check:
+        quality_metrics.update(
+            {
+                "oracle_status": "pass" if oracle_failures == 0 and quality.get("enabled") else "fail",
+                "passed_checks": oracle_passes,
+                "failed_checks": oracle_failures,
+                "expected_count": len(replay_specs),
+                "observed_count": (
+                    int(quality.get("evaluated_case_count", 0))
+                    + oracle_unstable
+                    + oracle_errors
+                ),
+                "mismatches": oracle_failures,
+            }
+        )
+
+    metrics: dict[str, Any] = {"quality": quality_metrics}
+    memory = aggregate.get("memory")
+    if isinstance(memory, dict):
+        resources: dict[str, float] = {}
+        rss_bytes = memory.get("benchmark_rss_bytes")
+        if isinstance(rss_bytes, dict):
+            for label in ("start", "end", "delta"):
+                value = rss_bytes.get(label)
+                if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                    resources[f"benchmark_rss_{label}_bytes"] = max(0.0, float(value))
+        peak_bytes = memory.get("benchmark_peak_rss_bytes")
+        if isinstance(peak_bytes, dict):
+            for label in ("start", "end", "delta"):
+                value = peak_bytes.get(label)
+                if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                    resources[f"benchmark_peak_rss_{label}_bytes"] = max(0.0, float(value))
+        if resources:
+            metrics["resources"] = resources
+
+    workload_id = protocol_slug(
+        f"search-query-log-{args.query_variant_mode}-terms-{args.max_query_terms}-"
+        f"json-{'on' if args.parse_json_response else 'off'}"
+    )
+    cache_state = "disabled"
+    if args.use_search_cache:
+        cache_state = "warm" if args.warmup > 0 else "mixed"
+    root = repo_root or Path(__file__).resolve().parents[2]
+    source = git_metadata(root)
+    target = protocol_slug(f"{platform.machine()}-{platform.system()}")
+
     return {
-        "meta": {
-            "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "git_sha": git_sha(),
-            "config_path": str(config_path),
-            "parameters": {
-                "window": args.window,
-                "top_n": args.top_n,
-                "warmup": args.warmup,
-                "repeats": args.repeats,
-                "timeout_seconds": args.timeout_seconds,
-                "dry_run": dry_run,
-                "skip_maturin_develop": args.skip_maturin_develop,
-                "include_benchmark_replays": args.include_benchmark_replays,
-                "query_variant_mode": args.query_variant_mode,
-                "max_query_terms": args.max_query_terms,
-                "use_search_cache": args.use_search_cache,
-                "request_source": args.request_source,
-                "parse_json_response": args.parse_json_response,
-                "oracle_quality_check": args.oracle_quality_check,
-                "oracle_k": args.oracle_k,
-                "oracle_recall_at_k_threshold": args.oracle_recall_at_k_threshold,
-                "oracle_ndcg_at_k_threshold": args.oracle_ndcg_at_k_threshold,
-                "oracle_min_stability_recall": args.oracle_min_stability_recall,
-                "oracle_min_stability_ndcg": args.oracle_min_stability_ndcg,
-            },
-            "selected_count": len(selected_rows),
-            "replayed_count": len(replay_results),
+        "schema_version": BENCHMARK_SCHEMA_VERSION,
+        "benchmark_id": BENCHMARK_ID,
+        "scenario_id": SCENARIO_ID,
+        "source": {
+            "git_commit": source["commit"],
+            "dirty": source["dirty"],
         },
-        "selected_queries": selected_rows,
-        "replay_results": replay_results,
-        "aggregate": aggregate,
-        "failures": failures,
+        "build": {"profile": "release", "target": target},
+        "runner": {
+            "os": protocol_slug(platform.system()),
+            "cpu_class": protocol_slug(platform.machine()),
+        },
+        "scenario": {
+            "profile": args.profile,
+            "workload_id": workload_id,
+            "measured_boundary": MEASURED_BOUNDARY,
+            "dimensions": {
+                "dataset_backed": True,
+                "cache_sensitive": True,
+                "concurrent": False,
+                "request_producing": True,
+            },
+            "fingerprints": {
+                "dataset": corpus_fingerprint,
+                "cache_state": cache_state,
+                "request_source": args.request_source,
+            },
+        },
+        "samples": {
+            "planned": planned,
+            "attempted": attempted,
+            "successful": successful,
+            "errors": measured_errors,
+            "measurements": {"latency_ms": latency_ms},
+        },
+        "semantic": {"status": "pass" if semantic_pass else "fail"},
+        "timing": {"status": "not_evaluated", "non_blocking": True},
+        "metrics": metrics,
+        "diagnostics": diagnostics,
+        "artifacts": [],
     }
 
 
 def write_output_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    benchmark_protocol.write_artifact(path, payload)
+
+
+def emit_output_json(path_value: Optional[str], payload: dict[str, Any]) -> bool:
+    if not path_value:
+        return True
+    try:
+        write_output_json(Path(path_value).expanduser(), payload)
+    except Exception as exc:
+        print(
+            f"fatal: failed to write benchmark artifact ({type(exc).__name__})",
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 def main() -> int:
@@ -1389,6 +1738,7 @@ def main() -> int:
 
     try:
         raw_rows = clickhouse_query_json_each_row(ch_cfg, selection_sql)
+        corpus_fingerprint = search_corpus_fingerprint(ch_cfg)
     except Exception as exc:
         print(f"fatal: failed to query clickhouse: {exc}", file=sys.stderr)
         return 2
@@ -1402,8 +1752,7 @@ def main() -> int:
         )
         empty_payload = build_output_json(
             args=args,
-            config_path=config_path,
-            selected_rows=[],
+            replay_specs=[],
             replay_results=[],
             aggregate={
                 "stats_ms": None,
@@ -1411,11 +1760,12 @@ def main() -> int:
                 "memory": None,
                 "quality": None,
             },
-            failures={"timeouts": 0, "errors": 1},
+            failures={"selection_errors": 1},
             dry_run=args.dry_run,
+            repo_root=repo_root,
+            corpus_fingerprint=corpus_fingerprint,
         )
-        if args.output_json:
-            write_output_json(Path(args.output_json).expanduser(), empty_payload)
+        emit_output_json(args.output_json, empty_payload)
         return 2
 
     selected_rows, base_replay_rows = normalize_rows(raw_rows)
@@ -1430,8 +1780,7 @@ def main() -> int:
         print_dry_run_table(selected_rows)
         payload = build_output_json(
             args=args,
-            config_path=config_path,
-            selected_rows=selected_rows,
+            replay_specs=replayable_rows,
             replay_results=[],
             aggregate={
                 "stats_ms": None,
@@ -1441,9 +1790,11 @@ def main() -> int:
             },
             failures={"timeouts": 0, "errors": 0},
             dry_run=True,
+            repo_root=repo_root,
+            corpus_fingerprint=corpus_fingerprint,
         )
-        if args.output_json:
-            write_output_json(Path(args.output_json).expanduser(), payload)
+        if not emit_output_json(args.output_json, payload):
+            return 2
         return 0
 
     if not base_replay_rows:
@@ -1453,8 +1804,7 @@ def main() -> int:
         )
         payload = build_output_json(
             args=args,
-            config_path=config_path,
-            selected_rows=selected_rows,
+            replay_specs=replayable_rows,
             replay_results=[],
             aggregate={
                 "stats_ms": None,
@@ -1462,11 +1812,12 @@ def main() -> int:
                 "memory": None,
                 "quality": None,
             },
-            failures={"timeouts": 0, "errors": 1},
+            failures={"selection_errors": 1},
             dry_run=False,
+            repo_root=repo_root,
+            corpus_fingerprint=corpus_fingerprint,
         )
-        if args.output_json:
-            write_output_json(Path(args.output_json).expanduser(), payload)
+        emit_output_json(args.output_json, payload)
         return 2
 
     if args.skip_maturin_develop:
@@ -1474,9 +1825,23 @@ def main() -> int:
     else:
         print("Building local moraine_conversations binding via maturin develop...")
         try:
-            ensure_local_python_binding(repo_root)
+            ensure_local_python_binding(repo_root, timeout_seconds=args.build_timeout_seconds)
         except Exception as exc:
             print(f"fatal: failed to build local python binding: {exc}", file=sys.stderr)
+            payload = build_output_json(
+                args=args,
+                replay_specs=replayable_rows,
+                replay_results=[],
+                aggregate={"memory": None, "quality": None},
+                failures={
+                    "child_timeouts": int("timed out" in str(exc)),
+                    "child_errors": int("timed out" not in str(exc)),
+                },
+                dry_run=False,
+                repo_root=repo_root,
+                corpus_fingerprint=corpus_fingerprint,
+            )
+            emit_output_json(args.output_json, payload)
             return 2
 
     try:
@@ -1492,6 +1857,17 @@ def main() -> int:
         )
     except Exception as exc:
         print(f"fatal: failed to initialize local search client: {exc}", file=sys.stderr)
+        payload = build_output_json(
+            args=args,
+            replay_specs=replayable_rows,
+            replay_results=[],
+            aggregate={"memory": None, "quality": None},
+            failures={"setup_errors": 1},
+            dry_run=False,
+            repo_root=repo_root,
+            corpus_fingerprint=corpus_fingerprint,
+        )
+        emit_output_json(args.output_json, payload)
         return 2
 
     replay_results: list[dict[str, Any]] = []
@@ -1513,8 +1889,9 @@ def main() -> int:
         for idx in range(args.warmup):
             try:
                 start_ns = time.perf_counter_ns()
-                client.search(spec.arguments)
+                response = client.search(spec.arguments)
                 elapsed_ms = (time.perf_counter_ns() - start_ns) / 1_000_000.0
+                validate_search_response(response)
                 warmup_samples.append(elapsed_ms)
             except Exception as exc:
                 failure_type = classify_failure(exc)
@@ -1533,8 +1910,9 @@ def main() -> int:
                 rss_before_bytes = memory_tracker.current_rss_bytes()
                 peak_before_bytes = memory_tracker.peak_rss_bytes()
                 start_ns = time.perf_counter_ns()
-                client.search(spec.arguments)
+                response = client.search(spec.arguments)
                 elapsed_ms = (time.perf_counter_ns() - start_ns) / 1_000_000.0
+                validate_search_response(response)
                 rss_after_bytes = memory_tracker.current_rss_bytes()
                 peak_after_bytes = memory_tracker.peak_rss_bytes()
                 measured_samples.append(elapsed_ms)
@@ -1592,16 +1970,16 @@ def main() -> int:
                     disable_cache_override=True,
                 )
                 oracle_quality = evaluate_oracle_quality(
-                    optimized_payload=parse_search_payload(optimized_payload),
-                    oracle_payload=parse_search_payload(oracle_payload_primary),
+                    optimized_payload=validate_search_response(optimized_payload),
+                    oracle_payload=validate_search_response(oracle_payload_primary),
                     top_k=top_k,
                     recall_threshold=args.oracle_recall_at_k_threshold,
                     ndcg_threshold=args.oracle_ndcg_at_k_threshold,
                     min_stability_recall=args.oracle_min_stability_recall,
                     min_stability_ndcg=args.oracle_min_stability_ndcg,
                     oracle_recheck_payloads=[
-                        parse_search_payload(oracle_payload_recheck),
-                        parse_search_payload(oracle_payload_recheck_2),
+                        validate_search_response(oracle_payload_recheck),
+                        validate_search_response(oracle_payload_recheck_2),
                     ],
                 )
             except Exception as exc:
@@ -1789,15 +2167,16 @@ def main() -> int:
 
     payload = build_output_json(
         args=args,
-        config_path=config_path,
-        selected_rows=selected_rows,
+        replay_specs=replayable_rows,
         replay_results=replay_results,
         aggregate=aggregate,
         failures=failures,
         dry_run=False,
+        corpus_fingerprint=corpus_fingerprint,
+        repo_root=repo_root,
     )
-    if args.output_json:
-        write_output_json(Path(args.output_json).expanduser(), payload)
+    if not emit_output_json(args.output_json, payload):
+        return 2
 
     if runtime_failure_total > 0 or quality_failure_total > 0:
         if runtime_failure_total > 0 and quality_failure_total > 0:
