@@ -1,0 +1,5 @@
+{
+  "schema_version": "moraine-benchmark-v1",
+  "benchmark_id": "nonfinite-example",
+  "latency_ms": NaN
+}

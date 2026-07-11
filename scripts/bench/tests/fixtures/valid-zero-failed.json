@@ -1,0 +1,23 @@
+{
+  "schema_version": "moraine-benchmark-v1",
+  "benchmark_id": "replay-search-latency",
+  "scenario_id": "smoke-startup-failure",
+  "source": {"git_commit": "0123456789abcdef0123456789abcdef01234567", "dirty": true},
+  "build": {"profile": "debug", "target": "x86_64-unknown-linux-gnu"},
+  "runner": {"os": "linux", "cpu_class": "generic-x86-64"},
+  "scenario": {
+    "profile": "smoke",
+    "workload_id": "seeded-smoke-v1",
+    "measured_boundary": "python-binding",
+    "dimensions": {"dataset_backed": true, "cache_sensitive": false, "concurrent": false, "request_producing": true},
+    "fingerprints": {
+      "dataset": {"fingerprint": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "cardinality": 1},
+      "request_source": "production-binding"
+    }
+  },
+  "samples": {"planned": 3, "attempted": 3, "successful": 0, "errors": 3, "measurements": {"latency_ms": []}},
+  "semantic": {"status": "fail"},
+  "timing": {"status": "not_evaluated", "non_blocking": true},
+  "diagnostics": [{"code": "all-samples-failed"}],
+  "artifacts": []
+}
