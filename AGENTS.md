@@ -32,7 +32,10 @@ Use Rust 2021 idioms and keep code `rustfmt`-clean.
 - For shell scripts, follow existing strict mode (`set -euo pipefail`) and clear error messages.
 
 ## Testing Guidelines
-Run `cargo test --workspace --locked` before opening a PR. CI also runs `scripts/ci/e2e-stack.sh`, so changes affecting ingest, monitor, MCP, or ClickHouse flows should be validated with that script locally when possible. Place tests close to the code they verify (`#[cfg(test)]` modules or crate-level integration tests).
+
+The canonical testing and benchmarking guide is [docs/development/testing.md](docs/development/testing.md). Treat it as the source of truth for suite selection, exact commands, CI tiers and path ownership, prerequisites, and result semantics. Do not duplicate its test matrix here or assume a single Rust or Make command provides repository-wide validation.
+
+Place tests close to the code they verify (`#[cfg(test)]` modules or crate-level integration tests), then run every path-relevant suite required by the canonical guide.
 
 For changes that touch ingest, MCP, monitor, or ClickHouse schema, run them inside a dev sandbox rather than against your host install. The sandbox is isolated from your live `~/.moraine/`; the host stack is not.
 
