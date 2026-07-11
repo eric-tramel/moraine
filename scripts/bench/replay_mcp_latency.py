@@ -5,29 +5,55 @@
 from __future__ import annotations
 
 import argparse
-import base64
+import hashlib
 import json
 import math
 import os
+import platform
 import random
 import re
 import select
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
+
+import benchmark_protocol
 
 WINDOW_RE = re.compile(r"^\s*(\d+)\s*([smhdw])\s*$", re.IGNORECASE)
 SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 BENCHMARK_REPLAY_SOURCE = "benchmark-replay"
 QUERY_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 PROSE_TOOK_RE = re.compile(r"\((\d+)\s*ms\)")
+
+PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
+    "smoke": {
+        "top_n": 1,
+        "warmup": 0,
+        "repeats": 1,
+        "query_variant_mode": "none",
+        "tool": "search",
+    },
+    "full": {
+        "top_n": 20,
+        "warmup": 1,
+        "repeats": 5,
+        "query_variant_mode": "subset_scramble",
+        "tool": "both",
+    },
+}
+
+
+@dataclass(frozen=True)
+class CorpusIdentity:
+    fingerprint: str
+    cardinality: int
 
 
 @dataclass
@@ -67,20 +93,26 @@ def non_negative_int(value: str) -> int:
     return parsed
 
 
-def parse_args() -> argparse.Namespace:
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Replay top-N search queries against moraine-mcp over JSON-RPC stdio and "
-            "report end-to-end + server timing attribution for persistent and cold-process modes."
+            "emit a moraine-benchmark-v1 artifact."
         )
     )
     parser.add_argument("--config", required=True, help="Path to moraine.toml")
-    parser.add_argument("--window", default="24h", help="Selection window (e.g. 24h, 7d)")
-    parser.add_argument("--top-n", type=positive_int, default=20, help="Top N rows by response_ms")
-    parser.add_argument("--warmup", type=non_negative_int, default=1, help="Warmup runs per query")
     parser.add_argument(
-        "--repeats", type=positive_int, default=5, help="Measured replay runs per query"
+        "--profile",
+        choices=sorted(PROFILE_DEFAULTS),
+        default="full",
+        help="Workload profile; full accepts explicit workload overrides while smoke is fixed",
     )
+    parser.add_argument("--window", default="24h", help="Selection window (e.g. 24h, 7d)")
+    parser.add_argument("--top-n", type=positive_int, help="Top N rows by response_ms")
+    parser.add_argument("--warmup", type=non_negative_int, help="Warmup runs per query")
+    parser.add_argument("--repeats", type=positive_int, help="Measured replay runs per query")
     parser.add_argument(
         "--timeout-seconds",
         type=positive_int,
@@ -95,7 +127,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--query-variant-mode",
         choices=["none", "subset_scramble"],
-        default="subset_scramble",
         help=(
             "How replay queries are expanded before benchmarking. "
             "'subset_scramble' runs one deterministic scrambled variant for each k=1..N terms."
@@ -116,7 +147,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tool",
         choices=["search", "search_conversations", "both"],
-        default="both",
         help="MCP tool workload to replay",
     )
     parser.add_argument(
@@ -131,6 +161,12 @@ def parse_args() -> argparse.Namespace:
         help="Path to moraine CLI binary/script used to launch MCP",
     )
     parser.add_argument(
+        "--build-profile",
+        choices=["debug", "release"],
+        default="release",
+        help="Build profile used for the moraine executable",
+    )
+    parser.add_argument(
         "--post-init-wait-ms",
         type=non_negative_int,
         default=0,
@@ -138,10 +174,32 @@ def parse_args() -> argparse.Namespace:
             "Optional wait after initialize and before tool call; useful to model prewarm settling"
         ),
     )
-    parser.add_argument("--output-json", help="Write machine-readable results JSON to this path")
+    parser.add_argument("--output-json", help="Atomically write the benchmark artifact to this path")
     parser.add_argument("--print-sql", action="store_true", help="Print selection SQL before execution")
     parser.add_argument("--dry-run", action="store_true", help="Select rows but skip replay")
-    return parser.parse_args()
+
+    args = parser.parse_args(argv)
+    defaults = PROFILE_DEFAULTS[args.profile]
+    for name, value in defaults.items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
+
+    if args.profile == "smoke":
+        contradictions = [
+            name
+            for name, expected in PROFILE_DEFAULTS["smoke"].items()
+            if getattr(args, name) != expected
+        ]
+        if contradictions:
+            parser.error(
+                "smoke profile has a fixed workload; contradictory "
+                + ", ".join(f"--{name.replace('_', '-')}" for name in contradictions)
+            )
+        if args.include_benchmark_replays:
+            parser.error("smoke profile cannot include prior benchmark replay rows")
+        if args.dry_run:
+            parser.error("smoke profile must execute a production-path request")
+    return args
 
 
 def strip_inline_comment(value: str) -> str:
@@ -238,17 +296,26 @@ def read_config(path: Path) -> ClickHouseSettings:
     )
 
 
-def git_sha() -> str:
+def git_metadata() -> tuple[str, bool, bool]:
     try:
-        proc = subprocess.run(
+        commit_proc = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             check=True,
             capture_output=True,
             text=True,
         )
-        return proc.stdout.strip()
+        commit = commit_proc.stdout.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{40}", commit):
+            raise RuntimeError("git returned a non-SHA commit")
+        dirty_proc = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=normal"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return commit, bool(dirty_proc.stdout.strip()), True
     except Exception:
-        return "unknown"
+        return "0" * 40, False, False
 
 
 def parse_window_interval(value: str) -> str:
@@ -337,6 +404,44 @@ def clickhouse_query_json_each_row(cfg: ClickHouseSettings, query: str) -> list[
             raise RuntimeError(f"unexpected non-object JSON row: {parsed_row!r}")
         rows.append(parsed_row)
     return rows
+
+
+def searchable_corpus_identity(cfg: ClickHouseSettings) -> CorpusIdentity:
+    query = (
+        "SELECT\n"
+        "  event_uid,\n"
+        "  toString(doc_version) AS doc_version,\n"
+        "  session_id,\n"
+        "  source_name,\n"
+        "  harness,\n"
+        "  event_class,\n"
+        "  payload_type,\n"
+        "  actor_role,\n"
+        "  name,\n"
+        "  phase,\n"
+        "  toString(doc_len) AS doc_len,\n"
+        "  lower(hex(SHA256(text_content))) AS text_sha256,\n"
+        "  lower(hex(SHA256(payload_json))) AS payload_sha256\n"
+        f"FROM {cfg.database}.search_documents FINAL\n"
+        "ORDER BY event_uid\n"
+        "FORMAT JSONEachRow"
+    )
+    rows = clickhouse_query_json_each_row(cfg, query)
+    digest = hashlib.sha256()
+    for row in rows:
+        digest.update(
+            json.dumps(
+                row,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        digest.update(b"\n")
+    return CorpusIdentity(
+        fingerprint=f"sha256:{digest.hexdigest()}",
+        cardinality=len(rows),
+    )
 
 
 def parse_int_like(value: Any, field_name: str) -> int:
@@ -579,6 +684,92 @@ def expand_replay_specs(
     return expanded
 
 
+def workload_fingerprint(specs: list[ReplaySpec]) -> str:
+    digest = hashlib.sha256()
+    for spec in specs:
+        identity = {
+            "query_id": spec.query_id,
+            "source": spec.source,
+            "query": spec.raw_query,
+            "variant": spec.variant_label,
+            "arguments": spec.arguments,
+        }
+        digest.update(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        )
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _stable_oracle_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _stable_oracle_value(item)
+            for key, item in sorted(value.items())
+            if key.lower()
+            not in {
+                "stats",
+                "performance",
+                "query_id",
+                "request_id",
+                "took_ms",
+                "elapsed_ms",
+                "latency_ms",
+                "duration_ms",
+            }
+        }
+    if isinstance(value, list):
+        return [_stable_oracle_value(item) for item in value]
+    if isinstance(value, str):
+        return PROSE_TOOK_RE.sub("(<timing>)", value)
+    return value
+
+
+def _semantic_result_sequence(value: Any) -> Optional[list[Any]]:
+    if not isinstance(value, dict):
+        return None
+    for key in ("hits", "results", "conversations", "sessions"):
+        sequence = value.get(key)
+        if isinstance(sequence, list):
+            return sequence
+    for child in value.values():
+        sequence = _semantic_result_sequence(child)
+        if sequence is not None:
+            return sequence
+    return None
+
+
+def oracle_fingerprint(tool_result: dict[str, Any]) -> str:
+    structured = tool_result.get("structuredContent")
+    if isinstance(structured, dict):
+        if "error" in structured:
+            raise RuntimeError("tool response contains a semantic error")
+        results = _semantic_result_sequence(structured)
+        if results is None:
+            raise RuntimeError("tool response has no semantic result sequence")
+        if not results:
+            raise RuntimeError("tool response has an empty semantic result")
+        stable: Any = _stable_oracle_value(structured)
+    else:
+        content = tool_result.get("content")
+        if not isinstance(content, list) or not content:
+            raise RuntimeError("tool response has no semantic result payload")
+        text_items = [
+            item.get("text")
+            for item in content
+            if isinstance(item, dict) and isinstance(item.get("text"), str)
+        ]
+        if not text_items:
+            raise RuntimeError("tool response has no semantic text payload")
+        prose = "\n".join(text_items)
+        if re.search(r"(?im)^\s*(?:hits:\s*0\b|no (?:hits|results)\b)", prose):
+            raise RuntimeError("tool response has an empty semantic result")
+        prose = re.sub(r"(?im)^\s*query id:\s*\S+\s*$", "Query ID: <id>", prose)
+        stable = _stable_oracle_value(prose)
+    encoded = json.dumps(stable, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def percentile(values: list[float], q: float) -> Optional[float]:
     if not values:
         return None
@@ -708,8 +899,10 @@ def parse_server_took_ms(tool_result: dict[str, Any]) -> Optional[float]:
         stats = structured.get("stats")
         if isinstance(stats, dict):
             took_ms = stats.get("took_ms")
-            if isinstance(took_ms, (int, float)):
-                return float(took_ms)
+            if isinstance(took_ms, (int, float)) and not isinstance(took_ms, bool):
+                parsed = float(took_ms)
+                if math.isfinite(parsed) and parsed >= 0:
+                    return parsed
 
     content = tool_result.get("content")
     if isinstance(content, list) and content:
@@ -735,22 +928,41 @@ def start_mcp_process(moraine_bin: str, config_path: Path) -> subprocess.Popen[s
     )
 
 
-def stop_mcp_process(proc: Optional[subprocess.Popen[str]]) -> None:
+def stop_mcp_process(proc: Optional[subprocess.Popen[str]]) -> Optional[str]:
     if proc is None:
-        return
+        return None
+
+    cleanup_failed = False
     try:
         if proc.stdin:
             proc.stdin.close()
     except Exception:
-        pass
+        cleanup_failed = True
 
-    if proc.poll() is None:
-        proc.terminate()
+    try:
+        running = proc.poll() is None
+    except Exception:
+        return "child-cleanup-failed"
+
+    if running:
         try:
+            proc.terminate()
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                cleanup_failed = True
+        except Exception:
+            cleanup_failed = True
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+
+    return "child-cleanup-failed" if cleanup_failed else None
 
 
 def initialize_mcp(
@@ -796,7 +1008,7 @@ def call_tool(
     request_id: int,
     tool: str,
     arguments: dict[str, Any],
-) -> tuple[int, float, Optional[float]]:
+) -> tuple[int, float, Optional[float], str]:
     payload = {
         "jsonrpc": "2.0",
         "id": request_id,
@@ -813,10 +1025,10 @@ def call_tool(
     result = parse_rpc_ok(response, request_id)
 
     if bool(result.get("isError")):
-        raise RuntimeError(f"tool returned isError=true: {result}")
+        raise RuntimeError("tool returned isError=true")
 
     server_took_ms = parse_server_took_ms(result)
-    return request_id + 1, elapsed_ms, server_took_ms
+    return request_id + 1, elapsed_ms, server_took_ms, oracle_fingerprint(result)
 
 
 def choose_tools(tool_arg: str) -> list[str]:
@@ -958,14 +1170,19 @@ def print_target_summary(target: dict[str, Any]) -> None:
         formatted = ", ".join(f"{value:.2f}" for value in warmup_decay)
         print(f"  warmup_decay_first5_ms: [{formatted}]")
 
-    failures = target.get("failures", {})
     print(
-        "  failures: "
-        f"spawn={failures.get('spawn', 0)} "
-        f"initialize={failures.get('initialize', 0)} "
-        f"search={failures.get('search', 0)} "
-        f"decode={failures.get('decode', 0)}"
+        "  samples: "
+        f"planned={target.get('planned', 0)} "
+        f"attempted={target.get('attempted', 0)} "
+        f"successful={target.get('successful', 0)} "
+        f"errors={target.get('errors', 0)}"
     )
+
+    failures = target.get("failures", {})
+    failure_summary = " ".join(
+        f"{name}={failures.get(name, 0)}" for name in new_failure_counts()
+    )
+    print(f"  failures: {failure_summary}")
 
 
 def print_per_case_table(per_case: list[dict[str, Any]]) -> None:
@@ -997,6 +1214,66 @@ def print_per_case_table(per_case: list[dict[str, Any]]) -> None:
         )
 
 
+def new_failure_counts() -> dict[str, int]:
+    return {
+        "spawn": 0,
+        "initialize": 0,
+        "timeout": 0,
+        "crash": 0,
+        "search": 0,
+        "decode": 0,
+        "oracle": 0,
+        "cleanup": 0,
+    }
+
+
+def failure_bucket(
+    exc: BaseException, proc: Optional[subprocess.Popen[str]], phase: str
+) -> str:
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    if isinstance(exc, json.JSONDecodeError):
+        return "decode"
+    try:
+        if proc is not None and proc.poll() is not None:
+            return "crash"
+    except Exception:
+        return "crash"
+    return phase
+
+
+def empty_target(
+    *,
+    args: argparse.Namespace,
+    tool: str,
+    failures: dict[str, int],
+    planned: int,
+    process_boot_ms: Optional[float] = None,
+    init_ms: Optional[float] = None,
+) -> dict[str, Any]:
+    return {
+        "mode": args.mode,
+        "tool": tool,
+        "verbosity": args.verbosity,
+        "process_boot_ms": process_boot_ms,
+        "init_ms": init_ms,
+        "planned": planned,
+        "attempted": 0,
+        "successful": 0,
+        "errors": 0,
+        "sample_count": 0,
+        "raw_e2e_search_ms": [],
+        "e2e_search_ms": None,
+        "server_took_ms": None,
+        "transport_overhead_ms": None,
+        "cold_total_ms": None,
+        "first_call_ms": None,
+        "warmup_decay_ms": [],
+        "failures": failures,
+        "per_case": [],
+    }
+
+
 def run_target(
     *,
     args: argparse.Namespace,
@@ -1016,11 +1293,13 @@ def run_target_persistent(
     tool: str,
     specs: list[ReplaySpec],
 ) -> dict[str, Any]:
-    failures = {"spawn": 0, "initialize": 0, "search": 0, "decode": 0}
+    failures = new_failure_counts()
     samples: list[dict[str, Any]] = []
     per_case: list[dict[str, Any]] = []
     first_call_ms: Optional[float] = None
     warmup_decay_ms: list[float] = []
+    attempted = 0
+    planned = len(specs) * args.repeats
 
     proc: Optional[subprocess.Popen[str]] = None
     process_boot_ms: Optional[float] = None
@@ -1032,22 +1311,7 @@ def run_target_persistent(
         proc = start_mcp_process(args.moraine_bin, config_path)
     except Exception:
         failures["spawn"] += 1
-        return {
-            "mode": args.mode,
-            "tool": tool,
-            "verbosity": args.verbosity,
-            "process_boot_ms": None,
-            "init_ms": None,
-            "sample_count": 0,
-            "e2e_search_ms": None,
-            "server_took_ms": None,
-            "transport_overhead_ms": None,
-            "cold_total_ms": None,
-            "first_call_ms": None,
-            "warmup_decay_ms": [],
-            "failures": failures,
-            "per_case": [],
-        }
+        return empty_target(args=args, tool=tool, failures=failures, planned=planned)
 
     try:
         try:
@@ -1055,70 +1319,80 @@ def run_target_persistent(
                 proc, timeout_seconds=args.timeout_seconds, request_id=next_request_id
             )
             process_boot_ms = (time.perf_counter_ns() - spawn_started_ns) / 1_000_000.0
-        except Exception:
-            failures["initialize"] += 1
-            return {
-                "mode": args.mode,
-                "tool": tool,
-                "verbosity": args.verbosity,
-                "process_boot_ms": process_boot_ms,
-                "init_ms": init_ms,
-                "sample_count": 0,
-                "e2e_search_ms": None,
-                "server_took_ms": None,
-                "transport_overhead_ms": None,
-                "cold_total_ms": None,
-                "first_call_ms": None,
-                "warmup_decay_ms": [],
-                "failures": failures,
-                "per_case": [],
-            }
+        except Exception as exc:
+            failures[failure_bucket(exc, proc, "initialize")] += 1
+            return empty_target(
+                args=args,
+                tool=tool,
+                failures=failures,
+                planned=planned,
+                process_boot_ms=process_boot_ms,
+                init_ms=init_ms,
+            )
 
         if args.post_init_wait_ms > 0:
             time.sleep(args.post_init_wait_ms / 1000.0)
+
+        expected_oracles: dict[int, str] = {}
+        for spec in specs:
+            oracle_args = build_tool_arguments(spec, tool=tool, verbosity=args.verbosity)
+            try:
+                next_request_id, _, _, expected = call_tool(
+                    proc,
+                    timeout_seconds=args.timeout_seconds,
+                    request_id=next_request_id,
+                    tool=tool,
+                    arguments=oracle_args,
+                )
+            except Exception as exc:
+                failures[failure_bucket(exc, proc, "oracle")] += 1
+                continue
+            expected_oracles[id(spec)] = expected
 
         for spec in specs:
             case_e2e: list[float] = []
             case_server_took: list[float] = []
             case_overhead: list[float] = []
             case_failures = 0
+            expected_oracle = expected_oracles.get(id(spec))
 
-            total_runs = args.warmup + args.repeats
-            for idx in range(total_runs):
+            iterations = (
+                range(args.warmup + args.repeats)
+                if expected_oracle is not None
+                else ()
+            )
+            for idx in iterations:
                 measured = idx >= args.warmup
+                if measured:
+                    attempted += 1
                 tool_args = build_tool_arguments(spec, tool=tool, verbosity=args.verbosity)
 
                 try:
-                    next_request_id, e2e_ms, server_took_ms = call_tool(
+                    next_request_id, e2e_ms, server_took_ms, oracle = call_tool(
                         proc,
                         timeout_seconds=args.timeout_seconds,
                         request_id=next_request_id,
                         tool=tool,
                         arguments=tool_args,
                     )
-                except TimeoutError:
-                    failures["search"] += 1
-                    if measured:
-                        case_failures += 1
-                    continue
-                except json.JSONDecodeError:
-                    failures["decode"] += 1
-                    if measured:
-                        case_failures += 1
-                    continue
-                except Exception:
-                    failures["search"] += 1
+                except Exception as exc:
+                    failures[failure_bucket(exc, proc, "search")] += 1
                     if measured:
                         case_failures += 1
                     continue
 
                 if not measured:
                     continue
+                if oracle != expected_oracle:
+                    failures["oracle"] += 1
+                    case_failures += 1
+                    continue
 
-                overhead_ms = None
-                if server_took_ms is not None:
-                    overhead_ms = max(0.0, e2e_ms - server_took_ms)
-
+                overhead_ms = (
+                    max(0.0, e2e_ms - server_took_ms)
+                    if server_took_ms is not None
+                    else None
+                )
                 record = {
                     "rank": spec.rank,
                     "tool": tool,
@@ -1133,13 +1407,11 @@ def run_target_persistent(
                     "cold_total_ms": None,
                 }
                 samples.append(record)
-
                 case_e2e.append(e2e_ms)
                 if server_took_ms is not None:
                     case_server_took.append(server_took_ms)
                 if overhead_ms is not None:
                     case_overhead.append(overhead_ms)
-
                 if first_call_ms is None:
                     first_call_ms = e2e_ms
                 if len(warmup_decay_ms) < 5:
@@ -1157,12 +1429,15 @@ def run_target_persistent(
                     "failure_count": case_failures,
                     "e2e_search_ms": summarize_values(case_e2e, include_p99=True),
                     "server_took_ms": summarize_values(case_server_took, include_p99=True),
-                    "transport_overhead_ms": summarize_values(case_overhead, include_p99=True),
+                    "transport_overhead_ms": summarize_values(
+                        case_overhead, include_p99=True
+                    ),
                     "cold_total_ms": None,
                 }
             )
     finally:
-        stop_mcp_process(proc)
+        if stop_mcp_process(proc):
+            failures["cleanup"] += 1
 
     e2e_values = [float(item["e2e_search_ms"]) for item in samples]
     server_values = [
@@ -1175,14 +1450,18 @@ def run_target_persistent(
         for item in samples
         if isinstance(item.get("transport_overhead_ms"), (int, float))
     ]
-
     return {
         "mode": args.mode,
         "tool": tool,
         "verbosity": args.verbosity,
         "process_boot_ms": process_boot_ms,
         "init_ms": init_ms,
+        "planned": planned,
+        "attempted": attempted,
+        "successful": len(samples),
+        "errors": attempted - len(samples),
         "sample_count": len(samples),
+        "raw_e2e_search_ms": e2e_values,
         "e2e_search_ms": summarize_values(e2e_values, include_p99=True),
         "server_took_ms": summarize_values(server_values, include_p99=True),
         "transport_overhead_ms": summarize_values(overhead_values, include_p99=True),
@@ -1194,6 +1473,53 @@ def run_target_persistent(
     }
 
 
+def derive_cold_process_oracle(
+    *,
+    args: argparse.Namespace,
+    config_path: Path,
+    tool: str,
+    spec: ReplaySpec,
+    failures: dict[str, int],
+) -> Optional[str]:
+    proc: Optional[subprocess.Popen[str]] = None
+    try:
+        try:
+            proc = start_mcp_process(args.moraine_bin, config_path)
+        except Exception:
+            failures["spawn"] += 1
+            return None
+        try:
+            next_request_id, _ = initialize_mcp(
+                proc,
+                timeout_seconds=args.timeout_seconds,
+                request_id=1,
+            )
+        except Exception as exc:
+            failures[failure_bucket(exc, proc, "initialize")] += 1
+            return None
+        if args.post_init_wait_ms > 0:
+            time.sleep(args.post_init_wait_ms / 1000.0)
+        try:
+            _, _, _, expected = call_tool(
+                proc,
+                timeout_seconds=args.timeout_seconds,
+                request_id=next_request_id,
+                tool=tool,
+                arguments=build_tool_arguments(
+                    spec,
+                    tool=tool,
+                    verbosity=args.verbosity,
+                ),
+            )
+        except Exception as exc:
+            failures[failure_bucket(exc, proc, "oracle")] += 1
+            return None
+        return expected
+    finally:
+        if stop_mcp_process(proc):
+            failures["cleanup"] += 1
+
+
 def run_target_cold_process(
     *,
     args: argparse.Namespace,
@@ -1201,11 +1527,13 @@ def run_target_cold_process(
     tool: str,
     specs: list[ReplaySpec],
 ) -> dict[str, Any]:
-    failures = {"spawn": 0, "initialize": 0, "search": 0, "decode": 0}
+    failures = new_failure_counts()
     samples: list[dict[str, Any]] = []
     per_case: list[dict[str, Any]] = []
     first_call_ms: Optional[float] = None
     warmup_decay_ms: list[float] = []
+    attempted = 0
+    planned = len(specs) * args.repeats
 
     for spec in specs:
         case_e2e: list[float] = []
@@ -1215,95 +1543,94 @@ def run_target_cold_process(
         case_overhead: list[float] = []
         case_cold_total: list[float] = []
         case_failures = 0
+        expected_oracle = derive_cold_process_oracle(
+            args=args,
+            config_path=config_path,
+            tool=tool,
+            spec=spec,
+            failures=failures,
+        )
 
-        total_runs = args.warmup + args.repeats
-        for idx in range(total_runs):
+        iterations = (
+            range(args.warmup + args.repeats)
+            if expected_oracle is not None
+            else ()
+        )
+        for idx in iterations:
             measured = idx >= args.warmup
+            if measured:
+                attempted += 1
             proc: Optional[subprocess.Popen[str]] = None
             next_request_id = 1
             spawn_started_ns = time.perf_counter_ns()
             try:
-                proc = start_mcp_process(args.moraine_bin, config_path)
-            except Exception:
-                failures["spawn"] += 1
-                if measured:
-                    case_failures += 1
-                continue
+                try:
+                    proc = start_mcp_process(args.moraine_bin, config_path)
+                except Exception:
+                    failures["spawn"] += 1
+                    if measured:
+                        case_failures += 1
+                    continue
 
-            try:
                 try:
                     next_request_id, init_ms = initialize_mcp(
-                        proc, timeout_seconds=args.timeout_seconds, request_id=next_request_id
+                        proc,
+                        timeout_seconds=args.timeout_seconds,
+                        request_id=next_request_id,
                     )
-                except TimeoutError:
-                    failures["initialize"] += 1
-                    if measured:
-                        case_failures += 1
-                    continue
-                except json.JSONDecodeError:
-                    failures["decode"] += 1
-                    if measured:
-                        case_failures += 1
-                    continue
-                except Exception:
-                    failures["initialize"] += 1
+                except Exception as exc:
+                    failures[failure_bucket(exc, proc, "initialize")] += 1
                     if measured:
                         case_failures += 1
                     continue
 
                 process_boot_ms = (time.perf_counter_ns() - spawn_started_ns) / 1_000_000.0
-
                 if args.post_init_wait_ms > 0:
                     time.sleep(args.post_init_wait_ms / 1000.0)
 
                 tool_args = build_tool_arguments(spec, tool=tool, verbosity=args.verbosity)
                 try:
-                    next_request_id, e2e_ms, server_took_ms = call_tool(
+                    next_request_id, e2e_ms, server_took_ms, oracle = call_tool(
                         proc,
                         timeout_seconds=args.timeout_seconds,
                         request_id=next_request_id,
                         tool=tool,
                         arguments=tool_args,
                     )
-                except TimeoutError:
-                    failures["search"] += 1
-                    if measured:
-                        case_failures += 1
-                    continue
-                except json.JSONDecodeError:
-                    failures["decode"] += 1
-                    if measured:
-                        case_failures += 1
-                    continue
-                except Exception:
-                    failures["search"] += 1
+                except Exception as exc:
+                    failures[failure_bucket(exc, proc, "search")] += 1
                     if measured:
                         case_failures += 1
                     continue
 
                 if not measured:
                     continue
+                if oracle != expected_oracle:
+                    failures["oracle"] += 1
+                    case_failures += 1
+                    continue
 
-                overhead_ms = None
-                if server_took_ms is not None:
-                    overhead_ms = max(0.0, e2e_ms - server_took_ms)
+                overhead_ms = (
+                    max(0.0, e2e_ms - server_took_ms)
+                    if server_took_ms is not None
+                    else None
+                )
                 cold_total_ms = init_ms + e2e_ms
-
-                record = {
-                    "rank": spec.rank,
-                    "tool": tool,
-                    "variant_label": spec.variant_label,
-                    "variant_term_count": spec.variant_term_count,
-                    "query": str(spec.arguments["query"]),
-                    "e2e_search_ms": e2e_ms,
-                    "init_ms": init_ms,
-                    "process_boot_ms": process_boot_ms,
-                    "server_took_ms": server_took_ms,
-                    "transport_overhead_ms": overhead_ms,
-                    "cold_total_ms": cold_total_ms,
-                }
-                samples.append(record)
-
+                samples.append(
+                    {
+                        "rank": spec.rank,
+                        "tool": tool,
+                        "variant_label": spec.variant_label,
+                        "variant_term_count": spec.variant_term_count,
+                        "query": str(spec.arguments["query"]),
+                        "e2e_search_ms": e2e_ms,
+                        "init_ms": init_ms,
+                        "process_boot_ms": process_boot_ms,
+                        "server_took_ms": server_took_ms,
+                        "transport_overhead_ms": overhead_ms,
+                        "cold_total_ms": cold_total_ms,
+                    }
+                )
                 case_e2e.append(e2e_ms)
                 case_init.append(init_ms)
                 case_boot.append(process_boot_ms)
@@ -1312,13 +1639,13 @@ def run_target_cold_process(
                     case_server_took.append(server_took_ms)
                 if overhead_ms is not None:
                     case_overhead.append(overhead_ms)
-
                 if first_call_ms is None:
                     first_call_ms = e2e_ms
                 if len(warmup_decay_ms) < 5:
                     warmup_decay_ms.append(e2e_ms)
             finally:
-                stop_mcp_process(proc)
+                if stop_mcp_process(proc):
+                    failures["cleanup"] += 1
 
         per_case.append(
             {
@@ -1353,14 +1680,18 @@ def run_target_cold_process(
         for item in samples
         if isinstance(item.get("transport_overhead_ms"), (int, float))
     ]
-
     return {
         "mode": args.mode,
         "tool": tool,
         "verbosity": args.verbosity,
         "process_boot_ms": summarize_values(boot_values, include_p99=True),
         "init_ms": summarize_values(init_values, include_p99=True),
+        "planned": planned,
+        "attempted": attempted,
+        "successful": len(samples),
+        "errors": attempted - len(samples),
         "sample_count": len(samples),
+        "raw_e2e_search_ms": e2e_values,
         "e2e_search_ms": summarize_values(e2e_values, include_p99=True),
         "server_took_ms": summarize_values(server_values, include_p99=True),
         "transport_overhead_ms": summarize_values(overhead_values, include_p99=True),
@@ -1375,43 +1706,231 @@ def run_target_cold_process(
 def build_output_json(
     *,
     args: argparse.Namespace,
-    config_path: Path,
-    selected_rows: list[dict[str, Any]],
+    replay_specs: list[ReplaySpec],
+    corpus_identity: CorpusIdentity,
     targets: list[dict[str, Any]],
     dry_run: bool,
 ) -> dict[str, Any]:
+    commit, dirty, git_available = git_metadata()
+    workload_digest = workload_fingerprint(replay_specs)
+    configured_tools = choose_tools(args.tool)
+    planned = (
+        sum(int(target["planned"]) for target in targets)
+        if targets
+        else max(1, len(replay_specs) * args.repeats * len(configured_tools))
+    )
+    attempted = sum(int(target["attempted"]) for target in targets)
+    successful = sum(int(target["successful"]) for target in targets)
+    errors = sum(int(target["errors"]) for target in targets)
+    raw_latency_ms = [
+        float(value)
+        for target in targets
+        for value in target.get("raw_e2e_search_ms", [])
+    ]
+
+    failure_totals = new_failure_counts()
+    for target in targets:
+        for code, count in target.get("failures", {}).items():
+            if code in failure_totals:
+                failure_totals[code] += int(count)
+
+    diagnostic_codes: set[str] = set()
+    failure_diagnostics = {
+        "spawn": "child-spawn-failed",
+        "initialize": "child-initialize-failed",
+        "timeout": "child-timeout",
+        "crash": "child-crash",
+        "search": "request-failed",
+        "decode": "response-decode-failed",
+        "oracle": "semantic-oracle-failed",
+        "cleanup": "child-cleanup-failed",
+    }
+    diagnostic_codes.update(
+        failure_diagnostics[name] for name, count in failure_totals.items() if count
+    )
+    if attempted < planned or successful < planned:
+        diagnostic_codes.add("insufficient-samples")
+    if dry_run:
+        diagnostic_codes.add("dry-run-no-samples")
+    if not git_available:
+        diagnostic_codes.add("source-metadata-unavailable")
+
+    semantic_pass = (
+        not dry_run
+        and planned == attempted == successful
+        and errors == 0
+        and not any(failure_totals.values())
+    )
+    safe_target = re.sub(r"[^a-z0-9._-]+", "-", Path(args.moraine_bin).name.lower())
+    safe_target = safe_target.strip("-._") or "moraine"
+    runner_os = re.sub(r"[^a-z0-9._-]+", "-", platform.system().lower()).strip("-")
+    cpu_class = re.sub(r"[^a-z0-9._-]+", "-", platform.machine().lower()).strip("-")
+    cache_state = "mixed" if args.mode == "persistent" else "cold"
+
     return {
-        "meta": {
-            "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "git_sha": git_sha(),
-            "config_path": str(config_path),
-            "parameters": {
-                "window": args.window,
-                "top_n": args.top_n,
-                "warmup": args.warmup,
-                "repeats": args.repeats,
-                "timeout_seconds": args.timeout_seconds,
-                "include_benchmark_replays": args.include_benchmark_replays,
-                "query_variant_mode": args.query_variant_mode,
-                "max_query_terms": args.max_query_terms,
-                "mode": args.mode,
-                "tool": args.tool,
-                "verbosity": args.verbosity,
-                "moraine_bin": args.moraine_bin,
-                "post_init_wait_ms": args.post_init_wait_ms,
-                "dry_run": dry_run,
-            },
-            "selected_count": len(selected_rows),
-            "target_count": len(targets),
+        "schema_version": "moraine-benchmark-v1",
+        "benchmark_id": "replay-mcp-latency",
+        "scenario_id": (
+            f"{args.profile}.{args.mode}.{args.tool}.{args.verbosity}."
+            f"{args.query_variant_mode}.n{args.top_n}.w{args.warmup}."
+            f"r{args.repeats}.wait{args.post_init_wait_ms}.q{workload_digest[:12]}"
+        ),
+        "source": {"git_commit": commit, "dirty": dirty},
+        "build": {"profile": args.build_profile, "target": safe_target[:128]},
+        "runner": {
+            "os": (runner_os or "unknown")[:128],
+            "cpu_class": (cpu_class or "unknown")[:128],
         },
-        "selected_queries": selected_rows,
-        "targets": targets,
+        "scenario": {
+            "profile": args.profile,
+            "workload_id": f"search-query-log-replay.{args.tool}",
+            "measured_boundary": "mcp-json-rpc-stdio-tool-call",
+            "dimensions": {
+                "dataset_backed": True,
+                "cache_sensitive": True,
+                "concurrent": False,
+                "request_producing": True,
+            },
+            "fingerprints": {
+                "dataset": {
+                    "fingerprint": corpus_identity.fingerprint,
+                    "cardinality": corpus_identity.cardinality,
+                },
+                "cache_state": cache_state,
+                "request_source": "production-mcp-json-rpc-stdio",
+            },
+        },
+        "samples": {
+            "planned": planned,
+            "attempted": attempted,
+            "successful": successful,
+            "errors": errors,
+            "measurements": {"latency_ms": raw_latency_ms},
+        },
+        "semantic": {"status": "pass" if semantic_pass else "fail"},
+        "timing": {"status": "not_evaluated", "non_blocking": True},
+        "metrics": {
+            "quality": {
+                "oracle_status": "pass" if failure_totals["oracle"] == 0 else "fail",
+                "passed_checks": successful,
+                "failed_checks": errors,
+                "expected_count": planned,
+                "observed_count": successful,
+                "mismatches": failure_totals["oracle"],
+                "success_rate": successful / planned,
+                "error_rate": errors / attempted if attempted else 0.0,
+            }
+        },
+        "diagnostics": [{"code": code} for code in sorted(diagnostic_codes)],
+        "artifacts": [],
     }
 
 
-def write_output_json(path: Path, payload: dict[str, Any]) -> None:
+def build_diagnostics_json(
+    args: argparse.Namespace, targets: list[dict[str, Any]]
+) -> dict[str, Any]:
+    safe_targets: list[dict[str, Any]] = []
+    for target in targets:
+        safe_target = {key: value for key, value in target.items() if key != "per_case"}
+        safe_target["cases"] = [
+            {key: value for key, value in case.items() if key != "query"}
+            for case in target.get("per_case", [])
+        ]
+        safe_targets.append(safe_target)
+    return {
+        "profile": args.profile,
+        "parameters": {
+            "window": args.window,
+            "top_n": args.top_n,
+            "warmup": args.warmup,
+            "repeats": args.repeats,
+            "timeout_seconds": args.timeout_seconds,
+            "include_benchmark_replays": args.include_benchmark_replays,
+            "query_variant_mode": args.query_variant_mode,
+            "max_query_terms": args.max_query_terms,
+            "mode": args.mode,
+            "tool": args.tool,
+            "verbosity": args.verbosity,
+            "post_init_wait_ms": args.post_init_wait_ms,
+        },
+        "targets": safe_targets,
+    }
+
+
+def json_bytes(payload: dict[str, Any]) -> bytes:
+    return (
+        json.dumps(payload, allow_nan=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(json_bytes(payload))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+
+
+def emit_output(
+    args: argparse.Namespace,
+    payload: dict[str, Any],
+    diagnostics_payload: Optional[dict[str, Any]] = None,
+) -> bool:
+    if not args.output_json:
+        return True
+
+    output_path = Path(args.output_json).expanduser()
+    diagnostics_path: Optional[Path] = None
+    diagnostics_existed = False
+    try:
+        if diagnostics_payload is not None:
+            digest = hashlib.sha256(json_bytes(diagnostics_payload)).hexdigest()
+            diagnostics_name = f"{output_path.stem}.diagnostics-{digest[:12]}.json"
+            diagnostics_path = output_path.with_name(diagnostics_name)
+            diagnostics_existed = diagnostics_path.exists()
+            payload["artifacts"] = [
+                {
+                    "id": "replay-diagnostics",
+                    "kind": "benchmark-diagnostics",
+                    "path": diagnostics_name,
+                    "sha256": digest,
+                }
+            ]
+            for diagnostic in payload["diagnostics"]:
+                diagnostic["artifact_id"] = "replay-diagnostics"
+            write_json_atomic(diagnostics_path, diagnostics_payload)
+        benchmark_protocol.write_artifact(output_path, payload)
+        return True
+    except (OSError, benchmark_protocol.ProtocolError, TypeError, ValueError) as exc:
+        if diagnostics_path is not None and not diagnostics_existed:
+            try:
+                diagnostics_path.unlink()
+            except FileNotFoundError:
+                pass
+        print(
+            f"fatal: failed to write benchmark artifact ({type(exc).__name__})",
+            file=sys.stderr,
+        )
+        return False
 
 
 def main() -> int:
@@ -1437,6 +1956,7 @@ def main() -> int:
         print("")
 
     try:
+        corpus_identity = searchable_corpus_identity(ch_cfg)
         raw_rows = clickhouse_query_json_each_row(ch_cfg, selection_sql)
     except Exception as exc:
         print(f"fatal: failed to query clickhouse: {exc}", file=sys.stderr)
@@ -1450,13 +1970,13 @@ def main() -> int:
         )
         payload = build_output_json(
             args=args,
-            config_path=config_path,
-            selected_rows=[],
+            replay_specs=[],
+            corpus_identity=corpus_identity,
             targets=[],
             dry_run=args.dry_run,
         )
-        if args.output_json:
-            write_output_json(Path(args.output_json).expanduser(), payload)
+        if not emit_output(args, payload, build_diagnostics_json(args, [])):
+            return 2
         return 2
 
     selected_rows, base_replay_rows = normalize_rows(raw_rows)
@@ -1472,13 +1992,13 @@ def main() -> int:
         print_dry_run_table(selected_rows)
         payload = build_output_json(
             args=args,
-            config_path=config_path,
-            selected_rows=selected_rows,
+            replay_specs=replayable_rows,
+            corpus_identity=corpus_identity,
             targets=[],
             dry_run=True,
         )
-        if args.output_json:
-            write_output_json(Path(args.output_json).expanduser(), payload)
+        if not emit_output(args, payload, build_diagnostics_json(args, [])):
+            return 2
         return 0
 
     if not base_replay_rows:
@@ -1488,13 +2008,13 @@ def main() -> int:
         )
         payload = build_output_json(
             args=args,
-            config_path=config_path,
-            selected_rows=selected_rows,
+            replay_specs=[],
+            corpus_identity=corpus_identity,
             targets=[],
             dry_run=False,
         )
-        if args.output_json:
-            write_output_json(Path(args.output_json).expanduser(), payload)
+        if not emit_output(args, payload, build_diagnostics_json(args, [])):
+            return 2
         return 2
 
     tools = choose_tools(args.tool)
@@ -1513,15 +2033,14 @@ def main() -> int:
 
     payload = build_output_json(
         args=args,
-        config_path=config_path,
-        selected_rows=selected_rows,
+        replay_specs=replayable_rows,
+        corpus_identity=corpus_identity,
         targets=targets,
         dry_run=False,
     )
-    if args.output_json:
-        write_output_json(Path(args.output_json).expanduser(), payload)
-
-    return 0
+    if not emit_output(args, payload, build_diagnostics_json(args, targets)):
+        return 2
+    return 0 if payload["semantic"]["status"] == "pass" else 2
 
 
 if __name__ == "__main__":

@@ -1,0 +1,385 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://moraine.dev/schema/moraine-benchmark-v1.schema.json",
+  "title": "Moraine benchmark result protocol v1",
+  "description": "One redaction-safe benchmark scenario result. Timing is diagnostic and never blocks correctness.",
+  "$comment": "The standard-library validator additionally enforces sample-count arithmetic, raw-series cardinality, finite in-memory numbers, diagnostic references, error-rate contradictions, and recursive redaction.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "benchmark_id",
+    "scenario_id",
+    "source",
+    "build",
+    "runner",
+    "scenario",
+    "samples",
+    "semantic",
+    "timing",
+    "diagnostics",
+    "artifacts"
+  ],
+  "properties": {
+    "schema_version": { "const": "moraine-benchmark-v1" },
+    "benchmark_id": { "$ref": "#/$defs/slug" },
+    "scenario_id": { "$ref": "#/$defs/slug" },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["git_commit", "dirty"],
+      "properties": {
+        "git_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "dirty": { "type": "boolean" }
+      }
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile", "target"],
+      "properties": {
+        "profile": { "$ref": "#/$defs/slug" },
+        "target": { "$ref": "#/$defs/slug" }
+      }
+    },
+    "runner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "cpu_class"],
+      "properties": {
+        "os": { "$ref": "#/$defs/slug" },
+        "cpu_class": { "$ref": "#/$defs/slug" }
+      }
+    },
+    "scenario": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile", "workload_id", "measured_boundary", "dimensions", "fingerprints"],
+      "properties": {
+        "profile": { "enum": ["smoke", "full"] },
+        "workload_id": { "$ref": "#/$defs/slug" },
+        "measured_boundary": { "$ref": "#/$defs/slug" },
+        "dimensions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["dataset_backed", "cache_sensitive", "concurrent", "request_producing"],
+          "properties": {
+            "dataset_backed": { "type": "boolean" },
+            "cache_sensitive": { "type": "boolean" },
+            "concurrent": { "type": "boolean" },
+            "request_producing": { "type": "boolean" }
+          }
+        },
+        "fingerprints": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "dataset": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["fingerprint", "cardinality"],
+              "properties": {
+                "fingerprint": { "$ref": "#/$defs/sha256Prefixed" },
+                "cardinality": { "type": "integer", "minimum": 0 }
+              }
+            },
+            "cache_state": { "enum": ["cold", "warm", "mixed", "disabled"] },
+            "concurrency": { "type": "integer", "minimum": 1 },
+            "request_source": { "$ref": "#/$defs/slug" }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "dimensions": {
+                "properties": { "dataset_backed": { "const": true } },
+                "required": ["dataset_backed"]
+              }
+            }
+          },
+          "then": { "properties": { "fingerprints": { "required": ["dataset"] } } },
+          "else": { "properties": { "fingerprints": { "not": { "required": ["dataset"] } } } }
+        },
+        {
+          "if": {
+            "properties": {
+              "dimensions": {
+                "properties": { "cache_sensitive": { "const": true } },
+                "required": ["cache_sensitive"]
+              }
+            }
+          },
+          "then": { "properties": { "fingerprints": { "required": ["cache_state"] } } },
+          "else": { "properties": { "fingerprints": { "not": { "required": ["cache_state"] } } } }
+        },
+        {
+          "if": {
+            "properties": {
+              "dimensions": {
+                "properties": { "concurrent": { "const": true } },
+                "required": ["concurrent"]
+              }
+            }
+          },
+          "then": { "properties": { "fingerprints": { "required": ["concurrency"] } } },
+          "else": { "properties": { "fingerprints": { "not": { "required": ["concurrency"] } } } }
+        },
+        {
+          "if": {
+            "properties": {
+              "dimensions": {
+                "properties": { "request_producing": { "const": true } },
+                "required": ["request_producing"]
+              }
+            }
+          },
+          "then": { "properties": { "fingerprints": { "required": ["request_source"] } } },
+          "else": { "properties": { "fingerprints": { "not": { "required": ["request_source"] } } } }
+        }
+      ]
+    },
+    "samples": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["planned", "attempted", "successful", "errors"],
+      "properties": {
+        "planned": { "type": "integer", "minimum": 1 },
+        "attempted": { "type": "integer", "minimum": 0 },
+        "successful": { "type": "integer", "minimum": 0 },
+        "errors": { "type": "integer", "minimum": 0 },
+        "measurements": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": { "$ref": "#/$defs/measurementName" },
+          "additionalProperties": {
+            "type": "array",
+            "items": { "type": "number", "minimum": 0 }
+          }
+        },
+        "external_samples": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["artifact_id", "measurement", "count", "sha256"],
+          "properties": {
+            "artifact_id": { "$ref": "#/$defs/slug" },
+            "measurement": { "$ref": "#/$defs/measurementName" },
+            "count": { "type": "integer", "minimum": 0 },
+            "sha256": { "$ref": "#/$defs/sha256" }
+          }
+        }
+      },
+      "oneOf": [
+        { "required": ["measurements"], "not": { "required": ["external_samples"] } },
+        { "required": ["external_samples"], "not": { "required": ["measurements"] } }
+      ]
+    },
+    "semantic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": { "enum": ["pass", "fail"] }
+      }
+    },
+    "timing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "non_blocking"],
+      "properties": {
+        "status": { "enum": ["pass", "fail", "inconclusive", "not_evaluated"] },
+        "non_blocking": { "const": true },
+        "comparison_policy": { "$ref": "#/$defs/comparisonPolicy" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "enum": ["pass", "fail", "inconclusive"] } } },
+          "then": { "required": ["comparison_policy"] }
+        }
+      ]
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "quality": { "$ref": "#/$defs/qualityMetrics" },
+        "resources": { "$ref": "#/$defs/numericMetrics" },
+        "storage": { "$ref": "#/$defs/numericMetrics" },
+        "model_tokens": { "$ref": "#/$defs/modelTokenMetrics" }
+      }
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/diagnostic" }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/artifact" }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "semantic": {
+            "properties": { "status": { "const": "fail" } },
+            "required": ["status"]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "timing": {
+            "properties": { "status": { "const": "not_evaluated" } }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "scenario": {
+            "properties": { "profile": { "const": "smoke" } },
+            "required": ["profile"]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "timing": {
+            "properties": { "status": { "const": "not_evaluated" } }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "samples": {
+            "properties": { "successful": { "const": 0 } },
+            "required": ["successful"]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "semantic": {
+            "properties": { "status": { "const": "fail" } }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "slug": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9][a-z0-9._-]*$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "sha256Prefixed": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "measurementName": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(?:_ns|_us|_ms|_seconds|_bytes|_count|_ratio|_percent)$"
+    },
+    "comparisonPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["statistic", "minimum_independent_run_pairs", "threshold", "error_rate", "variability"],
+      "properties": {
+        "statistic": { "enum": ["mean", "median", "p95", "p99"] },
+        "minimum_independent_run_pairs": { "type": "integer", "minimum": 1 },
+        "threshold": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["maximum_relative_regression"],
+          "properties": {
+            "maximum_relative_regression": { "type": "number", "minimum": 0 }
+          }
+        },
+        "error_rate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["maximum"],
+          "properties": {
+            "maximum": { "type": "number", "minimum": 0, "maximum": 1 }
+          }
+        },
+        "variability": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["statistic", "maximum"],
+          "properties": {
+            "statistic": { "enum": ["coefficient_of_variation", "relative_range"] },
+            "maximum": { "type": "number", "minimum": 0 }
+          }
+        }
+      }
+    },
+    "qualityMetrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "oracle_status": { "enum": ["pass", "fail"] },
+        "passed_checks": { "type": "integer", "minimum": 0 },
+        "failed_checks": { "type": "integer", "minimum": 0 },
+        "expected_count": { "type": "integer", "minimum": 0 },
+        "observed_count": { "type": "integer", "minimum": 0 },
+        "mismatches": { "type": "integer", "minimum": 0 },
+        "success_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+        "error_rate": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "numericMetrics": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "$ref": "#/$defs/measurementName" },
+      "additionalProperties": { "type": "number", "minimum": 0 }
+    },
+    "modelTokenMetrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "input_tokens": { "type": "integer", "minimum": 0 },
+        "output_tokens": { "type": "integer", "minimum": 0 },
+        "total_tokens": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code"],
+      "properties": {
+        "code": { "$ref": "#/$defs/slug" },
+        "artifact_id": { "$ref": "#/$defs/slug" }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "path"],
+      "properties": {
+        "id": { "$ref": "#/$defs/slug" },
+        "kind": { "$ref": "#/$defs/slug" },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^(?!/)(?![A-Za-z]:[\\\\/])(?![A-Za-z][A-Za-z0-9+.-]*:)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+        },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}
