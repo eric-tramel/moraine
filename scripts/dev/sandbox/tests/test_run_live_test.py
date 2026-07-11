@@ -80,6 +80,11 @@ case "$cmd" in
     if [[ "${FAKE_DOWN_RC:-0}" != 0 ]]; then
       exit "$FAKE_DOWN_RC"
     fi
+    if [[ "${FAKE_DATABASE_CLEANUP_RC:-0}" == 0 ]]; then
+      suffix="${id#sb-}"
+      printf -v database 'moraine_test_%s%026d' "$suffix" 0
+      rm -f "$FAKE_DATABASE_DIR/$database"
+    fi
     rm -f "$state"
     ;;
   *)
@@ -605,6 +610,9 @@ class RunLiveTestTests(unittest.TestCase):
         self.assertEqual(calls, [("up", calls[0][1]), ("down", calls[0][1])])
         self.assertIn("timeout after 1 seconds", self.only_diagnostic())
         self.assert_recorded_processes_reaped()
+        self.assertEqual(self.database_resources(), [])
+        self.assertEqual(list(self.compose_projects.iterdir()), [])
+        self.assertEqual(list(self.locks.iterdir()), [])
 
     def test_foreign_project_collision_is_rejected_without_destructive_teardown(self) -> None:
         result = self.run_wrapper(
@@ -653,6 +661,8 @@ class RunLiveTestTests(unittest.TestCase):
         self.assertIn("during sandbox boot", diagnostic)
         self.assertIn("process group resisted TERM; sending KILL", diagnostic)
         self.assertEqual(list(self.compose_projects.iterdir()), [])
+        self.assertEqual(self.database_resources(), [])
+        self.assertEqual(list(self.locks.iterdir()), [])
 
     def test_term_resistant_test_is_killed_reaped_and_owned_sandbox_is_cleaned(self) -> None:
         result = self.run_wrapper(
@@ -669,6 +679,7 @@ class RunLiveTestTests(unittest.TestCase):
         self.assert_recorded_processes_reaped()
         self.assertEqual(list(self.compose_projects.iterdir()), [])
         self.assertEqual(list(self.locks.iterdir()), [])
+        self.assertEqual(self.database_resources(), [])
 
     def test_sigterm_returns_143_and_cleans_owned_sandbox(self) -> None:
         process = self.spawn_wrapper(
@@ -686,6 +697,10 @@ class RunLiveTestTests(unittest.TestCase):
         calls = self.sandbox_calls()
         self.assertEqual(calls, [("up", calls[0][1]), ("down", calls[0][1])])
         self.assertIn("caught signal TERM", self.only_diagnostic())
+        self.assert_recorded_processes_reaped()
+        self.assertEqual(self.database_resources(), [])
+        self.assertEqual(list(self.compose_projects.iterdir()), [])
+        self.assertEqual(list(self.locks.iterdir()), [])
 
 
 
