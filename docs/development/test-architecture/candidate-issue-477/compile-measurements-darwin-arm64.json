@@ -1,0 +1,116 @@
+{
+  "cold_definition": "first invocation after creating an empty isolated CARGO_TARGET_DIR; shared Cargo registry/git caches are host state",
+  "command": "cargo test -p moraine-conversations --locked --no-run --message-format=json",
+  "environment": {
+    "CARGO_TARGET_DIR": "$VERIFIER_OWNED_FRESH_TARGET",
+    "CARGO_TERM_COLOR": "never"
+  },
+  "format_version": 1,
+  "host": {
+    "machine": "arm64",
+    "system": "darwin"
+  },
+  "linked_identity_sets_equal": true,
+  "non_deterministic_fields": [
+    "runs[0].started_at_utc",
+    "runs[0].wall_time_seconds",
+    "runs[1].started_at_utc",
+    "runs[1].wall_time_seconds"
+  ],
+  "owned_target_cleanup": "removed",
+  "runs": [
+    {
+      "exit_code": 0,
+      "linked_test_executable_count": 4,
+      "linked_test_executables": [
+        {
+          "executable": "$CARGO_TARGET_DIR/debug/deps/analytics_benchmark_support-807d790bf7a29237",
+          "fresh": false,
+          "kind": [
+            "test"
+          ],
+          "package": "moraine-conversations",
+          "target": "analytics_benchmark_support"
+        },
+        {
+          "executable": "$CARGO_TARGET_DIR/debug/deps/live_clickhouse-c5177d958104ee1c",
+          "fresh": false,
+          "kind": [
+            "test"
+          ],
+          "package": "moraine-conversations",
+          "target": "live_clickhouse"
+        },
+        {
+          "executable": "$CARGO_TARGET_DIR/debug/deps/moraine_conversations-437db157b9162629",
+          "fresh": false,
+          "kind": [
+            "lib"
+          ],
+          "package": "moraine-conversations",
+          "target": "moraine_conversations"
+        },
+        {
+          "executable": "$CARGO_TARGET_DIR/debug/deps/repository_integration-f7e5c4c73e1e3d14",
+          "fresh": false,
+          "kind": [
+            "test"
+          ],
+          "package": "moraine-conversations",
+          "target": "repository_integration"
+        }
+      ],
+      "phase": "cold",
+      "started_at_utc": "2026-07-11T04:55:44.408Z",
+      "wall_time_seconds": 25.451226
+    },
+    {
+      "exit_code": 0,
+      "linked_test_executable_count": 4,
+      "linked_test_executables": [
+        {
+          "executable": "$CARGO_TARGET_DIR/debug/deps/analytics_benchmark_support-807d790bf7a29237",
+          "fresh": true,
+          "kind": [
+            "test"
+          ],
+          "package": "moraine-conversations",
+          "target": "analytics_benchmark_support"
+        },
+        {
+          "executable": "$CARGO_TARGET_DIR/debug/deps/live_clickhouse-c5177d958104ee1c",
+          "fresh": true,
+          "kind": [
+            "test"
+          ],
+          "package": "moraine-conversations",
+          "target": "live_clickhouse"
+        },
+        {
+          "executable": "$CARGO_TARGET_DIR/debug/deps/moraine_conversations-437db157b9162629",
+          "fresh": true,
+          "kind": [
+            "lib"
+          ],
+          "package": "moraine-conversations",
+          "target": "moraine_conversations"
+        },
+        {
+          "executable": "$CARGO_TARGET_DIR/debug/deps/repository_integration-f7e5c4c73e1e3d14",
+          "fresh": true,
+          "kind": [
+            "test"
+          ],
+          "package": "moraine-conversations",
+          "target": "repository_integration"
+        }
+      ],
+      "phase": "warm",
+      "started_at_utc": "2026-07-11T04:56:09.862Z",
+      "wall_time_seconds": 0.205015
+    }
+  ],
+  "rustc_host_target": "aarch64-apple-darwin",
+  "source": "current working tree",
+  "warm_definition": "second identical invocation in the same CARGO_TARGET_DIR with no intervening source or environment change"
+}

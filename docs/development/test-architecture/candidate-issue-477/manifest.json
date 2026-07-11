@@ -1,0 +1,63 @@
+{
+  "artifact_sha256": {
+    "cargo-targets.json": "b4ee37536ccaaa92ac1abd918e3538ba2f251b2b3495b19a3006c72240ef8a3b",
+    "compile-measurements-darwin-arm64.json": "c50c72ad04ba7e835a1f5691e4291f5d7ccaa11dc78793ec1c90233befef8e99",
+    "normal-dependencies.json": "b9c083277d9fdb82b2aa84c898e6b6fef28dbc20fa1012145f79d30e573b127f",
+    "repository-migration.json": "2c8269ca99f2bd1178c886a0539c5b6f3d1855804ed2daefe885035292099db0",
+    "rust-libtest-darwin-arm64.json": "84346ef862c5ace61bc466f81b4ec64ab77f9620b29c3005af4379540f1c7090"
+  },
+  "baseline_commit": "77c90d6c572ba71bcfaa0362f7ead2cfa5e6712a",
+  "commands": {
+    "baseline_source": "git show 77c90d6:crates/moraine-conversations/tests/repository_integration.rs",
+    "cold_compile": "cargo test -p moraine-conversations --locked --no-run --message-format=json",
+    "dependency_policy": "python3 scripts/ci/dependency_policy.py",
+    "metadata": "cargo metadata --format-version 1 --locked --no-deps",
+    "native_collection_compile": "cargo test --workspace --locked --no-run --message-format=json",
+    "native_collection_ignored_list": "$EXECUTABLE --list --ignored --format terse",
+    "native_collection_list": "$EXECUTABLE --list --format terse",
+    "warm_compile": "cargo test -p moraine-conversations --locked --no-run --message-format=json"
+  },
+  "format_version": 1,
+  "generated_artifacts": [
+    "cargo-targets.json",
+    "compile-measurements-darwin-arm64.json",
+    "normal-dependencies.json",
+    "repository-migration.json",
+    "rust-libtest-darwin-arm64.json"
+  ],
+  "generated_at_utc": "2026-07-11T04:56:43.995Z",
+  "generator": "docs/development/test-architecture/verify_candidate.py",
+  "generator_sha256": "7b03df997efbb9e2773c53361fccac28ab6d887291df6a0f2980ba33b0795149",
+  "host": {
+    "machine": "arm64",
+    "rustc_host_target": "aarch64-apple-darwin",
+    "system": "darwin"
+  },
+  "non_deterministic_fields": [
+    "generated_at_utc",
+    "summary.cold_wall_time_seconds",
+    "summary.warm_wall_time_seconds",
+    "artifact_sha256.compile-measurements-darwin-arm64.json"
+  ],
+  "reproduce": "python3 docs/development/test-architecture/verify_candidate.py --repo-root .",
+  "source": "current working tree",
+  "summary": {
+    "candidate_repository_linked_executable_count": 1,
+    "candidate_repository_target_count": 1,
+    "candidate_workspace_target_count": 22,
+    "cold_linked_test_executable_count": 4,
+    "cold_wall_time_seconds": 25.451226,
+    "dependency_policy": "pass",
+    "owned_target_cleanup": "removed",
+    "repository_contract_mismatch_count": 0,
+    "repository_test_bijection_count": 67,
+    "warm_linked_test_executable_count": 4,
+    "warm_wall_time_seconds": 0.205015
+  },
+  "tool_versions": {
+    "cargo": "cargo 1.96.0 (30a34c682 2026-05-25) (Homebrew)",
+    "python": "3.14.6",
+    "rustc": "rustc 1.96.0",
+    "rustc_host_target": "aarch64-apple-darwin"
+  }
+}

@@ -1,0 +1,130 @@
+name: T0 test architecture
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ci-test-architecture.yml'
+      - 'scripts/bench/**'
+      - 'scripts/dev/sandbox/run-live-test'
+      - 'scripts/dev/sandbox/tests/**'
+      - 'docs/development/test-architecture/package_isolation.py'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'apps/moraine/Cargo.toml'
+      - 'apps/moraine-ingest/Cargo.toml'
+      - 'apps/moraine-mcp/Cargo.toml'
+      - 'apps/moraine-monitor/Cargo.toml'
+      - 'crates/moraine-clickhouse/Cargo.toml'
+      - 'crates/moraine-config/Cargo.toml'
+      - 'crates/moraine-conversations/Cargo.toml'
+      - 'crates/moraine-ingest-core/Cargo.toml'
+      - 'crates/moraine-mcp-core/Cargo.toml'
+      - 'crates/moraine-monitor-core/Cargo.toml'
+      - 'crates/moraine-conversations/benches/**'
+      - 'crates/moraine-conversations/tests/live_clickhouse.rs'
+      - 'crates/moraine-conversations/tests/analytics_benchmark_support.rs'
+      - 'crates/moraine-conversations/tests/repository_integration/support/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  architecture-t0:
+    name: T0 / deterministic test architecture
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect package-isolation changes
+        id: changes
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            package_isolation:
+              - '.github/workflows/ci-test-architecture.yml'
+              - 'docs/development/test-architecture/package_isolation.py'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'apps/moraine/Cargo.toml'
+              - 'apps/moraine-ingest/Cargo.toml'
+              - 'apps/moraine-mcp/Cargo.toml'
+              - 'apps/moraine-monitor/Cargo.toml'
+              - 'crates/moraine-clickhouse/Cargo.toml'
+              - 'crates/moraine-config/Cargo.toml'
+              - 'crates/moraine-conversations/Cargo.toml'
+              - 'crates/moraine-ingest-core/Cargo.toml'
+              - 'crates/moraine-mcp-core/Cargo.toml'
+              - 'crates/moraine-monitor-core/Cargo.toml'
+              - 'crates/moraine-conversations/benches/analytics_latency/support.rs'
+              - 'crates/moraine-conversations/tests/analytics_benchmark_support.rs'
+              - 'crates/moraine-conversations/tests/repository_integration/support/**'
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run benchmark protocol unittest discovery
+        run: |
+          python - <<'PY'
+          import unittest
+
+          suite = unittest.defaultTestLoader.discover(
+              "scripts/bench/tests", pattern="test_*.py"
+          )
+          count = suite.countTestCases()
+          print(f"Discovered {count} benchmark protocol unittest(s).")
+          if count == 0:
+              raise SystemExit("Benchmark protocol discovery selected zero tests.")
+          PY
+          python -m unittest discover -v -s scripts/bench/tests -p 'test_*.py'
+
+      - name: Run benchmark adapter unittest discovery
+        run: |
+          python - <<'PY'
+          import unittest
+
+          suite = unittest.defaultTestLoader.discover(
+              "scripts/bench", pattern="test_*.py"
+          )
+          count = suite.countTestCases()
+          print(f"Discovered {count} benchmark adapter unittest(s).")
+          if count == 0:
+              raise SystemExit("Benchmark adapter discovery selected zero tests.")
+          PY
+          python -m unittest discover -v -s scripts/bench -p 'test_*.py'
+
+      - name: Run sandbox live-wrapper unittest discovery
+        run: |
+          python - <<'PY'
+          import unittest
+
+          suite = unittest.defaultTestLoader.discover(
+              "scripts/dev/sandbox/tests", pattern="test_*.py"
+          )
+          count = suite.countTestCases()
+          print(f"Discovered {count} sandbox live-wrapper unittest(s).")
+          if count == 0:
+              raise SystemExit("Sandbox live-wrapper discovery selected zero tests.")
+          PY
+          python -m unittest discover -v -s scripts/dev/sandbox/tests -p 'test_*.py'
+
+      - name: Compile analytics latency benchmark
+        run: cargo bench -p moraine-conversations --bench analytics_latency --locked --no-run
+
+      - name: Compile metadata-derived package isolation set
+        if: github.event_name != 'pull_request' || steps.changes.outputs.package_isolation == 'true'
+        run: python docs/development/test-architecture/package_isolation.py --repo-root .
+
+      - name: Report package isolation not selected
+        if: github.event_name == 'pull_request' && steps.changes.outputs.package_isolation != 'true'
+        run: echo 'Package isolation not selected because no workspace manifest, dev-dependency, or shared support path changed.'
