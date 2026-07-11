@@ -1,0 +1,394 @@
+#!/usr/bin/env bash
+# Run one explicitly supported ignored live ClickHouse test in a fresh sandbox.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SANDBOX_CLI="${MORAINE_SANDBOX_CLI:-${SCRIPT_DIR}/moraine-sandbox}"
+DOCKER_BIN="${MORAINE_LIVE_TEST_DOCKER_BIN:-docker}"
+TRUSTED_TMP="${TMPDIR:-/tmp}"
+TRUSTED_TMP="${TRUSTED_TMP%/}"
+DIAGNOSTIC_ROOT="${MORAINE_LIVE_TEST_DIAGNOSTIC_ROOT:-${TRUSTED_TMP}/moraine-live-test-diagnostics}"
+OWNERSHIP_ROOT="${MORAINE_LIVE_TEST_ID_LOCK_ROOT:-${TRUSTED_TMP}/moraine-live-test-ownership}"
+TIMEOUT_SECONDS="${MORAINE_LIVE_TEST_TIMEOUT_SECONDS:-1800}"
+CLEANUP_TIMEOUT_SECONDS="${MORAINE_LIVE_TEST_CLEANUP_TIMEOUT_SECONDS:-120}"
+TERM_GRACE_SECONDS=2
+PROJECT_PREFIX="moraine-sandbox-"
+
+log() { printf '[run-live-test] %s\n' "$*" >&2; }
+die() { printf '[run-live-test] ERROR: %s\n' "$*" >&2; exit 2; }
+
+usage() {
+    cat >&2 <<'EOF'
+Usage: scripts/dev/sandbox/run-live-test <mode>
+
+Modes:
+  analytics-schema  Run live_schema_semantics_and_teardown exactly.
+  analytics-parity  Run live_monitor_repository_semantic_parity exactly.
+
+Each invocation creates and owns a fresh sandbox, enables destructive tests
+only for the in-container Cargo process, retains a diagnostic log, and tears
+down that exact sandbox. Set MORAINE_LIVE_TEST_TIMEOUT_SECONDS to change the
+1800-second timeout.
+EOF
+}
+
+[[ $# -eq 1 ]] || { usage; die "exactly one mode is required"; }
+case "$1" in
+    analytics-schema)
+        test_function="live_schema_semantics_and_teardown"
+        ;;
+    analytics-parity)
+        test_function="live_monitor_repository_semantic_parity"
+        ;;
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    *)
+        usage
+        die "unknown mode: $1"
+        ;;
+esac
+mode="$1"
+
+[[ "$TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || \
+    die "MORAINE_LIVE_TEST_TIMEOUT_SECONDS must be a positive integer"
+[[ "$CLEANUP_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || \
+    die "MORAINE_LIVE_TEST_CLEANUP_TIMEOUT_SECONDS must be a positive integer"
+[[ -x "$SANDBOX_CLI" ]] || die "sandbox CLI is not executable: ${SANDBOX_CLI}"
+command -v "$DOCKER_BIN" >/dev/null 2>&1 || die "required command not found: ${DOCKER_BIN}"
+
+umask 077
+
+private_root_is_safe() {
+    local root="$1"
+    local mode
+    [[ -d "$root" && ! -L "$root" && -O "$root" ]] || return 1
+    mode="$(stat -f '%Lp' "$root" 2>/dev/null || true)"
+    if [[ ! "$mode" =~ ^[0-7]{3,4}$ ]]; then
+        mode="$(stat -c '%a' "$root" 2>/dev/null || true)"
+    fi
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#$mode & 077) == 0 ))
+}
+
+private_ancestor_chain_is_safe() {
+    local parent="$1"
+    local trusted_real="$2"
+    local cursor="$parent"
+    while [[ "$cursor" != "$trusted_real" ]]; do
+        private_root_is_safe "$cursor" || return 1
+        cursor="$(dirname "$cursor")"
+    done
+}
+
+lexical_parent_has_no_symlink() {
+    local root="$1"
+    local trusted_tmp="${2%/}"
+    local relative parent_relative cursor component
+    case "$root" in
+        "${trusted_tmp}/"*) relative="${root#"${trusted_tmp}/"}" ;;
+        *) return 1 ;;
+    esac
+    [[ "$relative" != */../* && "$relative" != ../* && "$relative" != */.. ]] || return 1
+    parent_relative="$(dirname "$relative")"
+    [[ "$parent_relative" == "." ]] && return 0
+    cursor="$trusted_tmp"
+    local old_ifs="$IFS"
+    IFS='/'
+    set -- $parent_relative
+    IFS="$old_ifs"
+    for component in "$@"; do
+        [[ -n "$component" && "$component" != "." && "$component" != ".." ]] || return 1
+        cursor="${cursor}/${component}"
+        [[ ! -L "$cursor" ]] || return 1
+    done
+}
+
+ensure_private_root() {
+    local root="${1%/}"
+    local trusted_tmp="$TRUSTED_TMP"
+    local trusted_real parent_real
+
+    [[ -n "$root" && "$root" != "/" ]] || die "refusing unsafe temporary root: ${root}"
+    [[ -d "$trusted_tmp" ]] || die "trusted temporary directory is unavailable: ${trusted_tmp}"
+    lexical_parent_has_no_symlink "$root" "$trusted_tmp" || \
+        die "temporary root path traverses an untrusted symlink: ${root}"
+    trusted_real="$(cd -P "$trusted_tmp" && pwd)"
+    parent_real="$(cd -P "$(dirname "$root")" 2>/dev/null && pwd)" || \
+        die "temporary root parent does not exist: $(dirname "$root")"
+    case "${parent_real}/" in
+        "${trusted_real}/"|"${trusted_real}/"*) ;;
+        *) die "temporary root must be beneath trusted temp ${trusted_real}: ${root}" ;;
+    esac
+    private_ancestor_chain_is_safe "$parent_real" "$trusted_real" || \
+        die "temporary root parent is not private: ${root}"
+
+    if [[ -e "$root" || -L "$root" ]]; then
+        private_root_is_safe "$root" || \
+            die "refusing unsafe pre-created temporary root: ${root}"
+    else
+        if ! mkdir -m 700 "$root" 2>/dev/null; then
+            private_root_is_safe "$root" || \
+                die "could not create private temporary root: ${root}"
+        fi
+    fi
+}
+
+ensure_private_root "$DIAGNOSTIC_ROOT"
+ensure_private_root "$OWNERSHIP_ROOT"
+diagnostic_dir="$(mktemp -d "${DIAGNOSTIC_ROOT%/}/run.XXXXXX")"
+ownership_dir="$(mktemp -d "${OWNERSHIP_ROOT%/}/run.XXXXXX")"
+diagnostic_log="${diagnostic_dir}/run.log"
+ownership_record="${ownership_dir}/ownership"
+up_output_file="${diagnostic_dir}/up.out"
+: >"$diagnostic_log"
+: >"$up_output_file"
+
+sandbox_id="sb-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
+ownership_token="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+printf 'sandbox_id=%s\nownership_token=%s\n' "$sandbox_id" "$ownership_token" >"$ownership_record"
+export MORAINE_SANDBOX_OWNERSHIP_TOKEN="$ownership_token"
+
+owned_sandbox=0
+cleanup_attempted=0
+cleanup_rc=0
+primary_rc=0
+child_pid=""
+child_pgid=""
+timed_out=0
+deadline=$((SECONDS + TIMEOUT_SECONDS))
+
+append_diagnostic_header() {
+    {
+        printf 'mode=%s\n' "$mode"
+        printf 'sandbox_id=%s\n' "$sandbox_id"
+        printf 'container=%s%s\n' "$PROJECT_PREFIX" "$sandbox_id"
+        printf 'timeout_seconds=%s\n' "$TIMEOUT_SECONDS"
+        printf 'cleanup_timeout_seconds=%s\n' "$CLEANUP_TIMEOUT_SECONDS"
+        printf 'cargo_command=cargo test -p moraine-conversations --test live_clickhouse --locked %s -- --exact --ignored --nocapture\n' "$test_function"
+        printf 'sandbox_cleanup_redacted=scripts/dev/sandbox/moraine-sandbox down %s\n' "$sandbox_id"
+        printf 'database_cleanup=emitted by the live test with credentials redacted before its first mutation\n'
+    } >>"$diagnostic_log"
+}
+
+cleanup_owned_sandbox() {
+    local rc
+    local cleanup_deadline
+    (( cleanup_attempted == 0 )) || return 0
+    cleanup_attempted=1
+
+    if (( owned_sandbox == 0 )); then
+        rm -f "$ownership_record"
+        rmdir "$ownership_dir" 2>/dev/null || true
+        return 0
+    fi
+
+    log "tearing down owned sandbox ${sandbox_id}"
+    printf '[run-live-test] cleanup start: scripts/dev/sandbox/moraine-sandbox down %s (credentials redacted)\n' \
+        "$sandbox_id" >>"$diagnostic_log"
+    cleanup_deadline=$((SECONDS + CLEANUP_TIMEOUT_SECONDS))
+    set -m
+    "$SANDBOX_CLI" down "$sandbox_id" >>"$diagnostic_log" 2>&1 &
+    child_pid=$!
+    child_pgid=$child_pid
+    set +m
+    if ! wait_for_child_until "$cleanup_deadline"; then
+        rc=124
+        printf '[run-live-test] cleanup TIMEOUT after %s seconds; terminating teardown process group\n' \
+            "$CLEANUP_TIMEOUT_SECONDS" >>"$diagnostic_log"
+        log "ERROR: cleanup timed out for ${sandbox_id} after ${CLEANUP_TIMEOUT_SECONDS}s"
+        terminate_child_group
+    else
+        set +e
+        wait "$child_pid"
+        rc=$?
+        set -e
+        child_pid=""
+        child_pgid=""
+    fi
+    cleanup_rc=$rc
+    if (( rc == 0 )); then
+        printf '[run-live-test] cleanup complete: %s\n' "$sandbox_id" >>"$diagnostic_log"
+        rm -f "$ownership_record"
+        rmdir "$ownership_dir" 2>/dev/null || true
+    else
+        printf '[run-live-test] cleanup FAILED: sandbox=%s exit=%d; ownership evidence retained at %s\n' \
+            "$sandbox_id" "$rc" "$ownership_record" >>"$diagnostic_log"
+        log "ERROR: cleanup failed for ${sandbox_id} with exit ${rc}; ownership evidence retained"
+    fi
+}
+
+child_group_alive() {
+    [[ -n "$child_pgid" ]] && kill -0 "-${child_pgid}" 2>/dev/null
+}
+
+terminate_child_group() {
+    local grace_deadline
+    [[ -n "$child_pid" ]] || return 0
+
+    if child_group_alive; then
+        kill -TERM "-${child_pgid}" 2>/dev/null || true
+        grace_deadline=$((SECONDS + TERM_GRACE_SECONDS))
+        while child_group_alive && (( SECONDS < grace_deadline )); do
+            sleep 0.1
+        done
+        if child_group_alive; then
+            printf '[run-live-test] process group resisted TERM; sending KILL\n' >>"$diagnostic_log"
+            kill -KILL "-${child_pgid}" 2>/dev/null || true
+        fi
+    fi
+    set +e
+    wait "$child_pid" 2>/dev/null
+    set -e
+    child_pid=""
+    child_pgid=""
+}
+
+wait_for_child_until() {
+    local stop_at="$1"
+    while kill -0 "$child_pid" 2>/dev/null; do
+        if (( SECONDS >= stop_at )); then
+            return 124
+        fi
+        sleep 0.1
+    done
+    return 0
+}
+
+finish() {
+    local observed_rc=$?
+    local result
+    trap - EXIT INT TERM HUP
+
+    terminate_child_group
+    if (( primary_rc == 0 && observed_rc != 0 )); then
+        primary_rc=$observed_rc
+    fi
+    cleanup_owned_sandbox
+
+    result=$primary_rc
+    if (( cleanup_rc != 0 )); then
+        if (( result == 0 )); then
+            result=$cleanup_rc
+        else
+            log "ERROR: primary failure exit ${result}; cleanup also failed with exit ${cleanup_rc}"
+            printf '[run-live-test] primary failure exit=%d; cleanup failure exit=%d\n' \
+                "$result" "$cleanup_rc" >>"$diagnostic_log"
+        fi
+    fi
+
+    log "diagnostics retained at ${diagnostic_log}"
+    exit "$result"
+}
+
+handle_signal() {
+    local signal_name="$1"
+    local signal_rc="$2"
+    trap - INT TERM HUP
+    primary_rc=$signal_rc
+    printf '[run-live-test] caught signal %s; terminating test process\n' "$signal_name" \
+        >>"$diagnostic_log"
+    log "caught ${signal_name}; stopping ${sandbox_id}"
+    terminate_child_group
+    exit "$signal_rc"
+}
+
+trap finish EXIT
+trap 'handle_signal INT 130' INT
+trap 'handle_signal TERM 143' TERM
+trap 'handle_signal HUP 129' HUP
+
+owned_sandbox=1
+append_diagnostic_header
+log "reserved ownership token for ${sandbox_id}; diagnostics: ${diagnostic_log}"
+
+set -m
+"$SANDBOX_CLI" up --id "$sandbox_id" --quiet >"$up_output_file" 2>>"$diagnostic_log" &
+child_pid=$!
+child_pgid=$child_pid
+set +m
+if ! wait_for_child_until "$deadline"; then
+    timed_out=1
+    primary_rc=124
+    printf '[run-live-test] timeout after %s seconds during sandbox boot; terminating process group\n' \
+        "$TIMEOUT_SECONDS" >>"$diagnostic_log"
+    log "ERROR: ${mode} timed out after ${TIMEOUT_SECONDS}s during sandbox boot"
+    terminate_child_group
+    exit "$primary_rc"
+fi
+set +e
+wait "$child_pid"
+up_rc=$?
+set -e
+child_pid=""
+child_pgid=""
+up_output="$(<"$up_output_file")"
+rm -f "$up_output_file"
+if (( up_rc != 0 )); then
+    primary_rc=$up_rc
+    printf '[run-live-test] sandbox boot FAILED: sandbox=%s exit=%d\n' \
+        "$sandbox_id" "$up_rc" >>"$diagnostic_log"
+    log "ERROR: sandbox ${sandbox_id} failed to boot with exit ${up_rc}"
+    exit "$primary_rc"
+fi
+if [[ "$up_output" != "$sandbox_id" ]]; then
+    primary_rc=2
+    printf '[run-live-test] sandbox boot returned unexpected id: expected=%s actual=%q\n' \
+        "$sandbox_id" "$up_output" >>"$diagnostic_log"
+    log "ERROR: sandbox CLI returned an unexpected id; refusing to run Cargo"
+    exit "$primary_rc"
+fi
+log "booted owned sandbox ${sandbox_id}"
+
+container="${PROJECT_PREFIX}${sandbox_id}"
+printf '[run-live-test] cargo output follows\n' >>"$diagnostic_log"
+set +e
+set -m
+"$DOCKER_BIN" exec \
+    -i \
+    -u moraine \
+    -w /repo \
+    -e HOME=/home/moraine \
+    -e MORAINE_ALLOW_DESTRUCTIVE_TESTS=1 \
+    -e "MORAINE_LIVE_TEST_SANDBOX_ID=${sandbox_id}" \
+    -e MORAINE_BENCH_CLICKHOUSE_URL=http://clickhouse:8123 \
+    "$container" \
+    cargo test -p moraine-conversations \
+        --test live_clickhouse --locked \
+        "$test_function" -- \
+        --exact --ignored --nocapture \
+    >>"$diagnostic_log" 2>&1 &
+child_pid=$!
+child_pgid=$child_pid
+set +m
+set -e
+
+if ! wait_for_child_until "$deadline"; then
+    timed_out=1
+    primary_rc=124
+    printf '[run-live-test] timeout after %s seconds; terminating test process group\n' \
+        "$TIMEOUT_SECONDS" >>"$diagnostic_log"
+    log "ERROR: ${mode} timed out after ${TIMEOUT_SECONDS}s"
+    terminate_child_group
+    test_rc=124
+else
+    set +e
+    wait "$child_pid"
+    test_rc=$?
+    set -e
+    child_pid=""
+    child_pgid=""
+fi
+if (( timed_out == 0 )); then
+    primary_rc=$test_rc
+fi
+printf '[run-live-test] cargo exit=%d\n' "$primary_rc" >>"$diagnostic_log"
+
+if (( primary_rc != 0 )); then
+    log "ERROR: ${mode} failed with exit ${primary_rc}"
+else
+    log "${mode} passed"
+fi
+exit "$primary_rc"
