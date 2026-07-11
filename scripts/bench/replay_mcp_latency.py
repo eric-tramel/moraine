@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Optional, Sequence
 from urllib.error import HTTPError, URLError
@@ -31,6 +31,15 @@ SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 BENCHMARK_REPLAY_SOURCE = "benchmark-replay"
 QUERY_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 PROSE_TOOK_RE = re.compile(r"\((\d+)\s*ms\)")
+SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+ORACLE_SCHEMA_VERSION = "moraine-replay-mcp-oracle-v1"
+ORACLE_TOOLS = frozenset({"search", "search_conversations"})
+PROSE_CARDINALITY_RE = re.compile(
+    r"(?im)^\s*(?:hits|results|conversations|sessions):\s*(\d+)\b"
+)
+PROSE_FOUND_CARDINALITY_RE = re.compile(
+    r"(?im)^\s*found\s+(\d+)\s+(?:search\s+)?(?:hit|result|conversation|session)"
+)
 
 PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
     "smoke": {
@@ -56,6 +65,33 @@ class CorpusIdentity:
     cardinality: int
 
 
+@dataclass(frozen=True)
+class OracleExpectation:
+    semantic_digest: str
+    cardinality: int
+    marker: str
+
+
+@dataclass(frozen=True)
+class OracleManifest:
+    provenance: str
+    fingerprint: str
+    expectations: dict[tuple[str, str, str], OracleExpectation]
+
+
+@dataclass(frozen=True)
+class SemanticObservation:
+    semantic_digest: str
+    cardinality: int
+    semantic_strings: tuple[str, ...]
+
+class OracleError(RuntimeError):
+    pass
+
+
+
+
+
 @dataclass
 class ClickHouseSettings:
     url: str
@@ -77,6 +113,7 @@ class ReplaySpec:
     raw_query: str
     baseline_response_ms: float
     arguments: dict[str, Any]
+    oracles: dict[str, OracleExpectation]
 
 
 def positive_int(value: str) -> int:
@@ -175,6 +212,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--output-json", help="Atomically write the benchmark artifact to this path")
+    parser.add_argument(
+        "--oracle-manifest",
+        help=(
+            "Independent seed/query oracle manifest. Required for execution; "
+            "the measured MCP process never creates expected values."
+        ),
+    )
     parser.add_argument("--print-sql", action="store_true", help="Print selection SQL before execution")
     parser.add_argument("--dry-run", action="store_true", help="Select rows but skip replay")
 
@@ -584,6 +628,7 @@ def normalize_rows(raw_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
                     raw_query=query,
                     baseline_response_ms=baseline_response_ms,
                     arguments=arguments,
+                    oracles={},
                 )
             )
         except ValueError as exc:
@@ -640,6 +685,7 @@ def expand_replay_specs(
             raw_query=spec.raw_query,
             baseline_response_ms=spec.baseline_response_ms,
             arguments=dict(spec.arguments),
+            oracles=dict(spec.oracles),
         )
         expanded.append(base)
 
@@ -678,10 +724,113 @@ def expand_replay_specs(
                     raw_query=variant_query,
                     baseline_response_ms=spec.baseline_response_ms,
                     arguments=variant_args,
+                    oracles={},
                 )
             )
 
     return expanded
+
+
+def load_oracle_manifest(path: Path) -> OracleManifest:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("oracle manifest is not readable valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("oracle manifest root must be an object")
+    expected_root_fields = {"schema_version", "provenance", "cases"}
+    if set(payload) != expected_root_fields:
+        raise ValueError("oracle manifest must contain only schema_version, provenance, and cases")
+    if payload.get("schema_version") != ORACLE_SCHEMA_VERSION:
+        raise ValueError(f"oracle manifest schema_version must be {ORACLE_SCHEMA_VERSION}")
+    provenance = payload.get("provenance")
+    if not isinstance(provenance, str) or not provenance.strip():
+        raise ValueError("oracle manifest provenance must be a non-empty string")
+    cases = payload.get("cases")
+    if not isinstance(cases, list) or not cases:
+        raise ValueError("oracle manifest cases must be a non-empty array")
+
+    expectations: dict[tuple[str, str, str], OracleExpectation] = {}
+    expected_case_fields = {
+        "query_id",
+        "variant_label",
+        "tool",
+        "semantic_digest",
+        "cardinality",
+        "marker",
+    }
+    for index, case in enumerate(cases):
+        if not isinstance(case, dict) or set(case) != expected_case_fields:
+            raise ValueError(f"oracle manifest case {index} has an invalid shape")
+        query_id = case.get("query_id")
+        variant_label = case.get("variant_label")
+        tool = case.get("tool")
+        semantic_digest = case.get("semantic_digest")
+        cardinality = case.get("cardinality")
+        marker = case.get("marker")
+        if not isinstance(query_id, str) or not query_id:
+            raise ValueError(f"oracle manifest case {index} query_id must be non-empty")
+        if not isinstance(variant_label, str) or not variant_label:
+            raise ValueError(f"oracle manifest case {index} variant_label must be non-empty")
+        if tool not in ORACLE_TOOLS:
+            raise ValueError(f"oracle manifest case {index} tool is invalid")
+        if not isinstance(semantic_digest, str) or not SHA256_RE.fullmatch(semantic_digest):
+            raise ValueError(f"oracle manifest case {index} semantic_digest is invalid")
+        if isinstance(cardinality, bool) or not isinstance(cardinality, int) or cardinality <= 0:
+            raise ValueError(f"oracle manifest case {index} cardinality must be > 0")
+        if not isinstance(marker, str) or not marker:
+            raise ValueError(f"oracle manifest case {index} marker must be non-empty")
+        key = (query_id, variant_label, tool)
+        if key in expectations:
+            raise ValueError(f"oracle manifest has duplicate case {query_id}/{variant_label}/{tool}")
+        expectations[key] = OracleExpectation(
+            semantic_digest=semantic_digest,
+            cardinality=cardinality,
+            marker=marker,
+        )
+
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    return OracleManifest(
+        provenance=provenance.strip(),
+        fingerprint=f"sha256:{hashlib.sha256(encoded).hexdigest()}",
+        expectations=expectations,
+    )
+
+
+def bind_oracle_expectations(
+    specs: list[ReplaySpec], tools: list[str], manifest: OracleManifest
+) -> list[ReplaySpec]:
+    bound: list[ReplaySpec] = []
+    selected_keys: set[tuple[str, str, str]] = set()
+    for spec in specs:
+        oracles: dict[str, OracleExpectation] = {}
+        for tool in tools:
+            key = (spec.query_id, spec.variant_label, tool)
+            if key in selected_keys:
+                raise ValueError(
+                    f"selected workload has ambiguous oracle case "
+                    f"{spec.query_id}/{spec.variant_label}/{tool}"
+                )
+            selected_keys.add(key)
+            expectation = manifest.expectations.get(key)
+            if expectation is None:
+                raise ValueError(
+                    f"oracle manifest is missing case "
+                    f"{spec.query_id}/{spec.variant_label}/{tool}"
+                )
+            oracles[tool] = expectation
+        bound.append(replace(spec, oracles=oracles))
+    return bound
+
+
+def oracle_identity_slug(manifest: Optional[OracleManifest]) -> str:
+    if manifest is None:
+        return "missing"
+    provenance = re.sub(r"[^a-z0-9._-]+", "-", manifest.provenance.lower()).strip("-._")
+    provenance = provenance[:48] or "manifest"
+    return f"{provenance}-{manifest.fingerprint.removeprefix('sha256:')[:12]}"
 
 
 def workload_fingerprint(specs: list[ReplaySpec]) -> str:
@@ -693,6 +842,14 @@ def workload_fingerprint(specs: list[ReplaySpec]) -> str:
             "query": spec.raw_query,
             "variant": spec.variant_label,
             "arguments": spec.arguments,
+            "oracles": {
+                tool: {
+                    "semantic_digest": expectation.semantic_digest,
+                    "cardinality": expectation.cardinality,
+                    "marker": expectation.marker,
+                }
+                for tool, expectation in sorted(spec.oracles.items())
+            },
         }
         digest.update(
             json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -739,35 +896,77 @@ def _semantic_result_sequence(value: Any) -> Optional[list[Any]]:
     return None
 
 
-def oracle_fingerprint(tool_result: dict[str, Any]) -> str:
+def _semantic_strings(value: Any) -> tuple[str, ...]:
+    found: list[str] = []
+
+    def collect(item: Any) -> None:
+        if isinstance(item, str):
+            found.append(item)
+        elif isinstance(item, dict):
+            for child in item.values():
+                collect(child)
+        elif isinstance(item, list):
+            for child in item:
+                collect(child)
+
+    collect(value)
+    return tuple(found)
+
+
+def semantic_observation(tool_result: dict[str, Any]) -> SemanticObservation:
     structured = tool_result.get("structuredContent")
     if isinstance(structured, dict):
         if "error" in structured:
-            raise RuntimeError("tool response contains a semantic error")
+            raise OracleError("tool response contains a semantic error")
         results = _semantic_result_sequence(structured)
         if results is None:
-            raise RuntimeError("tool response has no semantic result sequence")
+            raise OracleError("tool response has no semantic result sequence")
         if not results:
-            raise RuntimeError("tool response has an empty semantic result")
+            raise OracleError("tool response has an empty semantic result")
+        cardinality = len(results)
         stable: Any = _stable_oracle_value(structured)
     else:
         content = tool_result.get("content")
         if not isinstance(content, list) or not content:
-            raise RuntimeError("tool response has no semantic result payload")
+            raise OracleError("tool response has no semantic result payload")
         text_items = [
             item.get("text")
             for item in content
             if isinstance(item, dict) and isinstance(item.get("text"), str)
         ]
         if not text_items:
-            raise RuntimeError("tool response has no semantic text payload")
+            raise OracleError("tool response has no semantic text payload")
         prose = "\n".join(text_items)
-        if re.search(r"(?im)^\s*(?:hits:\s*0\b|no (?:hits|results)\b)", prose):
-            raise RuntimeError("tool response has an empty semantic result")
+        cardinality_match = PROSE_CARDINALITY_RE.search(prose)
+        if cardinality_match is None:
+            cardinality_match = PROSE_FOUND_CARDINALITY_RE.search(prose)
+        if cardinality_match is None:
+            raise OracleError("tool response has no semantic cardinality")
+        cardinality = int(cardinality_match.group(1))
+        if cardinality <= 0:
+            raise OracleError("tool response has an empty semantic result")
         prose = re.sub(r"(?im)^\s*query id:\s*\S+\s*$", "Query ID: <id>", prose)
         stable = _stable_oracle_value(prose)
     encoded = json.dumps(stable, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return SemanticObservation(
+        semantic_digest=f"sha256:{hashlib.sha256(encoded).hexdigest()}",
+        cardinality=cardinality,
+        semantic_strings=_semantic_strings(stable),
+    )
+
+
+def oracle_fingerprint(tool_result: dict[str, Any]) -> str:
+    return semantic_observation(tool_result).semantic_digest
+
+
+def oracle_matches(
+    observation: SemanticObservation, expectation: OracleExpectation
+) -> bool:
+    return (
+        observation.semantic_digest == expectation.semantic_digest
+        and observation.cardinality == expectation.cardinality
+        and any(expectation.marker in value for value in observation.semantic_strings)
+    )
 
 
 def percentile(values: list[float], q: float) -> Optional[float]:
@@ -1008,7 +1207,7 @@ def call_tool(
     request_id: int,
     tool: str,
     arguments: dict[str, Any],
-) -> tuple[int, float, Optional[float], str]:
+) -> tuple[int, float, Optional[float], SemanticObservation]:
     payload = {
         "jsonrpc": "2.0",
         "id": request_id,
@@ -1025,10 +1224,10 @@ def call_tool(
     result = parse_rpc_ok(response, request_id)
 
     if bool(result.get("isError")):
-        raise RuntimeError("tool returned isError=true")
+        raise OracleError("tool returned isError=true")
 
     server_took_ms = parse_server_took_ms(result)
-    return request_id + 1, elapsed_ms, server_took_ms, oracle_fingerprint(result)
+    return request_id + 1, elapsed_ms, server_took_ms, semantic_observation(result)
 
 
 def choose_tools(tool_arg: str) -> list[str]:
@@ -1230,6 +1429,8 @@ def new_failure_counts() -> dict[str, int]:
 def failure_bucket(
     exc: BaseException, proc: Optional[subprocess.Popen[str]], phase: str
 ) -> str:
+    if isinstance(exc, OracleError):
+        return "oracle"
     if isinstance(exc, TimeoutError):
         return "timeout"
     if isinstance(exc, json.JSONDecodeError):
@@ -1300,6 +1501,11 @@ def run_target_persistent(
     warmup_decay_ms: list[float] = []
     attempted = 0
     planned = len(specs) * args.repeats
+    missing_oracles = sum(tool not in spec.oracles for spec in specs)
+    if missing_oracles:
+        failures["oracle"] += missing_oracles
+        return empty_target(args=args, tool=tool, failures=failures, planned=planned)
+
 
     proc: Optional[subprocess.Popen[str]] = None
     process_boot_ms: Optional[float] = None
@@ -1333,34 +1539,14 @@ def run_target_persistent(
         if args.post_init_wait_ms > 0:
             time.sleep(args.post_init_wait_ms / 1000.0)
 
-        expected_oracles: dict[int, str] = {}
-        for spec in specs:
-            oracle_args = build_tool_arguments(spec, tool=tool, verbosity=args.verbosity)
-            try:
-                next_request_id, _, _, expected = call_tool(
-                    proc,
-                    timeout_seconds=args.timeout_seconds,
-                    request_id=next_request_id,
-                    tool=tool,
-                    arguments=oracle_args,
-                )
-            except Exception as exc:
-                failures[failure_bucket(exc, proc, "oracle")] += 1
-                continue
-            expected_oracles[id(spec)] = expected
-
         for spec in specs:
             case_e2e: list[float] = []
             case_server_took: list[float] = []
             case_overhead: list[float] = []
             case_failures = 0
-            expected_oracle = expected_oracles.get(id(spec))
+            expected_oracle = spec.oracles[tool]
 
-            iterations = (
-                range(args.warmup + args.repeats)
-                if expected_oracle is not None
-                else ()
-            )
+            iterations = range(args.warmup + args.repeats)
             for idx in iterations:
                 measured = idx >= args.warmup
                 if measured:
@@ -1368,7 +1554,7 @@ def run_target_persistent(
                 tool_args = build_tool_arguments(spec, tool=tool, verbosity=args.verbosity)
 
                 try:
-                    next_request_id, e2e_ms, server_took_ms, oracle = call_tool(
+                    next_request_id, e2e_ms, server_took_ms, observation = call_tool(
                         proc,
                         timeout_seconds=args.timeout_seconds,
                         request_id=next_request_id,
@@ -1381,11 +1567,12 @@ def run_target_persistent(
                         case_failures += 1
                     continue
 
-                if not measured:
-                    continue
-                if oracle != expected_oracle:
+                if not oracle_matches(observation, expected_oracle):
                     failures["oracle"] += 1
-                    case_failures += 1
+                    if measured:
+                        case_failures += 1
+                    continue
+                if not measured:
                     continue
 
                 overhead_ms = (
@@ -1473,51 +1660,6 @@ def run_target_persistent(
     }
 
 
-def derive_cold_process_oracle(
-    *,
-    args: argparse.Namespace,
-    config_path: Path,
-    tool: str,
-    spec: ReplaySpec,
-    failures: dict[str, int],
-) -> Optional[str]:
-    proc: Optional[subprocess.Popen[str]] = None
-    try:
-        try:
-            proc = start_mcp_process(args.moraine_bin, config_path)
-        except Exception:
-            failures["spawn"] += 1
-            return None
-        try:
-            next_request_id, _ = initialize_mcp(
-                proc,
-                timeout_seconds=args.timeout_seconds,
-                request_id=1,
-            )
-        except Exception as exc:
-            failures[failure_bucket(exc, proc, "initialize")] += 1
-            return None
-        if args.post_init_wait_ms > 0:
-            time.sleep(args.post_init_wait_ms / 1000.0)
-        try:
-            _, _, _, expected = call_tool(
-                proc,
-                timeout_seconds=args.timeout_seconds,
-                request_id=next_request_id,
-                tool=tool,
-                arguments=build_tool_arguments(
-                    spec,
-                    tool=tool,
-                    verbosity=args.verbosity,
-                ),
-            )
-        except Exception as exc:
-            failures[failure_bucket(exc, proc, "oracle")] += 1
-            return None
-        return expected
-    finally:
-        if stop_mcp_process(proc):
-            failures["cleanup"] += 1
 
 
 def run_target_cold_process(
@@ -1534,6 +1676,11 @@ def run_target_cold_process(
     warmup_decay_ms: list[float] = []
     attempted = 0
     planned = len(specs) * args.repeats
+    missing_oracles = sum(tool not in spec.oracles for spec in specs)
+    if missing_oracles:
+        failures["oracle"] += missing_oracles
+        return empty_target(args=args, tool=tool, failures=failures, planned=planned)
+
 
     for spec in specs:
         case_e2e: list[float] = []
@@ -1543,19 +1690,9 @@ def run_target_cold_process(
         case_overhead: list[float] = []
         case_cold_total: list[float] = []
         case_failures = 0
-        expected_oracle = derive_cold_process_oracle(
-            args=args,
-            config_path=config_path,
-            tool=tool,
-            spec=spec,
-            failures=failures,
-        )
+        expected_oracle = spec.oracles[tool]
 
-        iterations = (
-            range(args.warmup + args.repeats)
-            if expected_oracle is not None
-            else ()
-        )
+        iterations = range(args.warmup + args.repeats)
         for idx in iterations:
             measured = idx >= args.warmup
             if measured:
@@ -1590,7 +1727,7 @@ def run_target_cold_process(
 
                 tool_args = build_tool_arguments(spec, tool=tool, verbosity=args.verbosity)
                 try:
-                    next_request_id, e2e_ms, server_took_ms, oracle = call_tool(
+                    next_request_id, e2e_ms, server_took_ms, observation = call_tool(
                         proc,
                         timeout_seconds=args.timeout_seconds,
                         request_id=next_request_id,
@@ -1603,11 +1740,12 @@ def run_target_cold_process(
                         case_failures += 1
                     continue
 
-                if not measured:
-                    continue
-                if oracle != expected_oracle:
+                if not oracle_matches(observation, expected_oracle):
                     failures["oracle"] += 1
-                    case_failures += 1
+                    if measured:
+                        case_failures += 1
+                    continue
+                if not measured:
                     continue
 
                 overhead_ms = (
@@ -1710,9 +1848,16 @@ def build_output_json(
     corpus_identity: CorpusIdentity,
     targets: list[dict[str, Any]],
     dry_run: bool,
+    oracle_manifest: Optional[OracleManifest] = None,
 ) -> dict[str, Any]:
     commit, dirty, git_available = git_metadata()
     workload_digest = workload_fingerprint(replay_specs)
+    oracle_identity = oracle_identity_slug(oracle_manifest)
+    oracle_token = (
+        oracle_manifest.fingerprint.removeprefix("sha256:")[:12]
+        if oracle_manifest is not None
+        else "missing"
+    )
     configured_tools = choose_tools(args.tool)
     planned = (
         sum(int(target["planned"]) for target in targets)
@@ -1748,6 +1893,8 @@ def build_output_json(
     diagnostic_codes.update(
         failure_diagnostics[name] for name, count in failure_totals.items() if count
     )
+    if oracle_manifest is None and not dry_run:
+        diagnostic_codes.add("semantic-oracle-missing")
     if attempted < planned or successful < planned:
         diagnostic_codes.add("insufficient-samples")
     if dry_run:
@@ -1757,6 +1904,7 @@ def build_output_json(
 
     semantic_pass = (
         not dry_run
+        and oracle_manifest is not None
         and planned == attempted == successful
         and errors == 0
         and not any(failure_totals.values())
@@ -1773,7 +1921,8 @@ def build_output_json(
         "scenario_id": (
             f"{args.profile}.{args.mode}.{args.tool}.{args.verbosity}."
             f"{args.query_variant_mode}.n{args.top_n}.w{args.warmup}."
-            f"r{args.repeats}.wait{args.post_init_wait_ms}.q{workload_digest[:12]}"
+            f"r{args.repeats}.wait{args.post_init_wait_ms}.q{workload_digest[:12]}."
+            f"o{oracle_token}"
         ),
         "source": {"git_commit": commit, "dirty": dirty},
         "build": {"profile": args.build_profile, "target": safe_target[:128]},
@@ -1783,7 +1932,9 @@ def build_output_json(
         },
         "scenario": {
             "profile": args.profile,
-            "workload_id": f"search-query-log-replay.{args.tool}",
+            "workload_id": (
+                f"search-query-log-replay.{args.tool}.oracle-{oracle_identity}"
+            ),
             "measured_boundary": "mcp-json-rpc-stdio-tool-call",
             "dimensions": {
                 "dataset_backed": True,
@@ -1811,7 +1962,11 @@ def build_output_json(
         "timing": {"status": "not_evaluated", "non_blocking": True},
         "metrics": {
             "quality": {
-                "oracle_status": "pass" if failure_totals["oracle"] == 0 else "fail",
+                "oracle_status": (
+                    "pass"
+                    if oracle_manifest is not None and failure_totals["oracle"] == 0
+                    else "fail"
+                ),
                 "passed_checks": successful,
                 "failed_checks": errors,
                 "expected_count": planned,
@@ -2018,6 +2173,42 @@ def main() -> int:
         return 2
 
     tools = choose_tools(args.tool)
+    oracle_manifest: Optional[OracleManifest] = None
+    try:
+        if not args.oracle_manifest:
+            raise ValueError("--oracle-manifest is required for benchmark execution")
+        oracle_manifest = load_oracle_manifest(
+            Path(args.oracle_manifest).expanduser().resolve()
+        )
+        replayable_rows = bind_oracle_expectations(
+            replayable_rows, tools, oracle_manifest
+        )
+    except ValueError as exc:
+        print(f"fatal: {exc}", file=sys.stderr)
+        targets = []
+        for tool in tools:
+            failures = new_failure_counts()
+            failures["oracle"] = max(1, len(replayable_rows))
+            targets.append(
+                empty_target(
+                    args=args,
+                    tool=tool,
+                    failures=failures,
+                    planned=len(replayable_rows) * args.repeats,
+                )
+            )
+        payload = build_output_json(
+            args=args,
+            replay_specs=replayable_rows,
+            corpus_identity=corpus_identity,
+            targets=targets,
+            dry_run=False,
+            oracle_manifest=oracle_manifest,
+        )
+        if not emit_output(args, payload, build_diagnostics_json(args, targets)):
+            return 2
+        return 2
+
     targets: list[dict[str, Any]] = []
 
     for tool in tools:
@@ -2037,6 +2228,7 @@ def main() -> int:
         corpus_identity=corpus_identity,
         targets=targets,
         dry_run=False,
+        oracle_manifest=oracle_manifest,
     )
     if not emit_output(args, payload, build_diagnostics_json(args, targets)):
         return 2
