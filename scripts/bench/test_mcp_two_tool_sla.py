@@ -30,6 +30,30 @@ CORPUS_IDENTITY = {
     "content_xor": "101",
     "content_sum": "202",
 }
+SEARCH_ORACLE = {
+    "schema_version": "moraine-mcp-two-tool-oracle-v1",
+    "queries": [
+        {
+            "query": "raw secret query",
+            "expected": {
+                "result_count": 1,
+                "open_ids": {
+                    "event": "evt-1",
+                    "turn": "turn-1",
+                    "session": "session-1",
+                },
+            },
+        }
+    ],
+}
+LIST_ORACLE = {
+    **SEARCH_ORACLE,
+    "list_sessions": {
+        "result_count": 1,
+        "session_ids": ["seed-session"],
+        "result_marker": {"title": "seed marker"},
+    },
+}
 
 
 def sample(*, met_sla: bool = True, structured: dict[str, object] | None = None) -> dict[str, object]:
@@ -76,6 +100,27 @@ def open_sample(
                 "kind": kind,
                 kind: {"id": returned_id},
             },
+        },
+    }
+
+
+def list_sample(*, session_id: str = "seed-session", title: str = "seed marker") -> dict[str, object]:
+    return {
+        "tool": "list_sessions",
+        "arguments": {"limit": 20},
+        "e2e_ms": 2.75,
+        "server_elapsed_ms": 1.75,
+        "sla_target_ms": 500.0,
+        "met_sla": True,
+        "structured": {
+            "data": {
+                "sessions": [
+                    {
+                        "title": title,
+                        "open": {"session_id": session_id},
+                    }
+                ]
+            }
         },
     }
 
@@ -266,6 +311,8 @@ class MainTests(unittest.TestCase):
         repeats: int = 1,
         warmup: int = 0,
         corpus_identity: dict[str, object] = CORPUS_IDENTITY,
+        oracle: dict[str, object] | None = SEARCH_ORACLE,
+        skip_list: bool = True,
     ) -> int:
         fake_proc = SimpleNamespace()
         self.start_mcp = mock.Mock(return_value=fake_proc)
@@ -274,7 +321,10 @@ class MainTests(unittest.TestCase):
             if method == "initialize":
                 return {}
             if method == "tools/list":
-                return {"tools": [{"name": "search_sessions"}, {"name": "open"}]}
+                names = ["search_sessions", "open"]
+                if not skip_list:
+                    names.append("list_sessions")
+                return {"tools": [{"name": name} for name in names]}
             raise AssertionError(method)
 
         argv = [
@@ -284,7 +334,6 @@ class MainTests(unittest.TestCase):
             "smoke",
             "--query",
             "raw secret query",
-            "--skip-list-sessions",
             "--open-kind",
             open_kind,
             "--min-docs",
@@ -299,16 +348,31 @@ class MainTests(unittest.TestCase):
             "--output-json",
             str(output),
         ]
+        if skip_list:
+            argv.append("--skip-list-sessions")
+        if oracle is not None:
+            oracle_path = output.with_name("query-oracle.json")
+            oracle_path.write_text(json.dumps(oracle), encoding="utf-8")
+            argv.extend(["--oracle-json", str(oracle_path)])
         if isinstance(measured_side_effect, BaseException):
             measured_call = mock.Mock(side_effect=measured_side_effect)
         elif isinstance(measured_side_effect, list):
             measured_call = mock.Mock(side_effect=measured_side_effect)
         else:
             measured_call = mock.Mock(return_value=measured_side_effect)
+        self.measured_call = measured_call
         with (
             mock.patch.object(bench, "read_clickhouse_config", return_value={}),
             mock.patch.object(bench, "corpus_counts", return_value=COUNTS),
             mock.patch.object(bench, "search_corpus_identity", return_value=corpus_identity),
+            mock.patch.object(
+                bench,
+                "corpus_session_window",
+                return_value={
+                    "start_datetime": "2026-01-01T00:00:00.000Z",
+                    "end_datetime": "2026-01-02T00:00:00.000Z",
+                },
+            ),
             mock.patch.object(bench, "select_log_queries", return_value=[]),
             mock.patch.object(bench, "resolve_service_bin_dir", return_value=None),
             mock.patch.object(bench, "start_mcp", self.start_mcp),
@@ -357,27 +421,37 @@ class MainTests(unittest.TestCase):
             self.assertEqual(payload["semantic"]["status"], "fail")
             self.assertIn({"code": "tool-call-error"}, payload["diagnostics"])
 
-    def test_missing_open_oracle_fails_and_exposes_insufficient_sample(self) -> None:
+    def test_missing_search_hit_fails_semantics_but_opens_seed_entity(self) -> None:
         search_without_hits = sample(structured={"data": {"results": []}})
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "result.json"
-            result = self.run_main(output, (2, search_without_hits), open_kind="event")
+            result = self.run_main(
+                output,
+                [(2, search_without_hits), (3, open_sample())],
+                open_kind="event",
+            )
             self.assertEqual(result, 1)
             payload = json.loads(output.read_text(encoding="utf-8"))
             benchmark_protocol.validate_artifact(payload)
+            self.assertEqual(payload["samples"]["successful"], 2)
+            self.assertEqual(payload["samples"]["errors"], 0)
             self.assertEqual(payload["metrics"]["quality"]["mismatches"], 1)
-            self.assertIn({"code": "missing-open-id"}, payload["diagnostics"])
-            self.assertIn({"code": "insufficient-samples"}, payload["diagnostics"])
+            self.assertIn({"code": "search-oracle-mismatch"}, payload["diagnostics"])
+            open_calls = [
+                call
+                for call in self.measured_call.call_args_list
+                if call.args[3] == "open"
+            ]
+            self.assertEqual(open_calls[0].args[4], {"id": "evt-1"})
 
-    def test_unstable_search_oracle_fails_even_when_every_call_succeeds(self) -> None:
-        first = sample()
-        second = sample(
+    def test_repeatable_wrong_search_ids_fail_independent_oracle(self) -> None:
+        wrong = sample(
             structured={
                 "data": {
                     "results": [
                         {
                             "open": {
-                                "event_id": "evt-2",
+                                "event_id": "evt-wrong",
                                 "turn_id": "turn-1",
                                 "session_id": "session-1",
                             }
@@ -386,13 +460,11 @@ class MainTests(unittest.TestCase):
                 }
             }
         )
-        first_open = open_sample(returned_id="evt-1")
-        second_open = open_sample(returned_id="evt-2")
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "result.json"
             result = self.run_main(
                 output,
-                [(2, first), (3, first_open), (4, second), (5, second_open)],
+                [(2, wrong), (3, open_sample()), (4, wrong), (5, open_sample())],
                 open_kind="event",
                 repeats=2,
             )
@@ -401,8 +473,58 @@ class MainTests(unittest.TestCase):
             benchmark_protocol.validate_artifact(payload)
             self.assertEqual(payload["samples"]["successful"], 4)
             self.assertEqual(payload["samples"]["errors"], 0)
+            self.assertEqual(payload["metrics"]["quality"]["mismatches"], 2)
+            self.assertIn({"code": "search-oracle-mismatch"}, payload["diagnostics"])
+            self.assertNotIn({"code": "oracle-instability"}, payload["diagnostics"])
+            open_calls = [
+                call
+                for call in self.measured_call.call_args_list
+                if call.args[3] == "open"
+            ]
+            self.assertEqual([call.args[4] for call in open_calls], [{"id": "evt-1"}] * 2)
+
+    def test_repeatable_wrong_list_results_fail_independent_oracle(self) -> None:
+        wrong_list = list_sample(session_id="wrong-session", title="wrong marker")
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "result.json"
+            result = self.run_main(
+                output,
+                [(2, sample()), (3, sample()), (4, wrong_list), (5, wrong_list)],
+                oracle=LIST_ORACLE,
+                skip_list=False,
+                repeats=2,
+            )
+
+            self.assertEqual(result, 1)
+            payload = benchmark_protocol.load_artifact(output)
+            self.assertEqual(payload["samples"]["planned"], 4)
+            self.assertEqual(payload["samples"]["successful"], 4)
+            self.assertEqual(payload["samples"]["errors"], 0)
+            self.assertEqual(payload["metrics"]["quality"]["mismatches"], 2)
+            self.assertIn({"code": "list-oracle-mismatch"}, payload["diagnostics"])
+            self.assertNotIn({"code": "oracle-instability"}, payload["diagnostics"])
+
+    def test_missing_list_oracle_fails_closed_with_valid_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "result.json"
+            result = self.run_main(
+                output,
+                (2, sample()),
+                oracle=SEARCH_ORACLE,
+                skip_list=False,
+            )
+
+            self.assertEqual(result, 1)
+            self.start_mcp.assert_not_called()
+            self.measured_call.assert_not_called()
+            payload = benchmark_protocol.load_artifact(output)
+            self.assertEqual(payload["samples"]["planned"], 2)
+            self.assertEqual(payload["samples"]["attempted"], 0)
+            self.assertEqual(payload["samples"]["successful"], 0)
+            self.assertEqual(payload["samples"]["errors"], 0)
+            self.assertEqual(payload["semantic"]["status"], "fail")
             self.assertEqual(payload["metrics"]["quality"]["mismatches"], 1)
-            self.assertIn({"code": "oracle-instability"}, payload["diagnostics"])
+            self.assertIn({"code": "missing-list-oracle"}, payload["diagnostics"])
 
     def test_wrong_open_entity_or_kind_is_a_failed_attempt(self) -> None:
         wrong_responses = [
@@ -482,6 +604,33 @@ class MainTests(unittest.TestCase):
             self.assertEqual(payload["semantic"]["status"], "fail")
             self.assertEqual(payload["scenario"]["fingerprints"]["cache_state"], "mixed")
             self.assertIn({"code": "warmup-error"}, payload["diagnostics"])
+
+    def test_missing_oracle_fails_closed_with_valid_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "result.json"
+            result = self.run_main(output, (2, sample()), oracle=None)
+
+            self.assertEqual(result, 1)
+            self.start_mcp.assert_not_called()
+            self.measured_call.assert_not_called()
+            payload = benchmark_protocol.load_artifact(output)
+            self.assertEqual(
+                payload["samples"],
+                {
+                    "planned": 1,
+                    "attempted": 0,
+                    "successful": 0,
+                    "errors": 0,
+                    "measurements": {
+                        "latency_ms": [],
+                        "server_elapsed_ms": [],
+                        "sla_target_ms": [],
+                    },
+                },
+            )
+            self.assertEqual(payload["semantic"]["status"], "fail")
+            self.assertEqual(payload["metrics"]["quality"]["mismatches"], 1)
+            self.assertIn({"code": "missing-search-oracle"}, payload["diagnostics"])
 
     def test_missing_config_and_corpus_threshold_fail_before_live_process(self) -> None:
         missing = bench.main(["--config", "/definitely/missing/config.toml", "--dry-run"])
