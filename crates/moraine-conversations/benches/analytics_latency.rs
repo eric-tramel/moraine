@@ -574,22 +574,36 @@ async fn execute() -> Result<()> {
         .build()
         .context("failed to construct monitor HTTP client")?;
     let dataset = load_dataset_identity(&config).await?;
-    let (mut reports, dataset_manifest_verified) =
-        match DatasetManifest::load(&config.dataset_manifest).and_then(|manifest| {
-            dataset.verify_manifest(&manifest)?;
-            Ok(manifest)
-        }) {
-            Ok(manifest) => (
-                run_matrix(
-                    &config,
-                    &client,
-                    &manifest,
-                    cli.profile.warmups(),
-                    cli.profile.samples(),
-                )
-                .await?,
-                true,
-            ),
+    let (mut reports, dataset_manifest_verified, oracle_contract_fingerprint) =
+        match DatasetManifest::load(&config.dataset_manifest) {
+            Ok(manifest) => {
+                let oracle_contract_fingerprint = Some(manifest.oracle_contract_fingerprint()?);
+                match dataset.verify_manifest(&manifest) {
+                    Ok(()) => (
+                        run_matrix(
+                            &config,
+                            &client,
+                            &manifest,
+                            cli.profile.warmups(),
+                            cli.profile.samples(),
+                        )
+                        .await?,
+                        true,
+                        oracle_contract_fingerprint,
+                    ),
+                    Err(error) => {
+                        eprintln!("analytics_latency dataset verification failed: {error:#}");
+                        (
+                            MatrixReports::setup_failure(
+                                cli.profile.samples(),
+                                "dataset-manifest-verification-error",
+                            )?,
+                            false,
+                            oracle_contract_fingerprint,
+                        )
+                    }
+                }
+            }
             Err(error) => {
                 eprintln!("analytics_latency dataset verification failed: {error:#}");
                 (
@@ -598,6 +612,7 @@ async fn execute() -> Result<()> {
                         "dataset-manifest-verification-error",
                     )?,
                     false,
+                    None,
                 )
             }
         };
@@ -751,6 +766,7 @@ async fn execute() -> Result<()> {
         passed_checks,
         failed_checks,
         dataset_fingerprint: dataset.fingerprint,
+        oracle_contract_fingerprint,
         dataset_cardinality: dataset.cardinality,
         diagnostics,
         artifacts: vec![json!({

@@ -359,15 +359,20 @@ impl DatasetIdentity {
     }
 }
 
-fn validate_dataset_identity(fingerprint: &str, cardinality: usize) -> Result<()> {
+fn validate_sha256_fingerprint(fingerprint: &str, label: &str) -> Result<()> {
     if !fingerprint.starts_with("sha256:")
         || fingerprint.len() != 71
         || !fingerprint[7..]
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
-        bail!("dataset fingerprint must be sha256:<64 lowercase hex digits>");
+        bail!("{label} must be sha256:<64 lowercase hex digits>");
     }
+    Ok(())
+}
+
+fn validate_dataset_identity(fingerprint: &str, cardinality: usize) -> Result<()> {
+    validate_sha256_fingerprint(fingerprint, "dataset fingerprint")?;
     if cardinality == 0 {
         bail!("dataset manifest must identify at least one seeded row");
     }
@@ -405,6 +410,16 @@ impl DatasetManifest {
         label: &str,
     ) -> Result<()> {
         verify_expected_semantics(self.expected(scenario)?, observed, label)
+    }
+
+    pub fn oracle_contract_fingerprint(&self) -> Result<String> {
+        self.validate()?;
+        let canonical = serde_json::to_vec(self)
+            .context("failed to canonicalize validated dataset manifest")?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"moraine-analytics-oracle-contract-v1\0");
+        hasher.update(canonical);
+        Ok(format!("sha256:{:x}", hasher.finalize()))
     }
 
     fn validate(&self) -> Result<()> {
@@ -677,6 +692,7 @@ pub struct ProtocolReportInput {
     pub passed_checks: usize,
     pub failed_checks: usize,
     pub dataset_fingerprint: String,
+    pub oracle_contract_fingerprint: Option<String>,
     pub dataset_cardinality: usize,
     pub diagnostics: Vec<Value>,
     pub artifacts: Vec<Value>,
@@ -713,14 +729,17 @@ pub fn build_protocol_report(input: ProtocolReportInput) -> Result<Value> {
             bail!("measurement {name:?} contains an invalid sample");
         }
     }
-    if !input.dataset_fingerprint.starts_with("sha256:")
-        || input.dataset_fingerprint.len() != 71
-        || !input.dataset_fingerprint[7..]
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        bail!("dataset fingerprint must be sha256:<64 lowercase hex digits>");
-    }
+    validate_sha256_fingerprint(&input.dataset_fingerprint, "dataset fingerprint")?;
+    let oracle_identity = match input.oracle_contract_fingerprint.as_deref() {
+        Some(fingerprint) => {
+            validate_sha256_fingerprint(fingerprint, "oracle contract fingerprint")?;
+            fingerprint
+                .strip_prefix("sha256:")
+                .expect("validated sha256 fingerprint has prefix")
+        }
+        None => "unavailable",
+    };
+    let workload_id = format!("analytics-24h_sessions-30d50.oracle-{oracle_identity}");
     Ok(json!({
         "schema_version": SCHEMA_VERSION,
         "benchmark_id": "analytics-latency",
@@ -736,7 +755,7 @@ pub fn build_protocol_report(input: ProtocolReportInput) -> Result<Value> {
         },
         "scenario": {
             "profile": input.profile.name(),
-            "workload_id": "analytics-24h_sessions-30d50",
+            "workload_id": workload_id,
             "measured_boundary": "monitor-http-and-direct-repository",
             "dimensions": {
                 "dataset_backed": true,
@@ -1010,6 +1029,55 @@ mod tests {
     }
 
     #[test]
+    fn manifest_oracle_fingerprint_is_deterministic_and_semantics_sensitive() {
+        let manifest = seed_manifest(DatasetIdentity::from_serialized_rows([b"owned-seed-row"]));
+        let baseline = manifest.oracle_contract_fingerprint().unwrap();
+
+        let mut reordered = manifest.clone();
+        let analytics = reordered
+            .expected_semantics
+            .remove(ANALYTICS_24H_SCENARIO)
+            .unwrap();
+        let sessions = reordered
+            .expected_semantics
+            .remove(SESSIONS_30D50_SCENARIO)
+            .unwrap();
+        reordered
+            .expected_semantics
+            .insert(SESSIONS_30D50_SCENARIO.to_string(), sessions);
+        reordered
+            .expected_semantics
+            .insert(ANALYTICS_24H_SCENARIO.to_string(), analytics);
+        assert_eq!(baseline, reordered.oracle_contract_fingerprint().unwrap());
+
+        let mut cardinality_changed = manifest.clone();
+        match &mut cardinality_changed
+            .expected_semantics
+            .get_mut(ANALYTICS_24H_SCENARIO)
+            .unwrap()
+            .cardinality
+        {
+            Cardinality::AnalyticsSeries { tokens, .. } => *tokens += 1,
+            Cardinality::Sessions { .. } => panic!("analytics scenario changed cardinality kind"),
+        }
+        assert_ne!(
+            baseline,
+            cardinality_changed.oracle_contract_fingerprint().unwrap()
+        );
+
+        let mut digest_changed = manifest;
+        digest_changed
+            .expected_semantics
+            .get_mut(SESSIONS_30D50_SCENARIO)
+            .unwrap()
+            .digest = "fnv1a64:0000000000000000".to_string();
+        assert_ne!(
+            baseline,
+            digest_changed.oracle_contract_fingerprint().unwrap()
+        );
+    }
+
+    #[test]
     fn timing_comparison_is_diagnostic_without_a_threshold() {
         let comparison = timing_comparison(10.0, 25.0).unwrap();
         assert_close(comparison.repository_minus_monitor_ms, 15.0);
@@ -1037,6 +1105,7 @@ mod tests {
             passed_checks: 3,
             failed_checks: 0,
             dataset_fingerprint: format!("sha256:{}", "b".repeat(64)),
+            oracle_contract_fingerprint: Some(format!("sha256:{}", "c".repeat(64))),
             dataset_cardinality: 7,
             diagnostics: vec![json!({"code": "timing-not-evaluated"})],
             artifacts: Vec::new(),
@@ -1052,7 +1121,93 @@ mod tests {
         assert_eq!(report["semantic"]["status"], "pass");
         assert_eq!(report["timing"]["status"], "not_evaluated");
         assert_eq!(report["timing"]["non_blocking"], true);
+        assert_eq!(
+            report["scenario"]["workload_id"],
+            format!("analytics-24h_sessions-30d50.oracle-{}", "c".repeat(64))
+        );
         assert!(report["timing"].get("comparison_policy").is_none());
+    }
+
+    #[test]
+    fn changed_manifest_oracles_produce_incomparable_artifacts() {
+        let dataset = DatasetIdentity::from_serialized_rows([b"owned-seed-row"]);
+        let baseline_manifest = seed_manifest(dataset.clone());
+        let mut cardinality_changed = baseline_manifest.clone();
+        match &mut cardinality_changed
+            .expected_semantics
+            .get_mut(ANALYTICS_24H_SCENARIO)
+            .unwrap()
+            .cardinality
+        {
+            Cardinality::AnalyticsSeries { turns, .. } => *turns += 1,
+            Cardinality::Sessions { .. } => panic!("analytics scenario changed cardinality kind"),
+        }
+        let mut digest_changed = baseline_manifest.clone();
+        digest_changed
+            .expected_semantics
+            .get_mut(SESSIONS_30D50_SCENARIO)
+            .unwrap()
+            .digest = "fnv1a64:1111111111111111".to_string();
+
+        let mut baseline_input = protocol_input();
+        baseline_input.dataset_fingerprint = dataset.fingerprint.clone();
+        baseline_input.dataset_cardinality = dataset.cardinality;
+        baseline_input.oracle_contract_fingerprint =
+            Some(baseline_manifest.oracle_contract_fingerprint().unwrap());
+        let baseline_artifact = build_protocol_report(baseline_input).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "moraine-benchmark-oracle-comparability-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let baseline_path = root.join("baseline.json");
+        write_json_atomic(&baseline_path, &baseline_artifact).unwrap();
+        let protocol =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/bench/benchmark_protocol.py");
+
+        for (label, candidate_manifest) in [
+            ("cardinality", cardinality_changed),
+            ("digest", digest_changed),
+        ] {
+            let mut candidate_input = protocol_input();
+            candidate_input.dataset_fingerprint = dataset.fingerprint.clone();
+            candidate_input.dataset_cardinality = dataset.cardinality;
+            candidate_input.oracle_contract_fingerprint =
+                Some(candidate_manifest.oracle_contract_fingerprint().unwrap());
+            let candidate_artifact = build_protocol_report(candidate_input).unwrap();
+            assert_eq!(
+                baseline_artifact["scenario"]["fingerprints"]["dataset"],
+                candidate_artifact["scenario"]["fingerprints"]["dataset"]
+            );
+            assert_ne!(
+                baseline_artifact["scenario"]["workload_id"],
+                candidate_artifact["scenario"]["workload_id"]
+            );
+            let candidate_path = root.join(format!("{label}.json"));
+            write_json_atomic(&candidate_path, &candidate_artifact).unwrap();
+            let comparison = Command::new("python3")
+                .arg(&protocol)
+                .arg("compare")
+                .arg(&baseline_path)
+                .arg(&candidate_path)
+                .output()
+                .unwrap();
+            assert_eq!(
+                comparison.status.code(),
+                Some(2),
+                "comparison stderr: {}",
+                String::from_utf8_lossy(&comparison.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&comparison.stderr).contains("scenario.workload_id"),
+                "comparison stderr: {}",
+                String::from_utf8_lossy(&comparison.stderr)
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1115,6 +1270,10 @@ mod tests {
         assert_eq!(artifact["semantic"]["status"], "fail");
         assert_eq!(artifact["timing"]["status"], "not_evaluated");
         assert_eq!(artifact["timing"]["non_blocking"], true);
+        assert_eq!(
+            artifact["scenario"]["workload_id"],
+            format!("analytics-24h_sessions-30d50.oracle-{}", "c".repeat(64))
+        );
         let root = std::env::temp_dir().join(format!(
             "moraine-benchmark-failure-artifact-{}-{}",
             std::process::id(),
