@@ -36,8 +36,8 @@
             }
           ],
           "phase": "cold",
-          "started_at_utc": "2026-07-11T14:06:22.354Z",
-          "wall_time_seconds": 20.071608
+          "started_at_utc": "2026-07-11T14:24:55.808Z",
+          "wall_time_seconds": 29.049799
         },
         {
           "exit_code": 0,
@@ -72,8 +72,8 @@
             }
           ],
           "phase": "warm",
-          "started_at_utc": "2026-07-11T14:06:42.427Z",
-          "wall_time_seconds": 0.204112
+          "started_at_utc": "2026-07-11T14:25:24.864Z",
+          "wall_time_seconds": 0.402747
         }
       ],
       "topology": {
@@ -151,8 +151,8 @@
             }
           ],
           "phase": "cold",
-          "started_at_utc": "2026-07-11T14:06:42.646Z",
-          "wall_time_seconds": 24.128268
+          "started_at_utc": "2026-07-11T14:25:25.285Z",
+          "wall_time_seconds": 36.540221
         },
         {
           "exit_code": 0,
@@ -196,8 +196,8 @@
             }
           ],
           "phase": "warm",
-          "started_at_utc": "2026-07-11T14:07:06.775Z",
-          "wall_time_seconds": 0.209209
+          "started_at_utc": "2026-07-11T14:26:01.831Z",
+          "wall_time_seconds": 0.472429
         }
       ],
       "topology": {
@@ -248,11 +248,11 @@
   "command": "cargo test -p moraine-conversations --locked --no-run --message-format=json",
   "comparison": "same-host same-toolchain baseline versus candidate target topology",
   "delta": {
-    "cold_wall_time_seconds": 4.05666,
+    "cold_wall_time_seconds": 7.490422,
     "integration_test_target_count": 1,
     "linked_test_executable_count": 1,
     "package_target_count": 2,
-    "warm_wall_time_seconds": 0.005097
+    "warm_wall_time_seconds": 0.069682
   },
   "environment": {
     "baseline": {
@@ -315,8 +315,8 @@
     "candidate": {
       "commit_command": "git rev-parse --verify HEAD^{commit}",
       "description": "current working tree",
-      "head_commit": "3e8283e45217b630d5f968b799612b4986c4f378",
-      "head_tree": "7f1961949725f70b1d0da598693d1b71cfc751b2",
+      "head_commit": "3254e315dead7e20e35ec0fc515289874ac8f47a",
+      "head_tree": "9931067b1de5f407e07bfec953d79ac25c452bf3",
       "tree_command": "git rev-parse --verify HEAD^{tree}"
     }
   },

@@ -182,7 +182,7 @@
   },
   "method": "Cargo workspace no-run JSON artifacts followed by direct native libtest list modes; no test body is executed",
   "source": "current working tree",
-  "test_count": 747,
+  "test_count": 751,
   "tests": [
     {
       "executable": "$CARGO_TARGET_DIR/debug/deps/clickhouse_supervision-3219026b059eaaf7",
@@ -2850,6 +2850,16 @@
       "kind": [
         "test"
       ],
+      "name": "support::tests::changed_manifest_oracles_produce_incomparable_artifacts",
+      "package": "moraine-conversations",
+      "target": "analytics_benchmark_support"
+    },
+    {
+      "executable": "$CARGO_TARGET_DIR/debug/deps/analytics_benchmark_support-d103c633017316f0",
+      "ignored": false,
+      "kind": [
+        "test"
+      ],
       "name": "support::tests::cli_requires_explicit_profile_and_output",
       "package": "moraine-conversations",
       "target": "analytics_benchmark_support"
@@ -2881,6 +2891,16 @@
         "test"
       ],
       "name": "support::tests::manifest_missing_an_expected_scenario_fails_closed",
+      "package": "moraine-conversations",
+      "target": "analytics_benchmark_support"
+    },
+    {
+      "executable": "$CARGO_TARGET_DIR/debug/deps/analytics_benchmark_support-d103c633017316f0",
+      "ignored": false,
+      "kind": [
+        "test"
+      ],
+      "name": "support::tests::manifest_oracle_fingerprint_is_deterministic_and_semantics_sensitive",
       "package": "moraine-conversations",
       "target": "analytics_benchmark_support"
     },
@@ -3030,6 +3050,16 @@
       "kind": [
         "test"
       ],
+      "name": "support::tests::changed_manifest_oracles_produce_incomparable_artifacts",
+      "package": "moraine-conversations",
+      "target": "live_clickhouse"
+    },
+    {
+      "executable": "$CARGO_TARGET_DIR/debug/deps/live_clickhouse-ed5c7dcf4e405459",
+      "ignored": false,
+      "kind": [
+        "test"
+      ],
       "name": "support::tests::cli_requires_explicit_profile_and_output",
       "package": "moraine-conversations",
       "target": "live_clickhouse"
@@ -3061,6 +3091,16 @@
         "test"
       ],
       "name": "support::tests::manifest_missing_an_expected_scenario_fails_closed",
+      "package": "moraine-conversations",
+      "target": "live_clickhouse"
+    },
+    {
+      "executable": "$CARGO_TARGET_DIR/debug/deps/live_clickhouse-ed5c7dcf4e405459",
+      "ignored": false,
+      "kind": [
+        "test"
+      ],
+      "name": "support::tests::manifest_oracle_fingerprint_is_deterministic_and_semantics_sensitive",
       "package": "moraine-conversations",
       "target": "live_clickhouse"
     },
