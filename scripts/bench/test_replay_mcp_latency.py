@@ -53,6 +53,41 @@ class ReplayMcpLatencyTests(unittest.TestCase):
             cardinality=cardinality,
         )
 
+
+    def expectation(
+        self,
+        digest_char: str = "a",
+        cardinality: int = 1,
+        marker: str = "event-1",
+    ) -> bench.OracleExpectation:
+        return bench.OracleExpectation(
+            semantic_digest=f"sha256:{digest_char * 64}",
+            cardinality=cardinality,
+            marker=marker,
+        )
+
+    def observation(
+        self,
+        digest_char: str = "a",
+        cardinality: int = 1,
+        *semantic_strings: str,
+    ) -> bench.SemanticObservation:
+        return bench.SemanticObservation(
+            semantic_digest=f"sha256:{digest_char * 64}",
+            cardinality=cardinality,
+            semantic_strings=semantic_strings or ("event-1",),
+        )
+
+    def manifest(self) -> bench.OracleManifest:
+        return bench.OracleManifest(
+            provenance="seed-manifest-unit",
+            fingerprint="sha256:" + "2" * 64,
+            expectations={
+                ("query-1", "orig", "search"): self.expectation(),
+            },
+        )
+
+
     def spec(self, query: str = "private benchmark query") -> bench.ReplaySpec:
         return bench.ReplaySpec(
             rank=1,
@@ -72,6 +107,7 @@ class ReplayMcpLatencyTests(unittest.TestCase):
                 "include_tool_events": False,
                 "exclude_codex_mcp": True,
             },
+            oracles={"search": self.expectation()},
         )
 
     def successful_target(self, latency_ms: float = 2.5) -> dict[str, object]:
@@ -91,16 +127,20 @@ class ReplayMcpLatencyTests(unittest.TestCase):
             stack.enter_context(
                 patch.object(bench, "initialize_mcp", return_value=(2, 1.0))
             )
-            stack.enter_context(patch.object(bench, "call_tool", side_effect=call_effect))
+            call = stack.enter_context(
+                patch.object(bench, "call_tool", side_effect=call_effect)
+            )
             stack.enter_context(
                 patch.object(bench, "stop_mcp_process", return_value=cleanup)
             )
-            return bench.run_target_persistent(
+            target = bench.run_target_persistent(
                 args=args,
                 config_path=Path("fixture.toml"),
                 tool="search",
                 specs=[self.spec()],
             )
+        self.last_tool_call_count = call.call_count
+        return target
 
     def test_profile_defaults_and_full_overrides_are_deterministic(self) -> None:
         full = self.args()
@@ -145,6 +185,37 @@ class ReplayMcpLatencyTests(unittest.TestCase):
             with self.subTest(extra=extra), redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
                     self.args(*extra)
+    def test_oracle_manifest_binds_seed_expectations_before_execution(self) -> None:
+        payload = {
+            "schema_version": bench.ORACLE_SCHEMA_VERSION,
+            "provenance": "seed-query-manifest-v3",
+            "cases": [
+                {
+                    "query_id": "query-1",
+                    "variant_label": "orig",
+                    "tool": "search",
+                    "semantic_digest": "sha256:" + "a" * 64,
+                    "cardinality": 1,
+                    "marker": "event-1",
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "oracle.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            manifest = bench.load_oracle_manifest(path)
+
+        bound = bench.bind_oracle_expectations(
+            [self.spec()], ["search"], manifest
+        )
+        self.assertEqual(
+            bound[0].oracles["search"],
+            self.expectation(),
+        )
+        self.assertEqual(manifest.provenance, "seed-query-manifest-v3")
+        self.assertRegex(manifest.fingerprint, r"^sha256:[0-9a-f]{64}$")
+
+
 
     def test_representative_artifact_validates_and_redacts_inputs(self) -> None:
         args = self.args("--profile", "smoke")
@@ -156,6 +227,7 @@ class ReplayMcpLatencyTests(unittest.TestCase):
                 corpus_identity=self.corpus(),
                 targets=[self.successful_target()],
                 dry_run=False,
+                oracle_manifest=self.manifest(),
             )
 
         benchmark_protocol.validate_artifact(payload)
@@ -170,6 +242,11 @@ class ReplayMcpLatencyTests(unittest.TestCase):
         self.assertEqual(payload["semantic"]["status"], "pass")
         self.assertEqual(payload["timing"], {"status": "not_evaluated", "non_blocking": True})
         self.assertNotIn("comparison_policy", payload["timing"])
+        self.assertIn(
+            "oracle-seed-manifest-unit-222222222222",
+            payload["scenario"]["workload_id"],
+        )
+        self.assertTrue(payload["scenario_id"].endswith(".o222222222222"))
 
     def test_searchable_corpus_change_is_recorded_and_incomparable(self) -> None:
         cfg = bench.ClickHouseSettings(
@@ -215,6 +292,7 @@ class ReplayMcpLatencyTests(unittest.TestCase):
                 corpus_identity=original,
                 targets=[target],
                 dry_run=False,
+                oracle_manifest=self.manifest(),
             )
             candidate = bench.build_output_json(
                 args=args,
@@ -222,6 +300,7 @@ class ReplayMcpLatencyTests(unittest.TestCase):
                 corpus_identity=changed,
                 targets=[target],
                 dry_run=False,
+                oracle_manifest=self.manifest(),
             )
         self.assertEqual(baseline["scenario_id"], candidate["scenario_id"])
         with self.assertRaises(benchmark_protocol.IncomparableError):
@@ -247,6 +326,7 @@ class ReplayMcpLatencyTests(unittest.TestCase):
                 corpus_identity=self.corpus(),
                 targets=[target],
                 dry_run=False,
+                oracle_manifest=self.manifest(),
             )
         benchmark_protocol.validate_artifact(payload)
         self.assertEqual(payload["semantic"]["status"], "fail")
@@ -254,6 +334,40 @@ class ReplayMcpLatencyTests(unittest.TestCase):
             {item["code"] for item in payload["diagnostics"]},
             {"child-spawn-failed", "insufficient-samples"},
         )
+    def test_missing_case_oracle_fails_closed_before_process_spawn(self) -> None:
+        args = self.args("--profile", "smoke")
+        spec = self.spec()
+        spec.oracles.clear()
+        with patch.object(bench, "start_mcp_process") as start:
+            target = bench.run_target_persistent(
+                args=args,
+                config_path=Path("fixture.toml"),
+                tool="search",
+                specs=[spec],
+            )
+        start.assert_not_called()
+        self.assertEqual(
+            (target["planned"], target["attempted"], target["successful"], target["errors"]),
+            (1, 0, 0, 0),
+        )
+        self.assertEqual(target["failures"]["oracle"], 1)
+
+        with patch.object(bench, "git_metadata", return_value=("b" * 40, False, True)):
+            artifact = bench.build_output_json(
+                args=args,
+                replay_specs=[spec],
+                corpus_identity=self.corpus(),
+                targets=[target],
+                dry_run=False,
+            )
+        benchmark_protocol.validate_artifact(artifact)
+        self.assertEqual(artifact["semantic"]["status"], "fail")
+        self.assertIn(
+            "semantic-oracle-missing",
+            {item["code"] for item in artifact["diagnostics"]},
+        )
+
+
 
     def test_half_started_child_timeout_is_cleaned_and_never_attempted(self) -> None:
         args = self.args("--profile", "smoke")
@@ -286,10 +400,7 @@ class ReplayMcpLatencyTests(unittest.TestCase):
 
     def test_timeout_and_child_crash_are_counted_as_sample_errors(self) -> None:
         args = self.args("--profile", "smoke")
-        timed_out = self.run_persistent(
-            args,
-            [(3, 1.0, 0.5, "a" * 64), TimeoutError("timed out")],
-        )
+        timed_out = self.run_persistent(args, TimeoutError("timed out"))
         self.assertEqual(
             (timed_out["attempted"], timed_out["successful"], timed_out["errors"]),
             (1, 0, 1),
@@ -304,12 +415,7 @@ class ReplayMcpLatencyTests(unittest.TestCase):
             stack.enter_context(
                 patch.object(bench, "initialize_mcp", return_value=(2, 1.0))
             )
-            call_count = [0]
-
             def crash_on_measured_call(*_args, **_kwargs):
-                call_count[0] += 1
-                if call_count[0] == 1:
-                    return (3, 1.0, 0.5, "a" * 64)
                 crashed_proc.returncode = 9
                 raise RuntimeError("child exited")
 
@@ -328,18 +434,29 @@ class ReplayMcpLatencyTests(unittest.TestCase):
         self.assertEqual(crashed["failures"]["crash"], 1)
         self.assertEqual(crashed["errors"], 1)
 
-    def test_smoke_wrong_first_measured_response_fails_independent_oracle(self) -> None:
-        args = self.args("--profile", "smoke")
+    def test_consistently_wrong_repeatable_result_fails_independent_oracle(self) -> None:
+        args = self.args(
+            "--warmup",
+            "0",
+            "--repeats",
+            "2",
+            "--query-variant-mode",
+            "none",
+            "--tool",
+            "search",
+        )
+        wrong = self.observation("b", 1, "event-1")
         target = self.run_persistent(
             args,
-            [(3, 1.0, 0.5, "a" * 64), (4, 2.0, 1.0, "b" * 64)],
+            [(2, 1.0, 0.5, wrong), (3, 1.0, 0.5, wrong)],
         )
         self.assertEqual(
             (target["planned"], target["attempted"], target["successful"], target["errors"]),
-            (1, 1, 0, 1),
+            (2, 2, 0, 2),
         )
         self.assertEqual(target["raw_e2e_search_ms"], [])
-        self.assertEqual(target["failures"]["oracle"], 1)
+        self.assertEqual(target["failures"]["oracle"], 2)
+        self.assertEqual(self.last_tool_call_count, 2)
         with patch.object(bench, "git_metadata", return_value=("a" * 40, False, True)):
             payload = bench.build_output_json(
                 args=args,
@@ -347,6 +464,7 @@ class ReplayMcpLatencyTests(unittest.TestCase):
                 corpus_identity=self.corpus(),
                 targets=[target],
                 dry_run=False,
+                oracle_manifest=self.manifest(),
             )
         benchmark_protocol.validate_artifact(payload)
         self.assertEqual(payload["semantic"]["status"], "fail")
@@ -354,6 +472,20 @@ class ReplayMcpLatencyTests(unittest.TestCase):
             {item["code"] for item in payload["diagnostics"]},
             {"insufficient-samples", "semantic-oracle-failed"},
         )
+    def test_smoke_checks_its_only_response_against_seed_oracle(self) -> None:
+        args = self.args("--profile", "smoke")
+        target = self.run_persistent(
+            args,
+            [(2, 1.0, 0.5, self.observation("b", 1, "event-1"))],
+        )
+        self.assertEqual(self.last_tool_call_count, 1)
+        self.assertEqual(
+            (target["planned"], target["attempted"], target["successful"], target["errors"]),
+            (1, 1, 0, 1),
+        )
+        self.assertEqual(target["failures"]["oracle"], 1)
+
+
 
     def test_oracle_canonicalizes_dynamic_fields_and_rejects_empty_results(self) -> None:
         first = {
@@ -374,6 +506,37 @@ class ReplayMcpLatencyTests(unittest.TestCase):
             bench.oracle_fingerprint(first),
             bench.oracle_fingerprint(second),
         )
+        observation = bench.semantic_observation(first)
+        self.assertTrue(
+            bench.oracle_matches(
+                observation,
+                bench.OracleExpectation(
+                    semantic_digest=observation.semantic_digest,
+                    cardinality=1,
+                    marker="event-1",
+                ),
+            )
+        )
+        self.assertFalse(
+            bench.oracle_matches(
+                observation,
+                bench.OracleExpectation(
+                    semantic_digest=observation.semantic_digest,
+                    cardinality=2,
+                    marker="event-1",
+                ),
+            )
+        )
+        self.assertFalse(
+            bench.oracle_matches(
+                observation,
+                bench.OracleExpectation(
+                    semantic_digest=observation.semantic_digest,
+                    cardinality=1,
+                    marker="different-event",
+                ),
+            )
+        )
         with self.assertRaisesRegex(RuntimeError, "empty semantic result"):
             bench.oracle_fingerprint(
                 {
@@ -388,12 +551,13 @@ class ReplayMcpLatencyTests(unittest.TestCase):
         args = self.args("--profile", "smoke")
         target = self.run_persistent(
             args,
-            RuntimeError("tool response has an empty semantic result"),
+            bench.OracleError("tool response has an empty semantic result"),
         )
         self.assertEqual(
             (target["planned"], target["attempted"], target["successful"], target["errors"]),
-            (1, 0, 0, 0),
+            (1, 1, 0, 1),
         )
+        self.assertEqual(target["failures"]["oracle"], 1)
         with patch.object(bench, "git_metadata", return_value=("b" * 40, False, True)):
             payload = bench.build_output_json(
                 args=args,
@@ -401,6 +565,7 @@ class ReplayMcpLatencyTests(unittest.TestCase):
                 corpus_identity=self.corpus(),
                 targets=[target],
                 dry_run=False,
+                oracle_manifest=self.manifest(),
             )
         benchmark_protocol.validate_artifact(payload)
         self.assertEqual(payload["semantic"]["status"], "fail")
@@ -409,10 +574,7 @@ class ReplayMcpLatencyTests(unittest.TestCase):
         args = self.args("--profile", "smoke")
         target = self.run_persistent(
             args,
-            [
-                (3, 1.0, 0.5, "a" * 64),
-                (4, 2.0, 1.0, "a" * 64),
-            ],
+            [(3, 2.0, 1.0, self.observation())],
             cleanup="child-cleanup-failed",
         )
         self.assertEqual(
@@ -425,6 +587,7 @@ class ReplayMcpLatencyTests(unittest.TestCase):
                 corpus_identity=self.corpus(),
                 targets=[target],
                 dry_run=False,
+                oracle_manifest=self.manifest(),
             )
         benchmark_protocol.validate_artifact(payload)
         self.assertEqual(payload["semantic"]["status"], "fail")
@@ -441,9 +604,11 @@ class ReplayMcpLatencyTests(unittest.TestCase):
             stack.enter_context(
                 patch.object(bench, "initialize_mcp", return_value=(2, 1.0))
             )
-            stack.enter_context(
+            call = stack.enter_context(
                 patch.object(
-                    bench, "call_tool", return_value=(3, 2.0, 1.0, "a" * 64)
+                    bench,
+                    "call_tool",
+                    return_value=(3, 2.0, 1.0, self.observation()),
                 )
             )
             stack.enter_context(
@@ -460,6 +625,7 @@ class ReplayMcpLatencyTests(unittest.TestCase):
             (1, 1, 1, 0),
         )
         self.assertEqual(target["raw_e2e_search_ms"], [2.0])
+        call.assert_called_once()
 
     def test_emission_references_content_addressed_redacted_diagnostics(self) -> None:
         spec = self.spec("sensitive raw query")
@@ -477,6 +643,7 @@ class ReplayMcpLatencyTests(unittest.TestCase):
                     corpus_identity=self.corpus(),
                     targets=[target],
                     dry_run=False,
+                    oracle_manifest=self.manifest(),
                 )
             details = bench.build_diagnostics_json(args, [target])
             self.assertTrue(bench.emit_output(args, payload, details))
@@ -501,6 +668,7 @@ class ReplayMcpLatencyTests(unittest.TestCase):
                 corpus_identity=self.corpus(),
                 targets=[self.successful_target()],
                 dry_run=False,
+                oracle_manifest=self.manifest(),
             )
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -529,6 +697,7 @@ class ReplayMcpLatencyTests(unittest.TestCase):
                     corpus_identity=self.corpus(),
                     targets=[target],
                     dry_run=False,
+                    oracle_manifest=self.manifest(),
                 )
             details = bench.build_diagnostics_json(args, [target])
             real_replace = bench.os.replace
