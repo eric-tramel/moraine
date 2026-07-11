@@ -1,21 +1,30 @@
 {
   "artifact_sha256": {
     "cargo-targets.json": "b4ee37536ccaaa92ac1abd918e3538ba2f251b2b3495b19a3006c72240ef8a3b",
-    "compile-measurements-darwin-arm64.json": "c50c72ad04ba7e835a1f5691e4291f5d7ccaa11dc78793ec1c90233befef8e99",
+    "compile-measurements-darwin-arm64.json": "d819ba33b6620d22c543abf37b402dc9eff98fe1ca753dc849d44c121cb33919",
     "normal-dependencies.json": "b9c083277d9fdb82b2aa84c898e6b6fef28dbc20fa1012145f79d30e573b127f",
     "repository-migration.json": "2c8269ca99f2bd1178c886a0539c5b6f3d1855804ed2daefe885035292099db0",
-    "rust-libtest-darwin-arm64.json": "84346ef862c5ace61bc466f81b4ec64ab77f9620b29c3005af4379540f1c7090"
+    "rust-libtest-darwin-arm64.json": "bacd2a79183f72f244f88e810825cc38bf77717bc9a8b231ab164796b4a52c95"
   },
   "baseline_commit": "77c90d6c572ba71bcfaa0362f7ead2cfa5e6712a",
+  "baseline_tree": "0ae5df87300c6748161f2035394b6e0b9a92e627",
+  "candidate_head_commit": "3e8283e45217b630d5f968b799612b4986c4f378",
+  "candidate_head_tree": "7f1961949725f70b1d0da598693d1b71cfc751b2",
   "commands": {
+    "baseline_archive": "git archive --format=tar --output $BASELINE_ARCHIVE 77c90d6c572ba71bcfaa0362f7ead2cfa5e6712a",
+    "baseline_authenticate_commit": "git rev-parse --verify 77c90d6c572ba71bcfaa0362f7ead2cfa5e6712a^{commit}",
+    "baseline_authenticate_tree": "git rev-parse --verify 77c90d6c572ba71bcfaa0362f7ead2cfa5e6712a^{tree}",
+    "baseline_cold_compile": "cargo test -p moraine-conversations --locked --no-run --message-format=json",
+    "baseline_extract": "tar -xf $BASELINE_ARCHIVE -C $BASELINE_SOURCE_DIR",
     "baseline_source": "git show 77c90d6:crates/moraine-conversations/tests/repository_integration.rs",
-    "cold_compile": "cargo test -p moraine-conversations --locked --no-run --message-format=json",
+    "baseline_warm_compile": "cargo test -p moraine-conversations --locked --no-run --message-format=json",
+    "candidate_cold_compile": "cargo test -p moraine-conversations --locked --no-run --message-format=json",
+    "candidate_warm_compile": "cargo test -p moraine-conversations --locked --no-run --message-format=json",
     "dependency_policy": "python3 scripts/ci/dependency_policy.py",
     "metadata": "cargo metadata --format-version 1 --locked --no-deps",
     "native_collection_compile": "cargo test --workspace --locked --no-run --message-format=json",
     "native_collection_ignored_list": "$EXECUTABLE --list --ignored --format terse",
-    "native_collection_list": "$EXECUTABLE --list --format terse",
-    "warm_compile": "cargo test -p moraine-conversations --locked --no-run --message-format=json"
+    "native_collection_list": "$EXECUTABLE --list --format terse"
   },
   "format_version": 1,
   "generated_artifacts": [
@@ -25,38 +34,63 @@
     "repository-migration.json",
     "rust-libtest-darwin-arm64.json"
   ],
-  "generated_at_utc": "2026-07-11T04:56:43.995Z",
+  "generated_at_utc": "2026-07-11T14:07:38.306Z",
   "generator": "docs/development/test-architecture/verify_candidate.py",
-  "generator_sha256": "7b03df997efbb9e2773c53361fccac28ab6d887291df6a0f2980ba33b0795149",
+  "generator_sha256": "5c6cacbfb3c58483c3c75fb4f8a9b18634353c5a634469d969c115d949b63603",
   "host": {
     "machine": "arm64",
+    "release": "24.1.0",
     "rustc_host_target": "aarch64-apple-darwin",
     "system": "darwin"
   },
   "non_deterministic_fields": [
     "generated_at_utc",
-    "summary.cold_wall_time_seconds",
-    "summary.warm_wall_time_seconds",
+    "summary.baseline_cold_wall_time_seconds",
+    "summary.baseline_warm_wall_time_seconds",
+    "summary.candidate_cold_wall_time_seconds",
+    "summary.candidate_warm_wall_time_seconds",
+    "summary.cold_wall_time_seconds_delta",
+    "summary.warm_wall_time_seconds_delta",
     "artifact_sha256.compile-measurements-darwin-arm64.json"
   ],
   "reproduce": "python3 docs/development/test-architecture/verify_candidate.py --repo-root .",
   "source": "current working tree",
   "summary": {
+    "baseline_cold_linked_test_executable_count": 3,
+    "baseline_cold_wall_time_seconds": 20.071608,
+    "baseline_integration_test_target_count": 2,
+    "baseline_package_target_count": 3,
+    "baseline_source_tree": "0ae5df87300c6748161f2035394b6e0b9a92e627",
+    "baseline_warm_linked_test_executable_count": 3,
+    "baseline_warm_wall_time_seconds": 0.204112,
+    "candidate_cold_linked_test_executable_count": 4,
+    "candidate_cold_wall_time_seconds": 24.128268,
+    "candidate_integration_test_target_count": 3,
+    "candidate_package_target_count": 5,
     "candidate_repository_linked_executable_count": 1,
     "candidate_repository_target_count": 1,
+    "candidate_warm_linked_test_executable_count": 4,
+    "candidate_warm_wall_time_seconds": 0.209209,
     "candidate_workspace_target_count": 22,
-    "cold_linked_test_executable_count": 4,
-    "cold_wall_time_seconds": 25.451226,
+    "cold_wall_time_seconds_delta": 4.05666,
     "dependency_policy": "pass",
-    "owned_target_cleanup": "removed",
+    "integration_test_target_count_delta": 1,
+    "linked_test_executable_count_delta": 1,
+    "owned_compile_cleanup": {
+      "baseline_archive": "removed",
+      "baseline_source": "removed",
+      "baseline_target": "removed",
+      "candidate_target": "removed",
+      "temporary_root": "removed"
+    },
+    "package_target_count_delta": 2,
     "repository_contract_mismatch_count": 0,
     "repository_test_bijection_count": 67,
-    "warm_linked_test_executable_count": 4,
-    "warm_wall_time_seconds": 0.205015
+    "warm_wall_time_seconds_delta": 0.005097
   },
   "tool_versions": {
     "cargo": "cargo 1.96.0 (30a34c682 2026-05-25) (Homebrew)",
-    "python": "3.14.6",
+    "python": "3.9.6",
     "rustc": "rustc 1.96.0",
     "rustc_host_target": "aarch64-apple-darwin"
   }
