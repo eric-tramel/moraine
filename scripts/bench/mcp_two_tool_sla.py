@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
+import platform
 import re
 import select
 import subprocess
@@ -12,13 +14,20 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+import benchmark_protocol
 
 
 WINDOW_RE = re.compile(r"^\s*(\d+)\s*([smhdw])\s*$", re.IGNORECASE)
 BENCHMARK_REPLAY_SOURCE = "benchmark-replay"
+
+PROFILE_DEFAULTS = {
+    "smoke": {"warmup": 0, "repeats": 1, "min_docs": 1},
+    "full": {"warmup": 1, "repeats": 5, "min_docs": 100_000},
+}
 
 
 def positive_int(value: str) -> int:
@@ -35,12 +44,18 @@ def non_negative_int(value: str) -> int:
     return parsed
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Measure the Moraine MCP v1 search_sessions/open/list_sessions interface over JSON-RPC stdio. "
             "The tool calls are read-only; corpus and query selection use ClickHouse SELECTs only."
         )
+    )
+    parser.add_argument(
+        "--profile",
+        choices=sorted(PROFILE_DEFAULTS),
+        default="full",
+        help="Workload profile. Defaults to full, preserving the historical workload.",
     )
     parser.add_argument("--config", required=True, help="Path to moraine.toml/config.toml")
     parser.add_argument(
@@ -69,8 +84,25 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--window", default="7d", help="Log-query selection window, e.g. 24h, 7d")
     parser.add_argument("--n-hits", type=positive_int, default=10)
-    parser.add_argument("--warmup", type=non_negative_int, default=1)
-    parser.add_argument("--repeats", type=positive_int, default=5)
+    parser.add_argument(
+        "--build-profile",
+        default="release",
+        help="Build profile recorded in the benchmark artifact.",
+    )
+    parser.add_argument(
+        "--target",
+        help="Build target recorded in the benchmark artifact (auto-detected when omitted).",
+    )
+    parser.add_argument(
+        "--git-commit",
+        help="Exact 40-character lowercase git commit (auto-detected when omitted).",
+    )
+    git_state = parser.add_mutually_exclusive_group()
+    git_state.add_argument("--git-dirty", dest="git_dirty", action="store_true")
+    git_state.add_argument("--git-clean", dest="git_dirty", action="store_false")
+    parser.set_defaults(git_dirty=None)
+    parser.add_argument("--warmup", type=non_negative_int)
+    parser.add_argument("--repeats", type=positive_int)
     parser.add_argument("--timeout-seconds", type=positive_int, default=20)
     parser.add_argument(
         "--open-kind",
@@ -110,22 +142,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--min-docs",
         type=non_negative_int,
-        default=100_000,
-        help="Minimum search_documents rows expected for SLA validation.",
+        help="Minimum search_documents rows required for a valid benchmark corpus.",
     )
     parser.add_argument(
         "--allow-small-corpus",
         action="store_true",
         help="Do not fail when search_documents has fewer than --min-docs rows.",
     )
-    parser.add_argument(
-        "--fail-on-sla-miss",
-        action="store_true",
-        help="Exit non-zero if any measured tool response reports met_sla=false.",
-    )
     parser.add_argument("--dry-run", action="store_true", help="Select queries and print corpus only.")
-    parser.add_argument("--output-json", help="Write machine-readable results JSON.")
-    return parser.parse_args()
+    parser.add_argument(
+        "--output-json",
+        default="target/bench/mcp-two-tool-sla.json",
+        help="Write the moraine-benchmark-v1 artifact to this path.",
+    )
+    args = parser.parse_args(argv)
+    defaults = PROFILE_DEFAULTS[args.profile]
+    for name, value in defaults.items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
+    return args
 
 
 def strip_inline_comment(value: str) -> str:
@@ -255,6 +290,40 @@ SELECT metric, value FROM (
     return {
         str(row["metric"]): int(row["value"])
         for row in clickhouse_select_json_each_row(ch_cfg, sql)
+    }
+
+def search_corpus_identity(ch_cfg: dict[str, Any]) -> dict[str, Any]:
+    """Return a stable identity for the indexed document rows."""
+    database = ch_cfg["database"]
+    row_hash = (
+        "cityHash64(toJSONString(tuple("
+        "event_uid, doc_version, session_id, source_name, harness, record_ts, "
+        "event_class, payload_type, actor_role, name, phase, source_ref, "
+        "doc_len, text_content, payload_json"
+        ")))"
+    )
+    sql = (
+        "SELECT\n"
+        "  toUInt64(count()) AS cardinality,\n"
+        "  toString(groupBitXor(row_hash)) AS content_xor,\n"
+        "  toString(sumWithOverflow(row_hash)) AS content_sum\n"
+        "FROM (\n"
+        f"  SELECT {row_hash} AS row_hash\n"
+        f"  FROM {database}.search_documents FINAL\n"
+        ")\n"
+        "FORMAT JSONEachRow"
+    )
+    rows = clickhouse_select_json_each_row(ch_cfg, sql)
+    if len(rows) != 1:
+        raise RuntimeError("search corpus identity query returned no aggregate row")
+    row = rows[0]
+    cardinality = int(row["cardinality"])
+    if cardinality < 0:
+        raise RuntimeError("search corpus cardinality must be non-negative")
+    return {
+        "cardinality": cardinality,
+        "content_xor": str(row["content_xor"]),
+        "content_sum": str(row["content_sum"]),
     }
 
 
@@ -423,6 +492,15 @@ def stop_mcp(proc: Optional[subprocess.Popen[str]]) -> None:
             proc.wait(timeout=5)
 
 
+def finite_non_negative_number(value: Any, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeError(f"{field_name} must be numeric")
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        raise RuntimeError(f"{field_name} must be finite and non-negative")
+    return parsed
+
+
 def measured_tool_call(
     proc: subprocess.Popen[str],
     request_id: int,
@@ -443,19 +521,28 @@ def measured_tool_call(
     if not isinstance(structured, dict):
         raise RuntimeError(f"{name} response missing structuredContent")
     if bool(result.get("isError")):
-        raise RuntimeError(f"{name} returned isError=true: {structured}")
+        raise RuntimeError(f"{name} returned isError=true")
     if "error" in structured:
-        raise RuntimeError(f"{name} returned error envelope: {structured['error']}")
+        raise RuntimeError(f"{name} returned an error envelope")
     performance = structured.get("performance")
     if not isinstance(performance, dict):
         raise RuntimeError(f"{name} response missing performance object")
+    server_elapsed_ms = finite_non_negative_number(
+        performance.get("elapsed_ms"), f"{name} performance.elapsed_ms"
+    )
+    sla_target_ms = finite_non_negative_number(
+        performance.get("sla_target_ms"), f"{name} performance.sla_target_ms"
+    )
+    met_sla = performance.get("met_sla")
+    if not isinstance(met_sla, bool):
+        raise RuntimeError(f"{name} performance.met_sla must be boolean")
     return request_id + 1, {
         "tool": name,
         "arguments": arguments,
         "e2e_ms": e2e_ms,
-        "server_elapsed_ms": performance.get("elapsed_ms"),
-        "sla_target_ms": performance.get("sla_target_ms"),
-        "met_sla": performance.get("met_sla"),
+        "server_elapsed_ms": server_elapsed_ms,
+        "sla_target_ms": sla_target_ms,
+        "met_sla": met_sla,
         "structured": structured,
     }
 
@@ -520,8 +607,20 @@ def print_stats(label: str, stats: dict[str, Any]) -> None:
     )
 
 
-def first_hit_open_ids(search_payload: dict[str, Any]) -> dict[str, str]:
-    results = search_payload.get("data", {}).get("results", [])
+def structured_data(sample: Any, tool_name: str) -> dict[str, Any]:
+    if not isinstance(sample, dict):
+        raise RuntimeError(f"{tool_name} sample must be an object")
+    structured = sample.get("structured")
+    if not isinstance(structured, dict):
+        raise RuntimeError(f"{tool_name} structuredContent must be an object")
+    data = structured.get("data")
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{tool_name} structuredContent.data must be an object")
+    return data
+
+
+def first_hit_open_ids(search_data: dict[str, Any]) -> dict[str, str]:
+    results = search_data.get("results", [])
     if not isinstance(results, list) or not results:
         return {}
     first = results[0]
@@ -542,8 +641,8 @@ def first_hit_open_ids(search_payload: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def first_list_session_open_id(list_payload: dict[str, Any]) -> Optional[str]:
-    sessions = list_payload.get("data", {}).get("sessions", [])
+def first_list_session_open_id(list_data: dict[str, Any]) -> Optional[str]:
+    sessions = list_data.get("sessions", [])
     if not isinstance(sessions, list) or not sessions:
         return None
     first = sessions[0]
@@ -554,6 +653,32 @@ def first_list_session_open_id(list_payload: dict[str, Any]) -> Optional[str]:
         return None
     value = open_block.get("session_id")
     return value if isinstance(value, str) and value else None
+
+
+def validate_open_oracle(
+    open_sample: Any,
+    expected_kind: str,
+    expected_id: str,
+) -> None:
+    data = structured_data(open_sample, "open")
+    if data.get("kind") != expected_kind:
+        raise RuntimeError(
+            f"open returned kind={data.get('kind')!r}, expected {expected_kind!r}"
+        )
+    structured = open_sample["structured"]
+    request = structured.get("request")
+    if not isinstance(request, dict) or request.get("id") != expected_id:
+        returned_id = request.get("id") if isinstance(request, dict) else None
+        raise RuntimeError(
+            f"open returned request.id={returned_id!r}, expected {expected_id!r}"
+        )
+    entity = data.get(expected_kind)
+    if not isinstance(entity, dict) or entity.get("id") != expected_id:
+        returned_id = entity.get("id") if isinstance(entity, dict) else None
+        raise RuntimeError(
+            f"open returned data.{expected_kind}.id={returned_id!r}, "
+            f"expected {expected_id!r}"
+        )
 
 
 def unique_queries(args: argparse.Namespace, log_rows: list[dict[str, Any]]) -> list[str]:
@@ -568,27 +693,225 @@ def unique_queries(args: argparse.Namespace, log_rows: list[dict[str, Any]]) -> 
     return queries
 
 
-def main() -> int:
-    args = parse_args()
+def sha256_json(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def git_source(
+    explicit_commit: Optional[str],
+    explicit_dirty: Optional[bool],
+) -> dict[str, Any]:
+    repo_root = Path(__file__).resolve().parents[2]
+    commit = explicit_commit
+    dirty = explicit_dirty
+    if commit is None:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        commit = completed.stdout.strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise RuntimeError("git commit must be exactly 40 lowercase hexadecimal characters")
+    if dirty is None:
+        completed = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=normal"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        dirty = bool(completed.stdout)
+    return {"git_commit": commit, "dirty": dirty}
+
+
+def runner_identity() -> dict[str, str]:
+    os_name = platform.system().lower()
+    machine = platform.machine().lower()
+    if os_name == "darwin" and machine in {"arm64", "aarch64"}:
+        cpu_class = "apple-silicon"
+    elif machine in {"x86_64", "amd64"}:
+        cpu_class = "x86-64"
+    elif machine in {"arm64", "aarch64"}:
+        cpu_class = "arm64"
+    else:
+        cpu_class = re.sub(r"[^a-z0-9._-]+", "-", machine).strip("-") or "other"
+    return {"os": os_name, "cpu_class": cpu_class}
+
+
+def detected_target() -> str:
+    os_name = platform.system().lower()
+    machine = platform.machine().lower()
+    arch = {
+        "arm64": "aarch64",
+        "aarch64": "aarch64",
+        "amd64": "x86_64",
+        "x86_64": "x86_64",
+    }.get(machine, re.sub(r"[^a-z0-9._-]+", "-", machine).strip("-") or "unknown")
+    if os_name == "darwin":
+        return f"{arch}-apple-darwin"
+    if os_name == "linux":
+        return f"{arch}-unknown-linux-gnu"
+    return f"{arch}-{re.sub(r'[^a-z0-9._-]+', '-', os_name).strip('-') or 'unknown'}"
+
+
+def planned_sample_count(
+    repeats: int,
+    queries: list[str],
+    open_kinds: list[str],
+    list_sessions_args: Optional[dict[str, Any]],
+) -> int:
+    per_repeat = len(queries) * (1 + len(open_kinds))
+    if list_sessions_args is not None:
+        per_repeat += 1
+    return repeats * per_repeat
+
+
+def build_artifact(
+    *,
+    args: argparse.Namespace,
+    counts: dict[str, int],
+    corpus_identity: dict[str, Any],
+    queries: list[str],
+    open_kinds: list[str],
+    list_sessions_args: Optional[dict[str, Any]],
+    samples: list[dict[str, Any]],
+    planned: int,
+    attempted: int,
+    errors: int,
+    initialization_ms: Optional[float],
+    diagnostic_codes: list[str],
+    oracle_mismatches: int,
+    warmup_failures: int,
+) -> dict[str, Any]:
+    if planned <= 0:
+        raise RuntimeError("benchmark workload planned zero measured samples")
+    if attempted != len(samples) + errors:
+        raise RuntimeError("attempted sample count does not equal successful plus errors")
+    if attempted > planned:
+        raise RuntimeError("attempted sample count exceeds planned samples")
+
+    workload_shape = {
+        "profile": args.profile,
+        "query_hashes": [hashlib.sha256(query.encode("utf-8")).hexdigest() for query in queries],
+        "open_kinds": open_kinds,
+        "list_sessions": list_sessions_args,
+        "event_types": sorted(args.event_type),
+        "n_hits": args.n_hits,
+        "warmup": args.warmup,
+        "repeats": args.repeats,
+    }
+    dataset_shape = {
+        "cardinality": corpus_identity["cardinality"],
+        "content_sum": corpus_identity["content_sum"],
+        "content_xor": corpus_identity["content_xor"],
+    }
+    sla_successes = sum(sample["met_sla"] is True for sample in samples)
+    sla_failures = len(samples) - sla_successes
+    insufficient = len(samples) < planned
+    oracle_failed = bool(oracle_mismatches)
+    semantic_failed = bool(errors or oracle_failed or insufficient or warmup_failures)
+    if insufficient and "insufficient-samples" not in diagnostic_codes:
+        diagnostic_codes.append("insufficient-samples")
+
+    quality_failed_checks = oracle_mismatches + sla_failures
+    artifact: dict[str, Any] = {
+        "schema_version": "moraine-benchmark-v1",
+        "benchmark_id": "mcp-two-tool-sla",
+        "scenario_id": "production-mcp-stdio-search-open-list",
+        "source": git_source(args.git_commit, args.git_dirty),
+        "build": {
+            "profile": args.build_profile,
+            "target": args.target or detected_target(),
+        },
+        "runner": runner_identity(),
+        "scenario": {
+            "profile": args.profile,
+            "workload_id": f"two-tool-{sha256_json(workload_shape)[:24]}",
+            "measured_boundary": "json-rpc-stdio-tool-call",
+            "dimensions": {
+                "dataset_backed": True,
+                "cache_sensitive": True,
+                "concurrent": False,
+                "request_producing": True,
+            },
+            "fingerprints": {
+                "dataset": {
+                    "fingerprint": f"sha256:{sha256_json(dataset_shape)}",
+                    "cardinality": corpus_identity["cardinality"],
+                },
+                "cache_state": (
+                    "warm" if args.warmup > 0 and warmup_failures == 0 else "mixed"
+                ),
+                "request_source": "production-mcp",
+            },
+        },
+        "samples": {
+            "planned": planned,
+            "attempted": attempted,
+            "successful": len(samples),
+            "errors": errors,
+            "measurements": {
+                "latency_ms": [float(sample["e2e_ms"]) for sample in samples],
+                "server_elapsed_ms": [
+                    float(sample["server_elapsed_ms"]) for sample in samples
+                ],
+                "sla_target_ms": [float(sample["sla_target_ms"]) for sample in samples],
+            },
+        },
+        "semantic": {"status": "fail" if semantic_failed else "pass"},
+        "timing": {"status": "not_evaluated", "non_blocking": True},
+        "metrics": {
+            "quality": {
+                "oracle_status": "fail" if oracle_failed else "pass",
+                "passed_checks": sla_successes,
+                "failed_checks": quality_failed_checks,
+                "expected_count": planned,
+                "observed_count": len(samples),
+                "mismatches": oracle_mismatches,
+                "success_rate": len(samples) / attempted if attempted else 0.0,
+                "error_rate": errors / attempted if attempted else 0.0,
+            },
+            "storage": {
+                f"corpus_{name}_count": value for name, value in sorted(counts.items())
+            },
+        },
+        "diagnostics": [{"code": code} for code in sorted(set(diagnostic_codes))],
+        "artifacts": [],
+    }
+    if initialization_ms is not None:
+        artifact["metrics"]["resources"] = {"mcp_initialization_ms": initialization_ms}
+    return artifact
+
+
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parse_args(argv)
     config = Path(args.config).expanduser().resolve()
 
     try:
         ch_cfg = read_clickhouse_config(config)
         counts = corpus_counts(ch_cfg)
+        corpus_identity = search_corpus_identity(ch_cfg)
         session_window = corpus_session_window(ch_cfg) if not args.skip_list_sessions else None
         log_rows = select_log_queries(ch_cfg, args.window, args.top_n_log_queries)
         queries = unique_queries(args, log_rows)
     except Exception as exc:
-        print(f"fatal: {exc}", file=sys.stderr)
+        print(f"fatal: prerequisite discovery failed: {exc}", file=sys.stderr)
         return 2
 
     print("Corpus")
     for key in ["events", "sessions", "turns", "search_documents", "search_postings", "search_query_log"]:
         print(f"  {key}: {counts.get(key, 0)}")
 
-    if counts.get("search_documents", 0) < args.min_docs and not args.allow_small_corpus:
+    searchable_documents = corpus_identity["cardinality"]
+    if searchable_documents < args.min_docs and not args.allow_small_corpus:
         print(
-            f"fatal: search_documents={counts.get('search_documents', 0)} below --min-docs={args.min_docs}",
+            f"fatal: search_documents={searchable_documents} below --min-docs={args.min_docs}",
             file=sys.stderr,
         )
         return 2
@@ -642,11 +965,31 @@ def main() -> int:
     open_kinds = args.open_kind or ["event", "turn", "session"]
     if "none" in open_kinds:
         open_kinds = []
+    planned = planned_sample_count(args.repeats, queries, open_kinds, list_sessions_args)
+    if planned == 0:
+        print("fatal: selected workload plans zero measured samples", file=sys.stderr)
+        return 2
+
+    try:
+        source = git_source(args.git_commit, args.git_dirty)
+    except Exception as exc:
+        print(f"fatal: benchmark provenance unavailable: {exc}", file=sys.stderr)
+        return 2
+    args.git_commit = source["git_commit"]
+    args.git_dirty = source["dirty"]
 
     proc: Optional[subprocess.Popen[str]] = None
     request_id = 1
     samples: list[dict[str, Any]] = []
     failures: list[str] = []
+    diagnostic_codes: list[str] = []
+    attempted = 0
+    errors = 0
+    oracle_mismatches = 0
+    warmup_failures = 0
+    init_ms: Optional[float] = None
+    search_oracles: dict[int, tuple[tuple[str, str], ...]] = {}
+    list_oracle: Optional[str] = None
     service_bin_dir = resolve_service_bin_dir(args.moraine_bin, args.service_bin_dir)
 
     try:
@@ -672,7 +1015,7 @@ def main() -> int:
 
         print(f"Initialized MCP in {init_ms:.2f}ms")
 
-        for query in queries:
+        for query_index, query in enumerate(queries, start=1):
             total_runs = args.warmup + args.repeats
             for run_idx in range(total_runs):
                 measured = run_idx >= args.warmup
@@ -680,6 +1023,8 @@ def main() -> int:
                 if args.event_type:
                     search_args["event_types"] = args.event_type
 
+                if measured:
+                    attempted += 1
                 try:
                     request_id, search_sample = measured_tool_call(
                         proc,
@@ -688,19 +1033,62 @@ def main() -> int:
                         "search_sessions",
                         search_args,
                     )
-                    open_ids = first_hit_open_ids(search_sample["structured"])
+                except Exception as exc:
                     if measured:
-                        sample = dict(search_sample)
-                        sample.pop("structured", None)
-                        sample["query"] = query
-                        samples.append(sample)
+                        errors += 1
+                        diagnostic_codes.append("tool-call-error")
+                    else:
+                        warmup_failures += 1
+                        diagnostic_codes.append("warmup-error")
+                    failures.append(
+                        f"query_index={query_index} run={run_idx} search_sessions: {exc}"
+                    )
+                    continue
+                try:
+                    search_data = structured_data(search_sample, "search_sessions")
+                except Exception as exc:
+                    if measured:
+                        errors += 1
+                        diagnostic_codes.append("malformed-tool-data")
+                    else:
+                        warmup_failures += 1
+                        diagnostic_codes.extend(["malformed-tool-data", "warmup-error"])
+                    failures.append(
+                        f"query_index={query_index} run={run_idx} search_sessions: {exc}"
+                    )
+                    continue
 
-                    for kind in open_kinds:
-                        target_id = open_ids.get(kind)
-                        if not target_id:
-                            if measured:
-                                failures.append(f"query={query!r} produced no {kind} id to open")
-                            continue
+                open_ids = first_hit_open_ids(search_data)
+                if measured and open_kinds and all(kind in open_ids for kind in open_kinds):
+                    signature = tuple((kind, open_ids[kind]) for kind in open_kinds)
+                    expected_signature = search_oracles.setdefault(query_index, signature)
+                    if signature != expected_signature:
+                        oracle_mismatches += 1
+                        diagnostic_codes.append("oracle-instability")
+                        failures.append(
+                            f"query_index={query_index} returned unstable search-to-open ids"
+                        )
+                if measured:
+                    sample = dict(search_sample)
+                    sample.pop("structured", None)
+                    samples.append(sample)
+
+                for kind in open_kinds:
+                    target_id = open_ids.get(kind)
+                    if not target_id:
+                        if measured:
+                            oracle_mismatches += 1
+                            diagnostic_codes.append("missing-open-id")
+                        else:
+                            warmup_failures += 1
+                            diagnostic_codes.extend(["missing-open-id", "warmup-error"])
+                        failures.append(
+                            f"query_index={query_index} produced no {kind} id to open"
+                        )
+                        continue
+                    if measured:
+                        attempted += 1
+                    try:
                         request_id, open_sample = measured_tool_call(
                             proc,
                             request_id,
@@ -708,20 +1096,43 @@ def main() -> int:
                             "open",
                             {"id": target_id},
                         )
+                    except Exception as exc:
                         if measured:
-                            sample = dict(open_sample)
-                            sample.pop("structured", None)
-                            sample["query"] = query
-                            sample["open_kind"] = kind
-                            samples.append(sample)
-                except Exception as exc:
+                            errors += 1
+                            diagnostic_codes.append("tool-call-error")
+                        else:
+                            warmup_failures += 1
+                            diagnostic_codes.append("warmup-error")
+                        failures.append(
+                            f"query_index={query_index} run={run_idx} open:{kind}: {exc}"
+                        )
+                        continue
+                    try:
+                        validate_open_oracle(open_sample, kind, target_id)
+                    except Exception as exc:
+                        if measured:
+                            errors += 1
+                            oracle_mismatches += 1
+                        else:
+                            warmup_failures += 1
+                            diagnostic_codes.append("warmup-error")
+                        diagnostic_codes.append("open-oracle-mismatch")
+                        failures.append(
+                            f"query_index={query_index} run={run_idx} open:{kind}: {exc}"
+                        )
+                        continue
                     if measured:
-                        failures.append(f"query={query!r} run={run_idx}: {exc}")
+                        sample = dict(open_sample)
+                        sample.pop("structured", None)
+                        sample["open_kind"] = kind
+                        samples.append(sample)
 
         if list_sessions_args is not None:
             total_runs = args.warmup + args.repeats
             for run_idx in range(total_runs):
                 measured = run_idx >= args.warmup
+                if measured:
+                    attempted += 1
                 try:
                     request_id, list_sample = measured_tool_call(
                         proc,
@@ -730,18 +1141,50 @@ def main() -> int:
                         "list_sessions",
                         dict(list_sessions_args),
                     )
-                    if first_list_session_open_id(list_sample["structured"]) is None and measured:
-                        failures.append("list_sessions returned no open.session_id")
-                    if measured:
-                        sample = dict(list_sample)
-                        sample.pop("structured", None)
-                        samples.append(sample)
                 except Exception as exc:
                     if measured:
-                        failures.append(f"list_sessions run={run_idx}: {exc}")
+                        errors += 1
+                        diagnostic_codes.append("tool-call-error")
+                    else:
+                        warmup_failures += 1
+                        diagnostic_codes.append("warmup-error")
+                    failures.append(f"list_sessions run={run_idx}: {exc}")
+                    continue
+                try:
+                    list_data = structured_data(list_sample, "list_sessions")
+                except Exception as exc:
+                    if measured:
+                        errors += 1
+                        diagnostic_codes.append("malformed-tool-data")
+                    else:
+                        warmup_failures += 1
+                        diagnostic_codes.extend(["malformed-tool-data", "warmup-error"])
+                    failures.append(f"list_sessions run={run_idx}: {exc}")
+                    continue
+                current_list_oracle = first_list_session_open_id(list_data)
+                if measured and current_list_oracle is not None:
+                    if list_oracle is None:
+                        list_oracle = current_list_oracle
+                    elif current_list_oracle != list_oracle:
+                        oracle_mismatches += 1
+                        diagnostic_codes.append("oracle-instability")
+                        failures.append("list_sessions returned an unstable open.session_id")
+                if current_list_oracle is None:
+                    if measured:
+                        oracle_mismatches += 1
+                        diagnostic_codes.append("list-oracle-mismatch")
+                    else:
+                        warmup_failures += 1
+                        diagnostic_codes.extend(["list-oracle-mismatch", "warmup-error"])
+                    failures.append("list_sessions returned no open.session_id")
+                if measured:
+                    sample = dict(list_sample)
+                    sample.pop("structured", None)
+                    samples.append(sample)
 
     except Exception as exc:
-        failures.append(str(exc))
+        diagnostic_codes.append("mcp-prerequisite-error")
+        failures.append(f"MCP prerequisite failed: {exc}")
     finally:
         stop_mcp(proc)
 
@@ -764,34 +1207,29 @@ def main() -> int:
         for failure in failures[:20]:
             print(f"  {failure}")
 
-    total_sla_misses = sum(summary["sla_miss_count"] for summary in summaries.values())
-    payload = {
-        "corpus": counts,
-        "queries": queries,
-        "parameters": {
-            "warmup": args.warmup,
-            "repeats": args.repeats,
-            "n_hits": args.n_hits,
-            "open_kinds": open_kinds,
-            "list_sessions_args": list_sessions_args,
-            "min_docs": args.min_docs,
-            "moraine_bin": args.moraine_bin,
-            "service_bin_dir": service_bin_dir,
-        },
-        "summaries": summaries,
-        "failure_count": len(failures),
-        "sla_miss_count": total_sla_misses,
-        "samples": samples,
-    }
+    try:
+        payload = build_artifact(
+            args=args,
+            counts=counts,
+            corpus_identity=corpus_identity,
+            queries=queries,
+            open_kinds=open_kinds,
+            list_sessions_args=list_sessions_args,
+            samples=samples,
+            planned=planned,
+            attempted=attempted,
+            errors=errors,
+            initialization_ms=init_ms,
+            diagnostic_codes=diagnostic_codes,
+            oracle_mismatches=oracle_mismatches,
+            warmup_failures=warmup_failures,
+        )
+        benchmark_protocol.write_artifact(Path(args.output_json).expanduser(), payload)
+    except Exception as exc:
+        print(f"fatal: benchmark artifact validation/write failed: {exc}", file=sys.stderr)
+        return 2
 
-    if args.output_json:
-        output_path = Path(args.output_json).expanduser()
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-    if failures:
-        return 1
-    if args.fail_on_sla_miss and total_sla_misses:
+    if payload["semantic"]["status"] == "fail":
         return 1
     return 0
 
