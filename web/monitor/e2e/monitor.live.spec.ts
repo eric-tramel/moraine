@@ -1,6 +1,10 @@
 import { expect, test, type Page } from '@playwright/test';
 
-test.skip(!process.env.MONITOR_BASE_URL, 'MONITOR_BASE_URL must be set for the live monitor e2e test');
+if (!process.env.MONITOR_BASE_URL) {
+  throw new Error(
+    'MONITOR_BASE_URL is required and must point to the caller-owned monitor stack; the live Playwright suite never provisions one',
+  );
+}
 
 interface ApiBaseResponse {
   ok: boolean;
