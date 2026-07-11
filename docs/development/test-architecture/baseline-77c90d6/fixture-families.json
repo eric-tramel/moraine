@@ -1,0 +1,145 @@
+{
+  "families": {
+    "analytics_schema_cli_golden": {
+      "family_hash_contract": "sha256(relative POSIX path + NUL + bytes, sorted by path)",
+      "family_sha256": "f42646ae2851762c8c4f70ec1276511daaa2f388454126eefdffea4b55303465",
+      "file_count": 1,
+      "files": [
+        {
+          "bytes": 12944,
+          "path": "apps/moraine/src/commands/analytics_schema_v1.golden.json",
+          "sha256": "70e3ebd683903b0f4778d59e68f570421ee27918b0f3632b4f1196e89c361959"
+        }
+      ],
+      "root": "apps/moraine/src/commands/analytics_schema_v1.golden.json"
+    },
+    "raw_harness_inputs": {
+      "family_hash_contract": "sha256(relative POSIX path + NUL + bytes, sorted by path)",
+      "family_sha256": "112e21cdece244beaa2dec67d47595bd488e8d119837836e94b6fbe896e85fc2",
+      "file_count": 12,
+      "files": [
+        {
+          "bytes": 1712,
+          "path": "fixtures/claude-code/session.jsonl",
+          "sha256": "d64a2c485e54a920608fb126621588193b950ffaa1c784a92454d1a754b30f4c"
+        },
+        {
+          "bytes": 2535,
+          "path": "fixtures/codex/session.jsonl",
+          "sha256": "ea22b886e42728cd281bb20136c84e2e31d3e3b8b0bc0c6e4a028b5a4d20d2be"
+        },
+        {
+          "bytes": 1136,
+          "path": "fixtures/cursor/projects/demo/agent-transcripts/11111111-2222-4333-8444-555555555555/11111111-2222-4333-8444-555555555555.jsonl",
+          "sha256": "d6dd0beceb1bfec638fedf682e453a61c37bebd8587ade1e19e9a5e9597bf0dc"
+        },
+        {
+          "bytes": 4374,
+          "path": "fixtures/cursor/state-vscdb-kv.jsonl",
+          "sha256": "8c640440f0e51b897ae2aa34630e676f9476b39306c18f47dd87c8c6cd36d1b7"
+        },
+        {
+          "bytes": 1386,
+          "path": "fixtures/hermes/sessions/session_20260418_142200_live01.json",
+          "sha256": "40e252c575ec735281e3d944b3548d176815b8ed0097a118f8d932d423738891"
+        },
+        {
+          "bytes": 724,
+          "path": "fixtures/hermes/trajectories/001.jsonl",
+          "sha256": "f7f8da782b7499ae760fbe2ac6ec8115a274c373b580e1a08f613df4f7f5ea3f"
+        },
+        {
+          "bytes": 555,
+          "path": "fixtures/kimi-cli/project-273/11111111-2222-4333-8444-555555555555/subagents/agent-abcdef01/wire.jsonl",
+          "sha256": "84ef8ea716fdadb90c43b7c0d310f6a6fcfc923562c68c5c0a7435b7547ccf5d"
+        },
+        {
+          "bytes": 302,
+          "path": "fixtures/kimi-cli/project-273/11111111-2222-4333-8444-555555555555/wire.jsonl",
+          "sha256": "2ce8987b8b4ec6a806094006e7f897f655a251d92bf390e51fedbfb35c5a4c0d"
+        },
+        {
+          "bytes": 1395,
+          "path": "fixtures/kimi-cli/wire.jsonl",
+          "sha256": "fbf0cba94c1a7d6deb8ba23ea32db8275f434620720386739b7db1be5be45ff9"
+        },
+        {
+          "bytes": 3464,
+          "path": "fixtures/opencode/session.jsonl",
+          "sha256": "793f873d483b969a9a53bcee8221fa4e379c1b8fa0a33c93150cc3d07a1f0600"
+        },
+        {
+          "bytes": 402,
+          "path": "fixtures/pi/malformed.jsonl",
+          "sha256": "8d18f6afe3ec734958ca283b09b72a95b5020e848eb2c0743381b005163810de"
+        },
+        {
+          "bytes": 2992,
+          "path": "fixtures/pi/session.jsonl",
+          "sha256": "54b11859565939538a780e08865309be8e983678ca3874de1be1e85b1da5ca48"
+        }
+      ],
+      "root": "fixtures"
+    },
+    "source_normalization_goldens": {
+      "family_hash_contract": "sha256(relative POSIX path + NUL + bytes, sorted by path)",
+      "family_sha256": "6cfcd828e4bd5bbb732591df6d236db59a63f900773c9a9baecaccb30f969011",
+      "file_count": 10,
+      "files": [
+        {
+          "bytes": 29423,
+          "path": "crates/moraine-ingest-core/tests/goldens/source_normalization/claude_code.json",
+          "sha256": "840e95ea00ea31c775fd846d69fa14425c2afbd105a08f7d4ec817f9ec6235a0"
+        },
+        {
+          "bytes": 64279,
+          "path": "crates/moraine-ingest-core/tests/goldens/source_normalization/codex.json",
+          "sha256": "e7a7c192edde65337e154b2ec0a62ca8c7ff3d51ef9f4e28f94aa415dc125432"
+        },
+        {
+          "bytes": 31666,
+          "path": "crates/moraine-ingest-core/tests/goldens/source_normalization/cursor.json",
+          "sha256": "5017d33860a1b6fd9a6e99d614ce15639dbb2b5372c5c724cd39128edb5ebc54"
+        },
+        {
+          "bytes": 40641,
+          "path": "crates/moraine-ingest-core/tests/goldens/source_normalization/cursor_sqlite.json",
+          "sha256": "50d79e3b335c3eaa635f437c21db44274a67f62c34031abc43e5b206048c9955"
+        },
+        {
+          "bytes": 27129,
+          "path": "crates/moraine-ingest-core/tests/goldens/source_normalization/hermes_session_json.json",
+          "sha256": "eb1aa662c6c7a8cd97af498e9d18410435eafa033685cf134d757ef50e5eaeae"
+        },
+        {
+          "bytes": 24886,
+          "path": "crates/moraine-ingest-core/tests/goldens/source_normalization/hermes_trajectory.json",
+          "sha256": "469196a23bd1dadc22eb6629c7a06a7bbf9ce1c2b26bc620814ae8752458f161"
+        },
+        {
+          "bytes": 30896,
+          "path": "crates/moraine-ingest-core/tests/goldens/source_normalization/kimi_cli.json",
+          "sha256": "96d6e67424dc54e739cda967cfe7a53fda4568b9c18589fd6d70ef2e3a185ffc"
+        },
+        {
+          "bytes": 17308,
+          "path": "crates/moraine-ingest-core/tests/goldens/source_normalization/kimi_cli_subagent.json",
+          "sha256": "df69ba720e8e076b682d6eff32eef6c8080812d43d243cef0ac637b54dbec644"
+        },
+        {
+          "bytes": 48280,
+          "path": "crates/moraine-ingest-core/tests/goldens/source_normalization/opencode.json",
+          "sha256": "9ceea9f8f7937a999e99f3037c7f3d3db22d5b7a65399b21bdb448c1d6345cf5"
+        },
+        {
+          "bytes": 71438,
+          "path": "crates/moraine-ingest-core/tests/goldens/source_normalization/pi_coding_agent.json",
+          "sha256": "73be0ee7163b64a6b579be98646c819f3a45e624882ea371b5579050b1301d93"
+        }
+      ],
+      "root": "crates/moraine-ingest-core/tests/goldens/source_normalization"
+    }
+  },
+  "format_version": 1,
+  "source_commit": "77c90d6c572ba71bcfaa0362f7ead2cfa5e6712a"
+}

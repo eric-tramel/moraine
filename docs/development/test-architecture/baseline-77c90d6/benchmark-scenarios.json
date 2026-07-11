@@ -1,0 +1,50 @@
+{
+  "format_version": 1,
+  "note": "The baseline has four Python programs plus one Rust timing surface; replay MCP has two distinct lifecycle scenarios.",
+  "producer_count": 5,
+  "scenario_count": 6,
+  "scenarios": [
+    {
+      "baseline_class": "ignored Cargo integration test (timing mixed with helpers/live semantics)",
+      "benchmark_id": "analytics-latency",
+      "producer": "crates/moraine-conversations/tests/analytics_benchmark.rs",
+      "scenario_ids": [
+        "monitor-vs-repository"
+      ]
+    },
+    {
+      "baseline_class": "Python process/resource benchmark",
+      "benchmark_id": "central-mcp-resource",
+      "producer": "scripts/bench/central_mcp_resource.py",
+      "scenario_ids": [
+        "embedded-vs-central"
+      ]
+    },
+    {
+      "baseline_class": "Python MCP latency/semantic benchmark",
+      "benchmark_id": "mcp-two-tool-sla",
+      "producer": "scripts/bench/mcp_two_tool_sla.py",
+      "scenario_ids": [
+        "mcp-tool-matrix"
+      ]
+    },
+    {
+      "baseline_class": "Python MCP replay benchmark",
+      "benchmark_id": "replay-mcp-latency",
+      "producer": "scripts/bench/replay_mcp_latency.py",
+      "scenario_ids": [
+        "persistent",
+        "cold-process"
+      ]
+    },
+    {
+      "baseline_class": "Python/PyO3 search replay benchmark",
+      "benchmark_id": "replay-search-latency",
+      "producer": "scripts/bench/replay_search_latency.py",
+      "scenario_ids": [
+        "local-pyo3"
+      ]
+    }
+  ],
+  "source_commit": "77c90d6c572ba71bcfaa0362f7ead2cfa5e6712a"
+}

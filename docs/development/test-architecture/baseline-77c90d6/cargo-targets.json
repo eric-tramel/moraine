@@ -1,0 +1,336 @@
+{
+  "format_version": 1,
+  "packages": [
+    {
+      "manifest_path": "apps/moraine/Cargo.toml",
+      "name": "moraine",
+      "targets": [
+        {
+          "bench": false,
+          "crate_types": [
+            "bin"
+          ],
+          "doctest": false,
+          "kind": [
+            "test"
+          ],
+          "name": "clickhouse_supervision",
+          "src_path": "apps/moraine/tests/clickhouse_supervision.rs",
+          "test": true
+        },
+        {
+          "bench": false,
+          "crate_types": [
+            "bin"
+          ],
+          "doctest": false,
+          "kind": [
+            "test"
+          ],
+          "name": "export_cli",
+          "src_path": "apps/moraine/tests/export_cli.rs",
+          "test": true
+        },
+        {
+          "bench": false,
+          "crate_types": [
+            "bin"
+          ],
+          "doctest": false,
+          "kind": [
+            "bin"
+          ],
+          "name": "moraine",
+          "src_path": "apps/moraine/src/main.rs",
+          "test": true
+        },
+        {
+          "bench": false,
+          "crate_types": [
+            "bin"
+          ],
+          "doctest": false,
+          "kind": [
+            "test"
+          ],
+          "name": "status_cli",
+          "src_path": "apps/moraine/tests/status_cli.rs",
+          "test": true
+        }
+      ],
+      "version": "0.6.4"
+    },
+    {
+      "manifest_path": "crates/moraine-clickhouse/Cargo.toml",
+      "name": "moraine-clickhouse",
+      "targets": [
+        {
+          "bench": false,
+          "crate_types": [
+            "lib"
+          ],
+          "doctest": true,
+          "kind": [
+            "lib"
+          ],
+          "name": "moraine_clickhouse",
+          "src_path": "crates/moraine-clickhouse/src/lib.rs",
+          "test": true
+        }
+      ],
+      "version": "0.6.4"
+    },
+    {
+      "manifest_path": "crates/moraine-config/Cargo.toml",
+      "name": "moraine-config",
+      "targets": [
+        {
+          "bench": false,
+          "crate_types": [
+            "lib"
+          ],
+          "doctest": true,
+          "kind": [
+            "lib"
+          ],
+          "name": "moraine_config",
+          "src_path": "crates/moraine-config/src/lib.rs",
+          "test": true
+        }
+      ],
+      "version": "0.6.4"
+    },
+    {
+      "manifest_path": "crates/moraine-conversations/Cargo.toml",
+      "name": "moraine-conversations",
+      "targets": [
+        {
+          "bench": false,
+          "crate_types": [
+            "bin"
+          ],
+          "doctest": false,
+          "kind": [
+            "test"
+          ],
+          "name": "analytics_benchmark",
+          "src_path": "crates/moraine-conversations/tests/analytics_benchmark.rs",
+          "test": true
+        },
+        {
+          "bench": false,
+          "crate_types": [
+            "lib"
+          ],
+          "doctest": true,
+          "kind": [
+            "lib"
+          ],
+          "name": "moraine_conversations",
+          "src_path": "crates/moraine-conversations/src/lib.rs",
+          "test": true
+        },
+        {
+          "bench": false,
+          "crate_types": [
+            "bin"
+          ],
+          "doctest": false,
+          "kind": [
+            "test"
+          ],
+          "name": "repository_integration",
+          "src_path": "crates/moraine-conversations/tests/repository_integration.rs",
+          "test": true
+        }
+      ],
+      "version": "0.6.4"
+    },
+    {
+      "manifest_path": "apps/moraine-ingest/Cargo.toml",
+      "name": "moraine-ingest",
+      "targets": [
+        {
+          "bench": false,
+          "crate_types": [
+            "bin"
+          ],
+          "doctest": false,
+          "kind": [
+            "bin"
+          ],
+          "name": "moraine-ingest",
+          "src_path": "apps/moraine-ingest/src/main.rs",
+          "test": true
+        }
+      ],
+      "version": "0.6.4"
+    },
+    {
+      "manifest_path": "crates/moraine-ingest-core/Cargo.toml",
+      "name": "moraine-ingest-core",
+      "targets": [
+        {
+          "bench": false,
+          "crate_types": [
+            "bin"
+          ],
+          "doctest": false,
+          "kind": [
+            "test"
+          ],
+          "name": "golden_fixtures",
+          "src_path": "crates/moraine-ingest-core/tests/golden_fixtures.rs",
+          "test": true
+        },
+        {
+          "bench": false,
+          "crate_types": [
+            "bin"
+          ],
+          "doctest": false,
+          "kind": [
+            "test"
+          ],
+          "name": "hermes_fixture",
+          "src_path": "crates/moraine-ingest-core/tests/hermes_fixture.rs",
+          "test": true
+        },
+        {
+          "bench": false,
+          "crate_types": [
+            "bin"
+          ],
+          "doctest": false,
+          "kind": [
+            "test"
+          ],
+          "name": "hermes_session_fixture",
+          "src_path": "crates/moraine-ingest-core/tests/hermes_session_fixture.rs",
+          "test": true
+        },
+        {
+          "bench": false,
+          "crate_types": [
+            "bin"
+          ],
+          "doctest": false,
+          "kind": [
+            "test"
+          ],
+          "name": "kimi_cli_fixture",
+          "src_path": "crates/moraine-ingest-core/tests/kimi_cli_fixture.rs",
+          "test": true
+        },
+        {
+          "bench": false,
+          "crate_types": [
+            "lib"
+          ],
+          "doctest": true,
+          "kind": [
+            "lib"
+          ],
+          "name": "moraine_ingest_core",
+          "src_path": "crates/moraine-ingest-core/src/lib.rs",
+          "test": true
+        },
+        {
+          "bench": false,
+          "crate_types": [
+            "bin"
+          ],
+          "doctest": false,
+          "kind": [
+            "test"
+          ],
+          "name": "normalize_unit",
+          "src_path": "crates/moraine-ingest-core/tests/normalize_unit.rs",
+          "test": true
+        }
+      ],
+      "version": "0.6.4"
+    },
+    {
+      "manifest_path": "apps/moraine-mcp/Cargo.toml",
+      "name": "moraine-mcp",
+      "targets": [
+        {
+          "bench": false,
+          "crate_types": [
+            "bin"
+          ],
+          "doctest": false,
+          "kind": [
+            "bin"
+          ],
+          "name": "moraine-mcp",
+          "src_path": "apps/moraine-mcp/src/main.rs",
+          "test": true
+        }
+      ],
+      "version": "0.6.4"
+    },
+    {
+      "manifest_path": "crates/moraine-mcp-core/Cargo.toml",
+      "name": "moraine-mcp-core",
+      "targets": [
+        {
+          "bench": false,
+          "crate_types": [
+            "lib"
+          ],
+          "doctest": true,
+          "kind": [
+            "lib"
+          ],
+          "name": "moraine_mcp_core",
+          "src_path": "crates/moraine-mcp-core/src/lib.rs",
+          "test": true
+        }
+      ],
+      "version": "0.6.4"
+    },
+    {
+      "manifest_path": "apps/moraine-monitor/Cargo.toml",
+      "name": "moraine-monitor",
+      "targets": [
+        {
+          "bench": false,
+          "crate_types": [
+            "bin"
+          ],
+          "doctest": false,
+          "kind": [
+            "bin"
+          ],
+          "name": "moraine-monitor",
+          "src_path": "apps/moraine-monitor/src/main.rs",
+          "test": true
+        }
+      ],
+      "version": "0.6.4"
+    },
+    {
+      "manifest_path": "crates/moraine-monitor-core/Cargo.toml",
+      "name": "moraine-monitor-core",
+      "targets": [
+        {
+          "bench": false,
+          "crate_types": [
+            "lib"
+          ],
+          "doctest": true,
+          "kind": [
+            "lib"
+          ],
+          "name": "moraine_monitor_core",
+          "src_path": "crates/moraine-monitor-core/src/lib.rs",
+          "test": true
+        }
+      ],
+      "version": "0.6.4"
+    }
+  ],
+  "source_commit": "77c90d6c572ba71bcfaa0362f7ead2cfa5e6712a"
+}

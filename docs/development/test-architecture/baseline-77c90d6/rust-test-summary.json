@@ -1,0 +1,32 @@
+{
+  "format_version": 1,
+  "ignored_functions": [
+    {
+      "function": "live_monitor_vs_repository_latency",
+      "path": "crates/moraine-conversations/tests/analytics_benchmark.rs",
+      "reason": "requires live monitor and ClickHouse sandbox URLs"
+    },
+    {
+      "function": "live_schema_semantics_and_teardown",
+      "path": "crates/moraine-conversations/tests/analytics_benchmark.rs",
+      "reason": "creates and tears down a temporary database on a live ClickHouse sandbox"
+    }
+  ],
+  "integration_attributes": 128,
+  "integration_files": 10,
+  "merged_pr_476_runtime_evidence": {
+    "command": "cargo test --workspace --locked",
+    "ignored": 2,
+    "passed": 720,
+    "reported_suites": 32,
+    "source": "https://github.com/eric-tramel/moraine/pull/476"
+  },
+  "method": "static Rust test-attribute scan; not an executed-case equivalence oracle",
+  "prd_reported_source_local_files": 50,
+  "prd_reported_total_files": 60,
+  "source_commit": "77c90d6c572ba71bcfaa0362f7ead2cfa5e6712a",
+  "source_local_attributes": 589,
+  "source_local_files": 48,
+  "total_attributes": 717,
+  "warning": "Static attributes and expanded libtest runtime cases are intentionally not compared as counts."
+}

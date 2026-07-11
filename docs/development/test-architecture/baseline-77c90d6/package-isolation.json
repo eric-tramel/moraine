@@ -1,0 +1,194 @@
+{
+  "commands": [
+    {
+      "compile_only": [
+        "cargo",
+        "test",
+        "-p",
+        "moraine",
+        "--locked",
+        "--no-run"
+      ],
+      "execute": [
+        "cargo",
+        "test",
+        "-p",
+        "moraine",
+        "--locked"
+      ],
+      "package": "moraine"
+    },
+    {
+      "compile_only": [
+        "cargo",
+        "test",
+        "-p",
+        "moraine-clickhouse",
+        "--locked",
+        "--no-run"
+      ],
+      "execute": [
+        "cargo",
+        "test",
+        "-p",
+        "moraine-clickhouse",
+        "--locked"
+      ],
+      "package": "moraine-clickhouse"
+    },
+    {
+      "compile_only": [
+        "cargo",
+        "test",
+        "-p",
+        "moraine-config",
+        "--locked",
+        "--no-run"
+      ],
+      "execute": [
+        "cargo",
+        "test",
+        "-p",
+        "moraine-config",
+        "--locked"
+      ],
+      "package": "moraine-config"
+    },
+    {
+      "compile_only": [
+        "cargo",
+        "test",
+        "-p",
+        "moraine-conversations",
+        "--locked",
+        "--no-run"
+      ],
+      "execute": [
+        "cargo",
+        "test",
+        "-p",
+        "moraine-conversations",
+        "--locked"
+      ],
+      "package": "moraine-conversations"
+    },
+    {
+      "compile_only": [
+        "cargo",
+        "test",
+        "-p",
+        "moraine-ingest",
+        "--locked",
+        "--no-run"
+      ],
+      "execute": [
+        "cargo",
+        "test",
+        "-p",
+        "moraine-ingest",
+        "--locked"
+      ],
+      "package": "moraine-ingest"
+    },
+    {
+      "compile_only": [
+        "cargo",
+        "test",
+        "-p",
+        "moraine-ingest-core",
+        "--locked",
+        "--no-run"
+      ],
+      "execute": [
+        "cargo",
+        "test",
+        "-p",
+        "moraine-ingest-core",
+        "--locked"
+      ],
+      "package": "moraine-ingest-core"
+    },
+    {
+      "compile_only": [
+        "cargo",
+        "test",
+        "-p",
+        "moraine-mcp",
+        "--locked",
+        "--no-run"
+      ],
+      "execute": [
+        "cargo",
+        "test",
+        "-p",
+        "moraine-mcp",
+        "--locked"
+      ],
+      "package": "moraine-mcp"
+    },
+    {
+      "compile_only": [
+        "cargo",
+        "test",
+        "-p",
+        "moraine-mcp-core",
+        "--locked",
+        "--no-run"
+      ],
+      "execute": [
+        "cargo",
+        "test",
+        "-p",
+        "moraine-mcp-core",
+        "--locked"
+      ],
+      "package": "moraine-mcp-core"
+    },
+    {
+      "compile_only": [
+        "cargo",
+        "test",
+        "-p",
+        "moraine-monitor",
+        "--locked",
+        "--no-run"
+      ],
+      "execute": [
+        "cargo",
+        "test",
+        "-p",
+        "moraine-monitor",
+        "--locked"
+      ],
+      "package": "moraine-monitor"
+    },
+    {
+      "compile_only": [
+        "cargo",
+        "test",
+        "-p",
+        "moraine-monitor-core",
+        "--locked",
+        "--no-run"
+      ],
+      "execute": [
+        "cargo",
+        "test",
+        "-p",
+        "moraine-monitor-core",
+        "--locked"
+      ],
+      "package": "moraine-monitor-core"
+    }
+  ],
+  "format_version": 1,
+  "invariants": [
+    "metadata format version is 1",
+    "every workspace member resolves exactly once",
+    "workspace package names are nonempty and unique",
+    "zero selected packages is an error",
+    "every generated Cargo command must exit zero"
+  ],
+  "selection": "Cargo metadata workspace_members, sorted by unique package name",
+  "source_commit": "77c90d6c572ba71bcfaa0362f7ead2cfa5e6712a"
+}
