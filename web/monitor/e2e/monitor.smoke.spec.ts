@@ -51,8 +51,73 @@ function analyticsFixture(range: string) {
   };
 }
 
+const CANONICAL_API_PATHNAMES = [
+  '/api/v1/health',
+  '/api/v1/status',
+  '/api/v1/analytics',
+  '/api/v1/sessions',
+] as const;
+const STATIC_PATHNAMES = ['/', '/app.js', '/styles.css'] as const;
+
+interface RuntimeTraffic {
+  apiPathnames: string[];
+  responses: Array<{ origin: string; pathname: string; status: number }>;
+}
+
+function trackRuntimeTraffic(page: Page): RuntimeTraffic {
+  const traffic: RuntimeTraffic = {
+    apiPathnames: [],
+    responses: [],
+  };
+
+  page.on('request', (request) => {
+    const { pathname } = new URL(request.url());
+    if (pathname.startsWith('/api/')) {
+      traffic.apiPathnames.push(pathname);
+    }
+  });
+
+  page.on('response', (response) => {
+    const { origin, pathname } = new URL(response.url());
+    traffic.responses.push({ origin, pathname, status: response.status() });
+  });
+
+  return traffic;
+}
+
+async function expectVersionedRuntimeTraffic(
+  traffic: RuntimeTraffic,
+  pageOrigin: string,
+): Promise<void> {
+  await expect
+    .poll(() => [...traffic.apiPathnames], {
+      message: 'expected the dashboard to request every canonical monitor endpoint',
+    })
+    .toEqual(expect.arrayContaining([...CANONICAL_API_PATHNAMES]));
+
+  const legacyApiPathnames = traffic.apiPathnames.filter(
+    (pathname) => pathname.startsWith('/api/') && !pathname.startsWith('/api/v1/'),
+  );
+  expect(legacyApiPathnames).toEqual([]);
+
+  for (const pathname of STATIC_PATHNAMES) {
+    await expect
+      .poll(
+        () =>
+          traffic.responses.some(
+            (response) =>
+              response.origin === pageOrigin &&
+              response.pathname === pathname &&
+              response.status === 200,
+          ),
+        { message: `expected same-origin ${pathname} to return 200` },
+      )
+      .toBe(true);
+  }
+}
+
 async function setupMockMonitorApi(page: Page): Promise<void> {
-  await page.route('**/api/health', async (route) => {
+  await page.route('**/api/v1/health', async (route) => {
     await route.fulfill({
       json: {
         ok: true,
@@ -65,7 +130,7 @@ async function setupMockMonitorApi(page: Page): Promise<void> {
     });
   });
 
-  await page.route('**/api/status', async (route) => {
+  await page.route('**/api/v1/status', async (route) => {
     await route.fulfill({
       json: {
         ok: true,
@@ -83,11 +148,54 @@ async function setupMockMonitorApi(page: Page): Promise<void> {
     });
   });
 
-  await page.route('**/api/sessions', async (route) => {
-    await route.fulfill({ status: 404, body: 'not found' });
+  await page.route('**/api/v1/sessions', async (route) => {
+    await route.fulfill({
+      json: {
+        ok: true,
+        sessions: [
+          {
+            id: 'session-monitor-fixture',
+            title: 'Inspect the repository',
+            harness: { id: 'codex', label: 'codex', short: 'C', hue: 150 },
+            startedAt: 1_700_000_000_000,
+            endedAt: 1_700_000_003_900,
+            durationMs: 3_900,
+            status: 'completed',
+            models: ['gpt-5.3-codex'],
+            turns: [
+              {
+                idx: 0,
+                model: 'gpt-5.3-codex',
+                startedAt: 1_700_000_000_000,
+                endedAt: 1_700_000_003_900,
+                durationMs: 3_900,
+                promptTokens: 10,
+                completionTokens: 6,
+                totalTokens: 16,
+                toolCalls: 0,
+                steps: [
+                  { kind: 'user', at: 1_700_000_000_000, text: 'Inspect the repository' },
+                  {
+                    kind: 'assistant',
+                    at: 1_700_000_003_900,
+                    text: 'Repository inspection complete',
+                    tokens: 6,
+                    durationMs: 3_900,
+                  },
+                ],
+              },
+            ],
+            totalTokens: 16,
+            totalToolCalls: 0,
+            tags: [],
+            traceId: 'trace-monitor-fixture',
+          },
+        ],
+      },
+    });
   });
 
-  await page.route('**/api/analytics?range=*', async (route) => {
+  await page.route('**/api/v1/analytics?range=*', async (route) => {
     const requestUrl = new URL(route.request().url());
     const range = requestUrl.searchParams.get('range') || '24h';
 
@@ -119,7 +227,10 @@ test.beforeEach(async ({ page }) => {
 });
 
 test('loads dashboard and handles core interactions', async ({ page }) => {
-  await page.goto('/');
+  const runtimeTraffic = trackRuntimeTraffic(page);
+  const navigationResponse = await page.goto('/');
+  expect(navigationResponse).not.toBeNull();
+  const pageOrigin = new URL(navigationResponse!.url()).origin;
 
   await expect(page.getByRole('heading', { name: 'Moraine Monitor' })).toBeVisible();
 
@@ -131,8 +242,9 @@ test('loads dashboard and handles core interactions', async ({ page }) => {
   await page.locator('#analyticsRanges').getByRole('button', { name: '7d' }).click();
   await expect(page.locator('#analyticsMeta')).toContainText('Last 7d');
 
-  // Sessions panel (mock fallback) renders cards
+  // Sessions panel consumes the monitor API response rather than mock fallback data.
   await expect(page.locator('#sessionsPanel')).toBeVisible();
+  await expect(page.locator('.mv-card-title').first()).toHaveText('Inspect the repository');
   await expect(page.locator('.mv-card').first()).toBeVisible();
 
   // Clicking a card opens the side panel with detail (transcript is default)
@@ -169,6 +281,8 @@ test('loads dashboard and handles core interactions', async ({ page }) => {
   await page.locator(otherTheme === 'dark' ? '#themeDark' : '#themeLight').click();
   const htmlThemeAfter = await page.locator('html').getAttribute('data-theme');
   expect(htmlThemeAfter).toBe(otherTheme);
+
+  await expectVersionedRuntimeTraffic(runtimeTraffic, pageOrigin);
 });
 
 test('keeps dashboard and detail views inside the mobile viewport', async ({ page }) => {

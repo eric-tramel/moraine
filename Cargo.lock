@@ -1146,6 +1146,7 @@ dependencies = [
  "jsonc-parser",
  "moraine-clickhouse",
  "moraine-config",
+ "moraine-conversations",
  "ratatui",
  "reqwest",
  "serde",
@@ -1192,11 +1193,13 @@ dependencies = [
  "moraine-clickhouse",
  "moraine-config",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "url",
  "uuid",
 ]
 
@@ -1241,8 +1244,11 @@ version = "0.6.4"
 dependencies = [
  "anyhow",
  "moraine-config",
+ "moraine-conversations",
  "moraine-mcp-core",
+ "moraine-monitor-core",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 
@@ -1252,7 +1258,7 @@ version = "0.6.4"
 dependencies = [
  "anyhow",
  "chrono",
- "moraine-clickhouse",
+ "libc",
  "moraine-config",
  "moraine-conversations",
  "serde",
@@ -1264,12 +1270,6 @@ dependencies = [
 [[package]]
 name = "moraine-monitor"
 version = "0.6.4"
-dependencies = [
- "anyhow",
- "moraine-config",
- "moraine-monitor-core",
- "tokio",
-]
 
 [[package]]
 name = "moraine-monitor-core"
@@ -1277,13 +1277,14 @@ version = "0.6.4"
 dependencies = [
  "anyhow",
  "axum",
- "chrono",
  "mime_guess",
- "moraine-clickhouse",
  "moraine-config",
+ "moraine-conversations",
  "serde",
  "serde_json",
  "tokio",
+ "tower",
+ "tracing",
 ]
 
 [[package]]

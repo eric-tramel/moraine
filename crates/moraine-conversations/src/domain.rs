@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,9 +65,9 @@ pub struct McpSessionListFilter {
 /// whose input path ends with `rel`, scoped and filtered per the request.
 #[derive(Debug, Clone)]
 pub struct FileAttentionQuery {
-    /// Stable identifier assigned to the ClickHouse query so MCP deadlines can
-    /// cancel the backend scan if the client-side timeout fires.
-    pub query_id: String,
+    /// Opaque cancellation token assigned by the caller so timed-out requests
+    /// can cancel in-flight backend work.
+    pub cancellation_token: String,
     /// Repo-relative tail to suffix-match against captured file paths. The tail
     /// is what unifies the same logical file across worktree roots.
     pub rel: String,
@@ -89,12 +90,12 @@ pub struct FileAttentionQuery {
     pub tool: Option<String>,
     /// Drop common pure-read touches.
     pub mutations_only: bool,
-    /// Hard cap on matched rows pulled from ClickHouse. Summary, root, and
+    /// Hard cap on matched rows returned by the backend. Summary, root, and
     /// per-session rollups are computed over this scanned set; the caller flags
     /// the result truncated when the cap is hit.
     pub max_rows: usize,
-    /// Server-side ClickHouse execution cap for this scan.
-    pub max_execution_time_secs: u64,
+    /// Execution budget available to the backend for this scan.
+    pub execution_budget_secs: u64,
 }
 
 /// One captured tool call that touched the queried file. Deserialized from a
@@ -508,25 +509,27 @@ pub struct SearchEventsQuery {
     pub event_kinds: Option<Vec<SearchEventKind>>,
     #[serde(default)]
     pub exclude_codex_mcp: Option<bool>,
-    #[serde(default)]
-    pub disable_cache: Option<bool>,
-    #[serde(default)]
-    pub search_strategy: Option<SearchEventsStrategy>,
+    #[serde(default, rename = "disable_cache")]
+    pub bypass_cache: Option<bool>,
+    /// Preferred tradeoff for this search. Backends may treat this as a hint.
+    #[serde(default, rename = "search_strategy")]
+    pub strategy_hint: Option<SearchStrategyHint>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SearchEventsStrategy {
+pub enum SearchStrategyHint {
     #[default]
-    Optimized,
-    OracleExact,
+    #[serde(rename = "optimized")]
+    PreferPerformance,
+    #[serde(rename = "oracle_exact")]
+    Exact,
 }
 
-impl SearchEventsStrategy {
+impl SearchStrategyHint {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Optimized => "optimized",
-            Self::OracleExact => "oracle_exact",
+            Self::PreferPerformance => "optimized",
+            Self::Exact => "oracle_exact",
         }
     }
 }
@@ -908,6 +911,373 @@ pub struct OpenEventRequest {
     pub include_system_events: Option<bool>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AnalyticsRange {
+    #[serde(rename = "15m")]
+    FifteenMinutes,
+    #[serde(rename = "1h")]
+    OneHour,
+    #[serde(rename = "6h")]
+    SixHours,
+    #[default]
+    #[serde(rename = "24h")]
+    TwentyFourHours,
+    #[serde(rename = "7d")]
+    SevenDays,
+    #[serde(rename = "30d")]
+    ThirtyDays,
+}
+
+impl AnalyticsRange {
+    pub(crate) const ALL: [Self; 6] = [
+        Self::FifteenMinutes,
+        Self::OneHour,
+        Self::SixHours,
+        Self::TwentyFourHours,
+        Self::SevenDays,
+        Self::ThirtyDays,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FifteenMinutes => "15m",
+            Self::OneHour => "1h",
+            Self::SixHours => "6h",
+            Self::TwentyFourHours => "24h",
+            Self::SevenDays => "7d",
+            Self::ThirtyDays => "30d",
+        }
+    }
+
+    pub(crate) const fn window_seconds(self) -> u32 {
+        match self {
+            Self::FifteenMinutes => 15 * 60,
+            Self::OneHour => 60 * 60,
+            Self::SixHours => 6 * 60 * 60,
+            Self::TwentyFourHours => 24 * 60 * 60,
+            Self::SevenDays => 7 * 24 * 60 * 60,
+            Self::ThirtyDays => 30 * 24 * 60 * 60,
+        }
+    }
+
+    pub(crate) const fn bucket_seconds(self) -> u32 {
+        match self {
+            Self::FifteenMinutes => 60,
+            Self::OneHour => 5 * 60,
+            Self::SixHours => 15 * 60,
+            Self::TwentyFourHours => 60 * 60,
+            Self::SevenDays => 6 * 60 * 60,
+            Self::ThirtyDays => 24 * 60 * 60,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AnalyticsWindow {
+    pub range: AnalyticsRange,
+    pub window_seconds: u32,
+    pub bucket_seconds: u32,
+    pub from_unix: u64,
+    pub to_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnalyticsTokenPoint {
+    pub bucket_unix: u64,
+    pub model: String,
+    pub endpoint_kind: String,
+    pub bucket: String,
+    pub tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnalyticsTurnPoint {
+    pub bucket_unix: u64,
+    pub model: String,
+    pub turns: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnalyticsConcurrencyPoint {
+    pub bucket_unix: u64,
+    pub concurrent_sessions: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AnalyticsSnapshot {
+    pub window: AnalyticsWindow,
+    pub tokens: Vec<AnalyticsTokenPoint>,
+    pub turns: Vec<AnalyticsTurnPoint>,
+    pub concurrent_sessions: Vec<AnalyticsConcurrencyPoint>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionLookback {
+    #[serde(rename = "1h")]
+    OneHour,
+    #[serde(rename = "6h")]
+    SixHours,
+    #[serde(rename = "24h")]
+    TwentyFourHours,
+    #[serde(rename = "7d")]
+    SevenDays,
+    #[default]
+    #[serde(rename = "30d")]
+    ThirtyDays,
+    #[serde(rename = "90d")]
+    NinetyDays,
+    #[serde(rename = "all")]
+    All,
+}
+
+impl SessionLookback {
+    pub(crate) const fn window_seconds(self) -> Option<u32> {
+        match self {
+            Self::OneHour => Some(60 * 60),
+            Self::SixHours => Some(6 * 60 * 60),
+            Self::TwentyFourHours => Some(24 * 60 * 60),
+            Self::SevenDays => Some(7 * 24 * 60 * 60),
+            Self::ThirtyDays => Some(30 * 24 * 60 * 60),
+            Self::NinetyDays => Some(90 * 24 * 60 * 60),
+            Self::All => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionAnalyticsQuery {
+    #[serde(default)]
+    pub lookback: SessionLookback,
+    #[serde(default = "default_session_analytics_limit")]
+    pub limit: u16,
+}
+
+impl Default for SessionAnalyticsQuery {
+    fn default() -> Self {
+        Self {
+            lookback: SessionLookback::default(),
+            limit: default_session_analytics_limit(),
+        }
+    }
+}
+
+impl SessionAnalyticsQuery {
+    pub(crate) fn normalized_limit(&self) -> u16 {
+        self.limit.clamp(1, 200)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub event_unix_ms: i64,
+    pub text: String,
+    pub latency_ms: u32,
+    pub is_error: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionStep {
+    User {
+        event_unix_ms: i64,
+        text: String,
+    },
+    Assistant {
+        event_unix_ms: i64,
+        text: String,
+        endpoint_kind: String,
+        latency_ms: Option<u32>,
+        token_usage_buckets: BTreeMap<String, u64>,
+        token_usage_native_units: BTreeMap<String, f64>,
+    },
+    Thinking {
+        event_unix_ms: i64,
+        text: String,
+    },
+    ToolCall {
+        event_unix_ms: i64,
+        tool_name: String,
+        call_id: String,
+        arguments: Value,
+        latency_ms: Option<u32>,
+        is_error: bool,
+        result: Option<ToolResult>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionTurn {
+    pub summary: TurnSummary,
+    pub model: String,
+    pub token_usage_buckets: BTreeMap<String, u64>,
+    pub steps: Vec<SessionStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionAnalytics {
+    pub summary: ConversationSummary,
+    pub harness: String,
+    pub source_name: String,
+    pub models: Vec<String>,
+    pub trace_id: String,
+    pub first_user_text: String,
+    pub turns: Vec<SessionTurn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WebSearchEvent {
+    pub event_time: String,
+    pub harness: String,
+    pub source_name: String,
+    pub session_id: String,
+    pub model: String,
+    pub action: String,
+    pub search_query: String,
+    pub result_url: String,
+    pub source_ref: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct IngestHeartbeatRead {
+    pub table_present: bool,
+    pub latest: Option<IngestHeartbeat>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IngestHeartbeat {
+    pub ts: String,
+    pub ts_unix_ms: i64,
+    pub host: String,
+    pub service_version: String,
+    pub queue_depth: u64,
+    pub files_active: u32,
+    pub files_watched: u32,
+    pub rows_raw_written: u64,
+    pub rows_events_written: u64,
+    pub rows_errors_written: u64,
+    pub flush_latency_ms: u32,
+    pub append_to_visible_p50_ms: u32,
+    pub append_to_visible_p95_ms: u32,
+    pub last_error: String,
+    #[serde(default)]
+    pub watcher_backend: Option<String>,
+    #[serde(default)]
+    pub watcher_error_count: Option<u64>,
+    #[serde(default)]
+    pub watcher_reset_count: Option<u64>,
+    #[serde(default)]
+    pub watcher_last_reset_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub backend_sinks: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TableSummaries {
+    pub tables: Vec<TableSummary>,
+    pub row_counts_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableSummary {
+    pub name: String,
+    pub engine: String,
+    pub is_temporary: bool,
+    pub rows: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TablePreviewQuery {
+    pub table: String,
+    #[serde(default = "default_table_preview_limit")]
+    pub limit: u16,
+}
+
+impl TablePreviewQuery {
+    pub(crate) fn normalized_limit(&self) -> u16 {
+        self.limit.clamp(1, 500)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableColumn {
+    pub name: String,
+    pub type_name: String,
+    pub default_expression: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TablePreview {
+    pub table: String,
+    pub limit: u16,
+    pub schema: Vec<TableColumn>,
+    pub rows: Vec<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoreProbe<T> {
+    Available(T),
+    Failed { message: String },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreConnectionMetrics {
+    pub total: u64,
+    pub tcp: u64,
+    pub http: u64,
+    pub mysql: u64,
+    pub postgres: u64,
+    pub interserver: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoreHealth {
+    /// Successful ping latency in milliseconds.
+    pub ping: StoreProbe<f64>,
+    pub version: StoreProbe<String>,
+    pub database_exists: StoreProbe<bool>,
+    pub connections: StoreProbe<StoreConnectionMetrics>,
+}
+
+impl Default for StoreHealth {
+    fn default() -> Self {
+        Self {
+            ping: StoreProbe::Failed {
+                message: "ping probe not configured".to_string(),
+            },
+            version: StoreProbe::Failed {
+                message: "version probe not configured".to_string(),
+            },
+            database_exists: StoreProbe::Failed {
+                message: "database-existence probe not configured".to_string(),
+            },
+            connections: StoreProbe::Failed {
+                message: "connection-metrics probe not configured".to_string(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreDiagnostics {
+    pub healthy: bool,
+    pub version: Option<String>,
+    pub database: String,
+    pub database_exists: bool,
+    pub applied_schema_versions: Vec<String>,
+    pub pending_schema_versions: Vec<String>,
+    pub missing_tables: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+fn default_session_analytics_limit() -> u16 {
+    50
+}
+
+fn default_table_preview_limit() -> u16 {
+    25
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoConfig {
     pub max_results: u16,
@@ -954,7 +1324,50 @@ fn default_page_limit() -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::SessionOriginScope;
+    use super::{
+        AnalyticsRange, SearchEventKind, SearchEventsQuery, SearchStrategyHint,
+        SessionAnalyticsQuery, SessionLookback, SessionOriginScope, SessionStep, TablePreviewQuery,
+    };
+
+    #[test]
+    fn search_events_query_preserves_wire_contract() {
+        const WIRE_JSON: &str = r#"{"query":"needle","source":"mcp","limit":7,"session_id":"session-a","session_ids":["session-a","session-b"],"min_score":0.25,"min_should_match":2,"include_tool_events":true,"event_kinds":["message","tool_call"],"exclude_codex_mcp":false,"disable_cache":true,"search_strategy":"optimized"}"#;
+
+        let query: SearchEventsQuery =
+            serde_json::from_str(WIRE_JSON).expect("deserialize existing MCP query contract");
+
+        assert_eq!(query.bypass_cache, Some(true));
+        assert_eq!(
+            query.strategy_hint,
+            Some(SearchStrategyHint::PreferPerformance)
+        );
+        assert_eq!(
+            query.event_kinds.as_deref(),
+            Some(&[SearchEventKind::Message, SearchEventKind::ToolCall][..])
+        );
+        assert_eq!(
+            serde_json::to_string(&query).expect("serialize MCP query contract"),
+            WIRE_JSON
+        );
+    }
+
+    #[test]
+    fn search_strategy_hint_preserves_wire_values() {
+        for (hint, wire_value) in [
+            (SearchStrategyHint::PreferPerformance, r#""optimized""#),
+            (SearchStrategyHint::Exact, r#""oracle_exact""#),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&hint).expect("serialize strategy hint"),
+                wire_value
+            );
+            assert_eq!(
+                serde_json::from_str::<SearchStrategyHint>(wire_value)
+                    .expect("deserialize strategy hint"),
+                hint
+            );
+        }
+    }
 
     #[test]
     fn from_roots_normalizes_and_dedupes() {
@@ -967,5 +1380,93 @@ mod tests {
     #[test]
     fn from_roots_rejects_relative_root_and_bare_slash() {
         assert!(SessionOriginScope::from_roots(["relative/path", "", "/"]).is_none());
+    }
+    #[test]
+    fn analytics_ranges_have_exact_wire_and_window_mappings() {
+        let expected = [
+            (AnalyticsRange::FifteenMinutes, "15m", 900, 60),
+            (AnalyticsRange::OneHour, "1h", 3_600, 300),
+            (AnalyticsRange::SixHours, "6h", 21_600, 900),
+            (AnalyticsRange::TwentyFourHours, "24h", 86_400, 3_600),
+            (AnalyticsRange::SevenDays, "7d", 604_800, 21_600),
+            (AnalyticsRange::ThirtyDays, "30d", 2_592_000, 86_400),
+        ];
+
+        assert_eq!(
+            AnalyticsRange::ALL.map(AnalyticsRange::as_str),
+            ["15m", "1h", "6h", "24h", "7d", "30d"]
+        );
+        for (range, wire, window_seconds, bucket_seconds) in expected {
+            assert_eq!(range.as_str(), wire);
+            assert_eq!(range.window_seconds(), window_seconds);
+            assert_eq!(range.bucket_seconds(), bucket_seconds);
+            assert_eq!(
+                serde_json::to_string(&range).expect("serialize analytics range"),
+                format!(r#""{wire}""#)
+            );
+            assert_eq!(
+                serde_json::from_str::<AnalyticsRange>(&format!(r#""{wire}""#))
+                    .expect("deserialize analytics range"),
+                range
+            );
+        }
+        assert_eq!(AnalyticsRange::default(), AnalyticsRange::TwentyFourHours);
+    }
+
+    #[test]
+    fn session_lookbacks_have_exact_windows_and_default() {
+        for (lookback, wire, window_seconds) in [
+            (SessionLookback::OneHour, "1h", Some(3_600)),
+            (SessionLookback::SixHours, "6h", Some(21_600)),
+            (SessionLookback::TwentyFourHours, "24h", Some(86_400)),
+            (SessionLookback::SevenDays, "7d", Some(604_800)),
+            (SessionLookback::ThirtyDays, "30d", Some(2_592_000)),
+            (SessionLookback::NinetyDays, "90d", Some(7_776_000)),
+            (SessionLookback::All, "all", None),
+        ] {
+            assert_eq!(lookback.window_seconds(), window_seconds);
+            assert_eq!(
+                serde_json::to_string(&lookback).expect("serialize session lookback"),
+                format!(r#""{wire}""#)
+            );
+        }
+        assert_eq!(SessionLookback::default(), SessionLookback::ThirtyDays);
+    }
+
+    #[test]
+    fn analytics_query_and_table_preview_limits_are_normalized() {
+        let mut sessions = SessionAnalyticsQuery::default();
+        assert_eq!(sessions.limit, 50);
+        assert_eq!(sessions.normalized_limit(), 50);
+        sessions.limit = 0;
+        assert_eq!(sessions.normalized_limit(), 1);
+        sessions.limit = u16::MAX;
+        assert_eq!(sessions.normalized_limit(), 200);
+
+        let mut preview = TablePreviewQuery {
+            table: "events".to_string(),
+            limit: 0,
+        };
+        assert_eq!(preview.normalized_limit(), 1);
+        preview.limit = u16::MAX;
+        assert_eq!(preview.normalized_limit(), 500);
+    }
+
+    #[test]
+    fn session_steps_use_a_stable_kind_tag() {
+        let value = serde_json::to_value(SessionStep::User {
+            event_unix_ms: 123,
+            text: "hello".to_string(),
+        })
+        .expect("serialize typed session step");
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "kind": "user",
+                "event_unix_ms": 123,
+                "text": "hello",
+            })
+        );
     }
 }

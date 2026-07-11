@@ -15,10 +15,12 @@ serde_json = "1.0"
 thiserror = "2.0"
 tokio = { version = "1.40", features = ["macros", "rt", "sync"] }
 tracing = "0.1"
+url = "2.5"
 uuid = { version = "1.11", features = ["v4"] }
 moraine-clickhouse = { path = "../moraine-clickhouse" }
+moraine-config = { path = "../moraine-config" }
 
 [dev-dependencies]
 axum = "0.7"
-tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "net"] }
-moraine-config = { path = "../moraine-config" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "net", "time", "test-util"] }

@@ -1,7 +1,54 @@
 use super::*;
+use crate::domain::{
+    AnalyticsRange, AnalyticsSnapshot, IngestHeartbeatRead, SessionAnalytics,
+    SessionAnalyticsQuery, StoreDiagnostics, StoreHealth, TablePreview, TablePreviewQuery,
+    TableSummaries, WebSearchEvent,
+};
 
 #[async_trait]
 impl ConversationRepository for ClickHouseConversationRepository {
+    fn config(&self) -> &RepoConfig {
+        ClickHouseConversationRepository::config(self)
+    }
+
+    async fn prewarm_mcp_search_state(&self) -> RepoResult<()> {
+        ClickHouseConversationRepository::prewarm_mcp_search_state(self).await
+    }
+    async fn list_session_analytics(
+        &self,
+        query: SessionAnalyticsQuery,
+    ) -> RepoResult<Vec<SessionAnalytics>> {
+        self.list_session_analytics_impl(query).await
+    }
+
+    async fn analytics_series(&self, range: AnalyticsRange) -> RepoResult<AnalyticsSnapshot> {
+        self.analytics_series_impl(range).await
+    }
+
+    async fn list_web_searches(&self, limit: u16) -> RepoResult<Vec<WebSearchEvent>> {
+        self.list_web_searches_impl(limit).await
+    }
+
+    async fn latest_ingest_heartbeat(&self) -> RepoResult<IngestHeartbeatRead> {
+        self.latest_ingest_heartbeat_impl().await
+    }
+
+    async fn list_table_summaries(&self) -> RepoResult<TableSummaries> {
+        self.list_table_summaries_impl().await
+    }
+
+    async fn preview_table(&self, query: TablePreviewQuery) -> RepoResult<TablePreview> {
+        self.preview_table_impl(query).await
+    }
+
+    async fn read_store_health(&self) -> RepoResult<StoreHealth> {
+        self.read_store_health_impl().await
+    }
+
+    async fn read_store_diagnostics(&self) -> RepoResult<StoreDiagnostics> {
+        self.read_store_diagnostics_impl().await
+    }
+
     async fn list_conversations(
         &self,
         filter: ConversationListFilter,
@@ -89,10 +136,21 @@ impl ConversationRepository for ClickHouseConversationRepository {
         self.search_conversations_impl(query).await
     }
 
+    async fn search_session_metadata(
+        &self,
+        query: SessionMetadataSearchQuery,
+    ) -> RepoResult<SessionMetadataSearchResults> {
+        ClickHouseConversationRepository::search_session_metadata(self, query).await
+    }
+
     async fn file_attention(
         &self,
         query: FileAttentionQuery,
     ) -> RepoResult<Vec<FileAttentionTouch>> {
         self.file_attention_impl(query).await
+    }
+
+    async fn cancel_query(&self, query_id: &str) -> RepoResult<()> {
+        ClickHouseConversationRepository::cancel_query(self, query_id).await
     }
 }

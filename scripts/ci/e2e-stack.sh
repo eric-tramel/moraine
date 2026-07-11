@@ -98,6 +98,57 @@ json_ok_true() {
   "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sys.exit(0 if data.get("ok") is True else 1)'
 }
 
+assert_monitor_api_alias() {
+  local python_bin="$1"
+  local base_url="$2"
+  local tmp_root="$3"
+  local canonical_path="$4"
+  local legacy_path="$5"
+  local canonical_body_file
+  local legacy_body_file
+  canonical_body_file="$(mktemp "$tmp_root/canonical-api.XXXXXX")"
+  legacy_body_file="$(mktemp "$tmp_root/legacy-api.XXXXXX")"
+
+  local canonical_status
+  local legacy_status
+  # Deliberately omit --location: compatibility aliases must respond directly,
+  # not pass by redirecting curl to the canonical route.
+  if ! canonical_status="$(curl -sS --max-time 30 -o "$canonical_body_file" -w '%{http_code}' -- "${base_url}${canonical_path}")"; then
+    echo "[e2e] canonical monitor request failed: ${canonical_path}" >&2
+    rm -f "$canonical_body_file" "$legacy_body_file"
+    return 1
+  fi
+  if ! legacy_status="$(curl -sS --max-time 30 -o "$legacy_body_file" -w '%{http_code}' -- "${base_url}${legacy_path}")"; then
+    echo "[e2e] legacy monitor request failed: ${legacy_path}" >&2
+    rm -f "$canonical_body_file" "$legacy_body_file"
+    return 1
+  fi
+
+  if [[ "$canonical_status" != "$legacy_status" ]]; then
+    echo "[e2e] monitor alias status mismatch: ${legacy_path} (${legacy_status}) != ${canonical_path} (${canonical_status})" >&2
+    rm -f "$canonical_body_file" "$legacy_body_file"
+    return 1
+  fi
+
+  if [[ "$canonical_status" != "200" ]]; then
+    echo "[e2e] monitor alias returned unexpected status: ${canonical_path} (${canonical_status})" >&2
+    rm -f "$canonical_body_file" "$legacy_body_file"
+    return 1
+  fi
+  if ! json_ok_true "$python_bin" <"$canonical_body_file"; then
+    echo "[e2e] canonical monitor response is not successful JSON: ${canonical_path}" >&2
+    rm -f "$canonical_body_file" "$legacy_body_file"
+    return 1
+  fi
+  if ! json_ok_true "$python_bin" <"$legacy_body_file"; then
+    echo "[e2e] legacy monitor response is not successful JSON: ${legacy_path}" >&2
+    rm -f "$canonical_body_file" "$legacy_body_file"
+    return 1
+  fi
+
+  rm -f "$canonical_body_file" "$legacy_body_file"
+}
+
 wait_for_endpoint_ok() {
   local python_bin="$1"
   local url="$2"
@@ -182,6 +233,249 @@ assert_clickhouse_count() {
   assert_clickhouse_scalar "$clickhouse_url" "$label" "$query" "$expected"
 }
 
+read_live_pid_file() {
+  local path="$1"
+  local label="$2"
+  local pid=""
+
+  if [[ ! -f "$path" ]]; then
+    echo "[e2e] missing ${label} PID file: $path" >&2
+    return 1
+  fi
+  IFS= read -r pid < "$path" || true
+  if [[ ! "$pid" =~ ^[0-9]+$ ]]; then
+    echo "[e2e] invalid ${label} PID in $path: ${pid:-<empty>}" >&2
+    return 1
+  fi
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "[e2e] ${label} PID is not running: $pid" >&2
+    return 1
+  fi
+  printf '%s\n' "$pid"
+}
+
+assert_process_binary() {
+  local pid="$1"
+  local expected_binary="$2"
+  local label="$3"
+  local command_line
+
+  if ! command_line="$(ps -ww -p "$pid" -o command= 2>/dev/null)"; then
+    echo "[e2e] could not inspect ${label} process command for PID $pid" >&2
+    return 1
+  fi
+  case "$command_line" in
+    "$expected_binary" | "$expected_binary "*) ;;
+    *)
+      echo "[e2e] ${label} PID $pid is not executing the expected binary" >&2
+      echo "[e2e] expected: $expected_binary" >&2
+      echo "[e2e] actual:   $command_line" >&2
+      return 1
+      ;;
+  esac
+}
+
+assert_canonical_pid_layout() {
+  local pids_dir="$1"
+  local service
+  for service in clickhouse ingest backend; do
+    read_live_pid_file "$pids_dir/${service}.pid" "$service" >/dev/null
+  done
+
+  local retired
+  for retired in monitor.pid mcp.pid; do
+    if [[ -e "$pids_dir/$retired" ]]; then
+      echo "[e2e] retired PID file must not exist: $pids_dir/$retired" >&2
+      return 1
+    fi
+  done
+
+  local pid_path
+  for pid_path in "$pids_dir"/*.pid; do
+    [[ -f "$pid_path" ]] || continue
+    case "${pid_path##*/}" in
+      clickhouse.pid | ingest.pid | backend.pid) ;;
+      *)
+        echo "[e2e] unexpected managed PID file: $pid_path" >&2
+        return 1
+        ;;
+    esac
+  done
+}
+
+assert_frontend_asset_served() {
+  local python_bin="$1"
+  local base_url="$2"
+  local work_dir="$3"
+  local index_path="$work_dir/frontend-index.html"
+  local asset_path="$work_dir/frontend-asset"
+  local asset_url
+
+  curl -fsS --max-time 10 "$base_url/" -o "$index_path"
+  asset_url="$("$python_bin" - "$index_path" "$base_url" <<'PY'
+from html.parser import HTMLParser
+from pathlib import Path
+import sys
+from urllib.parse import urljoin, urlsplit
+
+index_path, base_url = sys.argv[1:3]
+document = Path(index_path).read_text(encoding="utf-8")
+if "<html" not in document.lower() and "<!doctype html" not in document.lower():
+    raise SystemExit(f"{base_url}/ did not return an HTML document")
+
+
+class AssetParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.references: list[str] = []
+
+    def handle_starttag(self, tag, attrs) -> None:
+        attribute = "src" if tag in {"script", "img"} else "href" if tag == "link" else None
+        if attribute is None:
+            return
+        for name, value in attrs:
+            if name == attribute and value:
+                self.references.append(value)
+
+
+parser = AssetParser()
+parser.feed(document)
+base = urlsplit(base_url)
+for reference in parser.references:
+    resolved = urlsplit(urljoin(f"{base_url}/", reference))
+    if resolved.scheme not in {"http", "https"} or resolved.netloc != base.netloc:
+        continue
+    if resolved.path in {"", "/"}:
+        continue
+    print(resolved.geturl())
+    break
+else:
+    raise SystemExit(f"{base_url}/ did not reference a same-origin static asset")
+PY
+)"
+  curl -fsS --max-time 10 "$asset_url" -o "$asset_path"
+  if [[ ! -s "$asset_path" ]]; then
+    echo "[e2e] referenced frontend asset was empty: $asset_url" >&2
+    return 1
+  fi
+}
+
+wait_for_mcp_cache_sequence() {
+  local python_bin="$1"
+  local backend_log="$2"
+  local baseline_bytes="$3"
+  local timeout_seconds="${4:-20}"
+
+  "$python_bin" - "$backend_log" "$baseline_bytes" "$timeout_seconds" <<'PY'
+from pathlib import Path
+import re
+import sys
+import time
+
+log_path = Path(sys.argv[1])
+baseline_bytes = int(sys.argv[2])
+deadline = time.monotonic() + float(sys.argv[3])
+ansi = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+hit_field = re.compile(r"\bcache_hit=(true|false)\b")
+relevant: list[str] = []
+
+while time.monotonic() < deadline:
+    relevant = []
+    observed: list[bool] = []
+    if log_path.is_file():
+        payload = log_path.read_bytes()
+        if len(payload) < baseline_bytes:
+            raise SystemExit(
+                f"{log_path} shrank below the cache-event baseline: "
+                f"{len(payload)} < {baseline_bytes}"
+            )
+        for raw_line in payload[baseline_bytes:].decode(
+            "utf-8", errors="replace"
+        ).splitlines():
+            line = ansi.sub("", raw_line)
+            if "mcp_search_cache" not in line:
+                continue
+            relevant.append(line)
+            hit_match = hit_field.search(line)
+            if hit_match is None:
+                raise SystemExit(
+                    "post-baseline mcp_search_cache marker omitted boolean cache_hit: "
+                    f"{line}"
+                )
+            observed.append(hit_match.group(1) == "true")
+    if len(observed) >= 2:
+        if observed[:2] == [False, True]:
+            raise SystemExit(0)
+        raise SystemExit(
+            "post-baseline mcp_search_cache markers were not ordered miss then hit: "
+            f"{observed}; lines={relevant[-10:]}"
+        )
+    time.sleep(0.2)
+
+raise SystemExit(
+    "timed out waiting for post-baseline mcp_search_cache miss/hit markers in "
+    f"{log_path}; lines={relevant[-10:]}"
+)
+PY
+}
+
+unix_socket_connectable() {
+  local python_bin="$1"
+  local socket_path="$2"
+
+  "$python_bin" - "$socket_path" <<'PY'
+import socket
+import sys
+
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.settimeout(0.5)
+try:
+    client.connect(sys.argv[1])
+except OSError:
+    raise SystemExit(1)
+finally:
+    client.close()
+PY
+}
+
+wait_for_backend_crash() {
+  local python_bin="$1"
+  local backend_pid="$2"
+  local socket_path="$3"
+  local http_url="$4"
+  local timeout_seconds="${5:-30}"
+  local started
+  started="$(date +%s)"
+
+  while true; do
+    local pid_live=0
+    local socket_present=0
+    local socket_connectable=0
+    local http_live=0
+    kill -0 "$backend_pid" 2>/dev/null && pid_live=1
+    [[ -S "$socket_path" ]] && socket_present=1
+    if unix_socket_connectable "$python_bin" "$socket_path"; then
+      socket_connectable=1
+    fi
+    if curl -fsS --max-time 1 "$http_url/" >/dev/null 2>&1; then
+      http_live=1
+    fi
+
+    if (( pid_live == 0 && socket_present == 1 && socket_connectable == 0 && http_live == 0 )); then
+      return 0
+    fi
+
+    local now
+    now="$(date +%s)"
+    if (( now - started >= timeout_seconds )); then
+      echo "[e2e] timed out waiting for abrupt backend loss" >&2
+      echo "[e2e] pid=$backend_pid pid_live=$pid_live socket_present=$socket_present socket_connectable=$socket_connectable http=$http_live" >&2
+      return 1
+    fi
+    sleep 0.2
+  done
+}
+
 cleanup_e2e() {
   local moraine_bin="$1"
   local config_path="$2"
@@ -221,6 +515,7 @@ main() {
   local repo_root
   repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
   local moraine_bin="${MORAINECTL_BIN:-$repo_root/target/debug/moraine}"
+  local service_bin_dir="${MORAINE_SERVICE_BIN_DIR:-$repo_root/target/debug}"
   local python_bin="${PYTHON_BIN:-python3}"
   local monitor_port="${MONITOR_PORT:-}"
   local base_keyword="${MORAINE_TEST_KEYWORD:-portable_ci_keyword}"
@@ -242,6 +537,7 @@ main() {
   local hermes_keyword="${base_keyword}_hermes_trajectory_${run_stamp}"
   local hermes_session_keyword="${base_keyword}_hermes_session_${run_stamp}"
   local clickhouse_database="moraine"
+  local routed_clickhouse_database="moraine_routed"
   local codex_session_suffix
   codex_session_suffix="$(printf '%06x%06x' "$RANDOM" "$RANDOM")"
   local codex_session_id="00000000-0000-4000-8000-${codex_session_suffix}"
@@ -278,6 +574,7 @@ main() {
 
   need_cmd curl
   need_cmd "$python_bin"
+  need_cmd ps
 
   if [[ -z "$monitor_port" ]]; then
     monitor_port="$(pick_open_port "$python_bin")"
@@ -293,6 +590,23 @@ main() {
     exit 1
   fi
 
+  if [[ ! -d "$service_bin_dir" ]]; then
+    echo "missing service binary directory: $service_bin_dir" >&2
+    exit 1
+  fi
+  service_bin_dir="$(cd "$service_bin_dir" && pwd -P)"
+  export MORAINE_SERVICE_BIN_DIR="$service_bin_dir"
+  local expected_ingest_bin="$service_bin_dir/moraine-ingest"
+  local expected_backend_bin="$service_bin_dir/moraine-mcp"
+  if [[ ! -x "$expected_ingest_bin" ]]; then
+    echo "missing ingest service binary: $expected_ingest_bin" >&2
+    exit 1
+  fi
+  if [[ ! -x "$expected_backend_bin" ]]; then
+    echo "missing backend service binary: $expected_backend_bin" >&2
+    exit 1
+  fi
+
   local tmp_root
   tmp_root="$(mktemp -d)"
   # Resolve symlinks (macOS mktemp returns /var/..., a symlink to
@@ -305,6 +619,7 @@ main() {
   local fixtures_root="$tmp_root/fixtures"
   local runtime_root="$tmp_root/runtime"
   local config_path="$tmp_root/moraine-ci.toml"
+  local routed_bootstrap_config_path="$tmp_root/moraine-routed-bootstrap.toml"
   local codex_fixture_file="$fixtures_root/codex/sessions/2026/02/16/session-${codex_session_id}.jsonl"
   local claude_fixture_file="$fixtures_root/claude/projects/e2e/session-${claude_session_id}.jsonl"
   local kimi_fixture_file="$fixtures_root/kimi/sessions/${kimi_session_id}/wire.jsonl"
@@ -572,13 +887,28 @@ EOF
 EOF
 
   cat > "$config_path" <<EOF
-[clickhouse]
+[backends.default]
 url = "${clickhouse_url}"
 database = "${clickhouse_database}"
 
+[backends.routed]
+url = "${clickhouse_url}"
+database = "${routed_clickhouse_database}"
+
+[[routes]]
+dir = "${claude_project_dir}/**"
+backend = "routed"
+mode = "mirror"
+
+[backend]
+bind = "127.0.0.1"
+start_on_up = true
+
 [monitor]
-host = "127.0.0.1"
 port = ${monitor_port}
+
+[identity]
+author = "routed-e2e"
 
 [ingest]
 backfill_on_start = true
@@ -651,23 +981,37 @@ glob = "${fixtures_root}/hermes/sessions/*.json"
 watch_root = "${fixtures_root}/hermes/sessions"
 
 [mcp]
-# Exercise the shared central server end to end: 'moraine up' starts the
-# (n.b. no backticks in this heredoc: it is unquoted, so they would execute)
-# daemon and the mcp_smoke.py runs below proxy through it (falling back to an
-# embedded server if the socket is not yet up). Both are the defaults; pinned
-# here so the e2e's coverage of the proxy path is explicit, not incidental.
+# Exercise the unified backend end to end: the canonical backend launch switch
+# makes 'moraine up' host both the central MCP socket and monitor HTTP surface.
+# mcp_smoke.py must proxy through it until the explicit crash check below.
 use_central_server = true
-start_central_on_up = true
 
 [runtime]
 root_dir = "${runtime_root}"
 logs_dir = "logs"
 pids_dir = "run"
-service_bin_dir = "${repo_root}/target/debug"
+service_bin_dir = "${service_bin_dir}"
 managed_clickhouse_dir = "${runtime_root}/managed-clickhouse"
 clickhouse_auto_install = true
 clickhouse_start_timeout_seconds = 90.0
-start_monitor_on_up = true
+EOF
+
+  cat > "$routed_bootstrap_config_path" <<EOF
+[clickhouse]
+url = "${clickhouse_url}"
+database = "${routed_clickhouse_database}"
+
+[backend]
+start_on_up = false
+
+[runtime]
+root_dir = "${runtime_root}"
+logs_dir = "logs"
+pids_dir = "run"
+service_bin_dir = "${service_bin_dir}"
+managed_clickhouse_dir = "${runtime_root}/managed-clickhouse"
+clickhouse_auto_install = true
+clickhouse_start_timeout_seconds = 90.0
 EOF
 
   trap "cleanup_e2e \"$moraine_bin\" \"$config_path\" \"$runtime_root\" \"$tmp_root\"" EXIT
@@ -691,11 +1035,47 @@ EOF
   echo "[e2e] ensuring monitor frontend assets"
   ensure_monitor_frontend "$repo_root"
 
+  echo "[e2e] bootstrapping distinct named-backend schema"
+  "$moraine_bin" up --config "$routed_bootstrap_config_path" --no-ingest
+
   echo "[e2e] starting stack"
   "$moraine_bin" up --config "$config_path"
 
+  echo "[e2e] checking canonical managed process topology"
+  local pids_dir="$runtime_root/run"
+  local backend_pid_file="$pids_dir/backend.pid"
+  local ingest_pid_file="$pids_dir/ingest.pid"
+  local clickhouse_pid_file="$pids_dir/clickhouse.pid"
+  local backend_socket="$pids_dir/mcp.sock"
+  local backend_log="$runtime_root/logs/backend.log"
+  local daemon_tools_snapshot="$tmp_root/tools-daemon.json"
+  local embedded_tools_snapshot="$tmp_root/tools-embedded.json"
+  assert_canonical_pid_layout "$pids_dir"
+  local backend_pid
+  local ingest_pid
+  local clickhouse_pid
+  backend_pid="$(read_live_pid_file "$backend_pid_file" "backend")"
+  ingest_pid="$(read_live_pid_file "$ingest_pid_file" "ingest")"
+  clickhouse_pid="$(read_live_pid_file "$clickhouse_pid_file" "clickhouse")"
+  echo "[e2e] checking managed service executable paths"
+  assert_process_binary "$ingest_pid" "$expected_ingest_bin" "ingest"
+  assert_process_binary "$backend_pid" "$expected_backend_bin" "backend"
+
+  local moraine_version
+  moraine_version="$("$moraine_bin" --version)"
+  moraine_version="${moraine_version##* }"
+  if [[ -z "$moraine_version" || "$moraine_version" == *" "* ]]; then
+    echo "[e2e] could not resolve Moraine version for ClickHouse attribution" >&2
+    return 1
+  fi
+  local expected_backend_ua="moraine-backend/${moraine_version} (pid=${backend_pid})"
+  local expected_ingest_ua="moraine-ingest/${moraine_version} (pid=${ingest_pid})"
+
   echo "[e2e] waiting for monitor health"
-  wait_for_endpoint_ok "$python_bin" "http://127.0.0.1:${monitor_port}/api/health" 120
+  wait_for_endpoint_ok "$python_bin" "http://127.0.0.1:${monitor_port}/api/v1/health" 120
+
+  echo "[e2e] checking unified backend HTML + referenced static asset"
+  assert_frontend_asset_served "$python_bin" "http://127.0.0.1:${monitor_port}" "$tmp_root"
 
   echo "[e2e] waiting for ingest heartbeat + indexed content"
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.ingest_heartbeats" 120
@@ -703,6 +1083,8 @@ EOF
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${codex_keyword}'" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${claude_keyword}') > 0" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${claude_keyword}'" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${routed_clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${claude_keyword}') > 0" 120
+  assert_clickhouse_count "$clickhouse_url" "named backend excludes default-only codex session" "SELECT count() FROM ${routed_clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${codex_keyword}') > 0" "0"
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${kimi_keyword}') > 0" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${kimi_keyword}'" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${cursor_keyword}') > 0" 120
@@ -851,14 +1233,86 @@ PY
     return 1
   fi
 
-  echo "[e2e] checking monitor API routes"
-  for path in /api/health /api/status /api/analytics /api/web-searches /api/sessions; do
+  echo "[e2e] checking canonical monitor API routes"
+  local path
+  for path in \
+    "/api/v1/health" \
+    "/api/v1/status" \
+    "/api/v1/analytics?range=24h" \
+    "/api/v1/tables" \
+    "/api/v1/web-searches?limit=25" \
+    "/api/v1/tables/v_conversation_trace?limit=500" \
+    "/api/v1/sessions?since=all&limit=200"; do
     local body
     body="$(curl -fsS "http://127.0.0.1:${monitor_port}${path}")"
     printf '%s' "$body" | json_ok_true "$python_bin"
   done
+
+  echo "[e2e] checking monitor API capabilities"
+  local applied_schema_level
+  applied_schema_level="$(clickhouse_scalar "$clickhouse_url" "SELECT max(version) FROM ${clickhouse_database}.schema_migrations")"
+  local expected_server_version
+  expected_server_version="$("$moraine_bin" --version)"
+  expected_server_version="${expected_server_version##* }"
+  local capabilities_body
+  capabilities_body="$(curl -fsS "http://127.0.0.1:${monitor_port}/api/v1/capabilities")"
+  printf '%s' "$capabilities_body" | "$python_bin" -c '
+import json
+import sys
+
+data = json.load(sys.stdin)
+expected_server_version, expected_schema_level = sys.argv[1:]
+expected_features = {
+    "analytics": True,
+    "sessions": True,
+    "table_inspection": True,
+    "web_searches": True,
+}
+valid = (
+    isinstance(data, dict)
+    and set(data) == {
+        "ok",
+        "server_version",
+        "schema_migration_level",
+        "features",
+    }
+    and data.get("ok") is True
+    and data.get("server_version") == expected_server_version
+    and data.get("schema_migration_level") == expected_schema_level
+    and data.get("features") == expected_features
+)
+if not valid:
+    print(
+        "unexpected monitor capabilities payload: "
+        f"expected server_version={expected_server_version!r}, "
+        f"schema_migration_level={expected_schema_level!r}, "
+        f"features={expected_features!r}; got {data!r}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+' "$expected_server_version" "$applied_schema_level"
+
+  local monitor_api_url="http://127.0.0.1:${monitor_port}"
+  echo "[e2e] checking one-release monitor API aliases"
+  assert_monitor_api_alias "$python_bin" "$monitor_api_url" "$tmp_root" \
+    "/api/v1/health" "/api/health"
+  assert_monitor_api_alias "$python_bin" "$monitor_api_url" "$tmp_root" \
+    "/api/v1/status" "/api/status"
+  assert_monitor_api_alias "$python_bin" "$monitor_api_url" "$tmp_root" \
+    "/api/v1/analytics?range=24h" "/api/analytics?range=24h"
+  assert_monitor_api_alias "$python_bin" "$monitor_api_url" "$tmp_root" \
+    "/api/v1/tables" "/api/tables"
+  assert_monitor_api_alias "$python_bin" "$monitor_api_url" "$tmp_root" \
+    "/api/v1/web-searches?limit=25" "/api/web-searches?limit=25"
+  assert_monitor_api_alias "$python_bin" "$monitor_api_url" "$tmp_root" \
+    "/api/v1/tables/v_conversation_trace?limit=500" \
+    "/api/tables/v_conversation_trace?limit=500"
+  assert_monitor_api_alias "$python_bin" "$monitor_api_url" "$tmp_root" \
+    "/api/v1/sessions?since=all&limit=200" \
+    "/api/sessions?since=all&limit=200"
+
   local sessions_body
-  sessions_body="$(curl -fsS "http://127.0.0.1:${monitor_port}/api/sessions?since=all&limit=200")"
+  sessions_body="$(curl -fsS "http://127.0.0.1:${monitor_port}/api/v1/sessions?since=all&limit=200")"
   printf '%s' "$sessions_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; ok=any(s.get("id")==sid and s.get("harness",{}).get("id")=="cursor" for s in data.get("sessions", [])); sys.exit(0 if ok else 1)' "$cursor_session_id"
   printf '%s' "$sessions_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; ok=any(s.get("id")==sid and s.get("harness",{}).get("id")=="pi-coding-agent" for s in data.get("sessions", [])); sys.exit(0 if ok else 1)' "$pi_session_id"
 
@@ -902,14 +1356,125 @@ PY
   # Re-enable merges now that the pre-merge assertions have passed.
   clickhouse_scalar "$clickhouse_url" "SYSTEM START MERGES ${clickhouse_database}.events" >/dev/null
 
-  echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (codex)"
+  # `/api/v1/sessions` intentionally keeps its dashboard shape without
+  # eventCount. Derive the monitor-side canonical count through the existing
+  # trace preview route, then compare both that count and sessions.endedAt with
+  # MCP below.
+  echo "[e2e] checking monitor/repository session count + last-activity parity"
+  sessions_body="$(curl -fsS "http://127.0.0.1:${monitor_port}/api/v1/sessions?since=all&limit=200")"
+  printf '%s' "$sessions_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; expected=int(sys.argv[2]); session=next((s for s in data.get("sessions", []) if s.get("id")==sid), None); ok=session is not None and session.get("endedAt")==expected; sys.exit(0 if ok else 1)' "$codex_session_id" "1771243203900"
+  local trace_body
+  trace_body="$(curl -fsS "http://127.0.0.1:${monitor_port}/api/v1/tables/v_conversation_trace?limit=500")"
+  printf '%s' "$trace_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; expected=int(sys.argv[2]); count=sum(1 for row in data.get("rows", []) if row.get("session_id")==sid); sys.exit(0 if count==expected else 1)' "$codex_session_id" "7"
+
+  # Capture a server-clock-bounded query_log window after `moraine up` and its
+  # status probe have exited. Direct curl assertions are excluded below by
+  # User-Agent, so every service-owned SELECT in this window must come from the
+  # long-lived backend PID rather than a transient CLI/test repository.
+  local query_log_start
+  query_log_start="$(clickhouse_scalar "$clickhouse_url" "SELECT toString(now64(6))")"
+  local cache_log_baseline
+  cache_log_baseline="$("$python_bin" - "$backend_log" <<'PY'
+from pathlib import Path
+import sys
+
+log_path = Path(sys.argv[1])
+print(log_path.stat().st_size if log_path.is_file() else 0)
+PY
+)"
+
+  echo "[e2e] checking first fresh stdio MCP process (codex cache miss)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
     --moraine "$moraine_bin" \
     --config "$config_path" \
     --query "$codex_keyword" \
     --expect-session-id "$codex_session_id" \
     --expect-open-text "$codex_trace_marker" \
-    --file-attention-path "Cargo.toml"
+    --expect-event-count "7" \
+    --expect-updated-at "2026-02-16T12:00:03.900Z" \
+    --file-attention-path "Cargo.toml" \
+    --write-tools-snapshot "$daemon_tools_snapshot"
+
+  echo "[e2e] checking second fresh stdio MCP process (identical codex cache hit)"
+  "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --query "$codex_keyword" \
+    --expect-session-id "$codex_session_id" \
+    --expect-open-text "$codex_trace_marker" \
+    --expect-event-count "7" \
+    --expect-updated-at "2026-02-16T12:00:03.900Z" \
+    --file-attention-path "Cargo.toml" \
+    --write-tools-snapshot "$daemon_tools_snapshot"
+
+  echo "[e2e] checking shared-daemon MCP cache miss -> hit markers"
+  wait_for_mcp_cache_sequence "$python_bin" "$backend_log" "$cache_log_baseline" 20
+
+  local routed_cache_log_baseline
+  routed_cache_log_baseline="$("$python_bin" - "$backend_log" <<'PY'
+from pathlib import Path
+import sys
+
+log_path = Path(sys.argv[1])
+print(log_path.stat().st_size if log_path.is_file() else 0)
+PY
+)"
+
+  echo "[e2e] checking first named-backend MCP route through daemon"
+  "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --working-dir "$claude_project_dir" \
+    --query "$claude_keyword" \
+    --expect-session-id "$claude_session_id" \
+    --expect-open-text "$claude_trace_marker"
+
+  echo "[e2e] checking named-backend HTTP route through shared daemon router"
+  routed_sessions_body="$(curl -fsS \
+    -H "X-Moraine-Project-Dir: ${claude_project_dir}" \
+    "http://127.0.0.1:${monitor_port}/api/v1/sessions?since=all&limit=200")"
+  printf '%s' "$routed_sessions_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); present=sys.argv[1]; absent=sys.argv[2]; ids={row.get("id") for row in data.get("sessions", [])}; sys.exit(0 if present in ids and absent not in ids else 1)' "$claude_session_id" "$codex_session_id"
+  routed_health_body="$(curl -fsS \
+    -H "X-Moraine-Project-Dir: ${claude_project_dir}" \
+    "http://127.0.0.1:${monitor_port}/api/v1/health")"
+  printf '%s' "$routed_health_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sys.exit(0 if data.get("database")==sys.argv[1] else 1)' "$routed_clickhouse_database"
+
+  echo "[e2e] checking named-backend repository/cache reuse on second MCP route"
+  "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --working-dir "$claude_project_dir" \
+    --query "$claude_keyword" \
+    --expect-session-id "$claude_session_id" \
+    --expect-open-text "$claude_trace_marker"
+  wait_for_mcp_cache_sequence "$python_bin" "$backend_log" "$routed_cache_log_baseline" 20
+
+  echo "[e2e] checking named route excludes default-only content"
+  "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --working-dir "$claude_project_dir" \
+    --query "$codex_keyword" \
+    --expect-no-results \
+    --expect-session-id "$claude_session_id" \
+    --expect-absent-session-id "$codex_session_id"
+
+  # The ingest heartbeat interval is one second. Leave enough room inside this
+  # same bounded window for a fresh ingest INSERT, then force query_log durable
+  # before asserting exact role + PID attribution.
+  sleep 3
+  local query_log_end
+  query_log_end="$(clickhouse_scalar "$clickhouse_url" "SELECT toString(now64(6))")"
+  clickhouse_scalar "$clickhouse_url" "SYSTEM FLUSH LOGS" >/dev/null
+  local query_log_window="event_time_microseconds >= parseDateTime64BestEffort('${query_log_start}') AND event_time_microseconds < parseDateTime64BestEffort('${query_log_end}')"
+  local attributed_service_filter="startsWith(http_user_agent, 'moraine-') AND NOT startsWith(http_user_agent, 'moraine-clickhouse/') AND NOT startsWith(http_user_agent, 'moraine-conversations/')"
+
+  echo "[e2e] checking bounded ClickHouse query ownership"
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND ${query_log_window} AND query_kind = 'Select' AND http_user_agent = '${expected_backend_ua}'" 30
+  assert_clickhouse_count "$clickhouse_url" "all service SELECTs use the backend UA/PID" "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND ${query_log_window} AND query_kind = 'Select' AND (${attributed_service_filter}) AND http_user_agent != '${expected_backend_ua}'" "0"
+  assert_clickhouse_count "$clickhouse_url" "named read schema handshake runs once despite MCP/HTTP reuse" "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND ${query_log_window} AND http_user_agent = '${expected_backend_ua}' AND position(query, 'system.tables') > 0 AND position(query, 'schema_migrations') > 0" "1"
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND ${query_log_window} AND query_kind = 'Insert' AND http_user_agent = '${expected_ingest_ua}'" 30
+  assert_clickhouse_count "$clickhouse_url" "all service INSERTs use the ingest UA/PID" "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND ${query_log_window} AND query_kind = 'Insert' AND (${attributed_service_filter}) AND http_user_agent != '${expected_ingest_ua}'" "0"
 
   echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (claude)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
@@ -1012,8 +1577,217 @@ PY
       --dry-run
   fi
 
-  echo "[e2e] final status"
-  "$moraine_bin" status --config "$config_path"
+  echo "[e2e] checking full-stack status prefers the daemon v1 API"
+  local daemon_status_path="$tmp_root/daemon-status.json"
+  "$moraine_bin" --output json --config "$config_path" status > "$daemon_status_path"
+  "$python_bin" - "$daemon_status_path" "$backend_pid" "$monitor_port" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+status = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+expected_backend_pid = int(sys.argv[2])
+expected_monitor_url = f"http://127.0.0.1:{int(sys.argv[3])}"
+services = {
+    row.get("service"): row
+    for row in status.get("services", [])
+    if isinstance(row, dict) and isinstance(row.get("service"), str)
+}
+
+if status.get("data_source") != "daemon_api":
+    raise SystemExit(f"full-stack status did not prefer daemon API: {status.get('data_source')!r}")
+backend = services.get("backend")
+if (
+    not isinstance(backend, dict)
+    or backend.get("state") != "running"
+    or backend.get("pid") != expected_backend_pid
+    or backend.get("socket_listening") is not True
+    or backend.get("http_listening") is not True
+):
+    raise SystemExit(f"full-stack status did not report the backend running: {backend!r}")
+doctor = status.get("doctor")
+if (
+    not isinstance(doctor, dict)
+    or doctor.get("clickhouse_healthy") is not True
+    or doctor.get("database_exists") is not True
+):
+    raise SystemExit(f"full-stack API status did not report a healthy database: {doctor!r}")
+heartbeat = status.get("heartbeat")
+if not isinstance(heartbeat, dict) or heartbeat.get("state") != "available":
+    raise SystemExit(f"full-stack API status did not report an available heartbeat: {heartbeat!r}")
+if status.get("monitor_url") != expected_monitor_url:
+    raise SystemExit(
+        f"full-stack status monitor URL mismatch: {status.get('monitor_url')!r}"
+    )
+PY
+
+  echo "[e2e] killing only the unified backend (crash/fallback scenario)"
+  kill -KILL "$backend_pid"
+  wait_for_backend_crash \
+    "$python_bin" \
+    "$backend_pid" \
+    "$backend_socket" \
+    "http://127.0.0.1:${monitor_port}" \
+    30
+
+  echo "[e2e] checking database + ingest survived backend termination"
+  local remaining_ingest_pid
+  local remaining_clickhouse_pid
+  remaining_ingest_pid="$(read_live_pid_file "$ingest_pid_file" "ingest after backend KILL")"
+  remaining_clickhouse_pid="$(read_live_pid_file "$clickhouse_pid_file" "clickhouse after backend KILL")"
+  if [[ "$remaining_ingest_pid" != "$ingest_pid" ]]; then
+    echo "[e2e] ingest PID changed across backend KILL: $ingest_pid -> $remaining_ingest_pid" >&2
+    return 1
+  fi
+  if [[ "$remaining_clickhouse_pid" != "$clickhouse_pid" ]]; then
+    echo "[e2e] ClickHouse PID changed across backend KILL: $clickhouse_pid -> $remaining_clickhouse_pid" >&2
+    return 1
+  fi
+  assert_clickhouse_scalar "$clickhouse_url" "database remains queryable after backend KILL" "SELECT 1" "1"
+
+  echo "[e2e] checking full MCP smoke through embedded fallback"
+  "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --query "$codex_keyword" \
+    --expect-session-id "$codex_session_id" \
+    --expect-open-text "$codex_trace_marker" \
+    --expect-event-count "7" \
+    --expect-updated-at "2026-02-16T12:00:03.900Z" \
+    --file-attention-path "Cargo.toml" \
+    --require-embedded-fallback \
+    --write-tools-snapshot "$embedded_tools_snapshot"
+
+  echo "[e2e] checking named-backend MCP route through embedded fallback"
+  "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --working-dir "$claude_project_dir" \
+    --query "$claude_keyword" \
+    --expect-session-id "$claude_session_id" \
+    --expect-open-text "$claude_trace_marker" \
+    --expect-absent-session-id "$codex_session_id" \
+    --require-embedded-fallback
+
+  echo "[e2e] comparing daemon and embedded canonical tools/list snapshots"
+  "$python_bin" - "$daemon_tools_snapshot" "$embedded_tools_snapshot" <<'PY'
+from hashlib import sha256
+from pathlib import Path
+import sys
+
+daemon_path, embedded_path = map(Path, sys.argv[1:3])
+daemon = daemon_path.read_bytes()
+embedded = embedded_path.read_bytes()
+if daemon != embedded:
+    raise SystemExit(
+        "canonical tools/list snapshots differ byte-for-byte: "
+        f"daemon={sha256(daemon).hexdigest()} ({len(daemon)} bytes), "
+        f"embedded={sha256(embedded).hexdigest()} ({len(embedded)} bytes)"
+    )
+PY
+
+  echo "[e2e] checking final JSON status after abrupt backend loss"
+  local final_status_path="$tmp_root/final-status.json"
+  "$moraine_bin" --output json --config "$config_path" status > "$final_status_path"
+  "$python_bin" - "$final_status_path" "$ingest_pid" "$clickhouse_pid" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+status = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if status.get("data_source") != "direct_db":
+    raise SystemExit(
+        f"backend-down status did not use direct DB fallback: {status.get('data_source')!r}"
+    )
+expected_ingest_pid = int(sys.argv[2])
+expected_clickhouse_pid = int(sys.argv[3])
+services = {
+    row.get("service"): row
+    for row in status.get("services", [])
+    if isinstance(row, dict) and isinstance(row.get("service"), str)
+}
+
+backend = services.get("backend")
+if backend != {
+    "service": "backend",
+    "pid": None,
+    "state": "stopped",
+    "socket_listening": False,
+    "http_listening": False,
+}:
+    raise SystemExit(f"final status did not report a fully stopped backend: {backend!r}")
+
+ingest = services.get("ingest")
+if (
+    not isinstance(ingest, dict)
+    or ingest.get("state") != "running"
+    or ingest.get("pid") != expected_ingest_pid
+):
+    raise SystemExit(f"final status did not report the original ingest PID running: {ingest!r}")
+
+clickhouse = services.get("clickhouse")
+if (
+    not isinstance(clickhouse, dict)
+    or clickhouse.get("state") != "running"
+    or clickhouse.get("pid") != expected_clickhouse_pid
+):
+    raise SystemExit(
+        f"final status did not report the original ClickHouse PID running: {clickhouse!r}"
+    )
+
+doctor = status.get("doctor")
+if (
+    not isinstance(doctor, dict)
+    or doctor.get("clickhouse_healthy") is not True
+    or doctor.get("database_exists") is not True
+):
+    raise SystemExit(f"final status did not report a healthy database: {doctor!r}")
+
+heartbeat = status.get("heartbeat")
+if not isinstance(heartbeat, dict) or heartbeat.get("state") != "available":
+    raise SystemExit(f"final status did not report an available heartbeat: {heartbeat!r}")
+if status.get("monitor_url") is not None:
+    raise SystemExit(f"final status retained a stopped monitor URL: {status.get('monitor_url')!r}")
+PY
+  cat "$final_status_path"
+  echo "[e2e] stopping remaining services and checking all-down status"
+  local all_down_transition_path="$tmp_root/all-down-transition.json"
+  local all_down_status_path="$tmp_root/all-down-status.json"
+  "$moraine_bin" --output json --config "$config_path" down > "$all_down_transition_path"
+  "$moraine_bin" --output json --config "$config_path" status > "$all_down_status_path"
+  "$python_bin" - "$all_down_status_path" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+status = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+services = {
+    row.get("service"): row
+    for row in status.get("services", [])
+    if isinstance(row, dict) and isinstance(row.get("service"), str)
+}
+
+if status.get("data_source") != "direct_db":
+    raise SystemExit(f"all-down status did not use direct DB: {status.get('data_source')!r}")
+for service in ("backend", "ingest", "clickhouse"):
+    row = services.get(service)
+    if (
+        not isinstance(row, dict)
+        or row.get("state") != "stopped"
+        or row.get("pid") is not None
+    ):
+        raise SystemExit(f"all-down status did not report {service} stopped: {row!r}")
+doctor = status.get("doctor")
+if not isinstance(doctor, dict) or doctor.get("clickhouse_healthy") is not False:
+    raise SystemExit(f"all-down status did not preserve database diagnosis: {doctor!r}")
+heartbeat = status.get("heartbeat")
+if not isinstance(heartbeat, dict) or heartbeat.get("state") != "error":
+    raise SystemExit(f"all-down status did not preserve heartbeat failure: {heartbeat!r}")
+if status.get("monitor_url") is not None:
+    raise SystemExit(f"all-down status retained a monitor URL: {status.get('monitor_url')!r}")
+PY
+  cat "$all_down_status_path"
+
   E2E_SUCCESS=1
 }
 

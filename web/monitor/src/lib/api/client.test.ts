@@ -1,13 +1,29 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { fetchHealth } from './client';
+import { fetchAnalytics, fetchHealth, fetchStatus } from './client';
 
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
 
-describe('fetchHealth', () => {
-  it('returns parsed json for successful responses', async () => {
+describe('versioned monitor requests', () => {
+  it.each([
+    {
+      label: 'health',
+      request: () => fetchHealth(),
+      expectedPath: '/api/v1/health',
+    },
+    {
+      label: 'status',
+      request: () => fetchStatus(),
+      expectedPath: '/api/v1/status',
+    },
+    {
+      label: 'analytics',
+      request: () => fetchAnalytics('7d'),
+      expectedPath: '/api/v1/analytics?range=7d',
+    },
+  ])('fetches $label with the canonical URL and JSON header', async ({ request, expectedPath }) => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ ok: true }), {
         status: 200,
@@ -16,11 +32,15 @@ describe('fetchHealth', () => {
     );
     vi.stubGlobal('fetch', fetchMock);
 
-    await expect(fetchHealth()).resolves.toEqual({ ok: true });
-    expect(fetchMock).toHaveBeenCalledWith('/api/health', {
+    await expect(request()).resolves.toEqual({ ok: true });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledWith(expectedPath, {
       headers: { Accept: 'application/json' },
     });
   });
+});
+
+describe('request errors', () => {
 
   it('uses API error text from json error payloads', async () => {
     vi.stubGlobal(

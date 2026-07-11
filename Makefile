@@ -1,5 +1,6 @@
 SHELL := /bin/bash
 UV ?= uv
+PYTHON ?= python3
 CODEX ?= codex
 AGENT_PLUGINS_SOURCE ?= main
 AGENT_PLUGINS_REMOTE ?= origin
@@ -21,15 +22,17 @@ endif
 CARGO_TARGET_DIR ?= $(DEFAULT_CARGO_TARGET_DIR)
 RUST_LABEL = $(if $(filter 1,$(USE_RUSTUP)),$(RUST_TOOLCHAIN) via $(RUSTUP_BIN_DIR),host PATH)
 
-.PHONY: help fmt clippy build test ci-check install docs-build docs-serve docs-clean sandbox-up sandbox-down sandbox-list hooks-install agent-plugins-install
+.PHONY: help dependency-policy fmt clippy build test ci-check install docs-build docs-serve docs-clean sandbox-up sandbox-down sandbox-list hooks-install agent-plugins-install
 
 help:
 	@echo "Available targets:"
+	@echo "  make dependency-policy"
+	@echo "                       Enforce the epic #451 Phase 1 dependency rules"
 	@echo "  make fmt            Check Rust formatting"
 	@echo "  make clippy         Run strict clippy baseline"
 	@echo "  make build          Build all workspace crates"
 	@echo "  make test           Run workspace tests"
-	@echo "  make ci-check       Run local CI checks: fmt, clippy, build, test"
+	@echo "  make ci-check       Run local CI checks: dependency policy, fmt, clippy, build, test"
 	@echo "  make install        Build the current checkout and install it to the host"
 	@echo "  make docs-build     Build static docs site into ./site"
 	@echo "  make docs-serve     Run live docs server at $(DOCS_ADDR)"
@@ -45,6 +48,11 @@ help:
 	@echo "Cargo command: $(CARGO_CMD)"
 	@echo "Cargo target dir: $(CARGO_TARGET_DIR)"
 	@echo "Override with: make ci-check USE_RUSTUP=0 CARGO_TARGET_DIR=target/nix"
+
+dependency-policy:
+	@echo "[dependency-policy] $(RUST_LABEL)"
+	@$(PYTHON) -m unittest -v scripts/ci/test_dependency_policy.py
+	@$(CARGO_ENV) MORAINE_CARGO='$(CARGO_CMD)' $(PYTHON) scripts/ci/dependency_policy.py
 
 fmt:
 	@echo "[fmt] $(RUST_LABEL)"
@@ -62,7 +70,7 @@ test:
 	@echo "[test] $(RUST_LABEL); target $(CARGO_TARGET_DIR)"
 	@$(CARGO_ENV) CARGO_TARGET_DIR='$(CARGO_TARGET_DIR)' $(CARGO_CMD) test --workspace --locked
 
-ci-check: fmt clippy build test
+ci-check: dependency-policy fmt clippy build test
 
 # Build the current checkout for the host target and install it over the
 # active `moraine` on your PATH. Pass flags via INSTALL_ARGS, e.g.

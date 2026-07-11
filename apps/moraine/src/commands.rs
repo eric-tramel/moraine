@@ -9,6 +9,7 @@ mod up;
 use anyhow::{bail, Context, Result};
 use moraine_clickhouse::{ClickHouseClient, DoctorReport};
 use moraine_config::AppConfig;
+use moraine_conversations::{ClickHouseConversationRepository, RepoConfig};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -41,7 +42,8 @@ pub(crate) async fn dispatch(cli: Cli, output: CliOutput) -> Result<ExitCode> {
         CliCommand::Status => {
             let (_, cfg) = load_cfg(cli.config.clone())?;
             let paths = runtime_paths(&cfg);
-            let snapshot = status::cmd_status(&paths, &cfg).await?;
+            let repository = conversation_repository(&cfg)?;
+            let snapshot = status::cmd_status(&paths, &cfg, &repository).await?;
             crate::render::render_status(&output, &snapshot)?;
             Ok(ExitCode::SUCCESS)
         }
@@ -189,6 +191,18 @@ async fn run_service(global_config: Option<PathBuf>, run: RunArgs) -> Result<Exi
     Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
 }
 
+fn conversation_repository(cfg: &AppConfig) -> Result<ClickHouseConversationRepository> {
+    let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
+    Ok(ClickHouseConversationRepository::new(
+        ch,
+        RepoConfig::default(),
+    ))
+}
+
+// Deliberate shared-read-layer exception: `db *`/`doctor` are storage administration,
+// while `export` owns a versioned row contract and schema-skew gate. Those paths keep
+// direct ClickHouse access; operational status reads go through ConversationRepository.
+
 async fn cmd_db_migrate(cfg: &AppConfig) -> Result<MigrationOutcome> {
     let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
     let applied = ch.run_migrations().await?;
@@ -215,6 +229,15 @@ fn parse_config_flag(args: &[String]) -> Result<(Option<PathBuf>, Vec<String>)> 
             continue;
         }
 
+        if let Some(path) = args[i].strip_prefix("--config=") {
+            if path.is_empty() {
+                bail!("--config requires a path");
+            }
+            raw_config = Some(PathBuf::from(path));
+            i += 1;
+            continue;
+        }
+
         rest.push(args[i].clone());
         i += 1;
     }
@@ -224,10 +247,11 @@ fn parse_config_flag(args: &[String]) -> Result<(Option<PathBuf>, Vec<String>)> 
 
 fn cmd_config_get(cfg: &AppConfig, key: &str) -> Result<String> {
     match key {
+        "backend.start_on_up" => Ok(cfg.backend.start_on_up.to_string()),
         "clickhouse.url" => Ok(cfg.clickhouse.url.clone()),
         "clickhouse.database" => Ok(cfg.clickhouse.database.clone()),
         _ => bail!(
-            "unsupported config key '{}'; supported keys: clickhouse.url, clickhouse.database",
+            "unsupported config key '{}'; supported keys: backend.start_on_up, clickhouse.url, clickhouse.database",
             key
         ),
     }
@@ -268,6 +292,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_config_flag_supports_equals_form_and_argument_order() {
+        let args = vec![
+            "--config=/tmp/first.toml".to_string(),
+            "--config".to_string(),
+            "/tmp/second.toml".to_string(),
+            "--host=127.0.0.1".to_string(),
+        ];
+        let (config, rest) = parse_config_flag(&args).expect("parse config");
+        assert_eq!(config, Some(PathBuf::from("/tmp/second.toml")));
+        assert_eq!(rest, vec!["--host=127.0.0.1".to_string()]);
+
+        let err = parse_config_flag(&["--config=".to_string()]).expect_err("empty equals config");
+        assert!(err.to_string().contains("--config requires a path"));
+    }
+
+    #[test]
     fn parse_config_flag_rejects_dangling_config() {
         let err = parse_config_flag(&["--config".to_string()]).expect_err("dangling config");
         assert!(err.to_string().contains("--config requires a path"));
@@ -287,6 +327,11 @@ mod tests {
             cmd_config_get(&cfg, "clickhouse.database").expect("database"),
             "analytics"
         );
+        cfg.backend.start_on_up = true;
+        assert_eq!(
+            cmd_config_get(&cfg, "backend.start_on_up").expect("backend switch"),
+            "true"
+        );
     }
 
     #[test]
@@ -294,6 +339,18 @@ mod tests {
         let cfg = AppConfig::default();
         let err = cmd_config_get(&cfg, "runtime.root_dir").expect_err("unknown key");
         assert!(err.to_string().contains("unsupported config key"));
+    }
+
+    #[test]
+    fn cmd_config_get_rejects_backend_auth_token_without_exposing_value() {
+        const TOKEN_SENTINEL: &str = "moraine-secret-token-sentinel-462";
+        let mut cfg = AppConfig::default();
+        cfg.backend.auth_token = Some(TOKEN_SENTINEL.to_string());
+
+        let err = cmd_config_get(&cfg, "backend.auth_token").expect_err("secret key");
+        let message = err.to_string();
+        assert!(message.contains("unsupported config key"));
+        assert!(!message.contains(TOKEN_SENTINEL));
     }
 
     #[tokio::test(flavor = "multi_thread")]

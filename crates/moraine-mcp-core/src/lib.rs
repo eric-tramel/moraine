@@ -4,23 +4,28 @@ pub mod contract;
 mod file_attention_v1;
 mod list_sessions_v1;
 mod open_v1;
+mod private_proxy;
 mod search_sessions_v1;
 
 use anyhow::{anyhow, Context, Result};
-use moraine_clickhouse::{enforce_remote_schema_policy, ClickHouseClient};
-use moraine_config::{AppConfig, DEFAULT_BACKEND_NAME};
-pub use moraine_conversations::SessionOriginScope;
-use moraine_conversations::{ClickHouseConversationRepository, RepoConfig, RepoError};
+use moraine_config::AppConfig;
+use moraine_conversations::{BackendRepositoryRouter, RepoError};
+pub use moraine_conversations::{ConversationRepository, SessionOriginScope};
+pub use private_proxy::private_route_deadline;
+#[cfg(unix)]
+pub use private_proxy::{negotiate_private_route, PrivateProxyConnection, PrivateRouteNegotiation};
 use serde::Deserialize;
 use serde_json::{json, Value};
-#[cfg(unix)]
+#[cfg(all(test, unix))]
+use std::future::pending;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
@@ -40,8 +45,8 @@ struct ToolCallParams {
 
 #[derive(Clone)]
 struct AppState {
-    cfg: AppConfig,
-    repo: ClickHouseConversationRepository,
+    cfg: Arc<AppConfig>,
+    repo: Arc<dyn ConversationRepository>,
     prewarm_started: Arc<AtomicBool>,
 }
 
@@ -436,97 +441,104 @@ pub(crate) fn internal_id_error(error: contract::ContractError) -> contract::Con
 }
 
 impl AppState {
-    /// Build the shared MCP application state: one ClickHouse client (and its
-    /// reqwest connection pool) and one conversation repository (and its
-    /// caches). A single instance is shared across every connection a central
-    /// server handles, so the heavy state is allocated once per host rather
-    /// than once per agent session.
-    ///
-    /// `session_scope` restricts every retrieval tool to sessions originating
-    /// under the given roots (`--project-only`). Scoped states are only ever
-    /// built for embedded per-session servers — the central server is shared
-    /// across projects and must stay unscoped.
-    pub fn build(
-        cfg: AppConfig,
-        session_scope: Option<SessionOriginScope>,
-    ) -> Result<Arc<AppState>> {
-        let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
-
-        let repo_cfg = RepoConfig {
-            max_results: cfg.mcp.max_results,
-            preview_chars: cfg.mcp.preview_chars,
-            default_context_before: cfg.mcp.default_context_before,
-            default_context_after: cfg.mcp.default_context_after,
-            default_include_tool_events: cfg.mcp.default_include_tool_events,
-            default_exclude_codex_mcp: cfg.mcp.default_exclude_codex_mcp,
-            async_log_writes: cfg.mcp.async_log_writes,
-            bm25_k1: cfg.bm25.k1,
-            bm25_b: cfg.bm25.b,
-            bm25_default_min_score: cfg.bm25.default_min_score,
-            bm25_default_min_should_match: cfg.bm25.default_min_should_match,
-            bm25_max_query_terms: cfg.bm25.max_query_terms,
-            session_scope,
-        };
-
-        let repo = ClickHouseConversationRepository::new(ch, repo_cfg);
-        Ok(Arc::new(AppState {
+    fn with_repository(
+        cfg: Arc<AppConfig>,
+        repo: Arc<dyn ConversationRepository>,
+        prewarm_started: Arc<AtomicBool>,
+    ) -> Arc<AppState> {
+        Arc::new(AppState {
             cfg,
             repo,
-            prewarm_started: Arc::new(AtomicBool::new(false)),
-        }))
+            prewarm_started,
+        })
+    }
+
+    fn embedded(cfg: AppConfig, repo: Arc<dyn ConversationRepository>) -> Arc<AppState> {
+        Self::with_repository(cfg.into(), repo, Arc::new(AtomicBool::new(false)))
     }
 }
 
 /// Drive a single newline-delimited JSON-RPC connection to completion.
 ///
-/// This is the one source of truth for the MCP wire framing: one JSON object
-/// per line in, one JSON object + `\n` per response out, blank lines skipped.
-/// `run_stdio` drives it over stdin/stdout; the central server drives one of
-/// these per accepted socket connection, all sharing a single `Arc<AppState>`.
-async fn serve_connection<R, W>(state: Arc<AppState>, reader: R, mut writer: W) -> Result<()>
+/// This is the one source of truth for the public MCP wire framing: one JSON
+/// object per line in, one JSON object plus `\n` per response out, with blank
+/// lines skipped. Socket connections may provide a first line that was already
+/// read while discriminating the daemon-private route request; that line is
+/// replayed here exactly once for compatibility with older raw clients.
+async fn serve_connection_with_first_line<R, W>(
+    state: Arc<AppState>,
+    mut reader: R,
+    mut writer: W,
+    first_line: Option<Vec<u8>>,
+) -> Result<()>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut lines = reader.lines();
+    if let Some(first_line) = first_line {
+        let first_line =
+            std::str::from_utf8(&first_line).context("incoming RPC line is not valid UTF-8")?;
+        serve_rpc_line(&state, first_line, &mut writer).await?;
+    }
 
-    while let Some(line) = lines.next_line().await? {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).await? == 0 {
+            break;
         }
-
-        debug!("incoming rpc line: {}", line);
-
-        let parsed = serde_json::from_str::<RpcRequest>(line);
-        let req = match parsed {
-            Ok(req) => req,
-            Err(err) => {
-                warn!("failed to parse rpc request: {}", err);
-                continue;
-            }
-        };
-
-        if let Some(resp) = state.handle_request(req).await {
-            let payload = serde_json::to_vec(&resp)?;
-            writer.write_all(&payload).await?;
-            writer.write_all(b"\n").await?;
-            writer.flush().await?;
-        }
+        serve_rpc_line(&state, &line, &mut writer).await?;
     }
 
     Ok(())
 }
 
-/// Run an embedded MCP server over stdin/stdout. This is the pre-central
-/// behavior: one full server (ClickHouse client + caches) per process, owned
-/// by the agent session that spawned it. Used directly when the central server
-/// is disabled, and as the transparent fallback when it is unreachable.
+async fn serve_connection<R, W>(state: Arc<AppState>, reader: R, writer: W) -> Result<()>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    serve_connection_with_first_line(state, reader, writer, None).await
+}
+
+async fn serve_rpc_line<W>(state: &Arc<AppState>, line: &str, writer: &mut W) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let line = line.trim();
+    if line.is_empty() {
+        return Ok(());
+    }
+
+    debug!("incoming rpc line: {}", line);
+    let req = match serde_json::from_str::<RpcRequest>(line) {
+        Ok(req) => req,
+        Err(err) => {
+            warn!("failed to parse rpc request: {}", err);
+            return Ok(());
+        }
+    };
+
+    if let Some(resp) = state.handle_request(req).await {
+        let payload = serde_json::to_vec(&resp)?;
+        writer.write_all(&payload).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+    }
+    Ok(())
+}
+
+/// Run an embedded MCP server over stdin/stdout using a repository selected and
+/// constructed by the owning application.
 ///
-/// `session_scope` carries the `--project-only` restriction; it is `None` for
-/// ordinary unscoped serving.
-pub async fn run_stdio(cfg: AppConfig, session_scope: Option<SessionOriginScope>) -> Result<()> {
-    let state = AppState::build(cfg, session_scope)?;
+/// Repository construction, project routing, schema policy, and scoped
+/// fallback all live outside mcp-core. The injected repository remains fixed
+/// for the lifetime of this stdio connection.
+pub async fn run_stdio_with_repository(
+    cfg: AppConfig,
+    repository: Arc<dyn ConversationRepository>,
+) -> Result<()> {
+    let state = AppState::embedded(cfg, repository);
     serve_connection(
         state,
         BufReader::new(tokio::io::stdin()),
@@ -535,21 +547,68 @@ pub async fn run_stdio(cfg: AppConfig, session_scope: Option<SessionOriginScope>
     .await
 }
 
-/// Run the shared central MCP server, listening on a Unix domain socket.
-///
-/// Builds the heavy `AppState` exactly once, then accepts connections and
-/// serves each on its own task sharing that single state. One bad client never
-/// takes down the server; transient `accept` errors back off and retry. A
-/// SIGTERM/SIGINT handler unlinks the socket so a clean `moraine down` leaves
-/// no stale socket behind.
 #[cfg(unix)]
-pub async fn run_socket(cfg: AppConfig, socket_path: PathBuf) -> Result<()> {
-    use tokio::net::{UnixListener, UnixStream};
+#[derive(Clone)]
+struct BackendPrewarmGates {
+    by_backend: Arc<std::collections::HashMap<String, Arc<AtomicBool>>>,
+}
 
-    // The central server is shared by sessions from every project on the
-    // host, so it always runs unscoped; `--project-only` sessions run
-    // embedded instead (see `apps/moraine-mcp`).
-    let state = AppState::build(cfg, None)?;
+#[cfg(unix)]
+impl BackendPrewarmGates {
+    fn new(cfg: &AppConfig) -> Self {
+        let by_backend = cfg
+            .backends
+            .keys()
+            .map(|name| (name.clone(), Arc::new(AtomicBool::new(false))))
+            .collect();
+        Self {
+            by_backend: Arc::new(by_backend),
+        }
+    }
+
+    fn for_backend(&self, backend_name: &str) -> Result<Arc<AtomicBool>> {
+        self.by_backend
+            .get(backend_name)
+            .cloned()
+            .ok_or_else(|| anyhow!("selected backend '{backend_name}' has no MCP prewarm gate"))
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct SocketState {
+    cfg: Arc<AppConfig>,
+    router: Arc<BackendRepositoryRouter>,
+    prewarm_gates: BackendPrewarmGates,
+}
+
+/// Run the shared MCP server on a Unix domain socket using the daemon-owned
+/// backend repository router.
+///
+/// The caller owns process supervision and supplies `shutdown`; this core
+/// never installs signal handlers or terminates the process. Each accepted
+/// connection negotiates and pins one repository handle, while connections to
+/// the same backend share both its repository and its MCP prewarm gate. When
+/// shutdown resolves, accepting stops, connection tasks are cancelled, and the
+/// public socket path is unlinked before this future returns.
+#[cfg(unix)]
+pub async fn run_socket_with_router<S>(
+    cfg: Arc<AppConfig>,
+    router: Arc<BackendRepositoryRouter>,
+    socket_path: PathBuf,
+    shutdown: S,
+) -> Result<()>
+where
+    S: Future<Output = ()> + Send,
+{
+    use tokio::net::{UnixListener, UnixStream};
+    use tokio::task::JoinSet;
+
+    let state = SocketState {
+        prewarm_gates: BackendPrewarmGates::new(&cfg),
+        cfg,
+        router,
+    };
 
     if let Some(parent) = socket_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         use std::os::unix::fs::DirBuilderExt;
@@ -564,25 +623,61 @@ pub async fn run_socket(cfg: AppConfig, socket_path: PathBuf) -> Result<()> {
             .with_context(|| format!("failed to create socket directory {}", parent.display()))?;
     }
 
-    // Stale-socket dance: if a live server already owns the path, this start is
-    // a no-op (idempotent `moraine up`). A dead socket file needs no removal —
-    // the rename below atomically replaces it.
-    if socket_path.exists() && UnixStream::connect(&socket_path).await.is_ok() {
-        warn!(
-            "central MCP server already listening at {}; nothing to do",
-            socket_path.display()
-        );
-        return Ok(());
+    // A live listener is a startup failure for the unified backend: returning
+    // success here would leave its HTTP sibling running without the MCP half.
+    // Remove a dead socket only if the path still names the inode that failed
+    // the connection probe; a concurrently published replacement makes this
+    // start fail rather than being unlinked.
+    match std::fs::symlink_metadata(&socket_path) {
+        Ok(stale) => {
+            use std::os::unix::fs::MetadataExt;
+            let stale_identity = (stale.dev(), stale.ino());
+            if UnixStream::connect(&socket_path).await.is_ok() {
+                return Err(anyhow!(
+                    "failed to bind MCP socket {}: another backend is already listening",
+                    socket_path.display()
+                ));
+            }
+            match std::fs::symlink_metadata(&socket_path) {
+                Ok(current) if (current.dev(), current.ino()) == stale_identity => {
+                    std::fs::remove_file(&socket_path).with_context(|| {
+                        format!(
+                            "failed to remove stale MCP socket {}",
+                            socket_path.display()
+                        )
+                    })?;
+                }
+                Ok(_) => {
+                    return Err(anyhow!(
+                        "failed to bind MCP socket {}: socket path changed during startup",
+                        socket_path.display()
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to inspect MCP socket {}", socket_path.display())
+                    });
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect MCP socket {}", socket_path.display())
+            });
+        }
     }
 
     // Bind on a private temp path, restrict it, then atomically rename into
     // place. The socket is therefore never connectable at the public path with
-    // umask-derived (possibly world-connectable) permissions — there is no
-    // bind-then-chmod window. Unix sockets are bound to the inode, so the
-    // listener keeps accepting through the renamed path.
+    // umask-derived (possibly world-connectable) permissions.
     let tmp_path = socket_path.with_extension(format!("{}.tmp", std::process::id()));
     let _ = std::fs::remove_file(&tmp_path);
     let listener = UnixListener::bind(&tmp_path)
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp_path);
+        })
         .with_context(|| format!("failed to bind MCP socket {}", tmp_path.display()))?;
 
     {
@@ -599,111 +694,253 @@ pub async fn run_socket(cfg: AppConfig, socket_path: PathBuf) -> Result<()> {
             })?;
     }
 
-    std::fs::rename(&tmp_path, &socket_path)
+    // Capture the inode before publication. Cleanup only unlinks this inode,
+    // so a concurrently started backend that later wins the public path can
+    // never have its socket removed by this server's shutdown guard.
+    let socket_identity = {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(&tmp_path)
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&tmp_path);
+            })
+            .with_context(|| {
+                format!(
+                    "failed to inspect MCP socket before publishing {}",
+                    tmp_path.display()
+                )
+            })?;
+        (metadata.dev(), metadata.ino())
+    };
+
+    rename_socket_noreplace(&tmp_path, &socket_path)
         .inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp_path);
         })
         .with_context(|| {
             format!(
-                "failed to move MCP socket into place at {}",
+                "failed to publish MCP socket at {} without replacing another backend",
                 socket_path.display()
             )
         })?;
-
-    spawn_socket_cleanup_on_signal(socket_path.clone());
+    let _socket_cleanup = SocketCleanup::new(socket_path.clone(), socket_identity);
 
     debug!("central MCP server listening on {}", socket_path.display());
 
+    let mut connections = JoinSet::new();
+    tokio::pin!(shutdown);
     loop {
-        match listener.accept().await {
-            Ok((stream, _addr)) => {
-                let conn_state = state.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = serve_socket_connection(conn_state, stream).await {
-                        debug!("mcp connection ended: {}", err);
+        tokio::select! {
+            _ = &mut shutdown => break,
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((stream, _addr)) => {
+                        let conn_state = state.clone();
+                        connections.spawn(async move {
+                            serve_socket_connection(conn_state, stream).await
+                        });
                     }
-                });
+                    Err(err) => {
+                        // e.g. EMFILE under fd pressure: log and keep serving
+                        // rather than tearing down every existing session.
+                        warn!("mcp accept error: {}", err);
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                }
             }
-            Err(err) => {
-                // e.g. EMFILE under fd pressure: log and keep serving rather
-                // than tearing down every other session's connection.
-                warn!("mcp accept error: {}", err);
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Some(completed) = connections.join_next(), if !connections.is_empty() => {
+                match completed {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => debug!("mcp connection ended: {}", err),
+                    Err(err) => debug!("mcp connection task ended unexpectedly: {}", err),
+                }
             }
+        }
+    }
+
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+    Ok(())
+}
+
+#[cfg(unix)]
+struct SocketCleanup {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+impl SocketCleanup {
+    fn new(path: PathBuf, (device, inode): (u64, u64)) -> Self {
+        Self {
+            path,
+            device,
+            inode,
         }
     }
 }
 
 #[cfg(unix)]
-async fn serve_socket_connection(
-    state: Arc<AppState>,
-    stream: tokio::net::UnixStream,
-) -> Result<()> {
-    let (read_half, write_half) = stream.into_split();
-    serve_connection(state, BufReader::new(read_half), write_half).await
-}
+impl Drop for SocketCleanup {
+    fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt;
 
-#[cfg(unix)]
-fn spawn_socket_cleanup_on_signal(socket_path: PathBuf) {
-    use tokio::signal::unix::{signal, SignalKind};
-
-    tokio::spawn(async move {
-        let mut term = match signal(SignalKind::terminate()) {
-            Ok(sig) => sig,
-            Err(err) => {
-                warn!("failed to install SIGTERM handler: {}", err);
-                return;
-            }
+        let Ok(metadata) = std::fs::symlink_metadata(&self.path) else {
+            return;
         };
-        let mut int = match signal(SignalKind::interrupt()) {
-            Ok(sig) => sig,
-            Err(err) => {
-                warn!("failed to install SIGINT handler: {}", err);
-                return;
-            }
-        };
-
-        tokio::select! {
-            _ = term.recv() => {}
-            _ = int.recv() => {}
+        if metadata.dev() == self.device && metadata.ino() == self.inode {
+            let _ = std::fs::remove_file(&self.path);
         }
-
-        let _ = std::fs::remove_file(&socket_path);
-        std::process::exit(0);
-    });
+    }
 }
 
-/// Run a near-zero-cost stdio<->socket proxy for a single agent session.
-///
-/// No ClickHouse client, no caches, no multi-threaded runtime: just two byte
-/// pumps. Because it never parses the JSON, it cannot perturb the framing
-/// (id presence, compact spacing, etc.) — it forwards bytes verbatim.
-///
-/// Half-close semantics matter: when the agent closes stdin we must *not* abort
-/// the downstream copy, or a large in-flight `tools/call` response would be
-/// truncated. So the downstream pump (server -> stdout) is authoritative for
-/// exit; on stdin EOF we shut down the socket write half (signalling EOF to the
-/// server) and keep draining downstream until the server closes its side.
-#[cfg(unix)]
-pub async fn run_proxy(stream: tokio::net::UnixStream) -> Result<()> {
-    proxy_streams(tokio::io::stdin(), tokio::io::stdout(), stream).await
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+fn socket_path_cstring(path: &std::path::Path) -> std::io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+
+    std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Unix socket path contains a NUL byte",
+        )
+    })
 }
 
-/// Core of [`run_proxy`], generic over the client side so it can be exercised
-/// with in-memory streams in tests. `client_in`/`client_out` are stdin/stdout
-/// in production; `stream` is the connection to the central server.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_socket_noreplace(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    let from = socket_path_cstring(from)?;
+    let to = socket_path_cstring(to)?;
+    // SAFETY: both C strings are alive for the call, contain no interior NUL,
+    // and the directory descriptors are the platform's current-directory
+    // sentinel.
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn rename_socket_noreplace(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    let from = socket_path_cstring(from)?;
+    let to = socket_path_cstring(to)?;
+    // SAFETY: both C strings are alive for the call and contain no interior
+    // NUL. RENAME_EXCL makes publication fail if `to` already exists.
+    let result = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))
+))]
+fn rename_socket_noreplace(_from: &std::path::Path, _to: &std::path::Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace Unix socket publication is unsupported on this platform",
+    ))
+}
+
 #[cfg(unix)]
-async fn proxy_streams<I, O>(
+async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStream) -> Result<()> {
+    use private_proxy::ServerFirstLine;
+
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    let Some(first_line) = private_proxy::read_server_first_line(&mut reader).await? else {
+        return Ok(());
+    };
+
+    let (backend, replay_first_line, negotiated) =
+        match private_proxy::classify_server_first_line(&first_line) {
+            ServerFirstLine::Route { cwd } => {
+                match state.router.repository_for_project_dir(Some(&cwd)).await {
+                    Ok(backend) => (backend, None, true),
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        private_proxy::write_route_error(&mut write_half, &message).await?;
+                        return Ok(());
+                    }
+                }
+            }
+            ServerFirstLine::Incompatible => {
+                private_proxy::write_incompatible_error(&mut write_half).await?;
+                return Ok(());
+            }
+            ServerFirstLine::Raw => {
+                let backend = state.router.default_repository().await?;
+                (backend, Some(first_line), false)
+            }
+        };
+
+    let prewarm_started = match state.prewarm_gates.for_backend(backend.backend_name()) {
+        Ok(gate) => gate,
+        Err(error) if negotiated => {
+            private_proxy::write_route_error(&mut write_half, &error.to_string()).await?;
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let app_state =
+        AppState::with_repository(state.cfg, backend.repository().clone(), prewarm_started);
+    if negotiated {
+        private_proxy::write_ack(&mut write_half).await?;
+    }
+    serve_connection_with_first_line(app_state, reader, write_half, replay_first_line).await
+}
+
+/// Run the stdio byte pumps after a private route negotiation was accepted.
+///
+/// The accepted connection retains the buffered daemon reader used for the
+/// private ACK. No agent stdin is consumed before this function starts.
+#[cfg(unix)]
+pub async fn run_proxy(connection: PrivateProxyConnection) -> Result<()> {
+    let (sock_read, sock_write) = connection.into_parts();
+    proxy_streams_with_halves(
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        sock_read,
+        sock_write,
+    )
+    .await
+}
+
+#[cfg(unix)]
+async fn proxy_streams_with_halves<I, O, R, W>(
     mut client_in: I,
     mut client_out: O,
-    stream: tokio::net::UnixStream,
+    mut sock_read: R,
+    mut sock_write: W,
 ) -> Result<()>
 where
     I: AsyncRead + Unpin,
     O: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
 {
-    let (mut sock_read, mut sock_write) = stream.into_split();
-
     let upstream = async {
         let _ = tokio::io::copy(&mut client_in, &mut sock_write).await;
         // Signal EOF to the server so it can finish any in-flight response and
@@ -732,149 +969,18 @@ where
     Ok(())
 }
 
-/// Resolve the non-default backend a stdio entry should serve against, given
-/// the process working directory: home-config `[[routes]]` win over a repo
-/// `.moraine.toml` reference, a reference to an unknown backend name warns
-/// and falls back to default behavior (the trust boundary: a cloned repo can
-/// only name backends the user already configured), and routing to
-/// `"default"` is a no-op. `None` means keep the default entry behavior.
-fn resolve_stdio_backend(cfg: &AppConfig, cwd: &str) -> Option<String> {
-    resolve_stdio_backend_with_lookup(cfg, cwd, |dir| moraine_config::find_repo_backend_ref(dir))
-}
-
-/// Core of [`resolve_stdio_backend`], with the repo `.moraine.toml` lookup
-/// injectable so the decision is testable without a filesystem walk-up.
-fn resolve_stdio_backend_with_lookup(
-    cfg: &AppConfig,
-    cwd: &str,
-    repo_lookup: impl Fn(&str) -> Option<String>,
-) -> Option<String> {
-    // With only the default backend configured there is nothing to route to;
-    // skip resolution (and the repo-file filesystem walk) entirely so the
-    // common single-backend install pays nothing at startup.
-    if !cfg.backends.keys().any(|name| name != DEFAULT_BACKEND_NAME) {
-        return None;
-    }
-    let cwd = cwd.trim();
-    if cwd.is_empty() {
-        return None;
-    }
-    // A matching home route decides the name even when it fails validation
-    // below: first match wins, it never falls through to the repo file.
-    let name = match cfg.route_for_dir(cwd) {
-        Some(route) => route.backend.clone(),
-        None => repo_lookup(cwd)?,
-    };
-    if name == DEFAULT_BACKEND_NAME {
-        // Explicitly routing to default is the default behavior already.
-        return None;
-    }
-    if cfg.backends.contains_key(&name) {
-        return Some(name);
-    }
-    warn!(
-        backend = %name,
-        cwd,
-        "route names a backend with no [backends.{}] entry in the home config; \
-         serving against the default backend",
-        name
-    );
-    None
-}
-
-/// Run an embedded stdio server against a named non-default backend.
-///
-/// The schema handshake runs first and fails fast: moraine never migrates
-/// non-default backends, so a skewed (or unreachable) server must error
-/// loudly at startup rather than degrade at query time. Only after the
-/// handshake passes is the backend's config swapped in as `cfg.clickhouse`,
-/// which is all `AppState::build` reads.
-async fn run_stdio_for_backend(
-    mut cfg: AppConfig,
-    backend: &str,
-    session_scope: Option<SessionOriginScope>,
-) -> Result<()> {
-    let backend_cfg = cfg
-        .backends
-        .get(backend)
-        .cloned()
-        .ok_or_else(|| anyhow!("backend '{backend}' is not configured"))?;
-
-    let client = ClickHouseClient::new(backend_cfg.clone())?;
-    let skew = client.schema_skew().await.with_context(|| {
-        format!("backend '{backend}': schema handshake failed (is the server reachable?)")
-    })?;
-    enforce_remote_schema_policy(backend, &skew, backend_cfg.allow_newer_server)?;
-
-    cfg.clickhouse = backend_cfg;
-    run_stdio(cfg, session_scope).await
-}
-
-/// Entry point used by `moraine run mcp` (the command agents register).
-///
-/// First, per-project routing: when the process cwd routes to a non-default
-/// backend (home-config routes, then the repo `.moraine.toml` walk-up), the
-/// central proxy is skipped — the central server only serves the default
-/// backend — and an embedded server runs against the routed backend instead,
-/// failing fast on schema skew.
-///
-/// Otherwise, when the central server is enabled (the default), connect to its
-/// socket and proxy; if the socket is missing, refused, or slow to answer,
-/// fall back to an embedded stdio server so correctness never depends on the
-/// daemon being up. When central mode is disabled, run embedded directly
-/// (pre-central behavior).
-///
-/// `session_scope` carries the `--project-only` restriction. A scoped session
-/// never proxies — the central server is shared across projects and the proxy
-/// forwards bytes verbatim, so the scope could not be enforced through it — but
-/// it still honors per-project backend routing: the scope is applied to an
-/// embedded server against whichever backend the cwd routes to.
-pub async fn run_mcp_entry(
-    cfg: AppConfig,
-    session_scope: Option<SessionOriginScope>,
-) -> Result<()> {
-    let cwd = std::env::current_dir()
-        .map(|dir| dir.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    if let Some(backend) = resolve_stdio_backend(&cfg, &cwd) {
-        info!(
-            backend = %backend,
-            cwd,
-            scoped = session_scope.is_some(),
-            "cwd routes to a non-default backend; serving embedded against it"
-        );
-        return run_stdio_for_backend(cfg, &backend, session_scope).await;
-    }
-
-    // A scoped session always runs embedded; skip the proxy entirely.
-    #[cfg(unix)]
-    if session_scope.is_none() && cfg.mcp.use_central_server {
-        use tokio::net::UnixStream;
-
-        let socket_path = PathBuf::from(&cfg.mcp.central_socket_path);
-        let dur = std::time::Duration::from_millis(cfg.mcp.central_connect_timeout_ms);
-        match tokio::time::timeout(dur, UnixStream::connect(&socket_path)).await {
-            Ok(Ok(stream)) => {
-                debug!(
-                    "proxying stdio to central MCP server at {}",
-                    socket_path.display()
-                );
-                return run_proxy(stream).await;
-            }
-            Ok(Err(err)) => warn!(
-                "central MCP server unreachable at {} ({}); using embedded server",
-                socket_path.display(),
-                err
-            ),
-            Err(_) => warn!(
-                "central MCP server connect timed out at {} after {}ms; using embedded server",
-                socket_path.display(),
-                cfg.mcp.central_connect_timeout_ms
-            ),
-        }
-    }
-
-    run_stdio(cfg, session_scope).await
+#[cfg(all(test, unix))]
+async fn proxy_streams<I, O>(
+    client_in: I,
+    client_out: O,
+    stream: tokio::net::UnixStream,
+) -> Result<()>
+where
+    I: AsyncRead + Unpin,
+    O: AsyncWrite + Unpin,
+{
+    let (read_half, write_half) = stream.into_split();
+    proxy_streams_with_halves(client_in, client_out, BufReader::new(read_half), write_half).await
 }
 
 /// Resolve the `--project-only` scope from the directory this process was
@@ -914,33 +1020,43 @@ pub fn project_scope_from_launch_dir() -> Result<SessionOriginScope> {
     })
 }
 
-/// Non-Unix platforms do not support the Unix-socket central server. The
-/// `moraine run mcp` entry point still works (embedded only) via the
-/// `run_mcp_entry` fallback above.
+/// Non-Unix platforms expose the same injected API so composition roots can
+/// compile portably, but attempting to start the socket listener fails.
 #[cfg(not(unix))]
-pub async fn run_socket(_cfg: AppConfig, _socket_path: std::path::PathBuf) -> Result<()> {
+pub async fn run_socket_with_router<S>(
+    _cfg: Arc<AppConfig>,
+    _router: Arc<BackendRepositoryRouter>,
+    _socket_path: PathBuf,
+    _shutdown: S,
+) -> Result<()>
+where
+    S: Future<Output = ()> + Send,
+{
     anyhow::bail!("the central MCP socket server is only supported on Unix platforms")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use moraine_conversations::{InMemoryConversationRepository, RepoConfig};
 
-    fn test_state() -> AppState {
-        let cfg = AppConfig::default();
-        let ch = ClickHouseClient::new(cfg.clickhouse.clone()).expect("clickhouse client");
-        let repo = ClickHouseConversationRepository::new(ch, RepoConfig::default());
-        AppState {
-            cfg,
-            repo,
-            prewarm_started: Arc::new(AtomicBool::new(false)),
-        }
+    fn repository_with_scope(
+        session_scope: Option<SessionOriginScope>,
+    ) -> Arc<dyn ConversationRepository> {
+        Arc::new(InMemoryConversationRepository::new(RepoConfig {
+            session_scope,
+            ..RepoConfig::default()
+        }))
+    }
+
+    fn test_state() -> Arc<AppState> {
+        AppState::embedded(AppConfig::default(), repository_with_scope(None))
     }
 
     #[tokio::test]
     async fn initialize_advertises_project_scope_in_instructions() {
         let scope = SessionOriginScope::from_roots(["/work/project"]).expect("valid scope");
-        let state = AppState::build(AppConfig::default(), Some(scope)).expect("build state");
+        let state = AppState::embedded(AppConfig::default(), repository_with_scope(Some(scope)));
         let response = state
             .handle_request(RpcRequest {
                 id: Some(json!(1)),
@@ -956,7 +1072,7 @@ mod tests {
         assert!(instructions.contains("/work/project"));
 
         // Unscoped servers must not grow an instructions field.
-        let unscoped = AppState::build(AppConfig::default(), None).expect("build state");
+        let unscoped = AppState::embedded(AppConfig::default(), repository_with_scope(None));
         let response = unscoped
             .handle_request(RpcRequest {
                 id: Some(json!(1)),
@@ -1110,157 +1226,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn app_state_build_succeeds_without_live_clickhouse() {
-        // Building state only constructs the HTTP client and caches; it must
-        // not require ClickHouse to be reachable.
-        let state = AppState::build(AppConfig::default(), None).expect("build state");
-        assert!(!state.prewarm_started.load(Ordering::Acquire));
-    }
-
-    /// Config with one non-default backend (`team-ch`) and a single home
-    /// route mapping `/work/team/**` to it.
-    fn routed_config() -> AppConfig {
-        let mut cfg = AppConfig::default();
-        cfg.backends.insert(
-            "team-ch".to_string(),
-            moraine_config::ClickHouseConfig {
-                url: "http://127.0.0.1:1".to_string(),
-                database: "moraine_team".to_string(),
-                ..Default::default()
-            },
-        );
-        cfg.routes.push(moraine_config::RouteConfig {
-            dir: "/work/team/**".to_string(),
-            backend: "team-ch".to_string(),
-            mode: moraine_config::ROUTE_MODE_MIRROR.to_string(),
-        });
-        cfg
-    }
-
-    /// Repo lookup that fails the test if consulted; used to prove a branch
-    /// never reaches the filesystem walk-up.
-    fn panicking_lookup(dir: &str) -> Option<String> {
-        panic!("repo lookup must not be consulted (cwd: {dir})");
-    }
-
-    #[test]
-    fn resolve_stdio_backend_skips_lookup_when_only_default_backend() {
-        let cfg = AppConfig::default();
-        assert_eq!(
-            resolve_stdio_backend_with_lookup(&cfg, "/work/team/x", panicking_lookup),
-            None
-        );
-    }
-
-    #[test]
-    fn resolve_stdio_backend_prefers_home_route_over_repo_file() {
-        let cfg = routed_config();
-        assert_eq!(
-            resolve_stdio_backend_with_lookup(&cfg, "/work/team/x", panicking_lookup),
-            Some("team-ch".to_string())
-        );
-    }
-
-    #[test]
-    fn resolve_stdio_backend_falls_back_to_repo_reference() {
-        let cfg = routed_config();
-        let resolved = resolve_stdio_backend_with_lookup(&cfg, "/elsewhere/proj", |dir| {
-            assert_eq!(dir, "/elsewhere/proj");
-            Some("team-ch".to_string())
-        });
-        assert_eq!(resolved, Some("team-ch".to_string()));
-    }
-
-    #[test]
-    fn resolve_stdio_backend_warns_and_continues_on_unknown_repo_name() {
-        let cfg = routed_config();
-        let resolved = resolve_stdio_backend_with_lookup(&cfg, "/elsewhere/proj", |_| {
-            Some("ghost".to_string())
-        });
-        assert_eq!(resolved, None);
-    }
-
-    #[test]
-    fn resolve_stdio_backend_treats_default_reference_as_no_route() {
-        let mut cfg = routed_config();
-        cfg.routes.insert(
-            0,
-            moraine_config::RouteConfig {
-                dir: "/work/local/**".to_string(),
-                backend: DEFAULT_BACKEND_NAME.to_string(),
-                mode: moraine_config::ROUTE_MODE_MIRROR.to_string(),
-            },
-        );
-
-        // Via a home route...
-        assert_eq!(
-            resolve_stdio_backend_with_lookup(&cfg, "/work/local/x", panicking_lookup),
-            None
-        );
-        // ...and via a repo reference.
-        let resolved = resolve_stdio_backend_with_lookup(&cfg, "/elsewhere/proj", |_| {
-            Some(DEFAULT_BACKEND_NAME.to_string())
-        });
-        assert_eq!(resolved, None);
-    }
-
-    #[test]
-    fn resolve_stdio_backend_home_route_to_unknown_name_does_not_fall_through() {
-        // First match wins even when its backend name fails validation: the
-        // repo file must not be consulted for a cwd a home route claimed.
-        let mut cfg = routed_config();
-        cfg.routes[0].backend = "ghost".to_string();
-        assert_eq!(
-            resolve_stdio_backend_with_lookup(&cfg, "/work/team/x", panicking_lookup),
-            None
-        );
-    }
-
-    #[test]
-    fn resolve_stdio_backend_ignores_empty_cwd() {
-        let cfg = routed_config();
-        assert_eq!(
-            resolve_stdio_backend_with_lookup(&cfg, "", panicking_lookup),
-            None
-        );
-        assert_eq!(
-            resolve_stdio_backend_with_lookup(&cfg, "   ", panicking_lookup),
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn run_stdio_for_backend_fails_fast_when_backend_unreachable() {
-        // The handshake against a connection-refused backend must fail at
-        // startup with an error naming the backend, never fall back to the
-        // default backend or start serving stdio.
-        let cfg = routed_config();
-        let err = run_stdio_for_backend(cfg, "team-ch", None)
-            .await
-            .expect_err("unreachable backend must fail the handshake");
-        let chain = format!("{err:#}");
-        assert!(
-            chain.contains("team-ch"),
-            "error names the backend: {chain}"
-        );
-        assert!(
-            chain.contains("schema handshake failed"),
-            "error explains the handshake: {chain}"
-        );
-    }
-
-    #[tokio::test]
-    async fn run_stdio_for_backend_rejects_unconfigured_backend() {
-        let err = run_stdio_for_backend(AppConfig::default(), "ghost", None)
-            .await
-            .expect_err("unknown backend must error");
-        assert!(err.to_string().contains("'ghost' is not configured"));
-    }
-
     #[tokio::test]
     async fn serve_connection_frames_one_response_per_request() {
-        let state = AppState::build(AppConfig::default(), None).expect("build state");
+        let state = test_state();
 
         // Two requests separated by a blank line (which must be skipped).
         let input = concat!(
@@ -1306,31 +1274,198 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn run_socket_serves_initialize_over_unix_socket() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-        use tokio::net::UnixStream;
+    fn default_test_router() -> (Arc<AppConfig>, Arc<BackendRepositoryRouter>) {
+        let cfg = Arc::new(AppConfig::default());
+        let repository: Arc<dyn ConversationRepository> =
+            Arc::new(InMemoryConversationRepository::default());
+        let router = BackendRepositoryRouter::from_preloaded_for_testing(
+            cfg.clone(),
+            [("default".to_string(), repository)],
+        )
+        .expect("preloaded default router");
+        (cfg, Arc::new(router))
+    }
 
-        let sock = unique_socket_path("serve");
+    #[cfg(unix)]
+    fn routed_test_router(
+        prewarm_on_initialize: bool,
+    ) -> (
+        Arc<AppConfig>,
+        Arc<BackendRepositoryRouter>,
+        Arc<InMemoryConversationRepository>,
+        Arc<InMemoryConversationRepository>,
+    ) {
+        let mut cfg = AppConfig::default();
+        cfg.mcp.prewarm_on_initialize = prewarm_on_initialize;
+        cfg.backends.insert(
+            "team-ch".to_string(),
+            moraine_config::ClickHouseConfig {
+                url: "http://team.invalid".to_string(),
+                database: "moraine_team".to_string(),
+                ..Default::default()
+            },
+        );
+        cfg.routes.push(moraine_config::RouteConfig {
+            dir: "/work/team/**".to_string(),
+            backend: "team-ch".to_string(),
+            mode: moraine_config::ROUTE_MODE_MIRROR.to_string(),
+        });
+        let cfg = Arc::new(cfg);
+
+        let default = Arc::new(InMemoryConversationRepository::default());
+        let named_scope =
+            SessionOriginScope::from_roots(["/named-repository"]).expect("named scope");
+        let named = Arc::new(InMemoryConversationRepository::new(RepoConfig {
+            session_scope: Some(named_scope),
+            ..RepoConfig::default()
+        }));
+        let router = BackendRepositoryRouter::from_preloaded_for_testing(
+            cfg.clone(),
+            [
+                (
+                    "default".to_string(),
+                    default.clone() as Arc<dyn ConversationRepository>,
+                ),
+                (
+                    "team-ch".to_string(),
+                    named.clone() as Arc<dyn ConversationRepository>,
+                ),
+            ],
+        )
+        .expect("preloaded routed router");
+        (cfg, Arc::new(router), default, named)
+    }
+
+    #[cfg(unix)]
+    async fn spawn_test_socket(
+        tag: &str,
+        cfg: Arc<AppConfig>,
+        router: Arc<BackendRepositoryRouter>,
+    ) -> (
+        PathBuf,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let sock = unique_socket_path(tag);
         let _ = std::fs::remove_file(&sock);
-
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let server_sock = sock.clone();
         let server = tokio::spawn(async move {
-            let _ = run_socket(AppConfig::default(), server_sock).await;
+            run_socket_with_router(cfg, router, server_sock, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
         });
+        (sock, shutdown_tx, server)
+    }
 
-        // Connect with a few retries while the listener comes up.
-        let mut stream = None;
+    #[cfg(unix)]
+    async fn connect_to_test_socket(sock: &std::path::Path) -> tokio::net::UnixStream {
         for _ in 0..50 {
-            match UnixStream::connect(&sock).await {
-                Ok(s) => {
-                    stream = Some(s);
-                    break;
-                }
+            match tokio::net::UnixStream::connect(sock).await {
+                Ok(stream) => return stream,
                 Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
             }
         }
-        let mut stream = stream.expect("connect to central socket");
+        panic!("failed to connect to test socket {}", sock.display());
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    fn socket_publication_never_replaces_an_existing_path() {
+        let from = unique_socket_path("publish-from");
+        let to = unique_socket_path("publish-to");
+        std::fs::write(&from, b"new").expect("write source");
+        std::fs::write(&to, b"existing").expect("write destination");
+
+        let error = rename_socket_noreplace(&from, &to)
+            .expect_err("atomic publication must not replace a destination");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(&from).expect("source retained"),
+            b"new".to_vec()
+        );
+        assert_eq!(
+            std::fs::read(&to).expect("destination retained"),
+            b"existing".to_vec()
+        );
+
+        let _ = std::fs::remove_file(from);
+        let _ = std::fs::remove_file(to);
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        ))
+    ))]
+    #[test]
+    fn socket_publication_fails_when_atomic_noreplace_is_unsupported() {
+        let from = unique_socket_path("unsupported-from");
+        let to = unique_socket_path("unsupported-to");
+        std::fs::write(&from, b"new").expect("write source");
+        let _ = std::fs::remove_file(&to);
+
+        let error = rename_socket_noreplace(&from, &to)
+            .expect_err("publication must fail without an atomic no-replace primitive");
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert_eq!(
+            error.to_string(),
+            "atomic no-replace Unix socket publication is unsupported on this platform"
+        );
+        assert_eq!(
+            std::fs::read(&from).expect("source retained"),
+            b"new".to_vec()
+        );
+        assert!(!to.exists(), "destination must not be published");
+
+        let _ = std::fs::remove_file(from);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_socket_collision_is_an_error_and_preserves_owner() {
+        use tokio::net::{UnixListener, UnixStream};
+
+        let sock = unique_socket_path("live");
+        let _ = std::fs::remove_file(&sock);
+        let owner = UnixListener::bind(&sock).expect("bind existing owner");
+        let (cfg, router) = default_test_router();
+        let error = run_socket_with_router(cfg, router, sock.clone(), pending())
+            .await
+            .expect_err("second backend must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("another backend is already listening"),
+            "unexpected error: {error:#}"
+        );
+        assert!(sock.exists(), "losing backend must preserve owner's socket");
+        UnixStream::connect(&sock)
+            .await
+            .expect("owner remains connectable");
+
+        drop(owner);
+        let _ = std::fs::remove_file(sock);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn router_socket_replays_raw_client_and_cleans_up() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (cfg, router) = default_test_router();
+        let (sock, shutdown_tx, server) = spawn_test_socket("serve", cfg, router).await;
+        let mut stream = connect_to_test_socket(&sock).await;
 
         // The bind-restrict-rename dance must leave the public path user-only.
         {
@@ -1343,20 +1478,344 @@ mod tests {
         }
 
         stream
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"initialize\",\"params\":{}}\n")
+            .write_all(
+                concat!(
+                    "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"initialize\",\"params\":{}}\n",
+                    "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"ping\"}\n",
+                )
+                .as_bytes(),
+            )
             .await
-            .expect("write request");
+            .expect("write pipelined raw requests");
+        stream.shutdown().await.expect("half-close raw client");
 
+        let mut output = String::new();
+        stream
+            .read_to_string(&mut output)
+            .await
+            .expect("read raw responses");
+        let responses = output.lines().collect::<Vec<_>>();
+        assert_eq!(
+            responses.len(),
+            2,
+            "first line must be replayed exactly once and buffered input retained: {output}"
+        );
+        let initialize: Value = serde_json::from_str(responses[0]).expect("initialize response");
+        assert_eq!(initialize["id"], json!(7));
+        assert_eq!(
+            initialize["result"]["serverInfo"]["name"],
+            json!("moraine-mcp")
+        );
+        let ping: Value = serde_json::from_str(responses[1]).expect("ping response");
+        assert_eq!(ping["id"], json!(8));
+        assert_eq!(ping["result"], json!({}));
+
+        shutdown_tx.send(()).expect("request server shutdown");
+        server
+            .await
+            .expect("server task")
+            .expect("clean server shutdown");
+        assert!(
+            !sock.exists(),
+            "socket path must be removed before shutdown completes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn router_socket_preserves_oversized_legacy_first_request() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let (cfg, router) = default_test_router();
+        let (sock, shutdown_tx, server) = spawn_test_socket("oversized-legacy", cfg, router).await;
+        let mut stream = connect_to_test_socket(&sock).await;
+        let mut request = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "initialize",
+            "params": {
+                "padding": "x".repeat(private_proxy::PRIVATE_ROUTE_MAX_LINE_BYTES + 1)
+            },
+        }))
+        .expect("oversized raw request JSON");
+        request.push(b'\n');
+        assert!(request.len() > private_proxy::PRIVATE_ROUTE_MAX_LINE_BYTES);
+        stream
+            .write_all(&request)
+            .await
+            .expect("write oversized legacy request");
+
+        let mut response = String::new();
+        BufReader::new(stream)
+            .read_line(&mut response)
+            .await
+            .expect("read oversized legacy response");
+        let response: Value = serde_json::from_str(response.trim()).expect("response JSON");
+        assert_eq!(response["id"], json!(9));
+        assert_eq!(
+            response["result"]["serverInfo"]["name"],
+            json!("moraine-mcp")
+        );
+
+        shutdown_tx.send(()).expect("request server shutdown");
+        server
+            .await
+            .expect("server task")
+            .expect("clean server shutdown");
+    }
+
+    #[cfg(unix)]
+    async fn accepted_test_connection(sock: &std::path::Path, cwd: &str) -> PrivateProxyConnection {
+        let stream = connect_to_test_socket(sock).await;
+        match negotiate_private_route(stream, cwd, std::time::Duration::from_secs(3)).await {
+            PrivateRouteNegotiation::Accepted(connection) => connection,
+            PrivateRouteNegotiation::Incompatible { reason } => {
+                panic!("test daemon must be compatible: {reason}")
+            }
+            PrivateRouteNegotiation::Rejected { message } => {
+                panic!("test route must be accepted: {message}")
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    async fn proxy_test_requests(connection: PrivateProxyConnection, requests: Vec<u8>) -> Vec<u8> {
+        let (sock_read, sock_write) = connection.into_parts();
+        let mut output = Vec::new();
+        proxy_streams_with_halves(
+            std::io::Cursor::new(requests),
+            &mut output,
+            sock_read,
+            sock_write,
+        )
+        .await
+        .expect("proxy test requests");
+        output
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn negotiated_socket_selects_named_and_default_without_exposing_ack() {
+        let (cfg, router, _default, _named) = routed_test_router(false);
+        let (sock, shutdown_tx, server) = spawn_test_socket("route-select", cfg, router).await;
+
+        let named = accepted_test_connection(&sock, "/work/team/project").await;
+        let named_output = proxy_test_requests(
+            named,
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n".to_vec(),
+        )
+        .await;
+        let named_lines = String::from_utf8(named_output).expect("named output UTF-8");
+        let named_responses = named_lines.lines().collect::<Vec<_>>();
+        assert_eq!(
+            named_responses.len(),
+            1,
+            "private ACK must not reach agent stdout: {named_lines}"
+        );
+        let named_response: Value =
+            serde_json::from_str(named_responses[0]).expect("named initialize");
+        assert_eq!(named_response["id"], json!(1));
+        assert!(named_response["result"]["instructions"]
+            .as_str()
+            .expect("named repository marker")
+            .contains("/named-repository"));
+
+        let default = accepted_test_connection(&sock, "").await;
+        let default_output = proxy_test_requests(
+            default,
+            b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{}}\n".to_vec(),
+        )
+        .await;
+        let default_response: Value =
+            serde_json::from_slice(&default_output).expect("default initialize");
+        assert_eq!(default_response["id"], json!(2));
+        assert!(default_response["result"].get("instructions").is_none());
+
+        shutdown_tx.send(()).expect("shutdown route server");
+        server
+            .await
+            .expect("route server task")
+            .expect("route server shutdown");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connection_stays_pinned_after_private_route_ack() {
+        let (cfg, router, default, named) = routed_test_router(false);
+        let (sock, shutdown_tx, server) = spawn_test_socket("route-pin", cfg, router).await;
+
+        let connection = accepted_test_connection(&sock, "/work/team/project").await;
+        let requests = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":\"moraine-route-v1\",\"method\":\"moraine/private/route\",\"params\":{\"version\":1,\"cwd\":\"\"}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"search_sessions\",\"arguments\":{\"query\":\"pin-check\"}}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"list_sessions\",\"arguments\":{\"start_datetime\":\"2026-01-01T00:00:00Z\",\"end_datetime\":\"2026-01-02T00:00:00Z\"}}}\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let output = proxy_test_requests(connection, requests).await;
+        let text = String::from_utf8(output).expect("pinned output UTF-8");
+        let responses = text.lines().collect::<Vec<_>>();
+        assert_eq!(
+            responses.len(),
+            4,
+            "one response per public request: {text}"
+        );
+        let reselection: Value =
+            serde_json::from_str(responses[0]).expect("midstream route response");
+        assert_eq!(reselection["error"]["code"], json!(-32601));
+        let initialize: Value =
+            serde_json::from_str(responses[1]).expect("pinned initialize response");
+        assert!(initialize["result"]["instructions"]
+            .as_str()
+            .expect("named repository remains selected")
+            .contains("/named-repository"));
+
+        let named_calls = named.calls();
+        assert_eq!(named_calls.search_mcp_events.len(), 1);
+        assert_eq!(named_calls.list_mcp_sessions.len(), 1);
+        let default_calls = default.calls();
+        assert!(default_calls.search_mcp_events.is_empty());
+        assert!(default_calls.list_mcp_sessions.is_empty());
+
+        shutdown_tx.send(()).expect("shutdown pin server");
+        server
+            .await
+            .expect("pin server task")
+            .expect("pin server shutdown");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prewarm_gate_is_shared_per_backend_and_isolated_between_backends() {
+        let (cfg, router, default, named) = routed_test_router(true);
+        let (sock, shutdown_tx, server) = spawn_test_socket("prewarm", cfg, router).await;
+        let initialize =
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n";
+
+        for _ in 0..2 {
+            let connection = accepted_test_connection(&sock, "/work/team/project").await;
+            let _ = proxy_test_requests(connection, initialize.to_vec()).await;
+        }
+        let default_connection = accepted_test_connection(&sock, "").await;
+        let _ = proxy_test_requests(default_connection, initialize.to_vec()).await;
+
+        for _ in 0..50 {
+            if named.calls().prewarm_mcp_search_state == 1
+                && default.calls().prewarm_mcp_search_state == 1
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(named.calls().prewarm_mcp_search_state, 1);
+        assert_eq!(default.calls().prewarm_mcp_search_state, 1);
+
+        shutdown_tx.send(()).expect("shutdown prewarm server");
+        server
+            .await
+            .expect("prewarm server task")
+            .expect("prewarm server shutdown");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unsupported_private_version_gets_structured_incompatible_error() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let (cfg, router) = default_test_router();
+        let (sock, shutdown_tx, server) = spawn_test_socket("incompatible", cfg, router).await;
+        let mut stream = connect_to_test_socket(&sock).await;
+        stream
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":\"moraine-route-v1\",\"method\":\"moraine/private/route\",\"params\":{\"version\":2,\"cwd\":\"/work\"}}\n",
+            )
+            .await
+            .expect("write unsupported hello");
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
-        reader.read_line(&mut line).await.expect("read response");
+        reader
+            .read_line(&mut line)
+            .await
+            .expect("read incompatible response");
+        let response: Value = serde_json::from_str(line.trim()).expect("incompatible JSON");
+        assert_eq!(response["id"], json!("moraine-route-v1"));
+        assert_eq!(response["error"]["code"], json!(-32001));
+        assert_eq!(response["error"]["data"]["kind"], json!("incompatible"));
+        assert_eq!(response["error"]["data"]["version"], json!(1));
 
-        let resp: Value = serde_json::from_str(line.trim()).expect("json response");
-        assert_eq!(resp["id"], json!(7));
-        assert_eq!(resp["result"]["serverInfo"]["name"], json!("moraine-mcp"));
+        shutdown_tx.send(()).expect("shutdown incompatible server");
+        server
+            .await
+            .expect("incompatible server task")
+            .expect("incompatible server shutdown");
+    }
 
-        server.abort();
-        let _ = std::fs::remove_file(&sock);
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn named_repository_build_failure_is_typed_route_rejection() {
+        let mut cfg = AppConfig::default();
+        cfg.clickhouse.timeout_seconds = 0.1;
+        cfg.backends
+            .get_mut("default")
+            .expect("default backend")
+            .timeout_seconds = 0.1;
+        cfg.backends.insert(
+            "team-ch".to_string(),
+            moraine_config::ClickHouseConfig {
+                url: "http://127.0.0.1:1".to_string(),
+                database: "moraine_team".to_string(),
+                timeout_seconds: 0.1,
+                ..Default::default()
+            },
+        );
+        cfg.routes.push(moraine_config::RouteConfig {
+            dir: "/work/team/**".to_string(),
+            backend: "team-ch".to_string(),
+            mode: moraine_config::ROUTE_MODE_MIRROR.to_string(),
+        });
+        let cfg = Arc::new(cfg);
+        let default: Arc<dyn ConversationRepository> =
+            Arc::new(InMemoryConversationRepository::default());
+        let router = BackendRepositoryRouter::from_preloaded_for_testing(
+            cfg.clone(),
+            [("default".to_string(), default)],
+        )
+        .expect("router with lazy failing named backend");
+        let (sock, shutdown_tx, server) =
+            spawn_test_socket("route-reject", cfg, Arc::new(router)).await;
+
+        let stream = connect_to_test_socket(&sock).await;
+        let outcome = negotiate_private_route(
+            stream,
+            "/work/team/project",
+            std::time::Duration::from_secs(3),
+        )
+        .await;
+        match outcome {
+            PrivateRouteNegotiation::Rejected { message } => {
+                assert!(
+                    message.contains("team-ch"),
+                    "backend named in error: {message}"
+                );
+                assert!(
+                    message.contains("schema handshake failed"),
+                    "handshake named in error: {message}"
+                );
+            }
+            PrivateRouteNegotiation::Incompatible { reason } => {
+                panic!("route failures must not become fallback-compatible: {reason}")
+            }
+            PrivateRouteNegotiation::Accepted(_) => {
+                panic!("unreachable named backend must not be accepted")
+            }
+        }
+
+        shutdown_tx.send(()).expect("shutdown rejection server");
+        server
+            .await
+            .expect("rejection server task")
+            .expect("rejection server shutdown");
     }
 
     #[cfg(unix)]

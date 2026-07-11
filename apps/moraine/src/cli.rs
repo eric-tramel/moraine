@@ -48,8 +48,13 @@ pub(crate) enum CliCommand {
 pub(crate) struct UpArgs {
     #[arg(long)]
     pub(crate) no_ingest: bool,
+    /// Start the unified MCP socket and monitor HTTP backend.
+    #[arg(long)]
+    pub(crate) backend: bool,
+    /// Deprecated compatibility alias for `--backend`.
     #[arg(long)]
     pub(crate) monitor: bool,
+    /// Deprecated compatibility alias for `--backend`.
     #[arg(long)]
     pub(crate) mcp: bool,
 }
@@ -389,6 +394,19 @@ mod tests {
         let err = Cli::try_parse_from(["moraine", "setup", "--skip-mcp", "--mcp-target", "codex"])
             .expect_err("conflicting setup mcp flags should fail");
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn clap_parses_backend_and_compatibility_up_flags() {
+        let cli = Cli::parse_from(["moraine", "up", "--backend", "--monitor", "--mcp"]);
+        match cli.command {
+            CliCommand::Up(args) => {
+                assert!(args.backend);
+                assert!(args.monitor);
+                assert!(args.mcp);
+            }
+            _ => panic!("expected up command"),
+        }
     }
 
     #[test]

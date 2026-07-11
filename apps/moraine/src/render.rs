@@ -18,10 +18,55 @@ pub(crate) enum OutputMode {
     Json,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ServiceRuntimeState {
+    Running,
+    Stopped,
+    Partial,
+    Unmanaged,
+}
+
+impl ServiceRuntimeState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Stopped => "stopped",
+            Self::Partial => "partial",
+            Self::Unmanaged => "serving (unmanaged)",
+        }
+    }
+
+    fn fully_available(self) -> bool {
+        matches!(self, Self::Running | Self::Unmanaged)
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct ServiceRuntimeStatus {
     pub(crate) service: Service,
     pub(crate) pid: Option<u32>,
+    pub(crate) state: ServiceRuntimeState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) socket_listening: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) http_listening: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StatusDataSource {
+    DaemonApi,
+    DirectDb,
+}
+
+impl StatusDataSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::DaemonApi => "daemon API",
+            Self::DirectDb => "direct DB",
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -46,6 +91,7 @@ pub(crate) enum HeartbeatSnapshot {
 pub(crate) struct StatusSnapshot {
     pub(crate) services: Vec<ServiceRuntimeStatus>,
     pub(crate) monitor_url: Option<String>,
+    pub(crate) data_source: StatusDataSource,
     pub(crate) managed_clickhouse_installed: bool,
     pub(crate) managed_clickhouse_path: String,
     pub(crate) managed_clickhouse_version: Option<String>,
@@ -307,10 +353,21 @@ fn stoplight(running: bool) -> &'static str {
     }
 }
 
-fn service_endpoint(service: Service, snapshot: &StatusSnapshot) -> Option<String> {
-    match service {
+fn service_endpoint(row: &ServiceRuntimeStatus, snapshot: &StatusSnapshot) -> Option<String> {
+    match row.service {
         Service::ClickHouse => Some(snapshot.clickhouse_health_url.clone()),
-        Service::Monitor => snapshot.monitor_url.clone(),
+        Service::Backend => {
+            let mut endpoints = Vec::new();
+            if row.socket_listening == Some(true) {
+                endpoints.push("MCP socket".to_string());
+            }
+            if row.http_listening == Some(true) {
+                if let Some(url) = &snapshot.monitor_url {
+                    endpoints.push(url.clone());
+                }
+            }
+            (!endpoints.is_empty()).then(|| endpoints.join(", "))
+        }
         _ => None,
     }
 }
@@ -341,15 +398,14 @@ pub(crate) fn render_status(output: &CliOutput, snapshot: &StatusSnapshot) -> Re
         .services
         .iter()
         .map(|row| {
-            let running = row.pid.is_some();
             let mut cols = vec![
-                format!("{} {}", stoplight(running), row.service.name()),
-                if running {
-                    "running".to_string()
-                } else {
-                    "stopped".to_string()
-                },
-                service_endpoint(row.service, snapshot).unwrap_or_default(),
+                format!(
+                    "{} {}",
+                    stoplight(row.state.fully_available()),
+                    row.service.name()
+                ),
+                row.state.label().to_string(),
+                service_endpoint(row, snapshot).unwrap_or_default(),
             ];
             if output.verbose {
                 cols.push(
@@ -390,6 +446,7 @@ pub(crate) fn render_status(output: &CliOutput, snapshot: &StatusSnapshot) -> Re
     if let Some(version) = &snapshot.doctor.clickhouse_version {
         doctor_lines[0].push_str(&format!("  (v{version})"));
     }
+    doctor_lines.push(format!("source: {}", snapshot.data_source.label()));
     if !snapshot.doctor.pending_migrations.is_empty() {
         doctor_lines.push(format!(
             "  pending migrations: {}",

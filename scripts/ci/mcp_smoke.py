@@ -164,6 +164,26 @@ def assert_tools_surface(tool_names_ordered: list[str]) -> None:
             f"{tool_names_ordered}"
         )
 
+def write_tools_snapshot(path: str, tools_result: Dict[str, Any]) -> None:
+    canonical = json.dumps(
+        tools_result,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    with open(path, "w", encoding="utf-8", newline="\n") as snapshot:
+        snapshot.write(canonical)
+        snapshot.write("\n")
+
+
+def assert_embedded_fallback(stderr: str) -> None:
+    if "central MCP server" not in stderr or "using embedded server" not in stderr:
+        raise AssertionError(
+            "MCP stderr missing the central-server embedded fallback warning; "
+            f"stderr={stderr.strip()!r}"
+        )
+
+
 
 def select_search_sessions_result(
     results: list[Any],
@@ -416,19 +436,26 @@ def run_smoke(
     expect_open_text: Optional[str],
     file_attention_path: Optional[str] = None,
     project_dir: Optional[str] = None,
+    working_dir: Optional[str] = None,
     absent_session_ids: Optional[list[str]] = None,
     expect_no_results: bool = False,
+    expect_event_count: Optional[int] = None,
+    expect_updated_at: Optional[str] = None,
+    require_embedded_fallback: bool = False,
+    tools_snapshot: Optional[str] = None,
 ) -> None:
     absent_session_ids = absent_session_ids or []
     argv = [moraine, "run", "mcp", "--config", config]
     popen_kwargs: Dict[str, Any] = {}
+    launch_dir = project_dir or working_dir
     if project_dir is not None:
         argv.append("--project-only")
+    if launch_dir is not None:
         # Mimic a shell launching from the project directory: cwd is the
         # physical path and PWD carries the logical spelling, which may
         # differ through symlinks (e.g. /var vs /private/var on macOS).
-        popen_kwargs["cwd"] = project_dir
-        popen_kwargs["env"] = {**os.environ, "PWD": project_dir}
+        popen_kwargs["cwd"] = launch_dir
+        popen_kwargs["env"] = {**os.environ, "PWD": launch_dir}
 
     proc = subprocess.Popen(
         argv,
@@ -484,6 +511,8 @@ def run_smoke(
         ):
             raise AssertionError(f"tools/list returned duplicate or invalid tool names: {tools}")
         assert_tools_surface(tool_names_ordered)
+        if tools_snapshot is not None:
+            write_tools_snapshot(tools_snapshot, tools_result)
 
         next_id = 3
         search_result = call_tool(
@@ -553,6 +582,29 @@ def run_smoke(
                     "list_sessions returned no sessions for the in-scope fixture window"
                 )
             selected_session = select_list_sessions_result(sessions, expect_session_id)
+            session_metadata = selected_session.get("session")
+            if not isinstance(session_metadata, dict):
+                raise AssertionError(
+                    f"list_sessions result missing session metadata: {selected_session}"
+                )
+            if (
+                expect_event_count is not None
+                and session_metadata.get("event_count") != expect_event_count
+            ):
+                raise AssertionError(
+                    "list_sessions event_count parity failed: "
+                    f"got {session_metadata.get('event_count')}, "
+                    f"wanted {expect_event_count}"
+                )
+            if (
+                expect_updated_at is not None
+                and session_metadata.get("updated_at") != expect_updated_at
+            ):
+                raise AssertionError(
+                    "list_sessions updated_at parity failed: "
+                    f"got {session_metadata.get('updated_at')!r}, "
+                    f"wanted {expect_updated_at!r}"
+                )
             next_id = assert_open_search_ids(
                 proc,
                 next_id,
@@ -594,6 +646,11 @@ def run_smoke(
                 None,
             )
 
+        if require_embedded_fallback:
+            assert_embedded_fallback(
+                collect_stderr(proc, wait_seconds=0.5, max_bytes=65_536)
+            )
+
     finally:
         if proc.stdin:
             proc.stdin.close()
@@ -624,6 +681,13 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--working-dir",
+        help=(
+            "launch `moraine run mcp` from this directory without enabling "
+            "--project-only (used to exercise daemon-owned backend routing)"
+        ),
+    )
+    parser.add_argument(
         "--expect-absent-session-id",
         action="append",
         default=[],
@@ -638,7 +702,33 @@ def main() -> int:
         action="store_true",
         help="assert search_sessions returns zero results for the query",
     )
+    parser.add_argument(
+        "--expect-event-count",
+        type=int,
+        help="expected canonical event_count for the selected list_sessions fixture",
+    )
+    parser.add_argument(
+        "--expect-updated-at",
+        help="expected RFC3339 updated_at for the selected list_sessions fixture",
+    )
+    parser.add_argument(
+        "--require-embedded-fallback",
+        action="store_true",
+        help=(
+            "require stderr to report that the unreachable central MCP server "
+            "fell back to an embedded server"
+        ),
+    )
+    parser.add_argument(
+        "--write-tools-snapshot",
+        help=(
+            "write the tools/list result as canonical deterministic JSON "
+            "(sorted object keys, compact separators, one trailing newline)"
+        ),
+    )
     args = parser.parse_args()
+    if args.project_dir and args.working_dir:
+        parser.error("--project-dir and --working-dir are mutually exclusive")
 
     run_smoke(
         args.moraine,
@@ -648,8 +738,13 @@ def main() -> int:
         args.expect_open_text,
         file_attention_path=args.file_attention_path,
         project_dir=args.project_dir,
+        working_dir=args.working_dir,
         absent_session_ids=args.expect_absent_session_id,
         expect_no_results=args.expect_no_results,
+        expect_event_count=args.expect_event_count,
+        expect_updated_at=args.expect_updated_at,
+        require_embedded_fallback=args.require_embedded_fallback,
+        tools_snapshot=args.write_tools_snapshot,
     )
     print("mcp smoke passed")
     return 0

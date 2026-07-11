@@ -9,7 +9,7 @@ use crate::contract::{
 use anyhow::{Context, Result};
 use moraine_conversations::{
     ConversationListSort as RepoListSort, ConversationMode as RepoConversationMode,
-    ConversationRepository, McpSessionListFilter, McpSessionListItem, Page, PageRequest,
+    McpSessionListFilter, McpSessionListItem, Page, PageRequest,
 };
 use serde_json::{json, Value};
 use tokio::time::{timeout, Duration};
@@ -321,7 +321,11 @@ fn format_list_sessions_error_text(payload: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use moraine_conversations::ConversationMode;
+    use moraine_config::AppConfig;
+    use moraine_conversations::{
+        ConversationMode, InMemoryConversationRepository, InMemoryConversationResponses, RepoConfig,
+    };
+    use std::sync::Arc;
 
     #[test]
     fn parses_and_canonicalizes_list_sessions_args() {
@@ -397,17 +401,8 @@ mod tests {
         assert_eq!(limit.code(), ToolErrorCode::InvalidRequest);
     }
 
-    #[test]
-    fn shapes_session_metadata_only_with_open_handle() {
-        let args = parse_list_sessions_args(
-            json!({
-                "start_datetime": "2026-04-30T09:00:00-04:00",
-                "end_datetime": "2026-04-30T13:00:00-04:00",
-                "limit": 1
-            }),
-            50,
-        )
-        .expect("valid args");
+    #[tokio::test]
+    async fn shapes_session_metadata_only_with_open_handle() {
         let page = Page {
             items: vec![McpSessionListItem {
                 session_id: "sess-open".to_string(),
@@ -426,8 +421,26 @@ mod tests {
             }],
             next_cursor: None,
         };
+        let repository = Arc::new(InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            InMemoryConversationResponses {
+                list_mcp_sessions: Some(Ok(page)),
+                ..InMemoryConversationResponses::default()
+            },
+        ));
+        let state = AppState::embedded(AppConfig::default(), repository.clone());
 
-        let data = list_sessions_data_json(&args, &page).expect("shape data");
+        let result = state
+            .list_sessions_v1(json!({
+                "start_datetime": "2026-04-30T09:00:00-04:00",
+                "end_datetime": "2026-04-30T13:00:00-04:00",
+                "limit": 1
+            }))
+            .await
+            .expect("list sessions");
+        assert_eq!(result["isError"], json!(false));
+
+        let data = &result["structuredContent"]["data"];
         let first = &data["sessions"][0];
         assert_eq!(first["id"], json!("session:c2Vzcy1vcGVu"));
         assert_eq!(first["open"]["session_id"], first["session"]["id"]);
@@ -436,6 +449,16 @@ mod tests {
         assert!(first.get("snippet").is_none());
         assert!(first.get("events").is_none());
         assert!(first.get("payload_json").is_none());
+
+        let calls = repository.calls();
+        assert_eq!(calls.list_mcp_sessions.len(), 1);
+        let (filter, page) = &calls.list_mcp_sessions[0];
+        assert_eq!(filter.start_unix_ms, 1_777_554_000_000);
+        assert_eq!(filter.end_unix_ms, 1_777_568_400_000);
+        assert_eq!(filter.mode, None);
+        assert_eq!(filter.sort, RepoListSort::Desc);
+        assert_eq!(page.limit, 1);
+        assert_eq!(page.cursor, None);
     }
 
     #[test]

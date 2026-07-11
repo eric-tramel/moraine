@@ -6,6 +6,10 @@ pub(super) fn sql_identifier(value: &str) -> String {
     format!("`{}`", value.replace('`', "``"))
 }
 
+pub(super) fn canonical_events_source(events_ref: &str) -> String {
+    format!("(SELECT * FROM {events_ref} FINAL)")
+}
+
 pub(super) fn truncated_utf8_sql(column: &str, max_chars: usize) -> String {
     let max_chars = max_chars.max(4);
     let prefix_chars = max_chars.saturating_sub(3);
@@ -25,4 +29,17 @@ pub(super) fn sql_array_f64(items: &[f64]) -> String {
         .map(|v| format!("{:.12}", v))
         .collect::<Vec<_>>();
     format!("[{}]", parts.join(","))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonical_events_source;
+
+    #[test]
+    fn canonical_source_wraps_final_for_outer_predicates() {
+        assert_eq!(
+            canonical_events_source("`moraine`.`events`"),
+            "(SELECT * FROM `moraine`.`events` FINAL)"
+        );
+    }
 }

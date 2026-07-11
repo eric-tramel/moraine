@@ -1,28 +1,34 @@
 use anyhow::{anyhow, Result};
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
-    http::{header, HeaderValue, StatusCode, Uri},
+    extract::{Extension, Path, Query, State},
+    http::{header, HeaderValue, Request, StatusCode, Uri},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
+#[cfg(test)]
+use moraine_config::AppConfig;
+use moraine_conversations::{
+    AnalyticsRange, BackendRepository, BackendRepositoryRouter, IngestHeartbeat,
+    IngestHeartbeatRead, RepoError, SessionAnalytics, SessionAnalyticsQuery, SessionLookback,
+    SessionStep, SessionTurn, StoreConnectionMetrics, StoreHealth, StoreProbe, TablePreviewQuery,
+    TableSummaries,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::future::Future;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
-use tokio::time::Instant;
+use tracing::warn;
 
-use moraine_clickhouse::ClickHouseClient;
-use moraine_config::AppConfig;
-
-#[derive(Clone)]
 struct AppState {
-    clickhouse: ClickHouseClient,
+    backend_router: Arc<BackendRepositoryRouter>,
     static_dir: PathBuf,
 }
 
@@ -36,58 +42,224 @@ struct AnalyticsQuery {
     range: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct SessionsQuery {
+    limit: Option<u32>,
+    since: Option<String>,
+}
+
 #[derive(Serialize)]
-struct TableSummary {
+struct MonitorTableSummary {
     name: String,
     engine: String,
     is_temporary: u8,
     rows: u64,
 }
 
-pub async fn run_server(
-    cfg: AppConfig,
+/// Run the monitor HTTP server using the daemon-owned backend router.
+///
+/// The supplied shutdown future stops the listener gracefully.
+pub async fn run_server_with_router<S>(
+    backend_router: Arc<BackendRepositoryRouter>,
     host: String,
     port: u16,
     static_dir: PathBuf,
-) -> Result<()> {
-    validate_static_dir(&static_dir)?;
-
-    let clickhouse = ClickHouseClient::new(cfg.clickhouse)?;
-
-    let state = AppState {
-        clickhouse,
-        static_dir,
-    };
-
-    let app = Router::new()
-        .route("/api/health", get(api_health))
-        .route("/api/status", get(api_status))
-        .route("/api/analytics", get(api_analytics))
-        .route("/api/tables", get(api_tables))
-        .route("/api/web-searches", get(api_web_searches))
-        .route("/api/tables/:table", get(api_table_rows))
-        .route("/api/sessions", get(api_sessions))
-        .fallback(get(static_fallback))
-        .with_state(state.clone());
-
-    let bind = format!("{}:{}", host, port)
+    shutdown: S,
+) -> Result<()>
+where
+    S: Future<Output = ()> + Send + 'static,
+{
+    let static_dir_display = static_dir.display().to_string();
+    let app = router_with_backend_router(backend_router, static_dir)?;
+    let bind = format!("{host}:{port}")
         .parse::<SocketAddr>()
         .map_err(|err| anyhow!("invalid bind address: {err}"))?;
-
-    println!("moraine-monitor running at http://{}", bind);
-    println!("serving UI from {}", state.static_dir.display());
 
     let listener = tokio::net::TcpListener::bind(bind).await.map_err(|error| {
         if error.kind() == ErrorKind::AddrInUse {
             anyhow!(
-                "failed to bind {bind}: address already in use. another monitor may already be running (including legacy cortex-monitor). stop it or rerun with `moraine run monitor -- --port <free-port>`"
+                "failed to bind {bind}: address already in use. another backend or legacy monitor may already be running; stop it or choose a free --port"
             )
         } else {
             anyhow!("failed to bind {bind}: {error}")
         }
     })?;
-    axum::serve(listener, app).await?;
+
+    println!("moraine-monitor running at http://{bind}");
+    println!("serving UI from {static_dir_display}");
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
     Ok(())
+}
+
+/// Build the complete monitor router around the daemon-owned backend router.
+fn router_with_backend_router(
+    backend_router: Arc<BackendRepositoryRouter>,
+    static_dir: PathBuf,
+) -> Result<Router> {
+    validate_static_dir(&static_dir)?;
+    let state = Arc::new(AppState {
+        backend_router,
+        static_dir,
+    });
+    Ok(monitor_router(state))
+}
+
+fn monitor_router(state: Arc<AppState>) -> Router {
+    let data_routes = dashboard_routes().route_layer(middleware::from_fn_with_state(
+        state.backend_router.clone(),
+        select_backend_repository,
+    ));
+    // Capabilities is daemon/default-global metadata, not a project-routed data
+    // endpoint. It intentionally remains outside project selection middleware.
+    let versioned_routes = data_routes
+        .clone()
+        .route("/capabilities", get(api_capabilities));
+
+    Router::new()
+        .nest("/api/v1", versioned_routes)
+        // One-release compatibility surface. These are direct aliases so
+        // status codes, query handling, response payloads, and backend
+        // selection remain identical.
+        .nest("/api", data_routes)
+        .fallback(get(static_fallback))
+        .with_state(state)
+}
+
+fn dashboard_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/health", get(api_health))
+        .route("/status", get(api_status))
+        .route("/analytics", get(api_analytics))
+        .route("/tables", get(api_tables))
+        .route("/web-searches", get(api_web_searches))
+        .route("/tables/:table", get(api_table_rows))
+        .route("/sessions", get(api_sessions))
+}
+
+/// Optional project context for repository-backed data endpoints. The value is
+/// resolved only through configured cwd routes/repo references; it never names
+/// a backend endpoint or credentials. Capabilities and static routes ignore it.
+const PROJECT_DIR_HEADER: &str = "x-moraine-project-dir";
+
+fn project_dir_header(
+    headers: &axum::http::HeaderMap,
+) -> std::result::Result<Option<&str>, &'static str> {
+    let mut values = headers.get_all(PROJECT_DIR_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err("X-Moraine-Project-Dir must be provided exactly once");
+    }
+    let value = value
+        .to_str()
+        .map_err(|_| "X-Moraine-Project-Dir must be valid UTF-8")?
+        .trim();
+    if value.is_empty() {
+        return Err("X-Moraine-Project-Dir must not be empty");
+    }
+    if !FsPath::new(value).is_absolute() {
+        return Err("X-Moraine-Project-Dir must be an absolute path");
+    }
+    Ok(Some(value))
+}
+
+async fn select_backend_repository(
+    State(backend_router): State<Arc<BackendRepositoryRouter>>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
+    let selected = match project_dir_header(request.headers()) {
+        Ok(None) => backend_router.default_repository().await,
+        Ok(Some(project_dir)) => {
+            backend_router
+                .repository_for_project_dir(Some(project_dir))
+                .await
+        }
+        Err(error) => {
+            return json_response(
+                json!({"ok": false, "error": error}),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+    };
+
+    let backend = match selected {
+        Ok(backend) => backend,
+        Err(_) => {
+            warn!("backend project route selection failed; selected backend unavailable or schema-incompatible");
+            return json_response(
+                json!({
+                    "ok": false,
+                    "error": "selected backend is unavailable or schema-incompatible"
+                }),
+                StatusCode::SERVICE_UNAVAILABLE,
+            );
+        }
+    };
+    request.extensions_mut().insert(backend);
+    next.run(request).await
+}
+
+const MONITOR_DIST_ENV_KEYS: &[&str] = &["MORAINE_MONITOR_DIST", "MORAINE_MONITOR_STATIC_DIR"];
+
+fn monitor_dist_candidate(root: &FsPath) -> PathBuf {
+    root.join("web").join("monitor").join("dist")
+}
+
+fn find_monitor_dir(root: &FsPath) -> Option<PathBuf> {
+    let candidate = monitor_dist_candidate(root);
+    candidate.exists().then_some(candidate)
+}
+
+fn source_tree_static_dir() -> PathBuf {
+    let manifest_dir = FsPath::new(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .parent()
+        .and_then(FsPath::parent)
+        .expect("workspace root")
+        .join("web")
+        .join("monitor")
+        .join("dist")
+}
+
+fn env_override_static_dir_with_keys(keys: &[&str]) -> Option<PathBuf> {
+    keys.iter().find_map(|key| {
+        let value = std::env::var(key).ok()?;
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+        let configured = PathBuf::from(value);
+        configured.exists().then_some(configured)
+    })
+}
+
+/// Resolve the monitor distribution directory.
+///
+/// An explicit CLI override wins, followed by the established environment
+/// variables, an installed bundle beside the current executable, and finally
+/// the source-tree `web/monitor/dist` path. Availability and `index.html` are
+/// validated when the router is built.
+pub fn resolve_static_dir(override_path: Option<PathBuf>) -> PathBuf {
+    if let Some(path) = override_path {
+        return path;
+    }
+    if let Some(configured) = env_override_static_dir_with_keys(MONITOR_DIST_ENV_KEYS) {
+        return configured;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let exe = exe.canonicalize().unwrap_or(exe);
+        if let Some(bundle_root) = exe.parent().and_then(FsPath::parent) {
+            if let Some(found) = find_monitor_dir(bundle_root) {
+                return found;
+            }
+        }
+    }
+    source_tree_static_dir()
 }
 
 fn validate_static_dir(static_dir: &FsPath) -> Result<()> {
@@ -121,165 +293,225 @@ fn json_response<T: Serialize>(payload: T, status: StatusCode) -> Response {
     *response.status_mut() = status;
     response
 }
-
-fn clickhouse_ping_payload(version: String, ping_result: Result<()>, ping_ms: f64) -> Value {
-    match ping_result {
-        Ok(()) => json!({
-            "healthy": true,
-            "version": version,
-            "ping_ms": ping_ms,
-            "error": Value::Null,
-        }),
-        Err(error) => json!({
-            "healthy": false,
-            "version": version,
-            "ping_ms": ping_ms,
-            "error": error.to_string(),
-        }),
-    }
-}
-
-async fn api_health(State(state): State<AppState>) -> Response {
-    let start = Instant::now();
-    let connection_stats = query_clickhouse_connections(&state)
-        .await
-        .unwrap_or_else(|error| json!({"total": Value::Null, "error": error.to_string()}));
-
-    match state.clickhouse.ping().await {
-        Ok(()) => match state.clickhouse.version().await {
-            Ok(version) => {
-                let ingestor = query_health_heartbeat_or_absent(&state).await;
-                let body = json!({
-                    "ok": true,
-                    "url": state.clickhouse.config().url,
-                    "database": state.clickhouse.config().database,
-                    "version": version,
-                    "ping_ms": (Instant::elapsed(&start).as_secs_f64() * 1000.0),
-                    "connections": connection_stats,
-                    "ingestor": ingestor,
-                });
-                json_response(body, StatusCode::OK)
-            }
-            Err(error) => json_response(
-                json!({
-                    "ok": false,
-                    "url": state.clickhouse.config().url,
-                    "database": state.clickhouse.config().database,
-                    "error": error.to_string(),
-                    "connections": connection_stats,
-                }),
-                StatusCode::SERVICE_UNAVAILABLE,
-            ),
-        },
-        Err(error) => json_response(
-            json!({
-                "ok": false,
-                "url": state.clickhouse.config().url,
-                "database": state.clickhouse.config().database,
-                "error": error.to_string(),
-                "connections": connection_stats,
-            }),
-            StatusCode::SERVICE_UNAVAILABLE,
-        ),
-    }
-}
-
-async fn api_status(State(state): State<AppState>) -> Response {
-    let db_exists = match state
-        .clickhouse
-        .query_rows::<Value>(
-            &format!(
-                "SELECT name FROM system.databases WHERE name = '{}'",
-                escape_literal(&state.clickhouse.config().database)
-            ),
-            None,
-        )
-        .await
-    {
-        Ok(rows) => !rows.is_empty(),
-        Err(_) => false,
+/// Daemon-wide capabilities intentionally report the owned default backend's
+/// schema level. Project routing selects externally managed data stores, not a
+/// different daemon protocol or feature set, so this endpoint ignores
+/// `X-Moraine-Project-Dir` and remains outside routing middleware.
+async fn api_capabilities(State(state): State<Arc<AppState>>) -> Response {
+    let schema_migration_level = match state.backend_router.default_repository().await {
+        Ok(default_backend) => default_backend
+            .repository()
+            .read_store_diagnostics()
+            .await
+            .ok()
+            .and_then(|diagnostics| diagnostics.applied_schema_versions.into_iter().max()),
+        Err(_) => None,
     };
 
-    let tables = if db_exists {
-        match query_table_summaries(&state).await {
-            Ok(value) => value,
+    json_response(
+        json!({
+            "ok": true,
+            "server_version": env!("CARGO_PKG_VERSION"),
+            "schema_migration_level": schema_migration_level,
+            "features": {
+                "analytics": true,
+                "sessions": true,
+                "table_inspection": true,
+                "web_searches": true,
+            },
+        }),
+        StatusCode::OK,
+    )
+}
+
+async fn api_health(Extension(backend): Extension<Arc<BackendRepository>>) -> Response {
+    let (health, heartbeat) = tokio::join!(
+        backend.repository().read_store_health(),
+        backend.repository().latest_ingest_heartbeat()
+    );
+    let health = match health {
+        Ok(health) => health,
+        Err(error) => {
+            let message = error.to_string();
+            return json_response(
+                json!({
+                    "ok": false,
+                    "url": backend.clickhouse_url(),
+                    "database": backend.clickhouse_database(),
+                    "error": message,
+                    "connections": {"total": Value::Null, "error": message},
+                }),
+                StatusCode::SERVICE_UNAVAILABLE,
+            );
+        }
+    };
+    let connections = connection_payload(&health.connections);
+
+    let ping_ms = match &health.ping {
+        StoreProbe::Available(value) => *value,
+        StoreProbe::Failed { message } => {
+            return health_failure_response(&backend, message, connections);
+        }
+    };
+    let version = match &health.version {
+        StoreProbe::Available(value) => value,
+        StoreProbe::Failed { message } => {
+            return health_failure_response(&backend, message, connections);
+        }
+    };
+    let heartbeat = heartbeat.map(monitor_heartbeat_status).unwrap_or_default();
+
+    json_response(
+        json!({
+            "ok": true,
+            "url": backend.clickhouse_url(),
+            "database": backend.clickhouse_database(),
+            "version": version,
+            "ping_ms": ping_ms,
+            "connections": connections,
+            "ingestor": health_heartbeat_payload(&heartbeat),
+        }),
+        StatusCode::OK,
+    )
+}
+
+fn health_failure_response(
+    backend: &BackendRepository,
+    message: &str,
+    connections: Value,
+) -> Response {
+    json_response(
+        json!({
+            "ok": false,
+            "url": backend.clickhouse_url(),
+            "database": backend.clickhouse_database(),
+            "error": message,
+            "connections": connections,
+        }),
+        StatusCode::SERVICE_UNAVAILABLE,
+    )
+}
+
+async fn api_status(Extension(backend): Extension<Arc<BackendRepository>>) -> Response {
+    let health = backend
+        .repository()
+        .read_store_health()
+        .await
+        .unwrap_or_else(|error| unavailable_store_health(error.to_string()));
+    let database_exists = probe_bool(&health.database_exists).unwrap_or(false);
+
+    let (tables, heartbeat) = if database_exists {
+        let (tables, heartbeat) = tokio::join!(
+            backend.repository().list_table_summaries(),
+            backend.repository().latest_ingest_heartbeat()
+        );
+        let tables = match tables {
+            Ok(tables) => monitor_table_summaries(tables),
             Err(error) => {
                 return json_response(
                     json!({"ok": false, "error": error.to_string()}),
                     StatusCode::SERVICE_UNAVAILABLE,
                 );
             }
-        }
+        };
+        let heartbeat = heartbeat.map(monitor_heartbeat_status).unwrap_or_default();
+        (tables, heartbeat)
     } else {
-        Vec::new()
+        (Vec::new(), MonitorHeartbeatStatus::default())
     };
 
     let estimated_total_rows = tables.iter().map(|table| table.rows).sum::<u64>();
-    let heartbeat = if db_exists {
-        query_heartbeat_or_absent(&state).await
-    } else {
-        heartbeat_absent()
-    };
-
-    let clickhouse_ping = if db_exists {
-        match state.clickhouse.version().await {
-            Ok(version) => {
-                let start = Instant::now();
-                let ping_result = state.clickhouse.ping().await;
-                let ping_ms = Instant::elapsed(&start).as_secs_f64() * 1000.0;
-                clickhouse_ping_payload(version, ping_result, ping_ms)
-            }
-            Err(error) => {
-                json!({
-                    "healthy": false,
-                    "version": Value::Null,
-                    "ping_ms": Value::Null,
-                    "error": error.to_string(),
-                })
-            }
-        }
-    } else {
-        json!({
-            "healthy": false,
-            "version": Value::Null,
-            "ping_ms": Value::Null,
-            "error": "database not found",
-        })
-    };
+    let clickhouse = status_clickhouse_payload(&backend, &health, database_exists);
 
     json_response(
         json!({
             "ok": true,
-            "clickhouse": {
-                "url": state.clickhouse.config().url,
-            "database": state.clickhouse.config().database,
-            "healthy": clickhouse_ping["healthy"],
-            "version": clickhouse_ping["version"],
-            "ping_ms": clickhouse_ping["ping_ms"],
-            "error": clickhouse_ping["error"],
-            "connections": if db_exists {
-                query_clickhouse_connections(&state)
-                    .await
-                    .unwrap_or_else(|error| json!({"total": Value::Null, "error": error.to_string()}))
-            } else {
-                json!({"total": Value::Null, "error": "database not found"})
-            },
-        },
-        "database": {
-            "exists": db_exists,
-            "table_count": tables.len(),
-            "estimated_total_rows": estimated_total_rows,
+            "clickhouse": clickhouse,
+            "database": {
+                "exists": database_exists,
+                "table_count": tables.len(),
+                "estimated_total_rows": estimated_total_rows,
                 "tables": tables,
             },
-            "ingestor": heartbeat,
+            "ingestor": heartbeat_payload(&heartbeat),
         }),
         StatusCode::OK,
     )
 }
 
-async fn api_tables(State(state): State<AppState>) -> Response {
-    match query_table_summaries(&state).await {
-        Ok(tables) => json_response(json!({"ok": true, "tables": tables}), StatusCode::OK),
+fn unavailable_store_health(message: String) -> StoreHealth {
+    StoreHealth {
+        ping: StoreProbe::Failed {
+            message: message.clone(),
+        },
+        version: StoreProbe::Failed {
+            message: message.clone(),
+        },
+        database_exists: StoreProbe::Failed {
+            message: message.clone(),
+        },
+        connections: StoreProbe::Failed { message },
+    }
+}
+
+fn probe_bool(probe: &StoreProbe<bool>) -> Option<bool> {
+    match probe {
+        StoreProbe::Available(value) => Some(*value),
+        StoreProbe::Failed { .. } => None,
+    }
+}
+
+fn status_clickhouse_payload(
+    backend: &BackendRepository,
+    health: &StoreHealth,
+    database_exists: bool,
+) -> Value {
+    if !database_exists {
+        return json!({
+            "url": backend.clickhouse_url(),
+            "database": backend.clickhouse_database(),
+            "healthy": false,
+            "version": Value::Null,
+            "ping_ms": Value::Null,
+            "error": "database not found",
+            "connections": {"total": Value::Null, "error": "database not found"},
+        });
+    }
+
+    let (version, ping_ms, healthy, error) = match &health.version {
+        StoreProbe::Failed { message } => (Value::Null, Value::Null, false, json!(message)),
+        StoreProbe::Available(version) => match &health.ping {
+            StoreProbe::Available(ping_ms) => (json!(version), json!(ping_ms), true, Value::Null),
+            StoreProbe::Failed { message } => (json!(version), Value::Null, false, json!(message)),
+        },
+    };
+
+    json!({
+        "url": backend.clickhouse_url(),
+        "database": backend.clickhouse_database(),
+        "healthy": healthy,
+        "version": version,
+        "ping_ms": ping_ms,
+        "error": error,
+        "connections": connection_payload(&health.connections),
+    })
+}
+
+fn connection_payload(probe: &StoreProbe<StoreConnectionMetrics>) -> Value {
+    match probe {
+        StoreProbe::Available(metrics) => json!(metrics),
+        StoreProbe::Failed { message } => {
+            json!({"total": Value::Null, "error": message})
+        }
+    }
+}
+
+async fn api_tables(Extension(backend): Extension<Arc<BackendRepository>>) -> Response {
+    match backend.repository().list_table_summaries().await {
+        Ok(tables) => json_response(
+            json!({"ok": true, "tables": monitor_table_summaries(tables)}),
+            StatusCode::OK,
+        ),
         Err(error) => json_response(
             json!({"ok": false, "error": error.to_string()}),
             StatusCode::SERVICE_UNAVAILABLE,
@@ -287,65 +519,25 @@ async fn api_tables(State(state): State<AppState>) -> Response {
     }
 }
 
+fn monitor_table_summaries(summaries: TableSummaries) -> Vec<MonitorTableSummary> {
+    summaries
+        .tables
+        .into_iter()
+        .map(|table| MonitorTableSummary {
+            name: table.name,
+            engine: table.engine,
+            is_temporary: u8::from(table.is_temporary),
+            rows: table.rows,
+        })
+        .collect()
+}
+
 async fn api_web_searches(
     Query(params): Query<LimitQuery>,
-    State(state): State<AppState>,
+    Extension(backend): Extension<Arc<BackendRepository>>,
 ) -> Response {
-    #[derive(serde::Deserialize, serde::Serialize)]
-    struct WebSearchRow {
-        event_time: String,
-        harness: String,
-        source_name: String,
-        session_id: String,
-        model: String,
-        action: String,
-        search_query: String,
-        result_url: String,
-        source_ref: String,
-    }
-
-    let limit = params.limit.unwrap_or(100).clamp(1, 1000);
-    let database = &state.clickhouse.config().database;
-    let table = format!(
-        "{}.{}",
-        escape_identifier(database),
-        escape_identifier("events")
-    );
-
-    let query = format!(
-        "SELECT \
-            toString(event_ts) AS event_time, \
-            harness, \
-            source_name, \
-            session_id, \
-            lowerUTF8(trim(BOTH ' ' FROM model)) AS model, \
-            if(payload_type = 'web_search_call', op_kind, if(tool_name = 'WebFetch', 'open_page', if(tool_name = 'WebSearch', 'search', payload_type))) AS action, \
-            if(length(JSONExtractString(payload_json, 'action', 'query')) > 0, \
-               JSONExtractString(payload_json, 'action', 'query'), \
-               if(length(JSONExtractString(payload_json, 'input', 'query')) > 0, \
-                  JSONExtractString(payload_json, 'input', 'query'), \
-                  if(length(JSONExtractString(payload_json, 'data', 'query')) > 0, \
-                     JSONExtractString(payload_json, 'data', 'query'), \
-                     text_content))) AS search_query, \
-            if(length(JSONExtractString(payload_json, 'action', 'url')) > 0, \
-               JSONExtractString(payload_json, 'action', 'url'), \
-               JSONExtractString(payload_json, 'input', 'url')) AS result_url, \
-            source_ref \
-         FROM {table} \
-         WHERE payload_type = 'web_search_call' \
-            OR (payload_type = 'tool_use' AND tool_name IN ('WebSearch', 'WebFetch')) \
-            OR payload_type = 'search_results_received' \
-         ORDER BY event_ts DESC \
-         LIMIT {limit}",
-        table = table,
-        limit = limit,
-    );
-
-    let rows = match state
-        .clickhouse
-        .query_rows::<WebSearchRow>(&query, None)
-        .await
-    {
+    let limit = params.limit.unwrap_or(100).clamp(1, 1000) as u16;
+    let rows = match backend.repository().list_web_searches(limit).await {
         Ok(rows) => rows,
         Err(error) => {
             return json_response(
@@ -377,289 +569,18 @@ async fn api_web_searches(
     )
 }
 
-#[derive(Clone, Copy)]
-struct AnalyticsRange {
-    key: &'static str,
-    label: &'static str,
-    window_seconds: u32,
-    bucket_seconds: u32,
-}
-
-fn resolve_analytics_range(value: Option<&str>) -> AnalyticsRange {
-    match value.unwrap_or("24h") {
-        "15m" => AnalyticsRange {
-            key: "15m",
-            label: "Last 15m",
-            window_seconds: 15 * 60,
-            bucket_seconds: 60,
-        },
-        "1h" => AnalyticsRange {
-            key: "1h",
-            label: "Last 1h",
-            window_seconds: 60 * 60,
-            bucket_seconds: 5 * 60,
-        },
-        "6h" => AnalyticsRange {
-            key: "6h",
-            label: "Last 6h",
-            window_seconds: 6 * 60 * 60,
-            bucket_seconds: 15 * 60,
-        },
-        "24h" => AnalyticsRange {
-            key: "24h",
-            label: "Last 24h",
-            window_seconds: 24 * 60 * 60,
-            bucket_seconds: 60 * 60,
-        },
-        "7d" => AnalyticsRange {
-            key: "7d",
-            label: "Last 7d",
-            window_seconds: 7 * 24 * 60 * 60,
-            bucket_seconds: 6 * 60 * 60,
-        },
-        "30d" => AnalyticsRange {
-            key: "30d",
-            label: "Last 30d",
-            window_seconds: 30 * 24 * 60 * 60,
-            bucket_seconds: 24 * 60 * 60,
-        },
-        _ => AnalyticsRange {
-            key: "24h",
-            label: "Last 24h",
-            window_seconds: 24 * 60 * 60,
-            bucket_seconds: 60 * 60,
-        },
-    }
-}
-
-fn analytics_window_query(table: &str, window_filter: &str, window_seconds: u32) -> String {
-    format!(
-        "SELECT \
-           toUInt64(anchor_unix) AS now_unix, \
-           toUInt64(greatest(anchor_unix - toInt64({window_seconds}), toInt64(0))) AS from_unix \
-         FROM ( \
-           SELECT \
-             if( \
-               count() = 0, \
-               toInt64(toUnixTimestamp(now())), \
-               toInt64(intDiv(toUnixTimestamp64Milli(max(event_ts)), 1000)) \
-             ) AS anchor_unix \
-           FROM {table} \
-           WHERE {window_filter} \
-         )",
-    )
-}
-
 async fn api_analytics(
     Query(params): Query<AnalyticsQuery>,
-    State(state): State<AppState>,
+    Extension(backend): Extension<Arc<BackendRepository>>,
 ) -> Response {
-    #[derive(serde::Deserialize, serde::Serialize)]
-    struct TokenRow {
-        bucket_unix: u64,
-        model: String,
-        endpoint_kind: String,
-        bucket: String,
-        tokens: u64,
-    }
-
-    #[derive(serde::Deserialize, serde::Serialize)]
-    struct TurnRow {
-        bucket_unix: u64,
-        model: String,
-        turns: u64,
-    }
-
-    #[derive(serde::Deserialize, serde::Serialize)]
-    struct ConcurrentRow {
-        bucket_unix: u64,
-        concurrent_sessions: u64,
-    }
-
     let range = resolve_analytics_range(params.range.as_deref());
-    let database = &state.clickhouse.config().database;
-    let table = format!(
-        "{}.{}",
-        escape_identifier(database),
-        escape_identifier("events")
-    );
-    let model_expr = "if(lowerUTF8(trim(BOTH ' ' FROM model)) = 'codex', 'gpt-5.3-codex-xhigh', lowerUTF8(trim(BOTH ' ' FROM model)))";
-    let model_expr_latest = "if(lowerUTF8(trim(BOTH ' ' FROM model_latest)) = 'codex', 'gpt-5.3-codex-xhigh', lowerUTF8(trim(BOTH ' ' FROM model_latest)))";
-    let window_filter = format!(
-        "event_ts >= now() - INTERVAL {} SECOND AND length(trim(BOTH ' ' FROM model)) > 0 AND lowerUTF8(trim(BOTH ' ' FROM model)) != '<synthetic>'",
-        range.window_seconds
-    );
-    let token_latest_filter = format!(
-        "event_ts_latest >= now() - INTERVAL {} SECOND AND length(trim(BOTH ' ' FROM model_latest)) > 0 AND lowerUTF8(trim(BOTH ' ' FROM model_latest)) != '<synthetic>' AND arraySum(mapValues(token_usage_buckets_latest)) > 0",
-        range.window_seconds
-    );
-    let turn_filter = format!(
-        "{} AND length(trim(BOTH ' ' FROM request_id)) > 0",
-        window_filter
-    );
-    let concurrent_filter = format!(
-        "event_ts >= now() - INTERVAL {} SECOND AND length(trim(BOTH ' ' FROM session_id)) > 0 AND arraySum(mapValues(token_usage_buckets)) > 0",
-        range.window_seconds
-    );
-
-    let token_query = format!(
-        "SELECT bucket_unix, model, endpoint_kind, bucket, toUInt64(sum(tokens)) AS tokens \
-         FROM ( \
-           SELECT bucket_unix, model, endpoint_kind, bucket, toUInt64(max(tokens_latest)) AS tokens \
-           FROM ( \
-             SELECT \
-               toUInt64(toUnixTimestamp(toStartOfInterval(event_ts_latest, INTERVAL {bucket_seconds} SECOND))) AS bucket_unix, \
-               {model_expr_latest} AS model, \
-               endpoint_kind_latest AS endpoint_kind, \
-               harness_latest, \
-               session_id_latest, \
-               request_id_latest, \
-               bucket, \
-               toUInt64(tokens_latest) AS tokens_latest \
-             FROM ( \
-               SELECT \
-                 event_uid, \
-                 argMax(event_ts, event_version) AS event_ts_latest, \
-                 argMax(model, event_version) AS model_latest, \
-                 argMax(endpoint_kind, event_version) AS endpoint_kind_latest, \
-                 argMax(harness, event_version) AS harness_latest, \
-                 argMax(session_id, event_version) AS session_id_latest, \
-                 argMax(request_id, event_version) AS request_id_latest, \
-                 argMax(token_usage_buckets, event_version) AS token_usage_buckets_latest \
-               FROM {table} \
-               GROUP BY event_uid \
-             ) ARRAY JOIN mapKeys(token_usage_buckets_latest) AS bucket, mapValues(token_usage_buckets_latest) AS tokens_latest \
-             WHERE {token_latest_filter} AND tokens_latest > 0 \
-           ) \
-           WHERE harness_latest = 'claude-code' AND length(trim(BOTH ' ' FROM request_id_latest)) > 0 \
-           GROUP BY bucket_unix, model, endpoint_kind, session_id_latest, request_id_latest, bucket \
-           UNION ALL \
-           SELECT \
-             toUInt64(toUnixTimestamp(toStartOfInterval(event_ts_latest, INTERVAL {bucket_seconds} SECOND))) AS bucket_unix, \
-             {model_expr_latest} AS model, \
-             endpoint_kind_latest AS endpoint_kind, \
-             bucket, \
-             toUInt64(tokens_latest) AS tokens \
-           FROM ( \
-             SELECT \
-               event_uid, \
-               argMax(event_ts, event_version) AS event_ts_latest, \
-               argMax(model, event_version) AS model_latest, \
-               argMax(endpoint_kind, event_version) AS endpoint_kind_latest, \
-               argMax(harness, event_version) AS harness_latest, \
-               argMax(session_id, event_version) AS session_id_latest, \
-               argMax(request_id, event_version) AS request_id_latest, \
-               argMax(token_usage_buckets, event_version) AS token_usage_buckets_latest \
-             FROM {table} \
-             GROUP BY event_uid \
-           ) ARRAY JOIN mapKeys(token_usage_buckets_latest) AS bucket, mapValues(token_usage_buckets_latest) AS tokens_latest \
-           WHERE {token_latest_filter} AND tokens_latest > 0 \
-           AND NOT (harness_latest = 'claude-code' AND length(trim(BOTH ' ' FROM request_id_latest)) > 0) \
-         ) \
-         GROUP BY bucket_unix, model, endpoint_kind, bucket \
-         ORDER BY bucket_unix ASC, model ASC, endpoint_kind ASC, bucket ASC",
-        bucket_seconds = range.bucket_seconds,
-        model_expr_latest = model_expr_latest,
-        table = table,
-        token_latest_filter = token_latest_filter,
-    );
-
-    let turns_query = format!(
-        "SELECT \
-            toUInt64(toUnixTimestamp(toStartOfInterval(event_ts, INTERVAL {bucket_seconds} SECOND))) AS bucket_unix, \
-            {model_expr} AS model, \
-            toUInt64(uniqExact(tuple(session_id, request_id))) AS turns \
-         FROM {table} \
-         WHERE {turn_filter} \
-         GROUP BY bucket_unix, model \
-         ORDER BY bucket_unix ASC, model ASC",
-        bucket_seconds = range.bucket_seconds,
-        model_expr = model_expr,
-        table = table,
-        turn_filter = turn_filter,
-    );
-
-    let concurrent_query = format!(
-        "SELECT bucket_unix, toUInt64(uniqExact(session_stream_key)) AS concurrent_sessions \
-         FROM ( \
-           SELECT \
-             toUInt64(toUnixTimestamp(toStartOfInterval(event_ts, INTERVAL {bucket_seconds} SECOND))) AS bucket_unix, \
-             if(harness = 'claude-code' AND length(trim(BOTH ' ' FROM agent_run_id)) > 0, concat(session_id, '::', agent_run_id), session_id) AS session_stream_key \
-           FROM {table} \
-           WHERE {concurrent_filter} \
-         ) \
-         GROUP BY bucket_unix \
-         ORDER BY bucket_unix ASC",
-        bucket_seconds = range.bucket_seconds,
-        table = table,
-        concurrent_filter = concurrent_filter,
-    );
-
-    let token_rows = match state
-        .clickhouse
-        .query_rows::<TokenRow>(&token_query, None)
-        .await
-    {
-        Ok(rows) => rows,
+    let snapshot = match backend.repository().analytics_series(range).await {
+        Ok(snapshot) => snapshot,
         Err(error) => {
             return json_response(
-                json!({"ok": false, "error": format!("analytics token query failed: {error}")}),
+                json!({"ok": false, "error": format!("analytics query failed: {error}")}),
                 StatusCode::SERVICE_UNAVAILABLE,
             );
-        }
-    };
-
-    let turn_rows = match state
-        .clickhouse
-        .query_rows::<TurnRow>(&turns_query, None)
-        .await
-    {
-        Ok(rows) => rows,
-        Err(error) => {
-            return json_response(
-                json!({"ok": false, "error": format!("analytics turns query failed: {error}")}),
-                StatusCode::SERVICE_UNAVAILABLE,
-            );
-        }
-    };
-
-    let concurrent_rows = match state
-        .clickhouse
-        .query_rows::<ConcurrentRow>(&concurrent_query, None)
-        .await
-    {
-        Ok(rows) => rows,
-        Err(error) => {
-            return json_response(
-                json!({"ok": false, "error": format!("analytics concurrent-session query failed: {error}")}),
-                StatusCode::SERVICE_UNAVAILABLE,
-            );
-        }
-    };
-
-    #[derive(serde::Deserialize)]
-    struct WindowRow {
-        now_unix: u64,
-        from_unix: u64,
-    }
-
-    let window_query = analytics_window_query(&table, &window_filter, range.window_seconds);
-
-    let (now_unix, from_unix) = match state
-        .clickhouse
-        .query_rows::<WindowRow>(&window_query, None)
-        .await
-    {
-        Ok(rows) if !rows.is_empty() => {
-            let row = &rows[0];
-            (row.now_unix, row.from_unix)
-        }
-        _ => {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            (now, now.saturating_sub(range.window_seconds as u64))
         }
     };
 
@@ -667,284 +588,254 @@ async fn api_analytics(
         json!({
             "ok": true,
             "range": {
-                "key": range.key,
-                "label": range.label,
-                "window_seconds": range.window_seconds,
-                "bucket_seconds": range.bucket_seconds,
-                "from_unix": from_unix,
-                "to_unix": now_unix,
+                "key": snapshot.window.range.as_str(),
+                "label": format!("Last {}", snapshot.window.range.as_str()),
+                "window_seconds": snapshot.window.window_seconds,
+                "bucket_seconds": snapshot.window.bucket_seconds,
+                "from_unix": snapshot.window.from_unix,
+                "to_unix": snapshot.window.to_unix,
             },
             "series": {
-                "tokens": token_rows,
-                "turns": turn_rows,
-                "concurrent_sessions": concurrent_rows,
+                "tokens": snapshot.tokens,
+                "turns": snapshot.turns,
+                "concurrent_sessions": snapshot.concurrent_sessions,
             }
         }),
         StatusCode::OK,
     )
 }
 
-#[derive(Deserialize)]
-struct SessionsQuery {
-    limit: Option<u32>,
-    since: Option<String>,
+fn resolve_analytics_range(value: Option<&str>) -> AnalyticsRange {
+    match value.unwrap_or("24h") {
+        "15m" => AnalyticsRange::FifteenMinutes,
+        "1h" => AnalyticsRange::OneHour,
+        "6h" => AnalyticsRange::SixHours,
+        "24h" => AnalyticsRange::TwentyFourHours,
+        "7d" => AnalyticsRange::SevenDays,
+        "30d" => AnalyticsRange::ThirtyDays,
+        _ => AnalyticsRange::TwentyFourHours,
+    }
 }
 
 async fn api_sessions(
     Query(params): Query<SessionsQuery>,
-    State(state): State<AppState>,
+    Extension(backend): Extension<Arc<BackendRepository>>,
 ) -> Response {
-    let limit = params.limit.unwrap_or(50).clamp(1, 200);
-    let since = params.since.as_deref().unwrap_or("30d");
-
-    let since_seconds: u64 = match since {
-        "1h" => 60 * 60,
-        "6h" => 6 * 60 * 60,
-        "24h" => 24 * 60 * 60,
-        "7d" => 7 * 24 * 60 * 60,
-        "30d" => 30 * 24 * 60 * 60,
-        "90d" => 90 * 24 * 60 * 60,
-        "all" => 0,
-        _ => 30 * 24 * 60 * 60,
+    let query = SessionAnalyticsQuery {
+        lookback: resolve_session_lookback(params.since.as_deref()),
+        limit: params.limit.unwrap_or(50).clamp(1, 200) as u16,
     };
-
-    match build_sessions_payload(&state, limit, since_seconds).await {
-        Ok(payload) => json_response(payload, StatusCode::OK),
-        Err(error) => json_response(
-            json!({"ok": false, "error": format!("sessions query failed: {error}")}),
-            StatusCode::SERVICE_UNAVAILABLE,
-        ),
-    }
-}
-
-#[derive(serde::Deserialize)]
-struct SessionSummaryRow {
-    session_id: String,
-    harness: String,
-    source_name: String,
-    started_at_ms: i64,
-    ended_at_ms: i64,
-    models_blob: String,
-    trace_id: String,
-    first_user_text: String,
-}
-
-#[derive(serde::Deserialize)]
-struct SessionEventRow {
-    session_id: String,
-    event_ts_ms: i64,
-    event_kind: String,
-    actor_kind: String,
-    payload_type: String,
-    tool_name: String,
-    tool_call_id: String,
-    tool_error: u8,
-    latency_ms: u32,
-    model: String,
-    endpoint_kind: String,
-    input_tokens: u32,
-    output_tokens: u32,
-    cache_read_tokens: u32,
-    cache_write_tokens: u32,
-    #[serde(default)]
-    token_usage_buckets: HashMap<String, u64>,
-    #[serde(default)]
-    token_usage_native_units: HashMap<String, f64>,
-    text_preview: String,
-    text_content: String,
-    tool_args_json: String,
-}
-
-fn events_table_ref(database: &str) -> String {
-    format!(
-        "{}.{}",
-        escape_identifier(database),
-        escape_identifier("events")
-    )
-}
-
-fn deduped_events_source(events_table: &str, filter: &str) -> String {
-    let filter = filter.trim();
-    debug_assert!(!filter.is_empty());
-
-    format!(
-        "(SELECT * FROM {events_table} WHERE {filter} \
-         ORDER BY event_uid ASC, event_version DESC, ingested_at DESC \
-         LIMIT 1 BY event_uid)"
-    )
-}
-
-fn session_summary_query(events_table: &str, limit: u32, since_seconds: u64) -> String {
-    let recency_filter = if since_seconds == 0 {
-        String::new()
-    } else {
-        format!(" AND event_ts >= now() - INTERVAL {} SECOND", since_seconds)
+    let sessions = match backend.repository().list_session_analytics(query).await {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            return json_response(
+                json!({"ok": false, "error": format!("sessions query failed: {error}")}),
+                StatusCode::SERVICE_UNAVAILABLE,
+            );
+        }
     };
-    let source_filter = format!("length(trim(BOTH ' ' FROM session_id)) > 0{recency_filter}");
-    let events_source = deduped_events_source(events_table, &source_filter);
-
-    format!(
-        "SELECT \
-            session_id, \
-            any(harness) AS harness, \
-            any(source_name) AS source_name, \
-            toInt64(toUnixTimestamp64Milli(min(event_ts))) AS started_at_ms, \
-            toInt64(toUnixTimestamp64Milli(max(event_ts))) AS ended_at_ms, \
-            arrayStringConcat( \
-                arrayFilter(m -> length(m) > 0, \
-                    groupUniqArray(lowerUTF8(trim(BOTH ' ' FROM model)))), \
-                '\u{1f}' \
-            ) AS models_blob, \
-            any(if(length(trim(BOTH ' ' FROM trace_id)) > 0, trace_id, '')) AS trace_id, \
-            argMin( \
-                if(length(text_content) > 0, substring(text_content, 1, 400), substring(text_preview, 1, 400)), \
-                if(event_kind = 'message' AND actor_kind = 'user', event_ts, toDateTime64('2099-01-01', 3)) \
-            ) AS first_user_text \
-         FROM {events_source} AS deduped_events \
-         GROUP BY session_id \
-         ORDER BY ended_at_ms DESC \
-         LIMIT {limit}"
-    )
-}
-
-fn session_events_query(events_table: &str, session_ids: &[String]) -> String {
-    debug_assert!(!session_ids.is_empty());
-    let id_list = session_ids
-        .iter()
-        .map(|id| format!("'{}'", escape_literal(id)))
-        .collect::<Vec<_>>()
-        .join(",");
-    let source_filter = format!("session_id IN ({id_list})");
-    let events_source = deduped_events_source(events_table, &source_filter);
-
-    format!(
-        "SELECT \
-            session_id, \
-            toInt64(toUnixTimestamp64Milli(event_ts)) AS event_ts_ms, \
-            event_kind, \
-            actor_kind, \
-            payload_type, \
-            tool_name, \
-            tool_call_id, \
-            tool_error, \
-            latency_ms, \
-            model, \
-            endpoint_kind, \
-            input_tokens, \
-            output_tokens, \
-            cache_read_tokens, \
-            cache_write_tokens, \
-            token_usage_buckets, \
-            token_usage_native_units, \
-            substring(text_preview, 1, 2000) AS text_preview, \
-            substring(text_content, 1, 2000) AS text_content, \
-            if(event_kind = 'tool_call', substring(JSONExtractRaw(payload_json, 'input'), 1, 2000), '') AS tool_args_json \
-         FROM {events_source} AS deduped_events \
-         ORDER BY session_id, event_ts, source_file, source_generation, source_offset, source_line_no, event_uid"
-    )
-}
-
-async fn build_sessions_payload(state: &AppState, limit: u32, since_seconds: u64) -> Result<Value> {
-    let database = &state.clickhouse.config().database;
-    let events_table = events_table_ref(database);
-    let summary_query = session_summary_query(&events_table, limit, since_seconds);
-
-    let summary_rows = state
-        .clickhouse
-        .query_rows::<SessionSummaryRow>(&summary_query, None)
-        .await?;
-
-    if summary_rows.is_empty() {
-        return Ok(json!({"ok": true, "sessions": []}));
-    }
-
-    let session_ids: Vec<String> = summary_rows.iter().map(|r| r.session_id.clone()).collect();
-    let events_query = session_events_query(&events_table, &session_ids);
-
-    let event_rows = state
-        .clickhouse
-        .query_rows::<SessionEventRow>(&events_query, None)
-        .await?;
-
-    let mut events_by_session: HashMap<String, Vec<SessionEventRow>> = HashMap::new();
-    for row in event_rows {
-        events_by_session
-            .entry(row.session_id.clone())
-            .or_default()
-            .push(row);
-    }
-
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-
-    let sessions: Vec<Value> = summary_rows
+    let now_ms = unix_now_ms();
+    let sessions = sessions
         .into_iter()
-        .map(|summary| {
-            let events = events_by_session
-                .remove(&summary.session_id)
-                .unwrap_or_default();
-            build_session_json(summary, events, now_ms)
-        })
-        .collect();
+        .map(|session| monitor_session_json(session, now_ms))
+        .collect::<Vec<_>>();
 
-    Ok(json!({"ok": true, "sessions": sessions}))
+    json_response(json!({"ok": true, "sessions": sessions}), StatusCode::OK)
 }
 
-fn build_session_json(
-    summary: SessionSummaryRow,
-    events: Vec<SessionEventRow>,
-    now_ms: i64,
-) -> Value {
-    let duration_ms = (summary.ended_at_ms - summary.started_at_ms).max(0);
+fn resolve_session_lookback(value: Option<&str>) -> SessionLookback {
+    match value.unwrap_or("30d") {
+        "1h" => SessionLookback::OneHour,
+        "6h" => SessionLookback::SixHours,
+        "24h" => SessionLookback::TwentyFourHours,
+        "7d" => SessionLookback::SevenDays,
+        "30d" => SessionLookback::ThirtyDays,
+        "90d" => SessionLookback::NinetyDays,
+        "all" => SessionLookback::All,
+        _ => SessionLookback::ThirtyDays,
+    }
+}
 
-    let status = if now_ms - summary.ended_at_ms < 60_000 {
+fn monitor_session_json(session: SessionAnalytics, now_ms: i64) -> Value {
+    let mut total_tokens = 0_u64;
+    let mut total_tool_calls = 0_u64;
+    let turns = session
+        .turns
+        .into_iter()
+        .enumerate()
+        .map(|(idx, turn)| {
+            let (value, tokens, tool_calls) = monitor_turn_json(idx, turn);
+            total_tokens = total_tokens.saturating_add(tokens);
+            total_tool_calls = total_tool_calls.saturating_add(tool_calls);
+            value
+        })
+        .collect::<Vec<_>>();
+    let duration_ms = session
+        .summary
+        .last_event_unix_ms
+        .saturating_sub(session.summary.first_event_unix_ms)
+        .max(0);
+    let status = if now_ms.saturating_sub(session.summary.last_event_unix_ms) < 60_000 {
         "active"
     } else {
         "completed"
     };
 
-    let models: Vec<String> = if summary.models_blob.is_empty() {
-        Vec::new()
-    } else {
-        summary
-            .models_blob
-            .split('\u{1f}')
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect()
-    };
-
-    let title = derive_title(&summary.first_user_text);
-
-    let turns = build_turns(&events);
-    let total_tokens: u64 = turns
-        .iter()
-        .map(|t| t.get("totalTokens").and_then(|v| v.as_u64()).unwrap_or(0))
-        .sum();
-    let total_tool_calls: u64 = turns
-        .iter()
-        .map(|t| t.get("toolCalls").and_then(|v| v.as_u64()).unwrap_or(0))
-        .sum();
-
-    let harness = harness_descriptor(&summary.harness, &summary.source_name);
-
     json!({
-        "id": summary.session_id,
-        "title": title,
-        "harness": harness,
-        "startedAt": summary.started_at_ms,
-        "endedAt": summary.ended_at_ms,
+        "id": session.summary.session_id,
+        "title": derive_title(&session.first_user_text),
+        "harness": harness_descriptor(&session.harness, &session.source_name),
+        "startedAt": session.summary.first_event_unix_ms,
+        "endedAt": session.summary.last_event_unix_ms,
         "durationMs": duration_ms,
         "status": status,
-        "models": models,
+        "models": session.models,
         "turns": turns,
         "totalTokens": total_tokens,
         "totalToolCalls": total_tool_calls,
         "tags": Vec::<String>::new(),
-        "traceId": summary.trace_id,
+        "traceId": session.trace_id,
     })
+}
+
+fn monitor_turn_json(idx: usize, turn: SessionTurn) -> (Value, u64, u64) {
+    let prompt_tokens = sum_buckets(
+        &turn.token_usage_buckets,
+        &[
+            "input_text",
+            "input_cache_read",
+            "input_cache_write",
+            "input_image",
+            "input_audio",
+            "embedding_input_text",
+            "embedding_input_image",
+        ],
+    );
+    let total_tokens = turn
+        .token_usage_buckets
+        .values()
+        .copied()
+        .fold(0_u64, u64::saturating_add);
+    let completion_tokens = total_tokens.saturating_sub(prompt_tokens);
+    let tool_calls = turn.summary.tool_calls;
+    let steps = turn
+        .steps
+        .into_iter()
+        .map(monitor_step_json)
+        .collect::<Vec<_>>();
+    let duration_ms = turn
+        .summary
+        .ended_at_unix_ms
+        .saturating_sub(turn.summary.started_at_unix_ms)
+        .max(0);
+
+    (
+        json!({
+            "idx": idx,
+            "model": turn.model,
+            "startedAt": turn.summary.started_at_unix_ms,
+            "endedAt": turn.summary.ended_at_unix_ms,
+            "durationMs": duration_ms,
+            "promptTokens": prompt_tokens,
+            "completionTokens": completion_tokens,
+            "totalTokens": total_tokens,
+            "toolCalls": tool_calls,
+            "steps": steps,
+        }),
+        total_tokens,
+        tool_calls,
+    )
+}
+
+fn monitor_step_json(step: SessionStep) -> Value {
+    match step {
+        SessionStep::User {
+            event_unix_ms,
+            text,
+        } => json!({"kind": "user", "at": event_unix_ms, "text": text}),
+        SessionStep::Assistant {
+            event_unix_ms,
+            text,
+            endpoint_kind,
+            latency_ms,
+            token_usage_buckets,
+            token_usage_native_units,
+        } => {
+            let tokens = sum_buckets(
+                &token_usage_buckets,
+                &[
+                    "output_text",
+                    "output_image",
+                    "output_audio",
+                    "reasoning",
+                    "server_tool_use",
+                ],
+            );
+            let mut value = json!({
+                "kind": "assistant",
+                "at": event_unix_ms,
+                "text": text,
+                "tokens": tokens,
+                "endpointKind": endpoint_kind,
+                "nativeTokenUnits": token_usage_native_units,
+            });
+            if let Some(latency_ms) = latency_ms {
+                value["durationMs"] = json!(latency_ms);
+            }
+            value
+        }
+        SessionStep::Thinking {
+            event_unix_ms,
+            text,
+        } => json!({"kind": "thinking", "at": event_unix_ms, "text": text}),
+        SessionStep::ToolCall {
+            event_unix_ms,
+            tool_name,
+            call_id,
+            arguments,
+            latency_ms: call_latency_ms,
+            is_error: call_is_error,
+            result,
+        } => {
+            let (latency_ms, result_text, result_at, status) = match result {
+                Some(result) => (
+                    result.latency_ms,
+                    result.text,
+                    result.event_unix_ms,
+                    if call_is_error || result.is_error {
+                        "error"
+                    } else {
+                        "ok"
+                    },
+                ),
+                None => (
+                    call_latency_ms.unwrap_or_default(),
+                    String::new(),
+                    event_unix_ms,
+                    if call_is_error { "error" } else { "ok" },
+                ),
+            };
+            json!({
+                "kind": "tool_call",
+                "at": event_unix_ms,
+                "tool": tool_name,
+                "args": arguments,
+                "latencyMs": latency_ms,
+                "result": result_text,
+                "resultAt": result_at,
+                "status": status,
+                "callId": call_id,
+            })
+        }
+    }
+}
+
+fn sum_buckets(buckets: &std::collections::BTreeMap<String, u64>, names: &[&str]) -> u64 {
+    names
+        .iter()
+        .filter_map(|name| buckets.get(*name))
+        .copied()
+        .fold(0_u64, u64::saturating_add)
 }
 
 fn derive_title(first_user_text: &str) -> String {
@@ -953,15 +844,14 @@ fn derive_title(first_user_text: &str) -> String {
         return "(untitled session)".to_string();
     }
 
-    let first_line = trimmed.lines().next().unwrap_or(trimmed);
-    let clean = first_line.trim();
-    let max_chars = 120;
-    let char_count = clean.chars().count();
-    if char_count <= max_chars {
-        clean.to_string()
+    let first_line = trimmed.lines().next().unwrap_or(trimmed).trim();
+    if first_line.chars().count() <= 120 {
+        first_line.to_string()
     } else {
-        let truncated: String = clean.chars().take(max_chars).collect();
-        format!("{truncated}\u{2026}")
+        format!(
+            "{}\u{2026}",
+            first_line.chars().take(120).collect::<String>()
+        )
     }
 }
 
@@ -972,9 +862,8 @@ fn harness_descriptor(harness_id: &str, source_name: &str) -> Value {
         harness_id.trim()
     };
     let id = if id.is_empty() { "unknown" } else { id };
-    let label = id.to_string();
-    let short: String = id
-        .split(|c: char| !c.is_ascii_alphanumeric())
+    let short = id
+        .split(|character: char| !character.is_ascii_alphanumeric())
         .filter(|part| !part.is_empty())
         .take(2)
         .filter_map(|part| part.chars().next())
@@ -986,13 +875,11 @@ fn harness_descriptor(harness_id: &str, source_name: &str) -> Value {
         short
     };
 
-    let hue = hue_for_label(id);
-
     json!({
         "id": id,
-        "label": label,
+        "label": id,
         "short": short,
-        "hue": hue,
+        "hue": hue_for_label(id),
     })
 }
 
@@ -1006,585 +893,141 @@ fn hue_for_label(label: &str) -> u32 {
         "continue" => 100,
         "cli" => 60,
         _ => {
-            let mut hash: u32 = 0;
-            for byte in label.bytes() {
-                hash = hash.wrapping_mul(31).wrapping_add(byte as u32);
-            }
-            hash % 360
+            label.bytes().fold(0_u32, |hash, byte| {
+                hash.wrapping_mul(31).wrapping_add(u32::from(byte))
+            }) % 360
         }
     }
 }
 
-fn token_bucket(event: &SessionEventRow, bucket: &str) -> u64 {
-    event.token_usage_buckets.get(bucket).copied().unwrap_or(0)
+#[derive(Default)]
+struct MonitorHeartbeatStatus {
+    latest: Option<IngestHeartbeat>,
+    age_seconds: Option<u64>,
 }
 
-fn sum_token_buckets(event: &SessionEventRow, buckets: &[&str]) -> u64 {
-    buckets
-        .iter()
-        .map(|bucket| token_bucket(event, bucket))
-        .sum()
-}
-
-fn event_token_total(event: &SessionEventRow) -> u64 {
-    let canonical_total: u64 = event.token_usage_buckets.values().copied().sum();
-    if canonical_total > 0 {
-        canonical_total
-    } else {
-        (event.input_tokens
-            + event.output_tokens
-            + event.cache_read_tokens
-            + event.cache_write_tokens) as u64
+fn monitor_heartbeat_status(read: IngestHeartbeatRead) -> MonitorHeartbeatStatus {
+    let age_seconds = read.latest.as_ref().and_then(|latest| {
+        (latest.ts_unix_ms >= 0)
+            .then(|| unix_now_ms().saturating_sub(latest.ts_unix_ms).max(0) as u64 / 1_000)
+    });
+    MonitorHeartbeatStatus {
+        latest: read.latest,
+        age_seconds,
     }
 }
 
-fn event_prompt_tokens(event: &SessionEventRow) -> u64 {
-    let canonical_prompt = sum_token_buckets(
-        event,
-        &[
-            "input_text",
-            "input_cache_read",
-            "input_cache_write",
-            "input_image",
-            "input_audio",
-            "embedding_input_text",
-            "embedding_input_image",
-        ],
-    );
-    if canonical_prompt > 0 {
-        canonical_prompt
-    } else {
-        (event.input_tokens + event.cache_read_tokens + event.cache_write_tokens) as u64
-    }
-}
-
-fn event_output_tokens(event: &SessionEventRow) -> u64 {
-    let canonical_output = sum_token_buckets(
-        event,
-        &[
-            "output_text",
-            "output_image",
-            "output_audio",
-            "reasoning",
-            "server_tool_use",
-        ],
-    );
-    if canonical_output > 0 {
-        canonical_output
-    } else {
-        event.output_tokens as u64
-    }
-}
-
-fn nonzero_native_units(event: &SessionEventRow) -> Value {
-    let units = event
-        .token_usage_native_units
-        .iter()
-        .filter(|(_, value)| **value > 0.0)
-        .map(|(key, value)| (key.clone(), json!(value)))
-        .collect::<serde_json::Map<_, _>>();
-    Value::Object(units)
-}
-
-fn build_turns(events: &[SessionEventRow]) -> Vec<Value> {
-    struct TurnBuilder {
-        idx: u32,
-        model: String,
-        started_at: i64,
-        ended_at: i64,
-        steps: Vec<Value>,
-        prompt_tokens: u64,
-        completion_tokens: u64,
-        tool_calls: u64,
-    }
-
-    if events.is_empty() {
-        return Vec::new();
-    }
-
-    let mut turns: Vec<TurnBuilder> = Vec::new();
-    let mut current: Option<TurnBuilder> = None;
-    let mut open_tool_calls: HashMap<String, usize> = HashMap::new();
-
-    for event in events {
-        let starts_new_turn = event.event_kind == "message" && event.actor_kind == "user";
-
-        if starts_new_turn {
-            if let Some(finished) = current.take() {
-                turns.push(finished);
-            }
-            current = Some(TurnBuilder {
-                idx: turns.len() as u32,
-                model: String::new(),
-                started_at: event.event_ts_ms,
-                ended_at: event.event_ts_ms,
-                steps: Vec::new(),
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                tool_calls: 0,
+fn heartbeat_payload(status: &MonitorHeartbeatStatus) -> Value {
+    let latest = status
+        .latest
+        .as_ref()
+        .map(|latest| {
+            let mut payload = json!({
+                "ts": latest.ts,
+                "ts_unix_ms": latest.ts_unix_ms,
+                "host": latest.host,
+                "service_version": latest.service_version,
+                "queue_depth": latest.queue_depth,
+                "files_active": latest.files_active,
+                "files_watched": latest.files_watched,
+                "rows_raw_written": latest.rows_raw_written,
+                "rows_events_written": latest.rows_events_written,
+                "rows_errors_written": latest.rows_errors_written,
+                "flush_latency_ms": latest.flush_latency_ms,
+                "append_to_visible_p50_ms": latest.append_to_visible_p50_ms,
+                "append_to_visible_p95_ms": latest.append_to_visible_p95_ms,
+                "last_error": latest.last_error,
             });
-            open_tool_calls.clear();
-        }
-
-        let turn = match current.as_mut() {
-            Some(t) => t,
-            None => continue,
-        };
-
-        turn.ended_at = turn.ended_at.max(event.event_ts_ms);
-        let event_prompt = event_prompt_tokens(event);
-        let event_total = event_token_total(event);
-        turn.prompt_tokens += event_prompt;
-        turn.completion_tokens += event_total.saturating_sub(event_prompt);
-        if !event.model.trim().is_empty() && turn.model.is_empty() {
-            turn.model = event.model.trim().to_string();
-        }
-
-        match (
-            event.event_kind.as_str(),
-            event.actor_kind.as_str(),
-            event.payload_type.as_str(),
-        ) {
-            ("message", "user", _) => {
-                turn.steps.push(json!({
-                    "kind": "user",
-                    "at": event.event_ts_ms,
-                    "text": preferred_text(event),
-                }));
+            if let Some(backend_sinks) = &latest.backend_sinks {
+                payload["backend_sinks"] = backend_sinks.clone();
             }
-            ("message", "assistant", _) | (_, "assistant", "text") => {
-                let mut step = json!({
-                    "kind": "assistant",
-                    "at": event.event_ts_ms,
-                    "text": preferred_text(event),
-                    "tokens": event_output_tokens(event),
-                    "endpointKind": event.endpoint_kind,
-                    "nativeTokenUnits": nonzero_native_units(event),
-                });
-                if event.latency_ms > 0 {
-                    if let Some(obj) = step.as_object_mut() {
-                        obj.insert("durationMs".into(), json!(event.latency_ms));
-                    }
-                }
-                turn.steps.push(step);
-            }
-            ("reasoning", _, _) | (_, _, "thinking") => {
-                let text = preferred_text(event);
-                if !text.is_empty() {
-                    turn.steps.push(json!({
-                        "kind": "thinking",
-                        "at": event.event_ts_ms,
-                        "text": text,
-                    }));
-                }
-            }
-            ("tool_call", _, _) | (_, _, "tool_use") => {
-                turn.tool_calls += 1;
-                let step_index = turn.steps.len();
-                if !event.tool_call_id.is_empty() {
-                    open_tool_calls.insert(event.tool_call_id.clone(), step_index);
-                }
-                let args = if event.tool_args_json.trim().is_empty() {
-                    Value::Object(Default::default())
-                } else {
-                    serde_json::from_str::<Value>(&event.tool_args_json)
-                        .unwrap_or_else(|_| Value::Object(Default::default()))
-                };
-                turn.steps.push(json!({
-                    "kind": "tool_call",
-                    "at": event.event_ts_ms,
-                    "tool": if event.tool_name.is_empty() { "tool".to_string() } else { event.tool_name.clone() },
-                    "args": args,
-                    "latencyMs": event.latency_ms,
-                    "result": "",
-                    "resultAt": event.event_ts_ms,
-                    "status": if event.tool_error != 0 { "error" } else { "ok" },
-                    "callId": event.tool_call_id,
-                }));
-            }
-            ("tool_result", _, _) | (_, "tool", "tool_result") => {
-                let result_text = preferred_text(event);
-                if let Some(&step_index) = open_tool_calls.get(&event.tool_call_id) {
-                    if let Some(step) = turn.steps.get_mut(step_index) {
-                        if let Some(obj) = step.as_object_mut() {
-                            let call_at = obj
-                                .get("at")
-                                .and_then(|v| v.as_i64())
-                                .unwrap_or(event.event_ts_ms);
-                            obj.insert("resultAt".into(), json!(event.event_ts_ms));
-                            obj.insert(
-                                "latencyMs".into(),
-                                json!((event.event_ts_ms - call_at).max(0) as u32),
-                            );
-                            obj.insert("result".into(), json!(result_text));
-                            if event.tool_error != 0 {
-                                obj.insert("status".into(), json!("error"));
-                            }
-                        }
-                    }
-                    open_tool_calls.remove(&event.tool_call_id);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if let Some(finished) = current.take() {
-        turns.push(finished);
-    }
-
-    turns
-        .into_iter()
-        .map(|builder| {
-            let duration = (builder.ended_at - builder.started_at).max(0);
-            let total = builder.prompt_tokens + builder.completion_tokens;
-            json!({
-                "idx": builder.idx,
-                "model": builder.model,
-                "startedAt": builder.started_at,
-                "endedAt": builder.ended_at,
-                "durationMs": duration,
-                "promptTokens": builder.prompt_tokens,
-                "completionTokens": builder.completion_tokens,
-                "totalTokens": total,
-                "toolCalls": builder.tool_calls,
-                "steps": builder.steps,
-            })
-        })
-        .collect()
-}
-
-fn preferred_text(event: &SessionEventRow) -> String {
-    if !event.text_content.trim().is_empty() {
-        event.text_content.trim().to_string()
-    } else {
-        event.text_preview.trim().to_string()
-    }
-}
-
-async fn query_table_summaries(state: &AppState) -> Result<Vec<TableSummary>> {
-    #[derive(serde::Deserialize)]
-    struct TableRow {
-        name: String,
-        engine: String,
-        is_temporary: u8,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct PartsRow {
-        table: String,
-        rows: u64,
-    }
-
-    let database = &state.clickhouse.config().database;
-    let tables = state
-        .clickhouse
-        .query_rows::<TableRow>(&format!(
-            "SELECT name, engine, is_temporary FROM system.tables WHERE database = '{}' ORDER BY name",
-            escape_literal(database)
-        ), None)
-        .await?;
-
-    let parts = state
-        .clickhouse
-        .query_rows::<PartsRow>(&format!(
-            "SELECT table, SUM(rows) AS rows FROM system.parts WHERE database = '{}' AND active GROUP BY table",
-            escape_literal(database)
-        ), None)
-        .await
-        .unwrap_or_default();
-
-    let counts: HashMap<String, u64> = parts.into_iter().map(|row| (row.table, row.rows)).collect();
-
-    let values = tables
-        .into_iter()
-        .map(|row| TableSummary {
-            name: row.name.clone(),
-            engine: row.engine,
-            is_temporary: row.is_temporary,
-            rows: counts.get(&row.name).copied().unwrap_or(0),
-        })
-        .collect();
-
-    Ok(values)
-}
-
-async fn query_heartbeat(state: &AppState) -> Result<Value> {
-    let database = &state.clickhouse.config().database;
-    // Column-level probe: presence of any column means the table exists, and
-    // the optional backend_sinks column (migration 017) is only selected when
-    // the database actually carries it.
-    #[derive(serde::Deserialize)]
-    struct ColumnRow {
-        name: String,
-    }
-    let columns = state
-        .clickhouse
-        .query_rows::<ColumnRow>(
-            &format!(
-            "SELECT name FROM system.columns WHERE database = '{}' AND table = 'ingest_heartbeats'",
-            escape_literal(database)
-        ),
-            None,
-        )
-        .await?;
-
-    if columns.is_empty() {
-        return Ok(json!({
-            "present": false,
-            "alive": false,
-            "latest": Value::Null,
-            "age_seconds": Value::Null,
-        }));
-    }
-
-    let backend_sinks_select = if columns.iter().any(|col| col.name == "backend_sinks") {
-        ", backend_sinks"
-    } else {
-        ""
-    };
-    let query = format!(
-        "SELECT ts, toUnixTimestamp64Milli(ts) AS ts_unix_ms, host, service_version, queue_depth, files_active, files_watched, rows_raw_written, rows_events_written, rows_errors_written, flush_latency_ms, append_to_visible_p50_ms, append_to_visible_p95_ms, last_error{} FROM {}.ingest_heartbeats ORDER BY ts DESC LIMIT 1",
-        backend_sinks_select,
-        escape_identifier(database)
-    );
-
-    let latest = state
-        .clickhouse
-        .query_rows::<Value>(&query, None)
-        .await?
-        .into_iter()
-        .next();
-
-    let Some(mut latest) = latest else {
-        return Ok(
-            json!({"present": false, "alive": false, "latest": Value::Null, "age_seconds": Value::Null}),
-        );
-    };
-
-    // The sink stores backend_sinks as a JSON-encoded string; decode it so
-    // /api/health consumers see a structured `{backend: status}` map.
-    if let Some(obj) = latest.as_object_mut() {
-        if let Some(Value::String(raw)) = obj.get("backend_sinks") {
-            let decoded = if raw.trim().is_empty() {
-                json!({})
-            } else {
-                serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.clone()))
-            };
-            obj.insert("backend_sinks".to_string(), decoded);
-        }
-    }
-
-    let age_seconds = latest
-        .get("ts_unix_ms")
-        .and_then(value_to_i64)
-        .and_then(|ts_ms| {
-            if ts_ms < 0 {
-                return None;
-            }
-
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .ok()?
-                .as_millis() as i64;
-            if now_ms < ts_ms {
-                return Some(0);
-            }
-
-            Some(((now_ms - ts_ms) / 1000) as u64)
-        });
-
-    Ok(json!({
-        "present": true,
-        "latest": latest,
-        "age_seconds": age_seconds,
-        "alive": age_seconds.map(|age| age <= 30).unwrap_or(false),
-    }))
-}
-
-fn heartbeat_absent() -> Value {
-    json!({
-        "present": false,
-        "alive": false,
-        "latest": Value::Null,
-        "age_seconds": Value::Null,
-    })
-}
-
-async fn query_heartbeat_or_absent(state: &AppState) -> Value {
-    query_heartbeat(state)
-        .await
-        .unwrap_or_else(|_| heartbeat_absent())
-}
-
-fn health_heartbeat(heartbeat: Value) -> Value {
-    let latest = heartbeat
-        .get("latest")
-        .and_then(Value::as_object)
-        .map(|obj| {
-            json!({
-                "backend_sinks": obj
-                    .get("backend_sinks")
-                    .cloned()
-                    .unwrap_or_else(|| json!({})),
-            })
+            payload
         })
         .unwrap_or(Value::Null);
 
     json!({
-        "present": heartbeat
-            .get("present")
-            .cloned()
-            .unwrap_or(Value::Bool(false)),
-        "alive": heartbeat
-            .get("alive")
-            .cloned()
-            .unwrap_or(Value::Bool(false)),
+        "present": status.latest.is_some(),
+        "alive": status.age_seconds.map(|age| age <= 30).unwrap_or(false),
         "latest": latest,
-        "age_seconds": heartbeat.get("age_seconds").cloned().unwrap_or(Value::Null),
+        "age_seconds": status.age_seconds,
     })
 }
 
-async fn query_health_heartbeat_or_absent(state: &AppState) -> Value {
-    health_heartbeat(query_heartbeat_or_absent(state).await)
+fn health_heartbeat_payload(status: &MonitorHeartbeatStatus) -> Value {
+    let latest = status.latest.as_ref().map_or(Value::Null, |latest| {
+        json!({
+            "backend_sinks": latest.backend_sinks.clone().unwrap_or_else(|| json!({})),
+        })
+    });
+
+    json!({
+        "present": status.latest.is_some(),
+        "alive": status.age_seconds.map(|age| age <= 30).unwrap_or(false),
+        "latest": latest,
+        "age_seconds": status.age_seconds,
+    })
 }
 
-async fn query_clickhouse_connections(state: &AppState) -> Result<Value> {
-    #[derive(serde::Deserialize)]
-    struct MetricRow {
-        metric: String,
-        value: u64,
-    }
-
-    let metrics = state
-        .clickhouse
-        .query_rows::<MetricRow>(
-            "SELECT metric, value FROM system.metrics WHERE metric IN ('TCPConnection','HTTPConnection','MySQLConnection','PostgreSQLConnection','InterserverConnection')",
-            None,
-        )
-        .await?;
-
-    let mut tcp = 0_u64;
-    let mut http = 0_u64;
-    let mut mysql = 0_u64;
-    let mut postgres = 0_u64;
-    let mut interserver = 0_u64;
-
-    for row in metrics {
-        match row.metric.as_str() {
-            "TCPConnection" => tcp = tcp.saturating_add(row.value),
-            "HTTPConnection" => http = http.saturating_add(row.value),
-            "MySQLConnection" => mysql = mysql.saturating_add(row.value),
-            "PostgreSQLConnection" => postgres = postgres.saturating_add(row.value),
-            "InterserverConnection" => interserver = interserver.saturating_add(row.value),
-            _ => {}
-        }
-    }
-
-    let total = tcp
-        .saturating_add(http)
-        .saturating_add(mysql)
-        .saturating_add(postgres)
-        .saturating_add(interserver);
-
-    Ok(json!({
-        "total": total,
-        "tcp": tcp,
-        "http": http,
-        "mysql": mysql,
-        "postgres": postgres,
-        "interserver": interserver,
-    }))
+fn unix_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
 }
 
 async fn api_table_rows(
     Path(table): Path<String>,
     Query(params): Query<LimitQuery>,
-    State(state): State<AppState>,
+    Extension(backend): Extension<Arc<BackendRepository>>,
 ) -> Response {
-    if !is_safe_identifier(&table) {
-        return json_response(
+    let limit = params.limit.unwrap_or(25).clamp(1, 500) as u16;
+    match backend
+        .repository()
+        .preview_table(TablePreviewQuery {
+            table: table.clone(),
+            limit,
+        })
+        .await
+    {
+        Ok(preview) => {
+            let schema = preview
+                .schema
+                .into_iter()
+                .map(|column| {
+                    json!({
+                        "name": column.name,
+                        "type": column.type_name,
+                        "default_expression": column.default_expression,
+                    })
+                })
+                .collect::<Vec<_>>();
+            json_response(
+                json!({
+                    "ok": true,
+                    "table": preview.table,
+                    "limit": preview.limit,
+                    "schema": schema,
+                    "rows": preview.rows,
+                }),
+                StatusCode::OK,
+            )
+        }
+        Err(RepoError::InvalidArgument(_)) => json_response(
             json!({"ok": false, "error": "invalid table name"}),
             StatusCode::BAD_REQUEST,
-        );
-    }
-
-    let limit = params.limit.unwrap_or(25).clamp(1, 500);
-    let database = &state.clickhouse.config().database;
-
-    #[derive(serde::Deserialize)]
-    struct SchemaRow {
-        name: String,
-        #[serde(rename = "type")]
-        type_name: String,
-        default_expression: Option<String>,
-    }
-
-    let schema = match state
-        .clickhouse
-        .query_rows::<SchemaRow>(&format!(
-            "SELECT name, type, default_expression FROM system.columns WHERE database = '{}' AND table = '{}' ORDER BY position",
-            escape_literal(database),
-            escape_literal(&table)
-        ), None)
-        .await
-    {
-        Ok(value) => value,
-        Err(error) => {
-            return json_response(
-                json!({
-                    "ok": false,
-                    "error": format!("unable to read schema for table {table}: {error}"),
-                }),
-                StatusCode::SERVICE_UNAVAILABLE,
-            );
-        }
-    };
-
-    let preview_columns: Vec<String> = schema.iter().map(|entry| entry.name.clone()).collect();
-    let rows_query = table_preview_rows_query(database, &table, &preview_columns, limit);
-
-    let rows = match state
-        .clickhouse
-        .query_rows::<Value>(&rows_query, None)
-        .await
-    {
-        Ok(value) => value,
-        Err(error) => {
-            return json_response(
-                json!({
-                    "ok": false,
-                    "error": format!("unable to read table {table}: {error}"),
-                }),
-                StatusCode::SERVICE_UNAVAILABLE,
-            );
-        }
-    };
-
-    let schema_payload: Vec<Value> = schema
-        .into_iter()
-        .map(|entry| {
+        ),
+        Err(error) => json_response(
             json!({
-                "name": entry.name,
-                "type": entry.type_name,
-                "default_expression": entry.default_expression.unwrap_or_default(),
-            })
-        })
-        .collect();
-
-    json_response(
-        json!({
-            "ok": true,
-            "table": table,
-            "limit": limit,
-            "schema": schema_payload,
-            "rows": rows,
-        }),
-        StatusCode::OK,
-    )
+                "ok": false,
+                "error": format!("unable to read table {table}: {error}"),
+            }),
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+    }
 }
 
-async fn static_fallback(State(state): State<AppState>, uri: Uri) -> Response {
+async fn static_fallback(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
     let requested = uri.path();
     if requested.contains("..") {
         return json_response(
@@ -1612,7 +1055,6 @@ async fn static_fallback(State(state): State<AppState>, uri: Uri) -> Response {
             );
         }
     };
-
     let canonical_file = match fs::canonicalize(&file_path).await {
         Ok(path) => path,
         Err(_) => {
@@ -1622,7 +1064,6 @@ async fn static_fallback(State(state): State<AppState>, uri: Uri) -> Response {
             );
         }
     };
-
     if !canonical_file.starts_with(&canonical_root) {
         return json_response(
             json!({"ok": false, "error": "forbidden"}),
@@ -1639,12 +1080,10 @@ async fn static_fallback(State(state): State<AppState>, uri: Uri) -> Response {
             );
         }
     };
-
     let content_type = mime_guess::from_path(&canonical_file)
         .first_or_octet_stream()
         .essence_str()
         .to_string();
-
     let mut response = Response::new(Body::from(bytes));
     *response.status_mut() = StatusCode::OK;
     response.headers_mut().insert(
@@ -1655,67 +1094,21 @@ async fn static_fallback(State(state): State<AppState>, uri: Uri) -> Response {
     response
 }
 
-fn is_safe_identifier(value: &str) -> bool {
-    let mut chars = value.chars();
-    match chars.next() {
-        Some(first) if first == '_' || first.is_ascii_alphabetic() => {}
-        _ => return false,
-    }
-
-    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-}
-
-fn escape_literal(value: &str) -> String {
-    value.replace('\'', "''")
-}
-
-fn escape_identifier(value: &str) -> String {
-    format!("`{}`", value.replace('`', "``"))
-}
-
-fn table_preview_rows_query(
-    database: &str,
-    table: &str,
-    column_names: &[String],
-    limit: u32,
-) -> String {
-    let database = escape_identifier(database);
-    let table = escape_identifier(table);
-
-    if column_names.is_empty() {
-        return format!("SELECT * FROM {database}.{table} LIMIT {limit}");
-    }
-
-    let order_by = column_names
-        .iter()
-        .map(|name| escape_identifier(name))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    format!("SELECT * FROM {database}.{table} ORDER BY {order_by} LIMIT {limit}")
-}
-
-fn value_to_i64(value: &Value) -> Option<i64> {
-    if let Some(n) = value.as_i64() {
-        return Some(n);
-    }
-    if let Some(n) = value.as_u64() {
-        return i64::try_from(n).ok();
-    }
-    value.as_str().and_then(|raw| raw.parse::<i64>().ok())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::anyhow;
-    use axum::{body::to_bytes, extract::Query, http::StatusCode, routing::post};
-    use moraine_clickhouse::ClickHouseClient;
-    use moraine_config::ClickHouseConfig;
-    use std::collections::HashMap;
+    use axum::body::to_bytes;
+    use moraine_config::{ClickHouseConfig, RouteConfig, DEFAULT_BACKEND_NAME, ROUTE_MODE_MIRROR};
+    use moraine_conversations::{
+        AnalyticsConcurrencyPoint, AnalyticsSnapshot, AnalyticsTokenPoint, AnalyticsTurnPoint,
+        AnalyticsWindow, ConversationMode, ConversationRepository, ConversationSummary,
+        InMemoryConversationRepository, InMemoryConversationResponses, IngestHeartbeat, RepoConfig,
+        SessionStep, StoreDiagnostics, TableColumn, TablePreview, TableSummary, ToolResult,
+        TurnSummary, WebSearchEvent,
+    };
+    use std::collections::BTreeMap;
     use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use tower::ServiceExt;
 
     fn temp_path(suffix: &str) -> PathBuf {
         let stamp = SystemTime::now()
@@ -1728,293 +1121,1061 @@ mod tests {
         ))
     }
 
-    fn session_event(
-        event_kind: &str,
-        actor_kind: &str,
-        payload_type: &str,
-        at: i64,
-    ) -> SessionEventRow {
-        SessionEventRow {
-            session_id: "session-1".to_string(),
-            event_ts_ms: at,
-            event_kind: event_kind.to_string(),
-            actor_kind: actor_kind.to_string(),
-            payload_type: payload_type.to_string(),
-            tool_name: String::new(),
-            tool_call_id: String::new(),
-            tool_error: 0,
-            latency_ms: 0,
-            model: String::new(),
-            endpoint_kind: String::new(),
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-            token_usage_buckets: HashMap::new(),
-            token_usage_native_units: HashMap::new(),
-            text_preview: String::new(),
-            text_content: String::new(),
-            tool_args_json: String::new(),
-        }
-    }
-
-    fn compact_sql(query: &str) -> String {
-        query.split_whitespace().collect::<Vec<_>>().join(" ")
-    }
-
-    async fn health_mock_handler(Query(params): Query<HashMap<String, String>>) -> String {
-        let query = params.get("query").cloned().unwrap_or_default();
-        if query.trim() == "SELECT 1" {
-            return "1".to_string();
-        }
-        if query.contains("version()") {
-            return json!({"data": [{"version": "25.1.1"}]}).to_string();
-        }
-        if query.contains("system.metrics") {
-            return json!({"data": []}).to_string();
-        }
-        if query.contains("system.columns") && query.contains("ingest_heartbeats") {
-            return json!({"data": [{"name": "backend_sinks"}]}).to_string();
-        }
-        if query.contains("ingest_heartbeats") {
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock")
-                .as_millis() as u64;
-            return json!({
-                "data": [{
-                    "ts": "2026-07-07 20:00:00.000",
-                    "ts_unix_ms": now_ms,
-                    "host": "host-a",
-                    "service_version": "0.6.4",
-                    "queue_depth": 0,
-                    "files_active": 0,
-                    "files_watched": 1,
-                    "rows_raw_written": 2,
-                    "rows_events_written": 2,
-                    "rows_errors_written": 0,
-                    "flush_latency_ms": 1,
-                    "append_to_visible_p50_ms": 1,
-                    "append_to_visible_p95_ms": 2,
-                    "last_error": "",
-                    "backend_sinks": "{\"team-ch\":\"disabled_missing_identity_author\"}"
-                }]
-            })
-            .to_string();
-        }
-        json!({"data": []}).to_string()
-    }
-
-    async fn mock_health_state() -> AppState {
-        let app = Router::new().route("/", post(health_mock_handler));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    async fn fake_backend(
+        responses: InMemoryConversationResponses,
+    ) -> (Arc<BackendRepository>, Arc<InMemoryConversationRepository>) {
+        let repository = Arc::new(InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            responses,
+        ));
+        let injected: Arc<dyn ConversationRepository> = repository.clone();
+        let router = BackendRepositoryRouter::from_preloaded_for_testing(
+            Arc::new(AppConfig::default()),
+            [(DEFAULT_BACKEND_NAME.to_string(), injected)],
+        )
+        .expect("preloaded default router");
+        let backend = router
+            .default_repository()
             .await
-            .expect("bind mock clickhouse");
-        let addr = listener.local_addr().expect("mock addr");
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
+            .expect("preloaded default backend");
+        (backend, repository)
+    }
 
-        let cfg = ClickHouseConfig {
-            url: format!("http://{}", addr),
-            timeout_seconds: 1.0,
-            ..Default::default()
-        };
-        AppState {
-            clickhouse: ClickHouseClient::new(cfg).expect("mock client"),
-            static_dir: PathBuf::new(),
+    fn fake_state(
+        responses: InMemoryConversationResponses,
+    ) -> (Arc<AppState>, Arc<InMemoryConversationRepository>) {
+        let repository = Arc::new(InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            responses,
+        ));
+        let injected: Arc<dyn ConversationRepository> = repository.clone();
+        let backend_router = Arc::new(
+            BackendRepositoryRouter::from_preloaded_for_testing(
+                Arc::new(AppConfig::default()),
+                [(DEFAULT_BACKEND_NAME.to_string(), injected)],
+            )
+            .expect("preloaded default router"),
+        );
+        (
+            Arc::new(AppState {
+                backend_router,
+                static_dir: PathBuf::new(),
+            }),
+            repository,
+        )
+    }
+
+    fn routing_config() -> AppConfig {
+        let mut config = AppConfig::default();
+        config.clickhouse.url = "http://default.example:8123".to_string();
+        config.clickhouse.database = "moraine_default".to_string();
+        config
+            .backends
+            .insert(DEFAULT_BACKEND_NAME.to_string(), config.clickhouse.clone());
+        config.backends.insert(
+            "team-ch".to_string(),
+            ClickHouseConfig {
+                url: "http://team.example:8123".to_string(),
+                database: "moraine_team".to_string(),
+                ..ClickHouseConfig::default()
+            },
+        );
+        config.routes = vec![
+            RouteConfig {
+                dir: "/work/team/**".to_string(),
+                backend: "team-ch".to_string(),
+                mode: ROUTE_MODE_MIRROR.to_string(),
+            },
+            RouteConfig {
+                dir: "/work/ghost/**".to_string(),
+                backend: "not-configured".to_string(),
+                mode: ROUTE_MODE_MIRROR.to_string(),
+            },
+        ];
+        config
+    }
+
+    fn preloaded_backend_router(
+        config: AppConfig,
+        default_repository: Arc<InMemoryConversationRepository>,
+        named_repository: Arc<InMemoryConversationRepository>,
+    ) -> Arc<BackendRepositoryRouter> {
+        let default_repository: Arc<dyn ConversationRepository> = default_repository;
+        let named_repository: Arc<dyn ConversationRepository> = named_repository;
+        Arc::new(
+            BackendRepositoryRouter::from_preloaded_for_testing(
+                Arc::new(config),
+                [
+                    (DEFAULT_BACKEND_NAME.to_string(), default_repository),
+                    ("team-ch".to_string(), named_repository),
+                ],
+            )
+            .expect("preloaded routing backend"),
+        )
+    }
+
+    fn static_root(suffix: &str, index: &[u8]) -> PathBuf {
+        let root = temp_path(suffix);
+        fs::create_dir_all(&root).expect("create static root");
+        fs::write(root.join("index.html"), index).expect("write index");
+        root
+    }
+
+    async fn get_with_project_dir(
+        app: &Router,
+        uri: &str,
+        project_dir: Option<HeaderValue>,
+    ) -> Response {
+        let mut request = Request::builder().uri(uri);
+        if let Some(project_dir) = project_dir {
+            request = request.header(PROJECT_DIR_HEADER, project_dir);
         }
+        app.clone()
+            .oneshot(request.body(Body::empty()).expect("request"))
+            .await
+            .expect("response")
     }
 
-    #[test]
-    fn identifier_safety_helper() {
-        assert!(is_safe_identifier("events"));
-        assert!(is_safe_identifier("_tmp_1"));
-        assert!(!is_safe_identifier("1events"));
-        assert!(!is_safe_identifier("events;drop"));
-    }
-
-    #[test]
-    fn build_turns_emits_assistant_latency_duration() {
-        let mut user = session_event("message", "user", "text", 1_000);
-        user.text_content = "run the tool".to_string();
-        let mut assistant = session_event("message", "assistant", "text", 5_500);
-        assistant.text_content = "done".to_string();
-        assistant.output_tokens = 42;
-        assistant.latency_ms = 4_500;
-
-        let turns = build_turns(&[user, assistant]);
-        let steps = turns[0]["steps"].as_array().expect("steps");
-
-        assert_eq!(steps[1]["durationMs"], json!(4_500));
-        assert_eq!(steps[1]["tokens"], json!(42));
-    }
-
-    #[test]
-    fn build_turns_omits_zero_assistant_latency_duration() {
-        let mut user = session_event("message", "user", "text", 1_000);
-        user.text_content = "fresh prompt".to_string();
-        let mut assistant = session_event("message", "assistant", "text", 1_600);
-        assistant.text_content = "first reply".to_string();
-
-        let turns = build_turns(&[user, assistant]);
-        let steps = turns[0]["steps"].as_array().expect("steps");
-
-        assert!(steps[1].get("durationMs").is_none());
-    }
-
-    #[test]
-    fn escaping_helpers() {
-        assert_eq!(escape_literal("a'b"), "a''b");
-        assert_eq!(escape_identifier("ev`ents"), "`ev``ents`");
-    }
-
-    #[test]
-    fn events_table_ref_escapes_database_identifier() {
-        assert_eq!(events_table_ref("mor`aine"), "`mor``aine`.`events`");
-    }
-
-    #[test]
-    fn session_summary_query_dedups_by_latest_event_uid_with_recency() {
-        let query = compact_sql(&session_summary_query("`moraine`.`events`", 50, 86_400));
-
-        assert!(query.contains(
-            "FROM (SELECT * FROM `moraine`.`events` WHERE length(trim(BOTH ' ' FROM session_id)) > 0 AND event_ts >= now() - INTERVAL 86400 SECOND ORDER BY event_uid ASC, event_version DESC, ingested_at DESC LIMIT 1 BY event_uid) AS deduped_events"
-        ));
-        assert!(query.contains("GROUP BY session_id ORDER BY ended_at_ms DESC LIMIT 50"));
-    }
-
-    #[test]
-    fn session_summary_query_since_all_omits_recency_filter() {
-        let query = compact_sql(&session_summary_query("`moraine`.`events`", 25, 0));
-
-        assert!(query.contains(
-            "FROM (SELECT * FROM `moraine`.`events` WHERE length(trim(BOTH ' ' FROM session_id)) > 0 ORDER BY event_uid ASC, event_version DESC, ingested_at DESC LIMIT 1 BY event_uid) AS deduped_events"
-        ));
-        assert!(!query.contains("INTERVAL"));
-    }
-
-    #[test]
-    fn session_events_query_dedups_and_escapes_session_ids() {
-        let query = compact_sql(&session_events_query(
-            "`moraine`.`events`",
-            &["session-1".to_string(), "quote's".to_string()],
-        ));
-
-        assert!(query.contains(
-            "FROM (SELECT * FROM `moraine`.`events` WHERE session_id IN ('session-1','quote''s') ORDER BY event_uid ASC, event_version DESC, ingested_at DESC LIMIT 1 BY event_uid) AS deduped_events"
-        ));
-        assert!(query.contains(
-            "ORDER BY session_id, event_ts, source_file, source_generation, source_offset, source_line_no, event_uid"
-        ));
-    }
-
-    #[test]
-    fn table_preview_query_orders_by_schema_columns() {
-        let query = table_preview_rows_query(
-            "analytics",
-            "events",
-            &[
-                "event_ts".to_string(),
-                "session_id".to_string(),
-                "event_id".to_string(),
-            ],
-            25,
-        );
-        assert_eq!(
-            query,
-            "SELECT * FROM `analytics`.`events` ORDER BY `event_ts`, `session_id`, `event_id` LIMIT 25"
-        );
-    }
-
-    #[test]
-    fn table_preview_query_escapes_identifiers() {
-        let query = table_preview_rows_query("ana`lytics", "ev`ents", &["co`l".to_string()], 10);
-        assert_eq!(
-            query,
-            "SELECT * FROM `ana``lytics`.`ev``ents` ORDER BY `co``l` LIMIT 10"
-        );
-    }
-
-    #[test]
-    fn table_preview_query_handles_empty_schema() {
-        let columns: Vec<String> = Vec::new();
-        let query = table_preview_rows_query("analytics", "events", &columns, 5);
-        assert_eq!(query, "SELECT * FROM `analytics`.`events` LIMIT 5");
-    }
-
-    #[test]
-    fn analytics_window_query_guards_empty_recent_window() {
-        let query = analytics_window_query(
-            "`moraine`.`events`",
-            "event_ts >= now() - INTERVAL 86400 SECOND",
-            86_400,
-        );
-
-        assert!(query.contains("count() = 0"));
-        assert!(query.contains("toUnixTimestamp64Milli(max(event_ts))"));
-        assert!(query.contains("greatest(anchor_unix - toInt64(86400), toInt64(0))"));
-        assert!(!query.contains("max(event_ts) - INTERVAL"));
-    }
-
-    #[test]
-    fn clickhouse_ping_payload_marks_healthy_when_ping_succeeds() {
-        let payload = clickhouse_ping_payload("24.8".to_string(), Ok(()), 3.5);
-        assert_eq!(payload["healthy"], json!(true));
-        assert_eq!(payload["version"], json!("24.8"));
-        assert_eq!(payload["ping_ms"], json!(3.5));
-        assert_eq!(payload["error"], Value::Null);
-    }
-
-    #[test]
-    fn clickhouse_ping_payload_marks_unhealthy_when_ping_fails() {
-        let payload =
-            clickhouse_ping_payload("24.8".to_string(), Err(anyhow!("ping failed")), 8.25);
-        assert_eq!(payload["healthy"], json!(false));
-        assert_eq!(payload["version"], json!("24.8"));
-        assert_eq!(payload["ping_ms"], json!(8.25));
-        assert_eq!(payload["error"], json!("ping failed"));
-    }
-
-    #[tokio::test]
-    async fn query_heartbeat_decodes_disabled_backend_status() {
-        let state = mock_health_state().await;
-        let heartbeat = query_heartbeat(&state).await.expect("heartbeat");
-
-        assert_eq!(
-            heartbeat["latest"]["backend_sinks"]["team-ch"],
-            json!("disabled_missing_identity_author")
-        );
-        assert_eq!(heartbeat["present"], json!(true));
-        assert_eq!(heartbeat["alive"], json!(true));
-    }
-
-    #[tokio::test]
-    async fn api_health_includes_ingestor_without_affecting_health_status() {
-        let state = mock_health_state().await;
-        let response = api_health(axum::extract::State(state)).await;
-
-        assert_eq!(response.status(), StatusCode::OK);
+    async fn response_json(response: Response) -> Value {
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("body bytes");
-        let payload: Value = serde_json::from_slice(&body).expect("health json");
-        assert_eq!(payload["ok"], json!(true));
+        serde_json::from_slice(&body).expect("response json")
+    }
+
+    async fn router_json(app: &Router, uri: &str) -> (StatusCode, Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("API request"),
+            )
+            .await
+            .expect("API response");
+        let status = response.status();
+        (status, response_json(response).await)
+    }
+
+    fn sample_health() -> StoreHealth {
+        StoreHealth {
+            ping: StoreProbe::Available(3.5),
+            version: StoreProbe::Available("25.1.1".to_string()),
+            database_exists: StoreProbe::Available(true),
+            connections: StoreProbe::Available(StoreConnectionMetrics {
+                total: 15,
+                tcp: 2,
+                http: 3,
+                mysql: 4,
+                postgres: 5,
+                interserver: 1,
+            }),
+        }
+    }
+
+    fn sample_heartbeat() -> IngestHeartbeatRead {
+        IngestHeartbeatRead {
+            table_present: true,
+            latest: Some(IngestHeartbeat {
+                ts: "2026-07-10 00:00:00.000".to_string(),
+                ts_unix_ms: unix_now_ms(),
+                host: "host-a".to_string(),
+                service_version: "0.6.4".to_string(),
+                queue_depth: 1,
+                files_active: 2,
+                files_watched: 3,
+                rows_raw_written: 4,
+                rows_events_written: 5,
+                rows_errors_written: 0,
+                flush_latency_ms: 6,
+                append_to_visible_p50_ms: 7,
+                append_to_visible_p95_ms: 8,
+                last_error: String::new(),
+                watcher_backend: Some("fsevents".to_string()),
+                watcher_error_count: Some(0),
+                watcher_reset_count: Some(0),
+                watcher_last_reset_unix_ms: None,
+                backend_sinks: Some(json!({"team-ch": "healthy"})),
+            }),
+        }
+    }
+
+    fn sample_session() -> SessionAnalytics {
+        let assistant_buckets =
+            BTreeMap::from([("output_text".to_string(), 4), ("reasoning".to_string(), 2)]);
+        SessionAnalytics {
+            summary: ConversationSummary {
+                session_id: "session-1".to_string(),
+                first_event_time: "2026-02-16T12:00:00.000Z".to_string(),
+                first_event_unix_ms: 1_771_243_200_000,
+                last_event_time: "2026-02-16T12:00:03.900Z".to_string(),
+                last_event_unix_ms: 1_771_243_203_900,
+                total_turns: 1,
+                total_events: 7,
+                user_messages: 1,
+                assistant_messages: 1,
+                tool_calls: 1,
+                tool_results: 1,
+                mode: ConversationMode::ToolCalling,
+                session_slug: None,
+                session_summary: None,
+            },
+            harness: "codex".to_string(),
+            source_name: "ci-codex".to_string(),
+            models: vec!["gpt-5.3-codex".to_string()],
+            trace_id: "trace-1".to_string(),
+            first_user_text: "Inspect the repository".to_string(),
+            turns: vec![SessionTurn {
+                summary: TurnSummary {
+                    session_id: "session-1".to_string(),
+                    turn_seq: 1,
+                    turn_id: "turn-1".to_string(),
+                    started_at: "2026-02-16T12:00:00.000Z".to_string(),
+                    started_at_unix_ms: 1_771_243_200_000,
+                    ended_at: "2026-02-16T12:00:03.900Z".to_string(),
+                    ended_at_unix_ms: 1_771_243_203_900,
+                    total_events: 7,
+                    user_messages: 1,
+                    assistant_messages: 1,
+                    tool_calls: 1,
+                    tool_results: 1,
+                    reasoning_items: 1,
+                },
+                model: "gpt-5.3-codex".to_string(),
+                token_usage_buckets: BTreeMap::from([
+                    ("input_text".to_string(), 10),
+                    ("output_text".to_string(), 4),
+                    ("reasoning".to_string(), 2),
+                ]),
+                steps: vec![
+                    SessionStep::User {
+                        event_unix_ms: 1_771_243_200_000,
+                        text: "Inspect the repository".to_string(),
+                    },
+                    SessionStep::Assistant {
+                        event_unix_ms: 1_771_243_201_000,
+                        text: "I will inspect it".to_string(),
+                        endpoint_kind: "responses".to_string(),
+                        latency_ms: Some(900),
+                        token_usage_buckets: assistant_buckets,
+                        token_usage_native_units: BTreeMap::new(),
+                    },
+                    SessionStep::ToolCall {
+                        event_unix_ms: 1_771_243_202_000,
+                        tool_name: "Read".to_string(),
+                        call_id: "call-1".to_string(),
+                        arguments: json!({"path": "Cargo.toml"}),
+                        latency_ms: Some(250),
+                        is_error: false,
+                        result: Some(ToolResult {
+                            event_unix_ms: 1_771_243_203_000,
+                            text: "workspace".to_string(),
+                            latency_ms: 1_000,
+                            is_error: false,
+                        }),
+                    },
+                ],
+            }],
+        }
+    }
+
+    fn successful_responses() -> InMemoryConversationResponses {
+        InMemoryConversationResponses {
+            list_session_analytics: Some(Ok(vec![sample_session()])),
+            analytics_series: Some(Ok(AnalyticsSnapshot {
+                window: AnalyticsWindow {
+                    range: AnalyticsRange::SevenDays,
+                    window_seconds: 604_800,
+                    bucket_seconds: 21_600,
+                    from_unix: 100,
+                    to_unix: 200,
+                },
+                tokens: vec![AnalyticsTokenPoint {
+                    bucket_unix: 100,
+                    model: "gpt-5.3-codex".to_string(),
+                    endpoint_kind: "responses".to_string(),
+                    bucket: "output_text".to_string(),
+                    tokens: 4,
+                }],
+                turns: vec![AnalyticsTurnPoint {
+                    bucket_unix: 100,
+                    model: "gpt-5.3-codex".to_string(),
+                    turns: 1,
+                }],
+                concurrent_sessions: vec![AnalyticsConcurrencyPoint {
+                    bucket_unix: 100,
+                    concurrent_sessions: 1,
+                }],
+            })),
+            list_web_searches: Some(Ok(vec![WebSearchEvent {
+                event_time: "2026-02-16T12:00:00.000Z".to_string(),
+                harness: "codex".to_string(),
+                source_name: "ci-codex".to_string(),
+                session_id: "session-1".to_string(),
+                model: "gpt-5.3-codex".to_string(),
+                action: "search".to_string(),
+                search_query: "moraine".to_string(),
+                result_url: String::new(),
+                source_ref: "fixture".to_string(),
+            }])),
+            latest_ingest_heartbeat: Some(Ok(sample_heartbeat())),
+            list_table_summaries: Some(Ok(TableSummaries {
+                tables: vec![TableSummary {
+                    name: "events".to_string(),
+                    engine: "ReplacingMergeTree".to_string(),
+                    is_temporary: false,
+                    rows: 7,
+                }],
+                row_counts_error: None,
+            })),
+            preview_table: Some(Ok(TablePreview {
+                table: "events".to_string(),
+                limit: 500,
+                schema: vec![TableColumn {
+                    name: "session_id".to_string(),
+                    type_name: "String".to_string(),
+                    default_expression: String::new(),
+                }],
+                rows: vec![json!({"session_id": "session-1"})],
+            })),
+            read_store_health: Some(Ok(sample_health())),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn capabilities_report_runtime_schema_and_feature_facts() {
+        let (state, repository) = fake_state(InMemoryConversationResponses {
+            read_store_diagnostics: Some(Ok(StoreDiagnostics {
+                applied_schema_versions: vec![
+                    "003".to_string(),
+                    "025".to_string(),
+                    "017".to_string(),
+                ],
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+
+        let response = api_capabilities(State(state)).await;
+        assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            payload["ingestor"]["latest"]["backend_sinks"]["team-ch"],
-            json!("disabled_missing_identity_author")
+            response_json(response).await,
+            json!({
+                "ok": true,
+                "server_version": env!("CARGO_PKG_VERSION"),
+                "schema_migration_level": "025",
+                "features": {
+                    "analytics": true,
+                    "sessions": true,
+                    "table_inspection": true,
+                    "web_searches": true,
+                },
+            })
         );
-        let latest = payload["ingestor"]["latest"]
+        assert_eq!(repository.calls().read_store_diagnostics, 1);
+    }
+
+    #[tokio::test]
+    async fn capabilities_keep_schema_level_null_when_diagnostics_are_unavailable() {
+        for response in [
+            Ok(StoreDiagnostics::default()),
+            Err(RepoError::backend("migration ledger unavailable")),
+        ] {
+            let (state, repository) = fake_state(InMemoryConversationResponses {
+                read_store_diagnostics: Some(response),
+                ..Default::default()
+            });
+
+            let response = api_capabilities(State(state)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let payload = response_json(response).await;
+            assert_eq!(payload["ok"], json!(true));
+            assert_eq!(payload["schema_migration_level"], Value::Null);
+            assert_eq!(repository.calls().read_store_diagnostics, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn versioned_route_errors_keep_existing_status_and_envelope() {
+        let (state, _) = fake_state(InMemoryConversationResponses {
+            analytics_series: Some(Err(RepoError::backend("analytics unavailable"))),
+            ..Default::default()
+        });
+        let app = monitor_router(state);
+
+        let canonical = router_json(&app, "/api/v1/analytics?range=24h").await;
+        let legacy = router_json(&app, "/api/analytics?range=24h").await;
+        assert_eq!(canonical, legacy);
+        assert_eq!(canonical.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(canonical.1["ok"], json!(false));
+        assert_eq!(
+            canonical.1["error"],
+            json!("analytics query failed: backend error: analytics unavailable")
+        );
+
+        let malformed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/sessions?limit=not-a-number")
+                    .body(Body::empty())
+                    .expect("malformed query request"),
+            )
+            .await
+            .expect("malformed query response");
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn handlers_delegate_to_shared_repository_and_preserve_json_contracts() {
+        let (backend, repository) = fake_backend(successful_responses()).await;
+
+        let response = api_health(Extension(backend.clone())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let health = response_json(response).await;
+        assert_eq!(health["ok"], json!(true));
+        assert_eq!(health["version"], json!("25.1.1"));
+        assert_eq!(health["connections"]["total"], json!(15));
+        assert_eq!(
+            health["ingestor"]["latest"],
+            json!({"backend_sinks": {"team-ch": "healthy"}})
+        );
+
+        let response = api_status(Extension(backend.clone())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let status = response_json(response).await;
+        assert_eq!(status["database"]["exists"], json!(true));
+        assert_eq!(status["database"]["table_count"], json!(1));
+        assert_eq!(status["database"]["estimated_total_rows"], json!(7));
+        assert_eq!(status["ingestor"]["latest"]["host"], json!("host-a"));
+        let status_latest = status["ingestor"]["latest"]
             .as_object()
-            .expect("latest object");
+            .expect("status latest");
+        assert!(!status_latest.contains_key("watcher_backend"));
+        assert!(!status_latest.contains_key("watcher_error_count"));
+        assert!(!status_latest.contains_key("watcher_reset_count"));
+        assert!(!status_latest.contains_key("watcher_last_reset_unix_ms"));
+
+        let response = api_tables(Extension(backend.clone())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let tables = response_json(response).await;
+        assert_eq!(tables["tables"][0]["is_temporary"], json!(0));
+
+        let response = api_web_searches(
+            Query(LimitQuery { limit: Some(2_500) }),
+            Extension(backend.clone()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let web_searches = response_json(response).await;
+        assert_eq!(web_searches["limit"], json!(1_000));
+        assert_eq!(web_searches["schema"].as_array().unwrap().len(), 9);
+        assert_eq!(web_searches["rows"][0]["search_query"], json!("moraine"));
+
+        let response = api_analytics(
+            Query(AnalyticsQuery {
+                range: Some("7d".to_string()),
+            }),
+            Extension(backend.clone()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let analytics = response_json(response).await;
+        assert_eq!(analytics["range"]["key"], json!("7d"));
+        assert_eq!(analytics["range"]["label"], json!("Last 7d"));
+        assert_eq!(analytics["series"]["tokens"][0]["tokens"], json!(4));
+
+        let response = api_sessions(
+            Query(SessionsQuery {
+                limit: Some(0),
+                since: Some("not-a-window".to_string()),
+            }),
+            Extension(backend.clone()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let sessions = response_json(response).await;
+        let session = &sessions["sessions"][0];
+        assert_eq!(session["id"], json!("session-1"));
+        assert_eq!(session["endedAt"], json!(1_771_243_203_900_i64));
+        assert_eq!(session["turns"][0]["idx"], json!(0));
+        assert_eq!(session["turns"][0]["promptTokens"], json!(10));
+        assert_eq!(session["turns"][0]["completionTokens"], json!(6));
+        assert_eq!(session["turns"][0]["steps"][1]["durationMs"], json!(900));
+        assert_eq!(session["turns"][0]["steps"][2]["latencyMs"], json!(1_000));
         assert!(
-            !latest.contains_key("last_error"),
-            "/api/health should expose mirror status without full heartbeat internals"
+            session.get("eventCount").is_none(),
+            "session response shape must remain unchanged"
         );
-        assert!(
-            !latest.contains_key("host"),
-            "/api/health should expose mirror status without full heartbeat internals"
+
+        let response = api_table_rows(
+            Path("events".to_string()),
+            Query(LimitQuery { limit: Some(999) }),
+            Extension(backend),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let preview = response_json(response).await;
+        assert_eq!(preview["limit"], json!(500));
+        assert_eq!(preview["schema"][0]["type"], json!("String"));
+
+        let calls = repository.calls();
+        assert_eq!(calls.read_store_health, 2);
+        assert_eq!(calls.read_store_diagnostics, 0);
+        assert_eq!(calls.latest_ingest_heartbeat, 2);
+        assert_eq!(calls.list_table_summaries, 2);
+        assert_eq!(calls.list_web_searches, vec![1_000]);
+        assert_eq!(calls.analytics_series, vec![AnalyticsRange::SevenDays]);
+        assert_eq!(
+            calls.list_session_analytics,
+            vec![SessionAnalyticsQuery {
+                lookback: SessionLookback::ThirtyDays,
+                limit: 1,
+            }]
         );
+        assert_eq!(
+            calls.preview_table,
+            vec![TablePreviewQuery {
+                table: "events".to_string(),
+                limit: 500,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_failures_keep_existing_http_status_envelopes() {
+        let (backend, _) = fake_backend(InMemoryConversationResponses {
+            list_session_analytics: Some(Err(RepoError::backend("sessions unavailable"))),
+            analytics_series: Some(Err(RepoError::backend("analytics unavailable"))),
+            list_web_searches: Some(Err(RepoError::backend("web unavailable"))),
+            list_table_summaries: Some(Err(RepoError::backend("tables unavailable"))),
+            preview_table: Some(Err(RepoError::invalid_argument("unsafe table"))),
+            read_store_health: Some(Ok(StoreHealth {
+                ping: StoreProbe::Failed {
+                    message: "ping unavailable".to_string(),
+                },
+                ..sample_health()
+            })),
+            ..Default::default()
+        })
+        .await;
+
+        let health = api_health(Extension(backend.clone())).await;
+        assert_eq!(health.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response_json(health).await["error"],
+            json!("ping unavailable")
+        );
+
+        let analytics = api_analytics(
+            Query(AnalyticsQuery { range: None }),
+            Extension(backend.clone()),
+        )
+        .await;
+        assert_eq!(analytics.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response_json(analytics).await["ok"], json!(false));
+
+        let sessions = api_sessions(
+            Query(SessionsQuery {
+                limit: None,
+                since: None,
+            }),
+            Extension(backend.clone()),
+        )
+        .await;
+        assert_eq!(sessions.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let web = api_web_searches(
+            Query(LimitQuery { limit: None }),
+            Extension(backend.clone()),
+        )
+        .await;
+        assert_eq!(web.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let tables = api_tables(Extension(backend.clone())).await;
+        assert_eq!(tables.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let preview = api_table_rows(
+            Path("events;drop".to_string()),
+            Query(LimitQuery { limit: None }),
+            Extension(backend),
+        )
+        .await;
+        assert_eq!(preview.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(preview).await["error"],
+            json!("invalid table name")
+        );
+    }
+
+    #[test]
+    fn default_and_invalid_ranges_keep_legacy_fallbacks() {
+        assert_eq!(
+            resolve_analytics_range(None),
+            AnalyticsRange::TwentyFourHours
+        );
+        assert_eq!(
+            resolve_analytics_range(Some("invalid")),
+            AnalyticsRange::TwentyFourHours
+        );
+        assert_eq!(resolve_session_lookback(None), SessionLookback::ThirtyDays);
+        assert_eq!(
+            resolve_session_lookback(Some("invalid")),
+            SessionLookback::ThirtyDays
+        );
+        assert_eq!(resolve_session_lookback(Some("all")), SessionLookback::All);
+    }
+
+    #[test]
+    fn unmatched_tool_call_preserves_call_latency_and_error() {
+        let step = monitor_step_json(SessionStep::ToolCall {
+            event_unix_ms: 1_000,
+            tool_name: "Read".to_string(),
+            call_id: "call-unmatched".to_string(),
+            arguments: json!({"path": "Cargo.toml"}),
+            latency_ms: Some(321),
+            is_error: true,
+            result: None,
+        });
+
+        assert_eq!(step["latencyMs"], json!(321));
+        assert_eq!(step["status"], json!("error"));
+        assert_eq!(step["result"], json!(""));
+        assert_eq!(step["resultAt"], json!(1_000));
+    }
+
+    #[tokio::test]
+    async fn api_health_redacts_full_heartbeat_internals() {
+        let (backend, _) = fake_backend(InMemoryConversationResponses {
+            read_store_health: Some(Ok(sample_health())),
+            latest_ingest_heartbeat: Some(Ok(sample_heartbeat())),
+            ..Default::default()
+        })
+        .await;
+        let payload = response_json(api_health(Extension(backend)).await).await;
+        let latest = payload["ingestor"]["latest"].as_object().expect("latest");
+
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest["backend_sinks"]["team-ch"], json!("healthy"));
+        assert!(!latest.contains_key("host"));
+        assert!(!latest.contains_key("last_error"));
+    }
+
+    #[tokio::test]
+    async fn pre017_heartbeat_keeps_legacy_health_and_status_shapes() {
+        let mut heartbeat = sample_heartbeat();
+        let latest = heartbeat.latest.as_mut().expect("latest heartbeat");
+        latest.backend_sinks = None;
+        let (backend, _) = fake_backend(InMemoryConversationResponses {
+            read_store_health: Some(Ok(sample_health())),
+            latest_ingest_heartbeat: Some(Ok(heartbeat)),
+            ..Default::default()
+        })
+        .await;
+
+        let health = response_json(api_health(Extension(backend.clone())).await).await;
+        assert_eq!(health["ingestor"]["latest"]["backend_sinks"], json!({}));
+
+        let status = response_json(api_status(Extension(backend)).await).await;
+        let latest = status["ingestor"]["latest"].as_object().expect("latest");
+        assert!(!latest.contains_key("backend_sinks"));
+        assert!(!latest.contains_key("watcher_backend"));
+    }
+
+    #[tokio::test]
+    async fn versioned_routes_alias_legacy_payloads_and_preserve_static_assets() {
+        const INDEX_BYTES: &[u8] = b"<!doctype html><title>shared-backend</title>\n";
+        let root = temp_path("versioned-router");
+        fs::create_dir_all(&root).expect("create static root");
+        fs::write(root.join("index.html"), INDEX_BYTES).expect("write index");
+
+        let mut responses = successful_responses();
+        responses.latest_ingest_heartbeat = Some(Ok(IngestHeartbeatRead {
+            table_present: true,
+            latest: None,
+        }));
+        responses.read_store_diagnostics = Some(Ok(StoreDiagnostics {
+            applied_schema_versions: vec!["001".to_string(), "025".to_string()],
+            ..Default::default()
+        }));
+        let repository = Arc::new(InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            responses,
+        ));
+        let injected: Arc<dyn ConversationRepository> = repository.clone();
+        let backend_router = Arc::new(
+            BackendRepositoryRouter::from_preloaded_for_testing(
+                Arc::new(AppConfig::default()),
+                [(DEFAULT_BACKEND_NAME.to_string(), injected)],
+            )
+            .expect("preloaded default router"),
+        );
+        let app = router_with_backend_router(backend_router, root.clone())
+            .expect("build injected router");
+
+        let static_response = get_with_project_dir(
+            &app,
+            "/",
+            Some(HeaderValue::from_static("malformed-relative-path")),
+        )
+        .await;
+        assert_eq!(static_response.status(), StatusCode::OK);
+        assert_eq!(
+            static_response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/html"))
+        );
+        let static_body = to_bytes(static_response.into_body(), usize::MAX)
+            .await
+            .expect("static body");
+        assert_eq!(&static_body[..], INDEX_BYTES);
+
+        let route_matrix = [
+            ("/api/v1/health", "/api/health"),
+            ("/api/v1/status", "/api/status"),
+            ("/api/v1/analytics?range=7d", "/api/analytics?range=7d"),
+            ("/api/v1/tables", "/api/tables"),
+            (
+                "/api/v1/web-searches?limit=1000",
+                "/api/web-searches?limit=1000",
+            ),
+            (
+                "/api/v1/tables/events?limit=500",
+                "/api/tables/events?limit=500",
+            ),
+            (
+                "/api/v1/sessions?since=30d&limit=1",
+                "/api/sessions?since=30d&limit=1",
+            ),
+        ];
+        for (canonical_path, legacy_path) in route_matrix {
+            let canonical = router_json(&app, canonical_path).await;
+            let legacy = router_json(&app, legacy_path).await;
+            assert_eq!(
+                canonical, legacy,
+                "{legacy_path} must directly alias {canonical_path}"
+            );
+            assert_eq!(canonical.0, StatusCode::OK);
+        }
+
+        let (status, capabilities) = router_json(&app, "/api/v1/capabilities").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(capabilities["server_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(capabilities["schema_migration_level"], json!("025"));
+        assert_eq!(
+            capabilities["features"],
+            json!({
+                "analytics": true,
+                "sessions": true,
+                "table_inspection": true,
+                "web_searches": true,
+            })
+        );
+
+        let (status, missing) = router_json(&app, "/api/v1/not-a-route").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing, json!({"ok": false, "error": "not found"}));
+        let calls = repository.calls();
+        assert_eq!(calls.read_store_health, 4);
+        assert_eq!(calls.read_store_diagnostics, 1);
+        assert_eq!(calls.latest_ingest_heartbeat, 4);
+        assert_eq!(calls.list_table_summaries, 4);
+        assert_eq!(calls.list_web_searches, vec![1_000, 1_000]);
+        assert_eq!(
+            calls.analytics_series,
+            vec![AnalyticsRange::SevenDays, AnalyticsRange::SevenDays]
+        );
+        assert_eq!(
+            calls.list_session_analytics,
+            vec![
+                SessionAnalyticsQuery {
+                    lookback: SessionLookback::ThirtyDays,
+                    limit: 1,
+                },
+                SessionAnalyticsQuery {
+                    lookback: SessionLookback::ThirtyDays,
+                    limit: 1,
+                },
+            ]
+        );
+        assert_eq!(
+            calls.preview_table,
+            vec![
+                TablePreviewQuery {
+                    table: "events".to_string(),
+                    limit: 500,
+                },
+                TablePreviewQuery {
+                    table: "events".to_string(),
+                    limit: 500,
+                },
+            ]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn data_routes_select_default_named_unknown_and_reuse_repositories() {
+        let root = static_root("routing-selection", b"<!doctype html>");
+        let default_repository = Arc::new(InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            successful_responses(),
+        ));
+        let named_repository = Arc::new(InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            successful_responses(),
+        ));
+        let backend_router = preloaded_backend_router(
+            routing_config(),
+            default_repository.clone(),
+            named_repository.clone(),
+        );
+        let app =
+            router_with_backend_router(backend_router, root.clone()).expect("routing test app");
+
+        let default = response_json(get_with_project_dir(&app, "/api/v1/tables", None).await).await;
+        assert_eq!(default_repository.calls().list_table_summaries, 1);
+        assert_eq!(named_repository.calls().list_table_summaries, 0);
+
+        let named = response_json(
+            get_with_project_dir(
+                &app,
+                "/api/v1/tables",
+                Some(HeaderValue::from_static("  /work/team/project  ")),
+            )
+            .await,
+        )
+        .await;
+        let unknown = response_json(
+            get_with_project_dir(
+                &app,
+                "/api/tables",
+                Some(HeaderValue::from_static("/work/ghost/project")),
+            )
+            .await,
+        )
+        .await;
+        let named_again = response_json(
+            get_with_project_dir(
+                &app,
+                "/api/tables",
+                Some(HeaderValue::from_static("/work/team/other")),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(default, named);
+        assert_eq!(default, unknown);
+        assert_eq!(default, named_again);
+        assert_eq!(default_repository.calls().list_table_summaries, 2);
+        assert_eq!(named_repository.calls().list_table_summaries, 2);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn capabilities_ignore_project_selector_and_use_default_schema() {
+        let root = static_root("routing-capabilities", b"<!doctype html>");
+        let mut default_responses = successful_responses();
+        default_responses.read_store_diagnostics = Some(Ok(StoreDiagnostics {
+            applied_schema_versions: vec!["025".to_string()],
+            ..Default::default()
+        }));
+        let mut named_responses = successful_responses();
+        named_responses.read_store_diagnostics = Some(Ok(StoreDiagnostics {
+            applied_schema_versions: vec!["999".to_string()],
+            ..Default::default()
+        }));
+        let default_repository = Arc::new(InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            default_responses,
+        ));
+        let named_repository = Arc::new(InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            named_responses,
+        ));
+        let backend_router = preloaded_backend_router(
+            routing_config(),
+            default_repository.clone(),
+            named_repository.clone(),
+        );
+        let app = router_with_backend_router(backend_router, root.clone())
+            .expect("capabilities routing test app");
+
+        for header in [
+            None,
+            Some(HeaderValue::from_static("/work/team/project")),
+            Some(HeaderValue::from_static("malformed-relative-path")),
+        ] {
+            let response = get_with_project_dir(&app, "/api/v1/capabilities", header).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let payload = response_json(response).await;
+            assert_eq!(payload["schema_migration_level"], json!("025"));
+        }
+        assert_eq!(default_repository.calls().read_store_diagnostics, 3);
+        assert_eq!(named_repository.calls().read_store_diagnostics, 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn health_and_status_report_selected_backend_metadata() {
+        let root = static_root("routing-metadata", b"<!doctype html>");
+        let default_repository = Arc::new(InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            successful_responses(),
+        ));
+        let named_repository = Arc::new(InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            successful_responses(),
+        ));
+        let mut config = routing_config();
+        config
+            .backends
+            .get_mut("team-ch")
+            .expect("named backend")
+            .url = "http://user:secret@team.example:8123/path?token=secret#fragment".to_string();
+        let backend_router = preloaded_backend_router(config, default_repository, named_repository);
+        let app =
+            router_with_backend_router(backend_router, root.clone()).expect("metadata test app");
+
+        let default_health =
+            response_json(get_with_project_dir(&app, "/api/health", None).await).await;
+        assert_eq!(default_health["url"], json!("http://default.example:8123"));
+        assert_eq!(default_health["database"], json!("moraine_default"));
+
+        let named_header = HeaderValue::from_static("/work/team/project");
+        let named_health = response_json(
+            get_with_project_dir(&app, "/api/health", Some(named_header.clone())).await,
+        )
+        .await;
+        assert_eq!(named_health["url"], json!("http://team.example:8123"));
+        assert_eq!(named_health["database"], json!("moraine_team"));
+
+        let named_status =
+            response_json(get_with_project_dir(&app, "/api/status", Some(named_header)).await)
+                .await;
+        assert_eq!(
+            named_status["clickhouse"]["url"],
+            json!("http://team.example:8123")
+        );
+        assert_eq!(
+            named_status["clickhouse"]["database"],
+            json!("moraine_team")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn project_dir_header_validation_rejects_bad_data_requests() {
+        let root = static_root("routing-validation", b"<!doctype html>");
+        let default_repository =
+            Arc::new(InMemoryConversationRepository::new(RepoConfig::default()));
+        let named_repository = Arc::new(InMemoryConversationRepository::new(RepoConfig::default()));
+        let backend_router = preloaded_backend_router(
+            routing_config(),
+            default_repository.clone(),
+            named_repository.clone(),
+        );
+        let app =
+            router_with_backend_router(backend_router, root.clone()).expect("validation test app");
+
+        let mut repeated = Request::builder()
+            .uri("/api/health")
+            .body(Body::empty())
+            .expect("repeated header request");
+        repeated.headers_mut().append(
+            PROJECT_DIR_HEADER,
+            HeaderValue::from_static("/work/team/one"),
+        );
+        repeated.headers_mut().append(
+            PROJECT_DIR_HEADER,
+            HeaderValue::from_static("/work/team/two"),
+        );
+        let requests = vec![
+            repeated,
+            Request::builder()
+                .uri("/api/health")
+                .header(PROJECT_DIR_HEADER, HeaderValue::from_static("   "))
+                .body(Body::empty())
+                .expect("empty header request"),
+            Request::builder()
+                .uri("/api/health")
+                .header(
+                    PROJECT_DIR_HEADER,
+                    HeaderValue::from_static("relative/project"),
+                )
+                .body(Body::empty())
+                .expect("relative header request"),
+            Request::builder()
+                .uri("/api/health")
+                .header(
+                    PROJECT_DIR_HEADER,
+                    HeaderValue::from_bytes(&[0xff]).expect("opaque header"),
+                )
+                .body(Body::empty())
+                .expect("non-UTF-8 header request"),
+        ];
+
+        for request in requests {
+            let response = app.clone().oneshot(request).await.expect("response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let payload = response_json(response).await;
+            assert_eq!(payload["ok"], json!(false));
+            assert!(payload["error"]
+                .as_str()
+                .is_some_and(|error| !error.is_empty()));
+        }
+        assert_eq!(default_repository.calls().read_store_health, 0);
+        assert_eq!(named_repository.calls().read_store_health, 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn named_backend_construction_errors_return_service_unavailable() {
+        let root = static_root("routing-construction-error", b"<!doctype html>");
+        let mut config = routing_config();
+        config
+            .backends
+            .get_mut("team-ch")
+            .expect("named backend")
+            .url = "://invalid".to_string();
+        let backend_router = Arc::new(
+            BackendRepositoryRouter::new(
+                Arc::new(config),
+                RepoConfig::default(),
+                "moraine-monitor-core/test",
+            )
+            .expect("lazy backend router"),
+        );
+        let app = router_with_backend_router(backend_router, root.clone())
+            .expect("construction error test app");
+
+        let response = get_with_project_dir(
+            &app,
+            "/api/health",
+            Some(HeaderValue::from_static("/work/team/project")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let payload = response_json(response).await;
+        assert_eq!(payload["ok"], json!(false));
+        assert_eq!(
+            payload["error"],
+            json!("selected backend is unavailable or schema-incompatible")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_static_dir_override_is_authoritative() {
+        let path = temp_path("explicit-static");
+        assert_eq!(resolve_static_dir(Some(path.clone())), path);
     }
 
     #[test]
@@ -2031,8 +2192,8 @@ mod tests {
     #[test]
     fn validate_static_dir_rejects_missing_directory() {
         let missing = temp_path("static-missing");
-        let err = validate_static_dir(&missing).expect_err("missing static dir should fail");
-        assert!(err.to_string().contains("is unavailable"));
+        let error = validate_static_dir(&missing).expect_err("missing static dir should fail");
+        assert!(error.to_string().contains("is unavailable"));
     }
 
     #[test]
@@ -2042,8 +2203,8 @@ mod tests {
         let path = root.join("dist");
         fs::write(&path, "not a dir").expect("write file");
 
-        let err = validate_static_dir(&path).expect_err("file should fail");
-        assert!(err.to_string().contains("is not a directory"));
+        let error = validate_static_dir(&path).expect_err("file should fail");
+        assert!(error.to_string().contains("is not a directory"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2053,8 +2214,8 @@ mod tests {
         let root = temp_path("static-no-index");
         fs::create_dir_all(&root).expect("create root");
 
-        let err = validate_static_dir(&root).expect_err("missing index should fail");
-        assert!(err.to_string().contains("does not contain `index.html`"));
+        let error = validate_static_dir(&root).expect_err("missing index should fail");
+        assert!(error.to_string().contains("does not contain `index.html`"));
 
         let _ = fs::remove_dir_all(root);
     }

@@ -1,11 +1,15 @@
 use super::*;
 
 pub(super) const BENCHMARK_REPLAY_SOURCE: &str = "benchmark-replay";
+pub(super) const ANALYTICS_CACHE_TTL: Duration = Duration::from_secs(30);
+pub(super) const ANALYTICS_RANGE_COUNT: usize = AnalyticsRange::ALL.len();
 pub(super) const CORPUS_STATS_CACHE_TTL: Duration = Duration::from_secs(30);
 pub(super) const TERM_DF_CACHE_TTL: Duration = Duration::from_secs(300);
 pub(super) const SEARCH_SCHEMA_CACHE_TTL: Duration = Duration::from_secs(60);
 pub(super) const SEARCH_RESULT_CACHE_TTL: Duration = Duration::from_secs(15);
 pub(super) const SEARCH_RESULT_CACHE_MAX_ENTRIES: usize = 256;
+pub(super) const MCP_SEARCH_RESULT_CACHE_TTL: Duration = Duration::from_secs(15);
+pub(super) const MCP_SEARCH_RESULT_CACHE_MAX_ENTRIES: usize = 256;
 pub(super) const TERM_POSTINGS_CACHE_TTL: Duration = Duration::from_secs(15);
 pub(super) const TERM_POSTINGS_CACHE_MAX_ENTRIES: usize = 2048;
 pub(super) const TERM_POSTINGS_CACHE_MAX_ROWS_PER_TERM: usize = 131_072;
@@ -22,6 +26,31 @@ pub(super) const TERM_POSTINGS_FAST_PATH_MAX_DOC_RATIO_DENOMINATOR: u64 = 4;
 // a preview up to a minute old, never a wrong hit.
 pub(super) const SEARCH_DOC_EXTRA_CACHE_TTL: Duration = Duration::from_secs(60);
 pub(super) const SEARCH_DOC_EXTRA_CACHE_MAX_ENTRIES: usize = 65536;
+
+#[derive(Debug, Clone)]
+pub(super) struct AnalyticsCacheEntry {
+    pub(super) snapshot: AnalyticsSnapshot,
+    pub(super) fetched_at: Instant,
+}
+
+impl AnalyticsCacheEntry {
+    pub(super) fn is_fresh(&self, now: Instant) -> bool {
+        now.checked_duration_since(self.fetched_at)
+            .unwrap_or_default()
+            <= ANALYTICS_CACHE_TTL
+    }
+}
+
+pub(super) const fn analytics_range_index(range: AnalyticsRange) -> usize {
+    match range {
+        AnalyticsRange::FifteenMinutes => 0,
+        AnalyticsRange::OneHour => 1,
+        AnalyticsRange::SixHours => 2,
+        AnalyticsRange::TwentyFourHours => 3,
+        AnalyticsRange::SevenDays => 4,
+        AnalyticsRange::ThirtyDays => 5,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct CorpusStatsCacheEntry {
@@ -46,6 +75,13 @@ pub(super) struct SearchStatsCache {
 #[derive(Debug, Clone)]
 pub(super) struct SearchEventsCacheEntry {
     pub(super) hits: Vec<SearchEventHit>,
+    pub(super) fetched_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct SearchMcpEventsCacheEntry {
+    pub(super) hits: Vec<SearchMcpEventHit>,
+    pub(super) truncated: bool,
     pub(super) fetched_at: Instant,
 }
 
@@ -99,8 +135,8 @@ impl ClickHouseConversationRepository {
                     include_tool_events: None,
                     event_kinds: None,
                     exclude_codex_mcp: None,
-                    disable_cache: Some(false),
-                    search_strategy: Some(SearchEventsStrategy::Optimized),
+                    bypass_cache: Some(false),
+                    strategy_hint: Some(SearchStrategyHint::PreferPerformance),
                 })
                 .await
             {
@@ -146,7 +182,7 @@ impl ClickHouseConversationRepository {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn search_events_cache_key(
         terms: &[String],
-        search_strategy: SearchEventsStrategy,
+        strategy_hint: SearchStrategyHint,
         include_tool_events: bool,
         event_kinds: Option<&[SearchEventKind]>,
         exclude_codex_mcp: bool,
@@ -176,7 +212,7 @@ impl ClickHouseConversationRepository {
             .unwrap_or_default();
         format!(
             "strategy={};incl_tools={include_tool_events};event_kinds={event_kind_sig};excl_codex={exclude_codex_mcp};session={};sessions={session_ids_sig};msm={min_should_match};min_score={min_score:.12};limit={limit};terms={}",
-            search_strategy.as_str(),
+            strategy_hint.as_str(),
             session_id.unwrap_or(""),
             cache_terms.join(",")
         )
@@ -226,6 +262,86 @@ impl ClickHouseConversationRepository {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn search_mcp_events_cache_key(
+        terms: &[String],
+        event_types: &[McpEventType],
+        session_id: Option<&str>,
+        turn_seq: Option<u32>,
+        min_should_match: u16,
+        min_score: f64,
+        effective_n_hits: u16,
+    ) -> String {
+        let mut cache_terms = terms.to_vec();
+        cache_terms.sort_unstable();
+        let event_type_sig = event_types
+            .iter()
+            .map(|event_type| event_type.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "event_types={event_type_sig};session={};turn_seq={};msm={min_should_match};min_score={:016x};limit={effective_n_hits};terms={}",
+            session_id.unwrap_or(""),
+            turn_seq.unwrap_or(0),
+            min_score.to_bits(),
+            cache_terms.join(",")
+        )
+    }
+
+    pub(super) async fn search_mcp_events_cache_get(
+        &self,
+        key: &str,
+    ) -> Option<(Vec<SearchMcpEventHit>, bool)> {
+        let now = Instant::now();
+        {
+            let cache = self.mcp_search_cache.read().await;
+            let entry = cache.get(key)?;
+            if now.duration_since(entry.fetched_at) <= MCP_SEARCH_RESULT_CACHE_TTL {
+                return Some((entry.hits.clone(), entry.truncated));
+            }
+        }
+
+        let mut cache = self.mcp_search_cache.write().await;
+        if let Some(entry) = cache.get(key) {
+            if now.duration_since(entry.fetched_at) <= MCP_SEARCH_RESULT_CACHE_TTL {
+                return Some((entry.hits.clone(), entry.truncated));
+            }
+        }
+        cache.remove(key);
+        None
+    }
+
+    pub(super) async fn search_mcp_events_cache_put(
+        &self,
+        key: String,
+        hits: &[SearchMcpEventHit],
+        truncated: bool,
+    ) {
+        let now = Instant::now();
+        let mut cache = self.mcp_search_cache.write().await;
+        cache
+            .retain(|_, entry| now.duration_since(entry.fetched_at) <= MCP_SEARCH_RESULT_CACHE_TTL);
+
+        if cache.len() >= MCP_SEARCH_RESULT_CACHE_MAX_ENTRIES {
+            if let Some(oldest_key) = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.fetched_at)
+                .map(|(key, _)| key.clone())
+            {
+                cache.remove(&oldest_key);
+            }
+        }
+
+        cache.insert(
+            key,
+            SearchMcpEventsCacheEntry {
+                hits: hits.to_vec(),
+                truncated,
+                fetched_at: now,
+            },
+        );
+    }
+
     pub(super) async fn corpus_stats(&self) -> RepoResult<(u64, u64)> {
         let now = Instant::now();
         {
@@ -243,7 +359,7 @@ impl ClickHouseConversationRepository {
         );
 
         let from_stats: Vec<CorpusStatsRow> =
-            self.map_backend(self.ch.query_rows(&from_stats_query, None).await)?;
+            self.map_backend(self.query_rows(&from_stats_query, None).await)?;
 
         if let Some(row) = from_stats.first() {
             if row.docs > 0 {
@@ -258,7 +374,7 @@ impl ClickHouseConversationRepository {
             self.table_ref("search_documents")
         );
         let fallback: Vec<CorpusStatsRow> =
-            self.map_backend(self.ch.query_rows(&fallback_query, None).await)?;
+            self.map_backend(self.query_rows(&fallback_query, None).await)?;
         let resolved = if let Some(row) = fallback.first() {
             (row.docs, row.total_doc_len)
         } else {
@@ -326,7 +442,7 @@ FORMAT JSONEachRow",
             self.table_ref("search_query_log"),
             limit
         );
-        let rows: Vec<HotQueryRow> = self.map_backend(self.ch.query_rows(&query, None).await)?;
+        let rows: Vec<HotQueryRow> = self.map_backend(self.query_rows(&query, None).await)?;
         Ok(rows.into_iter().map(|row| row.raw_query).collect())
     }
 
@@ -358,7 +474,7 @@ FORMAT JSONEachRow",
         let df_query = format!(
             "SELECT term, toUInt64(uniqExact(doc_id)) AS df FROM {postings_table} WHERE term IN {missing_terms_array} GROUP BY term FORMAT JSONEachRow",
         );
-        let rows: Vec<DfRow> = self.map_backend(self.ch.query_rows(&df_query, None).await)?;
+        let rows: Vec<DfRow> = self.map_backend(self.query_rows(&df_query, None).await)?;
         for row in rows {
             map.insert(row.term, row.df);
         }

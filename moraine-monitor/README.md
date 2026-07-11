@@ -1,6 +1,6 @@
 # Moraine Monitor
 
-Local UI to inspect the `moraine` ClickHouse database, now backed by a Rust server.
+The unified Rust backend serves the MCP socket, monitor HTTP API, and static UI together from one shared repository and cache set.
 
 Note: `moraine-monitor/backend` is a legacy reference-only tree. Authoritative monitor runtime code is in `apps/moraine-monitor` and `crates/moraine-monitor-core`.
 
@@ -8,8 +8,11 @@ Note: `moraine-monitor/backend` is a legacy reference-only tree. Authoritative m
 
 ```bash
 cd /Users/eric/src/moraine
-bin/moraine run monitor -- --host 127.0.0.1 --port 8080
+bin/moraine run backend -- --host 127.0.0.1 --port 8080
 ```
+
+The `moraine-monitor` executable is a deprecated compatibility alias for the
+same unified backend process. It does not start a separate monitor service.
 
 Open:
 
@@ -45,11 +48,21 @@ Serve custom assets by passing `--static-dir` if needed.
 
 ## API endpoints
 
-- `GET /api/health` – ClickHouse ping/version
-- `GET /api/status` – database and ingestor status summary
-- `GET /api/analytics?range=24h` – model analytics (token usage and turns by time bucket)
-- `GET /api/tables` – table list and estimated row counts
-- `GET /api/tables/:name?limit=25` – schema and sample rows
+The canonical dashboard API is versioned under `/api/v1`:
+
+- `GET /api/v1/capabilities` – server version, applied schema migration level, and feature flags
+- `GET /api/v1/health` – ClickHouse ping/version
+- `GET /api/v1/status` – database and ingestor status summary
+- `GET /api/v1/analytics?range=24h` – model analytics (token usage and turns by time bucket)
+- `GET /api/v1/tables` – table list and estimated row counts
+- `GET /api/v1/tables/:name?limit=25` – schema and sample rows
+- `GET /api/v1/web-searches?limit=100` – normalized web-search activity
+- `GET /api/v1/sessions?since=30d&limit=50` – session analytics
+
+The former `/api/*` dashboard paths remain direct aliases for one release.
+New clients must use `/api/v1`. See
+[`docs/monitor-http-api.md`](../docs/monitor-http-api.md) for the complete
+contract, query bounds, compatibility matrix, and error behavior.
 
 Supported analytics ranges:
 

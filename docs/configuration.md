@@ -43,23 +43,26 @@ future keys.
 | `[identity]` | Explicit person identity stamped on ingested raw/events rows. |
 | `[ingest]` | Ingest batching, backfill, watcher, checkpoint, and heartbeat settings. |
 | `[[ingest.sources]]` | Watched agent trace sources. |
-| `[mcp]` | MCP retrieval defaults and shared central server settings. |
+| `[mcp]` | MCP retrieval defaults and shared backend socket settings. |
 | `[bm25]` | Search ranking defaults. |
-| `[monitor]` | Monitor HTTP bind settings. |
-| `[runtime]` | Runtime directories, service startup behavior, and managed ClickHouse settings. |
+| `[monitor]` | Monitor HTTP port. |
+| `[backend]` | Unified MCP socket and monitor HTTP daemon startup, HTTP bind, and experimental non-loopback guard. |
+| `[runtime]` | Runtime directories and managed ClickHouse settings. |
 
 ## Minimal Example
 
 Most users only need to override paths, ports, or watched sources:
 
 ```toml
+[backend]
+bind = "127.0.0.1"
+start_on_up = false
+
 [monitor]
-host = "127.0.0.1"
 port = 8080
 
 [runtime]
 root_dir = "~/.moraine"
-start_monitor_on_up = true
 
 [[ingest.sources]]
 name = "codex"
@@ -221,7 +224,7 @@ only affects traces that carry no working directory at all.
 Per-backend mirror status — `connecting`, `ok`, `lagging`, `unreachable`,
 `disabled_skew`, or `disabled_missing_identity_author` — is written to ingest
 heartbeats as a `backend_sinks` map and surfaced through the monitor's
-`/api/health`. This uses a column added by migration 017; until
+`/api/v1/health`. This uses a column added by migration 017; until
 `moraine db migrate` runs (and ingest restarts), ingest warns and omits the
 field rather than failing heartbeats. `disabled_missing_identity_author` means
 `[identity].author` is empty; set it and restart ingest before mirroring to
@@ -241,7 +244,7 @@ build — a strictly read-only probe — and enforces:
 | Server ahead (server-applied migrations unknown to this build) | Mirror disabled unless that backend sets `allow_newer_server = true`. Upgrade Moraine, or opt in. |
 
 For ingest mirroring, a skew failure disables that one mirror until the
-ingest service restarts and shows as `disabled_skew` in `/api/health`; the
+ingest service restarts and shows as `disabled_skew` in `/api/v1/health`; the
 default backend is unaffected. A backend that simply does not answer retries
 the handshake periodically and shows as `unreachable`. The same handshake
 also runs when `moraine run mcp` starts in a routed directory, where it
@@ -580,7 +583,6 @@ prewarm_on_initialize = false
 async_log_writes = true
 protocol_version = "2024-11-05"
 use_central_server = true
-start_central_on_up = true
 central_socket_path = "mcp.sock"
 central_connect_timeout_ms = 250
 ```
@@ -597,7 +599,6 @@ central_connect_timeout_ms = 250
 | `async_log_writes` | `true` | Writes MCP observability rows asynchronously so tool calls stay responsive. |
 | `protocol_version` | `2024-11-05` | MCP protocol version advertised by the server. |
 | `use_central_server` | `true` | Makes `moraine run mcp` prefer the shared central server socket, with embedded fallback. |
-| `start_central_on_up` | `true` | Starts the shared central MCP server when `moraine up` starts services. |
 | `central_socket_path` | `mcp.sock` | Unix socket path. Bare filenames resolve under `runtime.pids_dir`; absolute paths are used verbatim. |
 | `central_connect_timeout_ms` | `250` | Milliseconds a proxy client waits for the central socket before falling back to embedded mode. |
 
@@ -609,14 +610,16 @@ first-search latency.
 
 ### Shared central MCP server
 
-By default Moraine runs a single shared MCP server per host instead of one
-full server per agent session, which sharply reduces CPU and memory when many
-sessions are active at once. The fields above control it:
+When the backend daemon is running, Moraine uses one repository, ClickHouse
+client, and warm cache set for every MCP proxy session and the monitor HTTP
+server. The shipped configuration leaves the daemon off until `moraine up
+--backend` is run or `backend.start_on_up` is enabled. `use_central_server`
+controls whether `moraine run mcp` attempts that shared socket before falling
+back to an embedded server:
 
 | Field | Default | Purpose |
 | --- | --- | --- |
 | `use_central_server` | `true` | When set, `moraine run mcp` connects to the central server's socket and proxies to it; if the socket is missing or unreachable it transparently falls back to an embedded server. Set to `false` to always run embedded (pre-central behavior). In a directory routed to a non-default backend the central proxy is bypassed regardless of this flag (see [MCP in routed directories](#mcp-in-routed-directories)). |
-| `start_central_on_up` | `true` | When set, `moraine up` launches the central server as a background daemon. |
 | `central_socket_path` | `mcp.sock` | Unix socket path. A bare filename resolves under the runtime pids dir (`~/.moraine/run/mcp.sock`, mode `0o600`); an absolute path is used verbatim. |
 | `central_connect_timeout_ms` | `250` | How long a client waits to connect before falling back to embedded. |
 
@@ -638,11 +641,14 @@ server, because the shared central server serves every project on the host.
 See
 [Agent MCP Search → Install](agent-mcp-search/install.md#project-scoped-retrieval-project-only).
 
-The up-managed MCP service is always the central socket server; the legacy
-per-`up` stdio daemon is gone (v0.6.0). `runtime.start_mcp_on_up` is
-deprecated: it is still parsed so existing configs keep loading, and it now
-acts as a force-on alias for the central server (the same as `moraine up
---mcp`). Use `mcp.start_central_on_up` instead.
+The up-managed MCP service is the unified backend daemon; the legacy per-`up`
+stdio daemon and standalone monitor service are gone. The old
+`runtime.start_monitor_on_up`, `mcp.start_central_on_up`, and
+`runtime.start_mcp_on_up` keys remain load-only compatibility aliases for one
+release. When `backend.start_on_up` is absent, any explicitly true alias maps
+to true. An explicitly configured canonical value always wins, including
+`false`. `moraine setup` materializes the prior effective value at
+`backend.start_on_up` and atomically removes all three obsolete keys.
 
 ## Search Ranking
 
@@ -667,19 +673,55 @@ Most installations should keep these defaults.
 | `default_min_should_match` | `1` | Default minimum number of query terms that should match. |
 | `max_query_terms` | `32` | Maximum query terms kept after tokenization. |
 
+## Backend Daemon
+
+`[backend]` controls the unified daemon's startup behavior and HTTP listener:
+
+```toml
+[backend]
+bind = "127.0.0.1"
+# auth_token = "<generate-a-random-guard-token>"
+start_on_up = false
+```
+
+| Field | Default | Purpose |
+| --- | --- | --- |
+| `bind` | `127.0.0.1` | Interface for the monitor HTTP listener. Keep the loopback default for local-only access. |
+| `auth_token` | unset | Experimental startup prerequisite for a non-loopback effective bind. It does not authenticate HTTP requests. |
+| `start_on_up` | `false` | Starts one `moraine-mcp --serve socket` backend process that serves the MCP socket, monitor HTTP API, and static UI from one shared repository/cache set. |
+
+Use `moraine up --backend` for an explicit one-time start without changing the
+configuration. `moraine up --monitor` and `moraine up --mcp` remain deprecated
+CLI aliases for the same single backend process; they never launch separate
+services.
+
+### Experimental HTTP bind guard
+
+`backend.bind` defaults to the loopback interface. When the effective bind is
+non-loopback, `backend.auth_token` must contain at least one non-whitespace
+character or backend startup fails before creating any listener.
+
+This is experimental configuration groundwork and a startup prerequisite only.
+It does not authenticate HTTP requests: the monitor API and UI remain
+unauthenticated, and exposing them to an untrusted network remains unsafe. Real
+monitor authentication is tracked in
+[issue #383, Phase 3](https://github.com/eric-tramel/moraine/issues/383).
+
+The guard does not change the MCP transport. The MCP server continues to use
+the same per-user Unix socket and proxy/embedded fallback behavior described in
+[Shared central MCP server](#shared-central-mcp-server).
+
 ## Monitor
 
-`[monitor]` controls the monitor HTTP server:
+`[monitor]` controls the monitor HTTP port:
 
 ```toml
 [monitor]
-host = "127.0.0.1"
 port = 8080
 ```
 
 | Field | Default | Purpose |
 | --- | --- | --- |
-| `host` | `127.0.0.1` | Interface the monitor binds. Keep the default for local-only access. |
 | `port` | `8080` | Monitor HTTP port. |
 
 ## Runtime Paths
@@ -698,14 +740,13 @@ clickhouse_start_timeout_seconds = 30.0
 healthcheck_interval_ms = 500
 clickhouse_auto_install = true
 clickhouse_version = "v25.12.5.44-stable"
-start_monitor_on_up = true
-start_mcp_on_up = false
 ```
 
 Relative `logs_dir` and `pids_dir` values are resolved under `root_dir`.
-`service_bin_dir` must contain `moraine-ingest`, `moraine-monitor`, and
-`moraine-mcp`, unless `MORAINE_SERVICE_BIN_DIR` is set or source-tree mode is
-enabled.
+`service_bin_dir` must contain `moraine-ingest` and `moraine-mcp`, unless
+`MORAINE_SERVICE_BIN_DIR` is set or source-tree mode is enabled. Release
+packages also retain `moraine-monitor` as a deprecated executable alias that
+delegates to the unified backend; `moraine up` never manages it separately.
 
 | Field | Default | Purpose |
 | --- | --- | --- |
@@ -718,5 +759,3 @@ enabled.
 | `healthcheck_interval_ms` | `500` | Milliseconds between readiness checks while a managed ClickHouse process generation starts. This is not a permanent health-poll interval after readiness. |
 | `clickhouse_auto_install` | `true` | Automatically installs the managed ClickHouse binary when needed. |
 | `clickhouse_version` | `v25.12.5.44-stable` | Managed ClickHouse release tag expected by this Moraine build. |
-| `start_monitor_on_up` | `true` | Starts the monitor service when `moraine up` starts services. |
-| `start_mcp_on_up` | `false` | Deprecated compatibility flag. Existing configs may keep it; new configs should use `mcp.start_central_on_up`. |

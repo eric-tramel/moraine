@@ -102,50 +102,28 @@ resolve_config_path() {
   fi
 }
 
-monitor_enabled_for_up() {
-  if has_flag "--monitor" "$@"; then
+backend_enabled_for_up() {
+  if has_flag "--backend" "$@" || has_flag "--monitor" "$@" || has_flag "--mcp" "$@"; then
     return 0
   fi
 
   local cfg_path
   cfg_path="$(resolve_config_path "$@")"
   if [[ ! -f "$cfg_path" ]]; then
-    # Runtime default in moraine-config is start_monitor_on_up=true.
-    return 0
+    return 1
   fi
 
   local value=""
-  value="$(
-    awk '
-      BEGIN { in_runtime = 0 }
-      /^[[:space:]]*\[/ {
-        in_runtime = ($0 ~ /^[[:space:]]*\[runtime\][[:space:]]*$/)
-        next
-      }
-      in_runtime && /^[[:space:]]*start_monitor_on_up[[:space:]]*=/ {
-        line = $0
-        sub(/^[^=]*=[[:space:]]*/, "", line)
-        sub(/[[:space:]]*(#.*)?$/, "", line)
-        gsub(/"/, "", line)
-        print tolower(line)
-        exit
-      }
-    ' "$cfg_path"
-  )"
-
-  if [[ -z "$value" ]]; then
-    return 0
+  if ! value="$("$BIN_PATH" --output plain --config "$cfg_path" config get backend.start_on_up 2>/dev/null)"; then
+    return 1
   fi
 
   case "$value" in
-    1|true|yes|on)
+    true)
       return 0
-      ;;
-    0|false|no|off)
-      return 1
       ;;
     *)
-      return 0
+      return 1
       ;;
   esac
 }
@@ -244,8 +222,9 @@ export MORAINE_SOURCE_TREE_MODE
 
 command_name="$(first_non_flag_arg "$@" || true)"
 if [[ "$command_name" == "up" ]]; then
-  if monitor_enabled_for_up "$@"; then
+  if backend_enabled_for_up "$@"; then
     ensure_monitor_frontend
+    build_binary "$PROJECT_ROOT/apps/moraine-mcp/Cargo.toml"
   fi
 fi
 
@@ -255,11 +234,11 @@ if [[ "$command_name" == "run" ]]; then
     ingest)
       build_binary "$PROJECT_ROOT/apps/moraine-ingest/Cargo.toml"
       ;;
-    monitor)
+    backend)
       if ! has_flag "--static-dir" "$@"; then
         ensure_monitor_frontend
       fi
-      build_binary "$PROJECT_ROOT/apps/moraine-monitor/Cargo.toml"
+      build_binary "$PROJECT_ROOT/apps/moraine-mcp/Cargo.toml"
       ;;
     mcp)
       build_binary "$PROJECT_ROOT/apps/moraine-mcp/Cargo.toml"
