@@ -1,5 +1,9 @@
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use moraine_ingest_core::model::NormalizedRecord;
 use moraine_ingest_core::normalize::normalize_record;
@@ -7,6 +11,8 @@ use moraine_ingest_core::sqlite_poll::synthesize_cursor_sqlite_record;
 use serde_json::{json, Value};
 
 const UPDATE_ENV: &str = "MORAINE_UPDATE_INGEST_GOLDENS";
+const CI_ENV: &str = "CI";
+static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 struct GoldenCase {
     name: &'static str,
@@ -499,15 +505,127 @@ fn redact_dynamic_in_place(value: &mut Value) {
     }
 }
 
-fn assert_or_update_golden(path: &Path, actual: &Value) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GoldenUpdatePlan {
+    Compare,
+    Update,
+}
+
+fn plan_golden_update(
+    update_value: Option<&OsStr>,
+    ci_value: Option<&OsStr>,
+) -> Result<GoldenUpdatePlan, String> {
+    match update_value {
+        None => Ok(GoldenUpdatePlan::Compare),
+        Some(value) if value == OsStr::new("1") => {
+            if ci_value.is_some() {
+                Err(format!("{UPDATE_ENV}=1 is forbidden when {CI_ENV} is set"))
+            } else {
+                Ok(GoldenUpdatePlan::Update)
+            }
+        }
+        Some(value) => Err(format!(
+            "{UPDATE_ENV} must be unset or exactly 1, got {value:?}"
+        )),
+    }
+}
+
+fn golden_update_plan_from_env() -> Result<GoldenUpdatePlan, String> {
+    let update_value = std::env::var_os(UPDATE_ENV);
+    let ci_value = std::env::var_os(CI_ENV);
+    plan_golden_update(update_value.as_deref(), ci_value.as_deref())
+}
+
+struct PendingTempFile {
+    path: Option<PathBuf>,
+}
+
+impl PendingTempFile {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn persist(mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for PendingTempFile {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn create_golden_temp_file(path: &Path) -> io::Result<(PendingTempFile, File)> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "golden path has no parent"))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "golden path has no file name"))?
+        .to_string_lossy();
+
+    loop {
+        let id = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let temp_path = parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), id));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((PendingTempFile::new(temp_path), file)),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn write_golden_if_changed(path: &Path, contents: &str) -> io::Result<bool> {
+    match std::fs::read(path) {
+        Ok(existing) if existing == contents.as_bytes() => return Ok(false),
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "golden path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+
+    let (pending, mut file) = create_golden_temp_file(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(pending.path.as_deref().expect("pending temp path"), path)?;
+    pending.persist();
+    Ok(true)
+}
+
+fn update_golden(
+    path: &Path,
+    contents: &str,
+    mut report_changed: impl FnMut(&Path),
+) -> io::Result<()> {
+    if write_golden_if_changed(path, contents)? {
+        report_changed(path);
+    }
+    Ok(())
+}
+
+fn assert_or_update_golden(path: &Path, actual: &Value, plan: GoldenUpdatePlan) {
     let actual_pretty = format!(
         "{}\n",
         serde_json::to_string_pretty(actual).expect("serialize golden")
     );
 
-    if std::env::var_os(UPDATE_ENV).is_some() {
-        std::fs::create_dir_all(path.parent().expect("golden parent")).expect("create golden dir");
-        std::fs::write(path, actual_pretty).expect("write golden");
+    if plan == GoldenUpdatePlan::Update {
+        update_golden(path, &actual_pretty, |changed_path| {
+            println!("updated ingest golden {}", changed_path.display());
+        })
+        .unwrap_or_else(|err| panic!("update golden {}: {err}", path.display()));
         return;
     }
 
@@ -979,6 +1097,7 @@ fn source_normalization_golden_fixtures_are_stable() {
     // Only `event_version` is redacted. UIDs, source refs, timestamps, token
     // maps, links, tool phases, model/provider fields, hints, and row counts
     // remain part of the committed snapshot.
+    let plan = golden_update_plan_from_env().unwrap_or_else(|err| panic!("{err}"));
     let cases = golden_cases();
     assert_known_harness_fixture_coverage(&cases);
 
@@ -991,7 +1110,11 @@ fn source_normalization_golden_fixtures_are_stable() {
             "source_file": case.source_file,
             "records": snapshot_records,
         });
-        assert_or_update_golden(&golden_root().join(format!("{}.json", case.name)), &actual);
+        assert_or_update_golden(
+            &golden_root().join(format!("{}.json", case.name)),
+            &actual,
+            plan,
+        );
     }
 }
 
@@ -1017,4 +1140,123 @@ fn source_normalization_fixtures_satisfy_schema_contracts() {
             &link_domain,
         );
     }
+}
+
+struct GoldenTestDir {
+    path: PathBuf,
+}
+
+impl GoldenTestDir {
+    fn new(label: &str) -> Self {
+        let id = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "moraine-ingest-golden-{label}-{}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).expect("create golden test directory");
+        Self { path }
+    }
+}
+
+impl Drop for GoldenTestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[test]
+fn golden_update_plan_requires_exact_opt_in_without_mutating_the_environment() {
+    assert_eq!(
+        plan_golden_update(None, None),
+        Ok(GoldenUpdatePlan::Compare)
+    );
+    assert_eq!(
+        plan_golden_update(Some(OsStr::new("1")), None),
+        Ok(GoldenUpdatePlan::Update)
+    );
+
+    for invalid in ["", "0", "true", " 1", "1 "] {
+        let err = plan_golden_update(Some(OsStr::new(invalid)), None)
+            .expect_err("non-exact update opt-in must fail");
+        assert!(
+            err.contains("must be unset or exactly 1"),
+            "unexpected error for {invalid:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn golden_update_plan_refuses_ci_before_an_update_can_run() {
+    for ci_value in ["", "0", "false", "true", "1"] {
+        let err = plan_golden_update(Some(OsStr::new("1")), Some(OsStr::new(ci_value)))
+            .expect_err("every present CI value must forbid updates");
+        assert_eq!(
+            err,
+            "MORAINE_UPDATE_INGEST_GOLDENS=1 is forbidden when CI is set"
+        );
+    }
+
+    assert_eq!(
+        plan_golden_update(None, Some(OsStr::new("true"))),
+        Ok(GoldenUpdatePlan::Compare),
+        "CI comparison mode remains available"
+    );
+}
+
+#[test]
+fn golden_updates_replace_atomically_report_changes_and_skip_identical_files() {
+    let test_dir = GoldenTestDir::new("atomic");
+    let golden = test_dir.path.join("case.json");
+    let original_link = test_dir.path.join("original-link.json");
+    std::fs::write(&golden, "old\n").expect("write original golden");
+    std::fs::hard_link(&golden, &original_link).expect("link original golden");
+
+    let mut changed_paths = Vec::new();
+    update_golden(&golden, "new\n", |path| {
+        changed_paths.push(path.to_path_buf())
+    })
+    .expect("atomically update changed golden");
+
+    assert_eq!(changed_paths, vec![golden.clone()]);
+    assert_eq!(
+        std::fs::read_to_string(&golden).expect("read updated golden"),
+        "new\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&original_link).expect("read original link"),
+        "old\n",
+        "renaming a complete temp file must replace rather than rewrite the original file"
+    );
+
+    let unchanged_link = test_dir.path.join("unchanged-link.json");
+    std::fs::hard_link(&golden, &unchanged_link).expect("link unchanged golden");
+    changed_paths.clear();
+    update_golden(&golden, "new\n", |path| {
+        changed_paths.push(path.to_path_buf())
+    })
+    .expect("skip unchanged golden");
+    assert!(changed_paths.is_empty(), "unchanged golden was reported");
+
+    std::fs::write(&unchanged_link, "link-write\n").expect("write through unchanged hard link");
+    assert_eq!(
+        std::fs::read_to_string(&golden).expect("read untouched golden"),
+        "link-write\n",
+        "an identical update must leave the original file identity untouched"
+    );
+
+    let leftovers = std::fs::read_dir(&test_dir.path)
+        .expect("list golden test directory")
+        .map(|entry| {
+            entry
+                .expect("read golden test entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|name| name.ends_with(".tmp"))
+        .collect::<Vec<_>>();
+    assert!(
+        leftovers.is_empty(),
+        "temporary files leaked: {leftovers:?}"
+    );
 }
