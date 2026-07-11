@@ -1,0 +1,97 @@
+name: ci-python-binding
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ci-python-binding.yml'
+      - 'bindings/python/moraine_conversations/**'
+      - 'crates/moraine-clickhouse/**'
+      - 'crates/moraine-config/**'
+      - 'crates/moraine-conversations/**'
+      - 'sql/**'
+  workflow_dispatch:
+
+jobs:
+  python-binding-smoke:
+    name: python-binding-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    defaults:
+      run:
+        working-directory: bindings/python/moraine_conversations
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bindings/python/moraine_conversations
+
+      - name: Provision hash-locked test environment
+        run: |
+          python -m venv .venv-test
+          .venv-test/bin/pip install --require-hashes -r requirements-test.lock
+
+      - name: Build and install the PyO3 binding
+        run: VIRTUAL_ENV="$PWD/.venv-test" .venv-test/bin/maturin develop --locked
+
+      - name: Assert smoke test collection is nonzero
+        run: |
+          collection="$(.venv-test/bin/pytest --collect-only -q tests/test_smoke.py)"
+          printf '%s\n' "$collection"
+          test_count="$(printf '%s\n' "$collection" | grep -Ec '^tests/test_smoke\.py::')"
+          if [ "$test_count" -le 0 ]; then
+            echo 'No binding smoke tests were collected.' >&2
+            exit 1
+          fi
+          printf 'BINDING_SMOKE_TEST_COUNT=%s\n' "$test_count" >> "$GITHUB_ENV"
+
+      - name: Run the exact binding smoke path
+        run: |
+          .venv-test/bin/pytest -q tests/test_smoke.py --junitxml=.pytest-smoke.xml
+          .venv-test/bin/python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse('.pytest-smoke.xml').getroot()
+          suites = list(root.iter('testsuite'))
+          totals = {
+              outcome: sum(
+                  int(suite.attrib.get(outcome, '0')) for suite in suites
+              )
+              for outcome in ('tests', 'skipped', 'errors', 'failures')
+          }
+          collected = int(os.environ['BINDING_SMOKE_TEST_COUNT'])
+          if collected <= 0:
+              raise SystemExit('Pytest collected zero binding smoke tests.')
+          for outcome in ('skipped', 'errors', 'failures'):
+              if totals[outcome] != 0:
+                  raise SystemExit(
+                      f"Pytest reported {totals[outcome]} {outcome} "
+                      'in the binding smoke suite.'
+                  )
+          passed = (
+              totals['tests']
+              - totals['skipped']
+              - totals['errors']
+              - totals['failures']
+          )
+          if passed <= 0:
+              raise SystemExit('Pytest reported zero passed binding smoke tests.')
+          if passed != collected:
+              raise SystemExit(
+                  f'Pytest collected {collected} smoke tests but passed {passed}.'
+              )
+          print(f'Passed {passed} binding smoke test(s).')
+          PY
