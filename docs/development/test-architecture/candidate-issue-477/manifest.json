@@ -1,15 +1,15 @@
 {
   "artifact_sha256": {
     "cargo-targets.json": "b4ee37536ccaaa92ac1abd918e3538ba2f251b2b3495b19a3006c72240ef8a3b",
-    "compile-measurements-darwin-arm64.json": "d819ba33b6620d22c543abf37b402dc9eff98fe1ca753dc849d44c121cb33919",
+    "compile-measurements-darwin-arm64.json": "88cb21d6412997d99b7ea496c70a76c47b91dac7e4bcc0033340721a4e4ff70b",
     "normal-dependencies.json": "b9c083277d9fdb82b2aa84c898e6b6fef28dbc20fa1012145f79d30e573b127f",
     "repository-migration.json": "2c8269ca99f2bd1178c886a0539c5b6f3d1855804ed2daefe885035292099db0",
-    "rust-libtest-darwin-arm64.json": "bacd2a79183f72f244f88e810825cc38bf77717bc9a8b231ab164796b4a52c95"
+    "rust-libtest-darwin-arm64.json": "ff0ae0464bbd37222fb411de560a3f2a4e0c17f04a2403244757b9e2d971c97d"
   },
   "baseline_commit": "77c90d6c572ba71bcfaa0362f7ead2cfa5e6712a",
   "baseline_tree": "0ae5df87300c6748161f2035394b6e0b9a92e627",
-  "candidate_head_commit": "3e8283e45217b630d5f968b799612b4986c4f378",
-  "candidate_head_tree": "7f1961949725f70b1d0da598693d1b71cfc751b2",
+  "candidate_head_commit": "3254e315dead7e20e35ec0fc515289874ac8f47a",
+  "candidate_head_tree": "9931067b1de5f407e07bfec953d79ac25c452bf3",
   "commands": {
     "baseline_archive": "git archive --format=tar --output $BASELINE_ARCHIVE 77c90d6c572ba71bcfaa0362f7ead2cfa5e6712a",
     "baseline_authenticate_commit": "git rev-parse --verify 77c90d6c572ba71bcfaa0362f7ead2cfa5e6712a^{commit}",
@@ -34,7 +34,7 @@
     "repository-migration.json",
     "rust-libtest-darwin-arm64.json"
   ],
-  "generated_at_utc": "2026-07-11T14:07:38.306Z",
+  "generated_at_utc": "2026-07-11T14:26:41.998Z",
   "generator": "docs/development/test-architecture/verify_candidate.py",
   "generator_sha256": "5c6cacbfb3c58483c3c75fb4f8a9b18634353c5a634469d969c115d949b63603",
   "host": {
@@ -57,22 +57,22 @@
   "source": "current working tree",
   "summary": {
     "baseline_cold_linked_test_executable_count": 3,
-    "baseline_cold_wall_time_seconds": 20.071608,
+    "baseline_cold_wall_time_seconds": 29.049799,
     "baseline_integration_test_target_count": 2,
     "baseline_package_target_count": 3,
     "baseline_source_tree": "0ae5df87300c6748161f2035394b6e0b9a92e627",
     "baseline_warm_linked_test_executable_count": 3,
-    "baseline_warm_wall_time_seconds": 0.204112,
+    "baseline_warm_wall_time_seconds": 0.402747,
     "candidate_cold_linked_test_executable_count": 4,
-    "candidate_cold_wall_time_seconds": 24.128268,
+    "candidate_cold_wall_time_seconds": 36.540221,
     "candidate_integration_test_target_count": 3,
     "candidate_package_target_count": 5,
     "candidate_repository_linked_executable_count": 1,
     "candidate_repository_target_count": 1,
     "candidate_warm_linked_test_executable_count": 4,
-    "candidate_warm_wall_time_seconds": 0.209209,
+    "candidate_warm_wall_time_seconds": 0.472429,
     "candidate_workspace_target_count": 22,
-    "cold_wall_time_seconds_delta": 4.05666,
+    "cold_wall_time_seconds_delta": 7.490422,
     "dependency_policy": "pass",
     "integration_test_target_count_delta": 1,
     "linked_test_executable_count_delta": 1,
@@ -86,7 +86,7 @@
     "package_target_count_delta": 2,
     "repository_contract_mismatch_count": 0,
     "repository_test_bijection_count": 67,
-    "warm_wall_time_seconds_delta": 0.005097
+    "warm_wall_time_seconds_delta": 0.069682
   },
   "tool_versions": {
     "cargo": "cargo 1.96.0 (30a34c682 2026-05-25) (Homebrew)",
