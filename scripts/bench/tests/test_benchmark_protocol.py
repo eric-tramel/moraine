@@ -500,6 +500,13 @@ class BenchmarkComparatorTests(unittest.TestCase):
         self.assertEqual(result["status"], "not_evaluated")
         self.assertEqual(result["reason"], "missing_comparison_policy")
 
+        baseline = self.fixture()
+        candidate = self.fixture()
+        baseline["timing"] = {"status": "not_evaluated", "non_blocking": True}
+        result = protocol.compare_artifacts(baseline, candidate)
+        self.assertEqual(result["status"], "not_evaluated")
+        self.assertEqual(result["reason"], "missing_comparison_policy")
+
     def test_scenario_fingerprint_mismatches_are_rejected(self) -> None:
         mutations = {
             "smoke_full": lambda value: value["scenario"].update(profile="smoke"),

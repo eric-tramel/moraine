@@ -600,9 +600,9 @@ def compare_artifacts(
 
     baseline_policy = baseline["timing"].get("comparison_policy")
     candidate_policy = candidate["timing"].get("comparison_policy")
-    if candidate_policy is None:
+    if baseline_policy is None or candidate_policy is None:
         return {"status": "not_evaluated", "non_blocking": True, "reason": "missing_comparison_policy"}
-    if baseline_policy is not None and baseline_policy != candidate_policy:
+    if baseline_policy != candidate_policy:
         raise IncomparableError("incomparable timing.comparison_policy")
     policy = candidate_policy
     measurement_name = _select_measurement(baseline, candidate, measurement)
