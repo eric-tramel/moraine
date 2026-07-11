@@ -22,6 +22,9 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 SANDBOX_ID_REGEX='^sb-[a-f0-9]{6}$'
 PROJECT_PREFIX="moraine-sandbox-"
+OWNERSHIP_LABEL="io.moraine.sandbox.ownership-token"
+OWNERSHIP_TOKEN_REGEX='^[a-f0-9]{64}$'
+SANDBOX_STATE_ROOT="${MORAINE_SANDBOX_STATE_ROOT:-/tmp}"
 
 # compose.yaml / compose.sessions.yaml reference these at parse time, even
 # for read-only commands like `docker compose ps|logs|port|down`. When a
@@ -113,7 +116,7 @@ project_name_for() {
 }
 
 config_dir_for() {
-    printf '/tmp/%s%s' "$PROJECT_PREFIX" "$1"
+    printf '%s/%s%s' "${SANDBOX_STATE_ROOT%/}" "$PROJECT_PREFIX" "$1"
 }
 
 check_docker() {
@@ -238,6 +241,9 @@ docker_compose_files_args() {
     if [[ "$mount_sessions" == "1" ]]; then
         args+=(-f "$SESSIONS_COMPOSE_FILE")
     fi
+    if [[ -n "${SANDBOX_OWNERSHIP_COMPOSE_FILE:-}" ]]; then
+        args+=(-f "$SANDBOX_OWNERSHIP_COMPOSE_FILE")
+    fi
     printf '%s\n' "${args[@]}"
 }
 
@@ -295,6 +301,203 @@ dc() {
     read_lines_into files < <(docker_compose_files_args "$mount_sessions")
     ensure_compose_env
     docker compose -p "$project" "${files[@]}" "$@"
+}
+
+ownership_marker_for() {
+    printf '%s_ownership' "$1"
+}
+
+generate_ownership_token() {
+    head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'
+}
+
+validate_ownership_token() {
+    [[ "$1" =~ $OWNERSHIP_TOKEN_REGEX ]] || \
+        die "invalid sandbox ownership token"
+}
+
+private_config_dir_is_safe() {
+    local dir="$1"
+    local mode
+    [[ -d "$dir" && ! -L "$dir" && -O "$dir" ]] || return 1
+    mode="$(stat -f '%Lp' "$dir" 2>/dev/null || true)"
+    if [[ ! "$mode" =~ ^[0-7]{3,4}$ ]]; then
+        mode="$(stat -c '%a' "$dir" 2>/dev/null || true)"
+    fi
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#$mode & 077) == 0 ))
+}
+
+sandbox_state_root_is_safe() {
+    if [[ -n "${MORAINE_SANDBOX_STATE_ROOT+x}" ]]; then
+        private_config_dir_is_safe "$SANDBOX_STATE_ROOT"
+    else
+        [[ "$SANDBOX_STATE_ROOT" == "/tmp" && -d "$SANDBOX_STATE_ROOT" ]]
+    fi
+}
+
+project_has_resources() {
+    local project="$1"
+    local containers volumes networks
+    containers="$(docker ps -aq --filter "label=com.docker.compose.project=${project}")" || return 2
+    volumes="$(docker volume ls -q --filter "label=com.docker.compose.project=${project}")" || return 2
+    networks="$(docker network ls -q --filter "label=com.docker.compose.project=${project}")" || return 2
+    if [[ -n "$containers" || -n "$volumes" || -n "$networks" ]]; then
+        return 0
+    fi
+
+    # Refuse legacy or foreign resources that use our deterministic names but
+    # do not carry Compose labels.
+    containers="$(docker ps -aq --filter "name=${project}")" || return 2
+    volumes="$(docker volume ls -q --filter "name=${project}_")" || return 2
+    networks="$(docker network ls -q --filter "name=${project}_")" || return 2
+    [[ -n "$containers" || -n "$volumes" || -n "$networks" ]]
+}
+
+docker_label_for() {
+    local kind="$1"
+    local resource="$2"
+    case "$kind" in
+        container)
+            docker container inspect --format "{{ index .Config.Labels \"${OWNERSHIP_LABEL}\" }}" "$resource" 2>/dev/null
+            ;;
+        volume|network)
+            docker "$kind" inspect --format "{{ index .Labels \"${OWNERSHIP_LABEL}\" }}" "$resource" 2>/dev/null
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+reserve_project_ownership() {
+    local project="$1"
+    local token="$2"
+    local marker actual
+    marker="$(ownership_marker_for "$project")"
+
+    if project_has_resources "$project"; then
+        return 1
+    elif [[ $? -ne 1 ]]; then
+        return 1
+    fi
+    docker volume create \
+        --label "com.docker.compose.project=${project}" \
+        --label "${OWNERSHIP_LABEL}=${token}" \
+        "$marker" >/dev/null || return 1
+    actual="$(docker_label_for volume "$marker" || true)"
+    [[ "$actual" == "$token" ]]
+}
+
+release_project_ownership() {
+    local project="$1"
+    local token="$2"
+    local marker actual
+    marker="$(ownership_marker_for "$project")"
+    actual="$(docker_label_for volume "$marker" || true)"
+    [[ "$actual" == "$token" ]] || return 1
+    docker volume rm "$marker" >/dev/null
+}
+
+write_ownership_evidence() {
+    local config_dir="$1"
+    local token="$2"
+    local token_path="${config_dir}/.ownership-token"
+    local overlay_path="${config_dir}/ownership.compose.yaml"
+
+    printf '%s\n' "$token" >"$token_path"
+    chmod 0600 "$token_path"
+    cat >"$overlay_path" <<EOF
+services:
+  clickhouse:
+    labels:
+      ${OWNERSHIP_LABEL}: "${token}"
+  moraine:
+    labels:
+      ${OWNERSHIP_LABEL}: "${token}"
+volumes:
+  state:
+    labels:
+      ${OWNERSHIP_LABEL}: "${token}"
+  clickhouse-data:
+    labels:
+      ${OWNERSHIP_LABEL}: "${token}"
+  binaries:
+    labels:
+      ${OWNERSHIP_LABEL}: "${token}"
+  cargo-home:
+    labels:
+      ${OWNERSHIP_LABEL}: "${token}"
+  cargo-target:
+    labels:
+      ${OWNERSHIP_LABEL}: "${token}"
+networks:
+  default:
+    labels:
+      ${OWNERSHIP_LABEL}: "${token}"
+EOF
+    chmod 0600 "$overlay_path"
+    printf '%s' "$overlay_path"
+}
+
+read_recorded_ownership_token() {
+    local config_dir="$1"
+    local token_path="${config_dir}/.ownership-token"
+    local token
+    private_config_dir_is_safe "$config_dir" || return 1
+    [[ -f "$token_path" && ! -L "$token_path" && -O "$token_path" ]] || return 1
+    IFS= read -r token <"$token_path" || return 1
+    [[ "$token" =~ $OWNERSHIP_TOKEN_REGEX ]] || return 1
+    printf '%s' "$token"
+}
+
+verify_project_ownership() {
+    local project="$1"
+    local token="$2"
+    local resource actual resources
+    local marker
+    marker="$(ownership_marker_for "$project")"
+    actual="$(docker_label_for volume "$marker" || true)"
+    [[ "$actual" == "$token" ]] || return 1
+
+    resources="$(docker ps -aq --filter "label=com.docker.compose.project=${project}")" || return 1
+    while IFS= read -r resource; do
+        [[ -n "$resource" ]] || continue
+        actual="$(docker_label_for container "$resource" || true)"
+        [[ "$actual" == "$token" ]] || return 1
+    done <<<"$resources"
+    resources="$(docker volume ls -q --filter "label=com.docker.compose.project=${project}")" || return 1
+    while IFS= read -r resource; do
+        [[ -n "$resource" ]] || continue
+        actual="$(docker_label_for volume "$resource" || true)"
+        [[ "$actual" == "$token" ]] || return 1
+    done <<<"$resources"
+    resources="$(docker network ls -q --filter "label=com.docker.compose.project=${project}")" || return 1
+    while IFS= read -r resource; do
+        [[ -n "$resource" ]] || continue
+        actual="$(docker_label_for network "$resource" || true)"
+        [[ "$actual" == "$token" ]] || return 1
+    done <<<"$resources"
+}
+
+compose_resources_removed() {
+    local project="$1"
+    local marker containers volumes networks resource
+    marker="$(ownership_marker_for "$project")"
+    containers="$(docker ps -aq --filter "label=com.docker.compose.project=${project}")" || return 1
+    networks="$(docker network ls -q --filter "label=com.docker.compose.project=${project}")" || return 1
+    volumes="$(docker volume ls -q --filter "label=com.docker.compose.project=${project}")" || return 1
+    [[ -z "$containers" && -z "$networks" ]] || return 1
+    while IFS= read -r resource; do
+        [[ -z "$resource" || "$resource" == "$marker" ]] || return 1
+    done <<<"$volumes"
+}
+
+cleanup_local_config() {
+    local config_dir="$1"
+    private_config_dir_is_safe "$config_dir" || return 1
+    rm -f "${config_dir}/moraine.toml" "${config_dir}/ownership.compose.yaml"
+    rm -rf "${config_dir}/fixtures"
 }
 
 # Resolve <id>: if given validate; else find exactly one existing sandbox.
@@ -583,11 +786,30 @@ cmd_up() {
 
     check_docker
     check_repo_root
+    sandbox_state_root_is_safe || \
+        die "sandbox state root is not a private trusted directory: ${SANDBOX_STATE_ROOT}"
 
     local project
     project="$(project_name_for "$id")"
     local config_dir
     config_dir="$(config_dir_for "$id")"
+    if [[ -e "$config_dir" || -L "$config_dir" ]]; then
+        die "sandbox config path already exists; refusing collision: ${config_dir}"
+    fi
+    local ownership_token="${MORAINE_SANDBOX_OWNERSHIP_TOKEN:-}"
+    if [[ -z "$ownership_token" ]]; then
+        ownership_token="$(generate_ownership_token)"
+    fi
+    validate_ownership_token "$ownership_token"
+    if ! reserve_project_ownership "$project" "$ownership_token"; then
+        die "sandbox project already exists or could not be reserved: ${project}"
+    fi
+    if ! (umask 077; mkdir -m 700 "$config_dir"); then
+        release_project_ownership "$project" "$ownership_token" || true
+        die "could not create private sandbox config directory: ${config_dir}"
+    fi
+    export SANDBOX_OWNERSHIP_COMPOSE_FILE
+    SANDBOX_OWNERSHIP_COMPOSE_FILE="$(write_ownership_evidence "$config_dir" "$ownership_token")"
 
     log "starting sandbox ${id} (project ${project})"
 
@@ -698,9 +920,12 @@ cmd_up() {
     log "building runtime image (docker compose build)"
     dc "$project" "$mount_sessions" build
 
-    # Up.
+    # Up. The ownership overlay labels every destructive Compose resource.
     log "starting container (docker compose up -d)"
     dc "$project" "$mount_sessions" up -d
+    if ! verify_project_ownership "$project" "$ownership_token"; then
+        die "sandbox ${id} ownership labels are incomplete or mismatched; refusing to continue"
+    fi
 
     # Wait for health. The first boot of a sandbox runs `cargo build
     # --workspace --locked` inside the container before moraine's /api/v1/health
@@ -781,39 +1006,83 @@ down_one() {
     project="$(project_name_for "$id")"
     local config_dir
     config_dir="$(config_dir_for "$id")"
+    local recorded_token expected_token
+
+    recorded_token="$(read_recorded_ownership_token "$config_dir" || true)"
+    if [[ -z "$recorded_token" ]]; then
+        warn "refusing teardown for ${project}: private ownership evidence is missing or unsafe"
+        return 1
+    fi
+    expected_token="${MORAINE_SANDBOX_OWNERSHIP_TOKEN:-$recorded_token}"
+    if [[ ! "$expected_token" =~ $OWNERSHIP_TOKEN_REGEX || "$expected_token" != "$recorded_token" ]]; then
+        warn "refusing teardown for ${project}: ownership token mismatch"
+        return 1
+    fi
+    if ! verify_project_ownership "$project" "$expected_token"; then
+        warn "refusing teardown for ${project}: Compose ownership labels do not match"
+        return 1
+    fi
+
     log "tearing down ${id} (project ${project})"
-    # Route through dc() so env-var fallbacks are applied; don't silence output
-    # so compose failures surface to the operator.
-    dc "$project" 0 down -v --remove-orphans || \
-        warn "docker compose down reported non-zero exit for ${project}"
-    if [[ -d "$config_dir" ]]; then
-        rm -rf "$config_dir"
+    local compose_rc=0
+    local marker_rc=0
+    set +e
+    dc "$project" 0 down -v --remove-orphans
+    compose_rc=$?
+    set -e
+
+    # Remove only known generated files. The token remains until both Compose
+    # resources and the ownership marker volume are confirmed removed.
+    cleanup_local_config "$config_dir" || \
+        warn "could not safely clean generated config files in ${config_dir}"
+    if (( compose_rc != 0 )); then
+        warn "docker compose down failed for ${project} with exit ${compose_rc}; ownership evidence retained"
+        return "$compose_rc"
+    fi
+    if ! compose_resources_removed "$project"; then
+        warn "Compose reported success but owned resources remain for ${project}; ownership evidence retained"
+        return 1
+    fi
+    set +e
+    release_project_ownership "$project" "$expected_token"
+    marker_rc=$?
+    set -e
+    if (( marker_rc != 0 )); then
+        warn "ownership marker volume removal failed for ${project} with exit ${marker_rc}; ownership evidence retained"
+        return "$marker_rc"
+    fi
+    rm -f "${config_dir}/.ownership-token"
+    if rmdir "$config_dir" 2>/dev/null; then
         log "removed ${config_dir}"
+    else
+        warn "sandbox resources were removed but local config directory is not empty: ${config_dir}"
+        return 1
     fi
 }
 
 cmd_down() {
     check_docker
+    sandbox_state_root_is_safe || \
+        die "sandbox state root is not a private trusted directory: ${SANDBOX_STATE_ROOT}"
     if [[ "${1-}" == "--all" ]]; then
         local ids
+        local result=0
+        local item_rc
         read_lines_into ids < <(list_sandbox_ids)
         if [[ "${#ids[@]}" -eq 0 ]]; then
             log "no sandboxes to tear down"
         else
             for id in "${ids[@]}"; do
+                set +e
                 down_one "$id"
+                item_rc=$?
+                set -e
+                if (( item_rc != 0 && result == 0 )); then
+                    result=$item_rc
+                fi
             done
         fi
-        # Sweep any stray /tmp/moraine-sandbox-* dirs (e.g. from failed ups).
-        shopt -s nullglob
-        local leftover=(/tmp/${PROJECT_PREFIX}*)
-        shopt -u nullglob
-        if [[ "${#leftover[@]}" -gt 0 ]]; then
-            for d in "${leftover[@]}"; do
-                rm -rf "$d" && log "removed ${d}"
-            done
-        fi
-        return 0
+        return "$result"
     fi
 
     local id
