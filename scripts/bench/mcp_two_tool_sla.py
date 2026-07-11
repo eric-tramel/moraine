@@ -23,6 +23,7 @@ import benchmark_protocol
 
 WINDOW_RE = re.compile(r"^\s*(\d+)\s*([smhdw])\s*$", re.IGNORECASE)
 BENCHMARK_REPLAY_SOURCE = "benchmark-replay"
+ORACLE_SCHEMA_VERSION = "moraine-mcp-two-tool-oracle-v1"
 
 PROFILE_DEFAULTS = {
     "smoke": {"warmup": 0, "repeats": 1, "min_docs": 1},
@@ -636,14 +637,44 @@ def normalize_query(value: str) -> str:
     return " ".join(value.split()).casefold()
 
 
+def oracle_contract_fingerprint(
+    query_oracles: dict[str, dict[str, Any]],
+    list_sessions_oracle: Optional[dict[str, Any]],
+) -> str:
+    query_contracts = [
+        {
+            "query": normalize_query(query),
+            "expected": {
+                "result_count": oracle["result_count"],
+                "open_ids": dict(sorted(oracle["open_ids"].items())),
+                "result_marker": oracle["result_marker"],
+            },
+        }
+        for query, oracle in sorted(
+            query_oracles.items(), key=lambda item: normalize_query(item[0])
+        )
+    ]
+    contract: dict[str, Any] = {
+        "schema_version": ORACLE_SCHEMA_VERSION,
+        "queries": query_contracts,
+    }
+    if list_sessions_oracle is not None:
+        contract["list_sessions"] = {
+            "result_count": list_sessions_oracle["result_count"],
+            "session_ids": sorted(list_sessions_oracle["session_ids"]),
+            "result_marker": list_sessions_oracle["result_marker"],
+        }
+    return sha256_json(contract)
+
+
 def load_benchmark_oracles(
     path_value: Optional[str],
     queries: list[str],
     open_kinds: list[str],
     require_list_sessions: bool,
-) -> tuple[dict[str, dict[str, Any]], Optional[dict[str, Any]]]:
+) -> tuple[dict[str, dict[str, Any]], Optional[dict[str, Any]], str]:
     if not queries and not require_list_sessions:
-        return {}, None
+        return {}, None, oracle_contract_fingerprint({}, None)
     if not path_value:
         code = "missing-search-oracle" if queries else "missing-list-oracle"
         raise OracleConfigurationError(
@@ -661,10 +692,10 @@ def load_benchmark_oracles(
         raise OracleConfigurationError(
             "invalid-benchmark-oracle", "benchmark oracle root must be an object"
         )
-    if payload.get("schema_version") != "moraine-mcp-two-tool-oracle-v1":
+    if payload.get("schema_version") != ORACLE_SCHEMA_VERSION:
         raise OracleConfigurationError(
             "invalid-benchmark-oracle",
-            "benchmark oracle schema_version must be 'moraine-mcp-two-tool-oracle-v1'",
+            f"benchmark oracle schema_version must be '{ORACLE_SCHEMA_VERSION}'",
         )
     entries = payload.get("queries")
     if not isinstance(entries, list):
@@ -738,7 +769,7 @@ def load_benchmark_oracles(
     query_oracles = {query: by_query[normalize_query(query)] for query in queries}
 
     if not require_list_sessions:
-        return query_oracles, None
+        return query_oracles, None, oracle_contract_fingerprint(query_oracles, None)
     list_oracle = payload.get("list_sessions")
     if not isinstance(list_oracle, dict):
         raise OracleConfigurationError(
@@ -776,11 +807,16 @@ def load_benchmark_oracles(
             "missing-list-oracle",
             "list_sessions must declare result_count, session_ids, or result_marker",
         )
-    return query_oracles, {
+    validated_list_oracle = {
         "result_count": result_count,
         "session_ids": list(session_ids),
         "result_marker": marker,
     }
+    return (
+        query_oracles,
+        validated_list_oracle,
+        oracle_contract_fingerprint(query_oracles, validated_list_oracle),
+    )
 
 
 def contains_marker(value: Any, marker: Any) -> bool:
@@ -995,6 +1031,7 @@ def build_artifact(
     queries: list[str],
     open_kinds: list[str],
     list_sessions_args: Optional[dict[str, Any]],
+    oracle_fingerprint: Optional[str],
     samples: list[dict[str, Any]],
     planned: int,
     attempted: int,
@@ -1010,10 +1047,18 @@ def build_artifact(
         raise RuntimeError("attempted sample count does not equal successful plus errors")
     if attempted > planned:
         raise RuntimeError("attempted sample count exceeds planned samples")
+    if oracle_fingerprint is None and oracle_mismatches == 0:
+        raise RuntimeError("validated oracle fingerprint is required")
+    if oracle_fingerprint is not None and not re.fullmatch(
+        r"[0-9a-f]{64}", oracle_fingerprint
+    ):
+        raise RuntimeError("oracle fingerprint must be 64 lowercase hexadecimal characters")
 
     workload_shape = {
         "profile": args.profile,
-        "query_hashes": [hashlib.sha256(query.encode("utf-8")).hexdigest() for query in queries],
+        "query_hashes": [
+            hashlib.sha256(query.encode("utf-8")).hexdigest() for query in queries
+        ],
         "open_kinds": open_kinds,
         "list_sessions": list_sessions_args,
         "event_types": sorted(args.event_type),
@@ -1021,6 +1066,7 @@ def build_artifact(
         "warmup": args.warmup,
         "repeats": args.repeats,
     }
+    oracle_identity = oracle_fingerprint or "invalid"
     dataset_shape = {
         "cardinality": corpus_identity["cardinality"],
         "content_sum": corpus_identity["content_sum"],
@@ -1047,7 +1093,9 @@ def build_artifact(
         "runner": runner_identity(),
         "scenario": {
             "profile": args.profile,
-            "workload_id": f"two-tool-{sha256_json(workload_shape)[:24]}",
+            "workload_id": (
+                f"two-tool-{sha256_json(workload_shape)[:24]}-oracle-{oracle_identity}"
+            ),
             "measured_boundary": "json-rpc-stdio-tool-call",
             "dimensions": {
                 "dataset_backed": True,
@@ -1205,8 +1253,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     oracle_mismatches = 0
     warmup_failures = 0
     init_ms: Optional[float] = None
+    oracle_fingerprint: Optional[str] = None
     try:
-        query_oracles, list_sessions_oracle = load_benchmark_oracles(
+        (
+            query_oracles,
+            list_sessions_oracle,
+            oracle_fingerprint,
+        ) = load_benchmark_oracles(
             args.oracle_json,
             queries,
             open_kinds,
@@ -1226,6 +1279,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 queries=queries,
                 open_kinds=open_kinds,
                 list_sessions_args=list_sessions_args,
+                oracle_fingerprint=oracle_fingerprint,
                 samples=samples,
                 planned=planned,
                 attempted=attempted,
@@ -1455,6 +1509,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             queries=queries,
             open_kinds=open_kinds,
             list_sessions_args=list_sessions_args,
+            oracle_fingerprint=oracle_fingerprint,
             samples=samples,
             planned=planned,
             attempted=attempted,

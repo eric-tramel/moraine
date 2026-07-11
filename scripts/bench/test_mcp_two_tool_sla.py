@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import copy
 import json
 import sys
 import tempfile
@@ -54,6 +55,19 @@ LIST_ORACLE = {
         "result_marker": {"title": "seed marker"},
     },
 }
+VALIDATED_SEARCH_EXPECTATION = {
+    "result_count": 1,
+    "open_ids": {
+        "event": "evt-1",
+        "turn": "turn-1",
+        "session": "session-1",
+    },
+    "result_marker": None,
+}
+ORACLE_FINGERPRINT = bench.oracle_contract_fingerprint(
+    {"private raw query": VALIDATED_SEARCH_EXPECTATION},
+    None,
+)
 
 
 def sample(*, met_sla: bool = True, structured: dict[str, object] | None = None) -> dict[str, object]:
@@ -193,6 +207,7 @@ class ArtifactTests(unittest.TestCase):
         oracle_mismatches: int = 0,
         extra_args: tuple[str, ...] = (),
         corpus_identity: dict[str, object] = CORPUS_IDENTITY,
+        oracle_fingerprint: str = ORACLE_FINGERPRINT,
     ) -> dict[str, object]:
         return bench.build_artifact(
             args=self.args(*extra_args),
@@ -201,6 +216,7 @@ class ArtifactTests(unittest.TestCase):
             queries=["private raw query"],
             open_kinds=[],
             list_sessions_args=None,
+            oracle_fingerprint=oracle_fingerprint,
             samples=samples,
             planned=planned,
             attempted=attempted,
@@ -227,6 +243,12 @@ class ArtifactTests(unittest.TestCase):
         self.assertEqual(payload["semantic"]["status"], "pass")
         self.assertEqual(payload["timing"], {"status": "not_evaluated", "non_blocking": True})
         self.assertNotIn("model_tokens", payload["metrics"])
+        workload_id = payload["scenario"]["workload_id"]
+        self.assertRegex(
+            workload_id,
+            rf"^two-tool-[0-9a-f]{{24}}-oracle-{ORACLE_FINGERPRINT}$",
+        )
+        self.assertNotIn("private raw query", workload_id)
 
     def test_count_invariant_is_enforced_before_serialization(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "successful plus errors"):
@@ -290,6 +312,177 @@ class ArtifactTests(unittest.TestCase):
         self.assertNotEqual(
             original["scenario"]["fingerprints"]["dataset"]["fingerprint"],
             changed["scenario"]["fingerprints"]["dataset"]["fingerprint"],
+        )
+
+    def load_oracle_fingerprint(
+        self,
+        oracle: dict[str, object],
+        *,
+        require_list_sessions: bool,
+    ) -> str:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "oracle.json"
+            path.write_text(json.dumps(oracle), encoding="utf-8")
+            _, _, fingerprint = bench.load_benchmark_oracles(
+                str(path),
+                ["raw secret query"],
+                ["event", "turn", "session"],
+                require_list_sessions,
+            )
+        return fingerprint
+
+    def test_complete_validated_oracle_contract_determines_comparability(self) -> None:
+        oracle = copy.deepcopy(LIST_ORACLE)
+        oracle["queries"][0]["expected"]["result_marker"] = {
+            "summary": {"label": "sensitive search marker"}
+        }
+        oracle["list_sessions"]["result_marker"] = {
+            "title": {"label": "sensitive list marker"}
+        }
+        baseline_fingerprint = self.load_oracle_fingerprint(
+            oracle,
+            require_list_sessions=True,
+        )
+        mutations = {
+            "search result count": lambda value: value["queries"][0]["expected"].update(
+                result_count=2
+            ),
+            "search event ID": lambda value: value["queries"][0]["expected"]["open_ids"].update(
+                event="evt-changed"
+            ),
+            "search turn ID": lambda value: value["queries"][0]["expected"]["open_ids"].update(
+                turn="turn-changed"
+            ),
+            "search session ID": lambda value: value["queries"][0]["expected"]["open_ids"].update(
+                session="session-changed"
+            ),
+            "search object marker": lambda value: value["queries"][0]["expected"][
+                "result_marker"
+            ]["summary"].update(label="changed search marker"),
+            "list result count": lambda value: value["list_sessions"].update(
+                result_count=2
+            ),
+            "list session ID": lambda value: value["list_sessions"].update(
+                session_ids=["changed-session"]
+            ),
+            "list object marker": lambda value: value["list_sessions"]["result_marker"][
+                "title"
+            ].update(label="changed list marker"),
+        }
+        baseline = self.build(
+            samples=[sample()],
+            planned=1,
+            attempted=1,
+            errors=0,
+            oracle_fingerprint=baseline_fingerprint,
+        )
+        for name, mutate in mutations.items():
+            with self.subTest(field=name):
+                changed_oracle = copy.deepcopy(oracle)
+                mutate(changed_oracle)
+                changed_fingerprint = self.load_oracle_fingerprint(
+                    changed_oracle,
+                    require_list_sessions=True,
+                )
+                self.assertNotEqual(baseline_fingerprint, changed_fingerprint)
+                candidate = self.build(
+                    samples=[sample()],
+                    planned=1,
+                    attempted=1,
+                    errors=0,
+                    oracle_fingerprint=changed_fingerprint,
+                )
+                benchmark_protocol.validate_artifact(candidate)
+                with self.assertRaisesRegex(
+                    benchmark_protocol.IncomparableError,
+                    "scenario.workload_id",
+                ):
+                    benchmark_protocol.compare_artifacts(baseline, candidate)
+
+    def test_oracle_fingerprint_is_canonical_and_redaction_safe(self) -> None:
+        oracle = copy.deepcopy(LIST_ORACLE)
+        oracle["queries"][0]["expected"]["result_marker"] = {
+            "private": "raw oracle marker"
+        }
+        fingerprint = self.load_oracle_fingerprint(
+            oracle,
+            require_list_sessions=True,
+        )
+        reordered = {
+            "list_sessions": {
+                "result_marker": {"title": "seed marker"},
+                "session_ids": ["seed-session"],
+                "result_count": 1,
+            },
+            "queries": [
+                {
+                    "expected": {
+                        "result_marker": {"private": "raw oracle marker"},
+                        "open_ids": {
+                            "session": "session-1",
+                            "turn": "turn-1",
+                            "event": "evt-1",
+                        },
+                        "result_count": 1,
+                    },
+                    "query": "  RAW   SECRET QUERY  ",
+                }
+            ],
+            "schema_version": "moraine-mcp-two-tool-oracle-v1",
+        }
+        self.assertEqual(
+            fingerprint,
+            self.load_oracle_fingerprint(reordered, require_list_sessions=True),
+        )
+        payload = self.build(
+            samples=[sample()],
+            planned=1,
+            attempted=1,
+            errors=0,
+            oracle_fingerprint=fingerprint,
+        )
+        benchmark_protocol.validate_artifact(payload)
+        workload_id = payload["scenario"]["workload_id"]
+        self.assertTrue(workload_id.endswith(f"-oracle-{fingerprint}"))
+        encoded = json.dumps(payload)
+        for sensitive in (
+            "raw secret query",
+            "raw oracle marker",
+            "seed-session",
+            "seed marker",
+            "evt-1",
+            "turn-1",
+            "session-1",
+        ):
+            self.assertNotIn(sensitive, workload_id)
+            self.assertNotIn(sensitive, encoded)
+
+    def test_unselected_or_unmeasured_oracle_cases_do_not_change_identity(self) -> None:
+        oracle = copy.deepcopy(LIST_ORACLE)
+        oracle["queries"].append(
+            {
+                "query": "unselected private query",
+                "expected": {
+                    "result_count": 1,
+                    "open_ids": {
+                        "event": "unused-event",
+                        "turn": "unused-turn",
+                        "session": "unused-session",
+                    },
+                    "result_marker": {"unused": "private marker"},
+                },
+            }
+        )
+        baseline = self.load_oracle_fingerprint(
+            oracle,
+            require_list_sessions=False,
+        )
+        oracle["queries"][1]["expected"]["result_count"] = 99
+        oracle["queries"][1]["expected"]["open_ids"]["event"] = "changed-unused-event"
+        oracle["list_sessions"]["result_count"] = 99
+        self.assertEqual(
+            baseline,
+            self.load_oracle_fingerprint(oracle, require_list_sessions=False),
         )
 
     def test_output_uses_shared_atomic_writer(self) -> None:
@@ -392,6 +585,15 @@ class MainTests(unittest.TestCase):
             self.assertNotIn("raw secret query", json.dumps(payload))
             self.assertEqual(payload["samples"]["planned"], 1)
             self.assertEqual(payload["samples"]["successful"], 1)
+            expected_oracle_fingerprint = bench.oracle_contract_fingerprint(
+                {"raw secret query": VALIDATED_SEARCH_EXPECTATION},
+                None,
+            )
+            self.assertTrue(
+                payload["scenario"]["workload_id"].endswith(
+                    f"-oracle-{expected_oracle_fingerprint}"
+                )
+            )
 
     def test_sla_miss_exits_success_when_semantics_pass(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
