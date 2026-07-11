@@ -182,7 +182,7 @@
   },
   "method": "Cargo workspace no-run JSON artifacts followed by direct native libtest list modes; no test body is executed",
   "source": "current working tree",
-  "test_count": 745,
+  "test_count": 747,
   "tests": [
     {
       "executable": "$CARGO_TARGET_DIR/debug/deps/clickhouse_supervision-3219026b059eaaf7",
@@ -2870,6 +2870,26 @@
       "kind": [
         "test"
       ],
+      "name": "support::tests::identical_but_wrong_arms_fail_the_seed_manifest_oracle",
+      "package": "moraine-conversations",
+      "target": "analytics_benchmark_support"
+    },
+    {
+      "executable": "$CARGO_TARGET_DIR/debug/deps/analytics_benchmark_support-d103c633017316f0",
+      "ignored": false,
+      "kind": [
+        "test"
+      ],
+      "name": "support::tests::manifest_missing_an_expected_scenario_fails_closed",
+      "package": "moraine-conversations",
+      "target": "analytics_benchmark_support"
+    },
+    {
+      "executable": "$CARGO_TARGET_DIR/debug/deps/analytics_benchmark_support-d103c633017316f0",
+      "ignored": false,
+      "kind": [
+        "test"
+      ],
       "name": "support::tests::measurements_reject_cardinality_or_digest_instability",
       "package": "moraine-conversations",
       "target": "analytics_benchmark_support"
@@ -2921,16 +2941,6 @@
         "test"
       ],
       "name": "support::tests::protocol_report_rejects_count_and_measurement_contradictions",
-      "package": "moraine-conversations",
-      "target": "analytics_benchmark_support"
-    },
-    {
-      "executable": "$CARGO_TARGET_DIR/debug/deps/analytics_benchmark_support-d103c633017316f0",
-      "ignored": false,
-      "kind": [
-        "test"
-      ],
-      "name": "support::tests::semantic_comparison_is_the_only_correctness_gate",
       "package": "moraine-conversations",
       "target": "analytics_benchmark_support"
     },
@@ -3040,6 +3050,26 @@
       "kind": [
         "test"
       ],
+      "name": "support::tests::identical_but_wrong_arms_fail_the_seed_manifest_oracle",
+      "package": "moraine-conversations",
+      "target": "live_clickhouse"
+    },
+    {
+      "executable": "$CARGO_TARGET_DIR/debug/deps/live_clickhouse-ed5c7dcf4e405459",
+      "ignored": false,
+      "kind": [
+        "test"
+      ],
+      "name": "support::tests::manifest_missing_an_expected_scenario_fails_closed",
+      "package": "moraine-conversations",
+      "target": "live_clickhouse"
+    },
+    {
+      "executable": "$CARGO_TARGET_DIR/debug/deps/live_clickhouse-ed5c7dcf4e405459",
+      "ignored": false,
+      "kind": [
+        "test"
+      ],
       "name": "support::tests::measurements_reject_cardinality_or_digest_instability",
       "package": "moraine-conversations",
       "target": "live_clickhouse"
@@ -3091,16 +3121,6 @@
         "test"
       ],
       "name": "support::tests::protocol_report_rejects_count_and_measurement_contradictions",
-      "package": "moraine-conversations",
-      "target": "live_clickhouse"
-    },
-    {
-      "executable": "$CARGO_TARGET_DIR/debug/deps/live_clickhouse-ed5c7dcf4e405459",
-      "ignored": false,
-      "kind": [
-        "test"
-      ],
-      "name": "support::tests::semantic_comparison_is_the_only_correctness_gate",
       "package": "moraine-conversations",
       "target": "live_clickhouse"
     },

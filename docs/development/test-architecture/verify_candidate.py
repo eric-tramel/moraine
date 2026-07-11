@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Regenerate issue #477 current-tree migration and topology evidence.
 
-The verifier compiles but does not execute test bodies. It authenticates the
-baseline monolith with ``git show``, compares every moved Rust function body,
-collects native libtest names, and measures two same-host no-run builds in one
-fresh verifier-owned Cargo target directory.
+The verifier compiles but does not execute test bodies. It authenticates and
+materializes the exact baseline commit outside the candidate tree, compares
+every moved Rust function body, collects native libtest names, and measures
+same-host cold/warm no-run builds in separate fresh Cargo target directories.
 """
 
 from __future__ import annotations
@@ -34,6 +34,11 @@ PACKAGE = "moraine-conversations"
 TARGET = "repository_integration"
 FORMAT_VERSION = 1
 EXPECTED_REPOSITORY_TESTS = 67
+EXPECTED_BASELINE_INTEGRATION_TARGETS = 2
+EXPECTED_BASELINE_LINKED_TEST_EXECUTABLES = 3
+EXPECTED_CANDIDATE_INTEGRATION_TARGETS = 3
+EXPECTED_CANDIDATE_LINKED_TEST_EXECUTABLES = 4
+EXPECTED_BASELINE_TREE = "0ae5df87300c6748161f2035394b6e0b9a92e627"
 METADATA_COMMAND = ["cargo", "metadata", "--format-version", "1", "--locked", "--no-deps"]
 COMPILE_COMMAND = [
     "cargo",
@@ -124,6 +129,86 @@ def relative_path(path: str | Path, root: Path) -> str:
 
 def command_string(command: list[str]) -> str:
     return " ".join(command)
+
+
+def authenticate_baseline(repo: Path) -> dict[str, str]:
+    commit_command = [
+        "git",
+        "rev-parse",
+        "--verify",
+        f"{BASELINE_COMMIT}^{{commit}}",
+    ]
+    tree_command = [
+        "git",
+        "rev-parse",
+        "--verify",
+        f"{BASELINE_COMMIT}^{{tree}}",
+    ]
+    commit = run(commit_command, repo).stdout.strip()
+    tree = run(tree_command, repo).stdout.strip()
+    if commit != BASELINE_COMMIT:
+        fail(
+            "baseline commit authentication failed: "
+            f"expected {BASELINE_COMMIT}, observed {commit}"
+        )
+    if tree != EXPECTED_BASELINE_TREE:
+        fail(
+            "baseline tree authentication failed: "
+            f"expected {EXPECTED_BASELINE_TREE}, observed {tree}"
+        )
+    return {
+        "commit": commit,
+        "tree": tree,
+        "commit_authentication_command": command_string(commit_command),
+        "tree_authentication_command": command_string(tree_command),
+    }
+
+
+def materialize_baseline(
+    repo: Path, owned_root: Path, identity: dict[str, str]
+) -> tuple[Path, dict[str, str]]:
+    source = owned_root / "baseline-source"
+    archive = owned_root / "baseline.tar"
+    source.mkdir()
+    archive_command = [
+        "git",
+        "archive",
+        "--format=tar",
+        "--output",
+        "$BASELINE_ARCHIVE",
+        identity["commit"],
+    ]
+    run(
+        [
+            "git",
+            "archive",
+            "--format=tar",
+            "--output",
+            str(archive),
+            identity["commit"],
+        ],
+        repo,
+    )
+    extract_command = [
+        "tar",
+        "-xf",
+        "$BASELINE_ARCHIVE",
+        "-C",
+        "$BASELINE_SOURCE_DIR",
+    ]
+    run(["tar", "-xf", str(archive), "-C", str(source)], repo)
+    if not (source / "Cargo.toml").is_file() or not (source / "Cargo.lock").is_file():
+        fail("authenticated baseline archive did not materialize a Cargo workspace")
+    try:
+        source.resolve().relative_to(repo.resolve())
+    except ValueError:
+        pass
+    else:
+        fail(f"baseline source was materialized inside candidate tree: {source}")
+    return source, {
+        "archive_command": command_string(archive_command),
+        "extract_command": command_string(extract_command),
+    }
 
 
 def rust_literal_end(data: bytes, offset: int) -> int | None:
@@ -534,6 +619,40 @@ def package_names_by_id(raw: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def package_topology(raw: dict[str, Any]) -> dict[str, Any]:
+    members = set(raw.get("workspace_members", []))
+    packages = [
+        package
+        for package in raw.get("packages", [])
+        if package.get("id") in members and package.get("name") == PACKAGE
+    ]
+    if len(packages) != 1:
+        fail(
+            f"expected exactly one workspace package named {PACKAGE}; "
+            f"observed {len(packages)}"
+        )
+    targets = sorted(
+        (
+            {
+                "name": target["name"],
+                "kind": target["kind"],
+            }
+            for target in packages[0].get("targets", [])
+        ),
+        key=lambda item: (item["name"], item["kind"]),
+    )
+    integration_targets = [
+        target["name"] for target in targets if target["kind"] == ["test"]
+    ]
+    return {
+        "package": PACKAGE,
+        "target_count": len(targets),
+        "integration_test_target_count": len(integration_targets),
+        "integration_test_targets": integration_targets,
+        "targets": targets,
+    }
+
+
 def parse_artifacts(
     stdout: str,
     names_by_id: dict[str, str],
@@ -580,6 +699,7 @@ def timed_compile(
     target_dir: Path,
     env: dict[str, str],
     names_by_id: dict[str, str],
+    arm: str,
     phase: str,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     started = utc_now()
@@ -588,11 +708,11 @@ def timed_compile(
     elapsed = time.perf_counter() - before
     if result.returncode != 0:
         sys.stderr.write(result.stderr)
-        fail(f"{phase} candidate compile failed with status {result.returncode}")
+        fail(f"{phase} {arm} compile failed with status {result.returncode}")
     artifacts = parse_artifacts(result.stdout, names_by_id, target_dir)
     package_artifacts = [item for item in artifacts if item["package"] == PACKAGE]
     if not package_artifacts:
-        fail(f"{phase} compile emitted zero linked test executables for {PACKAGE}")
+        fail(f"{phase} {arm} compile emitted zero linked test executables for {PACKAGE}")
     stable_artifacts = [
         {key: value for key, value in item.items() if not key.startswith("_")}
         for item in package_artifacts
@@ -606,6 +726,73 @@ def timed_compile(
         "linked_test_executables": stable_artifacts,
     }
     return measurement, package_artifacts
+
+
+def compile_arm(
+    source_root: Path,
+    target_dir: Path,
+    arm: str,
+) -> tuple[dict[str, Any], dict[str, str], dict[str, str]]:
+    if target_dir.exists():
+        fail(f"{arm} Cargo target directory was not fresh: {target_dir}")
+    raw_metadata = json.loads(run(METADATA_COMMAND, source_root).stdout)
+    topology = package_topology(raw_metadata)
+    expected_targets = (
+        EXPECTED_BASELINE_INTEGRATION_TARGETS
+        if arm == "baseline"
+        else EXPECTED_CANDIDATE_INTEGRATION_TARGETS
+    )
+    if topology["integration_test_target_count"] != expected_targets:
+        fail(
+            f"{arm} {PACKAGE} integration target count mismatch: "
+            f"expected {expected_targets}, "
+            f"observed {topology['integration_test_target_count']} "
+            f"({topology['integration_test_targets']})"
+        )
+    names_by_id = package_names_by_id(raw_metadata)
+    env = os.environ.copy()
+    env["CARGO_TARGET_DIR"] = str(target_dir)
+    env["CARGO_TERM_COLOR"] = "never"
+    cold, cold_artifacts = timed_compile(
+        source_root, target_dir, env, names_by_id, arm, "cold"
+    )
+    warm, warm_artifacts = timed_compile(
+        source_root, target_dir, env, names_by_id, arm, "warm"
+    )
+    expected_linked = (
+        EXPECTED_BASELINE_LINKED_TEST_EXECUTABLES
+        if arm == "baseline"
+        else EXPECTED_CANDIDATE_LINKED_TEST_EXECUTABLES
+    )
+    for run_measurement in (cold, warm):
+        if run_measurement["linked_test_executable_count"] != expected_linked:
+            fail(
+                f"{run_measurement['phase']} {arm} linked test executable "
+                f"count mismatch: expected {expected_linked}, observed "
+                f"{run_measurement['linked_test_executable_count']}"
+            )
+    cold_identities = {
+        (item["package"], item["target"], tuple(item["kind"]))
+        for item in cold_artifacts
+    }
+    warm_identities = {
+        (item["package"], item["target"], tuple(item["kind"]))
+        for item in warm_artifacts
+    }
+    if cold_identities != warm_identities:
+        fail(
+            f"{arm} cold/warm linked test executable identities differ: "
+            f"cold={sorted(cold_identities)}, warm={sorted(warm_identities)}"
+        )
+    return (
+        {
+            "topology": topology,
+            "runs": [cold, warm],
+            "linked_identity_sets_equal": True,
+        },
+        env,
+        names_by_id,
+    )
 
 
 def collect_native_libtest(
@@ -1011,8 +1198,6 @@ def main() -> None:
 
     versions = tool_versions(repo)
     inventory, normal_dependencies = normalized_metadata(repo)
-    raw_metadata = json.loads(run(METADATA_COMMAND, repo).stdout)
-    names_by_id = package_names_by_id(raw_metadata)
 
     policy_result = run(POLICY_COMMAND, repo, check=False)
     normal_dependencies["dependency_policy"] = {
@@ -1027,66 +1212,158 @@ def main() -> None:
         sys.stderr.write(policy_result.stderr)
         fail(f"dependency policy failed with status {policy_result.returncode}")
 
-    target_parent = repo / ".candidate-issue-477-tmp"
-    target_parent.mkdir(exist_ok=True)
-    target_dir = Path(tempfile.mkdtemp(prefix="cargo-target-", dir=target_parent))
-    env = os.environ.copy()
-    env["CARGO_TARGET_DIR"] = str(target_dir)
-    env["CARGO_TERM_COLOR"] = "never"
-    cleanup_status = "not_attempted"
+    baseline_identity = authenticate_baseline(repo)
+    candidate_commit = run(
+        ["git", "rev-parse", "--verify", "HEAD^{commit}"], repo
+    ).stdout.strip()
+    candidate_tree = run(
+        ["git", "rev-parse", "--verify", "HEAD^{tree}"], repo
+    ).stdout.strip()
+
+    owned_root = Path(
+        tempfile.mkdtemp(prefix="moraine-issue-477-compile-", dir=tempfile.gettempdir())
+    ).resolve()
     try:
-        cold, cold_artifacts = timed_compile(
-            repo, target_dir, env, names_by_id, "cold"
+        owned_root.relative_to(repo)
+    except ValueError:
+        pass
+    else:
+        shutil.rmtree(owned_root)
+        fail(f"verifier-owned temporary root is inside candidate tree: {owned_root}")
+    baseline_source = owned_root / "baseline-source"
+    baseline_target = owned_root / "baseline-target"
+    candidate_target = owned_root / "candidate-target"
+    baseline_archive = owned_root / "baseline.tar"
+    owned_cleanup = {
+        "baseline_source": "not_attempted",
+        "baseline_archive": "not_attempted",
+        "baseline_target": "not_attempted",
+        "candidate_target": "not_attempted",
+        "temporary_root": "not_attempted",
+    }
+    try:
+        baseline_source, materialization = materialize_baseline(
+            repo, owned_root, baseline_identity
         )
-        warm, warm_artifacts = timed_compile(
-            repo, target_dir, env, names_by_id, "warm"
+        baseline_measurement, _, _ = compile_arm(
+            baseline_source, baseline_target, "baseline"
         )
-        cold_identities = {
-            (item["package"], item["target"], tuple(item["kind"]))
-            for item in cold_artifacts
-        }
-        warm_identities = {
-            (item["package"], item["target"], tuple(item["kind"]))
-            for item in warm_artifacts
-        }
-        if cold_identities != warm_identities:
-            fail(
-                "cold/warm linked test executable identities differ: "
-                f"cold={sorted(cold_identities)}, warm={sorted(warm_identities)}"
-            )
+        candidate_measurement, candidate_env, candidate_names_by_id = compile_arm(
+            repo, candidate_target, "candidate"
+        )
         collection, _ = collect_native_libtest(
-            repo, target_dir, env, names_by_id
+            repo, candidate_target, candidate_env, candidate_names_by_id
         )
         migration = repository_migration(repo, inventory, collection)
     finally:
-        if target_dir.exists():
-            shutil.rmtree(target_dir)
-        cleanup_status = "removed" if not target_dir.exists() else "failed"
-        if target_parent.exists() and not any(target_parent.iterdir()):
-            target_parent.rmdir()
-    if cleanup_status != "removed":
-        fail(f"failed to remove verifier-owned Cargo target directory: {target_dir}")
+        if owned_root.exists():
+            shutil.rmtree(owned_root)
+        owned_cleanup = {
+            "baseline_archive": (
+                "removed" if not baseline_archive.exists() else "failed"
+            ),
+            "baseline_source": (
+                "removed" if not baseline_source.exists() else "failed"
+            ),
+            "baseline_target": (
+                "removed" if not baseline_target.exists() else "failed"
+            ),
+            "candidate_target": (
+                "removed" if not candidate_target.exists() else "failed"
+            ),
+            "temporary_root": "removed" if not owned_root.exists() else "failed",
+        }
+    if set(owned_cleanup.values()) != {"removed"}:
+        fail(f"failed to remove verifier-owned compile resources: {owned_cleanup}")
 
+    baseline_cold, baseline_warm = baseline_measurement["runs"]
+    candidate_cold, candidate_warm = candidate_measurement["runs"]
     measurement = {
         "format_version": FORMAT_VERSION,
-        "source": "current working tree",
-        "host": {"system": system, "machine": machine},
-        "rustc_host_target": versions["rustc_host_target"],
-        "command": command_string(COMPILE_COMMAND),
-        "environment": {
-            "CARGO_TARGET_DIR": "$VERIFIER_OWNED_FRESH_TARGET",
-            "CARGO_TERM_COLOR": "never",
+        "comparison": "same-host same-toolchain baseline versus candidate target topology",
+        "same_host_toolchain": True,
+        "host": {
+            "system": system,
+            "release": platform.release(),
+            "machine": machine,
+            "rustc_host_target": versions["rustc_host_target"],
         },
-        "cold_definition": "first invocation after creating an empty isolated CARGO_TARGET_DIR; shared Cargo registry/git caches are host state",
-        "warm_definition": "second identical invocation in the same CARGO_TARGET_DIR with no intervening source or environment change",
-        "runs": [cold, warm],
-        "linked_identity_sets_equal": True,
-        "owned_target_cleanup": cleanup_status,
+        "tool_versions": versions,
+        "command": command_string(COMPILE_COMMAND),
+        "measurement_order": ["baseline", "candidate"],
+        "path_placeholders": {
+            "$BASELINE_ARCHIVE": "verifier-owned archive outside the candidate tree",
+            "$BASELINE_SOURCE_DIR": "verifier-owned extracted source outside the candidate tree",
+            "$BASELINE_OWNED_FRESH_TARGET": "fresh isolated baseline Cargo target directory",
+            "$CANDIDATE_OWNED_FRESH_TARGET": "fresh isolated candidate Cargo target directory",
+        },
+        "environment": {
+            "baseline": {
+                "CARGO_TARGET_DIR": "$BASELINE_OWNED_FRESH_TARGET",
+                "CARGO_TERM_COLOR": "never",
+            },
+            "candidate": {
+                "CARGO_TARGET_DIR": "$CANDIDATE_OWNED_FRESH_TARGET",
+                "CARGO_TERM_COLOR": "never",
+            },
+        },
+        "cold_definition": "first invocation after creating an empty isolated per-arm CARGO_TARGET_DIR; shared Cargo registry/git caches are host state",
+        "warm_definition": "second identical invocation in the same per-arm CARGO_TARGET_DIR with no intervening source or environment change",
+        "sources": {
+            "baseline": {
+                **baseline_identity,
+                **materialization,
+                "description": "authenticated git archive materialized outside the candidate tree",
+                "authentication": "pass",
+            },
+            "candidate": {
+                "description": "current working tree",
+                "head_commit": candidate_commit,
+                "head_tree": candidate_tree,
+                "commit_command": "git rev-parse --verify HEAD^{commit}",
+                "tree_command": "git rev-parse --verify HEAD^{tree}",
+            },
+        },
+        "arms": {
+            "baseline": baseline_measurement,
+            "candidate": candidate_measurement,
+        },
+        "delta": {
+            "package_target_count": (
+                candidate_measurement["topology"]["target_count"]
+                - baseline_measurement["topology"]["target_count"]
+            ),
+            "integration_test_target_count": (
+                candidate_measurement["topology"]["integration_test_target_count"]
+                - baseline_measurement["topology"]["integration_test_target_count"]
+            ),
+            "linked_test_executable_count": (
+                candidate_cold["linked_test_executable_count"]
+                - baseline_cold["linked_test_executable_count"]
+            ),
+            "cold_wall_time_seconds": round(
+                candidate_cold["wall_time_seconds"]
+                - baseline_cold["wall_time_seconds"],
+                6,
+            ),
+            "warm_wall_time_seconds": round(
+                candidate_warm["wall_time_seconds"]
+                - baseline_warm["wall_time_seconds"],
+                6,
+            ),
+        },
+        "owned_cleanup": owned_cleanup,
         "non_deterministic_fields": [
-            "runs[0].started_at_utc",
-            "runs[0].wall_time_seconds",
-            "runs[1].started_at_utc",
-            "runs[1].wall_time_seconds",
+            "arms.baseline.runs[0].started_at_utc",
+            "arms.baseline.runs[0].wall_time_seconds",
+            "arms.baseline.runs[1].started_at_utc",
+            "arms.baseline.runs[1].wall_time_seconds",
+            "arms.candidate.runs[0].started_at_utc",
+            "arms.candidate.runs[0].wall_time_seconds",
+            "arms.candidate.runs[1].started_at_utc",
+            "arms.candidate.runs[1].wall_time_seconds",
+            "delta.cold_wall_time_seconds",
+            "delta.warm_wall_time_seconds",
         ],
     }
 
@@ -1112,21 +1389,35 @@ def main() -> None:
     manifest = {
         "format_version": FORMAT_VERSION,
         "baseline_commit": BASELINE_COMMIT,
+        "baseline_tree": baseline_identity["tree"],
+        "candidate_head_commit": candidate_commit,
+        "candidate_head_tree": candidate_tree,
         "source": "current working tree",
         "generated_at_utc": utc_now(),
         "generator": "docs/development/test-architecture/verify_candidate.py",
         "generator_sha256": sha256(Path(__file__).read_bytes()),
         "host": {
             "system": system,
+            "release": platform.release(),
             "machine": machine,
             "rustc_host_target": versions["rustc_host_target"],
         },
         "tool_versions": versions,
         "commands": {
             "metadata": command_string(METADATA_COMMAND),
+            "baseline_authenticate_commit": baseline_identity[
+                "commit_authentication_command"
+            ],
+            "baseline_authenticate_tree": baseline_identity[
+                "tree_authentication_command"
+            ],
+            "baseline_archive": materialization["archive_command"],
+            "baseline_extract": materialization["extract_command"],
             "baseline_source": f"git show {BASELINE_REV}:{BASELINE_SOURCE}",
-            "cold_compile": command_string(COMPILE_COMMAND),
-            "warm_compile": command_string(COMPILE_COMMAND),
+            "baseline_cold_compile": command_string(COMPILE_COMMAND),
+            "baseline_warm_compile": command_string(COMPILE_COMMAND),
+            "candidate_cold_compile": command_string(COMPILE_COMMAND),
+            "candidate_warm_compile": command_string(COMPILE_COMMAND),
             "native_collection_compile": command_string(COLLECT_COMMAND),
             "native_collection_list": "$EXECUTABLE --list --format terse",
             "native_collection_ignored_list": "$EXECUTABLE --list --ignored --format terse",
@@ -1140,17 +1431,61 @@ def main() -> None:
             "candidate_repository_linked_executable_count": migration["topology"]["candidate_repository_linked_executable_count"],
             "repository_test_bijection_count": migration["bijection"]["map_count"],
             "repository_contract_mismatch_count": migration["contract_equivalence"]["mismatch_count"],
-            "cold_wall_time_seconds": cold["wall_time_seconds"],
-            "warm_wall_time_seconds": warm["wall_time_seconds"],
-            "cold_linked_test_executable_count": cold["linked_test_executable_count"],
-            "warm_linked_test_executable_count": warm["linked_test_executable_count"],
+            "baseline_source_tree": baseline_identity["tree"],
+            "baseline_package_target_count": baseline_measurement["topology"][
+                "target_count"
+            ],
+            "baseline_integration_test_target_count": baseline_measurement["topology"][
+                "integration_test_target_count"
+            ],
+            "baseline_cold_wall_time_seconds": baseline_cold["wall_time_seconds"],
+            "baseline_warm_wall_time_seconds": baseline_warm["wall_time_seconds"],
+            "baseline_cold_linked_test_executable_count": baseline_cold[
+                "linked_test_executable_count"
+            ],
+            "baseline_warm_linked_test_executable_count": baseline_warm[
+                "linked_test_executable_count"
+            ],
+            "candidate_package_target_count": candidate_measurement["topology"][
+                "target_count"
+            ],
+            "candidate_integration_test_target_count": candidate_measurement["topology"][
+                "integration_test_target_count"
+            ],
+            "candidate_cold_wall_time_seconds": candidate_cold["wall_time_seconds"],
+            "candidate_warm_wall_time_seconds": candidate_warm["wall_time_seconds"],
+            "candidate_cold_linked_test_executable_count": candidate_cold[
+                "linked_test_executable_count"
+            ],
+            "candidate_warm_linked_test_executable_count": candidate_warm[
+                "linked_test_executable_count"
+            ],
+            "package_target_count_delta": measurement["delta"][
+                "package_target_count"
+            ],
+            "integration_test_target_count_delta": measurement["delta"][
+                "integration_test_target_count"
+            ],
+            "linked_test_executable_count_delta": measurement["delta"][
+                "linked_test_executable_count"
+            ],
+            "cold_wall_time_seconds_delta": measurement["delta"][
+                "cold_wall_time_seconds"
+            ],
+            "warm_wall_time_seconds_delta": measurement["delta"][
+                "warm_wall_time_seconds"
+            ],
             "dependency_policy": normal_dependencies["dependency_policy"]["result"],
-            "owned_target_cleanup": cleanup_status,
+            "owned_compile_cleanup": owned_cleanup,
         },
         "non_deterministic_fields": [
             "generated_at_utc",
-            "summary.cold_wall_time_seconds",
-            "summary.warm_wall_time_seconds",
+            "summary.baseline_cold_wall_time_seconds",
+            "summary.baseline_warm_wall_time_seconds",
+            "summary.candidate_cold_wall_time_seconds",
+            "summary.candidate_warm_wall_time_seconds",
+            "summary.cold_wall_time_seconds_delta",
+            "summary.warm_wall_time_seconds_delta",
             f"artifact_sha256.compile-measurements-{system}-{machine}.json",
         ],
         "reproduce": "python3 docs/development/test-architecture/verify_candidate.py --repo-root .",
@@ -1161,9 +1496,12 @@ def main() -> None:
         f"targets={inventory['target_count']} "
         f"repository_tests={migration['bijection']['map_count']} "
         f"mismatches={migration['contract_equivalence']['mismatch_count']} "
-        f"cold={cold['wall_time_seconds']:.6f}s "
-        f"warm={warm['wall_time_seconds']:.6f}s "
-        f"linked={cold['linked_test_executable_count']}/{warm['linked_test_executable_count']} "
+        f"baseline={baseline_cold['wall_time_seconds']:.6f}/"
+        f"{baseline_warm['wall_time_seconds']:.6f}s "
+        f"candidate={candidate_cold['wall_time_seconds']:.6f}/"
+        f"{candidate_warm['wall_time_seconds']:.6f}s "
+        f"linked={baseline_cold['linked_test_executable_count']}->"
+        f"{candidate_cold['linked_test_executable_count']} "
         "status=pass"
     )
 
