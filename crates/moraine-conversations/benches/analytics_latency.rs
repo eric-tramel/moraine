@@ -17,11 +17,13 @@ use std::time::{Duration, Instant};
 
 #[path = "analytics_latency/support.rs"]
 mod support;
+const SEMANTIC_CHECKS_PER_SAMPLE: usize = 8;
 
 use support::{
-    AttemptCounts, Cardinality, Cli, DatasetIdentity, MeasurementReport, Measurements,
-    MonitorAnalyticsResponse, MonitorResponse, MonitorSessionsResponse, ProtocolReportInput,
-    SemanticComparison, SemanticObservation, Source, TimedObservation,
+    AttemptCounts, Cardinality, Cli, DatasetIdentity, DatasetManifest, MeasurementReport,
+    Measurements, MonitorAnalyticsResponse, MonitorResponse, MonitorSessionsResponse,
+    ProtocolReportInput, SemanticComparison, SemanticObservation, Source, TimedObservation,
+    ANALYTICS_24H_SCENARIO, SESSIONS_30D50_SCENARIO,
 };
 
 struct BenchmarkConfig {
@@ -345,12 +347,48 @@ async fn run_sample(
 
 fn validate_sample(
     sample: &MatrixSample,
+    manifest: &DatasetManifest,
     analytics_monitor: &Measurements,
     analytics_repository: &Measurements,
     sessions_monitor: &Measurements,
     sessions_repository: &Measurements,
     analytics_repository_warm: &Measurements,
 ) -> std::result::Result<(), SampleFailure> {
+    manifest
+        .verify_observation(
+            ANALYTICS_24H_SCENARIO,
+            &sample.analytics_monitor.semantics,
+            "monitor analytics",
+        )
+        .and_then(|()| {
+            manifest.verify_observation(
+                ANALYTICS_24H_SCENARIO,
+                &sample.analytics_repository.semantics,
+                "repository analytics",
+            )
+        })
+        .and_then(|()| {
+            manifest.verify_observation(
+                SESSIONS_30D50_SCENARIO,
+                &sample.sessions_monitor.semantics,
+                "monitor sessions",
+            )
+        })
+        .and_then(|()| {
+            manifest.verify_observation(
+                SESSIONS_30D50_SCENARIO,
+                &sample.sessions_repository.semantics,
+                "repository sessions",
+            )
+        })
+        .and_then(|()| {
+            manifest.verify_observation(
+                ANALYTICS_24H_SCENARIO,
+                &sample.analytics_repository_warm.semantics,
+                "warm repository analytics",
+            )
+        })
+        .map_err(|error| SampleFailure::new("semantic-seed-oracle-mismatch", error))?;
     analytics_monitor
         .validate(&sample.analytics_monitor, "monitor analytics")
         .and_then(|()| {
@@ -383,8 +421,8 @@ fn validate_sample(
     ];
     if comparisons.iter().any(|comparison| !comparison.passed()) {
         return Err(SampleFailure::new(
-            "semantic-oracle-mismatch",
-            anyhow::anyhow!("monitor/repository semantic parity failed"),
+            "semantic-parity-mismatch",
+            anyhow::anyhow!("supplemental monitor/repository semantic parity failed"),
         ));
     }
     Ok(())
@@ -430,6 +468,7 @@ async fn run_warmup(config: &BenchmarkConfig, client: &Client, iteration: usize)
 async fn run_matrix(
     config: &BenchmarkConfig,
     client: &Client,
+    manifest: &DatasetManifest,
     warmups: usize,
     samples: usize,
 ) -> Result<MatrixReports> {
@@ -463,6 +502,7 @@ async fn run_matrix(
             .and_then(|sample| {
                 validate_sample(
                     &sample,
+                    manifest,
                     &analytics_monitor,
                     &analytics_repository,
                     &sessions_monitor,
@@ -535,13 +575,15 @@ async fn execute() -> Result<()> {
         .context("failed to construct monitor HTTP client")?;
     let dataset = load_dataset_identity(&config).await?;
     let (mut reports, dataset_manifest_verified) =
-        match DatasetIdentity::load_manifest(&config.dataset_manifest)
-            .and_then(|manifest| dataset.verify_manifest(&manifest))
-        {
-            Ok(()) => (
+        match DatasetManifest::load(&config.dataset_manifest).and_then(|manifest| {
+            dataset.verify_manifest(&manifest)?;
+            Ok(manifest)
+        }) {
+            Ok(manifest) => (
                 run_matrix(
                     &config,
                     &client,
+                    &manifest,
                     cli.profile.warmups(),
                     cli.profile.samples(),
                 )
@@ -609,7 +651,10 @@ async fn execute() -> Result<()> {
         .map(|(monitor, repository)| support::timing_comparison(monitor, repository))
         .transpose()?;
     let semantic_passed = reports.semantic_passed();
-    let passed_checks = reports.counts.successful().saturating_mul(3);
+    let passed_checks = reports
+        .counts
+        .successful()
+        .saturating_mul(SEMANTIC_CHECKS_PER_SAMPLE);
     let failed_checks = reports.counts.errors() + usize::from(reports.setup_failed);
 
     let details = json!({
@@ -625,7 +670,7 @@ async fn execute() -> Result<()> {
         "dataset": dataset,
         "failures": reports.failure_details,
         "analytics": {
-            "semantic": analytics_comparison,
+            "supplemental_parity": analytics_comparison,
             "monitor": {
                 "p50_ms": reports.analytics_monitor.p50_ms,
                 "p95_ms": reports.analytics_monitor.p95_ms,
@@ -637,7 +682,7 @@ async fn execute() -> Result<()> {
             "diagnostic_p95_comparison": analytics_timing,
         },
         "sessions": {
-            "semantic": sessions_comparison,
+            "supplemental_parity": sessions_comparison,
             "monitor": {
                 "p50_ms": reports.sessions_monitor.p50_ms,
                 "p95_ms": reports.sessions_monitor.p95_ms,
@@ -649,7 +694,7 @@ async fn execute() -> Result<()> {
             "diagnostic_p95_comparison": sessions_timing,
         },
         "warm_repository_analytics": {
-            "semantic": warm_comparison,
+            "supplemental_parity": warm_comparison,
             "p50_ms": reports.analytics_repository_warm.p50_ms,
             "p95_ms": reports.analytics_repository_warm.p95_ms,
         },
@@ -686,7 +731,7 @@ async fn execute() -> Result<()> {
     );
     let mut diagnostics = reports.diagnostics;
     diagnostics.push(json!({
-        "code": if semantic_passed { "semantic-parity-pass" } else { "semantic-parity-fail" },
+        "code": if semantic_passed { "semantic-validation-pass" } else { "semantic-validation-fail" },
     }));
     if reports.counts.successful() < reports.counts.planned() {
         diagnostics.push(json!({"code": "insufficient-samples"}));

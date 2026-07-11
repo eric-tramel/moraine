@@ -9,6 +9,9 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const SCHEMA_VERSION: &str = "moraine-benchmark-v1";
+pub const ANALYTICS_24H_SCENARIO: &str = "analytics-24h";
+pub const SESSIONS_30D50_SCENARIO: &str = "sessions-30d50";
+const REQUIRED_SEMANTIC_SCENARIOS: [&str; 2] = [ANALYTICS_24H_SCENARIO, SESSIONS_30D50_SCENARIO];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -92,8 +95,8 @@ impl Cli {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Cardinality {
     AnalyticsSeries {
         tokens: usize,
@@ -105,7 +108,8 @@ pub enum Cardinality {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SemanticObservation {
     pub cardinality: Cardinality,
     pub digest: String,
@@ -118,8 +122,38 @@ impl SemanticObservation {
             digest: normalized_digest(payload)?,
         })
     }
+
+    fn validate(&self) -> Result<()> {
+        let digest = self
+            .digest
+            .strip_prefix("fnv1a64:")
+            .context("semantic digest must use the fnv1a64 prefix")?;
+        if digest.len() != 16
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            bail!("semantic digest must be fnv1a64:<16 lowercase hex digits>");
+        }
+        Ok(())
+    }
 }
 
+pub fn verify_expected_semantics(
+    expected: &SemanticObservation,
+    observed: &SemanticObservation,
+    label: &str,
+) -> Result<()> {
+    expected.validate()?;
+    observed.validate()?;
+    if expected.cardinality != observed.cardinality {
+        bail!("{label} cardinality did not match the seed manifest oracle");
+    }
+    if expected.digest != observed.digest {
+        bail!("{label} digest did not match the seed manifest oracle");
+    }
+    Ok(())
+}
 pub fn normalized_digest(value: &Value) -> Result<String> {
     let bytes = serde_json::to_vec(&canonicalize_json(value))
         .context("failed to serialize normalized benchmark payload")?;
@@ -304,16 +338,7 @@ impl DatasetIdentity {
         }
     }
 
-    pub fn load_manifest(path: &Path) -> Result<Self> {
-        let bytes = fs::read(path)
-            .with_context(|| format!("failed to read dataset manifest {}", path.display()))?;
-        let manifest = serde_json::from_slice::<Self>(&bytes)
-            .with_context(|| format!("invalid dataset manifest {}", path.display()))?;
-        manifest.validate()?;
-        Ok(manifest)
-    }
-
-    pub fn verify_manifest(&self, manifest: &Self) -> Result<()> {
+    pub fn verify_manifest(&self, manifest: &DatasetManifest) -> Result<()> {
         self.validate()?;
         manifest.validate()?;
         if self.cardinality != manifest.cardinality {
@@ -330,16 +355,77 @@ impl DatasetIdentity {
     }
 
     fn validate(&self) -> Result<()> {
-        if !self.fingerprint.starts_with("sha256:")
-            || self.fingerprint.len() != 71
-            || !self.fingerprint[7..]
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            bail!("dataset fingerprint must be sha256:<64 lowercase hex digits>");
+        validate_dataset_identity(&self.fingerprint, self.cardinality)
+    }
+}
+
+fn validate_dataset_identity(fingerprint: &str, cardinality: usize) -> Result<()> {
+    if !fingerprint.starts_with("sha256:")
+        || fingerprint.len() != 71
+        || !fingerprint[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("dataset fingerprint must be sha256:<64 lowercase hex digits>");
+    }
+    if cardinality == 0 {
+        bail!("dataset manifest must identify at least one seeded row");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatasetManifest {
+    pub fingerprint: String,
+    pub cardinality: usize,
+    pub expected_semantics: BTreeMap<String, SemanticObservation>,
+}
+
+impl DatasetManifest {
+    pub fn load(path: &Path) -> Result<Self> {
+        let bytes = fs::read(path)
+            .with_context(|| format!("failed to read dataset manifest {}", path.display()))?;
+        let manifest = serde_json::from_slice::<Self>(&bytes)
+            .with_context(|| format!("invalid dataset manifest {}", path.display()))?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    pub fn expected(&self, scenario: &str) -> Result<&SemanticObservation> {
+        self.expected_semantics
+            .get(scenario)
+            .with_context(|| format!("dataset manifest missing expected scenario {scenario:?}"))
+    }
+
+    pub fn verify_observation(
+        &self,
+        scenario: &str,
+        observed: &SemanticObservation,
+        label: &str,
+    ) -> Result<()> {
+        verify_expected_semantics(self.expected(scenario)?, observed, label)
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_dataset_identity(&self.fingerprint, self.cardinality)?;
+        for scenario in REQUIRED_SEMANTIC_SCENARIOS {
+            let expected = self.expected(scenario)?;
+            expected.validate()?;
+            let kind_matches = matches!(
+                (scenario, &expected.cardinality),
+                (ANALYTICS_24H_SCENARIO, Cardinality::AnalyticsSeries { .. })
+                    | (SESSIONS_30D50_SCENARIO, Cardinality::Sessions { .. })
+            );
+            if !kind_matches {
+                bail!("dataset manifest scenario {scenario:?} has the wrong cardinality kind");
+            }
         }
-        if self.cardinality == 0 {
-            bail!("dataset manifest must identify at least one seeded row");
+        if self.expected_semantics.len() != REQUIRED_SEMANTIC_SCENARIOS.len() {
+            bail!(
+                "dataset manifest must contain exactly the expected semantic scenarios: {}",
+                REQUIRED_SEMANTIC_SCENARIOS.join(", ")
+            );
         }
         Ok(())
     }
@@ -756,6 +842,33 @@ mod tests {
         );
     }
 
+    fn seed_manifest(dataset: DatasetIdentity) -> DatasetManifest {
+        DatasetManifest {
+            fingerprint: dataset.fingerprint,
+            cardinality: dataset.cardinality,
+            expected_semantics: BTreeMap::from([
+                (
+                    ANALYTICS_24H_SCENARIO.to_string(),
+                    SemanticObservation {
+                        cardinality: Cardinality::AnalyticsSeries {
+                            tokens: 1,
+                            turns: 1,
+                            concurrent_sessions: 1,
+                        },
+                        digest: "fnv1a64:bf9d0d146fa2b87a".to_string(),
+                    },
+                ),
+                (
+                    SESSIONS_30D50_SCENARIO.to_string(),
+                    SemanticObservation {
+                        cardinality: Cardinality::Sessions { sessions: 1 },
+                        digest: "fnv1a64:a5be61e61b8cb8f8".to_string(),
+                    },
+                ),
+            ]),
+        }
+    }
+
     #[test]
     fn profiles_have_stable_smoke_and_full_workloads() {
         assert_eq!(Profile::Smoke.name(), "smoke");
@@ -853,15 +966,47 @@ mod tests {
     }
 
     #[test]
-    fn semantic_comparison_is_the_only_correctness_gate() {
-        let monitor =
-            SemanticObservation::new(Cardinality::Sessions { sessions: 1 }, &json!([1])).unwrap();
-        let equal =
-            SemanticObservation::new(Cardinality::Sessions { sessions: 1 }, &json!([1])).unwrap();
-        let unequal =
-            SemanticObservation::new(Cardinality::Sessions { sessions: 1 }, &json!([2])).unwrap();
-        assert!(SemanticComparison::compare(&monitor, &equal).passed());
-        assert!(!SemanticComparison::compare(&monitor, &unequal).passed());
+    fn identical_but_wrong_arms_fail_the_seed_manifest_oracle() {
+        let manifest = seed_manifest(DatasetIdentity::from_serialized_rows([b"owned-seed-row"]));
+        let monitor = SemanticObservation::new(
+            Cardinality::Sessions { sessions: 1 },
+            &json!([{"session_id": "identically-wrong"}]),
+        )
+        .unwrap();
+        let repository = monitor.clone();
+
+        assert!(SemanticComparison::compare(&monitor, &repository).passed());
+        assert!(manifest
+            .verify_observation(SESSIONS_30D50_SCENARIO, &monitor, "monitor sessions")
+            .is_err());
+        assert!(manifest
+            .verify_observation(SESSIONS_30D50_SCENARIO, &repository, "repository sessions")
+            .is_err());
+        let serialized = serde_json::to_string(&manifest).unwrap();
+        assert!(!serialized.contains("seed-owner-private-value"));
+        assert!(serialized.contains("\"cardinality\""));
+        assert!(serialized.contains("\"digest\""));
+        let round_trip: DatasetManifest = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(round_trip, manifest);
+        let mut unsafe_manifest = serde_json::to_value(&manifest).unwrap();
+        unsafe_manifest
+            .pointer_mut("/expected_semantics/sessions-30d50")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("payload".to_string(), json!("private seed data"));
+        assert!(serde_json::from_value::<DatasetManifest>(unsafe_manifest).is_err());
+    }
+
+    #[test]
+    fn manifest_missing_an_expected_scenario_fails_closed() {
+        let mut manifest =
+            seed_manifest(DatasetIdentity::from_serialized_rows([b"owned-seed-row"]));
+        manifest.expected_semantics.remove(SESSIONS_30D50_SCENARIO);
+        let error = manifest.validate().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("missing expected scenario \"sessions-30d50\""));
     }
 
     #[test]
@@ -1017,9 +1162,13 @@ mod tests {
         assert_ne!(baseline.fingerprint, content_changed.fingerprint);
         assert_ne!(baseline.fingerprint, cardinality_changed.fingerprint);
         assert_ne!(baseline.cardinality, cardinality_changed.cardinality);
-        baseline.verify_manifest(&reordered).unwrap();
-        assert!(baseline.verify_manifest(&content_changed).is_err());
-        assert!(baseline.verify_manifest(&cardinality_changed).is_err());
+        baseline.verify_manifest(&seed_manifest(reordered)).unwrap();
+        assert!(baseline
+            .verify_manifest(&seed_manifest(content_changed))
+            .is_err());
+        assert!(baseline
+            .verify_manifest(&seed_manifest(cardinality_changed))
+            .is_err());
     }
 
     #[test]
