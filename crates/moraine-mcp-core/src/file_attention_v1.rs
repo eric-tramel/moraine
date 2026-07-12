@@ -910,6 +910,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rejects_negative_limit_with_field_specific_message() {
+        let error = parse_file_attention_args(
+            json!({
+                "path": "crates/moraine-mcp-core/src/contract.rs",
+                "limit": -1
+            }),
+            25,
+        )
+        .expect_err("negative limit rejected");
+
+        assert_eq!(error.code(), ToolErrorCode::InvalidRequest);
+        assert_eq!(error.message(), "limit must be between 1 and 25");
+    }
+
     fn touch(
         session: &str,
         event: &str,

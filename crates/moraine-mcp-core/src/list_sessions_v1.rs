@@ -417,6 +417,22 @@ mod tests {
         assert_eq!(limit.code(), ToolErrorCode::InvalidRequest);
     }
 
+    #[test]
+    fn rejects_negative_limit_with_field_specific_message() {
+        let error = parse_list_sessions_args(
+            json!({
+                "start_datetime": "2026-04-30T09:00:00-04:00",
+                "end_datetime": "2026-04-30T13:00:00-04:00",
+                "limit": -1
+            }),
+            25,
+        )
+        .expect_err("negative limit rejected");
+
+        assert_eq!(error.code(), ToolErrorCode::InvalidRequest);
+        assert_eq!(error.message(), "limit must be between 1 and 25");
+    }
+
     #[tokio::test]
     async fn shapes_session_metadata_only_with_open_handle() {
         let page = Page {

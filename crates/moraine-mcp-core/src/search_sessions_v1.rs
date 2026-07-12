@@ -678,6 +678,18 @@ mod tests {
     }
 
     #[test]
+    fn rejects_negative_n_hits_with_field_specific_message() {
+        let error = parse_search_sessions_args(json!({
+            "query": "migration",
+            "n_hits": -1
+        }))
+        .expect_err("negative n_hits rejected");
+
+        assert_eq!(error.code(), ToolErrorCode::InvalidRequest);
+        assert_eq!(error.message(), "n_hits must be between 1 and 50");
+    }
+
+    #[test]
     fn contract_validation_rejects_blank_query() {
         let error = SearchSessionsArgs {
             query: "   ".to_string(),

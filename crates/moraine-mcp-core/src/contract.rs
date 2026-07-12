@@ -516,7 +516,7 @@ pub struct SearchSessionsArgs {
     #[serde(default)]
     pub event_types: Option<Vec<String>>,
     #[serde(default)]
-    pub n_hits: Option<u16>,
+    pub n_hits: Option<i64>,
 }
 
 impl SearchSessionsArgs {
@@ -551,13 +551,18 @@ impl SearchSessionsArgs {
             None => default_search_event_types(),
         };
 
-        let n_hits = self.n_hits.unwrap_or(SEARCH_SESSIONS_DEFAULT_N_HITS);
-        if !(SEARCH_SESSIONS_MIN_N_HITS..=SEARCH_SESSIONS_MAX_N_HITS).contains(&n_hits) {
+        let n_hits = self
+            .n_hits
+            .unwrap_or(i64::from(SEARCH_SESSIONS_DEFAULT_N_HITS));
+        if !(i64::from(SEARCH_SESSIONS_MIN_N_HITS)..=i64::from(SEARCH_SESSIONS_MAX_N_HITS))
+            .contains(&n_hits)
+        {
             return Err(invalid_request_with_field(
                 "n_hits",
                 "n_hits must be between 1 and 50",
             ));
         }
+        let n_hits = n_hits as u16;
 
         Ok(CanonicalSearchSessionsArgs {
             query,
@@ -633,7 +638,7 @@ pub struct ListSessionsArgs {
     #[serde(default)]
     pub end_datetime: Option<String>,
     #[serde(default)]
-    pub limit: Option<u16>,
+    pub limit: Option<i64>,
     #[serde(default)]
     pub cursor: Option<String>,
     #[serde(default)]
@@ -647,13 +652,14 @@ impl ListSessionsArgs {
         let max_limit = max_results.max(LIST_SESSIONS_MIN_LIMIT);
         let limit = self
             .limit
-            .unwrap_or(LIST_SESSIONS_DEFAULT_LIMIT.min(max_limit));
-        if !(LIST_SESSIONS_MIN_LIMIT..=max_limit).contains(&limit) {
+            .unwrap_or(i64::from(LIST_SESSIONS_DEFAULT_LIMIT.min(max_limit)));
+        if !(i64::from(LIST_SESSIONS_MIN_LIMIT)..=i64::from(max_limit)).contains(&limit) {
             return Err(invalid_request_with_field(
                 "limit",
                 format!("limit must be between 1 and {max_limit}"),
             ));
         }
+        let limit = limit as u16;
 
         let Some(start_datetime) = self.start_datetime else {
             return Err(list_sessions_datetime_required_error());
@@ -809,7 +815,7 @@ pub struct FileAttentionArgs {
     #[serde(default)]
     pub mutations_only: Option<bool>,
     #[serde(default)]
-    pub limit: Option<u16>,
+    pub limit: Option<i64>,
 }
 
 impl FileAttentionArgs {
@@ -845,13 +851,14 @@ impl FileAttentionArgs {
         let max_limit = max_results.max(FILE_ATTENTION_MIN_LIMIT);
         let limit = self
             .limit
-            .unwrap_or(FILE_ATTENTION_DEFAULT_LIMIT.min(max_limit));
-        if !(FILE_ATTENTION_MIN_LIMIT..=max_limit).contains(&limit) {
+            .unwrap_or(i64::from(FILE_ATTENTION_DEFAULT_LIMIT.min(max_limit)));
+        if !(i64::from(FILE_ATTENTION_MIN_LIMIT)..=i64::from(max_limit)).contains(&limit) {
             return Err(invalid_request_with_field(
                 "limit",
                 format!("limit must be between 1 and {max_limit}"),
             ));
         }
+        let limit = limit as u16;
 
         // Both bounds are optional and independent, but if both are supplied
         // the window must be non-empty — same contract as list_sessions.
