@@ -1,7 +1,12 @@
 use anyhow::{Context, Result};
 use serde::{de::DeserializeOwned, Deserialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
 pub const KNOWN_INGEST_HARNESSES: &[&str] = &[
@@ -1397,6 +1402,108 @@ fn parse_repo_backend_ref(path: &Path) -> Option<String> {
     }
 }
 
+/// Stable, opaque identity for one Git repository and all of its linked
+/// worktrees. The repo backend marker is required, but its backend routing name
+/// is deliberately not the identity because multiple projects may share one
+/// backend.
+pub fn project_id_for_repo_root(root: impl AsRef<Path>) -> Option<String> {
+    let root = root.as_ref();
+    find_repo_backend_ref(root)?;
+    let common_dir = git_common_dir(root)?;
+    Some(project_id_for_common_dir(&common_dir))
+}
+
+fn project_id_for_common_dir(common_dir: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"moraine-git-common-dir\0");
+    #[cfg(unix)]
+    hasher.update(common_dir.as_os_str().as_bytes());
+    #[cfg(windows)]
+    for unit in common_dir.as_os_str().encode_wide() {
+        hasher.update(unit.to_le_bytes());
+    }
+    #[cfg(not(any(unix, windows)))]
+    hasher.update(common_dir.to_string_lossy().as_bytes());
+    format!("git:{:x}", hasher.finalize())
+}
+
+/// UTF-8 worktree roots currently registered under this repository's canonical
+/// Git common directory. These roots support a safe transition for normalized
+/// rows written before `project_id` became the common-directory digest.
+pub fn worktree_roots_for_repo_root(root: impl AsRef<Path>) -> Option<Vec<String>> {
+    let root = root.as_ref();
+    find_repo_backend_ref(root)?;
+    let common_dir = git_common_dir(root)?;
+    let mut roots = vec![root.to_path_buf()];
+
+    if common_dir.file_name().is_some_and(|name| name == ".git") {
+        if let Some(main_root) = common_dir.parent() {
+            roots.push(main_root.to_path_buf());
+        }
+    }
+
+    if let Ok(entries) = std::fs::read_dir(common_dir.join("worktrees")) {
+        for entry in entries.flatten() {
+            let gitdir_file = entry.path().join("gitdir");
+            let Ok(content) = std::fs::read_to_string(&gitdir_file) else {
+                continue;
+            };
+            let git_marker = Path::new(content.trim());
+            let git_marker = if git_marker.is_absolute() {
+                git_marker.to_path_buf()
+            } else {
+                entry.path().join(git_marker)
+            };
+            if let Some(worktree_root) = git_marker.parent() {
+                roots.push(worktree_root.to_path_buf());
+            }
+        }
+    }
+
+    roots.extend(
+        roots
+            .iter()
+            .filter_map(|root| root.canonicalize().ok())
+            .collect::<Vec<_>>(),
+    );
+    let mut roots = roots
+        .into_iter()
+        .filter_map(|root| root.to_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots.dedup();
+    Some(roots)
+}
+
+fn git_common_dir(root: &Path) -> Option<PathBuf> {
+    let marker = root.join(".git");
+    let git_dir = if marker.is_dir() {
+        marker
+    } else {
+        let content = std::fs::read_to_string(marker).ok()?;
+        let path = content.trim().strip_prefix("gitdir:")?.trim();
+        let path = Path::new(path);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        }
+    };
+    let common_dir_file = git_dir.join("commondir");
+    let common_dir = if common_dir_file.is_file() {
+        let content = std::fs::read_to_string(common_dir_file).ok()?;
+        let path = Path::new(content.trim());
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            git_dir.join(path)
+        }
+    } else {
+        git_dir
+    };
+    common_dir.canonicalize().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1419,6 +1526,73 @@ mod tests {
         let cfg = load_config(&path).expect("backend launch config should load");
         std::fs::remove_file(&path).ok();
         assert_eq!(cfg.backend.start_on_up, expected, "case `{label}`");
+    }
+
+    #[test]
+    fn project_id_unifies_linked_worktrees_but_not_other_repositories() {
+        let base = std::env::temp_dir().join(format!(
+            "moraine-project-id-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after unix epoch")
+                .as_nanos()
+        ));
+        let main = base.join("main");
+        let linked = base.join("linked");
+        let other = base.join("other");
+        let linked_git_dir = main.join(".git/worktrees/linked");
+        std::fs::create_dir_all(&linked_git_dir).expect("create main git dirs");
+        std::fs::create_dir_all(&linked).expect("create linked worktree");
+        std::fs::create_dir_all(other.join(".git")).expect("create other git dir");
+        for root in [&main, &linked, &other] {
+            std::fs::write(root.join(REPO_BACKEND_FILE), "backend = \"shared\"\n")
+                .expect("write repo backend marker");
+        }
+        std::fs::write(linked_git_dir.join("commondir"), "../..\n")
+            .expect("write common-dir pointer");
+        std::fs::write(
+            linked_git_dir.join("gitdir"),
+            format!("{}\n", linked.join(".git").to_string_lossy()),
+        )
+        .expect("write linked worktree pointer");
+        std::fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", linked_git_dir.to_string_lossy()),
+        )
+        .expect("write linked git pointer");
+
+        let main_id = project_id_for_repo_root(&main).expect("main project id");
+        let linked_id = project_id_for_repo_root(&linked).expect("linked project id");
+        let other_id = project_id_for_repo_root(&other).expect("other project id");
+        assert!(main_id.starts_with("git:"));
+        assert_eq!(main_id, linked_id);
+        assert_ne!(main_id, other_id);
+        let main_roots =
+            worktree_roots_for_repo_root(&main).expect("main registered worktree roots");
+        let linked_roots =
+            worktree_roots_for_repo_root(&linked).expect("linked registered worktree roots");
+        let canonical_main = main.canonicalize().expect("canonical main");
+        let canonical_linked = linked.canonicalize().expect("canonical linked");
+        for roots in [&main_roots, &linked_roots] {
+            assert!(roots.contains(&canonical_main.to_string_lossy().to_string()));
+            assert!(roots.contains(&canonical_linked.to_string_lossy().to_string()));
+        }
+
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_id_hashes_non_utf8_paths_losslessly() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let first = PathBuf::from(std::ffi::OsString::from_vec(b"/repo-\x80/.git".to_vec()));
+        let second = PathBuf::from(std::ffi::OsString::from_vec(b"/repo-\x81/.git".to_vec()));
+        assert_ne!(
+            project_id_for_common_dir(&first),
+            project_id_for_common_dir(&second)
+        );
     }
 
     #[test]

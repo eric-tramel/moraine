@@ -47,6 +47,7 @@ struct ToolCallParams {
 struct AppState {
     cfg: Arc<AppConfig>,
     repo: Arc<dyn ConversationRepository>,
+    launch_dir: Option<PathBuf>,
     prewarm_started: Arc<AtomicBool>,
 }
 
@@ -302,7 +303,7 @@ impl AppState {
                                     { "type": "null" }
                                 ],
                                 "default": "project",
-                                "description": "project (default) keeps the answer to the launch project by honoring --project-only; all drops that origin narrowing to include every worktree the backend holds."
+                                "description": "project (default) restricts results to the normalized launch-project identity even without --project-only; all is the deliberate widening path on an unscoped server. A configured --project-only origin boundary remains enforced."
                             },
                             "granularity": {
                                 "anyOf": [
@@ -453,16 +454,23 @@ impl AppState {
         cfg: Arc<AppConfig>,
         repo: Arc<dyn ConversationRepository>,
         prewarm_started: Arc<AtomicBool>,
+        launch_dir: Option<PathBuf>,
     ) -> Arc<AppState> {
         Arc::new(AppState {
             cfg,
             repo,
+            launch_dir,
             prewarm_started,
         })
     }
 
     fn embedded(cfg: AppConfig, repo: Arc<dyn ConversationRepository>) -> Arc<AppState> {
-        Self::with_repository(cfg.into(), repo, Arc::new(AtomicBool::new(false)))
+        Self::with_repository(
+            cfg.into(),
+            repo,
+            Arc::new(AtomicBool::new(false)),
+            std::env::current_dir().ok(),
+        )
     }
 }
 
@@ -882,11 +890,16 @@ async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStr
         return Ok(());
     };
 
-    let (backend, replay_first_line, negotiated) =
+    let (backend, replay_first_line, negotiated, launch_dir) =
         match private_proxy::classify_server_first_line(&first_line) {
             ServerFirstLine::Route { cwd } => {
                 match state.router.repository_for_project_dir(Some(&cwd)).await {
-                    Ok(backend) => (backend, None, true),
+                    Ok(backend) => (
+                        backend,
+                        None,
+                        true,
+                        (!cwd.is_empty()).then(|| PathBuf::from(cwd)),
+                    ),
                     Err(error) => {
                         let message = format!("{error:#}");
                         private_proxy::write_route_error(&mut write_half, &message).await?;
@@ -900,7 +913,12 @@ async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStr
             }
             ServerFirstLine::Raw => {
                 let backend = state.router.default_repository().await?;
-                (backend, Some(first_line), false)
+                (
+                    backend,
+                    Some(first_line),
+                    false,
+                    std::env::current_dir().ok(),
+                )
             }
         };
 
@@ -912,8 +930,12 @@ async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStr
         }
         Err(error) => return Err(error),
     };
-    let app_state =
-        AppState::with_repository(state.cfg, backend.repository().clone(), prewarm_started);
+    let app_state = AppState::with_repository(
+        state.cfg,
+        backend.repository().clone(),
+        prewarm_started,
+        launch_dir,
+    );
     if negotiated {
         private_proxy::write_ack(&mut write_half).await?;
     }
@@ -1859,6 +1881,85 @@ mod tests {
             .await
             .expect("route server task")
             .expect("route server shutdown");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn negotiated_socket_keeps_client_launch_project_for_file_attention() {
+        let root = std::env::temp_dir().join(format!(
+            "moraine-mcp-route-project-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join(".git")).expect("create test git directory");
+        std::fs::write(root.join(".moraine.toml"), "backend = \"default\"\n")
+            .expect("write repository backend marker");
+        let expected_project_id =
+            moraine_config::project_id_for_repo_root(&root).expect("canonical project id");
+
+        let cfg = Arc::new(AppConfig::default());
+        let repository = Arc::new(InMemoryConversationRepository::default());
+        let router = BackendRepositoryRouter::from_preloaded_for_testing(
+            cfg.clone(),
+            [(
+                "default".to_string(),
+                repository.clone() as Arc<dyn ConversationRepository>,
+            )],
+        )
+        .expect("preloaded default router");
+        let (sock, shutdown_tx, server) =
+            spawn_test_socket("route-project", cfg, Arc::new(router)).await;
+
+        let root_text = root.to_string_lossy().to_string();
+        let connection = accepted_test_connection(&sock, &root_text).await;
+        let output = proxy_test_requests(
+            connection,
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"file_attention\",\"arguments\":{\"path\":\"src/lib.rs\",\"scope\":\"project\"}}}\n".to_vec(),
+        )
+        .await;
+        let response: Value = serde_json::from_slice(&output).expect("file_attention response");
+        assert_eq!(response["id"], json!(1));
+        assert!(
+            response["result"]["isError"] == json!(false),
+            "file_attention should succeed: {response}"
+        );
+        assert!(
+            response["result"]["structuredContent"]["warnings"]
+                .as_array()
+                .expect("file_attention warnings")
+                .iter()
+                .any(|warning| warning.as_str().is_some_and(
+                    |warning| warning.contains("pruned before durable project mapping")
+                )),
+            "project scope must disclose the one-time unmappable-history exclusion: {response}"
+        );
+
+        let calls = repository.calls();
+        assert_eq!(calls.file_attention.len(), 1);
+        let query = &calls.file_attention[0];
+        assert_eq!(query.rel, "src/lib.rs");
+        assert_eq!(
+            query.normalized_project_id.as_deref(),
+            Some(expected_project_id.as_str())
+        );
+        assert!(
+            query
+                .normalized_project_roots
+                .iter()
+                .any(|root| root == &root_text),
+            "launch root must be present in registered project roots"
+        );
+        assert!(query.apply_project_scope);
+
+        shutdown_tx.send(()).expect("shutdown route server");
+        server
+            .await
+            .expect("route server task")
+            .expect("route server shutdown");
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[cfg(unix)]

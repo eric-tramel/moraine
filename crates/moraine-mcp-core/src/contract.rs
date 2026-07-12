@@ -735,10 +735,10 @@ pub struct CanonicalOpenV1Args {
 
 /// How far `file_attention` widens its search.
 ///
-/// `Project` (default) keeps the answer focused on the launch project by
-/// honoring the server's configured origin scope (`--project-only`). `All` is
-/// the deliberate widen for unscoped servers: it drops request-level origin
-/// narrowing so a touch in any worktree the backend holds can be returned. A
+/// `Project` (default) keeps the answer focused on the normalized identity of
+/// the launch project, independently of `--project-only`. `All` is the
+/// deliberate widen for unscoped servers: it drops request-level project
+/// narrowing so a touch in any project the backend holds can be returned. A
 /// configured server scope remains a hard floor, so `scope` never exposes IDs
 /// that `open` would reject.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]

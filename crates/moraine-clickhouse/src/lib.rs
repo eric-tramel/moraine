@@ -780,6 +780,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             name: "025_kimi_subagent_parent_links.sql",
             sql: include_str!("../../../sql/025_kimi_subagent_parent_links.sql"),
         },
+        Migration {
+            version: "026",
+            name: "026_file_attention_project_roots.sql",
+            sql: include_str!("../../../sql/026_file_attention_project_roots.sql"),
+        },
     ]
 }
 

@@ -848,13 +848,22 @@ Rules:
 - `path` is required and must name a file path string. Leading/trailing
   whitespace, `file://` URIs, and directory-style trailing slashes are invalid.
 - Absolute paths are reduced to a repo-relative tail by walking up to
-  `.moraine.toml` or `.git`. Existing relative paths are resolved from the MCP
-  server working directory first, so nested worktree prefixes strip to the
-  nested worktree root.
-- `scope` is `project` or `all`. `project` honors `--project-only`; `all`
-  deliberately drops request-level origin narrowing on unscoped servers. A
-  configured server scope remains a hard floor, so returned IDs must remain
-  accepted by `open`.
+  `.moraine.toml` or `.git`. Relative paths are resolved from the client's MCP
+  launch directory, including through a central-server route, so missing files
+  still retain launch-project provenance. Compound shell text and multi-path
+  captures are not interpreted as one path or root; unprovable roots remain
+  `unknown`.
+- `scope` is `project` or `all`. `project` independently restricts normalized
+  and legacy fallback lookup to the launch repository's canonical
+  Git-common-directory identity and fails closed if that identity cannot be
+  established. `all` deliberately drops request-level project narrowing. A
+  configured `--project-only` server scope remains a hard floor, so returned IDs
+  remain accepted by `open`.
+- Registered pre-digest roots are migrated into a durable project mapping, and
+  future normalized roots populate it automatically. A root pruned before that
+  mapping was installed lacks stored Git identity and cannot be attributed
+  safely; `project` excludes it rather than widening and emits an upgrade
+  limitation warning.
 - `granularity` is `sessions` or `events`.
 - Datetime bounds are optional, inclusive at `start_datetime` and exclusive at
   `end_datetime`. Bounds must be RFC 3339 strings with explicit timezone and at

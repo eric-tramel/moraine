@@ -71,18 +71,20 @@ pub struct FileAttentionQuery {
     /// Repo-relative tail to suffix-match against captured file paths. The tail
     /// is what unifies the same logical file across worktree roots.
     pub rel: String,
-    /// Best-effort project identity for exact Phase-1 normalized lookup. This
-    /// is a repo `.moraine.toml` backend name when the request path can be
-    /// resolved to one. `None` disables the exact branch and leaves Tier 0
-    /// suffix matching as the only source of results.
+    /// Canonical request-project identity used by both exact and fallback
+    /// lookup. It is an opaque digest of the Git common directory, so linked
+    /// worktrees agree while unrelated repositories sharing one backend do not.
+    /// `None` keeps project-scoped queries closed; only an explicit unscoped
+    /// query may omit this boundary.
     pub normalized_project_id: Option<String>,
-    /// Whether a structured matched path should be stripped by `rel` to report
-    /// a worktree root. Disabled for arbitrary suffixes that could otherwise
-    /// mislabel a source/package directory as a repository root.
-    pub derive_worktree_roots: bool,
-    /// When true the server's configured origin scope (`--project-only`) is
-    /// applied on top of the tail match; when false (`scope:"all"`) it is
-    /// dropped so touches in sibling and agent-isolation worktrees surface too.
+    /// Canonical registered roots for the request repository. These safely
+    /// admit rows written with the pre-digest project identity during the
+    /// transition without widening to another repository sharing the backend.
+    pub normalized_project_roots: Vec<String>,
+    /// When true normalized request-project identity is enforced in both query
+    /// paths. The repository's configured origin scope (`--project-only`) is an
+    /// independent hard floor. When false (`scope:"all"`), only request-project
+    /// narrowing is dropped.
     pub apply_project_scope: bool,
     pub start_unix_ms: Option<i64>,
     pub end_unix_ms: Option<i64>,

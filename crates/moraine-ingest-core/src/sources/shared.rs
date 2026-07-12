@@ -909,18 +909,16 @@ fn tool_file_attention_fields(
 
     let mut candidates = Vec::<String>::new();
     collect_structured_path_candidates(&input, &mut candidates);
-    for candidate in candidates {
-        if let Some(fields) = resolve_tool_path_fields(cwd, &candidate) {
-            return fields;
-        }
+    if candidates.len() != 1 {
+        return FileAttentionFields::default();
     }
 
-    FileAttentionFields::default()
+    resolve_tool_path_fields(cwd, &candidates[0]).unwrap_or_default()
 }
 
 fn resolve_tool_path_fields(cwd: &str, raw_path: &str) -> Option<FileAttentionFields> {
     let raw_path = raw_path.trim();
-    if raw_path.is_empty() || raw_path.contains('\0') {
+    if !is_single_path_candidate(raw_path) {
         return None;
     }
 
@@ -988,6 +986,14 @@ fn collect_path_values(value: &Value, out: &mut Vec<String>) {
     }
 }
 
+fn is_single_path_candidate(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains('\0')
+        && !path
+            .chars()
+            .any(|character| matches!(character, '\n' | '\r' | ';' | '|' | '&' | '`'))
+}
+
 fn normalize_path_text(path: &str) -> String {
     let absolute = path.starts_with('/');
     let mut parts: Vec<&str> = Vec::new();
@@ -1028,28 +1034,21 @@ fn find_file_attention_root(path: &Path) -> Option<String> {
     } else {
         path.parent()
     };
-    let mut git_fallback = None::<String>;
     while let Some(current) = dir {
-        if current.join(moraine_config::REPO_BACKEND_FILE).exists() {
+        if current.join(moraine_config::REPO_BACKEND_FILE).exists() || current.join(".git").exists()
+        {
             return Some(current.to_string_lossy().to_string());
-        }
-        if current.join(".git").exists() && git_fallback.is_none() {
-            git_fallback = Some(current.to_string_lossy().to_string());
         }
         if home.as_deref() == Some(current) {
             break;
         }
         dir = current.parent();
     }
-    git_fallback
+    None
 }
 
 fn project_id_for_root(root: &str) -> Option<String> {
-    let root = Path::new(root);
-    if root.join(moraine_config::REPO_BACKEND_FILE).is_file() {
-        return moraine_config::find_repo_backend_ref(root);
-    }
-    None
+    moraine_config::project_id_for_repo_root(root)
 }
 
 fn strip_root(path: &str, root: &str) -> Option<String> {
@@ -1380,6 +1379,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(root.join("src")).expect("create repo dirs");
+        std::fs::create_dir_all(root.join(".git")).expect("create git dir");
         std::fs::write(
             root.join(moraine_config::REPO_BACKEND_FILE),
             "backend = \"team\"\n",
@@ -1406,6 +1406,7 @@ mod tests {
         let cwd = root.join("src");
         let cwd_text = cwd.to_string_lossy().to_string();
         let ctx = test_record_context(&cwd_text);
+        let project_id = project_id_for_root(root.to_string_lossy().as_ref()).expect("project id");
 
         let row = Value::Object(base_event_obj(
             &ctx,
@@ -1417,9 +1418,44 @@ mod tests {
             "{}",
         ));
 
-        assert_eq!(row["project_id"], "team");
+        assert_eq!(row["project_id"], project_id);
         assert_eq!(row["worktree_root"], root.to_string_lossy().as_ref());
         assert_eq!(row["repo_rel_path"], "");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn event_rows_keep_linked_worktree_root_with_enclosing_project_marker() {
+        let root = make_repo("linked-worktree");
+        let linked = root.join("worktrees/linked");
+        let linked_git_dir = root.join(".git/worktrees/linked");
+        let cwd = linked.join("src");
+        std::fs::create_dir_all(&linked_git_dir).expect("create linked git dir");
+        std::fs::create_dir_all(&cwd).expect("create linked cwd");
+        std::fs::write(linked_git_dir.join("commondir"), "../..\n").expect("write commondir");
+        std::fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", linked_git_dir.to_string_lossy()),
+        )
+        .expect("write linked git marker");
+        let cwd_text = cwd.to_string_lossy().to_string();
+        let ctx = test_record_context(&cwd_text);
+
+        let row = Value::Object(base_event_obj(
+            &ctx,
+            "e1",
+            "message",
+            "message",
+            "assistant",
+            "hello",
+            "{}",
+        ));
+
+        assert_eq!(
+            row["project_id"],
+            project_id_for_root(root.to_string_lossy().as_ref()).expect("project id")
+        );
+        assert_eq!(row["worktree_root"], linked.to_string_lossy().as_ref());
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -1457,6 +1493,7 @@ mod tests {
         let cwd_text = root.to_string_lossy().to_string();
         let ctx = test_record_context(&cwd_text);
         let absolute = root.join("src/lib.rs").to_string_lossy().to_string();
+        let project_id = project_id_for_root(root.to_string_lossy().as_ref()).expect("project id");
 
         let absolute_row = build_tool_row(
             &ctx,
@@ -1470,7 +1507,7 @@ mod tests {
             "",
             "",
         );
-        assert_eq!(absolute_row["project_id"], "team");
+        assert_eq!(absolute_row["project_id"], project_id);
         assert_eq!(
             absolute_row["worktree_root"],
             root.to_string_lossy().as_ref()
@@ -1489,7 +1526,7 @@ mod tests {
             "",
             "",
         );
-        assert_eq!(relative_row["project_id"], "team");
+        assert_eq!(relative_row["project_id"], project_id);
         assert_eq!(
             relative_row["worktree_root"],
             root.to_string_lossy().as_ref()
@@ -1503,13 +1540,14 @@ mod tests {
         let root = make_repo("path-keys");
         let cwd_text = root.to_string_lossy().to_string();
         let ctx = test_record_context(&cwd_text);
+        let project_id = project_id_for_root(root.to_string_lossy().as_ref()).expect("project id");
 
         for key in FILE_ATTENTION_PATH_KEYS {
             let input = json!({ key: "src/lib.rs" }).to_string();
             let row = build_tool_row(
                 &ctx, "e1", "call-1", "", "Edit", "request", 0, &input, "", "",
             );
-            assert_eq!(row["project_id"], "team", "key {key}");
+            assert_eq!(row["project_id"], project_id, "key {key}");
             assert_eq!(row["repo_rel_path"], "src/lib.rs", "key {key}");
         }
 
@@ -1525,7 +1563,7 @@ mod tests {
             "",
             "",
         );
-        assert_eq!(nested["project_id"], "team");
+        assert_eq!(nested["project_id"], project_id);
         assert_eq!(nested["repo_rel_path"], "src/lib.rs");
         std::fs::remove_dir_all(root).ok();
     }
@@ -1583,6 +1621,48 @@ mod tests {
         assert_eq!(response["project_id"], "");
         assert_eq!(response["repo_rel_path"], "");
         assert_eq!(response["worktree_root"], "");
+        std::fs::remove_dir_all(root).ok();
+    }
+    #[test]
+    fn tool_rows_leave_compound_and_multi_path_inputs_unnormalized() {
+        let root = make_repo("compound-paths");
+        let cwd_text = root.to_string_lossy().to_string();
+        let ctx = test_record_context(&cwd_text);
+        let absolute = root.join("src/lib.rs").to_string_lossy().to_string();
+
+        for delimiter in ["\0", "\n", "\r", ";", "|", "&", "`"] {
+            let compound = build_tool_row(
+                &ctx,
+                "e1",
+                "call-1",
+                "",
+                "Bash",
+                "request",
+                0,
+                &json!({"path": format!("{absolute}{delimiter}src/other.rs")}).to_string(),
+                "",
+                "",
+            );
+            assert_eq!(compound["project_id"], "", "delimiter {delimiter:?}");
+            assert_eq!(compound["repo_rel_path"], "", "delimiter {delimiter:?}");
+            assert_eq!(compound["worktree_root"], "", "delimiter {delimiter:?}");
+        }
+
+        let multiple = build_tool_row(
+            &ctx,
+            "e2",
+            "call-2",
+            "",
+            "MultiEdit",
+            "request",
+            0,
+            r#"{"path":["src/lib.rs","src/other.rs"]}"#,
+            "",
+            "",
+        );
+        assert_eq!(multiple["project_id"], "");
+        assert_eq!(multiple["repo_rel_path"], "");
+        assert_eq!(multiple["worktree_root"], "");
         std::fs::remove_dir_all(root).ok();
     }
 

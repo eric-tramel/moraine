@@ -8,4 +8,5 @@ description = "Shared Moraine configuration schema and loaders"
 anyhow = "1.0"
 glob = "0.3"
 serde = { version = "1.0", features = ["derive"] }
+sha2 = "0.10"
 toml = "0.8"

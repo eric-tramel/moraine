@@ -158,6 +158,10 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             return (response.status, response.body);
         }
 
+        if query.starts_with("INSERT INTO `moraine`.`file_attention_project_roots`") {
+            return (StatusCode::OK, String::new());
+        }
+
         // --project-only origin-scope gate: the point lookup issued by
         // `session_in_scope`. Sessions whose ID contains "out-of-scope" are
         // outside the scope; everything else is inside it. Only the
@@ -192,6 +196,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
         if query.contains("FROM `moraine`.`tool_io` FINAL")
             && query.contains("repo_rel_path = 'crates/foo.rs'")
             && query.contains("project_id = 'project-a'")
+            && !query.contains("JSONExtractString(input_json")
         {
             return (
                 StatusCode::OK,
@@ -246,16 +251,16 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                         "event_uid": "evt-legacy",
                         "tool_call_id": "call-legacy",
                         "harness": "codex",
-                        "tool_name": "bash",
+                        "tool_name": "read",
                         "tool_phase": "request",
-                        "matched_path": "",
-                        "match_kind": "shell_path",
-                        "worktree_root": "",
+                        "matched_path": "crates/foo.rs",
+                        "match_kind": "path_suffix",
+                        "worktree_root": "/legacy",
                         "cwd": "/legacy",
                         "event_unix_ms": 1769940000000_i64,
                         "event_order": 10_u64,
                         "turn_seq": 1_u32,
-                        "input_preview": "{\"command\":\"rg crates/foo.rs\"}",
+                        "input_preview": "{\"path\":\"crates/foo.rs\"}",
                         "output_preview": ""
                     }
                 ])),
