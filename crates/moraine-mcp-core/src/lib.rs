@@ -555,7 +555,7 @@ where
 async fn serve_connection_with_shutdown<R, W, S>(
     state: Arc<AppState>,
     reader: R,
-    mut writer: W,
+    writer: W,
     first_line: Option<Vec<u8>>,
     shutdown: S,
 ) -> Result<()>
@@ -564,11 +564,29 @@ where
     W: AsyncWrite + Unpin,
     S: Future<Output = ()>,
 {
+    serve_connection_with_lifecycle(state, reader, writer, first_line, shutdown, pending()).await
+}
+
+async fn serve_connection_with_lifecycle<R, W, S, D>(
+    state: Arc<AppState>,
+    reader: R,
+    mut writer: W,
+    first_line: Option<Vec<u8>>,
+    shutdown: S,
+    peer_disconnected: D,
+) -> Result<()>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+    S: Future<Output = ()>,
+    D: Future<Output = ()>,
+{
     let mut requests = JoinSet::new();
     let mut active = HashMap::new();
     let mut shutdown_requested = false;
     let mut connection_error = None;
     tokio::pin!(shutdown);
+    tokio::pin!(peer_disconnected);
 
     if let Some(first_line) = first_line {
         let first_line =
@@ -631,12 +649,14 @@ where
     // EOF only closes the request half of a stream. A client may continue
     // reading responses after it has sent every frame, so admitted work keeps
     // its normal lifecycle and every completed response is serialized before
-    // this connection closes. Service shutdown and write failures still move
-    // directly to cancellation below.
+    // this connection closes. Socket transports separately report a full peer
+    // hangup, while service shutdown and write failures move directly to
+    // cancellation below.
     if !shutdown_requested && connection_error.is_none() {
         while !requests.is_empty() {
             let completed = tokio::select! {
                 _ = &mut shutdown => break,
+                _ = &mut peer_disconnected => break,
                 completed = requests.join_next() => completed,
             };
             if let Some(response) = finish_request(&state, completed, &mut active).await {
@@ -1252,10 +1272,32 @@ fn rename_socket_noreplace(_from: &std::path::Path, _to: &std::path::Path) -> st
 }
 
 #[cfg(unix)]
+fn socket_peer_hung_up(fd: std::os::fd::RawFd) -> bool {
+    let mut descriptor = libc::pollfd {
+        fd,
+        events: libc::POLLHUP,
+        revents: 0,
+    };
+    // SAFETY: `descriptor` points to one initialized pollfd for the duration
+    // of this non-blocking call. The owning socket halves outlive the monitor.
+    let ready = unsafe { libc::poll(&mut descriptor, 1, 0) };
+    ready > 0 && descriptor.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+}
+
+#[cfg(unix)]
+async fn wait_for_socket_hangup(fd: std::os::fd::RawFd) {
+    while !socket_peer_hung_up(fd) {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(unix)]
 async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStream) -> Result<()> {
     use private_proxy::ServerFirstLine;
+    use std::os::fd::AsRawFd;
 
     let mut shutdown = state.shutdown.clone();
+    let peer_fd = stream.as_raw_fd();
 
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -1313,7 +1355,7 @@ async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStr
     if negotiated {
         private_proxy::write_ack(&mut write_half).await?;
     }
-    serve_connection_with_shutdown(
+    serve_connection_with_lifecycle(
         app_state,
         reader,
         write_half,
@@ -1323,6 +1365,7 @@ async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStr
                 let _ = shutdown.changed().await;
             }
         },
+        wait_for_socket_hangup(peer_fd),
     )
     .await
 }

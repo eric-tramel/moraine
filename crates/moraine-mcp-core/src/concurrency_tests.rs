@@ -582,27 +582,38 @@ async fn request_cancellation_propagates_unique_clickhouse_query_ids() {
 }
 
 #[tokio::test]
-async fn disconnect_write_failure_cancels_blocked_repository_work() {
-    let repository = Arc::new(BlockingRepository::new(BLOCK_SEARCH));
-    let (reader, mut writer, server) = start_connection(repository.clone());
+async fn full_socket_disconnect_cancels_blocked_repository_work() {
+    use std::os::fd::AsRawFd;
 
-    writer
+    let repository = Arc::new(BlockingRepository::new(BLOCK_SEARCH));
+    let state = AppState::embedded(AppConfig::default(), repository.clone());
+    let (server_stream, client_stream) =
+        tokio::net::UnixStream::pair().expect("create socket pair");
+    let peer_fd = server_stream.as_raw_fd();
+    let (server_read, server_write) = server_stream.into_split();
+    let (client_read, mut client_write) = client_stream.into_split();
+    let server = tokio::spawn(serve_connection_with_lifecycle(
+        state,
+        BufReader::new(server_read),
+        server_write,
+        None,
+        pending(),
+        wait_for_socket_hangup(peer_fd),
+    ));
+
+    client_write
         .write_all(search_request(1).as_bytes())
         .await
         .expect("send blocked request");
     repository.wait_for_started(1).await;
-    drop(reader);
-    writer
-        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"probe\",\"method\":\"ping\"}\n")
-        .await
-        .expect("send response probe after closing read half");
-    drop(writer);
+    drop(client_read);
+    drop(client_write);
 
     tokio::time::timeout(std::time::Duration::from_secs(1), server)
         .await
         .expect("disconnect cleanup deadline")
         .expect("connection task joined")
-        .expect_err("closed response half must fail the connection");
+        .expect("connection succeeded");
     repository.wait_for_dropped(1).await;
     repository.wait_for_cancelled(1).await;
     assert!(repository.cancelled_queries.lock().await[0].starts_with("moraine-search-sessions-"));
