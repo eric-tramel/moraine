@@ -561,6 +561,23 @@ async fn get_mcp_session_includes_turn_summaries_and_latest_completion() {
         .as_ref()
         .is_some_and(|event| event.event_unix_ms > 0));
 
+    let listed_turns = repo
+        .list_turns(
+            "sess-open",
+            TurnListFilter::default(),
+            PageRequest::default(),
+        )
+        .await
+        .expect("turn list projection succeeds");
+    assert_eq!(listed_turns.items.len(), 2);
+
+    let opened_turn = repo
+        .get_turn("sess-incomplete", 2)
+        .await
+        .expect("turn detail projection succeeds")
+        .expect("turn detail exists");
+    assert_eq!(opened_turn.summary.turn_seq, 2);
+
     let queries = state.queries.lock().expect("queries lock").clone();
     assert!(queries.iter().any(|query| {
         query.contains("FROM `moraine`.`v_conversation_trace`")
@@ -568,11 +585,18 @@ async fn get_mcp_session_includes_turn_summaries_and_latest_completion() {
             && query.contains("ORDER BY event_order ASC, event_uid ASC")
             && query.contains("toInt64(toUnixTimestamp64Milli(event_time)) AS event_unix_ms")
     }));
-    assert!(queries.iter().any(|query| {
-        query.contains("toInt64(toUnixTimestamp64Milli(started_at)) AS started_at_unix_ms")
-            && query.contains("toInt64(toUnixTimestamp64Milli(ended_at)) AS ended_at_unix_ms")
-            && !query.contains("parseDateTime64BestEffort")
-    }));
+    let turn_summary_queries = queries
+        .iter()
+        .filter(|query| query.contains("FROM `moraine`.`v_turn_summary`"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        turn_summary_queries.len(),
+        3,
+        "expected session-open, turn-list, and turn-detail projections"
+    );
+    for query in turn_summary_queries {
+        assert_string_backed_turn_timestamp_projection(query);
+    }
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn get_mcp_turn_returns_compact_events_and_incomplete_state() {

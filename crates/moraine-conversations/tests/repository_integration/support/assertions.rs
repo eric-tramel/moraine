@@ -20,6 +20,27 @@ pub(crate) fn assert_script_consumed(state: &MockState, expected_requests: usize
     );
 }
 
+pub(crate) fn assert_string_backed_turn_timestamp_projection(sql: &str) {
+    for (column, alias) in [
+        ("started_at", "started_at_unix_ms"),
+        ("ended_at", "ended_at_unix_ms"),
+    ] {
+        let expected = format!(
+            "toInt64(toUnixTimestamp64Milli(parseDateTime64BestEffort(toString({column}), 3, 'UTC'))) AS {alias}"
+        );
+        assert!(
+            sql.contains(&expected),
+            "missing timezone-explicit String timestamp projection {expected:?} in query: {sql}"
+        );
+
+        let illegal_direct = format!("toInt64(toUnixTimestamp64Milli({column})) AS {alias}");
+        assert!(
+            !sql.contains(&illegal_direct),
+            "String-backed timestamp uses an illegal direct DateTime64 conversion: {sql}"
+        );
+    }
+}
+
 /// Regression helper for issue #253: ClickHouse 25.12's new analyzer treats
 /// `any(column) AS column` as a nested aggregate because the inner `column`
 /// binds to the alias expression. Returns true if the SQL contains that

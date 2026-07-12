@@ -3,7 +3,8 @@ use moraine_clickhouse::ClickHouseClient;
 use moraine_config::{AppConfig, ClickHouseConfig, DEFAULT_BACKEND_NAME};
 use moraine_conversations::{
     AnalyticsRange, BackendRepositoryRouter, ClickHouseConversationRepository,
-    ConversationRepository, RepoConfig, SessionAnalyticsQuery, SessionLookback,
+    ConversationRepository, PageRequest, RepoConfig, SessionAnalyticsQuery, SessionLookback,
+    TurnListFilter,
 };
 use reqwest::{Client, Url};
 use serde::Deserialize;
@@ -285,33 +286,34 @@ async fn install_schema_fixture(
         r#"INSERT INTO `{database}`.`events`
 (
   ingested_at, event_uid, session_id, session_date, source_name, harness, source_file,
-  source_ref, event_ts, event_kind, actor_kind, payload_type, op_kind, request_id,
+  source_ref, record_ts, event_ts, event_kind, actor_kind, payload_type, op_kind, request_id,
   trace_id, turn_index, model, input_tokens, output_tokens, text_content, payload_json,
   event_version
 )
 VALUES
 (
   addMonths(now64(3), -1), 'issue454-dedup', 'issue454-dedup-session', today(),
-  'fixture', 'codex', 'fixture-dedup', 'fixture-old', now64(3), 'message',
-  'assistant', 'text', '', 'issue454-request', 'issue454-trace', 1, 'old-model',
-  11, 0, 'old', '{{}}', 1
+  'fixture', 'codex', 'fixture-dedup', 'fixture-old', '2026-01-02T03:04:04.500Z',
+  now64(3), 'message', 'assistant', 'text', '', 'issue454-request', 'issue454-trace',
+  1, 'old-model', 11, 0, 'old', '{{}}', 1
 ),
 (
   now64(3), 'issue454-dedup', 'issue454-dedup-session', today(), 'fixture', 'codex',
-  'fixture-dedup', 'fixture-new', now64(3), 'message', 'assistant', 'text', '',
-  'issue454-request', 'issue454-trace', 1, 'new-model', 13, 0, 'new', '{{}}', 2
+  'fixture-dedup', 'fixture-new', '2026-01-02T03:04:05.678Z', now64(3), 'message',
+  'assistant', 'text', '', 'issue454-request', 'issue454-trace', 1, 'new-model',
+  13, 0, 'new', '{{}}', 2
 ),
 (
   now64(3), 'issue454-web-a', 'issue454-web-session', today(), 'fixture', 'codex',
-  'fixture-web', 'issue454-web-a', now64(3), 'tool_call', 'assistant',
-  'web_search_call', 'search', '', 'issue454-trace', 1, '', 0, 0, '',
-  '{{"action":{{"query":"a"}}}}', 1
+  'fixture-web', 'issue454-web-a', '2026-01-02T03:05:00.000Z', now64(3),
+  'tool_call', 'assistant', 'web_search_call', 'search', '', 'issue454-trace', 1,
+  '', 0, 0, '', '{{"action":{{"query":"a"}}}}', 1
 ),
 (
   now64(3), 'issue454-web-z', 'issue454-web-session', today(), 'fixture', 'codex',
-  'fixture-web', 'issue454-web-z', now64(3), 'tool_call', 'assistant',
-  'web_search_call', 'search', '', 'issue454-trace', 1, '', 0, 0, '',
-  '{{"action":{{"query":"z"}}}}', 1
+  'fixture-web', 'issue454-web-z', '2026-01-02T03:05:00.000Z', now64(3),
+  'tool_call', 'assistant', 'web_search_call', 'search', '', 'issue454-trace', 1,
+  '', 0, 0, '', '{{"action":{{"query":"z"}}}}', 1
 )"#
     );
     clickhouse
@@ -376,6 +378,29 @@ async fn live_schema_semantics_and_teardown() -> Result<()> {
         install_schema_fixture(&clickhouse, &database).await?;
 
         #[derive(Deserialize)]
+        struct TurnTimestampTypeRow {
+            started_at_type: String,
+            ended_at_type: String,
+        }
+        let turn_timestamp_types: Vec<TurnTimestampTypeRow> = clickhouse
+            .query_rows(
+                &format!(
+                    "SELECT toTypeName(started_at) AS started_at_type, \
+                     toTypeName(ended_at) AS ended_at_type \
+                     FROM `{}`.`v_turn_summary` \
+                     WHERE session_id = 'issue454-dedup-session' \
+                     FORMAT JSONEachRow",
+                    database.as_str()
+                ),
+                Some(database.as_str()),
+            )
+            .await
+            .context("turn summary timestamp type query failed")?;
+        assert_eq!(turn_timestamp_types.len(), 1);
+        assert_eq!(turn_timestamp_types[0].started_at_type, "String");
+        assert_eq!(turn_timestamp_types[0].ended_at_type, "String");
+
+        #[derive(Deserialize)]
         struct ModelRow {
             model: String,
         }
@@ -435,12 +460,46 @@ async fn live_schema_semantics_and_teardown() -> Result<()> {
             .context("deduped fixture session missing")?;
         assert_eq!(deduped.summary.total_events, 1);
         assert_eq!(deduped.models, vec!["new-model"]);
+        const FIXTURE_EVENT_UNIX_MS: i64 = 1_767_323_045_678;
+        assert_eq!(deduped.summary.first_event_unix_ms, FIXTURE_EVENT_UNIX_MS);
+        assert_eq!(deduped.summary.last_event_unix_ms, FIXTURE_EVENT_UNIX_MS);
+
+        let listed_turns = populated_repository
+            .list_turns(
+                "issue454-dedup-session",
+                TurnListFilter::default(),
+                PageRequest::default(),
+            )
+            .await
+            .context("String-backed turn list projection failed")?;
+        assert_eq!(listed_turns.items.len(), 1);
+        assert_eq!(
+            listed_turns.items[0].started_at_unix_ms,
+            FIXTURE_EVENT_UNIX_MS
+        );
+        assert_eq!(
+            listed_turns.items[0].ended_at_unix_ms,
+            FIXTURE_EVENT_UNIX_MS
+        );
+
+        let mcp_session = populated_repository
+            .get_mcp_session("issue454-dedup-session")
+            .await
+            .context("String-backed MCP session projection failed")?
+            .context("MCP fixture session missing")?;
+        assert_eq!(mcp_session.turns.len(), 1);
+        assert_eq!(
+            mcp_session.turns[0].metadata.started_at_unix_ms,
+            FIXTURE_EVENT_UNIX_MS
+        );
         let turn = populated_repository
             .get_turn("issue454-dedup-session", 1)
             .await
             .context("view-only turn read failed")?
             .context("view-only fixture turn missing")?;
         assert_eq!(turn.summary.total_events, 1);
+        assert_eq!(turn.summary.started_at_unix_ms, FIXTURE_EVENT_UNIX_MS);
+        assert_eq!(turn.summary.ended_at_unix_ms, FIXTURE_EVENT_UNIX_MS);
         assert_eq!(turn.events.len(), 1);
         assert_eq!(turn.events[0].text_content, "new");
         let web = populated_repository
