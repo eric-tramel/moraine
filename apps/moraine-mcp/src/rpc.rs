@@ -137,8 +137,23 @@ fn backend_router(
     )?))
 }
 
+fn prefer_logical_pwd(cwd: PathBuf, pwd: Option<&std::ffi::OsStr>) -> PathBuf {
+    let Some(pwd) = pwd.map(PathBuf::from).filter(|pwd| pwd.is_absolute()) else {
+        return cwd;
+    };
+    match (cwd.canonicalize(), pwd.canonicalize()) {
+        (Ok(canonical_cwd), Ok(canonical_pwd)) if canonical_cwd == canonical_pwd => pwd,
+        _ => cwd,
+    }
+}
+
+fn launch_dir_for_route() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    Some(prefer_logical_pwd(cwd, std::env::var_os("PWD").as_deref()))
+}
+
 async fn run_stdio_entry(cfg: AppConfig, session_scope: Option<SessionOriginScope>) -> Result<()> {
-    let cwd = std::env::current_dir()
+    let cwd = launch_dir_for_route()
         .map(|dir| dir.to_string_lossy().into_owned())
         .unwrap_or_default();
 
@@ -349,6 +364,29 @@ mod tests {
             "/tmp/moraine-mcp-{}-{stamp}.sock",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn route_prefers_same_directory_logical_pwd() {
+        let base = temp_path("logical-route");
+        let physical = base.join("physical");
+        let logical = base.join("logical");
+        std::fs::create_dir_all(physical.join("nested")).expect("create physical route directory");
+        std::os::unix::fs::symlink(&physical, &logical).expect("create logical route alias");
+
+        let logical_nested = logical.join("nested");
+        assert_eq!(
+            prefer_logical_pwd(physical.join("nested"), Some(logical_nested.as_os_str())),
+            logical_nested
+        );
+        assert_eq!(
+            prefer_logical_pwd(
+                physical.join("nested"),
+                Some(base.join("missing").as_os_str())
+            ),
+            physical.join("nested")
+        );
+        std::fs::remove_dir_all(base).ok();
     }
 
     #[test]
