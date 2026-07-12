@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, OnceLock,
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ahash::AHashMap as HashMap;
@@ -18,14 +21,37 @@ use uuid::Uuid;
 const REPOSITORY_READ_SETTINGS: [(&str, &str); 1] =
     [("do_not_merge_across_partitions_select_final", "0")];
 
-tokio::task_local! {
-    static ACTIVE_MCP_QUERY_ID: String;
+#[derive(Clone)]
+struct ActiveMcpQueryId {
+    base: Arc<str>,
+    sequence: Arc<AtomicU64>,
 }
+
+impl ActiveMcpQueryId {
+    fn new(base: String) -> Self {
+        Self {
+            base: base.into(),
+            sequence: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn next(&self) -> String {
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        format!("{}-{sequence}", self.base)
+    }
+}
+
+tokio::task_local! {
+    static ACTIVE_MCP_QUERY_ID: ActiveMcpQueryId;
+}
+
 pub async fn with_repository_query_id<F>(query_id: String, future: F) -> F::Output
 where
     F: Future,
 {
-    ACTIVE_MCP_QUERY_ID.scope(query_id, future).await
+    ACTIVE_MCP_QUERY_ID
+        .scope(ActiveMcpQueryId::new(query_id), future)
+        .await
 }
 
 use crate::cursor::{
@@ -122,7 +148,7 @@ impl ClickHouseConversationRepository {
         query: &str,
         database: Option<&str>,
     ) -> AnyResult<Vec<T>> {
-        if let Ok(query_id) = ACTIVE_MCP_QUERY_ID.try_with(Clone::clone) {
+        if let Ok(query_id) = ACTIVE_MCP_QUERY_ID.try_with(ActiveMcpQueryId::next) {
             let params = [("query_id", query_id.as_str()), REPOSITORY_READ_SETTINGS[0]];
             self.ch
                 .query_rows_with_params(query, database, &params)
@@ -140,7 +166,7 @@ impl ClickHouseConversationRepository {
         database: Option<&str>,
         params: &[(&str, &str)],
     ) -> AnyResult<Vec<T>> {
-        let query_id = ACTIVE_MCP_QUERY_ID.try_with(Clone::clone).ok();
+        let query_id = ACTIVE_MCP_QUERY_ID.try_with(ActiveMcpQueryId::next).ok();
         let has_query_id = params.iter().any(|(name, _)| *name == "query_id");
         let mut request_params = Vec::with_capacity(
             params.len() + REPOSITORY_READ_SETTINGS.len() + usize::from(!has_query_id),

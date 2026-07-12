@@ -28,7 +28,12 @@ use tokio::sync::{oneshot, watch, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
-const MAX_IN_FLIGHT_REQUESTS: usize = 8;
+// The widest retrieval stage runs three independent ClickHouse reads.
+// Eight admitted requests therefore cap MCP-owned backend reads at 24 while
+// retaining that per-request fan-out.
+const MAX_REPOSITORY_READ_FAN_OUT: usize = 3;
+const MAX_IN_FLIGHT_BACKEND_READS: usize = 24;
+const MAX_IN_FLIGHT_REQUESTS: usize = MAX_IN_FLIGHT_BACKEND_READS / MAX_REPOSITORY_READ_FAN_OUT;
 const QUERY_CANCELLATION_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1_000);
 const SERVICE_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(1_250);
 
@@ -833,20 +838,24 @@ async fn cancel_registered_query(state: &AppState, slot: &QueryCancellationSlot)
     let Some(query_id) = query_id else {
         return;
     };
+    cancel_query_with_deadline(state, &query_id).await;
+}
+
+pub(crate) async fn cancel_query_with_deadline(state: &AppState, query_id: &str) {
     match tokio::time::timeout(
         QUERY_CANCELLATION_DEADLINE,
-        state.repo.cancel_query(&query_id),
+        state.repo.cancel_query(query_id),
     )
     .await
     {
         Ok(Ok(())) => {}
         Ok(Err(error)) => warn!(
-            query_id = %query_id,
+            query_id,
             error = %error,
             "failed to cancel abandoned MCP ClickHouse query"
         ),
         Err(_) => warn!(
-            query_id = %query_id,
+            query_id,
             "timed out cancelling abandoned MCP ClickHouse query"
         ),
     }

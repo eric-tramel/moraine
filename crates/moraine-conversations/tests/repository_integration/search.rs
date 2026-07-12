@@ -546,9 +546,22 @@ async fn search_mcp_events_attaches_cancellation_token_to_clickhouse_reads() {
     assert_eq!(result.query_id, cancellation_token);
     let query_ids = state.query_ids.lock().expect("query id lock").clone();
     assert!(!query_ids.is_empty());
-    assert!(query_ids
+    let child_prefix = format!("{cancellation_token}-");
+    let observed = query_ids
         .iter()
-        .all(|query_id| query_id.as_deref() == Some(cancellation_token)));
+        .map(|query_id| query_id.as_deref().expect("query id"))
+        .collect::<Vec<_>>();
+    assert!(observed
+        .iter()
+        .all(|query_id| query_id.starts_with(&child_prefix)));
+    assert_eq!(
+        observed
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        observed.len()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -575,9 +588,22 @@ async fn repository_query_context_attaches_id_without_query_model_token() {
 
     let query_ids = state.query_ids.lock().expect("query id lock").clone();
     assert!(!query_ids.is_empty());
-    assert!(query_ids
+    let child_prefix = format!("{query_id}-");
+    let observed = query_ids
         .iter()
-        .all(|observed| observed.as_deref() == Some(query_id)));
+        .map(|observed| observed.as_deref().expect("query id"))
+        .collect::<Vec<_>>();
+    assert!(observed
+        .iter()
+        .all(|observed| observed.starts_with(&child_prefix)));
+    assert_eq!(
+        observed
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        observed.len()
+    );
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn search_mcp_events_does_not_serialize_independent_enrichment_queries() {

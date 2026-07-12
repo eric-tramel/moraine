@@ -127,9 +127,7 @@ impl ConversationRepository for ClickHouseConversationRepository {
         query: SearchMcpEventsQuery,
     ) -> RepoResult<SearchMcpEventsResult> {
         if let Some(query_id) = query.cancellation_token.clone() {
-            ACTIVE_MCP_QUERY_ID
-                .scope(query_id, self.search_mcp_events_impl(query))
-                .await
+            with_repository_query_id(query_id, self.search_mcp_events_impl(query)).await
         } else {
             self.search_mcp_events_impl(query).await
         }

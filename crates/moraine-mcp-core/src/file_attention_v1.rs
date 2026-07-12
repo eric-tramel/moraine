@@ -10,8 +10,8 @@
 //! it never reinvents inspection.
 
 use super::{
-    backend_query_id, handled_tool_error_result, internal_id_error, repo_error_to_contract_error,
-    tool_success_result, AppState, QueryCancellationGuard,
+    backend_query_id, cancel_query_with_deadline, handled_tool_error_result, internal_id_error,
+    repo_error_to_contract_error, tool_success_result, AppState, QueryCancellationGuard,
 };
 use crate::contract::{
     format_rfc3339_utc_millis, CanonicalFileAttentionArgs, ContractError, FileAttentionArgs,
@@ -138,13 +138,7 @@ impl AppState {
                 );
             }
             Err(_) => {
-                if let Err(error) = self.repo.cancel_query(&query_id).await {
-                    warn!(
-                        query_id = %query_id,
-                        error = %error,
-                        "file_attention: failed to cancel timed-out ClickHouse query"
-                    );
-                }
+                cancel_query_with_deadline(self, &query_id).await;
                 cancellation.disarm();
                 return encode_error(
                     canonical_request,
