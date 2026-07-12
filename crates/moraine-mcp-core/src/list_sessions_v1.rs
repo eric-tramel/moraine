@@ -1,4 +1,7 @@
-use super::{internal_id_error, repo_error_to_contract_error, tool_ok_hybrid, AppState};
+use super::{
+    handled_tool_error_result, internal_id_error, repo_error_to_contract_error,
+    tool_success_result, AppState,
+};
 use crate::contract::{
     format_rfc3339_utc_millis, CanonicalListSessionsArgs, ContractError, ListSessionsArgs,
     ListSessionsMode, ListSessionsSort, McpSessionId, Performance, ToolEnvelope, ToolErrorCode,
@@ -90,7 +93,10 @@ impl AppState {
             performance,
         ))
         .context("failed to encode list_sessions response envelope")?;
-        Ok(tool_ok_hybrid(format_list_sessions_text(&payload), payload))
+        Ok(tool_success_result(
+            format_list_sessions_text(&payload),
+            payload,
+        ))
     }
 }
 
@@ -225,23 +231,10 @@ fn encode_list_sessions_error(
         performance,
     ))
     .context("failed to encode list_sessions error envelope")?;
-    Ok(tool_error_hybrid(
+    Ok(handled_tool_error_result(
         format_list_sessions_error_text(&payload),
         payload,
     ))
-}
-
-fn tool_error_hybrid(text: String, payload: Value) -> Value {
-    json!({
-        "content": [
-            {
-                "type": "text",
-                "text": text
-            }
-        ],
-        "structuredContent": payload,
-        "isError": false
-    })
 }
 
 fn format_list_sessions_text(payload: &Value) -> String {
@@ -326,6 +319,29 @@ mod tests {
         ConversationMode, InMemoryConversationRepository, InMemoryConversationResponses, RepoConfig,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn deadline_envelope_is_a_handled_tool_error() {
+        let result = encode_list_sessions_error(
+            json!({}),
+            ContractError::new(
+                ToolErrorCode::DeadlineExceeded,
+                "list_sessions exceeded its response deadline",
+            ),
+            Performance::builder(LIST_SESSIONS_DEFAULT_SLA_TARGET_MS).finish(),
+        )
+        .expect("deadline response");
+
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["structuredContent"]["schema_version"],
+            crate::contract::ERROR_SCHEMA_VERSION
+        );
+        assert_eq!(
+            result["structuredContent"]["error"]["code"],
+            "deadline_exceeded"
+        );
+    }
 
     #[test]
     fn parses_and_canonicalizes_list_sessions_args() {

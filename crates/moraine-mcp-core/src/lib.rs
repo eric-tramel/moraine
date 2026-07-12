@@ -108,7 +108,7 @@ impl AppState {
                     Ok(params) => {
                         let tool_result = match self.call_tool(params).await {
                             Ok(value) => value,
-                            Err(err) => tool_error_result(err.to_string()),
+                            Err(err) => unstructured_tool_error_result(err.to_string()),
                         };
                         Some(rpc_ok(msg_id, tool_result))
                     }
@@ -392,7 +392,15 @@ fn rpc_err(id: Value, code: i64, message: &str) -> Value {
     })
 }
 
-fn tool_ok_hybrid(text: String, payload: Value) -> Value {
+pub(crate) fn tool_success_result(text: String, payload: Value) -> Value {
+    structured_tool_result(text, payload, false)
+}
+
+pub(crate) fn handled_tool_error_result(text: String, payload: Value) -> Value {
+    structured_tool_result(text, payload, true)
+}
+
+fn structured_tool_result(text: String, payload: Value, is_error: bool) -> Value {
     json!({
         "content": [
             {
@@ -401,11 +409,11 @@ fn tool_ok_hybrid(text: String, payload: Value) -> Value {
             }
         ],
         "structuredContent": payload,
-        "isError": false
+        "isError": is_error
     })
 }
 
-fn tool_error_result(message: String) -> Value {
+fn unstructured_tool_error_result(message: String) -> Value {
     json!({
         "content": [
             {
@@ -1038,7 +1046,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use moraine_conversations::{InMemoryConversationRepository, RepoConfig};
+    use moraine_conversations::{
+        ConversationMode, InMemoryConversationRepository, InMemoryConversationResponses,
+        McpSessionOpen, RepoConfig, RepoError, SessionMetadata,
+    };
 
     fn repository_with_scope(
         session_scope: Option<SessionOriginScope>,
@@ -1051,6 +1062,105 @@ mod tests {
 
     fn test_state() -> Arc<AppState> {
         AppState::embedded(AppConfig::default(), repository_with_scope(None))
+    }
+
+    fn successful_test_state() -> Arc<AppState> {
+        let session = McpSessionOpen {
+            metadata: SessionMetadata {
+                session_id: "session-success".to_string(),
+                first_event_time: "2026-07-11 12:00:00.000".to_string(),
+                first_event_unix_ms: 1_783_771_200_000,
+                last_event_time: "2026-07-11 12:00:00.000".to_string(),
+                last_event_unix_ms: 1_783_771_200_000,
+                total_turns: 0,
+                total_events: 0,
+                user_messages: 0,
+                assistant_messages: 0,
+                tool_calls: 0,
+                tool_results: 0,
+                mode: ConversationMode::Chat,
+                first_event_uid: "event-first".to_string(),
+                last_event_uid: "event-last".to_string(),
+                last_actor_role: "assistant".to_string(),
+            },
+            title: Some("Successful retrieval".to_string()),
+            source: Some("test".to_string()),
+            harness: None,
+            inference_provider: None,
+            session_slug: None,
+            session_summary: None,
+            turns: Vec::new(),
+            completed: false,
+            terminal_event_uid: None,
+        };
+        let repository = Arc::new(InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            InMemoryConversationResponses {
+                get_mcp_session: Some(Ok(Some(session))),
+                ..InMemoryConversationResponses::default()
+            },
+        ));
+        AppState::embedded(AppConfig::default(), repository)
+    }
+
+    fn repository_error_test_state() -> Arc<AppState> {
+        let repository = Arc::new(InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            InMemoryConversationResponses {
+                get_mcp_session: Some(Err(RepoError::internal("open failed"))),
+                list_mcp_sessions: Some(Err(RepoError::backend("list failed"))),
+                search_mcp_events: Some(Err(RepoError::internal("search failed"))),
+                file_attention: Some(Err(RepoError::backend("attention failed"))),
+                ..InMemoryConversationResponses::default()
+            },
+        ));
+        AppState::embedded(AppConfig::default(), repository)
+    }
+
+    async fn call_tool_rpc(state: &AppState, id: u64, tool: &str, arguments: Value) -> Value {
+        state
+            .handle_request(RpcRequest {
+                id: Some(json!(id)),
+                method: "tools/call".to_string(),
+                params: json!({
+                    "name": tool,
+                    "arguments": arguments,
+                }),
+            })
+            .await
+            .expect("tools/call response")
+    }
+
+    fn assert_successful_tool_exchange(response: &Value, tool: &str) {
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert!(
+            response.get("error").is_none(),
+            "handled tool success must use a JSON-RPC result: {response}"
+        );
+        assert_eq!(response["result"]["isError"], false);
+        assert_ne!(
+            response["result"]["structuredContent"]["schema_version"],
+            contract::ERROR_SCHEMA_VERSION
+        );
+        assert_eq!(response["result"]["structuredContent"]["tool"], tool);
+    }
+
+    fn assert_handled_tool_error_exchange(response: &Value, tool: &str, code: &str) {
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert!(
+            response.get("error").is_none(),
+            "handled tool failure must remain a successful JSON-RPC exchange: {response}"
+        );
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(
+            response["result"]["structuredContent"]["schema_version"],
+            contract::ERROR_SCHEMA_VERSION
+        );
+        assert_eq!(response["result"]["structuredContent"]["tool"], tool);
+        assert_eq!(
+            response["result"]["structuredContent"]["error"]["code"],
+            code
+        );
     }
 
     #[tokio::test]
@@ -1224,6 +1334,119 @@ mod tests {
                 "next_cursor"
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn every_retrieval_tool_marks_success_results_as_non_errors() {
+        let state = successful_test_state();
+        let open_id = contract::McpSessionId::from_raw_session_id("session-success")
+            .expect("valid session id")
+            .to_string();
+        let cases = [
+            (
+                contract::SEARCH_SESSIONS_TOOL,
+                json!({ "query": "nothing" }),
+            ),
+            (
+                contract::LIST_SESSIONS_TOOL,
+                json!({
+                    "start_datetime": "2026-07-11T00:00:00Z",
+                    "end_datetime": "2026-07-12T00:00:00Z"
+                }),
+            ),
+            (contract::OPEN_TOOL, json!({ "id": open_id })),
+            (
+                contract::FILE_ATTENTION_TOOL,
+                json!({ "path": "crates/moraine-mcp-core/src/lib.rs" }),
+            ),
+        ];
+
+        for (index, (tool, arguments)) in cases.into_iter().enumerate() {
+            let response = call_tool_rpc(&state, index as u64 + 1, tool, arguments).await;
+            assert_successful_tool_exchange(&response, tool);
+        }
+    }
+
+    #[tokio::test]
+    async fn every_retrieval_tool_marks_invalid_requests_as_handled_errors() {
+        let state = test_state();
+        let cases = [
+            (
+                contract::SEARCH_SESSIONS_TOOL,
+                json!({ "n_hits": 1 }),
+                "invalid_request",
+            ),
+            (
+                contract::LIST_SESSIONS_TOOL,
+                json!({
+                    "start_datetime": "2026-07-12T00:00:00Z",
+                    "end_datetime": "2026-07-11T00:00:00Z"
+                }),
+                "invalid_request",
+            ),
+            (
+                contract::OPEN_TOOL,
+                json!({ "id": "session:not-valid-base64" }),
+                "invalid_id",
+            ),
+            (contract::FILE_ATTENTION_TOOL, json!({}), "invalid_request"),
+        ];
+
+        for (index, (tool, arguments, code)) in cases.into_iter().enumerate() {
+            let response = call_tool_rpc(&state, index as u64 + 1, tool, arguments).await;
+            assert_handled_tool_error_exchange(&response, tool, code);
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_search_and_open_not_found_are_handled_tool_errors() {
+        let state = test_state();
+        let missing_id = contract::McpSessionId::from_raw_session_id("missing-session")
+            .expect("valid session id")
+            .to_string();
+
+        let open = call_tool_rpc(&state, 1, contract::OPEN_TOOL, json!({ "id": missing_id })).await;
+        assert_handled_tool_error_exchange(&open, contract::OPEN_TOOL, "not_found");
+
+        let search = call_tool_rpc(
+            &state,
+            2,
+            contract::SEARCH_SESSIONS_TOOL,
+            json!({ "query": "nothing", "within_id": missing_id }),
+        )
+        .await;
+        assert_handled_tool_error_exchange(&search, contract::SEARCH_SESSIONS_TOOL, "not_found");
+    }
+
+    #[tokio::test]
+    async fn every_retrieval_tool_marks_repository_failures_as_handled_errors() {
+        let state = repository_error_test_state();
+        let open_id = contract::McpSessionId::from_raw_session_id("session-error")
+            .expect("valid session id")
+            .to_string();
+        let cases = [
+            (
+                contract::SEARCH_SESSIONS_TOOL,
+                json!({ "query": "nothing" }),
+            ),
+            (
+                contract::LIST_SESSIONS_TOOL,
+                json!({
+                    "start_datetime": "2026-07-11T00:00:00Z",
+                    "end_datetime": "2026-07-12T00:00:00Z"
+                }),
+            ),
+            (contract::OPEN_TOOL, json!({ "id": open_id })),
+            (
+                contract::FILE_ATTENTION_TOOL,
+                json!({ "path": "crates/moraine-mcp-core/src/lib.rs" }),
+            ),
+        ];
+
+        for (index, (tool, arguments)) in cases.into_iter().enumerate() {
+            let response = call_tool_rpc(&state, index as u64 + 1, tool, arguments).await;
+            assert_handled_tool_error_exchange(&response, tool, "internal_error");
+        }
     }
 
     #[tokio::test]
