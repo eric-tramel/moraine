@@ -216,12 +216,21 @@ async fn list_mcp_sessions_uses_overlap_filter_and_cursor_pagination() {
 
     assert!(list_query.contains("toUnixTimestamp64Milli(s.last_event_time) >= 1767261600000"));
     assert!(list_query.contains("toUnixTimestamp64Milli(s.first_event_time) < 1767500000000"));
-    assert!(list_query.contains("ifNull(m.mode, 'chat') = 'web_search'"));
-    assert!(list_query.contains("ORDER BY s.last_event_time DESC, s.session_id DESC"));
+    assert!(list_query.contains("ifNull(r.mode, 'chat') = 'web_search'"));
+    assert!(list_query.contains("ORDER BY w.last_event_unix_ms DESC, w.session_id DESC"));
     assert!(list_query.contains("payload_type IN ('task_complete', 'turn_aborted')"));
     // Blank session_id rows are filtered at the source so they never consume a
     // LIMIT slot or anchor the keyset cursor (#386).
     assert!(list_query.contains("notEmpty(trimBoth(s.session_id))"));
+    assert!(list_query.contains("window_sessions AS ("));
+    assert!(list_query.contains("candidate_sessions AS ("));
+    assert_eq!(
+        list_query
+            .matches("session_id IN (SELECT session_id FROM window_sessions)")
+            .count(),
+        1,
+        "all event-backed fields must share one window-bounded aggregate"
+    );
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn list_mcp_sessions_rejects_cursor_filter_mismatch() {
@@ -295,6 +304,12 @@ async fn list_mcp_sessions_applies_session_origin_scope() {
     assert!(list_query.contains("WHERE cwd != ''"));
     assert!(list_query.contains("origin_cwd = '/work/project'"));
     assert!(list_query.contains("startsWith(origin_cwd, '/work/project/')"));
+    let window_sessions = list_query
+        .split_once("event_rollups AS (")
+        .map(|(window, _)| window)
+        .expect("list query must define event rollups after the session window");
+    assert!(window_sessions.contains("ORDER BY s.last_event_time DESC, s.session_id DESC"));
+    assert!(window_sessions.contains("LIMIT 6"));
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn list_mcp_sessions_rejects_cursor_from_differently_scoped_server() {
@@ -593,6 +608,120 @@ async fn get_mcp_session_includes_turn_summaries_and_latest_completion() {
     for query in turn_summary_queries {
         assert_typed_turn_timestamp_projection(query);
     }
+    assert!(queries.iter().any(|query| {
+        query.contains("FROM `moraine`.`v_session_summary` AS s")
+            && query.contains("AS inference_provider")
+            && query.contains("AS session_summary")
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_mcp_session_does_not_serialize_independent_clickhouse_queries() {
+    let reached = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let header = ScriptedResponse::rows(
+        &[
+            "FROM `moraine`.`v_session_summary` AS s",
+            "AS session_summary",
+        ],
+        json!([{
+            "session_id": "sess-parallel",
+            "first_event_time": "2026-02-01 10:00:00",
+            "first_event_unix_ms": 1769940000000_i64,
+            "last_event_time": "2026-02-01 10:00:01",
+            "last_event_unix_ms": 1769940001000_i64,
+            "total_turns": 1_u32,
+            "total_events": 1_u64,
+            "user_messages": 1_u64,
+            "assistant_messages": 0_u64,
+            "tool_calls": 0_u64,
+            "tool_results": 0_u64,
+            "mode": "chat",
+            "first_event_uid": "evt-parallel",
+            "last_event_uid": "evt-parallel",
+            "last_actor_role": "user",
+            "title": "",
+            "source": "fixture",
+            "harness": "codex",
+            "inference_provider": "openai",
+            "session_slug": "",
+            "session_summary": ""
+        }]),
+    )
+    .blocked(reached.clone(), release.clone());
+    let events = ScriptedResponse::rows(
+        &["ORDER BY event_order ASC, event_uid ASC"],
+        json!([trace_event_row(
+            "sess-parallel",
+            "evt-parallel",
+            1,
+            1,
+            "user",
+            "message",
+            "message",
+            "parallel lookup",
+            "{}",
+            "",
+            "",
+        )]),
+    );
+    let turns = ScriptedResponse::rows(
+        &["FROM `moraine`.`v_turn_summary`"],
+        json!([turn_summary_row("sess-parallel", 1, 1, 1, 0, 0, 0, 0,)]),
+    );
+    let (repo, state) = build_unordered_scripted_repo(vec![header, events, turns]).await;
+    let repo = Arc::new(repo);
+    let open = {
+        let repo = Arc::clone(&repo);
+        tokio::spawn(async move { repo.get_mcp_session("sess-parallel").await })
+    };
+
+    tokio::time::timeout(Duration::from_secs(2), reached.notified())
+        .await
+        .expect("header query reached the wire barrier");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if state.queries.lock().expect("queries lock").len() >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a second query reached ClickHouse while the header query was blocked");
+
+    release.notify_one();
+    let session = open
+        .await
+        .expect("open task joins")
+        .expect("parallel session queries succeed")
+        .expect("session exists");
+    assert_eq!(session.metadata.session_id, "sess-parallel");
+    assert_eq!(state.queries.lock().expect("queries lock").len(), 3);
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn get_mcp_session_missing_header_ignores_concurrent_sibling_failures() {
+    let header = ScriptedResponse::rows(
+        &[
+            "FROM `moraine`.`v_session_summary` AS s",
+            "AS session_summary",
+        ],
+        json!([]),
+    );
+    let events = ScriptedResponse::failure(
+        &["ORDER BY event_order ASC, event_uid ASC"],
+        "events unavailable",
+    );
+    let turns =
+        ScriptedResponse::failure(&["FROM `moraine`.`v_turn_summary`"], "turns unavailable");
+    let (repo, state) = build_unordered_scripted_repo(vec![header, events, turns]).await;
+
+    let session = repo
+        .get_mcp_session("sess-missing-parallel")
+        .await
+        .expect("missing authoritative header takes precedence over sibling failures");
+    assert!(session.is_none());
+    assert_eq!(state.queries.lock().expect("queries lock").len(), 3);
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn get_mcp_turn_returns_compact_events_and_incomplete_state() {
@@ -647,7 +776,7 @@ async fn get_mcp_turn_returns_compact_events_and_incomplete_state() {
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn get_mcp_event_returns_full_content_and_navigation_refs() {
-    let (repo, _state) = build_repo().await;
+    let (repo, state) = build_repo().await;
 
     let event = repo
         .get_mcp_event("evt-open-full")
@@ -685,6 +814,13 @@ async fn get_mcp_event_returns_full_content_and_navigation_refs() {
     );
     assert!(event.previous_turn.is_none());
     assert_eq!(event.next_turn.as_ref().map(|turn| turn.turn_seq), Some(2));
+
+    let queries = state.queries.lock().expect("queries lock").clone();
+    assert_eq!(
+        queries.len(),
+        4,
+        "event open should issue one identity query plus three parallel parent queries"
+    );
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn list_session_events_supports_forward_cursor_pagination() {

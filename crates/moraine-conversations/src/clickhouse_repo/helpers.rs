@@ -5,11 +5,12 @@ pub(super) const MCP_INTERNAL_TOOL_NAMES_SQL: &str =
 
 impl ClickHouseConversationRepository {
     pub(super) fn mode_subquery(&self) -> String {
-        let events_source = canonical_events_source(&self.table_ref("events"));
+        self.mode_subquery_for_sessions(None)
+    }
+
+    pub(super) fn mode_aggregate_sql() -> String {
         format!(
-            "SELECT
-  session_id,
-  multiIf(
+            "multiIf(
     countIf(
       payload_type = 'web_search_call'
       OR payload_type = 'search_results_received'
@@ -21,9 +22,22 @@ impl ClickHouseConversationRepository {
     countIf(event_kind IN ('tool_call', 'tool_result') OR payload_type = 'tool_use') > 0,
     'tool_calling',
     'chat'
-  ) AS mode
+  )"
+        )
+    }
+
+    pub(super) fn mode_subquery_for_sessions(&self, session_ids_sql: Option<&str>) -> String {
+        let events_source = canonical_events_source(&self.table_ref("events"));
+        let mode_aggregate = Self::mode_aggregate_sql();
+        let session_filter = session_ids_sql
+            .map(|session_ids_sql| format!("WHERE session_id IN ({session_ids_sql})\n"))
+            .unwrap_or_default();
+        format!(
+            "SELECT
+  session_id,
+  {mode_aggregate} AS mode
 FROM {events_source}
-GROUP BY session_id"
+{session_filter}GROUP BY session_id"
         )
     }
 

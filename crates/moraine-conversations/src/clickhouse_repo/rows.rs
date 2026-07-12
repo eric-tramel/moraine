@@ -42,6 +42,14 @@ pub(super) struct SessionMetadataRow {
     pub(super) last_actor_role: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub(super) struct McpSessionHeaderRow {
+    #[serde(flatten)]
+    pub(super) metadata: SessionMetadataRow,
+    #[serde(flatten)]
+    pub(super) info: McpSessionInfoRow,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct McpSessionListRow {
     pub(super) session_id: String,

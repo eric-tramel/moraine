@@ -70,8 +70,10 @@ FORMAT JSONEachRow",
         session_id: &str,
     ) -> RepoResult<Option<SessionMetadata>> {
         let session_summary = self.table_ref("v_session_summary");
-        let mode_subquery = self.mode_subquery();
         let trace_table = self.table_ref("v_conversation_trace");
+        let session_id_sql = sql_quote(session_id);
+        let single_session_sql = format!("SELECT {session_id_sql}");
+        let mode_subquery = self.mode_subquery_for_sessions(Some(&single_session_sql));
         let query = format!(
             "SELECT
   s.session_id AS session_id,
@@ -107,7 +109,7 @@ FORMAT JSONEachRow",
             session_summary = session_summary,
             mode_subquery = mode_subquery,
             trace_table = trace_table,
-            session_id_sql = sql_quote(session_id),
+            session_id_sql = session_id_sql,
         );
 
         let rows: Vec<SessionMetadataRow> =
@@ -115,41 +117,86 @@ FORMAT JSONEachRow",
         Ok(rows.into_iter().next().map(Self::map_session_metadata_row))
     }
 
-    pub(super) async fn load_mcp_session_info(
+    pub(super) async fn load_mcp_session_header(
         &self,
         session_id: &str,
-    ) -> RepoResult<McpSessionInfoRow> {
+    ) -> RepoResult<Option<(SessionMetadata, McpSessionInfoRow)>> {
+        let session_summary = self.table_ref("v_session_summary");
+        let trace_table = self.table_ref("v_conversation_trace");
         let events_source = canonical_events_source(&self.table_ref("events"));
+        let session_id_sql = sql_quote(session_id);
+        let mode_aggregate = Self::mode_aggregate_sql();
         let query = format!(
             "SELECT
-  ifNull(
-    argMaxIf(nullIf(JSONExtractString(payload_json, 'title'), ''), tuple(event_ts, event_uid), event_kind = 'session_meta'),
-    ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'name'), ''), tuple(event_ts, event_uid), event_kind = 'session_meta'), '')
-  ) AS title,
-  ifNull(
-    argMaxIf(nullIf(JSONExtractString(payload_json, 'source'), ''), tuple(event_ts, event_uid), event_kind = 'session_meta'),
-    ifNull(argMax(nullIf(source_name, ''), tuple(event_ts, event_uid)), '')
-  ) AS source,
-  ifNull(argMax(nullIf(harness, ''), tuple(event_ts, event_uid)), '') AS harness,
-  ifNull(argMax(nullIf(inference_provider, ''), tuple(event_ts, event_uid)), '') AS inference_provider,
-  ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'slug'), ''), tuple(event_ts, event_uid), event_kind = 'session_meta'), '') AS session_slug,
-  ifNull(
-    argMaxIf(nullIf(JSONExtractString(payload_json, 'summary'), ''), tuple(event_ts, event_uid), event_kind = 'session_meta'),
+  s.session_id AS session_id,
+  toString(s.first_event_time) AS first_event_time,
+  toInt64(toUnixTimestamp64Milli(s.first_event_time)) AS first_event_unix_ms,
+  toString(s.last_event_time) AS last_event_time,
+  toInt64(toUnixTimestamp64Milli(s.last_event_time)) AS last_event_unix_ms,
+  toUInt32(s.total_turns) AS total_turns,
+  toUInt64(s.total_events) AS total_events,
+  toUInt64(s.user_messages) AS user_messages,
+  toUInt64(s.assistant_messages) AS assistant_messages,
+  toUInt64(s.tool_calls) AS tool_calls,
+  toUInt64(s.tool_results) AS tool_results,
+  ifNull(i.mode, 'chat') AS mode,
+  ifNull(e.first_event_uid, '') AS first_event_uid,
+  ifNull(e.last_event_uid, '') AS last_event_uid,
+  ifNull(e.last_actor_role, '') AS last_actor_role,
+  ifNull(i.title, '') AS title,
+  ifNull(i.source, '') AS source,
+  ifNull(i.harness, '') AS harness,
+  ifNull(i.inference_provider, '') AS inference_provider,
+  ifNull(i.session_slug, '') AS session_slug,
+  ifNull(i.session_summary, '') AS session_summary
+FROM {session_summary} AS s
+LEFT JOIN (
+  SELECT
+    session_id,
+    argMin(event_uid, tuple(event_time, event_order, event_uid)) AS first_event_uid,
+    argMax(event_uid, tuple(event_time, event_order, event_uid)) AS last_event_uid,
+    argMax(actor_role, tuple(event_time, event_order, event_uid)) AS last_actor_role
+  FROM {trace_table}
+  WHERE session_id = {session_id_sql}
+  GROUP BY session_id
+) AS e ON e.session_id = s.session_id
+LEFT JOIN (
+  SELECT
+    {mode_aggregate} AS mode,
+    session_id,
     ifNull(
       argMaxIf(nullIf(JSONExtractString(payload_json, 'title'), ''), tuple(event_ts, event_uid), event_kind = 'session_meta'),
       ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'name'), ''), tuple(event_ts, event_uid), event_kind = 'session_meta'), '')
-    )
-  ) AS session_summary
-FROM {events_source}
-WHERE session_id = {}
-GROUP BY session_id
+    ) AS title,
+    ifNull(
+      argMaxIf(nullIf(JSONExtractString(payload_json, 'source'), ''), tuple(event_ts, event_uid), event_kind = 'session_meta'),
+      ifNull(argMax(nullIf(source_name, ''), tuple(event_ts, event_uid)), '')
+    ) AS source,
+    ifNull(argMax(nullIf(harness, ''), tuple(event_ts, event_uid)), '') AS harness,
+    ifNull(argMax(nullIf(inference_provider, ''), tuple(event_ts, event_uid)), '') AS inference_provider,
+    ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'slug'), ''), tuple(event_ts, event_uid), event_kind = 'session_meta'), '') AS session_slug,
+    ifNull(
+      argMaxIf(nullIf(JSONExtractString(payload_json, 'summary'), ''), tuple(event_ts, event_uid), event_kind = 'session_meta'),
+      ifNull(
+        argMaxIf(nullIf(JSONExtractString(payload_json, 'title'), ''), tuple(event_ts, event_uid), event_kind = 'session_meta'),
+        ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'name'), ''), tuple(event_ts, event_uid), event_kind = 'session_meta'), '')
+      )
+    ) AS session_summary
+  FROM {events_source}
+  WHERE session_id = {session_id_sql}
+  GROUP BY session_id
+) AS i ON i.session_id = s.session_id
+WHERE s.session_id = {session_id_sql}
 LIMIT 1
-FORMAT JSONEachRow",
-            sql_quote(session_id),
+FORMAT JSONEachRow"
         );
 
-        let rows: Vec<McpSessionInfoRow> = self.map_backend(self.query_rows(&query, None).await)?;
-        Ok(rows.into_iter().next().unwrap_or_default())
+        let rows: Vec<McpSessionHeaderRow> =
+            self.map_backend(self.query_rows(&query, None).await)?;
+        Ok(rows
+            .into_iter()
+            .next()
+            .map(|row| (Self::map_session_metadata_row(row.metadata), row.info)))
     }
 
     pub(super) async fn load_turn_summary(
@@ -578,12 +625,21 @@ FORMAT JSONEachRow",
             return Ok(None);
         }
 
-        let Some(metadata) = self.load_session_metadata(session_id).await? else {
+        let load_started = Instant::now();
+        let (header, events, turn_summaries) = tokio::join!(
+            self.load_mcp_session_header(session_id),
+            self.load_mcp_session_events(session_id, None, None),
+            self.load_turns_for_session(session_id),
+        );
+        tracing::debug!(
+            elapsed_ms = load_started.elapsed().as_millis() as u64,
+            "mcp_open_session_load"
+        );
+        let Some((metadata, session_info)) = header? else {
             return Ok(None);
         };
-        let events = self.load_mcp_session_events(session_id, None, None).await?;
-        let session_info = self.load_mcp_session_info(session_id).await?;
-        let turn_summaries = self.load_turns_for_session(session_id).await?;
+        let events = events?;
+        let turn_summaries = turn_summaries?;
         let mut events_by_turn = BTreeMap::<u32, Vec<TraceEvent>>::new();
         for event in events {
             events_by_turn
@@ -646,7 +702,16 @@ FORMAT JSONEachRow",
             return Ok(None);
         }
 
-        let turn_summaries = self.load_turns_for_session(session_id).await?;
+        let load_started = Instant::now();
+        let (turn_summaries, events) = tokio::join!(
+            self.load_turns_for_session(session_id),
+            self.load_mcp_session_events(session_id, Some(turn_seq), None),
+        );
+        tracing::debug!(
+            elapsed_ms = load_started.elapsed().as_millis() as u64,
+            "mcp_open_turn_load"
+        );
+        let turn_summaries = turn_summaries?;
         let Some(summary) = turn_summaries
             .iter()
             .find(|summary| summary.turn_seq == turn_seq)
@@ -654,6 +719,7 @@ FORMAT JSONEachRow",
         else {
             return Ok(None);
         };
+        let events = events?;
         let previous_turn = turn_summaries
             .iter()
             .rev()
@@ -663,9 +729,6 @@ FORMAT JSONEachRow",
             .iter()
             .find(|summary| summary.turn_seq > turn_seq)
             .map(Self::mcp_turn_ref_from_summary);
-        let events = self
-            .load_mcp_session_events(session_id, Some(turn_seq), None)
-            .await?;
 
         Ok(Some(self.mcp_turn_open(
             summary,
@@ -897,19 +960,26 @@ FORMAT JSONEachRow",
             return Ok(None);
         }
 
-        let events = self
-            .load_mcp_session_events(&session_id, None, Some(event_uid))
-            .await?;
+        let load_started = Instant::now();
+        let (events, header, turn_summaries) = tokio::join!(
+            self.load_mcp_session_events(&session_id, None, Some(event_uid)),
+            self.load_mcp_session_header(&session_id),
+            self.load_turns_for_session(&session_id),
+        );
+        tracing::debug!(
+            elapsed_ms = load_started.elapsed().as_millis() as u64,
+            "mcp_open_event_load"
+        );
+        let events = events?;
         let Some(target_index) = events.iter().position(|event| event.event_uid == event_uid)
         else {
             return Ok(None);
         };
         let event = events[target_index].clone();
-        let Some(parent_session) = self.load_session_metadata(&session_id).await? else {
+        let Some((parent_session, parent_session_info)) = header? else {
             return Ok(None);
         };
-        let parent_session_info = self.load_mcp_session_info(&session_id).await?;
-        let turn_summaries = self.load_turns_for_session(&session_id).await?;
+        let turn_summaries = turn_summaries?;
         let Some(parent_turn) = turn_summaries
             .iter()
             .find(|summary| summary.turn_seq == event.turn_seq)

@@ -22,6 +22,13 @@ pub(crate) struct ScriptedBarrier {
 }
 
 #[derive(Clone)]
+pub(crate) struct QueryBarrier {
+    pub(crate) required: Vec<&'static str>,
+    pub(crate) reached: Arc<Notify>,
+    pub(crate) release: Arc<Notify>,
+}
+
+#[derive(Clone)]
 pub(crate) struct ScriptedResponse {
     pub(crate) required: Vec<&'static str>,
     pub(crate) forbidden: Vec<&'static str>,
@@ -76,6 +83,8 @@ impl ScriptedResponse {
 pub(crate) struct MockOptions {
     pub(crate) omit_second_snippet_row: bool,
     pub(crate) scripted_responses: Vec<ScriptedResponse>,
+    pub(crate) unordered_scripted_responses: bool,
+    pub(crate) query_barrier: Option<QueryBarrier>,
 }
 
 #[derive(Default)]
@@ -117,12 +126,41 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             .expect("query lock")
             .push(query.clone());
 
+        if let Some(barrier) = state.options.query_barrier.clone() {
+            if barrier
+                .required
+                .iter()
+                .all(|required| query.contains(*required))
+            {
+                barrier.reached.notify_one();
+                barrier.release.notified().await;
+            }
+        }
+
         let scripted_response = {
             let mut scripted = state
                 .scripted_responses
                 .lock()
                 .expect("scripted response lock");
-            scripted.as_mut().map(|responses| responses.pop_front())
+            scripted.as_mut().map(|responses| {
+                if state.options.unordered_scripted_responses {
+                    responses
+                        .iter()
+                        .position(|response| {
+                            response
+                                .required
+                                .iter()
+                                .all(|required| query.contains(*required))
+                                && response
+                                    .forbidden
+                                    .iter()
+                                    .all(|forbidden| !query.contains(*forbidden))
+                        })
+                        .and_then(|position| responses.remove(position))
+                } else {
+                    responses.pop_front()
+                }
+            })
         };
         if let Some(scripted_response) = scripted_response {
             let Some(response) = scripted_response else {
@@ -476,7 +514,13 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                             "mode": "tool_calling",
                             "first_event_uid": "evt-open-1",
                             "last_event_uid": "evt-open-8",
-                            "last_actor_role": "system"
+                            "last_actor_role": "system",
+                            "title": "Open model session",
+                            "source": "codex-source",
+                            "harness": "codex",
+                            "inference_provider": "openai",
+                            "session_slug": "open-model-session",
+                            "session_summary": "Session summary from metadata"
                         }
                     ])),
                 );
@@ -1808,6 +1852,20 @@ pub(crate) async fn build_scripted_repo(
         100,
         MockOptions {
             scripted_responses,
+            ..MockOptions::default()
+        },
+    )
+    .await
+}
+
+pub(crate) async fn build_unordered_scripted_repo(
+    scripted_responses: Vec<ScriptedResponse>,
+) -> (ClickHouseConversationRepository, Arc<MockState>) {
+    build_repo_with_options(
+        100,
+        MockOptions {
+            scripted_responses,
+            unordered_scripted_responses: true,
             ..MockOptions::default()
         },
     )
