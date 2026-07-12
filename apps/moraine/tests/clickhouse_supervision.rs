@@ -101,18 +101,27 @@ fn wait_for_file(path: &Path, timeout: Duration) -> String {
     }
 }
 
-fn wait_for_log(path: &Path, needle: &str, timeout: Duration) {
+fn wait_for_retained_log(path: &Path, needle: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
-        if fs::read_to_string(path)
-            .map(|contents| contents.contains(needle))
-            .unwrap_or(false)
-        {
+        let found = (0..=3).any(|generation| {
+            let retained_path = if generation == 0 {
+                path.to_path_buf()
+            } else {
+                let mut name = path.file_name().expect("log file name").to_os_string();
+                name.push(format!(".{generation}"));
+                path.with_file_name(name)
+            };
+            fs::read_to_string(retained_path)
+                .map(|contents| contents.contains(needle))
+                .unwrap_or(false)
+        });
+        if found {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for `{needle}` in {}",
+            "timed out waiting for `{needle}` in retained segments for {}",
             path.display()
         );
         thread::sleep(Duration::from_millis(20));
@@ -186,19 +195,17 @@ fn sigterm_during_backoff_exits_without_replacement() {
         ),
     );
     let config = write_config(&root, unused_port());
-    let supervisor_log_path = root.join("supervisor.stderr");
-    let supervisor_log = fs::File::create(&supervisor_log_path).expect("create supervisor log");
-    let supervisor_log_err = supervisor_log.try_clone().expect("clone supervisor log");
+    let supervisor_log_path = root.join("runtime/logs/clickhouse-supervisor.log");
     let mut supervisor = Command::new(env!("CARGO_BIN_EXE_moraine"))
         .arg("--config")
         .arg(&config)
         .args(["clickhouse", "supervise"])
-        .stdout(Stdio::from(supervisor_log))
-        .stderr(Stdio::from(supervisor_log_err))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .expect("start supervisor");
 
-    wait_for_log(
+    wait_for_retained_log(
         &supervisor_log_path,
         "state=backoff",
         Duration::from_secs(3),
