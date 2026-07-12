@@ -71,8 +71,8 @@ def assert_rpc_ok(response: Dict[str, Any], expected_id: int) -> Dict[str, Any]:
 
 
 def assert_tool_success(result: Dict[str, Any]) -> Dict[str, Any]:
-    if result.get("isError"):
-        raise AssertionError(f"tool call returned isError=true: {result}")
+    if result.get("isError") is not False:
+        raise AssertionError(f"tool call did not return isError=false: {result}")
     return result
 
 
@@ -95,6 +95,48 @@ def call_tool(
         },
     )
     return assert_tool_success(assert_rpc_ok(response, expected_id))
+
+
+def call_tool_expect_handled_error(
+    proc: subprocess.Popen[str],
+    expected_id: int,
+    name: str,
+    arguments: Dict[str, Any],
+    expected_code: str,
+) -> Dict[str, Any]:
+    response = send_request(
+        proc,
+        {
+            "jsonrpc": "2.0",
+            "id": expected_id,
+            "method": "tools/call",
+            "params": {
+                "name": name,
+                "arguments": arguments,
+            },
+        },
+    )
+    result = assert_rpc_ok(response, expected_id)
+    if result.get("isError") is not True:
+        raise AssertionError(f"{name} handled error must return isError=true: {result}")
+    payload = result.get("structuredContent")
+    if not isinstance(payload, dict):
+        raise AssertionError(f"{name} handled error structuredContent missing: {result}")
+    if payload.get("schema_version") != "moraine.mcp.error.v1":
+        raise AssertionError(
+            f"{name} handled error has wrong schema_version: "
+            f"{payload.get('schema_version')}"
+        )
+    if payload.get("tool") != name:
+        raise AssertionError(
+            f"{name} handled error has wrong tool: {payload.get('tool')}"
+        )
+    error = payload.get("error")
+    if not isinstance(error, dict) or error.get("code") != expected_code:
+        raise AssertionError(
+            f"{name} handled error must return {expected_code}, got: {error}"
+        )
+    return payload
 
 
 def assert_structured_content(result: Dict[str, Any], tool_name: str) -> Dict[str, Any]:
@@ -414,18 +456,10 @@ def assert_open_not_found(
 ) -> int:
     open_id = expected_mcp_session_id(raw_session_id)
     assert open_id is not None
-    open_result = call_tool(proc, next_id, "open", {"id": open_id})
-    next_id += 1
-    payload = open_result.get("structuredContent")
-    if not isinstance(payload, dict):
-        raise AssertionError(f"open structuredContent missing: {open_result}")
-    error_code = nested_string(payload, "error", "code")
-    if error_code != "not_found":
-        raise AssertionError(
-            f"open of out-of-scope session {raw_session_id} must return not_found, "
-            f"got: {payload.get('error') or payload.get('data')}"
-        )
-    return next_id
+    call_tool_expect_handled_error(
+        proc, next_id, "open", {"id": open_id}, "not_found"
+    )
+    return next_id + 1
 
 
 def run_smoke(
