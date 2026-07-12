@@ -556,12 +556,22 @@ async fn get_mcp_session_includes_turn_summaries_and_latest_completion() {
             .map(|event| event.event_uid.as_str()),
         Some("evt-open-5")
     );
+    assert!(first_turn
+        .first_event
+        .as_ref()
+        .is_some_and(|event| event.event_unix_ms > 0));
 
     let queries = state.queries.lock().expect("queries lock").clone();
     assert!(queries.iter().any(|query| {
         query.contains("FROM `moraine`.`v_conversation_trace`")
             && query.contains("WHERE session_id = 'sess-open'")
             && query.contains("ORDER BY event_order ASC, event_uid ASC")
+            && query.contains("toInt64(toUnixTimestamp64Milli(event_time)) AS event_unix_ms")
+    }));
+    assert!(queries.iter().any(|query| {
+        query.contains("toInt64(toUnixTimestamp64Milli(started_at)) AS started_at_unix_ms")
+            && query.contains("toInt64(toUnixTimestamp64Milli(ended_at)) AS ended_at_unix_ms")
+            && !query.contains("parseDateTime64BestEffort")
     }));
 }
 #[tokio::test(flavor = "multi_thread")]
@@ -678,6 +688,7 @@ async fn list_session_events_supports_forward_cursor_pagination() {
     assert_eq!(first.items.len(), 2);
     assert_eq!(first.items[0].event_uid, "evt-1");
     assert_eq!(first.items[1].event_uid, "evt-2");
+    assert!(first.items.iter().all(|event| event.event_unix_ms > 0));
     assert!(first.next_cursor.is_some());
 
     let second = repo
@@ -705,6 +716,7 @@ async fn list_session_events_supports_forward_cursor_pagination() {
         .find(|q| q.contains("ORDER BY event_order ASC, event_uid ASC") && q.contains("LIMIT 3"))
         .expect("initial page query should be captured");
     assert!(initial_query.contains("WHERE session_id = 'sess_c'"));
+    assert!(initial_query.contains("toInt64(toUnixTimestamp64Milli(event_time)) AS event_unix_ms"));
 
     let paged_query = queries
         .iter()

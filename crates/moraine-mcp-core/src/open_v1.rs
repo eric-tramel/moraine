@@ -445,7 +445,7 @@ fn open_turn_event_summary(
         "id": id,
         "ordinal": ordinal,
         "type": event.event_type,
-        "timestamp": format_repository_timestamp(&event.event_time),
+        "timestamp": format_unix_ms(event.event_unix_ms),
         "terminal": terminal_event_uid == Some(event.event_uid.as_str()),
         "tool_name": tool_name,
         "model": null,
@@ -498,7 +498,7 @@ fn open_event_data(
             "turn_id": turn_id,
             "ordinal": event.event_ordinal,
             "type": event.event_type,
-            "timestamp": format_repository_timestamp(&trace.event_time),
+            "timestamp": format_unix_ms(trace.event_unix_ms),
             "terminal": terminal,
             "model": model,
             "originating_model": originating_model,
@@ -691,34 +691,6 @@ fn format_unix_ms(unix_ms: i64) -> String {
     crate::contract::format_rfc3339_utc_millis(unix_ms)
 }
 
-fn format_repository_timestamp(timestamp: &str) -> String {
-    let trimmed = timestamp.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    if trimmed.contains('T') && trimmed.ends_with('Z') {
-        return trimmed.to_string();
-    }
-
-    let Some((date, time)) = trimmed.split_once(' ') else {
-        return trimmed.to_string();
-    };
-    let (clock, fraction) = time.split_once('.').unwrap_or((time, ""));
-    if date.len() != 10 || clock.len() != 8 {
-        return trimmed.to_string();
-    }
-    let millis = if fraction.is_empty() {
-        "000".to_string()
-    } else {
-        let mut millis = fraction.chars().take(3).collect::<String>();
-        while millis.len() < 3 {
-            millis.push('0');
-        }
-        millis
-    };
-    format!("{date}T{clock}.{millis}Z")
-}
-
 fn encode_session_id(raw_session_id: &str) -> Result<String> {
     Ok(McpSessionId::from_raw_session_id(raw_session_id)
         .context("invalid repository session id")?
@@ -888,7 +860,8 @@ mod tests {
                 event_uid: "event-tool".to_string(),
                 event_order: 2,
                 turn_seq: 1,
-                event_time: "2026-04-29 12:00:01.123".to_string(),
+                event_time: "2026-04-29 08:00:01.123".to_string(),
+                event_unix_ms: 1_777_464_001_123,
                 actor_role: "assistant".to_string(),
                 event_class: "tool_call".to_string(),
                 payload_type: "tool_call".to_string(),
@@ -1003,6 +976,7 @@ mod tests {
             event_order,
             turn_seq: 1,
             event_time: "2026-04-29 12:00:00".to_string(),
+            event_unix_ms: 1_777_464_000_000,
             event_type: "user_input".to_string(),
         }
     }
@@ -1020,6 +994,7 @@ mod tests {
             event_order: 1,
             turn_seq: 1,
             event_time: "2026-04-29 12:00:00".to_string(),
+            event_unix_ms: 1_777_464_000_000,
             actor_role: actor_role.to_string(),
             event_class: event_type.to_string(),
             payload_type: event_type.to_string(),

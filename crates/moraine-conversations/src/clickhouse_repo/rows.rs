@@ -130,6 +130,7 @@ pub(super) struct TraceEventRow {
     pub(super) event_order: u64,
     pub(super) turn_seq: u32,
     pub(super) event_time: String,
+    pub(super) event_unix_ms: i64,
     pub(super) actor_role: String,
     pub(super) event_class: String,
     pub(super) payload_type: String,
@@ -379,6 +380,8 @@ pub(super) struct SessionTimeBoundsRow {
     pub(super) session_id: String,
     pub(super) first_event_time: String,
     pub(super) last_event_time: String,
+    pub(super) first_event_unix_ms: i64,
+    pub(super) last_event_unix_ms: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -398,6 +401,8 @@ pub(super) struct ConversationCandidateSet {
 pub(super) struct SessionTimeBounds {
     pub(super) first_event_time: String,
     pub(super) last_event_time: String,
+    pub(super) first_event_unix_ms: i64,
+    pub(super) last_event_unix_ms: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -527,6 +532,7 @@ impl ClickHouseConversationRepository {
             event_order: row.event_order,
             turn_seq: row.turn_seq,
             event_time: row.event_time,
+            event_unix_ms: row.event_unix_ms,
             actor_role: row.actor_role,
             event_class: row.event_class,
             payload_type: row.payload_type,

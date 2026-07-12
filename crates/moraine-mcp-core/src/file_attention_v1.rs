@@ -1204,8 +1204,22 @@ mod tests {
     fn build_data_events_granularity_returns_flat_timeline() {
         let tail = resolve_tail("crates/foo/tee.rs");
         let touches = vec![
-            touch("sess-a", "ev-2", "Edit", "path_suffix", "/repo/main", 2_000),
-            touch("sess-a", "ev-1", "Read", "path_suffix", "/repo/main", 1_000),
+            touch(
+                "sess-a",
+                "ev-2",
+                "Edit",
+                "path_suffix",
+                "/repo/main",
+                1_777_464_001_123,
+            ),
+            touch(
+                "sess-a",
+                "ev-1",
+                "Read",
+                "path_suffix",
+                "/repo/main",
+                1_777_464_000_000,
+            ),
         ];
         let mut warnings = Vec::new();
         let data = build_data(
@@ -1222,6 +1236,10 @@ mod tests {
         assert_eq!(data["summary"]["ambiguous"], json!(false));
         assert_eq!(data["summary"]["distinct_roots"], json!(1));
         assert_eq!(events[0]["event"]["tool_name"], json!("Edit"));
+        assert_eq!(
+            events[0]["event"]["timestamp"],
+            json!("2026-04-29T12:00:01.123Z")
+        );
         assert!(events[0]["open"]["event_id"].as_str().is_some());
         assert!(events[0]["open"]["turn_id"].as_str().is_some());
     }
