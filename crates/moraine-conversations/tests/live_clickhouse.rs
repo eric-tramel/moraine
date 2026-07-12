@@ -294,12 +294,12 @@ VALUES
 (
   addMonths(now64(3), -1), 'issue454-dedup', 'issue454-dedup-session', today(),
   'fixture', 'codex', 'fixture-dedup', 'fixture-old', '2026-01-02T03:04:04.500Z',
-  now64(3), 'message', 'assistant', 'text', '', 'issue454-request', 'issue454-trace',
+  toStartOfMinute(now64(3)), 'message', 'assistant', 'text', '', 'issue454-request', 'issue454-trace',
   1, 'old-model', 11, 0, 'old', '{{}}', 1
 ),
 (
   now64(3), 'issue454-dedup', 'issue454-dedup-session', today(), 'fixture', 'codex',
-  'fixture-dedup', 'fixture-new', '2026-01-02T03:04:05.678Z', now64(3), 'message',
+  'fixture-dedup', 'fixture-new', '2026-01-02T03:04:05.678Z', toStartOfMinute(now64(3)), 'message',
   'assistant', 'text', '', 'issue454-request', 'issue454-trace', 1, 'new-model',
   13, 0, 'new', '{{}}', 2
 ),
@@ -397,8 +397,20 @@ async fn live_schema_semantics_and_teardown() -> Result<()> {
             .await
             .context("turn summary timestamp type query failed")?;
         assert_eq!(turn_timestamp_types.len(), 1);
-        assert_eq!(turn_timestamp_types[0].started_at_type, "String");
-        assert_eq!(turn_timestamp_types[0].ended_at_type, "String");
+        assert!(
+            turn_timestamp_types[0]
+                .started_at_type
+                .starts_with("DateTime64(3"),
+            "started_at must remain typed: {}",
+            turn_timestamp_types[0].started_at_type
+        );
+        assert!(
+            turn_timestamp_types[0]
+                .ended_at_type
+                .starts_with("DateTime64(3"),
+            "ended_at must remain typed: {}",
+            turn_timestamp_types[0].ended_at_type
+        );
 
         #[derive(Deserialize)]
         struct ModelRow {
@@ -471,7 +483,7 @@ async fn live_schema_semantics_and_teardown() -> Result<()> {
                 PageRequest::default(),
             )
             .await
-            .context("String-backed turn list projection failed")?;
+            .context("typed turn list projection failed")?;
         assert_eq!(listed_turns.items.len(), 1);
         assert_eq!(
             listed_turns.items[0].started_at_unix_ms,
@@ -485,7 +497,7 @@ async fn live_schema_semantics_and_teardown() -> Result<()> {
         let mcp_session = populated_repository
             .get_mcp_session("issue454-dedup-session")
             .await
-            .context("String-backed MCP session projection failed")?
+            .context("typed MCP session projection failed")?
             .context("MCP fixture session missing")?;
         assert_eq!(mcp_session.turns.len(), 1);
         assert_eq!(

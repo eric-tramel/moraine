@@ -625,12 +625,12 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             );
         }
 
-        if query.contains("FROM `moraine`.`v_session_summary`")
+        if query.contains("FROM `moraine`.`v_session_summary` AS ss")
             && query.contains("WHERE session_id IN")
-            && query.contains("toString(first_event_time) AS first_event_time")
-            && query.contains("toString(last_event_time) AS last_event_time")
-            && query.contains("AS first_event_unix_ms")
-            && query.contains("AS last_event_unix_ms")
+            && query.contains("toString(ss.first_event_time) AS first_event_time")
+            && query.contains("toString(ss.last_event_time) AS last_event_time")
+            && query.contains("toUnixTimestamp64Milli(ss.first_event_time)")
+            && query.contains("toUnixTimestamp64Milli(ss.last_event_time)")
         {
             return (
                 StatusCode::OK,

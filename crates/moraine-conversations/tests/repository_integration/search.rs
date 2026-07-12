@@ -364,7 +364,7 @@ async fn search_conversations_without_time_window_uses_postings_only_fast_path()
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn search_events_includes_session_time_bounds() {
-    let (repo, _state) = build_repo().await;
+    let (repo, state) = build_repo().await;
 
     let result = repo
         .search_events(SearchEventsQuery {
@@ -399,6 +399,24 @@ async fn search_events_includes_session_time_bounds() {
     assert_eq!(result.hits[1].session_id, "sess_a");
     assert_eq!(result.hits[1].first_event_time, "2026-01-01 10:00:00");
     assert_eq!(result.hits[1].last_event_time, "2026-01-01 10:10:00");
+    let queries = state.queries.lock().expect("queries lock");
+    let bounds_query = queries
+        .iter()
+        .find(|query| query.contains("FROM `moraine`.`v_session_summary` AS ss"))
+        .expect("session time bounds query should be captured");
+    assert!(
+        bounds_query.contains(
+            "toInt64(toUnixTimestamp64Milli(ss.first_event_time)) AS first_event_unix_ms"
+        ),
+        "first-event epoch must use the qualified typed source: {bounds_query}"
+    );
+    assert!(
+        bounds_query
+            .contains("toInt64(toUnixTimestamp64Milli(ss.last_event_time)) AS last_event_unix_ms"),
+        "last-event epoch must use the qualified typed source: {bounds_query}"
+    );
+    assert!(!bounds_query.contains("toUnixTimestamp64Milli(first_event_time)"));
+    assert!(!bounds_query.contains("toUnixTimestamp64Milli(last_event_time)"));
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn search_events_documents_subquery_avoids_self_aliased_aggregates() {

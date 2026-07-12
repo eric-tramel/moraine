@@ -556,10 +556,6 @@ async fn get_mcp_session_includes_turn_summaries_and_latest_completion() {
             .map(|event| event.event_uid.as_str()),
         Some("evt-open-5")
     );
-    assert!(first_turn
-        .first_event
-        .as_ref()
-        .is_some_and(|event| event.event_unix_ms > 0));
 
     let listed_turns = repo
         .list_turns(
@@ -580,10 +576,10 @@ async fn get_mcp_session_includes_turn_summaries_and_latest_completion() {
 
     let queries = state.queries.lock().expect("queries lock").clone();
     assert!(queries.iter().any(|query| {
-        query.contains("FROM `moraine`.`v_conversation_trace`")
+        query.contains("FROM `moraine`.`v_conversation_trace` AS tr")
             && query.contains("WHERE session_id = 'sess-open'")
             && query.contains("ORDER BY event_order ASC, event_uid ASC")
-            && query.contains("toInt64(toUnixTimestamp64Milli(event_time)) AS event_unix_ms")
+            && query.contains("toInt64(toUnixTimestamp64Milli(tr.event_time)) AS event_unix_ms")
     }));
     let turn_summary_queries = queries
         .iter()
@@ -595,7 +591,7 @@ async fn get_mcp_session_includes_turn_summaries_and_latest_completion() {
         "expected session-open, turn-list, and turn-detail projections"
     );
     for query in turn_summary_queries {
-        assert_string_backed_turn_timestamp_projection(query);
+        assert_typed_turn_timestamp_projection(query);
     }
 }
 #[tokio::test(flavor = "multi_thread")]
@@ -740,7 +736,9 @@ async fn list_session_events_supports_forward_cursor_pagination() {
         .find(|q| q.contains("ORDER BY event_order ASC, event_uid ASC") && q.contains("LIMIT 3"))
         .expect("initial page query should be captured");
     assert!(initial_query.contains("WHERE session_id = 'sess_c'"));
-    assert!(initial_query.contains("toInt64(toUnixTimestamp64Milli(event_time)) AS event_unix_ms"));
+    assert!(
+        initial_query.contains("toInt64(toUnixTimestamp64Milli(tr.event_time)) AS event_unix_ms")
+    );
 
     let paged_query = queries
         .iter()

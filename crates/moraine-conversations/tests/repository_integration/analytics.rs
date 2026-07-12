@@ -18,9 +18,9 @@ async fn session_analytics_assembles_canonical_views_and_public_steps() {
         .forbidding(&["now() - INTERVAL"]),
         ScriptedResponse::rows(
             &[
-                "FROM `moraine`.`v_turn_summary`",
-                "toInt64(toUnixTimestamp64Milli(parseDateTime64BestEffort(toString(started_at), 3, 'UTC'))) AS started_at_unix_ms",
-                "toInt64(toUnixTimestamp64Milli(parseDateTime64BestEffort(toString(ended_at), 3, 'UTC'))) AS ended_at_unix_ms",
+                "FROM `moraine`.`v_turn_summary` AS ts",
+                "toInt64(toUnixTimestamp64Milli(ts.started_at)) AS started_at_unix_ms",
+                "toInt64(toUnixTimestamp64Milli(ts.ended_at)) AS ended_at_unix_ms",
                 "WHERE session_id IN ['analytics-session']",
                 "ORDER BY session_id ASC, turn_seq ASC",
                 "FORMAT JSONEachRow",
@@ -30,6 +30,7 @@ async fn session_analytics_assembles_canonical_views_and_public_steps() {
         .forbidding(&[
             "toInt64(toUnixTimestamp64Milli(started_at)) AS started_at_unix_ms",
             "toInt64(toUnixTimestamp64Milli(ended_at)) AS ended_at_unix_ms",
+            "parseDateTime64BestEffort",
         ]),
         ScriptedResponse::rows(
             &[

@@ -320,7 +320,6 @@ pub struct McpEventRef {
     pub event_order: u64,
     pub turn_seq: u32,
     pub event_time: String,
-    pub event_unix_ms: i64,
     pub event_type: String,
 }
 

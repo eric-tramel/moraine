@@ -2140,11 +2140,11 @@ FORMAT JSONEachRow",
         let sql = format!(
             "SELECT
   session_id,
-  toString(first_event_time) AS first_event_time,
-  toString(last_event_time) AS last_event_time,
-  toInt64(toUnixTimestamp64Milli(first_event_time)) AS first_event_unix_ms,
-  toInt64(toUnixTimestamp64Milli(last_event_time)) AS last_event_unix_ms
-FROM {session_summary_table}
+  toString(ss.first_event_time) AS first_event_time,
+  toString(ss.last_event_time) AS last_event_time,
+  toInt64(toUnixTimestamp64Milli(ss.first_event_time)) AS first_event_unix_ms,
+  toInt64(toUnixTimestamp64Milli(ss.last_event_time)) AS last_event_unix_ms
+FROM {session_summary_table} AS ss
 WHERE session_id IN {session_ids_sql}
 FORMAT JSONEachRow",
             session_summary_table = session_summary_table,

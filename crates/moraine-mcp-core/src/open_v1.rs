@@ -976,7 +976,6 @@ mod tests {
             event_order,
             turn_seq: 1,
             event_time: "2026-04-29 12:00:00".to_string(),
-            event_unix_ms: 1_777_464_000_000,
             event_type: "user_input".to_string(),
         }
     }

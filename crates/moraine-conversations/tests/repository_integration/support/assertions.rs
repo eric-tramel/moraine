@@ -20,23 +20,25 @@ pub(crate) fn assert_script_consumed(state: &MockState, expected_requests: usize
     );
 }
 
-pub(crate) fn assert_string_backed_turn_timestamp_projection(sql: &str) {
+pub(crate) fn assert_typed_turn_timestamp_projection(sql: &str) {
     for (column, alias) in [
         ("started_at", "started_at_unix_ms"),
         ("ended_at", "ended_at_unix_ms"),
     ] {
-        let expected = format!(
-            "toInt64(toUnixTimestamp64Milli(parseDateTime64BestEffort(toString({column}), 3, 'UTC'))) AS {alias}"
-        );
+        let expected = format!("toInt64(toUnixTimestamp64Milli(ts.{column})) AS {alias}");
         assert!(
             sql.contains(&expected),
-            "missing timezone-explicit String timestamp projection {expected:?} in query: {sql}"
+            "epoch conversion must use the qualified typed source {expected:?}: {sql}"
         );
 
-        let illegal_direct = format!("toInt64(toUnixTimestamp64Milli({column})) AS {alias}");
+        let shadowed = format!("toUnixTimestamp64Milli({column})");
         assert!(
-            !sql.contains(&illegal_direct),
-            "String-backed timestamp uses an illegal direct DateTime64 conversion: {sql}"
+            !sql.contains(&shadowed),
+            "epoch conversion can bind the same-name String projection alias: {sql}"
+        );
+        assert!(
+            !sql.contains("parseDateTime64BestEffort"),
+            "typed timestamps must not round-trip through String parsing: {sql}"
         );
     }
 }
