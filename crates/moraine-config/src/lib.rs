@@ -1431,7 +1431,14 @@ fn project_id_for_common_dir(common_dir: &Path) -> String {
 /// Git common directory. These roots support a safe transition for normalized
 /// rows written before `project_id` became the common-directory digest.
 pub fn worktree_roots_for_repo_root(root: impl AsRef<Path>) -> Option<Vec<String>> {
-    let root = root.as_ref();
+    let pwd = std::env::var_os("PWD").map(PathBuf::from);
+    worktree_roots_for_repo_root_with_pwd(root.as_ref(), pwd.as_deref())
+}
+
+fn worktree_roots_for_repo_root_with_pwd(
+    root: &Path,
+    logical_cwd: Option<&Path>,
+) -> Option<Vec<String>> {
     find_repo_backend_ref(root)?;
     let common_dir = git_common_dir(root)?;
     let mut roots = vec![root.to_path_buf()];
@@ -1456,6 +1463,20 @@ pub fn worktree_roots_for_repo_root(root: impl AsRef<Path>) -> Option<Vec<String
             };
             if let Some(worktree_root) = git_marker.parent() {
                 roots.push(worktree_root.to_path_buf());
+            }
+        }
+    }
+
+    let canonical_root = root.canonicalize().ok();
+    if let (Some(canonical_root), Some(logical_cwd)) = (&canonical_root, logical_cwd) {
+        if let Ok(canonical_cwd) = logical_cwd.canonicalize() {
+            if let Ok(relative_cwd) = canonical_cwd.strip_prefix(canonical_root) {
+                let depth = relative_cwd.components().count();
+                if let Some(logical_root) = logical_cwd.ancestors().nth(depth) {
+                    if logical_root.canonicalize().ok().as_ref() == Some(canonical_root) {
+                        roots.push(logical_root.to_path_buf());
+                    }
+                }
             }
         }
     }
@@ -1579,6 +1600,46 @@ mod tests {
             assert!(roots.contains(&canonical_linked.to_string_lossy().to_string()));
         }
 
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_roots_include_logical_launch_alias() {
+        let base = std::env::temp_dir().join(format!(
+            "moraine-project-root-alias-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after unix epoch")
+                .as_nanos()
+        ));
+        let physical_root = base.join("physical/repo");
+        let logical_root = base.join("logical-repo");
+        std::fs::create_dir_all(physical_root.join(".git")).expect("create physical repository");
+        std::fs::create_dir_all(physical_root.join("nested")).expect("create nested launch dir");
+        std::fs::write(
+            physical_root.join(REPO_BACKEND_FILE),
+            "backend = \"shared\"\n",
+        )
+        .expect("write repo backend marker");
+        std::os::unix::fs::symlink(&physical_root, &logical_root)
+            .expect("create logical repository alias");
+
+        let roots = worktree_roots_for_repo_root_with_pwd(
+            &physical_root,
+            Some(&logical_root.join("nested")),
+        )
+        .expect("registered worktree roots");
+
+        assert!(roots.contains(&logical_root.to_string_lossy().to_string()));
+        assert!(roots.contains(
+            &physical_root
+                .canonicalize()
+                .expect("canonical physical root")
+                .to_string_lossy()
+                .to_string()
+        ));
         std::fs::remove_dir_all(base).ok();
     }
 
