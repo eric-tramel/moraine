@@ -3,12 +3,15 @@ use moraine_clickhouse::ClickHouseClient;
 use moraine_config::AppConfig;
 use reqwest::{Client, Url};
 use sha2::{Digest, Sha256};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command as TokioCommand};
+use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout, Instant};
 
 #[cfg(unix)]
@@ -20,7 +23,8 @@ use std::os::unix::{
 use crate::paths::{ensure_runtime_dirs, RuntimePaths};
 use crate::process::{
     cleanup_legacy_clickhouse_pipe_log, clickhouse_supervisor_log_path, pid_path,
-    remove_pid_if_matches, service_running, write_pid, StartOutcome, StartState,
+    remove_pid_if_matches, service_running, write_pid, RollingLog, RollingLogPolicy, StartOutcome,
+    StartState,
 };
 use crate::render::ClickhouseStatusSnapshot;
 use crate::service::Service;
@@ -573,6 +577,11 @@ const RESTART_DELAYS: [Duration; 5] = [
 const STABILITY_WINDOW: Duration = Duration::from_secs(5 * 60);
 const CHILD_SHUTDOWN_GRACE: Duration = Duration::from_secs(4);
 const SUPERVISOR_SHUTDOWN_GRACE: Duration = Duration::from_secs(8);
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(1);
+const OUTPUT_RECORD_BYTES: usize = 64 * 1024;
+const OUTPUT_FRAGMENT_BYTES: usize = OUTPUT_RECORD_BYTES - 64;
+const OUTPUT_CONTINUATION_MARKER: &[u8] = b" [moraine: output continues]\n";
+const OUTPUT_UNTERMINATED_MARKER: &[u8] = b" [moraine: stream ended without newline]\n";
 
 #[derive(Clone, Copy)]
 struct SupervisorPolicy {
@@ -587,6 +596,234 @@ impl SupervisorPolicy {
             restart_delays: RESTART_DELAYS,
             stability_window: STABILITY_WINDOW,
             child_shutdown_grace: CHILD_SHUTDOWN_GRACE,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SupervisorLog {
+    inner: Arc<Mutex<RollingLog>>,
+}
+
+impl SupervisorLog {
+    fn open(path: PathBuf, policy: RollingLogPolicy) -> Result<Self> {
+        Ok(Self {
+            inner: Arc::new(Mutex::new(RollingLog::open(path, policy)?)),
+        })
+    }
+
+    async fn write_record(&self, bytes: Vec<u8>) -> Result<Vec<u8>> {
+        let inner = Arc::clone(&self.inner);
+        let (bytes, result) = tokio::task::spawn_blocking(move || {
+            let result = inner
+                .lock()
+                .map_err(|_| anyhow!("ClickHouse supervisor log lock is poisoned"))
+                .and_then(|mut log| log.write_all(&bytes));
+            (bytes, result)
+        })
+        .await
+        .context("ClickHouse supervisor log writer task failed")?;
+        result?;
+        Ok(bytes)
+    }
+
+    async fn line(&self, message: impl AsRef<str>) -> Result<()> {
+        let message = message.as_ref();
+        let mut bytes = Vec::with_capacity(message.len() + 1);
+        bytes.extend_from_slice(message.as_bytes());
+        bytes.push(b'\n');
+        self.write_record(bytes).await.map(|_| ())
+    }
+
+    async fn flush(&self) -> Result<()> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            inner
+                .lock()
+                .map_err(|_| anyhow!("ClickHouse supervisor log lock is poisoned"))?
+                .flush()
+        })
+        .await
+        .context("ClickHouse supervisor log flush task failed")?
+    }
+
+    #[cfg(test)]
+    fn writer_count(&self) -> usize {
+        Arc::strong_count(&self.inner)
+    }
+}
+
+struct OutputForwarders {
+    stdout: Option<JoinHandle<Result<()>>>,
+    stderr: Option<JoinHandle<Result<()>>>,
+}
+
+impl OutputForwarders {
+    async fn finish(&mut self) -> Result<bool> {
+        let stdout = self.stdout.take();
+        let stderr = self.stderr.take();
+        let stdout_abort = stdout.as_ref().map(JoinHandle::abort_handle);
+        let stderr_abort = stderr.as_ref().map(JoinHandle::abort_handle);
+        let drain = async move {
+            let (stdout, stderr) = tokio::join!(
+                join_output_forwarder(stdout, "stdout"),
+                join_output_forwarder(stderr, "stderr")
+            );
+            stdout?;
+            stderr?;
+            Ok(())
+        };
+        match timeout(OUTPUT_DRAIN_GRACE, drain).await {
+            Ok(result) => result.map(|()| true),
+            Err(_) => {
+                if let Some(abort) = stdout_abort {
+                    abort.abort();
+                }
+                if let Some(abort) = stderr_abort {
+                    abort.abort();
+                }
+                Ok(false)
+            }
+        }
+    }
+}
+
+async fn finish_output_forwarders(
+    forwarders: &mut OutputForwarders,
+    log: &SupervisorLog,
+) -> Result<()> {
+    if !forwarders.finish().await? {
+        log.line(format!(
+            "clickhouse supervisor: output-drain=aborted timeout_seconds={}",
+            OUTPUT_DRAIN_GRACE.as_secs_f64()
+        ))
+        .await?;
+    }
+    Ok(())
+}
+
+async fn join_output_forwarder(task: Option<JoinHandle<Result<()>>>, stream: &str) -> Result<()> {
+    if let Some(task) = task {
+        task.await
+            .with_context(|| format!("ClickHouse {stream} forwarder task failed"))??;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+impl OutputStream {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
+async fn stop_after_output_forwarder(
+    child: &mut Child,
+    forwarders: &mut OutputForwarders,
+    stream: OutputStream,
+    outcome: std::result::Result<Result<()>, tokio::task::JoinError>,
+    grace: Duration,
+    log: &SupervisorLog,
+) -> Result<GenerationOutcome> {
+    match stream {
+        OutputStream::Stdout => {
+            forwarders.stdout.take();
+        }
+        OutputStream::Stderr => {
+            forwarders.stderr.take();
+        }
+    }
+    let stream_name = stream.name();
+    let failure = match outcome {
+        Ok(Ok(())) => anyhow!("ClickHouse {stream_name} closed while the child was still running"),
+        Ok(Err(err)) => err.context(format!("ClickHouse {stream_name} forwarding failed")),
+        Err(err) => anyhow!(err).context(format!("ClickHouse {stream_name} forwarder task failed")),
+    };
+    let stopped = terminate_and_reap(child, grace, None).await;
+    let drained = finish_output_forwarders(forwarders, log).await;
+    if let Err(err) = stopped {
+        return Err(failure.context(format!(
+            "also failed to stop child after output forwarding failure: {err:#}"
+        )));
+    }
+    if let Err(err) = drained {
+        return Err(failure.context(format!(
+            "also failed to drain remaining child output: {err:#}"
+        )));
+    }
+    Err(failure)
+}
+
+async fn log_while_child_live(
+    child: &mut Child,
+    forwarders: &mut OutputForwarders,
+    grace: Duration,
+    log: &SupervisorLog,
+    message: String,
+) -> Result<()> {
+    let Err(log_err) = log.line(message).await else {
+        return Ok(());
+    };
+    let stopped = terminate_and_reap(child, grace, None).await;
+    let drained = forwarders.finish().await;
+    if let Err(err) = stopped {
+        return Err(log_err.context(format!(
+            "also failed to stop child after supervisor log failure: {err:#}"
+        )));
+    }
+    if let Err(err) = drained {
+        return Err(log_err.context(format!(
+            "also failed to drain child after supervisor log failure: {err:#}"
+        )));
+    }
+    Err(log_err)
+}
+
+async fn forward_clickhouse_output<R>(mut reader: R, log: SupervisorLog) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut input = [0_u8; 8 * 1024];
+    let mut record = Vec::with_capacity(OUTPUT_RECORD_BYTES);
+    loop {
+        let read = reader
+            .read(&mut input)
+            .await
+            .context("failed to read ClickHouse output")?;
+        if read == 0 {
+            if !record.is_empty() {
+                record.extend_from_slice(OUTPUT_UNTERMINATED_MARKER);
+                log.write_record(record).await?;
+            }
+            return Ok(());
+        }
+
+        let mut offset = 0;
+        while offset < read {
+            let available = OUTPUT_FRAGMENT_BYTES - record.len();
+            let input_end = read.min(offset + available);
+            let newline = input[offset..input_end]
+                .iter()
+                .position(|byte| *byte == b'\n');
+            let take = newline.map_or(input_end - offset, |index| index + 1);
+            record.extend_from_slice(&input[offset..offset + take]);
+            offset += take;
+            if newline.is_some() {
+                record = log.write_record(record).await?;
+                record.clear();
+            } else if record.len() == OUTPUT_FRAGMENT_BYTES {
+                record.extend_from_slice(OUTPUT_CONTINUATION_MARKER);
+                record = log.write_record(record).await?;
+                record.clear();
+            }
         }
     }
 }
@@ -680,7 +917,11 @@ async fn send_terminate(pid: u32) -> Result<()> {
     }
 }
 
-async fn terminate_and_reap(child: &mut Child, grace: Duration) -> Result<ExitStatus> {
+async fn terminate_and_reap(
+    child: &mut Child,
+    grace: Duration,
+    log: Option<&SupervisorLog>,
+) -> Result<ExitStatus> {
     if let Some(status) = child.try_wait().context("failed to inspect child status")? {
         return Ok(status);
     }
@@ -694,7 +935,14 @@ async fn terminate_and_reap(child: &mut Child, grace: Duration) -> Result<ExitSt
             {
                 return Ok(status);
             }
-            eprintln!("clickhouse supervisor: {err:#}; forcing child shutdown");
+            if let Some(log) = log {
+                log.line(format!(
+                    "clickhouse supervisor: {err:#}; forcing child shutdown"
+                ))
+                .await?;
+            } else {
+                eprintln!("clickhouse supervisor: {err:#}; forcing child shutdown");
+            }
         }
 
         #[cfg(not(unix))]
@@ -720,7 +968,11 @@ async fn terminate_and_reap(child: &mut Child, grace: Duration) -> Result<ExitSt
     }
 }
 
-fn spawn_clickhouse_generation(server_bin: &Path, config_path: &Path) -> Result<Child> {
+fn spawn_clickhouse_generation(
+    server_bin: &Path,
+    config_path: &Path,
+    log: &SupervisorLog,
+) -> Result<(Child, OutputForwarders)> {
     let mut command = TokioCommand::new(server_bin);
     command
         .arg("--config-file")
@@ -731,10 +983,25 @@ fn spawn_clickhouse_generation(server_bin: &Path, config_path: &Path) -> Result<
         .env("CLICKHOUSE_WATCHDOG_ENABLE", "0")
         .env("CLICKHOUSE_WATCHDOG_RESTART", "0")
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
-    command
+    let mut child = command
         .spawn()
-        .with_context(|| format!("failed to start {}", server_bin.display()))
+        .with_context(|| format!("failed to start {}", server_bin.display()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("ClickHouse stdout pipe was not created"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("ClickHouse stderr pipe was not created"))?;
+    let forwarders = OutputForwarders {
+        stdout: Some(tokio::spawn(forward_clickhouse_output(stdout, log.clone()))),
+        stderr: Some(tokio::spawn(forward_clickhouse_output(stderr, log.clone()))),
+    };
+    Ok((child, forwarders))
 }
 
 async fn run_generation(
@@ -744,56 +1011,103 @@ async fn run_generation(
     generation: u64,
     policy: SupervisorPolicy,
     signals: &mut ShutdownSignals,
+    log: &SupervisorLog,
 ) -> Result<GenerationOutcome> {
-    let mut child = match spawn_clickhouse_generation(server_bin, config_path) {
-        Ok(child) => child,
-        Err(err) => {
-            return Ok(GenerationOutcome::Failed {
-                reason: format!("{err:#}"),
-                ready_uptime: None,
-            });
-        }
-    };
-    let pid = child.id();
-    eprintln!(
-        "clickhouse supervisor: generation={generation} pid={} state=starting",
-        pid.map_or_else(|| "unknown".to_string(), |pid| pid.to_string())
-    );
-
-    let readiness = wait_for_clickhouse(cfg);
-    tokio::pin!(readiness);
-    tokio::select! {
-        biased;
-        _ = signals.recv() => {
-            let status = terminate_and_reap(&mut child, policy.child_shutdown_grace).await?;
-            eprintln!(
-                "clickhouse supervisor: generation={generation} state=stopped reason={}",
-                describe_exit(status)
-            );
-            return Ok(GenerationOutcome::Stopped);
-        }
-        status = child.wait() => {
-            let status = status.context("failed waiting for ClickHouse startup exit")?;
-            return Ok(GenerationOutcome::Failed {
-                reason: format!("exited before readiness ({})", describe_exit(status)),
-                ready_uptime: None,
-            });
-        }
-        ready = &mut readiness => {
-            if let Err(err) = ready {
-                let status = terminate_and_reap(&mut child, policy.child_shutdown_grace).await?;
+    let (mut child, mut forwarders) =
+        match spawn_clickhouse_generation(server_bin, config_path, log) {
+            Ok(generation) => generation,
+            Err(err) => {
                 return Ok(GenerationOutcome::Failed {
-                    reason: format!("readiness failed ({err:#}); stopped child ({})", describe_exit(status)),
+                    reason: format!("{err:#}"),
                     ready_uptime: None,
                 });
             }
+        };
+    let pid = child.id();
+    log_while_child_live(
+        &mut child,
+        &mut forwarders,
+        policy.child_shutdown_grace,
+        log,
+        format!(
+            "clickhouse supervisor: generation={generation} pid={} state=starting",
+            pid.map_or_else(|| "unknown".to_string(), |pid| pid.to_string())
+        ),
+    )
+    .await?;
+
+    let readiness = wait_for_clickhouse(cfg);
+    tokio::pin!(readiness);
+    let startup_outcome = tokio::select! {
+        biased;
+        _ = signals.recv() => {
+            let status =
+                terminate_and_reap(&mut child, policy.child_shutdown_grace, None).await?;
+            let _ = log
+                .line(format!(
+                    "clickhouse supervisor: generation={generation} state=stopped reason={}",
+                    describe_exit(status)
+                ))
+                .await;
+            Some(GenerationOutcome::Stopped)
         }
+        status = child.wait() => {
+            let status = status.context("failed waiting for ClickHouse startup exit")?;
+            Some(GenerationOutcome::Failed {
+                reason: format!("exited before readiness ({})", describe_exit(status)),
+                ready_uptime: None,
+            })
+        }
+        ready = &mut readiness => {
+            match ready {
+                Ok(()) => None,
+                Err(err) => {
+                    let status =
+                        terminate_and_reap(&mut child, policy.child_shutdown_grace, None)
+                            .await?;
+                    Some(GenerationOutcome::Failed {
+                        reason: format!(
+                            "readiness failed ({err:#}); stopped child ({})",
+                            describe_exit(status)
+                        ),
+                        ready_uptime: None,
+                    })
+                }
+            }
+        }
+        stdout = forwarders.stdout.as_mut().expect("stdout forwarder is active") => {
+            return stop_after_output_forwarder(
+                &mut child,
+                &mut forwarders,
+                OutputStream::Stdout,
+                stdout,
+                policy.child_shutdown_grace,
+                log,
+            )
+            .await;
+        }
+        stderr = forwarders.stderr.as_mut().expect("stderr forwarder is active") => {
+            return stop_after_output_forwarder(
+                &mut child,
+                &mut forwarders,
+                OutputStream::Stderr,
+                stderr,
+                policy.child_shutdown_grace,
+                log,
+            )
+            .await;
+        }
+    };
+    if let Some(outcome) = startup_outcome {
+        finish_output_forwarders(&mut forwarders, log).await?;
+        return Ok(outcome);
     }
 
     if let Some(status) = child
         .try_wait()
         .context("failed to inspect ClickHouse after readiness")?
     {
+        finish_output_forwarders(&mut forwarders, log).await?;
         return Ok(GenerationOutcome::Failed {
             reason: format!("exited at readiness boundary ({})", describe_exit(status)),
             ready_uptime: None,
@@ -801,28 +1115,62 @@ async fn run_generation(
     }
 
     let ready_since = Instant::now();
-    eprintln!(
-        "clickhouse supervisor: generation={generation} pid={} state=ready",
-        pid.map_or_else(|| "unknown".to_string(), |pid| pid.to_string())
-    );
-    tokio::select! {
+    log_while_child_live(
+        &mut child,
+        &mut forwarders,
+        policy.child_shutdown_grace,
+        log,
+        format!(
+            "clickhouse supervisor: generation={generation} pid={} state=ready",
+            pid.map_or_else(|| "unknown".to_string(), |pid| pid.to_string())
+        ),
+    )
+    .await?;
+    let outcome = tokio::select! {
         biased;
         _ = signals.recv() => {
-            let status = terminate_and_reap(&mut child, policy.child_shutdown_grace).await?;
-            eprintln!(
-                "clickhouse supervisor: generation={generation} state=stopped reason={}",
-                describe_exit(status)
-            );
-            Ok(GenerationOutcome::Stopped)
+            let status =
+                terminate_and_reap(&mut child, policy.child_shutdown_grace, None).await?;
+            let _ = log
+                .line(format!(
+                    "clickhouse supervisor: generation={generation} state=stopped reason={}",
+                    describe_exit(status)
+                ))
+                .await;
+            GenerationOutcome::Stopped
         }
         status = child.wait() => {
             let status = status.context("failed waiting for ClickHouse exit")?;
-            Ok(GenerationOutcome::Failed {
+            GenerationOutcome::Failed {
                 reason: describe_exit(status),
                 ready_uptime: Some(ready_since.elapsed()),
-            })
+            }
         }
-    }
+        stdout = forwarders.stdout.as_mut().expect("stdout forwarder is active") => {
+            return stop_after_output_forwarder(
+                &mut child,
+                &mut forwarders,
+                OutputStream::Stdout,
+                stdout,
+                policy.child_shutdown_grace,
+                log,
+            )
+            .await;
+        }
+        stderr = forwarders.stderr.as_mut().expect("stderr forwarder is active") => {
+            return stop_after_output_forwarder(
+                &mut child,
+                &mut forwarders,
+                OutputStream::Stderr,
+                stderr,
+                policy.child_shutdown_grace,
+                log,
+            )
+            .await;
+        }
+    };
+    finish_output_forwarders(&mut forwarders, log).await?;
+    Ok(outcome)
 }
 
 fn next_failure_count(
@@ -839,6 +1187,7 @@ async fn supervise_clickhouse(
     server_bin: &Path,
     config_path: &Path,
     policy: SupervisorPolicy,
+    log: &SupervisorLog,
 ) -> Result<ExitCode> {
     let mut signals = ShutdownSignals::install()?;
     let mut consecutive_failures = 0usize;
@@ -849,15 +1198,19 @@ async fn supervise_clickhouse(
             let Some(delay) = policy.restart_delays.get(consecutive_failures - 1).copied() else {
                 unreachable!("restart budget checked after every failed generation");
             };
-            eprintln!(
+            log.line(format!(
                 "clickhouse supervisor: replacement={} delay_seconds={} state=backoff",
                 consecutive_failures,
                 delay.as_secs_f64()
-            );
+            ))
+            .await?;
             tokio::select! {
                 biased;
                 _ = signals.recv() => {
-                    eprintln!("clickhouse supervisor: state=stopped reason=intentional shutdown during backoff");
+                    log.line(
+                        "clickhouse supervisor: state=stopped reason=intentional shutdown during backoff"
+                    )
+                    .await?;
                     return Ok(ExitCode::SUCCESS);
                 }
                 _ = sleep(delay) => {}
@@ -871,6 +1224,7 @@ async fn supervise_clickhouse(
             generation,
             policy,
             &mut signals,
+            log,
         )
         .await?;
         match outcome {
@@ -882,19 +1236,22 @@ async fn supervise_clickhouse(
                 let (next_count, reset) =
                     next_failure_count(consecutive_failures, ready_uptime, policy.stability_window);
                 if reset {
-                    eprintln!(
+                    log.line(format!(
                         "clickhouse supervisor: generation={generation} state=stable-budget-reset"
-                    );
+                    ))
+                    .await?;
                 }
                 consecutive_failures = next_count;
-                eprintln!(
+                log.line(format!(
                     "clickhouse supervisor: generation={generation} state=failed reason={reason}"
-                );
+                ))
+                .await?;
                 if consecutive_failures > policy.restart_delays.len() {
-                    eprintln!(
+                    log.line(format!(
                         "clickhouse supervisor: state=exhausted replacements={} final_reason={reason}",
                         policy.restart_delays.len()
-                    );
+                    ))
+                    .await?;
                     return Ok(ExitCode::from(1));
                 }
                 generation += 1;
@@ -904,7 +1261,7 @@ async fn supervise_clickhouse(
 }
 
 async fn stop_new_supervisor(child: &mut Child, pid_file: &Path, pid: u32) -> Result<()> {
-    terminate_and_reap(child, SUPERVISOR_SHUTDOWN_GRACE).await?;
+    terminate_and_reap(child, SUPERVISOR_SHUTDOWN_GRACE, None).await?;
     remove_pid_if_matches(pid_file, pid);
     Ok(())
 }
@@ -980,14 +1337,13 @@ pub(crate) async fn start_clickhouse(
     resolve_clickhouse_server_command(cfg, paths).await?;
     materialize_clickhouse_config(cfg, paths)?;
 
-    let logfile = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&supervisor_log)
-        .with_context(|| format!("failed to open {}", supervisor_log.display()))?;
-    let logfile_err = logfile
-        .try_clone()
-        .with_context(|| format!("failed to clone {}", supervisor_log.display()))?;
+    // Validate the sink before detaching. The supervisor reopens it as the
+    // sole writer, so neither it nor ClickHouse inherits a rotatable file
+    // descriptor from this short-lived launcher.
+    drop(RollingLog::open(
+        supervisor_log.clone(),
+        RollingLogPolicy::clickhouse_supervisor(),
+    )?);
     let launcher = std::env::current_exe().context("failed to resolve current moraine binary")?;
     let mut supervisor = TokioCommand::new(&launcher)
         .arg("--config")
@@ -995,8 +1351,8 @@ pub(crate) async fn start_clickhouse(
         .arg("clickhouse")
         .arg("supervise")
         .stdin(Stdio::null())
-        .stdout(Stdio::from(logfile))
-        .stderr(Stdio::from(logfile_err))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .with_context(|| {
             format!(
@@ -1061,18 +1417,39 @@ pub(crate) async fn run_supervised_clickhouse(
     paths: &RuntimePaths,
 ) -> Result<ExitCode> {
     ensure_runtime_dirs(paths)?;
-    let server_bin = resolve_clickhouse_server_command(cfg, paths).await?;
-    materialize_clickhouse_config(cfg, paths)?;
-
-    let result = supervise_clickhouse(
-        cfg,
-        &server_bin,
-        &paths.clickhouse_config,
-        SupervisorPolicy::production(),
-    )
+    let log = SupervisorLog::open(
+        clickhouse_supervisor_log_path(paths),
+        RollingLogPolicy::clickhouse_supervisor(),
+    )?;
+    let result = async {
+        let server_bin = resolve_clickhouse_server_command(cfg, paths).await?;
+        materialize_clickhouse_config(cfg, paths)?;
+        supervise_clickhouse(
+            cfg,
+            &server_bin,
+            &paths.clickhouse_config,
+            SupervisorPolicy::production(),
+            &log,
+        )
+        .await
+    }
     .await;
+
+    if let Err(err) = &result {
+        let _ = log
+            .line(format!("clickhouse supervisor: state=fatal reason={err:#}"))
+            .await;
+    }
+    let flush = log.flush().await;
     remove_pid_if_matches(&pid_path(paths, Service::ClickHouse), std::process::id());
-    result
+    match (result, flush) {
+        (Ok(code), Ok(())) => Ok(code),
+        (Ok(_), Err(err)) => Err(err),
+        (Err(err), Ok(())) => Err(err),
+        (Err(err), Err(flush_err)) => Err(err.context(format!(
+            "also failed to flush supervisor log: {flush_err:#}"
+        ))),
+    }
 }
 
 pub(crate) fn managed_clickhouse_version(paths: &RuntimePaths) -> Option<String> {
@@ -1413,6 +1790,17 @@ mod tests {
         }
     }
 
+    fn test_supervisor_log(root: &Path) -> SupervisorLog {
+        SupervisorLog::open(
+            root.join("clickhouse-supervisor.log"),
+            RollingLogPolicy {
+                segment_bytes: 1024,
+                rotations: 2,
+            },
+        )
+        .expect("open test supervisor log")
+    }
+
     #[test]
     fn fake_clickhouse_process() {
         let Ok(mode) = std::env::var("MORAINE_TEST_CLICKHOUSE_MODE") else {
@@ -1429,6 +1817,7 @@ mod tests {
             + 1;
         fs::write(&count_file, format!("{count}\n")).expect("record generation");
         fs::write(&pid_file, format!("{}\n", std::process::id())).expect("record child pid");
+        eprintln!("fake ClickHouse generation={count} mode={mode}");
 
         match mode.as_str() {
             "exit" => thread::sleep(Duration::from_millis(120)),
@@ -1468,7 +1857,7 @@ mod tests {
     }
 
     #[test]
-    fn materialized_config_caps_only_idle_global_threads() {
+    fn materialized_config_applies_managed_runtime_limits() {
         let root = temp_dir("thread-pool-config");
         let cfg = test_config(&root, "http://127.0.0.1:18123".to_string());
         let paths = crate::paths::runtime_paths(&cfg);
@@ -1482,6 +1871,7 @@ mod tests {
                 .count(),
             1
         );
+        assert_eq!(rendered.matches("<console>false</console>").count(), 1);
         assert!(!rendered.contains("<max_thread_pool_size>"));
         let _ = fs::remove_dir_all(root);
     }
@@ -1506,9 +1896,13 @@ mod tests {
         let config_path = root.join("config.xml");
         fs::write(&config_path, "<clickhouse/>").expect("fake config");
 
-        let mut child =
-            spawn_clickhouse_generation(&script, &config_path).expect("spawn fake generation");
+        let log = test_supervisor_log(&root);
+        let (mut child, mut forwarders) = spawn_clickhouse_generation(&script, &config_path, &log)
+            .expect("spawn fake generation");
         let status = child.wait().await.expect("wait fake generation");
+        finish_output_forwarders(&mut forwarders, &log)
+            .await
+            .expect("drain fake output");
 
         assert!(status.success());
         assert_eq!(
@@ -1516,6 +1910,151 @@ mod tests {
             "0|0"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_drain_aborts_reader_when_descendant_keeps_pipe_open() {
+        let root = temp_dir("output-drain-timeout");
+        let script = root.join("pipe-holder");
+        let descendant_pid = root.join("descendant.pid");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsleep 60 &\necho $! > {}\nexit 0\n",
+                shell_quote(&descendant_pid)
+            ),
+        )
+        .expect("write pipe-holder script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
+            .expect("make pipe-holder executable");
+        let config_path = root.join("config.xml");
+        fs::write(&config_path, "<clickhouse/>").expect("fake config");
+        let log = test_supervisor_log(&root);
+        let (mut child, mut forwarders) = spawn_clickhouse_generation(&script, &config_path, &log)
+            .expect("spawn pipe-holder generation");
+        assert!(child.wait().await.expect("wait direct child").success());
+
+        let started = Instant::now();
+        let drained = forwarders.finish().await.expect("bounded drain result");
+        assert!(!drained, "descendant-held pipe unexpectedly drained");
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let descendant = fs::read_to_string(&descendant_pid)
+            .expect("descendant pid")
+            .trim()
+            .to_string();
+        let _ = Command::new("kill").args(["-TERM", &descendant]).status();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while log.writer_count() != 1 {
+            assert!(
+                Instant::now() < deadline,
+                "aborted output tasks retained log handles"
+            );
+            sleep(Duration::from_millis(5)).await;
+        }
+        drop(log);
+        fs::remove_dir_all(root).expect("remove drain test root");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn high_volume_child_output_rotates_while_child_remains_live() {
+        let root = temp_dir("live-output-rotation");
+        let script = root.join("synthetic-clickhouse");
+        let ready = root.join("writer-ready");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 i=0\n\
+                 while [ \"$i\" -lt 10000 ]; do\n\
+                   printf 'stdout-%08d-abcdefghijklmnopqrstuvwxyz\\n' \"$i\"\n\
+                   printf 'stderr-%08d-abcdefghijklmnopqrstuvwxyz\\n' \"$i\" >&2\n\
+                   i=$((i + 1))\n\
+                 done\n\
+                 touch {}\n\
+                 exec sleep 60\n",
+                shell_quote(&ready)
+            ),
+        )
+        .expect("write synthetic writer");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
+            .expect("make synthetic writer executable");
+        let config_path = root.join("config.xml");
+        fs::write(&config_path, "<clickhouse/>").expect("fake config");
+        let log_path = root.join("clickhouse-supervisor.log");
+        let log = test_supervisor_log(&root);
+
+        let (mut child, mut forwarders) = spawn_clickhouse_generation(&script, &config_path, &log)
+            .expect("spawn synthetic writer");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() || !crate::process::RollingLog::rotation_path(&log_path, 2).exists() {
+            assert!(
+                Instant::now() < deadline,
+                "synthetic writer did not fill retained segments"
+            );
+            sleep(Duration::from_millis(5)).await;
+        }
+
+        assert!(
+            child.try_wait().expect("inspect live writer").is_none(),
+            "writer exited before live rotation was observed"
+        );
+        let retained_while_live: u64 = (0..=2)
+            .filter_map(|generation| {
+                let path = if generation == 0 {
+                    log_path.clone()
+                } else {
+                    crate::process::RollingLog::rotation_path(&log_path, generation)
+                };
+                fs::metadata(path).ok()
+            })
+            .map(|metadata| {
+                assert!(metadata.len() <= 1024, "live segment exceeded size cap");
+                metadata.len()
+            })
+            .sum();
+        assert!(retained_while_live <= 3 * 1024);
+        eprintln!(
+            "synthetic child emitted 860000 bytes; live retained bytes={retained_while_live}"
+        );
+
+        terminate_and_reap(&mut child, Duration::from_millis(200), Some(&log))
+            .await
+            .expect("stop synthetic writer");
+        finish_output_forwarders(&mut forwarders, &log)
+            .await
+            .expect("drain synthetic output");
+        assert_eq!(log.writer_count(), 1, "output tasks retained log handles");
+        log.line("shutdown-marker")
+            .await
+            .expect("write shutdown marker");
+        log.flush().await.expect("flush shutdown marker");
+        assert!(fs::read(&log_path)
+            .expect("read current retained log")
+            .ends_with(b"shutdown-marker\n"));
+        let retained = [
+            crate::process::RollingLog::rotation_path(&log_path, 2),
+            crate::process::RollingLog::rotation_path(&log_path, 1),
+            log_path.clone(),
+        ]
+        .into_iter()
+        .filter_map(|path| fs::read(path).ok())
+        .flatten()
+        .collect::<Vec<_>>();
+        let retained = String::from_utf8(retained).expect("synthetic output is utf8");
+        for line in retained.lines().skip(1) {
+            assert!(
+                line == "shutdown-marker"
+                    || ((line.starts_with("stdout-") || line.starts_with("stderr-"))
+                        && line.ends_with("-abcdefghijklmnopqrstuvwxyz")),
+                "stdout/stderr record was interleaved: {line:?}"
+            );
+        }
+
+        drop(log);
+        fs::remove_dir_all(root).expect("remove logs after shutdown");
     }
 
     #[cfg(unix)]
@@ -1547,7 +2086,7 @@ mod tests {
             sleep(Duration::from_millis(5)).await;
         }
 
-        let status = terminate_and_reap(&mut child, Duration::from_millis(50))
+        let status = terminate_and_reap(&mut child, Duration::from_millis(50), None)
             .await
             .expect("terminate child");
 
@@ -1594,7 +2133,8 @@ mod tests {
         let config_path = root.join("config.xml");
         fs::write(&config_path, "<clickhouse/>").expect("fake config");
 
-        let exit = supervise_clickhouse(&cfg, &server_bin, &config_path, test_policy())
+        let log = test_supervisor_log(&root);
+        let exit = supervise_clickhouse(&cfg, &server_bin, &config_path, test_policy(), &log)
             .await
             .expect("supervisor result");
 
@@ -1605,6 +2145,19 @@ mod tests {
                 .trim(),
             "6"
         );
+        log.flush().await.expect("flush restarted generations");
+        assert_eq!(log.writer_count(), 1, "generation output tasks leaked");
+        let log_path = root.join("clickhouse-supervisor.log");
+        let retained = [
+            crate::process::RollingLog::rotation_path(&log_path, 2),
+            crate::process::RollingLog::rotation_path(&log_path, 1),
+            log_path,
+        ]
+        .into_iter()
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .collect::<String>();
+        assert!(retained.contains("fake ClickHouse generation=6 mode=exit"));
+        assert!(retained.contains("state=exhausted"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1620,6 +2173,7 @@ mod tests {
         let config_path = root.join("config.xml");
         fs::write(&config_path, "<clickhouse/>").expect("fake config");
         let mut signals = ShutdownSignals::install().expect("shutdown signals");
+        let log = test_supervisor_log(&root);
 
         let outcome = run_generation(
             &cfg,
@@ -1628,6 +2182,7 @@ mod tests {
             1,
             test_policy(),
             &mut signals,
+            &log,
         )
         .await
         .expect("generation outcome");

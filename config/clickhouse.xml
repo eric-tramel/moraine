@@ -1,6 +1,7 @@
 <clickhouse>
   <logger>
     <level>information</level>
+    <console>false</console>
     <log>__MORAINE_HOME__/clickhouse/log/clickhouse-server.log</log>
     <errorlog>__MORAINE_HOME__/clickhouse/log/clickhouse-server.err.log</errorlog>
     <size>1000M</size>

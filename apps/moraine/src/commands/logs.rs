@@ -4,7 +4,9 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::paths::RuntimePaths;
-use crate::process::{clickhouse_supervisor_log_path, log_path};
+use crate::process::{
+    clickhouse_supervisor_log_path, log_path, RollingLog, CLICKHOUSE_SUPERVISOR_LOG_ROTATIONS,
+};
 use crate::render::{LogsSnapshot, ServiceLogSection};
 use crate::service::Service;
 
@@ -56,8 +58,7 @@ fn tail_lines(path: &Path, lines: usize) -> Result<Vec<String>> {
     } else {
         0
     };
-    let content = std::str::from_utf8(&bytes[start..])
-        .with_context(|| format!("failed to decode log file {} as utf-8", path.display()))?;
+    let content = String::from_utf8_lossy(&bytes[start..]);
     let mut collected = content
         .lines()
         .rev()
@@ -69,18 +70,31 @@ fn tail_lines(path: &Path, lines: usize) -> Result<Vec<String>> {
 }
 
 fn service_log_paths(paths: &RuntimePaths, service: Service) -> Vec<PathBuf> {
-    if service == Service::ClickHouse {
-        vec![
-            clickhouse_supervisor_log_path(paths),
-            log_path(paths, service),
-        ]
-    } else {
-        vec![log_path(paths, service)]
+    if service != Service::ClickHouse {
+        return vec![log_path(paths, service)];
     }
+
+    let supervisor = clickhouse_supervisor_log_path(paths);
+    let mut log_paths = (1..=CLICKHOUSE_SUPERVISOR_LOG_ROTATIONS)
+        .rev()
+        .map(|generation| RollingLog::rotation_path(&supervisor, generation))
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    log_paths.push(supervisor);
+    log_paths.push(log_path(paths, service));
+    log_paths
 }
 
 fn default_log_services() -> [Service; 3] {
     [Service::ClickHouse, Service::Ingest, Service::Backend]
+}
+
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    })
 }
 
 pub(super) fn collect_logs(
@@ -106,11 +120,24 @@ pub(super) fn collect_logs(
                 });
                 continue;
             }
+            let retained_lines = match tail_lines(&path, lines) {
+                Ok(lines) => lines,
+                Err(err) if is_not_found(&err) => {
+                    sections.push(ServiceLogSection {
+                        service: svc,
+                        path: path_string,
+                        exists: false,
+                        lines: Vec::new(),
+                    });
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             sections.push(ServiceLogSection {
                 service: svc,
                 path: path_string,
                 exists: true,
-                lines: tail_lines(&path, lines)?,
+                lines: retained_lines,
             });
         }
     }
@@ -168,6 +195,26 @@ mod tests {
     }
 
     #[test]
+    fn missing_log_error_is_detected_through_context() {
+        let root = temp_dir("tail-lines-missing");
+        let err = tail_lines(&root.join("vanished.log"), 1).expect_err("missing log");
+        assert!(is_not_found(&err), "{err:#}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tail_lines_remains_readable_when_rotation_splits_utf8() {
+        let root = temp_dir("tail-lines-split-utf8");
+        let path = root.join("test.log");
+        fs::write(&path, [0xa9, b'\n', b't', b'a', b'i', b'l', b'\n'])
+            .expect("write split utf8 log");
+
+        let lines = tail_lines(&path, 2).expect("decode split log");
+        assert_eq!(lines, vec!["�".to_string(), "tail".to_string()]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn clickhouse_logs_include_supervisor_and_server_sections() {
         let root = temp_dir("clickhouse-log-sections");
         let mut cfg = AppConfig::default();
@@ -189,6 +236,40 @@ mod tests {
         assert_eq!(snapshot.sections[0].lines, ["state=exhausted"]);
         assert_eq!(snapshot.sections[1].path, server.display().to_string());
         assert_eq!(snapshot.sections[1].lines, ["server line"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn clickhouse_logs_include_retained_supervisor_rotations() {
+        let root = temp_dir("clickhouse-rotated-log-sections");
+        let mut cfg = AppConfig::default();
+        cfg.runtime.root_dir = root.join("runtime").display().to_string();
+        cfg.runtime.logs_dir = root.join("logs").display().to_string();
+        let paths = crate::paths::runtime_paths(&cfg);
+        fs::create_dir_all(&paths.logs_dir).expect("logs dir");
+        fs::create_dir_all(paths.clickhouse_root.join("log")).expect("clickhouse log dir");
+        let supervisor = clickhouse_supervisor_log_path(&paths);
+        fs::write(
+            RollingLog::rotation_path(&supervisor, 2),
+            "oldest retained\n",
+        )
+        .expect("oldest supervisor rotation");
+        fs::write(
+            RollingLog::rotation_path(&supervisor, 1),
+            "newer retained\n",
+        )
+        .expect("newer supervisor rotation");
+        fs::write(&supervisor, "current supervisor\n").expect("current supervisor");
+        fs::write(log_path(&paths, Service::ClickHouse), "server line\n").expect("server log");
+
+        let snapshot =
+            collect_logs(&paths, Some(Service::ClickHouse), 10).expect("collect retained logs");
+
+        assert_eq!(snapshot.sections.len(), 4);
+        assert_eq!(snapshot.sections[0].lines, ["oldest retained"]);
+        assert_eq!(snapshot.sections[1].lines, ["newer retained"]);
+        assert_eq!(snapshot.sections[2].lines, ["current supervisor"]);
+        assert_eq!(snapshot.sections[3].lines, ["server line"]);
         let _ = fs::remove_dir_all(root);
     }
 

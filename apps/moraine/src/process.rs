@@ -1,10 +1,11 @@
 use anyhow::{bail, Context, Result};
 use moraine_config::AppConfig;
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::paths::RuntimePaths;
@@ -40,6 +41,294 @@ pub(crate) fn pid_path(paths: &RuntimePaths, service: Service) -> PathBuf {
 
 pub(crate) fn clickhouse_supervisor_log_path(paths: &RuntimePaths) -> PathBuf {
     paths.logs_dir.join("clickhouse-supervisor.log")
+}
+
+/// The current supervisor stream plus three rotations retain at most 32 MiB.
+/// If the current path is externally unlinked, at most one 8 MiB segment can
+/// remain detached until the next write reopens the path or the process exits.
+pub(crate) const CLICKHOUSE_SUPERVISOR_LOG_SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const CLICKHOUSE_SUPERVISOR_LOG_ROTATIONS: usize = 3;
+
+#[derive(Clone, Copy)]
+pub(crate) struct RollingLogPolicy {
+    pub(crate) segment_bytes: u64,
+    pub(crate) rotations: usize,
+}
+
+impl RollingLogPolicy {
+    pub(crate) const fn clickhouse_supervisor() -> Self {
+        Self {
+            segment_bytes: CLICKHOUSE_SUPERVISOR_LOG_SEGMENT_BYTES,
+            rotations: CLICKHOUSE_SUPERVISOR_LOG_ROTATIONS,
+        }
+    }
+}
+
+pub(crate) struct RollingLog {
+    path: PathBuf,
+    policy: RollingLogPolicy,
+    file: Option<File>,
+    len: u64,
+}
+
+impl RollingLog {
+    pub(crate) fn open(path: PathBuf, policy: RollingLogPolicy) -> Result<Self> {
+        if policy.segment_bytes == 0 {
+            bail!("rolling log segment size must be greater than zero");
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create log directory {}", parent.display()))?;
+        }
+
+        Self::bound_existing_file(&path, policy.segment_bytes)?;
+        for generation in 1..=policy.rotations {
+            Self::bound_existing_file(
+                &Self::rotation_path(&path, generation),
+                policy.segment_bytes,
+            )?;
+        }
+
+        let file = Self::open_append(&path)?;
+        let len = file
+            .metadata()
+            .with_context(|| format!("failed to inspect {}", path.display()))?
+            .len();
+        Ok(Self {
+            path,
+            policy,
+            file: Some(file),
+            len,
+        })
+    }
+
+    pub(crate) fn write_all(&mut self, mut bytes: &[u8]) -> Result<()> {
+        self.reopen_if_replaced()?;
+        while !bytes.is_empty() {
+            if self.len >= self.policy.segment_bytes {
+                self.rotate()?;
+            }
+            let available = self.policy.segment_bytes - self.len;
+            let write_len = usize::try_from(available.min(bytes.len() as u64))
+                .expect("write length is bounded by the input slice");
+            self.file
+                .as_mut()
+                .context("rolling log file is unavailable")?
+                .write_all(&bytes[..write_len])
+                .with_context(|| format!("failed to write {}", self.path.display()))?;
+            self.len += write_len as u64;
+            bytes = &bytes[write_len..];
+        }
+        Ok(())
+    }
+
+    pub(crate) fn flush(&mut self) -> Result<()> {
+        self.file
+            .as_mut()
+            .context("rolling log file is unavailable")?
+            .flush()
+            .with_context(|| format!("failed to flush {}", self.path.display()))
+    }
+
+    fn open_append(path: &Path) -> Result<File> {
+        if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            bail!("refusing symlinked log path {}", path.display());
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        Self::verify_opened_path(&file, path)?;
+        Ok(file)
+    }
+
+    pub(crate) fn rotation_path(path: &Path, generation: usize) -> PathBuf {
+        let mut name = path
+            .file_name()
+            .expect("rolling log path has a file name")
+            .to_os_string();
+        name.push(format!(".{generation}"));
+        path.with_file_name(name)
+    }
+
+    fn bound_existing_file(path: &Path, max_bytes: u64) -> Result<()> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_file() => metadata,
+            Ok(_) => bail!("log path is not a regular file: {}", path.display()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to inspect {}", path.display()));
+            }
+        };
+        let len = metadata.len();
+        if len <= max_bytes {
+            return Ok(());
+        }
+
+        let mut source = File::open(path)
+            .with_context(|| format!("failed to open oversized log {}", path.display()))?;
+        Self::verify_opened_path(&source, path)?;
+        source
+            .seek(SeekFrom::Start(len - max_bytes))
+            .with_context(|| format!("failed to seek oversized log {}", path.display()))?;
+        let tail_len = usize::try_from(max_bytes)
+            .context("rolling log segment size does not fit in memory")?;
+        let mut tail = vec![0; tail_len];
+        source
+            .read_exact(&mut tail)
+            .with_context(|| format!("failed to read oversized log {}", path.display()))?;
+        drop(source);
+
+        static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let mut temp_name = path
+            .file_name()
+            .context("rolling log path has no file name")?
+            .to_os_string();
+        temp_name.push(format!(".tmp-{}-{sequence}", std::process::id()));
+        let temp_path = path.with_file_name(temp_name);
+        let replacement = (|| -> Result<()> {
+            let mut temp = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temp_path)
+                .with_context(|| format!("failed to create {}", temp_path.display()))?;
+            temp.write_all(&tail)
+                .with_context(|| format!("failed to write {}", temp_path.display()))?;
+            temp.flush()
+                .with_context(|| format!("failed to flush {}", temp_path.display()))?;
+            temp.set_permissions(metadata.permissions())
+                .with_context(|| format!("failed to set permissions on {}", temp_path.display()))?;
+            Self::verify_opened_path(&temp, &temp_path)?;
+            #[cfg(windows)]
+            fs::remove_file(path)
+                .with_context(|| format!("failed to replace {}", path.display()))?;
+            fs::rename(&temp_path, path).with_context(|| {
+                format!(
+                    "failed to replace oversized log {} with retained tail",
+                    path.display()
+                )
+            })
+        })();
+        if replacement.is_err() {
+            let _ = fs::remove_file(&temp_path);
+        }
+        replacement
+    }
+
+    fn verify_opened_path(file: &File, path: &Path) -> Result<()> {
+        let opened = file
+            .metadata()
+            .with_context(|| format!("failed to inspect opened log {}", path.display()))?;
+        let current = fs::symlink_metadata(path)
+            .with_context(|| format!("failed to inspect log path {}", path.display()))?;
+        if !opened.file_type().is_file()
+            || !current.file_type().is_file()
+            || !same_file(&opened, &current)
+        {
+            bail!("log path changed while opening {}", path.display());
+        }
+        Ok(())
+    }
+
+    fn reopen_if_replaced(&mut self) -> Result<()> {
+        let needs_reopen = match (&self.file, fs::symlink_metadata(&self.path)) {
+            (_, Err(err)) if err.kind() == std::io::ErrorKind::NotFound => true,
+            (_, Err(err)) => {
+                return Err(err)
+                    .with_context(|| format!("failed to inspect {}", self.path.display()));
+            }
+            (None, Ok(_)) => true,
+            (Some(file), Ok(path_metadata)) => {
+                let file_metadata = file
+                    .metadata()
+                    .with_context(|| format!("failed to inspect {}", self.path.display()))?;
+                !path_metadata.file_type().is_file() || !same_file(&file_metadata, &path_metadata)
+            }
+        };
+        if needs_reopen {
+            Self::bound_existing_file(&self.path, self.policy.segment_bytes)?;
+            let file = Self::open_append(&self.path)?;
+            self.len = file
+                .metadata()
+                .with_context(|| format!("failed to inspect {}", self.path.display()))?
+                .len();
+            self.file = Some(file);
+        }
+        Ok(())
+    }
+
+    fn rotate(&mut self) -> Result<()> {
+        self.file.take();
+        let rotation = self.rotate_files();
+        let reopened = Self::open_append(&self.path);
+        match reopened {
+            Ok(file) => {
+                self.len = file
+                    .metadata()
+                    .with_context(|| format!("failed to inspect {}", self.path.display()))?
+                    .len();
+                self.file = Some(file);
+            }
+            Err(reopen_err) => {
+                return match rotation {
+                    Ok(()) => Err(reopen_err),
+                    Err(rotation_err) => Err(rotation_err
+                        .context(format!("also failed to reopen rolling log: {reopen_err:#}"))),
+                };
+            }
+        }
+        rotation
+    }
+
+    fn rotate_files(&self) -> Result<()> {
+        if self.policy.rotations > 0 {
+            let oldest = Self::rotation_path(&self.path, self.policy.rotations);
+            if oldest.exists() {
+                fs::remove_file(&oldest)
+                    .with_context(|| format!("failed to remove {}", oldest.display()))?;
+            }
+            for generation in (1..self.policy.rotations).rev() {
+                let source = Self::rotation_path(&self.path, generation);
+                if source.exists() {
+                    let destination = Self::rotation_path(&self.path, generation + 1);
+                    fs::rename(&source, &destination).with_context(|| {
+                        format!(
+                            "failed to rotate {} to {}",
+                            source.display(),
+                            destination.display()
+                        )
+                    })?;
+                }
+            }
+            if self.path.exists() {
+                let first = Self::rotation_path(&self.path, 1);
+                fs::rename(&self.path, &first).with_context(|| {
+                    format!(
+                        "failed to rotate {} to {}",
+                        self.path.display(),
+                        first.display()
+                    )
+                })?;
+            }
+        } else if self.path.exists() {
+            fs::remove_file(&self.path)
+                .with_context(|| format!("failed to reset {}", self.path.display()))?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.len() == right.len() && left.modified().ok() == right.modified().ok()
 }
 
 fn clickhouse_internal_log_path(paths: &RuntimePaths) -> PathBuf {
@@ -646,6 +935,197 @@ mod tests {
             logs_dir.join("ingest.log")
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn tiny_log_policy() -> RollingLogPolicy {
+        RollingLogPolicy {
+            segment_bytes: 64,
+            rotations: 2,
+        }
+    }
+
+    fn retained_log_paths(path: &Path) -> [PathBuf; 3] {
+        [
+            path.to_path_buf(),
+            RollingLog::rotation_path(path, 1),
+            RollingLog::rotation_path(path, 2),
+        ]
+    }
+    #[test]
+    fn clickhouse_supervisor_log_policy_is_32_mib() {
+        let policy = RollingLogPolicy::clickhouse_supervisor();
+        assert_eq!(policy.segment_bytes, 8 * 1024 * 1024);
+        assert_eq!(policy.rotations, 3);
+        assert_eq!(
+            policy.segment_bytes * (policy.rotations as u64 + 1),
+            32 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn rolling_log_bounds_repeated_output_and_preserves_recent_bytes() {
+        let root = temp_dir("rolling-log-bound");
+        let path = root.join("supervisor.log");
+        let mut log = RollingLog::open(path.clone(), tiny_log_policy()).expect("open rolling log");
+
+        log.write_all(&vec![b'x'; 64 * 20 + 17])
+            .expect("write repeated output");
+        log.write_all(b"recent-marker\n")
+            .expect("write recent marker");
+        log.flush().expect("flush rolling log");
+
+        let paths = retained_log_paths(&path);
+        let retained_bytes: u64 = paths
+            .iter()
+            .filter_map(|path| fs::metadata(path).ok())
+            .map(|metadata| {
+                assert!(metadata.len() <= 64, "segment exceeded configured cap");
+                metadata.len()
+            })
+            .sum();
+        assert!(retained_bytes <= 64 * 3);
+        assert!(
+            fs::read(&path)
+                .expect("read current log")
+                .ends_with(b"recent-marker\n"),
+            "newest diagnostics were not retained"
+        );
+        drop(log);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rolling_log_reopens_replaced_path_without_writing_unlinked_inode() {
+        let root = temp_dir("rolling-log-reopen");
+        let path = root.join("supervisor.log");
+        let mut log = RollingLog::open(path.clone(), tiny_log_policy()).expect("open rolling log");
+        log.write_all(b"old inode\n").expect("write old inode");
+        fs::remove_file(&path).expect("unlink live log");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                log.file
+                    .as_ref()
+                    .expect("open old inode")
+                    .metadata()
+                    .expect("old inode metadata")
+                    .nlink(),
+                0
+            );
+        }
+
+        log.write_all(b"new inode\n").expect("reopen after unlink");
+        log.flush().expect("flush replacement log");
+        assert_eq!(fs::read(&path).expect("read replacement"), b"new inode\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                log.file
+                    .as_ref()
+                    .expect("open replacement inode")
+                    .metadata()
+                    .expect("replacement metadata")
+                    .nlink(),
+                1
+            );
+        }
+        drop(log);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rolling_log_restart_keeps_bound_and_appends_to_current_segment() {
+        let root = temp_dir("rolling-log-restart");
+        let path = root.join("supervisor.log");
+        {
+            let mut log =
+                RollingLog::open(path.clone(), tiny_log_policy()).expect("open first writer");
+            log.write_all(&[b'a'; 150]).expect("write first run");
+            log.flush().expect("flush first run");
+        }
+        {
+            let mut log =
+                RollingLog::open(path.clone(), tiny_log_policy()).expect("reopen second writer");
+            log.write_all(b"restart-marker\n")
+                .expect("write restart marker");
+            log.flush().expect("flush second run");
+        }
+
+        let retained_bytes: u64 = retained_log_paths(&path)
+            .iter()
+            .filter_map(|path| fs::metadata(path).ok())
+            .map(|metadata| metadata.len())
+            .sum();
+        assert!(retained_bytes <= 64 * 3);
+        assert!(fs::read(&path)
+            .expect("read restarted log")
+            .ends_with(b"restart-marker\n"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rolling_log_startup_reduces_oversized_file_to_recent_tail() {
+        let root = temp_dir("rolling-log-oversized-startup");
+        let path = root.join("supervisor.log");
+        let mut old = vec![b'o'; 256];
+        old.extend_from_slice(b"recent-tail");
+        fs::write(&path, &old).expect("write oversized old log");
+
+        let log = RollingLog::open(path.clone(), tiny_log_policy()).expect("bound old log");
+
+        let retained = fs::read(&path).expect("read bounded old log");
+        assert_eq!(retained.len(), 64);
+        assert!(retained.ends_with(b"recent-tail"));
+        drop(log);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rolling_log_recovers_after_rotation_error() {
+        let root = temp_dir("rolling-log-rotation-error");
+        let path = root.join("supervisor.log");
+        let mut log = RollingLog::open(path.clone(), tiny_log_policy()).expect("open rolling log");
+        log.write_all(&[b'x'; 64]).expect("fill current segment");
+        let blocked_oldest = RollingLog::rotation_path(&path, 2);
+        fs::create_dir(&blocked_oldest).expect("block oldest rotation");
+
+        let err = log
+            .write_all(b"first retry")
+            .expect_err("rotation should fail on directory");
+        assert!(err.to_string().contains("failed to remove"), "{err:#}");
+        fs::remove_dir(&blocked_oldest).expect("unblock rotation");
+        log.write_all(b"recovered\n")
+            .expect("writer should remain usable after error");
+        log.flush().expect("flush recovered writer");
+        assert!(fs::read(&path)
+            .expect("read recovered segment")
+            .ends_with(b"recovered\n"));
+        drop(log);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rolling_log_rejects_symlinked_oversized_segment_without_changing_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("rolling-log-symlink");
+        let target = root.join("target");
+        let path = root.join("supervisor.log");
+        let original = vec![b's'; 256];
+        fs::write(&target, &original).expect("write symlink target");
+        symlink(&target, &path).expect("create log symlink");
+
+        let Err(err) = RollingLog::open(path, tiny_log_policy()) else {
+            panic!("symlink should be rejected");
+        };
+
+        assert!(err.to_string().contains("not a regular file"), "{err:#}");
+        assert_eq!(fs::read(&target).expect("read target"), original);
         let _ = fs::remove_dir_all(root);
     }
 
