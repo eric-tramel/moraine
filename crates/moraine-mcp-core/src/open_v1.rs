@@ -2,7 +2,7 @@ use crate::contract::{
     ContractError, McpEntityKind, McpEventId, McpId, McpSessionId, McpTurnId, OpenV1Args,
     Performance, ToolEnvelope, ToolError, ToolErrorCode, ToolErrorEnvelope, OPEN_TOOL,
 };
-use crate::AppState;
+use crate::{handled_tool_error_result, tool_success_result, AppState};
 use anyhow::{Context, Result};
 use moraine_conversations::{
     McpEventOpen, McpEventRef, McpEventSummary, McpSessionOpen, McpTurnCompact, McpTurnOpen,
@@ -161,7 +161,7 @@ fn success_tool_response(
     let envelope =
         ToolEnvelope::success(OPEN_TOOL, request, data, performance).with_warnings(warnings);
     let payload = serde_json::to_value(envelope).context("failed to encode open envelope")?;
-    Ok(tool_result(open_result_text(&payload), payload, false))
+    Ok(tool_success_result(open_result_text(&payload), payload))
 }
 
 fn contract_error_tool_response(
@@ -250,20 +250,10 @@ fn error_tool_response(
     let performance = Performance::from_elapsed(started_at.elapsed(), sla_target_ms);
     let envelope = ToolErrorEnvelope::error(OPEN_TOOL, request, error, performance);
     let payload = serde_json::to_value(envelope).context("failed to encode open error envelope")?;
-    Ok(tool_result(open_result_text(&payload), payload, false))
-}
-
-fn tool_result(text: String, payload: Value, is_error: bool) -> Value {
-    json!({
-        "content": [
-            {
-                "type": "text",
-                "text": text
-            }
-        ],
-        "structuredContent": payload,
-        "isError": is_error
-    })
+    Ok(handled_tool_error_result(
+        open_result_text(&payload),
+        payload,
+    ))
 }
 
 fn open_result_text(payload: &Value) -> String {
@@ -960,7 +950,7 @@ mod tests {
         )
         .expect("error response");
 
-        assert_eq!(result["isError"], false);
+        assert_eq!(result["isError"], true);
         assert_eq!(
             result["structuredContent"]["schema_version"],
             "moraine.mcp.error.v1"

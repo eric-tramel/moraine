@@ -9,7 +9,10 @@
 //! It returns typed `session:` / `event:` IDs that drill down through `open`;
 //! it never reinvents inspection.
 
-use super::{internal_id_error, repo_error_to_contract_error, tool_ok_hybrid, AppState};
+use super::{
+    handled_tool_error_result, internal_id_error, repo_error_to_contract_error,
+    tool_success_result, AppState,
+};
 use crate::contract::{
     format_rfc3339_utc_millis, CanonicalFileAttentionArgs, ContractError, FileAttentionArgs,
     FileAttentionGranularity, FileAttentionScope, McpEventId, McpSessionId, McpTurnId, Performance,
@@ -155,7 +158,7 @@ impl AppState {
                 .with_warnings(warnings),
         )
         .context("failed to encode file_attention response envelope")?;
-        Ok(tool_ok_hybrid(format_text(&payload), payload))
+        Ok(tool_success_result(format_text(&payload), payload))
     }
 }
 
@@ -738,15 +741,10 @@ fn encode_error(request: Value, error: ContractError, performance: Performance) 
         performance,
     ))
     .context("failed to encode file_attention error envelope")?;
-    Ok(error_hybrid(format_error_text(&payload), payload))
-}
-
-fn error_hybrid(text: String, payload: Value) -> Value {
-    json!({
-        "content": [{ "type": "text", "text": text }],
-        "structuredContent": payload,
-        "isError": false
-    })
+    Ok(handled_tool_error_result(
+        format_error_text(&payload),
+        payload,
+    ))
 }
 
 fn format_text(payload: &Value) -> String {
@@ -864,6 +862,29 @@ fn format_error_text(payload: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deadline_envelope_is_a_handled_tool_error() {
+        let result = encode_error(
+            json!({}),
+            ContractError::new(
+                ToolErrorCode::DeadlineExceeded,
+                "file_attention exceeded its response deadline",
+            ),
+            Performance::builder(FILE_ATTENTION_DEFAULT_SLA_TARGET_MS).finish(),
+        )
+        .expect("deadline response");
+
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["structuredContent"]["schema_version"],
+            crate::contract::ERROR_SCHEMA_VERSION
+        );
+        assert_eq!(
+            result["structuredContent"]["error"]["code"],
+            "deadline_exceeded"
+        );
+    }
 
     fn touch(
         session: &str,

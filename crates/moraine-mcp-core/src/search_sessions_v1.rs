@@ -1,4 +1,7 @@
-use super::{internal_id_error, repo_error_to_contract_error, tool_ok_hybrid, AppState};
+use super::{
+    handled_tool_error_result, internal_id_error, repo_error_to_contract_error,
+    tool_success_result, AppState,
+};
 use crate::contract::{
     format_rfc3339_utc_millis, CanonicalSearchSessionsArgs, ContractError, McpEventId, McpId,
     McpSessionId, McpTurnId, Performance, PerformanceBuilder, SearchSessionsArgs, ToolEnvelope,
@@ -77,7 +80,7 @@ impl AppState {
                 .with_warnings(warnings),
         )
         .context("failed to encode search_sessions response envelope")?;
-        Ok(tool_ok_hybrid(
+        Ok(tool_success_result(
             format_search_sessions_text(&payload),
             payload,
         ))
@@ -425,23 +428,10 @@ fn encode_search_sessions_error(
         performance,
     ))
     .context("failed to encode search_sessions error envelope")?;
-    Ok(tool_error_hybrid(
+    Ok(handled_tool_error_result(
         format_search_sessions_error_text(&payload),
         payload,
     ))
-}
-
-fn tool_error_hybrid(text: String, payload: Value) -> Value {
-    json!({
-        "content": [
-            {
-                "type": "text",
-                "text": text
-            }
-        ],
-        "structuredContent": payload,
-        "isError": false
-    })
 }
 
 fn format_search_sessions_text(payload: &Value) -> String {
