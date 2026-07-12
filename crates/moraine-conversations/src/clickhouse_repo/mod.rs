@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -16,6 +17,16 @@ use uuid::Uuid;
 
 const REPOSITORY_READ_SETTINGS: [(&str, &str); 1] =
     [("do_not_merge_across_partitions_select_final", "0")];
+
+tokio::task_local! {
+    static ACTIVE_MCP_QUERY_ID: String;
+}
+pub async fn with_repository_query_id<F>(query_id: String, future: F) -> F::Output
+where
+    F: Future,
+{
+    ACTIVE_MCP_QUERY_ID.scope(query_id, future).await
+}
 
 use crate::cursor::{
     decode_cursor, encode_cursor, ConversationCursor, McpSessionListCursor, SessionEventCursor,
@@ -111,9 +122,16 @@ impl ClickHouseConversationRepository {
         query: &str,
         database: Option<&str>,
     ) -> AnyResult<Vec<T>> {
-        self.ch
-            .query_rows_with_params(query, database, &REPOSITORY_READ_SETTINGS)
-            .await
+        if let Ok(query_id) = ACTIVE_MCP_QUERY_ID.try_with(Clone::clone) {
+            let params = [("query_id", query_id.as_str()), REPOSITORY_READ_SETTINGS[0]];
+            self.ch
+                .query_rows_with_params(query, database, &params)
+                .await
+        } else {
+            self.ch
+                .query_rows_with_params(query, database, &REPOSITORY_READ_SETTINGS)
+                .await
+        }
     }
 
     pub(super) async fn query_rows_with_params<T: DeserializeOwned>(
@@ -122,8 +140,17 @@ impl ClickHouseConversationRepository {
         database: Option<&str>,
         params: &[(&str, &str)],
     ) -> AnyResult<Vec<T>> {
-        let mut request_params = Vec::with_capacity(params.len() + REPOSITORY_READ_SETTINGS.len());
+        let query_id = ACTIVE_MCP_QUERY_ID.try_with(Clone::clone).ok();
+        let has_query_id = params.iter().any(|(name, _)| *name == "query_id");
+        let mut request_params = Vec::with_capacity(
+            params.len() + REPOSITORY_READ_SETTINGS.len() + usize::from(!has_query_id),
+        );
         request_params.extend_from_slice(params);
+        if !has_query_id {
+            if let Some(query_id) = query_id.as_deref() {
+                request_params.push(("query_id", query_id));
+            }
+        }
         request_params.extend_from_slice(&REPOSITORY_READ_SETTINGS);
         self.ch
             .query_rows_with_params(query, database, &request_params)

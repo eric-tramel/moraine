@@ -2786,7 +2786,10 @@ FORMAT JSONEachRow",
             }
         }
 
-        let query_id = Uuid::new_v4().to_string();
+        let query_id = query
+            .cancellation_token
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let started = Instant::now();
 
         let terms_with_qf = tokenize_query(query_text, self.cfg.bm25_max_query_terms);

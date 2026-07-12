@@ -10,8 +10,8 @@
 //! it never reinvents inspection.
 
 use super::{
-    handled_tool_error_result, internal_id_error, repo_error_to_contract_error,
-    tool_success_result, AppState,
+    backend_query_id, handled_tool_error_result, internal_id_error, repo_error_to_contract_error,
+    tool_success_result, AppState, QueryCancellationGuard,
 };
 use crate::contract::{
     format_rfc3339_utc_millis, CanonicalFileAttentionArgs, ContractError, FileAttentionArgs,
@@ -25,7 +25,6 @@ use moraine_conversations::{FileAttentionQuery, FileAttentionTouch};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{timeout, Duration};
 use tracing::warn;
 
@@ -99,7 +98,7 @@ impl AppState {
             );
         }
 
-        let query_id = file_attention_query_id();
+        let query_id = backend_query_id("file-attention");
         let repo_query = FileAttentionQuery {
             cancellation_token: query_id.clone(),
             rel: tail.rel.clone(),
@@ -118,19 +117,25 @@ impl AppState {
             execution_budget_secs: FILE_ATTENTION_DEADLINE_MS.div_ceil(1_000),
         };
 
-        let touches = match timeout(
+        let mut cancellation = QueryCancellationGuard::new(query_id.clone());
+        let repo_result = timeout(
             Duration::from_millis(FILE_ATTENTION_DEADLINE_MS),
             self.repo.file_attention(repo_query),
         )
-        .await
-        {
-            Ok(Ok(touches)) => touches,
+        .await;
+
+        let touches = match repo_result {
+            Ok(Ok(touches)) => {
+                cancellation.disarm();
+                touches
+            }
             Ok(Err(error)) => {
+                cancellation.disarm();
                 return encode_error(
                     canonical_request,
                     repo_error_to_contract_error(error),
                     perf.finish(),
-                )
+                );
             }
             Err(_) => {
                 if let Err(error) = self.repo.cancel_query(&query_id).await {
@@ -140,6 +145,7 @@ impl AppState {
                         "file_attention: failed to cancel timed-out ClickHouse query"
                     );
                 }
+                cancellation.disarm();
                 return encode_error(
                     canonical_request,
                     ContractError::new(
@@ -162,14 +168,6 @@ impl AppState {
         .context("failed to encode file_attention response envelope")?;
         Ok(tool_success_result(format_text(&payload), payload))
     }
-}
-
-fn file_attention_query_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    format!("moraine-file-attention-{}-{nanos}", std::process::id())
 }
 
 fn parse_file_attention_args(

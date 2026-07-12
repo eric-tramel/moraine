@@ -140,7 +140,10 @@ impl InMemoryConversationRepository {
     fn empty_search_mcp_events(&self, query: &SearchMcpEventsQuery) -> SearchMcpEventsResult {
         let requested_n_hits = query.n_hits.unwrap_or(self.config.max_results).max(1);
         SearchMcpEventsResult {
-            query_id: "in-memory".to_string(),
+            query_id: query
+                .cancellation_token
+                .clone()
+                .unwrap_or_else(|| "in-memory".to_string()),
             query: query.query.clone(),
             terms: Vec::new(),
             event_types: query

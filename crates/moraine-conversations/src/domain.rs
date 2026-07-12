@@ -701,6 +701,8 @@ pub struct SearchEventsResult {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SearchMcpEventsQuery {
     pub query: String,
+    #[serde(skip)]
+    pub cancellation_token: Option<String>,
     #[serde(default)]
     pub n_hits: Option<u16>,
     #[serde(default)]
