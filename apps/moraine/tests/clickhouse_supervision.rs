@@ -8,6 +8,8 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+const EVENT_TIMEOUT: Duration = Duration::from_secs(15);
+
 fn temp_dir(name: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -101,7 +103,7 @@ fn wait_for_file(path: &Path, timeout: Duration) -> String {
     }
 }
 
-fn wait_for_retained_log(path: &Path, needle: &str, timeout: Duration) {
+fn wait_for_retained_log(supervisor: &mut Child, path: &Path, needle: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
         let found = (0..=3).any(|generation| {
@@ -119,6 +121,10 @@ fn wait_for_retained_log(path: &Path, needle: &str, timeout: Duration) {
         if found {
             return;
         }
+        assert!(
+            supervisor.try_wait().expect("inspect supervisor").is_none(),
+            "supervisor exited before logging `{needle}`"
+        );
         assert!(
             Instant::now() < deadline,
             "timed out waiting for `{needle}` in retained segments for {}",
@@ -206,17 +212,17 @@ fn sigterm_during_backoff_exits_without_replacement() {
         .expect("start supervisor");
 
     wait_for_retained_log(
+        &mut supervisor,
         &supervisor_log_path,
         "state=backoff",
-        Duration::from_secs(3),
+        EVENT_TIMEOUT,
     );
     let status = Command::new("kill")
         .arg(supervisor.id().to_string())
         .status()
         .expect("signal supervisor");
     assert!(status.success());
-    assert!(wait_for_child(&mut supervisor, Duration::from_secs(3)).success());
-    thread::sleep(Duration::from_millis(1200));
+    assert!(wait_for_child(&mut supervisor, EVENT_TIMEOUT).success());
     assert_eq!(
         fs::read_to_string(&count_path)
             .expect("generation count")
