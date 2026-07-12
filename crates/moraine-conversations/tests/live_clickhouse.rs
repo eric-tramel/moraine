@@ -540,11 +540,10 @@ async fn start_owned_monitor(
     tokio::task::JoinHandle<Result<()>>,
     std::path::PathBuf,
 )> {
-    let reservation = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
-        .context("failed to reserve monitor port")?;
-    let port = reservation.local_addr()?.port();
-    drop(reservation);
+        .context("failed to bind monitor listener")?;
+    let port = listener.local_addr()?.port();
 
     let base = Url::parse(&format!("http://127.0.0.1:{port}/api/v1/"))?;
     let health_url = base.join("health")?;
@@ -566,10 +565,9 @@ async fn start_owned_monitor(
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server_static_dir = static_dir.clone();
     let server = tokio::spawn(async move {
-        moraine_monitor_core::run_server_with_router(
+        moraine_monitor_core::run_server_with_listener(
             router,
-            "127.0.0.1".to_string(),
-            port,
+            listener,
             server_static_dir,
             async move {
                 let _ = shutdown_rx.await;

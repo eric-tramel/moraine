@@ -85,6 +85,41 @@ where
         }
     })?;
 
+    serve_on_listener(listener, app, bind, static_dir_display, shutdown).await
+}
+
+/// Run the monitor HTTP server on an already-bound listener.
+///
+/// Ownership of the listener transfers to the server and is released after
+/// shutdown completes or startup fails.
+pub async fn run_server_with_listener<S>(
+    backend_router: Arc<BackendRepositoryRouter>,
+    listener: tokio::net::TcpListener,
+    static_dir: PathBuf,
+    shutdown: S,
+) -> Result<()>
+where
+    S: Future<Output = ()> + Send + 'static,
+{
+    let static_dir_display = static_dir.display().to_string();
+    let app = router_with_backend_router(backend_router, static_dir)?;
+    let bind = listener
+        .local_addr()
+        .map_err(|error| anyhow!("failed to read monitor listener address: {error}"))?;
+
+    serve_on_listener(listener, app, bind, static_dir_display, shutdown).await
+}
+
+async fn serve_on_listener<S>(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    bind: SocketAddr,
+    static_dir_display: String,
+    shutdown: S,
+) -> Result<()>
+where
+    S: Future<Output = ()> + Send + 'static,
+{
     println!("moraine-monitor running at http://{bind}");
     println!("serving UI from {static_dir_display}");
 
@@ -2170,6 +2205,107 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn host_port_startup_validates_static_dir_before_binding() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind occupied address");
+        let address = occupied.local_addr().expect("occupied address");
+        let missing_static_dir = temp_path("host-port-validation-order");
+        let (state, _) = fake_state(InMemoryConversationResponses::default());
+
+        let error = run_server_with_router(
+            state.backend_router.clone(),
+            address.ip().to_string(),
+            address.port(),
+            missing_static_dir,
+            std::future::pending(),
+        )
+        .await
+        .expect_err("missing static directory should fail before bind");
+        assert!(error.to_string().contains("is unavailable"));
+        assert!(!error.to_string().contains("address already in use"));
+    }
+
+    #[tokio::test]
+    async fn supplied_listener_is_owned_until_shutdown_then_released() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let address = listener.local_addr().expect("listener address");
+        let static_dir = static_root("listener-ownership", b"<!doctype html>");
+        let (state, _) = fake_state(InMemoryConversationResponses::default());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_static_dir = static_dir.clone();
+        let server = tokio::spawn(run_server_with_listener(
+            state.backend_router.clone(),
+            listener,
+            server_static_dir,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        let bind_error = tokio::net::TcpListener::bind(address)
+            .await
+            .expect_err("server must retain exclusive ownership of listener address");
+        assert_eq!(bind_error.kind(), ErrorKind::AddrInUse);
+
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect to supplied listener");
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write monitor request");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read monitor response");
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+
+        shutdown_tx.send(()).expect("signal shutdown");
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("server shutdown timed out")
+            .expect("server task panicked")
+            .expect("server shutdown failed");
+
+        let rebound = tokio::net::TcpListener::bind(address)
+            .await
+            .expect("listener address should be reusable after shutdown");
+        drop(rebound);
+        let _ = fs::remove_dir_all(static_dir);
+    }
+
+    #[tokio::test]
+    async fn supplied_listener_is_released_when_startup_fails() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let address = listener.local_addr().expect("listener address");
+        let missing_static_dir = temp_path("listener-startup-failure");
+        let (state, _) = fake_state(InMemoryConversationResponses::default());
+
+        let error = run_server_with_listener(
+            state.backend_router.clone(),
+            listener,
+            missing_static_dir,
+            std::future::pending(),
+        )
+        .await
+        .expect_err("missing static directory should fail startup");
+        assert!(error.to_string().contains("is unavailable"));
+
+        let rebound = tokio::net::TcpListener::bind(address)
+            .await
+            .expect("listener address should be reusable after startup failure");
+        drop(rebound);
     }
 
     #[test]
