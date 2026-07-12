@@ -168,7 +168,7 @@ impl AppState {
                         "properties": {
                             "query": {
                                 "type": "string",
-                                "description": "Natural-language search query."
+                                "description": "Keyword (BM25) search query. Matching is bag-of-words: quotes and punctuation are ignored, and a quoted phrase is matched as independent terms subject to the configured minimum-match threshold, not as an exact phrase."
                             },
                             "within_id": {
                                 "type": ["string", "null"],
@@ -1732,6 +1732,10 @@ mod tests {
             .iter()
             .find(|tool| tool["name"].as_str() == Some("search_sessions"))
             .expect("search_sessions exists");
+        assert_eq!(
+            search["inputSchema"]["properties"]["query"]["description"],
+            json!("Keyword (BM25) search query. Matching is bag-of-words: quotes and punctuation are ignored, and a quoted phrase is matched as independent terms subject to the configured minimum-match threshold, not as an exact phrase.")
+        );
         assert_eq!(
             search["inputSchema"]["properties"]["event_types"]["description"],
             json!("Optional normalized event type filter. Defaults to user_input, assistant_response, and tool_response.")
