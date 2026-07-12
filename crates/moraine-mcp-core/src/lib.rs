@@ -1281,21 +1281,35 @@ fn rename_socket_noreplace(_from: &std::path::Path, _to: &std::path::Path) -> st
 }
 
 #[cfg(unix)]
-fn socket_peer_hung_up(fd: std::os::fd::RawFd) -> bool {
-    let mut descriptor = libc::pollfd {
-        fd,
-        events: libc::POLLHUP,
-        revents: 0,
+fn socket_peer_disconnected(fd: std::os::fd::RawFd) -> bool {
+    // A zero-length send emits no protocol bytes, but still checks whether the
+    // peer retains its read half. Unlike POLLHUP, this distinguishes a client
+    // write-half shutdown from a full disconnect on supported Unix sockets.
+    // SAFETY: a null buffer is valid for a zero-length send, and the owning
+    // socket halves outlive this monitor.
+    let sent = unsafe {
+        libc::send(
+            fd,
+            std::ptr::null(),
+            0,
+            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+        )
     };
-    // SAFETY: `descriptor` points to one initialized pollfd for the duration
-    // of this non-blocking call. The owning socket halves outlive the monitor.
-    let ready = unsafe { libc::poll(&mut descriptor, 1, 0) };
-    ready > 0 && descriptor.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+    if sent == 0 {
+        return false;
+    }
+
+    let errno = std::io::Error::last_os_error().raw_os_error();
+    !matches!(
+        errno,
+        Some(code)
+            if code == libc::EINTR || code == libc::EAGAIN || code == libc::EWOULDBLOCK
+    )
 }
 
 #[cfg(unix)]
-async fn wait_for_socket_hangup(fd: std::os::fd::RawFd) {
-    while !socket_peer_hung_up(fd) {
+async fn wait_for_socket_disconnect(fd: std::os::fd::RawFd) {
+    while !socket_peer_disconnected(fd) {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
@@ -1374,7 +1388,7 @@ async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStr
                 let _ = shutdown.changed().await;
             }
         },
-        wait_for_socket_hangup(peer_fd),
+        wait_for_socket_disconnect(peer_fd),
     )
     .await
 }

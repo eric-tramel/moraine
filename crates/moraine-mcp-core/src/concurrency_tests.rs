@@ -598,7 +598,7 @@ async fn full_socket_disconnect_cancels_blocked_repository_work() {
         server_write,
         None,
         pending(),
-        wait_for_socket_hangup(peer_fd),
+        wait_for_socket_disconnect(peer_fd),
     ));
 
     client_write
