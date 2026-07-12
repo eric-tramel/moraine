@@ -2311,11 +2311,11 @@ FORMAT JSONEachRow",
             .iter()
             .map(|row| row.session_id.clone())
             .collect::<Vec<_>>();
-        let session_time_bounds = self.load_session_time_bounds(&session_ids).await?;
-        let session_metadata_by_session_id = self
-            .fetch_conversation_session_metadata(&session_ids)
-            .await?;
-        let event_enrichment_by_uid = self.load_mcp_event_enrichment(&rows).await?;
+        let (session_time_bounds, session_metadata_by_session_id, event_enrichment_by_uid) = tokio::try_join!(
+            self.load_session_time_bounds(&session_ids),
+            self.fetch_conversation_session_metadata(&session_ids),
+            self.load_mcp_event_enrichment(&rows),
+        )?;
         let max_raw_score = rows.iter().map(|row| row.raw_score).fold(0.0_f64, f64::max);
 
         Ok(rows

@@ -522,6 +522,74 @@ async fn search_mcp_events_supports_global_search_with_enriched_hits() {
     assert_eq!(result.hits[0].model.as_deref(), Some("gpt-5.3-codex"));
 }
 #[tokio::test(flavor = "multi_thread")]
+async fn search_mcp_events_does_not_serialize_independent_enrichment_queries() {
+    let reached = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let (repo, state) = build_repo_with_options(
+        100,
+        MockOptions {
+            query_barrier: Some(QueryBarrier {
+                required: vec!["FROM `moraine`.`v_session_summary`", "WHERE session_id IN"],
+                reached: reached.clone(),
+                release: release.clone(),
+            }),
+            ..MockOptions::default()
+        },
+    )
+    .await;
+    let repo = Arc::new(repo);
+    let search = {
+        let repo = Arc::clone(&repo);
+        tokio::spawn(async move {
+            repo.search_mcp_events(SearchMcpEventsQuery {
+                query: "hello world".to_string(),
+                n_hits: Some(10),
+                event_types: Some(vec![
+                    McpEventType::ToolResponse,
+                    McpEventType::UserInput,
+                    McpEventType::AssistantResponse,
+                ]),
+                min_score: Some(0.0),
+                min_should_match: Some(1),
+                ..SearchMcpEventsQuery::default()
+            })
+            .await
+        })
+    };
+
+    tokio::time::timeout(Duration::from_secs(2), reached.notified())
+        .await
+        .expect("session-time enrichment query reached the wire barrier");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let (metadata_started, event_enrichment_started) = {
+                let queries = state.queries.lock().expect("queries lock");
+                (
+                    queries
+                        .iter()
+                        .any(|query| query.contains("event_kind = 'session_meta'")),
+                    queries
+                        .iter()
+                        .any(|query| query.contains("AS event_ordinal")),
+                )
+            };
+            if metadata_started && event_enrichment_started {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("metadata and event enrichment reached ClickHouse concurrently");
+
+    release.notify_one();
+    let result = search
+        .await
+        .expect("search task joins")
+        .expect("parallel enrichment succeeds");
+    assert_eq!(result.hits.len(), 2);
+}
+#[tokio::test(flavor = "multi_thread")]
 async fn search_mcp_events_supports_session_scoped_search() {
     let (repo, state) = build_repo().await;
 

@@ -178,7 +178,6 @@ FORMAT JSONEachRow",
 
         let session_summary = self.table_ref("v_session_summary");
         let events_source = canonical_events_source(&self.table_ref("events"));
-        let mode_subquery = self.mode_subquery();
 
         let mut where_clauses = vec![
             // A blank session_id is never a real session (e.g. the orphan
@@ -197,9 +196,6 @@ FORMAT JSONEachRow",
                 filter.end_unix_ms
             ),
         ];
-        if let Some(mode_clause) = Self::mode_filter_clause(filter.mode) {
-            where_clauses.push(mode_clause);
-        }
         if let Some(scope_clause) = self.session_scope_clause("s.session_id") {
             where_clauses.push(scope_clause);
         }
@@ -222,88 +218,149 @@ FORMAT JSONEachRow",
             ConversationListSort::Desc => "DESC",
             ConversationListSort::Asc => "ASC",
         };
+        let limit_plus = (limit as usize) + 1;
+        let window_limit_sql = if filter.mode.is_none() {
+            format!(
+                "  ORDER BY s.last_event_time {order_dir}, s.session_id {order_dir}\n  LIMIT {limit_plus}\n"
+            )
+        } else {
+            String::new()
+        };
+        let mode_filter_sql = filter
+            .mode
+            .map(|mode| {
+                format!(
+                    "WHERE ifNull(r.mode, 'chat') = {}\n",
+                    sql_quote(mode.as_str())
+                )
+            })
+            .unwrap_or_default();
+        let mode_aggregate = Self::mode_aggregate_sql();
 
+        // Resolve the time/scope window first, applying the keyset LIMIT before
+        // event aggregation whenever no mode predicate depends on that
+        // aggregation. Then compute every event-backed field in one grouped pass
+        // over only the candidate sessions. The previous query independently
+        // aggregated mode, completion state, and metadata across the entire
+        // events table before applying the window and LIMIT.
         let query = format!(
-            "SELECT
-  s.session_id AS session_id,
-  toString(s.first_event_time) AS first_event_time,
-  toInt64(toUnixTimestamp64Milli(s.first_event_time)) AS first_event_unix_ms,
-  toString(s.last_event_time) AS last_event_time,
-  toInt64(toUnixTimestamp64Milli(s.last_event_time)) AS last_event_unix_ms,
-  toUInt32(s.total_turns) AS total_turns,
-  toUInt64(s.total_events) AS total_events,
-  ifNull(m.mode, 'chat') AS mode,
-  toUInt8(
-    ifNull(status.latest_terminal_turn_seq, toUInt32(0)) = toUInt32(s.total_turns)
-    AND ifNull(status.latest_terminal_payload_type, '') = 'task_complete'
-  ) AS completed,
-  ifNull(meta.title, '') AS title,
-  ifNull(meta.source, '') AS source,
-  ifNull(meta.session_slug, '') AS session_slug,
-  ifNull(meta.session_summary, '') AS session_summary
-FROM {session_summary} AS s
-LEFT JOIN ({mode_subquery}) AS m ON m.session_id = s.session_id
-LEFT JOIN (
+            "WITH
+window_sessions AS (
+  SELECT
+    s.session_id AS session_id,
+    toString(s.first_event_time) AS first_event_time,
+    toInt64(toUnixTimestamp64Milli(s.first_event_time)) AS first_event_unix_ms,
+    toString(s.last_event_time) AS last_event_time,
+    toInt64(toUnixTimestamp64Milli(s.last_event_time)) AS last_event_unix_ms,
+    toUInt32(s.total_turns) AS total_turns,
+    toUInt64(s.total_events) AS total_events
+  FROM {session_summary} AS s
+  WHERE {where_sql}
+{window_limit_sql}),
+event_rollups AS (
   SELECT
     session_id,
+    {mode_aggregate} AS mode,
     maxIf(toUInt32(turn_index), payload_type IN ('task_complete', 'turn_aborted')) AS latest_terminal_turn_seq,
     ifNull(
       argMaxIf(payload_type, tuple(event_ts, event_uid), payload_type IN ('task_complete', 'turn_aborted')),
       ''
-    ) AS latest_terminal_payload_type
-  FROM {events_source}
-  GROUP BY session_id
-) AS status ON status.session_id = s.session_id
-LEFT JOIN (
-  SELECT
-    session_id,
+    ) AS latest_terminal_payload_type,
     ifNull(
-      argMax(
+      argMaxIf(
         coalesce(
           nullIf(JSONExtractString(payload_json, 'title'), ''),
           nullIf(JSONExtractString(payload_json, 'name'), ''),
           nullIf(JSONExtractString(payload_json, 'summary'), '')
         ),
-        tuple(event_ts, event_uid)
+        tuple(event_ts, event_uid),
+        event_kind = 'session_meta'
       ),
       ''
     ) AS title,
     ifNull(
-      argMax(
+      argMaxIf(
         coalesce(
           nullIf(JSONExtractString(payload_json, 'source'), ''),
           nullIf(source_name, '')
         ),
-        tuple(event_ts, event_uid)
+        tuple(event_ts, event_uid),
+        event_kind = 'session_meta'
       ),
       ''
     ) AS source,
-    ifNull(argMax(nullIf(JSONExtractString(payload_json, 'slug'), ''), tuple(event_ts, event_uid)), '') AS session_slug,
     ifNull(
-      argMax(
+      argMaxIf(
+        nullIf(JSONExtractString(payload_json, 'slug'), ''),
+        tuple(event_ts, event_uid),
+        event_kind = 'session_meta'
+      ),
+      ''
+    ) AS session_slug,
+    ifNull(
+      argMaxIf(
         coalesce(
           nullIf(JSONExtractString(payload_json, 'summary'), ''),
           nullIf(JSONExtractString(payload_json, 'title'), ''),
           nullIf(JSONExtractString(payload_json, 'name'), '')
         ),
-        tuple(event_ts, event_uid)
+        tuple(event_ts, event_uid),
+        event_kind = 'session_meta'
       ),
       ''
     ) AS session_summary
   FROM {events_source}
-  WHERE event_kind = 'session_meta'
+  WHERE session_id IN (SELECT session_id FROM window_sessions)
   GROUP BY session_id
-) AS meta ON meta.session_id = s.session_id
-WHERE {where_sql}
-ORDER BY s.last_event_time {order_dir}, s.session_id {order_dir}
-LIMIT {limit_plus}
+),
+candidate_sessions AS (
+  SELECT
+    w.session_id AS session_id,
+    w.first_event_time AS first_event_time,
+    w.last_event_time AS last_event_time,
+    w.first_event_unix_ms AS first_event_unix_ms,
+    w.last_event_unix_ms AS last_event_unix_ms,
+    w.total_turns AS total_turns,
+    w.total_events AS total_events,
+    ifNull(r.mode, 'chat') AS mode,
+    toUInt8(
+      ifNull(r.latest_terminal_turn_seq, toUInt32(0)) = w.total_turns
+      AND ifNull(r.latest_terminal_payload_type, '') = 'task_complete'
+    ) AS completed,
+    ifNull(r.title, '') AS title,
+    ifNull(r.source, '') AS source,
+    ifNull(r.session_slug, '') AS session_slug,
+    ifNull(r.session_summary, '') AS session_summary
+  FROM window_sessions AS w
+  LEFT JOIN event_rollups AS r ON r.session_id = w.session_id
+  {mode_filter_sql}ORDER BY w.last_event_unix_ms {order_dir}, w.session_id {order_dir}
+  LIMIT {limit_plus}
+)
+SELECT
+  session_id,
+  first_event_time,
+  first_event_unix_ms,
+  last_event_time,
+  last_event_unix_ms,
+  total_turns,
+  total_events,
+  mode,
+  completed,
+  title,
+  source,
+  session_slug,
+  session_summary
+FROM candidate_sessions
+ORDER BY last_event_unix_ms {order_dir}, session_id {order_dir}
 FORMAT JSONEachRow",
             session_summary = session_summary,
             events_source = events_source,
-            mode_subquery = mode_subquery,
             where_sql = where_sql,
+            mode_aggregate = mode_aggregate,
+            window_limit_sql = window_limit_sql,
+            mode_filter_sql = mode_filter_sql,
             order_dir = order_dir,
-            limit_plus = (limit as usize) + 1,
+            limit_plus = limit_plus,
         );
 
         let rows: Vec<McpSessionListRow> = self.map_backend(self.query_rows(&query, None).await)?;
