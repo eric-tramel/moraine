@@ -23,12 +23,10 @@ fn temp_dir(name: &str) -> PathBuf {
     path
 }
 
-fn unused_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("reserve port")
-        .local_addr()
-        .expect("reserved port address")
-        .port()
+fn reserve_unhealthy_endpoint() -> TcpListener {
+    (20_000..60_000)
+        .find_map(|port| TcpListener::bind(("127.0.0.1", port)).ok())
+        .expect("reserve safe ClickHouse test endpoint")
 }
 
 fn write_executable(path: &Path, contents: &str) {
@@ -103,10 +101,9 @@ fn wait_for_file(path: &Path, timeout: Duration) -> String {
     }
 }
 
-fn wait_for_retained_log(supervisor: &mut Child, path: &Path, needle: &str, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let found = (0..=3).any(|generation| {
+fn retained_log_contents(path: &Path) -> Vec<(PathBuf, String)> {
+    (0..=3)
+        .filter_map(|generation| {
             let retained_path = if generation == 0 {
                 path.to_path_buf()
             } else {
@@ -114,17 +111,28 @@ fn wait_for_retained_log(supervisor: &mut Child, path: &Path, needle: &str, time
                 name.push(format!(".{generation}"));
                 path.with_file_name(name)
             };
-            fs::read_to_string(retained_path)
-                .map(|contents| contents.contains(needle))
-                .unwrap_or(false)
-        });
+            fs::read_to_string(&retained_path)
+                .ok()
+                .map(|contents| (retained_path, contents))
+        })
+        .collect()
+}
+
+fn wait_for_retained_log(supervisor: &mut Child, path: &Path, needle: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let retained = retained_log_contents(path);
+        let found = retained
+            .iter()
+            .any(|(_, contents)| contents.contains(needle));
         if found {
             return;
         }
-        assert!(
-            supervisor.try_wait().expect("inspect supervisor").is_none(),
-            "supervisor exited before logging `{needle}`"
-        );
+        if let Some(status) = supervisor.try_wait().expect("inspect supervisor") {
+            panic!(
+                "supervisor exited with {status} before logging `{needle}`; retained logs: {retained:#?}"
+            );
+        }
         assert!(
             Instant::now() < deadline,
             "timed out waiting for `{needle}` in retained segments for {}",
@@ -157,7 +165,14 @@ fn failed_initial_readiness_rolls_back_supervisor_child_and_pid() {
             raw_pid_path.display()
         ),
     );
-    let config = write_config(&root, unused_port());
+    let endpoint_guard = reserve_unhealthy_endpoint();
+    let config = write_config(
+        &root,
+        endpoint_guard
+            .local_addr()
+            .expect("reserved endpoint address")
+            .port(),
+    );
 
     let output = Command::new(env!("CARGO_BIN_EXE_moraine"))
         .arg("--config")
@@ -200,7 +215,14 @@ fn sigterm_during_backoff_exits_without_replacement() {
             count_path.display()
         ),
     );
-    let config = write_config(&root, unused_port());
+    let endpoint_guard = reserve_unhealthy_endpoint();
+    let config = write_config(
+        &root,
+        endpoint_guard
+            .local_addr()
+            .expect("reserved endpoint address")
+            .port(),
+    );
     let supervisor_log_path = root.join("runtime/logs/clickhouse-supervisor.log");
     let mut supervisor = Command::new(env!("CARGO_BIN_EXE_moraine"))
         .arg("--config")

@@ -725,14 +725,16 @@ impl OutputStream {
     }
 }
 
-async fn stop_after_output_forwarder(
-    child: &mut Child,
-    forwarders: &mut OutputForwarders,
-    stream: OutputStream,
-    outcome: std::result::Result<Result<()>, tokio::task::JoinError>,
-    grace: Duration,
-    log: &SupervisorLog,
-) -> Result<GenerationOutcome> {
+async fn wait_output_forwarder(
+    task: &mut Option<JoinHandle<Result<()>>>,
+) -> std::result::Result<Result<()>, tokio::task::JoinError> {
+    match task {
+        Some(task) => task.await,
+        None => std::future::pending().await,
+    }
+}
+
+fn mark_output_closed(forwarders: &mut OutputForwarders, stream: OutputStream) {
     match stream {
         OutputStream::Stdout => {
             forwarders.stdout.take();
@@ -741,9 +743,20 @@ async fn stop_after_output_forwarder(
             forwarders.stderr.take();
         }
     }
+}
+
+async fn stop_after_output_forwarder(
+    child: &mut Child,
+    forwarders: &mut OutputForwarders,
+    stream: OutputStream,
+    outcome: std::result::Result<Result<()>, tokio::task::JoinError>,
+    grace: Duration,
+    log: &SupervisorLog,
+) -> Result<GenerationOutcome> {
+    mark_output_closed(forwarders, stream);
     let stream_name = stream.name();
     let failure = match outcome {
-        Ok(Ok(())) => anyhow!("ClickHouse {stream_name} closed while the child was still running"),
+        Ok(Ok(())) => unreachable!("normal output closure is handled without stopping the child"),
         Ok(Err(err)) => err.context(format!("ClickHouse {stream_name} forwarding failed")),
         Err(err) => anyhow!(err).context(format!("ClickHouse {stream_name} forwarder task failed")),
     };
@@ -1038,65 +1051,76 @@ async fn run_generation(
 
     let readiness = wait_for_clickhouse(cfg);
     tokio::pin!(readiness);
-    let startup_outcome = tokio::select! {
-        biased;
-        _ = signals.recv() => {
-            let status =
-                terminate_and_reap(&mut child, policy.child_shutdown_grace, None).await?;
-            let _ = log
-                .line(format!(
-                    "clickhouse supervisor: generation={generation} state=stopped reason={}",
-                    describe_exit(status)
-                ))
-                .await;
-            Some(GenerationOutcome::Stopped)
-        }
-        status = child.wait() => {
-            let status = status.context("failed waiting for ClickHouse startup exit")?;
-            Some(GenerationOutcome::Failed {
-                reason: format!("exited before readiness ({})", describe_exit(status)),
-                ready_uptime: None,
-            })
-        }
-        ready = &mut readiness => {
-            match ready {
-                Ok(()) => None,
-                Err(err) => {
-                    let status =
-                        terminate_and_reap(&mut child, policy.child_shutdown_grace, None)
-                            .await?;
-                    Some(GenerationOutcome::Failed {
-                        reason: format!(
-                            "readiness failed ({err:#}); stopped child ({})",
-                            describe_exit(status)
-                        ),
-                        ready_uptime: None,
-                    })
+    let startup_outcome = loop {
+        let outcome = tokio::select! {
+            biased;
+            _ = signals.recv() => {
+                let status =
+                    terminate_and_reap(&mut child, policy.child_shutdown_grace, None).await?;
+                let _ = log
+                    .line(format!(
+                        "clickhouse supervisor: generation={generation} state=stopped reason={}",
+                        describe_exit(status)
+                    ))
+                    .await;
+                Some(GenerationOutcome::Stopped)
+            }
+            status = child.wait() => {
+                let status = status.context("failed waiting for ClickHouse startup exit")?;
+                Some(GenerationOutcome::Failed {
+                    reason: format!("exited before readiness ({})", describe_exit(status)),
+                    ready_uptime: None,
+                })
+            }
+            ready = &mut readiness => {
+                match ready {
+                    Ok(()) => None,
+                    Err(err) => {
+                        let status =
+                            terminate_and_reap(&mut child, policy.child_shutdown_grace, None)
+                                .await?;
+                        Some(GenerationOutcome::Failed {
+                            reason: format!(
+                                "readiness failed ({err:#}); stopped child ({})",
+                                describe_exit(status)
+                            ),
+                            ready_uptime: None,
+                        })
+                    }
                 }
             }
-        }
-        stdout = forwarders.stdout.as_mut().expect("stdout forwarder is active") => {
-            return stop_after_output_forwarder(
-                &mut child,
-                &mut forwarders,
-                OutputStream::Stdout,
-                stdout,
-                policy.child_shutdown_grace,
-                log,
-            )
-            .await;
-        }
-        stderr = forwarders.stderr.as_mut().expect("stderr forwarder is active") => {
-            return stop_after_output_forwarder(
-                &mut child,
-                &mut forwarders,
-                OutputStream::Stderr,
-                stderr,
-                policy.child_shutdown_grace,
-                log,
-            )
-            .await;
-        }
+            stdout = wait_output_forwarder(&mut forwarders.stdout) => {
+                if matches!(stdout, Ok(Ok(()))) {
+                    mark_output_closed(&mut forwarders, OutputStream::Stdout);
+                    continue;
+                }
+                return stop_after_output_forwarder(
+                    &mut child,
+                    &mut forwarders,
+                    OutputStream::Stdout,
+                    stdout,
+                    policy.child_shutdown_grace,
+                    log,
+                )
+                .await;
+            }
+            stderr = wait_output_forwarder(&mut forwarders.stderr) => {
+                if matches!(stderr, Ok(Ok(()))) {
+                    mark_output_closed(&mut forwarders, OutputStream::Stderr);
+                    continue;
+                }
+                return stop_after_output_forwarder(
+                    &mut child,
+                    &mut forwarders,
+                    OutputStream::Stderr,
+                    stderr,
+                    policy.child_shutdown_grace,
+                    log,
+                )
+                .await;
+            }
+        };
+        break outcome;
     };
     if let Some(outcome) = startup_outcome {
         finish_output_forwarders(&mut forwarders, log).await?;
@@ -1126,48 +1150,59 @@ async fn run_generation(
         ),
     )
     .await?;
-    let outcome = tokio::select! {
-        biased;
-        _ = signals.recv() => {
-            let status =
-                terminate_and_reap(&mut child, policy.child_shutdown_grace, None).await?;
-            let _ = log
-                .line(format!(
-                    "clickhouse supervisor: generation={generation} state=stopped reason={}",
-                    describe_exit(status)
-                ))
-                .await;
-            GenerationOutcome::Stopped
-        }
-        status = child.wait() => {
-            let status = status.context("failed waiting for ClickHouse exit")?;
-            GenerationOutcome::Failed {
-                reason: describe_exit(status),
-                ready_uptime: Some(ready_since.elapsed()),
+    let outcome = loop {
+        let outcome = tokio::select! {
+            biased;
+            _ = signals.recv() => {
+                let status =
+                    terminate_and_reap(&mut child, policy.child_shutdown_grace, None).await?;
+                let _ = log
+                    .line(format!(
+                        "clickhouse supervisor: generation={generation} state=stopped reason={}",
+                        describe_exit(status)
+                    ))
+                    .await;
+                GenerationOutcome::Stopped
             }
-        }
-        stdout = forwarders.stdout.as_mut().expect("stdout forwarder is active") => {
-            return stop_after_output_forwarder(
-                &mut child,
-                &mut forwarders,
-                OutputStream::Stdout,
-                stdout,
-                policy.child_shutdown_grace,
-                log,
-            )
-            .await;
-        }
-        stderr = forwarders.stderr.as_mut().expect("stderr forwarder is active") => {
-            return stop_after_output_forwarder(
-                &mut child,
-                &mut forwarders,
-                OutputStream::Stderr,
-                stderr,
-                policy.child_shutdown_grace,
-                log,
-            )
-            .await;
-        }
+            status = child.wait() => {
+                let status = status.context("failed waiting for ClickHouse exit")?;
+                GenerationOutcome::Failed {
+                    reason: describe_exit(status),
+                    ready_uptime: Some(ready_since.elapsed()),
+                }
+            }
+            stdout = wait_output_forwarder(&mut forwarders.stdout) => {
+                if matches!(stdout, Ok(Ok(()))) {
+                    mark_output_closed(&mut forwarders, OutputStream::Stdout);
+                    continue;
+                }
+                return stop_after_output_forwarder(
+                    &mut child,
+                    &mut forwarders,
+                    OutputStream::Stdout,
+                    stdout,
+                    policy.child_shutdown_grace,
+                    log,
+                )
+                .await;
+            }
+            stderr = wait_output_forwarder(&mut forwarders.stderr) => {
+                if matches!(stderr, Ok(Ok(()))) {
+                    mark_output_closed(&mut forwarders, OutputStream::Stderr);
+                    continue;
+                }
+                return stop_after_output_forwarder(
+                    &mut child,
+                    &mut forwarders,
+                    OutputStream::Stderr,
+                    stderr,
+                    policy.child_shutdown_grace,
+                    log,
+                )
+                .await;
+            }
+        };
+        break outcome;
     };
     finish_output_forwarders(&mut forwarders, log).await?;
     Ok(outcome)
@@ -1909,6 +1944,66 @@ mod tests {
             fs::read_to_string(&observed).expect("watchdog environment"),
             "0|0"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    async fn run_closed_output_generation(root: &Path, body: &str) -> GenerationOutcome {
+        let server_bin = root.join("clickhouse-server");
+        fs::write(&server_bin, format!("#!/bin/sh\n{body}\n")).expect("write fake server");
+        fs::set_permissions(&server_bin, fs::Permissions::from_mode(0o755))
+            .expect("make fake server executable");
+        let config_path = root.join("config.xml");
+        fs::write(&config_path, "<clickhouse/>").expect("fake config");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("reserve unused port");
+        let port = listener.local_addr().expect("unused port").port();
+        drop(listener);
+        let cfg = test_config(root, format!("http://127.0.0.1:{port}"));
+        let mut signals = ShutdownSignals::install().expect("shutdown signals");
+        let log = test_supervisor_log(root);
+        let outcome = run_generation(
+            &cfg,
+            &server_bin,
+            &config_path,
+            1,
+            test_policy(),
+            &mut signals,
+            &log,
+        )
+        .await
+        .expect("clean output EOF must not fail supervision");
+        drop(log);
+        outcome
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn generation_tolerates_one_stream_closing_while_child_remains_live() {
+        let root = temp_dir("one-stream-clean-eof");
+        let started = Instant::now();
+        let outcome = run_closed_output_generation(&root, "exec 2>&-\nsleep 0.2\nexit 42").await;
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "clean stderr EOF ended supervision before the child exited"
+        );
+        assert!(matches!(
+            outcome,
+            GenerationOutcome::Failed { reason, .. } if reason.contains("exit code 42")
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn generation_tolerates_immediate_exit_after_both_streams_close() {
+        let root = temp_dir("both-streams-clean-eof");
+        let outcome = run_closed_output_generation(&root, "exec 1>&-\nexec 2>&-\nexit 42").await;
+
+        assert!(matches!(
+            outcome,
+            GenerationOutcome::Failed { reason, .. } if reason.contains("exit code 42")
+        ));
         let _ = fs::remove_dir_all(root);
     }
 
