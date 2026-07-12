@@ -35,12 +35,6 @@ use tracing::warn;
 /// per-file touch count, but bounds memory on a pathological tail.
 const FILE_ATTENTION_SCAN_CAP: usize = 2_000;
 
-/// Marker files that identify a repo (worktree) root when stripping an absolute
-/// query path to its repo-relative tail. `.moraine.toml` is the committed,
-/// per-project moraine backend reference; `.git` (a dir in the main checkout, a
-/// file in a worktree) is the universal fallback.
-const REPO_ROOT_MARKERS: [&str; 2] = [".moraine.toml", ".git"];
-
 impl AppState {
     pub(crate) async fn file_attention_v1(&self, arguments: Value) -> Result<Value> {
         let perf = Performance::builder(FILE_ATTENTION_DEFAULT_SLA_TARGET_MS);
@@ -58,7 +52,7 @@ impl AppState {
         let perf = perf.with_sla_target(FILE_ATTENTION_BROAD_SLA_TARGET_MS);
 
         let mut warnings: Vec<String> = Vec::new();
-        let tail = resolve_tail(&args.path);
+        let tail = resolve_tail_from(&args.path, self.launch_dir.as_deref());
         if tail.normalized {
             warnings.push(format!(
                 "normalized {:?} to {:?} before matching.",
@@ -84,11 +78,15 @@ impl AppState {
                 tail.rel
             ));
         }
-        if args.scope == FileAttentionScope::Project && self.repo.config().session_scope.is_none() {
-            // The default scope honors `--project-only`; without it the server
-            // sees the whole backend, so "project" cannot narrow further.
+        if args.scope == FileAttentionScope::Project && tail.project_id.is_none() {
             warnings.push(
-                "scope=\"project\" but this server is not project-scoped (not launched with --project-only); results may span every project in the backend. The surfaced roots show the spread."
+                "scope=\"project\" could not establish the launch project's normalized identity; the repository query remains closed rather than widening across projects."
+                    .to_string(),
+            );
+        }
+        if args.scope == FileAttentionScope::Project {
+            warnings.push(
+                "pre-digest worktree roots pruned before durable project mapping was installed cannot be attributed safely and remain excluded; currently registered roots are migrated and future normalized roots remain durable."
                     .to_string(),
             );
         }
@@ -106,8 +104,12 @@ impl AppState {
             cancellation_token: query_id.clone(),
             rel: tail.rel.clone(),
             normalized_project_id: tail.project_id.clone(),
-            derive_worktree_roots: tail.derive_worktree_roots,
-            apply_project_scope: args.scope == FileAttentionScope::Project || project_scoped_server,
+            normalized_project_roots: tail
+                .root
+                .as_deref()
+                .and_then(moraine_config::worktree_roots_for_repo_root)
+                .unwrap_or_default(),
+            apply_project_scope: args.scope == FileAttentionScope::Project,
             start_unix_ms: args.start_unix_ms,
             end_unix_ms: args.end_unix_ms,
             tool: args.tool.clone(),
@@ -217,32 +219,46 @@ struct TailResolution {
 
 /// Reduce a query `path` to the repo-relative tail used for suffix matching.
 ///
-/// - A relative path is the tail as given.
-/// - An absolute path is stripped of its worktree root, found by walking up to
-///   a `.moraine.toml` / `.git` marker. When no marker is found (e.g. the file
-///   was deleted, or lives in a foreign root), the absolute path is matched
-///   literally and `tail_is_absolute` is set so the caller can warn.
+/// Relative paths are resolved lexically against the launch directory, so a
+/// deleted or not-yet-created file still carries the launch project's identity.
+/// Absolute paths are stripped against their marker root. Compound shell text
+/// is never interpreted as a path or repository root.
+#[cfg(test)]
 fn resolve_tail(path: &str) -> TailResolution {
+    resolve_tail_from(path, std::env::current_dir().ok().as_deref())
+}
+
+fn resolve_tail_from(path: &str, launch_dir: Option<&Path>) -> TailResolution {
     let cleaned = path.strip_prefix("./").unwrap_or(path);
+    let raw_is_single_path = is_single_path_candidate(cleaned);
     let normalized = normalize_path_text(cleaned);
     let normalized_changed = normalized != cleaned;
+    let normalized_is_single_path = is_single_path_candidate(&normalized);
+    let launch_project = launch_dir.and_then(|cwd| {
+        let scope_probe = cwd.join(".moraine-project-scope");
+        let root = find_project_root(&scope_probe)?;
+        let project_id = project_id_for_root(&root)?;
+        Some((root, project_id))
+    });
+
     if !normalized.starts_with('/') {
-        if let Ok(cwd) = std::env::current_dir() {
-            let candidate = cwd.join(&normalized);
-            if candidate.exists() {
-                let candidate_str = candidate.to_string_lossy().to_string();
-                if let Some(root) = find_project_root(&candidate) {
-                    if let Some(rel) = strip_root(&candidate_str, &root) {
-                        if !rel.is_empty() {
-                            return TailResolution {
-                                rel,
-                                project_id: project_id_for_root(&root),
-                                root: Some(root),
-                                tail_is_absolute: false,
-                                normalized: normalized_changed,
-                                derive_worktree_roots: true,
-                            };
-                        }
+        if raw_is_single_path && normalized_is_single_path {
+            if let (Some(cwd), Some((root, project_id))) = (launch_dir, launch_project) {
+                let absolute = normalize_path_text(&format!(
+                    "{}/{}",
+                    cwd.to_string_lossy().trim_end_matches('/'),
+                    normalized
+                ));
+                if let Some(rel) = strip_root(&absolute, &root) {
+                    if !rel.is_empty() {
+                        return TailResolution {
+                            rel,
+                            project_id: Some(project_id),
+                            root: Some(root),
+                            tail_is_absolute: false,
+                            normalized: normalized_changed,
+                            derive_worktree_roots: true,
+                        };
                     }
                 }
             }
@@ -257,17 +273,29 @@ fn resolve_tail(path: &str) -> TailResolution {
         };
     }
 
-    if let Some(root) = find_project_root(Path::new(&normalized)) {
-        if let Some(rel) = strip_root(&normalized, &root) {
-            if !rel.is_empty() {
-                return TailResolution {
-                    rel,
-                    project_id: project_id_for_root(&root),
-                    root: Some(root),
-                    tail_is_absolute: false,
-                    normalized: normalized_changed,
-                    derive_worktree_roots: true,
-                };
+    if raw_is_single_path && normalized_is_single_path {
+        if let Some(root) = find_project_root(Path::new(&normalized)) {
+            if let Some(rel) = strip_root(&normalized, &root) {
+                if !rel.is_empty() {
+                    let target_project_id = project_id_for_root(&root);
+                    let project_id = match (launch_dir, launch_project, target_project_id) {
+                        (None, _, target_project_id) => target_project_id,
+                        (Some(_), Some((_, launch_id)), Some(target_id))
+                            if launch_id == target_id =>
+                        {
+                            Some(launch_id)
+                        }
+                        _ => None,
+                    };
+                    return TailResolution {
+                        rel,
+                        project_id,
+                        root: Some(root),
+                        tail_is_absolute: false,
+                        normalized: normalized_changed,
+                        derive_worktree_roots: true,
+                    };
+                }
             }
         }
     }
@@ -280,6 +308,14 @@ fn resolve_tail(path: &str) -> TailResolution {
         normalized: normalized_changed,
         derive_worktree_roots: false,
     }
+}
+
+fn is_single_path_candidate(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains('\0')
+        && !path
+            .chars()
+            .any(|character| matches!(character, '\n' | '\r' | ';' | '|' | '&' | '`'))
 }
 
 fn normalize_path_text(path: &str) -> String {
@@ -326,15 +362,15 @@ fn strip_root(path: &str, root: &str) -> Option<String> {
         .map(|tail| tail.to_string())
 }
 
-/// Walk up from a file path's parent directory looking for a repo-root marker,
-/// bounded at `$HOME` or the filesystem root. Returns the marker directory.
+/// Walk up from a file path's parent directory looking for the nearest
+/// repository boundary, bounded at `$HOME` or the filesystem root. A linked
+/// worktree may inherit its `.moraine.toml` route from an enclosing checkout,
+/// but its own `.git` marker still defines the root reported to callers.
 fn find_project_root(file_path: &Path) -> Option<String> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let mut dir = file_path.parent();
     while let Some(current) = dir {
-        if REPO_ROOT_MARKERS
-            .iter()
-            .any(|marker| current.join(marker).exists())
+        if current.join(moraine_config::REPO_BACKEND_FILE).exists() || current.join(".git").exists()
         {
             return Some(current.to_string_lossy().to_string());
         }
@@ -347,11 +383,7 @@ fn find_project_root(file_path: &Path) -> Option<String> {
 }
 
 fn project_id_for_root(root: &str) -> Option<String> {
-    let root = Path::new(root);
-    if root.join(moraine_config::REPO_BACKEND_FILE).is_file() {
-        return moraine_config::find_repo_backend_ref(root);
-    }
-    None
+    moraine_config::project_id_for_repo_root(root)
 }
 
 /// Count non-empty, slash-separated segments of a tail. `mod.rs` is depth 1;
@@ -934,14 +966,78 @@ mod tests {
     }
 
     #[test]
-    fn resolve_tail_passes_relative_paths_through() {
-        let resolved = resolve_tail("crates/foo/tee.rs");
+    fn resolve_tail_passes_unscoped_relative_paths_through() {
+        let resolved = resolve_tail_from("crates/foo/tee.rs", None);
         assert_eq!(resolved.rel, "crates/foo/tee.rs");
         assert!(!resolved.tail_is_absolute);
         assert!(resolved.root.is_none());
 
-        let dotted = resolve_tail("./crates/foo/tee.rs");
+        let dotted = resolve_tail_from("./crates/foo/tee.rs", None);
         assert_eq!(dotted.rel, "crates/foo/tee.rs");
+    }
+
+    #[test]
+    fn resolve_tail_carries_launch_project_identity_for_missing_relative_file() {
+        let dir = std::env::temp_dir().join(format!("moraine-fa-relative-{}", std::process::id()));
+        let root = dir.join("repo");
+        std::fs::create_dir_all(&root).expect("mkdir root");
+        std::fs::create_dir_all(root.join(".git")).expect("mkdir git dir");
+        std::fs::write(root.join(".moraine.toml"), "backend = \"x\"\n").expect("write marker");
+
+        let resolved = resolve_tail_from("crates/new/file.rs", Some(&root));
+        assert_eq!(resolved.rel, "crates/new/file.rs");
+        assert_eq!(resolved.root.as_deref(), root.to_str());
+        assert_eq!(
+            resolved.project_id,
+            moraine_config::project_id_for_repo_root(&root)
+        );
+        assert!(resolved.derive_worktree_roots);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_tail_makes_nested_launch_paths_repository_relative() {
+        let dir =
+            std::env::temp_dir().join(format!("moraine-fa-nested-launch-{}", std::process::id()));
+        let root = dir.join("repo");
+        let launch = root.join("crates/foo");
+        std::fs::create_dir_all(root.join(".git")).expect("mkdir git dir");
+        std::fs::create_dir_all(&launch).expect("mkdir launch dir");
+        std::fs::write(root.join(".moraine.toml"), "backend = \"x\"\n").expect("write marker");
+
+        let nested = resolve_tail_from("src/lib.rs", Some(&launch));
+        assert_eq!(nested.rel, "crates/foo/src/lib.rs");
+        assert_eq!(nested.root.as_deref(), root.to_str());
+
+        let parent = resolve_tail_from("../shared.rs", Some(&launch));
+        assert_eq!(parent.rel, "crates/shared.rs");
+        assert_eq!(parent.root.as_deref(), root.to_str());
+
+        let outside = resolve_tail_from("../../../outside.rs", Some(&launch));
+        assert!(outside.project_id.is_none());
+        assert!(!outside.derive_worktree_roots);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_tail_never_derives_provenance_from_compound_input() {
+        let dir = std::env::temp_dir().join(format!("moraine-fa-compound-{}", std::process::id()));
+        let root = dir.join("repo");
+        std::fs::create_dir_all(&root).expect("mkdir root");
+        std::fs::create_dir_all(root.join(".git")).expect("mkdir git dir");
+        std::fs::write(root.join(".moraine.toml"), "backend = \"x\"\n").expect("write marker");
+
+        for delimiter in ["\0", "\n", "\r", ";", "|", "&", "`"] {
+            let path = format!("bad{delimiter}command/../src/lib.rs");
+            let resolved = resolve_tail_from(&path, Some(&root));
+            assert!(resolved.root.is_none(), "delimiter {delimiter:?}");
+            assert!(resolved.project_id.is_none(), "delimiter {delimiter:?}");
+            assert!(!resolved.derive_worktree_roots, "delimiter {delimiter:?}");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -950,15 +1046,69 @@ mod tests {
         let root = dir.join("repo");
         let nested = root.join("crates/foo");
         std::fs::create_dir_all(&nested).expect("mkdir nested");
+        std::fs::create_dir_all(root.join(".git")).expect("mkdir git dir");
         std::fs::write(root.join(".moraine.toml"), "backend = \"x\"\n").expect("write marker");
         let file = nested.join("tee.rs");
         std::fs::write(&file, "// test").expect("write file");
 
-        let resolved = resolve_tail(file.to_str().expect("utf8 path"));
+        let resolved = resolve_tail_from(file.to_str().expect("utf8 path"), None);
         assert_eq!(resolved.rel, "crates/foo/tee.rs");
         assert!(!resolved.tail_is_absolute);
         assert_eq!(resolved.root.as_deref(), root.to_str());
-        assert_eq!(resolved.project_id.as_deref(), Some("x"));
+        assert_eq!(
+            resolved.project_id,
+            moraine_config::project_id_for_repo_root(&root)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_tail_closes_project_scope_for_absolute_path_in_another_project() {
+        let dir =
+            std::env::temp_dir().join(format!("moraine-fa-cross-project-{}", std::process::id()));
+        let launch = dir.join("launch");
+        let other = dir.join("other");
+        for root in [&launch, &other] {
+            std::fs::create_dir_all(root.join(".git")).expect("mkdir git dir");
+            std::fs::write(root.join(".moraine.toml"), "backend = \"shared\"\n")
+                .expect("write marker");
+        }
+        let file = other.join("src/lib.rs");
+        std::fs::create_dir_all(file.parent().expect("file parent")).expect("mkdir file parent");
+        std::fs::write(&file, "// test").expect("write file");
+
+        let resolved = resolve_tail_from(file.to_str().expect("utf8 path"), Some(&launch));
+        assert_eq!(resolved.rel, "src/lib.rs");
+        assert_eq!(resolved.root.as_deref(), other.to_str());
+        assert!(resolved.project_id.is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_tail_keeps_linked_worktree_root_with_enclosing_project_marker() {
+        let dir =
+            std::env::temp_dir().join(format!("moraine-fa-linked-worktree-{}", std::process::id()));
+        let root = dir.join("repo");
+        let linked = root.join("worktrees/linked");
+        let linked_git_dir = root.join(".git/worktrees/linked");
+        std::fs::create_dir_all(&linked_git_dir).expect("mkdir linked git dir");
+        std::fs::create_dir_all(&linked).expect("mkdir linked worktree");
+        std::fs::write(linked_git_dir.join("commondir"), "../..\n").expect("write commondir");
+        std::fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", linked_git_dir.to_string_lossy()),
+        )
+        .expect("write linked git marker");
+        std::fs::write(root.join(".moraine.toml"), "backend = \"shared\"\n").expect("write marker");
+
+        let resolved = resolve_tail_from("src/lib.rs", Some(&linked));
+        assert_eq!(resolved.root.as_deref(), linked.to_str());
+        assert_eq!(
+            resolved.project_id,
+            moraine_config::project_id_for_repo_root(&root)
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1289,13 +1439,16 @@ mod tests {
 
     #[test]
     fn resolve_tail_normalizes_dotdot_and_repeated_slashes() {
-        assert_eq!(resolve_tail("crates/foo/../foo.rs").rel, "crates/foo.rs");
         assert_eq!(
-            resolve_tail("crates//foo///bar.rs").rel,
+            resolve_tail_from("crates/foo/../foo.rs", None).rel,
+            "crates/foo.rs"
+        );
+        assert_eq!(
+            resolve_tail_from("crates//foo///bar.rs", None).rel,
             "crates/foo/bar.rs"
         );
         assert_eq!(
-            resolve_tail("crates/foo dir/x.rs").rel,
+            resolve_tail_from("crates/foo dir/x.rs", None).rel,
             "crates/foo dir/x.rs"
         );
     }

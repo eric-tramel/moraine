@@ -202,16 +202,25 @@ Input:
 ```
 
 `path` is required. Absolute paths are reduced to a repo-relative tail by walking
-up to a `.moraine.toml` / `.git` marker; a repo-relative path is used as the tail
-directly and gives the best cross-worktree coverage. Existing relative paths are
-resolved from the server's working directory first, so nested worktree prefixes
-strip to the nested worktree root. Boundary whitespace, `file://` URIs, and
-directory-style trailing slashes are rejected rather than silently mapped to a
-different file. `scope` is `project`
-(default, honoring `--project-only`) or `all` (drop request-level origin
-narrowing on unscoped servers to include every worktree the backend holds).
-When the server was launched with `--project-only`, that configured project
-scope remains a hard floor so returned IDs stay openable. `granularity` is
+up to a `.moraine.toml` / `.git` marker. Relative paths are resolved from the
+client's launch directory, including when the client is routed through the
+central MCP server, so deleted or not-yet-created files retain launch-project
+provenance. Boundary whitespace, `file://` URIs, and directory-style trailing
+slashes are rejected rather than silently mapped to a different file. Compound
+shell text and multi-path captures are never interpreted as one path or root;
+unprovable roots remain `unknown`.
+
+`scope` is `project` (default) or `all`. `project` restricts both normalized and
+legacy fallback lookup to the launch repository's canonical Git-common-directory
+identity independently of `--project-only`, and fails closed when that identity
+cannot be established. `all` deliberately drops that request-level project
+narrowing. A configured `--project-only` server scope remains a hard floor so
+returned IDs stay openable. Registered pre-digest roots are migrated to a
+durable project mapping, and future normalized roots populate that mapping
+automatically. A root pruned before this mapping was installed has no stored Git
+identity and cannot be attributed safely; project scope excludes it rather than
+widening across projects, and the response warns about this one-time upgrade
+limitation. `granularity` is
 `sessions` (default, one rollup per session) or `events` (the flat
 touch-by-touch timeline). `tool` filters by tool name and `mutations_only`
 excludes common pure-read tools. The default limit is `min(50, mcp.max_results)`

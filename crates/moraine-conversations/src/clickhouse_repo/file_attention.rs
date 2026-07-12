@@ -29,26 +29,59 @@ impl ClickHouseConversationRepository {
             ));
         }
 
-        let mut touches = Vec::<FileAttentionTouch>::new();
-        if !query.apply_project_scope
-            || query
+        if query.apply_project_scope
+            && query
                 .normalized_project_id
                 .as_deref()
-                .is_some_and(|project_id| !project_id.is_empty())
+                .is_none_or(str::is_empty)
         {
-            match self.file_attention_exact_impl(&query).await {
-                Ok(rows) => touches.extend(rows),
+            return Ok(Vec::new());
+        }
+
+        let mut touches = Vec::<FileAttentionTouch>::new();
+        let normalized_schema_available = match self.file_attention_exact_impl(&query).await {
+            Ok(rows) => {
+                touches.extend(rows);
+                true
+            }
+            Err(RepoError::Backend(message)) if is_file_attention_schema_skew(&message) => {
+                warn!(
+                    error = %message,
+                    "file_attention normalized lookup unavailable; using Tier-0 suffix scan where its scope can be proven"
+                );
+                false
+            }
+            Err(error) => return Err(error),
+        };
+        let project_root_mapping_available = if query.apply_project_scope
+            && normalized_schema_available
+        {
+            match self.record_file_attention_project_roots(&query).await {
+                Ok(()) => true,
                 Err(RepoError::Backend(message)) if is_file_attention_schema_skew(&message) => {
                     warn!(
                         error = %message,
-                        "file_attention normalized lookup unavailable; falling back to Tier-0 suffix scan"
+                        "file_attention durable project-root mapping unavailable; using registered roots for this request"
                     );
+                    false
                 }
                 Err(error) => return Err(error),
             }
-        }
+        } else {
+            false
+        };
 
-        touches.extend(self.file_attention_suffix_impl(&query).await?);
+        if query.apply_project_scope && !normalized_schema_available {
+            return Ok(touches);
+        }
+        touches.extend(
+            self.file_attention_suffix_impl(
+                &query,
+                normalized_schema_available,
+                project_root_mapping_available,
+            )
+            .await?,
+        );
         Ok(merge_file_attention_touches(
             touches,
             query.max_rows.saturating_add(1),
@@ -92,10 +125,8 @@ impl ClickHouseConversationRepository {
                 "lowerUTF8(tool_name) NOT IN ({FILE_ATTENTION_READ_TOOL_NAMES_SQL})"
             ));
         }
-        if query.apply_project_scope {
-            if let Some(scope_clause) = self.session_scope_clause("session_id") {
-                inner_clauses.push(scope_clause);
-            }
+        if let Some(scope_clause) = self.session_scope_clause("session_id") {
+            inner_clauses.push(scope_clause);
         }
         let match_predicate = inner_clauses.join("\n      AND ");
 
@@ -120,6 +151,8 @@ impl ClickHouseConversationRepository {
             ("join_use_nulls", "1"),
         ];
 
+        let normalized_root_condition = single_path_sql("ti.worktree_root");
+
         let sql = format!(
             "WITH matched AS (
     SELECT session_id, event_uid, tool_call_id, harness, tool_name, tool_phase, input_preview, output_preview, repo_rel_path, worktree_root
@@ -133,9 +166,9 @@ impl ClickHouseConversationRepository {
     ti.harness AS harness,
     ti.tool_name AS tool_name,
     ti.tool_phase AS tool_phase,
-    if(ti.worktree_root != '', concat(ti.worktree_root, '/', ti.repo_rel_path), ti.repo_rel_path) AS matched_path,
+    if({normalized_root_condition}, concat(ti.worktree_root, '/', ti.repo_rel_path), ti.repo_rel_path) AS matched_path,
     'path_suffix' AS match_kind,
-    ti.worktree_root AS worktree_root,
+    if({normalized_root_condition}, ti.worktree_root, '') AS worktree_root,
     ifNull(e.cwd, '') AS cwd,
     toInt64(toUnixTimestamp64Milli(tr.event_time)) AS event_unix_ms,
     toUInt64(ifNull(tr.event_order, toUInt64(0))) AS event_order,
@@ -163,9 +196,47 @@ impl ClickHouseConversationRepository {
         self.map_backend(self.query_rows_with_params(&sql, None, &params).await)
     }
 
+    async fn record_file_attention_project_roots(
+        &self,
+        query: &FileAttentionQuery,
+    ) -> RepoResult<()> {
+        let Some(project_id) = query
+            .normalized_project_id
+            .as_deref()
+            .filter(|project_id| !project_id.is_empty())
+        else {
+            return Ok(());
+        };
+        if query.normalized_project_roots.is_empty() {
+            return Ok(());
+        }
+
+        let roots = query
+            .normalized_project_roots
+            .iter()
+            .filter(|root| !root.is_empty())
+            .map(|root| sql_quote(root))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if roots.is_empty() {
+            return Ok(());
+        }
+
+        let mappings = self.table_ref("file_attention_project_roots");
+        let sql = format!(
+            "INSERT INTO {mappings} (project_id, worktree_root, observed_version)
+SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
+            sql_quote(project_id)
+        );
+        self.map_backend(self.ch.request_text(&sql, None, None, false, None).await)
+            .map(|_| ())
+    }
+
     async fn file_attention_suffix_impl(
         &self,
         query: &FileAttentionQuery,
+        normalized_schema_available: bool,
+        project_root_mapping_available: bool,
     ) -> RepoResult<Vec<FileAttentionTouch>> {
         let rel = query.rel.as_str();
 
@@ -176,7 +247,6 @@ impl ClickHouseConversationRepository {
         let slash_rel_sql = sql_quote(&format!("/{rel}"));
         let rel_regex = regex::escape(rel);
         let slash_rel_regex = regex::escape(&format!("/{rel}"));
-        let rel_len = rel.len();
 
         const PATH_KEYS: [&str; 9] = [
             "file_path",
@@ -223,6 +293,15 @@ impl ClickHouseConversationRepository {
             "((JSONHas(input_json, 'command') OR JSONHas(input_json, 'cmd')) AND match({command_expr}, {shell_path_regex}))"
         );
 
+        let matched_path_is_single = single_path_sql("matched_path");
+        let normalized_root_is_single = single_path_sql("ti.worktree_root");
+        let event_root_expression = if normalized_schema_available {
+            "ifNull(e.worktree_root, '')"
+        } else {
+            "ifNull(e.cwd, '')"
+        };
+        let event_root_is_single = single_path_sql(event_root_expression);
+
         let mut inner_clauses = vec![format!(
             "tool_phase = 'request'\n      AND NOT (lowerUTF8(tool_name) = 'file_attention' OR endsWith(lowerUTF8(tool_name), '_file_attention'))\n      AND (\n        {ends_with_any}\n        OR {nested_path_match}\n        OR {shell_match}\n      )"
         )];
@@ -234,10 +313,8 @@ impl ClickHouseConversationRepository {
                 "lowerUTF8(tool_name) NOT IN ({FILE_ATTENTION_READ_TOOL_NAMES_SQL})"
             ));
         }
-        if query.apply_project_scope {
-            if let Some(scope_clause) = self.session_scope_clause("session_id") {
-                inner_clauses.push(scope_clause);
-            }
+        if let Some(scope_clause) = self.session_scope_clause("session_id") {
+            inner_clauses.push(scope_clause);
         }
         let match_predicate = inner_clauses.join("\n      AND ");
 
@@ -254,27 +331,32 @@ impl ClickHouseConversationRepository {
         let matched_path_expr =
             format!("multiIf(\n      {matched_path_arms},\n      {nested_path_expr})");
 
-        let exact_relative_root_condition = if rel.starts_with('/') {
+        let verified_event_root_condition = if rel.starts_with('/') {
             "0".to_string()
         } else {
-            format!("matched_path = {rel_sql} AND ifNull(e.cwd, '') != ''")
-        };
-
-        let worktree_root_expr = if query.derive_worktree_roots {
             format!(
-                "multiIf(
-      matched_path != ''
-      AND length(matched_path) > {rel_len} + 1
-      AND substring(matched_path, length(matched_path) - {rel_len}, 1) = '/',
-      substring(matched_path, 1, length(matched_path) - {rel_len} - 1),
-      {exact_relative_root_condition},
-      ifNull(e.cwd, ''),
-      ''
-    )"
+                "{matched_path_is_single}
+      AND {event_root_is_single}
+      AND (matched_path = {rel_sql} OR matched_path = concat({event_root_expression}, '/', {rel_sql}))"
+            )
+        };
+        let normalized_root_condition = if normalized_schema_available {
+            format!(
+                "ti.project_id != '' AND ti.repo_rel_path = {rel_sql} AND {normalized_root_is_single}"
             )
         } else {
-            format!("if({exact_relative_root_condition}, ifNull(e.cwd, ''), '')")
+            "0".to_string()
         };
+
+        let worktree_root_expr = format!(
+            "multiIf(
+      {normalized_root_condition},
+      ti.worktree_root,
+      {verified_event_root_condition},
+      {event_root_expression},
+      ''
+    )"
+        );
 
         let mut outer_clauses: Vec<String> = Vec::new();
         if let Some(start) = query.start_unix_ms {
@@ -283,6 +365,51 @@ impl ClickHouseConversationRepository {
         if let Some(end) = query.end_unix_ms {
             outer_clauses.push(format!("toUnixTimestamp64Milli(tr.event_time) < {end}"));
         }
+        if query.apply_project_scope {
+            let project_id = query
+                .normalized_project_id
+                .as_deref()
+                .expect("project scope identity checked before querying");
+            let project_id_sql = sql_quote(project_id);
+            let legacy_roots_sql = query
+                .normalized_project_roots
+                .iter()
+                .filter(|root| !root.is_empty())
+                .map(|root| sql_quote(root))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let durable_roots = self.table_ref("file_attention_project_roots");
+            let root_membership = |expression: &str| {
+                let mut predicates = Vec::with_capacity(2);
+                if !legacy_roots_sql.is_empty() {
+                    predicates.push(format!("{expression} IN ({legacy_roots_sql})"));
+                }
+                if project_root_mapping_available {
+                    predicates.push(format!(
+                        "{expression} IN (SELECT worktree_root FROM {durable_roots} FINAL WHERE project_id = {project_id_sql})"
+                    ));
+                }
+                if predicates.is_empty() {
+                    "0".to_string()
+                } else {
+                    format!("({})", predicates.join(" OR "))
+                }
+            };
+            let legacy_tool_scope = format!(
+                "(ti.project_id != '' AND NOT startsWith(ti.project_id, 'git:') AND {normalized_root_is_single} AND {})",
+                root_membership("ti.worktree_root")
+            );
+            let legacy_event_scope = format!(
+                "(e.project_id != '' AND NOT startsWith(e.project_id, 'git:') AND {event_root_is_single} AND {})",
+                root_membership(event_root_expression)
+            );
+            outer_clauses.push(format!(
+                "(ti.project_id = {project_id_sql}
+      OR {legacy_tool_scope}
+      OR (ti.project_id = '' AND (e.project_id = {project_id_sql} OR {legacy_event_scope}) AND {verified_event_root_condition}))"
+            ));
+        }
+
         let outer_where = if outer_clauses.is_empty() {
             "1".to_string()
         } else {
@@ -297,9 +424,20 @@ impl ClickHouseConversationRepository {
             ("join_use_nulls", "1"),
         ];
 
+        let normalized_tool_columns = if normalized_schema_available {
+            ", project_id, repo_rel_path, worktree_root"
+        } else {
+            ""
+        };
+        let normalized_event_columns = if normalized_schema_available {
+            ", any(project_id) AS project_id, any(worktree_root) AS worktree_root"
+        } else {
+            ""
+        };
+
         let sql = format!(
             "WITH matched AS (
-    SELECT session_id, event_uid, tool_call_id, harness, tool_name, tool_phase, input_json, input_preview, output_preview
+    SELECT session_id, event_uid, tool_call_id, harness, tool_name, tool_phase, input_json, input_preview, output_preview{normalized_tool_columns}
     FROM {tool_io} FINAL
     WHERE {match_predicate}
   )
@@ -326,7 +464,7 @@ impl ClickHouseConversationRepository {
     WHERE (session_id, event_uid) IN (SELECT session_id, event_uid FROM matched)
   ) AS tr ON tr.session_id = ti.session_id AND tr.event_uid = ti.event_uid
   ANY LEFT JOIN (
-    SELECT session_id, event_uid, any(cwd) AS cwd
+    SELECT session_id, event_uid, any(cwd) AS cwd{normalized_event_columns}
     FROM {events_source}
     WHERE (session_id, event_uid) IN (SELECT session_id, event_uid FROM matched)
     GROUP BY session_id, event_uid
@@ -351,11 +489,18 @@ impl ClickHouseConversationRepository {
     }
 }
 
+fn single_path_sql(expression: &str) -> String {
+    format!(
+        "({expression} != '' AND position({expression}, char(0)) = 0 AND position({expression}, char(10)) = 0 AND position({expression}, char(13)) = 0 AND position({expression}, ';') = 0 AND position({expression}, '|') = 0 AND position({expression}, '&') = 0 AND position({expression}, '`') = 0)"
+    )
+}
+
 fn is_file_attention_schema_skew(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("project_id")
         || lower.contains("repo_rel_path")
         || lower.contains("worktree_root")
+        || lower.contains("file_attention_project_roots")
 }
 
 pub(super) fn merge_file_attention_touches(
