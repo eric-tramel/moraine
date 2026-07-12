@@ -16,16 +16,43 @@ pub use private_proxy::private_route_deadline;
 pub use private_proxy::{negotiate_private_route, PrivateProxyConnection, PrivateRouteNegotiation};
 use serde::Deserialize;
 use serde_json::{json, Value};
-#[cfg(all(test, unix))]
-use std::future::pending;
-use std::future::Future;
+use std::collections::HashMap;
+use std::future::{pending, Future};
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex as StdMutex,
 };
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::sync::{oneshot, watch, Semaphore};
+use tokio::task::JoinSet;
 use tracing::{debug, warn};
+
+// The widest retrieval stage runs three independent ClickHouse reads.
+// Eight admitted requests therefore cap MCP-owned backend reads at 24 while
+// retaining that per-request fan-out.
+const MAX_REPOSITORY_READ_FAN_OUT: usize = 3;
+const MAX_IN_FLIGHT_BACKEND_READS: usize = 24;
+const MAX_IN_FLIGHT_REQUESTS: usize = MAX_IN_FLIGHT_BACKEND_READS / MAX_REPOSITORY_READ_FAN_OUT;
+const QUERY_CANCELLATION_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1_000);
+const SERVICE_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(1_250);
+
+type QueryCancellationSlot = Arc<StdMutex<Option<String>>>;
+
+tokio::task_local! {
+    static REQUEST_QUERY_CANCELLATION: QueryCancellationSlot;
+}
+
+pub(crate) fn backend_query_id(kind: &str) -> String {
+    static QUERY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let sequence = QUERY_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("moraine-{kind}-{}-{nanos}-{sequence}", std::process::id())
+}
 
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
@@ -43,12 +70,19 @@ struct ToolCallParams {
     arguments: Value,
 }
 
+#[derive(Debug, Deserialize)]
+struct CancelledParams {
+    #[serde(rename = "requestId")]
+    request_id: Value,
+}
+
 #[derive(Clone)]
 struct AppState {
     cfg: Arc<AppConfig>,
     repo: Arc<dyn ConversationRepository>,
     launch_dir: Option<PathBuf>,
     prewarm_started: Arc<AtomicBool>,
+    request_permits: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -455,12 +489,14 @@ impl AppState {
         repo: Arc<dyn ConversationRepository>,
         prewarm_started: Arc<AtomicBool>,
         launch_dir: Option<PathBuf>,
+        request_permits: Arc<Semaphore>,
     ) -> Arc<AppState> {
         Arc::new(AppState {
             cfg,
             repo,
             launch_dir,
             prewarm_started,
+            request_permits,
         })
     }
 
@@ -470,43 +506,203 @@ impl AppState {
             repo,
             Arc::new(AtomicBool::new(false)),
             std::env::current_dir().ok(),
+            Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS)),
         )
+    }
+}
+
+pub(crate) struct QueryCancellationGuard {
+    query_id: String,
+    slot: Option<QueryCancellationSlot>,
+}
+
+impl QueryCancellationGuard {
+    pub(crate) fn new(query_id: String) -> Self {
+        let slot = REQUEST_QUERY_CANCELLATION
+            .try_with(|slot| slot.clone())
+            .ok();
+        if let Some(slot) = &slot {
+            *slot.lock().expect("query cancellation slot poisoned") = Some(query_id.clone());
+        }
+        Self { query_id, slot }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        let Some(slot) = &self.slot else {
+            return;
+        };
+        let mut registered = slot.lock().expect("query cancellation slot poisoned");
+        if registered.as_ref() == Some(&self.query_id) {
+            *registered = None;
+        }
     }
 }
 
 /// Drive a single newline-delimited JSON-RPC connection to completion.
 ///
-/// This is the one source of truth for the public MCP wire framing: one JSON
-/// object per line in, one JSON object plus `\n` per response out, with blank
-/// lines skipped. Socket connections may provide a first line that was already
-/// read while discriminating the daemon-private route request; that line is
-/// replayed here exactly once for compatibility with older raw clients.
+/// Slow repository requests execute concurrently and may complete out of order.
+/// Response encoding and writes stay on this connection task so JSON frames can
+/// never interleave. Admission is shared across socket connections and rejects
+/// excess work immediately instead of building an unbounded queue.
 async fn serve_connection_with_first_line<R, W>(
     state: Arc<AppState>,
-    mut reader: R,
-    mut writer: W,
+    reader: R,
+    writer: W,
     first_line: Option<Vec<u8>>,
 ) -> Result<()>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    serve_connection_with_shutdown(state, reader, writer, first_line, pending()).await
+}
+
+async fn serve_connection_with_shutdown<R, W, S>(
+    state: Arc<AppState>,
+    reader: R,
+    writer: W,
+    first_line: Option<Vec<u8>>,
+    shutdown: S,
+) -> Result<()>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+    S: Future<Output = ()>,
+{
+    serve_connection_with_lifecycle(state, reader, writer, first_line, shutdown, pending()).await
+}
+
+async fn serve_connection_with_lifecycle<R, W, S, D>(
+    state: Arc<AppState>,
+    reader: R,
+    mut writer: W,
+    first_line: Option<Vec<u8>>,
+    shutdown: S,
+    peer_disconnected: D,
+) -> Result<()>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+    S: Future<Output = ()>,
+    D: Future<Output = ()>,
+{
+    let mut requests = JoinSet::new();
+    let mut active = HashMap::new();
+    let mut shutdown_requested = false;
+    let mut connection_error = None;
+    tokio::pin!(shutdown);
+    tokio::pin!(peer_disconnected);
+
     if let Some(first_line) = first_line {
         let first_line =
             std::str::from_utf8(&first_line).context("incoming RPC line is not valid UTF-8")?;
-        serve_rpc_line(&state, first_line, &mut writer).await?;
-    }
-
-    let mut line = String::new();
-    loop {
-        line.clear();
-        if reader.read_line(&mut line).await? == 0 {
-            break;
+        if let Some(response) =
+            dispatch_rpc_line(&state, first_line, &mut requests, &mut active).await?
+        {
+            tokio::select! {
+                result = write_rpc_response(&mut writer, &response) => result?,
+                _ = &mut shutdown => shutdown_requested = true,
+            }
         }
-        serve_rpc_line(&state, &line, &mut writer).await?;
     }
 
-    Ok(())
+    let mut lines = reader.lines();
+    while !shutdown_requested && connection_error.is_none() {
+        tokio::select! {
+            _ = &mut shutdown => {
+                shutdown_requested = true;
+            }
+            completed = requests.join_next(), if !requests.is_empty() => {
+                if let Some(response) = finish_request(&state, completed, &mut active).await {
+                    tokio::select! {
+                        result = write_rpc_response(&mut writer, &response) => {
+                            if let Err(error) = result {
+                                connection_error = Some(error);
+                            }
+                        }
+                        _ = &mut shutdown => shutdown_requested = true,
+                    }
+                }
+            }
+            next_line = lines.next_line() => {
+                let line = match next_line {
+                    Ok(Some(line)) => line,
+                    Ok(None) => break,
+                    Err(error) => {
+                        connection_error = Some(error.into());
+                        continue;
+                    }
+                };
+                match dispatch_rpc_line(&state, &line, &mut requests, &mut active).await {
+                    Ok(Some(response)) => {
+                        tokio::select! {
+                            result = write_rpc_response(&mut writer, &response) => {
+                                if let Err(error) = result {
+                                    connection_error = Some(error);
+                                }
+                            }
+                            _ = &mut shutdown => shutdown_requested = true,
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => connection_error = Some(error),
+                }
+            }
+        }
+    }
+
+    // EOF only closes the request half of a stream. A client may continue
+    // reading responses after it has sent every frame, so admitted work keeps
+    // its normal lifecycle and every completed response is serialized before
+    // this connection closes. Socket transports separately report a full peer
+    // hangup, while service shutdown and write failures move directly to
+    // cancellation below.
+    if !shutdown_requested && connection_error.is_none() {
+        while !requests.is_empty() {
+            let completed = tokio::select! {
+                _ = &mut shutdown => break,
+                _ = &mut peer_disconnected => break,
+                completed = requests.join_next() => completed,
+            };
+            if let Some(response) = finish_request(&state, completed, &mut active).await {
+                tokio::select! {
+                    result = write_rpc_response(&mut writer, &response) => {
+                        if let Err(error) = result {
+                            connection_error = Some(error);
+                            break;
+                        }
+                    }
+                    _ = &mut shutdown => break,
+                }
+            }
+        }
+    }
+
+    for request in active.values_mut() {
+        if let Some(cancellation) = request.cancellation.take() {
+            let _ = cancellation.send(());
+        }
+    }
+
+    // Request tasks own backend cancellation and must be given time to finish
+    // it before the connection or service reports itself drained.
+    let cancellation_deadline = tokio::time::Instant::now() + QUERY_CANCELLATION_DEADLINE;
+    while !requests.is_empty() {
+        match tokio::time::timeout_at(cancellation_deadline, requests.join_next()).await {
+            Ok(completed) => {
+                let _ = finish_request(&state, completed, &mut active).await;
+            }
+            Err(_) => break,
+        }
+    }
+    requests.abort_all();
+    while requests.join_next().await.is_some() {}
+
+    if let Some(error) = connection_error {
+        Err(error)
+    } else {
+        Ok(())
+    }
 }
 
 async fn serve_connection<R, W>(state: Arc<AppState>, reader: R, writer: W) -> Result<()>
@@ -517,13 +713,24 @@ where
     serve_connection_with_first_line(state, reader, writer, None).await
 }
 
-async fn serve_rpc_line<W>(state: &Arc<AppState>, line: &str, writer: &mut W) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
+struct ActiveRequest {
+    id: Value,
+    task_id: tokio::task::Id,
+    query_cancellation: QueryCancellationSlot,
+    cancellation: Option<oneshot::Sender<()>>,
+}
+
+type RequestResult = (String, Option<Value>);
+
+async fn dispatch_rpc_line(
+    state: &Arc<AppState>,
+    line: &str,
+    requests: &mut JoinSet<RequestResult>,
+    active: &mut HashMap<String, ActiveRequest>,
+) -> Result<Option<Value>> {
     let line = line.trim();
     if line.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     debug!("incoming rpc line: {}", line);
@@ -531,16 +738,195 @@ where
         Ok(req) => req,
         Err(err) => {
             warn!("failed to parse rpc request: {}", err);
-            return Ok(());
+            return Ok(None);
         }
     };
 
-    if let Some(resp) = state.handle_request(req).await {
-        let payload = serde_json::to_vec(&resp)?;
-        writer.write_all(&payload).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
+    if req.method == "notifications/cancelled" {
+        if let Ok(params) = serde_json::from_value::<CancelledParams>(req.params) {
+            if let Some(request) = active.get_mut(&request_key(&params.request_id)?) {
+                if let Some(cancellation) = request.cancellation.take() {
+                    let _ = cancellation.send(());
+                }
+            }
+        }
+        return Ok(None);
     }
+
+    if !request_requires_admission(&req, state.cfg.mcp.max_results) {
+        return Ok(state.handle_request(req).await);
+    }
+
+    let id = req
+        .id
+        .clone()
+        .expect("admitted repository requests always carry an id");
+    let key = request_key(&id)?;
+    if active.contains_key(&key) {
+        return Ok(Some(rpc_err(
+            id,
+            -32600,
+            "duplicate request id is already in flight",
+        )));
+    }
+
+    let permit = match state.request_permits.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return Ok(Some(rpc_err(
+                id,
+                -32000,
+                "server busy: concurrent request limit reached",
+            )))
+        }
+    };
+
+    let (cancel_tx, mut cancel_rx) = oneshot::channel();
+    let request_query_id = backend_query_id("request");
+    let query_cancellation = Arc::new(StdMutex::new(Some(request_query_id.clone())));
+    let task_query_cancellation = query_cancellation.clone();
+    let request_state = state.clone();
+    let task_key = key.clone();
+    let task = requests.spawn(async move {
+        let _permit = permit;
+        let query_cancellation = task_query_cancellation;
+        enum Outcome {
+            Completed(Option<Value>),
+            Cancelled,
+        }
+        let outcome = {
+            let request = REQUEST_QUERY_CANCELLATION.scope(
+                query_cancellation.clone(),
+                moraine_conversations::with_repository_query_id(
+                    request_query_id,
+                    request_state.handle_request(req),
+                ),
+            );
+            tokio::pin!(request);
+            tokio::select! {
+                biased;
+                _ = &mut cancel_rx => Outcome::Cancelled,
+                response = &mut request => Outcome::Completed(response),
+            }
+        };
+        let response = match outcome {
+            Outcome::Completed(response) => response,
+            Outcome::Cancelled => {
+                cancel_registered_query(&request_state, &query_cancellation).await;
+                None
+            }
+        };
+        (task_key, response)
+    });
+    active.insert(
+        key,
+        ActiveRequest {
+            id,
+            task_id: task.id(),
+            query_cancellation,
+            cancellation: Some(cancel_tx),
+        },
+    );
+    Ok(None)
+}
+
+async fn cancel_registered_query(state: &AppState, slot: &QueryCancellationSlot) {
+    let query_id = slot
+        .lock()
+        .expect("query cancellation slot poisoned")
+        .take();
+    let Some(query_id) = query_id else {
+        return;
+    };
+    cancel_query_with_deadline(state, &query_id).await;
+}
+
+pub(crate) async fn cancel_query_with_deadline(state: &AppState, query_id: &str) {
+    match tokio::time::timeout(
+        QUERY_CANCELLATION_DEADLINE,
+        state.repo.cancel_query(query_id),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!(
+            query_id,
+            error = %error,
+            "failed to cancel abandoned MCP ClickHouse query"
+        ),
+        Err(_) => warn!(
+            query_id,
+            "timed out cancelling abandoned MCP ClickHouse query"
+        ),
+    }
+}
+
+fn request_requires_admission(req: &RpcRequest, max_results: u16) -> bool {
+    if req.id.is_none() || req.method != "tools/call" {
+        return false;
+    }
+    let Ok(params) = serde_json::from_value::<ToolCallParams>(req.params.clone()) else {
+        return false;
+    };
+
+    match params.name.as_str() {
+        contract::SEARCH_SESSIONS_TOOL => {
+            serde_json::from_value::<contract::SearchSessionsArgs>(params.arguments)
+                .is_ok_and(|args| args.validate().is_ok())
+        }
+        contract::LIST_SESSIONS_TOOL => {
+            serde_json::from_value::<contract::ListSessionsArgs>(params.arguments)
+                .is_ok_and(|args| args.validate(max_results).is_ok())
+        }
+        contract::OPEN_TOOL => serde_json::from_value::<contract::OpenV1Args>(params.arguments)
+            .is_ok_and(|args| args.validate().is_ok()),
+        contract::FILE_ATTENTION_TOOL => {
+            serde_json::from_value::<contract::FileAttentionArgs>(params.arguments)
+                .is_ok_and(|args| args.validate(max_results).is_ok())
+        }
+        _ => false,
+    }
+}
+
+fn request_key(id: &Value) -> Result<String> {
+    serde_json::to_string(id).context("failed to encode JSON-RPC request id")
+}
+
+async fn finish_request(
+    state: &AppState,
+    completed: Option<Result<RequestResult, tokio::task::JoinError>>,
+    active: &mut HashMap<String, ActiveRequest>,
+) -> Option<Value> {
+    match completed {
+        Some(Ok((key, response))) => {
+            active.remove(&key);
+            response
+        }
+        Some(Err(error)) => {
+            let failed = active
+                .iter()
+                .find_map(|(key, request)| (request.task_id == error.id()).then(|| key.clone()))
+                .and_then(|key| active.remove(&key));
+            debug!("mcp request task ended unexpectedly: {error}");
+            if let Some(request) = failed {
+                cancel_registered_query(state, &request.query_cancellation).await;
+                Some(rpc_err(request.id, -32603, "request failed"))
+            } else {
+                None
+            }
+        }
+        None => None,
+    }
+}
+
+async fn write_rpc_response<W>(writer: &mut W, response: &Value) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let payload = serde_json::to_vec(response)?;
+    writer.write_all(&payload).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
     Ok(())
 }
 
@@ -596,6 +982,8 @@ struct SocketState {
     cfg: Arc<AppConfig>,
     router: Arc<BackendRepositoryRouter>,
     prewarm_gates: BackendPrewarmGates,
+    request_permits: Arc<Semaphore>,
+    shutdown: watch::Receiver<bool>,
 }
 
 /// Run the shared MCP server on a Unix domain socket using the daemon-owned
@@ -605,8 +993,8 @@ struct SocketState {
 /// never installs signal handlers or terminates the process. Each accepted
 /// connection negotiates and pins one repository handle, while connections to
 /// the same backend share both its repository and its MCP prewarm gate. When
-/// shutdown resolves, accepting stops, connection tasks are cancelled, and the
-/// public socket path is unlinked before this future returns.
+/// shutdown resolves, accepting stops, connection and request cancellation is
+/// drained within a fixed bound, and the public socket path is unlinked.
 #[cfg(unix)]
 pub async fn run_socket_with_router<S>(
     cfg: Arc<AppConfig>,
@@ -620,8 +1008,11 @@ where
     use tokio::net::{UnixListener, UnixStream};
     use tokio::task::JoinSet;
 
+    let (connection_shutdown_tx, connection_shutdown_rx) = watch::channel(false);
     let state = SocketState {
         prewarm_gates: BackendPrewarmGates::new(&cfg),
+        request_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS)),
+        shutdown: connection_shutdown_rx,
         cfg,
         router,
     };
@@ -773,6 +1164,15 @@ where
         }
     }
 
+    let _ = connection_shutdown_tx.send(true);
+    let drain_deadline = tokio::time::Instant::now() + SERVICE_DRAIN_GRACE;
+    while !connections.is_empty() {
+        match tokio::time::timeout_at(drain_deadline, connections.join_next()).await {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
     connections.abort_all();
     while connections.join_next().await.is_some() {}
     Ok(())
@@ -881,8 +1281,46 @@ fn rename_socket_noreplace(_from: &std::path::Path, _to: &std::path::Path) -> st
 }
 
 #[cfg(unix)]
+fn socket_peer_disconnected(fd: std::os::fd::RawFd) -> bool {
+    // A zero-length send emits no protocol bytes, but still checks whether the
+    // peer retains its read half. Unlike POLLHUP, this distinguishes a client
+    // write-half shutdown from a full disconnect on supported Unix sockets.
+    // SAFETY: a null buffer is valid for a zero-length send, and the owning
+    // socket halves outlive this monitor.
+    let sent = unsafe {
+        libc::send(
+            fd,
+            std::ptr::null(),
+            0,
+            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+        )
+    };
+    if sent == 0 {
+        return false;
+    }
+
+    let errno = std::io::Error::last_os_error().raw_os_error();
+    !matches!(
+        errno,
+        Some(code)
+            if code == libc::EINTR || code == libc::EAGAIN || code == libc::EWOULDBLOCK
+    )
+}
+
+#[cfg(unix)]
+async fn wait_for_socket_disconnect(fd: std::os::fd::RawFd) {
+    while !socket_peer_disconnected(fd) {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(unix)]
 async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStream) -> Result<()> {
     use private_proxy::ServerFirstLine;
+    use std::os::fd::AsRawFd;
+
+    let mut shutdown = state.shutdown.clone();
+    let peer_fd = stream.as_raw_fd();
 
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -935,11 +1373,24 @@ async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStr
         backend.repository().clone(),
         prewarm_started,
         launch_dir,
+        state.request_permits,
     );
     if negotiated {
         private_proxy::write_ack(&mut write_half).await?;
     }
-    serve_connection_with_first_line(app_state, reader, write_half, replay_first_line).await
+    serve_connection_with_lifecycle(
+        app_state,
+        reader,
+        write_half,
+        replay_first_line,
+        async move {
+            if !*shutdown.borrow() {
+                let _ = shutdown.changed().await;
+            }
+        },
+        wait_for_socket_disconnect(peer_fd),
+    )
+    .await
 }
 
 /// Run the stdio byte pumps after a private route negotiation was accepted.
@@ -1064,6 +1515,9 @@ where
 {
     anyhow::bail!("the central MCP socket server is only supported on Unix platforms")
 }
+
+#[cfg(test)]
+mod concurrency_tests;
 
 #[cfg(test)]
 mod tests {

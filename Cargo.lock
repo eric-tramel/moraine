@@ -1260,6 +1260,7 @@ name = "moraine-mcp-core"
 version = "0.6.4"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "libc",
  "moraine-config",

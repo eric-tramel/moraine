@@ -31,3 +31,4 @@ libc = "0.2"
 # which would break `cargo test -p moraine-mcp-core` if that crate ever
 # dropped "macros".
 tokio = { version = "1.40", features = ["macros"] }
+async-trait = "0.1"

@@ -483,7 +483,12 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
         if query_id.is_empty() {
             return Ok(());
         }
-        let sql = format!("KILL QUERY WHERE query_id = {} SYNC", sql_quote(query_id));
+        let child_prefix = format!("{query_id}-");
+        let sql = format!(
+            "KILL QUERY WHERE query_id = {} OR startsWith(query_id, {}) SYNC",
+            sql_quote(query_id),
+            sql_quote(&child_prefix)
+        );
         self.map_backend(self.ch.request_text(&sql, None, None, false, None).await)
             .map(|_| ())
     }

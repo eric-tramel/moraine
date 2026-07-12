@@ -90,6 +90,7 @@ pub(crate) struct MockOptions {
 #[derive(Default)]
 pub(crate) struct MockState {
     pub(crate) queries: Mutex<Vec<String>>,
+    pub(crate) query_ids: Mutex<Vec<Option<String>>>,
     pub(crate) options: MockOptions,
     pub(crate) scripted_responses: Mutex<Option<VecDeque<ScriptedResponse>>>,
 }
@@ -125,6 +126,11 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             .lock()
             .expect("query lock")
             .push(query.clone());
+        state
+            .query_ids
+            .lock()
+            .expect("query id lock")
+            .push(params.get("query_id").cloned());
 
         if let Some(barrier) = state.options.query_barrier.clone() {
             if barrier
@@ -1801,6 +1807,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
         .then(|| options.scripted_responses.iter().cloned().collect());
     let state = Arc::new(MockState {
         queries: Mutex::default(),
+        query_ids: Mutex::default(),
         options,
         scripted_responses: Mutex::new(scripted_responses),
     });

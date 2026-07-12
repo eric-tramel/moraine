@@ -355,3 +355,20 @@ async fn file_attention_project_scope_without_identity_stays_closed() {
         "an unknown request project must stay closed without issuing a backend query"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_query_kills_base_and_fanout_child_query_ids() {
+    let (repo, state) = build_repo().await;
+
+    repo.cancel_query("mcp-request-123")
+        .await
+        .expect("cancel query family");
+
+    let queries = state.queries.lock().expect("queries lock");
+    let kill = queries
+        .iter()
+        .find(|query| query.starts_with("KILL QUERY"))
+        .expect("kill query captured");
+    assert!(kill.contains("query_id = 'mcp-request-123'"));
+    assert!(kill.contains("startsWith(query_id, 'mcp-request-123-')"));
+}

@@ -521,6 +521,90 @@ async fn search_mcp_events_supports_global_search_with_enriched_hits() {
     assert_eq!(result.hits[0].raw_score, 12.5);
     assert_eq!(result.hits[0].model.as_deref(), Some("gpt-5.3-codex"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_mcp_events_attaches_cancellation_token_to_clickhouse_reads() {
+    let (repo, state) = build_repo().await;
+    let cancellation_token = "mcp-search-cancel-test";
+
+    let result = repo
+        .search_mcp_events(SearchMcpEventsQuery {
+            query: "hello world".to_string(),
+            cancellation_token: Some(cancellation_token.to_string()),
+            n_hits: Some(2),
+            event_types: Some(vec![
+                McpEventType::UserInput,
+                McpEventType::AssistantResponse,
+            ]),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            ..SearchMcpEventsQuery::default()
+        })
+        .await
+        .expect("cancellable mcp event search");
+
+    assert_eq!(result.query_id, cancellation_token);
+    let query_ids = state.query_ids.lock().expect("query id lock").clone();
+    assert!(!query_ids.is_empty());
+    let child_prefix = format!("{cancellation_token}-");
+    let observed = query_ids
+        .iter()
+        .map(|query_id| query_id.as_deref().expect("query id"))
+        .collect::<Vec<_>>();
+    assert!(observed
+        .iter()
+        .all(|query_id| query_id.starts_with(&child_prefix)));
+    assert_eq!(
+        observed
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        observed.len()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repository_query_context_attaches_id_without_query_model_token() {
+    let (repo, state) = build_repo().await;
+    let query_id = "mcp-request-context-test";
+
+    with_repository_query_id(
+        query_id.to_string(),
+        repo.search_mcp_events(SearchMcpEventsQuery {
+            query: "hello world".to_string(),
+            n_hits: Some(2),
+            event_types: Some(vec![
+                McpEventType::UserInput,
+                McpEventType::AssistantResponse,
+            ]),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            ..SearchMcpEventsQuery::default()
+        }),
+    )
+    .await
+    .expect("query scoped by request context");
+
+    let query_ids = state.query_ids.lock().expect("query id lock").clone();
+    assert!(!query_ids.is_empty());
+    let child_prefix = format!("{query_id}-");
+    let observed = query_ids
+        .iter()
+        .map(|observed| observed.as_deref().expect("query id"))
+        .collect::<Vec<_>>();
+    assert!(observed
+        .iter()
+        .all(|observed| observed.starts_with(&child_prefix)));
+    assert_eq!(
+        observed
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        observed.len()
+    );
+}
 #[tokio::test(flavor = "multi_thread")]
 async fn search_mcp_events_does_not_serialize_independent_enrichment_queries() {
     let reached = Arc::new(Notify::new());
@@ -624,6 +708,7 @@ async fn search_mcp_events_supports_turn_scoped_search() {
     let result = repo
         .search_mcp_events(SearchMcpEventsQuery {
             query: "cargo failure".to_string(),
+            cancellation_token: None,
             n_hits: Some(5),
             session_id: Some("sess_c".to_string()),
             turn_seq: Some(2),

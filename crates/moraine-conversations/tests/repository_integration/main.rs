@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use moraine_conversations::{
-    AnalyticsRange, ConversationListFilter, ConversationListSort, ConversationMode,
-    ConversationRepository, ConversationSearchQuery, FileAttentionQuery, McpEventType,
-    McpSessionListFilter, PageRequest, RepoError, SearchEventKind, SearchEventsQuery,
+    with_repository_query_id, AnalyticsRange, ConversationListFilter, ConversationListSort,
+    ConversationMode, ConversationRepository, ConversationSearchQuery, FileAttentionQuery,
+    McpEventType, McpSessionListFilter, PageRequest, RepoError, SearchEventKind, SearchEventsQuery,
     SearchMcpEventsQuery, SessionAnalyticsQuery, SessionEventsDirection, SessionEventsQuery,
     SessionLookback, SessionMetadataSearchQuery, SessionStep, StoreProbe, TablePreviewQuery,
     TurnListFilter,
