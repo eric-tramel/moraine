@@ -306,19 +306,13 @@ fn search_hit_json(
             "title": hit.session_title.as_deref().or(hit.session_slug.as_deref()),
             "source": hit.source_name.as_deref().or(hit.harness.as_deref()),
             "started_at": metadata
-                .map(|metadata| format_rfc3339_utc_millis(metadata.first_event_unix_ms))
-                .or_else(|| {
-                    hit.session_started_at
-                        .as_deref()
-                        .map(format_repository_timestamp)
-                }),
+                .map(|metadata| metadata.first_event_unix_ms)
+                .or(hit.session_started_at_unix_ms)
+                .map(format_rfc3339_utc_millis),
             "updated_at": metadata
-                .map(|metadata| format_rfc3339_utc_millis(metadata.last_event_unix_ms))
-                .or_else(|| {
-                    hit.session_updated_at
-                        .as_deref()
-                        .map(format_repository_timestamp)
-                }),
+                .map(|metadata| metadata.last_event_unix_ms)
+                .or(hit.session_updated_at_unix_ms)
+                .map(format_rfc3339_utc_millis),
             "completed": session_completed,
         },
         "snippet": {
@@ -375,34 +369,6 @@ fn score_unit(score: f64) -> f64 {
 
 fn is_terminal_payload_type(payload_type: &str) -> bool {
     matches!(payload_type, "task_complete" | "turn_aborted")
-}
-
-fn format_repository_timestamp(timestamp: &str) -> String {
-    let trimmed = timestamp.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    if trimmed.contains('T') && trimmed.ends_with('Z') {
-        return trimmed.to_string();
-    }
-
-    let Some((date, time)) = trimmed.split_once(' ') else {
-        return trimmed.to_string();
-    };
-    let (clock, fraction) = time.split_once('.').unwrap_or((time, ""));
-    if date.len() != 10 || clock.len() != 8 {
-        return trimmed.to_string();
-    }
-    let millis = if fraction.is_empty() {
-        "000".to_string()
-    } else {
-        let mut millis = fraction.chars().take(3).collect::<String>();
-        while millis.len() < 3 {
-            millis.push('0');
-        }
-        millis
-    };
-    format!("{date}T{clock}.{millis}Z")
 }
 
 fn search_warnings(result: &SearchMcpEventsResult) -> Vec<String> {
@@ -536,15 +502,15 @@ mod tests {
             event_uid: "evt-1".to_string(),
             session_id: "sess-1".to_string(),
             event_type: RepoMcpEventType::ToolResponse,
-            event_time: "2026-04-29 18:42:31.125".to_string(),
-            event_unix_ms: 1_777_487_751_125,
+            event_time: "2026-04-29 08:00:01.123".to_string(),
+            event_unix_ms: 1_777_464_001_123,
             turn_seq: 2,
             turn_ordinal: 2,
             event_order: 5,
             event_ordinal: 3,
             turn_event_count: 4,
-            session_started_at: None,
-            session_updated_at: None,
+            session_started_at_unix_ms: None,
+            session_updated_at_unix_ms: None,
             session_title: Some("Fix tests".to_string()),
             session_slug: None,
             session_summary: None,
@@ -575,10 +541,10 @@ mod tests {
             "sess-1".to_string(),
             SessionMetadata {
                 session_id: "sess-1".to_string(),
-                first_event_time: "unused".to_string(),
-                first_event_unix_ms: 1_777_487_700_000,
-                last_event_time: "unused".to_string(),
-                last_event_unix_ms: 1_777_487_800_000,
+                first_event_time: "2026-04-30 09:00:00".to_string(),
+                first_event_unix_ms: 1_777_554_000_000,
+                last_event_time: "2026-04-30 09:10:00".to_string(),
+                last_event_unix_ms: 1_777_554_600_000,
                 total_turns: 2,
                 total_events: 8,
                 user_messages: 1,
@@ -629,6 +595,9 @@ mod tests {
         assert_eq!(shaped["open"]["turn_id"], "turn:c2Vzcy0x:2");
         assert_eq!(shaped["event"]["type"], "tool_response");
         assert_eq!(shaped["event"]["terminal"], true);
+        assert_eq!(shaped["event"]["timestamp"], "2026-04-29T12:00:01.123Z");
+        assert_eq!(shaped["session"]["started_at"], "2026-04-30T13:00:00.000Z");
+        assert_eq!(shaped["session"]["updated_at"], "2026-04-30T13:10:00.000Z");
         assert_eq!(shaped["turn"]["completed"], true);
         assert_eq!(shaped["session"]["completed"], true);
         assert!(shaped.get("text_content").is_none());
@@ -649,8 +618,8 @@ mod tests {
             event_order: 7,
             event_ordinal: 2,
             turn_event_count: 2,
-            session_started_at: None,
-            session_updated_at: None,
+            session_started_at_unix_ms: None,
+            session_updated_at_unix_ms: None,
             session_title: None,
             session_slug: None,
             session_summary: None,

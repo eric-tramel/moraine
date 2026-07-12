@@ -20,6 +20,29 @@ pub(crate) fn assert_script_consumed(state: &MockState, expected_requests: usize
     );
 }
 
+pub(crate) fn assert_typed_turn_timestamp_projection(sql: &str) {
+    for (column, alias) in [
+        ("started_at", "started_at_unix_ms"),
+        ("ended_at", "ended_at_unix_ms"),
+    ] {
+        let expected = format!("toInt64(toUnixTimestamp64Milli(ts.{column})) AS {alias}");
+        assert!(
+            sql.contains(&expected),
+            "epoch conversion must use the qualified typed source {expected:?}: {sql}"
+        );
+
+        let shadowed = format!("toUnixTimestamp64Milli({column})");
+        assert!(
+            !sql.contains(&shadowed),
+            "epoch conversion can bind the same-name String projection alias: {sql}"
+        );
+        assert!(
+            !sql.contains("parseDateTime64BestEffort"),
+            "typed timestamps must not round-trip through String parsing: {sql}"
+        );
+    }
+}
+
 /// Regression helper for issue #253: ClickHouse 25.12's new analyzer treats
 /// `any(column) AS column` as a nested aggregate because the inner `column`
 /// binds to the alias expression. Returns true if the SQL contains that

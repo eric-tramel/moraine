@@ -18,16 +18,24 @@ async fn session_analytics_assembles_canonical_views_and_public_steps() {
         .forbidding(&["now() - INTERVAL"]),
         ScriptedResponse::rows(
             &[
-                "FROM `moraine`.`v_turn_summary`",
+                "FROM `moraine`.`v_turn_summary` AS ts",
+                "toInt64(toUnixTimestamp64Milli(ts.started_at)) AS started_at_unix_ms",
+                "toInt64(toUnixTimestamp64Milli(ts.ended_at)) AS ended_at_unix_ms",
                 "WHERE session_id IN ['analytics-session']",
                 "ORDER BY session_id ASC, turn_seq ASC",
                 "FORMAT JSONEachRow",
             ],
             session_analytics_turn_rows(),
-        ),
+        )
+        .forbidding(&[
+            "toInt64(toUnixTimestamp64Milli(started_at)) AS started_at_unix_ms",
+            "toInt64(toUnixTimestamp64Milli(ended_at)) AS ended_at_unix_ms",
+            "parseDateTime64BestEffort",
+        ]),
         ScriptedResponse::rows(
             &[
                 "FROM `moraine`.`v_conversation_trace` AS t",
+                "toInt64(toUnixTimestamp64Milli(t.event_time)) AS event_unix_ms",
                 "LEFT JOIN (SELECT * FROM `moraine`.`events` FINAL) AS e ON e.event_uid = t.event_uid",
                 "WHERE t.session_id IN ['analytics-session']",
                 "ORDER BY t.session_id ASC, t.event_order ASC",

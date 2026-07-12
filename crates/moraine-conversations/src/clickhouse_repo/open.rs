@@ -11,17 +11,17 @@ impl ClickHouseConversationRepository {
   session_id,
   toUInt32(turn_seq) AS turn_seq,
   ifNull(turn_id, '') AS turn_id,
-  toString(started_at) AS started_at,
-  toInt64(toUnixTimestamp64Milli(parseDateTime64BestEffort(toString(started_at), 3))) AS started_at_unix_ms,
-  toString(ended_at) AS ended_at,
-  toInt64(toUnixTimestamp64Milli(parseDateTime64BestEffort(toString(ended_at), 3))) AS ended_at_unix_ms,
+  toString(ts.started_at) AS started_at,
+  toInt64(toUnixTimestamp64Milli(ts.started_at)) AS started_at_unix_ms,
+  toString(ts.ended_at) AS ended_at,
+  toInt64(toUnixTimestamp64Milli(ts.ended_at)) AS ended_at_unix_ms,
   toUInt64(total_events) AS total_events,
   toUInt64(user_messages) AS user_messages,
   toUInt64(assistant_messages) AS assistant_messages,
   toUInt64(tool_calls) AS tool_calls,
   toUInt64(tool_results) AS tool_results,
   toUInt64(reasoning_items) AS reasoning_items
-FROM {turn_summary}
+FROM {turn_summary} AS ts
 WHERE session_id = {}
 ORDER BY turn_seq ASC
 FORMAT JSONEachRow",
@@ -163,17 +163,17 @@ FORMAT JSONEachRow",
   session_id,
   toUInt32(turn_seq) AS turn_seq,
   ifNull(turn_id, '') AS turn_id,
-  toString(started_at) AS started_at,
-  toInt64(toUnixTimestamp64Milli(parseDateTime64BestEffort(toString(started_at), 3))) AS started_at_unix_ms,
-  toString(ended_at) AS ended_at,
-  toInt64(toUnixTimestamp64Milli(parseDateTime64BestEffort(toString(ended_at), 3))) AS ended_at_unix_ms,
+  toString(ts.started_at) AS started_at,
+  toInt64(toUnixTimestamp64Milli(ts.started_at)) AS started_at_unix_ms,
+  toString(ts.ended_at) AS ended_at,
+  toInt64(toUnixTimestamp64Milli(ts.ended_at)) AS ended_at_unix_ms,
   toUInt64(total_events) AS total_events,
   toUInt64(user_messages) AS user_messages,
   toUInt64(assistant_messages) AS assistant_messages,
   toUInt64(tool_calls) AS tool_calls,
   toUInt64(tool_results) AS tool_results,
   toUInt64(reasoning_items) AS reasoning_items
-FROM {turn_summary}
+FROM {turn_summary} AS ts
 WHERE session_id = {} AND turn_seq = {}
 LIMIT 1
 FORMAT JSONEachRow",
@@ -196,7 +196,8 @@ FORMAT JSONEachRow",
   event_uid,
   toUInt64(event_order) AS event_order,
   toUInt32(turn_seq) AS turn_seq,
-  toString(event_time) AS event_time,
+  toString(tr.event_time) AS event_time,
+  toInt64(toUnixTimestamp64Milli(tr.event_time)) AS event_unix_ms,
   actor_role,
   event_class,
   payload_type,
@@ -211,7 +212,7 @@ FORMAT JSONEachRow",
   endpoint_kind,
   token_usage_buckets,
   token_usage_native_units
-FROM {trace_table}
+FROM {trace_table} AS tr
 WHERE event_uid = {}
 ORDER BY event_order DESC
 LIMIT 1
@@ -294,7 +295,8 @@ FORMAT JSONEachRow",
   event_uid,
   toUInt64(event_order) AS event_order,
   toUInt32(turn_seq) AS turn_seq,
-  toString(event_time) AS event_time,
+  toString(tr.event_time) AS event_time,
+  toInt64(toUnixTimestamp64Milli(tr.event_time)) AS event_unix_ms,
   actor_role,
   event_class,
   payload_type,
@@ -309,7 +311,7 @@ FORMAT JSONEachRow",
   endpoint_kind,
   token_usage_buckets,
   token_usage_native_units
-FROM {trace_table}
+FROM {trace_table} AS tr
 WHERE session_id = {}{turn_filter}
 ORDER BY event_order ASC, event_uid ASC
 FORMAT JSONEachRow",
@@ -332,7 +334,8 @@ FORMAT JSONEachRow",
   event_uid,
   toUInt64(event_order) AS event_order,
   toUInt32(turn_seq) AS turn_seq,
-  toString(event_time) AS event_time,
+  toString(tr.event_time) AS event_time,
+  toInt64(toUnixTimestamp64Milli(tr.event_time)) AS event_unix_ms,
   actor_role,
   event_class,
   payload_type,
@@ -347,7 +350,7 @@ FORMAT JSONEachRow",
   endpoint_kind,
   token_usage_buckets,
   token_usage_native_units
-FROM {trace_table}
+FROM {trace_table} AS tr
 WHERE session_id = {} AND turn_seq = {}
 ORDER BY event_order ASC
 FORMAT JSONEachRow",
@@ -391,6 +394,7 @@ FORMAT JSONEachRow",
             event_order: event.event_order,
             turn_seq: event.turn_seq,
             event_time: event.event_time.clone(),
+            event_unix_ms: event.event_unix_ms,
             actor_role: event.actor_role.clone(),
             event_class: event.event_class.clone(),
             payload_type: event.payload_type.clone(),
@@ -710,7 +714,8 @@ FORMAT JSONEachRow",
   event_uid,
   toUInt64(event_order) AS event_order,
   toUInt32(turn_seq) AS turn_seq,
-  toString(event_time) AS event_time,
+  toString(tr.event_time) AS event_time,
+  toInt64(toUnixTimestamp64Milli(tr.event_time)) AS event_unix_ms,
   actor_role,
   event_class,
   payload_type,
@@ -725,7 +730,7 @@ FORMAT JSONEachRow",
   endpoint_kind,
   token_usage_buckets,
   token_usage_native_units
-FROM {trace_table}
+FROM {trace_table} AS tr
 WHERE session_id = {} AND event_order = {} AND event_uid = {}
 ORDER BY event_order ASC
 FORMAT JSONEachRow",
@@ -743,7 +748,8 @@ FORMAT JSONEachRow",
   event_uid,
   toUInt64(event_order) AS event_order,
   toUInt32(turn_seq) AS turn_seq,
-  toString(event_time) AS event_time,
+  toString(tr.event_time) AS event_time,
+  toInt64(toUnixTimestamp64Milli(tr.event_time)) AS event_unix_ms,
   actor_role,
   event_class,
   payload_type,
@@ -758,7 +764,7 @@ FORMAT JSONEachRow",
   endpoint_kind,
   token_usage_buckets,
   token_usage_native_units
-FROM {trace_table}
+FROM {trace_table} AS tr
 WHERE session_id = {} AND event_order < {}{}
 ORDER BY event_order DESC
 LIMIT {}
@@ -790,7 +796,8 @@ FORMAT JSONEachRow",
   event_uid,
   toUInt64(event_order) AS event_order,
   toUInt32(turn_seq) AS turn_seq,
-  toString(event_time) AS event_time,
+  toString(tr.event_time) AS event_time,
+  toInt64(toUnixTimestamp64Milli(tr.event_time)) AS event_unix_ms,
   actor_role,
   event_class,
   payload_type,
@@ -805,7 +812,7 @@ FORMAT JSONEachRow",
   endpoint_kind,
   token_usage_buckets,
   token_usage_native_units
-FROM {trace_table}
+FROM {trace_table} AS tr
 WHERE session_id = {} AND event_order > {}{}
 ORDER BY event_order ASC
 LIMIT {}

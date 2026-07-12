@@ -151,17 +151,17 @@ FORMAT JSONEachRow"
   session_id,
   toUInt32(turn_seq) AS turn_seq,
   ifNull(turn_id, '') AS turn_id,
-  toString(started_at) AS started_at,
-  toInt64(toUnixTimestamp64Milli(parseDateTime64BestEffort(toString(started_at), 3))) AS started_at_unix_ms,
-  toString(ended_at) AS ended_at,
-  toInt64(toUnixTimestamp64Milli(parseDateTime64BestEffort(toString(ended_at), 3))) AS ended_at_unix_ms,
+  toString(ts.started_at) AS started_at,
+  toInt64(toUnixTimestamp64Milli(ts.started_at)) AS started_at_unix_ms,
+  toString(ts.ended_at) AS ended_at,
+  toInt64(toUnixTimestamp64Milli(ts.ended_at)) AS ended_at_unix_ms,
   toUInt64(total_events) AS total_events,
   toUInt64(user_messages) AS user_messages,
   toUInt64(assistant_messages) AS assistant_messages,
   toUInt64(tool_calls) AS tool_calls,
   toUInt64(tool_results) AS tool_results,
   toUInt64(reasoning_items) AS reasoning_items
-FROM {turn_summary}
+FROM {turn_summary} AS ts
 WHERE session_id IN {session_ids_sql}
 ORDER BY session_id ASC, turn_seq ASC
 FORMAT JSONEachRow"

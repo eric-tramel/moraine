@@ -2140,9 +2140,11 @@ FORMAT JSONEachRow",
         let sql = format!(
             "SELECT
   session_id,
-  toString(first_event_time) AS first_event_time,
-  toString(last_event_time) AS last_event_time
-FROM {session_summary_table}
+  toString(ss.first_event_time) AS first_event_time,
+  toString(ss.last_event_time) AS last_event_time,
+  toInt64(toUnixTimestamp64Milli(ss.first_event_time)) AS first_event_unix_ms,
+  toInt64(toUnixTimestamp64Milli(ss.last_event_time)) AS last_event_unix_ms
+FROM {session_summary_table} AS ss
 WHERE session_id IN {session_ids_sql}
 FORMAT JSONEachRow",
             session_summary_table = session_summary_table,
@@ -2164,6 +2166,8 @@ FORMAT JSONEachRow",
                 SessionTimeBounds {
                     first_event_time: row.first_event_time,
                     last_event_time: row.last_event_time,
+                    first_event_unix_ms: row.first_event_unix_ms,
+                    last_event_unix_ms: row.last_event_unix_ms,
                 },
             );
         }
@@ -2333,12 +2337,12 @@ FORMAT JSONEachRow",
                     (!meta.session_summary.is_empty()).then(|| meta.session_summary.clone())
                 });
                 let session_title = session_summary.clone().or_else(|| session_slug.clone());
-                let (session_started_at, session_updated_at) = session_time_bounds
+                let (session_started_at_unix_ms, session_updated_at_unix_ms) = session_time_bounds
                     .get(session_id.as_str())
                     .map(|bounds| {
                         (
-                            non_empty_string(bounds.first_event_time.clone()),
-                            non_empty_string(bounds.last_event_time.clone()),
+                            Some(bounds.first_event_unix_ms),
+                            Some(bounds.last_event_unix_ms),
                         )
                     })
                     .unwrap_or_default();
@@ -2381,8 +2385,8 @@ FORMAT JSONEachRow",
                     turn_event_count: enrichment
                         .map(|value| value.turn_event_count)
                         .unwrap_or_default(),
-                    session_started_at,
-                    session_updated_at,
+                    session_started_at_unix_ms,
+                    session_updated_at_unix_ms,
                     session_title,
                     session_slug,
                     session_summary,

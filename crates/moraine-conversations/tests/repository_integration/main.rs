@@ -10,6 +10,7 @@ use moraine_conversations::{
     McpSessionListFilter, PageRequest, RepoError, SearchEventKind, SearchEventsQuery,
     SearchMcpEventsQuery, SessionAnalyticsQuery, SessionEventsDirection, SessionEventsQuery,
     SessionLookback, SessionMetadataSearchQuery, SessionStep, StoreProbe, TablePreviewQuery,
+    TurnListFilter,
 };
 use serde_json::json;
 use tokio::sync::Notify;

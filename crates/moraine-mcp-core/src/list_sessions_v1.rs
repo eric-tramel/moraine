@@ -422,9 +422,9 @@ mod tests {
         let page = Page {
             items: vec![McpSessionListItem {
                 session_id: "sess-open".to_string(),
-                first_event_time: "2026-04-30 13:00:00".to_string(),
+                first_event_time: "2026-04-30 09:00:00".to_string(),
                 first_event_unix_ms: 1_777_554_000_000,
-                last_event_time: "2026-04-30 13:10:00".to_string(),
+                last_event_time: "2026-04-30 09:10:00".to_string(),
                 last_event_unix_ms: 1_777_554_600_000,
                 total_turns: 3,
                 total_events: 17,
@@ -462,6 +462,14 @@ mod tests {
         assert_eq!(first["open"]["session_id"], first["session"]["id"]);
         assert_eq!(first["session"]["turn_count"], json!(3));
         assert_eq!(first["session"]["event_count"], json!(17));
+        assert_eq!(
+            first["session"]["started_at"],
+            json!("2026-04-30T13:00:00.000Z")
+        );
+        assert_eq!(
+            first["session"]["updated_at"],
+            json!("2026-04-30T13:10:00.000Z")
+        );
         assert!(first.get("snippet").is_none());
         assert!(first.get("events").is_none());
         assert!(first.get("payload_json").is_none());

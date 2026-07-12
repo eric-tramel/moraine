@@ -557,12 +557,42 @@ async fn get_mcp_session_includes_turn_summaries_and_latest_completion() {
         Some("evt-open-5")
     );
 
+    let listed_turns = repo
+        .list_turns(
+            "sess-open",
+            TurnListFilter::default(),
+            PageRequest::default(),
+        )
+        .await
+        .expect("turn list projection succeeds");
+    assert_eq!(listed_turns.items.len(), 2);
+
+    let opened_turn = repo
+        .get_turn("sess-incomplete", 2)
+        .await
+        .expect("turn detail projection succeeds")
+        .expect("turn detail exists");
+    assert_eq!(opened_turn.summary.turn_seq, 2);
+
     let queries = state.queries.lock().expect("queries lock").clone();
     assert!(queries.iter().any(|query| {
-        query.contains("FROM `moraine`.`v_conversation_trace`")
+        query.contains("FROM `moraine`.`v_conversation_trace` AS tr")
             && query.contains("WHERE session_id = 'sess-open'")
             && query.contains("ORDER BY event_order ASC, event_uid ASC")
+            && query.contains("toInt64(toUnixTimestamp64Milli(tr.event_time)) AS event_unix_ms")
     }));
+    let turn_summary_queries = queries
+        .iter()
+        .filter(|query| query.contains("FROM `moraine`.`v_turn_summary`"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        turn_summary_queries.len(),
+        3,
+        "expected session-open, turn-list, and turn-detail projections"
+    );
+    for query in turn_summary_queries {
+        assert_typed_turn_timestamp_projection(query);
+    }
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn get_mcp_turn_returns_compact_events_and_incomplete_state() {
@@ -678,6 +708,7 @@ async fn list_session_events_supports_forward_cursor_pagination() {
     assert_eq!(first.items.len(), 2);
     assert_eq!(first.items[0].event_uid, "evt-1");
     assert_eq!(first.items[1].event_uid, "evt-2");
+    assert!(first.items.iter().all(|event| event.event_unix_ms > 0));
     assert!(first.next_cursor.is_some());
 
     let second = repo
@@ -705,6 +736,9 @@ async fn list_session_events_supports_forward_cursor_pagination() {
         .find(|q| q.contains("ORDER BY event_order ASC, event_uid ASC") && q.contains("LIMIT 3"))
         .expect("initial page query should be captured");
     assert!(initial_query.contains("WHERE session_id = 'sess_c'"));
+    assert!(
+        initial_query.contains("toInt64(toUnixTimestamp64Milli(tr.event_time)) AS event_unix_ms")
+    );
 
     let paged_query = queries
         .iter()

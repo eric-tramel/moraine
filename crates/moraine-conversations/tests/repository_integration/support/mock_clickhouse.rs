@@ -625,10 +625,12 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             );
         }
 
-        if query.contains("FROM `moraine`.`v_session_summary`")
+        if query.contains("FROM `moraine`.`v_session_summary` AS ss")
             && query.contains("WHERE session_id IN")
-            && query.contains("toString(first_event_time) AS first_event_time")
-            && query.contains("toString(last_event_time) AS last_event_time")
+            && query.contains("toString(ss.first_event_time) AS first_event_time")
+            && query.contains("toString(ss.last_event_time) AS last_event_time")
+            && query.contains("toUnixTimestamp64Milli(ss.first_event_time)")
+            && query.contains("toUnixTimestamp64Milli(ss.last_event_time)")
         {
             return (
                 StatusCode::OK,
@@ -636,12 +638,16 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                     {
                         "session_id": "sess_c",
                         "first_event_time": "2026-01-03 10:00:00",
-                        "last_event_time": "2026-01-03 10:10:00"
+                        "last_event_time": "2026-01-03 10:10:00",
+                        "first_event_unix_ms": 1_767_434_400_000_i64,
+                        "last_event_unix_ms": 1_767_435_000_000_i64
                     },
                     {
                         "session_id": "sess_a",
                         "first_event_time": "2026-01-01 10:00:00",
-                        "last_event_time": "2026-01-01 10:10:00"
+                        "last_event_time": "2026-01-01 10:10:00",
+                        "first_event_unix_ms": 1_767_261_600_000_i64,
+                        "last_event_unix_ms": 1_767_262_200_000_i64
                     }
                 ])),
             );
@@ -1585,6 +1591,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                             "event_order": 3_u64,
                             "turn_seq": 2_u32,
                             "event_time": "2026-01-03 10:02:00",
+                            "event_unix_ms": 1_767_434_520_000_i64,
                             "actor_role": "assistant",
                             "event_class": "message",
                             "payload_type": "text",
@@ -1610,6 +1617,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                         "event_order": 1_u64,
                         "turn_seq": 1_u32,
                         "event_time": "2026-01-03 10:00:00",
+                        "event_unix_ms": 1_767_434_400_000_i64,
                         "actor_role": "user",
                         "event_class": "message",
                         "payload_type": "text",
@@ -1628,6 +1636,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                         "event_order": 2_u64,
                         "turn_seq": 1_u32,
                         "event_time": "2026-01-03 10:01:00",
+                        "event_unix_ms": 1_767_434_460_000_i64,
                         "actor_role": "assistant",
                         "event_class": "reasoning",
                         "payload_type": "text",
@@ -1646,6 +1655,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                         "event_order": 3_u64,
                         "turn_seq": 2_u32,
                         "event_time": "2026-01-03 10:02:00",
+                        "event_unix_ms": 1_767_434_520_000_i64,
                         "actor_role": "assistant",
                         "event_class": "message",
                         "payload_type": "text",
@@ -1677,6 +1687,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                                 "event_order": 1_u64,
                                 "turn_seq": 1_u32,
                                 "event_time": "2026-01-03 10:00:00",
+                                "event_unix_ms": 1_767_434_400_000_i64,
                                 "actor_role": "user",
                                 "event_class": "message",
                                 "payload_type": "text",
@@ -1702,6 +1713,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                             "event_order": 3_u64,
                             "turn_seq": 2_u32,
                             "event_time": "2026-01-03 10:02:00",
+                            "event_unix_ms": 1_767_434_520_000_i64,
                             "actor_role": "assistant",
                             "event_class": "message",
                             "payload_type": "text",
@@ -1720,6 +1732,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                             "event_order": 1_u64,
                             "turn_seq": 1_u32,
                             "event_time": "2026-01-03 10:00:00",
+                            "event_unix_ms": 1_767_434_400_000_i64,
                             "actor_role": "user",
                             "event_class": "message",
                             "payload_type": "text",
