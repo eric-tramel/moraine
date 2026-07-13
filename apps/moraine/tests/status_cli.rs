@@ -333,3 +333,99 @@ fn backend_status_distinguishes_endpoint_combinations_and_gates_monitor_url() {
         let _ = fs::remove_dir_all(root);
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn status_preserves_pid_files_when_processes_are_not_visible() {
+    let root = temp_dir();
+    let config = write_config(&root, 0);
+    let run_dir = root.join("runtime/run");
+    fs::create_dir_all(&run_dir).expect("create PID directory");
+    let pid_bytes = b"2147483647\n";
+    let pid_files = [
+        "clickhouse.pid",
+        "ingest.pid",
+        "backend.pid",
+        "monitor.pid",
+        "mcp.pid",
+    ];
+    for pid_file in pid_files {
+        fs::write(run_dir.join(pid_file), pid_bytes).expect("write PID file");
+    }
+
+    let output = run_status(&config);
+    assert!(
+        output.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: Value = serde_json::from_slice(&output.stdout).expect("status JSON output");
+
+    let services = status["services"].as_array().expect("services array");
+    for service_name in ["clickhouse", "ingest", "backend"] {
+        let service = services
+            .iter()
+            .find(|service| service["service"] == service_name)
+            .expect("service row");
+        assert_eq!(service["state"], "stopped", "{service}");
+        assert_eq!(service["pid"], Value::Null, "{service}");
+    }
+    let status_notes = status["status_notes"].as_array().expect("status notes");
+    assert!(
+        status_notes.iter().all(|note| !note
+            .as_str()
+            .expect("status note string")
+            .contains("legacy managed")),
+        "{status_notes:?}"
+    );
+    for pid_file in pid_files {
+        assert_eq!(
+            fs::read(run_dir.join(pid_file)).expect("read preserved PID file"),
+            pid_bytes,
+            "{pid_file} changed"
+        );
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn status_preserves_and_reports_visible_legacy_pid_files() {
+    let root = temp_dir();
+    let config = write_config(&root, 0);
+    let run_dir = root.join("runtime/run");
+    fs::create_dir_all(&run_dir).expect("create PID directory");
+    let pid_bytes = format!("{}\n", std::process::id());
+    for pid_file in ["monitor.pid", "mcp.pid"] {
+        fs::write(run_dir.join(pid_file), &pid_bytes).expect("write legacy PID file");
+    }
+
+    let output = run_status(&config);
+    assert!(
+        output.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: Value = serde_json::from_slice(&output.stdout).expect("status JSON output");
+    let status_notes = status["status_notes"].as_array().expect("status notes");
+    for service_name in ["monitor", "MCP"] {
+        let expected = format!(
+            "legacy managed {service_name} process (pid {}) is still tracked; run `moraine down` before starting the unified backend",
+            std::process::id()
+        );
+        assert!(
+            status_notes.iter().any(|note| note == &expected),
+            "missing {expected:?} in {status_notes:?}"
+        );
+    }
+    for pid_file in ["monitor.pid", "mcp.pid"] {
+        assert_eq!(
+            fs::read_to_string(run_dir.join(pid_file)).expect("read preserved legacy PID file"),
+            pid_bytes,
+            "{pid_file} changed"
+        );
+    }
+
+    let _ = fs::remove_dir_all(root);
+}

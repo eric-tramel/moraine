@@ -388,6 +388,11 @@ fn is_pid_running(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+fn pid_if_running(path: &Path) -> Option<u32> {
+    let pid = read_pid(path)?;
+    is_pid_running(pid).then_some(pid)
+}
+
 fn ensure_pid_fresh(path: &Path) {
     if let Some(pid) = read_pid(path) {
         if !is_pid_running(pid) {
@@ -399,19 +404,24 @@ fn ensure_pid_fresh(path: &Path) {
 pub(crate) fn service_running(paths: &RuntimePaths, service: Service) -> Option<u32> {
     let path = pid_path(paths, service);
     ensure_pid_fresh(&path);
-    let pid = read_pid(&path)?;
-    if is_pid_running(pid) {
-        Some(pid)
-    } else {
-        None
-    }
+    pid_if_running(&path)
+}
+
+pub(crate) fn service_running_read_only(paths: &RuntimePaths, service: Service) -> Option<u32> {
+    pid_if_running(&pid_path(paths, service))
 }
 
 pub(crate) fn legacy_service_running(paths: &RuntimePaths, pid_file: &str) -> Option<u32> {
     let path = paths.pids_dir.join(pid_file);
     ensure_pid_fresh(&path);
-    let pid = read_pid(&path)?;
-    is_pid_running(pid).then_some(pid)
+    pid_if_running(&path)
+}
+
+pub(crate) fn legacy_service_running_read_only(
+    paths: &RuntimePaths,
+    pid_file: &str,
+) -> Option<u32> {
+    pid_if_running(&paths.pids_dir.join(pid_file))
 }
 
 /// True when something is currently accepting connections on the central MCP
@@ -1143,6 +1153,31 @@ mod tests {
 
         remove_pid_if_matches(&path, 42);
         assert!(!path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lifecycle_pid_probes_remove_stale_files() {
+        let root = temp_dir("stale-service-pids");
+        let pids_dir = root.join("run");
+        fs::create_dir_all(&pids_dir).expect("create PID directory");
+        let mut cfg = AppConfig::default();
+        cfg.runtime.pids_dir = pids_dir.to_string_lossy().to_string();
+        let paths = crate::paths::runtime_paths(&cfg);
+        let canonical_path = pid_path(&paths, Service::Ingest);
+        let legacy_path = pids_dir.join(LEGACY_MONITOR_PID_FILE);
+        let stale_pid = i32::MAX as u32;
+        write_pid(&canonical_path, stale_pid).expect("write canonical PID");
+        write_pid(&legacy_path, stale_pid).expect("write legacy PID");
+
+        assert_eq!(service_running(&paths, Service::Ingest), None);
+        assert!(!canonical_path.exists());
+        assert_eq!(
+            legacy_service_running(&paths, LEGACY_MONITOR_PID_FILE),
+            None
+        );
+        assert!(!legacy_path.exists());
+
         let _ = fs::remove_dir_all(root);
     }
 
