@@ -4,8 +4,8 @@ use crate::managed_clickhouse::{
 };
 use crate::paths::RuntimePaths;
 use crate::process::{
-    backend_endpoint_status, backend_http_connect_host, legacy_service_running, service_running,
-    BackendEndpointStatus, LEGACY_MCP_PID_FILE, LEGACY_MONITOR_PID_FILE,
+    backend_endpoint_status, backend_http_connect_host, legacy_service_running_read_only,
+    service_running_read_only, BackendEndpointStatus, LEGACY_MCP_PID_FILE, LEGACY_MONITOR_PID_FILE,
 };
 use crate::render::{
     HeartbeatSnapshot, ServiceRuntimeState, ServiceRuntimeStatus, StatusDataSource, StatusSnapshot,
@@ -357,10 +357,16 @@ pub(super) async fn cmd_status(
     let services = vec![
         managed_runtime_status(
             Service::ClickHouse,
-            service_running(paths, Service::ClickHouse),
+            service_running_read_only(paths, Service::ClickHouse),
         ),
-        managed_runtime_status(Service::Ingest, service_running(paths, Service::Ingest)),
-        backend_runtime_status(service_running(paths, Service::Backend), backend_endpoints),
+        managed_runtime_status(
+            Service::Ingest,
+            service_running_read_only(paths, Service::Ingest),
+        ),
+        backend_runtime_status(
+            service_running_read_only(paths, Service::Backend),
+            backend_endpoints,
+        ),
     ];
     let managed_server = managed_clickhouse_bin(paths, "clickhouse-server");
     let (source, source_path) = active_clickhouse_source(paths);
@@ -385,7 +391,7 @@ pub(super) async fn cmd_status(
         ("monitor", LEGACY_MONITOR_PID_FILE),
         ("MCP", LEGACY_MCP_PID_FILE),
     ] {
-        if let Some(pid) = legacy_service_running(paths, pid_file) {
+        if let Some(pid) = legacy_service_running_read_only(paths, pid_file) {
             status_notes.push(format!(
                 "legacy managed {name} process (pid {pid}) is still tracked; run `moraine down` before starting the unified backend"
             ));
