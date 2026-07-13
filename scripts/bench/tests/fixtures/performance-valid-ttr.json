@@ -1,0 +1,134 @@
+{
+  "artifact_sha256": "sha256:30237dbd42adad1cc20a56626bbea9c8c0efe969308c9aae0cb1fe618f81d084",
+  "binary": {
+    "build_identity_sha256": "sha256:ece6d58d49bfbdce4a4c22eee2ce0b630fc968544af56ff3b76a39d2187d9aa5",
+    "image_digest": "sha256:eb68193e69bd29700a35bd71b142d984e45033954831ae6af6ebd2a91290cf41",
+    "running_binaries": [
+      {
+        "proc_exe_sha256": "sha256:244573124bc109d2681058ff64cd48378b644a35b3afaa6e7428779dbcfcc30c",
+        "role": "moraine",
+        "sha256": "sha256:244573124bc109d2681058ff64cd48378b644a35b3afaa6e7428779dbcfcc30c",
+        "verified": true
+      }
+    ]
+  },
+  "cache": {
+    "clickhouse_cache": "seed_warmed",
+    "fingerprint_sha256": "sha256:67ca9e50646df9c8d42f6828dfad4f65ded0474c9c0bdc29fb413f46328a6e50",
+    "generation_sha256": "sha256:aedfce8a1a72560378a3532f963aec2bf3a666923ed88661ae6df6d110c9387f",
+    "label": "fresh_moraine_existing_clickhouse",
+    "mcp_document_cache": "fresh",
+    "mcp_document_frequency_cache": "fresh",
+    "mcp_hydration_cache": "fresh",
+    "mcp_posting_cache": "fresh",
+    "mcp_result_cache": "fresh",
+    "moraine_process": "fresh",
+    "os_page_cache": "uncontrolled",
+    "target_query_prewarmed": false
+  },
+  "document_type": "scenario_result",
+  "gates": {
+    "correctness": true,
+    "resources": true,
+    "scenario": true,
+    "schedule": true
+  },
+  "metrics": {
+    "direction": "lower",
+    "p95_ms": 100.0,
+    "sample_count": 1
+  },
+  "resources": {
+    "authoritative": true,
+    "cgroup_driver": "systemd",
+    "cgroup_identity_sha256": "sha256:dfbfd31f35717bef67e3b053f75d238c63f9eec390a98f15ef467235e7360969",
+    "cgroup_version": 2,
+    "controllers_enabled_proven": true,
+    "cpu_max_period_us": 100000,
+    "cpu_max_quota_us": 100000,
+    "cpu_nr_throttled_delta": 1,
+    "cpu_usage_usec_delta": 1000,
+    "cpuset_cpus_effective": "0-3",
+    "effective_limits_proven": true,
+    "host_headroom_proven": true,
+    "loadgen_excluded_proven": true,
+    "memory_current_bytes": 1024,
+    "memory_event_high_delta": 0,
+    "memory_event_max_delta": 0,
+    "memory_max_bytes": 8589934592,
+    "memory_peak_bytes": 2048,
+    "oom_kill_delta": 0,
+    "role_membership_sha256": "sha256:60adbae23b4bd0fa10eb51501e473e4ff6bebe5aedd8593203607efc0428e5ff",
+    "server_descendants_proven": true,
+    "swap_current_bytes": 0,
+    "swap_max_bytes": 0,
+    "throttled_usec_delta": 10
+  },
+  "run": {
+    "arm": "baseline",
+    "authoritative": true,
+    "order": "AB",
+    "pair_id": 1,
+    "profile": "full",
+    "reset_id": "fixture-reset",
+    "run_id": "run-baseline-1-fixture-reset"
+  },
+  "samples": [
+    {
+      "cache_generation_sha256": "sha256:710034321b4a811d71f1908536aec2fe2edde5f913747690e25803305bdb72e7",
+      "central_request_count": 1,
+      "embedded_fallback": false,
+      "error_code": null,
+      "phases_ms": {
+        "central_readiness": 20.0,
+        "initialize_tools": 10.0,
+        "oracle_validation": 10.0,
+        "request_write": 10.0,
+        "response_read": 20.0,
+        "route_connect": 10.0,
+        "spawn_exec": 20.0
+      },
+      "pid_start_sha256": "sha256:6aa5554ac232b464d164e76d7d71eb2fbbd1365317f1f89f72353be2cf2aa03a",
+      "route_marker_sha256": "sha256:8981fa3ac4fe68ee4e3bca4020f67f3987ce47e489c82b760152224f1c398b72",
+      "sample_id": "ttr-1",
+      "searches_before_write": 0,
+      "total_ms": 100.0,
+      "valid": true
+    }
+  ],
+  "scenario": "ttr",
+  "schedule": {
+    "completed": 1,
+    "drain_ms": 1.0,
+    "drained": true,
+    "dropped": 0,
+    "p99_start_slip_ms": 1.0,
+    "planned": 1,
+    "physical_resets": [
+      {
+        "reset_sha256": "sha256:90c71d9e14c533977db15256ec598421b2e010e90c7cca4cea0efb4e725d1f58",
+        "role": "scenario"
+      }
+    ],
+    "schedule_sha256": "sha256:3e1f8cc4191d2eb6d1cad9ef4f7dc57f7b4d87293d694f2a852970fa2362a632",
+    "seed": 480,
+    "started": 1,
+    "streams_overlap": null,
+    "unfinished": 0
+  },
+  "schema_version": "moraine-performance-v1",
+  "semantic": {
+    "duplicate_count": 0,
+    "expected_count": 1,
+    "malformed_count": 0,
+    "missing_count": 0,
+    "observed_count": 1,
+    "oracle_sha256": "sha256:b4080c3cf89526ce719a6147595758c36f30631d2d4029d66c960fd4779f4007",
+    "other_error_count": 0,
+    "passed": true,
+    "stale_count": 0
+  },
+  "split": "research",
+  "status": "pass",
+  "suite_definition_sha256": "sha256:37d4d8364976ce011c3882e88d2bec50aa494e61920fc366dadabf646b509429"
+}

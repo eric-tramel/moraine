@@ -814,8 +814,8 @@ class MoraineSandboxOwnershipTests(unittest.TestCase):
         self.assertEqual(result.returncode, 29, result.stderr)
         self.assertIn("ownership evidence retained", result.stderr)
         self.assertTrue((config_dir / ".ownership-token").exists())
-        self.assertFalse((config_dir / "moraine.toml").exists())
-        self.assertFalse((config_dir / "ownership.compose.yaml").exists())
+        self.assertTrue((config_dir / "moraine.toml").exists())
+        self.assertTrue((config_dir / "ownership.compose.yaml").exists())
         self.assertTrue((self.docker_state / "marker-name").exists())
 
     def test_marker_volume_failure_propagates_and_retains_ownership_evidence(self) -> None:

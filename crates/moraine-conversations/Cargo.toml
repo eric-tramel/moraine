@@ -24,9 +24,4 @@ moraine-config = { path = "../moraine-config" }
 axum = "0.7"
 moraine-monitor-core = { path = "../moraine-monitor-core" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-sha2 = "0.10"
 tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "net", "time", "test-util"] }
-
-[[bench]]
-name = "analytics_latency"
-harness = false

@@ -1,0 +1,353 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://moraine.dev/schema/moraine-performance-v1.schema.json",
+  "title": "Moraine fixed-resource performance documents",
+  "oneOf": [
+    {"$ref": "#/$defs/scenario_result"},
+    {"$ref": "#/$defs/comparison"},
+    {"$ref": "#/$defs/repeatability"}
+  ],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "nonnegative": {"type": "number", "minimum": 0},
+    "nonnegative_integer": {"type": "integer", "minimum": 0},
+    "interval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lower_ms", "upper_ms", "censoring"],
+      "properties": {
+        "lower_ms": {"$ref": "#/$defs/nonnegative"},
+        "upper_ms": {"oneOf": [{"$ref": "#/$defs/nonnegative"}, {"type": "null"}]},
+        "censoring": {"enum": ["none", "left", "interval", "right"]}
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "reset_id", "arm", "pair_id", "order", "profile", "authoritative"],
+      "properties": {
+        "run_id": {"type": "string", "minLength": 1},
+        "reset_id": {"type": "string", "minLength": 1},
+        "arm": {"enum": ["baseline", "candidate"]},
+        "pair_id": {"type": "integer", "minimum": 1},
+        "order": {"enum": ["AB", "BA"]},
+        "profile": {"enum": ["smoke", "full"]},
+        "authoritative": {"type": "boolean"}
+      }
+    },
+    "cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["label", "moraine_process", "mcp_result_cache", "mcp_posting_cache", "mcp_document_frequency_cache", "mcp_document_cache", "mcp_hydration_cache", "target_query_prewarmed", "clickhouse_cache", "os_page_cache", "generation_sha256", "fingerprint_sha256"],
+      "properties": {
+        "label": {"const": "fresh_moraine_existing_clickhouse"},
+        "moraine_process": {"const": "fresh"},
+        "mcp_result_cache": {"const": "fresh"},
+        "mcp_posting_cache": {"const": "fresh"},
+        "mcp_document_frequency_cache": {"const": "fresh"},
+        "mcp_document_cache": {"const": "fresh"},
+        "mcp_hydration_cache": {"const": "fresh"},
+        "target_query_prewarmed": {"const": false},
+        "clickhouse_cache": {"const": "seed_warmed"},
+        "os_page_cache": {"enum": ["uncontrolled", "privileged_reset"]},
+        "generation_sha256": {"$ref": "#/$defs/sha256"},
+        "fingerprint_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "binary_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "sha256", "proc_exe_sha256", "verified"],
+      "properties": {
+        "role": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "proc_exe_sha256": {"$ref": "#/$defs/sha256"},
+        "verified": {"type": "boolean"}
+      }
+    },
+    "binary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["build_identity_sha256", "image_digest", "running_binaries"],
+      "properties": {
+        "build_identity_sha256": {"$ref": "#/$defs/sha256"},
+        "image_digest": {"$ref": "#/$defs/sha256"},
+        "running_binaries": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/binary_entry"}}
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["authoritative", "cgroup_version", "cgroup_driver", "cgroup_identity_sha256", "role_membership_sha256", "controllers_enabled_proven", "effective_limits_proven", "host_headroom_proven", "cpuset_cpus_effective", "cpu_max_quota_us", "cpu_max_period_us", "cpu_usage_usec_delta", "cpu_nr_throttled_delta", "throttled_usec_delta", "memory_max_bytes", "memory_current_bytes", "memory_peak_bytes", "memory_event_high_delta", "memory_event_max_delta", "swap_max_bytes", "swap_current_bytes", "oom_kill_delta", "server_descendants_proven", "loadgen_excluded_proven"],
+      "properties": {
+        "authoritative": {"type": "boolean"},
+        "cgroup_version": {"type": "integer", "minimum": 1},
+        "cgroup_driver": {"enum": ["cgroupfs", "systemd", "unavailable"]},
+        "cgroup_identity_sha256": {"$ref": "#/$defs/sha256"},
+        "role_membership_sha256": {"$ref": "#/$defs/sha256"},
+        "controllers_enabled_proven": {"type": "boolean"},
+        "effective_limits_proven": {"type": "boolean"},
+        "host_headroom_proven": {"type": "boolean"},
+        "cpuset_cpus_effective": {"type": "string", "minLength": 1},
+        "cpu_max_quota_us": {"type": "integer", "minimum": 1},
+        "cpu_max_period_us": {"type": "integer", "minimum": 1},
+        "cpu_usage_usec_delta": {"$ref": "#/$defs/nonnegative_integer"},
+        "cpu_nr_throttled_delta": {"$ref": "#/$defs/nonnegative_integer"},
+        "throttled_usec_delta": {"$ref": "#/$defs/nonnegative_integer"},
+        "memory_max_bytes": {"type": "integer", "minimum": 1},
+        "memory_current_bytes": {"$ref": "#/$defs/nonnegative_integer"},
+        "memory_peak_bytes": {"$ref": "#/$defs/nonnegative_integer"},
+        "memory_event_high_delta": {"$ref": "#/$defs/nonnegative_integer"},
+        "memory_event_max_delta": {"$ref": "#/$defs/nonnegative_integer"},
+        "swap_max_bytes": {"$ref": "#/$defs/nonnegative_integer"},
+        "swap_current_bytes": {"$ref": "#/$defs/nonnegative_integer"},
+        "oom_kill_delta": {"$ref": "#/$defs/nonnegative_integer"},
+        "server_descendants_proven": {"type": "boolean"},
+        "loadgen_excluded_proven": {"type": "boolean"}
+      }
+    },
+    "schedule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schedule_sha256", "seed", "planned", "started", "completed", "unfinished", "dropped", "p99_start_slip_ms", "drained", "drain_ms", "streams_overlap", "physical_resets"],
+      "properties": {
+        "schedule_sha256": {"$ref": "#/$defs/sha256"},
+        "seed": {"$ref": "#/$defs/nonnegative_integer"},
+        "planned": {"$ref": "#/$defs/nonnegative_integer"},
+        "started": {"$ref": "#/$defs/nonnegative_integer"},
+        "completed": {"$ref": "#/$defs/nonnegative_integer"},
+        "unfinished": {"$ref": "#/$defs/nonnegative_integer"},
+        "dropped": {"$ref": "#/$defs/nonnegative_integer"},
+        "p99_start_slip_ms": {"$ref": "#/$defs/nonnegative"},
+        "drained": {"type": "boolean"},
+        "drain_ms": {"$ref": "#/$defs/nonnegative"},
+        "streams_overlap": {"oneOf": [{"type": "boolean"}, {"type": "null"}]},
+        "physical_resets": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["role", "reset_sha256"],
+            "properties": {
+              "role": {"enum": ["trial", "scenario", "query_control", "ingest_control", "combined"]},
+              "reset_sha256": {"$ref": "#/$defs/sha256"}
+            }
+          }
+        }
+      }
+    },
+    "semantic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["passed", "oracle_sha256", "expected_count", "observed_count", "missing_count", "duplicate_count", "stale_count", "malformed_count", "other_error_count"],
+      "properties": {
+        "passed": {"type": "boolean"},
+        "oracle_sha256": {"$ref": "#/$defs/sha256"},
+        "expected_count": {"$ref": "#/$defs/nonnegative_integer"},
+        "observed_count": {"$ref": "#/$defs/nonnegative_integer"},
+        "missing_count": {"$ref": "#/$defs/nonnegative_integer"},
+        "duplicate_count": {"$ref": "#/$defs/nonnegative_integer"},
+        "stale_count": {"$ref": "#/$defs/nonnegative_integer"},
+        "malformed_count": {"$ref": "#/$defs/nonnegative_integer"},
+        "other_error_count": {"$ref": "#/$defs/nonnegative_integer"}
+      }
+    },
+    "gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["correctness", "resources", "schedule", "scenario"],
+      "properties": {
+        "correctness": {"type": "boolean"},
+        "resources": {"type": "boolean"},
+        "schedule": {"type": "boolean"},
+        "scenario": {"type": "boolean"}
+      }
+    },
+    "outcomes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["planned", "started", "correct", "rejected", "timed_out", "semantic_error", "protocol_error", "malformed", "late", "dropped", "other_error"],
+      "properties": {
+        "planned": {"$ref": "#/$defs/nonnegative_integer"},
+        "started": {"$ref": "#/$defs/nonnegative_integer"},
+        "correct": {"$ref": "#/$defs/nonnegative_integer"},
+        "rejected": {"$ref": "#/$defs/nonnegative_integer"},
+        "timed_out": {"$ref": "#/$defs/nonnegative_integer"},
+        "semantic_error": {"$ref": "#/$defs/nonnegative_integer"},
+        "protocol_error": {"$ref": "#/$defs/nonnegative_integer"},
+        "malformed": {"$ref": "#/$defs/nonnegative_integer"},
+        "late": {"$ref": "#/$defs/nonnegative_integer"},
+        "dropped": {"$ref": "#/$defs/nonnegative_integer"},
+        "other_error": {"$ref": "#/$defs/nonnegative_integer"}
+      }
+    },
+    "trial_telemetry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpu_usage_usec_delta", "cpu_nr_throttled_delta", "throttled_usec_delta", "memory_current_bytes", "memory_peak_bytes", "memory_event_high_delta", "memory_event_max_delta", "swap_current_bytes", "oom_kill_delta"],
+      "properties": {
+        "cpu_usage_usec_delta": {"$ref": "#/$defs/nonnegative_integer"},
+        "cpu_nr_throttled_delta": {"$ref": "#/$defs/nonnegative_integer"},
+        "throttled_usec_delta": {"$ref": "#/$defs/nonnegative_integer"},
+        "memory_current_bytes": {"$ref": "#/$defs/nonnegative_integer"},
+        "memory_peak_bytes": {"$ref": "#/$defs/nonnegative_integer"},
+        "memory_event_high_delta": {"$ref": "#/$defs/nonnegative_integer"},
+        "memory_event_max_delta": {"$ref": "#/$defs/nonnegative_integer"},
+        "swap_current_bytes": {"$ref": "#/$defs/nonnegative_integer"},
+        "oom_kill_delta": {"$ref": "#/$defs/nonnegative_integer"}
+      }
+    },
+    "qps_sample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["offered_qps", "replicate", "duration_s", "reset_sha256", "achieved_goodput_qps", "p95_ms", "p99_ms", "max_ms", "scheduler_p99_start_slip_ms", "drain_ms", "drained", "passed", "outcomes", "telemetry"],
+      "properties": {
+        "offered_qps": {"type": "integer", "minimum": 1, "maximum": 512},
+        "replicate": {"type": "integer", "minimum": 1, "maximum": 3},
+        "duration_s": {"enum": [3, 30]},
+        "reset_sha256": {"$ref": "#/$defs/sha256"},
+        "achieved_goodput_qps": {"$ref": "#/$defs/nonnegative"},
+        "p95_ms": {"$ref": "#/$defs/nonnegative"},
+        "p99_ms": {"$ref": "#/$defs/nonnegative"},
+        "max_ms": {"$ref": "#/$defs/nonnegative"},
+        "scheduler_p99_start_slip_ms": {"$ref": "#/$defs/nonnegative"},
+        "drain_ms": {"$ref": "#/$defs/nonnegative"},
+        "drained": {"type": "boolean"},
+        "passed": {"type": "boolean"},
+        "outcomes": {"$ref": "#/$defs/outcomes"},
+        "telemetry": {"$ref": "#/$defs/trial_telemetry"}
+      }
+    },
+    "ttr_sample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sample_id", "total_ms", "phases_ms", "pid_start_sha256", "cache_generation_sha256", "route_marker_sha256", "searches_before_write", "central_request_count", "embedded_fallback", "valid", "error_code"],
+      "properties": {
+        "sample_id": {"type": "string", "minLength": 1},
+        "total_ms": {"$ref": "#/$defs/nonnegative"},
+        "phases_ms": {
+          "type": "object", "additionalProperties": false,
+          "required": ["spawn_exec", "central_readiness", "route_connect", "initialize_tools", "request_write", "response_read", "oracle_validation"],
+          "properties": {
+            "spawn_exec": {"$ref": "#/$defs/nonnegative"}, "central_readiness": {"$ref": "#/$defs/nonnegative"},
+            "route_connect": {"$ref": "#/$defs/nonnegative"}, "initialize_tools": {"$ref": "#/$defs/nonnegative"},
+            "request_write": {"$ref": "#/$defs/nonnegative"}, "response_read": {"$ref": "#/$defs/nonnegative"},
+            "oracle_validation": {"$ref": "#/$defs/nonnegative"}
+          }
+        },
+        "pid_start_sha256": {"$ref": "#/$defs/sha256"},
+        "cache_generation_sha256": {"$ref": "#/$defs/sha256"},
+        "route_marker_sha256": {"$ref": "#/$defs/sha256"},
+        "searches_before_write": {"$ref": "#/$defs/nonnegative_integer"},
+        "central_request_count": {"$ref": "#/$defs/nonnegative_integer"},
+        "embedded_fallback": {"type": "boolean"},
+        "valid": {"type": "boolean"},
+        "error_code": {"oneOf": [{"type": "string", "minLength": 1}, {"type": "null"}]}
+      }
+    },
+    "cache_bypass": {
+      "type": "object", "additionalProperties": false,
+      "required": ["result", "document_frequency", "posting", "corpus", "hydration"],
+      "properties": {"result": {"type": "boolean"}, "document_frequency": {"type": "boolean"}, "posting": {"type": "boolean"}, "corpus": {"type": "boolean"}, "hydration": {"type": "boolean"}}
+    },
+    "etd_sample": {
+      "type": "object", "additionalProperties": false,
+      "required": ["event_identity_sha256", "term_sha256", "batch_sequence", "publication_durable_ms", "db_ack_ms", "last_miss_ms", "first_hit_ms", "first_valid_ms", "source_interval", "db_ack_interval", "term_use_count", "cache_bypass", "valid", "error_code"],
+      "properties": {
+        "event_identity_sha256": {"$ref": "#/$defs/sha256"}, "term_sha256": {"oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+        "batch_sequence": {"oneOf": [{"$ref": "#/$defs/nonnegative_integer"}, {"type": "null"}]},
+        "publication_durable_ms": {"oneOf": [{"$ref": "#/$defs/nonnegative"}, {"type": "null"}]}, "db_ack_ms": {"oneOf": [{"$ref": "#/$defs/nonnegative"}, {"type": "null"}]},
+        "last_miss_ms": {"oneOf": [{"$ref": "#/$defs/nonnegative"}, {"type": "null"}]},
+        "first_hit_ms": {"oneOf": [{"$ref": "#/$defs/nonnegative"}, {"type": "null"}]},
+        "first_valid_ms": {"oneOf": [{"$ref": "#/$defs/nonnegative"}, {"type": "null"}]},
+        "source_interval": {"$ref": "#/$defs/interval"}, "db_ack_interval": {"$ref": "#/$defs/interval"},
+        "term_use_count": {"$ref": "#/$defs/nonnegative_integer"}, "cache_bypass": {"$ref": "#/$defs/cache_bypass"},
+        "valid": {"type": "boolean"}, "error_code": {"oneOf": [{"type": "string", "minLength": 1}, {"type": "null"}]}
+      }
+    },
+    "scenario_result": {
+      "type": "object", "additionalProperties": false,
+      "required": ["document_type", "schema_version", "scenario", "split", "suite_definition_sha256", "artifact_sha256", "run", "status", "cache", "binary", "resources", "schedule", "metrics", "samples", "semantic", "gates"],
+      "properties": {
+        "document_type": {"const": "scenario_result"}, "schema_version": {"const": "moraine-performance-v1"},
+        "scenario": {"enum": ["qps", "ttr", "etd_idle", "etd_loaded", "mixed"]},
+        "split": {"enum": ["research", "holdout", "stress"]},
+        "suite_definition_sha256": {"$ref": "#/$defs/sha256"}, "artifact_sha256": {"$ref": "#/$defs/sha256"},
+        "run": {"$ref": "#/$defs/run"}, "status": {"enum": ["pass", "fail", "inconclusive"]},
+        "cache": {"$ref": "#/$defs/cache"}, "binary": {"$ref": "#/$defs/binary"},
+        "resources": {"$ref": "#/$defs/resources"}, "schedule": {"$ref": "#/$defs/schedule"},
+        "metrics": {"type": "object"}, "samples": {}, "semantic": {"$ref": "#/$defs/semantic"}, "gates": {"$ref": "#/$defs/gates"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"scenario": {"const": "qps"}}},
+          "then": {
+            "properties": {
+              "split": {"enum": ["research", "holdout"]},
+              "metrics": {
+                "type": "object", "additionalProperties": false,
+                "required": ["direction", "sustainable_qps", "capacity_lower_qps", "capacity_upper_qps", "capacity_censoring"],
+                "properties": {"direction": {"const": "higher"}, "sustainable_qps": {"$ref": "#/$defs/nonnegative_integer"}, "capacity_lower_qps": {"$ref": "#/$defs/nonnegative_integer"}, "capacity_upper_qps": {"$ref": "#/$defs/nonnegative_integer"}, "capacity_censoring": {"enum": ["none", "left", "right"]}}
+              },
+              "samples": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/qps_sample"}}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"scenario": {"const": "ttr"}}},
+          "then": {
+            "properties": {
+              "split": {"enum": ["research", "holdout"]},
+              "metrics": {"type": "object", "additionalProperties": false, "required": ["direction", "p95_ms", "sample_count"], "properties": {"direction": {"const": "lower"}, "p95_ms": {"$ref": "#/$defs/nonnegative"}, "sample_count": {"type": "integer", "minimum": 1}}},
+              "samples": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/ttr_sample"}}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"scenario": {"enum": ["etd_idle", "etd_loaded"]}}},
+          "then": {
+            "properties": {
+              "split": {"enum": ["research", "holdout"]},
+              "metrics": {"type": "object", "additionalProperties": false, "required": ["direction", "event_count", "source_etd_p95", "db_ack_etd_p95"], "properties": {"direction": {"const": "lower"}, "event_count": {"type": "integer", "minimum": 1}, "source_etd_p95": {"$ref": "#/$defs/interval"}, "db_ack_etd_p95": {"$ref": "#/$defs/interval"}}},
+              "samples": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/etd_sample"}}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"scenario": {"const": "mixed"}}},
+          "then": {
+            "properties": {
+              "split": {"const": "stress"},
+              "metrics": {"$ref": "#/$defs/mixed_metrics"},
+              "samples": {"type": "object", "additionalProperties": false, "required": ["query_records", "ingest"], "properties": {"query_records": {"type": "array"}, "ingest": {"type": "array", "items": {"$ref": "#/$defs/etd_sample"}}}}
+            }
+          }
+        }
+      ]
+    },
+    "query_metrics": {"type": "object", "additionalProperties": false, "required": ["goodput_qps", "p95_ms", "p99_ms"], "properties": {"goodput_qps": {"type": "number", "exclusiveMinimum": 0}, "p95_ms": {"$ref": "#/$defs/nonnegative"}, "p99_ms": {"$ref": "#/$defs/nonnegative"}}},
+    "ingest_metrics": {"type": "object", "additionalProperties": false, "required": ["source_etd_p95", "db_ack_etd_p95"], "properties": {"source_etd_p95": {"$ref": "#/$defs/interval"}, "db_ack_etd_p95": {"$ref": "#/$defs/interval"}}},
+    "mixed_metrics": {
+      "type": "object", "additionalProperties": false,
+      "required": ["direction", "query_control", "ingest_control", "combined_query", "combined_ingest", "ratios", "mixed_gates", "lost_events", "duplicate_events"],
+      "properties": {
+        "direction": {"const": "gates"}, "query_control": {"$ref": "#/$defs/query_metrics"}, "ingest_control": {"$ref": "#/$defs/ingest_metrics"}, "combined_query": {"$ref": "#/$defs/query_metrics"}, "combined_ingest": {"$ref": "#/$defs/ingest_metrics"},
+        "ratios": {"type": "object", "additionalProperties": false, "required": ["query_goodput", "query_p95", "query_p99", "source_etd", "db_ack_etd"], "properties": {"query_goodput": {"$ref": "#/$defs/nonnegative"}, "query_p95": {"$ref": "#/$defs/nonnegative"}, "query_p99": {"$ref": "#/$defs/nonnegative"}, "source_etd": {"$ref": "#/$defs/nonnegative"}, "db_ack_etd": {"$ref": "#/$defs/nonnegative"}}},
+        "mixed_gates": {"type": "object", "additionalProperties": false, "required": ["query_slo", "query_degradation", "ingest_slo", "ingest_degradation", "schedules_delivered", "overlap", "drained", "exact_events"], "properties": {"query_slo": {"type": "boolean"}, "query_degradation": {"type": "boolean"}, "ingest_slo": {"type": "boolean"}, "ingest_degradation": {"type": "boolean"}, "schedules_delivered": {"type": "boolean"}, "overlap": {"type": "boolean"}, "drained": {"type": "boolean"}, "exact_events": {"type": "boolean"}}},
+        "lost_events": {"$ref": "#/$defs/nonnegative_integer"}, "duplicate_events": {"$ref": "#/$defs/nonnegative_integer"}
+      }
+    },
+    "summary_common": {
+      "type": "object", "additionalProperties": false,
+      "required": ["document_type", "schema_version", "status", "inputs", "policy", "metrics", "diagnostics", "document_sha256"],
+      "properties": {
+        "document_type": {"enum": ["comparison", "repeatability"]}, "schema_version": {"const": "moraine-performance-v1"}, "status": {"enum": ["pass", "fail", "inconclusive"]},
+        "inputs": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["arm", "manifest_sha256"], "properties": {"arm": {"enum": ["baseline", "candidate"]}, "manifest_sha256": {"$ref": "#/$defs/sha256"}}}},
+        "policy": {"type": "object"}, "metrics": {"type": "object"}, "diagnostics": {"type": "array", "items": {"type": "string", "minLength": 1}}, "document_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "comparison": {"allOf": [{"$ref": "#/$defs/summary_common"}, {"properties": {"document_type": {"const": "comparison"}, "inputs": {"minItems": 2, "maxItems": 2}}}]},
+    "repeatability": {"allOf": [{"$ref": "#/$defs/summary_common"}, {"properties": {"document_type": {"const": "repeatability"}, "inputs": {"minItems": 7, "maxItems": 7}}}]}
+  }
+}
