@@ -411,31 +411,51 @@ def _build_event_case(profile: str, split: str, index: int, term_count: int) -> 
     raw_event, raw_session = _event_identity(split, index)
     prefix = f"perfprobe{profile}{split}{index:04d}x"
     probe_terms = [f"{prefix}{probe:03d}" for probe in range(term_count)]
-    identity = {
-        "event_id": public_id("event", raw_event),
-        "session_id": public_id("session", raw_session),
-    }
     recorded_at = f"2026-07-13T12:{SPLITS.index(split) * 10 + index:02d}:00.000Z"
-    return {
+    event = {
         "case_id": f"{split}-event-{index:04d}",
         "split": split,
         "raw_event_uid": raw_event,
         "raw_session_id": raw_session,
         "destination_filename": f"{split}-event-{index:04d}.jsonl",
-        "expected_event_id": identity["event_id"],
-        "expected_session_id": identity["session_id"],
         "recorded_at": recorded_at,
         "marker": f"perfmarker{profile}{split}{index:04d}",
         "probe_terms": probe_terms,
-        "expected_ack_digest": _ack_digest(raw_event),
-        "oracle": {
-            "count": 1,
-            "truncated": False,
-            "ordered_identities": [identity],
-            "ordered_sha256": _ordered_digest([identity]),
-            "set_sha256": sha256_json([identity]),
-        },
     }
+    source_bytes = codex_event_lines(event)
+    lines = source_bytes.splitlines(keepends=True)
+    if len(lines) != 2:
+        raise FixtureError("generated Codex ETD source must contain exactly two records")
+    source_file = (
+        "/sandbox/fixtures/codex/sessions/"
+        f"{event['destination_filename']}"
+    )
+    record_fingerprint = lines[1].rstrip(b"\n").decode("utf-8")
+    material = (
+        f"{source_file}|1|2|{len(lines[0])}|"
+        f"{record_fingerprint}|raw"
+    )
+    normalized_event_uid = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    identity = {
+        "event_id": public_id("event", normalized_event_uid),
+        "session_id": public_id("session", raw_session),
+    }
+    event.update(
+        {
+            "normalized_event_uid": normalized_event_uid,
+            "expected_event_id": identity["event_id"],
+            "expected_session_id": identity["session_id"],
+            "expected_ack_digest": _ack_digest(normalized_event_uid),
+            "oracle": {
+                "count": 1,
+                "truncated": False,
+                "ordered_identities": [identity],
+                "ordered_sha256": _ordered_digest([identity]),
+                "set_sha256": sha256_json([identity]),
+            },
+        }
+    )
+    return event
 
 
 def _event_operations(events: Sequence[Mapping[str, Any]], duration_ns: int) -> list[dict[str, Any]]:
@@ -660,7 +680,11 @@ def validate_recipe(recipe: Mapping[str, Any]) -> None:
             if not isinstance(raw_event, str) or raw_event in raw_event_ids:
                 raise FixtureError("ETD event identities are not disjoint")
             raw_event_ids.add(raw_event)
-            if event.get("expected_ack_digest") != _ack_digest(raw_event):
+            normalized_event = event.get("normalized_event_uid")
+            if (
+                not isinstance(normalized_event, str)
+                or event.get("expected_ack_digest") != _ack_digest(normalized_event)
+            ):
                 raise FixtureError("ETD acknowledgement digest differs")
             _validate_oracle(event.get("oracle"), event["case_id"])
             for term in event.get("probe_terms", []):
@@ -759,12 +783,12 @@ def seed_search_sql(target: FreshSeedTarget, recipe: Mapping[str, Any]) -> str:
     documents = corpus["document_count"]
     database = target.database
     return f"""
-INSERT INTO {database}.search_documents
+INSERT INTO {database}.events
 (
-  doc_version, ingested_at, event_uid, compacted_parent_uid, session_id, session_date,
+  event_version, ingested_at, event_uid, origin_event_id, session_id, session_date,
   source_name, harness, inference_provider, endpoint_kind, source_file, source_generation,
-  source_line_no, source_offset, source_ref, record_ts, event_class, payload_type,
-  actor_role, name, phase, text_content, payload_json, token_usage_json
+  source_line_no, source_offset, source_ref, record_ts, event_kind, payload_type,
+  actor_kind, tool_name, tool_phase, text_content, payload_json, token_usage_json
 )
 WITH
   {split_name} AS fixture_split,

@@ -40,7 +40,7 @@ def protocol_build(arm: str = "baseline") -> dict:
         image_digest=digest(f"image:{arm}"),
         build_environment_sha256=digest("environment"),
         binaries=[
-            {"role": "moraine", "sha256": digest(f"{arm}:moraine")},
+            {"role": "moraine-ingest", "sha256": digest(f"{arm}:ingest")},
             {"role": "moraine-mcp", "sha256": digest(f"{arm}:mcp")},
         ],
     )
@@ -195,6 +195,43 @@ class EvidenceTests(unittest.TestCase):
         result = ScenarioResult("pass", {"capacity_censoring": "none"}, (sample,))
         schedule = _schedule_evidence(result, "qps", "research", definition, recipe, EvidenceCollector())
         self.assertEqual(schedule["physical_resets"], [{"role": "trial", "reset_sha256": reset}])
+
+
+class LifecycleTests(unittest.TestCase):
+    def test_setup_failure_reports_each_owned_cleanup_failure(self) -> None:
+        envelope = mock.Mock()
+        envelope.owned_id = "perf-0123456789abcdef"
+        envelope.create.return_value = "owned-parent"
+        envelope.remove.side_effect = OSError("cgroup remains busy")
+        sandbox = mock.Mock()
+        sandbox.sandbox_id = "sb-123456"
+        sandbox.down.side_effect = OSError("compose down failed")
+        sandbox.status.return_value.image_ids = {"moraine": "sha256:runtime"}
+
+        with (
+            mock.patch.object(suite, "FixedEnvelope", return_value=envelope),
+            mock.patch.object(suite, "start_owned_sandbox", return_value=sandbox),
+            mock.patch.object(
+                suite,
+                "_seed_owned_sandbox",
+                side_effect=OSError("seed failed"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                suite.SuiteFailure,
+                "sandbox sb-123456 cleanup failed.*"
+                "cgroup perf-0123456789abcdef cleanup failed",
+            ):
+                suite._start_measured_sandbox(
+                    Path("."),
+                    mock.Mock(),
+                    sha256_json({"moraine": "sha256:runtime"}),
+                    {},
+                    EvidenceCollector(),
+                    reset_role="trial",
+                )
+        sandbox.down.assert_called_once()
+        envelope.remove.assert_called_once()
 
 
 class CliArtifactTests(unittest.TestCase):

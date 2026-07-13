@@ -336,14 +336,17 @@ class TtrScenarioTests(unittest.TestCase):
                 self.assertEqual(result.status, "fail")
                 self.assertEqual(result.samples[0]["error_code"], "route_proof")
 
-    def test_pid_starttime_and_cache_generation_must_each_be_new(self) -> None:
-        for mode in ("same_pid", "same_starttime", "same_generation"):
+    def test_pid_reuse_or_equal_starttime_is_valid_when_process_tuple_is_new(self) -> None:
+        for mode in ("same_pid", "same_starttime"):
             with self.subTest(mode=mode):
                 self.setUp()
-                result = self.run_mode(mode)
-                self.assertEqual(result.status, "fail")
-                self.assertEqual(result.samples[0]["error_code"], "freshness")
-                self.assertEqual(self.runtimes[0].search_writes, 0)
+                self.assertEqual(self.run_mode(mode).status, "pass")
+
+    def test_cache_generation_must_be_new(self) -> None:
+        result = self.run_mode("same_generation")
+        self.assertEqual(result.status, "fail")
+        self.assertEqual(result.samples[0]["error_code"], "freshness")
+        self.assertEqual(self.runtimes[0].search_writes, 0)
 
     def test_identity_cannot_repeat_across_samples(self) -> None:
         result = run_ttr_scenario(

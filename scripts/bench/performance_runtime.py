@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import time
+import tempfile
 import uuid
 import urllib.error
 import urllib.request
@@ -131,6 +132,10 @@ class BuildIdentity:
     @property
     def manifest_path(self) -> Path:
         return self.directory / "manifest.json"
+    @property
+    def linker(self) -> str:
+        return _recorded_linker(self.build_environment, self.target)
+
 
     def artifact(self) -> dict[str, Any]:
         return {
@@ -141,8 +146,11 @@ class BuildIdentity:
                 "target": self.target,
                 "rustc_release": self.rustc_release,
                 "toolchain_sha256": self.toolchain_sha256,
-                "linker": _recorded_linker(self.build_environment, self.target),
-                "environment": dict(sorted(self.build_environment.items())),
+                "linker_sha256": _canonical_sha256(self.linker),
+                "environment_allowlist": sorted(self.build_environment),
+                "build_environment_sha256": _canonical_sha256(
+                    dict(sorted(self.build_environment.items()))
+                ),
             },
             "binaries": {
                 name: {
@@ -204,9 +212,23 @@ def freeze_release_binaries(
         )
         manifest_bytes = (json.dumps(draft.artifact(), sort_keys=True, separators=(",", ":")) + "\n").encode()
         manifest_path = destination / "manifest.json"
-        manifest_path.write_bytes(manifest_bytes)
-        with manifest_path.open("rb") as stream:
-            os.fsync(stream.fileno())
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=destination,
+            prefix=".manifest.",
+            suffix=".tmp",
+        )
+        temporary_path = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(manifest_bytes)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_path, manifest_path)
+        finally:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
         manifest_path.chmod(0o444)
         manifest_hash = _sha256_bytes(manifest_bytes)
         directory_fd = os.open(destination, os.O_RDONLY)

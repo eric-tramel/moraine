@@ -14,7 +14,7 @@ shutting_down=0
 log() { printf '[performance] %s\n' "$*" >&2; }
 die() { printf '[performance] ERROR: %s\n' "$*" >&2; exit 1; }
 
-for binary in moraine-ingest moraine-mcp; do
+for binary in moraine moraine-ingest moraine-mcp; do
     [[ -x "${BIN_DIR}/${binary}" ]] || die "immutable release binary missing: ${binary}"
 done
 [[ -f "$CONFIG" ]] || die "benchmark config missing: ${CONFIG}"
@@ -53,6 +53,10 @@ for attempt in $(seq 1 120); do
     (( attempt < 120 )) || die "ClickHouse did not become ready before service start"
     sleep 1
 done
+
+# Schema setup is owned by the frozen arm binary and occurs before any measured
+# boundary. A fresh ClickHouse volume has no tables until migrations run.
+"${BIN_DIR}/moraine" db migrate --config "$CONFIG" >/dev/null
 
 cache_generation="$(cat /proc/sys/kernel/random/uuid)"
 "${BIN_DIR}/moraine-ingest" --config "$CONFIG" &

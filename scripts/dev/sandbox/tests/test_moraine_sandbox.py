@@ -20,6 +20,7 @@ REPO = Path(__file__).resolve().parents[4]
 RUNTIME_PATH = REPO / "scripts/bench/performance_runtime.py"
 SANDBOX = REPO / "scripts/dev/sandbox/moraine-sandbox"
 COMPOSE = REPO / "scripts/bench/compose.performance.yaml"
+BASE_COMPOSE = REPO / "scripts/dev/sandbox/compose.yaml"
 ENTRYPOINT = REPO / "scripts/dev/sandbox/performance-entrypoint.sh"
 SPEC = importlib.util.spec_from_file_location("performance_runtime_sandbox_tests", RUNTIME_PATH)
 assert SPEC and SPEC.loader
@@ -357,6 +358,28 @@ class EvidenceAndBuildTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(frozen.directory.stat().st_mode), 0o555)
             self.assertEqual(stat.S_IMODE(frozen.manifest_path.stat().st_mode), 0o444)
             self.assertEqual(runtime.hash_file(frozen.manifest_path), frozen.manifest_sha256)
+            manifest = json.loads(frozen.manifest_path.read_text())
+            self.assertEqual(
+                manifest["recipe"]["environment_allowlist"],
+                ["RUSTFLAGS"],
+            )
+            self.assertNotIn("-Ctarget-cpu=x86-64", frozen.manifest_path.read_text())
+            self.assertNotIn("environment", manifest["recipe"])
+
+    def test_sandbox_ports_bind_only_to_host_loopback(self) -> None:
+        compose = BASE_COMPOSE.read_text()
+        self.assertIn(
+            '"127.0.0.1:${SANDBOX_MONITOR_HOST_PORT}:8080"',
+            compose,
+        )
+        self.assertIn(
+            '"127.0.0.1:${SANDBOX_CLICKHOUSE_HTTP_HOST_PORT}:8123"',
+            compose,
+        )
+        self.assertIn(
+            '"127.0.0.1:${SANDBOX_CLICKHOUSE_TCP_HOST_PORT}:9000"',
+            compose,
+        )
 
     def test_build_uses_only_frozen_workspace_release_locked_recipe(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -394,7 +417,8 @@ class EvidenceAndBuildTests(unittest.TestCase):
             )
             self.assertEqual(build.target, "x86_64-unknown-linux-gnu")
             self.assertEqual(build.rustc_release, "1.96.0")
-            self.assertEqual(build.artifact()["recipe"]["linker"], "rustc-default")
+            self.assertEqual(build.linker, "rustc-default")
+            self.assertNotIn("linker", build.artifact()["recipe"])
 
     def test_sandbox_status_rejects_role_or_image_identity_mismatch(self) -> None:
         digest = "sha256:" + "a" * 64

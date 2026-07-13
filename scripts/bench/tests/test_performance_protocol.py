@@ -53,7 +53,13 @@ def make_definition(profile: str = "full", *, both_arms: bool = True) -> tuple[d
             git_commit=("a" if arm == "baseline" else "b") * 40,
             image_digest=digest(f"image:{arm}"),
             build_environment_sha256=build_environment,
-            binaries=[{"role": "moraine", "sha256": digest(f"binary:{arm}")}],
+            binaries=[
+                {
+                    "role": role,
+                    "sha256": digest(f"binary:{arm}:{role}"),
+                }
+                for role in sorted(protocol.MEASURED_BINARY_ROLES)
+            ],
         )
     schedules = {
         f"{scenario}:{split}": digest(f"schedule:{profile}:{scenario}:{split}")

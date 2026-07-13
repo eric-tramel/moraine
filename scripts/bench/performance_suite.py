@@ -30,7 +30,6 @@ from performance_fixtures import (
 from performance_protocol import (
     PAIR_ORDER,
     ProtocolError,
-    canonical_json_bytes,
     compare_manifests,
     create_build_identity,
     create_build_recipe,
@@ -40,6 +39,7 @@ from performance_protocol import (
     evaluate_repeatability,
     load_document,
     policy_document,
+    load_suite_manifest,
     sha256_bytes,
     sha256_json,
     validate_document,
@@ -69,8 +69,8 @@ from performance_scenarios import (
     run_ttr_scenario,
 )
 
+SUITE_ROOT = Path(__file__).resolve().parents[2]
 SCENARIOS = ("qps", "ttr", "etd_idle", "etd_loaded", "mixed")
-SERVER_BINARY_NAMES = ("moraine", "moraine-ingest", "moraine-monitor")
 IMAGE_RECIPE_PATHS = (
     "scripts/dev/sandbox/Dockerfile",
     "scripts/dev/sandbox/compose.yaml",
@@ -298,12 +298,12 @@ class ManagedSandbox:
         self.config_dir = sandbox.config_dir
         self.build = sandbox.build
         self._collector.record_reset(reset_role, self.sandbox_id)
-        status = sandbox.status()
-        self._server_pids = status.server_pids
-        self._loadgen_pids = status.loadgen_pids
-        for item in envelope.verify_running_binaries(build.binary_sha256):
-            self._collector.record_binary(item.name, item.sha256)
-        self._before = envelope.reset_measurement(self._server_pids, self._loadgen_pids)
+        self._build = build
+        self._refresh_server_processes()
+        self._before = envelope.reset_measurement(
+            self._server_pids,
+            self._loadgen_pids,
+        )
         central = sandbox.central_status()
         self._collector.cache_generations.append(str(central["cache_generation"]))
 
@@ -324,16 +324,34 @@ class ManagedSandbox:
                 evidence = verify_process_binary(
                     int(routes[-1]["pid"]), "moraine-mcp", self.build.binary_sha256["moraine-mcp"]
                 )
-                self._collector.record_binary(evidence.name, evidence.sha256)
+                self._collector.record_binary(evidence.name, evidence.exe_sha256)
                 return process
             __import__("time").sleep(0.01)
         process.kill()
         process.wait(timeout=2)
         raise SuiteFailure("MCP route process was not observable for binary verification")
 
+    def _refresh_server_processes(self) -> None:
+        try:
+            self._sandbox.central_status()
+        except BaseException:
+            process = self._sandbox.spawn_central()
+            self._sandbox.wait_central_ready_without_search(process)
+        status = self._sandbox.status()
+        self._server_pids = status.server_pids
+        self._loadgen_pids = status.loadgen_pids
+        for item in self._envelope.verify_running_binaries(
+            self._build.binary_sha256
+        ):
+            self._collector.record_binary(item.name, item.exe_sha256)
+
     def _capture(self) -> Any:
         if self._captured is None:
-            evidence = self._envelope.inspect(self._server_pids, self._loadgen_pids)
+            self._refresh_server_processes()
+            evidence = self._envelope.inspect(
+                self._server_pids,
+                self._loadgen_pids,
+            )
             evidence.assert_clean(self._before)
             self._captured = evidence
         return self._captured
@@ -379,8 +397,9 @@ class ManagedSandbox:
 
 
 def _start_measured_sandbox(
-    repo: Path,
+    _repo: Path,
     build: BuildIdentity,
+    expected_image_digest: str,
     recipe: Mapping[str, Any],
     collector: EvidenceCollector,
     *,
@@ -390,19 +409,36 @@ def _start_measured_sandbox(
     sandbox = None
     try:
         parent = envelope.create()
-        sandbox = start_owned_sandbox(repo, cgroup_parent=parent, build=build)
+        sandbox = start_owned_sandbox(
+            SUITE_ROOT,
+            cgroup_parent=parent,
+            build=build,
+        )
+        observed_image_digest = sha256_json(sandbox.status().image_ids)
+        if observed_image_digest != expected_image_digest:
+            raise SuiteFailure("measured sandbox image identity differs from prepared build")
         _seed_owned_sandbox(sandbox, recipe)
         return ManagedSandbox(sandbox, envelope, build, collector, reset_role=reset_role)
-    except BaseException:
+    except BaseException as setup_error:
+        cleanup_errors: list[str] = []
         if sandbox is not None:
             try:
                 sandbox.down()
-            except BaseException:
-                pass
+            except BaseException as error:
+                cleanup_errors.append(
+                    f"sandbox {sandbox.sandbox_id} cleanup failed: {error}"
+                )
         try:
-            envelope.remove(ignore_nonempty=True)
-        except BaseException:
-            pass
+            envelope.remove()
+        except BaseException as error:
+            cleanup_errors.append(
+                f"cgroup {envelope.owned_id} cleanup failed: {error}"
+            )
+        if cleanup_errors:
+            raise SuiteFailure(
+                f"benchmark setup failed: {setup_error}; "
+                f"owned cleanup incomplete: {'; '.join(cleanup_errors)}"
+            ) from setup_error
         raise
 
 
@@ -413,9 +449,9 @@ def _discover_image_digest(repo: Path, build: BuildIdentity, *, prove_cpu: bool)
         parent = envelope.create()
         if prove_cpu:
             proof = run_busy_child_proof(envelope)
-            if proof.cpu_to_wall_ratio < 0.85 or proof.cpu_to_wall_ratio > 1.15:
+            if proof.usage_per_wall_cpu < 0.85 or proof.usage_per_wall_cpu > 1.15:
                 raise SuiteFailure("aggregate busy-child CPU proof fell outside the declared tolerance")
-        sandbox = start_owned_sandbox(repo, cgroup_parent=parent, build=build)
+        sandbox = start_owned_sandbox(SUITE_ROOT, cgroup_parent=parent, build=build)
         status = sandbox.status()
         return sha256_json(status.image_ids)
     finally:
@@ -447,20 +483,19 @@ def _prepare_builds(repositories: Mapping[str, Path], output: Path) -> tuple[dic
         _require_clean(repo)
         runtime_build = build_release_binaries(repo, output / arm)
         build_environment_sha256 = sha256_json(dict(sorted(runtime_build.build_environment.items())))
-        runtime_recipe = runtime_build.artifact()["recipe"]
         recipe = create_build_recipe(
             toolchain_sha256=runtime_build.toolchain_sha256,
             target=runtime_build.target,
-            linker=runtime_recipe["linker"],
+            linker=runtime_build.linker,
             environment_allowlist=sorted(runtime_build.build_environment),
             build_environment_sha256=build_environment_sha256,
-            image_recipe_sha256=_image_recipe_sha256(repo),
+            image_recipe_sha256=_image_recipe_sha256(SUITE_ROOT),
         )
         if common_recipe is None:
             common_recipe = recipe
         elif recipe != common_recipe:
             raise SuiteFailure("baseline and candidate build recipes differ")
-        image_digest = _discover_image_digest(repo, runtime_build, prove_cpu=index == 0)
+        image_digest = _discover_image_digest(SUITE_ROOT, runtime_build, prove_cpu=index == 0)
         protocol_build = create_build_identity(
             arm=arm,
             git_commit=_git_commit(repo),
@@ -529,6 +564,8 @@ def _semantic_evidence(
 
 
 def _scenario_pass(result: ScenarioResult, scenario: str) -> bool:
+    if result.status == "fail":
+        return False
     if scenario == "qps":
         return True
     if scenario == "ttr":
@@ -614,14 +651,28 @@ def _run_scenario(
     event_count = 0
     if scenario == "qps":
         def sandbox_factory(_spec: Any) -> ManagedSandbox:
-            return _start_measured_sandbox(repo, prepared.runtime, recipe, collector, reset_role="trial")
+            return _start_measured_sandbox(
+                repo,
+                prepared.runtime,
+                str(prepared.protocol["image_digest"]),
+                recipe,
+                collector,
+                reset_role="trial",
+            )
 
         runtime_factory = make_owned_sandbox_qps_runtime_factory(
             sandbox_factory, lambda sandbox: sandbox.trial_telemetry()
         )
         result = run_qps_scenario(query_cases, runtime_factory, profile=run["profile"])
     elif scenario == "ttr":
-        sandbox = _start_measured_sandbox(repo, prepared.runtime, recipe, collector, reset_role="scenario")
+        sandbox = _start_measured_sandbox(
+            repo,
+            prepared.runtime,
+            str(prepared.protocol["image_digest"]),
+            recipe,
+            collector,
+            reset_role="scenario",
+        )
         try:
             samples = 3 if run["profile"] == "smoke" else 15
             result = run_ttr_scenario(
@@ -632,7 +683,14 @@ def _run_scenario(
         finally:
             sandbox.down()
     elif scenario in {"etd_idle", "etd_loaded"}:
-        sandbox = _start_measured_sandbox(repo, prepared.runtime, recipe, collector, reset_role="scenario")
+        sandbox = _start_measured_sandbox(
+            repo,
+            prepared.runtime,
+            str(prepared.protocol["image_digest"]),
+            recipe,
+            collector,
+            reset_role="scenario",
+        )
         event_schedule = open_event_schedule(recipe, split)
         event_count = len(event_schedule)
         timeout_s = recipe["schedule_templates"]["etd"]["visibility_timeout_ns"] / 1_000_000_000
@@ -680,6 +738,7 @@ def _run_scenario(
             return _start_measured_sandbox(
                 repo,
                 prepared.runtime,
+                str(prepared.protocol["image_digest"]),
                 recipe,
                 collector,
                 reset_role=role_map[label],
@@ -824,16 +883,21 @@ def freeze(profile: str, output: Path) -> None:
     recipe = build_recipe(profile)
     validate_recipe(recipe)
     output.mkdir(parents=True, exist_ok=False)
-    (output / f"fixture-{profile}.json").write_bytes(canonical_json_bytes(recipe))
-    (output / f"policy-{profile}.json").write_bytes(
-        canonical_json_bytes(
-            {
-                "profile": profile,
-                "fixture_sha256": recipe["fixture_sha256"],
-                "policy": policy_document(),
-                "schedules": _schedule_hashes(recipe),
-            }
-        )
+    write_json_atomic(
+        output / f"fixture-{profile}.json",
+        recipe,
+        validator=validate_recipe,
+    )
+    policy = policy_document()
+
+    def validate_policy(document: Any) -> None:
+        if document != policy:
+            raise SuiteFailure("policy document changed before write")
+
+    write_json_atomic(
+        output / f"policy-{profile}.json",
+        policy,
+        validator=validate_policy,
     )
 
 
@@ -842,7 +906,9 @@ def validate_path(path: Path) -> None:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise SuiteFailure(f"cannot load {path}: {error}") from error
-    if isinstance(document, dict) and "document_type" in document:
+    if isinstance(document, dict) and document.get("document_type") == "suite_manifest":
+        load_suite_manifest(path)
+    elif isinstance(document, dict) and "document_type" in document:
         validate_document(document)
     elif isinstance(document, dict) and "recipe_version" in document:
         validate_recipe(document)

@@ -270,7 +270,7 @@ class SeedTests(unittest.TestCase):
 
     def test_seed_requires_fresh_owned_empty_target_and_never_destroys_data(self) -> None:
         sql = seed_search_sql(self.target, self.recipe)
-        self.assertTrue(sql.startswith("INSERT INTO moraine_perf.search_documents"))
+        self.assertTrue(sql.startswith("INSERT INTO moraine_perf.events"))
         upper = sql.upper()
         self.assertNotIn("TRUNCATE", upper)
         self.assertNotIn("DROP ", upper)
@@ -303,7 +303,7 @@ class SeedTests(unittest.TestCase):
         self.assertTrue(event["destination_filename"].endswith(".jsonl"))
         self.assertEqual(
             event["expected_ack_digest"],
-            hashlib.sha256(event["raw_event_uid"].encode("utf-8")).hexdigest(),
+            hashlib.sha256(event["normalized_event_uid"].encode("utf-8")).hexdigest(),
         )
         lines = [json.loads(line) for line in codex_event_lines(event).splitlines()]
         self.assertEqual(lines[0]["payload"]["id"], event["raw_session_id"])

@@ -633,10 +633,10 @@ def _fresh_identity(previous: CentralIdentity, current: CentralIdentity) -> bool
     return bool(
         previous.pid > 0
         and current.pid > 0
-        and previous.pid != current.pid
         and previous.starttime_ticks > 0
         and current.starttime_ticks > 0
-        and previous.starttime_ticks != current.starttime_ticks
+        and (previous.pid, previous.starttime_ticks)
+        != (current.pid, current.starttime_ticks)
         and previous.cache_generation
         and current.cache_generation
         and previous.cache_generation != current.cache_generation
@@ -1484,7 +1484,11 @@ class OwnedSandboxTtrControl:
                 routes = status.get("route_processes")
                 if not isinstance(routes, list):
                     raise ScenarioError("central status omitted route process cleanup evidence")
-                self._survivors = tuple(int(pid) for pid in routes)
+                self._survivors = tuple(
+                    int(process["pid"])
+                    for process in routes
+                    if isinstance(process, dict) and "pid" in process
+                )
                 if not self._survivors or time.monotonic() >= cleanup_deadline:
                     break
                 time.sleep(0.02)
@@ -2595,11 +2599,17 @@ def run_mixed_scenario(
             diagnostics,
         )
     finally:
+        cleanup_errors: list[Exception] = []
         for runtime in runtimes:
             try:
                 runtime.close()
-            except Exception:
-                pass
+            except Exception as error:
+                cleanup_errors.append(error)
+        if cleanup_errors:
+            raise ScenarioError(
+                "mixed runtime cleanup failed: "
+                + "; ".join(str(error) for error in cleanup_errors)
+            ) from cleanup_errors[0]
 
 
 # ---------------------------------------------------------------------------

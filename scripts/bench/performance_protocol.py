@@ -17,7 +17,7 @@ import re
 import statistics
 import tempfile
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import unquote_plus
 
 PERFORMANCE_VERSION = "moraine-performance-v1"
@@ -28,6 +28,7 @@ SPLITS = frozenset({"research", "holdout", "stress"})
 ARMS = frozenset({"baseline", "candidate"})
 STATUSES = frozenset({"pass", "fail", "inconclusive"})
 PAIR_ORDER = ("AB", "BA", "AB", "BA", "AB", "BA", "AB")
+MEASURED_BINARY_ROLES = frozenset({"moraine-ingest", "moraine-mcp"})
 COMPARISON_MATRIX = {
     "qps": ("research", "holdout"),
     "ttr": ("research", "holdout"),
@@ -1030,28 +1031,280 @@ def _validate_manifest(document: Any) -> Mapping[str, Any]:
     return value
 
 
+def _validate_comparison_summary(
+    metrics_value: Any,
+    diagnostics: Sequence[str],
+) -> str:
+    metrics = _mapping(metrics_value, "$.metrics")
+    _fields(
+        metrics,
+        {
+            "comparison_split",
+            "ratios",
+            "source_etd_ratio_upper",
+            "geometric_rsd",
+            "direction_pairs",
+            "suite_score_ratio",
+            "suite_score_ci95",
+            "pair_results",
+        },
+        "$.metrics",
+    )
+    _string(
+        metrics["comparison_split"],
+        "$.metrics.comparison_split",
+        choices={POLICY["comparison_split"]},
+    )
+    names = {"qps", "ttr", "source_etd"}
+    ratios = _mapping(metrics["ratios"], "$.metrics.ratios")
+    rsd = _mapping(metrics["geometric_rsd"], "$.metrics.geometric_rsd")
+    directions = _mapping(metrics["direction_pairs"], "$.metrics.direction_pairs")
+    _fields(ratios, names, "$.metrics.ratios")
+    _fields(rsd, names, "$.metrics.geometric_rsd")
+    _fields(directions, names, "$.metrics.direction_pairs")
+    pairs = _sequence(metrics["pair_results"], "$.metrics.pair_results")
+    if len(pairs) != POLICY["pair_count"]:
+        _fail("$.metrics.pair_results", "must contain exactly seven pairs")
+    series: dict[str, list[float]] = {name: [] for name in names}
+    upper_series: list[float] = []
+    score_series: list[float] = []
+    for index, raw in enumerate(pairs):
+        path = f"$.metrics.pair_results[{index}]"
+        pair = _mapping(raw, path)
+        fields = {
+            "pair_id",
+            "qps_ratio",
+            "ttr_ratio",
+            "source_etd_ratio_lower",
+            "source_etd_ratio_upper",
+            "score_ratio_lower",
+            "score_ratio_upper",
+        }
+        _fields(pair, fields, path)
+        if _integer(pair["pair_id"], f"{path}.pair_id", 1) != index + 1:
+            _fail(f"{path}.pair_id", "must be contiguous and ordered")
+        qps = _number(pair["qps_ratio"], f"{path}.qps_ratio", minimum=0)
+        ttr = _number(pair["ttr_ratio"], f"{path}.ttr_ratio", minimum=0)
+        source = _number(
+            pair["source_etd_ratio_lower"],
+            f"{path}.source_etd_ratio_lower",
+            minimum=0,
+        )
+        score = _number(pair["score_ratio_lower"], f"{path}.score_ratio_lower", minimum=0)
+        expected_score = _geometric_mean_nonnegative([qps, ttr, source])
+        if not _close(score, expected_score):
+            _fail(f"{path}.score_ratio_lower", "does not match constituent ratios")
+        upper_raw = pair["source_etd_ratio_upper"]
+        score_upper_raw = pair["score_ratio_upper"]
+        if upper_raw is None:
+            if score_upper_raw is not None:
+                _fail(f"{path}.score_ratio_upper", "must be null with an unbounded ETD ratio")
+        else:
+            upper = _number(upper_raw, f"{path}.source_etd_ratio_upper", minimum=0)
+            score_upper = _number(score_upper_raw, f"{path}.score_ratio_upper", minimum=0)
+            if not _close(score_upper, _geometric_mean_nonnegative([qps, ttr, upper])):
+                _fail(f"{path}.score_ratio_upper", "does not match constituent ratios")
+            upper_series.append(upper)
+        series["qps"].append(qps)
+        series["ttr"].append(ttr)
+        series["source_etd"].append(source)
+        score_series.append(score)
+    expected_ratios = {
+        name: _geometric_mean_nonnegative(values) for name, values in series.items()
+    }
+    expected_rsd = {name: geometric_rsd(values) for name, values in series.items()}
+    expected_directions = {
+        name: sum(value > 1.0 for value in values) for name, values in series.items()
+    }
+    for name in names:
+        if not _close(
+            _number(ratios[name], f"$.metrics.ratios.{name}", minimum=0),
+            expected_ratios[name],
+        ):
+            _fail(f"$.metrics.ratios.{name}", "does not match pair results")
+        observed_rsd = rsd[name]
+        if expected_rsd[name] is None:
+            if observed_rsd is not None:
+                _fail(f"$.metrics.geometric_rsd.{name}", "must be null")
+        elif not _close(
+            _number(observed_rsd, f"$.metrics.geometric_rsd.{name}", minimum=0),
+            expected_rsd[name],
+        ):
+            _fail(f"$.metrics.geometric_rsd.{name}", "does not match pair results")
+        if _integer(
+            directions[name],
+            f"$.metrics.direction_pairs.{name}",
+            0,
+        ) != expected_directions[name]:
+            _fail(f"$.metrics.direction_pairs.{name}", "does not match pair results")
+    expected_upper = (
+        geometric_mean(upper_series)
+        if len(upper_series) == POLICY["pair_count"]
+        else None
+    )
+    if expected_upper is None:
+        if metrics["source_etd_ratio_upper"] is not None:
+            _fail("$.metrics.source_etd_ratio_upper", "must be null")
+    elif not _close(
+        _number(
+            metrics["source_etd_ratio_upper"],
+            "$.metrics.source_etd_ratio_upper",
+            minimum=0,
+        ),
+        expected_upper,
+    ):
+        _fail("$.metrics.source_etd_ratio_upper", "does not match pair results")
+    expected_score = _geometric_mean_nonnegative(score_series)
+    if not _close(
+        _number(metrics["suite_score_ratio"], "$.metrics.suite_score_ratio", minimum=0),
+        expected_score,
+    ):
+        _fail("$.metrics.suite_score_ratio", "does not match pair results")
+    interval = _mapping(metrics["suite_score_ci95"], "$.metrics.suite_score_ci95")
+    _fields(interval, {"lower", "upper"}, "$.metrics.suite_score_ci95")
+    expected_lower, expected_ci_upper = bootstrap_interval(score_series)
+    if not _close(
+        _number(interval["lower"], "$.metrics.suite_score_ci95.lower", minimum=0),
+        expected_lower,
+    ) or not _close(
+        _number(interval["upper"], "$.metrics.suite_score_ci95.upper", minimum=0),
+        expected_ci_upper,
+    ):
+        _fail("$.metrics.suite_score_ci95", "does not match deterministic bootstrap")
+    failed_arms = any(
+        diagnostic.endswith(":arm-not-pass") or diagnostic.endswith(":gate-failed")
+        for diagnostic in diagnostics
+    )
+    high_variability = any(
+        expected_rsd[name] is None
+        or expected_rsd[name] > POLICY[f"{'etd' if name == 'source_etd' else name}_max_geometric_rsd"]
+        for name in names
+    )
+    inconclusive = high_variability or expected_lower <= 1.0 or any(
+        diagnostic.endswith(
+            (
+                ":capacity-censored",
+                ":zero-baseline",
+                ":zero-candidate",
+                ":censored",
+                ":threshold-overlap",
+            )
+        )
+        for diagnostic in diagnostics
+    )
+    threshold_failure = (
+        expected_score < POLICY["minimum_score_ratio"]
+        or any(
+            value < POLICY["minimum_constituent_ratio"]
+            for value in expected_ratios.values()
+        )
+        or any(
+            value < POLICY["minimum_direction_pairs"]
+            for value in expected_directions.values()
+        )
+    )
+    if failed_arms:
+        return "fail"
+    if inconclusive:
+        return "inconclusive"
+    return "fail" if threshold_failure else "pass"
+
+
+def _validate_repeatability_summary(
+    metrics_value: Any,
+    diagnostics: Sequence[str],
+) -> str:
+    metrics = _mapping(metrics_value, "$.metrics")
+    _fields(metrics, {"values", "mad_ratios", "limits"}, "$.metrics")
+    names = {"qps", "ttr", "source_etd", "db_ack_etd"}
+    values = _mapping(metrics["values"], "$.metrics.values")
+    ratios = _mapping(metrics["mad_ratios"], "$.metrics.mad_ratios")
+    limits = _mapping(metrics["limits"], "$.metrics.limits")
+    _fields(values, names, "$.metrics.values")
+    _fields(ratios, names, "$.metrics.mad_ratios")
+    _fields(limits, names, "$.metrics.limits")
+    expected_limits = {
+        "qps": POLICY["repeatability_qps_mad_ratio"],
+        "ttr": POLICY["repeatability_ttr_mad_ratio"],
+        "source_etd": POLICY["repeatability_etd_mad_ratio"],
+        "db_ack_etd": POLICY["repeatability_etd_mad_ratio"],
+    }
+    expected_ratios: dict[str, float] = {}
+    for name in names:
+        series_raw = _sequence(values[name], f"$.metrics.values.{name}")
+        if len(series_raw) != POLICY["repeatability_runs"]:
+            _fail(f"$.metrics.values.{name}", "must contain exactly seven runs")
+        series = [
+            _number(item, f"$.metrics.values.{name}[{index}]", minimum=0)
+            for index, item in enumerate(series_raw)
+        ]
+        if any(item <= 0 for item in series):
+            _fail(f"$.metrics.values.{name}", "measurements must be positive")
+        expected_ratios[name] = mad_ratio(series)
+        if not _close(
+            _number(ratios[name], f"$.metrics.mad_ratios.{name}", minimum=0),
+            expected_ratios[name],
+        ):
+            _fail(f"$.metrics.mad_ratios.{name}", "does not match measured values")
+        if not _close(
+            _number(limits[name], f"$.metrics.limits.{name}", minimum=0),
+            expected_limits[name],
+        ):
+            _fail(f"$.metrics.limits.{name}", "does not match frozen policy")
+    failures = [
+        f"repeatability:{name}:mad-ratio-exceeded"
+        for name in ("qps", "ttr", "source_etd", "db_ack_etd")
+        if expected_ratios[name] > expected_limits[name]
+    ]
+    if list(diagnostics) != failures:
+        _fail("$.diagnostics", "does not match repeatability threshold failures")
+    return "fail" if failures else "pass"
+
+
 def _validate_summary(document: Any, document_type: str) -> Mapping[str, Any]:
     value = _mapping(document, "$")
     _fields(value, {"document_type", "schema_version", "status", "inputs", "policy", "metrics", "diagnostics", "document_sha256"}, "$")
     _string(value["document_type"], "$.document_type", choices={document_type})
     _string(value["schema_version"], "$.schema_version", choices={PERFORMANCE_VERSION})
-    _string(value["status"], "$.status", choices=STATUSES)
+    status = _string(value["status"], "$.status", choices=STATUSES)
     inputs = _sequence(value["inputs"], "$.inputs")
     if document_type == "comparison" and len(inputs) != 2:
         _fail("$.inputs", "comparison requires baseline and candidate manifests")
     if document_type == "repeatability" and len(inputs) != POLICY["repeatability_runs"]:
         _fail("$.inputs", "repeatability requires exactly seven manifests")
+    input_arms: list[str] = []
+    input_hashes: list[str] = []
     for index, raw in enumerate(inputs):
         item = _mapping(raw, f"$.inputs[{index}]")
         _fields(item, {"arm", "manifest_sha256"}, f"$.inputs[{index}]")
-        _string(item["arm"], f"$.inputs[{index}].arm", choices=ARMS)
-        _sha(item["manifest_sha256"], f"$.inputs[{index}].manifest_sha256")
+        input_arms.append(
+            _string(item["arm"], f"$.inputs[{index}].arm", choices=ARMS)
+        )
+        input_hashes.append(
+            _sha(item["manifest_sha256"], f"$.inputs[{index}].manifest_sha256")
+        )
+    if len(set(input_hashes)) != len(input_hashes):
+        _fail("$.inputs", "manifest checksums must be unique")
+    if document_type == "comparison" and input_arms != ["baseline", "candidate"]:
+        _fail("$.inputs", "comparison inputs must be baseline then candidate")
+    if document_type == "repeatability" and (
+        set(input_arms) != {"baseline"} or input_hashes != sorted(input_hashes)
+    ):
+        _fail("$.inputs", "repeatability inputs must be sorted baseline manifests")
     if value["policy"] != policy_document():
         _fail("$.policy", "does not equal frozen protocol policy")
-    _mapping(value["metrics"], "$.metrics")
-    diagnostics = _sequence(value["diagnostics"], "$.diagnostics")
-    for index, diagnostic in enumerate(diagnostics):
+    diagnostics_raw = _sequence(value["diagnostics"], "$.diagnostics")
+    diagnostics = [
         _string(diagnostic, f"$.diagnostics[{index}]")
+        for index, diagnostic in enumerate(diagnostics_raw)
+    ]
+    expected_status = (
+        _validate_comparison_summary(value["metrics"], diagnostics)
+        if document_type == "comparison"
+        else _validate_repeatability_summary(value["metrics"], diagnostics)
+    )
+    if status != expected_status:
+        _fail("$.status", "contradicts validated summary metrics and diagnostics")
     expected_hash = sha256_json({key: child for key, child in value.items() if key != "document_sha256"})
     if _sha(value["document_sha256"], "$.document_sha256") != expected_hash:
         _fail("$.document_sha256", "does not match canonical summary content")
@@ -1247,9 +1500,24 @@ def load_suite_manifest(path: Path | str) -> tuple[Mapping[str, Any], dict[tuple
             raise ProtocolError(f"artifact {reference['relative_path']} profile mismatch")
         if artifact["binary"]["build_identity_sha256"] != build["identity_sha256"] or artifact["binary"]["image_digest"] != build["image_digest"]:
             raise ProtocolError(f"artifact {reference['relative_path']} build identity mismatch")
-        running = {item["role"]: item for item in artifact["binary"]["running_binaries"]}
-        if set(running) != set(expected_binaries) or any(not running[role]["verified"] or running[role]["sha256"] != checksum or running[role]["proc_exe_sha256"] != checksum for role, checksum in expected_binaries.items()):
-            raise ProtocolError(f"artifact {reference['relative_path']} running binary evidence mismatch")
+        running = {
+            item["role"]: item
+            for item in artifact["binary"]["running_binaries"]
+        }
+        if set(running) != MEASURED_BINARY_ROLES:
+            raise ProtocolError(
+                f"artifact {reference['relative_path']} measured binary roles differ"
+            )
+        if any(
+            role not in expected_binaries
+            or not item["verified"]
+            or item["sha256"] != expected_binaries[role]
+            or item["proc_exe_sha256"] != expected_binaries[role]
+            for role, item in running.items()
+        ):
+            raise ProtocolError(
+                f"artifact {reference['relative_path']} running binary evidence mismatch"
+            )
         schedule_key = f"{artifact['scenario']}:{artifact['split']}"
         if artifact["schedule"]["schedule_sha256"] != manifest["suite_definition"]["schedules"][schedule_key]:
             raise ProtocolError(f"artifact {reference['relative_path']} schedule fingerprint mismatch")
@@ -1266,9 +1534,14 @@ def load_suite_manifest(path: Path | str) -> tuple[Mapping[str, Any], dict[tuple
     return manifest, loaded
 
 
-def write_json_atomic(path: Path | str, document: Mapping[str, Any]) -> None:
+def write_json_atomic(
+    path: Path | str,
+    document: Mapping[str, Any],
+    *,
+    validator: Callable[[Any], Any] = validate_document,
+) -> None:
     """Validate, fsync, atomically replace, then fsync the destination directory."""
-    validate_document(document)
+    validator(document)
     destination = Path(path)
     encoded = canonical_json_bytes(document)
     destination.parent.mkdir(parents=True, exist_ok=True)
