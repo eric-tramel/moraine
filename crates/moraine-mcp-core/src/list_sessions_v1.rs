@@ -38,6 +38,8 @@ impl AppState {
             start_unix_ms: args.start_unix_ms,
             end_unix_ms: args.end_unix_ms,
             mode: args.mode.map(repo_mode),
+            harness: args.harness.clone(),
+            source_name: args.source.clone(),
             sort: repo_sort(args.sort),
         };
         let repo_page = PageRequest {
@@ -120,6 +122,8 @@ fn canonical_request_json(args: &CanonicalListSessionsArgs) -> Value {
         "start_datetime": args.start_datetime,
         "end_datetime": args.end_datetime,
         "mode": args.mode.map(|mode| mode.as_str()),
+        "harness": args.harness.as_deref(),
+        "source": args.source.as_deref(),
         "sort": args.sort.as_str(),
         "limit": args.limit,
         "cursor": args.cursor.as_deref(),
@@ -178,7 +182,7 @@ fn list_sessions_sla_target_ms(args: &CanonicalListSessionsArgs, has_more: bool)
     let is_broad_window =
         args.end_unix_ms.saturating_sub(args.start_unix_ms) >= LIST_SESSIONS_BROAD_WINDOW_MS;
     if is_broad_window || has_more {
-        if args.mode.is_some() {
+        if args.mode.is_some() || args.harness.is_some() || args.source.is_some() {
             LIST_SESSIONS_FILTERED_BROAD_SLA_TARGET_MS
         } else {
             LIST_SESSIONS_BROAD_SLA_TARGET_MS
@@ -197,6 +201,7 @@ fn session_json(rank: usize, session: &McpSessionListItem) -> Result<Value, Cont
         "session": {
             "id": session_id,
             "title": session.title.as_deref(),
+            "harness": session.harness.as_deref(),
             "source": session.source.as_deref(),
             "started_at": format_rfc3339_utc_millis(session.first_event_unix_ms),
             "updated_at": format_rfc3339_utc_millis(session.last_event_unix_ms),
@@ -448,6 +453,7 @@ mod tests {
                 completed: true,
                 title: Some("Build failure triage".to_string()),
                 source: Some("codex".to_string()),
+                harness: Some("codex".to_string()),
                 session_slug: Some("build-failure".to_string()),
                 session_summary: Some("Build failure triage summary.".to_string()),
             }],
@@ -466,6 +472,8 @@ mod tests {
             .list_sessions_v1(json!({
                 "start_datetime": "2026-04-30T09:00:00-04:00",
                 "end_datetime": "2026-04-30T13:00:00-04:00",
+                "harness": " codex ",
+                "source": " codex ",
                 "limit": 1
             }))
             .await
@@ -475,6 +483,7 @@ mod tests {
         let data = &result["structuredContent"]["data"];
         let first = &data["sessions"][0];
         assert_eq!(first["id"], json!("session:c2Vzcy1vcGVu"));
+        assert_eq!(first["session"]["harness"], json!("codex"));
         assert_eq!(first["open"]["session_id"], first["session"]["id"]);
         assert_eq!(first["session"]["turn_count"], json!(3));
         assert_eq!(first["session"]["event_count"], json!(17));
@@ -497,6 +506,8 @@ mod tests {
         assert_eq!(filter.end_unix_ms, 1_777_568_400_000);
         assert_eq!(filter.mode, None);
         assert_eq!(filter.sort, RepoListSort::Desc);
+        assert_eq!(filter.harness.as_deref(), Some("codex"));
+        assert_eq!(filter.source_name.as_deref(), Some("codex"));
         assert_eq!(page.limit, 1);
         assert_eq!(page.cursor, None);
     }
@@ -525,6 +536,7 @@ mod tests {
             completed: true,
             title: None,
             source: Some("claude-code".to_string()),
+            harness: Some("claude-code".to_string()),
             session_slug: None,
             session_summary: None,
         };
@@ -577,6 +589,7 @@ mod tests {
             completed: true,
             title: None,
             source: Some("claude-code".to_string()),
+            harness: Some("claude-code".to_string()),
             session_slug: None,
             session_summary: None,
         };

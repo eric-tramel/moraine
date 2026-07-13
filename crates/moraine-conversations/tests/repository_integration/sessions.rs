@@ -170,6 +170,8 @@ async fn list_mcp_sessions_uses_overlap_filter_and_cursor_pagination() {
         start_unix_ms: 1767261600000_i64,
         end_unix_ms: 1767500000000_i64,
         mode: Some(ConversationMode::WebSearch),
+        harness: Some("codex".to_string()),
+        source_name: Some("codex".to_string()),
         sort: ConversationListSort::Desc,
     };
 
@@ -188,6 +190,7 @@ async fn list_mcp_sessions_uses_overlap_filter_and_cursor_pagination() {
     assert_eq!(first.items[0].session_id, "sess_c");
     assert_eq!(first.items[0].title.as_deref(), Some("Session C title"));
     assert_eq!(first.items[0].source.as_deref(), Some("codex"));
+    assert_eq!(first.items[0].harness.as_deref(), Some("codex"));
     assert!(first.items[0].completed);
     assert_eq!(first.items[1].session_id, "sess_b");
     assert!(first.next_cursor.is_some());
@@ -217,6 +220,9 @@ async fn list_mcp_sessions_uses_overlap_filter_and_cursor_pagination() {
     assert!(list_query.contains("toUnixTimestamp64Milli(s.last_event_time) >= 1767261600000"));
     assert!(list_query.contains("toUnixTimestamp64Milli(s.first_event_time) < 1767500000000"));
     assert!(list_query.contains("ifNull(r.mode, 'chat') = 'web_search'"));
+    assert!(list_query.contains("r.latest_harness = 'codex'"));
+    assert!(list_query.contains("r.latest_source_name = 'codex'"));
+    assert!(list_query.contains("ifNull(r.latest_source_name, '') AS source"));
     assert!(list_query.contains("ORDER BY w.last_event_unix_ms DESC, w.session_id DESC"));
     assert!(list_query.contains("payload_type IN ('task_complete', 'turn_aborted')"));
     // Blank session_id rows are filtered at the source so they never consume a
@@ -240,6 +246,8 @@ async fn list_mcp_sessions_rejects_cursor_filter_mismatch() {
         start_unix_ms: 1767261600000_i64,
         end_unix_ms: 1767500000000_i64,
         mode: Some(ConversationMode::WebSearch),
+        harness: None,
+        source_name: None,
         sort: ConversationListSort::Desc,
     };
 
@@ -259,6 +267,25 @@ async fn list_mcp_sessions_rejects_cursor_filter_mismatch() {
         .list_mcp_sessions(
             McpSessionListFilter {
                 mode: Some(ConversationMode::Chat),
+                ..base_filter.clone()
+            },
+            PageRequest {
+                limit: 1,
+                cursor: Some(cursor.clone()),
+            },
+        )
+        .await
+        .expect_err("filter mismatch should fail");
+
+    assert_eq!(
+        err.to_string(),
+        "invalid cursor: cursor does not match current list_sessions filter"
+    );
+
+    let err = repo
+        .list_mcp_sessions(
+            McpSessionListFilter {
+                source_name: Some("__none__".to_string()),
                 ..base_filter
             },
             PageRequest {
@@ -267,7 +294,7 @@ async fn list_mcp_sessions_rejects_cursor_filter_mismatch() {
             },
         )
         .await
-        .expect_err("filter mismatch should fail");
+        .expect_err("absent and literal sentinel source filters must not share a cursor");
 
     assert_eq!(
         err.to_string(),
@@ -283,6 +310,8 @@ async fn list_mcp_sessions_applies_session_origin_scope() {
             start_unix_ms: 1767261600000_i64,
             end_unix_ms: 1767500000000_i64,
             mode: None,
+            harness: None,
+            source_name: None,
             sort: ConversationListSort::Desc,
         },
         PageRequest {
@@ -320,6 +349,8 @@ async fn list_mcp_sessions_rejects_cursor_from_differently_scoped_server() {
         start_unix_ms: 1767261600000_i64,
         end_unix_ms: 1767500000000_i64,
         mode: Some(ConversationMode::WebSearch),
+        harness: None,
+        source_name: None,
         sort: ConversationListSort::Desc,
     };
 

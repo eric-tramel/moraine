@@ -8,7 +8,7 @@ mod private_proxy;
 mod search_sessions_v1;
 
 use anyhow::{anyhow, Context, Result};
-use moraine_config::AppConfig;
+use moraine_config::{AppConfig, KNOWN_INGEST_HARNESSES};
 use moraine_conversations::{BackendRepositoryRouter, RepoError};
 pub use moraine_conversations::{ConversationRepository, SessionOriginScope};
 pub use private_proxy::private_route_deadline;
@@ -157,6 +157,28 @@ impl AppState {
     }
 
     fn tools_list_result(&self) -> Value {
+        let harness_filter_description = format!(
+            "Optional exact, case-sensitive normalized harness filter. Supported values: {}.",
+            KNOWN_INGEST_HARNESSES.join(", ")
+        );
+        let mut source_values = self
+            .cfg
+            .ingest
+            .sources
+            .iter()
+            .map(|source| source.name.as_str())
+            .filter(|name| !name.is_empty())
+            .collect::<Vec<_>>();
+        source_values.sort_unstable();
+        source_values.dedup();
+        let source_filter_description = if source_values.is_empty() {
+            "Optional exact, case-sensitive ingest source filter. No ingest sources are configured for this server.".to_string()
+        } else {
+            format!(
+                "Optional exact, case-sensitive ingest source filter. Configured values for this server: {}. Use source to distinguish sources such as pi and omp that share a harness.",
+                source_values.join(", ")
+            )
+        };
         json!({
             "tools": [
                 {
@@ -190,6 +212,14 @@ impl AppState {
                                     ]
                                 },
                                 "description": "Optional normalized event type filter. Defaults to user_input, assistant_response, and tool_response."
+                            },
+                            "harness": {
+                                "type": ["string", "null"],
+                                "description": harness_filter_description.as_str()
+                            },
+                            "source": {
+                                "type": ["string", "null"],
+                                "description": source_filter_description.as_str()
                             },
                             "n_hits": {
                                 "type": ["integer", "null"],
@@ -287,6 +317,14 @@ impl AppState {
                                 ],
                                 "description": "Optional session mode filter."
                             },
+                            "harness": {
+                                "type": ["string", "null"],
+                                "description": harness_filter_description.as_str()
+                            },
+                            "source": {
+                                "type": ["string", "null"],
+                                "description": source_filter_description.as_str()
+                            },
                             "sort": {
                                 "anyOf": [
                                     {
@@ -358,6 +396,14 @@ impl AppState {
                             "tool": {
                                 "type": ["string", "null"],
                                 "description": "Optional case-insensitive tool-name filter (e.g. Edit, Write, Read, Bash)."
+                            },
+                            "harness": {
+                                "type": ["string", "null"],
+                                "description": harness_filter_description.as_str()
+                            },
+                            "source": {
+                                "type": ["string", "null"],
+                                "description": source_filter_description.as_str()
                             },
                             "mutations_only": {
                                 "type": ["boolean", "null"],
@@ -1751,6 +1797,27 @@ mod tests {
             "search_sessions should not advertise legacy evidence policy controls"
         );
 
+        let harness_description = json!(
+            "Optional exact, case-sensitive normalized harness filter. Supported values: codex, claude-code, cursor, hermes, kimi-cli, opencode, pi-coding-agent."
+        );
+        let source_description = json!(
+            "Optional exact, case-sensitive ingest source filter. Configured values for this server: claude, codex, cursor, cursor-sqlite, hermes, kimi-cli, omp, opencode, pi. Use source to distinguish sources such as pi and omp that share a harness."
+        );
+        for tool_name in ["search_sessions", "list_sessions", "file_attention"] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool["name"].as_str() == Some(tool_name))
+                .expect("retrieval tool exists");
+            assert_eq!(
+                tool["inputSchema"]["properties"]["harness"]["description"],
+                harness_description
+            );
+            assert_eq!(
+                tool["inputSchema"]["properties"]["source"]["description"],
+                source_description
+            );
+        }
+
         let list_sessions = tools
             .iter()
             .find(|tool| tool["name"].as_str() == Some("list_sessions"))
@@ -1813,6 +1880,28 @@ mod tests {
                 "sessions",
                 "next_cursor"
             ])
+        );
+    }
+
+    #[test]
+    fn tools_list_source_values_follow_server_config() {
+        let mut cfg = AppConfig::default();
+        cfg.ingest.sources.truncate(1);
+        cfg.ingest.sources[0].name = "custom-source".to_string();
+        let state = AppState::embedded(cfg, repository_with_scope(None));
+        let payload = state.tools_list_result();
+        let search = payload["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|tool| tool["name"].as_str() == Some("search_sessions"))
+            .expect("search_sessions exists");
+
+        assert_eq!(
+            search["inputSchema"]["properties"]["source"]["description"],
+            json!(
+                "Optional exact, case-sensitive ingest source filter. Configured values for this server: custom-source. Use source to distinguish sources such as pi and omp that share a harness."
+            )
         );
     }
 

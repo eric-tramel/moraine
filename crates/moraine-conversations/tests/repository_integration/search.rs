@@ -11,6 +11,8 @@ async fn search_mcp_events_applies_session_origin_scope() {
             McpEventType::UserInput,
             McpEventType::AssistantResponse,
         ]),
+        harness: Some("claude-code".to_string()),
+        source_name: Some("claude".to_string()),
         min_score: Some(0.0),
         min_should_match: Some(1),
         ..SearchMcpEventsQuery::default()
@@ -27,6 +29,8 @@ async fn search_mcp_events_applies_session_origin_scope() {
     assert!(search_query.contains("d.session_id IN (SELECT session_id FROM ("));
     assert!(search_query.contains("origin_cwd = '/work/project'"));
     assert!(search_query.contains("startsWith(origin_cwd, '/work/project/')"));
+    assert!(search_query.contains("d.harness = 'claude-code'"));
+    assert!(search_query.contains("d.source_name = 'claude'"));
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn search_session_metadata_returns_summary_only_matches() {
@@ -713,6 +717,8 @@ async fn search_mcp_events_supports_turn_scoped_search() {
             session_id: Some("sess_c".to_string()),
             turn_seq: Some(2),
             event_types: Some(vec![McpEventType::ToolResponse]),
+            harness: None,
+            source_name: None,
             min_score: Some(0.0),
             min_should_match: Some(1),
         })

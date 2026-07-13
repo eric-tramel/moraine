@@ -53,6 +53,8 @@ impl AppState {
                     .map(repo_event_type)
                     .collect(),
             ),
+            harness: args.harness.clone(),
+            source_name: args.source.clone(),
             min_score: None,
             min_should_match: None,
         };
@@ -311,6 +313,7 @@ fn search_hit_json(
         "session": {
             "id": session_id,
             "title": hit.session_title.as_deref().or(hit.session_slug.as_deref()),
+            "harness": hit.harness,
             "source": hit.source_name.as_deref().or(hit.harness.as_deref()),
             "started_at": metadata
                 .map(|metadata| metadata.first_event_unix_ms)
@@ -476,6 +479,8 @@ mod tests {
         let args = parse_search_sessions_args(json!({
             "query": "  cargo test failure  ",
             "event_types": ["tool_response", "user_input", "tool_response"],
+            "harness": " claude-code ",
+            "source": " claude ",
             "n_hits": 3
         }))
         .expect("valid args");
@@ -485,6 +490,8 @@ mod tests {
             args.event_types,
             vec![McpEventType::UserInput, McpEventType::ToolResponse]
         );
+        assert_eq!(args.harness.as_deref(), Some("claude-code"));
+        assert_eq!(args.source.as_deref(), Some("claude"));
         assert_eq!(args.n_hits, 3);
     }
 
@@ -522,7 +529,7 @@ mod tests {
             session_slug: None,
             session_summary: None,
             source_name: Some("codex".to_string()),
-            harness: None,
+            harness: Some("codex".to_string()),
             inference_provider: None,
             event_class: "tool_result".to_string(),
             payload_type: "tool_result".to_string(),
@@ -605,6 +612,7 @@ mod tests {
         assert_eq!(shaped["event"]["timestamp"], "2026-04-29T12:00:01.123Z");
         assert_eq!(shaped["session"]["started_at"], "2026-04-30T13:00:00.000Z");
         assert_eq!(shaped["session"]["updated_at"], "2026-04-30T13:10:00.000Z");
+        assert_eq!(shaped["session"]["harness"], "codex");
         assert_eq!(shaped["turn"]["completed"], true);
         assert_eq!(shaped["session"]["completed"], true);
         assert!(shaped.get("text_content").is_none());
@@ -695,6 +703,8 @@ mod tests {
             query: "   ".to_string(),
             within_id: None,
             event_types: None,
+            harness: None,
+            source: None,
             n_hits: None,
         }
         .validate()
