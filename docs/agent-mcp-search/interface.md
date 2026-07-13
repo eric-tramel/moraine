@@ -74,8 +74,8 @@ Fields:
 | `query` | Required keyword query. Empty strings are rejected. |
 | `within_id` | Optional `session:...` or `turn:...` ID to scope the search. Event IDs are not valid scopes. |
 | `event_types` | Optional filter. Searchable event types are `user_input`, `assistant_response`, `reasoning`, `tool_call`, `tool_response`, `compaction`, `system`, and `runtime`. |
-| `harness` | Optional exact, case-sensitive normalized harness filter, such as `codex`, `claude-code`, or `pi-coding-agent`. |
-| `source` | Optional exact, case-sensitive ingest source filter, such as `codex`, `claude`, or `omp`. |
+| `harness` | Optional exact, case-sensitive normalized harness filter. Supported values are `codex`, `claude-code`, `cursor`, `hermes`, `kimi-cli`, `opencode`, and `pi-coding-agent`. |
+| `source` | Optional exact, case-sensitive ingest source filter. The default configured values are `claude`, `codex`, `cursor`, `cursor-sqlite`, `hermes`, `kimi-cli`, `omp`, `opencode`, and `pi`; each server's MCP tool instructions list its actual configured source names. |
 | `n_hits` | Optional result limit from 1 to 50. Default is 10. |
 
 The default event type filter is `user_input`, `assistant_response`, and

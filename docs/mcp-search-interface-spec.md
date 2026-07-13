@@ -284,11 +284,15 @@ search_sessions({
 - Optional and independently nullable.
 - When present, each must contain at least one non-whitespace character after
   trimming; blank values return `invalid_request`.
-- Each is an exact, case-sensitive filter. `harness` matches Moraine's
-  normalized harness name (for example `codex`, `claude-code`, or
-  `pi-coding-agent`); `source` matches the configured ingest source name.
+- Each is an exact, case-sensitive filter. Supported `harness` values are
+  `codex`, `claude-code`, `cursor`, `hermes`, `kimi-cli`, `opencode`, and
+  `pi-coding-agent`.
+- `source` matches a configured ingest source name. The default configured
+  values are `claude`, `codex`, `cursor`, `cursor-sqlite`, `hermes`, `kimi-cli`,
+  `omp`, `opencode`, and `pi`; each server's MCP tool instructions list its
+  actual configured source names.
 - When both are present, both predicates must match. Use `source` to distinguish
-  configured sources such as `pi` and `omp` that share a normalized harness.
+  `pi` and `omp`, which share the `pi-coding-agent` harness.
 
 ### Search Scope Behavior
 
