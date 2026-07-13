@@ -13,6 +13,13 @@ pub(super) struct SearchScoreAccum<'a> {
     pub(super) matched_mask: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RankedPosting<'a> {
+    pub(super) row: &'a CachedPostingRow,
+    pub(super) score: f64,
+    pub(super) matched_terms: u64,
+}
+
 impl ClickHouseConversationRepository {
     pub async fn search_session_metadata(
         &self,
@@ -735,6 +742,93 @@ FORMAT JSONEachRow",
         idf.max(0.0)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn rank_cached_postings<'a>(
+        terms: &[String],
+        postings_by_term: &'a HashMap<String, Arc<[CachedPostingRow]>>,
+        df_by_term: &HashMap<String, u64>,
+        docs: u64,
+        avgdl: f64,
+        k1: f64,
+        b: f64,
+        min_should_match: u16,
+        min_score: f64,
+    ) -> Vec<RankedPosting<'a>> {
+        let posting_count = terms
+            .iter()
+            .take(64)
+            .filter_map(|term| postings_by_term.get(term))
+            .map(|rows| rows.len())
+            .sum::<usize>();
+        let initial_capacity = usize::try_from(docs)
+            .unwrap_or(usize::MAX)
+            .min(posting_count)
+            .min(TERM_POSTINGS_CACHE_MAX_ROWS_TOTAL);
+        let mut index_by_uid = HashMap::<&str, u32>::with_capacity(initial_capacity);
+        let mut accum_by_uid = Vec::<SearchScoreAccum<'a>>::with_capacity(initial_capacity);
+        let bm25_base = k1 * (1.0 - b);
+        let bm25_length_scale = k1 * b / avgdl.max(1.0);
+        for (idx, term) in terms.iter().take(64).enumerate() {
+            let df = *df_by_term.get(term).unwrap_or(&0);
+            let idf = Self::bm25_idf(docs, df);
+            if idf <= 0.0 {
+                continue;
+            }
+
+            if let Some(rows) = postings_by_term.get(term) {
+                for row in rows.iter() {
+                    let entry_index =
+                        *index_by_uid
+                            .entry(row.event_uid.as_str())
+                            .or_insert_with(|| {
+                                let index = u32::try_from(accum_by_uid.len())
+                                    .expect("posting candidate count exceeds u32");
+                                accum_by_uid.push(SearchScoreAccum {
+                                    row,
+                                    score: 0.0,
+                                    matched_mask: 0,
+                                });
+                                index
+                            }) as usize;
+                    let entry = &mut accum_by_uid[entry_index];
+                    let tf = f64::from(row.tf);
+                    let norm = tf + bm25_base + bm25_length_scale * f64::from(row.doc_len);
+                    entry.score += idf * tf * (k1 + 1.0) / norm;
+                    entry.matched_mask |= 1u64 << idx;
+                }
+            }
+        }
+
+        let mut candidates = Vec::<RankedPosting<'a>>::with_capacity(accum_by_uid.len());
+        for acc in &accum_by_uid {
+            let matched_terms = acc.matched_mask.count_ones() as u64;
+            if matched_terms < min_should_match as u64 || acc.score < min_score {
+                continue;
+            }
+            candidates.push(RankedPosting {
+                row: acc.row,
+                score: acc.score,
+                matched_terms,
+            });
+        }
+        Self::order_ranked_posting_prefix(&mut candidates, 256);
+        candidates
+    }
+
+    fn compare_ranked_postings(a: &RankedPosting<'_>, b: &RankedPosting<'_>) -> std::cmp::Ordering {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.row.event_uid.cmp(&b.row.event_uid))
+    }
+
+    fn order_ranked_posting_prefix(candidates: &mut [RankedPosting<'_>], prefix_len: usize) {
+        let prefix_len = prefix_len.min(candidates.len());
+        if prefix_len < candidates.len() {
+            candidates.select_nth_unstable_by(prefix_len, Self::compare_ranked_postings);
+        }
+        candidates[..prefix_len].sort_unstable_by(Self::compare_ranked_postings);
+    }
+
     pub(super) fn has_broad_fast_path_term(
         terms: &[String],
         df_by_term: &HashMap<String, u64>,
@@ -1136,13 +1230,6 @@ FORMAT JSONEachRow",
         min_score: f64,
         limit: u16,
     ) -> RepoResult<Vec<SearchMcpEventRow>> {
-        #[derive(Clone, Copy)]
-        struct CandidateRef<'a> {
-            row: &'a CachedPostingRow,
-            score: f64,
-            matched_terms: u64,
-        }
-
         let df_map = self.df_map(terms).await?;
         if Self::has_broad_fast_path_term(terms, &df_map, docs) {
             return Ok(Vec::new());
@@ -1150,62 +1237,17 @@ FORMAT JSONEachRow",
 
         let postings_by_term = self.load_term_postings_for_terms(terms).await?;
         let use_document_codex_flag = self.search_documents_has_codex_flag().await?;
-        let k1 = self.cfg.bm25_k1.max(0.01);
-        let b = self.cfg.bm25_b.clamp(0.0, 1.0);
-        let mut idf_by_term = HashMap::<&str, f64>::new();
-        for term in terms {
-            let df = *df_map.get(term).unwrap_or(&0);
-            idf_by_term.insert(term.as_str(), Self::bm25_idf(docs, df));
-        }
-
-        let mut accum_by_uid = HashMap::<&str, SearchScoreAccum<'_>>::new();
-        for (idx, term) in terms.iter().enumerate() {
-            if idx >= 64 {
-                break;
-            }
-            let idf = *idf_by_term.get(term.as_str()).unwrap_or(&0.0);
-            if idf <= 0.0 {
-                continue;
-            }
-
-            if let Some(rows) = postings_by_term.get(term) {
-                for row in rows.iter() {
-                    let entry = accum_by_uid
-                        .entry(row.event_uid.as_str())
-                        .or_insert_with(|| SearchScoreAccum {
-                            row,
-                            score: 0.0,
-                            matched_mask: 0,
-                        });
-
-                    entry.score += idf * Self::bm25_term_score(row.tf, row.doc_len, avgdl, k1, b);
-                    entry.matched_mask |= 1u64 << idx;
-                }
-            }
-        }
-
-        let mut candidates = Vec::<CandidateRef<'_>>::new();
-        for acc in accum_by_uid.values() {
-            let matched_terms = acc.matched_mask.count_ones() as u64;
-            if matched_terms < min_should_match as u64 || acc.score < min_score {
-                continue;
-            }
-            candidates.push(CandidateRef {
-                row: acc.row,
-                score: acc.score,
-                matched_terms,
-            });
-        }
-
-        if candidates.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        candidates.sort_by(|a, b| {
-            b.score
-                .total_cmp(&a.score)
-                .then_with(|| a.row.event_uid.cmp(&b.row.event_uid))
-        });
+        let mut candidates = Self::rank_cached_postings(
+            terms,
+            &postings_by_term,
+            &df_map,
+            docs,
+            avgdl,
+            self.cfg.bm25_k1.max(0.01),
+            self.cfg.bm25_b.clamp(0.0, 1.0),
+            min_should_match,
+            min_score,
+        );
 
         let mut rows = Vec::<SearchMcpEventRow>::new();
         let target_rows = (limit as usize)
@@ -1214,7 +1256,12 @@ FORMAT JSONEachRow",
             .min(256);
         let hydrate_chunk_size = target_rows.max(128);
         let mut offset = 0usize;
+        let mut remaining_candidates_sorted = false;
         while offset < candidates.len() && rows.len() < target_rows {
+            if offset > 0 && !remaining_candidates_sorted {
+                candidates[offset..].sort_unstable_by(Self::compare_ranked_postings);
+                remaining_candidates_sorted = true;
+            }
             let end = (offset + hydrate_chunk_size).min(candidates.len());
             let event_uids: Vec<String> = candidates[offset..end]
                 .iter()
