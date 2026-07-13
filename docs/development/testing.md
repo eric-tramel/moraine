@@ -300,7 +300,7 @@ and [Harness author workflow](harness-author-workflow.md#6-add-fixtures).
 
 ## Benchmark protocol and registry
 
-All five existing producers emit one `moraine-benchmark-v1` result object per output
+All six existing producers emit one `moraine-benchmark-v1` result object per output
 file. Rust owns cross-process analytics latency; `scripts/bench` owns process/database/
 system measurement. Setup, seeding, build, startup, and warmup stay outside timed
 samples. Smoke records latency but never gates on it.
@@ -320,16 +320,19 @@ The envelope records `schema_version`, benchmark/scenario IDs,
 `source.{git_commit,dirty}`, build profile/target, non-identifying OS/CPU runner class,
 workload/profile/measured boundary, applicable fingerprints, planned/attempted/
 successful/error counts, unit-suffixed successful raw measurements, semantic status,
-non-blocking timing status, safe diagnostics, and artifact references. Dataset-backed,
-cache-sensitive, concurrent, and request-producing scenarios conditionally require
-dataset digest/cardinality, cache state, concurrency, and request source.
+non-blocking timing status, safe diagnostics, and artifact references. Request-producing
+load scenarios may also retain redaction-safe per-case records and arbitrary-cardinality
+observation series. Dataset-backed, cache-sensitive, concurrent, and request-producing
+scenarios conditionally require dataset digest/cardinality, cache state, concurrency,
+and request source.
 
-Validation enforces `attempted = successful + errors`, `attempted <= planned`, and each
-raw series length equals `successful`; percentiles use successes while error rate stays
-explicit. Producers omit meaningless null/sentinel fields. Artifacts must not contain
-credentials, credentialized URLs, raw query/conversation/prompt/content, absolute home
-paths, or user/host identity. Large raw samples may be externalized only with count and
-checksum retained.
+Validation enforces `attempted = successful + errors`, `attempted <= planned`, each raw
+measurement series length equals `successful`, outcome totals equal `attempted`, and
+burst records agree with both. Percentiles use successes while error and rejection
+rates stay explicit. Producers omit meaningless null/sentinel fields. Artifacts must
+not contain credentials, credentialized URLs, raw query/conversation/prompt/content,
+absolute home paths, or user/host identity. Large raw samples may be externalized only
+with count and checksum retained.
 
 A comparison rejects different schema versions, workload/dataset, measured boundary,
 cache state, request source, concurrency, build profile, or any applicable fingerprint.
@@ -358,6 +361,62 @@ python3 -m unittest discover -s scripts/bench/tests \
 | `replay_mcp_latency` / persistent and cold-process | `python3 scripts/bench/replay_mcp_latency.py --config <moraine.toml> --oracle-manifest <seed-owned-oracle.json> --profile smoke --mode persistent --output-json target/bench/replay-mcp-persistent-smoke.json`; use `cold_process` for the distinct lifecycle boundary and `full` for full runs. Check: `python3 -m unittest scripts/bench/test_replay_mcp_latency.py`. The independent manifest is `{"schema_version":"moraine-replay-mcp-oracle-v1","provenance":"<seed/query-generator-reference>","cases":[{"query_id":"<telemetry-query-id>","variant_label":"<expanded-query-variant>","tool":"search","semantic_digest":"sha256:<64-lowercase-hex>","cardinality":<positive-result-count>,"marker":"<seed-owned-marker>"}]}` with one case for every selected query variant and tool. | Populated telemetry, production `bin/moraine`/`moraine-mcp`, exact git provenance, and complete seed/query expectations created without invoking the measured MCP path. Persistent owns one long-lived MCP child; cold owns one per sample. Per-RPC timeout and TERM/KILL cleanup are producer-owned. Manifest/case fingerprints and provenance are retained in workload identity. | T4; modes are fingerprint-distinct and never compared to one another. Missing/malformed/incomplete oracle fails before process spawn; repeatably wrong or one-sample smoke semantics, child/timeout/output failure is nonzero; timing non-blocking. |
 | `mcp_two_tool_sla` / MCP tool matrix | `python3 scripts/bench/mcp_two_tool_sla.py --config <owned-config> --oracle-json <seed-owned-oracle.json> --profile smoke --output-json target/bench/mcp-two-tool-sla.json` (or `--profile full`; full defaults warmup=1/repeats=5/min-docs=100000). Check: `python3 scripts/bench/test_mcp_two_tool_sla.py`. The independent oracle is `{"schema_version":"moraine-mcp-two-tool-oracle-v1","queries":[{"query":"<selected-query>","expected":{"result_count":<n>,"open_ids":{"event":"<seed-id>","turn":"<seed-id>","session":"<seed-id>"},"result_marker":{"<seed-field>":"<seed-value>"}}}],"list_sessions":{"result_count":<n>,"session_ids":["<seed-session-id>"],"result_marker":{"<seed-field>":"<seed-value>"}}}`. Each query needs at least one expectation; only requested open kinds require IDs. The root `list_sessions` object is required whenever that default boundary is measured and needs at least one count/ID/object-marker expectation. | Python 3, read-only ClickHouse corpus, production binaries, exact git provenance, and a complete oracle generated by the corpus owner without measured MCP responses. Search cardinality/IDs/object marker are checked against seed truth; open targets the oracle ID rather than a measured search result; every list result checks the exact count, presence of all seed IDs, and matching seed object marker. One owned stdio MCP child; 20s RPC timeout; close stdin, TERM/wait 5s, KILL/wait 5s. | T4. Missing/incomplete oracle or corpus/prerequisite, repeatable wrong search/open/list result, insufficient sample, validation/write failure is nonzero. No first measured response becomes expected truth. Historical SLA values are diagnostics; v1 timing stays `not_evaluated`. |
 | `central_mcp_resource` / embedded-versus-central | Smoke: `uv run --script scripts/bench/central_mcp_resource.py --moraine-mcp target/debug/moraine-mcp --arms embedded,central --ns 1 --reps 1 --profile smoke --settle-seconds 0 --batch 1 --startup-timeout-seconds 5 --request-timeout-seconds 20 --dataset-fingerprint sha256:<64-lowercase-hex> --dataset-cardinality <seeded-session-count> --json-out target/bench/central-mcp-resource-smoke.json`. Full substitutes the release binary, owned sandbox ClickHouse URL, `--ns 1,10,50,100 --reps 3 --profile full --settle-seconds 2 --batch 25 --startup-timeout-seconds 10`, and `...-full.json`. Check: `python3 scripts/bench/test_central_mcp_resource.py`. | Built MCP binary, deterministic seeded ClickHouse, and psutil or Linux `/proc`; Linux is authoritative. Each repetition owns temporary config/root/socket, central daemon, clients, loopback port, and static fixture; cleanup TERM/KILLs children and removes the root. macOS observations are directional. | T4. JSON output requires dataset fingerprint/cardinality. The configured arm×N matrix is one paired result. Startup/exit/timeout/semantic/sampling/cleanup/validation/atomic-output failure is nonzero; timing/resources remain `not_evaluated` and non-blocking. |
+| `concurrent_mcp_retrieval` / central persistent concurrent uncached `search_sessions` | Smoke: `python3 scripts/bench/concurrent_mcp_retrieval.py --moraine-mcp target/debug/moraine-mcp --clickhouse-url http://clickhouse:8123 --database moraine --oracle-json <seed-owned-oracle.json> --concurrency 1 --concurrency 4 --reps 1 --profile smoke --startup-timeout-seconds 10 --request-timeout-seconds 20 --run-timeout-seconds 120 --max-processes 16 --output-dir target/bench/concurrent-smoke`. Full uses a release binary, `--profile full --concurrency 1,2,4,8,16,32 --reps 3 --run-timeout-seconds 1800 --max-processes 64`; choose the sweep and high-stress value as caller workload inputs, never from the backend admission limit. A range such as `--concurrency 1:32:2` is inclusive. Smoke recovery is fixed at 0 and 1 seconds; full recovery is fixed at 0 and 10 seconds. Check: `python3 -m unittest scripts/bench/test_concurrent_mcp_retrieval.py`; validate every result with `for artifact in target/bench/concurrent-smoke/*.json; do python3 scripts/bench/benchmark_protocol.py validate "$artifact"; done`. The independent seed owner writes `{"schema_version":"moraine-concurrent-mcp-oracle-v1","provenance":"<stable-lowercase-slug>","dataset":{"fingerprint":"sha256:<64-lowercase-hex>","cardinality":<searchable-document-count>},"warmup":{"id":"warmup","query":"<startup-only-query>","result_count":<1..10>,"result_digest":"sha256:<digest-of-sorted-event-and-session-ids>"},"measured":[<same-shape-distinct-cases>],"recovery":[<same-shape-distinct-cases>]}`. Warmup, measured, and recovery query strings and IDs must all be distinct; the full manifest declares at least 100,000 searchable documents. | Linux owned dev sandbox, built MCP binary, deterministic seeded ClickHouse, and one oracle case per maximum requested concurrency plus two recovery probes. The timed boundary is each stdio `tools/call` write through its central-server response; client initialization, tool discovery, and one disjoint startup query are outside the burst. Every repetition owns a fresh central service, socket, clients, config, root, and temporary directory; the producer terminates/removes all of them while the sandbox owner owns ClickHouse corpus cleanup. `--max-processes` and startup/request/run timeouts protect the runner and do not state backend capacity or admission policy; request timeout is comparison-fingerprinted. | T4. Read-only seeded DB. One comparison-distinct schema-valid artifact per exact concurrency. Raw successful wall/server/SLA series, per-case outcome records, admission/error/timeout/deadline counts and rates, p50/p95/p99/max, throughput, maximum in-flight, hard-deadline violations, and largest-burst sequential recovery are retained. Timing is diagnostic `not_evaluated`; semantic-oracle and protocol failures remain correctness failures. |
+Prepare only an owned sandbox corpus. Both commands below truncate
+`moraine.search_documents`, `search_postings`, `search_query_log`, and
+`search_hit_log`; never point them at a host or shared database.
+
+```bash
+# Small live wiring/semantic smoke.
+python3 scripts/bench/seed_concurrent_mcp_benchmark.py seed \
+  --clickhouse-url http://clickhouse:8123 --database moraine \
+  --documents 200 --measured-cases 8 --recovery-cases 2 \
+  --oracle-json /tmp/concurrent-smoke-oracle.json
+
+# Full SLA-tier corpus and broad caller-selected sweep.
+python3 scripts/bench/seed_concurrent_mcp_benchmark.py seed \
+  --clickhouse-url http://clickhouse:8123 --database moraine \
+  --documents 100000 --measured-cases 64 --recovery-cases 2 \
+  --oracle-json /tmp/concurrent-full-oracle.json
+```
+
+The seeder writes the expected public event/session ID digest directly from its
+deterministic recipe; it never learns expectations from an MCP response. Cases
+alternate selective one-posting terms and distinct common terms, and reserve
+disjoint warmup/recovery terms. `seed ... --documents 100000` is the full-profile
+minimum. `clean` with the same ClickHouse/database arguments truncates the four
+tables explicitly; normally `moraine-sandbox down <id>` owns complete database,
+socket, child, config, temporary-directory, and volume cleanup.
+
+#### Current-main evidence (2026-07-12)
+
+An owned Linux sandbox run at `2ba068794554710708be8ca48ed88b8c73825c31`
+used the deterministic 100,000-document corpus, the sandbox workspace binary
+(`build.profile=unknown`), three fresh-service repetitions, and the caller-selected
+`1,2,4,8,16,32,64` sweep. Every artifact passed
+`benchmark_protocol.py validate`; every arm reported overlap and exact requested
+maximum in-flight. These are diagnostic observations, not a capacity contract:
+
+| Requested | Success / attempted | Rejected | p50 ms | p95 ms | p99 ms | max ms | mean success/s |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 3 / 3 | 0 | 43.7 | 123.3 | 130.4 | 132.2 | 19.1 |
+| 2 | 6 / 6 | 0 | 59.3 | 69.0 | 69.8 | 70.0 | 30.2 |
+| 4 | 12 / 12 | 0 | 91.0 | 149.0 | 149.9 | 150.1 | 38.6 |
+| 8 | 24 / 24 | 0 | 134.9 | 166.2 | 167.3 | 167.4 | 53.3 |
+| 16 | 24 / 48 | 24 | 120.1 | 143.5 | 147.7 | 148.9 | 61.2 |
+| 32 | 24 / 96 | 72 | 114.0 | 167.3 | 169.2 | 169.6 | 57.4 |
+| 64 | 24 / 192 | 168 | 184.1 | 243.9 | 247.9 | 248.8 | 38.4 |
+
+The observed curve rises through eight callers, then successful completions plateau
+at eight per repetition while admission rejections account for every additional
+attempt. That ordinal is an observation of this build, not an asserted product
+limit. All successful samples met their advertised SLA and none crossed the
+five-second hard deadline. At the largest arm, recovery wall latencies at fixed
+0/10-second offsets were `31.6/126.3`, `43.2/108.2`, and `34.7/103.1` ms across
+the three repetitions. Three repetitions show run-to-run spread but do not define
+the controlled runner, baseline, threshold, error, or variability policy; all
+artifacts therefore retain `timing.status=not_evaluated`.
+
 
 
 Every producer's deterministic checks cover arguments/profile/default/threshold

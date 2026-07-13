@@ -318,6 +318,21 @@ def _validate_sample_invariants(artifact: Mapping[str, Any]) -> None:
         _fail("$.samples", "attempted must equal successful + errors")
     if attempted > samples["planned"]:
         _fail("$.samples", "attempted must not exceed planned")
+    outcomes = samples.get("outcomes")
+    if outcomes is not None and sum(outcomes.values()) != attempted:
+        _fail("$.samples.outcomes", "outcome counts must sum to samples.attempted")
+    records = samples.get("records")
+    if records is not None:
+        burst_records = [record for record in records if record["phase"] == "burst"]
+        if len(burst_records) != attempted:
+            _fail("$.samples.records", "burst record count must equal samples.attempted")
+        if outcomes is not None:
+            recorded_outcomes = {
+                name: sum(record["outcome"] == name for record in burst_records)
+                for name in outcomes
+            }
+            if recorded_outcomes != outcomes:
+                _fail("$.samples.records", "burst record outcomes must match samples.outcomes")
     measurements = samples.get("measurements")
     if measurements is not None:
         for name, series in measurements.items():

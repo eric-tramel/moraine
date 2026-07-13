@@ -85,7 +85,23 @@
             },
             "cache_state": { "enum": ["cold", "warm", "mixed", "disabled"] },
             "concurrency": { "type": "integer", "minimum": 1 },
-            "request_source": { "$ref": "#/$defs/slug" }
+            "request_source": { "$ref": "#/$defs/slug" },
+            "request_schedule": { "enum": ["sequential", "concurrent"] },
+            "max_in_flight": { "type": "integer", "minimum": 1 },
+            "query_set": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["fingerprint", "cardinality"],
+              "properties": {
+                "fingerprint": { "$ref": "#/$defs/sha256Prefixed" },
+                "cardinality": { "type": "integer", "minimum": 1 }
+              }
+            },
+            "cache_isolation": { "$ref": "#/$defs/slug" },
+            "lifecycle": { "enum": ["persistent", "cold-process"] },
+            "boundary": { "enum": ["embedded", "central"] },
+            "oracle_provenance": { "$ref": "#/$defs/slug" },
+            "request_timeout_seconds": { "type": "number", "minimum": 0 }
           }
         }
       },
@@ -157,6 +173,25 @@
             "type": "array",
             "items": { "type": "number", "minimum": 0 }
           }
+        },
+        "outcomes": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": { "$ref": "#/$defs/slug" },
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        },
+        "observations": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": { "$ref": "#/$defs/measurementName" },
+          "additionalProperties": {
+            "type": "array",
+            "items": { "type": "number", "minimum": 0 }
+          }
+        },
+        "records": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/requestRecord" }
         },
         "external_samples": {
           "type": "object",
@@ -253,23 +288,6 @@
           }
         }
       }
-    },
-    {
-      "if": {
-        "properties": {
-          "samples": {
-            "properties": { "successful": { "const": 0 } },
-            "required": ["successful"]
-          }
-        }
-      },
-      "then": {
-        "properties": {
-          "semantic": {
-            "properties": { "status": { "const": "fail" } }
-          }
-        }
-      }
     }
   ],
   "$defs": {
@@ -289,7 +307,7 @@
     },
     "measurementName": {
       "type": "string",
-      "pattern": "^[a-z][a-z0-9_]*(?:_ns|_us|_ms|_seconds|_bytes|_count|_ratio|_percent)$"
+      "pattern": "^[a-z][a-z0-9_]*(?:_ns|_us|_ms|_seconds|_per_second|_bytes|_count|_ratio|_percent)$"
     },
     "comparisonPolicy": {
       "type": "object",
@@ -354,6 +372,31 @@
         "input_tokens": { "type": "integer", "minimum": 0 },
         "output_tokens": { "type": "integer", "minimum": 0 },
         "total_tokens": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "requestRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "case_id",
+        "repetition",
+        "phase",
+        "outcome",
+        "wall_latency_ms",
+        "hard_deadline_violation",
+        "oracle_passed"
+      ],
+      "properties": {
+        "case_id": { "$ref": "#/$defs/slug" },
+        "repetition": { "type": "integer", "minimum": 0 },
+        "phase": { "enum": ["burst", "recovery"] },
+        "outcome": { "$ref": "#/$defs/slug" },
+        "wall_latency_ms": { "type": "number", "minimum": 0 },
+        "server_elapsed_ms": { "type": "number", "minimum": 0 },
+        "sla_target_ms": { "type": "number", "minimum": 0 },
+        "met_sla": { "type": "boolean" },
+        "hard_deadline_violation": { "type": "boolean" },
+        "oracle_passed": { "type": "boolean" }
       }
     },
     "diagnostic": {
