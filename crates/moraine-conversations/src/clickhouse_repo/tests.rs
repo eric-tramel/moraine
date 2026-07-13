@@ -1,4 +1,5 @@
 use super::file_attention::merge_file_attention_touches;
+use super::search::{RankedPosting, SearchScoreAccum};
 use super::*;
 
 fn sample_search_doc() -> SearchDocExtraCacheEntry {
@@ -533,4 +534,130 @@ fn open_context_filter_clause_respects_include_system_events_flag() {
     assert!(filtered_clause.contains("progress"));
     assert!(filtered_clause.contains("file_history_snapshot"));
     assert!(filtered_clause.contains("lowerUTF8(actor_role) = 'system'"));
+}
+
+#[test]
+fn cached_posting_ranker_matches_full_sort_reference() {
+    let posting = |event_uid: &str, doc_len: u32, tf: u16| CachedPostingRow {
+        event_uid: event_uid.to_string(),
+        doc_len,
+        tf,
+    };
+    let terms = ["alpha", "beta", "gamma"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut alpha_rows = vec![
+        posting("u1", 100, 2),
+        posting("u2", 120, 1),
+        posting("tie-a", 100, 1),
+    ];
+    let mut beta_rows = vec![
+        posting("u1", 100, 1),
+        posting("u3", 80, 4),
+        posting("tie-b", 100, 1),
+    ];
+    for doc in 0..300 {
+        let event_uid = format!("bulk-{doc:03}");
+        alpha_rows.push(posting(&event_uid, 100, 1));
+        beta_rows.push(posting(&event_uid, 100, 1));
+    }
+    let postings_by_term = HashMap::<String, Arc<[CachedPostingRow]>>::from([
+        (
+            "alpha".to_string(),
+            Arc::from(alpha_rows.into_boxed_slice()),
+        ),
+        ("beta".to_string(), Arc::from(beta_rows.into_boxed_slice())),
+        (
+            "gamma".to_string(),
+            Arc::from(
+                vec![
+                    posting("u2", 120, 3),
+                    posting("u3", 80, 1),
+                    posting("tie-a", 100, 1),
+                    posting("tie-b", 100, 1),
+                ]
+                .into_boxed_slice(),
+            ),
+        ),
+    ]);
+    let df_by_term = postings_by_term
+        .iter()
+        .map(|(term, rows)| (term.clone(), rows.len() as u64))
+        .collect::<HashMap<_, _>>();
+    let docs = 100_u64;
+    let avgdl = 100.0;
+    let k1 = 1.2;
+    let b = 0.75;
+    let min_should_match = 2;
+
+    let actual = ClickHouseConversationRepository::rank_cached_postings(
+        &terms,
+        &postings_by_term,
+        &df_by_term,
+        docs,
+        avgdl,
+        k1,
+        b,
+        min_should_match,
+        0.0,
+    );
+
+    let mut reference_by_uid = HashMap::<&str, SearchScoreAccum<'_>>::new();
+    for (idx, term) in terms.iter().enumerate() {
+        let idf = ClickHouseConversationRepository::bm25_idf(docs, df_by_term[term]);
+        for row in postings_by_term[term].iter() {
+            let entry =
+                reference_by_uid
+                    .entry(row.event_uid.as_str())
+                    .or_insert(SearchScoreAccum {
+                        row,
+                        score: 0.0,
+                        matched_mask: 0,
+                    });
+            entry.score += idf
+                * ClickHouseConversationRepository::bm25_term_score(
+                    row.tf,
+                    row.doc_len,
+                    avgdl,
+                    k1,
+                    b,
+                );
+            entry.matched_mask |= 1_u64 << idx;
+        }
+    }
+    let mut expected = reference_by_uid
+        .into_values()
+        .filter_map(|acc| {
+            let matched_terms = u64::from(acc.matched_mask.count_ones());
+            (matched_terms >= u64::from(min_should_match)).then_some(RankedPosting {
+                row: acc.row,
+                score: acc.score,
+                matched_terms,
+            })
+        })
+        .collect::<Vec<_>>();
+    expected.sort_unstable_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.row.event_uid.cmp(&b.row.event_uid))
+    });
+
+    assert_eq!(actual.len(), expected.len());
+    assert!(actual.len() > 256, "fixture must exercise partial ordering");
+    assert_eq!(
+        expected[255].score, expected[256].score,
+        "fixture must place a score tie across the partial-order boundary"
+    );
+    for (actual, expected) in actual.iter().zip(&expected).take(256) {
+        assert_eq!(actual.row.event_uid, expected.row.event_uid);
+        assert_eq!(actual.matched_terms, expected.matched_terms);
+        assert!(
+            (actual.score - expected.score).abs() < 1e-12,
+            "score mismatch for {}: {} != {}",
+            actual.row.event_uid,
+            actual.score,
+            expected.score
+        );
+    }
 }
