@@ -856,8 +856,8 @@ def run_baseline(repositories: Mapping[str, Path], profile: str, output: Path) -
     recipe = build_recipe(profile)
     validate_recipe(recipe)
     output.mkdir(parents=True, exist_ok=False)
-    prepared, build_recipe = _prepare_builds(repositories, output / "builds")
-    definition = _definition(profile, recipe, prepared, build_recipe)
+    prepared, build_recipe_document = _prepare_builds(repositories, output / "builds")
+    definition = _definition(profile, recipe, prepared, build_recipe_document)
     manifest_paths: list[Path] = []
     count = 1 if profile == "smoke" else 7
     purpose = "smoke" if profile == "smoke" else "repeatability"
@@ -907,8 +907,8 @@ def run_comparison(
     recipe = build_recipe("full")
     validate_recipe(recipe)
     output.mkdir(parents=True, exist_ok=False)
-    prepared, build_recipe = _prepare_builds(repositories, output / "builds")
-    definition = _definition("full", recipe, prepared, build_recipe)
+    prepared, build_recipe_document = _prepare_builds(repositories, output / "builds")
+    definition = _definition("full", recipe, prepared, build_recipe_document)
     all_paths: dict[str, list[Path]] = {"baseline": [], "candidate": []}
     for pair_id, order in enumerate(PAIR_ORDER, 1):
         sequence = ("baseline", "candidate") if order == "AB" else ("candidate", "baseline")

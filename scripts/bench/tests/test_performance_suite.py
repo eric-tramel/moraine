@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from unittest import mock
 import sys
 from pathlib import Path
 BENCH = Path(__file__).resolve().parents[1]
@@ -10,6 +11,7 @@ if str(BENCH) not in sys.path:
     sys.path.insert(0, str(BENCH))
 
 
+import performance_suite as suite
 from performance_fixtures import build_recipe
 from performance_protocol import create_build_identity, create_build_recipe, sha256_json
 from performance_scenarios import ScenarioResult
@@ -202,6 +204,25 @@ class CliArtifactTests(unittest.TestCase):
             freeze("smoke", root)
             validate_path(root / "fixture-smoke.json")
             self.assertTrue((root / "policy-smoke.json").is_file())
+
+    def test_baseline_runner_builds_fixture_before_preparing_binaries(self) -> None:
+        class StopAfterFixture(Exception):
+            pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with mock.patch.object(
+                suite,
+                "_prepare_builds",
+                side_effect=StopAfterFixture,
+            ) as prepare:
+                with self.assertRaises(StopAfterFixture):
+                    suite.run_baseline(
+                        {"baseline": root},
+                        "smoke",
+                        root / "results",
+                    )
+            prepare.assert_called_once()
 
     def test_validate_rejects_untyped_json(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
