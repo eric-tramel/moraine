@@ -191,6 +191,14 @@ impl AppState {
                                 },
                                 "description": "Optional normalized event type filter. Defaults to user_input, assistant_response, and tool_response."
                             },
+                            "harness": {
+                                "type": ["string", "null"],
+                                "description": "Optional exact, case-sensitive normalized harness filter (for example codex, claude-code, or pi-coding-agent)."
+                            },
+                            "source": {
+                                "type": ["string", "null"],
+                                "description": "Optional exact, case-sensitive ingest source filter (for example codex, claude, or omp). Use source to distinguish sources such as pi and omp that share a harness."
+                            },
                             "n_hits": {
                                 "type": ["integer", "null"],
                                 "minimum": contract::SEARCH_SESSIONS_MIN_N_HITS,
@@ -287,6 +295,14 @@ impl AppState {
                                 ],
                                 "description": "Optional session mode filter."
                             },
+                            "harness": {
+                                "type": ["string", "null"],
+                                "description": "Optional exact, case-sensitive normalized harness filter (for example codex, claude-code, or pi-coding-agent)."
+                            },
+                            "source": {
+                                "type": ["string", "null"],
+                                "description": "Optional exact, case-sensitive ingest source filter (for example codex, claude, or omp). Use source to distinguish sources such as pi and omp that share a harness."
+                            },
                             "sort": {
                                 "anyOf": [
                                     {
@@ -358,6 +374,14 @@ impl AppState {
                             "tool": {
                                 "type": ["string", "null"],
                                 "description": "Optional case-insensitive tool-name filter (e.g. Edit, Write, Read, Bash)."
+                            },
+                            "harness": {
+                                "type": ["string", "null"],
+                                "description": "Optional exact, case-sensitive normalized harness filter (for example codex, claude-code, or pi-coding-agent)."
+                            },
+                            "source": {
+                                "type": ["string", "null"],
+                                "description": "Optional exact, case-sensitive ingest source filter (for example codex, claude, or omp). Use source to distinguish sources such as pi and omp that share a harness."
                             },
                             "mutations_only": {
                                 "type": ["boolean", "null"],

@@ -59,16 +59,49 @@ async fn search_mcp_events_result_cache_reuses_repository_across_requests() {
         .remove("took_ms");
     assert_eq!(first_payload, second_payload);
 
-    let requests_before_changed_option = state.queries.lock().expect("queries lock").len();
+    let requests_before_changed_harness = state.queries.lock().expect("queries lock").len();
     repo.search_mcp_events(SearchMcpEventsQuery {
-        turn_seq: Some(2),
+        harness: Some("codex".to_string()),
+        ..query.clone()
+    })
+    .await
+    .expect("MCP event search with changed harness");
+    assert!(
+        state.queries.lock().expect("queries lock").len() > requests_before_changed_harness,
+        "changed harness must miss the result cache"
+    );
+
+    let requests_before_changed_source = state.queries.lock().expect("queries lock").len();
+    repo.search_mcp_events(SearchMcpEventsQuery {
+        source_name: Some("codex".to_string()),
+        ..query.clone()
+    })
+    .await
+    .expect("MCP event search with changed source");
+    assert!(
+        state.queries.lock().expect("queries lock").len() > requests_before_changed_source,
+        "changed source must miss the result cache"
+    );
+
+    repo.search_mcp_events(SearchMcpEventsQuery {
+        harness: Some("codex".to_string()),
+        source_name: Some("custom;source=bar".to_string()),
+        ..query.clone()
+    })
+    .await
+    .expect("MCP event search with delimiter-bearing source");
+    let requests_after_delimited_filter = state.queries.lock().expect("queries lock").len();
+
+    repo.search_mcp_events(SearchMcpEventsQuery {
+        harness: Some("codex;source=custom".to_string()),
+        source_name: Some("bar".to_string()),
         ..query
     })
     .await
-    .expect("MCP event search with changed turn scope");
+    .expect("MCP event search with distinct delimiter-bearing harness");
     assert!(
-        state.queries.lock().expect("queries lock").len() > requests_before_changed_option,
-        "changed normalized search semantics must miss the result cache"
+        state.queries.lock().expect("queries lock").len() > requests_after_delimited_filter,
+        "distinct delimiter-bearing filters must miss the result cache"
     );
 }
 #[tokio::test(flavor = "multi_thread")]

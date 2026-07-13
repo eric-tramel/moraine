@@ -331,6 +331,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                             "completed": 0_u8,
                             "title": "",
                             "source": "codex",
+                            "harness": "codex",
                             "session_slug": "",
                             "session_summary": ""
                         }
@@ -353,6 +354,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                         "completed": 1_u8,
                         "title": "Session C title",
                         "source": "codex",
+                        "harness": "codex",
                         "session_slug": "project-c",
                         "session_summary": "Session C summary"
                     },
@@ -368,6 +370,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                         "completed": 1_u8,
                         "title": "Session B title",
                         "source": "codex",
+                        "harness": "codex",
                         "session_slug": "project-b",
                         "session_summary": "Session B summary"
                     },
@@ -383,6 +386,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                         "completed": 0_u8,
                         "title": "",
                         "source": "codex",
+                        "harness": "codex",
                         "session_slug": "",
                         "session_summary": ""
                     }

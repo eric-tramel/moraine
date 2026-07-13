@@ -112,6 +112,8 @@ impl AppState {
             start_unix_ms: args.start_unix_ms,
             end_unix_ms: args.end_unix_ms,
             tool: args.tool.clone(),
+            harness: args.harness.clone(),
+            source_name: args.source.clone(),
             mutations_only: args.mutations_only,
             max_rows: FILE_ATTENTION_SCAN_CAP,
             execution_budget_secs: FILE_ATTENTION_DEADLINE_MS.div_ceil(1_000),
@@ -187,6 +189,8 @@ fn canonical_request_json(args: &CanonicalFileAttentionArgs) -> Value {
         "start_datetime": args.start_datetime,
         "end_datetime": args.end_datetime,
         "tool": args.tool,
+        "harness": args.harness,
+        "source": args.source,
         "mutations_only": args.mutations_only,
         "limit": args.limit,
     })
@@ -394,6 +398,7 @@ struct SessionAgg {
     roots: BTreeSet<String>,
     match_kinds: BTreeSet<String>,
     harness: String,
+    source: String,
     /// The most recent touch's event_uid (first seen, since rows arrive
     /// newest-first) — the handle that drills straight to the latest touch.
     latest_event_uid: String,
@@ -574,6 +579,7 @@ fn session_rollups(touches: &[FileAttentionTouch], limit: usize) -> (Vec<Value>,
                 latest_event_uid: touch.event_uid.clone(),
                 latest_turn_seq: touch.turn_seq,
                 harness: touch.harness.clone(),
+                source: touch.source_name.clone(),
                 ..SessionAgg::default()
             }
         });
@@ -589,6 +595,9 @@ fn session_rollups(touches: &[FileAttentionTouch], limit: usize) -> (Vec<Value>,
         }
         if agg.harness.is_empty() {
             agg.harness = touch.harness.clone();
+        }
+        if agg.source.is_empty() {
+            agg.source = touch.source_name.clone();
         }
         if let Some(event_unix_ms) = touch.event_unix_ms {
             agg.first_ms = Some(
@@ -657,6 +666,7 @@ fn session_rollup_json(
         "session": {
             "id": mcp_session_id,
             "harness": agg.harness,
+            "source": agg.source,
             "first_touch": agg.first_ms.map(format_rfc3339_utc_millis),
             "last_touch": agg.last_ms.map(format_rfc3339_utc_millis),
             "touch_count": agg.touch_count,
@@ -724,6 +734,8 @@ fn event_json(rank: usize, touch: &FileAttentionTouch) -> Result<Value, Contract
             "id": event_id,
             "session_id": session_id,
             "timestamp": touch.event_unix_ms.map(format_rfc3339_utc_millis),
+            "harness": touch.harness,
+            "source": touch.source_name,
             "tool_name": touch.tool_name,
             "phase": touch.tool_phase,
             "turn": touch.turn_seq,
@@ -886,6 +898,9 @@ fn format_error_text(payload: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use moraine_config::AppConfig;
+    use moraine_conversations::{InMemoryConversationRepository, RepoConfig};
+    use std::sync::Arc;
 
     #[test]
     fn deadline_envelope_is_a_handled_tool_error() {
@@ -925,6 +940,34 @@ mod tests {
         assert_eq!(error.message(), "limit must be between 1 and 25");
     }
 
+    #[tokio::test]
+    async fn forwards_harness_and_source_filters() {
+        let repository = Arc::new(InMemoryConversationRepository::new(RepoConfig::default()));
+        let state = AppState::embedded(AppConfig::default(), repository.clone());
+
+        let result = state
+            .file_attention_v1(json!({
+                "path": "crates/moraine-mcp-core/src/contract.rs",
+                "scope": "all",
+                "harness": " claude-code ",
+                "source": " claude "
+            }))
+            .await
+            .expect("file attention");
+        assert_eq!(result["isError"], false);
+
+        let calls = repository.calls();
+        assert_eq!(calls.file_attention.len(), 1);
+        assert_eq!(
+            calls.file_attention[0].harness.as_deref(),
+            Some("claude-code")
+        );
+        assert_eq!(
+            calls.file_attention[0].source_name.as_deref(),
+            Some("claude")
+        );
+    }
+
     fn touch(
         session: &str,
         event: &str,
@@ -938,6 +981,7 @@ mod tests {
             event_uid: event.to_string(),
             tool_call_id: format!("call-{event}"),
             harness: "claude-code".to_string(),
+            source_name: "claude".to_string(),
             tool_name: tool.to_string(),
             tool_phase: "request".to_string(),
             match_kind: match_kind.to_string(),
@@ -1150,6 +1194,8 @@ mod tests {
             start_unix_ms: None,
             end_unix_ms: None,
             tool: None,
+            harness: None,
+            source: None,
             mutations_only: false,
             limit: 50,
         }

@@ -219,22 +219,34 @@ FORMAT JSONEachRow",
             ConversationListSort::Asc => "ASC",
         };
         let limit_plus = (limit as usize) + 1;
-        let window_limit_sql = if filter.mode.is_none() {
+        let window_limit_sql = if filter.mode.is_none()
+            && filter.harness.is_none()
+            && filter.source_name.is_none()
+        {
             format!(
-                "  ORDER BY s.last_event_time {order_dir}, s.session_id {order_dir}\n  LIMIT {limit_plus}\n"
-            )
+                    "  ORDER BY s.last_event_time {order_dir}, s.session_id {order_dir}\n  LIMIT {limit_plus}\n"
+                )
         } else {
             String::new()
         };
-        let mode_filter_sql = filter
-            .mode
-            .map(|mode| {
-                format!(
-                    "WHERE ifNull(r.mode, 'chat') = {}\n",
-                    sql_quote(mode.as_str())
-                )
-            })
-            .unwrap_or_default();
+        let mut event_filter_clauses = Vec::new();
+        if let Some(mode) = filter.mode {
+            event_filter_clauses.push(format!(
+                "ifNull(r.mode, 'chat') = {}",
+                sql_quote(mode.as_str())
+            ));
+        }
+        if let Some(harness) = filter.harness.as_deref() {
+            event_filter_clauses.push(format!("r.latest_harness = {}", sql_quote(harness)));
+        }
+        if let Some(source_name) = filter.source_name.as_deref() {
+            event_filter_clauses.push(format!("r.latest_source_name = {}", sql_quote(source_name)));
+        }
+        let event_filter_sql = if event_filter_clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}\n", event_filter_clauses.join("\n    AND "))
+        };
         let mode_aggregate = Self::mode_aggregate_sql();
 
         // Resolve the time/scope window first, applying the keyset LIMIT before
@@ -278,17 +290,8 @@ event_rollups AS (
       ),
       ''
     ) AS title,
-    ifNull(
-      argMaxIf(
-        coalesce(
-          nullIf(JSONExtractString(payload_json, 'source'), ''),
-          nullIf(source_name, '')
-        ),
-        tuple(event_ts, event_uid),
-        event_kind = 'session_meta'
-      ),
-      ''
-    ) AS source,
+    ifNull(argMax(nullIf(e.harness, ''), tuple(event_ts, event_uid)), '') AS latest_harness,
+    ifNull(argMax(nullIf(e.source_name, ''), tuple(event_ts, event_uid)), '') AS latest_source_name,
     ifNull(
       argMaxIf(
         nullIf(JSONExtractString(payload_json, 'slug'), ''),
@@ -309,7 +312,7 @@ event_rollups AS (
       ),
       ''
     ) AS session_summary
-  FROM {events_source}
+  FROM {events_source} AS e
   WHERE session_id IN (SELECT session_id FROM window_sessions)
   GROUP BY session_id
 ),
@@ -328,12 +331,13 @@ candidate_sessions AS (
       AND ifNull(r.latest_terminal_payload_type, '') = 'task_complete'
     ) AS completed,
     ifNull(r.title, '') AS title,
-    ifNull(r.source, '') AS source,
+    ifNull(r.latest_source_name, '') AS source,
+    ifNull(r.latest_harness, '') AS harness,
     ifNull(r.session_slug, '') AS session_slug,
     ifNull(r.session_summary, '') AS session_summary
   FROM window_sessions AS w
   LEFT JOIN event_rollups AS r ON r.session_id = w.session_id
-  {mode_filter_sql}ORDER BY w.last_event_unix_ms {order_dir}, w.session_id {order_dir}
+  {event_filter_sql}ORDER BY w.last_event_unix_ms {order_dir}, w.session_id {order_dir}
   LIMIT {limit_plus}
 )
 SELECT
@@ -348,6 +352,7 @@ SELECT
   completed,
   title,
   source,
+  harness,
   session_slug,
   session_summary
 FROM candidate_sessions
@@ -358,7 +363,7 @@ FORMAT JSONEachRow",
             where_sql = where_sql,
             mode_aggregate = mode_aggregate,
             window_limit_sql = window_limit_sql,
-            mode_filter_sql = mode_filter_sql,
+            event_filter_sql = event_filter_sql,
             order_dir = order_dir,
             limit_plus = limit_plus,
         );

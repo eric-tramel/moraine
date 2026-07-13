@@ -66,6 +66,8 @@ pub(super) struct McpSessionListRow {
     #[serde(default)]
     pub(super) source: String,
     #[serde(default)]
+    pub(super) harness: String,
+    #[serde(default)]
     pub(super) session_slug: String,
     #[serde(default)]
     pub(super) session_summary: String,
@@ -451,6 +453,7 @@ impl ClickHouseConversationRepository {
             completed: row.completed != 0,
             title: non_empty_string(row.title),
             source: non_empty_string(row.source),
+            harness: non_empty_string(row.harness),
             session_slug: non_empty_string(row.session_slug),
             session_summary: non_empty_string(row.session_summary),
         }

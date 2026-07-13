@@ -74,23 +74,19 @@ FROM {events_source}
         // The session scope participates in the signature so a cursor minted
         // by an unscoped (or differently scoped) server is rejected instead
         // of silently resuming with different visibility.
-        let scope = self
-            .cfg
-            .session_scope
-            .as_ref()
-            .map(|scope| scope.roots.join(","))
-            .unwrap_or_else(|| "__none__".to_string());
-        format!(
-            "start={};end={};mode={};sort={};scope={}",
+        serde_json::to_string(&(
             filter.start_unix_ms,
             filter.end_unix_ms,
-            filter
-                .mode
-                .map(ConversationMode::as_str)
-                .unwrap_or("__none__"),
+            filter.mode.map(ConversationMode::as_str),
+            filter.harness.as_deref(),
+            filter.source_name.as_deref(),
             filter.sort.as_str(),
-            scope,
-        )
+            self.cfg
+                .session_scope
+                .as_ref()
+                .map(|scope| scope.roots.as_slice()),
+        ))
+        .expect("list_sessions cursor filter contains only serializable primitives")
     }
 
     pub(super) fn turn_filter_sig(session_id: &str, filter: &TurnListFilter) -> String {

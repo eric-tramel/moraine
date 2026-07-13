@@ -198,6 +198,8 @@ Error behavior:
 
 - Invalid inputs must not be silently coerced, except where this specification
   explicitly defines normalization.
+- A provided `harness` or `source` containing only whitespace must return
+  `invalid_request` with `error.details.field` naming that filter.
 - Missing IDs must return `not_found`.
 - Malformed IDs must return `invalid_id`.
 - Unknown event type filters must return `unsupported_event_type`.
@@ -225,6 +227,8 @@ search_sessions({
   query: string,
   within_id?: string | null,
   event_types?: string[] | null,
+  harness?: string | null,
+  source?: string | null,
   n_hits?: number | null
 })
 ```
@@ -274,6 +278,17 @@ search_sessions({
 - Minimum: `1`.
 - Maximum: `50`.
 - Must be an integer.
+
+`harness` and `source`:
+
+- Optional and independently nullable.
+- When present, each must contain at least one non-whitespace character after
+  trimming; blank values return `invalid_request`.
+- Each is an exact, case-sensitive filter. `harness` matches Moraine's
+  normalized harness name (for example `codex`, `claude-code`, or
+  `pi-coding-agent`); `source` matches the configured ingest source name.
+- When both are present, both predicates must match. Use `source` to distinguish
+  configured sources such as `pi` and `omp` that share a normalized harness.
 
 ### Search Scope Behavior
 
@@ -361,6 +376,8 @@ should not compare scores across different queries.
     "query": "clickhouse schema migration failure",
     "within_id": null,
     "event_types": ["user_input", "assistant_response", "tool_response"],
+    "harness": null,
+    "source": null,
     "n_hits": 10
   },
   "data": {
@@ -422,6 +439,7 @@ Each hit must have this shape:
     "id": "session:ses_01J9Q3N7W6F9A8K2M4V5R6T7Y8",
     "title": "Fix ClickHouse schema migration failure",
     "source": "codex",
+    "harness": "codex",
     "started_at": "2026-04-29T18:41:55.000Z",
     "updated_at": "2026-04-29T19:03:12.442Z",
     "completed": true
@@ -444,6 +462,8 @@ Field rules:
 - `id` is the same as `event.id`.
 - `event.ordinal` is one-based within the parent turn.
 - `turn.ordinal` is one-based within the parent session.
+- `session.harness` is the normalized harness; `session.source` is the
+  configured ingest source.
 - `snippet.text` should be short enough to scan and must not contain a full
   payload when the event content is large.
 - `open` repeats the IDs callers are expected to use next.
@@ -750,6 +770,8 @@ and `open` to inspect a selected session.
   "limit": 20,
   "cursor": null,
   "mode": null,
+  "harness": null,
+  "source": null,
   "sort": "desc"
 }
 ```
@@ -763,6 +785,9 @@ Rules:
   `started_at < end_datetime`.
 - `mode`, when present, is one of `web_search`, `mcp_internal`,
   `tool_calling`, or `chat`.
+- `harness` and `source` are optional exact, case-sensitive filters with the
+  same semantics as `search_sessions`. Blank provided values return
+  `invalid_request`; when both are present, both must match.
 - `sort` is `desc` or `asc`, ordered by session `updated_at` and session ID.
 
 ### Response Shape
@@ -787,6 +812,7 @@ session metadata only:
           "id": "session:c2Vzcy0x",
           "title": "Build failure triage",
           "source": "codex",
+          "harness": "codex",
           "started_at": "2026-04-30T13:00:00.000Z",
           "updated_at": "2026-04-30T13:10:00.000Z",
           "completed": true,
@@ -814,6 +840,8 @@ session metadata only:
 
 `list_sessions` must not return event snippets, transcript text, or event
 payloads. To inspect a listed session, pass `open.session_id` to `open`.
+The returned `session.harness` and `session.source` identify the normalized
+harness and configured ingest source that the corresponding filters match.
 
 ## Tool: `file_attention`
 
@@ -838,6 +866,8 @@ Which sessions touched this file, and where do I drill in?
   "start_datetime": null,
   "end_datetime": null,
   "tool": null,
+  "harness": null,
+  "source": null,
   "mutations_only": false,
   "limit": 25
 }
@@ -870,6 +900,9 @@ Rules:
   most millisecond precision.
 - `tool` filters by tool name case-insensitively. `mutations_only` excludes
   common pure-read tools.
+- `harness` and `source` are optional exact, case-sensitive filters with the
+  same semantics as `search_sessions`. Blank provided values return
+  `invalid_request`; when both are present, both must match.
 - The default limit is `min(50, mcp.max_results)` and the maximum is
   server-configured.
 
@@ -915,6 +948,8 @@ root buckets, and either session rollups or a flat event timeline:
         "event": {
           "id": "event:...",
           "session_id": "session:...",
+          "harness": "codex",
+          "source": "codex",
           "timestamp": "2026-06-15T09:30:00.000Z",
           "tool_name": "Edit",
           "phase": "request",
@@ -939,6 +974,8 @@ root buckets, and either session rollups or a flat event timeline:
   }
 }
 ```
+Event rows and session rollups expose `harness` and `source` for the normalized
+harness and configured ingest source that the corresponding filters match.
 
 `event_id` and `session_id` must be present on displayed rows. `turn_id` is
 present when the touch joins to the conversation trace. `truncated` is true when
@@ -1764,6 +1801,10 @@ Missing object:
 | `query` + `within_id=turn` | Search only that turn with default event types. |
 | `query` + `within_id=session` + `event_types` | Search only that session and only those event types. |
 | `query` + `within_id=turn` + `event_types` | Search only that turn and only those event types. |
+| `query` + `harness` | Return only events from the exact normalized harness. |
+| `query` + `source` | Return only events from the exact configured ingest source. |
+| `query` + `harness` + `source` | AND both exact filters. |
+| blank `harness` or `source` | Return `invalid_request`. |
 | `query` + `within_id=event` | Return `invalid_request`. |
 | blank `query` | Return `invalid_request`. |
 | unknown `within_id` | Return `not_found` if ID is well-formed. |
@@ -1783,12 +1824,25 @@ Missing object:
 | range + `cursor` | Return the next deterministic page for the same filter and sort. |
 | range + `mode` | Return only sessions with that mode. |
 | range + `sort=asc` | Return oldest matching sessions first by `updated_at`, then ID. |
+| range + `harness` | Return only sessions from the exact normalized harness. |
+| range + `source` | Return only sessions from the exact configured ingest source. |
+| range + `harness` + `source` | AND both exact filters. |
+| blank `harness` or `source` | Return `invalid_request`. |
 | missing datetime | Return `invalid_request`. |
 | datetime without timezone | Return `invalid_request`. |
 | `end_datetime <= start_datetime` | Return `invalid_request`. |
 | unknown field | Return `invalid_request`. |
 | invalid `mode` or `sort` | Return `invalid_request`. |
 | cursor with changed filter or sort | Return `invalid_request`. |
+
+### `file_attention`
+
+| Input combination | Expected behavior |
+|---|---|
+| `path` + `harness` | Return only touches from the exact normalized harness. |
+| `path` + `source` | Return only touches from the exact configured ingest source. |
+| `path` + `harness` + `source` | AND both exact filters. |
+| blank `harness` or `source` | Return `invalid_request`. |
 
 ### `open`
 
@@ -1932,6 +1986,9 @@ An implementation is successful when:
 - Reasoning, tool calls, compactions, system events, and runtime events are
   excluded by default.
 - Explicit event type filters are honored exactly.
+- Exact `harness` and `source` filters are honored independently and ANDed when
+  combined; every hit exposes the matching normalized harness and configured
+  source.
 - Session and turn scoped search never returns hits outside the requested
   scope.
 - `n_hits` is honored exactly up to the maximum.
@@ -1948,6 +2005,9 @@ An implementation is successful when:
 - Valid requests return sessions overlapping the requested datetime range.
 - Boundary behavior is inclusive at `start_datetime` and exclusive at
   `end_datetime`.
+- Exact `harness` and `source` filters are honored independently and ANDed when
+  combined; every listed session exposes the matching normalized harness and
+  configured source.
 - Results are sorted deterministically and cursor-paginated.
 - Each session includes a typed session ID accepted by `open`.
 - The response contains compact metadata and no event snippets, event payloads,
@@ -1961,6 +2021,8 @@ An implementation is successful when:
 An implementation is successful when:
 
 - Valid requests return the specified response envelope.
+- Exact `harness` and `source` filters are honored independently and ANDed when
+  combined; event rows and session rollups expose the matching values.
 - Invalid paths, unknown fields, bad enum values, bad datetime precision, and
   invalid ranges produce structured errors.
 - The same logical file touched in the main checkout, a sibling worktree, and

@@ -120,6 +120,9 @@ impl ClickHouseConversationRepository {
         if let Some(tool) = query.tool.as_deref() {
             inner_clauses.push(format!("lower(tool_name) = lower({})", sql_quote(tool)));
         }
+        if let Some(harness) = query.harness.as_deref() {
+            inner_clauses.push(format!("harness = {}", sql_quote(harness)));
+        }
         if query.mutations_only {
             inner_clauses.push(format!(
                 "lowerUTF8(tool_name) NOT IN ({FILE_ATTENTION_READ_TOOL_NAMES_SQL})"
@@ -136,6 +139,9 @@ impl ClickHouseConversationRepository {
         }
         if let Some(end) = query.end_unix_ms {
             outer_clauses.push(format!("toUnixTimestamp64Milli(tr.event_time) < {end}"));
+        }
+        if let Some(source_name) = query.source_name.as_deref() {
+            outer_clauses.push(format!("e.source_name = {}", sql_quote(source_name)));
         }
         let outer_where = if outer_clauses.is_empty() {
             "1".to_string()
@@ -164,6 +170,7 @@ impl ClickHouseConversationRepository {
     ti.event_uid AS event_uid,
     ti.tool_call_id AS tool_call_id,
     ti.harness AS harness,
+    ifNull(e.source_name, '') AS source_name,
     ti.tool_name AS tool_name,
     ti.tool_phase AS tool_phase,
     if({normalized_root_condition}, concat(ti.worktree_root, '/', ti.repo_rel_path), ti.repo_rel_path) AS matched_path,
@@ -182,7 +189,7 @@ impl ClickHouseConversationRepository {
     WHERE (session_id, event_uid) IN (SELECT session_id, event_uid FROM matched)
   ) AS tr ON tr.session_id = ti.session_id AND tr.event_uid = ti.event_uid
   ANY LEFT JOIN (
-    SELECT session_id, event_uid, any(cwd) AS cwd
+    SELECT session_id, event_uid, any(cwd) AS cwd, any(source_name) AS source_name
     FROM {events_source}
     WHERE (session_id, event_uid) IN (SELECT session_id, event_uid FROM matched)
     GROUP BY session_id, event_uid
@@ -308,6 +315,9 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
         if let Some(tool) = query.tool.as_deref() {
             inner_clauses.push(format!("lower(tool_name) = lower({})", sql_quote(tool)));
         }
+        if let Some(harness) = query.harness.as_deref() {
+            inner_clauses.push(format!("harness = {}", sql_quote(harness)));
+        }
         if query.mutations_only {
             inner_clauses.push(format!(
                 "lowerUTF8(tool_name) NOT IN ({FILE_ATTENTION_READ_TOOL_NAMES_SQL})"
@@ -364,6 +374,9 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
         }
         if let Some(end) = query.end_unix_ms {
             outer_clauses.push(format!("toUnixTimestamp64Milli(tr.event_time) < {end}"));
+        }
+        if let Some(source_name) = query.source_name.as_deref() {
+            outer_clauses.push(format!("e.source_name = {}", sql_quote(source_name)));
         }
         if query.apply_project_scope {
             let project_id = query
@@ -446,6 +459,7 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
     ti.event_uid AS event_uid,
     ti.tool_call_id AS tool_call_id,
     ti.harness AS harness,
+    ifNull(e.source_name, '') AS source_name,
     ti.tool_name AS tool_name,
     ti.tool_phase AS tool_phase,
     {matched_path_expr} AS matched_path,
@@ -464,7 +478,7 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
     WHERE (session_id, event_uid) IN (SELECT session_id, event_uid FROM matched)
   ) AS tr ON tr.session_id = ti.session_id AND tr.event_uid = ti.event_uid
   ANY LEFT JOIN (
-    SELECT session_id, event_uid, any(cwd) AS cwd{normalized_event_columns}
+    SELECT session_id, event_uid, any(cwd) AS cwd, any(source_name) AS source_name{normalized_event_columns}
     FROM {events_source}
     WHERE (session_id, event_uid) IN (SELECT session_id, event_uid FROM matched)
     GROUP BY session_id, event_uid

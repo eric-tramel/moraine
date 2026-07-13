@@ -516,6 +516,10 @@ pub struct SearchSessionsArgs {
     #[serde(default)]
     pub event_types: Option<Vec<String>>,
     #[serde(default)]
+    pub harness: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
     pub n_hits: Option<i64>,
 }
 
@@ -550,6 +554,8 @@ impl SearchSessionsArgs {
             Some(event_types) => canonicalize_search_event_type_names(&event_types)?,
             None => default_search_event_types(),
         };
+        let harness = normalize_optional_filter("harness", self.harness)?;
+        let source = normalize_optional_filter("source", self.source)?;
 
         let n_hits = self
             .n_hits
@@ -568,6 +574,8 @@ impl SearchSessionsArgs {
             query,
             within_id,
             event_types,
+            harness,
+            source,
             n_hits,
         })
     }
@@ -578,6 +586,8 @@ pub struct CanonicalSearchSessionsArgs {
     pub query: String,
     pub within_id: Option<McpId>,
     pub event_types: Vec<McpEventType>,
+    pub harness: Option<String>,
+    pub source: Option<String>,
     pub n_hits: u16,
 }
 
@@ -644,6 +654,10 @@ pub struct ListSessionsArgs {
     #[serde(default)]
     pub mode: Option<ListSessionsMode>,
     #[serde(default)]
+    pub harness: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
     pub sort: Option<ListSessionsSort>,
 }
 
@@ -687,6 +701,9 @@ impl ListSessionsArgs {
             ));
         }
 
+        let harness = normalize_optional_filter("harness", self.harness)?;
+        let source = normalize_optional_filter("source", self.source)?;
+
         Ok(CanonicalListSessionsArgs {
             start_datetime,
             end_datetime,
@@ -695,6 +712,8 @@ impl ListSessionsArgs {
             limit,
             cursor,
             mode: self.mode,
+            harness,
+            source,
             sort: self.sort.unwrap_or_default(),
         })
     }
@@ -709,6 +728,8 @@ pub struct CanonicalListSessionsArgs {
     pub limit: u16,
     pub cursor: Option<String>,
     pub mode: Option<ListSessionsMode>,
+    pub harness: Option<String>,
+    pub source: Option<String>,
     pub sort: ListSessionsSort,
 }
 
@@ -813,6 +834,10 @@ pub struct FileAttentionArgs {
     #[serde(default)]
     pub tool: Option<String>,
     #[serde(default)]
+    pub harness: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
     pub mutations_only: Option<bool>,
     #[serde(default)]
     pub limit: Option<i64>,
@@ -877,6 +902,8 @@ impl FileAttentionArgs {
             .tool
             .map(|tool| tool.trim().to_string())
             .filter(|tool| !tool.is_empty());
+        let harness = normalize_optional_filter("harness", self.harness)?;
+        let source = normalize_optional_filter("source", self.source)?;
 
         Ok(CanonicalFileAttentionArgs {
             path,
@@ -887,6 +914,8 @@ impl FileAttentionArgs {
             start_unix_ms: start.map(|(ms, _)| ms),
             end_unix_ms: end.map(|(ms, _)| ms),
             tool,
+            harness,
+            source,
             mutations_only: self.mutations_only.unwrap_or(false),
             limit,
         })
@@ -903,6 +932,8 @@ pub struct CanonicalFileAttentionArgs {
     pub start_unix_ms: Option<i64>,
     pub end_unix_ms: Option<i64>,
     pub tool: Option<String>,
+    pub harness: Option<String>,
+    pub source: Option<String>,
     pub mutations_only: bool,
     pub limit: u16,
 }
@@ -1188,6 +1219,23 @@ fn list_sessions_datetime_required_error() -> ContractError {
             "end_datetime": "2026-04-30T13:00:00-04:00"
         }
     }))
+}
+
+fn normalize_optional_filter(
+    field: &'static str,
+    input: Option<String>,
+) -> ContractResult<Option<String>> {
+    let Some(raw) = input else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim().to_string();
+    if trimmed.is_empty() {
+        return Err(invalid_request_with_field(
+            field,
+            format!("{field} must be a non-empty string when provided"),
+        ));
+    }
+    Ok(Some(trimmed))
 }
 
 /// Parse an optional datetime bound, returning `(unix_ms, trimmed_input)`.
@@ -1557,6 +1605,8 @@ mod tests {
             query: " migration ".to_string(),
             within_id: None,
             event_types: None,
+            harness: None,
+            source: None,
             n_hits: None,
         }
         .validate()
@@ -1576,6 +1626,8 @@ mod tests {
             query: "query".to_string(),
             within_id: Some(session_id.clone()),
             event_types: Some(vec!["tool_response".to_string(), "user_input".to_string()]),
+            harness: None,
+            source: None,
             n_hits: Some(25),
         };
 
@@ -1591,6 +1643,8 @@ mod tests {
             query: " ".to_string(),
             within_id: None,
             event_types: None,
+            harness: None,
+            source: None,
             n_hits: None,
         }
         .validate()
@@ -1604,11 +1658,38 @@ mod tests {
             query: "query".to_string(),
             within_id: Some(event_id),
             event_types: None,
+            harness: None,
+            source: None,
             n_hits: None,
         }
         .validate()
         .expect_err("event scope");
         assert_eq!(event_scope.code(), ToolErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn retrieval_filters_reject_blank_values() {
+        let search_error = SearchSessionsArgs {
+            query: "query".to_string(),
+            within_id: None,
+            event_types: None,
+            harness: Some(" ".to_string()),
+            source: None,
+            n_hits: None,
+        }
+        .validate()
+        .expect_err("blank harness");
+        assert_eq!(search_error.details().expect("details")["field"], "harness");
+
+        let list_error = ListSessionsArgs {
+            start_datetime: Some("2026-04-30T09:00:00-04:00".to_string()),
+            end_datetime: Some("2026-04-30T13:00:00-04:00".to_string()),
+            source: Some(" ".to_string()),
+            ..ListSessionsArgs::default()
+        }
+        .validate(25)
+        .expect_err("blank source");
+        assert_eq!(list_error.details().expect("details")["field"], "source");
     }
 
     #[test]

@@ -59,6 +59,10 @@ pub struct McpSessionListFilter {
     pub mode: Option<ConversationMode>,
     #[serde(default)]
     pub sort: ConversationListSort,
+    #[serde(default)]
+    pub harness: Option<String>,
+    #[serde(default)]
+    pub source_name: Option<String>,
 }
 
 /// A single file-touch query for `file_attention`: every captured tool call
@@ -88,6 +92,10 @@ pub struct FileAttentionQuery {
     pub apply_project_scope: bool,
     pub start_unix_ms: Option<i64>,
     pub end_unix_ms: Option<i64>,
+    /// Restrict to one normalized harness name; `None` matches every harness.
+    pub harness: Option<String>,
+    /// Restrict to one configured ingest source name; `None` matches every source.
+    pub source_name: Option<String>,
     /// Restrict to one tool name (case-insensitive); `None` matches all tools.
     pub tool: Option<String>,
     /// Drop common pure-read touches.
@@ -111,6 +119,8 @@ pub struct FileAttentionTouch {
     pub tool_call_id: String,
     #[serde(default)]
     pub harness: String,
+    #[serde(default)]
+    pub source_name: String,
     #[serde(default)]
     pub tool_name: String,
     #[serde(default)]
@@ -394,6 +404,8 @@ pub struct McpSessionListItem {
     pub title: Option<String>,
     #[serde(default)]
     pub source: Option<String>,
+    #[serde(default)]
+    pub harness: Option<String>,
     #[serde(default)]
     pub session_slug: Option<String>,
     #[serde(default)]
@@ -711,6 +723,10 @@ pub struct SearchMcpEventsQuery {
     pub turn_seq: Option<u32>,
     #[serde(default)]
     pub event_types: Option<Vec<McpEventType>>,
+    #[serde(default)]
+    pub harness: Option<String>,
+    #[serde(default)]
+    pub source_name: Option<String>,
     #[serde(default)]
     pub min_score: Option<f64>,
     #[serde(default)]
