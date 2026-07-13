@@ -876,6 +876,25 @@ class ComparisonPolicyTests(unittest.TestCase):
         self.assertEqual(result["metrics"]["direction_pairs"], {"qps": 7, "ttr": 7, "source_etd": 7})
         self.assertGreater(result["metrics"]["suite_score_ci95"]["lower"], 1.0)
 
+    def test_summary_validator_recomputes_metrics_and_status(self) -> None:
+        result = self.compare()
+        protocol.validate_comparison(result)
+        for field in ("status", "ratios"):
+            mutated = copy.deepcopy(result)
+            if field == "status":
+                mutated["status"] = "fail"
+            else:
+                mutated["metrics"]["ratios"]["qps"] *= 2
+            mutated["document_sha256"] = protocol.sha256_json(
+                {
+                    key: value
+                    for key, value in mutated.items()
+                    if key != "document_sha256"
+                }
+            )
+            with self.subTest(field=field), self.assertRaises(protocol.ProtocolError):
+                protocol.validate_comparison(mutated)
+
     def test_manifest_argument_order_and_labels_do_not_change_result(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -972,6 +991,25 @@ class RepeatabilityPolicyTests(unittest.TestCase):
         over = self.evaluate([94, 94, 94, 100, 106, 106, 106])
         self.assertEqual(over["status"], "fail")
         self.assertGreater(over["metrics"]["mad_ratios"]["qps"], 0.05)
+
+    def test_summary_validator_recomputes_mad_and_status(self) -> None:
+        result = self.evaluate([100] * 7)
+        protocol.validate_repeatability(result)
+        for field in ("status", "mad"):
+            mutated = copy.deepcopy(result)
+            if field == "status":
+                mutated["status"] = "fail"
+            else:
+                mutated["metrics"]["mad_ratios"]["qps"] = 1.0
+            mutated["document_sha256"] = protocol.sha256_json(
+                {
+                    key: value
+                    for key, value in mutated.items()
+                    if key != "document_sha256"
+                }
+            )
+            with self.subTest(field=field), self.assertRaises(protocol.ProtocolError):
+                protocol.validate_repeatability(mutated)
 
     def test_all_mad_threshold_boundaries_are_inclusive(self) -> None:
         for name, limit in {

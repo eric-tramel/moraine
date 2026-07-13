@@ -310,6 +310,10 @@ The scenario, comparison, and repeatability schema is
 documents explicitly and rejects unknown document types.
 
 ```bash
+# Freeze deterministic fixture and policy artifacts without starting services.
+python3 scripts/bench/performance_suite.py freeze \
+  --profile full --output target/bench/performance/frozen
+
 # One non-comparable owned smoke.
 python3 scripts/bench/performance_suite.py smoke \
   --repo . --output target/bench/performance/smoke
@@ -337,19 +341,32 @@ python3 scripts/bench/performance_suite.py repeatability \
 ```
 
 Authoritative runs require a dedicated rootful Linux cgroup-v2 Docker host with
-more than 8 GiB of host memory. ClickHouse, central Moraine, and ingest/indexing
-workers share one aggregate 1-CPU/8-GiB/no-swap server envelope; load generation
-and result collection remain outside it. Unsupported cgroup drivers, missing
-controller authority, incorrect process placement, binary hash drift, OOM, or swap
-activity fail closed. A macOS or Docker Desktop run cannot claim authoritative
-resource evidence.
+strictly more than 8 GiB of host memory. They refuse Docker Desktop, rootless
+Docker, missing controller delegation, and non-cgroup-v2 drivers before collecting
+results. ClickHouse, central Moraine, and ingest/indexing workers share one aggregate
+1-CPU/8-GiB/no-swap server envelope; load generation and result collection remain
+outside it. A synthetic busy-child proof verifies that aggregate CPU accounting
+includes descendants. OOM, swap activity, misplaced processes, binary drift, or an
+unremovable owned resource fails the run.
 
-Every arm receives a new sandbox project, cgroup, volume, source root, and cache
-generation, followed by deterministic seeding. The sandbox wrapper remains the sole
+Each source worktree is clean and pinned to a full commit. The suite builds its four
+release binaries once, copies them into a read-only immutable directory, and records
+the compiler, target, linker, allowlisted build environment, manifest, and binary
+digests. Every measured sandbox mounts only those frozen binaries. The benchmark
+adapter and Compose overlay always come from the suite checkout—not from the
+baseline worktree—so an older baseline needs no benchmark-specific files. Before
+measurement, the arm's frozen `moraine` binary migrates its fresh database, the
+fixture seeds normalized `events`, and the production materialized view derives
+`search_documents`. Runtime evidence binds the exact image IDs and hashes each live
+`/proc/<pid>/exe` for `moraine-ingest`, `moraine-mcp`, and load-generator processes.
+
+Every physical arm receives a new sandbox project, delegated cgroup, ClickHouse
+volume, source root, and cache generation. The sandbox wrapper remains the sole
 Docker lifecycle and ownership authority; the suite never truncates or drops a
-pre-existing database. Setup, fixture generation, build, and seed readiness stay
-outside measured boundaries. Cleanup uncertainty reports an owned-resource leak
-inventory rather than touching resources whose ownership is not proven.
+pre-existing database. Setup, fixture generation, build, migration, seed, and
+readiness stay outside measured boundaries. Cleanup attempts every owned resource
+and propagates any uncertainty as a failed run rather than touching resources whose
+ownership is not proven.
 
 QPS uses an open arrival schedule and counts only semantically correct completions
 that satisfy the frozen latency, scheduling, error, and drain gates. TTR starts

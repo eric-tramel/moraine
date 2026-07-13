@@ -132,6 +132,8 @@ class FakeMixedArm:
 
     def close(self) -> None:
         self.closed = True
+        if self.owner.cleanup_failure_label == self.label:
+            raise OSError(f"{self.label} cleanup failed")
 
 
 class ArmFactory:
@@ -141,6 +143,8 @@ class ArmFactory:
         self.queue_depths: dict[str, int] = {}
         self.same_reset = False
         self.recipe_mismatch = False
+        self.cleanup_failure_label: str | None = None
+        self.arms: list[FakeMixedArm] = []
 
     def reset_id_for(self, label: str) -> str:
         return "one-reset" if self.same_reset else f"reset-{label}"
@@ -154,7 +158,9 @@ class ArmFactory:
             mutation(evidence)
 
     def __call__(self, label: str) -> FakeMixedArm:
-        return FakeMixedArm(label, self)
+        arm = FakeMixedArm(label, self)
+        self.arms.append(arm)
+        return arm
 
 
 class MixedScenarioTests(unittest.TestCase):
@@ -176,6 +182,15 @@ class MixedScenarioTests(unittest.TestCase):
         self.assertTrue(result.metrics["mixed_gates"]["drained"])
         self.assertTrue(result.metrics["mixed_gates"]["exact_events"])
         self.assertEqual(set(result.samples), {"query_records", "ingest"})
+
+    def test_cleanup_failure_is_propagated_after_every_arm_is_closed(self) -> None:
+        factory = ArmFactory()
+        factory.cleanup_failure_label = "combined"
+        with self.assertRaisesRegex(scenarios.ScenarioError, "combined cleanup failed"):
+            self.run_mixed(factory)
+        self.assertEqual(len(factory.arms), 3)
+        self.assertTrue(all(arm.closed for arm in factory.arms))
+
 
     def test_query_only_control_starvation_fails_independently(self) -> None:
         factory = ArmFactory()

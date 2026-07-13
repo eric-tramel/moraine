@@ -469,6 +469,8 @@ class EvidenceAndBuildTests(unittest.TestCase):
         self.assertIn("wait -n", text)
         self.assertIn("moraine-ingest", text)
         self.assertIn("moraine-mcp", text)
+        migration = text.index('moraine" db migrate')
+        self.assertLess(migration, text.index('"${BIN_DIR}/moraine-ingest"'))
 
 
 class RuntimeAdapterTests(unittest.TestCase):
