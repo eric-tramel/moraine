@@ -17,6 +17,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 COMPOSE_FILE="${SCRIPT_DIR}/compose.yaml"
 SESSIONS_COMPOSE_FILE="${SCRIPT_DIR}/compose.sessions.yaml"
 PERFORMANCE_COMPOSE_FILE="${REPO_ROOT}/scripts/bench/compose.performance.yaml"
+LOCAL_PERFORMANCE_COMPOSE_FILE="${REPO_ROOT}/scripts/bench/compose.performance.local.yaml"
 DOCKERFILE="${SCRIPT_DIR}/Dockerfile"
 PERFORMANCE_ENTRYPOINT="${SCRIPT_DIR}/performance-entrypoint.sh"
 DEFAULT_CONFIG_PATH="${REPO_ROOT}/config/moraine.toml"
@@ -51,6 +52,7 @@ SANDBOX_STATE_ROOT="${MORAINE_SANDBOX_STATE_ROOT:-/tmp}"
 # Internal Compose selectors are never accepted from the caller environment.
 # Lifecycle commands derive them only from ownership-checked local metadata.
 SANDBOX_PERFORMANCE=0
+SANDBOX_LOCAL_PERFORMANCE=0
 SANDBOX_OWNERSHIP_COMPOSE_FILE=""
 MORAINE_PERFORMANCE_CGROUP_PARENT=""
 export SANDBOX_REPO_ROOT SANDBOX_BIN_DIR SANDBOX_WEB_DIR SANDBOX_CONFIG_DIR
@@ -58,7 +60,7 @@ export SANDBOX_CODEX_SESSIONS_DIR SANDBOX_CLAUDE_PROJECTS_DIR SANDBOX_HERMES_SES
 export SANDBOX_KIMI_SESSIONS_DIR SANDBOX_CURSOR_PROJECTS_DIR SANDBOX_CURSOR_STATE_DIR
 export SANDBOX_MONITOR_HOST_PORT SANDBOX_CLICKHOUSE_HTTP_HOST_PORT SANDBOX_CLICKHOUSE_TCP_HOST_PORT
 export SANDBOX_CLICKHOUSE_IMAGE
-export MORAINE_PERFORMANCE_CGROUP_PARENT SANDBOX_PERFORMANCE SANDBOX_OWNERSHIP_COMPOSE_FILE
+export MORAINE_PERFORMANCE_CGROUP_PARENT SANDBOX_PERFORMANCE SANDBOX_LOCAL_PERFORMANCE SANDBOX_OWNERSHIP_COMPOSE_FILE
 
 # ---------------------------------------------------------------------------
 # Logging helpers
@@ -252,6 +254,9 @@ docker_compose_files_args() {
     if [[ "${SANDBOX_PERFORMANCE:-0}" == "1" ]]; then
         args+=(-f "$PERFORMANCE_COMPOSE_FILE")
     fi
+    if [[ "${SANDBOX_LOCAL_PERFORMANCE:-0}" == "1" ]]; then
+        args+=(-f "$LOCAL_PERFORMANCE_COMPOSE_FILE")
+    fi
     if [[ -n "${SANDBOX_OWNERSHIP_COMPOSE_FILE:-}" ]]; then
         args+=(-f "$SANDBOX_OWNERSHIP_COMPOSE_FILE")
     fi
@@ -305,10 +310,11 @@ ensure_compose_env() {
         SANDBOX_SCCACHE_HOST_DIR SANDBOX_REBUILD
     : "${SANDBOX_BIN_DIR:=/dev/null}"
     : "${SANDBOX_PERFORMANCE:=0}"
+    : "${SANDBOX_LOCAL_PERFORMANCE:=0}"
     : "${MORAINE_PERFORMANCE_CGROUP_PARENT:=}"
     : "${SANDBOX_OWNERSHIP_COMPOSE_FILE:=}"
-    export SANDBOX_BIN_DIR SANDBOX_PERFORMANCE MORAINE_PERFORMANCE_CGROUP_PARENT \
-        SANDBOX_OWNERSHIP_COMPOSE_FILE
+    export SANDBOX_BIN_DIR SANDBOX_PERFORMANCE SANDBOX_LOCAL_PERFORMANCE \
+        MORAINE_PERFORMANCE_CGROUP_PARENT SANDBOX_OWNERSHIP_COMPOSE_FILE
 }
 
 dc() {
@@ -626,6 +632,7 @@ cleanup_local_config() {
         "${config_dir}/moraine.toml" \
         "${config_dir}/ownership.compose.yaml" \
         "${config_dir}/.performance-mode" \
+        "${config_dir}/.local-performance-mode" \
         "${config_dir}/.cgroup-parent" \
         "${config_dir}/.lifecycle-phase" \
         "${config_dir}/.binary-manifest.json" \
@@ -1073,6 +1080,7 @@ cmd_up() {
     local rebuild=0
     local quiet=0
     local performance=0
+    local local_performance=0
     local cgroup_parent=""
     local binary_dir=""
 
@@ -1086,6 +1094,7 @@ cmd_up() {
             --mount-host-sessions) mount_sessions=1; shift ;;
             --rebuild)             rebuild=1; shift ;;
             --performance)         performance=1; shift ;;
+            --local-performance)   performance=1; local_performance=1; shift ;;
             --cgroup-parent)
                 cgroup_parent="${2-}"
                 [[ "$cgroup_parent" =~ ^[A-Za-z0-9_./-]+$ ]] || die "--cgroup-parent requires a safe non-empty cgroup name"
@@ -1103,7 +1112,12 @@ cmd_up() {
     done
 
     if (( performance )); then
-        [[ -n "$cgroup_parent" ]] || die "--performance requires --cgroup-parent"
+        if (( local_performance )); then
+            [[ -z "$cgroup_parent" ]] || die "--local-performance does not accept --cgroup-parent"
+            cgroup_parent="local-comparative"
+        else
+            [[ -n "$cgroup_parent" ]] || die "--performance requires --cgroup-parent"
+        fi
         [[ -n "$binary_dir" ]] || die "--performance requires --binary-dir"
         [[ "$cgroup_parent" != /* && "$cgroup_parent" != *".."* ]] || \
             die "--cgroup-parent must be a relative owned cgroup name"
@@ -1162,11 +1176,16 @@ cmd_up() {
     SANDBOX_OWNERSHIP_COMPOSE_FILE="$(write_ownership_evidence "$config_dir" "$ownership_token" "$performance")"
     export SANDBOX_PERFORMANCE="$performance"
     export MORAINE_PERFORMANCE_CGROUP_PARENT="$cgroup_parent"
+    export SANDBOX_LOCAL_PERFORMANCE="$local_performance"
     export SANDBOX_BIN_DIR="${binary_dir:-/dev/null}"
     if (( performance )); then
         validate_performance_binary_dir "$binary_dir" "$config_dir"
         printf '1\n' >"${config_dir}/.performance-mode"
         printf '%s\n' "$cgroup_parent" >"${config_dir}/.cgroup-parent"
+        if (( local_performance )); then
+            printf '1\n' >"${config_dir}/.local-performance-mode"
+            chmod 0600 "${config_dir}/.local-performance-mode"
+        fi
         printf 'reserved\n' >"${config_dir}/.lifecycle-phase"
         chmod 0600 \
             "${config_dir}/.performance-mode" \
@@ -1176,12 +1195,12 @@ cmd_up() {
 
     log "starting sandbox ${id} (project ${project})"
 
-    local web_dir="/dev/null"
-    if (( ! performance )); then
-        # Web assets are a development-only mount. The performance backend has
-        # no UI or frontend build in its immutable measured topology.
+    local web_dir="${REPO_ROOT}/web/monitor/dist"
+    if (( performance )); then
+        [[ -f "${web_dir}/index.html" ]] || \
+            die "performance monitor assets missing at ${web_dir}/index.html"
+    else
         ensure_monitor_frontend
-        web_dir="${REPO_ROOT}/web/monitor/dist"
         [[ -f "${web_dir}/index.html" ]] || \
             warn "monitor assets missing at ${web_dir}/index.html — UI will 404"
     fi
@@ -1298,11 +1317,17 @@ cmd_up() {
     # The shared runtime image is built before services start. Performance
     # Compose resets the service build definition and records the resulting
     # immutable image ID in machine status.
-    log "building runtime image"
-    if (( performance )); then
-        docker compose -p "$project" -f "$COMPOSE_FILE" build moraine
+    if (( local_performance )); then
+        log "reusing prebuilt local performance image"
+        docker image inspect moraine-sandbox-runtime:latest >/dev/null 2>&1 || \
+            die "local performance image is missing; run through performance_suite.py"
     else
-        dc "$project" "$mount_sessions" build
+        log "building runtime image"
+        if (( performance )); then
+            docker compose -p "$project" -f "$COMPOSE_FILE" build moraine
+        else
+            dc "$project" "$mount_sessions" build
+        fi
     fi
 
     # Up. The ownership overlay labels every destructive Compose resource.
@@ -1671,16 +1696,22 @@ PY
 print_central_status() {
     local id="$1"
     require_owned_performance "$id"
-    local moraine_id loadgen_id lifecycle moraine_top loadgen_top
+    local moraine_id loadgen_id lifecycle moraine_top loadgen_top local_mode=0
     moraine_id="$(container_id_for_service "$PERF_PROJECT" moraine)" || \
         die "moraine service identity is ambiguous"
     loadgen_id="$(container_id_for_service "$PERF_PROJECT" loadgen)" || \
         die "loadgen service identity is ambiguous"
     lifecycle="$(docker exec "$moraine_id" cat /home/moraine/.moraine/performance-central.json)"
-    moraine_top="$(docker top "$moraine_id" -eo pid,ppid,comm)"
-    loadgen_top="$(docker top "$loadgen_id" -eo pid,ppid,comm)"
+    if [[ -f "${PERF_CONFIG_DIR}/.local-performance-mode" ]]; then
+        local_mode=1
+        moraine_top="$(docker exec "$moraine_id" sh -c 'for stat in /proc/[0-9]*/stat; do cat "$stat" 2>/dev/null || :; done')"
+        loadgen_top="$(docker exec "$loadgen_id" sh -c 'for stat in /proc/[0-9]*/stat; do cat "$stat" 2>/dev/null || :; done')"
+    else
+        moraine_top="$(docker top "$moraine_id" -eo pid,ppid,comm)"
+        loadgen_top="$(docker top "$loadgen_id" -eo pid,ppid,comm)"
+    fi
     CENTRAL_LIFECYCLE="$lifecycle" CENTRAL_MORAINE_TOP="$moraine_top" \
-        CENTRAL_LOADGEN_TOP="$loadgen_top" "$PYTHON_BIN" - <<'PY'
+        CENTRAL_LOADGEN_TOP="$loadgen_top" CENTRAL_LOCAL="$local_mode" "$PYTHON_BIN" - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -1691,17 +1722,33 @@ if source.get("schema_version") != "moraine-performance-central-v1":
 
 def rows(text):
     result = []
+    if os.environ["CENTRAL_LOCAL"] == "1":
+        lines = text.splitlines()
+        for line in lines:
+            closing = line.rfind(")")
+            if closing < 0:
+                continue
+            prefix = line[:closing + 1]
+            fields = line[closing + 2:].split()
+            opening = prefix.find("(")
+            if opening < 0 or len(fields) < 20:
+                continue
+            result.append((
+                int(prefix[:opening].strip()),
+                int(fields[1]),
+                prefix[opening + 1:-1],
+                int(fields[19]),
+            ))
+        return result
     for line in text.splitlines()[1:]:
         fields = line.split(None, 2)
         if len(fields) == 3:
-            result.append((int(fields[0]), int(fields[1]), fields[2]))
+            pid = int(fields[0])
+            stat = (Path("/proc") / str(pid) / "stat").read_text()
+            closing = stat.rfind(")")
+            stat_fields = stat[closing + 2:].split()
+            result.append((pid, int(fields[1]), fields[2], int(stat_fields[19])))
     return result
-
-def starttime(pid):
-    text = (Path("/proc") / str(pid) / "stat").read_text()
-    closing = text.rfind(")")
-    fields = text[closing + 2:].split()
-    return int(fields[19])
 
 server = rows(os.environ["CENTRAL_MORAINE_TOP"])
 loadgen = rows(os.environ["CENTRAL_LOADGEN_TOP"])
@@ -1713,11 +1760,11 @@ roots = {central[0][0], ingest[0][0]}
 document = {
     "schema_version": "moraine-performance-central-v1",
     "cache_generation": source["cache_generation"],
-    "central": {"pid": central[0][0], "starttime": starttime(central[0][0])},
-    "ingest": {"pid": ingest[0][0], "starttime": starttime(ingest[0][0])},
+    "central": {"pid": central[0][0], "starttime": central[0][3]},
+    "ingest": {"pid": ingest[0][0], "starttime": ingest[0][3]},
     "server_children": sorted(row[0] for row in server if row[0] not in roots),
     "route_processes": [
-        {"pid": row[0], "starttime": starttime(row[0])}
+        {"pid": row[0], "starttime": row[3]}
         for row in loadgen if row[2] == "moraine-mcp"
     ],
 }

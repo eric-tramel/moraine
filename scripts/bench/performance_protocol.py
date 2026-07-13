@@ -365,6 +365,35 @@ def _validate_binary(value: Any, path: str = "$.binary") -> bool:
     return all_verified
 
 
+def resource_gate_passes(resources: Mapping[str, Any]) -> bool:
+    """Evaluate the canonical fixed-envelope resource gate."""
+
+    return bool(
+        resources["authoritative"]
+        and resources["cgroup_version"] == 2
+        and resources["cgroup_driver"] in {"cgroupfs", "systemd"}
+        and resources["cpu_max_quota_us"] == 100_000
+        and resources["cpu_max_period_us"] == 100_000
+        and resources["memory_max_bytes"] == 8 * 1024**3
+        and resources["swap_max_bytes"] == 0
+        and resources["memory_peak_bytes"] < resources["memory_max_bytes"]
+        and resources["swap_current_bytes"] == 0
+        and resources["oom_kill_delta"] == 0
+        and resources["memory_event_high_delta"] == 0
+        and resources["memory_event_max_delta"] == 0
+        and all(
+            resources[name]
+            for name in (
+                "controllers_enabled_proven",
+                "effective_limits_proven",
+                "host_headroom_proven",
+                "server_descendants_proven",
+                "loadgen_excluded_proven",
+            )
+        )
+    )
+
+
 def _validate_resources(value: Any, path: str = "$.resources") -> bool:
     resources = _mapping(value, path)
     _fields(resources, _RESOURCE_FIELDS, path)
@@ -380,16 +409,20 @@ def _validate_resources(value: Any, path: str = "$.resources") -> bool:
         _integer(resources[name], f"{path}.{name}", 1)
     for name in ("cpu_usage_usec_delta", "cpu_nr_throttled_delta", "throttled_usec_delta", "memory_current_bytes", "memory_peak_bytes", "memory_event_high_delta", "memory_event_max_delta", "swap_max_bytes", "swap_current_bytes", "oom_kill_delta"):
         _integer(resources[name], f"{path}.{name}")
-    passes = (
-        authoritative and resources["cgroup_version"] == 2 and resources["cgroup_driver"] in {"cgroupfs", "systemd"}
-        and resources["cpu_max_quota_us"] == 100_000 and resources["cpu_max_period_us"] == 100_000
-        and resources["memory_max_bytes"] == 8 * 1024**3 and resources["swap_max_bytes"] == 0
-        and resources["memory_peak_bytes"] < resources["memory_max_bytes"]
-        and resources["swap_current_bytes"] == 0 and resources["oom_kill_delta"] == 0
-        and resources["memory_event_high_delta"] == 0 and resources["memory_event_max_delta"] == 0
-        and all(resources[name] for name in ("controllers_enabled_proven", "effective_limits_proven", "host_headroom_proven", "server_descendants_proven", "loadgen_excluded_proven"))
+    return resource_gate_passes(resources)
+
+
+def schedule_gate_passes(schedule: Mapping[str, Any]) -> bool:
+    """Evaluate the canonical schedule gate for producers and validators."""
+
+    return bool(
+        schedule["dropped"] == 0
+        and schedule["unfinished"] == 0
+        and schedule["drained"]
+        and schedule["p99_start_slip_ms"]
+        <= POLICY["scheduler_p99_start_slip_ms_max"]
+        and schedule["drain_ms"] <= POLICY["drain_ms_max"]
     )
-    return bool(passes)
 
 
 def _validate_schedule(value: Any, path: str = "$.schedule") -> tuple[bool, list[tuple[str, str]]]:
@@ -434,7 +467,7 @@ def _validate_schedule(value: Any, path: str = "$.schedule") -> tuple[bool, list
             _fail(item_path, "physical reset identities must be unique")
         seen_resets.add(reset_sha256)
         physical_resets.append((role, reset_sha256))
-    passes = schedule["dropped"] == 0 and schedule["unfinished"] == 0 and drained and slip <= POLICY["scheduler_p99_start_slip_ms_max"] and drain <= POLICY["drain_ms_max"]
+    passes = schedule_gate_passes(schedule)
     return bool(passes), physical_resets
 
 
@@ -830,6 +863,21 @@ def _validate_etd(metrics_value: Any, samples_value: Any, *, loaded: bool) -> bo
     return all_valid and loaded_query_valid and operational_valid
 
 
+def _mixed_interval_comparison_bound(
+    interval: tuple[float, float | None, str],
+) -> float:
+    return interval[0] if interval[1] is None else interval[1]
+
+def _mixed_interval_ratio(
+    combined: tuple[float, float | None, str],
+    control: tuple[float, float | None, str],
+) -> float | None:
+    control_bound = _mixed_interval_comparison_bound(control)
+    if control_bound == 0:
+        return 0.0
+    return _mixed_interval_comparison_bound(combined) / control_bound
+
+
 def _validate_mixed(metrics_value: Any, samples_value: Any) -> bool:
     metrics = _mapping(metrics_value, "$.metrics")
     _fields(metrics, {"direction", "query_control", "ingest_control", "combined_query", "combined_ingest", "control_evidence", "ratios", "mixed_gates", "lost_events", "duplicate_events"}, "$.metrics")
@@ -886,13 +934,16 @@ def _validate_mixed(metrics_value: Any, samples_value: Any) -> bool:
         "query_goodput": cq[0] / qc[0],
         "query_p95": cq[1] / qc[1] if qc[1] else (1.0 if cq[1] == 0 else None),
         "query_p99": cq[2] / qc[2] if qc[2] else (1.0 if cq[2] == 0 else None),
-        "source_etd": ci[0][1] / ic[0][1] if ic[0][1] not in (None, 0) and ci[0][1] is not None else None,
-        "db_ack_etd": ci[1][1] / ic[1][1] if ic[1][1] not in (None, 0) and ci[1][1] is not None else None,
+        "source_etd": _mixed_interval_ratio(ci[0], ic[0]),
+        "db_ack_etd": _mixed_interval_ratio(ci[1], ic[1]),
     }
     for name, expected in expected_ratios.items():
         observed = _number(ratios[name], f"$.metrics.ratios.{name}", minimum=0)
         if expected is None or not _close(observed, expected):
-            _fail(f"$.metrics.ratios.{name}", "does not match control/combined metrics")
+            _fail(
+                f"$.metrics.ratios.{name}",
+                f"does not match control/combined metrics: expected {expected}, observed {observed}",
+            )
     mixed_gates = _mapping(metrics["mixed_gates"], "$.metrics.mixed_gates")
     _fields(mixed_gates, {"query_slo", "query_degradation", "ingest_slo", "ingest_degradation", "controls_valid", "schedules_delivered", "overlap", "drained", "exact_events"}, "$.metrics.mixed_gates")
     for name in mixed_gates:
@@ -977,7 +1028,7 @@ def validate_scenario(document: Any) -> Mapping[str, Any]:
             scenario_pass = False
     expected_gates = {"correctness": semantic_pass, "resources": resources_pass, "schedule": schedule_pass, "scenario": scenario_pass}
     if dict(gates) != expected_gates:
-        _fail("$.gates", f"must equal computed gates {expected_gates}")
+        _fail("$.gates", f"must equal computed gates {expected_gates}; received {dict(gates)}")
     failed = not semantic_pass or not schedule_pass or not scenario_pass or (run["authoritative"] and not resources_pass)
     inconclusive = not run["authoritative"] or run["profile"] == "smoke" or not scenario_conclusive
     expected_status = "fail" if failed else ("inconclusive" if inconclusive else "pass")

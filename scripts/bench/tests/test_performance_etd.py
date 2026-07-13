@@ -270,6 +270,8 @@ class EtdScenarioTests(unittest.TestCase):
         self.assertEqual(result.status, "fail")
         self.assertEqual(result.samples[0]["error_code"], "missing_db_ack")
         self.assertIsNone(result.samples[0]["db_ack_ms"])
+        self.assertIsNone(result.samples[0]["first_hit_ms"])
+        self.assertIsNone(result.samples[0]["first_valid_ms"])
 
     def test_exact_identity_mismatch_is_a_semantic_failure(self) -> None:
         wrong = visible_result(self.event)

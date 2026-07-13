@@ -27,6 +27,7 @@ from performance_suite import (
     freeze,
     validate_path,
 )
+from performance_runtime import LocalEnvelope
 
 
 def digest(label: str) -> str:
@@ -123,6 +124,26 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(aggregate["memory_event_max_delta"], 0)
         self.assertNotEqual(aggregate["cgroup_identity_sha256"], collector.resources[0]["cgroup_identity_sha256"])
 
+    def test_qps_scenario_gate_is_independent_from_schedule_failure(self) -> None:
+        result = ScenarioResult("fail", {}, (), 0)
+        self.assertTrue(suite._scenario_pass(result, "qps"))
+
+    def test_local_qps_goodput_calibrates_follow_on_load_without_passing_gate(self) -> None:
+        result = ScenarioResult(
+            "fail",
+            {"sustainable_qps": 0},
+            ({"achieved_goodput_qps": 16.0},),
+            0,
+        )
+        self.assertEqual(
+            suite._qps_capacity_for_follow_on_load(result, authoritative=False),
+            16.0,
+        )
+        self.assertEqual(
+            suite._qps_capacity_for_follow_on_load(result, authoritative=True),
+            0.0,
+        )
+
     def test_binary_cache_and_reset_evidence_publish_only_hashes(self) -> None:
         build = protocol_build()
         collector = EvidenceCollector()
@@ -135,6 +156,12 @@ class EvidenceTests(unittest.TestCase):
         self.assertTrue(all(item["verified"] for item in binary["running_binaries"]))
         self.assertNotIn("generation-a", str(cache))
         self.assertEqual(collector.physical_resets["scenario"], _physical_reset_sha256("sb-private"))
+
+    def test_local_resource_evidence_is_explicitly_non_authoritative(self) -> None:
+        snapshot = LocalEnvelope("perf-0123456789ab").reset_measurement((), ())
+        resources = snapshot.artifact(snapshot)
+        self.assertFalse(resources["authoritative"])
+        self.assertFalse(resources["effective_limits_proven"])
 
     def test_qps_semantic_evidence_does_not_treat_expected_overload_as_wrong_answer(self) -> None:
         outcomes = {
@@ -242,6 +269,16 @@ class LifecycleTests(unittest.TestCase):
         envelope.remove.assert_called_once()
 
 
+    def test_local_envelope_checks_docker_without_claiming_cgroup_control(self) -> None:
+        process = mock.Mock(returncode=0, stderr="")
+        with mock.patch("performance_runtime._run", return_value=process) as run:
+            envelope = LocalEnvelope("perf-0123456789ab")
+            self.assertEqual(envelope.create(), "local-comparative")
+            evidence = envelope.inspect((), ()).artifact(envelope.reset_measurement((), ()))
+        run.assert_called_once_with(["docker", "info"], timeout=30)
+        self.assertFalse(evidence["authoritative"])
+        self.assertFalse(evidence["effective_limits_proven"])
+
 class CliArtifactTests(unittest.TestCase):
     def test_freeze_writes_canonical_fixture_accepted_by_validate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -268,6 +305,39 @@ class CliArtifactTests(unittest.TestCase):
                         root / "results",
                     )
             prepare.assert_called_once()
+            self.assertFalse(prepare.call_args.kwargs["authoritative"])
+
+    def test_local_cli_exposes_practical_defaults(self) -> None:
+        args = suite._parse_args(
+            [
+                "run",
+                "--mode",
+                "local",
+                "--baseline",
+                "/baseline",
+                "--candidate",
+                "/candidate",
+                "--output",
+                "/results",
+            ]
+        )
+        self.assertEqual(args.mode, "local")
+        self.assertIsNone(args.profile)
+        self.assertIsNone(args.pairs)
+
+    def test_local_comparison_validator_requires_non_authoritative_relative_evidence(self) -> None:
+        document = {
+            "schema_version": "moraine-local-comparison-v1",
+            "mode": "local_comparative",
+            "authoritative": False,
+            "pairs": 1,
+            "pair_results": [{}],
+            "artifacts": ["baseline/pair-1/artifacts/qps-research.json"],
+        }
+        suite._validate_local_comparison(document)
+        document["authoritative"] = True
+        with self.assertRaisesRegex(suite.SuiteFailure, "non-authoritative"):
+            suite._validate_local_comparison(document)
 
     def test_validate_rejects_untyped_json(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

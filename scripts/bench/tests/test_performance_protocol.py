@@ -776,6 +776,20 @@ class DocumentValidationTests(unittest.TestCase):
         self.assert_mutation_rejected(exact, lambda doc: doc["metrics"].__setitem__("lost_events", 1), "gates|status")
         self.assert_mutation_rejected(exact, lambda doc: doc["metrics"].__setitem__("duplicate_events", 1), "gates|status")
         self.assert_mutation_rejected(exact, lambda doc: doc["schedule"].__setitem__("streams_overlap", False), "gates|status")
+        self.assertEqual(
+            protocol._mixed_interval_ratio(
+                (125.0, None, "right"),
+                (100.0, None, "right"),
+            ),
+            1.25,
+        )
+        self.assertEqual(
+            protocol._mixed_interval_ratio(
+                (1.0, 2.0, "interval"),
+                (0.0, 0.0, "none"),
+            ),
+            0.0,
+        )
 
     def test_resource_binary_cache_and_schedule_evidence_are_fail_closed(self) -> None:
         base = self.result()

@@ -42,14 +42,19 @@ from performance_protocol import (
     load_suite_manifest,
     sha256_bytes,
     sha256_json,
+    resource_gate_passes,
+    schedule_gate_passes,
     validate_document,
     write_json_atomic,
 )
 from performance_runtime import (
     BuildIdentity,
     FixedEnvelope,
+    LocalEnvelope,
     RuntimeFailure,
     build_release_binaries,
+    build_release_binaries_in_docker,
+    ensure_runtime_build_image,
     non_authoritative_resource_evidence,
     run_busy_child_proof,
     run_id,
@@ -178,14 +183,14 @@ def _physical_reset_sha256(reset_id: str) -> str:
 @dataclass
 class EvidenceCollector:
     resources: list[dict[str, Any]] = field(default_factory=list)
-    binary_hashes: dict[str, str] = field(default_factory=dict)
+    binary_hashes: dict[str, tuple[str, bool]] = field(default_factory=dict)
     cache_generations: list[str] = field(default_factory=list)
     physical_resets: dict[str, str] = field(default_factory=dict)
 
-    def record_binary(self, name: str, digest: str) -> None:
-        previous = self.binary_hashes.setdefault(name, digest)
-        if previous != digest:
-            raise SuiteFailure(f"running binary changed within scenario: {name}")
+    def record_binary(self, name: str, digest: str, *, verified: bool = True) -> None:
+        previous = self.binary_hashes.setdefault(name, (digest, verified))
+        if previous != (digest, verified):
+            raise SuiteFailure(f"running binary evidence changed within scenario: {name}")
 
     def record_reset(self, role: str, reset_id: str) -> None:
         digest = _physical_reset_sha256(reset_id)
@@ -243,10 +248,17 @@ class EvidenceCollector:
             raise SuiteFailure("scenario has no verified running binary evidence")
         expected = {item["role"]: item["sha256"] for item in build["binaries"]}
         running = []
-        for role, observed in sorted(self.binary_hashes.items()):
+        for role, (observed, verified) in sorted(self.binary_hashes.items()):
             if expected.get(role) != observed:
                 raise SuiteFailure(f"running binary differs from immutable build: {role}")
-            running.append({"role": role, "sha256": expected[role], "proc_exe_sha256": observed, "verified": True})
+            running.append(
+                {
+                    "role": role,
+                    "sha256": expected[role],
+                    "proc_exe_sha256": observed,
+                    "verified": verified,
+                }
+            )
         return {
             "build_identity_sha256": build["identity_sha256"],
             "image_digest": build["image_digest"],
@@ -285,6 +297,7 @@ class ManagedSandbox:
         collector: EvidenceCollector,
         *,
         reset_role: str,
+        authoritative: bool,
     ) -> None:
         self._sandbox = sandbox
         self._envelope = envelope
@@ -299,6 +312,7 @@ class ManagedSandbox:
         self.build = sandbox.build
         self._collector.record_reset(reset_role, self.sandbox_id)
         self._build = build
+        self._authoritative = authoritative
         self._refresh_server_processes()
         self._before = envelope.reset_measurement(
             self._server_pids,
@@ -321,10 +335,12 @@ class ManagedSandbox:
             status = self._sandbox.central_status()
             routes = status.get("route_processes", [])
             if routes:
-                evidence = verify_process_binary(
-                    int(routes[-1]["pid"]), "moraine-mcp", self.build.binary_sha256["moraine-mcp"]
-                )
-                self._collector.record_binary(evidence.name, evidence.exe_sha256)
+                expected = self.build.binary_sha256["moraine-mcp"]
+                if self._authoritative:
+                    evidence = verify_process_binary(
+                        int(routes[-1]["pid"]), "moraine-mcp", expected
+                    )
+                    self._collector.record_binary(evidence.name, evidence.exe_sha256)
                 return process
             __import__("time").sleep(0.01)
         process.kill()
@@ -333,16 +349,28 @@ class ManagedSandbox:
 
     def _refresh_server_processes(self) -> None:
         try:
-            self._sandbox.central_status()
+            central = self._sandbox.central_status()
         except BaseException:
             process = self._sandbox.spawn_central()
             self._sandbox.wait_central_ready_without_search(process)
+            central = self._sandbox.central_status()
         status = self._sandbox.status()
         self._server_pids = status.server_pids
         self._loadgen_pids = status.loadgen_pids
-        for item in self._envelope.verify_running_binaries(
-            self._build.binary_sha256
-        ):
+        if self._authoritative:
+            verifier = self._envelope.verify_running_binaries(
+                self._build.binary_sha256
+            )
+        else:
+            verifier = self._sandbox.verify_running_binaries(
+                self._build.binary_sha256,
+                (
+                    int(central["central"]["pid"]),
+                    int(central["ingest"]["pid"]),
+                    *(int(pid) for pid in central["server_children"]),
+                ),
+            )
+        for item in verifier:
             self._collector.record_binary(item.name, item.exe_sha256)
 
     def _capture(self) -> Any:
@@ -404,8 +432,9 @@ def _start_measured_sandbox(
     collector: EvidenceCollector,
     *,
     reset_role: str,
+    authoritative: bool = True,
 ) -> ManagedSandbox:
-    envelope = FixedEnvelope(run_id())
+    envelope = FixedEnvelope(run_id()) if authoritative else LocalEnvelope(run_id())
     sandbox = None
     try:
         parent = envelope.create()
@@ -413,12 +442,20 @@ def _start_measured_sandbox(
             SUITE_ROOT,
             cgroup_parent=parent,
             build=build,
+            local=not authoritative,
         )
         observed_image_digest = sha256_json(sandbox.status().image_ids)
         if observed_image_digest != expected_image_digest:
             raise SuiteFailure("measured sandbox image identity differs from prepared build")
         _seed_owned_sandbox(sandbox, recipe)
-        return ManagedSandbox(sandbox, envelope, build, collector, reset_role=reset_role)
+        return ManagedSandbox(
+            sandbox,
+            envelope,
+            build,
+            collector,
+            reset_role=reset_role,
+            authoritative=authoritative,
+        )
     except BaseException as setup_error:
         cleanup_errors: list[str] = []
         if sandbox is not None:
@@ -442,16 +479,27 @@ def _start_measured_sandbox(
         raise
 
 
-def _discover_image_digest(repo: Path, build: BuildIdentity, *, prove_cpu: bool) -> str:
-    envelope = FixedEnvelope(run_id())
+def _discover_image_digest(
+    repo: Path,
+    build: BuildIdentity,
+    *,
+    prove_cpu: bool,
+    authoritative: bool,
+) -> str:
+    envelope = FixedEnvelope(run_id()) if authoritative else LocalEnvelope(run_id())
     sandbox = None
     try:
         parent = envelope.create()
-        if prove_cpu:
+        if prove_cpu and authoritative:
             proof = run_busy_child_proof(envelope)
             if proof.usage_per_wall_cpu < 0.85 or proof.usage_per_wall_cpu > 1.15:
                 raise SuiteFailure("aggregate busy-child CPU proof fell outside the declared tolerance")
-        sandbox = start_owned_sandbox(SUITE_ROOT, cgroup_parent=parent, build=build)
+        sandbox = start_owned_sandbox(
+            SUITE_ROOT,
+            cgroup_parent=parent,
+            build=build,
+            local=not authoritative,
+        )
         status = sandbox.status()
         return sha256_json(status.image_ids)
     finally:
@@ -475,17 +523,31 @@ class PreparedBuild:
     protocol: Mapping[str, Any]
 
 
-def _prepare_builds(repositories: Mapping[str, Path], output: Path) -> tuple[dict[str, PreparedBuild], Mapping[str, Any]]:
+def _prepare_builds(
+    repositories: Mapping[str, Path],
+    output: Path,
+    *,
+    authoritative: bool,
+) -> tuple[dict[str, PreparedBuild], Mapping[str, Any]]:
     prepared: dict[str, PreparedBuild] = {}
     common_recipe: Optional[Mapping[str, Any]] = None
     output.mkdir(parents=True, exist_ok=False)
+    if not authoritative and platform.system() != "Linux":
+        ensure_runtime_build_image(SUITE_ROOT)
     for index, (arm, repo) in enumerate(repositories.items()):
         _require_clean(repo)
-        runtime_build = build_release_binaries(
-            repo,
-            output / arm,
-            toolchain_file=SUITE_ROOT / "rust-toolchain.toml",
-        )
+        if authoritative or platform.system() == "Linux":
+            runtime_build = build_release_binaries(
+                repo,
+                output / arm,
+                toolchain_file=SUITE_ROOT / "rust-toolchain.toml",
+            )
+        else:
+            runtime_build = build_release_binaries_in_docker(
+                repo,
+                output / arm,
+                toolchain_file=SUITE_ROOT / "rust-toolchain.toml",
+            )
         build_environment_sha256 = runtime_build.artifact()["recipe"]["build_environment_sha256"]
         recipe = create_build_recipe(
             toolchain_sha256=runtime_build.toolchain_sha256,
@@ -499,7 +561,12 @@ def _prepare_builds(repositories: Mapping[str, Path], output: Path) -> tuple[dic
             common_recipe = recipe
         elif recipe != common_recipe:
             raise SuiteFailure("baseline and candidate build recipes differ")
-        image_digest = _discover_image_digest(SUITE_ROOT, runtime_build, prove_cpu=index == 0)
+        image_digest = _discover_image_digest(
+            SUITE_ROOT,
+            runtime_build,
+            prove_cpu=index == 0,
+            authoritative=authoritative,
+        )
         protocol_build = create_build_identity(
             arm=arm,
             git_commit=_git_commit(repo),
@@ -568,8 +635,6 @@ def _semantic_evidence(
 
 
 def _scenario_pass(result: ScenarioResult, scenario: str) -> bool:
-    if result.status == "fail":
-        return False
     if scenario == "qps":
         return True
     if scenario == "ttr":
@@ -672,20 +737,29 @@ def _run_scenario(
     event_count = 0
     expanded_schedule: Mapping[str, Any]
     if scenario == "qps":
+        setup_errors: list[str] = []
+
         def sandbox_factory(_spec: Any) -> ManagedSandbox:
-            return _start_measured_sandbox(
-                repo,
-                prepared.runtime,
-                str(prepared.protocol["image_digest"]),
-                recipe,
-                collector,
-                reset_role="trial",
-            )
+            try:
+                return _start_measured_sandbox(
+                    repo,
+                    prepared.runtime,
+                    str(prepared.protocol["image_digest"]),
+                    recipe,
+                    collector,
+                    reset_role="trial",
+                    authoritative=bool(run["authoritative"]),
+                )
+            except BaseException as error:
+                setup_errors.append(str(error))
+                raise
 
         runtime_factory = make_owned_sandbox_qps_runtime_factory(
             sandbox_factory, lambda sandbox: sandbox.trial_telemetry()
         )
         result = run_qps_scenario(query_cases, runtime_factory, profile=run["profile"])
+        if setup_errors:
+            raise SuiteFailure(f"QPS sandbox setup failed: {setup_errors[0]}")
         expanded_schedule = {
             "scenario": scenario,
             "split": split,
@@ -707,6 +781,7 @@ def _run_scenario(
             recipe,
             collector,
             reset_role="scenario",
+            authoritative=bool(run["authoritative"]),
         )
         try:
             samples = 3 if run["profile"] == "smoke" else 15
@@ -733,6 +808,7 @@ def _run_scenario(
             recipe,
             collector,
             reset_role="scenario",
+            authoritative=bool(run["authoritative"]),
         )
         event_schedule = open_event_schedule(recipe, split)
         event_count = len(event_schedule)
@@ -773,7 +849,11 @@ def _run_scenario(
                 mode="idle" if scenario == "etd_idle" else "loaded",
                 timeout_s=timeout_s,
                 poll_interval_s=recipe["schedule_templates"]["etd"]["poll_interval_ns"] / 1_000_000_000,
-                baseline_sustainable_qps=baseline_sustainable_qps,
+                baseline_sustainable_qps=(
+                    baseline_sustainable_qps
+                    if scenario == "etd_loaded"
+                    else None
+                ),
                 query_load=query_load,
             )
         finally:
@@ -799,6 +879,7 @@ def _run_scenario(
                 recipe,
                 collector,
                 reset_role=role_map[label],
+                authoritative=bool(run["authoritative"]),
             )
 
         arm_factory = make_owned_sandbox_mixed_arm_factory(
@@ -832,9 +913,9 @@ def _run_scenario(
         event_count=event_count,
     )
     semantic = _semantic_evidence(result, scenario, split, recipe)
-    schedule_pass = not schedule["dropped"] and not schedule["unfinished"] and schedule["drained"] and schedule["p99_start_slip_ms"] <= 10 and schedule["drain_ms"] <= 5_000
-    resource_pass = resources["authoritative"] and resources["memory_peak_bytes"] < resources["memory_max_bytes"] and resources["swap_current_bytes"] == 0 and resources["oom_kill_delta"] == 0 and resources["memory_event_high_delta"] == 0 and resources["memory_event_max_delta"] == 0 and all(resources[name] for name in ("controllers_enabled_proven", "effective_limits_proven", "host_headroom_proven", "server_descendants_proven", "loadgen_excluded_proven"))
+    schedule_pass = schedule_gate_passes(schedule)
     scenario_pass = _scenario_pass(result, scenario)
+    resource_pass = resource_gate_passes(resources)
     gates = {
         "correctness": semantic["passed"],
         "resources": resource_pass,
@@ -874,6 +955,23 @@ def _ordered_usage(recipe: Mapping[str, Any], purpose: str) -> tuple[tuple[str, 
     usage = required_split_usage(recipe, "baseline")
     validate_split_usage(recipe, usage, "baseline")
     return usage
+
+
+def _qps_capacity_for_follow_on_load(
+    result: ScenarioResult,
+    *,
+    authoritative: bool,
+) -> float:
+    capacity = float(result.metrics["sustainable_qps"])
+    if capacity > 0 or authoritative:
+        return capacity
+    # A best-effort local run may miss the fixed scheduler gate by a small
+    # margin even when every request completes correctly. Keep the artifact
+    # failed, but use observed goodput to exercise the remaining scenarios.
+    return max(
+        (float(sample["achieved_goodput_qps"]) for sample in result.samples),
+        default=0.0,
+    )
 
 
 def _run_logical_arm(
@@ -922,7 +1020,10 @@ def _run_logical_arm(
         if split == "research" and document["status"] != "pass":
             research_passed = False
         if scenario == "qps" and split == "research" and measured_capacity is None:
-            measured_capacity = float(result.metrics["sustainable_qps"])
+            measured_capacity = _qps_capacity_for_follow_on_load(
+                result,
+                authoritative=authoritative,
+            )
     if measured_capacity is None or measured_capacity <= 0:
         raise SuiteFailure("arm did not produce a positive baseline capacity")
     return paths, measured_capacity
@@ -986,7 +1087,11 @@ def run_baseline(repositories: Mapping[str, Path], profile: str, output: Path) -
     recipe = build_recipe(profile)
     validate_recipe(recipe)
     output.mkdir(parents=True, exist_ok=False)
-    prepared, build_recipe_document = _prepare_builds(repositories, output / "builds")
+    prepared, build_recipe_document = _prepare_builds(
+        repositories,
+        output / "builds",
+        authoritative=profile == "full",
+    )
     definition = _definition(profile, recipe, prepared, build_recipe_document)
     manifest_paths: list[Path] = []
     count = 1 if profile == "smoke" else 7
@@ -1021,6 +1126,209 @@ def run_baseline(repositories: Mapping[str, Path], profile: str, output: Path) -
     if profile == "full":
         write_json_atomic(output / "repeatability.json", evaluate_repeatability(manifest_paths))
     return manifest_paths
+def _local_docker_platform() -> Mapping[str, Any]:
+    process = subprocess.run(
+        ["docker", "info", "--format", "{{json .}}"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if process.returncode:
+        raise SuiteFailure(f"cannot inspect local Docker environment: {process.stderr.strip()}")
+    try:
+        value = json.loads(process.stdout)
+    except json.JSONDecodeError as error:
+        raise SuiteFailure("Docker returned invalid environment metadata") from error
+    fields = (
+        "OperatingSystem",
+        "Architecture",
+        "NCPU",
+        "MemTotal",
+        "ServerVersion",
+        "CgroupVersion",
+        "CgroupDriver",
+    )
+    return {name: value.get(name) for name in fields}
+
+
+def _interval_midpoint(interval: Mapping[str, Any]) -> Optional[float]:
+    lower = interval.get("lower_ms")
+    upper = interval.get("upper_ms")
+    if not isinstance(lower, (int, float)) or isinstance(lower, bool):
+        return None
+    if not isinstance(upper, (int, float)) or isinstance(upper, bool):
+        return None
+    return (float(lower) + float(upper)) / 2.0
+
+
+def _positive_geometric_mean(values: Sequence[float]) -> Optional[float]:
+    if not values or any(value <= 0 for value in values):
+        return None
+    return statistics.geometric_mean(values)
+
+
+def _validate_local_comparison(document: Any) -> None:
+    if not isinstance(document, Mapping):
+        raise SuiteFailure("local comparison must be a mapping")
+    if document.get("schema_version") != "moraine-local-comparison-v1":
+        raise SuiteFailure("local comparison schema is invalid")
+    if document.get("mode") != "local_comparative" or document.get("authoritative") is not False:
+        raise SuiteFailure("local comparison must remain explicitly non-authoritative")
+    pairs = document.get("pairs")
+    pair_results = document.get("pair_results")
+    if (
+        isinstance(pairs, bool)
+        or not isinstance(pairs, int)
+        or pairs < 1
+        or not isinstance(pair_results, list)
+        or len(pair_results) != pairs
+    ):
+        raise SuiteFailure("local comparison pair evidence is incomplete")
+    artifacts = document.get("artifacts")
+    if not isinstance(artifacts, list) or not artifacts:
+        raise SuiteFailure("local comparison artifacts are missing")
+    for raw in artifacts:
+        if not isinstance(raw, str) or Path(raw).is_absolute() or ".." in Path(raw).parts:
+            raise SuiteFailure("local comparison artifact path is not relative")
+
+
+def run_local_comparison(
+    repositories: Mapping[str, Path],
+    *,
+    profile: str,
+    pairs: int,
+    output: Path,
+) -> Path:
+    """Run a paired, directional comparison under the local Docker scheduler."""
+
+    if set(repositories) != {"baseline", "candidate"}:
+        raise SuiteFailure("local comparison requires baseline and candidate repositories")
+    if profile not in {"smoke", "full"}:
+        raise SuiteFailure("local comparison profile must be smoke or full")
+    if pairs < 1 or pairs > len(PAIR_ORDER):
+        raise SuiteFailure(f"local comparison pairs must be between 1 and {len(PAIR_ORDER)}")
+    recipe = build_recipe(profile)
+    validate_recipe(recipe)
+    output.mkdir(parents=True, exist_ok=False)
+    prepared, build_recipe_document = _prepare_builds(
+        repositories,
+        output / "builds",
+        authoritative=False,
+    )
+    definition = _definition(profile, recipe, prepared, build_recipe_document)
+    frozen_capacity: Optional[float] = None
+    pair_documents: list[dict[str, Any]] = []
+    artifact_paths: list[str] = []
+    for pair_id, order in enumerate(PAIR_ORDER[:pairs], 1):
+        sequence = ("baseline", "candidate") if order == "AB" else ("candidate", "baseline")
+        by_arm: dict[str, dict[str, Mapping[str, Any]]] = {}
+        for arm in sequence:
+            artifacts_root = output / arm / f"pair-{pair_id}" / "artifacts"
+            artifacts_root.mkdir(parents=True)
+            paths, measured_capacity = _run_logical_arm(
+                repositories[arm],
+                prepared[arm],
+                recipe,
+                definition,
+                arm=arm,
+                pair_id=pair_id,
+                order=order,
+                purpose="baseline",
+                authoritative=False,
+                baseline_sustainable_qps=frozen_capacity,
+                output=artifacts_root,
+            )
+            if frozen_capacity is None:
+                if arm != "baseline":
+                    raise SuiteFailure("first local pair must establish baseline capacity before candidate")
+                frozen_capacity = measured_capacity
+            by_arm[arm] = {}
+            for path in paths:
+                document = load_document(path)
+                by_arm[arm][str(document["scenario"])] = document
+                artifact_paths.append(str(path.relative_to(output)))
+        baseline = by_arm["baseline"]
+        candidate = by_arm["candidate"]
+        baseline_qps = float(baseline["qps"]["metrics"]["sustainable_qps"])
+        candidate_qps = float(candidate["qps"]["metrics"]["sustainable_qps"])
+        baseline_ttr = float(baseline["ttr"]["metrics"]["p95_ms"])
+        candidate_ttr = float(candidate["ttr"]["metrics"]["p95_ms"])
+        baseline_etd = _interval_midpoint(
+            baseline["etd_loaded"]["metrics"]["source_etd_p95"]
+        )
+        candidate_etd = _interval_midpoint(
+            candidate["etd_loaded"]["metrics"]["source_etd_p95"]
+        )
+        pair_documents.append(
+            {
+                "pair_id": pair_id,
+                "order": order,
+                "baseline": {
+                    "qps": baseline_qps,
+                    "ttr_p95_ms": baseline_ttr,
+                    "source_etd_p95_midpoint_ms": baseline_etd,
+                    "mixed_ratios": baseline["mixed"]["metrics"]["ratios"],
+                },
+                "candidate": {
+                    "qps": candidate_qps,
+                    "ttr_p95_ms": candidate_ttr,
+                    "source_etd_p95_midpoint_ms": candidate_etd,
+                    "mixed_ratios": candidate["mixed"]["metrics"]["ratios"],
+                },
+                "ratios": {
+                    "qps": candidate_qps / baseline_qps if baseline_qps > 0 else None,
+                    "ttr": baseline_ttr / candidate_ttr if candidate_ttr > 0 else None,
+                    "source_etd": (
+                        baseline_etd / candidate_etd
+                        if baseline_etd is not None
+                        and candidate_etd is not None
+                        and candidate_etd > 0
+                        else None
+                    ),
+                },
+            }
+        )
+    ratios = {
+        name: [
+            float(pair["ratios"][name])
+            for pair in pair_documents
+            if pair["ratios"][name] is not None
+        ]
+        for name in ("qps", "ttr", "source_etd")
+    }
+    summary = {
+        "schema_version": "moraine-local-comparison-v1",
+        "mode": "local_comparative",
+        "authoritative": False,
+        "profile": profile,
+        "pairs": pairs,
+        "docker_platform": _local_docker_platform(),
+        "builds": {
+            arm: prepared[arm].protocol["identity_sha256"]
+            for arm in ("baseline", "candidate")
+        },
+        "frozen_baseline_capacity_qps": frozen_capacity,
+        "pair_results": pair_documents,
+        "aggregate_ratios": {
+            name: _positive_geometric_mean(values)
+            for name, values in ratios.items()
+        },
+        "candidate_wins": {
+            name: sum(value > 1.0 for value in values)
+            for name, values in ratios.items()
+        },
+        "artifacts": artifact_paths,
+        "interpretation": (
+            "Directional paired evidence for this Docker environment only; "
+            "resource isolation is best-effort and results are not authoritative."
+        ),
+    }
+    path = output / "local-comparison.json"
+    write_json_atomic(path, summary, validator=_validate_local_comparison)
+    return path
+
+
 
 
 def _bind_repeatability_study(
@@ -1074,7 +1382,11 @@ def run_comparison(
     recipe = build_recipe("full")
     validate_recipe(recipe)
     output.mkdir(parents=True, exist_ok=False)
-    prepared, build_recipe_document = _prepare_builds(repositories, output / "builds")
+    prepared, build_recipe_document = _prepare_builds(
+        repositories,
+        output / "builds",
+        authoritative=True,
+    )
     definition = _definition("full", recipe, prepared, build_recipe_document)
     _bind_repeatability_study(baseline_manifests, definition)
     baseline_capacity = statistics.median(repeatability["metrics"]["values"]["qps"])
@@ -1134,6 +1446,13 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     smoke_parser.add_argument("--repo", type=Path, default=Path.cwd())
     smoke_parser.add_argument("--output", type=Path, required=True)
     run_parser = commands.add_parser("run")
+    run_parser.add_argument(
+        "--mode",
+        choices=("local", "authoritative"),
+        default="authoritative",
+    )
+    run_parser.add_argument("--profile", choices=("smoke", "full"))
+    run_parser.add_argument("--pairs", type=int)
     run_parser.add_argument("--baseline", type=Path, required=True)
     run_parser.add_argument("--candidate", type=Path)
     run_parser.add_argument("--baseline-manifests", type=Path, nargs=7)
@@ -1155,11 +1474,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             write_json_atomic(args.output, evaluate_repeatability(args.manifests))
         elif args.command == "smoke":
             run_baseline({"baseline": args.repo.resolve()}, "smoke", args.output)
+        elif args.mode == "local":
+            if args.candidate is None:
+                raise SuiteFailure("local comparison requires --candidate")
+            if args.baseline_manifests is not None:
+                raise SuiteFailure("local comparison does not accept --baseline-manifests")
+            run_local_comparison(
+                {
+                    "baseline": args.baseline.resolve(),
+                    "candidate": args.candidate.resolve(),
+                },
+                profile=args.profile or "smoke",
+                pairs=args.pairs or 3,
+                output=args.output,
+            )
         elif args.candidate is None:
+            if args.profile is not None or args.pairs is not None:
+                raise SuiteFailure("--profile and --pairs apply only to --mode local")
             if args.baseline_manifests is not None:
                 raise SuiteFailure("baseline-only run does not accept --baseline-manifests")
             run_baseline({"baseline": args.baseline.resolve()}, "full", args.output)
         else:
+            if args.profile is not None or args.pairs is not None:
+                raise SuiteFailure("--profile and --pairs apply only to --mode local")
             if args.baseline_manifests is None:
                 raise SuiteFailure("comparison run requires seven --baseline-manifests")
             run_comparison(

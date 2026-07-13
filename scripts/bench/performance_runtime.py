@@ -315,6 +315,99 @@ def build_release_binaries(
     )
 
 
+def ensure_runtime_build_image(
+    repo_root: Path,
+    image: str = "moraine-sandbox-runtime:latest",
+) -> None:
+    """Refresh the shared Linux build/runtime image once per local suite run."""
+
+    dockerfile_root = repo_root / "scripts/dev/sandbox"
+    built = _run(
+        ["docker", "build", "-t", image, str(dockerfile_root)],
+        timeout=3600,
+    )
+    if built.returncode:
+        raise RuntimeFailure(
+            f"sandbox runtime image build failed: {built.stderr[-4096:].strip()}"
+        )
+
+
+def build_release_binaries_in_docker(
+    repo_root: Path,
+    destination: Path,
+    *,
+    toolchain_file: Path,
+    image: str = "moraine-sandbox-runtime:latest",
+) -> BuildIdentity:
+    """Build Linux binaries in the sandbox image for local Docker benchmarks."""
+
+    try:
+        document = tomllib.loads(toolchain_file.read_text(encoding="utf-8"))
+        channel = document["toolchain"]["channel"]
+    except (OSError, tomllib.TOMLDecodeError, KeyError, TypeError) as error:
+        raise RuntimeFailure("suite rust-toolchain.toml is invalid") from error
+    if not isinstance(channel, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", channel):
+        raise RuntimeFailure("suite Rust toolchain channel is invalid")
+    inspect = _run(["docker", "image", "inspect", image], timeout=30)
+    if inspect.returncode:
+        ensure_runtime_build_image(repo_root, image)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=f".{destination.name}-linux-",
+        dir=destination.parent,
+    ) as temporary:
+        raw = Path(temporary)
+        copies = " && ".join(
+            f"install -m 0755 /target/release/{name} /out/{name}"
+            for name in RELEASE_BINARIES
+        )
+        command = (
+            f"rustup toolchain install {channel} --profile minimal"
+            " && rustc -vV > /out/rustc-vv"
+            " && cd /repo"
+            " && cargo build --workspace --release --locked"
+            f" && {copies}"
+            f" && chown -R {os.getuid()}:{os.getgid()} /out"
+        )
+        proc = _run(
+            [
+                "docker", "run", "--rm", "--user", "root",
+                "--entrypoint", "/bin/bash",
+                "-e", f"RUSTUP_TOOLCHAIN={channel}",
+                "-e", "CARGO_HOME=/usr/local/cargo",
+                "-e", "RUSTC_WRAPPER=",
+                "-e", "CARGO_TARGET_DIR=/target",
+                "-v", f"{repo_root.resolve()}:/repo:ro",
+                "-v", f"{raw.resolve()}:/out",
+                image,
+                "-c", command,
+            ],
+            timeout=3600,
+        )
+        if proc.returncode:
+            raise RuntimeFailure(f"containerized release build failed: {proc.stderr[-4096:].strip()}")
+        try:
+            fields = dict(
+                line.split(": ", 1)
+                for line in (raw / "rustc-vv").read_text(encoding="utf-8").splitlines()
+                if ": " in line
+            )
+        except OSError as error:
+            raise RuntimeFailure("containerized rustc identity is unavailable") from error
+        target = fields.get("host", "")
+        release = fields.get("release", "")
+        if not target or not release:
+            raise RuntimeFailure("containerized rustc identity is incomplete")
+        return freeze_release_binaries(
+            raw,
+            destination,
+            target=target,
+            rustc_release=release,
+            toolchain_sha256=hash_file(toolchain_file),
+            build_environment={},
+        )
+
+
 def run_id() -> str:
     return "perf-" + uuid.uuid4().hex[:12]
 
@@ -597,6 +690,51 @@ def non_authoritative_resource_evidence() -> dict[str, Any]:
         _canonical_sha256([]),
     )
     return empty.artifact(empty)
+@dataclass(frozen=True)
+class LocalResourceSnapshot:
+    """Best-effort resource marker for a Docker-owned local comparison."""
+
+    def artifact(self, _before: "LocalResourceSnapshot") -> dict[str, Any]:
+        return non_authoritative_resource_evidence()
+
+    def assert_clean(self, _before: "LocalResourceSnapshot") -> None:
+        return None
+
+
+class LocalEnvelope:
+    """Preserve the measured topology without claiming host cgroup control."""
+
+    authoritative = False
+
+    def __init__(self, owned_id: str) -> None:
+        if not OWNED_ID_RE.fullmatch(owned_id):
+            raise RuntimeFailure("invalid performance run id")
+        self.owned_id = owned_id
+
+    def create(self) -> str:
+        proc = _run(["docker", "info"], timeout=30)
+        if proc.returncode:
+            raise RuntimeFailure(f"local benchmark requires Docker: {proc.stderr.strip()}")
+        return "local-comparative"
+
+    def reset_measurement(
+        self,
+        _server_pids: Sequence[int],
+        _excluded_pids: Sequence[int],
+    ) -> LocalResourceSnapshot:
+        return LocalResourceSnapshot()
+
+    def inspect(
+        self,
+        _server_pids: Sequence[int],
+        _excluded_pids: Sequence[int],
+    ) -> LocalResourceSnapshot:
+        return LocalResourceSnapshot()
+
+    def remove(self, *, ignore_nonempty: bool = False) -> None:
+        del ignore_nonempty
+
+
 
 
 CommandRunner = Callable[[Sequence[str], float], subprocess.CompletedProcess[str]]
@@ -604,6 +742,7 @@ CommandRunner = Callable[[Sequence[str], float], subprocess.CompletedProcess[str
 
 class FixedEnvelope:
     """Own and prove one aggregate server cgroup and no other resources."""
+    authoritative = True
 
     def __init__(
         self,
@@ -1246,6 +1385,60 @@ class OwnedSandbox:
             raise RuntimeFailure("sandbox ownership identity changed")
         return status
 
+    def verify_running_binaries(
+        self,
+        expected_hashes: Mapping[str, str],
+        pids: Sequence[int],
+    ) -> tuple[BinaryProcessEvidence, ...]:
+        """Hash measured executables from inside the container PID namespace."""
+
+        unknown = set(RUNNING_SERVER_BINARIES) - set(expected_hashes)
+        if unknown:
+            raise RuntimeFailure(f"missing expected binary hashes: {sorted(unknown)}")
+        status = self.status()
+        container = next(
+            item.container_id
+            for item in status.containers
+            if item.role == "server_moraine"
+        )
+        found: dict[str, BinaryProcessEvidence] = {}
+        for pid in sorted(set(pids)):
+            exe = f"/proc/{pid}/exe"
+            readlink = _run(["docker", "exec", container, "readlink", exe], timeout=30)
+            if readlink.returncode:
+                continue
+            name = Path(readlink.stdout.strip()).name.removesuffix(" (deleted)")
+            if name not in RUNNING_SERVER_BINARIES:
+                continue
+            if name in found:
+                raise RuntimeFailure(f"multiple running {name} binaries in measured container")
+            checksum = _run(["docker", "exec", container, "sha256sum", exe], timeout=30)
+            if checksum.returncode:
+                raise RuntimeFailure(
+                    f"cannot hash running {name} binary: {checksum.stderr.strip()}"
+                )
+            digest = "sha256:" + checksum.stdout.split(maxsplit=1)[0]
+            if digest != expected_hashes[name]:
+                raise RuntimeFailure(f"running {name} binary differs from frozen build")
+            stat_result = _run(["docker", "exec", container, "cat", f"/proc/{pid}/stat"], timeout=30)
+            if stat_result.returncode:
+                raise RuntimeFailure(
+                    f"cannot read running {name} process identity: {stat_result.stderr.strip()}"
+                )
+            closing = stat_result.stdout.rfind(")")
+            fields = stat_result.stdout[closing + 2 :].split()
+            if closing < 0 or len(fields) < 20:
+                raise RuntimeFailure(f"cannot read starttime for running {name}")
+            try:
+                starttime = int(fields[19])
+            except ValueError as error:
+                raise RuntimeFailure(f"invalid starttime for running {name}") from error
+            found[name] = BinaryProcessEvidence(name, pid, starttime, digest)
+        missing = set(RUNNING_SERVER_BINARIES) - set(found)
+        if missing:
+            raise RuntimeFailure(f"required server binaries are not running: {sorted(missing)}")
+        return tuple(found[name] for name in RUNNING_SERVER_BINARIES)
+
     def central_status(self) -> Mapping[str, Any]:
         value = self._json_command(["benchmark-service", "status", self.sandbox_id])
         expected_fields = {
@@ -1540,6 +1733,7 @@ def start_owned_sandbox(
     *,
     cgroup_parent: str,
     build: BuildIdentity,
+    local: bool = False,
 ) -> OwnedSandbox:
     """Start one physical performance sandbox and verify its immutable identity."""
 
@@ -1555,12 +1749,14 @@ def start_owned_sandbox(
         "--quiet",
         "--id",
         sandbox_id,
-        "--performance",
-        "--cgroup-parent",
-        cgroup_parent,
+        "--local-performance" if local else "--performance",
+    ]
+    if not local:
+        args.extend(["--cgroup-parent", cgroup_parent])
+    args.extend([
         "--binary-dir",
         str(build.directory),
-    ]
+    ])
     try:
         proc = _run(args, timeout=3600)
         if proc.returncode:
@@ -1569,7 +1765,7 @@ def start_owned_sandbox(
             raise RuntimeFailure("sandbox returned a mismatched owned id")
         status = _sandbox_status(script, sandbox_id)
         if not status.performance or status.cgroup_parent != cgroup_parent:
-            raise RuntimeFailure("sandbox status omitted performance cgroup identity")
+            raise RuntimeFailure("sandbox status omitted performance execution identity")
         if dict(status.binary_sha256) != dict(build.binary_sha256):
             raise RuntimeFailure("sandbox binary manifest differs from frozen build")
         if status.binary_manifest_sha256 != build.manifest_sha256:

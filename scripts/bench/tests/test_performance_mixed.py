@@ -4,6 +4,7 @@ import sys
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 BENCH_DIR = Path(__file__).resolve().parents[1]
 if str(BENCH_DIR) not in sys.path:
@@ -172,6 +173,26 @@ class MixedScenarioTests(unittest.TestCase):
             combined_timeout_s=1.0,
         )
 
+    def test_owned_query_stream_prepares_route_before_measurement(self) -> None:
+        sandbox = mock.Mock(sandbox_id="sb-123456")
+        runner = mock.Mock(return_value=query_evidence())
+        with mock.patch.object(
+            scenarios,
+            "make_owned_sandbox_query_load",
+            return_value=runner,
+        ):
+            arm = scenarios.OwnedSandboxMixedArm(
+                sandbox,
+                {"q0": {"case_id": "q0"}},
+                {"e0": {"case_id": "e0"}},
+                query_rate_qps=10.0,
+                recipe_fingerprint="fixture",
+            )
+            result = arm.run_query(QUERY_SCHEDULE[:1])
+        runner.prepare.assert_called_once_with()
+        runner.assert_called_once_with(10.0)
+        self.assertEqual(result["metrics"]["goodput_qps"], 100.0)
+
     def test_controls_run_before_one_barrier_started_overlapping_combined_arm(self) -> None:
         factory = ArmFactory()
         result = self.run_mixed(factory)
@@ -216,6 +237,28 @@ class MixedScenarioTests(unittest.TestCase):
         factory.mutations[("ingest_only", "ingest")] = starve
         result = self.run_mixed(factory)
         self.assertEqual(result.status, "fail")
+
+    def test_right_censored_ingest_control_emits_failed_result(self) -> None:
+        factory = ArmFactory()
+
+        def censor(evidence: dict) -> None:
+            evidence["status"] = "fail"
+            for name in ("source_etd_p95", "db_ack_etd_p95"):
+                evidence["metrics"][name] = {
+                    "lower_ms": 5_000.0,
+                    "upper_ms": None,
+                    "censoring": "right",
+                }
+            for sample in evidence["samples"]:
+                sample["valid"] = False
+
+        factory.mutations[("ingest_only", "ingest")] = censor
+        result = self.run_mixed(factory)
+        self.assertEqual(result.status, "fail")
+        self.assertFalse(result.metrics["mixed_gates"]["controls_valid"])
+        self.assertIsNone(
+            result.metrics["ingest_control"]["source_etd_p95"]["upper_ms"]
+        )
 
     def test_severe_degradation_fails_even_while_absolute_slos_pass(self) -> None:
         factory = ArmFactory()

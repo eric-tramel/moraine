@@ -457,6 +457,7 @@ class EvidenceAndBuildTests(unittest.TestCase):
         self.assertNotIn("/repo", text)
         self.assertNotIn("cargo-home", text)
         self.assertIn("${SANDBOX_BIN_DIR:?immutable release binary directory required}:/opt/moraine/bin:ro", text)
+        self.assertIn("${SANDBOX_WEB_DIR:?monitor static directory required}:/opt/moraine/web:ro", text)
         self.assertNotIn("cgroup_parent", loadgen)
         self.assertIn('["/bin/sleep", "infinity"]', loadgen)
 

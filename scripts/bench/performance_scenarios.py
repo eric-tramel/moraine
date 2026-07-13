@@ -1987,16 +1987,8 @@ def _run_one_etd_event(
                     if last_miss_ns is not None and t0_ns is not None
                     else None
                 ),
-                "first_hit_ms": (
-                    _milliseconds(first_hit_ns, t0_ns)
-                    if first_hit_ns is not None and t0_ns is not None
-                    else None
-                ),
-                "first_valid_ms": (
-                    _milliseconds(first_valid_ns, t0_ns)
-                    if first_valid_ns is not None and t0_ns is not None
-                    else None
-                ),
+                "first_hit_ms": None,
+                "first_valid_ms": None,
                 "source_interval": _right_interval(
                     _milliseconds(last_miss_ns, t0_ns)
                     if last_miss_ns is not None and t0_ns is not None
@@ -2336,16 +2328,22 @@ def _interval_metric(value: Any, name: str) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise ScenarioError(f"{name} interval is missing")
     lower = _finite_nonnegative(value.get("lower_ms"), f"{name} lower")
+    censoring = value.get("censoring")
     upper = value.get("upper_ms")
     if upper is None:
-        raise ScenarioError(f"{name} is right-censored")
+        if censoring != "right":
+            raise ScenarioError(f"{name} null upper bound is not right-censored")
+        return {"lower_ms": lower, "upper_ms": None, "censoring": censoring}
     upper_number = _finite_nonnegative(upper, f"{name} upper")
     if lower > upper_number:
         raise ScenarioError(f"{name} interval is inverted")
-    censoring = value.get("censoring")
     if censoring not in {"none", "left", "interval"}:
         raise ScenarioError(f"{name} censoring is invalid")
     return {"lower_ms": lower, "upper_ms": upper_number, "censoring": censoring}
+
+def _interval_comparison_bound(interval: Mapping[str, Any]) -> float:
+    upper = interval["upper_ms"]
+    return float(interval["lower_ms"] if upper is None else upper)
 
 
 def _ingest_arm_metrics(evidence: Mapping[str, Any]) -> dict[str, Any]:
@@ -2495,7 +2493,7 @@ def run_mixed_scenario(
                     combined_bounds[name] = (first_started_ns, last_completed_ns)
             except Exception as exc:
                 with result_lock:
-                    combined_errors.append(f"{name}_{type(exc).__name__}")
+                    combined_errors.append(f"{name}_{type(exc).__name__}: {exc}")
 
         query_thread = threading.Thread(target=run_combined_stream, args=("query",), daemon=True)
         ingest_thread = threading.Thread(target=run_combined_stream, args=("ingest",), daemon=True)
@@ -2509,7 +2507,11 @@ def run_mixed_scenario(
         combined_depth = combined_runtime.queue_depth()
         combined_runtime.close()
         if combined_errors or set(combined_results) != {"query", "ingest"}:
-            raise ScenarioError("combined streams did not both complete and drain")
+            missing = sorted({"query", "ingest"} - set(combined_results))
+            raise ScenarioError(
+                "combined streams did not both complete and drain: "
+                f"errors={sorted(combined_errors)!r}, missing={missing!r}"
+            )
 
         query_control_metrics = _query_arm_metrics(query_control)
         ingest_control_metrics = _ingest_arm_metrics(ingest_control)
@@ -2555,12 +2557,12 @@ def run_mixed_scenario(
                 combined_query_metrics["p99_ms"], query_control_metrics["p99_ms"]
             ),
             "source_etd": _safe_ratio(
-                combined_ingest_metrics["source_etd_p95"]["upper_ms"],
-                ingest_control_metrics["source_etd_p95"]["upper_ms"],
+                _interval_comparison_bound(combined_ingest_metrics["source_etd_p95"]),
+                _interval_comparison_bound(ingest_control_metrics["source_etd_p95"]),
             ),
             "db_ack_etd": _safe_ratio(
-                combined_ingest_metrics["db_ack_etd_p95"]["upper_ms"],
-                ingest_control_metrics["db_ack_etd_p95"]["upper_ms"],
+                _interval_comparison_bound(combined_ingest_metrics["db_ack_etd_p95"]),
+                _interval_comparison_bound(ingest_control_metrics["db_ack_etd_p95"]),
             ),
         }
         query_slo = (
@@ -3109,6 +3111,7 @@ class OwnedSandboxMixedArm:
             offered_qps=self._query_rate_qps,
             timeout_s=self._request_timeout_s,
         )
+        runner.prepare()
         return runner(self._query_rate_qps)
 
     def run_ingest(

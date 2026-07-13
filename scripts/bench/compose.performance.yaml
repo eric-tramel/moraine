@@ -27,6 +27,7 @@ services:
       - "${SANDBOX_BIN_DIR:?immutable release binary directory required}:/opt/moraine/bin:ro"
       - "${SANDBOX_CONFIG_DIR:?benchmark config directory required}:/sandbox:ro"
       - "${SANDBOX_ENTRYPOINT:?benchmark entrypoint required}:/usr/local/bin/entrypoint.sh:ro"
+      - "${SANDBOX_WEB_DIR:?monitor static directory required}:/opt/moraine/web:ro"
       - "state:/home/moraine/.moraine"
 
   loadgen:
