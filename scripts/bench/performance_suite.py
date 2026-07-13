@@ -481,12 +481,16 @@ def _prepare_builds(repositories: Mapping[str, Path], output: Path) -> tuple[dic
     output.mkdir(parents=True, exist_ok=False)
     for index, (arm, repo) in enumerate(repositories.items()):
         _require_clean(repo)
-        runtime_build = build_release_binaries(repo, output / arm)
-        build_environment_sha256 = sha256_json(dict(sorted(runtime_build.build_environment.items())))
+        runtime_build = build_release_binaries(
+            repo,
+            output / arm,
+            toolchain_file=SUITE_ROOT / "rust-toolchain.toml",
+        )
+        build_environment_sha256 = runtime_build.artifact()["recipe"]["build_environment_sha256"]
         recipe = create_build_recipe(
             toolchain_sha256=runtime_build.toolchain_sha256,
             target=runtime_build.target,
-            linker=runtime_build.linker,
+            linker_sha256=runtime_build.artifact()["recipe"]["linker_sha256"],
             environment_allowlist=sorted(runtime_build.build_environment),
             build_environment_sha256=build_environment_sha256,
             image_recipe_sha256=_image_recipe_sha256(SUITE_ROOT),
@@ -584,6 +588,7 @@ def _schedule_evidence(
     recipe: Mapping[str, Any],
     collector: EvidenceCollector,
     *,
+    expanded_schedule: Mapping[str, Any],
     query_count: int = 0,
     event_count: int = 0,
 ) -> dict[str, Any]:
@@ -608,16 +613,32 @@ def _schedule_evidence(
             {"role": role, "reset_sha256": collector.physical_resets[role]}
             for role in ("query_control", "ingest_control", "combined")
         ]
+    elif scenario in {"etd_idle", "etd_loaded"}:
+        samples = list(result.samples)  # type: ignore[arg-type]
+        operational = result.metrics["operational"]
+        planned = int(operational["planned"])
+        started = int(operational["started"])
+        completed = int(operational["completed"])
+        dropped = planned - started
+        slip = float(operational["scheduler_p99_slip_ms"])
+        drained = completed == planned and all(bool(sample["valid"]) for sample in samples)
+        if scenario == "etd_loaded":
+            loaded = result.metrics["loaded_query"]
+            drained = drained and loaded is not None and loaded["drained"] is True
+        drain_ms = 0.0
+        physical = [{"role": "scenario", "reset_sha256": collector.physical_resets["scenario"]}]
     else:
         samples = list(result.samples)  # type: ignore[arg-type]
         planned = started = completed = len(samples)
         dropped = 0
         slip = 0.0
-        drained = True
+        drained = all(bool(sample["valid"]) for sample in samples)
         drain_ms = 0.0
         physical = [{"role": "scenario", "reset_sha256": collector.physical_resets["scenario"]}]
     return {
         "schedule_sha256": definition["schedules"][f"{scenario}:{split}"],
+        "expanded_schedule": dict(expanded_schedule),
+        "expanded_schedule_sha256": sha256_json(expanded_schedule),
         "seed": recipe["seed"]["value"],
         "planned": planned,
         "started": started,
@@ -649,6 +670,7 @@ def _run_scenario(
     event_cases = recipe["event_splits"][split if scenario != "mixed" else "stress"]
     query_count = 0
     event_count = 0
+    expanded_schedule: Mapping[str, Any]
     if scenario == "qps":
         def sandbox_factory(_spec: Any) -> ManagedSandbox:
             return _start_measured_sandbox(
@@ -664,6 +686,19 @@ def _run_scenario(
             sandbox_factory, lambda sandbox: sandbox.trial_telemetry()
         )
         result = run_qps_scenario(query_cases, runtime_factory, profile=run["profile"])
+        expanded_schedule = {
+            "scenario": scenario,
+            "split": split,
+            "trials": [
+                {
+                    "offered_qps": sample["offered_qps"],
+                    "planned": sample["outcomes"]["planned"],
+                    "duration_s": sample["duration_s"],
+                    "replicate": sample["replicate"],
+                }
+                for sample in result.samples
+            ],
+        }
     elif scenario == "ttr":
         sandbox = _start_measured_sandbox(
             repo,
@@ -680,6 +715,14 @@ def _run_scenario(
                 make_owned_sandbox_ttr_runtime_factory(sandbox),
                 samples=samples,
             )
+            expanded_schedule = {
+                "scenario": scenario,
+                "split": split,
+                "sample_case_ids": [
+                    query_cases[index % len(query_cases)]["case_id"]
+                    for index in range(samples)
+                ],
+            }
         finally:
             sandbox.down()
     elif scenario in {"etd_idle", "etd_loaded"}:
@@ -709,6 +752,20 @@ def _run_scenario(
                     offered_qps=offered,
                     timeout_s=5.0,
                 )
+                expanded_schedule = {
+                    "scenario": scenario,
+                    "split": split,
+                    "events": event_schedule,
+                    "background_queries": load_schedule,
+                    "offered_qps": offered,
+                }
+            else:
+                expanded_schedule = {
+                    "scenario": scenario,
+                    "split": split,
+                    "events": event_schedule,
+                    "background_queries": [],
+                }
             result = run_owned_sandbox_etd_scenario(
                 sandbox,
                 event_cases,
@@ -754,6 +811,12 @@ def _run_scenario(
             poll_interval_s=recipe["schedule_templates"]["etd"]["poll_interval_ns"] / 1_000_000_000,
         )
         result = run_mixed_scenario(query_schedule, event_schedule, arm_factory)
+        expanded_schedule = {
+            "scenario": scenario,
+            "split": split,
+            "streams": schedules,
+            "offered_qps": offered,
+        }
     resources = collector.resource_artifact(authoritative=bool(run["authoritative"]))
     binary = collector.binary_artifact(prepared.protocol)
     cache = collector.cache_artifact(recipe, scenario, split)
@@ -764,6 +827,7 @@ def _run_scenario(
         definition,
         recipe,
         collector,
+        expanded_schedule=expanded_schedule,
         query_count=query_count,
         event_count=event_count,
     )
@@ -959,6 +1023,44 @@ def run_baseline(repositories: Mapping[str, Path], profile: str, output: Path) -
     return manifest_paths
 
 
+def _bind_repeatability_study(
+    manifest_paths: Sequence[Path],
+    current_definition: Mapping[str, Any],
+) -> None:
+    """Reject baseline studies produced by another build or suite contract."""
+
+    current_baseline = next(
+        build for build in current_definition["builds"] if build["arm"] == "baseline"
+    )
+    contract_fields = (
+        "suite_id",
+        "profile",
+        "resource_envelope",
+        "cache_policy",
+        "fixture",
+        "policy",
+        "build_recipe",
+        "schedules",
+    )
+    for path in manifest_paths:
+        manifest, _ = load_suite_manifest(path)
+        study_definition = manifest["suite_definition"]
+        study_baseline = next(
+            build for build in study_definition["builds"] if build["arm"] == "baseline"
+        )
+        if study_baseline != current_baseline:
+            raise SuiteFailure(
+                f"repeatability study build does not match current baseline: {path}"
+            )
+        if any(
+            study_definition[field] != current_definition[field]
+            for field in contract_fields
+        ):
+            raise SuiteFailure(
+                f"repeatability study suite contract does not match current comparison: {path}"
+            )
+
+
 def run_comparison(
     repositories: Mapping[str, Path],
     baseline_manifests: Sequence[Path],
@@ -969,12 +1071,13 @@ def run_comparison(
     repeatability = evaluate_repeatability(baseline_manifests)
     if repeatability["status"] != "pass":
         raise SuiteFailure("comparison requires a passing seven-run baseline repeatability study")
-    baseline_capacity = statistics.median(repeatability["metrics"]["values"]["qps"])
     recipe = build_recipe("full")
     validate_recipe(recipe)
     output.mkdir(parents=True, exist_ok=False)
     prepared, build_recipe_document = _prepare_builds(repositories, output / "builds")
     definition = _definition("full", recipe, prepared, build_recipe_document)
+    _bind_repeatability_study(baseline_manifests, definition)
+    baseline_capacity = statistics.median(repeatability["metrics"]["values"]["qps"])
     all_paths: dict[str, list[Path]] = {"baseline": [], "candidate": []}
     for pair_id, order in enumerate(PAIR_ORDER, 1):
         sequence = ("baseline", "candidate") if order == "AB" else ("candidate", "baseline")

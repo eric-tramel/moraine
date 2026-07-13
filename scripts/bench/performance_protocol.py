@@ -394,8 +394,18 @@ def _validate_resources(value: Any, path: str = "$.resources") -> bool:
 
 def _validate_schedule(value: Any, path: str = "$.schedule") -> tuple[bool, list[tuple[str, str]]]:
     schedule = _mapping(value, path)
-    _fields(schedule, {"schedule_sha256", "seed", "planned", "started", "completed", "unfinished", "dropped", "p99_start_slip_ms", "drained", "drain_ms", "streams_overlap", "physical_resets"}, path)
+    _fields(schedule, {"schedule_sha256", "expanded_schedule", "expanded_schedule_sha256", "seed", "planned", "started", "completed", "unfinished", "dropped", "p99_start_slip_ms", "drained", "drain_ms", "streams_overlap", "physical_resets"}, path)
     _sha(schedule["schedule_sha256"], f"{path}.schedule_sha256")
+    expanded = _mapping(schedule["expanded_schedule"], f"{path}.expanded_schedule")
+    expanded_hash = _sha(
+        schedule["expanded_schedule_sha256"],
+        f"{path}.expanded_schedule_sha256",
+    )
+    if expanded_hash != sha256_json(expanded):
+        _fail(
+            f"{path}.expanded_schedule_sha256",
+            "does not match expanded_schedule",
+        )
     _integer(schedule["seed"], f"{path}.seed")
     for name in ("planned", "started", "completed", "unfinished", "dropped"):
         _integer(schedule[name], f"{path}.{name}")
@@ -699,13 +709,91 @@ def _validate_etd_sample(value: Any, path: str) -> tuple[bool, tuple[float, floa
     return computed_valid, source, db_ack
 
 
-def _validate_etd(metrics_value: Any, samples_value: Any) -> bool:
+def _validate_etd(metrics_value: Any, samples_value: Any, *, loaded: bool) -> bool:
     metrics = _mapping(metrics_value, "$.metrics")
-    _fields(metrics, {"direction", "event_count", "source_etd_p95", "db_ack_etd_p95"}, "$.metrics")
+    _fields(metrics, {"direction", "event_count", "source_etd_p95", "db_ack_etd_p95", "loaded_query", "operational"}, "$.metrics")
     _string(metrics["direction"], "$.metrics.direction", choices={"lower"})
     event_count = _integer(metrics["event_count"], "$.metrics.event_count", 1)
     source_metric = _validate_interval(metrics["source_etd_p95"], "$.metrics.source_etd_p95")
     db_metric = _validate_interval(metrics["db_ack_etd_p95"], "$.metrics.db_ack_etd_p95")
+    operational = _mapping(metrics["operational"], "$.metrics.operational")
+    _fields(
+        operational,
+        {
+            "planned",
+            "started",
+            "completed",
+            "scheduler_p99_slip_ms",
+            "first_started_ns",
+            "last_completed_ns",
+        },
+        "$.metrics.operational",
+    )
+    operational_planned = _integer(
+        operational["planned"], "$.metrics.operational.planned"
+    )
+    operational_started = _integer(
+        operational["started"], "$.metrics.operational.started"
+    )
+    operational_completed = _integer(
+        operational["completed"], "$.metrics.operational.completed"
+    )
+    operational_slip = _number(
+        operational["scheduler_p99_slip_ms"],
+        "$.metrics.operational.scheduler_p99_slip_ms",
+        minimum=0,
+    )
+    first_started = _integer(
+        operational["first_started_ns"], "$.metrics.operational.first_started_ns"
+    )
+    last_completed = _integer(
+        operational["last_completed_ns"], "$.metrics.operational.last_completed_ns"
+    )
+    operational_valid = (
+        operational_planned == event_count
+        and operational_started == event_count
+        and operational_completed == event_count
+        and operational_slip <= POLICY["scheduler_p99_start_slip_ms_max"]
+        and first_started <= last_completed
+    )
+    loaded_query_valid = True
+    loaded_query = metrics["loaded_query"]
+    if not loaded:
+        if loaded_query is not None:
+            _fail("$.metrics.loaded_query", "idle ETD cannot include query-load evidence")
+    else:
+        load = _mapping(loaded_query, "$.metrics.loaded_query")
+        _fields(load, {
+            "offered_qps", "planned", "started", "completed",
+            "scheduler_p99_slip_ms", "schedule_delivered", "drained",
+            "backlog", "first_start_slip_ms", "coverage_ns",
+            "failure_count", "semantic_failures",
+        }, "$.metrics.loaded_query")
+        _number(load["offered_qps"], "$.metrics.loaded_query.offered_qps", positive=True)
+        planned = _integer(load["planned"], "$.metrics.loaded_query.planned")
+        started = _integer(load["started"], "$.metrics.loaded_query.started")
+        completed = _integer(load["completed"], "$.metrics.loaded_query.completed")
+        slip = _number(load["scheduler_p99_slip_ms"], "$.metrics.loaded_query.scheduler_p99_slip_ms", minimum=0)
+        delivered = _boolean(load["schedule_delivered"], "$.metrics.loaded_query.schedule_delivered")
+        drained = _boolean(load["drained"], "$.metrics.loaded_query.drained")
+        backlog = _integer(load["backlog"], "$.metrics.loaded_query.backlog")
+        first_slip = _number(load["first_start_slip_ms"], "$.metrics.loaded_query.first_start_slip_ms", minimum=0)
+        coverage = _integer(load["coverage_ns"], "$.metrics.loaded_query.coverage_ns")
+        failures = _integer(load["failure_count"], "$.metrics.loaded_query.failure_count")
+        semantic_failures = _integer(load["semantic_failures"], "$.metrics.loaded_query.semantic_failures")
+        loaded_query_valid = (
+            planned > 0
+            and started == planned
+            and completed == planned
+            and delivered
+            and drained
+            and backlog == 0
+            and slip <= POLICY["scheduler_p99_start_slip_ms_max"]
+            and first_slip <= POLICY["scheduler_p99_start_slip_ms_max"]
+            and coverage > 0
+            and failures == 0
+            and semantic_failures == 0
+        )
     samples = _sequence(samples_value, "$.samples")
     if len(samples) != event_count:
         _fail("$.metrics.event_count", "must equal len(samples)")
@@ -739,12 +827,12 @@ def _validate_etd(metrics_value: Any, samples_value: Any) -> bool:
             _fail(path, "does not equal nearest-rank sample interval p95")
     check_aggregate(source_metric, sources, "$.metrics.source_etd_p95")
     check_aggregate(db_metric, dbs, "$.metrics.db_ack_etd_p95")
-    return all_valid
+    return all_valid and loaded_query_valid and operational_valid
 
 
 def _validate_mixed(metrics_value: Any, samples_value: Any) -> bool:
     metrics = _mapping(metrics_value, "$.metrics")
-    _fields(metrics, {"direction", "query_control", "ingest_control", "combined_query", "combined_ingest", "ratios", "mixed_gates", "lost_events", "duplicate_events"}, "$.metrics")
+    _fields(metrics, {"direction", "query_control", "ingest_control", "combined_query", "combined_ingest", "control_evidence", "ratios", "mixed_gates", "lost_events", "duplicate_events"}, "$.metrics")
     _string(metrics["direction"], "$.metrics.direction", choices={"gates"})
     def query_metrics(value: Any, path: str) -> tuple[float, float, float]:
         item = _mapping(value, path)
@@ -758,6 +846,40 @@ def _validate_mixed(metrics_value: Any, samples_value: Any) -> bool:
         return _validate_interval(item["source_etd_p95"], f"{path}.source_etd_p95"), _validate_interval(item["db_ack_etd_p95"], f"{path}.db_ack_etd_p95")
     ic = ingest_metrics(metrics["ingest_control"], "$.metrics.ingest_control")
     ci = ingest_metrics(metrics["combined_ingest"], "$.metrics.combined_ingest")
+    controls = _mapping(metrics["control_evidence"], "$.metrics.control_evidence")
+    _fields(controls, {
+        "query_schedule_delivered", "ingest_schedule_delivered",
+        "query_queue_depth", "ingest_queue_depth", "ingest_status_pass",
+        "ingest_lost_events", "ingest_duplicate_events",
+    }, "$.metrics.control_evidence")
+    query_delivery = _boolean(
+        controls["query_schedule_delivered"],
+        "$.metrics.control_evidence.query_schedule_delivered",
+    )
+    ingest_delivery = _boolean(
+        controls["ingest_schedule_delivered"],
+        "$.metrics.control_evidence.ingest_schedule_delivered",
+    )
+    query_depth = _integer(
+        controls["query_queue_depth"],
+        "$.metrics.control_evidence.query_queue_depth",
+    )
+    ingest_depth = _integer(
+        controls["ingest_queue_depth"],
+        "$.metrics.control_evidence.ingest_queue_depth",
+    )
+    ingest_status = _boolean(
+        controls["ingest_status_pass"],
+        "$.metrics.control_evidence.ingest_status_pass",
+    )
+    ingest_lost = _integer(
+        controls["ingest_lost_events"],
+        "$.metrics.control_evidence.ingest_lost_events",
+    )
+    ingest_duplicates = _integer(
+        controls["ingest_duplicate_events"],
+        "$.metrics.control_evidence.ingest_duplicate_events",
+    )
     ratios = _mapping(metrics["ratios"], "$.metrics.ratios")
     _fields(ratios, {"query_goodput", "query_p95", "query_p99", "source_etd", "db_ack_etd"}, "$.metrics.ratios")
     expected_ratios = {
@@ -772,7 +894,7 @@ def _validate_mixed(metrics_value: Any, samples_value: Any) -> bool:
         if expected is None or not _close(observed, expected):
             _fail(f"$.metrics.ratios.{name}", "does not match control/combined metrics")
     mixed_gates = _mapping(metrics["mixed_gates"], "$.metrics.mixed_gates")
-    _fields(mixed_gates, {"query_slo", "query_degradation", "ingest_slo", "ingest_degradation", "schedules_delivered", "overlap", "drained", "exact_events"}, "$.metrics.mixed_gates")
+    _fields(mixed_gates, {"query_slo", "query_degradation", "ingest_slo", "ingest_degradation", "controls_valid", "schedules_delivered", "overlap", "drained", "exact_events"}, "$.metrics.mixed_gates")
     for name in mixed_gates:
         _boolean(mixed_gates[name], f"$.metrics.mixed_gates.{name}")
     computed_gates = {
@@ -780,6 +902,17 @@ def _validate_mixed(metrics_value: Any, samples_value: Any) -> bool:
         "query_degradation": ratios["query_goodput"] >= POLICY["mixed_query_goodput_ratio_min"] and ratios["query_p95"] <= POLICY["mixed_query_p95_degradation_max"] and ratios["query_p99"] <= POLICY["mixed_query_p99_degradation_max"],
         "ingest_slo": ci[0][1] is not None and ci[1][1] is not None,
         "ingest_degradation": ratios["source_etd"] <= POLICY["mixed_source_etd_degradation_max"] and ratios["db_ack_etd"] <= POLICY["mixed_db_ack_etd_degradation_max"],
+        "controls_valid": (
+            query_delivery
+            and ingest_delivery
+            and query_depth == 0
+            and ingest_depth == 0
+            and ingest_status
+            and ingest_lost == 0
+            and ingest_duplicates == 0
+            and qc[1] <= POLICY["qps_p95_ms_max"]
+            and qc[2] <= POLICY["qps_p99_ms_max"]
+        ),
     }
     for name, expected in computed_gates.items():
         if mixed_gates[name] != expected:
@@ -827,7 +960,11 @@ def validate_scenario(document: Any) -> Mapping[str, Any]:
         if reset_roles != ["scenario"]:
             _fail("$.schedule.physical_resets", "TTR requires exactly one scenario reset")
     elif scenario in {"etd_idle", "etd_loaded"}:
-        scenario_pass = _validate_etd(value["metrics"], value["samples"])
+        scenario_pass = _validate_etd(
+            value["metrics"],
+            value["samples"],
+            loaded=scenario == "etd_loaded",
+        )
         scenario_conclusive = True
         if reset_roles != ["scenario"]:
             _fail("$.schedule.physical_resets", "ETD requires exactly one scenario reset")
@@ -854,7 +991,7 @@ def validate_scenario(document: Any) -> Mapping[str, Any]:
 
 def _validate_build_recipe(value: Any, path: str) -> Mapping[str, Any]:
     recipe = _mapping(value, path)
-    _fields(recipe, {"toolchain_sha256", "command", "default_features", "locked", "target", "linker", "environment_allowlist", "build_environment_sha256", "image_recipe_sha256", "recipe_sha256"}, path)
+    _fields(recipe, {"toolchain_sha256", "command", "default_features", "locked", "target", "linker_sha256", "environment_allowlist", "build_environment_sha256", "image_recipe_sha256", "recipe_sha256"}, path)
     _sha(recipe["toolchain_sha256"], f"{path}.toolchain_sha256")
     command = list(_sequence(recipe["command"], f"{path}.command"))
     if command != ["cargo", "build", "--workspace", "--release", "--locked"]:
@@ -862,7 +999,7 @@ def _validate_build_recipe(value: Any, path: str) -> Mapping[str, Any]:
     if _boolean(recipe["default_features"], f"{path}.default_features") is not True or _boolean(recipe["locked"], f"{path}.locked") is not True:
         _fail(path, "default features and --locked are mandatory")
     _string(recipe["target"], f"{path}.target")
-    _string(recipe["linker"], f"{path}.linker")
+    _sha(recipe["linker_sha256"], f"{path}.linker_sha256")
     allowlist = _sequence(recipe["environment_allowlist"], f"{path}.environment_allowlist")
     if any(not isinstance(name, str) or not name for name in allowlist) or len(set(allowlist)) != len(allowlist):
         _fail(f"{path}.environment_allowlist", "must contain unique non-empty variable names")
@@ -1357,13 +1494,13 @@ def create_scenario_result(*, scenario: str, split: str, suite_definition_sha256
     return _finalize(document, "artifact_sha256")
 
 
-def create_build_recipe(*, toolchain_sha256: str, target: str, linker: str,
+def create_build_recipe(*, toolchain_sha256: str, target: str, linker_sha256: str,
                         environment_allowlist: Sequence[str], build_environment_sha256: str,
                         image_recipe_sha256: str) -> dict[str, Any]:
     recipe: dict[str, Any] = {
         "toolchain_sha256": toolchain_sha256,
         "command": ["cargo", "build", "--workspace", "--release", "--locked"],
-        "default_features": True, "locked": True, "target": target, "linker": linker,
+        "default_features": True, "locked": True, "target": target, "linker_sha256": linker_sha256,
         "environment_allowlist": list(environment_allowlist),
         "build_environment_sha256": build_environment_sha256,
         "image_recipe_sha256": image_recipe_sha256, "recipe_sha256": "sha256:" + "0" * 64,

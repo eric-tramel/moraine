@@ -41,7 +41,7 @@ def make_definition(profile: str = "full", *, both_arms: bool = True) -> tuple[d
     recipe = protocol.create_build_recipe(
         toolchain_sha256=digest("rust-toolchain"),
         target="x86_64-unknown-linux-gnu",
-        linker="cc",
+        linker_sha256=digest("linker"),
         environment_allowlist=["CARGO_HOME", "RUSTFLAGS", "SOURCE_DATE_EPOCH"],
         build_environment_sha256=build_environment,
         image_recipe_sha256=digest("image-recipe"),
@@ -136,8 +136,11 @@ def binary(build: dict) -> dict:
 
 def schedule(definition: dict, scenario: str, split: str, count: int,
              physical_resets: list[dict], *, overlap: bool | None = None) -> dict:
+    expanded = {"scenario": scenario, "split": split, "planned": count}
     return {
         "schedule_sha256": definition["schedules"][f"{scenario}:{split}"],
+        "expanded_schedule": expanded,
+        "expanded_schedule_sha256": protocol.sha256_json(expanded),
         "seed": 480,
         "planned": count,
         "started": count,
@@ -326,7 +329,7 @@ def etd_sample(lower: float = 100.0, upper: float | None = None, *, left: bool =
     }
 
 
-def etd_metrics(sample: dict) -> dict:
+def etd_metrics(sample: dict, *, loaded: bool = False) -> dict:
     source = sample["source_interval"]
     db_ack = sample["db_ack_interval"]
     def aggregate(interval: dict) -> dict:
@@ -334,7 +337,37 @@ def etd_metrics(sample: dict) -> dict:
             return dict(interval)
         censoring = "left" if interval["censoring"] == "left" else ("none" if interval["lower_ms"] == interval["upper_ms"] else "interval")
         return {"lower_ms": interval["lower_ms"], "upper_ms": interval["upper_ms"], "censoring": censoring}
-    return {"direction": "lower", "event_count": 1, "source_etd_p95": aggregate(source), "db_ack_etd_p95": aggregate(db_ack)}
+    loaded_query = None
+    if loaded:
+        loaded_query = {
+            "offered_qps": 75.0,
+            "planned": 1,
+            "started": 1,
+            "completed": 1,
+            "scheduler_p99_slip_ms": 1.0,
+            "schedule_delivered": True,
+            "drained": True,
+            "backlog": 0,
+            "first_start_slip_ms": 1.0,
+            "coverage_ns": 1,
+            "failure_count": 0,
+            "semantic_failures": 0,
+        }
+    return {
+        "direction": "lower",
+        "event_count": 1,
+        "source_etd_p95": aggregate(source),
+        "db_ack_etd_p95": aggregate(db_ack),
+        "loaded_query": loaded_query,
+        "operational": {
+            "planned": 1,
+            "started": 1,
+            "completed": 1,
+            "scheduler_p99_slip_ms": 1.0,
+            "first_started_ns": 1,
+            "last_completed_ns": 2,
+        },
+    }
 
 
 def mixed_metrics(sample: dict, degradation: float = 1.0) -> dict:
@@ -362,12 +395,22 @@ def mixed_metrics(sample: dict, degradation: float = 1.0) -> dict:
         "ingest_control": ingest_control,
         "combined_query": combined_query,
         "combined_ingest": combined_ingest,
+        "control_evidence": {
+            "query_schedule_delivered": True,
+            "ingest_schedule_delivered": True,
+            "query_queue_depth": 0,
+            "ingest_queue_depth": 0,
+            "ingest_status_pass": True,
+            "ingest_lost_events": 0,
+            "ingest_duplicate_events": 0,
+        },
         "ratios": ratios,
         "mixed_gates": {
             "query_slo": combined_query["p95_ms"] <= 750 and combined_query["p99_ms"] <= 2000,
             "query_degradation": passing,
             "ingest_slo": True,
             "ingest_degradation": passing,
+            "controls_valid": True,
             "schedules_delivered": True,
             "overlap": True,
             "drained": True,
@@ -406,7 +449,7 @@ def make_result(definition: dict, builds: dict[str, dict], scenario: str, split:
     elif scenario in {"etd_idle", "etd_loaded"}:
         event = etd_sample(etd_lower, etd_upper, left=etd_left, failed=etd_failed, suffix=f"{arm}:{pair}:{scenario}:{split}")
         samples = [event]
-        metrics = etd_metrics(event)
+        metrics = etd_metrics(event, loaded=scenario == "etd_loaded")
         count = 1
         scenario_ok = not etd_failed
         conclusive = True

@@ -1,5 +1,5 @@
 {
-  "artifact_sha256": "sha256:30237dbd42adad1cc20a56626bbea9c8c0efe969308c9aae0cb1fe618f81d084",
+  "artifact_sha256": "sha256:34b96d47538287f98793a5c860165425c693db3e15b1d59bc637884fcca1be18",
   "binary": {
     "build_identity_sha256": "sha256:ece6d58d49bfbdce4a4c22eee2ce0b630fc968544af56ff3b76a39d2187d9aa5",
     "image_digest": "sha256:eb68193e69bd29700a35bd71b142d984e45033954831ae6af6ebd2a91290cf41",
@@ -102,6 +102,12 @@
     "drain_ms": 1.0,
     "drained": true,
     "dropped": 0,
+    "expanded_schedule": {
+      "planned": 1,
+      "scenario": "ttr",
+      "split": "research"
+    },
+    "expanded_schedule_sha256": "sha256:273100c8161d2a09aea17108dfd3e0ad25d2584b0255aaba6566763e21cebe14",
     "p99_start_slip_ms": 1.0,
     "planned": 1,
     "physical_resets": [

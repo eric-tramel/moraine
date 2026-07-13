@@ -21,31 +21,58 @@ done
 mkdir -p "$STATE_DIR"
 rm -f "$STATUS_FILE" "${STATUS_FILE}.tmp"
 
+write_central_status() {
+    local generation="$1"
+    printf '{"schema_version":"moraine-performance-central-v1","cache_generation":"%s","central_container_pid":%s,"ingest_container_pid":%s}\n' \
+        "$generation" "$central_pid" "$ingest_pid" >"${STATUS_FILE}.tmp"
+    chmod 0600 "${STATUS_FILE}.tmp"
+    mv "${STATUS_FILE}.tmp" "$STATUS_FILE"
+}
+
+start_central() {
+    if [[ -n "$central_pid" ]] && kill -0 "$central_pid" 2>/dev/null; then
+        return
+    fi
+    local cache_generation
+    cache_generation="$(cat /proc/sys/kernel/random/uuid)"
+    "${BIN_DIR}/moraine-mcp" --config "$CONFIG" --serve socket --host 0.0.0.0 --port 8080 &
+    central_pid=$!
+    write_central_status "$cache_generation"
+    log "central generation ${cache_generation} started"
+}
+
+stop_central() {
+    if [[ -n "$central_pid" ]] && kill -0 "$central_pid" 2>/dev/null; then
+        kill -TERM "$central_pid"
+        wait "$central_pid" 2>/dev/null || true
+    fi
+    central_pid=""
+    rm -f "$STATUS_FILE" "${STATUS_FILE}.tmp"
+}
+
 shutdown() {
     local rc="${1:-0}"
     if (( shutting_down )); then
         return
     fi
     shutting_down=1
-    trap - TERM INT
-    for pid in "$central_pid" "$ingest_pid"; do
-        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-            kill -TERM "$pid" 2>/dev/null || true
-        fi
-    done
-    for pid in "$central_pid" "$ingest_pid"; do
-        if [[ -n "$pid" ]]; then
-            wait "$pid" 2>/dev/null || true
-        fi
-    done
-    rm -f "$STATUS_FILE" "${STATUS_FILE}.tmp"
+    trap - TERM INT USR1 USR2
+    stop_central
+    if [[ -n "$ingest_pid" ]] && kill -0 "$ingest_pid" 2>/dev/null; then
+        kill -TERM "$ingest_pid" 2>/dev/null || true
+    fi
+    if [[ -n "$ingest_pid" ]]; then
+        wait "$ingest_pid" 2>/dev/null || true
+    fi
     exit "$rc"
 }
 trap 'shutdown 143' TERM
 trap 'shutdown 130' INT
+trap 'stop_central' USR1
+trap 'start_central' USR2
 
-# This bounded readiness probe occurs before suite timing. There is no Docker
-# healthcheck or periodic probe during measurement.
+# This bounded readiness probe and schema setup occur once, before suite timing.
+# TTR signals only the central child; ingest and this container remain alive.
 for attempt in $(seq 1 120); do
     if curl -fsS --max-time 1 "${CH_URL}/ping" >/dev/null 2>&1; then
         break
@@ -53,30 +80,30 @@ for attempt in $(seq 1 120); do
     (( attempt < 120 )) || die "ClickHouse did not become ready before service start"
     sleep 1
 done
-
-# Schema setup is owned by the frozen arm binary and occurs before any measured
-# boundary. A fresh ClickHouse volume has no tables until migrations run.
 "${BIN_DIR}/moraine" db migrate --config "$CONFIG" >/dev/null
 
-cache_generation="$(cat /proc/sys/kernel/random/uuid)"
 "${BIN_DIR}/moraine-ingest" --config "$CONFIG" &
 ingest_pid=$!
-"${BIN_DIR}/moraine-mcp" --config "$CONFIG" --serve socket --host 0.0.0.0 --port 8080 &
-central_pid=$!
+start_central
 
-# Container-local identities are paired with host PIDs/starttimes by the
-# ownership-checked `moraine-sandbox benchmark-service status` operation.
-printf '{"schema_version":"moraine-performance-central-v1","cache_generation":"%s","central_container_pid":%s,"ingest_container_pid":%s}\n' \
-    "$cache_generation" "$central_pid" "$ingest_pid" >"${STATUS_FILE}.tmp"
-chmod 0600 "${STATUS_FILE}.tmp"
-mv "${STATUS_FILE}.tmp" "$STATUS_FILE"
-log "central generation ${cache_generation} started"
-
-set +e
-wait -n "$central_pid" "$ingest_pid"
-rc=$?
-set -e
-if (( ! shutting_down )); then
-    log "measured service exited unexpectedly (status ${rc})"
-fi
-shutdown "$rc"
+while true; do
+    set +e
+    if [[ -n "$central_pid" ]]; then
+        wait -n "$central_pid" "$ingest_pid"
+    else
+        wait "$ingest_pid"
+    fi
+    rc=$?
+    set -e
+    if (( shutting_down )); then
+        exit "$rc"
+    fi
+    if ! kill -0 "$ingest_pid" 2>/dev/null; then
+        log "ingest exited unexpectedly (status ${rc})"
+        shutdown "$rc"
+    fi
+    if [[ -n "$central_pid" ]] && ! kill -0 "$central_pid" 2>/dev/null; then
+        log "central exited unexpectedly (status ${rc})"
+        shutdown "$rc"
+    fi
+done

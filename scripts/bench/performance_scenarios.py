@@ -777,7 +777,6 @@ def _run_ttr_sample(
             semantic_failures += 1
             raise ScenarioError("independent oracle rejected first result") from exc
         finish_phase()
-        endpoint_ns = clock_ns()
 
         if not runtime.central_alive():
             raise CentralCrashed("central exited before route proof")
@@ -2121,6 +2120,9 @@ def run_etd_scenario(
     load_barrier: Optional[threading.Barrier] = None
     load_thread: Optional[threading.Thread] = None
     if loaded_qps is not None and query_load is not None:
+        prepare_load = getattr(query_load, "prepare", None)
+        if callable(prepare_load):
+            prepare_load()
         load_barrier = threading.Barrier(2)
 
         def run_background_load() -> None:
@@ -2210,13 +2212,54 @@ def run_etd_scenario(
     )
     status = "pass" if all(sample["valid"] for sample in ordered) else "fail"
 
+    loaded_query_evidence: Optional[dict[str, Any]] = None
     if mode == "loaded":
         if load_errors or len(load_result) != 1:
             status = "fail"
             diagnostics.extend(load_errors or ["missing_query_load_evidence"])
+            loaded_query_evidence = {
+                "offered_qps": float(loaded_qps or 0.0),
+                "planned": 0,
+                "started": 0,
+                "completed": 0,
+                "scheduler_p99_slip_ms": ETD_SCHEDULER_SLIP_LIMIT_MS + 1.0,
+                "schedule_delivered": False,
+                "drained": False,
+                "backlog": 1,
+                "first_start_slip_ms": ETD_SCHEDULER_SLIP_LIMIT_MS + 1.0,
+                "coverage_ns": 0,
+                "failure_count": len(load_errors) or 1,
+                "semantic_failures": 0,
+            }
         else:
             evidence = load_result[0]
             offered = evidence.get("offered_qps")
+            first_started = evidence.get("first_started_ns")
+            last_completed = evidence.get("last_completed_ns")
+            loaded_query_evidence = {
+                "offered_qps": offered,
+                "planned": evidence.get("planned"),
+                "started": evidence.get("started"),
+                "completed": evidence.get("completed"),
+                "scheduler_p99_slip_ms": evidence.get("scheduler_p99_slip_ms"),
+                "schedule_delivered": evidence.get("schedule_delivered"),
+                "drained": evidence.get("drained"),
+                "backlog": evidence.get("backlog"),
+                "first_start_slip_ms": (
+                    (first_started - scenario_start_ns) / 1_000_000.0
+                    if isinstance(first_started, int) and not isinstance(first_started, bool)
+                    else math.inf
+                ),
+                "coverage_ns": (
+                    last_completed - scenario_start_ns
+                    if isinstance(last_completed, int) and not isinstance(last_completed, bool)
+                    else 0
+                ),
+                "failure_count": sum(evidence.get("failures", {}).values())
+                if isinstance(evidence.get("failures"), Mapping)
+                else 1,
+                "semantic_failures": evidence.get("semantic_failures"),
+            }
             if (
                 isinstance(offered, bool)
                 or not isinstance(offered, (int, float))
@@ -2224,13 +2267,10 @@ def run_etd_scenario(
                 or evidence.get("schedule_delivered") is not True
                 or evidence.get("drained") is not True
                 or evidence.get("backlog", 0) != 0
-                or isinstance(evidence.get("first_started_ns"), bool)
-                or not isinstance(evidence.get("first_started_ns"), int)
-                or isinstance(evidence.get("last_completed_ns"), bool)
-                or not isinstance(evidence.get("last_completed_ns"), int)
-                or evidence["first_started_ns"]
-                > scenario_start_ns + int(ETD_SCHEDULER_SLIP_LIMIT_MS * 1_000_000)
-                or evidence["last_completed_ns"] < scenario_start_ns + previous_offset
+                or loaded_query_evidence["first_start_slip_ms"] > ETD_SCHEDULER_SLIP_LIMIT_MS
+                or loaded_query_evidence["coverage_ns"] < previous_offset
+                or loaded_query_evidence["failure_count"] != 0
+                or loaded_query_evidence["semantic_failures"] != 0
             ):
                 status = "fail"
                 diagnostics.append("invalid_loaded_query_evidence")
@@ -2240,6 +2280,7 @@ def run_etd_scenario(
         "event_count": len(ordered),
         "source_etd_p95": _aggregate_etd_interval(ordered, "source_interval"),
         "db_ack_etd_p95": _aggregate_etd_interval(ordered, "db_ack_interval"),
+        "loaded_query": loaded_query_evidence,
     }
     return ScenarioResult(
         status,
@@ -2564,6 +2605,7 @@ def run_mixed_scenario(
             "query_degradation": query_degradation,
             "ingest_slo": ingest_slo,
             "ingest_degradation": ingest_degradation,
+            "controls_valid": query_control_pass and ingest_control_pass,
             "schedules_delivered": query_delivery and ingest_delivery,
             "overlap": overlap,
             "drained": drained,
@@ -2575,6 +2617,17 @@ def run_mixed_scenario(
             "ingest_control": ingest_control_metrics,
             "combined_query": combined_query_metrics,
             "combined_ingest": combined_ingest_metrics,
+            "control_evidence": {
+                "query_schedule_delivered": query_delivery,
+                "ingest_schedule_delivered": ingest_delivery,
+                "query_queue_depth": query_control_depth,
+                "ingest_queue_depth": ingest_control_depth,
+                "ingest_status_pass": ingest_control.get("status") == "pass",
+                "ingest_lost_events": int(ingest_control.get("lost_events", 0)),
+                "ingest_duplicate_events": int(
+                    ingest_control.get("duplicate_events", 0)
+                ),
+            },
             "ratios": ratios,
             "mixed_gates": gates,
             "lost_events": lost_events,
@@ -2687,12 +2740,16 @@ class OwnedSandboxEtdRuntime:
         self.timeout_s = timeout_s
         self._clock_ns = clock_ns
         self._ack_reader = OwnedSandboxAckReader(sandbox)
-        self._client = _StdioJsonRpcClient(sandbox.spawn_stdio_route())
-        self._client.wait_for_central_route(timeout_s)
-        self._client.initialize(timeout_s)
-        if "search_sessions" not in self._client.list_tools(timeout_s):
-            self._client.close()
-            raise ScenarioError("owned sandbox central route omitted search_sessions")
+        client = _StdioJsonRpcClient(sandbox.spawn_stdio_route())
+        try:
+            client.wait_for_central_route(timeout_s)
+            client.initialize(timeout_s)
+            if "search_sessions" not in client.list_tools(timeout_s):
+                raise ScenarioError("owned sandbox central route omitted search_sessions")
+        except BaseException:
+            client.close()
+            raise
+        self._client = client
         self._closed = False
 
     @property
@@ -2769,8 +2826,9 @@ def run_owned_sandbox_etd_scenario(
     """Run ETD without suite-provided placeholder callbacks."""
 
     runtime = make_owned_sandbox_etd_runtime(sandbox, timeout_s=timeout_s)
+    operational: dict[str, Any] = {}
     try:
-        return run_etd_scenario(
+        result = run_etd_scenario(
             events,
             event_schedule,
             runtime.watched_dir,
@@ -2782,6 +2840,16 @@ def run_owned_sandbox_etd_scenario(
             poll_interval_s=poll_interval_s,
             baseline_sustainable_qps=baseline_sustainable_qps,
             query_load=query_load,
+            operational_evidence=operational,
+        )
+        metrics = dict(result.metrics)
+        metrics["operational"] = operational
+        return ScenarioResult(
+            result.status,
+            metrics,
+            result.samples,
+            result.semantic_failures,
+            result.diagnostics,
         )
     finally:
         runtime.close()
@@ -2811,6 +2879,23 @@ class OwnedSandboxQueryLoad:
         self._clock_ns = clock_ns
         self._sleeper = sleeper
         self._used = False
+        self._client: Optional[_StdioJsonRpcClient] = None
+
+    def prepare(self) -> None:
+        """Establish and validate the route before the measured barrier."""
+
+        if self._used or self._client is not None:
+            raise ScenarioError("owned query load can only be prepared once")
+        client = _StdioJsonRpcClient(self._sandbox.spawn_stdio_route())
+        try:
+            client.wait_for_central_route(self._timeout_s)
+            client.initialize(self._timeout_s)
+            if "search_sessions" not in client.list_tools(self._timeout_s):
+                raise ScenarioError("owned query load route omitted search_sessions")
+        except BaseException:
+            client.close()
+            raise
+        self._client = client
 
     def __call__(self, offered_qps: float) -> Mapping[str, Any]:
         if self._used:
@@ -2824,12 +2909,10 @@ class OwnedSandboxQueryLoad:
             )
         ):
             raise ScenarioError("owned query load rate differs from its fixed schedule")
-        client = _StdioJsonRpcClient(self._sandbox.spawn_stdio_route())
-        client.wait_for_central_route(self._timeout_s)
-        client.initialize(self._timeout_s)
-        if "search_sessions" not in client.list_tools(self._timeout_s):
-            client.close()
-            raise ScenarioError("owned query load route omitted search_sessions")
+        client = self._client
+        if client is None:
+            raise ScenarioError("owned query load must be prepared before measurement")
+        self._client = None
         scenario_start_ns = self._clock_ns()
         lock = threading.Lock()
         records: list[dict[str, Any]] = []
@@ -2998,6 +3081,9 @@ class OwnedSandboxMixedArm:
         self._event_cases = event_cases
         self._query_rate_qps = float(query_rate_qps)
         self._request_timeout_s = request_timeout_s
+        # The production heartbeat interval is five seconds. Allow multiple
+        # heartbeats so a just-missed tick cannot manufacture a drain failure.
+        self._drain_timeout_s = max(15.0, request_timeout_s)
         self._poll_interval_s = poll_interval_s
         self.reset_id = sandbox.sandbox_id
         self.recipe_fingerprint = recipe_fingerprint
@@ -3056,7 +3142,7 @@ class OwnedSandboxMixedArm:
                 operational_evidence=operational,
             )
             drained = self._sandbox.wait_ingest_drained(
-                timeout_s=self._request_timeout_s
+                timeout_s=self._drain_timeout_s
             )
         finally:
             runtime.close()
@@ -3119,7 +3205,7 @@ class OwnedSandboxMixedArm:
         if self._queue_depth is not None:
             return self._queue_depth
         evidence = self._sandbox.wait_ingest_drained(
-            timeout_s=self._request_timeout_s
+            timeout_s=self._drain_timeout_s
         )
         queue_depth = getattr(evidence, "queue_depth", None)
         files_active = getattr(evidence, "files_active", None)

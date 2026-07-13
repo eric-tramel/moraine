@@ -12,6 +12,7 @@ on:
       # Root metadata and the lockfile control every --locked Cargo invocation below.
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'rust-toolchain.toml'
       # Any workspace member manifest can alter metadata-derived package isolation.
       - 'apps/*/Cargo.toml'
       - 'crates/*/Cargo.toml'
@@ -63,6 +64,7 @@ jobs:
               # Cargo metadata and --locked resolution depend on every workspace manifest and lock.
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'rust-toolchain.toml'
               - 'apps/*/Cargo.toml'
               - 'crates/*/Cargo.toml'
               # Auto-discovered build scripts and test/bench/example targets alter package topology.

@@ -109,9 +109,11 @@
     "schedule": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schedule_sha256", "seed", "planned", "started", "completed", "unfinished", "dropped", "p99_start_slip_ms", "drained", "drain_ms", "streams_overlap", "physical_resets"],
+      "required": ["schedule_sha256", "expanded_schedule", "expanded_schedule_sha256", "seed", "planned", "started", "completed", "unfinished", "dropped", "p99_start_slip_ms", "drained", "drain_ms", "streams_overlap", "physical_resets"],
       "properties": {
         "schedule_sha256": {"$ref": "#/$defs/sha256"},
+        "expanded_schedule": {"type": "object"},
+        "expanded_schedule_sha256": {"$ref": "#/$defs/sha256"},
         "seed": {"$ref": "#/$defs/nonnegative_integer"},
         "planned": {"$ref": "#/$defs/nonnegative_integer"},
         "started": {"$ref": "#/$defs/nonnegative_integer"},
@@ -309,7 +311,7 @@
           "then": {
             "properties": {
               "split": {"enum": ["research", "holdout"]},
-              "metrics": {"type": "object", "additionalProperties": false, "required": ["direction", "event_count", "source_etd_p95", "db_ack_etd_p95"], "properties": {"direction": {"const": "lower"}, "event_count": {"type": "integer", "minimum": 1}, "source_etd_p95": {"$ref": "#/$defs/interval"}, "db_ack_etd_p95": {"$ref": "#/$defs/interval"}}},
+              "metrics": {"type": "object", "additionalProperties": false, "required": ["direction", "event_count", "source_etd_p95", "db_ack_etd_p95", "loaded_query", "operational"], "properties": {"direction": {"const": "lower"}, "event_count": {"type": "integer", "minimum": 1}, "source_etd_p95": {"$ref": "#/$defs/interval"}, "db_ack_etd_p95": {"$ref": "#/$defs/interval"}, "loaded_query": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/loaded_query"}]}, "operational": {"type": "object", "additionalProperties": false, "required": ["planned", "started", "completed", "scheduler_p99_slip_ms", "first_started_ns", "last_completed_ns"], "properties": {"planned": {"$ref": "#/$defs/nonnegative_integer"}, "started": {"$ref": "#/$defs/nonnegative_integer"}, "completed": {"$ref": "#/$defs/nonnegative_integer"}, "scheduler_p99_slip_ms": {"$ref": "#/$defs/nonnegative"}, "first_started_ns": {"$ref": "#/$defs/nonnegative_integer"}, "last_completed_ns": {"$ref": "#/$defs/nonnegative_integer"}}}}},
               "samples": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/etd_sample"}}
             }
           }
@@ -326,15 +328,17 @@
         }
       ]
     },
+    "loaded_query": {"type": "object", "additionalProperties": false, "required": ["offered_qps", "planned", "started", "completed", "scheduler_p99_slip_ms", "schedule_delivered", "drained", "backlog", "first_start_slip_ms", "coverage_ns", "failure_count", "semantic_failures"], "properties": {"offered_qps": {"type": "number", "exclusiveMinimum": 0}, "planned": {"$ref": "#/$defs/nonnegative_integer"}, "started": {"$ref": "#/$defs/nonnegative_integer"}, "completed": {"$ref": "#/$defs/nonnegative_integer"}, "scheduler_p99_slip_ms": {"$ref": "#/$defs/nonnegative"}, "schedule_delivered": {"type": "boolean"}, "drained": {"type": "boolean"}, "backlog": {"$ref": "#/$defs/nonnegative_integer"}, "first_start_slip_ms": {"$ref": "#/$defs/nonnegative"}, "coverage_ns": {"$ref": "#/$defs/nonnegative_integer"}, "failure_count": {"$ref": "#/$defs/nonnegative_integer"}, "semantic_failures": {"$ref": "#/$defs/nonnegative_integer"}}},
     "query_metrics": {"type": "object", "additionalProperties": false, "required": ["goodput_qps", "p95_ms", "p99_ms"], "properties": {"goodput_qps": {"type": "number", "exclusiveMinimum": 0}, "p95_ms": {"$ref": "#/$defs/nonnegative"}, "p99_ms": {"$ref": "#/$defs/nonnegative"}}},
     "ingest_metrics": {"type": "object", "additionalProperties": false, "required": ["source_etd_p95", "db_ack_etd_p95"], "properties": {"source_etd_p95": {"$ref": "#/$defs/interval"}, "db_ack_etd_p95": {"$ref": "#/$defs/interval"}}},
     "mixed_metrics": {
       "type": "object", "additionalProperties": false,
-      "required": ["direction", "query_control", "ingest_control", "combined_query", "combined_ingest", "ratios", "mixed_gates", "lost_events", "duplicate_events"],
+      "required": ["direction", "query_control", "ingest_control", "combined_query", "combined_ingest", "control_evidence", "ratios", "mixed_gates", "lost_events", "duplicate_events"],
       "properties": {
         "direction": {"const": "gates"}, "query_control": {"$ref": "#/$defs/query_metrics"}, "ingest_control": {"$ref": "#/$defs/ingest_metrics"}, "combined_query": {"$ref": "#/$defs/query_metrics"}, "combined_ingest": {"$ref": "#/$defs/ingest_metrics"},
+        "control_evidence": {"type": "object", "additionalProperties": false, "required": ["query_schedule_delivered", "ingest_schedule_delivered", "query_queue_depth", "ingest_queue_depth", "ingest_status_pass", "ingest_lost_events", "ingest_duplicate_events"], "properties": {"query_schedule_delivered": {"type": "boolean"}, "ingest_schedule_delivered": {"type": "boolean"}, "query_queue_depth": {"$ref": "#/$defs/nonnegative_integer"}, "ingest_queue_depth": {"$ref": "#/$defs/nonnegative_integer"}, "ingest_status_pass": {"type": "boolean"}, "ingest_lost_events": {"$ref": "#/$defs/nonnegative_integer"}, "ingest_duplicate_events": {"$ref": "#/$defs/nonnegative_integer"}}},
         "ratios": {"type": "object", "additionalProperties": false, "required": ["query_goodput", "query_p95", "query_p99", "source_etd", "db_ack_etd"], "properties": {"query_goodput": {"$ref": "#/$defs/nonnegative"}, "query_p95": {"$ref": "#/$defs/nonnegative"}, "query_p99": {"$ref": "#/$defs/nonnegative"}, "source_etd": {"$ref": "#/$defs/nonnegative"}, "db_ack_etd": {"$ref": "#/$defs/nonnegative"}}},
-        "mixed_gates": {"type": "object", "additionalProperties": false, "required": ["query_slo", "query_degradation", "ingest_slo", "ingest_degradation", "schedules_delivered", "overlap", "drained", "exact_events"], "properties": {"query_slo": {"type": "boolean"}, "query_degradation": {"type": "boolean"}, "ingest_slo": {"type": "boolean"}, "ingest_degradation": {"type": "boolean"}, "schedules_delivered": {"type": "boolean"}, "overlap": {"type": "boolean"}, "drained": {"type": "boolean"}, "exact_events": {"type": "boolean"}}},
+        "mixed_gates": {"type": "object", "additionalProperties": false, "required": ["query_slo", "query_degradation", "ingest_slo", "ingest_degradation", "controls_valid", "schedules_delivered", "overlap", "drained", "exact_events"], "properties": {"query_slo": {"type": "boolean"}, "query_degradation": {"type": "boolean"}, "ingest_slo": {"type": "boolean"}, "ingest_degradation": {"type": "boolean"}, "controls_valid": {"type": "boolean"}, "schedules_delivered": {"type": "boolean"}, "overlap": {"type": "boolean"}, "drained": {"type": "boolean"}, "exact_events": {"type": "boolean"}}},
         "lost_events": {"$ref": "#/$defs/nonnegative_integer"}, "duplicate_events": {"$ref": "#/$defs/nonnegative_integer"}
       }
     },

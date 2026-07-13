@@ -301,11 +301,17 @@ class EtdScenarioTests(unittest.TestCase):
             observed_rates.append(rate)
             return {
                 "offered_qps": rate,
+                "planned": 1,
+                "started": 1,
+                "completed": 1,
+                "scheduler_p99_slip_ms": 0.0,
                 "schedule_delivered": True,
                 "drained": True,
                 "backlog": 0,
                 "first_started_ns": 0,
                 "last_completed_ns": 10**18,
+                "failures": {},
+                "semantic_failures": 0,
             }
 
         result = self.run_event(
@@ -454,6 +460,7 @@ class OwnedSandboxAdapterTests(unittest.TestCase):
                 clock_ns=clock,
                 sleeper=clock.sleep,
             )
+            runner.prepare()
             evidence = runner(4.0)
             self.assertTrue(evidence["schedule_delivered"])
             self.assertTrue(evidence["drained"])

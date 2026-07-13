@@ -50,7 +50,7 @@ def build_recipe_document() -> dict:
     return create_build_recipe(
         toolchain_sha256=digest("toolchain"),
         target="x86_64-unknown-linux-gnu",
-        linker="cc",
+        linker_sha256=digest("linker"),
         environment_allowlist=[],
         build_environment_sha256=digest("environment"),
         image_recipe_sha256=digest("image-recipe"),
@@ -193,7 +193,15 @@ class EvidenceTests(unittest.TestCase):
             "reset_sha256": reset,
         }
         result = ScenarioResult("pass", {"capacity_censoring": "none"}, (sample,))
-        schedule = _schedule_evidence(result, "qps", "research", definition, recipe, EvidenceCollector())
+        schedule = _schedule_evidence(
+            result,
+            "qps",
+            "research",
+            definition,
+            recipe,
+            EvidenceCollector(),
+            expanded_schedule={"scenario": "qps", "split": "research"},
+        )
         self.assertEqual(schedule["physical_resets"], [{"role": "trial", "reset_sha256": reset}])
 
 

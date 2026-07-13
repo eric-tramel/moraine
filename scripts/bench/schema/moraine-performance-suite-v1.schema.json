@@ -71,12 +71,12 @@
     },
     "build_recipe": {
       "type": "object", "additionalProperties": false,
-      "required": ["toolchain_sha256", "command", "default_features", "locked", "target", "linker", "environment_allowlist", "build_environment_sha256", "image_recipe_sha256", "recipe_sha256"],
+      "required": ["toolchain_sha256", "command", "default_features", "locked", "target", "linker_sha256", "environment_allowlist", "build_environment_sha256", "image_recipe_sha256", "recipe_sha256"],
       "properties": {
         "toolchain_sha256": {"$ref": "#/$defs/sha256"},
         "command": {"const": ["cargo", "build", "--workspace", "--release", "--locked"]},
         "default_features": {"const": true}, "locked": {"const": true},
-        "target": {"type": "string", "minLength": 1}, "linker": {"type": "string", "minLength": 1},
+        "target": {"type": "string", "minLength": 1}, "linker_sha256": {"$ref": "#/$defs/sha256"},
         "environment_allowlist": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
         "build_environment_sha256": {"$ref": "#/$defs/sha256"}, "image_recipe_sha256": {"$ref": "#/$defs/sha256"},
         "recipe_sha256": {"$ref": "#/$defs/sha256"}

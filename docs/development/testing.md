@@ -318,11 +318,18 @@ python3 scripts/bench/performance_suite.py freeze \
 python3 scripts/bench/performance_suite.py smoke \
   --repo . --output target/bench/performance/smoke
 
-# Seven counterbalanced AB/BA pairs from immutable worktrees.
+# First prove baseline repeatability in seven fresh owned sandboxes.
+python3 scripts/bench/performance_suite.py run \
+  --baseline <baseline-worktree> \
+  --output target/bench/performance/baseline-study
+
+# Then run seven counterbalanced AB/BA pairs. The immutable baseline study
+# selects the fixed 75%-capacity loaded schedules and must match this build.
 python3 scripts/bench/performance_suite.py run \
   --baseline <baseline-worktree> \
   --candidate <candidate-worktree> \
-  --profile full \
+  --baseline-manifests \
+    target/bench/performance/baseline-study/baseline-{01,02,03,04,05,06,07}/manifest.json \
   --output target/bench/performance/full
 
 # Validate one or more checked-in or produced documents.

@@ -367,7 +367,8 @@ if set(document) != {"schema_version", "recipe", "binaries"} or \
 recipe = document.get("recipe")
 if not isinstance(recipe, dict) or set(recipe) != {
     "command", "default_features", "target", "rustc_release",
-    "toolchain_sha256", "linker", "environment",
+    "toolchain_sha256", "linker_sha256", "environment_allowlist",
+    "build_environment_sha256",
 }:
     raise SystemExit("performance build recipe fields are invalid")
 if recipe["command"] != ["cargo", "build", "--workspace", "--release", "--locked"] or \
@@ -375,13 +376,13 @@ if recipe["command"] != ["cargo", "build", "--workspace", "--release", "--locked
     raise SystemExit("performance build recipe command is not frozen")
 if not isinstance(recipe["target"], str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", recipe["target"]):
     raise SystemExit("performance build target is invalid")
-if not isinstance(recipe["rustc_release"], str) or not recipe["rustc_release"] or \
-        not isinstance(recipe["linker"], str) or not recipe["linker"]:
-    raise SystemExit("performance build compiler/linker identity is invalid")
-if not isinstance(recipe["toolchain_sha256"], str) or \
-        not re.fullmatch(r"sha256:[0-9a-f]{64}", recipe["toolchain_sha256"]):
-    raise SystemExit("performance toolchain identity is invalid")
-environment = recipe["environment"]
+if not isinstance(recipe["rustc_release"], str) or not recipe["rustc_release"]:
+    raise SystemExit("performance build compiler identity is invalid")
+for field in ("toolchain_sha256", "linker_sha256", "build_environment_sha256"):
+    if not isinstance(recipe[field], str) or \
+            not re.fullmatch(r"sha256:[0-9a-f]{64}", recipe[field]):
+        raise SystemExit(f"performance {field} identity is invalid")
+environment_allowlist = recipe["environment_allowlist"]
 normalized_target = re.sub(r"[^A-Za-z0-9]", "_", recipe["target"]).upper()
 allowed_environment = {
     "CARGO_BUILD_TARGET", "CC", "CXX", "RUSTFLAGS", "RUSTC_WRAPPER",
@@ -389,9 +390,10 @@ allowed_environment = {
     f"CARGO_TARGET_{normalized_target}_LINKER",
     f"CARGO_TARGET_{normalized_target}_RUSTFLAGS",
 }
-if not isinstance(environment, dict) or not set(environment).issubset(allowed_environment) or \
-        any(not isinstance(value, str) for value in environment.values()):
-    raise SystemExit("performance build environment is not allowlisted")
+if not isinstance(environment_allowlist, list) or \
+        environment_allowlist != sorted(set(environment_allowlist)) or \
+        not set(environment_allowlist).issubset(allowed_environment):
+    raise SystemExit("performance build environment allowlist is invalid")
 binaries = document.get("binaries")
 if not isinstance(binaries, dict) or set(binaries) != required:
     raise SystemExit("performance binary manifest has the wrong binary set")
@@ -1747,8 +1749,26 @@ cmd_benchmark_service() {
     container_id="$(container_id_for_service "$PERF_PROJECT" moraine)" || \
         die "moraine service identity is ambiguous"
     case "$action" in
-        start) docker start "$container_id" >/dev/null ;;
-        stop) docker stop --time 15 "$container_id" >/dev/null ;;
+        start)
+            docker kill --signal USR2 "$container_id" >/dev/null
+            for _ in $(seq 1 200); do
+                if docker exec "$container_id" test -f /home/moraine/.moraine/performance-central.json; then
+                    return
+                fi
+                sleep 0.01
+            done
+            die "central service did not start"
+            ;;
+        stop)
+            docker kill --signal USR1 "$container_id" >/dev/null
+            for _ in $(seq 1 200); do
+                if ! docker exec "$container_id" test -f /home/moraine/.moraine/performance-central.json; then
+                    return
+                fi
+                sleep 0.01
+            done
+            die "central service did not stop"
+            ;;
         status) print_central_status "$id" ;;
         *) die "unknown benchmark-service action: ${action}" ;;
     esac

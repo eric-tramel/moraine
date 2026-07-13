@@ -16,6 +16,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tomllib
 import time
 import tempfile
 import uuid
@@ -264,15 +265,24 @@ def build_release_binaries(
     destination: Path,
     *,
     environment: Optional[Mapping[str, str]] = None,
+    toolchain_file: Optional[Path] = None,
 ) -> BuildIdentity:
     """Build the frozen workspace recipe, then freeze all release binaries."""
 
-    toolchain = repo_root / "rust-toolchain.toml"
+    toolchain = toolchain_file or (repo_root / "rust-toolchain.toml")
     if not toolchain.is_file():
-        raise RuntimeFailure("repository rust-toolchain.toml is required")
+        raise RuntimeFailure("suite rust-toolchain.toml is required")
+    try:
+        toolchain_document = tomllib.loads(toolchain.read_text(encoding="utf-8"))
+        channel = toolchain_document["toolchain"]["channel"]
+    except (OSError, tomllib.TOMLDecodeError, KeyError, TypeError) as error:
+        raise RuntimeFailure("suite rust-toolchain.toml is invalid") from error
+    if not isinstance(channel, str) or not channel:
+        raise RuntimeFailure("suite Rust toolchain channel is invalid")
     build_env = dict(os.environ)
     if environment is not None:
         build_env.update(environment)
+    build_env["RUSTUP_TOOLCHAIN"] = channel
     proc = _run(["rustc", "-vV"], cwd=repo_root, env=build_env, timeout=60)
     if proc.returncode:
         raise RuntimeFailure(f"rustc identity failed: {proc.stderr.strip()}")
@@ -1551,10 +1561,10 @@ def start_owned_sandbox(
         "--binary-dir",
         str(build.directory),
     ]
-    proc = _run(args, timeout=3600)
-    if proc.returncode:
-        raise RuntimeFailure(f"sandbox up failed: {proc.stderr[-4096:].strip()}")
     try:
+        proc = _run(args, timeout=3600)
+        if proc.returncode:
+            raise RuntimeFailure(f"sandbox up failed: {proc.stderr[-4096:].strip()}")
         if proc.stdout.strip() != sandbox_id:
             raise RuntimeFailure("sandbox returned a mismatched owned id")
         status = _sandbox_status(script, sandbox_id)
