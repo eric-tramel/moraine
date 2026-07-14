@@ -773,7 +773,7 @@ FORMAT JSONEachRow",
             .min(posting_count)
             .min(TERM_POSTINGS_CACHE_MAX_ROWS_TOTAL);
         let mut index_by_uid = HashMap::<&str, u32>::with_capacity(initial_capacity);
-        let mut accum_by_uid = Vec::<SearchScoreAccum<'a>>::with_capacity(initial_capacity);
+        let mut candidates = Vec::<RankedPosting<'a>>::with_capacity(initial_capacity);
         let bm25_base = k1 * (1.0 - b);
         let bm25_length_scale = k1 * b / avgdl.max(1.0);
         for (idx, term) in terms.iter().take(64).enumerate() {
@@ -789,36 +789,29 @@ FORMAT JSONEachRow",
                         *index_by_uid
                             .entry(row.event_uid.as_str())
                             .or_insert_with(|| {
-                                let index = u32::try_from(accum_by_uid.len())
+                                let index = u32::try_from(candidates.len())
                                     .expect("posting candidate count exceeds u32");
-                                accum_by_uid.push(SearchScoreAccum {
+                                candidates.push(RankedPosting {
                                     row,
                                     score: 0.0,
-                                    matched_mask: 0,
+                                    matched_terms: 0,
                                 });
                                 index
                             }) as usize;
-                    let entry = &mut accum_by_uid[entry_index];
+                    let entry = &mut candidates[entry_index];
                     let tf = f64::from(row.tf);
                     let norm = tf + bm25_base + bm25_length_scale * f64::from(row.doc_len);
                     entry.score += idf * tf * (k1 + 1.0) / norm;
-                    entry.matched_mask |= 1u64 << idx;
+                    entry.matched_terms |= 1u64 << idx;
                 }
             }
         }
 
-        let mut candidates = Vec::<RankedPosting<'a>>::with_capacity(accum_by_uid.len());
-        for acc in &accum_by_uid {
-            let matched_terms = acc.matched_mask.count_ones() as u64;
-            if matched_terms < min_should_match as u64 || acc.score < min_score {
-                continue;
-            }
-            candidates.push(RankedPosting {
-                row: acc.row,
-                score: acc.score,
-                matched_terms,
-            });
-        }
+        candidates.retain_mut(|candidate| {
+            let matched_terms = u64::from(candidate.matched_terms.count_ones());
+            candidate.matched_terms = matched_terms;
+            matched_terms >= u64::from(min_should_match) && candidate.score >= min_score
+        });
         Self::order_ranked_posting_prefix(&mut candidates, 256);
         candidates
     }
