@@ -98,6 +98,9 @@ struct CursorState {
     /// kv key → content-hash (hex u64). `BTreeMap` keeps serialization stable.
     #[serde(default)]
     kv_hashes: BTreeMap<String, String>,
+    /// Hash of normalized project exclusion globs used for this scan.
+    #[serde(default)]
+    project_exclusions_hash: u64,
     /// Last error kind reported for this database; used to emit each failure
     /// mode once instead of once per reconcile tick.
     #[serde(default)]
@@ -252,6 +255,8 @@ impl VolatilePollMap {
 #[derive(Debug, Clone)]
 pub struct SyntheticRecord {
     pub record: Value,
+    /// Session-sticky directory used only for project exclusion decisions.
+    pub project_dir: String,
     pub source_line_no: u64,
     pub source_offset: u64,
 }
@@ -282,6 +287,16 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
 
 fn hash_str(text: &str) -> u64 {
     hash_bytes(text.as_bytes())
+}
+
+fn project_exclusions_hash(config: &AppConfig) -> u64 {
+    if config.ingest.exclude_project_dirs.is_empty() {
+        return 0;
+    }
+    hash_str(
+        &serde_json::to_string(&config.ingest.exclude_project_dirs)
+            .expect("serializing string exclusion globs cannot fail"),
+    )
 }
 
 fn stat_fingerprint(db_path: &str) -> Option<StatFingerprint> {
@@ -367,16 +382,22 @@ pub(crate) async fn process_cursor_sqlite_db(
     });
 
     let mut state = CursorState::parse(&checkpoint.cursor_json);
+    let current_exclusions_hash = project_exclusions_hash(config);
 
     // A replaced database file is a new generation: every logical identity
     // (and therefore every event UID) starts over, and the hash cursor is
-    // meaningless for the new file's contents.
+    // meaningless for the new file's contents. A changed exclusion set also
+    // replays the database so rows skipped under the prior policy can return.
     let generation_changed = checkpoint.source_inode != inode;
+    let exclusions_changed = state.project_exclusions_hash != current_exclusions_hash;
     if generation_changed {
         checkpoint.source_inode = inode;
         checkpoint.source_generation = checkpoint.source_generation.saturating_add(1).max(1);
+    }
+    if generation_changed || exclusions_changed {
         state = CursorState::fresh();
     }
+    state.project_exclusions_hash = current_exclusions_hash;
 
     // Cheap no-change short-circuit: nothing touched the database or its WAL
     // sidecars since the last successful poll.
@@ -420,6 +441,7 @@ pub(crate) async fn process_cursor_sqlite_db(
             };
             let scan_is_noop = had_committed
                 && !generation_changed
+                && !exclusions_changed
                 && records.is_empty()
                 && checkpoint.status == "active"
                 && new_state == prior_state_covered
@@ -432,6 +454,14 @@ pub(crate) async fn process_cursor_sqlite_db(
 
             let mut batch = RowBatch::default();
             for synthetic in &records {
+                if crate::dispatch::record_project_dir_is_excluded(
+                    config,
+                    &work.harness,
+                    &synthetic.record,
+                    &synthetic.project_dir,
+                ) {
+                    continue;
+                }
                 let raw_json =
                     serde_json::to_string(&synthetic.record).unwrap_or_else(|_| "{}".to_string());
                 // No cwd hint: kv rows interleave many composers, so a linear
@@ -626,6 +656,7 @@ fn scan_database(db_path: &str, prior: &CursorState) -> ScanOutcome {
         version: CURSOR_STATE_VERSION,
         format: SOURCE_FORMAT_CURSOR_SQLITE.to_string(),
         stat: StatFingerprint::default(),
+        project_exclusions_hash: prior.project_exclusions_hash,
         kv_hashes: BTreeMap::new(),
         last_error: String::new(),
     };
@@ -1041,6 +1072,7 @@ fn synthesize_composer_record(composer_id: &str, data: &Value) -> Option<Synthet
     let (line_no, offset) = stable_coordinates("composerData", composer_id, "cursor_composer");
     Some(SyntheticRecord {
         record: Value::Object(record),
+        project_dir: String::new(),
         source_line_no: line_no,
         source_offset: offset,
     })
@@ -1126,6 +1158,7 @@ fn synthesize_bubble_record(
     let (line_no, offset) = stable_coordinates("bubbleId", &pk, "cursor_bubble");
     Some(SyntheticRecord {
         record: Value::Object(record),
+        project_dir: String::new(),
         source_line_no: line_no,
         source_offset: offset,
     })
@@ -1586,6 +1619,63 @@ mod tests {
         assert_eq!(checkpoint.last_line_no, 4, "relevant keys observed");
         assert!(checkpoint.cursor_json.contains("kv_hashes"));
         assert_ne!(checkpoint.schema_fingerprint, 0);
+
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cursor_sqlite_replays_rows_when_exclusions_change() {
+        let path = unique_db_path("exclusion-replay");
+        let _db = seed_fixture_db(&path);
+        let work = sqlite_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+        let poll_state = VolatilePollMap::new();
+
+        let mut excluded_config = moraine_config::AppConfig::default();
+        excluded_config.ingest.exclude_project_dirs = vec!["/Users/demo/project/**".to_string()];
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(64);
+        process_cursor_sqlite_db(
+            &excluded_config,
+            &work,
+            checkpoints.clone(),
+            &poll_state,
+            sink_tx,
+            &metrics,
+        )
+        .await
+        .expect("excluded Cursor poll");
+        let excluded_batches = drain_batches(&mut sink_rx).await;
+        assert!(
+            all_event_rows(&excluded_batches).is_empty(),
+            "excluded session rows must not reach the sink"
+        );
+        let checkpoint = excluded_batches
+            .last()
+            .and_then(|batch| batch.checkpoint.clone())
+            .expect("excluded poll must persist its cursor");
+        checkpoints.write().await.insert(
+            checkpoint_key(&checkpoint.source_name, &checkpoint.source_file),
+            checkpoint,
+        );
+
+        let included_config = moraine_config::AppConfig::default();
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(64);
+        process_cursor_sqlite_db(
+            &included_config,
+            &work,
+            checkpoints,
+            &poll_state,
+            sink_tx,
+            &metrics,
+        )
+        .await
+        .expect("Cursor replay after exclusion removal");
+        let replayed = drain_batches(&mut sink_rx).await;
+        assert!(
+            !all_event_rows(&replayed).is_empty(),
+            "removing exclusions must replay previously skipped rows"
+        );
 
         cleanup(&path);
     }

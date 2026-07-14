@@ -1034,6 +1034,132 @@ fn opencode_sqlite_scan_paginates_past_single_event_page() {
     cleanup(&path);
 }
 
+#[test]
+fn opencode_sqlite_project_dir_stays_on_first_absolute_session_directory() {
+    let path = unique_opencode_db_path("sticky-project-dir");
+    let connection = seed_opencode_db(&path);
+    let last_seq: i64 = connection
+        .query_row(
+            "SELECT seq FROM event_sequence WHERE aggregate_id = 'ses_demo'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read event sequence");
+    let next_seq = last_seq + 1;
+    connection
+        .execute(
+            "INSERT INTO event (id, aggregate_id, seq, type, data) \
+             VALUES ('evt_session_cd', 'ses_demo', ?1, 'session.updated.1', ?2)",
+            rusqlite::params![
+                next_seq,
+                serde_json::to_string(&json!({
+                    "sessionID": "ses_demo",
+                    "info": {
+                        "id": "ses_demo",
+                        "directory": "/work/after-cd",
+                        "title": "Moved session",
+                        "time": {
+                            "created": 1780000000000_i64,
+                            "updated": 1780000005000_i64
+                        }
+                    }
+                }))
+                .unwrap(),
+            ],
+        )
+        .expect("insert session directory update");
+    connection
+        .execute(
+            "UPDATE event_sequence SET seq = ?1 WHERE aggregate_id = 'ses_demo'",
+            rusqlite::params![next_seq],
+        )
+        .expect("advance event sequence");
+    drop(connection);
+
+    let outcome =
+        scan_opencode_database(path.to_str().expect("utf-8 path"), &OpenCodeState::fresh());
+    let records = match outcome {
+        OpenCodeScanOutcome::Scanned { records, .. } => records,
+        OpenCodeScanOutcome::Failed {
+            error_kind,
+            error_text,
+        } => panic!("scan failed: {error_kind}: {error_text}"),
+    };
+    assert!(!records.is_empty());
+    assert!(
+        records
+            .iter()
+            .all(|record| record.project_dir == "/work/opencode-demo"),
+        "every record must retain the session's first absolute directory"
+    );
+    assert!(
+        records.iter().any(|record| {
+            record.record.get("type").and_then(Value::as_str) == Some("opencode_session")
+                && record.record.get("directory").and_then(Value::as_str) == Some("/work/after-cd")
+        }),
+        "fixture must retain the later cwd on the raw session update"
+    );
+
+    cleanup(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn opencode_sqlite_replays_rows_when_exclusions_change() {
+    let path = unique_opencode_db_path("exclusion-replay");
+    drop(seed_opencode_db(&path));
+    let work = opencode_sqlite_work(&path);
+    let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+    let metrics = Arc::new(Metrics::default());
+    let poll_state = VolatilePollMap::new();
+
+    let mut excluded_config = moraine_config::AppConfig::default();
+    excluded_config.ingest.exclude_project_dirs = vec!["/work/opencode-demo/**".to_string()];
+    let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(64);
+    process_opencode_sqlite_db(
+        &excluded_config,
+        &work,
+        checkpoints.clone(),
+        &poll_state,
+        sink_tx,
+        &metrics,
+    )
+    .await
+    .expect("excluded OpenCode poll");
+    let excluded_batches = drain_batches(&mut sink_rx).await;
+    assert!(
+        all_event_rows(&excluded_batches).is_empty(),
+        "excluded session rows must not reach the sink"
+    );
+    let checkpoint = excluded_batches
+        .last()
+        .and_then(|batch| batch.checkpoint.clone())
+        .expect("excluded poll must persist its cursor");
+    checkpoints.write().await.insert(
+        checkpoint_key(&checkpoint.source_name, &checkpoint.source_file),
+        checkpoint,
+    );
+
+    let included_config = moraine_config::AppConfig::default();
+    let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(64);
+    process_opencode_sqlite_db(
+        &included_config,
+        &work,
+        checkpoints,
+        &poll_state,
+        sink_tx,
+        &metrics,
+    )
+    .await
+    .expect("OpenCode replay after exclusion removal");
+    let replayed = drain_batches(&mut sink_rx).await;
+    assert!(
+        !all_event_rows(&replayed).is_empty(),
+        "removing exclusions must replay previously skipped rows"
+    );
+
+    cleanup(&path);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn opencode_sqlite_ignores_events_above_sequence_bound() {
     let path = unique_opencode_db_path("future-row-bound");

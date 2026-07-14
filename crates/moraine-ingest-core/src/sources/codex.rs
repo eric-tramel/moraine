@@ -34,6 +34,10 @@ impl IngestSource for Codex {
         }
     }
 
+    fn jsonl_carries_cwd(&self) -> bool {
+        true
+    }
+
     fn cwd(&self, record: &Value) -> String {
         // Codex carries the working directory in `payload.cwd` on
         // `session_meta` (and on `turn_context` in newer rollouts); other

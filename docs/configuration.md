@@ -542,6 +542,7 @@ The `[ingest]` table controls batching and watcher behavior:
 
 ```toml
 [ingest]
+exclude_project_dirs = []
 batch_size = 4000
 max_batch_bytes = 8388608
 flush_interval_seconds = 0.5
@@ -556,6 +557,7 @@ heartbeat_interval_seconds = 5.0
 
 | Field | Default | Purpose |
 | --- | --- | --- |
+| `exclude_project_dirs` | `[]` | Directory globs for sessions to omit, matched against each session's first non-empty absolute working directory. |
 | `batch_size` | `4000` | Maximum rows collected before a sink flushes to ClickHouse. |
 | `max_batch_bytes` | `8388608` | Maximum serialized JSONEachRow batch size, in bytes, before flushing. |
 | `flush_interval_seconds` | `0.5` | Maximum time a non-empty batch waits before flushing. |
@@ -566,6 +568,24 @@ heartbeat_interval_seconds = 5.0
 | `debounce_ms` | `50` | Milliseconds to coalesce repeated filesystem notifications for the same tracked file. |
 | `reconcile_interval_seconds` | `30.0` | Seconds between reconciliation scans for missed watcher events, deleted files, and lagging backend replay. |
 | `heartbeat_interval_seconds` | `5.0` | Seconds between ingest heartbeat writes. |
+
+Exclusions use the same directory matching semantics as [`[[routes]]`](#routes):
+`~` expands when configuration loads, `*` stays within one path component, and
+a trailing `/**` matches both the project directory itself and everything
+below it. Moraine keeps the first non-empty working directory for the whole
+session, so a later `cd` cannot change the decision. For example:
+
+```toml
+[ingest]
+exclude_project_dirs = [
+  "~/code/project-with-large-trajectories/**",
+]
+```
+
+For JSONL sources, Moraine reads only far enough to find that initial working
+directory before normalization. Codex provides it in the early `session_meta`
+record, so excluded Codex trajectories do not require a full-file read and
+never reach the sink.
 
 ## MCP
 
