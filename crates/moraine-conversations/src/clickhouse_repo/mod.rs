@@ -18,8 +18,10 @@ use tokio::time::Instant;
 use tracing::warn;
 use uuid::Uuid;
 
-const REPOSITORY_READ_SETTINGS: [(&str, &str); 1] =
-    [("do_not_merge_across_partitions_select_final", "0")];
+const REPOSITORY_READ_SETTINGS: [(&str, &str); 2] = [
+    ("do_not_merge_across_partitions_select_final", "0"),
+    ("max_threads", "1"),
+];
 
 #[derive(Clone)]
 struct ActiveMcpQueryId {
@@ -149,7 +151,11 @@ impl ClickHouseConversationRepository {
         database: Option<&str>,
     ) -> AnyResult<Vec<T>> {
         if let Ok(query_id) = ACTIVE_MCP_QUERY_ID.try_with(ActiveMcpQueryId::next) {
-            let params = [("query_id", query_id.as_str()), REPOSITORY_READ_SETTINGS[0]];
+            let params = [
+                ("query_id", query_id.as_str()),
+                REPOSITORY_READ_SETTINGS[0],
+                REPOSITORY_READ_SETTINGS[1],
+            ];
             self.ch
                 .query_rows_with_params(query, database, &params)
                 .await
