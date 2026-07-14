@@ -43,6 +43,8 @@ impl RequestLimitSource {
     }
 }
 
+const AUTOMATIC_MAX_PARALLEL_REQUESTS: usize = 8;
+
 fn effective_max_parallel_requests(
     configured: Option<u16>,
     detected_parallelism: Option<usize>,
@@ -50,7 +52,9 @@ fn effective_max_parallel_requests(
     let (requested, source) = match configured {
         Some(configured) => (usize::from(configured), RequestLimitSource::Config),
         None => (
-            detected_parallelism.unwrap_or(1).min(8),
+            detected_parallelism
+                .unwrap_or(1)
+                .min(AUTOMATIC_MAX_PARALLEL_REQUESTS),
             RequestLimitSource::Automatic,
         ),
     };
@@ -1678,8 +1682,18 @@ mod tests {
             (1, RequestLimitSource::Automatic)
         );
         assert_eq!(
+            effective_max_parallel_requests(None, Some(12)),
+            (
+                AUTOMATIC_MAX_PARALLEL_REQUESTS,
+                RequestLimitSource::Automatic
+            )
+        );
+        assert_eq!(
             effective_max_parallel_requests(None, Some(Semaphore::MAX_PERMITS.saturating_add(1))),
-            (Semaphore::MAX_PERMITS, RequestLimitSource::Automatic)
+            (
+                AUTOMATIC_MAX_PARALLEL_REQUESTS,
+                RequestLimitSource::Automatic
+            )
         );
     }
 
