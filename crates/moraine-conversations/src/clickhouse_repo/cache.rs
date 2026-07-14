@@ -267,6 +267,8 @@ impl ClickHouseConversationRepository {
         terms: &[String],
         event_types: &[McpEventType],
         session_id: Option<&str>,
+        harness: Option<&str>,
+        source_name: Option<&str>,
         turn_seq: Option<u32>,
         min_should_match: u16,
         min_score: f64,
@@ -277,15 +279,19 @@ impl ClickHouseConversationRepository {
         let event_type_sig = event_types
             .iter()
             .map(|event_type| event_type.as_str())
-            .collect::<Vec<_>>()
-            .join(",");
-        format!(
-            "event_types={event_type_sig};session={};turn_seq={};msm={min_should_match};min_score={:016x};limit={effective_n_hits};terms={}",
-            session_id.unwrap_or(""),
-            turn_seq.unwrap_or(0),
+            .collect::<Vec<_>>();
+        serde_json::to_string(&(
+            event_type_sig,
+            session_id,
+            turn_seq,
+            harness,
+            source_name,
+            min_should_match,
             min_score.to_bits(),
-            cache_terms.join(",")
-        )
+            effective_n_hits,
+            cache_terms,
+        ))
+        .expect("MCP search cache key contains only serializable primitives")
     }
 
     pub(super) async fn search_mcp_events_cache_get(

@@ -97,6 +97,7 @@ fn sample_file_attention_touch(
         event_uid: event_uid.to_string(),
         tool_call_id: tool_call_id.to_string(),
         harness: "codex".to_string(),
+        source_name: "codex".to_string(),
         tool_name: "Edit".to_string(),
         tool_phase: "request".to_string(),
         match_kind: "path_suffix".to_string(),

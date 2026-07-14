@@ -61,6 +61,8 @@ Input:
   "query": "mcp open tool oneof top-level schema",
   "within_id": null,
   "event_types": ["user_input", "assistant_response", "tool_response"],
+  "harness": null,
+  "source": null,
   "n_hits": 10
 }
 ```
@@ -72,12 +74,19 @@ Fields:
 | `query` | Required keyword query. Empty strings are rejected. |
 | `within_id` | Optional `session:...` or `turn:...` ID to scope the search. Event IDs are not valid scopes. |
 | `event_types` | Optional filter. Searchable event types are `user_input`, `assistant_response`, `reasoning`, `tool_call`, `tool_response`, `compaction`, `system`, and `runtime`. |
+| `harness` | Optional exact, case-sensitive normalized harness filter. Supported values are `codex`, `claude-code`, `cursor`, `hermes`, `kimi-cli`, `opencode`, and `pi-coding-agent`. |
+| `source` | Optional exact, case-sensitive ingest source filter. The default configured values are `claude`, `codex`, `cursor`, `cursor-sqlite`, `hermes`, `kimi-cli`, `omp`, `opencode`, and `pi`; each server's MCP tool instructions list its actual configured source names. |
 | `n_hits` | Optional result limit from 1 to 50. Default is 10. |
 
 The default event type filter is `user_input`, `assistant_response`, and
 `tool_response`. That default is intentionally practical: it searches what the
 user asked, what the assistant concluded, and what tools returned, while leaving
 lower-signal operational records out until you request them.
+
+Use `source` when the configured source is the distinction that matters. For
+example, the `pi` and `omp` sources both use the `pi-coding-agent` harness, so
+`source: "omp"` selects only OMP sessions while `harness: "pi-coding-agent"`
+selects both.
 
 Output data:
 
@@ -145,13 +154,17 @@ Input:
   "limit": 20,
   "cursor": null,
   "mode": null,
+  "harness": null,
+  "source": null,
   "sort": "desc"
 }
 ```
 
 `start_datetime` and `end_datetime` are required and must include an explicit
 timezone. `mode` can filter session mode: `web_search`, `mcp_internal`,
-`tool_calling`, or `chat`. `next_cursor` lets clients continue the same listing.
+`tool_calling`, or `chat`. `harness` and `source` use the same exact,
+case-sensitive semantics as `search_sessions`. `next_cursor` lets clients
+continue the same listing; changing any filter invalidates that cursor.
 
 Output data includes compact session records:
 
@@ -161,6 +174,7 @@ Output data includes compact session records:
   "id": "session:...",
   "session": {
     "title": "...",
+    "harness": "codex",
     "source": "codex",
     "started_at": "2026-05-08T13:00:00.000Z",
     "updated_at": "2026-05-08T13:45:00.000Z",
@@ -196,6 +210,8 @@ Input:
   "start_datetime": null,
   "end_datetime": null,
   "tool": null,
+  "harness": null,
+  "source": null,
   "mutations_only": false,
   "limit": 25
 }
@@ -220,11 +236,11 @@ durable project mapping, and future normalized roots populate that mapping
 automatically. A root pruned before this mapping was installed has no stored Git
 identity and cannot be attributed safely; project scope excludes it rather than
 widening across projects, and the response warns about this one-time upgrade
-limitation. `granularity` is
-`sessions` (default, one rollup per session) or `events` (the flat
-touch-by-touch timeline). `tool` filters by tool name and `mutations_only`
-excludes common pure-read tools. The default limit is `min(50, mcp.max_results)`
-and the maximum is server-configured.
+limitation. `granularity` is `sessions` (default, one rollup per session) or
+`events` (the flat touch-by-touch timeline). `tool` filters by tool name,
+`harness` and `source` apply the same exact filters as the other retrieval
+tools, and `mutations_only` excludes common pure-read tools. The default limit
+is `min(50, mcp.max_results)` and the maximum is server-configured.
 
 Output data carries a summary, the distinct worktree roots the tail matched
 (so over-match is visible, never silently merged), and either per-session

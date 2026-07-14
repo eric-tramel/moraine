@@ -13,6 +13,8 @@ async fn file_attention_merges_normalized_exact_lookup_with_suffix_fallback() {
             apply_project_scope: true,
             start_unix_ms: None,
             end_unix_ms: None,
+            harness: Some("codex".to_string()),
+            source_name: Some("codex".to_string()),
             tool: None,
             mutations_only: false,
             max_rows: 10,
@@ -39,6 +41,8 @@ async fn file_attention_merges_normalized_exact_lookup_with_suffix_fallback() {
         .expect("normalized exact file_attention query should be captured");
     assert!(exact_query.contains("project_id = 'project-a'"));
     assert!(exact_query.contains("tool_phase = 'request'"));
+    assert!(exact_query.contains("harness = 'codex'"));
+    assert!(exact_query.contains("e.source_name = 'codex'"));
     assert!(
         !exact_query.contains("JSONExtractString(input_json"),
         "exact lookup should not depend on legacy JSON suffix extraction: {exact_query}"
@@ -59,6 +63,8 @@ async fn file_attention_merges_normalized_exact_lookup_with_suffix_fallback() {
         .find(|query| query.contains("JSONExtractString(input_json, 'path')"))
         .expect("Tier-0 suffix file_attention query should be captured");
     assert!(fallback_query.contains("crates/foo.rs"));
+    assert!(fallback_query.contains("harness = 'codex'"));
+    assert!(fallback_query.contains("e.source_name = 'codex'"));
     assert!(
         fallback_query.contains("ti.project_id = 'project-a'")
             && fallback_query.contains(
@@ -138,6 +144,8 @@ async fn file_attention_project_scope_migrates_registered_pre_digest_sibling_roo
             apply_project_scope: true,
             start_unix_ms: None,
             end_unix_ms: None,
+            harness: None,
+            source_name: None,
             tool: None,
             mutations_only: false,
             max_rows: 10,
@@ -182,6 +190,8 @@ async fn file_attention_project_scope_excludes_unmapped_pruned_legacy_root() {
             apply_project_scope: true,
             start_unix_ms: None,
             end_unix_ms: None,
+            harness: None,
+            source_name: None,
             tool: None,
             mutations_only: false,
             max_rows: 10,
@@ -205,6 +215,8 @@ async fn file_attention_all_scope_is_the_only_unscoped_widening_path() {
         apply_project_scope: false,
         start_unix_ms: None,
         end_unix_ms: None,
+        harness: None,
+        source_name: None,
         tool: None,
         mutations_only: false,
         max_rows: 10,
@@ -243,6 +255,8 @@ async fn file_attention_all_scope_keeps_the_configured_server_floor_only() {
         apply_project_scope: false,
         start_unix_ms: None,
         end_unix_ms: None,
+        harness: None,
+        source_name: None,
         tool: None,
         mutations_only: false,
         max_rows: 10,
@@ -289,6 +303,8 @@ async fn file_attention_all_scope_preserves_legacy_suffix_fallback_on_schema_ske
             apply_project_scope: false,
             start_unix_ms: None,
             end_unix_ms: None,
+            harness: None,
+            source_name: None,
             tool: None,
             mutations_only: false,
             max_rows: 10,
@@ -318,6 +334,8 @@ async fn file_attention_project_scope_stays_closed_on_schema_skew() {
             apply_project_scope: true,
             start_unix_ms: None,
             end_unix_ms: None,
+            harness: None,
+            source_name: None,
             tool: None,
             mutations_only: false,
             max_rows: 10,
@@ -342,6 +360,8 @@ async fn file_attention_project_scope_without_identity_stays_closed() {
         apply_project_scope: true,
         start_unix_ms: None,
         end_unix_ms: None,
+        harness: None,
+        source_name: None,
         tool: None,
         mutations_only: false,
         max_rows: 10,

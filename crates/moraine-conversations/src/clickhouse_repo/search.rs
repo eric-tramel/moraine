@@ -425,6 +425,8 @@ FORMAT JSONEachRow",
         event_types: &[McpEventType],
         session_id: Option<&str>,
         turn_seq: Option<u32>,
+        harness: Option<&str>,
+        source_name: Option<&str>,
         min_should_match: u16,
         min_score: f64,
         limit: u16,
@@ -484,6 +486,12 @@ GROUP BY t.event_uid)"
             ));
         } else if let Some(session_id) = session_id {
             where_clauses.push(format!("d.session_id = {}", sql_quote(session_id)));
+        }
+        if let Some(harness) = harness {
+            where_clauses.push(format!("d.harness = {}", sql_quote(harness)));
+        }
+        if let Some(source_name) = source_name {
+            where_clauses.push(format!("d.source_name = {}", sql_quote(source_name)));
         }
         where_clauses.push(Self::mcp_event_type_filter_clause(
             "d.event_class",
@@ -1168,6 +1176,8 @@ FORMAT JSONEachRow",
         event_types: &[McpEventType],
         session_id: Option<&str>,
         turn_seq: Option<u32>,
+        harness: Option<&str>,
+        source_name: Option<&str>,
         min_should_match: u16,
         min_score: f64,
         limit: u16,
@@ -1184,6 +1194,8 @@ FORMAT JSONEachRow",
                     avgdl,
                     event_types,
                     session_id,
+                    harness,
+                    source_name,
                     min_should_match,
                     min_score,
                     limit,
@@ -1208,6 +1220,8 @@ FORMAT JSONEachRow",
             event_types,
             session_id,
             turn_seq,
+            harness,
+            source_name,
             min_should_match,
             min_score,
             limit,
@@ -1226,6 +1240,8 @@ FORMAT JSONEachRow",
         avgdl: f64,
         event_types: &[McpEventType],
         session_id: Option<&str>,
+        harness: Option<&str>,
+        source_name: Option<&str>,
         min_should_match: u16,
         min_score: f64,
         limit: u16,
@@ -1276,6 +1292,12 @@ FORMAT JSONEachRow",
                     continue;
                 };
                 if session_id.is_some_and(|session_id| extra.session_id != session_id) {
+                    continue;
+                }
+                if harness.is_some_and(|harness| extra.harness != harness) {
+                    continue;
+                }
+                if source_name.is_some_and(|source_name| extra.source_name != source_name) {
                     continue;
                 }
                 let event_type = Self::mcp_event_type_for(
@@ -2887,6 +2909,8 @@ FORMAT JSONEachRow",
             &terms,
             &event_types,
             query.session_id.as_deref(),
+            query.harness.as_deref(),
+            query.source_name.as_deref(),
             query.turn_seq,
             min_should_match,
             min_score,
@@ -2907,6 +2931,8 @@ FORMAT JSONEachRow",
                     &event_types,
                     query.session_id.as_deref(),
                     query.turn_seq,
+                    query.harness.as_deref(),
+                    query.source_name.as_deref(),
                     min_should_match,
                     min_score,
                     fetch_limit,
