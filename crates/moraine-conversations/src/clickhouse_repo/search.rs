@@ -772,7 +772,7 @@ FORMAT JSONEachRow",
             .unwrap_or(usize::MAX)
             .min(posting_count)
             .min(TERM_POSTINGS_CACHE_MAX_ROWS_TOTAL);
-        let mut index_by_uid = HashMap::<&str, u32>::with_capacity(initial_capacity);
+        let mut index_by_uid = HashMap::<&str, usize>::with_capacity(initial_capacity);
         let mut candidates = Vec::<RankedPosting<'a>>::with_capacity(initial_capacity);
         let bm25_base = k1 * (1.0 - b);
         let bm25_length_scale = k1 * b / avgdl.max(1.0);
@@ -789,15 +789,14 @@ FORMAT JSONEachRow",
                         *index_by_uid
                             .entry(row.event_uid.as_str())
                             .or_insert_with(|| {
-                                let index = u32::try_from(candidates.len())
-                                    .expect("posting candidate count exceeds u32");
+                                let index = candidates.len();
                                 candidates.push(RankedPosting {
                                     row,
                                     score: 0.0,
                                     matched_terms: 0,
                                 });
                                 index
-                            }) as usize;
+                            });
                     let entry = &mut candidates[entry_index];
                     let tf = f64::from(row.tf);
                     let norm = tf + bm25_base + bm25_length_scale * f64::from(row.doc_len);
