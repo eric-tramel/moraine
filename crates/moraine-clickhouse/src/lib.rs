@@ -293,18 +293,10 @@ impl ClickHouseClient {
         let raw = self
             .request_text_with_params(query, None, database, false, None, params)
             .await?;
-        let mut rows = Vec::new();
-
-        for line in raw.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let row = serde_json::from_str::<T>(line)
-                .with_context(|| format!("failed to parse JSONEachRow line: {}", line))?;
-            rows.push(row);
-        }
-
-        Ok(rows)
+        serde_json::Deserializer::from_str(&raw)
+            .into_iter::<T>()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("failed to parse JSONEachRow response")
     }
 
     pub async fn query_json_data<T: DeserializeOwned>(
