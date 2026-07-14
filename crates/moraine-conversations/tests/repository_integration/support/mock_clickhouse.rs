@@ -13,6 +13,9 @@ use moraine_conversations::{ClickHouseConversationRepository, RepoConfig, Sessio
 use serde_json::json;
 use tokio::sync::Notify;
 
+use super::mcp_open_fixtures::{
+    event_lookup, event_ref_rows, full_event_row, session_row, turn_rows,
+};
 use super::responses::{json_each_row, trace_event_row, turn_summary_row};
 
 #[derive(Clone)]
@@ -83,7 +86,6 @@ impl ScriptedResponse {
 pub(crate) struct MockOptions {
     pub(crate) omit_second_snippet_row: bool,
     pub(crate) scripted_responses: Vec<ScriptedResponse>,
-    pub(crate) unordered_scripted_responses: bool,
     pub(crate) query_barrier: Option<QueryBarrier>,
 }
 
@@ -148,25 +150,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                 .scripted_responses
                 .lock()
                 .expect("scripted response lock");
-            scripted.as_mut().map(|responses| {
-                if state.options.unordered_scripted_responses {
-                    responses
-                        .iter()
-                        .position(|response| {
-                            response
-                                .required
-                                .iter()
-                                .all(|required| query.contains(*required))
-                                && response
-                                    .forbidden
-                                    .iter()
-                                    .all(|forbidden| !query.contains(*forbidden))
-                        })
-                        .and_then(|position| responses.remove(position))
-                } else {
-                    responses.pop_front()
-                }
-            })
+            scripted.as_mut().map(VecDeque::pop_front)
         };
         if let Some(scripted_response) = scripted_response {
             let Some(response) = scripted_response else {
@@ -200,6 +184,70 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                 barrier.release.notified().await;
             }
             return (response.status, response.body);
+        }
+
+        if query.contains("mcp_open_projection_state")
+            && query.contains("WHERE state_key = 'global'")
+        {
+            return (StatusCode::OK, json_each_row(json!([{ "ready": 1_u8 }])));
+        }
+
+        if query.contains("FROM `moraine`.`mcp_open_sessions`") && query.contains("FINAL") {
+            let session_id = query
+                .split("session_id = '")
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                .unwrap_or("");
+            let rows = session_row(session_id).into_iter().collect::<Vec<_>>();
+            return (StatusCode::OK, json_each_row(json!(rows)));
+        }
+
+        if query.contains("FROM `moraine`.`mcp_open_turns`") && query.contains("FINAL") {
+            let session_id = query
+                .split("session_id = '")
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                .unwrap_or("");
+            let turn_seq = query
+                .split(" AND turn_seq = ")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|value| value.parse::<u32>().ok());
+            return (
+                StatusCode::OK,
+                json_each_row(json!(turn_rows(session_id, turn_seq))),
+            );
+        }
+
+        if query.contains("FROM `moraine`.`mcp_open_events` FINAL")
+            && query.contains("SELECT\n  event_uid,\n  session_id,")
+        {
+            let event_uid = query
+                .split("WHERE event_uid = '")
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                .unwrap_or("");
+            let rows = event_lookup(event_uid).into_iter().collect::<Vec<_>>();
+            return (StatusCode::OK, json_each_row(json!(rows)));
+        }
+
+        if query.contains("FROM `moraine`.`mcp_open_events`")
+            && query.contains("FINAL")
+            && query.contains("previous_event_uid")
+        {
+            let event_uid = query
+                .split("event_uid = '")
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                .unwrap_or("");
+            let rows = full_event_row(event_uid).into_iter().collect::<Vec<_>>();
+            return (StatusCode::OK, json_each_row(json!(rows)));
+        }
+
+        if query.contains("FROM `moraine`.`mcp_open_events` FINAL")
+            && query.contains("event_uid IN")
+        {
+            return (StatusCode::OK, json_each_row(json!(event_ref_rows())));
         }
 
         if query.starts_with("INSERT INTO `moraine`.`file_attention_project_roots`") {
@@ -1863,20 +1911,6 @@ pub(crate) async fn build_scripted_repo(
         100,
         MockOptions {
             scripted_responses,
-            ..MockOptions::default()
-        },
-    )
-    .await
-}
-
-pub(crate) async fn build_unordered_scripted_repo(
-    scripted_responses: Vec<ScriptedResponse>,
-) -> (ClickHouseConversationRepository, Arc<MockState>) {
-    build_repo_with_options(
-        100,
-        MockOptions {
-            scripted_responses,
-            unordered_scripted_responses: true,
             ..MockOptions::default()
         },
     )

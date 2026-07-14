@@ -8,6 +8,8 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::Value;
 
+mod mcp_open_projection;
+
 const MAX_INSERT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 use std::collections::{BTreeSet, HashSet};
 use std::time::Duration;
@@ -355,6 +357,22 @@ impl ClickHouseClient {
     }
 
     pub async fn insert_json_rows(&self, table: &str, rows: &[Value]) -> Result<()> {
+        self.insert_json_rows_with_mode(table, rows, true).await
+    }
+
+    /// Insert rows synchronously even when the client is configured for
+    /// ClickHouse async inserts. Projection maintenance uses this boundary so
+    /// canonical events are visible before it rebuilds their session.
+    pub async fn insert_json_rows_sync(&self, table: &str, rows: &[Value]) -> Result<()> {
+        self.insert_json_rows_with_mode(table, rows, false).await
+    }
+
+    async fn insert_json_rows_with_mode(
+        &self,
+        table: &str,
+        rows: &[Value],
+        async_insert: bool,
+    ) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
@@ -371,15 +389,21 @@ impl ClickHouseClient {
                 && payload.len().saturating_add(line.len()).saturating_add(1)
                     > MAX_INSERT_PAYLOAD_BYTES
             {
-                self.request_text(&query, Some(std::mem::take(&mut payload)), None, true, None)
-                    .await?;
+                self.request_text(
+                    &query,
+                    Some(std::mem::take(&mut payload)),
+                    None,
+                    async_insert,
+                    None,
+                )
+                .await?;
             }
             payload.extend_from_slice(&line);
             payload.push(b'\n');
         }
 
         if !payload.is_empty() {
-            self.request_text(&query, Some(payload), None, true, None)
+            self.request_text(&query, Some(payload), None, async_insert, None)
                 .await?;
         }
         Ok(())
@@ -569,6 +593,11 @@ impl ClickHouseClient {
             "search_query_log",
             "search_hit_log",
             "search_interaction_log",
+            "mcp_open_sessions",
+            "mcp_open_turns",
+            "mcp_open_events",
+            "mcp_open_dirty_sessions",
+            "mcp_open_projection_state",
             "schema_migrations",
         ];
 
@@ -776,6 +805,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             version: "026",
             name: "026_file_attention_project_roots.sql",
             sql: include_str!("../../../sql/026_file_attention_project_roots.sql"),
+        },
+        Migration {
+            version: "027",
+            name: "027_mcp_open_read_model.sql",
+            sql: include_str!("../../../sql/027_mcp_open_read_model.sql"),
         },
     ]
 }

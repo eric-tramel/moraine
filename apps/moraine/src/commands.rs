@@ -206,6 +206,9 @@ fn conversation_repository(cfg: &AppConfig) -> Result<ClickHouseConversationRepo
 async fn cmd_db_migrate(cfg: &AppConfig) -> Result<MigrationOutcome> {
     let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
     let applied = ch.run_migrations().await?;
+    ch.backfill_mcp_open_read_model()
+        .await
+        .context("failed to backfill MCP open read model")?;
     Ok(MigrationOutcome { applied })
 }
 
