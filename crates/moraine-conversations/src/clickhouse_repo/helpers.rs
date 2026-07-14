@@ -685,12 +685,6 @@ pub(super) fn non_empty_string(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-pub(super) fn push_first_seen(items: &mut Vec<String>, value: String) {
-    if !items.iter().any(|item| item == &value) {
-        items.push(value);
-    }
-}
-
 pub(super) fn compact_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }

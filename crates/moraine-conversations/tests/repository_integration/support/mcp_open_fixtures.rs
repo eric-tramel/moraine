@@ -1,0 +1,461 @@
+use serde_json::{json, Value};
+
+pub(crate) fn session_row(session_id: &str) -> Option<Value> {
+    let (
+        first_time,
+        last_time,
+        total_turns,
+        total_events,
+        mode,
+        title,
+        source,
+        slug,
+        completed,
+        terminal,
+        origin,
+    ) = match session_id {
+        "sess-open" => (
+            "2026-02-01 10:01:00.000",
+            "2026-02-01 10:02:30.000",
+            2_u32,
+            8_u64,
+            "tool_calling",
+            "Open model session",
+            "codex-source",
+            "open-model-session",
+            1_u8,
+            "evt-open-8",
+            "/work/project",
+        ),
+        "sess-incomplete" => (
+            "2026-02-02 10:00:00.000",
+            "2026-02-02 10:02:00.000",
+            2,
+            5,
+            "tool_calling",
+            "",
+            "fixture",
+            "",
+            0,
+            "",
+            "/work/project",
+        ),
+        "sess-event" => (
+            "2026-02-03 10:00:00.000",
+            "2026-02-03 10:03:00.000",
+            2,
+            4,
+            "chat",
+            "",
+            "fixture",
+            "",
+            0,
+            "",
+            "/work/project",
+        ),
+        "sess-out-of-scope" => (
+            "2026-02-04 10:00:00.000",
+            "2026-02-04 10:00:00.000",
+            1,
+            1,
+            "chat",
+            "",
+            "fixture",
+            "",
+            0,
+            "",
+            "/other/project",
+        ),
+        _ => return None,
+    };
+    Some(json!({
+        "session_id": session_id,
+        "slot": 0_u8,
+        "generation": 100_u64,
+        "first_event_time": first_time,
+        "first_event_unix_ms": 1769940060000_i64,
+        "last_event_time": last_time,
+        "last_event_unix_ms": 1769940150000_i64,
+        "total_turns": total_turns,
+        "total_events": total_events,
+        "user_messages": 2_u64,
+        "assistant_messages": 2_u64,
+        "tool_calls": 1_u64,
+        "tool_results": 1_u64,
+        "mode": mode,
+        "first_event_uid": format!("{session_id}-first"),
+        "last_event_uid": terminal,
+        "last_actor_role": "assistant",
+        "title": title,
+        "source": source,
+        "harness": "codex",
+        "inference_provider": "openai",
+        "session_slug": slug,
+        "session_summary": title,
+        "completed": completed,
+        "terminal_event_uid": terminal,
+        "origin_cwd": origin
+    }))
+}
+
+pub(crate) fn turn_rows(session_id: &str, turn_seq: Option<u32>) -> Vec<Value> {
+    let rows = match session_id {
+        "sess-open" => vec![
+            turn_row(
+                session_id,
+                1,
+                5,
+                1,
+                1,
+                1,
+                1,
+                0,
+                "How should repository open models work?",
+                "First answer with repository context.",
+                vec!["search_repo"],
+                vec![
+                    "user_input",
+                    "tool_call",
+                    "tool_response",
+                    "assistant_response",
+                    "runtime",
+                ],
+                true,
+                "evt-open-5",
+                "evt-open-1",
+                "evt-open-5",
+                0,
+                2,
+                "[]".to_string(),
+            ),
+            turn_row(
+                session_id,
+                2,
+                3,
+                1,
+                1,
+                0,
+                0,
+                0,
+                "Continue.",
+                "Done.",
+                vec![],
+                vec!["user_input", "assistant_response", "runtime"],
+                true,
+                "evt-open-8",
+                "evt-open-6",
+                "evt-open-8",
+                1,
+                0,
+                "[]".to_string(),
+            ),
+        ],
+        "sess-incomplete" => vec![
+            turn_row(
+                session_id,
+                1,
+                2,
+                1,
+                1,
+                0,
+                0,
+                0,
+                "Earlier turn.",
+                "Earlier answer.",
+                vec![],
+                vec!["user_input", "assistant_response"],
+                false,
+                "",
+                "evt-inc-0",
+                "evt-inc-1",
+                0,
+                2,
+                "[]".to_string(),
+            ),
+            turn_row(
+                session_id,
+                2,
+                3,
+                1,
+                0,
+                1,
+                1,
+                0,
+                "Run the incomplete workflow.",
+                "",
+                vec!["inspect"],
+                vec!["user_input", "tool_call", "tool_response"],
+                false,
+                "",
+                "evt-inc-2",
+                "evt-inc-4",
+                1,
+                0,
+                serde_json::to_string(&json!([
+                    event_summary(
+                        "evt-inc-2",
+                        2,
+                        "user",
+                        "message",
+                        "message",
+                        "user_input",
+                        "",
+                        "",
+                        "",
+                        "Run the incomplete workflow."
+                    ),
+                    event_summary(
+                        "evt-inc-3",
+                        3,
+                        "assistant",
+                        "tool_call",
+                        "tool_use",
+                        "tool_call",
+                        "call-inc",
+                        "inspect",
+                        "",
+                        "{}"
+                    ),
+                    event_summary(
+                        "evt-inc-4",
+                        4,
+                        "tool",
+                        "tool_result",
+                        "tool_result",
+                        "tool_response",
+                        "call-inc",
+                        "inspect",
+                        "",
+                        "inspection output"
+                    )
+                ]))
+                .expect("event summaries serialize"),
+            ),
+        ],
+        "sess-event" => vec![
+            turn_row(
+                session_id,
+                1,
+                3,
+                1,
+                1,
+                0,
+                0,
+                0,
+                "Question",
+                "Answer",
+                vec![],
+                vec!["user_input", "assistant_response"],
+                false,
+                "",
+                "evt-event-1",
+                "evt-event-3",
+                0,
+                2,
+                "[]".to_string(),
+            ),
+            turn_row(
+                session_id,
+                2,
+                1,
+                1,
+                0,
+                0,
+                0,
+                0,
+                "Next",
+                "",
+                vec![],
+                vec!["user_input"],
+                false,
+                "",
+                "evt-event-4",
+                "evt-event-4",
+                1,
+                0,
+                "[]".to_string(),
+            ),
+        ],
+        _ => Vec::new(),
+    };
+    rows.into_iter()
+        .filter(|row| turn_seq.is_none_or(|seq| row["turn_seq"] == seq))
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn turn_row(
+    session_id: &str,
+    turn_seq: u32,
+    total_events: u64,
+    user_messages: u64,
+    assistant_messages: u64,
+    tool_calls: u64,
+    tool_results: u64,
+    reasoning_items: u64,
+    user_summary: &str,
+    final_summary: &str,
+    tools_called: Vec<&str>,
+    event_types: Vec<&str>,
+    completed: bool,
+    terminal: &str,
+    first_uid: &str,
+    last_uid: &str,
+    previous_turn_seq: u32,
+    next_turn_seq: u32,
+    event_summaries_json: String,
+) -> Value {
+    let event_type = |uid: &str| {
+        if uid.is_empty() {
+            ""
+        } else if uid == terminal {
+            "runtime"
+        } else {
+            "user_input"
+        }
+    };
+    json!({
+        "session_id": session_id,
+        "turn_seq": turn_seq,
+        "turn_id": format!("turn-{turn_seq}"),
+        "started_at": "2026-02-01 10:00:00.000",
+        "started_at_unix_ms": 1769940000000_i64,
+        "ended_at": "2026-02-01 10:01:00.000",
+        "ended_at_unix_ms": 1769940060000_i64,
+        "total_events": total_events,
+        "user_messages": user_messages,
+        "assistant_messages": assistant_messages,
+        "tool_calls": tool_calls,
+        "tool_results": tool_results,
+        "reasoning_items": reasoning_items,
+        "user_input_summary_source": user_summary,
+        "final_response_summary_source": final_summary,
+        "user_input_summary_is_payload": 0_u8,
+        "final_response_summary_is_payload": 0_u8,
+        "user_input_event_uid": first_uid,
+        "user_input_event_order": 1_u64,
+        "user_input_event_time": "2026-02-01 10:00:00.000",
+        "user_input_event_type": "user_input",
+        "final_response_event_uid": if final_summary.is_empty() { "" } else { last_uid },
+        "final_response_event_order": total_events,
+        "final_response_event_time": "2026-02-01 10:01:00.000",
+        "final_response_event_type": if final_summary.is_empty() { "" } else { "assistant_response" },
+        "tools_called": tools_called,
+        "normalized_event_types": event_types,
+        "completed": u8::from(completed),
+        "terminal_event_uid": terminal,
+        "first_event_uid": first_uid,
+        "first_event_order": 1_u64,
+        "first_event_time": "2026-02-01 10:00:00.000",
+        "first_event_type": event_type(first_uid),
+        "last_event_uid": last_uid,
+        "last_event_order": total_events,
+        "last_event_time": "2026-02-01 10:01:00.000",
+        "last_event_type": event_type(last_uid),
+        "previous_turn_seq": previous_turn_seq,
+        "previous_turn_id": if previous_turn_seq == 0 { "".to_string() } else { format!("turn-{previous_turn_seq}") },
+        "previous_turn_started_at": "2026-02-01 09:59:00.000",
+        "previous_turn_ended_at": "2026-02-01 10:00:00.000",
+        "next_turn_seq": next_turn_seq,
+        "next_turn_id": if next_turn_seq == 0 { "".to_string() } else { format!("turn-{next_turn_seq}") },
+        "next_turn_started_at": "2026-02-01 10:02:00.000",
+        "next_turn_ended_at": "2026-02-01 10:03:00.000",
+        "event_summaries_json": event_summaries_json
+    })
+}
+
+fn event_summary(
+    event_uid: &str,
+    event_order: u64,
+    actor_role: &str,
+    event_class: &str,
+    payload_type: &str,
+    event_type: &str,
+    call_id: &str,
+    name: &str,
+    phase: &str,
+    summary_source: &str,
+) -> Value {
+    json!({
+        "event_uid": event_uid,
+        "event_order": event_order,
+        "event_time": "2026-02-02 10:00:00.000",
+        "event_unix_ms": 1770026400000_i64,
+        "actor_role": actor_role,
+        "event_class": event_class,
+        "payload_type": payload_type,
+        "event_type": event_type,
+        "call_id": call_id,
+        "name": name,
+        "phase": phase,
+        "summary_source": summary_source,
+        "summary_is_payload": 0_u8
+    })
+}
+
+pub(crate) fn event_lookup(event_uid: &str) -> Option<Value> {
+    let session_id = match event_uid {
+        "evt-open-full" | "evt-event-1" | "evt-event-3" => "sess-event",
+        "evt-out-of-scope" => "sess-out-of-scope",
+        _ => return None,
+    };
+    Some(json!({
+        "event_uid": event_uid,
+        "session_id": session_id,
+        "slot": 0_u8,
+        "generation": 100_u64
+    }))
+}
+
+pub(crate) fn full_event_row(event_uid: &str) -> Option<Value> {
+    if event_uid != "evt-open-full" {
+        return None;
+    }
+    Some(json!({
+        "session_id": "sess-event",
+        "event_uid": event_uid,
+        "event_order": 2_u64,
+        "turn_seq": 1_u32,
+        "event_time": "2026-02-03 10:01:00.000",
+        "event_unix_ms": 1770112860000_i64,
+        "actor_role": "assistant",
+        "event_class": "message",
+        "payload_type": "text",
+        "event_type": "assistant_response",
+        "event_ordinal": 1_u32,
+        "call_id": "",
+        "name": "",
+        "phase": "",
+        "item_id": "",
+        "source_ref": "",
+        "text_content": "This is the full available event content that must not be clipped by the repository open model.",
+        "payload_json": "{\"text\":\"This is the full payload JSON value that must also remain intact\",\"nested\":{\"answer\":42}}",
+        "token_usage_json": "",
+        "endpoint_kind": "",
+        "token_usage_buckets": {},
+        "token_usage_native_units": {},
+        "previous_event_uid": "evt-event-1",
+        "next_event_uid": "evt-event-3"
+    }))
+}
+
+pub(crate) fn event_ref_rows() -> Vec<Value> {
+    vec![
+        json!({
+            "session_id": "sess-event",
+            "event_uid": "evt-event-1",
+            "event_order": 1_u64,
+            "turn_seq": 1_u32,
+            "event_time": "2026-02-03 10:00:00.000",
+            "event_type": "user_input"
+        }),
+        json!({
+            "session_id": "sess-event",
+            "event_uid": "evt-event-3",
+            "event_order": 3_u64,
+            "turn_seq": 1_u32,
+            "event_time": "2026-02-03 10:02:00.000",
+            "event_type": "assistant_response"
+        }),
+    ]
+}

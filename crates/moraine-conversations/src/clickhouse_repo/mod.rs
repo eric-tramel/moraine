@@ -84,6 +84,7 @@ mod cache;
 mod file_attention;
 mod helpers;
 mod list;
+mod mcp_open_read;
 mod open;
 mod operations;
 mod repo_impl;
@@ -190,6 +191,6 @@ impl ClickHouseConversationRepository {
     }
 
     pub(super) fn map_backend<T>(&self, result: AnyResult<T>) -> RepoResult<T> {
-        result.map_err(|err| RepoError::backend(err.to_string()))
+        result.map_err(|err| RepoError::backend(format!("{err:#}")))
     }
 }

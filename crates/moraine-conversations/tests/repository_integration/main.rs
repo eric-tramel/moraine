@@ -1,3 +1,4 @@
+#![recursion_limit = "512"]
 #![allow(clippy::collapsible_if, clippy::too_many_arguments)]
 
 use std::sync::Arc;
