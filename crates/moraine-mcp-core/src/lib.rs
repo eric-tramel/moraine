@@ -50,7 +50,7 @@ fn effective_max_parallel_requests(
     let (requested, source) = match configured {
         Some(configured) => (usize::from(configured), RequestLimitSource::Config),
         None => (
-            detected_parallelism.unwrap_or(1),
+            detected_parallelism.unwrap_or(1).min(8),
             RequestLimitSource::Automatic,
         ),
     };
