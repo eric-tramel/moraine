@@ -1,9 +1,11 @@
 use super::{escape_identifier, escape_literal, ClickHouseClient};
 use anyhow::{bail, Context, Result};
+use futures_util::{stream, TryStreamExt};
 use serde::Deserialize;
 use std::collections::BTreeSet;
 
 const BACKFILL_PAGE_SIZE: usize = 64;
+const REFRESH_CONCURRENCY: usize = 4;
 const MAX_UNSTABLE_REFRESH_ATTEMPTS: usize = 8;
 const MAX_PROJECTED_TEXT_SUMMARY_CHARS: usize = 65_536;
 const MAX_PROJECTED_PAYLOAD_SUMMARY_CHARS: usize = 131_071;
@@ -52,15 +54,30 @@ impl ClickHouseClient {
             .filter(|session_id| !session_id.is_empty())
             .collect::<BTreeSet<_>>();
 
-        for session_id in session_ids {
-            self.refresh_mcp_open_session(&session_id).await?;
-        }
-        Ok(())
+        stream::iter(session_ids.into_iter().map(Ok::<_, anyhow::Error>))
+            .try_for_each_concurrent(REFRESH_CONCURRENCY, |session_id| async move {
+                self.refresh_mcp_open_session(&session_id).await
+            })
+            .await
     }
 
     /// Resume the historical projection and reconcile sessions dirtied while
     /// the DDL/backfill was running. Safe to call after every migrate command.
     pub async fn backfill_mcp_open_read_model(&self) -> Result<()> {
+        self.backfill_mcp_open_read_model_with_progress(|_| {})
+            .await
+    }
+
+    /// Backfill the read model and report the cumulative number of refreshed
+    /// sessions after each bounded page.
+    pub async fn backfill_mcp_open_read_model_with_progress<F>(
+        &self,
+        mut on_progress: F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize),
+    {
+        let mut refreshed_sessions = 0;
         let state = self.mcp_open_projection_state().await?;
         let historical_complete = state.as_ref().is_some_and(|state| state.ready == 1);
         let mut cursor = state.map_or_else(String::new, |state| state.backfill_cursor);
@@ -92,6 +109,8 @@ impl ClickHouseClient {
                     .await?;
                 cursor = rows.last().expect("non-empty page").session_id.clone();
                 self.set_mcp_open_projection_state(false, &cursor).await?;
+                refreshed_sessions += rows.len();
+                on_progress(refreshed_sessions);
             }
         }
 
@@ -123,6 +142,8 @@ impl ClickHouseClient {
             }
             self.refresh_mcp_open_read_model(rows.iter().map(|row| row.session_id.as_str()))
                 .await?;
+            refreshed_sessions += rows.len();
+            on_progress(refreshed_sessions);
         }
 
         self.set_mcp_open_projection_state(true, "").await?;

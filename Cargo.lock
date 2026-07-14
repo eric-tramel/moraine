@@ -1163,6 +1163,7 @@ version = "0.6.4"
 dependencies = [
  "anyhow",
  "axum",
+ "futures-util",
  "moraine-config",
  "reqwest",
  "serde",
