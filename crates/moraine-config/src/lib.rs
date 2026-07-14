@@ -164,6 +164,11 @@ pub struct McpConfig {
     pub async_log_writes: bool,
     #[serde(default = "default_protocol_version")]
     pub protocol_version: String,
+    /// Maximum retrieval requests executed concurrently by each MCP server
+    /// process. When omitted, the server uses the process's available CPU
+    /// parallelism. Additional valid requests wait for capacity.
+    #[serde(default)]
+    pub max_parallel_requests: Option<u16>,
     /// When true, `moraine run mcp` first tries to reach the shared central
     /// MCP server over its Unix socket and proxies to it; if the socket is
     /// absent or unreachable it transparently falls back to an embedded
@@ -430,6 +435,7 @@ impl Default for McpConfig {
             prewarm_on_initialize: false,
             async_log_writes: true,
             protocol_version: default_protocol_version(),
+            max_parallel_requests: None,
             use_central_server: true,
             central_socket_path: default_mcp_socket(),
             start_central_on_up: true,
@@ -1167,6 +1173,12 @@ fn migrate_legacy_pi_source(sources: &mut Vec<IngestSource>) {
 }
 
 fn normalize_config(mut cfg: AppConfig) -> Result<AppConfig> {
+    if cfg.mcp.max_parallel_requests == Some(0) {
+        return Err(anyhow::anyhow!(
+            "mcp.max_parallel_requests must be greater than zero when configured"
+        ));
+    }
+
     migrate_legacy_pi_source(&mut cfg.ingest.sources);
     for (source_idx, source) in cfg.ingest.sources.iter_mut().enumerate() {
         source.harness = normalize_harness(&source.harness, source_idx, &source.name)?;
@@ -1996,6 +2008,36 @@ prewarm_on_initialize = true
         let cfg = load_config(&path).expect("mcp prewarm toggle should load");
         std::fs::remove_file(&path).ok();
         assert!(cfg.mcp.prewarm_on_initialize);
+    }
+
+    #[test]
+    fn mcp_parallel_request_limit_is_optional_and_positive() {
+        let default_cfg = McpConfig::default();
+        assert_eq!(default_cfg.max_parallel_requests, None);
+
+        let explicit_path = write_temp_config(
+            r#"
+[mcp]
+max_parallel_requests = 12
+"#,
+            "mcp-parallel-requests",
+        );
+        let explicit = load_config(&explicit_path).expect("positive limit should load");
+        std::fs::remove_file(&explicit_path).ok();
+        assert_eq!(explicit.mcp.max_parallel_requests, Some(12));
+
+        let zero_path = write_temp_config(
+            r#"
+[mcp]
+max_parallel_requests = 0
+"#,
+            "mcp-parallel-requests-zero",
+        );
+        let error = load_config(&zero_path).expect_err("zero limit must fail");
+        std::fs::remove_file(&zero_path).ok();
+        assert!(error
+            .to_string()
+            .contains("mcp.max_parallel_requests must be greater than zero"));
     }
 
     #[test]

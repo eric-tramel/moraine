@@ -21,6 +21,7 @@ const PANIC_SEARCH: u8 = 4;
 const BLOCK_SCOPE: u8 = 5;
 const BLOCK_LIST: u8 = 6;
 const BLOCK_OPEN: u8 = 7;
+const TEST_MAX_PARALLEL_REQUESTS: usize = 2;
 
 struct BlockingRepository {
     inner: InMemoryConversationRepository,
@@ -284,6 +285,16 @@ impl ConversationRepository for BlockingRepository {
 type ClientReader = BufReader<ReadHalf<tokio::io::DuplexStream>>;
 type ClientWriter = WriteHalf<tokio::io::DuplexStream>;
 
+fn test_state(repository: Arc<BlockingRepository>, max_parallel_requests: usize) -> Arc<AppState> {
+    AppState::with_repository(
+        Arc::new(AppConfig::default()),
+        repository,
+        Arc::new(AtomicBool::new(false)),
+        std::env::current_dir().ok(),
+        Arc::new(Semaphore::new(max_parallel_requests)),
+    )
+}
+
 fn start_connection(
     repository: Arc<BlockingRepository>,
 ) -> (
@@ -291,7 +302,18 @@ fn start_connection(
     ClientWriter,
     tokio::task::JoinHandle<Result<()>>,
 ) {
-    let state = AppState::embedded(AppConfig::default(), repository);
+    start_connection_with_capacity(repository, TEST_MAX_PARALLEL_REQUESTS)
+}
+
+fn start_connection_with_capacity(
+    repository: Arc<BlockingRepository>,
+    max_parallel_requests: usize,
+) -> (
+    ClientReader,
+    ClientWriter,
+    tokio::task::JoinHandle<Result<()>>,
+) {
+    let state = test_state(repository, max_parallel_requests);
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (client_read, client_write) = tokio::io::split(client);
     let (server_read, server_write) = tokio::io::split(server);
@@ -311,7 +333,7 @@ fn start_connection_with_shutdown(
     oneshot::Sender<()>,
     tokio::task::JoinHandle<Result<()>>,
 ) {
-    let state = AppState::embedded(AppConfig::default(), repository);
+    let state = test_state(repository, TEST_MAX_PARALLEL_REQUESTS);
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (client_read, client_write) = tokio::io::split(client);
     let (server_read, server_write) = tokio::io::split(server);
@@ -361,7 +383,10 @@ fn tool_request(id: &str, name: &str, arguments: Value) -> String {
     request
 }
 
-async fn read_response(reader: &mut ClientReader) -> Value {
+async fn read_response<R>(reader: &mut R) -> Value
+where
+    R: AsyncBufRead + Unpin,
+{
     let mut line = String::new();
     tokio::time::timeout(
         std::time::Duration::from_millis(500),
@@ -374,76 +399,129 @@ async fn read_response(reader: &mut ClientReader) -> Value {
 }
 
 #[tokio::test]
-async fn blocked_burst_preserves_fast_validation_backpressure_and_recovery() {
-    let repository = Arc::new(BlockingRepository::new(BLOCK_SEARCH));
+async fn blocked_burst_queues_retrieval_while_control_requests_stay_responsive() {
+    let repository = Arc::new(BlockingRepository::new(DELAY_SEARCH));
     let (mut reader, mut writer, server) = start_connection(repository.clone());
 
-    let burst = (1..=MAX_IN_FLIGHT_REQUESTS)
-        .map(search_request)
+    let burst = (1..=TEST_MAX_PARALLEL_REQUESTS)
+        .map(|id| search_request_with_query(json!(id), "slow"))
         .collect::<String>();
     writer
         .write_all(burst.as_bytes())
         .await
-        .expect("send burst");
-    repository.wait_for_started(MAX_IN_FLIGHT_REQUESTS).await;
+        .expect("send admitted burst");
+    repository
+        .wait_for_started(TEST_MAX_PARALLEL_REQUESTS)
+        .await;
 
     writer
-        .write_all(
-            b"{\"jsonrpc\":\"2.0\",\"id\":\"invalid\",\"method\":\"tools/call\",\"params\":{\"name\":\"open\",\"arguments\":{\"id\":\"unknown:123\"}}}\n",
-        )
+        .write_all(search_request_with_query(json!(3), "slow").as_bytes())
         .await
-        .expect("send invalid request");
+        .expect("send queued request");
     writer
-        .write_all(search_request(9).as_bytes())
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"ping\",\"method\":\"ping\",\"params\":{}}\n")
         .await
-        .expect("send over-capacity request");
+        .expect("send control request");
+    writer
+        .write_all(tool_request("invalid-open", "open", json!({})).as_bytes())
+        .await
+        .expect("send invalid retrieval request");
+    writer
+        .write_all(tool_request("unknown-tool", "not_a_tool", json!({})).as_bytes())
+        .await
+        .expect("send unknown tool request");
+    writer
+        .write_all(search_request_with_query(json!(3), "slow").as_bytes())
+        .await
+        .expect("send duplicate queued id");
 
-    let first = read_response(&mut reader).await;
-    let second = read_response(&mut reader).await;
-    let responses = [first, second];
+    let responses = [
+        read_response(&mut reader).await,
+        read_response(&mut reader).await,
+        read_response(&mut reader).await,
+        read_response(&mut reader).await,
+    ];
+    let ping = responses
+        .iter()
+        .find(|response| response["id"] == json!("ping"))
+        .expect("ping bypassed saturated retrievals");
+    assert_eq!(ping["result"], json!({}));
+    let duplicate = responses
+        .iter()
+        .find(|response| response["id"] == json!(3))
+        .expect("queued request id was reserved");
+    assert_eq!(duplicate["error"]["code"], json!(-32600));
     let invalid = responses
         .iter()
-        .find(|response| response["id"] == json!("invalid"))
-        .expect("invalid request bypassed blocked retrievals");
+        .find(|response| response["id"] == json!("invalid-open"))
+        .expect("invalid arguments bypassed saturated retrievals");
+    assert_eq!(invalid["result"]["isError"], json!(true));
+    let unknown = responses
+        .iter()
+        .find(|response| response["id"] == json!("unknown-tool"))
+        .expect("unknown tool bypassed saturated retrievals");
+    assert_eq!(unknown["result"]["isError"], json!(true));
     assert_eq!(
-        invalid["result"]["structuredContent"]["error"]["code"],
-        json!("invalid_id")
+        repository.started.load(Ordering::Acquire),
+        TEST_MAX_PARALLEL_REQUESTS
     );
-    let rejected = responses
-        .iter()
-        .find(|response| response["id"] == json!(9))
-        .expect("bounded burst was rejected promptly");
-    assert_eq!(rejected["error"]["code"], json!(-32000));
 
-    for id in 1..=MAX_IN_FLIGHT_REQUESTS {
-        writer
-            .write_all(
-                format!(
-                    "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{{\"requestId\":{id},\"reason\":\"test\"}}}}\n"
-                )
-                .as_bytes(),
-            )
-            .await
-            .expect("cancel request");
+    repository.release_search.notify_one();
+    repository
+        .wait_for_started(TEST_MAX_PARALLEL_REQUESTS + 1)
+        .await;
+    repository.release_search.notify_waiters();
+
+    let mut completed_ids = Vec::new();
+    for _ in 0..=TEST_MAX_PARALLEL_REQUESTS {
+        let response = read_response(&mut reader).await;
+        assert!(response.get("result").is_some());
+        completed_ids.push(response["id"].as_u64().expect("numeric response id"));
     }
-    repository.wait_for_dropped(MAX_IN_FLIGHT_REQUESTS).await;
-    repository.wait_for_cancelled(MAX_IN_FLIGHT_REQUESTS).await;
-    let mut cancelled_searches = repository.cancelled_queries.lock().await.clone();
-    cancelled_searches.sort();
-    cancelled_searches.dedup();
-    assert_eq!(cancelled_searches.len(), MAX_IN_FLIGHT_REQUESTS);
-    assert!(cancelled_searches
-        .iter()
-        .all(|query_id| query_id.starts_with("moraine-search-sessions-")));
-    repository.mode.store(0, Ordering::Release);
+    completed_ids.sort_unstable();
+    assert_eq!(completed_ids, vec![1, 2, 3]);
+
+    writer.shutdown().await.expect("half-close request stream");
+    drop(writer);
+    tokio::time::timeout(std::time::Duration::from_secs(1), server)
+        .await
+        .expect("connection drained")
+        .expect("connection task joined")
+        .expect("connection succeeded");
+}
+
+#[tokio::test]
+async fn queued_cancellation_never_reaches_repository_or_backend_cancel() {
+    let repository = Arc::new(BlockingRepository::new(DELAY_SEARCH));
+    let (mut reader, mut writer, server) = start_connection_with_capacity(repository.clone(), 1);
 
     writer
-        .write_all(search_request(10).as_bytes())
+        .write_all(search_request_with_query(json!(1), "slow").as_bytes())
         .await
-        .expect("send recovery request");
-    let recovered = read_response(&mut reader).await;
-    assert_eq!(recovered["id"], json!(10));
-    assert!(recovered.get("result").is_some());
+        .expect("send admitted request");
+    repository.wait_for_started(1).await;
+    writer
+        .write_all(search_request_with_query(json!(2), "slow").as_bytes())
+        .await
+        .expect("send queued request");
+    writer
+        .write_all(
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":2,\"reason\":\"test\"}}\n",
+        )
+        .await
+        .expect("cancel queued request");
+    writer
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"barrier\",\"method\":\"ping\",\"params\":{}}\n")
+        .await
+        .expect("send dispatch barrier");
+
+    let barrier = read_response(&mut reader).await;
+    assert_eq!(barrier["id"], json!("barrier"));
+    repository.release_search.notify_one();
+    let completed = read_response(&mut reader).await;
+    assert_eq!(completed["id"], json!(1));
+    assert_eq!(repository.started.load(Ordering::Acquire), 1);
+    assert!(repository.cancelled_queries.lock().await.is_empty());
 
     writer.shutdown().await.expect("half-close request stream");
     drop(writer);
@@ -586,12 +664,13 @@ async fn full_socket_disconnect_cancels_blocked_repository_work() {
     use std::os::fd::AsRawFd;
 
     let repository = Arc::new(BlockingRepository::new(BLOCK_SEARCH));
-    let state = AppState::embedded(AppConfig::default(), repository.clone());
+    let state = test_state(repository.clone(), 1);
     let (server_stream, client_stream) =
         tokio::net::UnixStream::pair().expect("create socket pair");
     let peer_fd = server_stream.as_raw_fd();
     let (server_read, server_write) = server_stream.into_split();
     let (client_read, mut client_write) = client_stream.into_split();
+    let mut client_read = BufReader::new(client_read);
     let server = tokio::spawn(serve_connection_with_lifecycle(
         state,
         BufReader::new(server_read),
@@ -601,11 +680,19 @@ async fn full_socket_disconnect_cancels_blocked_repository_work() {
         wait_for_socket_disconnect(peer_fd),
     ));
 
+    let burst = format!(
+        "{}{}{}",
+        search_request(1),
+        search_request(2),
+        "{\"jsonrpc\":\"2.0\",\"id\":\"disconnect-barrier\",\"method\":\"ping\"}\n"
+    );
     client_write
-        .write_all(search_request(1).as_bytes())
+        .write_all(burst.as_bytes())
         .await
-        .expect("send blocked request");
+        .expect("send running, queued, and barrier requests");
     repository.wait_for_started(1).await;
+    let barrier = read_response(&mut client_read).await;
+    assert_eq!(barrier["id"], json!("disconnect-barrier"));
     drop(client_read);
     drop(client_write);
 
@@ -616,6 +703,8 @@ async fn full_socket_disconnect_cancels_blocked_repository_work() {
         .expect("connection succeeded");
     repository.wait_for_dropped(1).await;
     repository.wait_for_cancelled(1).await;
+    assert_eq!(repository.started.load(Ordering::Acquire), 1);
+    assert_eq!(repository.cancelled_queries.lock().await.len(), 1);
     assert!(repository.cancelled_queries.lock().await[0].starts_with("moraine-search-sessions-"));
 }
 
@@ -716,13 +805,20 @@ async fn service_shutdown_cancels_in_flight_backend_query() {
     let (_reader, mut writer, shutdown, server) =
         start_connection_with_shutdown(repository.clone());
 
-    writer
-        .write_all(
-            b"{\"jsonrpc\":\"2.0\",\"id\":\"shutdown\",\"method\":\"tools/call\",\"params\":{\"name\":\"file_attention\",\"arguments\":{\"path\":\"src/lib.rs\"}}}\n",
-        )
-        .await
-        .expect("send blocked request");
-    repository.wait_for_started(1).await;
+    for id in ["shutdown-a", "shutdown-b", "shutdown-queued"] {
+        writer
+            .write_all(
+                format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":\"{id}\",\"method\":\"tools/call\",\"params\":{{\"name\":\"file_attention\",\"arguments\":{{\"path\":\"src/lib.rs\"}}}}}}\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("send shutdown request");
+    }
+    repository
+        .wait_for_started(TEST_MAX_PARALLEL_REQUESTS)
+        .await;
     shutdown.send(()).expect("request service shutdown");
 
     tokio::time::timeout(std::time::Duration::from_secs(2), server)
@@ -730,9 +826,105 @@ async fn service_shutdown_cancels_in_flight_backend_query() {
         .expect("service shutdown deadline")
         .expect("connection task joined")
         .expect("connection succeeded");
+    repository
+        .wait_for_dropped(TEST_MAX_PARALLEL_REQUESTS)
+        .await;
+    repository
+        .wait_for_cancelled(TEST_MAX_PARALLEL_REQUESTS)
+        .await;
+    assert_eq!(
+        repository.started.load(Ordering::Acquire),
+        TEST_MAX_PARALLEL_REQUESTS
+    );
+    assert!(repository
+        .cancelled_queries
+        .lock()
+        .await
+        .iter()
+        .all(|query_id| query_id.starts_with("moraine-file-attention-")));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn central_service_shutdown_cancels_process_wide_queued_requests() {
+    async fn connect(path: &std::path::Path) -> tokio::net::UnixStream {
+        for _ in 0..100 {
+            if let Ok(stream) = tokio::net::UnixStream::connect(path).await {
+                return stream;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("failed to connect to test socket {}", path.display());
+    }
+
+    let repository = Arc::new(BlockingRepository::new(BLOCK_FILE_ATTENTION));
+    let mut cfg = AppConfig::default();
+    cfg.mcp.max_parallel_requests = Some(1);
+    let cfg = Arc::new(cfg);
+    let repository_trait: Arc<dyn ConversationRepository> = repository.clone();
+    let router = Arc::new(
+        BackendRepositoryRouter::from_preloaded_for_testing(
+            cfg.clone(),
+            [("default".to_string(), repository_trait)],
+        )
+        .expect("preload blocking repository"),
+    );
+    let socket_path = PathBuf::from(format!(
+        "/tmp/moraine-shutdown-{}-{}.sock",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&socket_path);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server_socket_path = socket_path.clone();
+    let server = tokio::spawn(async move {
+        run_socket_with_router(cfg, router, server_socket_path, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let running_client = connect(&socket_path).await;
+    let queued_client = connect(&socket_path).await;
+    let (running_read, mut running_writer) = running_client.into_split();
+    let _running_reader = BufReader::new(running_read);
+    let (queued_read, mut queued_writer) = queued_client.into_split();
+    let mut queued_reader = BufReader::new(queued_read);
+
+    running_writer
+        .write_all(
+            tool_request("running", "file_attention", json!({"path": "src/lib.rs"})).as_bytes(),
+        )
+        .await
+        .expect("send running request");
+    repository.wait_for_started(1).await;
+    queued_writer
+        .write_all(
+            tool_request("queued", "file_attention", json!({"path": "src/lib.rs"})).as_bytes(),
+        )
+        .await
+        .expect("send queued request");
+    queued_writer
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"barrier\",\"method\":\"ping\",\"params\":{}}\n")
+        .await
+        .expect("send queued-connection barrier");
+    let barrier = read_response(&mut queued_reader).await;
+    assert_eq!(barrier["id"], json!("barrier"));
+
+    shutdown_tx.send(()).expect("request central shutdown");
+    tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .expect("central shutdown deadline")
+        .expect("central server task joined")
+        .expect("central server shutdown succeeded");
     repository.wait_for_dropped(1).await;
     repository.wait_for_cancelled(1).await;
-    assert!(repository.cancelled_queries.lock().await[0].starts_with("moraine-file-attention-"));
+    assert_eq!(repository.started.load(Ordering::Acquire), 1);
+    assert_eq!(repository.cancelled_queries.lock().await.len(), 1);
+    assert!(!socket_path.exists(), "central socket was cleaned up");
 }
 
 #[tokio::test]
@@ -740,13 +932,20 @@ async fn malformed_transport_still_cancels_in_flight_backend_query() {
     let repository = Arc::new(BlockingRepository::new(BLOCK_FILE_ATTENTION));
     let (_reader, mut writer, server) = start_connection(repository.clone());
 
-    writer
-        .write_all(
-            b"{\"jsonrpc\":\"2.0\",\"id\":\"malformed\",\"method\":\"tools/call\",\"params\":{\"name\":\"file_attention\",\"arguments\":{\"path\":\"src/lib.rs\"}}}\n",
-        )
-        .await
-        .expect("send blocked request");
-    repository.wait_for_started(1).await;
+    for id in ["malformed-a", "malformed-b", "malformed-queued"] {
+        writer
+            .write_all(
+                format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":\"{id}\",\"method\":\"tools/call\",\"params\":{{\"name\":\"file_attention\",\"arguments\":{{\"path\":\"src/lib.rs\"}}}}}}\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("send malformed-transport request");
+    }
+    repository
+        .wait_for_started(TEST_MAX_PARALLEL_REQUESTS)
+        .await;
     writer
         .write_all(&[0xff, b'\n'])
         .await
@@ -760,6 +959,14 @@ async fn malformed_transport_still_cancels_in_flight_backend_query() {
     assert!(error
         .to_string()
         .contains("stream did not contain valid UTF-8"));
-    repository.wait_for_dropped(1).await;
-    repository.wait_for_cancelled(1).await;
+    repository
+        .wait_for_dropped(TEST_MAX_PARALLEL_REQUESTS)
+        .await;
+    repository
+        .wait_for_cancelled(TEST_MAX_PARALLEL_REQUESTS)
+        .await;
+    assert_eq!(
+        repository.started.load(Ordering::Acquire),
+        TEST_MAX_PARALLEL_REQUESTS
+    );
 }

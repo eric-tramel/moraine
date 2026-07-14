@@ -26,14 +26,50 @@ use std::sync::{
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{oneshot, watch, Semaphore};
 use tokio::task::JoinSet;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
-// The widest retrieval stage runs three independent ClickHouse reads.
-// Eight admitted requests therefore cap MCP-owned backend reads at 24 while
-// retaining that per-request fan-out.
-const MAX_REPOSITORY_READ_FAN_OUT: usize = 3;
-const MAX_IN_FLIGHT_BACKEND_READS: usize = 24;
-const MAX_IN_FLIGHT_REQUESTS: usize = MAX_IN_FLIGHT_BACKEND_READS / MAX_REPOSITORY_READ_FAN_OUT;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequestLimitSource {
+    Automatic,
+    Config,
+}
+
+impl RequestLimitSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::Config => "config",
+        }
+    }
+}
+
+fn effective_max_parallel_requests(
+    configured: Option<u16>,
+    detected_parallelism: Option<usize>,
+) -> (usize, RequestLimitSource) {
+    let (requested, source) = match configured {
+        Some(configured) => (usize::from(configured), RequestLimitSource::Config),
+        None => (
+            detected_parallelism.unwrap_or(1),
+            RequestLimitSource::Automatic,
+        ),
+    };
+    (requested.clamp(1, Semaphore::MAX_PERMITS), source)
+}
+
+fn build_request_permits(cfg: &AppConfig) -> Arc<Semaphore> {
+    let detected_parallelism = std::thread::available_parallelism()
+        .ok()
+        .map(std::num::NonZeroUsize::get);
+    let (max_parallel_requests, source) =
+        effective_max_parallel_requests(cfg.mcp.max_parallel_requests, detected_parallelism);
+    info!(
+        max_parallel_requests,
+        source = source.as_str(),
+        "configured MCP retrieval concurrency"
+    );
+    Arc::new(Semaphore::new(max_parallel_requests))
+}
 const QUERY_CANCELLATION_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1_000);
 const SERVICE_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(1_250);
 
@@ -547,12 +583,13 @@ impl AppState {
     }
 
     fn embedded(cfg: AppConfig, repo: Arc<dyn ConversationRepository>) -> Arc<AppState> {
+        let request_permits = build_request_permits(&cfg);
         Self::with_repository(
             cfg.into(),
             repo,
             Arc::new(AtomicBool::new(false)),
             std::env::current_dir().ok(),
-            Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS)),
+            request_permits,
         )
     }
 }
@@ -588,8 +625,8 @@ impl QueryCancellationGuard {
 ///
 /// Slow repository requests execute concurrently and may complete out of order.
 /// Response encoding and writes stay on this connection task so JSON frames can
-/// never interleave. Admission is shared across socket connections and rejects
-/// excess work immediately instead of building an unbounded queue.
+/// never interleave. Admission is shared across socket connections; requests
+/// wait asynchronously when all execution permits are in use.
 async fn serve_connection_with_first_line<R, W>(
     state: Arc<AppState>,
     reader: R,
@@ -618,6 +655,17 @@ where
     serve_connection_with_lifecycle(state, reader, writer, first_line, shutdown, pending()).await
 }
 
+async fn wait_for_connection_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    if *shutdown.borrow_and_update() {
+        return;
+    }
+    while shutdown.changed().await.is_ok() {
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+    }
+}
+
 async fn serve_connection_with_lifecycle<R, W, S, D>(
     state: Arc<AppState>,
     reader: R,
@@ -634,6 +682,7 @@ where
 {
     let mut requests = JoinSet::new();
     let mut active = HashMap::new();
+    let (request_shutdown_tx, request_shutdown_rx) = watch::channel(false);
     let mut shutdown_requested = false;
     let mut connection_error = None;
     tokio::pin!(shutdown);
@@ -642,8 +691,14 @@ where
     if let Some(first_line) = first_line {
         let first_line =
             std::str::from_utf8(&first_line).context("incoming RPC line is not valid UTF-8")?;
-        if let Some(response) =
-            dispatch_rpc_line(&state, first_line, &mut requests, &mut active).await?
+        if let Some(response) = dispatch_rpc_line(
+            &state,
+            first_line,
+            &mut requests,
+            &mut active,
+            request_shutdown_rx.clone(),
+        )
+        .await?
         {
             tokio::select! {
                 result = write_rpc_response(&mut writer, &response) => result?,
@@ -679,7 +734,13 @@ where
                         continue;
                     }
                 };
-                match dispatch_rpc_line(&state, &line, &mut requests, &mut active).await {
+                match dispatch_rpc_line(
+                    &state,
+                    &line,
+                    &mut requests,
+                    &mut active,
+                    request_shutdown_rx.clone(),
+                ).await {
                     Ok(Some(response)) => {
                         tokio::select! {
                             result = write_rpc_response(&mut writer, &response) => {
@@ -723,6 +784,8 @@ where
             }
         }
     }
+
+    let _ = request_shutdown_tx.send(true);
 
     for request in active.values_mut() {
         if let Some(cancellation) = request.cancellation.take() {
@@ -773,6 +836,7 @@ async fn dispatch_rpc_line(
     line: &str,
     requests: &mut JoinSet<RequestResult>,
     active: &mut HashMap<String, ActiveRequest>,
+    mut connection_shutdown: watch::Receiver<bool>,
 ) -> Result<Option<Value>> {
     let line = line.trim();
     if line.is_empty() {
@@ -816,26 +880,28 @@ async fn dispatch_rpc_line(
         )));
     }
 
-    let permit = match state.request_permits.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            return Ok(Some(rpc_err(
-                id,
-                -32000,
-                "server busy: concurrent request limit reached",
-            )))
-        }
-    };
-
     let (cancel_tx, mut cancel_rx) = oneshot::channel();
     let request_query_id = backend_query_id("request");
-    let query_cancellation = Arc::new(StdMutex::new(Some(request_query_id.clone())));
+    let query_cancellation = Arc::new(StdMutex::new(None));
     let task_query_cancellation = query_cancellation.clone();
     let request_state = state.clone();
     let task_key = key.clone();
     let task = requests.spawn(async move {
+        let permit = tokio::select! {
+            biased;
+            _ = &mut cancel_rx => None,
+            _ = wait_for_connection_shutdown(&mut connection_shutdown) => None,
+            permit = request_state.request_permits.clone().acquire_owned() => permit.ok(),
+        };
+        let Some(permit) = permit else {
+            return (task_key, None);
+        };
         let _permit = permit;
         let query_cancellation = task_query_cancellation;
+        *query_cancellation
+            .lock()
+            .expect("query cancellation slot poisoned") = Some(request_query_id.clone());
+
         enum Outcome {
             Completed(Option<Value>),
             Cancelled,
@@ -852,6 +918,7 @@ async fn dispatch_rpc_line(
             tokio::select! {
                 biased;
                 _ = &mut cancel_rx => Outcome::Cancelled,
+                _ = wait_for_connection_shutdown(&mut connection_shutdown) => Outcome::Cancelled,
                 response = &mut request => Outcome::Completed(response),
             }
         };
@@ -1055,9 +1122,10 @@ where
     use tokio::task::JoinSet;
 
     let (connection_shutdown_tx, connection_shutdown_rx) = watch::channel(false);
+    let request_permits = build_request_permits(&cfg);
     let state = SocketState {
         prewarm_gates: BackendPrewarmGates::new(&cfg),
-        request_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS)),
+        request_permits,
         shutdown: connection_shutdown_rx,
         cfg,
         router,
@@ -1210,6 +1278,7 @@ where
         }
     }
 
+    state.request_permits.close();
     let _ = connection_shutdown_tx.send(true);
     let drain_deadline = tokio::time::Instant::now() + SERVICE_DRAIN_GRACE;
     while !connections.is_empty() {
@@ -1584,6 +1653,42 @@ mod tests {
 
     fn test_state() -> Arc<AppState> {
         AppState::embedded(AppConfig::default(), repository_with_scope(None))
+    }
+
+    #[test]
+    fn effective_parallel_request_limit_prefers_config_and_falls_back_safely() {
+        assert_eq!(
+            effective_max_parallel_requests(Some(12), Some(8)),
+            (12, RequestLimitSource::Config)
+        );
+        assert_eq!(
+            effective_max_parallel_requests(None, Some(1)),
+            (1, RequestLimitSource::Automatic)
+        );
+        assert_eq!(
+            effective_max_parallel_requests(None, Some(2)),
+            (2, RequestLimitSource::Automatic)
+        );
+        assert_eq!(
+            effective_max_parallel_requests(None, Some(8)),
+            (8, RequestLimitSource::Automatic)
+        );
+        assert_eq!(
+            effective_max_parallel_requests(None, None),
+            (1, RequestLimitSource::Automatic)
+        );
+        assert_eq!(
+            effective_max_parallel_requests(None, Some(Semaphore::MAX_PERMITS.saturating_add(1))),
+            (Semaphore::MAX_PERMITS, RequestLimitSource::Automatic)
+        );
+    }
+
+    #[test]
+    fn embedded_state_uses_configured_parallel_request_limit() {
+        let mut cfg = AppConfig::default();
+        cfg.mcp.max_parallel_requests = Some(3);
+        let state = AppState::embedded(cfg, repository_with_scope(None));
+        assert_eq!(state.request_permits.available_permits(), 3);
     }
 
     fn successful_test_state() -> Arc<AppState> {

@@ -582,6 +582,7 @@ default_exclude_codex_mcp = true
 prewarm_on_initialize = false
 async_log_writes = true
 protocol_version = "2024-11-05"
+# max_parallel_requests = 16 # optional; omitted uses available CPU parallelism
 use_central_server = true
 central_socket_path = "mcp.sock"
 central_connect_timeout_ms = 250
@@ -598,6 +599,7 @@ central_connect_timeout_ms = 250
 | `prewarm_on_initialize` | `false` | Warms query metadata during MCP initialize, trading startup work for lower first-search latency. |
 | `async_log_writes` | `true` | Writes MCP observability rows asynchronously so tool calls stay responsive. |
 | `protocol_version` | `2024-11-05` | MCP protocol version advertised by the server. |
+| `max_parallel_requests` | automatic | Maximum retrieval requests executed concurrently by each MCP server process. Omitted uses the CPU parallelism available to that process; additional valid requests wait for capacity. A configured value must be greater than zero. |
 | `use_central_server` | `true` | Makes `moraine run mcp` prefer the shared central server socket, with embedded fallback. |
 | `central_socket_path` | `mcp.sock` | Unix socket path. Bare filenames resolve under `runtime.pids_dir`; absolute paths are used verbatim. |
 | `central_connect_timeout_ms` | `250` | Milliseconds a proxy client waits for the central socket before falling back to embedded mode. |
@@ -607,6 +609,13 @@ context defaults when retrieval snippets are too narrow.
 Leave `prewarm_on_initialize` disabled for harnesses that launch multiple MCP
 processes at once; enabling it trades startup CPU/database work for lower
 first-search latency.
+
+The shared central server applies one parallel-request budget across every MCP
+socket connection and queues valid retrievals when that budget is busy. An
+embedded fallback is a separate process, so its automatic or configured budget
+is process-local. Saturation does not produce a `server busy` JSON-RPC error;
+queued requests remain cancellable while validation and control requests
+continue to run.
 
 ### Shared central MCP server
 
