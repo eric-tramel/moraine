@@ -807,11 +807,17 @@ FORMAT JSONEachRow",
             }
         }
 
-        candidates.retain_mut(|candidate| {
+        let mut candidate_index = 0;
+        while candidate_index < candidates.len() {
+            let candidate = &mut candidates[candidate_index];
             let matched_terms = u64::from(candidate.matched_terms.count_ones());
             candidate.matched_terms = matched_terms;
-            matched_terms >= u64::from(min_should_match) && candidate.score >= min_score
-        });
+            if matched_terms < u64::from(min_should_match) || candidate.score < min_score {
+                candidates.swap_remove(candidate_index);
+            } else {
+                candidate_index += 1;
+            }
+        }
         Self::order_ranked_posting_prefix(&mut candidates, 256);
         candidates
     }
