@@ -113,6 +113,13 @@ pub(crate) trait IngestSource: Send + Sync {
         shared::to_str(record.get("type"))
     }
 
+    /// Whether file-backed JSONL records can expose a session working
+    /// directory. SQLite pollers may still synthesize cwd-bearing records for
+    /// an adapter that returns false here.
+    fn jsonl_carries_cwd(&self) -> bool {
+        false
+    }
+
     /// Working directory carried by the record content itself (never derived
     /// from file paths). Harnesses that only expose a session-level cwd return
     /// it on the records that carry it; the normalizer handles the

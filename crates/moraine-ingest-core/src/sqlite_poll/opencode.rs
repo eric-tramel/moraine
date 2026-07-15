@@ -57,6 +57,8 @@ struct OpenCodeState {
     #[serde(default)]
     aggregate_sequences: BTreeMap<String, i64>,
     #[serde(default)]
+    project_exclusions_hash: u64,
+    #[serde(default)]
     last_error: String,
 }
 
@@ -185,15 +187,20 @@ pub(crate) async fn process_opencode_sqlite_db(
     });
 
     let mut state = OpenCodeState::parse(&checkpoint.cursor_json);
+    let current_exclusions_hash = super::project_exclusions_hash(config);
 
-    // A replaced database file is a new generation: logical identities (and so
-    // event UIDs) restart, and the old event cursor no longer applies.
+    // Replaced databases restart logical identities. Changed exclusions replay
+    // the event history so rows skipped under the prior policy can return.
     let generation_changed = checkpoint.source_inode != inode;
+    let exclusions_changed = state.project_exclusions_hash != current_exclusions_hash;
     if generation_changed {
         checkpoint.source_inode = inode;
         checkpoint.source_generation = checkpoint.source_generation.saturating_add(1).max(1);
+    }
+    if generation_changed || exclusions_changed {
         state = OpenCodeState::fresh();
     }
+    state.project_exclusions_hash = current_exclusions_hash;
 
     // Cheap no-change short-circuit: nothing touched the database or its WAL
     // sidecars since the last poll. `event_scan_complete` also forces one real
@@ -239,6 +246,7 @@ pub(crate) async fn process_opencode_sqlite_db(
             };
             let scan_is_noop = had_committed
                 && !generation_changed
+                && !exclusions_changed
                 && records.is_empty()
                 && checkpoint.status == "active"
                 && new_state == prior_state_covered
@@ -250,6 +258,14 @@ pub(crate) async fn process_opencode_sqlite_db(
 
             let mut batch = RowBatch::default();
             for synthetic in &records {
+                if crate::dispatch::record_project_dir_is_excluded(
+                    config,
+                    &work.harness,
+                    &synthetic.record,
+                    &synthetic.project_dir,
+                ) {
+                    continue;
+                }
                 let raw_json =
                     serde_json::to_string(&synthetic.record).unwrap_or_else(|_| "{}".to_string());
                 match normalize_record(
@@ -622,24 +638,25 @@ fn scan_opencode_rows(
     }
 
     for (_, record) in accumulated.sessions {
-        push_opencode_record("session", &record, &mut records);
+        push_opencode_record("session", &record, &session_contexts, &mut records);
     }
     for (_, mut record) in accumulated.messages {
         enrich_message_record(&mut record, &session_contexts);
-        push_opencode_record("message", &record, &mut records);
+        push_opencode_record("message", &record, &session_contexts, &mut records);
     }
     for (_, mut record) in accumulated.parts {
         enrich_part_record(&mut record, &session_contexts, &message_contexts);
-        push_opencode_record("part", &record, &mut records);
+        push_opencode_record("part", &record, &session_contexts, &mut records);
     }
     for (_, mut record) in accumulated.session_messages {
         enrich_session_message_record(&mut record, &session_contexts);
         if opencode_record_is_relevant(&record) {
-            push_opencode_record("session_message", &record, &mut records);
+            push_opencode_record("session_message", &record, &session_contexts, &mut records);
         }
     }
 
     let mut new_state = OpenCodeState::fresh();
+    new_state.project_exclusions_hash = prior.project_exclusions_hash;
     new_state.event_scan_complete = true;
     new_state.aggregate_sequences = aggregate_sequences;
     Ok((records, new_state, relevant_events))
@@ -694,13 +711,35 @@ fn update_opencode_context(
         "session.created.1" | "session.updated.1" => {
             let info = event.data.get("info").unwrap_or(&event.data);
             if let Some((id, record)) = build_session_event_record(info) {
-                session_contexts.insert(id, session_context_from_record(&record));
+                let next = session_context_from_record(&record);
+                session_contexts
+                    .entry(id)
+                    .and_modify(|current| {
+                        if !std::path::Path::new(&current.directory).is_absolute()
+                            && std::path::Path::new(&next.directory).is_absolute()
+                        {
+                            current.directory.clone_from(&next.directory);
+                        }
+                        if next.model.is_some() {
+                            current.model.clone_from(&next.model);
+                        }
+                    })
+                    .or_insert(next);
             }
         }
         "message.updated.1" => {
             let info = event.data.get("info").unwrap_or(&event.data);
             if let Some((id, record)) = build_message_event_record(info) {
-                message_contexts.insert(id, message_context_from_record(&record));
+                let context = message_context_from_record(&record);
+                if let Some(session_id) = record.get("session_id").and_then(Value::as_str) {
+                    if std::path::Path::new(&context.directory).is_absolute() {
+                        let session = session_contexts.entry(session_id.to_string()).or_default();
+                        if !std::path::Path::new(&session.directory).is_absolute() {
+                            session.directory.clone_from(&context.directory);
+                        }
+                    }
+                }
+                message_contexts.insert(id, context);
             }
         }
         _ => {}
@@ -1203,6 +1242,7 @@ fn copy_message_context_pointer(
 fn push_opencode_record(
     table: &str,
     record: &Map<String, Value>,
+    session_contexts: &BTreeMap<String, OpenCodeSessionContext>,
     records: &mut Vec<SyntheticRecord>,
 ) {
     let id = record.get("id").and_then(Value::as_str).unwrap_or("");
@@ -1215,12 +1255,23 @@ fn push_opencode_record(
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("opencode_sqlite");
+    let session_id = record
+        .get("session_id")
+        .and_then(Value::as_str)
+        .or_else(|| (record_kind == "opencode_session").then_some(id))
+        .unwrap_or_default();
+    let project_dir = session_contexts
+        .get(session_id)
+        .map(|context| context.directory.clone())
+        .filter(|dir| std::path::Path::new(dir).is_absolute())
+        .unwrap_or_default();
     let source_line_no = hash_str(&format!("{table}:{id}"));
     let source_offset = hash_str(&format!(
         "{SOURCE_FORMAT_OPENCODE_SQLITE}:{table}:{id}:{record_kind}"
     ));
     records.push(SyntheticRecord {
         record: value,
+        project_dir,
         source_line_no,
         source_offset,
     });

@@ -62,6 +62,10 @@ impl IngestSource for Opencode {
         epoch_ms_or_string_ts(raw)
     }
 
+    fn jsonl_carries_cwd(&self) -> bool {
+        true
+    }
+
     fn cwd(&self, record: &Value) -> String {
         first_text([
             record.get("cwd"),

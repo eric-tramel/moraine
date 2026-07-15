@@ -42,6 +42,8 @@ ruleset = "builtin"
 # extra_patterns = ["acme_internal_[A-Za-z0-9]{32}"]
 
 [ingest]
+# Session cwd globs; a trailing `/**` includes the project directory itself.
+exclude_project_dirs = []
 batch_size = 4000
 max_batch_bytes = 8388608
 flush_interval_seconds = 0.5

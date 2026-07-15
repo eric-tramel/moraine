@@ -29,6 +29,10 @@ impl IngestSource for ClaudeCode {
         }
     }
 
+    fn jsonl_carries_cwd(&self) -> bool {
+        true
+    }
+
     fn cwd(&self, record: &Value) -> String {
         // Claude Code stamps the working directory on every JSONL record.
         to_str(record.get("cwd"))

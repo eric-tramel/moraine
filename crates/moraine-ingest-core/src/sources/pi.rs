@@ -37,6 +37,10 @@ impl IngestSource for PiCodingAgent {
         }
     }
 
+    fn jsonl_carries_cwd(&self) -> bool {
+        true
+    }
+
     fn cwd(&self, record: &Value) -> String {
         // Only the `session` header record carries the working directory;
         // later records inherit it via the normalizer's session-level fallback.
