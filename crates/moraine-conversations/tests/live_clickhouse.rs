@@ -18,8 +18,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-#[allow(dead_code)]
-#[path = "../benches/analytics_latency/support.rs"]
+#[path = "live_clickhouse/support.rs"]
 mod support;
 
 use support::{

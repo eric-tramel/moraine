@@ -14,9 +14,11 @@ use crate::{
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use moraine_clickhouse::{is_oversized_json_each_row_insert_error, ClickHouseClient};
+use serde::Serialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify, RwLock};
@@ -27,6 +29,120 @@ const CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES: usize = 10 * 1024 * 1024;
 const OVERSIZED_ROW_FRAGMENT_CHARS: usize = 20_000;
 const SINK_JSON_OBJECT_TOO_LARGE: &str = "sink_json_object_too_large";
 const MAX_SINK_ERROR_TEXT_CHARS: usize = 1_000;
+
+const INGEST_ACK_TRACE_TARGET: &str = "moraine_ingest_ack";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct IngestAckObservation {
+    batch_sequence: u64,
+    event_identity_digests: Vec<String>,
+    ack_monotonic_ns: u64,
+}
+
+struct IngestAckObserver {
+    enabled: bool,
+    next_batch_sequence: AtomicU64,
+    clock: fn() -> Option<u64>,
+    #[cfg(test)]
+    captured: Mutex<Vec<IngestAckObservation>>,
+}
+
+impl IngestAckObserver {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            next_batch_sequence: AtomicU64::new(1),
+            clock: monotonic_timestamp_ns,
+            #[cfg(test)]
+            captured: Mutex::new(Vec::new()),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_clock(enabled: bool, clock: fn() -> Option<u64>) -> Self {
+        Self {
+            clock,
+            ..Self::new(enabled)
+        }
+    }
+
+    fn observe(&self, event_identity_digests: &[String]) {
+        if !self.enabled || event_identity_digests.is_empty() {
+            return;
+        }
+        let Some(ack_monotonic_ns) = (self.clock)() else {
+            warn!("ingest acknowledgement observation skipped: monotonic clock unavailable");
+            return;
+        };
+        let observation = IngestAckObservation {
+            batch_sequence: self.next_batch_sequence.fetch_add(1, Ordering::Relaxed),
+            event_identity_digests: event_identity_digests.to_vec(),
+            ack_monotonic_ns,
+        };
+        let encoded_digests = serde_json::to_string(&observation.event_identity_digests)
+            .expect("serializing string digests cannot fail");
+        info!(
+            target: INGEST_ACK_TRACE_TARGET,
+            batch_sequence = observation.batch_sequence,
+            event_identity_digests = encoded_digests.as_str(),
+            ack_monotonic_ns = observation.ack_monotonic_ns,
+            "ingest batch acknowledged"
+        );
+        #[cfg(test)]
+        self.captured
+            .lock()
+            .expect("ack observation capture mutex poisoned")
+            .push(observation);
+    }
+
+    #[cfg(test)]
+    fn captured(&self) -> Vec<IngestAckObservation> {
+        self.captured
+            .lock()
+            .expect("ack observation capture mutex poisoned")
+            .clone()
+    }
+}
+
+#[derive(Default)]
+struct PendingAckBatch {
+    event_identity_digests: Vec<String>,
+}
+
+impl PendingAckBatch {
+    fn extend(&mut self, event_rows: &[Value]) {
+        self.event_identity_digests
+            .extend(event_rows.iter().filter_map(event_identity_digest));
+    }
+
+    fn clear(&mut self) {
+        self.event_identity_digests.clear();
+    }
+}
+
+fn event_identity_digest(row: &Value) -> Option<String> {
+    let event_uid = row.get("event_uid")?.as_str()?;
+    let mut hasher = Sha256::new();
+    hasher.update(event_uid.as_bytes());
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+fn monotonic_timestamp_ns() -> Option<u64> {
+    let mut timestamp = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `timestamp` points to a valid writable `timespec`; CLOCK_MONOTONIC
+    // has no additional preconditions and is supported on Moraine's Unix hosts.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut timestamp) } != 0 {
+        return None;
+    }
+    let seconds = u64::try_from(timestamp.tv_sec).ok()?;
+    let nanoseconds = u64::try_from(timestamp.tv_nsec).ok()?;
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(nanoseconds))
+}
 
 /// What a sink task is writing for. The flush/checkpoint/retry machinery is
 /// identical for both; the role decides intake filtering, heartbeats, and
@@ -215,6 +331,10 @@ pub(crate) fn spawn_sink_task(
         let mut error_rows = Vec::<Value>::new();
         let mut checkpoint_updates = HashMap::<String, Checkpoint>::new();
         let mut pending_batch_bytes = 0usize;
+        let ack_observer = IngestAckObserver::new(
+            config.ingest.ack_observation && matches!(&role, SinkRole::Default { .. }),
+        );
+        let mut pending_ack = PendingAckBatch::default();
 
         // Mirror sinks share one ingest_checkpoints table per team backend,
         // so their rows are scoped per host (migration 018; guaranteed
@@ -257,7 +377,7 @@ pub(crate) fn spawn_sink_task(
                     &checkpoint_updates,
                 )
             {
-                let flush_ok = flush_pending(
+                let flush_ok = flush_pending_with_ack(
                     &clickhouse,
                     &checkpoints,
                     &metrics,
@@ -269,6 +389,8 @@ pub(crate) fn spawn_sink_task(
                     &mut checkpoint_updates,
                     checkpoint_cursor_columns,
                     &checkpoint_host,
+                    &ack_observer,
+                    &mut pending_ack,
                 )
                 .await;
                 note_flush_outcome(&role, &checkpoints, flush_ok, rx.is_empty()).await;
@@ -327,7 +449,7 @@ pub(crate) fn spawn_sink_task(
                             if total_rows >= config.ingest.batch_size
                                 || pending_batch_bytes >= config.ingest.max_batch_bytes.max(1)
                             {
-                                let flush_ok = flush_pending(
+                                let flush_ok = flush_pending_with_ack(
                                     &clickhouse,
                                     &checkpoints,
                                     &metrics,
@@ -339,6 +461,8 @@ pub(crate) fn spawn_sink_task(
                                     &mut checkpoint_updates,
                                     checkpoint_cursor_columns,
                                     &checkpoint_host,
+                    &ack_observer,
+                    &mut pending_ack,
                                 ).await;
                                 note_flush_outcome(&role, &checkpoints, flush_ok, rx.is_empty()).await;
                                 if !flush_ok {
@@ -359,7 +483,7 @@ pub(crate) fn spawn_sink_task(
                 }
                 _ = flush_tick.tick() => {
                     if has_pending_data(&raw_rows, &event_rows, &link_rows, &tool_rows, &error_rows, &checkpoint_updates) {
-                        let flush_ok = flush_pending(
+                        let flush_ok = flush_pending_with_ack(
                             &clickhouse,
                             &checkpoints,
                             &metrics,
@@ -371,6 +495,8 @@ pub(crate) fn spawn_sink_task(
                             &mut checkpoint_updates,
                             checkpoint_cursor_columns,
                             &checkpoint_host,
+                    &ack_observer,
+                    &mut pending_ack,
                         ).await;
                         note_flush_outcome(&role, &checkpoints, flush_ok, rx.is_empty()).await;
                         if !flush_ok {
@@ -400,7 +526,7 @@ pub(crate) fn spawn_sink_task(
             &error_rows,
             &checkpoint_updates,
         ) {
-            let flush_ok = flush_pending(
+            let flush_ok = flush_pending_with_ack(
                 &clickhouse,
                 &checkpoints,
                 &metrics,
@@ -412,6 +538,8 @@ pub(crate) fn spawn_sink_task(
                 &mut checkpoint_updates,
                 checkpoint_cursor_columns,
                 &checkpoint_host,
+                &ack_observer,
+                &mut pending_ack,
             )
             .await;
             note_flush_outcome(&role, &checkpoints, flush_ok, true).await;
@@ -823,6 +951,7 @@ async fn emit_heartbeat(clickhouse: &ClickHouseClient, metrics: &Arc<Metrics>, r
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn flush_pending(
     clickhouse: &ClickHouseClient,
@@ -836,6 +965,42 @@ async fn flush_pending(
     checkpoint_updates: &mut HashMap<String, Checkpoint>,
     checkpoint_cursor_columns: bool,
     checkpoint_host: &str,
+) -> bool {
+    let observer = IngestAckObserver::new(false);
+    let mut pending_ack = PendingAckBatch::default();
+    flush_pending_with_ack(
+        clickhouse,
+        checkpoints,
+        metrics,
+        raw_rows,
+        event_rows,
+        link_rows,
+        tool_rows,
+        error_rows,
+        checkpoint_updates,
+        checkpoint_cursor_columns,
+        checkpoint_host,
+        &observer,
+        &mut pending_ack,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn flush_pending_with_ack(
+    clickhouse: &ClickHouseClient,
+    checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
+    metrics: &Arc<Metrics>,
+    raw_rows: &mut Vec<Value>,
+    event_rows: &mut Vec<Value>,
+    link_rows: &mut Vec<Value>,
+    tool_rows: &mut Vec<Value>,
+    error_rows: &mut Vec<Value>,
+    checkpoint_updates: &mut HashMap<String, Checkpoint>,
+    checkpoint_cursor_columns: bool,
+    checkpoint_host: &str,
+    ack_observer: &IngestAckObserver,
+    pending_ack: &mut PendingAckBatch,
 ) -> bool {
     let started = Instant::now();
 
@@ -946,6 +1111,9 @@ async fn flush_pending(
             metrics
                 .event_rows_written
                 .fetch_add(event_rows.len() as u64, Ordering::Relaxed);
+            if ack_observer.enabled {
+                pending_ack.extend(event_rows);
+            }
             event_rows.clear();
         }
 
@@ -996,7 +1164,11 @@ async fn flush_pending(
     .await;
 
     match flush_result {
-        Ok(()) => true,
+        Ok(()) => {
+            ack_observer.observe(&pending_ack.event_identity_digests);
+            pending_ack.clear();
+            true
+        }
         Err(failure) => {
             metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
             let error_text = failure.error.to_string();
@@ -1081,6 +1253,7 @@ async fn flush_pending(
                     error_rows,
                     checkpoint_updates,
                 );
+                pending_ack.clear();
                 return true;
             }
 
@@ -1314,6 +1487,152 @@ mod tests {
             redactions_column: false,
             redactions: test_redaction_audit(),
         }
+    }
+
+    fn fixed_monotonic_timestamp() -> Option<u64> {
+        Some(42_000_000)
+    }
+
+    #[test]
+    fn ack_observation_is_disabled_by_default_and_content_free() {
+        assert!(!moraine_config::AppConfig::default().ingest.ack_observation);
+        let row = json!({
+            "event_uid": "event-1",
+            "source_file": "/secret/session.jsonl",
+            "raw_json": "payload-marker-that-must-not-leak",
+        });
+        let mut pending = PendingAckBatch::default();
+        pending.extend(&[row]);
+        assert_eq!(
+            pending.event_identity_digests,
+            ["ce36863f51b6baf9d16397ffb3e9af506b284a816f72d487e55943c1fd974d6d"]
+        );
+
+        let disabled = IngestAckObserver::with_clock(false, fixed_monotonic_timestamp);
+        disabled.observe(&pending.event_identity_digests);
+        assert!(disabled.captured().is_empty());
+
+        let enabled = IngestAckObserver::with_clock(true, fixed_monotonic_timestamp);
+        enabled.observe(&pending.event_identity_digests);
+        let captured = enabled.captured();
+        assert_eq!(captured.len(), 1);
+        let encoded = serde_json::to_value(&captured[0]).expect("serialize observation");
+        assert_eq!(
+            encoded
+                .as_object()
+                .expect("observation object")
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "ack_monotonic_ns".to_string(),
+                "batch_sequence".to_string(),
+                "event_identity_digests".to_string(),
+            ]
+            .into_iter()
+            .collect()
+        );
+        let serialized = serde_json::to_string(&captured[0]).expect("serialize observation");
+        for forbidden in [
+            "event-1",
+            "/secret/session.jsonl",
+            "payload-marker-that-must-not-leak",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "leaked forbidden content: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn batched_ack_correlation_preserves_identity_multiplicity_and_sequence() {
+        let observer = IngestAckObserver::with_clock(true, fixed_monotonic_timestamp);
+        let mut pending = PendingAckBatch::default();
+        pending.extend(&[
+            json!({"event_uid": "event-1"}),
+            json!({"event_uid": "event-2"}),
+            json!({"event_uid": "event-1"}),
+        ]);
+        observer.observe(&pending.event_identity_digests);
+        pending.clear();
+        pending.extend(&[json!({"event_uid": "event-2"})]);
+        observer.observe(&pending.event_identity_digests);
+
+        let captured = observer.captured();
+        assert_eq!(
+            captured
+                .iter()
+                .map(|item| item.batch_sequence)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(captured[0].event_identity_digests.len(), 3);
+        assert_eq!(
+            captured[0].event_identity_digests[0],
+            captured[0].event_identity_digests[2]
+        );
+        assert_eq!(captured[0].ack_monotonic_ns, 42_000_000);
+        assert!(captured[1].ack_monotonic_ns >= captured[0].ack_monotonic_ns);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn acknowledgement_waits_for_the_entire_flush_and_survives_retry() {
+        let (clickhouse, _state) = spawn_mock_clickhouse("event_links").await;
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+        let observer = IngestAckObserver::with_clock(true, fixed_monotonic_timestamp);
+        let mut pending_ack = PendingAckBatch::default();
+        let mut raw_rows = vec![json!({"event_uid": "event-1"})];
+        let mut event_rows = vec![json!({"event_uid": "event-1"})];
+        let mut link_rows = vec![json!({"event_uid": "event-1"})];
+        let mut tool_rows = Vec::new();
+        let mut error_rows = Vec::new();
+        let mut checkpoint_updates = HashMap::new();
+
+        assert!(
+            !flush_pending_with_ack(
+                &clickhouse,
+                &checkpoints,
+                &metrics,
+                &mut raw_rows,
+                &mut event_rows,
+                &mut link_rows,
+                &mut tool_rows,
+                &mut error_rows,
+                &mut checkpoint_updates,
+                true,
+                "",
+                &observer,
+                &mut pending_ack,
+            )
+            .await
+        );
+        assert!(observer.captured().is_empty());
+        assert_eq!(pending_ack.event_identity_digests.len(), 1);
+
+        assert!(
+            flush_pending_with_ack(
+                &clickhouse,
+                &checkpoints,
+                &metrics,
+                &mut raw_rows,
+                &mut event_rows,
+                &mut link_rows,
+                &mut tool_rows,
+                &mut error_rows,
+                &mut checkpoint_updates,
+                true,
+                "",
+                &observer,
+                &mut pending_ack,
+            )
+            .await
+        );
+        let captured = observer.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].batch_sequence, 1);
+        assert!(pending_ack.event_identity_digests.is_empty());
     }
 
     #[test]

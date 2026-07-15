@@ -24,7 +24,7 @@ Run focused suites first, then expand according to the changed contract.
 | Mocked browser | `cd web/monitor && bun install --frozen-lockfile && bunx playwright@1.58.2 install chromium && bun run test:e2e:mocked` | Exactly two Chromium cases, one worker, no retries. |
 | Python binding smoke | See [Binding suite](#binding-suite) | Binding-local locked venv, maturin build, and pytest. |
 | Live ClickHouse schema/parity | `scripts/dev/sandbox/run-live-test analytics-schema` or `scripts/dev/sandbox/run-live-test analytics-parity` | Fresh owned sandbox and exact ignored test. |
-| Benchmark protocol | `python3 scripts/bench/benchmark_protocol.py validate <artifact.json>` | Validates one `moraine-benchmark-v1` result. |
+| Fixed-resource performance suite | `python3 scripts/bench/performance_suite.py validate <artifact.json> [...]` | Validates scenario, comparison, repeatability, and root suite documents. |
 
 Rare/manual benchmark, paid-agent, and raw ignored-test commands stay direct and are
 listed in their owning sections rather than gaining Make wrappers.
@@ -94,8 +94,7 @@ it returns.
 | Owner / target | Class and tags | Exact command | Prerequisites, resources, cleanup | Tier and result |
 | --- | --- | --- | --- | --- |
 | `moraine-conversations/repository_integration` | `integration`; repository, SQL-wire, cache, search, sessions, analytics | `cargo test -p moraine-conversations --test repository_integration --locked` | Rust/Cargo. One executable uses owned Axum mock-ClickHouse listeners on `127.0.0.1:0`; Tokio owns task/socket teardown; no real ClickHouse or persistent files. | T0; the owning CI job supplies the wall-clock timeout. The 67-test move map is `crates/moraine-conversations/tests/repository_integration/test-name-map.json`. |
-| `moraine-conversations/analytics_benchmark_support` | `integration`; benchmark serialization, digest, percentile, cardinality, profile, comparison | `cargo test -p moraine-conversations --test analytics_benchmark_support --locked` | Rust/Cargo; deterministic shared bench support only, no live endpoint. | T0. |
-| `moraine-conversations/live_clickhouse` deterministic support | `integration`; destructive guards, ownership, cleanup composition, corpus oracle | `cargo test -p moraine-conversations --test live_clickhouse --locked` | Rust/Cargo; deterministic tests use no live endpoint. The three ignored functions are separately owned below and remain unexecuted by this command. | T0; zero/failure is fail. |
+| `moraine-conversations/live_clickhouse` deterministic support | `integration`; destructive guards, ownership, cleanup composition, analytics schema/parity semantics, bounded-open corpus oracle | `cargo test -p moraine-conversations --test live_clickhouse --locked` | Rust/Cargo; deterministic tests use no live endpoint. The three ignored functions are separately owned below and remain unexecuted by this command. | T0; zero/failure is fail, exactly three live functions remain ignored. |
 | `moraine-ingest-core/golden_fixtures` | `integration`; golden, normalization, schema | `cargo test -p moraine-ingest-core --test golden_fixtures --locked` | Rust/Cargo and committed raw/golden families; read-only unless the explicit update mode below is used. | T0; byte drift fails. |
 | `moraine-ingest-core/hermes_fixture` | `integration`; ingest, serialization | `cargo test -p moraine-ingest-core --test hermes_fixture --locked` | Committed Hermes trajectory; no external service. | T0. |
 | `moraine-ingest-core/hermes_session_fixture` | `integration`; ingest, serialization | `cargo test -p moraine-ingest-core --test hermes_session_fixture --locked` | Committed Hermes session JSON; no external service. | T0. |
@@ -135,7 +134,7 @@ coverage for the standalone binding or legacy trees.
 | --- | --- | --- | --- | --- |
 | `docs/development/test-architecture/package_isolation.py` | `integration`; Cargo metadata, package isolation, target topology | `python3 docs/development/test-architecture/package_isolation.py` | Python 3, locked Cargo toolchain and registry/cache access. The architecture workflow owns a 45m job deadline; Cargo owns its configured target directory. No live service. | Path-filtered T0. Zero workspace packages, missing tools, metadata errors, or any package compile failure returns nonzero; never `not_run` once selected. |
 | `scripts/dev/sandbox/tests/test_run_live_test.py` | `unit`; sandbox ownership, concurrency, timeout, signal, cleanup | `python3 -m unittest scripts/dev/sandbox/tests/test_run_live_test.py` | Python 3 and POSIX process semantics; fake Docker/sandbox/Cargo binaries and test-owned private temp roots. Individual fake deadlines are seconds; the architecture workflow owns a 45m job deadline. Every spawned child is registered for TERM/KILL/reap cleanup. | Path-filtered T0. Zero tests or any lifecycle/resource assertion failure returns nonzero. |
-| `scripts/bench/tests/test_benchmark_protocol.py` | `unit`; JSON Schema, invariants, redaction, comparison, atomic artifacts | `python3 -m unittest discover -s scripts/bench/tests -p 'test_benchmark_protocol.py' -v` | Python 3 standard library; test-owned temporary files only, no network or service. The architecture workflow owns a 45m job deadline. | Path-filtered T0. Zero tests, invalid fixture behavior, or any assertion failure returns nonzero. |
+| `scripts/bench/tests/test_*.py` | `unit`; fixed-resource protocol, fixtures, runtime, scenarios, schema, comparison, and CLI | `python3 -m unittest discover -v -s scripts/bench/tests -p 'test_*.py'` | Python 3; deterministic tests use test-owned temporary files and fakes, with no live service. The architecture workflow owns a 45m job deadline. | Path-filtered T0. CI counts the selected cases first and fails on zero discovery or any assertion failure. |
 
 ## Live ClickHouse suites
 
@@ -281,7 +280,7 @@ Fixtures are owned by family rather than by every inline JSON value.
 | `apps/moraine/src/commands/analytics_schema_v1.golden.json` / `moraine` CLI | Exact JSON schema bytes for the analytics CLI contract. | `cargo test -p moraine --bin moraine --locked commands::schema::tests::analytics_schema_json_matches_golden -- --exact`; baseline checksum is in the generated fixture artifacts. Mechanical moves preserve its bytes. |
 | Scenario-stamped payloads synthesized by `scripts/ci/e2e-stack.sh` / stack owner | Canonical wire shapes plus unique semantic markers and lifecycle mutations. They stay separate from raw/golden bodies so search/open ambiguity and mutation transitions remain observable. | Generated/owned in the stack temp root; cleanup follows the stack. Do not consolidate fixture bodies during a move. |
 | Test-local mock responses and inline constructors / owning package or suite | Minimal private or public-contract cases tied to one harness. | Keep local until two packages prove identical primitive semantics; no fixture DSL is implied. |
-| `scripts/bench/tests/fixtures/` / benchmark protocol | Valid/invalid v1 envelopes, invariant, redaction, and comparability cases. | `python3 -m unittest discover -s scripts/bench/tests -p 'test_benchmark_protocol.py' -v`. Contains no credentials or user content. |
+| `scripts/bench/tests/fixtures/` / performance protocol | Valid/invalid `moraine-performance-v1` and `moraine-performance-suite-v1` documents, including mutation and policy boundaries. | `python3 -m unittest discover -v -s scripts/bench/tests -p 'test_*.py'`. Contains no credentials, user content, or host identities. |
 
 The only intentional ingest-golden update is:
 
@@ -299,132 +298,158 @@ generation changes, or expectation changes are separate contract changes, never 
 of a mechanical move. See [Ingest sources](ingest-sources.md#fixtures-and-contracts)
 and [Harness author workflow](harness-author-workflow.md#6-add-fixtures).
 
-## Benchmark protocol and registry
+## Fixed-resource search performance suite
 
-All six existing producers emit one `moraine-benchmark-v1` result object per output
-file. Rust owns cross-process analytics latency; `scripts/bench` owns process/database/
-system measurement. Setup, seeding, build, startup, and warmup stay outside timed
-samples. Smoke records latency but never gates on it.
+`scripts/bench/performance_suite.py` is the only end-to-end benchmark interface.
+The protocol, runtime, fixture, and scenario modules under `scripts/bench` are
+import-only helpers. The canonical scenarios are `qps`, `ttr`, `etd_idle`,
+`etd_loaded`, and `mixed`; there are no independent producer CLIs.
 
-### Normative artifact
-
-The schema is `scripts/bench/schema/moraine-benchmark-v1.schema.json`; the standard-
-library validator/comparator is `scripts/bench/benchmark_protocol.py`.
-
-```bash
-python3 scripts/bench/benchmark_protocol.py validate <artifact.json>
-python3 scripts/bench/benchmark_protocol.py compare \
-  <baseline.json> <candidate.json> [--measurement latency_ms] [--output <comparison.json>]
-```
-
-The envelope records `schema_version`, benchmark/scenario IDs,
-`source.{git_commit,dirty}`, build profile/target, non-identifying OS/CPU runner class,
-workload/profile/measured boundary, applicable fingerprints, planned/attempted/
-successful/error counts, unit-suffixed successful raw measurements, semantic status,
-non-blocking timing status, safe diagnostics, and artifact references. Request-producing
-load scenarios may also retain redaction-safe per-case records and arbitrary-cardinality
-observation series. Dataset-backed, cache-sensitive, concurrent, and request-producing
-scenarios conditionally require dataset digest/cardinality, cache state, concurrency,
-and request source.
-
-Validation enforces `attempted = successful + errors`, `attempted <= planned`, each raw
-measurement series length equals `successful`, outcome totals equal `attempted`, and
-burst records agree with both. Percentiles use successes while error and rejection
-rates stay explicit. Producers omit meaningless null/sentinel fields. Artifacts must
-not contain credentials, credentialized URLs, raw query/conversation/prompt/content,
-absolute home paths, or user/host identity. Large raw samples may be externalized only
-with count and checksum retained.
-
-A comparison rejects different schema versions, workload/dataset, measured boundary,
-cache state, request source, concurrency, build profile, or any applicable fingerprint.
-Smoke/full, warm/cold, embedded/central, and server/end-to-end runs are not equivalents.
-`timing.status` remains `not_evaluated` unless statistic, minimum independent run pairs,
-threshold, error-rate policy, and variability bound are complete. Comparable timing
-may be `pass`, `fail`, or `inconclusive`, but `non_blocking` is always true in this
-program: semantic/oracle failure is correctness failure; latency never blocks merge or
-release. Build baseline/candidate in the same profile, run on the same host and dataset,
-alternate order, and retain raw artifacts. Comparator timing failure reports the result
-without a correctness exit failure; invalid/incomparable artifacts return nonzero.
-
-Deterministic protocol validation (no network, mutable resources, or cleanup) is:
+The scenario, comparison, and repeatability schema is
+`scripts/bench/schema/moraine-performance-v1.schema.json`. Root suite manifests use
+`scripts/bench/schema/moraine-performance-suite-v1.schema.json`. The CLI dispatches
+documents explicitly and rejects unknown document types.
 
 ```bash
-python3 -m unittest discover -s scripts/bench/tests \
-  -p 'test_benchmark_protocol.py' -v
+# Freeze deterministic fixture and policy artifacts without starting services.
+python3 scripts/bench/performance_suite.py freeze \
+  --profile full --output target/bench/performance/frozen
+
+# One non-comparable owned smoke.
+python3 scripts/bench/performance_suite.py smoke \
+  --repo . --output target/bench/performance/smoke
+
+# First prove baseline repeatability in seven fresh owned sandboxes.
+python3 scripts/bench/performance_suite.py run \
+  --baseline <baseline-worktree> \
+  --output target/bench/performance/baseline-study
+
+# Then run seven counterbalanced AB/BA pairs. The immutable baseline study
+# selects the fixed 75%-capacity loaded schedules and must match this build.
+python3 scripts/bench/performance_suite.py run \
+  --baseline <baseline-worktree> \
+  --candidate <candidate-worktree> \
+  --baseline-manifests \
+    target/bench/performance/baseline-study/baseline-{01,02,03,04,05,06,07}/manifest.json \
+  --output target/bench/performance/full
+
+# Run a non-authoritative paired diagnostic on Docker Desktop or a dev host.
+python3 scripts/bench/performance_suite.py run \
+  --mode local --profile smoke --pairs 1 \
+  --baseline <baseline-worktree> --candidate <candidate-worktree> \
+  --output target/bench/performance/local
+
+# Emit OMP-compatible METRIC lines from a QPS artifact or local comparison.
+python3 scripts/bench/performance_suite.py autoresearch-metrics \
+  target/bench/performance/local/local-comparison.json
+
+# Validate one or more checked-in or produced documents.
+python3 scripts/bench/performance_suite.py validate <document.json> [...]
+
+# Compare two complete validated root manifests.
+python3 scripts/bench/performance_suite.py compare \
+  <baseline-manifest.json> <candidate-manifest.json> \
+  --output target/bench/performance/comparison.json
+
+# Check exactly seven complete baseline manifests from distinct resets.
+python3 scripts/bench/performance_suite.py repeatability \
+  <baseline-1.json> <baseline-2.json> <baseline-3.json> \
+  <baseline-4.json> <baseline-5.json> <baseline-6.json> <baseline-7.json> \
+  --output target/bench/performance/repeatability.json
 ```
 
-### Producer registry
+Local mode uses the same scenarios, fresh physical sandboxes, semantic oracles, and
+frozen binaries, but reports `authoritative: false` because it observes rather than
+owns the Docker host resource envelope. It never converts scheduler failures or
+right-censored ETD into passing evidence.
 
-| Owner / scenario | Native smoke/full command and deterministic check | Prerequisites, boundary, timeout, cleanup | Tier/result |
-| --- | --- | --- | --- |
-| `moraine-conversations/analytics_latency` | Compile: `cargo bench -p moraine-conversations --bench analytics_latency --locked --no-run`. Smoke: `MORAINE_BENCH_MONITOR_URL=<owned-monitor-url> MORAINE_BENCH_CLICKHOUSE_URL=<owned-clickhouse-url> MORAINE_BENCH_DATASET_MANIFEST=<owned-dataset-manifest.json> cargo bench -p moraine-conversations --bench analytics_latency --locked -- --profile smoke --output target/bench/analytics-latency-smoke.json`; full substitutes `--profile full` and `...-full.json`. The seed owner, independently of either measured arm, writes `{"fingerprint":"sha256:<64-lowercase-hex>","cardinality":<seeded-row-count>,"expected_semantics":{"analytics-24h":{"cardinality":{"kind":"analytics_series","tokens":<n>,"turns":<n>,"concurrent_sessions":<n>},"digest":"fnv1a64:<16-lowercase-hex>"},"sessions-30d50":{"cardinality":{"kind":"sessions","sessions":<n>},"digest":"fnv1a64:<16-lowercase-hex>"}}}` from the canonical seed contract. Optional database/user/password variables identify that same owned dataset for all arms. Helpers: `cargo test -p moraine-conversations --test analytics_benchmark_support --locked`. | Caller provisions one owned live stack/database, derives the manifest from the complete canonical seeded corpus without consulting measured responses, and always tears it down (for a sandbox: `scripts/dev/sandbox/moraine-sandbox down <id>`). The bench verifies the dataset identity, then verifies monitor, cold-repository, and warm-repository outputs separately against the two seed-owned semantic expectations before supplemental arm-parity checks; it verifies the corpus stayed unchanged afterward. It is read-only, uses 30s HTTP requests, and owns only its atomic output; unlike the live-test wrapper, it does not provision or clean the stack. Custom Cargo bench, not Criterion. | T4 compile/deterministic on PR when wired; reduced live smoke/manual and full manual. Missing URLs/manifest/expected scenario, corpus drift, semantic/cardinality/digest/output failure is nonzero; timing non-blocking. |
-| `replay_search_latency` / local PyO3 | `scripts/bench/replay_search_latency.py --config <moraine.toml> --profile smoke --output-json target/bench/replay-search-latency-smoke.json` (or `full`/`...-full.json`). Check: `python3 -m unittest scripts/bench/test_replay_search_latency.py`. | Readable config, populated ClickHouse `search_query_log`, uv/self-declared maturin+psutil, Rust/local binding. Smoke 2 rows/0 warmups/1 repeat; full 20/1/5. 20s request, 600s owned maturin child; process-group TERM/KILL cleanup. | T4. Read-only DB; atomic schema-valid output; missing data/tool, oracle/semantic/output failure is nonzero; timing `not_evaluated`. |
-| `replay_mcp_latency` / persistent and cold-process | `python3 scripts/bench/replay_mcp_latency.py --config <moraine.toml> --oracle-manifest <seed-owned-oracle.json> --profile smoke --mode persistent --output-json target/bench/replay-mcp-persistent-smoke.json`; use `cold_process` for the distinct lifecycle boundary and `full` for full runs. Check: `python3 -m unittest scripts/bench/test_replay_mcp_latency.py`. The independent manifest is `{"schema_version":"moraine-replay-mcp-oracle-v1","provenance":"<seed/query-generator-reference>","cases":[{"query_id":"<telemetry-query-id>","variant_label":"<expanded-query-variant>","tool":"search","semantic_digest":"sha256:<64-lowercase-hex>","cardinality":<positive-result-count>,"marker":"<seed-owned-marker>"}]}` with one case for every selected query variant and tool. | Populated telemetry, production `bin/moraine`/`moraine-mcp`, exact git provenance, and complete seed/query expectations created without invoking the measured MCP path. Persistent owns one long-lived MCP child; cold owns one per sample. Per-RPC timeout and TERM/KILL cleanup are producer-owned. Manifest/case fingerprints and provenance are retained in workload identity. | T4; modes are fingerprint-distinct and never compared to one another. Missing/malformed/incomplete oracle fails before process spawn; repeatably wrong or one-sample smoke semantics, child/timeout/output failure is nonzero; timing non-blocking. |
-| `mcp_two_tool_sla` / MCP tool matrix | `python3 scripts/bench/mcp_two_tool_sla.py --config <owned-config> --oracle-json <seed-owned-oracle.json> --profile smoke --output-json target/bench/mcp-two-tool-sla.json` (or `--profile full`; full defaults warmup=1/repeats=5/min-docs=100000). Check: `python3 scripts/bench/test_mcp_two_tool_sla.py`. The independent oracle is `{"schema_version":"moraine-mcp-two-tool-oracle-v1","queries":[{"query":"<selected-query>","expected":{"result_count":<n>,"open_ids":{"event":"<seed-id>","turn":"<seed-id>","session":"<seed-id>"},"result_marker":{"<seed-field>":"<seed-value>"}}}],"list_sessions":{"result_count":<n>,"session_ids":["<seed-session-id>"],"result_marker":{"<seed-field>":"<seed-value>"}}}`. Each query needs at least one expectation; only requested open kinds require IDs. The root `list_sessions` object is required whenever that default boundary is measured and needs at least one count/ID/object-marker expectation. | Python 3, read-only ClickHouse corpus, production binaries, exact git provenance, and a complete oracle generated by the corpus owner without measured MCP responses. Search cardinality/IDs/object marker are checked against seed truth; open targets the oracle ID rather than a measured search result; every list result checks the exact count, presence of all seed IDs, and matching seed object marker. One owned stdio MCP child; 20s RPC timeout; close stdin, TERM/wait 5s, KILL/wait 5s. | T4. Missing/incomplete oracle or corpus/prerequisite, repeatable wrong search/open/list result, insufficient sample, validation/write failure is nonzero. No first measured response becomes expected truth. Historical SLA values are diagnostics; v1 timing stays `not_evaluated`. |
-| `central_mcp_resource` / embedded-versus-central | Smoke: `uv run --script scripts/bench/central_mcp_resource.py --moraine-mcp target/debug/moraine-mcp --arms embedded,central --ns 1 --reps 1 --profile smoke --settle-seconds 0 --batch 1 --startup-timeout-seconds 5 --request-timeout-seconds 20 --dataset-fingerprint sha256:<64-lowercase-hex> --dataset-cardinality <seeded-session-count> --json-out target/bench/central-mcp-resource-smoke.json`. Full substitutes the release binary, owned sandbox ClickHouse URL, `--ns 1,10,50,100 --reps 3 --profile full --settle-seconds 2 --batch 25 --startup-timeout-seconds 10`, and `...-full.json`. Check: `python3 scripts/bench/test_central_mcp_resource.py`. | Built MCP binary, deterministic seeded ClickHouse, and psutil or Linux `/proc`; Linux is authoritative. Each repetition owns temporary config/root/socket, central daemon, clients, loopback port, and static fixture; cleanup TERM/KILLs children and removes the root. macOS observations are directional. | T4. JSON output requires dataset fingerprint/cardinality. The configured arm×N matrix is one paired result. Startup/exit/timeout/semantic/sampling/cleanup/validation/atomic-output failure is nonzero; timing/resources remain `not_evaluated` and non-blocking. |
-| `concurrent_mcp_retrieval` / central persistent concurrent uncached `search_sessions` | Smoke: `python3 scripts/bench/concurrent_mcp_retrieval.py --moraine-mcp target/debug/moraine-mcp --clickhouse-url http://clickhouse:8123 --database moraine --oracle-json <seed-owned-oracle.json> --concurrency 1 --concurrency 4 --reps 1 --profile smoke --startup-timeout-seconds 10 --request-timeout-seconds 20 --run-timeout-seconds 120 --max-processes 16 --output-dir target/bench/concurrent-smoke`. Full uses a release binary, `--profile full --concurrency 1,2,4,8,16,32 --reps 3 --run-timeout-seconds 1800 --max-processes 64`; choose the sweep and high-stress value as caller workload inputs, never from the backend admission limit. A range such as `--concurrency 1:32:2` is inclusive. Smoke recovery is fixed at 0 and 1 seconds; full recovery is fixed at 0 and 10 seconds. Check: `python3 -m unittest scripts/bench/test_concurrent_mcp_retrieval.py`; validate every result with `for artifact in target/bench/concurrent-smoke/*.json; do python3 scripts/bench/benchmark_protocol.py validate "$artifact"; done`. The independent seed owner writes `{"schema_version":"moraine-concurrent-mcp-oracle-v1","provenance":"<stable-lowercase-slug>","dataset":{"fingerprint":"sha256:<64-lowercase-hex>","cardinality":<searchable-document-count>},"warmup":{"id":"warmup","query":"<startup-only-query>","result_count":<1..10>,"result_digest":"sha256:<digest-of-sorted-event-and-session-ids>"},"measured":[<same-shape-distinct-cases>],"recovery":[<same-shape-distinct-cases>]}`. Warmup, measured, and recovery query strings and IDs must all be distinct; the full manifest declares at least 100,000 searchable documents. | Linux owned dev sandbox, built MCP binary, deterministic seeded ClickHouse, and one oracle case per maximum requested concurrency plus two recovery probes. The timed boundary is each stdio `tools/call` write through its central-server response; client initialization, tool discovery, and one disjoint startup query are outside the burst. Every repetition owns a fresh central service, socket, clients, config, root, and temporary directory; the producer terminates/removes all of them while the sandbox owner owns ClickHouse corpus cleanup. `--max-processes` and startup/request/run timeouts protect the runner and do not state backend capacity or admission policy; request timeout is comparison-fingerprinted. | T4. Read-only seeded DB. One comparison-distinct schema-valid artifact per exact concurrency. Raw successful wall/server/SLA series, per-case outcome records, admission/error/timeout/deadline counts and rates, p50/p95/p99/max, throughput, maximum in-flight, hard-deadline violations, and largest-burst sequential recovery are retained. Timing is diagnostic `not_evaluated`; semantic-oracle and protocol failures remain correctness failures. |
-Prepare only an owned sandbox corpus. Both commands below truncate
-`moraine.search_documents`, `search_postings`, `search_query_log`, and
-`search_hit_log`; never point them at a host or shared database.
+`./autoresearch.sh` is the optimization-loop adapter. Its default `inner` mode runs
+the ignored in-process cached-posting ranker benchmark inside one dev sandbox and
+emits low-noise `METRIC` lines while allowing a dirty candidate tree. This is a fast
+proxy, not end-to-end evidence. Retained changes must be checked against the suite.
+For a clean retained commit, `MORAINE_AUTORESEARCH_MODE=e2e` runs one local paired
+suite and translates its validated candidate QPS, TTR, and uncensored loaded-ETD
+evidence into the same metric protocol:
+The adapter reloads each referenced candidate artifact; copied summary values,
+censored capacity, failed gates, or fixture-oracle fingerprint mismatches fail
+closed instead of producing optimization metrics.
 
 ```bash
-# Small live wiring/semantic smoke.
-python3 scripts/bench/seed_concurrent_mcp_benchmark.py seed \
-  --clickhouse-url http://clickhouse:8123 --database moraine \
-  --documents 200 --measured-cases 8 --recovery-cases 2 \
-  --oracle-json /tmp/concurrent-smoke-oracle.json
-
-# Full SLA-tier corpus and broad caller-selected sweep.
-python3 scripts/bench/seed_concurrent_mcp_benchmark.py seed \
-  --clickhouse-url http://clickhouse:8123 --database moraine \
-  --documents 100000 --measured-cases 64 --recovery-cases 2 \
-  --oracle-json /tmp/concurrent-full-oracle.json
+MORAINE_AUTORESEARCH_MODE=e2e \
+MORAINE_AUTORESEARCH_BASELINE=<clean-baseline-worktree> \
+MORAINE_AUTORESEARCH_OUTPUT=target/bench/performance/autoresearch-local \
+./autoresearch.sh
 ```
 
-The seeder writes the expected public event/session ID digest directly from its
-deterministic recipe; it never learns expectations from an MCP response. Cases
-alternate selective one-posting terms and distinct common terms, and reserve
-disjoint warmup/recovery terms. `seed ... --documents 100000` is the full-profile
-minimum. `clean` with the same ClickHouse/database arguments truncates the four
-tables explicitly; normally `moraine-sandbox down <id>` owns complete database,
-socket, child, config, temporary-directory, and volume cleanup.
+The output directory must not already exist. E2E autoresearch always uses the
+`full` profile so QPS is bracketed before the metric bridge accepts it;
+`MORAINE_AUTORESEARCH_PAIRS` defaults to `1`. Neither local mode nor the inner-loop
+proxy can satisfy the authoritative merge-evidence contract.
 
-#### Current-main evidence (2026-07-12)
+Authoritative runs require a dedicated rootful Linux cgroup-v2 Docker host with
+strictly more than 8 GiB of host memory. They refuse Docker Desktop, rootless
+Docker, missing controller delegation, and non-cgroup-v2 drivers before collecting
+results. ClickHouse, central Moraine, and ingest/indexing workers share one aggregate
+1-CPU/8-GiB/no-swap server envelope; load generation and result collection remain
+outside it. A synthetic busy-child proof verifies that aggregate CPU accounting
+includes descendants. OOM, swap activity, misplaced processes, binary drift, or an
+unremovable owned resource fails the run.
 
-An owned Linux sandbox run at `2ba068794554710708be8ca48ed88b8c73825c31`
-used the deterministic 100,000-document corpus, the sandbox workspace binary
-(`build.profile=unknown`), three fresh-service repetitions, and the caller-selected
-`1,2,4,8,16,32,64` sweep. Every artifact passed
-`benchmark_protocol.py validate`; every arm reported overlap and exact requested
-maximum in-flight. These are diagnostic observations, not a capacity contract:
+The suite prebuilds one shared runtime image before any physical reset and pins
+that image identity for both arms; reset startup never rebuilds it inside a
+measured lifecycle.
 
-| Requested | Success / attempted | Rejected | p50 ms | p95 ms | p99 ms | max ms | mean success/s |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 3 / 3 | 0 | 43.7 | 123.3 | 130.4 | 132.2 | 19.1 |
-| 2 | 6 / 6 | 0 | 59.3 | 69.0 | 69.8 | 70.0 | 30.2 |
-| 4 | 12 / 12 | 0 | 91.0 | 149.0 | 149.9 | 150.1 | 38.6 |
-| 8 | 24 / 24 | 0 | 134.9 | 166.2 | 167.3 | 167.4 | 53.3 |
-| 16 | 24 / 48 | 24 | 120.1 | 143.5 | 147.7 | 148.9 | 61.2 |
-| 32 | 24 / 96 | 72 | 114.0 | 167.3 | 169.2 | 169.6 | 57.4 |
-| 64 | 24 / 192 | 168 | 184.1 | 243.9 | 247.9 | 248.8 | 38.4 |
+Each source worktree is clean and pinned to a full commit. The suite builds its four
+release binaries once, copies them into a read-only immutable directory, and records
+the compiler, target, linker, allowlisted build environment, manifest, and binary
+digests. Every measured sandbox mounts only those frozen binaries. The benchmark
+adapter and Compose overlay always come from the suite checkout—not from the
+baseline worktree—so an older baseline needs no benchmark-specific files. Before
+measurement, the arm's frozen `moraine` binary migrates its fresh database, the
+fixture seeds normalized `events`, and the production materialized view derives
+`search_documents`. Runtime evidence binds the exact image IDs and hashes each live
+`/proc/<pid>/exe` for `moraine-ingest`, `moraine-mcp`, and load-generator processes.
 
-The observed curve rises through eight callers, then successful completions plateau
-at eight per repetition while admission rejections account for every additional
-attempt. That ordinal is an observation of this build, not an asserted product
-limit. All successful samples met their advertised SLA and none crossed the
-five-second hard deadline. At the largest arm, recovery wall latencies at fixed
-0/10-second offsets were `31.6/126.3`, `43.2/108.2`, and `34.7/103.1` ms across
-the three repetitions. Three repetitions show run-to-run spread but do not define
-the controlled runner, baseline, threshold, error, or variability policy; all
-artifacts therefore retain `timing.status=not_evaluated`.
+Every physical arm receives a new sandbox project, delegated cgroup, ClickHouse
+volume, source root, and cache generation. The sandbox wrapper remains the sole
+Docker lifecycle and ownership authority; the suite never truncates or drops a
+pre-existing database. Setup, fixture generation, build, migration, seed, and
+readiness stay outside measured boundaries. Cleanup attempts every owned resource
+and propagates any uncertainty as a failed run rather than touching resources whose
+ownership is not proven.
 
+QPS uses an open arrival schedule and counts only semantically correct completions
+that satisfy the frozen latency, scheduling, error, and drain gates. TTR starts
+immediately before a fresh central process is spawned and ends only at the first
+independent-oracle-valid result through the proved central route. ETD publishes
+durably staged source events and polls with one-use terms so negative and posting
+caches cannot hide visibility. Loaded ETD runs at 75% of baseline sustainable QPS.
+Mixed runs compare simultaneous query and ingest streams against fresh query-only
+and ingest-only controls and require overlap, exact delivery, semantic validity, and
+complete drain.
 
+Full comparison uses seven physically reset pairs in the fixed order
+`AB, BA, AB, BA, AB, BA, AB`. It retains every arm and applies the frozen correctness,
+resource, constituent, variability, direction-agreement, and paired-bootstrap
+policies. Baseline repeatability accepts exactly seven complete manifests from
+distinct resets and performs no outlier deletion. Raw results stay under
+`target/bench/performance/`; repository baseline snapshots are not generated or
+updated by this suite.
 
-Every producer's deterministic checks cover arguments/profile/default/threshold
-propagation, schema serialization, contradictory inputs, output-write failures, and
-applicable child crash/timeout/cleanup, insufficient sample, and oracle instability.
-A live smoke is required only when it proves production wiring, telemetry discovery,
-or cleanup; a database-reading `--dry-run` is not a T0 hermetic test.
+The complete deterministic Python lane is:
+
+```bash
+python3 -m unittest discover -v -s scripts/bench/tests -p 'test_*.py'
+```
+
+CI counts the discovered tests first and fails if the count is zero. Production
+analytics schema and monitor/repository parity remain live semantic checks, not
+benchmarks:
+
+```bash
+scripts/dev/sandbox/run-live-test analytics-schema
+scripts/dev/sandbox/run-live-test analytics-parity
+```
 
 ## CI ownership and promotion
 
@@ -434,7 +459,7 @@ or cleanup; a database-reading `--dry-run` is not a T0 hermetic test.
 | `.github/workflows/ci-monitor-frontend.yml` / `monitor-frontend-bun` | PR paths/manual, Ubuntu, 10m. Bun 1.3.9 frozen install, typecheck, and nonzero Vitest. |
 | `.github/workflows/ci-python-binding.yml` / `python-binding-smoke` | Binding/dependency/SQL PR paths/manual, Ubuntu, 20m. Python 3.12 locked venv, `maturin develop --locked`, nonzero pytest/JUnit. |
 | `.github/workflows/ci-monitor-browser-mocked.yml` / `monitor-browser-mocked` | Visible PR/manual job, Ubuntu 24.04, 15m. Path-filtered pinned Chromium, exactly two mocked cases, no retry; initially non-required. |
-| `.github/workflows/ci-test-architecture.yml` / `architecture-t0` | Benchmark/live-wrapper/support/manifests PR paths/manual, Ubuntu, 45m. Python 3.12 nonzero protocol/adapter/wrapper unittest discovery, Rust analytics bench `--no-run`, and path-filtered metadata-derived package-isolation compilation. |
+| `.github/workflows/ci-test-architecture.yml` / `architecture-t0` | Benchmark/autoresearch/live-wrapper/support/manifests PR paths/manual, Ubuntu, 45m. Python 3.12 nonzero protocol/adapter/wrapper unittest discovery, autoresearch shell syntax, deterministic live ClickHouse support, and path-filtered metadata-derived package-isolation compilation. |
 | `.github/workflows/ci-packaging.yml` / `packaging-dryrun` | Every PR/manual, Ubuntu, 30m. Always asserts four-target consistency; matching paths own bundle/wheel/sdist, host/Debian install, layout/mode/glibc, entry points, and retained seven-day artifact. |
 | `.github/workflows/ci-functional.yml` / `functional-<target>` | Main/manual, 45m, four Linux/macOS targets with fail-fast disabled. Workspace checks plus installed-artifact stack T2. |
 | `.github/workflows/docs-deploy.yml` | Main/manual, Ubuntu, 10m. Build/required-asset validation, then Pages deployment; documentation-quality rather than runtime coverage. |
@@ -502,7 +527,7 @@ The generated migration evidence under
 - native Linux arm64 and macOS arm64 libtest list output with package, target, fully qualified name, and ignored state;
 - raw fixture and golden per-file SHA-256/byte counts plus path-and-byte family digests;
 - ordered shell E2E phase labels; and
-- the five existing benchmark producers and distinct lifecycle scenarios.
+- the five benchmark producers present in that historical tree and their distinct lifecycle scenarios.
 
 Regenerate with the issue-477 generator outside an unmodified source archive/worktree
 of that exact commit; output must also remain outside the authenticated source tree:

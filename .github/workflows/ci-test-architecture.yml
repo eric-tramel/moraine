@@ -4,18 +4,20 @@ on:
   pull_request:
     paths:
       - '.github/workflows/ci-test-architecture.yml'
-      # Protocol, producer, schema, fixture, and adapter-test changes share one Python lane.
+      # Protocol, runtime, fixture, scenario, schema, and CLI tests share one Python lane.
       - 'scripts/bench/**'
+      - 'autoresearch.sh'
       # Wrapper tests exercise both lifecycle scripts and their adjacent Compose/image support.
       - 'scripts/dev/sandbox/**'
       - 'docs/development/test-architecture/package_isolation.py'
       # Root metadata and the lockfile control every --locked Cargo invocation below.
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'rust-toolchain.toml'
       # Any workspace member manifest can alter metadata-derived package isolation.
       - 'apps/*/Cargo.toml'
       - 'crates/*/Cargo.toml'
-      # Cargo auto-discovers these targets; conversation benches/tests also own live producers and oracles.
+      # Cargo auto-discovers build scripts and test/example targets.
       - 'apps/*/build.rs'
       - 'crates/*/build.rs'
       - 'apps/*/tests/**'
@@ -63,6 +65,7 @@ jobs:
               # Cargo metadata and --locked resolution depend on every workspace manifest and lock.
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'rust-toolchain.toml'
               - 'apps/*/Cargo.toml'
               - 'crates/*/Cargo.toml'
               # Auto-discovered build scripts and test/bench/example targets alter package topology.
@@ -83,7 +86,7 @@ jobs:
       - name: Install Rust stable toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Run benchmark protocol unittest discovery
+      - name: Run performance suite unittest discovery
         run: |
           python - <<'PY'
           import unittest
@@ -92,26 +95,15 @@ jobs:
               "scripts/bench/tests", pattern="test_*.py"
           )
           count = suite.countTestCases()
-          print(f"Discovered {count} benchmark protocol unittest(s).")
+          print(f"Discovered {count} performance suite unittest(s).")
           if count == 0:
-              raise SystemExit("Benchmark protocol discovery selected zero tests.")
+              raise SystemExit("Performance suite discovery selected zero tests.")
           PY
           python -m unittest discover -v -s scripts/bench/tests -p 'test_*.py'
 
-      - name: Run benchmark adapter unittest discovery
-        run: |
-          python - <<'PY'
-          import unittest
+      - name: Check autoresearch adapter syntax
+        run: bash -n autoresearch.sh
 
-          suite = unittest.defaultTestLoader.discover(
-              "scripts/bench", pattern="test_*.py"
-          )
-          count = suite.countTestCases()
-          print(f"Discovered {count} benchmark adapter unittest(s).")
-          if count == 0:
-              raise SystemExit("Benchmark adapter discovery selected zero tests.")
-          PY
-          python -m unittest discover -v -s scripts/bench -p 'test_*.py'
 
       - name: Run sandbox live-wrapper unittest discovery
         run: |
@@ -128,8 +120,8 @@ jobs:
           PY
           python -m unittest discover -v -s scripts/dev/sandbox/tests -p 'test_*.py'
 
-      - name: Compile analytics latency benchmark
-        run: cargo bench -p moraine-conversations --bench analytics_latency --locked --no-run
+      - name: Run deterministic live ClickHouse support
+        run: cargo test -p moraine-conversations --test live_clickhouse --locked
 
       - name: Compile metadata-derived package isolation set
         if: github.event_name != 'pull_request' || steps.changes.outputs.package_isolation == 'true'

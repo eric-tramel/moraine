@@ -145,6 +145,11 @@ pub struct IngestConfig {
     pub reconcile_interval_seconds: f64,
     #[serde(default = "default_heartbeat_interval_seconds")]
     pub heartbeat_interval_seconds: f64,
+    /// Emit content-free ingest acknowledgement observations for benchmark
+    /// correlation. Disabled by default; observations contain only a batch
+    /// sequence, SHA-256 event-identity digests, and a monotonic timestamp.
+    #[serde(default)]
+    pub ack_observation: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -426,6 +431,7 @@ impl Default for IngestConfig {
             debounce_ms: default_debounce_ms(),
             reconcile_interval_seconds: default_reconcile_interval_seconds(),
             heartbeat_interval_seconds: default_heartbeat_interval_seconds(),
+            ack_observation: false,
         }
     }
 }
@@ -2085,6 +2091,17 @@ max_parallel_requests = 0
         assert!(!backend.start_on_up);
         assert_eq!(backend.bind, "127.0.0.1");
         assert_eq!(backend.auth_token, None);
+    }
+
+    #[test]
+    fn ingest_ack_observation_is_explicit_and_disabled_by_default() {
+        assert!(!AppConfig::default().ingest.ack_observation);
+        let omitted: AppConfig =
+            toml::from_str("").expect("empty config should deserialize with ack observation off");
+        assert!(!omitted.ingest.ack_observation);
+        let enabled: AppConfig = toml::from_str("[ingest]\nack_observation = true\n")
+            .expect("ack observation key should deserialize");
+        assert!(enabled.ingest.ack_observation);
     }
 
     #[test]

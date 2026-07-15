@@ -66,8 +66,8 @@ services:
     volumes:
       - "clickhouse-data:/var/lib/clickhouse"
     ports:
-      - "${SANDBOX_CLICKHOUSE_HTTP_HOST_PORT}:8123"
-      - "${SANDBOX_CLICKHOUSE_TCP_HOST_PORT}:9000"
+      - "127.0.0.1:${SANDBOX_CLICKHOUSE_HTTP_HOST_PORT}:8123"
+      - "127.0.0.1:${SANDBOX_CLICKHOUSE_TCP_HOST_PORT}:9000"
     healthcheck:
       test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:8123/ping || exit 1"]
       interval: 5s
@@ -93,7 +93,7 @@ services:
       SANDBOX_CLICKHOUSE_PORT: "8123"
       SANDBOX_REBUILD: "${SANDBOX_REBUILD:-0}"
     ports:
-      - "${SANDBOX_MONITOR_HOST_PORT}:8080"
+      - "127.0.0.1:${SANDBOX_MONITOR_HOST_PORT}:8080"
     volumes:
       - "${SANDBOX_REPO_ROOT}:/repo:ro"
       - "${SANDBOX_WEB_DIR}:/opt/moraine/web:ro"

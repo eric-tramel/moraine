@@ -1568,14 +1568,6 @@ PY
     --project-dir "$claude_project_dir" \
     --expect-absent-session-id "$codex_session_id"
 
-  if [[ "${RUN_REPLAY_BENCH_SMOKE:-0}" == "1" ]]; then
-    echo "[e2e] checking replay benchmark script (dry-run)"
-    "$python_bin" "$repo_root/scripts/bench/replay_search_latency.py" \
-      --config "$config_path" \
-      --window 24h \
-      --top-n 2 \
-      --dry-run
-  fi
 
   echo "[e2e] checking full-stack status prefers the daemon v1 API"
   local daemon_status_path="$tmp_root/daemon-status.json"

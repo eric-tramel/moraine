@@ -1,0 +1,8 @@
+# Non-authoritative local-comparative overlay. The measured topology and frozen
+# binaries match authoritative runs, but Docker Desktop owns resource scheduling.
+services:
+  clickhouse:
+    cgroup_parent: !reset null
+
+  moraine:
+    cgroup_parent: !reset null

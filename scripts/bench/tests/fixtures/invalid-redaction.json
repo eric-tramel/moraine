@@ -1,6 +1,0 @@
-{
-  "schema_version": "moraine-benchmark-v1",
-  "benchmark_id": "unsafe-example",
-  "scenario_id": "credential-leak",
-  "password": "do-not-record-this"
-}

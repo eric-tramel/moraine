@@ -6,21 +6,22 @@ AGENT_PLUGINS_SOURCE ?= main
 AGENT_PLUGINS_REMOTE ?= origin
 DOCS_ADDR ?= 127.0.0.1:8000
 RUSTUP ?= rustup
-RUST_TOOLCHAIN ?= stable
+# Empty means rustup honors the repository's rust-toolchain.toml pin.
+RUST_TOOLCHAIN ?=
 RUSTUP_BIN_DIR ?= $(shell command -v $(RUSTUP) >/dev/null 2>&1 && dirname "$$(command -v $(RUSTUP))" || printf '%s' "$$HOME/.cargo/bin")
 USE_RUSTUP ?= 1
 CARGO_CMD ?= cargo
 
 ifeq ($(USE_RUSTUP),1)
-CARGO_ENV = PATH='$(RUSTUP_BIN_DIR):$(PATH)' RUSTUP_TOOLCHAIN='$(RUST_TOOLCHAIN)'
-DEFAULT_CARGO_TARGET_DIR = target/rustup-$(RUST_TOOLCHAIN)
+CARGO_ENV = PATH='$(RUSTUP_BIN_DIR):$(PATH)' $(if $(RUST_TOOLCHAIN),RUSTUP_TOOLCHAIN='$(RUST_TOOLCHAIN)')
+DEFAULT_CARGO_TARGET_DIR = target/rustup-$(if $(RUST_TOOLCHAIN),$(RUST_TOOLCHAIN),pinned)
 else
 CARGO_ENV =
 DEFAULT_CARGO_TARGET_DIR = target/host
 endif
 
 CARGO_TARGET_DIR ?= $(DEFAULT_CARGO_TARGET_DIR)
-RUST_LABEL = $(if $(filter 1,$(USE_RUSTUP)),$(RUST_TOOLCHAIN) via $(RUSTUP_BIN_DIR),host PATH)
+RUST_LABEL = $(if $(filter 1,$(USE_RUSTUP)),$(if $(RUST_TOOLCHAIN),$(RUST_TOOLCHAIN),repository pin) via $(RUSTUP_BIN_DIR),host PATH)
 
 .PHONY: help dependency-policy fmt clippy build test ci-check install docs-build docs-serve docs-clean sandbox-up sandbox-down sandbox-list hooks-install agent-plugins-install
 
@@ -44,8 +45,9 @@ help:
 	@echo "                       Build and run the provisioned Python binding smoke"
 	@echo "  python3 docs/development/test-architecture/package_isolation.py"
 	@echo "                       Compile every workspace package test target independently"
-	@echo "  python3 scripts/bench/benchmark_protocol.py validate <artifact>"
-	@echo "                       Validate a moraine-benchmark-v1 result artifact"
+	@echo "  python3 scripts/bench/performance_suite.py validate <artifact> [...]"
+	@echo "                       Validate performance scenario, comparison, repeatability, or suite documents"
+	@echo "  ./autoresearch.sh   Run the sandboxed retrieval optimization proxy; e2e mode is documented in testing.md"
 	@echo "  make install        Build the current checkout and install it to the host"
 	@echo "  make docs-build     Build static docs site into ./site"
 	@echo "  make docs-serve     Run live docs server at $(DOCS_ADDR)"

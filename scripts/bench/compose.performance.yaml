@@ -1,0 +1,48 @@
+# Linux-authoritative overlay. Loaded only by moraine-sandbox --performance.
+# Build and readiness work finish before suite timing; measured services have no
+# Docker healthcheck, source mount, build cache, tailer, or sentinel process.
+services:
+  clickhouse:
+    cgroup_parent: ${MORAINE_PERFORMANCE_CGROUP_PARENT:?performance cgroup parent required}
+    healthcheck:
+      disable: true
+
+  moraine:
+    cgroup_parent: ${MORAINE_PERFORMANCE_CGROUP_PARENT:?performance cgroup parent required}
+    build: !reset null
+    tty: false
+    stdin_open: false
+    read_only: true
+    healthcheck:
+      disable: true
+    depends_on:
+      clickhouse:
+        condition: service_started
+    environment:
+      SANDBOX_CLICKHOUSE_HOST: clickhouse
+      SANDBOX_CLICKHOUSE_PORT: "8123"
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=64m
+    volumes: !override
+      - "${SANDBOX_BIN_DIR:?immutable release binary directory required}:/opt/moraine/bin:ro"
+      - "${SANDBOX_CONFIG_DIR:?benchmark config directory required}:/sandbox:ro"
+      - "${SANDBOX_ENTRYPOINT:?benchmark entrypoint required}:/usr/local/bin/entrypoint.sh:ro"
+      - "${SANDBOX_WEB_DIR:?monitor static directory required}:/opt/moraine/web:ro"
+      - "state:/home/moraine/.moraine"
+
+  loadgen:
+    image: moraine-sandbox-runtime:latest
+    user: "1000:1000"
+    restart: "no"
+    init: true
+    read_only: true
+    depends_on:
+      moraine:
+        condition: service_started
+    entrypoint: ["/bin/sleep", "infinity"]
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=64m
+    volumes:
+      - "${SANDBOX_BIN_DIR:?immutable release binary directory required}:/opt/moraine/bin:ro"
+      - "${SANDBOX_CONFIG_DIR:?benchmark config directory required}:/sandbox:ro"
+      - "state:/home/moraine/.moraine"

@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://moraine.dev/schema/moraine-performance-suite-v1.schema.json",
+  "title": "Moraine fixed-resource performance suite manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["document_type", "schema_version", "purpose", "arm", "suite_definition", "suite_definition_sha256", "artifacts", "manifest_sha256"],
+  "properties": {
+    "document_type": {"const": "suite_manifest"},
+    "schema_version": {"const": "moraine-performance-suite-v1"},
+    "purpose": {"enum": ["comparison", "repeatability", "smoke"]},
+    "arm": {"enum": ["baseline", "candidate"]},
+    "suite_definition": {"$ref": "#/$defs/suite_definition"},
+    "suite_definition_sha256": {"$ref": "#/$defs/sha256"},
+    "artifacts": {"type": "array", "minItems": 5, "maxItems": 63, "items": {"$ref": "#/$defs/artifact_reference"}},
+    "manifest_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "allOf": [
+    {"if": {"properties": {"purpose": {"const": "comparison"}}}, "then": {"properties": {"artifacts": {"minItems": 63, "maxItems": 63}}}},
+    {"if": {"properties": {"purpose": {"enum": ["repeatability", "smoke"]}}}, "then": {"properties": {"artifacts": {"minItems": 5, "maxItems": 5}}}},
+    {"if": {"properties": {"purpose": {"const": "repeatability"}}}, "then": {"properties": {"arm": {"const": "baseline"}}}}
+  ],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "fingerprints": {
+      "type": "object", "additionalProperties": false,
+      "required": ["corpus_sha256", "query_research_sha256", "query_holdout_sha256", "query_stress_sha256", "event_research_sha256", "event_holdout_sha256", "event_stress_sha256", "split_matrix_sha256", "schedule_templates_sha256"],
+      "properties": {
+        "corpus_sha256": {"$ref": "#/$defs/sha256"}, "query_research_sha256": {"$ref": "#/$defs/sha256"},
+        "query_holdout_sha256": {"$ref": "#/$defs/sha256"}, "query_stress_sha256": {"$ref": "#/$defs/sha256"},
+        "event_research_sha256": {"$ref": "#/$defs/sha256"}, "event_holdout_sha256": {"$ref": "#/$defs/sha256"},
+        "event_stress_sha256": {"$ref": "#/$defs/sha256"}, "split_matrix_sha256": {"$ref": "#/$defs/sha256"},
+        "schedule_templates_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "split_matrix": {
+      "type": "object", "additionalProperties": false,
+      "required": ["qps", "ttr", "etd_idle", "etd_loaded", "mixed"],
+      "properties": {
+        "qps": {"const": ["research", "holdout"]}, "ttr": {"const": ["research", "holdout"]},
+        "etd_idle": {"const": ["research", "holdout"]}, "etd_loaded": {"const": ["research", "holdout"]},
+        "mixed": {"const": ["stress"]}
+      }
+    },
+    "fixture": {
+      "type": "object", "additionalProperties": false,
+      "required": ["recipe_version", "profile", "seed", "fixture_sha256", "fingerprints", "split_matrix"],
+      "properties": {
+        "recipe_version": {"type": "string", "minLength": 1}, "profile": {"enum": ["smoke", "full"]},
+        "seed": {"type": "integer", "minimum": 0}, "fixture_sha256": {"$ref": "#/$defs/sha256"},
+        "fingerprints": {"$ref": "#/$defs/fingerprints"}, "split_matrix": {"$ref": "#/$defs/split_matrix"}
+      }
+    },
+    "resource_envelope": {
+      "type": "object", "additionalProperties": false,
+      "required": ["cpu_max_quota_us", "cpu_max_period_us", "memory_max_bytes", "swap_max_bytes", "aggregate", "loadgen_excluded"],
+      "properties": {
+        "cpu_max_quota_us": {"const": 100000}, "cpu_max_period_us": {"const": 100000},
+        "memory_max_bytes": {"const": 8589934592}, "swap_max_bytes": {"const": 0},
+        "aggregate": {"const": true}, "loadgen_excluded": {"const": true}
+      }
+    },
+    "cache_policy": {
+      "type": "object", "additionalProperties": false,
+      "required": ["label", "moraine_process", "mcp_caches", "target_query_prewarmed", "clickhouse_cache", "os_page_cache"],
+      "properties": {
+        "label": {"const": "fresh_moraine_existing_clickhouse"}, "moraine_process": {"const": "fresh"},
+        "mcp_caches": {"const": "fresh"}, "target_query_prewarmed": {"const": false},
+        "clickhouse_cache": {"const": "seed_warmed"}, "os_page_cache": {"const": "uncontrolled_or_privileged_reset"}
+      }
+    },
+    "build_recipe": {
+      "type": "object", "additionalProperties": false,
+      "required": ["toolchain_sha256", "command", "default_features", "locked", "target", "linker_sha256", "environment_allowlist", "build_environment_sha256", "image_recipe_sha256", "recipe_sha256"],
+      "properties": {
+        "toolchain_sha256": {"$ref": "#/$defs/sha256"},
+        "command": {"const": ["cargo", "build", "--workspace", "--release", "--locked"]},
+        "default_features": {"const": true}, "locked": {"const": true},
+        "target": {"type": "string", "minLength": 1}, "linker_sha256": {"$ref": "#/$defs/sha256"},
+        "environment_allowlist": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "build_environment_sha256": {"$ref": "#/$defs/sha256"}, "image_recipe_sha256": {"$ref": "#/$defs/sha256"},
+        "recipe_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "build_binary": {
+      "type": "object", "additionalProperties": false, "required": ["role", "sha256"],
+      "properties": {"role": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha256"}}
+    },
+    "build": {
+      "type": "object", "additionalProperties": false,
+      "required": ["arm", "git_commit", "dirty", "image_digest", "build_environment_sha256", "binaries", "identity_sha256"],
+      "properties": {
+        "arm": {"enum": ["baseline", "candidate"]}, "git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "dirty": {"const": false}, "image_digest": {"$ref": "#/$defs/sha256"},
+        "build_environment_sha256": {"$ref": "#/$defs/sha256"},
+        "binaries": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/build_binary"}},
+        "identity_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "policy": {
+      "type": "object", "additionalProperties": false,
+      "required": ["pair_count", "pair_order", "comparison_split", "minimum_score_ratio", "minimum_constituent_ratio", "minimum_direction_pairs", "qps_max_geometric_rsd", "ttr_max_geometric_rsd", "etd_max_geometric_rsd", "bootstrap_samples", "bootstrap_seed", "qps_trial_seconds", "qps_replicates", "qps_min", "qps_max", "smoke_qps_trial_seconds", "smoke_qps_max", "qps_p95_ms_max", "qps_p99_ms_max", "qps_deadline_ms", "scheduler_p99_start_slip_ms_max", "drain_ms_max", "mixed_query_goodput_ratio_min", "mixed_query_p95_degradation_max", "mixed_query_p99_degradation_max", "mixed_source_etd_degradation_max", "mixed_db_ack_etd_degradation_max", "repeatability_runs", "repeatability_qps_mad_ratio", "repeatability_ttr_mad_ratio", "repeatability_etd_mad_ratio"],
+      "properties": {
+        "pair_count": {"const": 7}, "pair_order": {"const": ["AB", "BA", "AB", "BA", "AB", "BA", "AB"]},
+        "comparison_split": {"const": "holdout"}, "minimum_score_ratio": {"const": 1.05},
+        "minimum_constituent_ratio": {"const": 0.97}, "minimum_direction_pairs": {"const": 5},
+        "qps_max_geometric_rsd": {"const": 0.1}, "ttr_max_geometric_rsd": {"const": 0.1}, "etd_max_geometric_rsd": {"const": 0.15},
+        "bootstrap_samples": {"const": 10000}, "bootstrap_seed": {"const": 1297044033},
+        "qps_trial_seconds": {"const": 30}, "qps_replicates": {"const": 3}, "qps_min": {"const": 1}, "qps_max": {"const": 512},
+        "smoke_qps_trial_seconds": {"const": 3}, "smoke_qps_max": {"const": 16},
+        "qps_p95_ms_max": {"const": 750.0}, "qps_p99_ms_max": {"const": 2000.0}, "qps_deadline_ms": {"const": 5000.0},
+        "scheduler_p99_start_slip_ms_max": {"const": 10.0}, "drain_ms_max": {"const": 5000.0},
+        "mixed_query_goodput_ratio_min": {"const": 0.9}, "mixed_query_p95_degradation_max": {"const": 1.25},
+        "mixed_query_p99_degradation_max": {"const": 1.25}, "mixed_source_etd_degradation_max": {"const": 1.25},
+        "mixed_db_ack_etd_degradation_max": {"const": 1.25}, "repeatability_runs": {"const": 7},
+        "repeatability_qps_mad_ratio": {"const": 0.05}, "repeatability_ttr_mad_ratio": {"const": 0.1},
+        "repeatability_etd_mad_ratio": {"const": 0.15}
+      }
+    },
+    "schedules": {
+      "type": "object", "additionalProperties": false,
+      "required": ["qps:research", "qps:holdout", "ttr:research", "ttr:holdout", "etd_idle:research", "etd_idle:holdout", "etd_loaded:research", "etd_loaded:holdout", "mixed:stress"],
+      "properties": {
+        "qps:research": {"$ref": "#/$defs/sha256"}, "qps:holdout": {"$ref": "#/$defs/sha256"},
+        "ttr:research": {"$ref": "#/$defs/sha256"}, "ttr:holdout": {"$ref": "#/$defs/sha256"},
+        "etd_idle:research": {"$ref": "#/$defs/sha256"}, "etd_idle:holdout": {"$ref": "#/$defs/sha256"},
+        "etd_loaded:research": {"$ref": "#/$defs/sha256"}, "etd_loaded:holdout": {"$ref": "#/$defs/sha256"},
+        "mixed:stress": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "suite_definition": {
+      "type": "object", "additionalProperties": false,
+      "required": ["suite_id", "profile", "resource_envelope", "cache_policy", "fixture", "policy", "build_recipe", "builds", "schedules"],
+      "properties": {
+        "suite_id": {"const": "fixed-resource-search-v1"}, "profile": {"enum": ["smoke", "full"]},
+        "resource_envelope": {"$ref": "#/$defs/resource_envelope"}, "cache_policy": {"$ref": "#/$defs/cache_policy"},
+        "fixture": {"$ref": "#/$defs/fixture"}, "policy": {"$ref": "#/$defs/policy"},
+        "build_recipe": {"$ref": "#/$defs/build_recipe"}, "builds": {"type": "array", "minItems": 1, "maxItems": 2, "items": {"$ref": "#/$defs/build"}},
+        "schedules": {"$ref": "#/$defs/schedules"}
+      }
+    },
+    "artifact_reference": {
+      "type": "object", "additionalProperties": false,
+      "required": ["scenario", "split", "run_id", "reset_id", "arm", "pair_id", "order", "artifact_sha256", "sha256", "relative_path"],
+      "properties": {
+        "scenario": {"enum": ["qps", "ttr", "etd_idle", "etd_loaded", "mixed"]}, "split": {"enum": ["research", "holdout", "stress"]},
+        "run_id": {"type": "string", "minLength": 1}, "reset_id": {"type": "string", "minLength": 1},
+        "arm": {"enum": ["baseline", "candidate"]}, "pair_id": {"type": "integer", "minimum": 1, "maximum": 7},
+        "order": {"enum": ["AB", "BA"]}, "artifact_sha256": {"$ref": "#/$defs/sha256"}, "sha256": {"$ref": "#/$defs/sha256"},
+        "relative_path": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"}
+      }
+    }
+  }
+}
