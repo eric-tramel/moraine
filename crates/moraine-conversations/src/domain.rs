@@ -758,11 +758,17 @@ pub struct SearchMcpEventHit {
     pub event_order: u64,
     pub event_ordinal: u32,
     pub turn_event_count: u64,
+    #[serde(default)]
+    pub turn_completed: bool,
+    #[serde(default)]
+    pub turn_terminal_event_uid: Option<String>,
     pub session_started_at_unix_ms: Option<i64>,
     pub session_updated_at_unix_ms: Option<i64>,
     pub session_title: Option<String>,
     pub session_slug: Option<String>,
     pub session_summary: Option<String>,
+    #[serde(default)]
+    pub session_completed: bool,
     pub source_name: Option<String>,
     pub harness: Option<String>,
     pub inference_provider: Option<String>,
@@ -792,9 +798,17 @@ pub struct SearchMcpEventsResult {
     pub query: String,
     pub terms: Vec<String>,
     pub event_types: Vec<McpEventType>,
+    /// Whether a requested session/turn scope exists and is visible to this
+    /// repository. Unscoped searches always report `true`.
+    #[serde(default = "default_true")]
+    pub scope_exists: bool,
     pub truncated: bool,
     pub stats: SearchMcpEventsStats,
     pub hits: Vec<SearchMcpEventHit>,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

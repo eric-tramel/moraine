@@ -2,7 +2,7 @@ use crate::contract::{
     ContractError, McpEntityKind, McpEventId, McpId, McpSessionId, McpTurnId, OpenV1Args,
     Performance, ToolEnvelope, ToolError, ToolErrorCode, ToolErrorEnvelope, OPEN_TOOL,
 };
-use crate::{handled_tool_error_result, tool_success_result, AppState};
+use crate::{handled_tool_error_result, request_started_at, tool_success_result, AppState};
 use anyhow::{Context, Result};
 use moraine_conversations::{
     McpEventOpen, McpEventRef, McpEventSummary, McpSessionOpen, McpTurnCompact, McpTurnOpen,
@@ -18,7 +18,7 @@ const SUMMARY_PREVIEW_CHARS: usize = 240;
 
 impl AppState {
     pub(crate) async fn open_v1(&self, arguments: Value) -> Result<Value> {
-        let started_at = Instant::now();
+        let started_at = request_started_at();
         let raw_request = request_from_arguments(&arguments);
 
         let args: OpenV1Args = match serde_json::from_value(arguments) {

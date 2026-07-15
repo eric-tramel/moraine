@@ -11,7 +11,8 @@
 
 use super::{
     backend_query_id, cancel_query_with_deadline, handled_tool_error_result, internal_id_error,
-    repo_error_to_contract_error, tool_success_result, AppState, QueryCancellationGuard,
+    repo_error_to_contract_error, request_performance, tool_success_result, AppState,
+    QueryCancellationGuard,
 };
 use crate::contract::{
     format_rfc3339_utc_millis, CanonicalFileAttentionArgs, ContractError, FileAttentionArgs,
@@ -36,7 +37,7 @@ const FILE_ATTENTION_SCAN_CAP: usize = 2_000;
 
 impl AppState {
     pub(crate) async fn file_attention_v1(&self, arguments: Value) -> Result<Value> {
-        let perf = Performance::builder(FILE_ATTENTION_DEFAULT_SLA_TARGET_MS);
+        let perf = request_performance(FILE_ATTENTION_DEFAULT_SLA_TARGET_MS);
         let raw_request = arguments.clone();
 
         let args = match parse_file_attention_args(arguments, self.cfg.mcp.max_results) {

@@ -1,25 +1,24 @@
 use super::{
     backend_query_id, handled_tool_error_result, internal_id_error, repo_error_to_contract_error,
-    tool_success_result, AppState, QueryCancellationGuard,
+    request_performance, tool_success_result, AppState, QueryCancellationGuard,
 };
 use crate::contract::{
     format_rfc3339_utc_millis, CanonicalSearchSessionsArgs, ContractError, McpEventId, McpId,
-    McpSessionId, McpTurnId, Performance, PerformanceBuilder, SearchSessionsArgs, ToolEnvelope,
-    ToolErrorCode, ToolErrorEnvelope, SEARCH_SESSIONS_SLA_TARGET_MS, SEARCH_SESSIONS_TOOL,
+    McpSessionId, McpTurnId, Performance, SearchSessionsArgs, ToolEnvelope, ToolErrorCode,
+    ToolErrorEnvelope, SEARCH_SESSIONS_SLA_TARGET_MS, SEARCH_SESSIONS_TOOL,
 };
 use anyhow::{Context, Result};
 use moraine_conversations::{
-    McpEventType as RepoMcpEventType, McpTurnOpen, RepoError, SearchMcpEventHit,
-    SearchMcpEventsQuery, SearchMcpEventsResult, SessionMetadata,
+    McpEventType as RepoMcpEventType, SearchMcpEventHit, SearchMcpEventsQuery,
+    SearchMcpEventsResult,
 };
 use serde_json::{json, Value};
-use std::collections::HashMap;
 
 const MAX_SNIPPET_CHARS: usize = 600;
 
 impl AppState {
     pub(crate) async fn search_sessions_v1(&self, arguments: Value) -> Result<Value> {
-        let perf = Performance::builder(SEARCH_SESSIONS_SLA_TARGET_MS);
+        let perf = request_performance(SEARCH_SESSIONS_SLA_TARGET_MS);
         let raw_request = arguments.clone();
 
         let args = match parse_search_sessions_args(arguments) {
@@ -30,15 +29,6 @@ impl AppState {
         };
 
         let canonical_request = canonical_request_json(&args)?;
-        let mut cache = SearchLookupCache::default();
-
-        if let Some(scope_error) = self
-            .validate_search_scope(&args, canonical_request.clone(), &perf, &mut cache)
-            .await?
-        {
-            return Ok(scope_error);
-        }
-
         let query_id = backend_query_id("search-sessions");
         let repo_query = SearchMcpEventsQuery {
             query: args.query.clone(),
@@ -75,9 +65,24 @@ impl AppState {
             }
         };
 
+        if !search_result.scope_exists {
+            let error = match args.within_id.as_ref() {
+                Some(McpId::Session(session_id)) => {
+                    not_found_error("session", session_id.to_string())
+                }
+                Some(McpId::Turn(turn_id)) => not_found_error("turn", turn_id.to_string()),
+                Some(McpId::Event(_)) => unreachable!("contract validation rejects event scope"),
+                None => ContractError::new(
+                    ToolErrorCode::InternalError,
+                    "repository reported a missing scope for an unscoped search",
+                ),
+            };
+            return encode_search_sessions_error(canonical_request, error, perf.finish());
+        }
+
         let performance = perf.finish();
         let warnings = search_warnings(&search_result);
-        let data = match search_sessions_data_json(&args, &search_result, &cache) {
+        let data = match search_sessions_data_json(&args, &search_result) {
             Ok(data) => data,
             Err(error) => {
                 return encode_search_sessions_error(canonical_request, error, performance);
@@ -94,99 +99,6 @@ impl AppState {
             payload,
         ))
     }
-
-    async fn validate_search_scope(
-        &self,
-        args: &CanonicalSearchSessionsArgs,
-        request: Value,
-        perf: &PerformanceBuilder,
-        cache: &mut SearchLookupCache,
-    ) -> Result<Option<Value>> {
-        match args.within_id.as_ref() {
-            None => Ok(None),
-            Some(McpId::Session(session_id)) => {
-                let raw_session_id = session_id.raw_session_id();
-                match load_session_metadata(self, cache, raw_session_id).await {
-                    Ok(Some(_)) => Ok(None),
-                    Ok(None) => encode_search_sessions_error(
-                        request.clone(),
-                        not_found_error("session", session_id.to_string()),
-                        perf.finish(),
-                    )
-                    .map(Some),
-                    Err(error) => encode_search_sessions_error(
-                        request.clone(),
-                        repo_error_to_contract_error(error),
-                        perf.finish(),
-                    )
-                    .map(Some),
-                }
-            }
-            Some(McpId::Turn(turn_id)) => {
-                let (raw_session_id, turn_seq) = turn_id.decode();
-                match load_turn_open(self, cache, raw_session_id, turn_seq).await {
-                    Ok(Some(_)) => Ok(None),
-                    Ok(None) => encode_search_sessions_error(
-                        request.clone(),
-                        not_found_error("turn", turn_id.to_string()),
-                        perf.finish(),
-                    )
-                    .map(Some),
-                    Err(error) => encode_search_sessions_error(
-                        request.clone(),
-                        repo_error_to_contract_error(error),
-                        perf.finish(),
-                    )
-                    .map(Some),
-                }
-            }
-            Some(McpId::Event(_)) => unreachable!("contract validation rejects event scope"),
-        }
-    }
-}
-
-#[derive(Default)]
-struct SearchLookupCache {
-    sessions: HashMap<String, SessionMetadata>,
-    turns: HashMap<(String, u32), McpTurnOpen>,
-}
-
-async fn load_session_metadata(
-    state: &AppState,
-    cache: &mut SearchLookupCache,
-    session_id: &str,
-) -> Result<Option<SessionMetadata>, RepoError> {
-    if let Some(metadata) = cache.sessions.get(session_id) {
-        return Ok(Some(metadata.clone()));
-    }
-
-    let metadata = state.repo.get_session_metadata(session_id).await?;
-    if let Some(metadata) = &metadata {
-        cache
-            .sessions
-            .insert(session_id.to_string(), metadata.clone());
-    }
-
-    Ok(metadata)
-}
-
-async fn load_turn_open(
-    state: &AppState,
-    cache: &mut SearchLookupCache,
-    session_id: &str,
-    turn_seq: u32,
-) -> Result<Option<McpTurnOpen>, RepoError> {
-    let key = (session_id.to_string(), turn_seq);
-    if let Some(turn) = cache.turns.get(&key) {
-        return Ok(Some(turn.clone()));
-    }
-
-    let turn = state.repo.get_mcp_turn(session_id, turn_seq).await?;
-    if let Some(turn) = &turn {
-        cache.turns.insert(key, turn.clone());
-    }
-
-    Ok(turn)
 }
 
 fn parse_search_sessions_args(
@@ -236,12 +148,11 @@ fn canonical_request_json(args: &CanonicalSearchSessionsArgs) -> Result<Value> {
 fn search_sessions_data_json(
     args: &CanonicalSearchSessionsArgs,
     result: &SearchMcpEventsResult,
-    cache: &SearchLookupCache,
 ) -> Result<Value, ContractError> {
     let results = result
         .hits
         .iter()
-        .map(|hit| search_hit_json(hit, cache))
+        .map(search_hit_json)
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(json!({
@@ -252,46 +163,13 @@ fn search_sessions_data_json(
     }))
 }
 
-fn search_hit_json(
-    hit: &SearchMcpEventHit,
-    cache: &SearchLookupCache,
-) -> Result<Value, ContractError> {
+fn search_hit_json(hit: &SearchMcpEventHit) -> Result<Value, ContractError> {
     let event_id = mcp_event_id(&hit.event_uid)?;
     let turn_id = mcp_turn_id(&hit.session_id, hit.turn_seq)?;
     let session_id = mcp_session_id(&hit.session_id)?;
-    let turn_key = (hit.session_id.clone(), hit.turn_seq);
-    let turn = cache.turns.get(&turn_key);
-    let metadata = cache.sessions.get(&hit.session_id);
-    let latest_turn = metadata.and_then(|metadata| {
-        cache
-            .turns
-            .get(&(hit.session_id.clone(), metadata.total_turns))
-    });
     let (snippet, snippet_truncated) = compact_snippet(&hit.snippet, hit.snippet_truncated);
 
-    let terminal_from_payload = is_terminal_payload_type(&hit.payload_type);
-    let turn_completed = turn
-        .map(|turn| turn.completed)
-        .unwrap_or(terminal_from_payload);
-    let turn_event_count = turn
-        .map(|turn| turn.metadata.total_events)
-        .unwrap_or(hit.turn_event_count);
-    let event_terminal = turn
-        .and_then(|turn| turn.terminal_event_uid.as_deref())
-        .map(|terminal_event_uid| terminal_event_uid == hit.event_uid)
-        .unwrap_or(terminal_from_payload);
-    let session_completed = latest_turn
-        .map(|turn| turn.completed)
-        .or_else(|| {
-            metadata
-                .and_then(|metadata| {
-                    cache
-                        .turns
-                        .get(&(hit.session_id.clone(), metadata.total_turns))
-                })
-                .map(|turn| turn.completed)
-        })
-        .unwrap_or(false);
+    let event_terminal = hit.turn_terminal_event_uid.as_deref() == Some(hit.event_uid.as_str());
 
     Ok(json!({
         "rank": hit.rank,
@@ -307,23 +185,21 @@ fn search_hit_json(
         "turn": {
             "id": turn_id,
             "ordinal": hit.turn_ordinal,
-            "completed": turn_completed,
-            "event_count": turn_event_count,
+            "completed": hit.turn_completed,
+            "event_count": hit.turn_event_count,
         },
         "session": {
             "id": session_id,
-            "title": hit.session_title.as_deref().or(hit.session_slug.as_deref()),
+            "title": hit.session_title.as_deref()
+                .or(hit.session_summary.as_deref())
+                .or(hit.session_slug.as_deref()),
             "harness": hit.harness,
             "source": hit.source_name.as_deref().or(hit.harness.as_deref()),
-            "started_at": metadata
-                .map(|metadata| metadata.first_event_unix_ms)
-                .or(hit.session_started_at_unix_ms)
+            "started_at": hit.session_started_at_unix_ms
                 .map(format_rfc3339_utc_millis),
-            "updated_at": metadata
-                .map(|metadata| metadata.last_event_unix_ms)
-                .or(hit.session_updated_at_unix_ms)
+            "updated_at": hit.session_updated_at_unix_ms
                 .map(format_rfc3339_utc_millis),
-            "completed": session_completed,
+            "completed": hit.session_completed,
         },
         "snippet": {
             "text": snippet,
@@ -375,10 +251,6 @@ fn score_unit(score: f64) -> f64 {
     } else {
         0.0
     }
-}
-
-fn is_terminal_payload_type(payload_type: &str) -> bool {
-    matches!(payload_type, "task_complete" | "turn_aborted")
 }
 
 fn search_warnings(result: &SearchMcpEventsResult) -> Vec<String> {
@@ -523,11 +395,14 @@ mod tests {
             event_order: 5,
             event_ordinal: 3,
             turn_event_count: 4,
-            session_started_at_unix_ms: None,
-            session_updated_at_unix_ms: None,
-            session_title: Some("Fix tests".to_string()),
+            turn_completed: true,
+            turn_terminal_event_uid: Some("evt-1".to_string()),
+            session_started_at_unix_ms: Some(1_777_554_000_000),
+            session_updated_at_unix_ms: Some(1_777_554_600_000),
+            session_title: None,
             session_slug: None,
-            session_summary: None,
+            session_summary: Some("Fix tests".to_string()),
+            session_completed: true,
             source_name: Some("codex".to_string()),
             harness: Some("codex".to_string()),
             inference_provider: None,
@@ -550,60 +425,7 @@ mod tests {
             matched_terms: 2,
             doc_len: 42,
         };
-        let mut cache = SearchLookupCache::default();
-        cache.sessions.insert(
-            "sess-1".to_string(),
-            SessionMetadata {
-                session_id: "sess-1".to_string(),
-                first_event_time: "2026-04-30 09:00:00".to_string(),
-                first_event_unix_ms: 1_777_554_000_000,
-                last_event_time: "2026-04-30 09:10:00".to_string(),
-                last_event_unix_ms: 1_777_554_600_000,
-                total_turns: 2,
-                total_events: 8,
-                user_messages: 1,
-                assistant_messages: 1,
-                tool_calls: 1,
-                tool_results: 1,
-                mode: moraine_conversations::ConversationMode::Chat,
-                first_event_uid: "evt-0".to_string(),
-                last_event_uid: "evt-1".to_string(),
-                last_actor_role: "assistant".to_string(),
-            },
-        );
-        cache.turns.insert(
-            ("sess-1".to_string(), 2),
-            McpTurnOpen {
-                metadata: moraine_conversations::TurnSummary {
-                    session_id: "sess-1".to_string(),
-                    turn_seq: 2,
-                    turn_id: "turn-2".to_string(),
-                    started_at: "unused".to_string(),
-                    started_at_unix_ms: 1_777_487_740_000,
-                    ended_at: "unused".to_string(),
-                    ended_at_unix_ms: 1_777_487_800_000,
-                    total_events: 4,
-                    user_messages: 1,
-                    assistant_messages: 1,
-                    tool_calls: 1,
-                    tool_results: 1,
-                    reasoning_items: 0,
-                },
-                events: Vec::new(),
-                user_input_summary: None,
-                final_response_summary: None,
-                tools_called: Vec::new(),
-                normalized_event_types: Vec::new(),
-                completed: true,
-                terminal_event_uid: Some("evt-1".to_string()),
-                previous_turn: None,
-                next_turn: None,
-                first_event: None,
-                last_event: None,
-            },
-        );
-
-        let shaped = search_hit_json(&hit, &cache).expect("shape hit");
+        let shaped = search_hit_json(&hit).expect("shape hit");
 
         assert_eq!(shaped["id"], "event:ZXZ0LTE");
         assert_eq!(shaped["open"]["turn_id"], "turn:c2Vzcy0x:2");
@@ -613,6 +435,7 @@ mod tests {
         assert_eq!(shaped["session"]["started_at"], "2026-04-30T13:00:00.000Z");
         assert_eq!(shaped["session"]["updated_at"], "2026-04-30T13:10:00.000Z");
         assert_eq!(shaped["session"]["harness"], "codex");
+        assert_eq!(shaped["session"]["title"], "Fix tests");
         assert_eq!(shaped["turn"]["completed"], true);
         assert_eq!(shaped["session"]["completed"], true);
         assert!(shaped.get("text_content").is_none());
@@ -633,11 +456,14 @@ mod tests {
             event_order: 7,
             event_ordinal: 2,
             turn_event_count: 2,
+            turn_completed: false,
+            turn_terminal_event_uid: None,
             session_started_at_unix_ms: None,
             session_updated_at_unix_ms: None,
             session_title: None,
             session_slug: None,
             session_summary: None,
+            session_completed: false,
             source_name: None,
             harness: None,
             inference_provider: None,
@@ -660,7 +486,7 @@ mod tests {
             matched_terms: 1,
             doc_len: 12,
         };
-        let shaped = search_hit_json(&hit, &SearchLookupCache::default()).expect("shape hit");
+        let shaped = search_hit_json(&hit).expect("shape hit");
 
         for field in ["event_id", "turn_id", "session_id"] {
             let open_id = shaped["open"][field]

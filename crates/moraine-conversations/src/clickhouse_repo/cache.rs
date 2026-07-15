@@ -82,6 +82,8 @@ pub(super) struct SearchEventsCacheEntry {
 pub(super) struct SearchMcpEventsCacheEntry {
     pub(super) hits: Vec<SearchMcpEventHit>,
     pub(super) truncated: bool,
+    pub(super) docs: u64,
+    pub(super) avgdl: f64,
     pub(super) fetched_at: Instant,
 }
 
@@ -297,20 +299,20 @@ impl ClickHouseConversationRepository {
     pub(super) async fn search_mcp_events_cache_get(
         &self,
         key: &str,
-    ) -> Option<(Vec<SearchMcpEventHit>, bool)> {
+    ) -> Option<SearchMcpEventsCacheEntry> {
         let now = Instant::now();
         {
             let cache = self.mcp_search_cache.read().await;
             let entry = cache.get(key)?;
             if now.duration_since(entry.fetched_at) <= MCP_SEARCH_RESULT_CACHE_TTL {
-                return Some((entry.hits.clone(), entry.truncated));
+                return Some(entry.clone());
             }
         }
 
         let mut cache = self.mcp_search_cache.write().await;
         if let Some(entry) = cache.get(key) {
             if now.duration_since(entry.fetched_at) <= MCP_SEARCH_RESULT_CACHE_TTL {
-                return Some((entry.hits.clone(), entry.truncated));
+                return Some(entry.clone());
             }
         }
         cache.remove(key);
@@ -322,6 +324,8 @@ impl ClickHouseConversationRepository {
         key: String,
         hits: &[SearchMcpEventHit],
         truncated: bool,
+        docs: u64,
+        avgdl: f64,
     ) {
         let now = Instant::now();
         let mut cache = self.mcp_search_cache.write().await;
@@ -343,6 +347,8 @@ impl ClickHouseConversationRepository {
             SearchMcpEventsCacheEntry {
                 hits: hits.to_vec(),
                 truncated,
+                docs,
+                avgdl,
                 fetched_at: now,
             },
         );

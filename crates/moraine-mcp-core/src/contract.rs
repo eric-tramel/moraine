@@ -1051,6 +1051,10 @@ impl Performance {
     pub fn builder(sla_target_ms: u64) -> PerformanceBuilder {
         PerformanceBuilder::new(sla_target_ms)
     }
+
+    pub(crate) fn builder_from(started_at: Instant, sla_target_ms: u64) -> PerformanceBuilder {
+        PerformanceBuilder::from_started_at(started_at, sla_target_ms)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1063,6 +1067,13 @@ impl PerformanceBuilder {
     pub fn new(sla_target_ms: u64) -> Self {
         Self {
             started_at: Instant::now(),
+            sla_target_ms,
+        }
+    }
+
+    fn from_started_at(started_at: Instant, sla_target_ms: u64) -> Self {
+        Self {
+            started_at,
             sla_target_ms,
         }
     }

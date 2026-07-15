@@ -161,8 +161,9 @@ default_exclude_codex_mcp = true
 prewarm_on_initialize = false
 async_log_writes = true
 protocol_version = "2024-11-05"
-# Valid retrievals beyond this process-wide parallel limit wait for capacity.
-# Omit to use the CPU parallelism available to the Moraine process.
+# Retrievals beyond this process-wide execution limit enter a 16-request FIFO
+# queue. Omit for the default of 8 executing requests. Queue time counts toward
+# the fixed 4-second request deadline; a full queue is rejected immediately.
 # max_parallel_requests = 16
 # MCP clients first try the unified backend's Unix socket, then transparently
 # fall back to an embedded server when the socket is absent or unreachable.
