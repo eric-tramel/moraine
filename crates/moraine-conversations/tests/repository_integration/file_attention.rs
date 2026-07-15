@@ -1,6 +1,47 @@
 use super::*;
 
 #[tokio::test(flavor = "multi_thread")]
+async fn file_attention_clamps_its_query_budget_to_the_request_deadline() {
+    let (repo, state) = build_repo().await;
+
+    with_repository_query_deadline(
+        "test-file-attention-deadline".to_string(),
+        tokio::time::Instant::now() + Duration::from_secs(2),
+        repo.file_attention(FileAttentionQuery {
+            cancellation_token: "test-file-attention-deadline".to_string(),
+            rel: "crates/foo.rs".to_string(),
+            normalized_project_id: Some("project-a".to_string()),
+            normalized_project_roots: vec!["/worktree-a".to_string()],
+            apply_project_scope: true,
+            start_unix_ms: None,
+            end_unix_ms: None,
+            harness: None,
+            source_name: None,
+            tool: None,
+            mutations_only: false,
+            max_rows: 10,
+            execution_budget_secs: 4,
+        }),
+    )
+    .await
+    .expect("deadline-scoped file attention succeeds");
+
+    let request_params = state.request_params.lock().expect("request params lock");
+    let deadline_params = request_params
+        .iter()
+        .filter(|params| params.contains_key("max_execution_time"))
+        .collect::<Vec<_>>();
+    assert!(!deadline_params.is_empty());
+    for params in deadline_params {
+        let remaining = params["max_execution_time"]
+            .parse::<f64>()
+            .expect("numeric remaining ClickHouse deadline");
+        assert!(remaining > 0.0 && remaining <= 2.0);
+        assert_eq!(params["timeout_overflow_mode"], "throw");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn file_attention_merges_normalized_exact_lookup_with_suffix_fallback() {
     let (repo, state) = build_repo().await;
 

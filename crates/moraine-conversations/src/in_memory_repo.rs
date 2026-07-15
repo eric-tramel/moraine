@@ -150,6 +150,9 @@ impl InMemoryConversationRepository {
                 .event_types
                 .clone()
                 .unwrap_or_else(McpEventType::default_search_types),
+            // The default fake contains no sessions or turns. Unscoped empty
+            // search is valid; a scoped lookup therefore reports not found.
+            scope_exists: query.session_id.is_none(),
             truncated: false,
             stats: SearchMcpEventsStats {
                 docs: 0,

@@ -327,6 +327,30 @@ pub(super) struct SearchRow {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub(super) struct SearchMcpCandidateRow {
+    pub(super) row_kind: u8,
+    #[serde(default)]
+    pub(super) event_uid: String,
+    #[serde(default)]
+    pub(super) session_id: String,
+    #[serde(default)]
+    pub(super) slot: u8,
+    #[serde(default)]
+    pub(super) generation: u64,
+    #[serde(default)]
+    pub(super) raw_score: f64,
+    #[serde(default)]
+    pub(super) matched_terms: u64,
+    #[serde(default)]
+    pub(super) event_unix_ms: i64,
+    pub(super) docs: u64,
+    pub(super) total_doc_len: u64,
+    pub(super) scope_exists: u8,
+    pub(super) projection_ready: u8,
+    pub(super) projection_clean: u8,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub(super) struct SearchMcpEventRow {
     pub(super) event_uid: String,
     pub(super) session_id: String,
@@ -356,23 +380,32 @@ pub(super) struct SearchMcpEventRow {
     pub(super) event_unix_ms: i64,
     pub(super) event_order: u64,
     pub(super) turn_seq: u32,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub(super) struct SearchMcpEventEnrichmentRow {
-    pub(super) event_uid: String,
-    pub(super) event_time: String,
-    pub(super) event_unix_ms: i64,
-    pub(super) event_order: u64,
-    pub(super) turn_seq: u32,
+    #[serde(default)]
     pub(super) event_ordinal: u32,
+    #[serde(default)]
     pub(super) turn_event_count: u64,
+    #[serde(default)]
+    pub(super) turn_completed: u8,
+    #[serde(default)]
+    pub(super) turn_terminal_event_uid: String,
     #[serde(default)]
     pub(super) call_id: String,
     #[serde(default)]
     pub(super) item_id: String,
     #[serde(default)]
     pub(super) model: String,
+    #[serde(default)]
+    pub(super) session_started_at_unix_ms: i64,
+    #[serde(default)]
+    pub(super) session_updated_at_unix_ms: i64,
+    #[serde(default)]
+    pub(super) session_title: String,
+    #[serde(default)]
+    pub(super) session_slug: String,
+    #[serde(default)]
+    pub(super) session_summary: String,
+    #[serde(default)]
+    pub(super) session_completed: u8,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -494,8 +527,6 @@ pub(super) struct SessionTimeBoundsRow {
     pub(super) session_id: String,
     pub(super) first_event_time: String,
     pub(super) last_event_time: String,
-    pub(super) first_event_unix_ms: i64,
-    pub(super) last_event_unix_ms: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -515,8 +546,6 @@ pub(super) struct ConversationCandidateSet {
 pub(super) struct SessionTimeBounds {
     pub(super) first_event_time: String,
     pub(super) last_event_time: String,
-    pub(super) first_event_unix_ms: i64,
-    pub(super) last_event_unix_ms: i64,
 }
 
 #[derive(Debug, Deserialize)]

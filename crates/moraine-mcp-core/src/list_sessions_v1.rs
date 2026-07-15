@@ -1,6 +1,6 @@
 use super::{
     handled_tool_error_result, internal_id_error, repo_error_to_contract_error,
-    tool_success_result, AppState,
+    request_performance, tool_success_result, AppState,
 };
 use crate::contract::{
     format_rfc3339_utc_millis, CanonicalListSessionsArgs, ContractError, ListSessionsArgs,
@@ -22,7 +22,7 @@ const LIST_SESSIONS_BROAD_WINDOW_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 
 impl AppState {
     pub(crate) async fn list_sessions_v1(&self, arguments: Value) -> Result<Value> {
-        let perf = Performance::builder(LIST_SESSIONS_DEFAULT_SLA_TARGET_MS);
+        let perf = request_performance(LIST_SESSIONS_DEFAULT_SLA_TARGET_MS);
         let raw_request = arguments.clone();
 
         let args = match parse_list_sessions_args(arguments, self.cfg.mcp.max_results) {

@@ -1,5 +1,23 @@
 use super::*;
 
+fn mcp_candidate_metadata(scope_exists: u8, docs: u64) -> serde_json::Value {
+    json!({
+        "row_kind": 1_u8,
+        "event_uid": "",
+        "session_id": "",
+        "slot": 0_u8,
+        "generation": 0_u64,
+        "raw_score": 0.0,
+        "matched_terms": 0_u64,
+        "event_unix_ms": 0_i64,
+        "docs": docs,
+        "total_doc_len": docs.saturating_mul(50),
+        "scope_exists": scope_exists,
+        "projection_ready": 1_u8,
+        "projection_clean": 1_u8
+    })
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn search_mcp_events_result_cache_reuses_repository_across_requests() {
     let (repo, state) = build_repo().await;
@@ -103,6 +121,42 @@ async fn search_mcp_events_result_cache_reuses_repository_across_requests() {
         state.queries.lock().expect("queries lock").len() > requests_after_delimited_filter,
         "distinct delimiter-bearing filters must miss the result cache"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_mcp_events_does_not_cache_a_missing_scope() {
+    let responses = vec![
+        ScriptedResponse::rows(
+            &["toUInt8(0) AS row_kind"],
+            json!([mcp_candidate_metadata(0, 100)]),
+        ),
+        ScriptedResponse::rows(
+            &["toUInt8(0) AS row_kind"],
+            json!([mcp_candidate_metadata(1, 100)]),
+        ),
+    ];
+    let (repo, state) = build_scripted_repo(responses).await;
+    let query = SearchMcpEventsQuery {
+        query: "newly published session".to_string(),
+        session_id: Some("session-new".to_string()),
+        n_hits: Some(5),
+        min_score: Some(0.0),
+        min_should_match: Some(1),
+        ..SearchMcpEventsQuery::default()
+    };
+
+    let missing = repo
+        .search_mcp_events(query.clone())
+        .await
+        .expect("missing scope response");
+    assert!(!missing.scope_exists);
+
+    let published = repo
+        .search_mcp_events(query)
+        .await
+        .expect("newly published scope response");
+    assert!(published.scope_exists);
+    assert_script_consumed(&state, 2);
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn analytics_cache_hit_and_distinct_key_are_request_count_proven() {

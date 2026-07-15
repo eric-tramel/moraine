@@ -14,6 +14,7 @@ pub(super) struct SearchScoreAccum<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(test)]
 pub(super) struct RankedPosting<'a> {
     pub(super) row: &'a CachedPostingRow,
     pub(super) score: f64,
@@ -420,8 +421,6 @@ FORMAT JSONEachRow",
     pub(super) fn build_search_mcp_events_sql(
         &self,
         terms: &[String],
-        idf_by_term: &HashMap<String, f64>,
-        avgdl: f64,
         event_types: &[McpEventType],
         session_id: Option<&str>,
         turn_seq: Option<u32>,
@@ -443,128 +442,362 @@ FORMAT JSONEachRow",
         }
 
         let postings_table = self.table_ref("search_postings");
-        let documents_table = self.table_ref("search_documents");
-        let trace_table = self.table_ref("v_conversation_trace");
+        let corpus_table = self.table_ref("search_corpus_stats");
+        let projection_state_table = self.table_ref("mcp_open_projection_state");
+        let sessions_table = self.table_ref("mcp_open_sessions");
+        let turns_table = self.table_ref("mcp_open_turns");
+        let events_table = self.table_ref("mcp_open_events");
+        let dirty_sessions_table = self.table_ref("mcp_open_dirty_sessions");
         let terms_array_sql = sql_array_strings(terms);
-        let idf_vals: Vec<f64> = terms
-            .iter()
-            .map(|t| *idf_by_term.get(t).unwrap_or(&0.0))
-            .collect();
-        let idf_array_sql = sql_array_f64(&idf_vals);
-        let documents_join_sql = format!(
-            "(SELECT
-  t.event_uid AS event_uid,
-  any(t.session_id) AS session_id,
-  any(t.source_name) AS source_name,
-  any(t.harness) AS harness,
-  any(t.inference_provider) AS inference_provider,
-  any(t.endpoint_kind) AS endpoint_kind,
-  any(t.event_class) AS event_class,
-  any(t.payload_type) AS payload_type,
-  any(t.actor_role) AS actor_role,
-  any(t.name) AS name,
-  any(t.phase) AS phase,
-  any(t.source_ref) AS source_ref,
-  any(t.doc_len) AS doc_len,
-  any(t.text_content) AS text_content,
-  any(t.payload_json) AS payload_json
-FROM {documents_table} AS t
-GROUP BY t.event_uid)"
-        );
 
-        let mut where_clauses = vec![format!("p.term IN {}", terms_array_sql)];
+        let mut posting_clauses = Vec::new();
+        if let Some(session_id) = session_id {
+            posting_clauses.push(format!("p.session_id = {}", sql_quote(session_id)));
+        }
+        let mut event_clauses = Vec::new();
         if let Some(turn_seq) = turn_seq {
             let Some(session_id) = session_id else {
                 return Err(RepoError::invalid_argument(
                     "turn-scoped search requires session_id",
                 ));
             };
-            where_clauses.push(format!(
-                "tr.session_id = {} AND tr.turn_seq = {}",
+            event_clauses.push(format!(
+                "e.session_id = {} AND e.turn_seq = {}",
                 sql_quote(session_id),
                 turn_seq
             ));
-        } else if let Some(session_id) = session_id {
-            where_clauses.push(format!("d.session_id = {}", sql_quote(session_id)));
         }
         if let Some(harness) = harness {
-            where_clauses.push(format!("d.harness = {}", sql_quote(harness)));
+            posting_clauses.push(format!("p.harness = {}", sql_quote(harness)));
         }
         if let Some(source_name) = source_name {
-            where_clauses.push(format!("d.source_name = {}", sql_quote(source_name)));
+            posting_clauses.push(format!("p.source_name = {}", sql_quote(source_name)));
         }
-        where_clauses.push(Self::mcp_event_type_filter_clause(
-            "d.event_class",
-            "d.payload_type",
-            "d.actor_role",
+        posting_clauses.push(Self::mcp_event_type_filter_clause(
+            "p.event_class",
+            "p.payload_type",
+            "p.actor_role",
             event_types,
         ));
-        if let Some(scope_clause) = self.session_scope_clause("d.session_id") {
-            where_clauses.push(scope_clause);
-        }
 
-        let where_sql = where_clauses.join("\n  AND ");
-        let mcp_event_type_expr =
-            Self::mcp_event_type_sql_expr("d.event_class", "d.payload_type", "d.actor_role");
+        let projected_origin_clause = |alias: &str| {
+            self.cfg.session_scope.as_ref().map(|scope| {
+                let roots = scope
+                    .roots
+                    .iter()
+                    .map(|root| {
+                        format!(
+                        "{alias}.origin_cwd = {root} OR startsWith({alias}.origin_cwd, {prefix})",
+                        root = sql_quote(root),
+                        prefix = sql_quote(&format!("{root}/")),
+                    )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
+                format!("({roots})")
+            })
+        };
+        let posting_origin_clause = projected_origin_clause("s");
+        if let Some(scope_clause) = posting_origin_clause.as_ref() {
+            posting_clauses.push(scope_clause.clone());
+        }
+        let posting_where_sql = posting_clauses.join("\n      AND ");
+        event_clauses.push("projection_ready = 1".to_string());
+        event_clauses.push("projection_clean = 1".to_string());
+        let event_where_sql = event_clauses.join("\n      AND ");
+        let scope_origin_filter = projected_origin_clause("scope_s")
+            .as_deref()
+            .map(|clause| format!(" AND {clause}"))
+            .unwrap_or_default();
+        let scope_state_sql = match (session_id, turn_seq) {
+            (Some(session_id), Some(turn_seq)) => format!(
+                "SELECT toUInt8(count() > 0) AS scope_exists
+FROM {sessions_table} AS scope_s FINAL
+ALL INNER JOIN {turns_table} AS scope_t FINAL
+  ON scope_t.session_id = scope_s.session_id
+  AND scope_t.slot = scope_s.slot
+  AND scope_t.generation = scope_s.generation
+WHERE scope_s.session_id = {session_id}
+  AND scope_t.turn_seq = {turn_seq}{scope_origin_filter}",
+                session_id = sql_quote(session_id),
+            ),
+            (Some(session_id), None) => format!(
+                "SELECT toUInt8(count() > 0) AS scope_exists
+FROM {sessions_table} AS scope_s FINAL
+WHERE scope_s.session_id = {session_id}{scope_origin_filter}",
+                session_id = sql_quote(session_id),
+            ),
+            (None, Some(_)) => {
+                return Err(RepoError::invalid_argument(
+                    "turn-scoped search requires session_id",
+                ));
+            }
+            (None, None) => "SELECT toUInt8(1) AS scope_exists".to_string(),
+        };
         let k1 = self.cfg.bm25_k1.max(0.01);
         let b = self.cfg.bm25_b.clamp(0.0, 1.0);
-        let text_content_limit = usize::from(self.cfg.preview_chars).saturating_mul(4);
-        let payload_json_limit = usize::from(self.cfg.preview_chars).saturating_mul(8);
 
         Ok(format!(
             "WITH
   {k1:.6} AS k1,
   {b:.6} AS b,
-  greatest({avgdl:.6}, 1.0) AS avgdl,
   {terms_array_sql} AS q_terms,
-  {idf_array_sql} AS q_idf
+  (
+    SELECT tuple(toUInt64(docs), toUInt64(total_doc_len))
+    FROM {corpus_table}
+  ) AS corpus_stats,
+  tupleElement(corpus_stats, 1) AS corpus_docs,
+  tupleElement(corpus_stats, 2) AS corpus_total_doc_len,
+  greatest(
+    if(corpus_docs = 0, 1.0, toFloat64(corpus_total_doc_len) / toFloat64(corpus_docs)),
+    1.0
+  ) AS avgdl,
+  (
+    SELECT toUInt8(if(count() = 0, 0, max(ready)))
+    FROM {projection_state_table} FINAL
+    WHERE state_key = 'global'
+  ) AS projection_ready,
+  (
+    SELECT toUInt8(count() = 0)
+    FROM (
+      SELECT session_id, dirty_revision
+      FROM {dirty_sessions_table} FINAL
+    ) AS dirty
+    LEFT JOIN (
+      SELECT session_id, dirty_revision
+      FROM {sessions_table} FINAL
+    ) AS published ON published.session_id = dirty.session_id
+    WHERE dirty.dirty_revision > ifNull(published.dirty_revision, 0)
+  ) AS projection_clean,
+  ({scope_state_sql}) AS scope_exists,
+  term_postings AS (
+    SELECT
+      p.*,
+      toUInt64(count() OVER (PARTITION BY p.term)) AS df
+    FROM {postings_table} AS p FINAL
+    PREWHERE p.term IN q_terms
+  ),
+  matching_doc_ids AS (
+    SELECT p.doc_id AS event_uid
+    FROM {postings_table} AS p FINAL
+    ALL INNER JOIN {sessions_table} AS s FINAL ON s.session_id = p.session_id
+    WHERE p.term IN q_terms
+      AND {posting_where_sql}
+      AND projection_ready = 1
+      AND projection_clean = 1
+  ),
+  projected_candidates AS (
+    SELECT event_uid, session_id, slot, generation, event_time, turn_seq
+    FROM {events_table} FINAL
+    WHERE event_uid IN (SELECT event_uid FROM matching_doc_ids)
+  ),
+  ranked AS (
+    SELECT
+      p.doc_id AS event_uid,
+      any(s.session_id) AS session_id,
+      toUInt8(any(s.slot)) AS slot,
+      toUInt64(any(s.generation)) AS generation,
+      sum(
+        log(1.0 + ((greatest(toFloat64(corpus_docs), toFloat64(p.df))
+          - toFloat64(p.df) + 0.5) / (toFloat64(p.df) + 0.5)))
+        * ((toFloat64(p.tf) * (k1 + 1.0))
+          / (toFloat64(p.tf) + k1 * (1.0 - b + b * (toFloat64(p.doc_len) / avgdl))))
+      ) AS raw_score,
+      toUInt64(count()) AS matched_terms,
+      toInt64(toUnixTimestamp64Milli(any(e.event_time))) AS event_unix_ms
+    FROM term_postings AS p
+    ALL INNER JOIN {sessions_table} AS s FINAL ON s.session_id = p.session_id
+    ALL INNER JOIN projected_candidates AS e
+      ON e.event_uid = p.doc_id
+      AND e.session_id = s.session_id
+      AND e.slot = s.slot
+      AND e.generation = s.generation
+    WHERE {posting_where_sql}
+      AND {event_where_sql}
+    GROUP BY p.doc_id
+    HAVING matched_terms >= {min_should_match} AND raw_score >= {min_score:.6}
+    ORDER BY raw_score DESC, event_unix_ms DESC, event_uid ASC
+    LIMIT {limit}
+  )
+SELECT *
+FROM (
 SELECT
-  p.doc_id AS event_uid,
-  any(d.session_id) AS session_id,
-  any(d.source_name) AS source_name,
-  any(d.harness) AS harness,
-  any(d.inference_provider) AS inference_provider,
-  any(d.endpoint_kind) AS endpoint_kind,
-  any(d.event_class) AS event_class,
-  any(d.payload_type) AS payload_type,
-  any(d.actor_role) AS actor_role,
-  any(d.name) AS name,
-  any(d.phase) AS phase,
-  any(d.source_ref) AS source_ref,
-  any(d.doc_len) AS doc_len,
-  leftUTF8(any(d.text_content), {preview}) AS text_preview,
-  leftUTF8(any(d.text_content), {text_content_limit}) AS text_content,
-  leftUTF8(any(d.payload_json), {payload_json_limit}) AS payload_json,
-  any({mcp_event_type_expr}) AS mcp_event_type,
-  sum(
-    transform(toString(p.term), q_terms, q_idf, 0.0)
-    *
-    (
-      (toFloat64(p.tf) * (k1 + 1.0))
-      /
-      (toFloat64(p.tf) + k1 * (1.0 - b + b * (toFloat64(p.doc_len) / avgdl)))
-    )
-  ) AS raw_score,
-  uniqExact(p.term) AS matched_terms,
-  toString(any(tr.event_time)) AS event_time,
-  toInt64(toUnixTimestamp64Milli(any(tr.event_time))) AS event_unix_ms,
-  toUInt64(any(tr.event_order)) AS event_order,
-  toUInt32(any(tr.turn_seq)) AS turn_seq
-FROM {postings_table} AS p
-INNER JOIN {documents_join_sql} AS d ON d.event_uid = p.doc_id
-ANY INNER JOIN {trace_table} AS tr ON tr.event_uid = p.doc_id
-WHERE {where_sql}
-GROUP BY p.doc_id
-HAVING matched_terms >= {min_should_match} AND raw_score >= {min_score:.6}
-ORDER BY raw_score DESC, event_unix_ms DESC, event_uid ASC
-LIMIT {limit}
+  toUInt8(0) AS row_kind,
+  ranked.event_uid AS event_uid,
+  ranked.session_id AS session_id,
+  ranked.slot AS slot,
+  ranked.generation AS generation,
+  ranked.raw_score AS raw_score,
+  ranked.matched_terms AS matched_terms,
+  ranked.event_unix_ms AS event_unix_ms,
+  corpus_docs AS docs,
+  corpus_total_doc_len AS total_doc_len,
+  scope_exists AS scope_exists,
+  projection_ready AS projection_ready,
+  projection_clean AS projection_clean
+FROM ranked
+UNION ALL
+SELECT
+  toUInt8(1) AS row_kind,
+  '' AS event_uid,
+  '' AS session_id,
+  toUInt8(0) AS slot,
+  toUInt64(0) AS generation,
+  toFloat64(0) AS raw_score,
+  toUInt64(0) AS matched_terms,
+  toInt64(0) AS event_unix_ms,
+  corpus_docs AS docs,
+  corpus_total_doc_len AS total_doc_len,
+  scope_exists AS scope_exists,
+  projection_ready AS projection_ready,
+  projection_clean AS projection_clean
+)
+ORDER BY row_kind ASC, raw_score DESC, event_unix_ms DESC, event_uid ASC
+SETTINGS max_bytes_before_external_group_by = 67108864,
+  max_bytes_before_external_sort = 67108864
 FORMAT JSONEachRow",
-            preview = self.cfg.preview_chars,
-            text_content_limit = text_content_limit,
-            payload_json_limit = payload_json_limit,
             postings_table = postings_table,
-            documents_join_sql = documents_join_sql,
-            trace_table = trace_table,
+            corpus_table = corpus_table,
+            projection_state_table = projection_state_table,
+            sessions_table = sessions_table,
+            events_table = events_table,
+            dirty_sessions_table = dirty_sessions_table,
+        ))
+    }
+
+    pub(super) fn build_search_mcp_event_details_sql(
+        &self,
+        candidates: &[SearchMcpCandidateRow],
+    ) -> RepoResult<String> {
+        if candidates.is_empty() {
+            return Err(RepoError::invalid_argument(
+                "cannot hydrate MCP search rows for empty event_uids",
+            ));
+        }
+
+        let documents_table = self.table_ref("search_documents");
+        let sessions_table = self.table_ref("mcp_open_sessions");
+        let turns_table = self.table_ref("mcp_open_turns");
+        let projected_events_table = self.table_ref("mcp_open_events");
+        let events_table = self.table_ref("events");
+        let event_uids = candidates
+            .iter()
+            .map(|candidate| candidate.event_uid.clone())
+            .collect::<Vec<_>>();
+        let event_uids_sql = sql_array_strings(&event_uids);
+        let candidate_heads_sql = candidates
+            .iter()
+            .map(|candidate| {
+                format!(
+                    "({}, {}, toUInt8({}), toUInt64({}))",
+                    sql_quote(&candidate.event_uid),
+                    sql_quote(&candidate.session_id),
+                    candidate.slot,
+                    candidate.generation,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let preview = self.cfg.preview_chars;
+        let text_content_limit = usize::from(preview).saturating_mul(4);
+        let payload_json_limit = usize::from(preview).saturating_mul(8);
+
+        Ok(format!(
+            "WITH
+  {event_uids_sql} AS event_uids,
+  candidate_heads AS (
+    SELECT
+      tupleElement(candidate, 1) AS event_uid,
+      tupleElement(candidate, 2) AS session_id,
+      toUInt8(tupleElement(candidate, 3)) AS slot,
+      toUInt64(tupleElement(candidate, 4)) AS generation
+    FROM (SELECT arrayJoin([{candidate_heads_sql}]) AS candidate)
+  ),
+  documents AS (
+    SELECT
+      document.event_uid AS event_uid,
+      argMax(document.session_id, document.doc_version) AS session_id,
+      argMax(document.source_name, document.doc_version) AS source_name,
+      argMax(document.harness, document.doc_version) AS harness,
+      argMax(document.inference_provider, document.doc_version) AS inference_provider,
+      argMax(document.event_class, document.doc_version) AS event_class,
+      argMax(document.payload_type, document.doc_version) AS payload_type,
+      argMax(document.actor_role, document.doc_version) AS actor_role,
+      argMax(document.name, document.doc_version) AS name,
+      argMax(document.phase, document.doc_version) AS phase,
+      argMax(document.source_ref, document.doc_version) AS source_ref,
+      toUInt32(argMax(document.doc_len, document.doc_version)) AS doc_len,
+      argMax(leftUTF8(document.text_content, {preview}), document.doc_version) AS text_preview,
+      argMax(leftUTF8(document.text_content, {text_content_limit}), document.doc_version) AS text_content,
+      argMax(leftUTF8(document.payload_json, {payload_json_limit}), document.doc_version) AS payload_json
+    FROM {documents_table} AS document
+    WHERE document.event_uid IN event_uids
+    GROUP BY document.event_uid
+  ),
+  models AS (
+    SELECT source_event.event_uid AS event_uid,
+      argMax(source_event.model, source_event.event_version) AS model
+    FROM {events_table} AS source_event
+    WHERE source_event.event_uid IN event_uids
+    GROUP BY source_event.event_uid
+  )
+SELECT
+  documents.event_uid AS event_uid,
+  documents.session_id AS session_id,
+  documents.source_name AS source_name,
+  documents.harness AS harness,
+  documents.inference_provider AS inference_provider,
+  projected_events.endpoint_kind AS endpoint_kind,
+  documents.event_class AS event_class,
+  documents.payload_type AS payload_type,
+  documents.actor_role AS actor_role,
+  documents.name AS name,
+  documents.phase AS phase,
+  documents.source_ref AS source_ref,
+  documents.doc_len AS doc_len,
+  documents.text_preview AS text_preview,
+  documents.text_content AS text_content,
+  documents.payload_json AS payload_json,
+  projected_events.event_type AS mcp_event_type,
+  toFloat64(0) AS raw_score,
+  toUInt64(0) AS matched_terms,
+  toString(projected_events.event_time) AS event_time,
+  toInt64(toUnixTimestamp64Milli(projected_events.event_time)) AS event_unix_ms,
+  toUInt64(projected_events.event_order) AS event_order,
+  toUInt32(projected_events.turn_seq) AS turn_seq,
+  toUInt32(projected_events.event_ordinal) AS event_ordinal,
+  toUInt64(ifNull(turns.total_events, 0)) AS turn_event_count,
+  toUInt8(ifNull(turns.completed, 0)) AS turn_completed,
+  ifNull(turns.terminal_event_uid, '') AS turn_terminal_event_uid,
+  projected_events.call_id AS call_id,
+  projected_events.item_id AS item_id,
+  ifNull(models.model, '') AS model,
+  toInt64(toUnixTimestamp64Milli(sessions.first_event_time)) AS session_started_at_unix_ms,
+  toInt64(toUnixTimestamp64Milli(sessions.last_event_time)) AS session_updated_at_unix_ms,
+  sessions.title AS session_title,
+  sessions.session_slug AS session_slug,
+  sessions.session_summary AS session_summary,
+  toUInt8(sessions.completed) AS session_completed
+FROM documents
+ALL INNER JOIN candidate_heads AS candidate
+  ON candidate.event_uid = documents.event_uid
+ALL INNER JOIN {sessions_table} AS sessions FINAL
+  ON sessions.session_id = candidate.session_id
+  AND sessions.slot = candidate.slot
+  AND sessions.generation = candidate.generation
+ALL INNER JOIN {projected_events_table} AS projected_events FINAL
+  ON projected_events.event_uid = candidate.event_uid
+  AND projected_events.session_id = candidate.session_id
+  AND projected_events.slot = candidate.slot
+  AND projected_events.generation = candidate.generation
+ANY LEFT JOIN {turns_table} AS turns FINAL
+  ON turns.session_id = sessions.session_id
+  AND turns.slot = sessions.slot
+  AND turns.generation = sessions.generation
+  AND turns.turn_seq = projected_events.turn_seq
+ANY LEFT JOIN models ON models.event_uid = documents.event_uid
+ORDER BY indexOf(event_uids, documents.event_uid) ASC
+FORMAT JSONEachRow",
         ))
     }
 
@@ -751,6 +984,7 @@ FORMAT JSONEachRow",
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(super) fn rank_cached_postings<'a>(
         terms: &[String],
         postings_by_term: &'a HashMap<String, Arc<[CachedPostingRow]>>,
@@ -821,12 +1055,14 @@ FORMAT JSONEachRow",
         candidates
     }
 
+    #[cfg(test)]
     fn compare_ranked_postings(a: &RankedPosting<'_>, b: &RankedPosting<'_>) -> std::cmp::Ordering {
         b.score
             .total_cmp(&a.score)
             .then_with(|| a.row.event_uid.cmp(&b.row.event_uid))
     }
 
+    #[cfg(test)]
     fn order_ranked_posting_prefix(candidates: &mut [RankedPosting<'_>], prefix_len: usize) {
         let prefix_len = prefix_len.min(candidates.len());
         if prefix_len < candidates.len() {
@@ -1169,8 +1405,6 @@ FORMAT JSONEachRow",
     pub(super) async fn search_mcp_event_rows(
         &self,
         terms: &[String],
-        docs: u64,
-        avgdl: f64,
         event_types: &[McpEventType],
         session_id: Option<&str>,
         turn_seq: Option<u32>,
@@ -1179,42 +1413,9 @@ FORMAT JSONEachRow",
         min_should_match: u16,
         min_score: f64,
         limit: u16,
-    ) -> RepoResult<Vec<SearchMcpEventRow>> {
-        // The in-memory postings fast pass filters per-session only after
-        // hydration and knows nothing about origin scoping, so a scoped
-        // repository always takes the SQL path, where the scope is a WHERE
-        // clause.
-        if turn_seq.is_none() && self.cfg.session_scope.is_none() {
-            let fast_rows = self
-                .search_mcp_event_rows_fast_pass(
-                    terms,
-                    docs,
-                    avgdl,
-                    event_types,
-                    session_id,
-                    harness,
-                    source_name,
-                    min_should_match,
-                    min_score,
-                    limit,
-                )
-                .await?;
-            if !fast_rows.is_empty() {
-                return Ok(fast_rows);
-            }
-        }
-
-        let df_map = self.df_map(terms).await?;
-        let mut idf_by_term = HashMap::<String, f64>::new();
-        for term in terms {
-            let df = *df_map.get(term).unwrap_or(&0);
-            idf_by_term.insert(term.clone(), Self::bm25_idf(docs, df));
-        }
-
+    ) -> RepoResult<(Vec<SearchMcpEventRow>, u64, u64, bool)> {
         let sql = self.build_search_mcp_events_sql(
             terms,
-            &idf_by_term,
-            avgdl,
             event_types,
             session_id,
             turn_seq,
@@ -1224,134 +1425,62 @@ FORMAT JSONEachRow",
             min_score,
             limit,
         )?;
-        let mut rows: Vec<SearchMcpEventRow> =
+        let candidate_rows: Vec<SearchMcpCandidateRow> =
             self.map_backend(self.query_rows(&sql, None).await)?;
-        Self::sort_search_mcp_event_rows(&mut rows);
-        Ok(rows)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn search_mcp_event_rows_fast_pass(
-        &self,
-        terms: &[String],
-        docs: u64,
-        avgdl: f64,
-        event_types: &[McpEventType],
-        session_id: Option<&str>,
-        harness: Option<&str>,
-        source_name: Option<&str>,
-        min_should_match: u16,
-        min_score: f64,
-        limit: u16,
-    ) -> RepoResult<Vec<SearchMcpEventRow>> {
-        let df_map = self.df_map(terms).await?;
-        if Self::has_broad_fast_path_term(terms, &df_map, docs) {
-            return Ok(Vec::new());
+        let metadata = candidate_rows
+            .iter()
+            .find(|row| row.row_kind == 1)
+            .ok_or_else(|| RepoError::backend("MCP search candidate query omitted metadata"))?;
+        if metadata.projection_ready == 0 {
+            return Err(RepoError::backend(
+                "MCP search read model is not ready; run `moraine db migrate`",
+            ));
+        }
+        if metadata.projection_clean == 0 {
+            return Err(RepoError::backend(
+                "MCP search read model is catching up with ingest; retry the request",
+            ));
         }
 
-        let postings_by_term = self.load_term_postings_for_terms(terms).await?;
-        let use_document_codex_flag = self.search_documents_has_codex_flag().await?;
-        let mut candidates = Self::rank_cached_postings(
-            terms,
-            &postings_by_term,
-            &df_map,
-            docs,
-            avgdl,
-            self.cfg.bm25_k1.max(0.01),
-            self.cfg.bm25_b.clamp(0.0, 1.0),
-            min_should_match,
-            min_score,
-        );
+        let docs = metadata.docs;
+        let total_doc_len = metadata.total_doc_len;
+        let scope_exists = metadata.scope_exists != 0;
+        self.cache_corpus_stats(docs, total_doc_len, Instant::now())
+            .await;
 
-        let mut rows = Vec::<SearchMcpEventRow>::new();
-        let target_rows = (limit as usize)
-            .saturating_mul(8)
-            .max((limit as usize).saturating_add(32))
-            .min(256);
-        let hydrate_chunk_size = target_rows.max(128);
-        let mut offset = 0usize;
-        let mut remaining_candidates_sorted = false;
-        while offset < candidates.len() && rows.len() < target_rows {
-            if offset > 0 && !remaining_candidates_sorted {
-                candidates[offset..].sort_unstable_by(Self::compare_ranked_postings);
-                remaining_candidates_sorted = true;
-            }
-            let end = (offset + hydrate_chunk_size).min(candidates.len());
-            let event_uids: Vec<String> = candidates[offset..end]
-                .iter()
-                .map(|candidate| candidate.row.event_uid.clone())
-                .collect();
-            let doc_extras = self
-                .load_search_doc_extras(&event_uids, use_document_codex_flag)
-                .await?;
-
-            for candidate in &candidates[offset..end] {
-                let Some(extra) = doc_extras.get(candidate.row.event_uid.as_str()) else {
-                    continue;
-                };
-                if session_id.is_some_and(|session_id| extra.session_id != session_id) {
-                    continue;
-                }
-                if harness.is_some_and(|harness| extra.harness != harness) {
-                    continue;
-                }
-                if source_name.is_some_and(|source_name| extra.source_name != source_name) {
-                    continue;
-                }
-                let event_type = Self::mcp_event_type_for(
-                    &extra.event_class,
-                    &extra.payload_type,
-                    &extra.actor_role,
-                );
-                if !event_types.contains(&event_type) {
-                    continue;
-                }
-
-                rows.push(SearchMcpEventRow {
-                    event_uid: candidate.row.event_uid.clone(),
-                    session_id: extra.session_id.clone(),
-                    source_name: extra.source_name.clone(),
-                    harness: extra.harness.clone(),
-                    inference_provider: extra.inference_provider.clone(),
-                    endpoint_kind: String::new(),
-                    event_class: extra.event_class.clone(),
-                    payload_type: extra.payload_type.clone(),
-                    actor_role: extra.actor_role.clone(),
-                    name: extra.name.clone(),
-                    phase: extra.phase.clone(),
-                    source_ref: extra.source_ref.clone(),
-                    doc_len: extra.doc_len,
-                    text_preview: extra.text_preview.clone(),
-                    text_content: extra.text_content.clone(),
-                    payload_json: extra.payload_json.clone(),
-                    mcp_event_type: event_type.as_str().to_string(),
-                    raw_score: candidate.score,
-                    matched_terms: candidate.matched_terms,
-                    event_time: String::new(),
-                    event_unix_ms: 0,
-                    event_order: 0,
-                    turn_seq: 0,
-                });
-
-                if rows.len() >= target_rows {
-                    break;
-                }
-            }
-            offset = end;
+        let candidates = candidate_rows
+            .into_iter()
+            .filter(|row| row.row_kind == 0)
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Ok((Vec::new(), docs, total_doc_len, scope_exists));
         }
 
-        let event_enrichment_by_uid = self.load_mcp_event_enrichment(&rows).await?;
-        for row in rows.iter_mut() {
-            if let Some(enrichment) = event_enrichment_by_uid.get(row.event_uid.as_str()) {
-                row.event_time = enrichment.event_time.clone();
-                row.event_unix_ms = enrichment.event_unix_ms;
-                row.event_order = enrichment.event_order;
-                row.turn_seq = enrichment.turn_seq;
-            }
+        let detail_sql = self.build_search_mcp_event_details_sql(&candidates)?;
+        let detail_rows: Vec<SearchMcpEventRow> =
+            self.map_backend(self.query_rows(&detail_sql, None).await)?;
+        let mut details_by_uid = detail_rows
+            .into_iter()
+            .map(|row| (row.event_uid.clone(), row))
+            .collect::<HashMap<_, _>>();
+
+        let mut rows = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let Some(mut detail) = details_by_uid.remove(candidate.event_uid.as_str()) else {
+                return Err(RepoError::backend(format!(
+                    "MCP search projection moved while hydrating event {}; retry the request",
+                    candidate.event_uid
+                )));
+            };
+            detail.raw_score = candidate.raw_score;
+            detail.matched_terms = candidate.matched_terms;
+            // Ranking is defined by the candidate snapshot. Preserve its
+            // timestamp if the projection publishes between the two reads.
+            detail.event_unix_ms = candidate.event_unix_ms;
+            rows.push(detail);
         }
         Self::sort_search_mcp_event_rows(&mut rows);
-        rows.truncate(limit as usize);
-        Ok(rows)
+        Ok((rows, docs, total_doc_len, scope_exists))
     }
 
     pub(super) fn sort_search_mcp_event_rows(rows: &mut [SearchMcpEventRow]) {
@@ -2233,8 +2362,6 @@ FORMAT JSONEachRow",
                 SessionTimeBounds {
                     first_event_time: row.first_event_time,
                     last_event_time: row.last_event_time,
-                    first_event_unix_ms: row.first_event_unix_ms,
-                    last_event_unix_ms: row.last_event_unix_ms,
                 },
             );
         }
@@ -2293,126 +2420,27 @@ FORMAT JSONEachRow",
             .collect())
     }
 
-    pub(super) async fn load_mcp_event_enrichment(
-        &self,
-        rows: &[SearchMcpEventRow],
-    ) -> RepoResult<HashMap<String, SearchMcpEventEnrichmentRow>> {
-        if rows.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let mut event_uids = rows
-            .iter()
-            .map(|row| row.event_uid.clone())
-            .collect::<Vec<_>>();
-        event_uids.sort_unstable();
-        event_uids.dedup();
-
-        let mut session_ids = rows
-            .iter()
-            .map(|row| row.session_id.clone())
-            .collect::<Vec<_>>();
-        session_ids.sort_unstable();
-        session_ids.dedup();
-
-        let trace_table = self.table_ref("v_conversation_trace");
-        let events_source = canonical_events_source(&self.table_ref("events"));
-        let event_uids_sql = sql_array_strings(&event_uids);
-        let session_ids_sql = sql_array_strings(&session_ids);
-        let sql = format!(
-            "SELECT
-  tr.event_uid AS event_uid,
-  toString(tr.event_time) AS event_time,
-  toInt64(toUnixTimestamp64Milli(tr.event_time)) AS event_unix_ms,
-  toUInt64(tr.event_order) AS event_order,
-  toUInt32(tr.turn_seq) AS turn_seq,
-  toUInt32(tr.event_ordinal) AS event_ordinal,
-  toUInt64(tr.turn_event_count) AS turn_event_count,
-  tr.call_id AS call_id,
-  tr.item_id AS item_id,
-  ifNull(e.model, '') AS model
-FROM (
-  SELECT
-    event_uid,
-    session_id,
-    event_time,
-    event_order,
-    turn_seq,
-    call_id,
-    item_id,
-    row_number() OVER (
-      PARTITION BY session_id, turn_seq
-      ORDER BY event_order ASC, event_uid ASC
-    ) AS event_ordinal,
-    count() OVER (PARTITION BY session_id, turn_seq) AS turn_event_count
-  FROM {trace_table}
-  WHERE session_id IN {session_ids_sql}
-) AS tr
-ANY LEFT JOIN (
-  SELECT event_uid, model
-  FROM {events_source}
-  WHERE event_uid IN {event_uids_sql}
-) AS e ON e.event_uid = tr.event_uid
-WHERE tr.event_uid IN {event_uids_sql}
-FORMAT JSONEachRow",
-            trace_table = trace_table,
-            events_source = events_source,
-            session_ids_sql = session_ids_sql,
-            event_uids_sql = event_uids_sql,
-        );
-
-        let rows: Vec<SearchMcpEventEnrichmentRow> =
-            self.map_backend(self.query_rows(&sql, None).await)?;
-        let mut by_uid = HashMap::new();
-        for row in rows {
-            by_uid.insert(row.event_uid.clone(), row);
-        }
-        Ok(by_uid)
-    }
-
-    pub(super) async fn map_search_mcp_rows_to_hits(
-        &self,
+    pub(super) fn map_search_mcp_rows_to_hits(
         rows: Vec<SearchMcpEventRow>,
-    ) -> RepoResult<Vec<SearchMcpEventHit>> {
-        let session_ids = rows
-            .iter()
-            .map(|row| row.session_id.clone())
-            .collect::<Vec<_>>();
-        let (session_time_bounds, session_metadata_by_session_id, event_enrichment_by_uid) = tokio::try_join!(
-            self.load_session_time_bounds(&session_ids),
-            self.fetch_conversation_session_metadata(&session_ids),
-            self.load_mcp_event_enrichment(&rows),
-        )?;
+    ) -> Vec<SearchMcpEventHit> {
         let max_raw_score = rows.iter().map(|row| row.raw_score).fold(0.0_f64, f64::max);
 
-        Ok(rows
-            .into_iter()
+        rows.into_iter()
             .enumerate()
             .map(|(idx, row)| {
                 let session_id = row.session_id;
-                let enrichment = event_enrichment_by_uid.get(row.event_uid.as_str());
                 let event_type = if row.mcp_event_type.is_empty() {
                     Self::mcp_event_type_for(&row.event_class, &row.payload_type, &row.actor_role)
                 } else {
                     McpEventType::from_normalized(&row.mcp_event_type)
                 };
-                let session_metadata = session_metadata_by_session_id.get(&session_id);
-                let session_slug = session_metadata.and_then(|meta| {
-                    (!meta.session_slug.is_empty()).then(|| meta.session_slug.clone())
-                });
-                let session_summary = session_metadata.and_then(|meta| {
-                    (!meta.session_summary.is_empty()).then(|| meta.session_summary.clone())
-                });
-                let session_title = session_summary.clone().or_else(|| session_slug.clone());
-                let (session_started_at_unix_ms, session_updated_at_unix_ms) = session_time_bounds
-                    .get(session_id.as_str())
-                    .map(|bounds| {
-                        (
-                            Some(bounds.first_event_unix_ms),
-                            Some(bounds.last_event_unix_ms),
-                        )
-                    })
-                    .unwrap_or_default();
+                let session_started_at_unix_ms =
+                    (row.session_started_at_unix_ms != 0).then_some(row.session_started_at_unix_ms);
+                let session_updated_at_unix_ms =
+                    (row.session_updated_at_unix_ms != 0).then_some(row.session_updated_at_unix_ms);
+                let session_title = non_empty_string(row.session_title);
+                let session_slug = non_empty_string(row.session_slug);
+                let session_summary = non_empty_string(row.session_summary);
                 let text_content_len = row.text_content.chars().count();
                 let snippet_len = row.text_preview.chars().count();
                 let snippet = if row.text_preview.is_empty() {
@@ -2431,32 +2459,21 @@ FORMAT JSONEachRow",
                     event_uid: row.event_uid,
                     session_id,
                     event_type,
-                    event_time: enrichment
-                        .map(|value| value.event_time.clone())
-                        .unwrap_or(row.event_time),
-                    event_unix_ms: enrichment
-                        .map(|value| value.event_unix_ms)
-                        .unwrap_or(row.event_unix_ms),
-                    turn_seq: enrichment
-                        .map(|value| value.turn_seq)
-                        .unwrap_or(row.turn_seq),
-                    turn_ordinal: enrichment
-                        .map(|value| value.turn_seq)
-                        .unwrap_or(row.turn_seq),
-                    event_order: enrichment
-                        .map(|value| value.event_order)
-                        .unwrap_or(row.event_order),
-                    event_ordinal: enrichment
-                        .map(|value| value.event_ordinal)
-                        .unwrap_or_default(),
-                    turn_event_count: enrichment
-                        .map(|value| value.turn_event_count)
-                        .unwrap_or_default(),
+                    event_time: row.event_time,
+                    event_unix_ms: row.event_unix_ms,
+                    turn_seq: row.turn_seq,
+                    turn_ordinal: row.turn_seq,
+                    event_order: row.event_order,
+                    event_ordinal: row.event_ordinal,
+                    turn_event_count: row.turn_event_count,
+                    turn_completed: row.turn_completed != 0,
+                    turn_terminal_event_uid: non_empty_string(row.turn_terminal_event_uid),
                     session_started_at_unix_ms,
                     session_updated_at_unix_ms,
                     session_title,
                     session_slug,
                     session_summary,
+                    session_completed: row.session_completed != 0,
                     source_name: non_empty_string(row.source_name),
                     harness: non_empty_string(row.harness),
                     inference_provider: non_empty_string(row.inference_provider),
@@ -2465,9 +2482,9 @@ FORMAT JSONEachRow",
                     actor_role: row.actor_role,
                     tool_name: non_empty_string(row.name),
                     tool_phase: non_empty_string(row.phase),
-                    call_id: enrichment.and_then(|value| non_empty_string(value.call_id.clone())),
-                    item_id: enrichment.and_then(|value| non_empty_string(value.item_id.clone())),
-                    model: enrichment.and_then(|value| non_empty_string(value.model.clone())),
+                    call_id: non_empty_string(row.call_id),
+                    item_id: non_empty_string(row.item_id),
+                    model: non_empty_string(row.model),
                     endpoint_kind: non_empty_string(row.endpoint_kind),
                     source_ref: non_empty_string(row.source_ref),
                     snippet,
@@ -2480,7 +2497,7 @@ FORMAT JSONEachRow",
                     doc_len: row.doc_len,
                 }
             })
-            .collect())
+            .collect()
     }
 
     pub(super) async fn fetch_conversation_session_metadata(
@@ -2879,30 +2896,6 @@ FORMAT JSONEachRow",
             .max(1)
             .min(terms.len() as u16);
         let min_score = query.min_score.unwrap_or(self.cfg.bm25_default_min_score);
-
-        let (docs, total_doc_len) = self.corpus_stats().await?;
-        if docs == 0 {
-            return Ok(SearchMcpEventsResult {
-                query_id,
-                query: query_text.to_string(),
-                terms,
-                event_types,
-                truncated: false,
-                stats: SearchMcpEventsStats {
-                    docs: 0,
-                    avgdl: 0.0,
-                    took_ms: started.elapsed().as_millis() as u32,
-                    result_count: 0,
-                    requested_n_hits,
-                    effective_n_hits,
-                    limit_capped,
-                    truncated: false,
-                },
-                hits: Vec::new(),
-            });
-        }
-
-        let avgdl = (total_doc_len as f64 / docs as f64).max(1.0);
         let cache_key = Self::search_mcp_events_cache_key(
             &terms,
             &event_types,
@@ -2918,14 +2911,18 @@ FORMAT JSONEachRow",
         let cache_hit = cached_result.is_some();
         tracing::info!(cache_hit, "mcp_search_cache");
 
-        let (hits, truncated) = if let Some(cached_result) = cached_result {
-            cached_result
+        let (hits, truncated, docs, avgdl, scope_exists) = if let Some(cached) = cached_result {
+            (
+                cached.hits,
+                cached.truncated,
+                cached.docs,
+                cached.avgdl,
+                true,
+            )
         } else {
-            let mut rows = self
+            let (mut rows, docs, total_doc_len, scope_exists) = self
                 .search_mcp_event_rows(
                     &terms,
-                    docs,
-                    avgdl,
                     &event_types,
                     query.session_id.as_deref(),
                     query.turn_seq,
@@ -2936,14 +2933,24 @@ FORMAT JSONEachRow",
                     fetch_limit,
                 )
                 .await?;
+            let avgdl = if docs == 0 {
+                0.0
+            } else {
+                (total_doc_len as f64 / docs as f64).max(1.0)
+            };
             let truncated = rows.len() > effective_n_hits as usize;
             if truncated {
                 rows.truncate(effective_n_hits as usize);
             }
-            let hits = self.map_search_mcp_rows_to_hits(rows).await?;
-            self.search_mcp_events_cache_put(cache_key, &hits, truncated)
-                .await;
-            (hits, truncated)
+            let hits = Self::map_search_mcp_rows_to_hits(rows);
+            // Projection publication and first ingest can make a negative or
+            // empty answer become positive immediately. Preserve that
+            // visibility by caching only stable, published-corpus results.
+            if scope_exists && docs > 0 {
+                self.search_mcp_events_cache_put(cache_key, &hits, truncated, docs, avgdl)
+                    .await;
+            }
+            (hits, truncated, docs, avgdl, scope_exists)
         };
         let took_ms = started.elapsed().as_millis() as u32;
 
@@ -2952,6 +2959,7 @@ FORMAT JSONEachRow",
             query: query_text.to_string(),
             terms,
             event_types,
+            scope_exists,
             truncated,
             stats: SearchMcpEventsStats {
                 docs,

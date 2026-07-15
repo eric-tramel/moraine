@@ -82,6 +82,19 @@ fn sample_mcp_search_row(event_uid: &str, raw_score: f64, event_unix_ms: i64) ->
         event_unix_ms,
         event_order: 0,
         turn_seq: 0,
+        event_ordinal: 0,
+        turn_event_count: 0,
+        turn_completed: 0,
+        turn_terminal_event_uid: String::new(),
+        call_id: String::new(),
+        item_id: String::new(),
+        model: String::new(),
+        session_started_at_unix_ms: 0,
+        session_updated_at_unix_ms: 0,
+        session_title: String::new(),
+        session_slug: String::new(),
+        session_summary: String::new(),
+        session_completed: 0,
     }
 }
 
@@ -118,6 +131,16 @@ fn tokenize_query_enforces_limits_and_counts() {
     assert_eq!(terms.len(), 3);
     assert_eq!(terms[0], ("hello".to_string(), 2));
     assert_eq!(terms[1].0, "world");
+}
+
+#[test]
+fn repository_reads_leave_thread_scheduling_to_clickhouse() {
+    assert!(REPOSITORY_READ_SETTINGS
+        .iter()
+        .all(|(name, _)| *name != "max_threads"));
+    assert!(
+        REPOSITORY_READ_SETTINGS.contains(&("do_not_merge_across_partitions_select_final", "0"))
+    );
 }
 
 #[test]
