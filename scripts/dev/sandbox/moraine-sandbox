@@ -1314,20 +1314,15 @@ cmd_up() {
         fi
     fi
 
-    # The shared runtime image is built before services start. Performance
-    # Compose resets the service build definition and records the resulting
-    # immutable image ID in machine status.
-    if (( local_performance )); then
-        log "reusing prebuilt local performance image"
+    # Performance suites prebuild one shared runtime image before any physical
+    # reset, then pin the observed image ID in every artifact.
+    if (( performance )); then
+        log "reusing prebuilt performance image"
         docker image inspect moraine-sandbox-runtime:latest >/dev/null 2>&1 || \
-            die "local performance image is missing; run through performance_suite.py"
+            die "performance image is missing; run through performance_suite.py"
     else
         log "building runtime image"
-        if (( performance )); then
-            docker compose -p "$project" -f "$COMPOSE_FILE" build moraine
-        else
-            dc "$project" "$mount_sessions" build
-        fi
+        dc "$project" "$mount_sessions" build
     fi
 
     # Up. The ownership overlay labels every destructive Compose resource.

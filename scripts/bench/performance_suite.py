@@ -5,15 +5,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
-import platform
 import shutil
 import statistics
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 from urllib.request import Request, urlopen
 
 from performance_fixtures import (
@@ -44,6 +44,7 @@ from performance_protocol import (
     sha256_json,
     resource_gate_passes,
     schedule_gate_passes,
+    semantic_oracle_sha256,
     validate_document,
     write_json_atomic,
 )
@@ -52,7 +53,6 @@ from performance_runtime import (
     FixedEnvelope,
     LocalEnvelope,
     RuntimeFailure,
-    build_release_binaries,
     build_release_binaries_in_docker,
     ensure_runtime_build_image,
     non_authoritative_resource_evidence,
@@ -350,7 +350,7 @@ class ManagedSandbox:
     def _refresh_server_processes(self) -> None:
         try:
             central = self._sandbox.central_status()
-        except BaseException:
+        except Exception:
             process = self._sandbox.spawn_central()
             self._sandbox.wait_central_ready_without_search(process)
             central = self._sandbox.central_status()
@@ -532,22 +532,14 @@ def _prepare_builds(
     prepared: dict[str, PreparedBuild] = {}
     common_recipe: Optional[Mapping[str, Any]] = None
     output.mkdir(parents=True, exist_ok=False)
-    if not authoritative and platform.system() != "Linux":
-        ensure_runtime_build_image(SUITE_ROOT)
+    ensure_runtime_build_image(SUITE_ROOT)
     for index, (arm, repo) in enumerate(repositories.items()):
         _require_clean(repo)
-        if authoritative or platform.system() == "Linux":
-            runtime_build = build_release_binaries(
-                repo,
-                output / arm,
-                toolchain_file=SUITE_ROOT / "rust-toolchain.toml",
-            )
-        else:
-            runtime_build = build_release_binaries_in_docker(
-                repo,
-                output / arm,
-                toolchain_file=SUITE_ROOT / "rust-toolchain.toml",
-            )
+        runtime_build = build_release_binaries_in_docker(
+            repo,
+            output / arm,
+            toolchain_file=SUITE_ROOT / "rust-toolchain.toml",
+        )
         build_environment_sha256 = runtime_build.artifact()["recipe"]["build_environment_sha256"]
         recipe = create_build_recipe(
             toolchain_sha256=runtime_build.toolchain_sha256,
@@ -618,12 +610,14 @@ def _semantic_evidence(
         observed = max(0, expected - missing) + duplicates
         other = result.semantic_failures
     passed = expected == observed and not any((missing, duplicates, stale, malformed, other))
-    fingerprint_name = f"{'query' if scenario in {'qps', 'ttr'} else 'event'}_{split}_sha256"
-    if scenario == "mixed":
-        fingerprint_name = "event_stress_sha256"
+    oracle_sha256 = semantic_oracle_sha256(
+        recipe["fingerprints"],
+        scenario,
+        split,
+    )
     return {
         "passed": passed,
-        "oracle_sha256": recipe["fingerprints"][fingerprint_name],
+        "oracle_sha256": oracle_sha256,
         "expected_count": expected,
         "observed_count": observed,
         "missing_count": missing,
@@ -1188,9 +1182,217 @@ def _validate_local_comparison(document: Any) -> None:
     artifacts = document.get("artifacts")
     if not isinstance(artifacts, list) or not artifacts:
         raise SuiteFailure("local comparison artifacts are missing")
+    suite_definition_sha256 = document.get("suite_definition_sha256")
+    builds = document.get("builds")
+    bindings = document.get("artifact_bindings")
+    if (
+        not isinstance(suite_definition_sha256, str)
+        or not isinstance(builds, Mapping)
+        or not isinstance(builds.get("candidate"), str)
+        or not isinstance(bindings, Mapping)
+        or set(bindings) != set(artifacts)
+    ):
+        raise SuiteFailure("local comparison artifact identities are incomplete")
+    for binding in bindings.values():
+        if not isinstance(binding, Mapping) or any(
+            not isinstance(binding.get(field), str)
+            for field in (
+                "suite_definition_sha256",
+                "build_identity_sha256",
+                "semantic_oracle_sha256",
+            )
+        ):
+            raise SuiteFailure("local comparison artifact binding is invalid")
     for raw in artifacts:
         if not isinstance(raw, str) or Path(raw).is_absolute() or ".." in Path(raw).parts:
             raise SuiteFailure("local comparison artifact path is not relative")
+
+
+def _positive_metric(value: Any, field: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise SuiteFailure(f"autoresearch metric {field} must be finite and positive")
+    return float(value)
+
+
+def _local_metric_artifact(
+    document: Mapping[str, Any],
+    pair_index: int,
+    scenario: str,
+    artifact_loader: Callable[[str], Mapping[str, Any]],
+) -> Mapping[str, Any]:
+    relative_path = f"candidate/pair-{pair_index}/artifacts/{scenario}-research.json"
+    if relative_path not in document["artifacts"]:
+        raise SuiteFailure(
+            f"autoresearch local pair {pair_index} {scenario} artifact is missing"
+        )
+    artifact = artifact_loader(relative_path)
+    binding = document["artifact_bindings"].get(relative_path)
+    binary = artifact.get("binary")
+    semantic = artifact.get("semantic")
+    run = artifact.get("run")
+    gates = artifact.get("gates")
+    if (
+        artifact.get("document_type") != "scenario_result"
+        or artifact.get("scenario") != scenario
+        or artifact.get("split") != "research"
+        or not isinstance(run, Mapping)
+        or run.get("arm") != "candidate"
+        or run.get("pair_id") != pair_index
+        or run.get("authoritative") is not False
+        or artifact.get("status") == "fail"
+        or not isinstance(gates, Mapping)
+        or any(gates.get(name) is not True for name in ("correctness", "schedule", "scenario"))
+        or not isinstance(binding, Mapping)
+        or artifact.get("suite_definition_sha256")
+        != document.get("suite_definition_sha256")
+        or binding.get("suite_definition_sha256")
+        != artifact.get("suite_definition_sha256")
+        or not isinstance(binary, Mapping)
+        or binary.get("build_identity_sha256")
+        != document.get("builds", {}).get("candidate")
+        or binding.get("build_identity_sha256")
+        != binary.get("build_identity_sha256")
+        or not isinstance(semantic, Mapping)
+        or binding.get("semantic_oracle_sha256") != semantic.get("oracle_sha256")
+    ):
+        raise SuiteFailure(
+            f"autoresearch local pair {pair_index} {scenario} evidence did not pass"
+        )
+    return artifact
+
+
+def autoresearch_metrics(
+    document: Mapping[str, Any],
+    *,
+    artifact_loader: Optional[Callable[[str], Mapping[str, Any]]] = None,
+) -> tuple[tuple[str, float | int], ...]:
+    """Translate validated suite evidence into OMP autoresearch metrics."""
+
+    if document.get("schema_version") == "moraine-local-comparison-v1":
+        _validate_local_comparison(document)
+        if artifact_loader is None:
+            raise SuiteFailure("local autoresearch metrics require referenced artifacts")
+        qps_values: list[float] = []
+        ttr_values: list[float] = []
+        etd_values: list[float] = []
+        for pair_index, pair in enumerate(document["pair_results"], 1):
+            if (
+                not isinstance(pair, Mapping)
+                or pair.get("pair_id") != pair_index
+                or not isinstance(pair.get("candidate"), Mapping)
+            ):
+                raise SuiteFailure(
+                    f"autoresearch local pair {pair_index} candidate evidence is missing"
+                )
+            candidate = pair["candidate"]
+            qps_artifact = _local_metric_artifact(
+                document, pair_index, "qps", artifact_loader
+            )
+            qps_metrics = qps_artifact.get("metrics")
+            if (
+                not isinstance(qps_metrics, Mapping)
+                or qps_metrics.get("capacity_censoring") != "none"
+            ):
+                raise SuiteFailure(
+                    f"autoresearch local pair {pair_index} QPS capacity is censored"
+                )
+            qps = _positive_metric(
+                qps_metrics.get("sustainable_qps"),
+                f"pair {pair_index} candidate qps",
+            )
+            ttr_artifact = _local_metric_artifact(
+                document, pair_index, "ttr", artifact_loader
+            )
+            ttr_metrics = ttr_artifact.get("metrics")
+            if not isinstance(ttr_metrics, Mapping):
+                raise SuiteFailure(
+                    f"autoresearch local pair {pair_index} TTR metrics are missing"
+                )
+            ttr = _positive_metric(
+                ttr_metrics.get("p95_ms"),
+                f"pair {pair_index} candidate ttr_p95_ms",
+            )
+            etd_artifact = _local_metric_artifact(
+                document, pair_index, "etd_loaded", artifact_loader
+            )
+            etd_metrics = etd_artifact.get("metrics")
+            if not isinstance(etd_metrics, Mapping):
+                raise SuiteFailure(
+                    f"autoresearch local pair {pair_index} loaded ETD metrics are missing"
+                )
+            etd = _positive_metric(
+                _interval_midpoint(etd_metrics.get("source_etd_p95", {})),
+                f"pair {pair_index} candidate source_etd_p95_midpoint_ms",
+            )
+            copied = (
+                candidate.get("qps"),
+                candidate.get("ttr_p95_ms"),
+                candidate.get("source_etd_p95_midpoint_ms"),
+            )
+            derived = (qps, ttr, etd)
+            if any(
+                isinstance(observed, bool)
+                or not isinstance(observed, (int, float))
+                or not math.isclose(float(observed), expected, rel_tol=1e-12)
+                for observed, expected in zip(copied, derived)
+            ):
+                raise SuiteFailure(
+                    f"autoresearch local pair {pair_index} summary metrics disagree with artifacts"
+                )
+            qps_values.append(qps)
+            ttr_values.append(ttr)
+            etd_values.append(etd)
+        qps = statistics.geometric_mean(qps_values)
+        return (
+            ("retrieval_operational_ns_per_query", round(1_000_000_000 / qps)),
+            ("retrieval_sustainable_qps", qps),
+            ("retrieval_ttr_p95_ms", statistics.geometric_mean(ttr_values)),
+            (
+                "retrieval_loaded_etd_p95_midpoint_ms",
+                statistics.geometric_mean(etd_values),
+            ),
+        )
+
+    validate_document(document)
+    if (
+        document.get("document_type") != "scenario_result"
+        or document.get("scenario") != "qps"
+    ):
+        raise SuiteFailure("autoresearch metrics require a QPS result or local comparison")
+    if document.get("status") != "pass":
+        raise SuiteFailure("autoresearch QPS evidence must pass its scenario gates")
+    qps = _positive_metric(
+        document.get("metrics", {}).get("sustainable_qps"),
+        "sustainable_qps",
+    )
+    return (
+        ("retrieval_operational_ns_per_query", round(1_000_000_000 / qps)),
+        ("retrieval_sustainable_qps", qps),
+    )
+
+
+def _reject_nonfinite_json(token: str) -> None:
+    raise SuiteFailure(f"non-finite JSON constant: {token}")
+
+
+def emit_autoresearch_metrics(path: Path) -> None:
+    document = json.loads(
+        path.read_text(encoding="utf-8"),
+        parse_constant=_reject_nonfinite_json,
+    )
+    if not isinstance(document, Mapping):
+        raise SuiteFailure("autoresearch evidence must be a JSON object")
+    for name, value in autoresearch_metrics(
+        document,
+        artifact_loader=lambda relative: load_document(path.parent / relative),
+    ):
+        rendered = str(value) if isinstance(value, int) else f"{value:.6f}"
+        print(f"METRIC {name}={rendered}")
 
 
 def run_local_comparison(
@@ -1220,6 +1422,7 @@ def run_local_comparison(
     frozen_capacity: Optional[float] = None
     pair_documents: list[dict[str, Any]] = []
     artifact_paths: list[str] = []
+    artifact_bindings: dict[str, dict[str, str]] = {}
     for pair_id, order in enumerate(PAIR_ORDER[:pairs], 1):
         sequence = ("baseline", "candidate") if order == "AB" else ("candidate", "baseline")
         by_arm: dict[str, dict[str, Mapping[str, Any]]] = {}
@@ -1247,8 +1450,15 @@ def run_local_comparison(
             for path in paths:
                 document = load_document(path)
                 by_arm[arm][str(document["scenario"])] = document
-                artifact_paths.append(str(path.relative_to(output)))
-        baseline = by_arm["baseline"]
+                relative_path = str(path.relative_to(output))
+                artifact_paths.append(relative_path)
+                artifact_bindings[relative_path] = {
+                    "suite_definition_sha256": document["suite_definition_sha256"],
+                    "build_identity_sha256": document["binary"][
+                        "build_identity_sha256"
+                    ],
+                    "semantic_oracle_sha256": document["semantic"]["oracle_sha256"],
+                }
         candidate = by_arm["candidate"]
         baseline_qps = float(baseline["qps"]["metrics"]["sustainable_qps"])
         candidate_qps = float(candidate["qps"]["metrics"]["sustainable_qps"])
@@ -1301,6 +1511,7 @@ def run_local_comparison(
         "schema_version": "moraine-local-comparison-v1",
         "mode": "local_comparative",
         "authoritative": False,
+        "suite_definition_sha256": sha256_json(definition),
         "profile": profile,
         "pairs": pairs,
         "docker_platform": _local_docker_platform(),
@@ -1318,6 +1529,7 @@ def run_local_comparison(
             name: sum(value > 1.0 for value in values)
             for name, values in ratios.items()
         },
+        "artifact_bindings": artifact_bindings,
         "artifacts": artifact_paths,
         "interpretation": (
             "Directional paired evidence for this Docker environment only; "
@@ -1435,6 +1647,8 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     freeze_parser.add_argument("--output", type=Path, required=True)
     validate_parser = commands.add_parser("validate")
     validate_parser.add_argument("paths", type=Path, nargs="+")
+    metrics_parser = commands.add_parser("autoresearch-metrics")
+    metrics_parser.add_argument("path", type=Path)
     compare_parser = commands.add_parser("compare")
     compare_parser.add_argument("baseline", type=Path)
     compare_parser.add_argument("candidate", type=Path)
@@ -1468,6 +1682,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif args.command == "validate":
             for path in args.paths:
                 validate_path(path)
+        elif args.command == "autoresearch-metrics":
+            emit_autoresearch_metrics(args.path)
         elif args.command == "compare":
             write_json_atomic(args.output, compare_manifests(args.baseline, args.candidate))
         elif args.command == "repeatability":
@@ -1479,13 +1695,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 raise SuiteFailure("local comparison requires --candidate")
             if args.baseline_manifests is not None:
                 raise SuiteFailure("local comparison does not accept --baseline-manifests")
+            local_profile = args.profile or "smoke"
+            local_pairs = (
+                args.pairs
+                if args.pairs is not None
+                else (3 if local_profile == "full" else 1)
+            )
             run_local_comparison(
                 {
                     "baseline": args.baseline.resolve(),
                     "candidate": args.candidate.resolve(),
                 },
-                profile=args.profile or "smoke",
-                pairs=args.pairs or 3,
+                profile=local_profile,
+                pairs=local_pairs,
                 output=args.output,
             )
         elif args.candidate is None:

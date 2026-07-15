@@ -300,7 +300,7 @@ and [Harness author workflow](harness-author-workflow.md#6-add-fixtures).
 
 ## Fixed-resource search performance suite
 
-`scripts/bench/performance_suite.py` is the only executable benchmark interface.
+`scripts/bench/performance_suite.py` is the only end-to-end benchmark interface.
 The protocol, runtime, fixture, and scenario modules under `scripts/bench` are
 import-only helpers. The canonical scenarios are `qps`, `ttr`, `etd_idle`,
 `etd_loaded`, and `mixed`; there are no independent producer CLIs.
@@ -333,6 +333,16 @@ python3 scripts/bench/performance_suite.py run \
     target/bench/performance/baseline-study/baseline-{01,02,03,04,05,06,07}/manifest.json \
   --output target/bench/performance/full
 
+# Run a non-authoritative paired diagnostic on Docker Desktop or a dev host.
+python3 scripts/bench/performance_suite.py run \
+  --mode local --profile smoke --pairs 1 \
+  --baseline <baseline-worktree> --candidate <candidate-worktree> \
+  --output target/bench/performance/local
+
+# Emit OMP-compatible METRIC lines from a QPS artifact or local comparison.
+python3 scripts/bench/performance_suite.py autoresearch-metrics \
+  target/bench/performance/local/local-comparison.json
+
 # Validate one or more checked-in or produced documents.
 python3 scripts/bench/performance_suite.py validate <document.json> [...]
 
@@ -348,6 +358,34 @@ python3 scripts/bench/performance_suite.py repeatability \
   --output target/bench/performance/repeatability.json
 ```
 
+Local mode uses the same scenarios, fresh physical sandboxes, semantic oracles, and
+frozen binaries, but reports `authoritative: false` because it observes rather than
+owns the Docker host resource envelope. It never converts scheduler failures or
+right-censored ETD into passing evidence.
+
+`./autoresearch.sh` is the optimization-loop adapter. Its default `inner` mode runs
+the ignored in-process cached-posting ranker benchmark inside one dev sandbox and
+emits low-noise `METRIC` lines while allowing a dirty candidate tree. This is a fast
+proxy, not end-to-end evidence. Retained changes must be checked against the suite.
+For a clean retained commit, `MORAINE_AUTORESEARCH_MODE=e2e` runs one local paired
+suite and translates its validated candidate QPS, TTR, and uncensored loaded-ETD
+evidence into the same metric protocol:
+The adapter reloads each referenced candidate artifact; copied summary values,
+censored capacity, failed gates, or fixture-oracle fingerprint mismatches fail
+closed instead of producing optimization metrics.
+
+```bash
+MORAINE_AUTORESEARCH_MODE=e2e \
+MORAINE_AUTORESEARCH_BASELINE=<clean-baseline-worktree> \
+MORAINE_AUTORESEARCH_OUTPUT=target/bench/performance/autoresearch-local \
+./autoresearch.sh
+```
+
+The output directory must not already exist. E2E autoresearch always uses the
+`full` profile so QPS is bracketed before the metric bridge accepts it;
+`MORAINE_AUTORESEARCH_PAIRS` defaults to `1`. Neither local mode nor the inner-loop
+proxy can satisfy the authoritative merge-evidence contract.
+
 Authoritative runs require a dedicated rootful Linux cgroup-v2 Docker host with
 strictly more than 8 GiB of host memory. They refuse Docker Desktop, rootless
 Docker, missing controller delegation, and non-cgroup-v2 drivers before collecting
@@ -356,6 +394,10 @@ results. ClickHouse, central Moraine, and ingest/indexing workers share one aggr
 outside it. A synthetic busy-child proof verifies that aggregate CPU accounting
 includes descendants. OOM, swap activity, misplaced processes, binary drift, or an
 unremovable owned resource fails the run.
+
+The suite prebuilds one shared runtime image before any physical reset and pins
+that image identity for both arms; reset startup never rebuilds it inside a
+measured lifecycle.
 
 Each source worktree is clean and pinned to a full commit. The suite builds its four
 release binaries once, copies them into a read-only immutable directory, and records
@@ -417,7 +459,7 @@ scripts/dev/sandbox/run-live-test analytics-parity
 | `.github/workflows/ci-monitor-frontend.yml` / `monitor-frontend-bun` | PR paths/manual, Ubuntu, 10m. Bun 1.3.9 frozen install, typecheck, and nonzero Vitest. |
 | `.github/workflows/ci-python-binding.yml` / `python-binding-smoke` | Binding/dependency/SQL PR paths/manual, Ubuntu, 20m. Python 3.12 locked venv, `maturin develop --locked`, nonzero pytest/JUnit. |
 | `.github/workflows/ci-monitor-browser-mocked.yml` / `monitor-browser-mocked` | Visible PR/manual job, Ubuntu 24.04, 15m. Path-filtered pinned Chromium, exactly two mocked cases, no retry; initially non-required. |
-| `.github/workflows/ci-test-architecture.yml` / `architecture-t0` | Benchmark/live-wrapper/support/manifests PR paths/manual, Ubuntu, 45m. Python 3.12 nonzero protocol/adapter/wrapper unittest discovery, Rust analytics bench `--no-run`, and path-filtered metadata-derived package-isolation compilation. |
+| `.github/workflows/ci-test-architecture.yml` / `architecture-t0` | Benchmark/autoresearch/live-wrapper/support/manifests PR paths/manual, Ubuntu, 45m. Python 3.12 nonzero protocol/adapter/wrapper unittest discovery, autoresearch shell syntax, deterministic live ClickHouse support, and path-filtered metadata-derived package-isolation compilation. |
 | `.github/workflows/ci-packaging.yml` / `packaging-dryrun` | Every PR/manual, Ubuntu, 30m. Always asserts four-target consistency; matching paths own bundle/wheel/sdist, host/Debian install, layout/mode/glibc, entry points, and retained seven-day artifact. |
 | `.github/workflows/ci-functional.yml` / `functional-<target>` | Main/manual, 45m, four Linux/macOS targets with fail-fast disabled. Workspace checks plus installed-artifact stack T2. |
 | `.github/workflows/docs-deploy.yml` | Main/manual, Ubuntu, 10m. Build/required-asset validation, then Pages deployment; documentation-quality rather than runtime coverage. |

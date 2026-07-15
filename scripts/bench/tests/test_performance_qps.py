@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import io
+
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from collections import Counter
 from pathlib import Path
 import sys
@@ -24,6 +26,8 @@ from performance_scenarios import (  # noqa: E402
     QpsTrialSpec,
     RequestTimeout,
     _QpsTrialExecution,
+    STDIO_LINE_LIMIT_BYTES,
+    _StdioJsonRpcClient,
     _empty_qps_sample,
     _empty_qps_telemetry,
     _execute_open_arrival_trial,
@@ -77,6 +81,8 @@ class FakeRuntime:
                 raise RequestTimeout("deadline")
             if self.outcome == "protocol":
                 raise McpProtocolError("bad frame")
+            if self.outcome == "interrupt":
+                raise KeyboardInterrupt
             if self.outcome == "wrong":
                 return {"ok": False}
             return {"ok": True}
@@ -141,6 +147,20 @@ class OpenArrivalTrialTests(unittest.TestCase):
         self.assertEqual(execution.sample["outcomes"]["semantic_error"], 2)
         self.assertEqual(execution.sample["outcomes"]["correct"], 0)
         self.assertFalse(execution.sample["passed"])
+
+    def test_oversized_stdio_frame_is_bounded_and_kills_route(self) -> None:
+        client = _StdioJsonRpcClient.__new__(_StdioJsonRpcClient)
+        client.proc = Mock()
+        stream = io.BytesIO(b"x" * (STDIO_LINE_LIMIT_BYTES + 1))
+        with self.assertRaisesRegex(McpProtocolError, "bounded frame"):
+            client._read_line(stream, "stdout")
+        client.proc.kill.assert_called_once()
+
+    def test_process_control_interrupt_is_not_classified_as_a_sample_error(self) -> None:
+        runtime = FakeRuntime("reset-interrupt", outcome="interrupt")
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_trial(runtime)
+        self.assertTrue(runtime.closed)
 
     def test_timeout_is_terminal_and_not_correct(self) -> None:
         execution = self.run_trial(FakeRuntime("reset-timeout", outcome="timeout"))

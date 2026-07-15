@@ -154,6 +154,22 @@ def canonical_json_bytes(value: Any) -> bytes:
 def sha256_json(value: Any) -> str:
     return sha256_bytes(canonical_json_bytes(value))
 
+def semantic_oracle_sha256(
+    fingerprints: Mapping[str, Any],
+    scenario: str,
+    split: str,
+) -> str:
+    """Bind scenario semantics to the frozen query/event fixture fingerprints."""
+    if scenario == "mixed":
+        return sha256_json(
+            {
+                "event_stress_sha256": fingerprints["event_stress_sha256"],
+                "query_stress_sha256": fingerprints["query_stress_sha256"],
+            }
+        )
+    prefix = "query" if scenario in {"qps", "ttr"} else "event"
+    return str(fingerprints[f"{prefix}_{split}_sha256"])
+
 
 def _mapping(value: Any, path: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
@@ -1686,6 +1702,15 @@ def load_suite_manifest(path: Path | str) -> tuple[Mapping[str, Any], dict[tuple
             raise ProtocolError(f"artifact {reference['relative_path']} suite definition mismatch")
         if artifact["run"]["profile"] != manifest["suite_definition"]["profile"]:
             raise ProtocolError(f"artifact {reference['relative_path']} profile mismatch")
+        expected_oracle = semantic_oracle_sha256(
+            manifest["suite_definition"]["fixture"]["fingerprints"],
+            artifact["scenario"],
+            artifact["split"],
+        )
+        if artifact["semantic"]["oracle_sha256"] != expected_oracle:
+            raise ProtocolError(
+                f"artifact {reference['relative_path']} semantic oracle mismatch"
+            )
         if artifact["binary"]["build_identity_sha256"] != build["identity_sha256"] or artifact["binary"]["image_digest"] != build["image_digest"]:
             raise ProtocolError(f"artifact {reference['relative_path']} build identity mismatch")
         running = {

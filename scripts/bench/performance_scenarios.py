@@ -19,6 +19,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 from performance_fixtures import validate_query_result
+from performance_protocol import POLICY
 
 
 class ScenarioError(RuntimeError):
@@ -87,11 +88,13 @@ class QpsPolicy:
     duration_s: float
     replicates: int
     maximum_qps: int
-    p95_limit_ms: float = 750.0
-    p99_limit_ms: float = 2_000.0
-    hard_deadline_ms: float = 5_000.0
-    scheduler_p99_slip_limit_ms: float = 10.0
-    drain_limit_s: float = 5.0
+    p95_limit_ms: float = float(POLICY["qps_p95_ms_max"])
+    p99_limit_ms: float = float(POLICY["qps_p99_ms_max"])
+    hard_deadline_ms: float = float(POLICY["qps_deadline_ms"])
+    scheduler_p99_slip_limit_ms: float = float(
+        POLICY["scheduler_p99_start_slip_ms_max"]
+    )
+    drain_limit_s: float = float(POLICY["drain_ms_max"]) / 1_000.0
     max_scheduler_workers: int = 4_096
 
     def __post_init__(self) -> None:
@@ -103,8 +106,18 @@ class QpsPolicy:
             raise ValueError("QPS scheduler policy is invalid")
 
 
-SMOKE_QPS_POLICY = QpsPolicy(profile="smoke", duration_s=3, replicates=1, maximum_qps=16)
-FULL_QPS_POLICY = QpsPolicy(profile="full", duration_s=30, replicates=3, maximum_qps=512)
+SMOKE_QPS_POLICY = QpsPolicy(
+    profile="smoke",
+    duration_s=float(POLICY["smoke_qps_trial_seconds"]),
+    replicates=1,
+    maximum_qps=int(POLICY["smoke_qps_max"]),
+)
+FULL_QPS_POLICY = QpsPolicy(
+    profile="full",
+    duration_s=float(POLICY["qps_trial_seconds"]),
+    replicates=int(POLICY["qps_replicates"]),
+    maximum_qps=int(POLICY["qps_max"]),
+)
 
 
 @dataclass(frozen=True)
@@ -268,7 +281,7 @@ def _execute_open_arrival_trial(
                     oracle(structured, case)
                 except MalformedResult:
                     outcome = "malformed"
-                except BaseException:
+                except Exception:
                     outcome = "semantic_error"
                 else:
                     outcome = "correct"
@@ -280,7 +293,7 @@ def _execute_open_arrival_trial(
             outcome = "malformed"
         except (McpProtocolError, McpToolError):
             outcome = "protocol_error"
-        except BaseException:
+        except Exception:
             outcome = "other_error"
         finally:
             with state_lock:
@@ -308,24 +321,27 @@ def _execute_open_arrival_trial(
         if until_end_s > 0:
             sleep(until_end_s)
         backlog_at_end = sum(not future.done() for future in futures)
-        _, initial_pending = wait(futures, timeout=policy.drain_limit_s)
+        completed, initial_pending = wait(futures, timeout=policy.drain_limit_s)
         observed_drain_ms = max(0.0, (clock_ns() - interval_end_ns) / 1_000_000.0)
         sample["drain_ms"] = min(observed_drain_ms, policy.drain_limit_s * 1_000.0)
         sample["drained"] = not initial_pending
         if initial_pending:
             try:
                 runtime.abort()
-            except BaseException:
+            except Exception:
                 infrastructure_errors.append("abort_failed")
-            _, lingering = wait(initial_pending, timeout=1.0)
+            completed_after_abort, lingering = wait(initial_pending, timeout=1.0)
+            completed.update(completed_after_abort)
             if lingering:
                 infrastructure_errors.append("worker_leak")
         else:
             lingering = set()
+        for future in completed:
+            future.result()
 
         try:
             sample["telemetry"] = _qps_telemetry(runtime.telemetry())
-        except BaseException:
+        except Exception:
             infrastructure_errors.append("telemetry_failed")
             sample["telemetry"] = _empty_qps_telemetry()
 
@@ -345,12 +361,12 @@ def _execute_open_arrival_trial(
         executor.shutdown(wait=not initial_pending, cancel_futures=True)
         try:
             runtime.close()
-        except BaseException:
+        except Exception:
             infrastructure_errors.append("cleanup_failed")
         try:
             if runtime.leaked_work():
                 infrastructure_errors.append("runtime_leak")
-        except BaseException:
+        except Exception:
             infrastructure_errors.append("leak_evidence_missing")
 
     adverse = sum(
@@ -443,12 +459,12 @@ def run_qps_sweep(
                 try:
                     runtime = runtime_factory(spec)
                     trial = execute_trial(spec, runtime, cases, oracle, policy)
-                except BaseException:
+                except Exception:
                     if runtime is not None:
                         try:
                             runtime.abort()
                             runtime.close()
-                        except BaseException:
+                        except Exception:
                             fatal = True
                     trial = _failed_qps_trial(spec, policy, "replicate_failed")
             if not trial.reset_id:
@@ -717,7 +733,7 @@ def _run_ttr_sample(
             or not previous.cache_generation
         ):
             raise ScenarioError("previous central identity is invalid")
-    except BaseException as exc:
+    except Exception as exc:
         previous_error = exc
 
     phase_started_ns = clock_ns()
@@ -773,7 +789,7 @@ def _run_ttr_sample(
             oracle(structured, spec.case)
         except MalformedResult:
             raise
-        except BaseException as exc:
+        except Exception as exc:
             semantic_failures += 1
             raise ScenarioError("independent oracle rejected first result") from exc
         finish_phase()
@@ -828,7 +844,7 @@ def _run_ttr_sample(
             error_code = "oracle"
         else:
             error_code = "scenario_error"
-    except BaseException:
+    except Exception:
         error_code = "runtime_error"
     finally:
         if phase_index < len(_TTR_PHASES) and not sample["valid"]:
@@ -837,13 +853,13 @@ def _run_ttr_sample(
             endpoint_ns = now
         try:
             runtime.close()
-        except BaseException:
+        except Exception:
             diagnostics.append("cleanup_failed")
             error_code = error_code or "cleanup"
             sample["valid"] = False
         try:
             survivors = tuple(runtime.surviving_children())
-        except BaseException:
+        except Exception:
             survivors = (-1,)
             diagnostics.append("child_evidence_missing")
         if survivors:
@@ -902,7 +918,7 @@ def run_ttr_scenario(
             )
             semantic_failures += failures
             diagnostics.extend(sample_diagnostics)
-        except BaseException:
+        except Exception:
             sample = _empty_ttr_sample(sample_id)
             sample["error_code"] = "runtime_factory"
             diagnostics.append("runtime_factory_failed")
@@ -927,6 +943,9 @@ class _PendingRpc:
     response: "queue.Queue[object]"
 
 
+STDIO_LINE_LIMIT_BYTES = 8 * 1024 * 1024
+
+
 class _StdioJsonRpcClient:
     """Thread-safe, multiplexed newline-delimited JSON-RPC client."""
 
@@ -947,6 +966,18 @@ class _StdioJsonRpcClient:
         self._reader.start()
         self._stderr_reader.start()
 
+    def _read_line(self, stream: Any, channel: str) -> bytes:
+        raw = stream.readline(STDIO_LINE_LIMIT_BYTES + 1)
+        if not raw:
+            return b""
+        if len(raw) > STDIO_LINE_LIMIT_BYTES or not raw.endswith(b"\n"):
+            try:
+                self.proc.kill()
+            except ProcessLookupError:
+                pass
+            raise McpProtocolError(f"MCP {channel} line exceeded the bounded frame")
+        return raw
+
     def _fail_pending(self, error: BaseException) -> None:
         with self._pending_lock:
             pending = tuple(self._pending.values())
@@ -957,27 +988,32 @@ class _StdioJsonRpcClient:
     def _read_stdout(self) -> None:
         assert self.proc.stdout is not None
         try:
-            for raw in iter(self.proc.stdout.readline, b""):
+            while raw := self._read_line(self.proc.stdout, "stdout"):
                 try:
                     response = json.loads(raw)
                     request_id = response.get("id")
                     if not isinstance(request_id, int):
                         raise ValueError("response id missing")
-                except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
                     self._fail_pending(McpProtocolError("MCP response was malformed"))
                     continue
                 with self._pending_lock:
                     pending = self._pending.pop(request_id, None)
                 if pending is not None:
                     pending.response.put(response)
+        except McpProtocolError as error:
+            self._fail_pending(error)
         finally:
             self._fail_pending(McpProtocolError("MCP route closed before response"))
 
     def _read_stderr(self) -> None:
         assert self.proc.stderr is not None
-        for raw in iter(self.proc.stderr.readline, b""):
-            if self.ROUTE_MARKER.encode() in raw:
-                self._route_marker.set()
+        try:
+            while raw := self._read_line(self.proc.stderr, "stderr"):
+                if self.ROUTE_MARKER.encode() in raw:
+                    self._route_marker.set()
+        except McpProtocolError as error:
+            self._fail_pending(error)
 
     def wait_for_central_route(self, timeout_s: float) -> str:
         if not self._route_marker.wait(timeout_s):
@@ -999,7 +1035,7 @@ class _StdioJsonRpcClient:
                 assert self.proc.stdin is not None
                 self.proc.stdin.write(encoded)
                 self.proc.stdin.flush()
-        except BaseException as exc:
+        except Exception as exc:
             with self._pending_lock:
                 self._pending.pop(request_id, None)
             raise McpProtocolError("MCP request write failed") from exc
@@ -1395,7 +1431,7 @@ class OwnedSandboxTtrControl:
         self._survivors: tuple[int, ...] = ()
         try:
             status = sandbox.central_status()
-        except BaseException:
+        except Exception:
             # A prior TTR sample intentionally left central stopped.  Create a
             # comparison identity outside the next measured boundary.
             prior_start = sandbox.spawn_central()
@@ -1437,7 +1473,7 @@ class OwnedSandboxTtrControl:
                 status = self._sandbox.central_status()
                 self._current = _central_identity_from_status(status)
                 return self._current
-            except BaseException:
+            except Exception:
                 time.sleep(min(0.005, self._remaining(deadline_ns)))
         raise RequestTimeout("central exec identity was not observable")
 
@@ -1471,7 +1507,7 @@ class OwnedSandboxTtrControl:
             return False
         try:
             return _central_identity_from_status(self._sandbox.central_status()) == self._current
-        except BaseException:
+        except Exception:
             return False
 
     def close(self) -> None:
@@ -1491,12 +1527,12 @@ class OwnedSandboxTtrControl:
                 if not self._survivors or time.monotonic() >= cleanup_deadline:
                     break
                 time.sleep(0.02)
-        except BaseException:
+        except Exception:
             status = None
             self._survivors = (-1,)
         try:
             self._sandbox.stop_central()
-        except BaseException:
+        except Exception:
             if status is not None:
                 children = status.get("server_children")
                 if isinstance(children, list):
@@ -1545,7 +1581,13 @@ def make_stdio_ttr_runtime_factory(
 
 
 ACK_OBSERVATION_KEYS = frozenset(
-    {"batch_sequence", "event_identity_digests", "ack_monotonic_ns"}
+    {
+        "batch_sequence",
+        "event_identity_digests",
+        "ack_monotonic_ns",
+        "observed_lower_ns",
+        "observed_upper_ns",
+    }
 )
 CACHE_BYPASS_KEYS = (
     "result",
@@ -1572,7 +1614,7 @@ ETD_SAMPLE_KEYS = frozenset(
         "error_code",
     }
 )
-ETD_SCHEDULER_SLIP_LIMIT_MS = 10.0
+ETD_SCHEDULER_SLIP_LIMIT_MS = float(POLICY["scheduler_p99_start_slip_ms_max"])
 
 
 @dataclass(frozen=True)
@@ -1594,6 +1636,8 @@ class IngestAckObservation:
     batch_sequence: int
     event_identity_digests: tuple[str, ...]
     ack_monotonic_ns: int
+    observed_lower_ns: int
+    observed_upper_ns: int
 
 
 class EtdSampleFailure(ScenarioError):
@@ -1610,6 +1654,7 @@ class IngestAckCursor:
         self._reader = reader
         self._last_sequence = 0
         self._last_ack_ns = 0
+        self._last_observed_upper_ns = 0
         self._by_digest: dict[str, list[IngestAckObservation]] = {}
         self._lock = threading.Lock()
 
@@ -1618,12 +1663,15 @@ class IngestAckCursor:
             raw_observations = self._reader()
             if not isinstance(raw_observations, Sequence):
                 raise ScenarioError("ack reader did not return a sequence")
+            batch_observed_interval: Optional[tuple[int, int]] = None
             for raw in raw_observations:
                 if not isinstance(raw, Mapping) or set(raw) != ACK_OBSERVATION_KEYS:
                     raise ScenarioError("ack observation contains non-allowlisted fields")
                 sequence = raw["batch_sequence"]
                 ack_ns = raw["ack_monotonic_ns"]
                 digests = raw["event_identity_digests"]
+                observed_lower_ns = raw["observed_lower_ns"]
+                observed_upper_ns = raw["observed_upper_ns"]
                 if (
                     isinstance(sequence, bool)
                     or not isinstance(sequence, int)
@@ -1636,6 +1684,21 @@ class IngestAckCursor:
                     or ack_ns < self._last_ack_ns
                 ):
                     raise ScenarioError("ack timestamp is not monotonic")
+                if (
+                    isinstance(observed_lower_ns, bool)
+                    or not isinstance(observed_lower_ns, int)
+                    or isinstance(observed_upper_ns, bool)
+                    or not isinstance(observed_upper_ns, int)
+                    or observed_upper_ns < observed_lower_ns
+                ):
+                    raise ScenarioError("ack observation interval is not monotonic")
+                observed_interval = (observed_lower_ns, observed_upper_ns)
+                if batch_observed_interval is None:
+                    if observed_lower_ns < self._last_observed_upper_ns:
+                        raise ScenarioError("ack observation interval is not monotonic")
+                    batch_observed_interval = observed_interval
+                elif observed_interval != batch_observed_interval:
+                    raise ScenarioError("ack observation batch intervals differ")
                 if not isinstance(digests, (list, tuple)) or not digests:
                     raise ScenarioError("ack observation has no event identity digests")
                 normalized: list[str] = []
@@ -1647,11 +1710,19 @@ class IngestAckCursor:
                     ):
                         raise ScenarioError("ack event identity digest is invalid")
                     normalized.append(digest)
-                observation = IngestAckObservation(sequence, tuple(normalized), ack_ns)
+                observation = IngestAckObservation(
+                    sequence,
+                    tuple(normalized),
+                    ack_ns,
+                    observed_lower_ns,
+                    observed_upper_ns,
+                )
                 for digest in normalized:
                     self._by_digest.setdefault(digest, []).append(observation)
                 self._last_sequence = sequence
                 self._last_ack_ns = ack_ns
+            if batch_observed_interval is not None:
+                self._last_observed_upper_ns = batch_observed_interval[1]
 
     def matches(self, digest: str) -> tuple[IngestAckObservation, ...]:
         self.drain()
@@ -1863,10 +1934,18 @@ def _run_one_etd_event(
         if publication_durable_ns < t0_ns:
             raise EtdSampleFailure("publication_clock_regressed")
         deadline_ns = t0_ns + int(timeout_s * 1_000_000_000)
+        digest = event.get("expected_ack_digest")
+        if not isinstance(digest, str):
+            raise EtdSampleFailure("missing_event_identity_digest")
 
         while True:
             if clock_ns() >= deadline_ns:
                 raise EtdSampleFailure("visibility_timeout")
+            matches = ack_cursor.matches(digest)
+            if len(matches) > 1:
+                raise EtdSampleFailure("duplicate_db_ack")
+            if matches:
+                ack = matches[0]
             try:
                 query = bank.claim_query()
             except FixtureError as exc:
@@ -1901,41 +1980,39 @@ def _run_one_etd_event(
                 raise EtdSampleFailure("visibility_timeout")
             sleeper(min(poll_interval_s, remaining_ns / 1_000_000_000.0))
 
-        digest = event.get("expected_ack_digest")
-        if not isinstance(digest, str):
-            raise EtdSampleFailure("missing_event_identity_digest")
-        matches = _await_ack(
-            ack_cursor,
-            digest,
-            deadline_ns,
-            clock_ns,
-            sleeper,
-            poll_interval_s,
-        )
+        matches = ack_cursor.matches(digest)
+        if not matches:
+            matches = _await_ack(
+                ack_cursor,
+                digest,
+                deadline_ns,
+                clock_ns,
+                sleeper,
+                poll_interval_s,
+            )
         if not matches:
             raise EtdSampleFailure("missing_db_ack")
         if len(matches) != 1:
             raise EtdSampleFailure("duplicate_db_ack")
         ack = matches[0]
-        if ack.ack_monotonic_ns < t0_ns:
+        if ack.observed_upper_ns < t0_ns:
             raise EtdSampleFailure("stale_db_ack")
         if first_valid_ns is None:
             raise AssertionError("successful event must have a valid hit")
-
+        ack_lower_ns = max(ack.observed_lower_ns, t0_ns)
+        ack_upper_ns = ack.observed_upper_ns
         source_lower = _milliseconds(last_miss_ns, t0_ns) if last_miss_ns else 0.0
         source_upper = _milliseconds(first_valid_ns, t0_ns)
         source_censoring = "interval" if last_miss_ns is not None else "left"
-        misses_after_ack = (
-            last_miss_ns is not None and last_miss_ns >= ack.ack_monotonic_ns
-        )
+        misses_after_ack = last_miss_ns is not None and last_miss_ns >= ack_upper_ns
         db_lower = (
-            _milliseconds(last_miss_ns, ack.ack_monotonic_ns)
+            _milliseconds(last_miss_ns, ack_upper_ns)
             if misses_after_ack and last_miss_ns is not None
             else 0.0
         )
         db_upper = (
-            _milliseconds(first_valid_ns, ack.ack_monotonic_ns)
-            if first_valid_ns >= ack.ack_monotonic_ns
+            _milliseconds(first_valid_ns, ack_lower_ns)
+            if first_valid_ns >= ack_lower_ns
             else 0.0
         )
         db_censoring = "interval" if misses_after_ack else "left"
@@ -1944,7 +2021,7 @@ def _run_one_etd_event(
                 "term_sha256": _term_sha256(last_term),
                 "batch_sequence": ack.batch_sequence,
                 "publication_durable_ms": _milliseconds(publication_durable_ns, t0_ns),
-                "db_ack_ms": _milliseconds(ack.ack_monotonic_ns, t0_ns),
+                "db_ack_ms": _milliseconds(ack_upper_ns, t0_ns),
                 "last_miss_ms": (
                     _milliseconds(last_miss_ns, t0_ns) if last_miss_ns is not None else None
                 ),
@@ -1978,7 +2055,7 @@ def _run_one_etd_event(
                     else None
                 ),
                 "db_ack_ms": (
-                    _milliseconds(ack.ack_monotonic_ns, t0_ns)
+                    _milliseconds(ack.observed_upper_ns, t0_ns)
                     if ack is not None and t0_ns is not None
                     else None
                 ),
@@ -1995,10 +2072,10 @@ def _run_one_etd_event(
                     else 0.0
                 ),
                 "db_ack_interval": _right_interval(
-                    _milliseconds(last_miss_ns, ack.ack_monotonic_ns)
+                    _milliseconds(last_miss_ns, ack.observed_upper_ns)
                     if last_miss_ns is not None
                     and ack is not None
-                    and last_miss_ns >= ack.ack_monotonic_ns
+                    and last_miss_ns >= ack.observed_upper_ns
                     else 0.0
                 ),
                 "term_use_count": term_use_count,
@@ -2111,11 +2188,12 @@ def run_etd_scenario(
     load_errors: list[str] = []
     load_barrier: Optional[threading.Barrier] = None
     load_thread: Optional[threading.Thread] = None
+    load_start_ns: list[int] = []
     if loaded_qps is not None and query_load is not None:
         prepare_load = getattr(query_load, "prepare", None)
         if callable(prepare_load):
             prepare_load()
-        load_barrier = threading.Barrier(2)
+        load_barrier = threading.Barrier(2, action=lambda: load_start_ns.append(clock_ns()))
 
         def run_background_load() -> None:
             try:
@@ -2130,8 +2208,9 @@ def run_etd_scenario(
         load_thread = threading.Thread(target=run_background_load, daemon=True)
         load_thread.start()
         load_barrier.wait()
-
-    scenario_start_ns = clock_ns()
+        scenario_start_ns = load_start_ns[0]
+    else:
+        scenario_start_ns = clock_ns()
     samples_by_id: dict[str, tuple[dict[str, Any], bool, int, int]] = {}
     with ThreadPoolExecutor(max_workers=min(32, len(event_schedule))) as executor:
         futures: dict[Future[tuple[dict[str, Any], bool, int, int]], str] = {}
@@ -2287,8 +2366,19 @@ def run_etd_scenario(
 # Mixed query/ingest interference
 
 
-MIXED_QUERY_GOODPUT_FLOOR = 0.90
-MIXED_DEGRADATION_CEILING = 1.25
+MIXED_QUERY_GOODPUT_FLOOR = float(POLICY["mixed_query_goodput_ratio_min"])
+MIXED_QUERY_P95_DEGRADATION_CEILING = float(
+    POLICY["mixed_query_p95_degradation_max"]
+)
+MIXED_QUERY_P99_DEGRADATION_CEILING = float(
+    POLICY["mixed_query_p99_degradation_max"]
+)
+MIXED_SOURCE_ETD_DEGRADATION_CEILING = float(
+    POLICY["mixed_source_etd_degradation_max"]
+)
+MIXED_DB_ACK_ETD_DEGRADATION_CEILING = float(
+    POLICY["mixed_db_ack_etd_degradation_max"]
+)
 
 
 class MixedArmRuntime(Protocol):
@@ -2535,8 +2625,8 @@ def run_mixed_scenario(
         query_control_pass = (
             query_delivery
             and query_control_depth == 0
-            and query_control_metrics["p95_ms"] <= 750.0
-            and query_control_metrics["p99_ms"] <= 2_000.0
+            and query_control_metrics["p95_ms"] <= POLICY["qps_p95_ms_max"]
+            and query_control_metrics["p99_ms"] <= POLICY["qps_p99_ms_max"]
             and query_control_metrics["goodput_qps"] > 0
         )
         ingest_control_pass = (
@@ -2566,14 +2656,14 @@ def run_mixed_scenario(
             ),
         }
         query_slo = (
-            combined_query_metrics["p95_ms"] <= 750.0
-            and combined_query_metrics["p99_ms"] <= 2_000.0
+            combined_query_metrics["p95_ms"] <= POLICY["qps_p95_ms_max"]
+            and combined_query_metrics["p99_ms"] <= POLICY["qps_p99_ms_max"]
             and combined_query_metrics["goodput_qps"] > 0
         )
         query_degradation = (
             ratios["query_goodput"] >= MIXED_QUERY_GOODPUT_FLOOR
-            and ratios["query_p95"] <= MIXED_DEGRADATION_CEILING
-            and ratios["query_p99"] <= MIXED_DEGRADATION_CEILING
+            and ratios["query_p95"] <= MIXED_QUERY_P95_DEGRADATION_CEILING
+            and ratios["query_p99"] <= MIXED_QUERY_P99_DEGRADATION_CEILING
         )
         ingest_slo = (
             combined_results["ingest"].get("status") == "pass"
@@ -2581,8 +2671,8 @@ def run_mixed_scenario(
             and combined_results["ingest"].get("duplicate_events", 0) == 0
         )
         ingest_degradation = (
-            ratios["source_etd"] <= MIXED_DEGRADATION_CEILING
-            and ratios["db_ack_etd"] <= MIXED_DEGRADATION_CEILING
+            ratios["source_etd"] <= MIXED_SOURCE_ETD_DEGRADATION_CEILING
+            and ratios["db_ack_etd"] <= MIXED_DB_ACK_ETD_DEGRADATION_CEILING
         )
         query_bounds = combined_bounds["query"]
         ingest_bounds = combined_bounds["ingest"]
@@ -2689,12 +2779,21 @@ class OwnedSandboxEtdPrimitives(Protocol):
 class OwnedSandboxAckReader:
     """Adapt the ownership-checked stable-cursor ack log API to ETD input."""
 
-    def __init__(self, sandbox: OwnedSandboxEtdPrimitives) -> None:
+    def __init__(
+        self,
+        sandbox: OwnedSandboxEtdPrimitives,
+        clock_ns: Callable[[], int] = time.perf_counter_ns,
+    ) -> None:
         self._sandbox = sandbox
+        self._clock_ns = clock_ns
         self._cursor = 0
+        self._observed_ns = self._clock_ns()
 
     def __call__(self) -> Sequence[Mapping[str, Any]]:
+        observed_lower_ns = self._observed_ns
         batch = self._sandbox.read_ingest_ack_logs(self._cursor)
+        observed_upper_ns = self._clock_ns()
+        self._observed_ns = observed_upper_ns
         next_cursor = getattr(batch, "next_cursor", None)
         observations = getattr(batch, "observations", None)
         gap_detected = getattr(batch, "gap_detected", None)
@@ -2720,6 +2819,8 @@ class OwnedSandboxAckReader:
                     "ack_monotonic_ns": getattr(
                         observation, "ack_monotonic_ns", None
                     ),
+                    "observed_lower_ns": observed_lower_ns,
+                    "observed_upper_ns": observed_upper_ns,
                 }
             )
         self._cursor = next_cursor
@@ -2741,7 +2842,7 @@ class OwnedSandboxEtdRuntime:
         self.sandbox = sandbox
         self.timeout_s = timeout_s
         self._clock_ns = clock_ns
-        self._ack_reader = OwnedSandboxAckReader(sandbox)
+        self._ack_reader = OwnedSandboxAckReader(sandbox, clock_ns)
         client = _StdioJsonRpcClient(sandbox.spawn_stdio_route())
         try:
             client.wait_for_central_route(timeout_s)

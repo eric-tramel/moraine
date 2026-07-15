@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import tomllib
+import threading
 import time
 import tempfile
 import uuid
@@ -49,6 +50,7 @@ BUILD_ENV_ALLOWLIST = (
     "CARGO_ENCODED_RUSTFLAGS",
 )
 CHECKPOINTS = frozenset({"services-ready", "seeded", "artifact-created"})
+COMMAND_OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024
 
 
 class RuntimeFailure(RuntimeError):
@@ -82,18 +84,81 @@ def _run(
     env: Optional[Mapping[str, str]] = None,
     timeout: float = 120.0,
 ) -> subprocess.CompletedProcess[str]:
+    command = list(argv)
     try:
-        return subprocess.run(
-            list(argv),
+        process = subprocess.Popen(
+            command,
             cwd=cwd,
             env=dict(env) if env is not None else None,
-            text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=timeout,
+            start_new_session=True,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except OSError as exc:
         raise RuntimeFailure(f"command failed to execute: {argv[0]}: {exc}") from exc
+
+    stdout = bytearray()
+    stderr = bytearray()
+    exceeded = threading.Event()
+
+    def drain(stream: Any, destination: bytearray) -> None:
+        while chunk := stream.read(64 * 1024):
+            remaining = COMMAND_OUTPUT_LIMIT_BYTES - len(destination)
+            if remaining <= 0 or len(chunk) > remaining:
+                if remaining > 0:
+                    destination.extend(chunk[:remaining])
+                exceeded.set()
+                kill_process_group()
+                return
+            destination.extend(chunk)
+
+    def kill_process_group() -> None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            if process.poll() is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+
+    assert process.stdout is not None and process.stderr is not None
+    readers = (
+        threading.Thread(target=drain, args=(process.stdout, stdout), daemon=True),
+        threading.Thread(target=drain, args=(process.stderr, stderr), daemon=True),
+    )
+    for reader in readers:
+        reader.start()
+    timed_out = False
+    try:
+        returncode = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        kill_process_group()
+        returncode = process.wait()
+    except BaseException:
+        kill_process_group()
+        process.wait()
+        raise
+    finally:
+        for reader in readers:
+            reader.join()
+        process.stdout.close()
+        process.stderr.close()
+
+    if timed_out:
+        raise RuntimeFailure(f"command failed to execute: {argv[0]}: timed out")
+    if exceeded.is_set():
+        raise RuntimeFailure(
+            f"command failed to execute: {argv[0]}: output exceeded "
+            f"{COMMAND_OUTPUT_LIMIT_BYTES} bytes per stream"
+        )
+    return subprocess.CompletedProcess(
+        command,
+        returncode,
+        stdout.decode("utf-8", errors="replace"),
+        stderr.decode("utf-8", errors="replace"),
+    )
 
 def _allowed_build_environment(environment: Mapping[str, str], target: str) -> dict[str, str]:
     normalized_target = re.sub(r"[^A-Za-z0-9]", "_", target).upper()
@@ -332,6 +397,20 @@ def ensure_runtime_build_image(
         )
 
 
+def _remove_owned_build_container(name: str) -> None:
+    """Force-remove a uniquely named build container and prove it is absent."""
+    removed = _run(["docker", "rm", "-f", name], timeout=30)
+    remaining = _run(["docker", "container", "inspect", name], timeout=30)
+    if remaining.returncode == 0:
+        raise RuntimeFailure(f"owned build container remains after cleanup: {name}")
+    missing_markers = (f"No such object: {name}", f"No such container: {name}")
+    if not any(marker in remaining.stderr for marker in missing_markers):
+        details = (remaining.stderr or removed.stderr)[-4096:].strip()
+        raise RuntimeFailure(
+            f"cannot prove owned build container cleanup for {name}: {details}"
+        )
+
+
 def build_release_binaries_in_docker(
     repo_root: Path,
     destination: Path,
@@ -369,23 +448,47 @@ def build_release_binaries_in_docker(
             f" && {copies}"
             f" && chown -R {os.getuid()}:{os.getgid()} /out"
         )
-        proc = _run(
-            [
-                "docker", "run", "--rm", "--user", "root",
-                "--entrypoint", "/bin/bash",
-                "-e", f"RUSTUP_TOOLCHAIN={channel}",
-                "-e", "CARGO_HOME=/usr/local/cargo",
-                "-e", "RUSTC_WRAPPER=",
-                "-e", "CARGO_TARGET_DIR=/target",
-                "-v", f"{repo_root.resolve()}:/repo:ro",
-                "-v", f"{raw.resolve()}:/out",
-                image,
-                "-c", command,
-            ],
-            timeout=3600,
-        )
+        container_name = f"moraine-performance-build-{uuid.uuid4().hex}"
+        proc: Optional[subprocess.CompletedProcess[str]] = None
+        run_error: Optional[BaseException] = None
+        try:
+            proc = _run(
+                [
+                    "docker", "run", "--rm", "--name", container_name,
+                    "--user", "root",
+                    "--entrypoint", "/bin/bash",
+                    "-e", f"RUSTUP_TOOLCHAIN={channel}",
+                    "-e", "CARGO_HOME=/usr/local/cargo",
+                    "-e", "RUSTC_WRAPPER=",
+                    "-e", "CARGO_TARGET_DIR=/target",
+                    "-v", f"{repo_root.resolve()}:/repo:ro",
+                    "-v", f"{raw.resolve()}:/out",
+                    image,
+                    "-c", command,
+                ],
+                timeout=3600,
+            )
+        except BaseException as error:
+            run_error = error
+        try:
+            _remove_owned_build_container(container_name)
+        except BaseException as cleanup_error:
+            if run_error is not None:
+                run_error.add_note(f"owned build container cleanup failed: {cleanup_error}")
+                if not isinstance(run_error, Exception):
+                    raise run_error
+                raise RuntimeFailure(
+                    f"containerized release build and cleanup failed: {run_error}; "
+                    f"{cleanup_error}"
+                ) from run_error
+            raise
+        if run_error is not None:
+            raise run_error
+        assert proc is not None
         if proc.returncode:
-            raise RuntimeFailure(f"containerized release build failed: {proc.stderr[-4096:].strip()}")
+            raise RuntimeFailure(
+                f"containerized release build failed: {proc.stderr[-4096:].strip()}"
+            )
         try:
             fields = dict(
                 line.split(": ", 1)
@@ -908,8 +1011,14 @@ class FixedEnvelope:
             self._controllers_proven = True
             self._prove_effective_ancestors()
             return self.parent_name
-        except BaseException:
-            self.remove(ignore_nonempty=True)
+        except BaseException as setup_error:
+            try:
+                self.remove()
+            except BaseException as cleanup_error:
+                raise RuntimeFailure(
+                    "fixed envelope setup failed and cleanup failed: "
+                    f"{setup_error}; {cleanup_error}"
+                ) from setup_error
             raise
 
     def _pid_cgroup(self, pid: int) -> Path:
@@ -1062,14 +1171,16 @@ class FixedEnvelope:
             raise RuntimeFailure("server envelope is not clean before measurement")
         return evidence
 
-    def remove(self, *, ignore_nonempty: bool = False) -> None:
+    def remove(self) -> None:
         path = self.path
         driver = self.driver
         parent = self.parent_name
         if driver == "systemd" and parent and self._systemd_started:
             proc = self._command(["systemctl", "stop", parent])
-            if proc.returncode and not ignore_nonempty:
-                raise RuntimeFailure(f"cannot stop owned systemd cgroup: {proc.stderr.strip()}")
+            if proc.returncode:
+                raise RuntimeFailure(
+                    f"cannot stop owned systemd cgroup: {proc.stderr.strip()}"
+                )
             self._systemd_started = False
         elif driver == "cgroupfs" and path is not None:
             try:
@@ -1077,8 +1188,7 @@ class FixedEnvelope:
             except FileNotFoundError:
                 pass
             except OSError as exc:
-                if not ignore_nonempty:
-                    raise RuntimeFailure(f"owned cgroup not empty: {path.name}") from exc
+                raise RuntimeFailure(f"owned cgroup not empty: {path.name}") from exc
         self.path = None
         self.parent_name = None
         self.driver = None

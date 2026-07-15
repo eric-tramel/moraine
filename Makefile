@@ -47,6 +47,7 @@ help:
 	@echo "                       Compile every workspace package test target independently"
 	@echo "  python3 scripts/bench/performance_suite.py validate <artifact> [...]"
 	@echo "                       Validate performance scenario, comparison, repeatability, or suite documents"
+	@echo "  ./autoresearch.sh   Run the sandboxed retrieval optimization proxy; e2e mode is documented in testing.md"
 	@echo "  make install        Build the current checkout and install it to the host"
 	@echo "  make docs-build     Build static docs site into ./site"
 	@echo "  make docs-serve     Run live docs server at $(DOCS_ADDR)"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import importlib.util
 import json
 import os
@@ -126,6 +127,68 @@ class FakeCgroupHost:
         (envelope.path / "pids.current").write_text("4\n")
 
 
+class RuntimeCommandTests(unittest.TestCase):
+    def test_command_output_is_drained_but_bounded(self) -> None:
+        with mock.patch.object(runtime, "COMMAND_OUTPUT_LIMIT_BYTES", 1_024):
+            with self.assertRaisesRegex(runtime.RuntimeFailure, "output exceeded"):
+                runtime._run(
+                    [sys.executable, "-c", "import sys; sys.stdout.write('x' * 4096)"],
+                    timeout=5,
+                )
+
+    def test_interrupt_kills_child_group_before_joining_readers(self) -> None:
+        process = mock.Mock(
+            pid=123,
+            stdout=io.BytesIO(),
+            stderr=io.BytesIO(),
+        )
+        process.wait.side_effect = [KeyboardInterrupt, 0]
+        with (
+            mock.patch.object(runtime.subprocess, "Popen", return_value=process),
+            mock.patch.object(runtime.os, "killpg") as killpg,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                runtime._run(["command"], timeout=5)
+        killpg.assert_called_once_with(123, runtime.signal.SIGKILL)
+        self.assertEqual(process.wait.call_count, 2)
+
+    def test_failed_docker_build_force_removes_named_container(self) -> None:
+        def completed(argv, code=0, stderr=""):
+            return subprocess.CompletedProcess(argv, code, "", stderr)
+
+        calls: list[list[str]] = []
+
+        def run(argv, **_kwargs):
+            command = list(argv)
+            calls.append(command)
+            if command[:2] == ["docker", "run"]:
+                raise runtime.RuntimeFailure("injected build timeout")
+            if command[:3] == ["docker", "container", "inspect"]:
+                return completed(command, 1, f"Error: No such object: {command[-1]}")
+            return completed(command)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.object(runtime, "_run", side_effect=run):
+                with self.assertRaisesRegex(runtime.RuntimeFailure, "injected"):
+                    runtime.build_release_binaries_in_docker(
+                        REPO,
+                        Path(temporary) / "frozen",
+                        toolchain_file=REPO / "rust-toolchain.toml",
+                    )
+        docker_run = next(command for command in calls if command[:2] == ["docker", "run"])
+        container_name = docker_run[docker_run.index("--name") + 1]
+        self.assertIn(["docker", "rm", "-f", container_name], calls)
+        self.assertIn(["docker", "container", "inspect", container_name], calls)
+
+    def test_docker_cleanup_daemon_error_fails_closed(self) -> None:
+        unavailable = subprocess.CompletedProcess(
+            ["docker"], 1, "", "Cannot connect to the Docker daemon"
+        )
+        with mock.patch.object(runtime, "_run", return_value=unavailable):
+            with self.assertRaisesRegex(runtime.RuntimeFailure, "cannot prove"):
+                runtime._remove_owned_build_container("owned-build")
+
+
 class FixedEnvelopeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -226,6 +289,15 @@ class FixedEnvelopeTests(unittest.TestCase):
         self.assertEqual((group / "cpu.max").read_text().strip(), "100000 100000")
         envelope.remove()
         self.assertTrue(any(call[:2] == ("systemctl", "stop") for call in calls))
+
+    def test_failed_remove_retains_owned_cgroup_identity(self) -> None:
+        envelope = self.host.create_envelope()
+        assert envelope.path is not None
+        with self.assertRaisesRegex(runtime.RuntimeFailure, "owned cgroup not empty"):
+            envelope.remove()
+        self.assertIsNotNone(envelope.path)
+        self.assertEqual(envelope.parent_name, "moraine-performance/perf-000000000000")
+        self.assertEqual(envelope.driver, "cgroupfs")
 
     def test_server_descendants_and_loadgen_exclusion_are_both_required(self) -> None:
         envelope = self.host.create_envelope()

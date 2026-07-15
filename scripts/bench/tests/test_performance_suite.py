@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import copy
 import tempfile
 import unittest
 from unittest import mock
@@ -32,6 +33,70 @@ from performance_runtime import LocalEnvelope
 
 def digest(label: str) -> str:
     return sha256_json({"label": label})
+
+
+def autoresearch_artifacts(pair_results: list[dict]) -> dict[str, dict]:
+    artifacts: dict[str, dict] = {}
+    for pair_index, pair in enumerate(pair_results, 1):
+        candidate = pair["candidate"]
+        common = {
+            "document_type": "scenario_result",
+            "split": "research",
+            "status": "inconclusive",
+            "run": {
+                "arm": "candidate",
+                "pair_id": pair_index,
+                "authoritative": False,
+            },
+            "gates": {
+                "correctness": True,
+                "schedule": True,
+                "scenario": True,
+            },
+        }
+        for scenario, metrics in (
+            (
+                "qps",
+                {
+                    "capacity_censoring": "none",
+                    "sustainable_qps": candidate["qps"],
+                },
+            ),
+            ("ttr", {"p95_ms": candidate["ttr_p95_ms"]}),
+            (
+                "etd_loaded",
+                {
+                    "source_etd_p95": {
+                        "lower_ms": candidate["source_etd_p95_midpoint_ms"],
+                        "upper_ms": candidate["source_etd_p95_midpoint_ms"],
+                    }
+                },
+            ),
+        ):
+            artifacts[f"candidate/pair-{pair_index}/artifacts/{scenario}-research.json"] = {
+                **common,
+                "scenario": scenario,
+                "metrics": metrics,
+            }
+    return artifacts
+
+
+def bind_autoresearch_artifacts(document: dict, artifacts: dict[str, dict]) -> None:
+    suite_identity = digest("local-suite")
+    candidate_identity = digest("candidate-build")
+    document["suite_definition_sha256"] = suite_identity
+    document["builds"] = {"candidate": candidate_identity}
+    document["artifact_bindings"] = {}
+    for path, artifact in artifacts.items():
+        oracle_identity = digest(f"oracle:{path}")
+        artifact["suite_definition_sha256"] = suite_identity
+        artifact["binary"] = {"build_identity_sha256": candidate_identity}
+        artifact["semantic"] = {"oracle_sha256": oracle_identity}
+        document["artifact_bindings"][path] = {
+            "suite_definition_sha256": suite_identity,
+            "build_identity_sha256": candidate_identity,
+            "semantic_oracle_sha256": oracle_identity,
+        }
 
 
 def protocol_build(arm: str = "baseline") -> dict:
@@ -279,6 +344,59 @@ class LifecycleTests(unittest.TestCase):
         self.assertFalse(evidence["authoritative"])
         self.assertFalse(evidence["effective_limits_proven"])
 
+    def test_build_image_is_prebuilt_once_and_both_arms_use_it(self) -> None:
+        runtime_build = mock.Mock(
+            toolchain_sha256=digest("toolchain"),
+            target="x86_64-unknown-linux-gnu",
+            build_environment={},
+            binary_sha256={
+                "moraine-ingest": digest("ingest"),
+                "moraine-mcp": digest("mcp"),
+            },
+        )
+        runtime_build.artifact.return_value = {
+            "recipe": {
+                "build_environment_sha256": digest("environment"),
+                "linker_sha256": digest("linker"),
+            }
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repositories = {
+                "baseline": root / "baseline",
+                "candidate": root / "candidate",
+            }
+            for repository in repositories.values():
+                repository.mkdir()
+            with (
+                mock.patch.object(suite, "_require_clean"),
+                mock.patch.object(suite, "ensure_runtime_build_image") as ensure,
+                mock.patch.object(
+                    suite,
+                    "build_release_binaries_in_docker",
+                    return_value=runtime_build,
+                ) as build,
+                mock.patch.object(
+                    suite,
+                    "_discover_image_digest",
+                    return_value=digest("runtime-image"),
+                ),
+                mock.patch.object(
+                    suite,
+                    "_git_commit",
+                    side_effect=("a" * 40, "b" * 40),
+                ),
+            ):
+                prepared, _ = suite._prepare_builds(
+                    repositories,
+                    root / "output",
+                    authoritative=True,
+                )
+        ensure.assert_called_once_with(suite.SUITE_ROOT)
+        self.assertEqual(build.call_count, 2)
+        self.assertEqual(set(prepared), {"baseline", "candidate"})
+
+
 class CliArtifactTests(unittest.TestCase):
     def test_freeze_writes_canonical_fixture_accepted_by_validate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -318,32 +436,141 @@ class CliArtifactTests(unittest.TestCase):
                 "--candidate",
                 "/candidate",
                 "--output",
-                "/results",
+                "/output",
             ]
         )
         self.assertEqual(args.mode, "local")
         self.assertIsNone(args.profile)
         self.assertIsNone(args.pairs)
 
-    def test_local_comparison_validator_requires_non_authoritative_relative_evidence(self) -> None:
+    def test_local_comparison_validator_requires_non_authoritative_relative_evidence(
+        self,
+    ) -> None:
+        artifact_path = "candidate/pair-1/artifacts/qps-research.json"
+        suite_identity = digest("local-suite")
+        candidate_identity = digest("candidate-build")
         document = {
             "schema_version": "moraine-local-comparison-v1",
             "mode": "local_comparative",
             "authoritative": False,
             "pairs": 1,
             "pair_results": [{}],
-            "artifacts": ["baseline/pair-1/artifacts/qps-research.json"],
+            "suite_definition_sha256": suite_identity,
+            "builds": {"candidate": candidate_identity},
+            "artifacts": [artifact_path],
+            "artifact_bindings": {
+                artifact_path: {
+                    "suite_definition_sha256": suite_identity,
+                    "build_identity_sha256": candidate_identity,
+                    "semantic_oracle_sha256": digest("oracle"),
+                }
+            },
         }
         suite._validate_local_comparison(document)
         document["authoritative"] = True
         with self.assertRaisesRegex(suite.SuiteFailure, "non-authoritative"):
             suite._validate_local_comparison(document)
 
+    def test_autoresearch_metrics_use_candidate_end_to_end_evidence(self) -> None:
+        pair_results = [
+            {
+                "pair_id": 1,
+                "candidate": {
+                    "qps": 100.0,
+                    "ttr_p95_ms": 25.0,
+                    "source_etd_p95_midpoint_ms": 80.0,
+                },
+            },
+            {
+                "pair_id": 2,
+                "candidate": {
+                    "qps": 400.0,
+                    "ttr_p95_ms": 100.0,
+                    "source_etd_p95_midpoint_ms": 320.0,
+                },
+            },
+        ]
+        document = {
+            "schema_version": "moraine-local-comparison-v1",
+            "mode": "local_comparative",
+            "authoritative": False,
+            "pairs": 2,
+            "pair_results": pair_results,
+            "artifacts": [
+                f"candidate/pair-{pair}/artifacts/{scenario}-research.json"
+                for pair in (1, 2)
+                for scenario in ("qps", "ttr", "etd_loaded")
+            ],
+        }
+        artifacts = autoresearch_artifacts(pair_results)
+        bind_autoresearch_artifacts(document, artifacts)
+        metrics = dict(
+            suite.autoresearch_metrics(document, artifact_loader=artifacts.__getitem__)
+        )
+        self.assertEqual(metrics["retrieval_operational_ns_per_query"], 5_000_000)
+        self.assertAlmostEqual(metrics["retrieval_sustainable_qps"], 200.0)
+        self.assertAlmostEqual(metrics["retrieval_ttr_p95_ms"], 50.0)
+        self.assertAlmostEqual(
+            metrics["retrieval_loaded_etd_p95_midpoint_ms"],
+            160.0,
+        )
+        artifact_path = "candidate/pair-1/artifacts/qps-research.json"
+        for section, field in (
+            (None, "suite_definition_sha256"),
+            ("binary", "build_identity_sha256"),
+            ("semantic", "oracle_sha256"),
+        ):
+            with self.subTest(identity=field):
+                tampered = copy.deepcopy(artifacts)
+                target = tampered[artifact_path]
+                if section is None:
+                    target[field] = digest(f"wrong:{field}")
+                else:
+                    target[section][field] = digest(f"wrong:{field}")
+                with self.assertRaisesRegex(suite.SuiteFailure, "did not pass"):
+                    suite.autoresearch_metrics(
+                        document,
+                        artifact_loader=tampered.__getitem__,
+                    )
+
+    def test_autoresearch_metrics_fail_closed_on_zero_candidate_capacity(self) -> None:
+        pair_results = [
+            {
+                "pair_id": 1,
+                "candidate": {
+                    "qps": 0.0,
+                    "ttr_p95_ms": 25.0,
+                    "source_etd_p95_midpoint_ms": 80.0,
+                },
+            }
+        ]
+        document = {
+            "schema_version": "moraine-local-comparison-v1",
+            "mode": "local_comparative",
+            "authoritative": False,
+            "pairs": 1,
+            "pair_results": pair_results,
+            "artifacts": [
+                f"candidate/pair-1/artifacts/{scenario}-research.json"
+                for scenario in ("qps", "ttr", "etd_loaded")
+            ],
+        }
+        artifacts = autoresearch_artifacts(pair_results)
+        bind_autoresearch_artifacts(document, artifacts)
+        with self.assertRaisesRegex(suite.SuiteFailure, "finite and positive"):
+            suite.autoresearch_metrics(
+                document,
+                artifact_loader=artifacts.__getitem__,
+            )
+
     def test_validate_rejects_untyped_json(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "unknown.json"
             path.write_text("{}\n")
-            with self.assertRaisesRegex(Exception, "neither a protocol document nor a fixture recipe"):
+            with self.assertRaisesRegex(
+                Exception,
+                "neither a protocol document nor a fixture recipe",
+            ):
                 validate_path(path)
 
 

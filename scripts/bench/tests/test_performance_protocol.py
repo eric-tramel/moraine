@@ -155,10 +155,14 @@ def schedule(definition: dict, scenario: str, split: str, count: int,
     }
 
 
-def semantic(count: int) -> dict:
+def semantic(definition: dict, scenario: str, split: str, count: int) -> dict:
     return {
         "passed": True,
-        "oracle_sha256": digest("independent-oracle"),
+        "oracle_sha256": protocol.semantic_oracle_sha256(
+            definition["fixture"]["fingerprints"],
+            scenario,
+            split,
+        ),
         "expected_count": count,
         "observed_count": count,
         "missing_count": 0,
@@ -496,7 +500,7 @@ def make_result(definition: dict, builds: dict[str, dict], scenario: str, split:
         schedule=common_schedule,
         metrics=metrics,
         samples=samples,
-        semantic=semantic(count),
+        semantic=semantic(definition, scenario, split, count),
         gates=gates,
     )
 
@@ -907,6 +911,33 @@ class ManifestValidationTests(unittest.TestCase):
         write_document(self.candidate, manifest)
         with self.assertRaisesRegex(protocol.ProtocolError, "suite definition mismatch"):
             protocol.load_suite_manifest(self.candidate)
+
+    def test_artifact_oracle_must_match_frozen_fixture_fingerprint(self) -> None:
+        manifest = self.manifest()
+        reference = manifest["artifacts"][0]
+        artifact_path = self.baseline.parent / reference["relative_path"]
+        artifact = json.loads(artifact_path.read_text())
+        artifact["semantic"]["oracle_sha256"] = digest("unrelated-oracle")
+        artifact["artifact_sha256"] = protocol.sha256_json(
+            {
+                key: value
+                for key, value in artifact.items()
+                if key != "artifact_sha256"
+            }
+        )
+        write_document(artifact_path, artifact)
+        reference["artifact_sha256"] = artifact["artifact_sha256"]
+        reference["sha256"] = protocol.sha256_bytes(artifact_path.read_bytes())
+        manifest["manifest_sha256"] = protocol.sha256_json(
+            {
+                key: value
+                for key, value in manifest.items()
+                if key != "manifest_sha256"
+            }
+        )
+        write_document(self.baseline, manifest)
+        with self.assertRaisesRegex(protocol.ProtocolError, "semantic oracle mismatch"):
+            protocol.load_suite_manifest(self.baseline)
 
     def test_artifact_reference_identity_mutation_is_rejected(self) -> None:
         manifest = self.manifest()

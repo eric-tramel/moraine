@@ -73,7 +73,9 @@ class AckReader:
             {
                 "batch_sequence": 1,
                 "event_identity_digests": self.digests,
-                "ack_monotonic_ns": max(0, self.clock.peek() - 1_000_000),
+                "ack_monotonic_ns": 1,
+                "observed_lower_ns": self.clock.peek(),
+                "observed_upper_ns": self.clock.peek(),
             }
         ]
 
@@ -152,6 +154,7 @@ class EtdScenarioTests(unittest.TestCase):
         *,
         event: dict | None = None,
         ack_reader=None,
+        ack_reader_factory=None,
         timeout_s: float = 0.05,
         mode: str = "idle",
         query_load=None,
@@ -160,7 +163,11 @@ class EtdScenarioTests(unittest.TestCase):
     ):
         selected = event or self.event
         clock = FakeClock()
-        reader = ack_reader or AckReader(clock, selected["expected_ack_digest"])
+        reader = (
+            ack_reader_factory(clock, selected)
+            if ack_reader_factory is not None
+            else ack_reader or AckReader(clock, selected["expected_ack_digest"])
+        )
         with tempfile.TemporaryDirectory() as root:
             result = scenarios.run_etd_scenario(
                 [selected],
@@ -235,6 +242,37 @@ class EtdScenarioTests(unittest.TestCase):
         self.assertEqual(sample["db_ack_interval"]["censoring"], "left")
         self.assertEqual(sample["db_ack_interval"]["lower_ms"], 0.0)
         self.assertIsNotNone(sample["db_ack_interval"]["upper_ms"])
+        self.assertGreater(sample["db_ack_ms"], 0.0)
+
+    def test_db_ack_upper_bound_includes_ack_poll_uncertainty(self) -> None:
+        def ack_factory(clock: FakeClock, event: dict):
+            yielded = False
+
+            def read():
+                nonlocal yielded
+                if yielded:
+                    return []
+                yielded = True
+                upper_ns = clock.peek()
+                return [
+                    {
+                        "batch_sequence": 1,
+                        "event_identity_digests": [event["expected_ack_digest"]],
+                        "ack_monotonic_ns": 1,
+                        "observed_lower_ns": upper_ns - 5_000_000,
+                        "observed_upper_ns": upper_ns,
+                    }
+                ]
+
+            return read
+
+        result = self.run_event(
+            self.immediate_hit,
+            ack_reader_factory=ack_factory,
+        )
+        sample = result.samples[0]
+        self.assertEqual(sample["db_ack_interval"]["lower_ms"], 0.0)
+        self.assertEqual(sample["db_ack_interval"]["upper_ms"], 5.0)
 
     def test_watcher_readiness_prevents_any_publication(self) -> None:
         probe_called = False
@@ -335,6 +373,8 @@ class AckCursorTests(unittest.TestCase):
                 "batch_sequence": 1,
                 "event_identity_digests": [first, second],
                 "ack_monotonic_ns": 123,
+                "observed_lower_ns": 124,
+                "observed_upper_ns": 125,
             }
         ]
         cursor = scenarios.IngestAckCursor(lambda: [observations.pop(0)] if observations else [])
@@ -342,6 +382,21 @@ class AckCursorTests(unittest.TestCase):
         second_match = cursor.matches(second)[0]
         self.assertEqual(first_match.batch_sequence, second_match.batch_sequence)
         self.assertEqual(first_match.ack_monotonic_ns, second_match.ack_monotonic_ns)
+
+    def test_multiple_ack_records_from_one_host_observation_share_bounds(self) -> None:
+        observations = [
+            {
+                "batch_sequence": sequence,
+                "event_identity_digests": [character * 64],
+                "ack_monotonic_ns": sequence,
+                "observed_lower_ns": 100,
+                "observed_upper_ns": 200,
+            }
+            for sequence, character in ((1, "a"), (2, "b"))
+        ]
+        batches = [observations]
+        cursor = scenarios.IngestAckCursor(lambda: batches.pop() if batches else [])
+        self.assertEqual(cursor.matches("b" * 64)[0].observed_upper_ns, 200)
 
     def test_non_allowlisted_content_and_nonmonotonic_sequence_are_rejected(self) -> None:
         digest = "a" * 64
@@ -360,8 +415,24 @@ class AckCursorTests(unittest.TestCase):
 
         batches = iter(
             [
-                [{"batch_sequence": 1, "event_identity_digests": [digest], "ack_monotonic_ns": 2}],
-                [{"batch_sequence": 3, "event_identity_digests": [digest], "ack_monotonic_ns": 3}],
+                [
+                    {
+                        "batch_sequence": 1,
+                        "event_identity_digests": [digest],
+                        "ack_monotonic_ns": 2,
+                        "observed_lower_ns": 4,
+                        "observed_upper_ns": 5,
+                    }
+                ],
+                [
+                    {
+                        "batch_sequence": 3,
+                        "event_identity_digests": [digest],
+                        "ack_monotonic_ns": 3,
+                        "observed_lower_ns": 6,
+                        "observed_upper_ns": 7,
+                    }
+                ],
             ]
         )
         cursor = scenarios.IngestAckCursor(lambda: next(batches, []))
@@ -382,7 +453,8 @@ class OwnedSandboxAdapterTests(unittest.TestCase):
             mock.Mock(next_cursor=1, observations=(observation,), gap_detected=False),
             mock.Mock(next_cursor=0, observations=(), gap_detected=True),
         ]
-        reader = scenarios.OwnedSandboxAckReader(sandbox)
+        clock_values = iter((100, 101, 200, 201))
+        reader = scenarios.OwnedSandboxAckReader(sandbox, lambda: next(clock_values))
         self.assertEqual(
             reader(),
             (
@@ -390,6 +462,8 @@ class OwnedSandboxAdapterTests(unittest.TestCase):
                     "batch_sequence": 1,
                     "event_identity_digests": ("a" * 64, "b" * 64),
                     "ack_monotonic_ns": 42,
+                    "observed_lower_ns": 100,
+                    "observed_upper_ns": 101,
                 },
             ),
         )
@@ -397,6 +471,24 @@ class OwnedSandboxAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(scenarios.ScenarioError, "cursor was truncated"):
             reader()
         self.assertEqual(sandbox.read_ingest_ack_logs.call_args_list[1], mock.call(1))
+
+    def test_ack_between_polls_uses_previous_poll_as_lower_bound(self) -> None:
+        observation = mock.Mock(
+            batch_sequence=1,
+            event_identity_digests=("a" * 64,),
+            ack_monotonic_ns=42,
+        )
+        sandbox = mock.Mock()
+        sandbox.read_ingest_ack_logs.side_effect = [
+            mock.Mock(next_cursor=0, observations=(), gap_detected=False),
+            mock.Mock(next_cursor=1, observations=(observation,), gap_detected=False),
+        ]
+        clock_values = iter((100, 101, 200))
+        reader = scenarios.OwnedSandboxAckReader(sandbox, lambda: next(clock_values))
+        self.assertEqual(reader(), ())
+        sample = reader()[0]
+        self.assertEqual(sample["observed_lower_ns"], 101)
+        self.assertEqual(sample["observed_upper_ns"], 200)
 
     def test_etd_runtime_wires_owned_readiness_ack_and_central_probe(self) -> None:
         observation = mock.Mock(

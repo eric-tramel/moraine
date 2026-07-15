@@ -6,6 +6,7 @@ on:
       - '.github/workflows/ci-test-architecture.yml'
       # Protocol, runtime, fixture, scenario, schema, and CLI tests share one Python lane.
       - 'scripts/bench/**'
+      - 'autoresearch.sh'
       # Wrapper tests exercise both lifecycle scripts and their adjacent Compose/image support.
       - 'scripts/dev/sandbox/**'
       - 'docs/development/test-architecture/package_isolation.py'
@@ -99,6 +100,9 @@ jobs:
               raise SystemExit("Performance suite discovery selected zero tests.")
           PY
           python -m unittest discover -v -s scripts/bench/tests -p 'test_*.py'
+
+      - name: Check autoresearch adapter syntax
+        run: bash -n autoresearch.sh
 
 
       - name: Run sandbox live-wrapper unittest discovery
