@@ -1,6 +1,6 @@
 [package]
 name = "moraine-conversations"
-version = "0.6.4"
+version = "0.7.0"
 edition = "2021"
 description = "High-level read/query APIs for Moraine conversations"
 
