@@ -662,3 +662,121 @@ fn cached_posting_ranker_matches_full_sort_reference() {
         );
     }
 }
+
+#[test]
+#[ignore = "autoresearch benchmark harness"]
+fn autoresearch_retrieval_benchmark() {
+    const DOCS: usize = 65_536;
+    const TERM_COUNT: usize = 8;
+    const SERIAL_BATCH: usize = 20;
+    const SERIAL_SAMPLES: usize = 9;
+    const CONCURRENT_THREADS: usize = 4;
+    const CONCURRENT_BATCH: usize = 10;
+    const CONCURRENT_SAMPLES: usize = 7;
+
+    let terms = (0..TERM_COUNT)
+        .map(|term| format!("term-{term}"))
+        .collect::<Vec<_>>();
+    let postings_by_term = terms
+        .iter()
+        .enumerate()
+        .map(|(term_index, term)| {
+            let rows = (0..DOCS)
+                .filter_map(|doc| {
+                    let mixed = (doc as u64)
+                        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                        .rotate_left((term_index * 7) as u32)
+                        ^ (term_index as u64).wrapping_mul(0xd6e8_feb8_6659_fd93);
+                    mixed.is_multiple_of(5).then(|| CachedPostingRow {
+                        event_uid: format!("event-{doc:05}"),
+                        doc_len: 64 + (mixed % 448) as u32,
+                        tf: 1 + ((mixed >> 11) % 7) as u16,
+                    })
+                })
+                .collect::<Vec<_>>();
+            (term.clone(), Arc::from(rows.into_boxed_slice()))
+        })
+        .collect::<HashMap<String, Arc<[CachedPostingRow]>>>();
+    let df_by_term = postings_by_term
+        .iter()
+        .map(|(term, rows)| (term.clone(), rows.len() as u64))
+        .collect::<HashMap<_, _>>();
+
+    let rank_once = || {
+        ClickHouseConversationRepository::rank_cached_postings(
+            &terms,
+            &postings_by_term,
+            &df_by_term,
+            DOCS as u64,
+            256.0,
+            1.2,
+            0.75,
+            2,
+            0.0,
+        )
+    };
+    let expected = rank_once();
+    assert!(expected.len() > 256, "benchmark corpus is too small");
+    let expected_len = expected.len();
+    let expected_first = expected[0].row.event_uid.as_str();
+
+    for _ in 0..3 {
+        let ranked = std::hint::black_box(rank_once());
+        assert_eq!(ranked.len(), expected_len);
+        assert_eq!(ranked[0].row.event_uid, expected_first);
+    }
+
+    let mut serial_samples = Vec::with_capacity(SERIAL_SAMPLES);
+    for _ in 0..SERIAL_SAMPLES {
+        let started = Instant::now();
+        let mut observed = 0_usize;
+        for _ in 0..SERIAL_BATCH {
+            let ranked = std::hint::black_box(rank_once());
+            observed ^= ranked.len();
+            observed ^= ranked[0].row.event_uid.len();
+        }
+        std::hint::black_box(observed);
+        serial_samples.push(started.elapsed().as_nanos() as u64 / SERIAL_BATCH as u64);
+    }
+    serial_samples.sort_unstable();
+    let serial_ns = serial_samples[SERIAL_SAMPLES / 2];
+
+    let mut concurrent_samples = Vec::with_capacity(CONCURRENT_SAMPLES);
+    for _ in 0..CONCURRENT_SAMPLES {
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            let handles = (0..CONCURRENT_THREADS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut observed = 0_usize;
+                        for _ in 0..CONCURRENT_BATCH {
+                            let ranked = std::hint::black_box(rank_once());
+                            observed ^= ranked.len();
+                            observed ^= ranked[0].row.event_uid.len();
+                        }
+                        observed
+                    })
+                })
+                .collect::<Vec<_>>();
+            for handle in handles {
+                std::hint::black_box(handle.join().expect("benchmark worker panicked"));
+            }
+        });
+        let query_count = CONCURRENT_THREADS * CONCURRENT_BATCH;
+        concurrent_samples.push(started.elapsed().as_nanos() as u64 / query_count as u64);
+    }
+    concurrent_samples.sort_unstable();
+    let concurrent_ns = concurrent_samples[CONCURRENT_SAMPLES / 2];
+
+    println!("METRIC retrieval_concurrent_ns_per_query={concurrent_ns}");
+    println!("METRIC retrieval_serial_ns_per_query={serial_ns}");
+    println!(
+        "METRIC retrieval_concurrent_qps={:.3}",
+        1_000_000_000.0 / concurrent_ns as f64
+    );
+    println!(
+        "METRIC retrieval_serial_qps={:.3}",
+        1_000_000_000.0 / serial_ns as f64
+    );
+    println!("METRIC retrieval_candidate_count={expected_len}");
+}

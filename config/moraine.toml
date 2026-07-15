@@ -42,6 +42,8 @@ ruleset = "builtin"
 # extra_patterns = ["acme_internal_[A-Za-z0-9]{32}"]
 
 [ingest]
+# Session cwd globs; a trailing `/**` includes the project directory itself.
+exclude_project_dirs = []
 batch_size = 4000
 max_batch_bytes = 8388608
 flush_interval_seconds = 0.5
@@ -159,6 +161,9 @@ default_exclude_codex_mcp = true
 prewarm_on_initialize = false
 async_log_writes = true
 protocol_version = "2024-11-05"
+# Valid retrievals beyond this process-wide parallel limit wait for capacity.
+# Omit to use the CPU parallelism available to the Moraine process.
+# max_parallel_requests = 16
 # MCP clients first try the unified backend's Unix socket, then transparently
 # fall back to an embedded server when the socket is absent or unreachable.
 # This proxy preference is independent of whether `moraine up` launches the

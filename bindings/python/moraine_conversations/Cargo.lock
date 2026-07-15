@@ -587,6 +587,7 @@ name = "moraine-clickhouse"
 version = "0.6.4"
 dependencies = [
  "anyhow",
+ "futures-util",
  "moraine-config",
  "reqwest",
  "serde",

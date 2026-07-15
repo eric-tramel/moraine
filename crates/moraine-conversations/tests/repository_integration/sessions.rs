@@ -411,21 +411,33 @@ async fn scoped_point_lookups_hide_out_of_scope_sessions() {
     assert!(event.is_none(), "out-of-scope event must be hidden");
 
     let queries = state.queries.lock().expect("queries lock").clone();
-    let gate_queries: Vec<&String> = queries
+    let legacy_gate_count = queries
         .iter()
-        .filter(|q| {
-            q.starts_with("SELECT session_id FROM (")
-                && q.contains("argMin(cwd, tuple(event_ts, event_uid))")
+        .filter(|query| {
+            query.starts_with("SELECT session_id FROM (")
+                && query.contains("argMin(cwd, tuple(event_ts, event_uid))")
         })
-        .collect();
-    assert!(
-        gate_queries.len() >= 4,
-        "each point lookup should run the scope gate, saw {}",
-        gate_queries.len()
+        .count();
+    assert_eq!(
+        legacy_gate_count, 1,
+        "only the legacy metadata lookup should need the canonical scope gate"
     );
-    assert!(gate_queries
-        .iter()
-        .any(|q| q.contains("session_id = 'sess-out-of-scope'")));
+    assert!(
+        queries
+            .iter()
+            .filter(|query| {
+                query.contains("FROM `moraine`.`mcp_open_sessions`")
+                    && query.contains("session_id = 'sess-out-of-scope'")
+            })
+            .count()
+            >= 3
+    );
+    assert!(
+        !queries
+            .iter()
+            .any(|query| query.contains("FROM `moraine`.`mcp_open_turns`")),
+        "an out-of-scope committed session must be rejected before child rows are read"
+    );
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn scoped_point_lookups_serve_in_scope_sessions() {
@@ -621,138 +633,142 @@ async fn get_mcp_session_includes_turn_summaries_and_latest_completion() {
     assert_eq!(opened_turn.summary.turn_seq, 2);
 
     let queries = state.queries.lock().expect("queries lock").clone();
-    assert!(queries.iter().any(|query| {
-        query.contains("FROM `moraine`.`v_conversation_trace` AS tr")
+    let open_turn_query = queries
+        .iter()
+        .find(|query| {
+            query.contains("FROM `moraine`.`mcp_open_turns`")
+                && query.contains("WHERE t.session_id = 'sess-open'")
+        })
+        .expect("session open must read its committed turn projection");
+    assert!(open_turn_query.contains("t.slot = 0 AND t.generation = 100"));
+    assert!(open_turn_query.contains("ORDER BY t.turn_seq ASC"));
+    assert!(!open_turn_query.contains("v_conversation_trace"));
+    assert!(!queries.iter().any(|query| {
+        query.contains("v_conversation_trace")
             && query.contains("WHERE session_id = 'sess-open'")
             && query.contains("ORDER BY event_order ASC, event_uid ASC")
-            && query.contains("toInt64(toUnixTimestamp64Milli(tr.event_time)) AS event_unix_ms")
     }));
-    let turn_summary_queries = queries
+    let legacy_turn_summary_queries = queries
         .iter()
         .filter(|query| query.contains("FROM `moraine`.`v_turn_summary`"))
         .collect::<Vec<_>>();
     assert_eq!(
-        turn_summary_queries.len(),
-        3,
-        "expected session-open, turn-list, and turn-detail projections"
+        legacy_turn_summary_queries.len(),
+        2,
+        "only the explicit turn-list and turn-detail calls use legacy detail projections"
     );
-    for query in turn_summary_queries {
+    for query in legacy_turn_summary_queries {
         assert_typed_turn_timestamp_projection(query);
     }
-    assert!(queries.iter().any(|query| {
-        query.contains("FROM `moraine`.`v_session_summary` AS s")
-            && query.contains("AS inference_provider")
-            && query.contains("AS session_summary")
-    }));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn get_mcp_session_does_not_serialize_independent_clickhouse_queries() {
-    let reached = Arc::new(Notify::new());
-    let release = Arc::new(Notify::new());
-    let header = ScriptedResponse::rows(
-        &[
-            "FROM `moraine`.`v_session_summary` AS s",
-            "AS session_summary",
-        ],
-        json!([{
-            "session_id": "sess-parallel",
-            "first_event_time": "2026-02-01 10:00:00",
-            "first_event_unix_ms": 1769940000000_i64,
-            "last_event_time": "2026-02-01 10:00:01",
-            "last_event_unix_ms": 1769940001000_i64,
-            "total_turns": 1_u32,
-            "total_events": 1_u64,
-            "user_messages": 1_u64,
-            "assistant_messages": 0_u64,
-            "tool_calls": 0_u64,
-            "tool_results": 0_u64,
-            "mode": "chat",
-            "first_event_uid": "evt-parallel",
-            "last_event_uid": "evt-parallel",
-            "last_actor_role": "user",
-            "title": "",
-            "source": "fixture",
-            "harness": "codex",
-            "inference_provider": "openai",
-            "session_slug": "",
-            "session_summary": ""
-        }]),
-    )
-    .blocked(reached.clone(), release.clone());
-    let events = ScriptedResponse::rows(
-        &["ORDER BY event_order ASC, event_uid ASC"],
-        json!([trace_event_row(
-            "sess-parallel",
-            "evt-parallel",
-            1,
-            1,
-            "user",
-            "message",
-            "message",
-            "parallel lookup",
-            "{}",
-            "",
-            "",
-        )]),
-    );
-    let turns = ScriptedResponse::rows(
-        &["FROM `moraine`.`v_turn_summary`"],
-        json!([turn_summary_row("sess-parallel", 1, 1, 1, 0, 0, 0, 0,)]),
-    );
-    let (repo, state) = build_unordered_scripted_repo(vec![header, events, turns]).await;
-    let repo = Arc::new(repo);
-    let open = {
-        let repo = Arc::clone(&repo);
-        tokio::spawn(async move { repo.get_mcp_session("sess-parallel").await })
-    };
-
-    tokio::time::timeout(Duration::from_secs(2), reached.notified())
-        .await
-        .expect("header query reached the wire barrier");
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if state.queries.lock().expect("queries lock").len() >= 2 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("a second query reached ClickHouse while the header query was blocked");
-
-    release.notify_one();
-    let session = open
-        .await
-        .expect("open task joins")
-        .expect("parallel session queries succeed")
-        .expect("session exists");
-    assert_eq!(session.metadata.session_id, "sess-parallel");
-    assert_eq!(state.queries.lock().expect("queries lock").len(), 3);
 }
 #[tokio::test(flavor = "multi_thread")]
-async fn get_mcp_session_missing_header_ignores_concurrent_sibling_failures() {
-    let header = ScriptedResponse::rows(
-        &[
-            "FROM `moraine`.`v_session_summary` AS s",
-            "AS session_summary",
-        ],
-        json!([]),
-    );
-    let events = ScriptedResponse::failure(
-        &["ORDER BY event_order ASC, event_uid ASC"],
-        "events unavailable",
-    );
-    let turns =
-        ScriptedResponse::failure(&["FROM `moraine`.`v_turn_summary`"], "turns unavailable");
-    let (repo, state) = build_unordered_scripted_repo(vec![header, events, turns]).await;
+async fn get_mcp_session_uses_only_bounded_projection_queries() {
+    let (repo, state) = build_repo().await;
 
     let session = repo
-        .get_mcp_session("sess-missing-parallel")
+        .get_mcp_session("sess-open")
         .await
-        .expect("missing authoritative header takes precedence over sibling failures");
+        .expect("bounded session open succeeds")
+        .expect("session exists");
+    assert_eq!(session.metadata.session_id, "sess-open");
+
+    let queries = state.queries.lock().expect("queries lock").clone();
+    assert_eq!(queries.len(), 4);
+    assert!(queries[0].contains("mcp_open_projection_state"));
+    assert!(queries[1].contains("FROM `moraine`.`mcp_open_sessions`"));
+    assert!(queries[1].contains("WHERE s.session_id = 'sess-open'"));
+    assert!(queries[2].contains("FROM `moraine`.`mcp_open_turns`"));
+    assert!(queries[2]
+        .contains("WHERE t.session_id = 'sess-open' AND t.slot = 0 AND t.generation = 100"));
+    assert!(queries[3].contains("FROM `moraine`.`mcp_open_sessions`"));
+    assert!(queries
+        .iter()
+        .all(|query| !query.contains("v_conversation_trace") && !query.contains("events FINAL")));
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn get_mcp_session_retries_when_projection_head_changes_during_open() {
+    let mut generation_100 = session_row("sess-open").expect("fixture session");
+    generation_100["generation"] = json!(100_u64);
+    let mut generation_101 = generation_100.clone();
+    generation_101["slot"] = json!(1_u8);
+    generation_101["generation"] = json!(101_u64);
+    let responses = vec![
+        ScriptedResponse::rows(
+            &["mcp_open_projection_state", "state_key = 'global'"],
+            json!([{ "ready": 1_u8 }]),
+        ),
+        ScriptedResponse::rows(
+            &[
+                "FROM `moraine`.`mcp_open_sessions`",
+                "s.session_id = 'sess-open'",
+            ],
+            json!([generation_100]),
+        ),
+        ScriptedResponse::rows(
+            &["FROM `moraine`.`mcp_open_turns`", "t.generation = 100"],
+            json!(turn_rows("sess-open", None)),
+        ),
+        ScriptedResponse::rows(
+            &[
+                "FROM `moraine`.`mcp_open_sessions`",
+                "s.session_id = 'sess-open'",
+            ],
+            json!([generation_101.clone()]),
+        ),
+        ScriptedResponse::rows(
+            &[
+                "FROM `moraine`.`mcp_open_sessions`",
+                "s.session_id = 'sess-open'",
+            ],
+            json!([generation_101.clone()]),
+        ),
+        ScriptedResponse::rows(
+            &["FROM `moraine`.`mcp_open_turns`", "t.generation = 101"],
+            json!(turn_rows("sess-open", None)),
+        ),
+        ScriptedResponse::rows(
+            &[
+                "FROM `moraine`.`mcp_open_sessions`",
+                "s.session_id = 'sess-open'",
+            ],
+            json!([generation_101]),
+        ),
+    ];
+    let (repo, state) = build_scripted_repo(responses).await;
+
+    let session = repo
+        .get_mcp_session("sess-open")
+        .await
+        .expect("snapshot retry succeeds")
+        .expect("session exists");
+
+    assert_eq!(session.turns.len(), 2);
+    assert_script_consumed(&state, 7);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_mcp_session_missing_committed_header_skips_child_queries() {
+    let responses = vec![
+        ScriptedResponse::rows(
+            &["mcp_open_projection_state", "state_key = 'global'"],
+            json!([{ "ready": 1_u8 }]),
+        ),
+        ScriptedResponse::rows(
+            &[
+                "FROM `moraine`.`mcp_open_sessions`",
+                "WHERE s.session_id = 'sess-missing-projection'",
+            ],
+            json!([]),
+        ),
+    ];
+    let (repo, state) = build_scripted_repo(responses).await;
+
+    let session = repo
+        .get_mcp_session("sess-missing-projection")
+        .await
+        .expect("missing committed header is a not-found result");
     assert!(session.is_none());
-    assert_eq!(state.queries.lock().expect("queries lock").len(), 3);
+    assert_script_consumed(&state, 2);
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn get_mcp_turn_returns_compact_events_and_incomplete_state() {
@@ -806,6 +822,79 @@ async fn get_mcp_turn_returns_compact_events_and_incomplete_state() {
     );
 }
 #[tokio::test(flavor = "multi_thread")]
+async fn get_mcp_event_retries_stale_lookup_generation() {
+    let mut stale_lookup = event_lookup("evt-open-full").expect("fixture event lookup");
+    stale_lookup["generation"] = json!(100_u64);
+    let mut current_lookup = stale_lookup.clone();
+    current_lookup["generation"] = json!(101_u64);
+    let mut current_session = session_row("sess-event").expect("fixture session");
+    current_session["generation"] = json!(101_u64);
+    let responses = vec![
+        ScriptedResponse::rows(
+            &["mcp_open_projection_state", "state_key = 'global'"],
+            json!([{ "ready": 1_u8 }]),
+        ),
+        ScriptedResponse::rows(
+            &[
+                "FROM `moraine`.`mcp_open_events` FINAL",
+                "event_uid = 'evt-open-full'",
+            ],
+            json!([stale_lookup]),
+        ),
+        ScriptedResponse::rows(
+            &[
+                "FROM `moraine`.`mcp_open_sessions`",
+                "s.session_id = 'sess-event'",
+            ],
+            json!([current_session.clone()]),
+        ),
+        ScriptedResponse::rows(
+            &[
+                "FROM `moraine`.`mcp_open_events` FINAL",
+                "event_uid = 'evt-open-full'",
+            ],
+            json!([current_lookup]),
+        ),
+        ScriptedResponse::rows(
+            &[
+                "FROM `moraine`.`mcp_open_sessions`",
+                "s.session_id = 'sess-event'",
+            ],
+            json!([current_session.clone()]),
+        ),
+        ScriptedResponse::rows(
+            &["FROM `moraine`.`mcp_open_events`", "previous_event_uid"],
+            json!([full_event_row("evt-open-full").expect("fixture full event")]),
+        ),
+        ScriptedResponse::rows(
+            &["FROM `moraine`.`mcp_open_turns`", "t.generation = 101"],
+            json!(turn_rows("sess-event", Some(1))),
+        ),
+        ScriptedResponse::rows(
+            &["FROM `moraine`.`mcp_open_events` FINAL", "event_uid IN"],
+            json!(event_ref_rows()),
+        ),
+        ScriptedResponse::rows(
+            &[
+                "FROM `moraine`.`mcp_open_sessions`",
+                "s.session_id = 'sess-event'",
+            ],
+            json!([current_session]),
+        ),
+    ];
+    let (repo, state) = build_scripted_repo(responses).await;
+
+    let event = repo
+        .get_mcp_event("evt-open-full")
+        .await
+        .expect("stale event lookup retries")
+        .expect("event exists");
+
+    assert_eq!(event.event.event_uid, "evt-open-full");
+    assert_script_consumed(&state, 9);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn get_mcp_event_returns_full_content_and_navigation_refs() {
     let (repo, state) = build_repo().await;
 
@@ -847,11 +936,16 @@ async fn get_mcp_event_returns_full_content_and_navigation_refs() {
     assert_eq!(event.next_turn.as_ref().map(|turn| turn.turn_seq), Some(2));
 
     let queries = state.queries.lock().expect("queries lock").clone();
-    assert_eq!(
-        queries.len(),
-        4,
-        "event open should issue one identity query plus three parallel parent queries"
-    );
+    assert_eq!(queries.len(), 7);
+    assert!(queries.iter().all(|query| {
+        query.contains("mcp_open_projection_state")
+            || query.contains("mcp_open_sessions")
+            || query.contains("mcp_open_turns")
+            || query.contains("mcp_open_events")
+    }));
+    assert!(queries
+        .iter()
+        .all(|query| !query.contains("v_conversation_trace")));
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn list_session_events_supports_forward_cursor_pagination() {

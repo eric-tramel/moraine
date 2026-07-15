@@ -119,6 +119,10 @@ pub struct IdentityConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IngestConfig {
+    /// Directory globs matched against each session's first non-empty working
+    /// directory. Matching sessions are omitted from ingestion.
+    #[serde(default)]
+    pub exclude_project_dirs: Vec<String>,
     #[serde(default = "default_sources")]
     pub sources: Vec<IngestSource>,
     #[serde(default = "default_batch_size")]
@@ -169,6 +173,11 @@ pub struct McpConfig {
     pub async_log_writes: bool,
     #[serde(default = "default_protocol_version")]
     pub protocol_version: String,
+    /// Maximum retrieval requests executed concurrently by each MCP server
+    /// process. When omitted, the server uses the process's available CPU
+    /// parallelism. Additional valid requests wait for capacity.
+    #[serde(default)]
+    pub max_parallel_requests: Option<u16>,
     /// When true, `moraine run mcp` first tries to reach the shared central
     /// MCP server over its Unix socket and proxies to it; if the socket is
     /// absent or unreachable it transparently falls back to an embedded
@@ -310,27 +319,40 @@ impl AppConfig {
     /// project root. `*` does not cross `/`, matching the per-component
     /// semantics of the filesystem glob enumeration used by ingest sources.
     pub fn route_for_dir(&self, dir: &str) -> Option<&RouteConfig> {
-        if dir.trim().is_empty() {
-            return None;
-        }
-        let trimmed = dir.trim_end_matches('/');
-        let candidate = if trimmed.is_empty() { "/" } else { trimmed };
-        let options = glob::MatchOptions {
-            case_sensitive: true,
-            require_literal_separator: true,
-            require_literal_leading_dot: false,
-        };
-        self.routes.iter().find(|route| {
-            // Route globs are validated at load time; a programmatically
-            // built config with an invalid glob simply never matches.
-            let Ok(pattern) = glob::Pattern::new(&route.dir) else {
-                return false;
-            };
-            pattern.matches_with(candidate, options)
-                || (route.dir.ends_with("/**")
-                    && pattern.matches_with(&format!("{candidate}/"), options))
-        })
+        self.routes
+            .iter()
+            .find(|route| directory_glob_matches(&route.dir, dir))
     }
+
+    /// Returns whether the absolute working directory `dir` matches any
+    /// ingest exclusion. Empty directories never match.
+    pub fn is_project_dir_excluded(&self, dir: &str) -> bool {
+        self.ingest
+            .exclude_project_dirs
+            .iter()
+            .any(|pattern| directory_glob_matches(pattern, dir))
+    }
+}
+
+fn directory_glob_matches(pattern: &str, dir: &str) -> bool {
+    if dir.trim().is_empty() {
+        return false;
+    }
+    let trimmed = dir.trim_end_matches('/');
+    let candidate = if trimmed.is_empty() { "/" } else { trimmed };
+    let options = glob::MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: true,
+        require_literal_leading_dot: false,
+    };
+    // Directory globs are validated at load time; a programmatically built
+    // config with an invalid glob simply never matches.
+    let Ok(pattern_glob) = glob::Pattern::new(pattern) else {
+        return false;
+    };
+    pattern_glob.matches_with(candidate, options)
+        || (pattern.ends_with("/**")
+            && pattern_glob.matches_with(&format!("{candidate}/"), options))
 }
 
 impl Default for ClickHouseConfig {
@@ -397,6 +419,7 @@ impl Default for AppConfig {
 impl Default for IngestConfig {
     fn default() -> Self {
         Self {
+            exclude_project_dirs: Vec::new(),
             sources: default_sources(),
             batch_size: default_batch_size(),
             max_batch_bytes: default_max_batch_bytes(),
@@ -436,6 +459,7 @@ impl Default for McpConfig {
             prewarm_on_initialize: false,
             async_log_writes: true,
             protocol_version: default_protocol_version(),
+            max_parallel_requests: None,
             use_central_server: true,
             central_socket_path: default_mcp_socket(),
             start_central_on_up: true,
@@ -1173,6 +1197,26 @@ fn migrate_legacy_pi_source(sources: &mut Vec<IngestSource>) {
 }
 
 fn normalize_config(mut cfg: AppConfig) -> Result<AppConfig> {
+    if cfg.mcp.max_parallel_requests == Some(0) {
+        return Err(anyhow::anyhow!(
+            "mcp.max_parallel_requests must be greater than zero when configured"
+        ));
+    }
+
+    for (exclude_idx, pattern) in cfg.ingest.exclude_project_dirs.iter_mut().enumerate() {
+        *pattern = expand_path(pattern.trim());
+        if pattern.is_empty() {
+            return Err(anyhow::anyhow!(
+                "ingest.exclude_project_dirs[{exclude_idx}] must be a non-empty directory glob"
+            ));
+        }
+        glob::Pattern::new(pattern.as_str()).map_err(|exc| {
+            anyhow::anyhow!(
+                "invalid ingest.exclude_project_dirs[{exclude_idx}] glob `{pattern}`: {exc}"
+            )
+        })?;
+    }
+
     migrate_legacy_pi_source(&mut cfg.ingest.sources);
     for (source_idx, source) in cfg.ingest.sources.iter_mut().enumerate() {
         source.harness = normalize_harness(&source.harness, source_idx, &source.name)?;
@@ -2002,6 +2046,36 @@ prewarm_on_initialize = true
         let cfg = load_config(&path).expect("mcp prewarm toggle should load");
         std::fs::remove_file(&path).ok();
         assert!(cfg.mcp.prewarm_on_initialize);
+    }
+
+    #[test]
+    fn mcp_parallel_request_limit_is_optional_and_positive() {
+        let default_cfg = McpConfig::default();
+        assert_eq!(default_cfg.max_parallel_requests, None);
+
+        let explicit_path = write_temp_config(
+            r#"
+[mcp]
+max_parallel_requests = 12
+"#,
+            "mcp-parallel-requests",
+        );
+        let explicit = load_config(&explicit_path).expect("positive limit should load");
+        std::fs::remove_file(&explicit_path).ok();
+        assert_eq!(explicit.mcp.max_parallel_requests, Some(12));
+
+        let zero_path = write_temp_config(
+            r#"
+[mcp]
+max_parallel_requests = 0
+"#,
+            "mcp-parallel-requests-zero",
+        );
+        let error = load_config(&zero_path).expect_err("zero limit must fail");
+        std::fs::remove_file(&zero_path).ok();
+        assert!(error
+            .to_string()
+            .contains("mcp.max_parallel_requests must be greater than zero"));
     }
 
     #[test]
@@ -3215,6 +3289,46 @@ backend = "team"
             .route_for_dir(&format!("{home}/src/teamproject2"))
             .is_none());
         assert!(cfg.route_for_dir("").is_none());
+    }
+
+    #[test]
+    fn ingest_exclude_project_dirs_expand_tilde_and_match_route_semantics() {
+        let home = std::env::var("HOME").expect("HOME set in test env");
+        let path = write_temp_config(
+            r#"
+[ingest]
+exclude_project_dirs = ["~/src/large-project/**"]
+"#,
+            "ingest-exclude-project-dirs",
+        );
+        let cfg = load_config(&path).expect("ingest exclusions should load");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            cfg.ingest.exclude_project_dirs,
+            vec![format!("{home}/src/large-project/**")]
+        );
+        assert!(cfg.is_project_dir_excluded(&format!("{home}/src/large-project")));
+        assert!(cfg.is_project_dir_excluded(&format!("{home}/src/large-project/sub/dir")));
+        assert!(!cfg.is_project_dir_excluded(&format!("{home}/src/large-project2")));
+        assert!(!cfg.is_project_dir_excluded(""));
+    }
+
+    #[test]
+    fn ingest_exclude_project_dirs_reject_invalid_globs() {
+        let path = write_temp_config(
+            r#"
+[ingest]
+exclude_project_dirs = ["/work/a**"]
+"#,
+            "ingest-exclude-project-dirs-invalid",
+        );
+        let err = load_config(&path).expect_err("invalid ingest exclusion should fail");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            format!("{err:#}").contains("invalid ingest.exclude_project_dirs[0] glob"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]

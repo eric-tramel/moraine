@@ -145,7 +145,17 @@ async fn diagnostics_maps_doctor_partial_report_and_ping_short_circuit() {
     assert!(diagnostics.database_exists);
     assert!(diagnostics.applied_schema_versions.is_empty());
     assert!(!diagnostics.pending_schema_versions.is_empty());
-    assert_eq!(diagnostics.missing_tables, vec!["ingest_errors"]);
+    assert_eq!(
+        diagnostics.missing_tables,
+        vec![
+            "ingest_errors",
+            "mcp_open_sessions",
+            "mcp_open_turns",
+            "mcp_open_events",
+            "mcp_open_dirty_sessions",
+            "mcp_open_projection_state",
+        ]
+    );
     assert_eq!(diagnostics.errors.len(), 2);
     assert!(diagnostics.errors[0].contains("version query failed"));
     assert!(diagnostics.errors[0].contains("doctor version probe failed"));

@@ -442,6 +442,73 @@ fn infer_initial_source_hints(source_file: &str, harness: &str) -> InitialSource
     hints
 }
 
+/// Reads a bounded JSONL prefix to find the session's first non-empty absolute
+/// working directory. For Codex this stops at the initial `session_meta`
+/// record, avoiding normalization and sink work for excluded trajectories.
+fn infer_first_source_cwd(source_file: &str, harness: &str, max_line_bytes: usize) -> String {
+    const MAX_CWD_SCAN_LINES: usize = 256;
+    const MAX_CWD_SCAN_BYTES: usize = 1024 * 1024;
+
+    let Some(source) = crate::sources::registry().get(harness) else {
+        return String::new();
+    };
+    if !source.jsonl_carries_cwd() {
+        return String::new();
+    }
+    let Ok(file) = std::fs::File::open(source_file) else {
+        return String::new();
+    };
+    let mut reader = BufReader::new(file.take(MAX_CWD_SCAN_BYTES as u64));
+    let mut bytes_scanned = 0usize;
+
+    for _ in 0..MAX_CWD_SCAN_LINES {
+        let Ok(read) = read_bounded_jsonl_line(&mut reader, max_line_bytes.min(MAX_CWD_SCAN_BYTES))
+        else {
+            return String::new();
+        };
+        let (buf, bytes_read) = match read {
+            JsonlLineRead::Eof => return String::new(),
+            JsonlLineRead::Normal { buf, bytes_read } => (Some(buf), bytes_read),
+            JsonlLineRead::Oversized { bytes_read } => (None, bytes_read),
+        };
+        bytes_scanned = bytes_scanned.saturating_add(bytes_read);
+        if bytes_scanned > MAX_CWD_SCAN_BYTES {
+            return String::new();
+        }
+        let Some(buf) = buf else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_slice::<Value>(&buf) else {
+            continue;
+        };
+        let cwd = source.cwd(&record);
+        if std::path::Path::new(&cwd).is_absolute() {
+            return cwd;
+        }
+    }
+    String::new()
+}
+
+pub(crate) fn record_project_dir_is_excluded(
+    config: &AppConfig,
+    harness: &str,
+    record: &Value,
+    session_cwd: &str,
+) -> bool {
+    if config.ingest.exclude_project_dirs.is_empty() {
+        return false;
+    }
+    let Some(source) = crate::sources::registry().get(harness) else {
+        return false;
+    };
+    let cwd = if session_cwd.is_empty() {
+        source.cwd(record)
+    } else {
+        session_cwd.to_string()
+    };
+    std::path::Path::new(&cwd).is_absolute() && config.is_project_dir_excluded(&cwd)
+}
+
 /// Post-process event rows from a single Claude Code record:
 ///   * if the session's prior event was a `tool_result`, stamp `latency_ms`
 ///     on the first assistant-actor event in this record (= wall-clock time
@@ -730,6 +797,23 @@ pub(crate) async fn process_file(
 
     if file_size == checkpoint.last_offset && !generation_changed {
         return Ok(());
+    }
+    if !config.ingest.exclude_project_dirs.is_empty() {
+        let cwd = infer_first_source_cwd(
+            source_file,
+            &work.harness,
+            jsonl_source_line_byte_limit(config),
+        );
+        if config.is_project_dir_excluded(&cwd) {
+            debug!(
+                source_name = %work.source_name,
+                harness = %work.harness,
+                source_file,
+                project_dir = %cwd,
+                "skipping session from excluded project directory"
+            );
+            return Ok(());
+        }
     }
 
     let mut file = std::fs::File::open(source_file)
@@ -1789,6 +1873,128 @@ mod tests {
             out.push(batch);
         }
         out
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_file_skips_codex_session_from_excluded_initial_cwd_before_sink() {
+        let path = unique_test_file("excluded-codex-session");
+        fs::write(
+            &path,
+            [
+                json!({
+                    "timestamp": "2026-07-14T11:59:59Z",
+                    "type": "turn_context",
+                    "payload": {"cwd": "."}
+                })
+                .to_string(),
+                json!({
+                    "timestamp": "2026-07-14T12:00:00Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "excluded-session",
+                        "cwd": "/work/excluded",
+                    }
+                })
+                .to_string(),
+                json!({
+                    "timestamp": "2026-07-14T12:00:01Z",
+                    "type": "turn_context",
+                    "payload": {"cwd": "/work/included"}
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("write excluded Codex session");
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.exclude_project_dirs = vec!["/work/excluded/**".to_string()];
+        let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(4);
+        let work = WorkItem {
+            source_name: "codex".to_string(),
+            harness: "codex".to_string(),
+            format: "jsonl".to_string(),
+            path: path.to_string_lossy().to_string(),
+        };
+
+        process_file(
+            &config,
+            &work,
+            checkpoints.clone(),
+            &VolatilePollMap::new(),
+            sink_tx,
+            &metrics,
+        )
+        .await
+        .expect("excluded Codex session should be skipped cleanly");
+
+        assert!(
+            drain_batches(&mut sink_rx).await.is_empty(),
+            "excluded session must not reach the sink"
+        );
+        assert!(
+            checkpoints.read().await.is_empty(),
+            "excluded session must not create a checkpoint through the sink"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_file_keeps_session_when_only_later_cwd_is_excluded() {
+        let path = unique_test_file("later-excluded-cwd");
+        fs::write(
+            &path,
+            [
+                json!({
+                    "timestamp": "2026-07-14T12:00:00Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "included-session",
+                        "cwd": "/work/included",
+                    }
+                })
+                .to_string(),
+                json!({
+                    "timestamp": "2026-07-14T12:00:01Z",
+                    "type": "turn_context",
+                    "payload": {"cwd": "/work/excluded"}
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("write included Codex session");
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.exclude_project_dirs = vec!["/work/excluded/**".to_string()];
+        let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(4);
+        let work = WorkItem {
+            source_name: "codex".to_string(),
+            harness: "codex".to_string(),
+            format: "jsonl".to_string(),
+            path: path.to_string_lossy().to_string(),
+        };
+
+        process_file(
+            &config,
+            &work,
+            checkpoints,
+            &VolatilePollMap::new(),
+            sink_tx,
+            &metrics,
+        )
+        .await
+        .expect("included Codex session should process");
+
+        assert!(
+            !drain_batches(&mut sink_rx).await.is_empty(),
+            "a later cd must not change the session's initial inclusion decision"
+        );
+        let _ = fs::remove_file(&path);
     }
 
     #[tokio::test(flavor = "multi_thread")]

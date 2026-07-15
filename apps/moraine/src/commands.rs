@@ -206,6 +206,22 @@ fn conversation_repository(cfg: &AppConfig) -> Result<ClickHouseConversationRepo
 async fn cmd_db_migrate(cfg: &AppConfig) -> Result<MigrationOutcome> {
     let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
     let applied = ch.run_migrations().await?;
+    let requires_historical_backfill = !ch.mcp_open_read_model_ready().await?;
+    if requires_historical_backfill {
+        eprintln!(
+            "Building the MCP open read model from existing sessions; this one-time step may take several minutes."
+        );
+    }
+    ch.backfill_mcp_open_read_model_with_progress(|refreshed_sessions| {
+        if requires_historical_backfill {
+            eprintln!("  projected {refreshed_sessions} sessions");
+        }
+    })
+    .await
+    .context("failed to backfill MCP open read model")?;
+    if requires_historical_backfill {
+        eprintln!("MCP open read model ready.");
+    }
     Ok(MigrationOutcome { applied })
 }
 

@@ -248,6 +248,11 @@ async_log_writes = true
 
 # MCP protocol version advertised by the server.
 protocol_version = "2024-11-05"
+# Maximum retrieval requests executed concurrently by this MCP server process.
+# Additional valid requests wait rather than returning a saturation error.
+# Omit to use the CPU parallelism available to the Moraine process.
+# max_parallel_requests = 16
+
 
 # Prefer the shared central MCP server when running "moraine run mcp". If the
 # socket is unavailable, Moraine falls back to an embedded stdio server.

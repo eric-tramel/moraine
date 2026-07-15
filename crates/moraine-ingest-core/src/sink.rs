@@ -17,7 +17,7 @@ use moraine_clickhouse::{is_oversized_json_each_row_insert_error, ClickHouseClie
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -646,10 +646,11 @@ fn oversized_row_fragment(row: &Value) -> String {
         .unwrap_or_default()
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SinkStage {
     RawEvents,
     Events,
+    McpOpenProjection,
     EventLinks,
     ToolIo,
     IngestErrors,
@@ -661,6 +662,7 @@ impl SinkStage {
         match self {
             Self::RawEvents => "raw_events",
             Self::Events => "events",
+            Self::McpOpenProjection => "mcp_open_projection",
             Self::EventLinks => "event_links",
             Self::ToolIo => "tool_io",
             Self::IngestErrors => "ingest_errors",
@@ -706,6 +708,7 @@ impl PendingSinkData<'_> {
         let stage_rows = match stage {
             SinkStage::RawEvents => self.raw_rows,
             SinkStage::Events => self.event_rows,
+            SinkStage::McpOpenProjection => self.event_rows,
             SinkStage::EventLinks => self.link_rows,
             SinkStage::ToolIo => self.tool_rows,
             SinkStage::IngestErrors => self.error_rows,
@@ -732,6 +735,7 @@ impl PendingSinkData<'_> {
         match stage {
             SinkStage::RawEvents => self.raw_rows.len(),
             SinkStage::Events => self.event_rows.len(),
+            SinkStage::McpOpenProjection => self.event_rows.len(),
             SinkStage::EventLinks => self.link_rows.len(),
             SinkStage::ToolIo => self.tool_rows.len(),
             SinkStage::IngestErrors => self.error_rows.len(),
@@ -1065,6 +1069,16 @@ async fn flush_pending_with_ack(
         );
     }
 
+    let projected_session_ids = event_rows
+        .iter()
+        .filter_map(|row| {
+            row.get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .filter(|session_id| !session_id.is_empty())
+        .collect::<BTreeSet<_>>();
+
     let flush_result = async {
         if !raw_rows.is_empty() {
             clickhouse
@@ -1087,9 +1101,13 @@ async fn flush_pending_with_ack(
 
         if !event_rows.is_empty() {
             clickhouse
-                .insert_json_rows("events", event_rows)
+                .insert_json_rows_sync("events", event_rows)
                 .await
                 .map_err(|error| SinkFlushFailure::new(SinkStage::Events, error))?;
+            clickhouse
+                .refresh_mcp_open_read_model(projected_session_ids.iter().map(String::as_str))
+                .await
+                .map_err(|error| SinkFlushFailure::new(SinkStage::McpOpenProjection, error))?;
             metrics
                 .event_rows_written
                 .fetch_add(event_rows.len() as u64, Ordering::Relaxed);
@@ -1154,7 +1172,9 @@ async fn flush_pending_with_ack(
         Err(failure) => {
             metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
             let error_text = failure.error.to_string();
-            if is_oversized_json_each_row_insert_error(&failure.error) {
+            if failure.stage != SinkStage::McpOpenProjection
+                && is_oversized_json_each_row_insert_error(&failure.error)
+            {
                 let last_error = format!(
                     "non-retryable sink flush failure at {}: {error_text}",
                     failure.stage.table()
