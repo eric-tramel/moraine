@@ -340,6 +340,11 @@ Tool-level errors return `schema_version: "moraine.mcp.error.v1"` with an
 `not_found`, `unsupported_event_type`, `deadline_exceeded`, and
 `internal_error`.
 
+While the search read model is publishing an active-ingest update,
+`search_sessions` returns `internal_error` with
+`error.details.reason = "read_model_refresh"`, `retryable = true`, and a
+positive `retry_after_ms`. Wait for that interval, then retry the same request.
+
 ## How Agents Should Read Results
 
 The agent should treat Moraine records as a navigable evidence graph:

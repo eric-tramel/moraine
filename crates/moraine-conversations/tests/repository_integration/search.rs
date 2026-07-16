@@ -1,10 +1,8 @@
 use super::*;
 
 #[tokio::test(flavor = "multi_thread")]
-async fn search_mcp_events_rejects_unready_and_dirty_projection_snapshots() {
-    for (projection_ready, projection_clean, expected) in
-        [(0_u8, 1_u8, "not ready"), (1_u8, 0_u8, "catching up")]
-    {
+async fn search_mcp_events_distinguishes_unready_and_dirty_projection_snapshots() {
+    for (projection_ready, projection_clean) in [(0_u8, 1_u8), (1_u8, 0_u8)] {
         let metadata = json!({
             "row_kind": 1_u8,
             "event_uid": "",
@@ -36,9 +34,70 @@ async fn search_mcp_events_rejects_unready_and_dirty_projection_snapshots() {
             })
             .await
             .expect_err("unhealthy projection must fail closed");
-        assert!(error.to_string().contains(expected), "{error}");
+        if projection_ready == 0 {
+            assert!(error.to_string().contains("not ready"), "{error}");
+        } else {
+            assert!(matches!(error, RepoError::ReadModelChanged));
+        }
         assert_script_consumed(&state, 1);
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_mcp_events_immediate_retry_finishes_within_request_deadline() {
+    let repeated_scan_reached = Arc::new(Notify::new());
+    let repeated_scan_release = Arc::new(Notify::new());
+    let (repo, state) = build_repo_with_options(
+        100,
+        MockOptions {
+            dirty_projection_on_first_candidate: true,
+            repeated_corpus_stats_barrier: Some(ScriptedBarrier {
+                reached: repeated_scan_reached.clone(),
+                release: repeated_scan_release,
+            }),
+            ..MockOptions::default()
+        },
+    )
+    .await;
+    let query = || SearchMcpEventsQuery {
+        query: "active ingest".to_string(),
+        n_hits: Some(10),
+        min_score: Some(0.0),
+        min_should_match: Some(1),
+        ..SearchMcpEventsQuery::default()
+    };
+
+    let first = repo
+        .search_mcp_events(query())
+        .await
+        .expect_err("dirty projection must return retry guidance");
+    assert!(matches!(first, RepoError::ReadModelChanged));
+
+    let retry_deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    let retry = tokio::time::timeout(
+        Duration::from_secs(4),
+        with_repository_query_deadline(
+            "active-ingest-retry".to_string(),
+            retry_deadline,
+            repo.search_mcp_events(query()),
+        ),
+    )
+    .await
+    .expect("published retry must finish inside the request deadline")
+    .expect("published retry must succeed");
+    assert_eq!(retry.hits.len(), 2);
+
+    let queries = state.queries.lock().expect("queries lock");
+    let candidate_queries = queries
+        .iter()
+        .filter(|query| {
+            query.contains("toUInt8(0) AS row_kind") && query.contains("projected_candidates AS")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(candidate_queries.len(), 2);
+    assert!(candidate_queries[0].contains("search_corpus_stats"));
+    assert!(!candidate_queries[1].contains("search_corpus_stats"));
+    assert!(candidate_queries[1].contains("tuple(toUInt64(100), toUInt64(5000)) AS corpus_stats"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -926,11 +985,36 @@ async fn search_mcp_events_rejects_projection_changes_between_candidate_pages() 
         .await
         .expect_err("candidate paging must reject a changed projection revision");
 
-    assert!(error.to_string().contains("snapshot changed"), "{error}");
+    assert!(matches!(error, RepoError::ReadModelChanged));
     let queries = state.queries.lock().expect("queries lock");
     assert!(queries
         .iter()
         .any(|query| query.contains("LIMIT 3 OFFSET 3")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_mcp_events_classifies_hydration_projection_movement() {
+    let (repo, _state) = build_repo_with_options(
+        100,
+        MockOptions {
+            omit_first_mcp_detail_row: true,
+            ..MockOptions::default()
+        },
+    )
+    .await;
+
+    let error = repo
+        .search_mcp_events(SearchMcpEventsQuery {
+            query: "hello world".to_string(),
+            n_hits: Some(2),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            ..SearchMcpEventsQuery::default()
+        })
+        .await
+        .expect_err("missing pinned detail must report projection movement");
+
+    assert!(matches!(error, RepoError::ReadModelChanged));
 }
 
 #[tokio::test(flavor = "multi_thread")]

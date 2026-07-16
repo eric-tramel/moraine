@@ -429,6 +429,7 @@ FORMAT JSONEachRow",
         source_name: Option<&str>,
         min_should_match: u16,
         min_score: f64,
+        corpus_stats: Option<(u64, u64)>,
         limit: u16,
         offset: u64,
     ) -> RepoResult<String> {
@@ -451,6 +452,14 @@ FORMAT JSONEachRow",
         let events_table = self.table_ref("mcp_open_events");
         let dirty_sessions_table = self.table_ref("mcp_open_dirty_sessions");
         let terms_array_sql = sql_array_strings(terms);
+        let corpus_stats_sql = match corpus_stats {
+            Some((docs, total_doc_len)) => {
+                format!("tuple(toUInt64({docs}), toUInt64({total_doc_len}))")
+            }
+            None => format!(
+                "(\n    SELECT tuple(toUInt64(docs), toUInt64(total_doc_len))\n    FROM {corpus_table}\n  )"
+            ),
+        };
 
         let mut posting_clauses = Vec::new();
         if let Some(session_id) = session_id {
@@ -544,10 +553,7 @@ WHERE scope_s.session_id = {session_id}{scope_origin_filter}",
   {k1:.6} AS k1,
   {b:.6} AS b,
   {terms_array_sql} AS q_terms,
-  (
-    SELECT tuple(toUInt64(docs), toUInt64(total_doc_len))
-    FROM {corpus_table}
-  ) AS corpus_stats,
+  {corpus_stats_sql} AS corpus_stats,
   tupleElement(corpus_stats, 1) AS corpus_docs,
   tupleElement(corpus_stats, 2) AS corpus_total_doc_len,
   greatest(
@@ -666,7 +672,6 @@ SETTINGS max_bytes_before_external_group_by = 67108864,
   max_bytes_before_external_sort = 67108864
 FORMAT JSONEachRow",
             postings_table = postings_table,
-            corpus_table = corpus_table,
             projection_state_table = projection_state_table,
             sessions_table = sessions_table,
             events_table = events_table,
@@ -1429,6 +1434,7 @@ FORMAT JSONEachRow",
         let mut offset = 0_u64;
         let mut page_count = 0_u16;
         let mut rows = Vec::<SearchMcpEventRow>::with_capacity(target_rows);
+        let mut corpus_stats = self.cached_corpus_stats().await;
         let mut snapshot = None::<(u64, u64, bool, u64)>;
 
         loop {
@@ -1439,6 +1445,7 @@ FORMAT JSONEachRow",
             }
             page_count += 1;
 
+            let scanned_corpus_stats = corpus_stats.is_none();
             let sql = self.build_search_mcp_events_sql(
                 terms,
                 event_types,
@@ -1448,6 +1455,7 @@ FORMAT JSONEachRow",
                 source_name,
                 min_should_match,
                 min_score,
+                corpus_stats,
                 page_limit,
                 offset,
             )?;
@@ -1457,15 +1465,19 @@ FORMAT JSONEachRow",
                 .iter()
                 .find(|row| row.row_kind == 1)
                 .ok_or_else(|| RepoError::backend("MCP search candidate query omitted metadata"))?;
+            let page_corpus_stats = (metadata.docs, metadata.total_doc_len);
+            if scanned_corpus_stats {
+                self.cache_corpus_stats(page_corpus_stats.0, page_corpus_stats.1, Instant::now())
+                    .await;
+                corpus_stats = Some(page_corpus_stats);
+            }
             if metadata.projection_ready == 0 {
                 return Err(RepoError::backend(
                     "MCP search read model is not ready; run `moraine db migrate`",
                 ));
             }
             if metadata.projection_clean == 0 {
-                return Err(RepoError::backend(
-                    "MCP search read model is catching up with ingest; retry the request",
-                ));
+                return Err(RepoError::ReadModelChanged);
             }
 
             let page_snapshot = (
@@ -1475,15 +1487,9 @@ FORMAT JSONEachRow",
                 metadata.projection_revision,
             );
             match snapshot {
-                None => {
-                    self.cache_corpus_stats(page_snapshot.0, page_snapshot.1, Instant::now())
-                        .await;
-                    snapshot = Some(page_snapshot);
-                }
+                None => snapshot = Some(page_snapshot),
                 Some(expected) if expected != page_snapshot => {
-                    return Err(RepoError::backend(
-                        "MCP search snapshot changed while paging candidates; retry the request",
-                    ));
+                    return Err(RepoError::ReadModelChanged);
                 }
                 Some(_) => {}
             }
@@ -1507,10 +1513,7 @@ FORMAT JSONEachRow",
 
             for candidate in candidates {
                 let Some(mut detail) = details_by_uid.remove(candidate.event_uid.as_str()) else {
-                    return Err(RepoError::backend(format!(
-                        "MCP search projection moved while hydrating event {}; retry the request",
-                        candidate.event_uid
-                    )));
+                    return Err(RepoError::ReadModelChanged);
                 };
                 detail.raw_score = candidate.raw_score;
                 detail.matched_terms = candidate.matched_terms;

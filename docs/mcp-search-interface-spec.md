@@ -198,6 +198,11 @@ Error behavior:
 - Malformed IDs must return `invalid_id`.
 - Unknown event type filters must return `unsupported_event_type`.
 - Runtime failures must return `internal_error` with a concise message.
+- While the search read model is publishing an active-ingest update,
+  `search_sessions` returns `internal_error` with
+  `error.details.reason = "read_model_refresh"`, `retryable = true`, and a
+  positive `retry_after_ms`; clients should wait for that interval and retry the
+  same request.
 
 ## Tool: `search_sessions`
 

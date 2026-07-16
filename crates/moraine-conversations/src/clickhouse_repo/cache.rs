@@ -354,15 +354,19 @@ impl ClickHouseConversationRepository {
         );
     }
 
+    pub(super) async fn cached_corpus_stats(&self) -> Option<(u64, u64)> {
+        let now = Instant::now();
+        let cache = self.stats_cache.read().await;
+        cache.corpus_stats.as_ref().and_then(|entry| {
+            (now.duration_since(entry.fetched_at) <= CORPUS_STATS_CACHE_TTL)
+                .then_some((entry.docs, entry.total_doc_len))
+        })
+    }
+
     pub(super) async fn corpus_stats(&self) -> RepoResult<(u64, u64)> {
         let now = Instant::now();
-        {
-            let cache = self.stats_cache.read().await;
-            if let Some(entry) = cache.corpus_stats.as_ref() {
-                if now.duration_since(entry.fetched_at) <= CORPUS_STATS_CACHE_TTL {
-                    return Ok((entry.docs, entry.total_doc_len));
-                }
-            }
+        if let Some(stats) = self.cached_corpus_stats().await {
+            return Ok(stats);
         }
 
         let from_stats_query = format!(
