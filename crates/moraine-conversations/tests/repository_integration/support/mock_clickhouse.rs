@@ -85,6 +85,8 @@ impl ScriptedResponse {
 #[derive(Clone, Default)]
 pub(crate) struct MockOptions {
     pub(crate) omit_second_snippet_row: bool,
+    pub(crate) change_projection_revision_on_second_search_page: bool,
+    pub(crate) repeat_duplicate_search_pages: bool,
     pub(crate) scripted_responses: Vec<ScriptedResponse>,
     pub(crate) query_barrier: Option<QueryBarrier>,
 }
@@ -795,6 +797,15 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
         }
 
         if query.contains("toUInt8(0) AS row_kind") && query.contains("projected_candidates AS") {
+            let projection_revision = if state
+                .options
+                .change_projection_revision_on_second_search_page
+                && query.contains("OFFSET 3")
+            {
+                2_u64
+            } else {
+                1_u64
+            };
             let candidate = |event_uid: &str,
                              raw_score: f64,
                              matched_terms: u64,
@@ -812,7 +823,8 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                     "total_doc_len": 5000_u64,
                     "scope_exists": 1_u8,
                     "projection_ready": 1_u8,
-                    "projection_clean": 1_u8
+                    "projection_clean": 1_u8,
+                    "projection_revision": projection_revision
                 })
             };
             let metadata = json!({
@@ -828,7 +840,8 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                 "total_doc_len": 5000_u64,
                 "scope_exists": 1_u8,
                 "projection_ready": 1_u8,
-                "projection_clean": 1_u8
+                "projection_clean": 1_u8,
+                "projection_revision": projection_revision
             });
             let filter_clause = query
                 .split_once("WHERE ")
@@ -847,11 +860,15 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                 && !filter_clause.contains("lowerUTF8(p.actor_role) = 'user'")
             {
                 vec![candidate("evt-c-42", 12.5, 2, 1_767_434_520_000)]
+            } else if query.contains("LIMIT 3 OFFSET 3")
+                && !state.options.repeat_duplicate_search_pages
+            {
+                vec![candidate("evt-b-9", 6.0, 1, 1_767_348_120_000)]
             } else if query.contains("LIMIT 3") {
                 vec![
                     candidate("evt-c-42", 12.5, 2, 1_767_434_520_000),
+                    candidate("evt-c-duplicate", 12.0, 2, 1_767_434_520_000),
                     candidate("evt-a-11", 7.0, 1, 1_767_261_720_000),
-                    candidate("evt-b-9", 6.0, 1, 1_767_348_120_000),
                 ]
             } else {
                 vec![
@@ -946,6 +963,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                     "doc_len": 19_u32,
                     "text_preview": text,
                     "text_content": text,
+                    "text_content_digest": text,
                     "payload_json": "{}",
                     "mcp_event_type": event_type,
                     "raw_score": 0.0,
@@ -973,6 +991,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                 "evt-c-tool",
                 "evt-c-user",
                 "evt-c-42",
+                "evt-c-duplicate",
                 "evt-a-11",
                 "evt-b-9",
             ]
