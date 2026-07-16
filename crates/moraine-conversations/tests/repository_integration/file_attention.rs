@@ -12,6 +12,7 @@ async fn file_attention_clamps_its_query_budget_to_the_request_deadline() {
             rel: "crates/foo.rs".to_string(),
             normalized_project_id: Some("project-a".to_string()),
             normalized_project_roots: vec!["/worktree-a".to_string()],
+            derive_legacy_roots: true,
             apply_project_scope: true,
             start_unix_ms: None,
             end_unix_ms: None,
@@ -51,6 +52,7 @@ async fn file_attention_merges_normalized_exact_lookup_with_suffix_fallback() {
             rel: "crates/foo.rs".to_string(),
             normalized_project_id: Some("project-a".to_string()),
             normalized_project_roots: vec!["/worktree-a".to_string()],
+            derive_legacy_roots: true,
             apply_project_scope: true,
             start_unix_ms: None,
             end_unix_ms: None,
@@ -111,15 +113,30 @@ async fn file_attention_merges_normalized_exact_lookup_with_suffix_fallback() {
             && fallback_query.contains(
                 "ti.project_id != '' AND NOT startsWith(ti.project_id, 'git:')"
             )
-            && fallback_query.contains("ti.worktree_root IN ('/worktree-a')")
-            && fallback_query.contains("ti.project_id = '' AND (e.project_id = 'project-a'")
+            && fallback_query.contains("has(project_roots, ti.worktree_root)")
+            && fallback_query.contains("ti.project_id = '' AND e.project_id = 'project-a'")
+            && fallback_query.contains("legacy_candidate_root")
+            && fallback_query.contains("verified_project_root")
             && fallback_query.contains(
-                "matched_path = concat(ifNull(e.worktree_root, ''), '/', 'crates/foo.rs')"
+                "arrayFirst(root -> legacy_candidate_root = root, project_roots)"
             ),
         "project scope must admit current IDs and root-verified pre-digest rows without widening: {fallback_query}"
     );
     assert!(
-        fallback_query.contains("position(matched_path, ';') = 0"),
+        fallback_query.contains("AS legacy_scalar_paths")
+            && fallback_query.contains("AS legacy_scalar_path")
+            && fallback_query.contains("countMatches(ti.input_json")
+            && fallback_query.contains("|command|cmd)")
+            && fallback_query
+                .contains("arrayCount(path -> path != '', legacy_scalar_paths) = 1")
+            && fallback_query.contains(
+                "= concat(ifNull(e.cwd, ''), '/', 'crates/foo.rs')"
+            ),
+        "legacy root recovery must require exactly one top-level scalar path and no second structured or shell path evidence: {fallback_query}"
+    );
+    assert!(
+        fallback_query.contains("position(legacy_scalar_path")
+            && fallback_query.contains("position(ifNull(e.cwd, ''), ';') = 0"),
         "legacy compound path captures must not become roots: {fallback_query}"
     );
     assert!(
@@ -135,21 +152,25 @@ async fn file_attention_merges_normalized_exact_lookup_with_suffix_fallback() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn file_attention_project_scope_migrates_registered_pre_digest_sibling_root() {
+async fn file_attention_project_scope_recovers_durable_only_deleted_root() {
     let responses = vec![
         ScriptedResponse::rows(&["repo_rel_path = 'crates/foo.rs'"], json!([])),
         ScriptedResponse::raw(
             &[
                 "INSERT INTO `moraine`.`file_attention_project_roots`",
-                "arrayJoin(['/worktree-a', '/worktree-b', '/worktree-''quoted'])",
+                "arrayJoin(['/worktree-a'])",
             ],
             "",
         ),
         ScriptedResponse::rows(
             &[
                 "NOT startsWith(ti.project_id, 'git:')",
-                "ti.worktree_root IN ('/worktree-a', '/worktree-b', '/worktree-''quoted')",
-                "SELECT worktree_root FROM `moraine`.`file_attention_project_roots` FINAL WHERE project_id = 'git:new-project-id'",
+                "has(project_roots, ti.worktree_root)",
+                "'/worktree-a'",
+                "arrayFirst(root -> legacy_candidate_root = root, project_roots)",
+                "e.project_id = '' AND verified_project_root != ''",
+                "SELECT groupArray(worktree_root) FROM `moraine`.`file_attention_project_roots` FINAL",
+                "WHERE project_id = 'git:new-project-id' AND worktree_root != ''",
             ],
             json!([{
                 "session_id": "sess-pre-digest",
@@ -177,11 +198,8 @@ async fn file_attention_project_scope_migrates_registered_pre_digest_sibling_roo
             cancellation_token: "test-file-attention-pre-digest".to_string(),
             rel: "crates/foo.rs".to_string(),
             normalized_project_id: Some("git:new-project-id".to_string()),
-            normalized_project_roots: vec![
-                "/worktree-a".to_string(),
-                "/worktree-b".to_string(),
-                "/worktree-'quoted".to_string(),
-            ],
+            normalized_project_roots: vec!["/worktree-a".to_string()],
+            derive_legacy_roots: true,
             apply_project_scope: true,
             start_unix_ms: None,
             end_unix_ms: None,
@@ -193,7 +211,7 @@ async fn file_attention_project_scope_migrates_registered_pre_digest_sibling_roo
             execution_budget_secs: 3,
         })
         .await
-        .expect("registered pre-digest sibling row remains visible during migration");
+        .expect("durably mapped deleted root remains visible during migration");
 
     assert_eq!(touches.len(), 1);
     assert_eq!(touches[0].session_id, "sess-pre-digest");
@@ -213,8 +231,9 @@ async fn file_attention_project_scope_excludes_unmapped_pruned_legacy_root() {
         ),
         ScriptedResponse::rows(
             &[
-                "ti.worktree_root IN ('/worktree-a')",
-                "SELECT worktree_root FROM `moraine`.`file_attention_project_roots` FINAL WHERE project_id = 'git:new-project-id'",
+                "has(project_roots, ti.worktree_root)",
+                "SELECT groupArray(worktree_root) FROM `moraine`.`file_attention_project_roots` FINAL",
+                "WHERE project_id = 'git:new-project-id' AND worktree_root != ''",
             ],
             json!([]),
         )
@@ -228,6 +247,7 @@ async fn file_attention_project_scope_excludes_unmapped_pruned_legacy_root() {
             rel: "crates/foo.rs".to_string(),
             normalized_project_id: Some("git:new-project-id".to_string()),
             normalized_project_roots: vec!["/worktree-a".to_string()],
+            derive_legacy_roots: true,
             apply_project_scope: true,
             start_unix_ms: None,
             end_unix_ms: None,
@@ -253,6 +273,7 @@ async fn file_attention_all_scope_is_the_only_unscoped_widening_path() {
         rel: "crates/foo.rs".to_string(),
         normalized_project_id: Some("project-a".to_string()),
         normalized_project_roots: vec!["/worktree-a".to_string()],
+        derive_legacy_roots: true,
         apply_project_scope: false,
         start_unix_ms: None,
         end_unix_ms: None,
@@ -293,6 +314,7 @@ async fn file_attention_all_scope_keeps_the_configured_server_floor_only() {
         rel: "crates/foo.rs".to_string(),
         normalized_project_id: Some("project-a".to_string()),
         normalized_project_roots: vec!["/worktree-a".to_string()],
+        derive_legacy_roots: true,
         apply_project_scope: false,
         start_unix_ms: None,
         end_unix_ms: None,
@@ -341,6 +363,7 @@ async fn file_attention_all_scope_preserves_legacy_suffix_fallback_on_schema_ske
             rel: "crates/foo.rs".to_string(),
             normalized_project_id: Some("project-a".to_string()),
             normalized_project_roots: vec!["/worktree-a".to_string()],
+            derive_legacy_roots: true,
             apply_project_scope: false,
             start_unix_ms: None,
             end_unix_ms: None,
@@ -372,6 +395,7 @@ async fn file_attention_project_scope_stays_closed_on_schema_skew() {
             rel: "crates/foo.rs".to_string(),
             normalized_project_id: Some("project-a".to_string()),
             normalized_project_roots: vec!["/worktree-a".to_string()],
+            derive_legacy_roots: true,
             apply_project_scope: true,
             start_unix_ms: None,
             end_unix_ms: None,
@@ -398,6 +422,7 @@ async fn file_attention_project_scope_without_identity_stays_closed() {
         rel: "crates/foo.rs".to_string(),
         normalized_project_id: None,
         normalized_project_roots: Vec::new(),
+        derive_legacy_roots: false,
         apply_project_scope: true,
         start_unix_ms: None,
         end_unix_ms: None,

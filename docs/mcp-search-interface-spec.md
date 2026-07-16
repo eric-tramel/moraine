@@ -861,20 +861,28 @@ Rules:
 
 - `path` is required and must name a file path string. Leading/trailing
   whitespace, `file://` URIs, and directory-style trailing slashes are invalid.
-- Absolute paths are reduced to a repo-relative tail by walking up to
-  `.moraine.toml` or `.git`. Relative paths are resolved from the client's MCP
-  launch directory, including through a central-server route, so missing files
-  still retain launch-project provenance. Compound shell text and multi-path
+- Absolute paths are reduced to a project-relative tail using the nearest Git
+  boundary or exact containment beneath a non-Git launch directory. Relative
+  paths are resolved from the client's MCP launch directory, including through
+  a central-server route, so missing files still retain launch-project
+  provenance. Git common-directory metadata unifies linked worktrees; without
+  Git metadata, the canonical launch directory is the identity and different
+  launch subdirectories remain separate. `.moraine.toml` independently selects
+  a backend and is not required. Compound shell text and multi-path
   captures are not interpreted as one path or root; unprovable roots remain
   `unknown`.
 - `scope` is `project` or `all`. `project` independently restricts normalized
-  and legacy fallback lookup to the launch repository's canonical
-  Git-common-directory identity and fails closed if that identity cannot be
-  established. `all` deliberately drops request-level project narrowing. A
+  and legacy fallback lookup to the launch project's canonical Git-common-
+  directory or exact working-directory identity and fails closed if neither can
+  be established. `all` deliberately drops request-level project narrowing. A
   configured `--project-only` server scope remains a hard floor, so returned IDs
   remain accepted by `open`.
 - Registered pre-digest roots are migrated into a durable project mapping, and
-  future normalized roots populate it automatically. A root pruned before that
+  future normalized roots populate it automatically. Retained older rows with
+  blank identity may be attributed only when exactly one top-level scalar
+  structured path agrees with the recorded cwd and that cwd is itself a current
+  or durable project root. A
+  root pruned before that
   mapping was installed lacks stored Git identity and cannot be attributed
   safely; `project` excludes it rather than widening and emits an upgrade
   limitation warning.

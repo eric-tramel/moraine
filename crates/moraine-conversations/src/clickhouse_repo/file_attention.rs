@@ -300,7 +300,6 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
             "((JSONHas(input_json, 'command') OR JSONHas(input_json, 'cmd')) AND match({command_expr}, {shell_path_regex}))"
         );
 
-        let matched_path_is_single = single_path_sql("matched_path");
         let normalized_root_is_single = single_path_sql("ti.worktree_root");
         let event_root_expression = if normalized_schema_available {
             "ifNull(e.worktree_root, '')"
@@ -328,27 +327,34 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
         }
         let match_predicate = inner_clauses.join("\n      AND ");
 
-        let matched_path_arms = PATH_KEYS
+        let scalar_path_values = PATH_KEYS
             .iter()
-            .map(|key| {
-                format!(
-                    "{}, JSONExtractString(ti.input_json, '{key}')",
-                    key_match("ti.input_json", key)
-                )
-            })
+            .map(|key| format!("JSONExtractString(ti.input_json, '{key}')"))
             .collect::<Vec<_>>()
-            .join(",\n      ");
-        let matched_path_expr =
-            format!("multiIf(\n      {matched_path_arms},\n      {nested_path_expr})");
-
-        let verified_event_root_condition = if rel.starts_with('/') {
-            "0".to_string()
-        } else {
+            .join(", ");
+        let legacy_scalar_paths_expr = format!("[{scalar_path_values}]");
+        let legacy_scalar_path_expr = format!(
+            "arrayFirst(path -> endsWith(path, {slash_rel_sql}) OR path = {rel_sql}, legacy_scalar_paths)"
+        );
+        let legacy_scalar_path_is_single = single_path_sql("legacy_scalar_path");
+        let provenance_key_regex = sql_quote(&format!(
+            "\"(?:{path_key_regex}|command|cmd)\"[[:space:]]*:"
+        ));
+        let cwd_is_single = single_path_sql("ifNull(e.cwd, '')");
+        let candidate_root_expr = if query.derive_legacy_roots && !rel.starts_with('/') {
             format!(
-                "{matched_path_is_single}
-      AND {event_root_is_single}
-      AND (matched_path = {rel_sql} OR matched_path = concat({event_root_expression}, '/', {rel_sql}))"
+                "if(
+      countMatches(ti.input_json, {provenance_key_regex}) = 1
+      AND arrayCount(path -> path != '', legacy_scalar_paths) = 1
+      AND {legacy_scalar_path_is_single}
+      AND {cwd_is_single}
+      AND (legacy_scalar_path = {rel_sql}
+           OR legacy_scalar_path = concat(ifNull(e.cwd, ''), '/', {rel_sql})),
+      ifNull(e.cwd, ''),
+      '')"
             )
+        } else {
+            "''".to_string()
         };
         let normalized_root_condition = if normalized_schema_available {
             format!(
@@ -357,16 +363,6 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
         } else {
             "0".to_string()
         };
-
-        let worktree_root_expr = format!(
-            "multiIf(
-      {normalized_root_condition},
-      ti.worktree_root,
-      {verified_event_root_condition},
-      {event_root_expression},
-      ''
-    )"
-        );
 
         let mut outer_clauses: Vec<String> = Vec::new();
         if let Some(start) = query.start_unix_ms {
@@ -378,36 +374,47 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
         if let Some(source_name) = query.source_name.as_deref() {
             outer_clauses.push(format!("e.source_name = {}", sql_quote(source_name)));
         }
-        if query.apply_project_scope {
+        let mut project_roots_with = String::new();
+        let verified_project_root_expr = if query.apply_project_scope {
             let project_id = query
                 .normalized_project_id
                 .as_deref()
                 .expect("project scope identity checked before querying");
             let project_id_sql = sql_quote(project_id);
-            let legacy_roots_sql = query
+            let mut registered_roots = query
                 .normalized_project_roots
                 .iter()
                 .filter(|root| !root.is_empty())
+                .cloned()
+                .collect::<Vec<_>>();
+            registered_roots.sort_by_key(|root| std::cmp::Reverse(root.len()));
+            registered_roots.dedup();
+            let legacy_roots_sql = registered_roots
+                .iter()
                 .map(|root| sql_quote(root))
                 .collect::<Vec<_>>()
                 .join(", ");
             let durable_roots = self.table_ref("file_attention_project_roots");
-            let root_membership = |expression: &str| {
-                let mut predicates = Vec::with_capacity(2);
-                if !legacy_roots_sql.is_empty() {
-                    predicates.push(format!("{expression} IN ({legacy_roots_sql})"));
-                }
-                if project_root_mapping_available {
-                    predicates.push(format!(
-                        "{expression} IN (SELECT worktree_root FROM {durable_roots} FINAL WHERE project_id = {project_id_sql})"
-                    ));
-                }
-                if predicates.is_empty() {
-                    "0".to_string()
-                } else {
-                    format!("({})", predicates.join(" OR "))
-                }
+            let registered_roots_array = if legacy_roots_sql.is_empty() {
+                "CAST([], 'Array(String)')".to_string()
+            } else {
+                format!("[{legacy_roots_sql}]")
             };
+            let project_roots_array = if project_root_mapping_available {
+                format!(
+                    "arrayDistinct(arrayConcat(
+      {registered_roots_array},
+      (SELECT groupArray(worktree_root) FROM {durable_roots} FINAL
+       WHERE project_id = {project_id_sql} AND worktree_root != '')
+    ))"
+                )
+            } else {
+                registered_roots_array
+            };
+            project_roots_with = format!("{project_roots_array} AS project_roots,\n  ");
+            let verified_root =
+                "arrayFirst(root -> legacy_candidate_root = root, project_roots)".to_string();
+            let root_membership = |expression: &str| format!("has(project_roots, {expression})");
             let legacy_tool_scope = format!(
                 "(ti.project_id != '' AND NOT startsWith(ti.project_id, 'git:') AND {normalized_root_is_single} AND {})",
                 root_membership("ti.worktree_root")
@@ -419,9 +426,33 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
             outer_clauses.push(format!(
                 "(ti.project_id = {project_id_sql}
       OR {legacy_tool_scope}
-      OR (ti.project_id = '' AND (e.project_id = {project_id_sql} OR {legacy_event_scope}) AND {verified_event_root_condition}))"
+      OR (ti.project_id = '' AND e.project_id = {project_id_sql})
+      OR (ti.project_id = '' AND legacy_candidate_root != ''
+          AND ({legacy_event_scope} OR (e.project_id = '' AND verified_project_root != ''))))"
             ));
-        }
+            Some(verified_root)
+        } else {
+            None
+        };
+
+        let legacy_root_expr = if verified_project_root_expr.is_some() {
+            "verified_project_root"
+        } else {
+            "legacy_candidate_root"
+        };
+        let worktree_root_expr = format!(
+            "multiIf(
+      {normalized_root_condition},
+      ti.worktree_root,
+      legacy_candidate_root != '',
+      {legacy_root_expr},
+      ''
+    )"
+        );
+        let verified_project_root_column = verified_project_root_expr
+            .as_deref()
+            .map(|expression| format!(",\n    {expression} AS verified_project_root"))
+            .unwrap_or_default();
 
         let outer_where = if outer_clauses.is_empty() {
             "1".to_string()
@@ -449,7 +480,7 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
         };
 
         let sql = format!(
-            "WITH matched AS (
+            "WITH {project_roots_with}matched AS (
     SELECT session_id, event_uid, tool_call_id, harness, tool_name, tool_phase, input_json, input_preview, output_preview{normalized_tool_columns}
     FROM {tool_io} FINAL
     WHERE {match_predicate}
@@ -462,7 +493,10 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
     ifNull(e.source_name, '') AS source_name,
     ti.tool_name AS tool_name,
     ti.tool_phase AS tool_phase,
-    {matched_path_expr} AS matched_path,
+    {legacy_scalar_paths_expr} AS legacy_scalar_paths,
+    {legacy_scalar_path_expr} AS legacy_scalar_path,
+    if(legacy_scalar_path != '', legacy_scalar_path, {nested_path_expr}) AS matched_path,
+    {candidate_root_expr} AS legacy_candidate_root{verified_project_root_column},
     if(matched_path != '', 'path_suffix', 'shell_path') AS match_kind,
     {worktree_root_expr} AS worktree_root,
     ifNull(e.cwd, '') AS cwd,

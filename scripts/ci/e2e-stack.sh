@@ -541,6 +541,8 @@ main() {
   local codex_session_suffix
   codex_session_suffix="$(printf '%06x%06x' "$RANDOM" "$RANDOM")"
   local codex_session_id="00000000-0000-4000-8000-${codex_session_suffix}"
+  local codex_multi_path_session_id="00000000-0000-4000-8001-${codex_session_suffix}"
+  local codex_nested_path_session_id="00000000-0000-4000-8002-${codex_session_suffix}"
   local claude_session_suffix
   claude_session_suffix="$(printf '%06x%06x' "$RANDOM" "$RANDOM")"
   local claude_session_id="00000000-0000-4000-8000-${claude_session_suffix}"
@@ -629,6 +631,11 @@ main() {
   local pi_fixture_file="$fixtures_root/pi/agent/sessions/--tmp-moraine-e2e--/2026-02-16T12-00-08-000Z_${pi_session_id}.jsonl"
   local hermes_fixture_file="$fixtures_root/hermes/trajectories/001-${run_stamp}.jsonl"
   local hermes_session_fixture_file="$fixtures_root/hermes/sessions/${hermes_session_id}.json"
+  # Codex records the launch cwd in session_meta. Keep this as a plain Git
+  # repository with no .moraine.toml so bundled MCP project identity and ingest
+  # normalization exercise the default, unconfigured repository path.
+  local codex_project_dir="$tmp_root/codex-project"
+  mkdir -p "$codex_project_dir/.git"
   # The directory the claude fixture session "originated from": real Claude
   # Code records a cwd on every message line, and `--project-only` scoping
   # keys off it. Must be a real directory so mcp_smoke.py can launch the
@@ -648,7 +655,7 @@ main() {
   mkdir -p "$runtime_root"
 
   cat > "$codex_fixture_file" <<EOF
-{"timestamp":"2026-02-16T12:00:00.000Z","type":"session_meta","payload":{"id":"${codex_session_id}"}}
+{"timestamp":"2026-02-16T12:00:00.000Z","type":"session_meta","payload":{"id":"${codex_session_id}","cwd":"${codex_project_dir}"}}
 {"timestamp":"2026-02-16T12:00:01.000Z","type":"turn_context","payload":{"turn_id":"1","model":"gpt-5.3-codex"}}
 {"timestamp":"2026-02-16T12:00:02.000Z","type":"response_item","payload":{"type":"message","role":"user","id":"msg-user-${run_stamp}","content":[{"type":"text","text":"local e2e codex user prompt ${codex_keyword}"}],"phase":"completed"}}
 {"timestamp":"2026-02-16T12:00:03.000Z","type":"response_item","parent_id":"msg-user-${run_stamp}","payload":{"type":"message","role":"assistant","id":"msg-assistant-${run_stamp}","content":[{"type":"text","text":"local e2e codex assistant reply ${codex_keyword} ${codex_trace_marker}"}],"phase":"completed"}}
@@ -1111,17 +1118,35 @@ EOF
   assert_clickhouse_count "$clickhouse_url" "codex link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-codex' AND link_type = 'parent_event' AND linked_external_id = 'msg-user-${run_stamp}'" "1"
   assert_clickhouse_count "$clickhouse_url" "codex tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-codex' AND tool_call_id = 'codex-tool-${run_stamp}'" "2"
   assert_clickhouse_count "$clickhouse_url" "codex tool request fields" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-codex' AND tool_call_id = 'codex-tool-${run_stamp}' AND tool_name = 'Read' AND tool_phase = 'request'" "1"
+  assert_clickhouse_count "$clickhouse_url" "codex plain-git event identity" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex' AND event_kind = 'tool_call' AND project_id != '' AND worktree_root = '${codex_project_dir}'" "1"
+  assert_clickhouse_count "$clickhouse_url" "codex plain-git tool identity" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-codex' AND tool_call_id = 'codex-tool-${run_stamp}' AND tool_phase = 'request' AND project_id != '' AND repo_rel_path = 'Cargo.toml' AND worktree_root = '${codex_project_dir}'" "1"
   assert_clickhouse_count "$clickhouse_url" "codex harness/session fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex' AND harness = 'codex' AND session_id = '${codex_session_id}'" "7"
   assert_clickhouse_count "$clickhouse_url" "codex model fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex' AND model IN ('gpt-5.3-codex', 'gpt-5.3-codex-spark')" "6"
   assert_clickhouse_count "$clickhouse_url" "codex token buckets" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex' AND payload_type = 'token_count' AND input_tokens = 17 AND output_tokens = 4 AND cache_read_tokens = 3 AND cache_write_tokens = 2 AND token_usage_buckets['input_text'] = 12 AND token_usage_buckets['output_text'] = 3 AND token_usage_buckets['reasoning'] = 1" "1"
+
+  # Simulate rows ingested before normalized project fields existed. The MCP
+  # smoke below must recover only this retained, structured path + cwd evidence
+  # and map it back to the launch repository without resetting checkpoints.
+  clickhouse_scalar "$clickhouse_url" "INSERT INTO ${clickhouse_database}.tool_io SELECT * REPLACE ('' AS project_id, '' AS repo_rel_path, '' AS worktree_root, event_version + 100 AS event_version) FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-codex' AND tool_call_id = 'codex-tool-${run_stamp}' AND tool_phase = 'request'" >/dev/null
+  clickhouse_scalar "$clickhouse_url" "INSERT INTO ${clickhouse_database}.events SELECT * REPLACE ('' AS project_id, '' AS repo_rel_path, '' AS worktree_root, event_version + 100 AS event_version) FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex' AND event_kind = 'tool_call' AND tool_call_id = 'codex-tool-${run_stamp}'" >/dev/null
+  assert_clickhouse_count "$clickhouse_url" "codex legacy tool identity fixture" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-codex' AND tool_call_id = 'codex-tool-${run_stamp}' AND tool_phase = 'request' AND project_id = '' AND repo_rel_path = '' AND worktree_root = ''" "1"
+
+  # Negative legacy fixtures: a top-level path plus nested path evidence, and
+  # a nested-only path, may match the file tail but must never invent a root.
+  clickhouse_scalar "$clickhouse_url" "INSERT INTO ${clickhouse_database}.tool_io SELECT * REPLACE ('${codex_multi_path_session_id}' AS session_id, concat(event_uid, '-multi-path') AS event_uid, 'codex-multi-path-${run_stamp}' AS tool_call_id, '{\"path\":\"Cargo.toml\",\"options\":{\"file_path\":\"other.rs\"}}' AS input_json, '' AS project_id, '' AS repo_rel_path, '' AS worktree_root, event_version + 200 AS event_version) FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-codex' AND tool_call_id = 'codex-tool-${run_stamp}' AND tool_phase = 'request'" >/dev/null
+  clickhouse_scalar "$clickhouse_url" "INSERT INTO ${clickhouse_database}.events SELECT * REPLACE ('${codex_multi_path_session_id}' AS session_id, concat(event_uid, '-multi-path') AS event_uid, 'codex-multi-path-${run_stamp}' AS tool_call_id, '' AS project_id, '' AS repo_rel_path, '' AS worktree_root, event_version + 200 AS event_version) FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex' AND event_kind = 'tool_call' AND tool_call_id = 'codex-tool-${run_stamp}'" >/dev/null
+  clickhouse_scalar "$clickhouse_url" "INSERT INTO ${clickhouse_database}.tool_io SELECT * REPLACE ('${codex_nested_path_session_id}' AS session_id, concat(event_uid, '-nested-path') AS event_uid, 'codex-nested-path-${run_stamp}' AS tool_call_id, '{\"options\":{\"path\":\"Cargo.toml\"}}' AS input_json, '' AS project_id, '' AS repo_rel_path, '' AS worktree_root, event_version + 300 AS event_version) FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-codex' AND tool_call_id = 'codex-tool-${run_stamp}' AND tool_phase = 'request'" >/dev/null
+  clickhouse_scalar "$clickhouse_url" "INSERT INTO ${clickhouse_database}.events SELECT * REPLACE ('${codex_nested_path_session_id}' AS session_id, concat(event_uid, '-nested-path') AS event_uid, 'codex-nested-path-${run_stamp}' AS tool_call_id, '' AS project_id, '' AS repo_rel_path, '' AS worktree_root, event_version + 300 AS event_version) FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex' AND event_kind = 'tool_call' AND tool_call_id = 'codex-tool-${run_stamp}'" >/dev/null
 
   assert_clickhouse_count "$clickhouse_url" "claude unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-claude'" "3"
   assert_clickhouse_count "$clickhouse_url" "claude event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude'" "5"
   # Every claude event carries the record-level cwd in the native column;
   # --project-only scoping reads it to resolve the session's origin directory.
   assert_clickhouse_count "$clickhouse_url" "claude cwd column populated" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude' AND cwd = '${claude_project_dir}'" "5"
+  assert_clickhouse_count "$clickhouse_url" "claude non-Git directory identity populated" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude' AND startsWith(project_id, 'dir:') AND worktree_root = '${claude_project_dir}'" "5"
   assert_clickhouse_count "$clickhouse_url" "claude link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-claude'" "6"
   assert_clickhouse_count "$clickhouse_url" "claude tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-claude' AND tool_call_id = 'claude-tool-${run_stamp}'" "2"
+  assert_clickhouse_count "$clickhouse_url" "claude non-Git tool path normalized" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-claude' AND tool_call_id = 'claude-tool-${run_stamp}' AND tool_phase = 'request' AND startsWith(project_id, 'dir:') AND worktree_root = '${claude_project_dir}' AND repo_rel_path = 'Cargo.toml'" "1"
   assert_clickhouse_count "$clickhouse_url" "claude harness/session fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude' AND harness = 'claude-code' AND inference_provider = 'anthropic' AND session_id = '${claude_session_id}'" "5"
   assert_clickhouse_count "$clickhouse_url" "claude model fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude' AND model = 'claude-opus-4-5-20251101'" "3"
   assert_clickhouse_count "$clickhouse_url" "claude token buckets" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude' AND actor_kind = 'assistant' AND input_tokens = 9 AND output_tokens = 5 AND token_usage_buckets['input_text'] = 9 AND token_usage_buckets['output_text'] = 5" "3"
@@ -1392,24 +1417,34 @@ PY
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
     --moraine "$moraine_bin" \
     --config "$config_path" \
+    --working-dir "$codex_project_dir" \
     --query "$codex_keyword" \
     --expect-session-id "$codex_session_id" \
     --expect-open-text "$codex_trace_marker" \
     --expect-event-count "7" \
     --expect-updated-at "2026-02-16T12:00:03.900Z" \
     --file-attention-path "Cargo.toml" \
+    --file-attention-expect-absent-session-id "$claude_session_id" \
+    --file-attention-expect-absent-session-id "$pi_session_id" \
+    --file-attention-expect-absent-session-id "$codex_multi_path_session_id" \
+    --file-attention-expect-absent-session-id "$codex_nested_path_session_id" \
     --write-tools-snapshot "$daemon_tools_snapshot"
 
   echo "[e2e] checking second fresh stdio MCP process (identical codex cache hit)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
     --moraine "$moraine_bin" \
     --config "$config_path" \
+    --working-dir "$codex_project_dir" \
     --query "$codex_keyword" \
     --expect-session-id "$codex_session_id" \
     --expect-open-text "$codex_trace_marker" \
     --expect-event-count "7" \
     --expect-updated-at "2026-02-16T12:00:03.900Z" \
     --file-attention-path "Cargo.toml" \
+    --file-attention-expect-absent-session-id "$claude_session_id" \
+    --file-attention-expect-absent-session-id "$pi_session_id" \
+    --file-attention-expect-absent-session-id "$codex_multi_path_session_id" \
+    --file-attention-expect-absent-session-id "$codex_nested_path_session_id" \
     --write-tools-snapshot "$daemon_tools_snapshot"
 
   echo "[e2e] checking shared-daemon MCP cache miss -> hit markers"
@@ -1432,7 +1467,8 @@ PY
     --working-dir "$claude_project_dir" \
     --query "$claude_keyword" \
     --expect-session-id "$claude_session_id" \
-    --expect-open-text "$claude_trace_marker"
+    --expect-open-text "$claude_trace_marker" \
+    --file-attention-path "Cargo.toml"
 
   echo "[e2e] checking named-backend HTTP route through shared daemon router"
   routed_sessions_body="$(curl -fsS \
@@ -1451,7 +1487,8 @@ PY
     --working-dir "$claude_project_dir" \
     --query "$claude_keyword" \
     --expect-session-id "$claude_session_id" \
-    --expect-open-text "$claude_trace_marker"
+    --expect-open-text "$claude_trace_marker" \
+    --file-attention-path "Cargo.toml"
   wait_for_mcp_cache_sequence "$python_bin" "$backend_log" "$routed_cache_log_baseline" 20
 
   echo "[e2e] checking named route excludes default-only content"
@@ -1479,7 +1516,11 @@ PY
   assert_clickhouse_count "$clickhouse_url" "all service SELECTs use the backend UA/PID" "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND ${query_log_window} AND query_kind = 'Select' AND (${attributed_service_filter}) AND http_user_agent != '${expected_backend_ua}'" "0"
   assert_clickhouse_count "$clickhouse_url" "named read schema handshake runs once despite MCP/HTTP reuse" "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND ${query_log_window} AND http_user_agent = '${expected_backend_ua}' AND position(query, 'system.tables') > 0 AND position(query, 'schema_migrations') > 0" "1"
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND ${query_log_window} AND query_kind = 'Insert' AND http_user_agent = '${expected_ingest_ua}'" 30
-  assert_clickhouse_count "$clickhouse_url" "all service INSERTs use the ingest UA/PID" "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND ${query_log_window} AND query_kind = 'Insert' AND (${attributed_service_filter}) AND http_user_agent != '${expected_ingest_ua}'" "0"
+  local file_attention_root_insert_prefix="INSERT INTO \`${clickhouse_database}\`.\`file_attention_project_roots\`"
+  local routed_file_attention_root_insert_prefix="INSERT INTO \`${routed_clickhouse_database}\`.\`file_attention_project_roots\`"
+  local allowed_backend_root_insert="http_user_agent = '${expected_backend_ua}' AND (startsWith(query, '${file_attention_root_insert_prefix}') OR startsWith(query, '${routed_file_attention_root_insert_prefix}'))"
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND ${query_log_window} AND query_kind = 'Insert' AND (${allowed_backend_root_insert})" 30
+  assert_clickhouse_count "$clickhouse_url" "service INSERTs use the ingest UA/PID except backend project-root mappings" "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND ${query_log_window} AND query_kind = 'Insert' AND (${attributed_service_filter}) AND http_user_agent != '${expected_ingest_ua}' AND NOT (${allowed_backend_root_insert})" "0"
 
   echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (claude)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
@@ -1547,8 +1588,8 @@ PY
 
   # --project-only: launched from the claude fixture's recorded cwd, the MCP
   # server must serve that session normally while sessions from other
-  # directories (pi: cwd=$tmp_root) or with no recorded cwd (codex) are
-  # invisible to search/list and answer not_found on open.
+  # directories (including the separate Codex Git repository) are invisible
+  # to search/list and answer not_found on open.
   echo "[e2e] checking MCP --project-only serves in-scope session and hides others"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
     --moraine "$moraine_bin" \
@@ -1646,12 +1687,17 @@ PY
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
     --moraine "$moraine_bin" \
     --config "$config_path" \
+    --working-dir "$codex_project_dir" \
     --query "$codex_keyword" \
     --expect-session-id "$codex_session_id" \
     --expect-open-text "$codex_trace_marker" \
     --expect-event-count "7" \
     --expect-updated-at "2026-02-16T12:00:03.900Z" \
     --file-attention-path "Cargo.toml" \
+    --file-attention-expect-absent-session-id "$claude_session_id" \
+    --file-attention-expect-absent-session-id "$pi_session_id" \
+    --file-attention-expect-absent-session-id "$codex_multi_path_session_id" \
+    --file-attention-expect-absent-session-id "$codex_nested_path_session_id" \
     --require-embedded-fallback \
     --write-tools-snapshot "$embedded_tools_snapshot"
 

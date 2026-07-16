@@ -2927,8 +2927,6 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(root.join(".git")).expect("create test git directory");
-        std::fs::write(root.join(".moraine.toml"), "backend = \"default\"\n")
-            .expect("write repository backend marker");
         let expected_project_id =
             moraine_config::project_id_for_repo_root(&root).expect("canonical project id");
 
@@ -2984,6 +2982,7 @@ mod tests {
                 .any(|root| root == &root_text),
             "launch root must be present in registered project roots"
         );
+        assert!(query.derive_legacy_roots);
         assert!(query.apply_project_scope);
 
         shutdown_tx.send(()).expect("shutdown route server");
