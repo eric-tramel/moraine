@@ -122,7 +122,7 @@ impl ClickHouseClient {
         Url::parse(&self.cfg.url).context("invalid ClickHouse URL")
     }
 
-    fn request_builder(
+    async fn request_builder(
         &self,
         query: &str,
         body: Vec<u8>,
@@ -153,13 +153,17 @@ impl ClickHouseClient {
         let (body, content_encoding) = match (self.cfg.request_compression, body.is_empty()) {
             (_, true) | (ClickHouseRequestCompression::None, false) => (body, None),
             (ClickHouseRequestCompression::Gzip, false) => {
-                let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-                encoder
-                    .write_all(&body)
-                    .context("failed to gzip ClickHouse request body")?;
-                let compressed = encoder
-                    .finish()
-                    .context("failed to finish gzip ClickHouse request body")?;
+                let compressed = tokio::task::spawn_blocking(move || {
+                    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+                    encoder
+                        .write_all(&body)
+                        .context("failed to gzip ClickHouse request body")?;
+                    encoder
+                        .finish()
+                        .context("failed to finish gzip ClickHouse request body")
+                })
+                .await
+                .context("ClickHouse request compression task failed")??;
                 (compressed, Some("gzip"))
             }
         };
@@ -224,17 +228,19 @@ impl ClickHouseClient {
         default_format: Option<&str>,
         params: &[(&str, &str)],
     ) -> Result<String> {
-        let req = self.request_builder(
-            query,
-            body.unwrap_or_default(),
-            ClickHouseRequestOptions {
-                database,
-                async_insert,
-                default_format,
-                params,
-                request_timeout: None,
-            },
-        )?;
+        let req = self
+            .request_builder(
+                query,
+                body.unwrap_or_default(),
+                ClickHouseRequestOptions {
+                    database,
+                    async_insert,
+                    default_format,
+                    params,
+                    request_timeout: None,
+                },
+            )
+            .await?;
         let response = self.send_checked_response(req).await?;
         let status = response.status();
         let text = response.text().await.with_context(|| {
@@ -255,17 +261,19 @@ impl ClickHouseClient {
         params: &[(&str, &str)],
         request_timeout: Option<Duration>,
     ) -> Result<ClickHouseByteStream> {
-        let req = self.request_builder(
-            query,
-            Vec::new(),
-            ClickHouseRequestOptions {
-                database,
-                async_insert: false,
-                default_format,
-                params,
-                request_timeout,
-            },
-        )?;
+        let req = self
+            .request_builder(
+                query,
+                Vec::new(),
+                ClickHouseRequestOptions {
+                    database,
+                    async_insert: false,
+                    default_format,
+                    params,
+                    request_timeout,
+                },
+            )
+            .await?;
         let response = self.send_checked_response(req).await?;
 
         Ok(ClickHouseByteStream { response })
