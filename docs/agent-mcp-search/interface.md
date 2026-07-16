@@ -145,6 +145,9 @@ Follow `next_cursor` until it is null to recover every compact turn or event
 summary. Then open an individual `event:` ID when exact wording, full tool
 arguments/output, or payload JSON is needed. There is intentionally no
 unbounded one-call transcript mode.
+Encrypted reasoning payloads appear as `[encrypted reasoning omitted]` in
+compact event summaries; open the event directly only when its opaque payload
+is needed.
 
 What comes back depends on the ID kind:
 

@@ -14,6 +14,7 @@ use serde_json::{json, Map, Value};
 use std::time::Instant;
 
 const SUMMARY_PREVIEW_CHARS: usize = 240;
+const ENCRYPTED_REASONING_SUMMARY: &str = "[encrypted reasoning omitted]";
 const SUMMARY_MAX_TOOLS: usize = 25;
 const SUMMARY_TOOL_NAME_CHARS: usize = 120;
 const OPEN_CURSOR_VERSION: u8 = 1;
@@ -702,11 +703,7 @@ fn open_turn_event_summary(
     let id = encode_event_id(&event.event_uid)?;
     let tool_name = tool_name_for(&event.event_type, &event.name, &event.call_id)
         .map(|name| compact_text_line(&name, SUMMARY_TOOL_NAME_CHARS));
-    let summary = event
-        .text_preview
-        .as_deref()
-        .map(|text| compact_text_line(text, SUMMARY_PREVIEW_CHARS))
-        .unwrap_or_default();
+    let (summary, summary_truncated) = compact_event_summary(event);
 
     Ok(json!({
         "id": id,
@@ -717,8 +714,33 @@ fn open_turn_event_summary(
         "tool_name": tool_name,
         "model": null,
         "summary": summary,
-        "truncated": event.text_preview.as_deref().is_some_and(looks_truncated)
+        "truncated": summary_truncated
     }))
+}
+
+fn compact_event_summary(event: &McpEventSummary) -> (String, bool) {
+    let Some(text) = event.text_preview.as_deref() else {
+        return (String::new(), false);
+    };
+    if event.event_type == "reasoning" && has_encrypted_content_field(text) {
+        return (ENCRYPTED_REASONING_SUMMARY.to_string(), false);
+    }
+
+    (
+        compact_text_line(text, SUMMARY_PREVIEW_CHARS),
+        looks_truncated(text),
+    )
+}
+
+fn has_encrypted_content_field(text: &str) -> bool {
+    let text = text.trim_start();
+    if !text.starts_with('{') {
+        return false;
+    }
+
+    const FIELD: &str = "\"encrypted_content\"";
+    text.match_indices(FIELD)
+        .any(|(index, _)| text[index + FIELD.len()..].trim_start().starts_with(':'))
 }
 
 fn open_event_data(
@@ -1225,6 +1247,44 @@ mod tests {
             encode_event_id("event-user").unwrap()
         );
         assert!(warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn turn_expansion_omits_encrypted_reasoning_payloads() {
+        let mut turn = large_turn(3, 7);
+        let encrypted_content = format!("encrypted-{}", "x".repeat(1_000));
+        let reasoning = &mut turn.events[1];
+        reasoning.actor_role = "assistant".to_string();
+        reasoning.event_class = "reasoning".to_string();
+        reasoning.payload_type = "reasoning".to_string();
+        reasoning.event_type = "reasoning".to_string();
+        reasoning.text_preview = Some(format!(
+            r#"{{"type":"reasoning","summary":[],"encrypted_content":"{encrypted_content}"}}"#
+        ));
+
+        let repository = Arc::new(InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            InMemoryConversationResponses {
+                get_mcp_turn: Some(Ok(Some(turn))),
+                ..InMemoryConversationResponses::default()
+            },
+        ));
+        let state = AppState::embedded(AppConfig::default(), repository);
+        let turn_id = encode_turn_id("session-a", 1).expect("turn id");
+
+        let result = state
+            .open_v1(json!({ "id": turn_id, "limit": 3 }))
+            .await
+            .expect("expanded turn");
+        let reasoning_summary = &result["structuredContent"]["data"]["events"][1];
+        assert_eq!(
+            reasoning_summary["summary"],
+            json!("[encrypted reasoning omitted]")
+        );
+        assert_eq!(reasoning_summary["truncated"], json!(false));
+        let response = serde_json::to_string(&result).expect("serialized response");
+        assert!(!response.contains("encrypted_content"));
+        assert!(!response.contains(&encrypted_content));
     }
 
     #[tokio::test]
