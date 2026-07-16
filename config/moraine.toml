@@ -4,6 +4,7 @@ database = "moraine"
 username = "default"
 password = ""
 timeout_seconds = 30.0
+request_compression = "none"
 async_insert = true
 wait_for_async_insert = true
 
@@ -20,6 +21,7 @@ wait_for_async_insert = true
 # database = "moraine_team"
 # username = "svc-moraine"
 # password = ""
+# request_compression = "gzip"
 # # Accept a server whose migration ledger is ahead of this moraine build.
 # allow_newer_server = false
 

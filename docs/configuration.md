@@ -105,6 +105,7 @@ database = "moraine"
 username = "default"
 password = ""
 timeout_seconds = 30.0
+request_compression = "none"
 async_insert = true
 wait_for_async_insert = true
 allow_newer_server = false
@@ -126,6 +127,7 @@ projects to additional servers, see
 | `username` | `default` | ClickHouse user for ingest, monitor, MCP, and migrations. |
 | `password` | empty | ClickHouse password. |
 | `timeout_seconds` | `30.0` | Per-request ClickHouse HTTP timeout. |
+| `request_compression` | `none` | Compression for non-empty HTTP request bodies. Supported values are `none` and `gzip`. |
 | `async_insert` | `true` | Enables ClickHouse async insert mode on writes. |
 | `wait_for_async_insert` | `true` | Waits for async insert completion before advancing checkpoints, so write failures are visible. |
 | `allow_newer_server` | `false` | Allows a non-default backend whose migration ledger is ahead of this Moraine build. The default backend is migrated by Moraine itself, so this is only useful on `[backends.<name>]`. |
@@ -142,6 +144,7 @@ url = "https://ch.team.example:8443"
 database = "moraine_team"
 username = "svc-moraine"
 password = "..."
+request_compression = "gzip"
 allow_newer_server = false
 
 [[routes]]

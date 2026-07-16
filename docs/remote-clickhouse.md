@@ -57,6 +57,7 @@ database = "moraine"
 username = "moraine"
 password = "change-me"
 timeout_seconds = 30.0
+request_compression = "none"
 async_insert = true
 wait_for_async_insert = true
 ```
@@ -85,6 +86,7 @@ database = "moraine"
 username = "moraine"
 password = "replace-with-your-secret"
 timeout_seconds = 30.0
+request_compression = "gzip"
 async_insert = true
 wait_for_async_insert = true
 ```
@@ -105,6 +107,11 @@ password = "replace-with-your-secret"
 ```
 
 Keep the tunnel running before starting Moraine.
+
+`request_compression = "gzip"` applies standard HTTP gzip content encoding to
+non-empty ClickHouse request bodies. It is useful for remote backends where
+trace payloads cross bandwidth-constrained or intermediary-managed links. The
+default is `"none"`.
 
 ## Initialize The Schema
 

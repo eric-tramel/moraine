@@ -39,6 +39,7 @@ impl ConversationClient {
             username,
             password,
             timeout_seconds,
+            request_compression: Default::default(),
             async_insert: true,
             wait_for_async_insert: true,
             allow_newer_server: false,
