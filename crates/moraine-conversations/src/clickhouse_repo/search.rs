@@ -5,6 +5,7 @@ pub(super) const CONVERSATION_CANDIDATE_MULTIPLIER: usize = 80;
 pub(super) const CONVERSATION_CANDIDATE_MAX: usize = 20_000;
 pub(super) const CONVERSATION_RECENT_WINDOW_MS: i64 = 45_000;
 pub(super) const CONVERSATION_RECENT_CANDIDATE_LIMIT: usize = 1024;
+pub(super) const MCP_SEARCH_MAX_CANDIDATE_PAGES: u16 = 16;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct SearchScoreAccum<'a> {
@@ -429,6 +430,7 @@ FORMAT JSONEachRow",
         min_should_match: u16,
         min_score: f64,
         limit: u16,
+        offset: u64,
     ) -> RepoResult<String> {
         if terms.is_empty() {
             return Err(RepoError::invalid_argument(
@@ -558,7 +560,10 @@ WHERE scope_s.session_id = {session_id}{scope_origin_filter}",
     WHERE state_key = 'global'
   ) AS projection_ready,
   (
-    SELECT toUInt8(count() = 0)
+    SELECT tuple(
+      toUInt8(countIf(dirty.dirty_revision > ifNull(published.dirty_revision, 0)) = 0),
+      toUInt64(ifNull(max(dirty.dirty_revision), 0))
+    )
     FROM (
       SELECT session_id, dirty_revision
       FROM {dirty_sessions_table} FINAL
@@ -567,8 +572,9 @@ WHERE scope_s.session_id = {session_id}{scope_origin_filter}",
       SELECT session_id, dirty_revision
       FROM {sessions_table} FINAL
     ) AS published ON published.session_id = dirty.session_id
-    WHERE dirty.dirty_revision > ifNull(published.dirty_revision, 0)
-  ) AS projection_clean,
+  ) AS projection_status,
+  tupleElement(projection_status, 1) AS projection_clean,
+  tupleElement(projection_status, 2) AS projection_revision,
   ({scope_state_sql}) AS scope_exists,
   term_postings AS (
     SELECT
@@ -617,7 +623,7 @@ WHERE scope_s.session_id = {session_id}{scope_origin_filter}",
     GROUP BY p.doc_id
     HAVING matched_terms >= {min_should_match} AND raw_score >= {min_score:.6}
     ORDER BY raw_score DESC, event_unix_ms DESC, event_uid ASC
-    LIMIT {limit}
+    LIMIT {limit} OFFSET {offset}
   )
 SELECT *
 FROM (
@@ -634,7 +640,8 @@ SELECT
   corpus_total_doc_len AS total_doc_len,
   scope_exists AS scope_exists,
   projection_ready AS projection_ready,
-  projection_clean AS projection_clean
+  projection_clean AS projection_clean,
+  projection_revision AS projection_revision
 FROM ranked
 UNION ALL
 SELECT
@@ -650,7 +657,8 @@ SELECT
   corpus_total_doc_len AS total_doc_len,
   scope_exists AS scope_exists,
   projection_ready AS projection_ready,
-  projection_clean AS projection_clean
+  projection_clean AS projection_clean,
+  projection_revision AS projection_revision
 )
 ORDER BY row_kind ASC, raw_score DESC, event_unix_ms DESC, event_uid ASC
 SETTINGS max_bytes_before_external_group_by = 67108864,
@@ -757,6 +765,7 @@ SELECT
   documents.doc_len AS doc_len,
   documents.text_preview AS text_preview,
   documents.text_content AS text_content,
+  hex(SHA256(projected_events.text_content)) AS text_content_digest,
   documents.payload_json AS payload_json,
   projected_events.event_type AS mcp_event_type,
   toFloat64(0) AS raw_score,
@@ -1414,72 +1423,112 @@ FORMAT JSONEachRow",
         min_score: f64,
         limit: u16,
     ) -> RepoResult<(Vec<SearchMcpEventRow>, u64, u64, bool)> {
-        let sql = self.build_search_mcp_events_sql(
-            terms,
-            event_types,
-            session_id,
-            turn_seq,
-            harness,
-            source_name,
-            min_should_match,
-            min_score,
-            limit,
-        )?;
-        let candidate_rows: Vec<SearchMcpCandidateRow> =
-            self.map_backend(self.query_rows(&sql, None).await)?;
-        let metadata = candidate_rows
-            .iter()
-            .find(|row| row.row_kind == 1)
+        let page_limit = limit.max(1);
+        let target_rows = usize::from(limit);
+        let mut offset = 0_u64;
+        let mut page_count = 0_u16;
+        let mut rows = Vec::<SearchMcpEventRow>::with_capacity(target_rows);
+        let mut snapshot = None::<(u64, u64, bool, u64)>;
+
+        loop {
+            if page_count >= MCP_SEARCH_MAX_CANDIDATE_PAGES {
+                return Err(RepoError::backend(
+                    "MCP search duplicate scan budget exhausted; narrow the query",
+                ));
+            }
+            page_count += 1;
+
+            let sql = self.build_search_mcp_events_sql(
+                terms,
+                event_types,
+                session_id,
+                turn_seq,
+                harness,
+                source_name,
+                min_should_match,
+                min_score,
+                page_limit,
+                offset,
+            )?;
+            let candidate_rows: Vec<SearchMcpCandidateRow> =
+                self.map_backend(self.query_rows(&sql, None).await)?;
+            let metadata = candidate_rows
+                .iter()
+                .find(|row| row.row_kind == 1)
+                .ok_or_else(|| RepoError::backend("MCP search candidate query omitted metadata"))?;
+            if metadata.projection_ready == 0 {
+                return Err(RepoError::backend(
+                    "MCP search read model is not ready; run `moraine db migrate`",
+                ));
+            }
+            if metadata.projection_clean == 0 {
+                return Err(RepoError::backend(
+                    "MCP search read model is catching up with ingest; retry the request",
+                ));
+            }
+
+            let page_snapshot = (
+                metadata.docs,
+                metadata.total_doc_len,
+                metadata.scope_exists != 0,
+                metadata.projection_revision,
+            );
+            match snapshot {
+                None => {
+                    self.cache_corpus_stats(page_snapshot.0, page_snapshot.1, Instant::now())
+                        .await;
+                    snapshot = Some(page_snapshot);
+                }
+                Some(expected) if expected != page_snapshot => {
+                    return Err(RepoError::backend(
+                        "MCP search snapshot changed while paging candidates; retry the request",
+                    ));
+                }
+                Some(_) => {}
+            }
+
+            let candidates = candidate_rows
+                .into_iter()
+                .filter(|row| row.row_kind == 0)
+                .collect::<Vec<_>>();
+            let candidate_count = candidates.len();
+            if candidates.is_empty() {
+                break;
+            }
+
+            let detail_sql = self.build_search_mcp_event_details_sql(&candidates)?;
+            let detail_rows: Vec<SearchMcpEventRow> =
+                self.map_backend(self.query_rows(&detail_sql, None).await)?;
+            let mut details_by_uid = detail_rows
+                .into_iter()
+                .map(|row| (row.event_uid.clone(), row))
+                .collect::<HashMap<_, _>>();
+
+            for candidate in candidates {
+                let Some(mut detail) = details_by_uid.remove(candidate.event_uid.as_str()) else {
+                    return Err(RepoError::backend(format!(
+                        "MCP search projection moved while hydrating event {}; retry the request",
+                        candidate.event_uid
+                    )));
+                };
+                detail.raw_score = candidate.raw_score;
+                detail.matched_terms = candidate.matched_terms;
+                // Ranking is defined by the candidate snapshot. Preserve its
+                // timestamp if the projection publishes between the two reads.
+                detail.event_unix_ms = candidate.event_unix_ms;
+                rows.push(detail);
+            }
+            Self::sort_search_mcp_event_rows(&mut rows);
+            rows = Self::dedupe_mcp_search_rows(rows, limit);
+
+            if rows.len() >= target_rows || candidate_count < usize::from(page_limit) {
+                break;
+            }
+            offset = offset.saturating_add(candidate_count as u64);
+        }
+
+        let (docs, total_doc_len, scope_exists, _) = snapshot
             .ok_or_else(|| RepoError::backend("MCP search candidate query omitted metadata"))?;
-        if metadata.projection_ready == 0 {
-            return Err(RepoError::backend(
-                "MCP search read model is not ready; run `moraine db migrate`",
-            ));
-        }
-        if metadata.projection_clean == 0 {
-            return Err(RepoError::backend(
-                "MCP search read model is catching up with ingest; retry the request",
-            ));
-        }
-
-        let docs = metadata.docs;
-        let total_doc_len = metadata.total_doc_len;
-        let scope_exists = metadata.scope_exists != 0;
-        self.cache_corpus_stats(docs, total_doc_len, Instant::now())
-            .await;
-
-        let candidates = candidate_rows
-            .into_iter()
-            .filter(|row| row.row_kind == 0)
-            .collect::<Vec<_>>();
-        if candidates.is_empty() {
-            return Ok((Vec::new(), docs, total_doc_len, scope_exists));
-        }
-
-        let detail_sql = self.build_search_mcp_event_details_sql(&candidates)?;
-        let detail_rows: Vec<SearchMcpEventRow> =
-            self.map_backend(self.query_rows(&detail_sql, None).await)?;
-        let mut details_by_uid = detail_rows
-            .into_iter()
-            .map(|row| (row.event_uid.clone(), row))
-            .collect::<HashMap<_, _>>();
-
-        let mut rows = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
-            let Some(mut detail) = details_by_uid.remove(candidate.event_uid.as_str()) else {
-                return Err(RepoError::backend(format!(
-                    "MCP search projection moved while hydrating event {}; retry the request",
-                    candidate.event_uid
-                )));
-            };
-            detail.raw_score = candidate.raw_score;
-            detail.matched_terms = candidate.matched_terms;
-            // Ranking is defined by the candidate snapshot. Preserve its
-            // timestamp if the projection publishes between the two reads.
-            detail.event_unix_ms = candidate.event_unix_ms;
-            rows.push(detail);
-        }
-        Self::sort_search_mcp_event_rows(&mut rows);
         Ok((rows, docs, total_doc_len, scope_exists))
     }
 
@@ -1490,6 +1539,56 @@ FORMAT JSONEachRow",
                 .then_with(|| b.event_unix_ms.cmp(&a.event_unix_ms))
                 .then_with(|| a.event_uid.cmp(&b.event_uid))
         });
+    }
+
+    pub(super) fn mcp_search_rows_are_equivalent(
+        a: &SearchMcpEventRow,
+        b: &SearchMcpEventRow,
+    ) -> bool {
+        let a_event_type = if a.mcp_event_type.is_empty() {
+            Self::mcp_event_type_for(&a.event_class, &a.payload_type, &a.actor_role)
+        } else {
+            McpEventType::from_normalized(&a.mcp_event_type)
+        };
+        let b_event_type = if b.mcp_event_type.is_empty() {
+            Self::mcp_event_type_for(&b.event_class, &b.payload_type, &b.actor_role)
+        } else {
+            McpEventType::from_normalized(&b.mcp_event_type)
+        };
+
+        a.session_id == b.session_id
+            && a.turn_seq == b.turn_seq
+            && a.event_unix_ms == b.event_unix_ms
+            && a_event_type == b_event_type
+            && if a.text_content_digest.is_empty() && b.text_content_digest.is_empty() {
+                a.text_content == b.text_content
+            } else {
+                a.text_content_digest == b.text_content_digest
+            }
+    }
+
+    pub(super) fn dedupe_mcp_search_rows(
+        rows: Vec<SearchMcpEventRow>,
+        limit: u16,
+    ) -> Vec<SearchMcpEventRow> {
+        let target = limit as usize;
+        let mut deduped = Vec::<SearchMcpEventRow>::with_capacity(rows.len().min(target));
+
+        for row in rows {
+            if deduped
+                .iter()
+                .any(|existing| Self::mcp_search_rows_are_equivalent(existing, &row))
+            {
+                continue;
+            }
+
+            deduped.push(row);
+            if deduped.len() >= target {
+                break;
+            }
+        }
+
+        deduped
     }
 
     pub(super) fn dedupe_fetch_limit(limit: u16) -> u16 {
@@ -2888,7 +2987,7 @@ FORMAT JSONEachRow",
         let requested_n_hits = query.n_hits.unwrap_or(10).max(1);
         let effective_n_hits = requested_n_hits.min(self.cfg.max_results);
         let limit_capped = requested_n_hits > effective_n_hits;
-        let fetch_limit = effective_n_hits.saturating_add(1);
+        let unique_fetch_limit = effective_n_hits.saturating_add(1);
 
         let min_should_match = query
             .min_should_match
@@ -2930,7 +3029,7 @@ FORMAT JSONEachRow",
                     query.source_name.as_deref(),
                     min_should_match,
                     min_score,
-                    fetch_limit,
+                    unique_fetch_limit,
                 )
                 .await?;
             let avgdl = if docs == 0 {
