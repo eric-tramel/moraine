@@ -734,6 +734,10 @@ async fn live_schema_semantics_and_teardown() -> Result<()> {
             generation: u64,
             dirty_revision: u64,
         }
+        #[derive(Deserialize)]
+        struct CountRow {
+            value: u64,
+        }
         let commentary_head_query = format!(
             "SELECT generation, dirty_revision \
              FROM `{}`.`mcp_open_sessions` FINAL \
@@ -770,6 +774,21 @@ async fn live_schema_semantics_and_teardown() -> Result<()> {
         clickhouse
             .request_text(
                 &format!(
+                    "INSERT INTO `{}`.`mcp_open_dirty_sessions` \
+                     (session_id, dirty_revision, observed_at) \
+                     VALUES ('', generateSnowflakeID(), now64(3))",
+                    database.as_str()
+                ),
+                None,
+                Some(database.as_str()),
+                false,
+                None,
+            )
+            .await
+            .context("failed to seed legacy blank-session dirty row")?;
+        clickhouse
+            .request_text(
+                &format!(
                     "INSERT INTO `{}`.`mcp_open_projection_state` \
                      (state_key, ready, generation, backfill_cursor) \
                      VALUES ('global', 0, generateSnowflakeID(), '')",
@@ -782,10 +801,12 @@ async fn live_schema_semantics_and_teardown() -> Result<()> {
             )
             .await
             .context("failed to reset MCP open projection state")?;
-        clickhouse
-            .backfill_mcp_open_read_model()
-            .await
-            .context("failed to rebuild reset MCP open projections")?;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            clickhouse.backfill_mcp_open_read_model(),
+        )
+        .await
+        .context("reset MCP open projection did not bypass blank dirty session")??;
         let after_reset = clickhouse
             .query_rows::<ProjectionRevisionRow>(
                 &commentary_head_query,
@@ -799,6 +820,22 @@ async fn live_schema_semantics_and_teardown() -> Result<()> {
         assert!(after_reset.generation > before_reset.generation);
         assert!(after_reset.dirty_revision > before_reset.dirty_revision);
         assert!(clickhouse.mcp_open_read_model_ready().await?);
+        let blank_projection_count = clickhouse
+            .query_rows::<CountRow>(
+                &format!(
+                    "SELECT count() AS value FROM `{}`.`mcp_open_sessions` FINAL \
+                     WHERE session_id = '' FORMAT JSONEachRow",
+                    database.as_str()
+                ),
+                Some(database.as_str()),
+            )
+            .await
+            .context("failed to count blank MCP open projections")?
+            .into_iter()
+            .next()
+            .context("blank MCP open projection count missing")?
+            .value;
+        assert_eq!(blank_projection_count, 0);
         let rebuilt_commentary_turn = repository
             .get_mcp_turn("issue549-commentary-session", 1)
             .await
