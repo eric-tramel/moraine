@@ -883,6 +883,10 @@ async fn search_mcp_events_deduplicates_before_limit_and_reports_truncation() {
     assert_eq!(result.hits.len(), 2);
     assert_eq!(result.hits[0].event_uid, "evt-c-42");
     assert_eq!(result.hits[1].event_uid, "evt-a-11");
+    assert!(result
+        .hits
+        .iter()
+        .all(|hit| hit.event_uid != "evt-c-duplicate"));
     assert!(result.truncated);
     assert!(result.stats.truncated);
     assert_eq!(result.stats.effective_n_hits, 2);
@@ -902,6 +906,13 @@ async fn search_mcp_events_deduplicates_before_limit_and_reports_truncation() {
     assert!(queries.iter().any(|query| {
         query.contains("hex(SHA256(projected_events.text_content)) AS text_content_digest")
     }));
+    assert!(queries.iter().any(|query| {
+        query.contains("JSONExtractString(document.payload_json, 'phase')")
+            && query.contains("AS payload_phase")
+    }));
+    assert!(queries
+        .iter()
+        .any(|query| { query.contains("documents AS (") && query.contains("'evt-b-9'") }));
 }
 
 #[tokio::test(flavor = "multi_thread")]

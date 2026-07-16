@@ -367,6 +367,8 @@ pub(super) struct SearchMcpEventRow {
     pub(super) actor_role: String,
     pub(super) name: String,
     pub(super) phase: String,
+    #[serde(default)]
+    pub(super) payload_phase: String,
     pub(super) source_ref: String,
     pub(super) doc_len: u32,
     pub(super) text_preview: String,
