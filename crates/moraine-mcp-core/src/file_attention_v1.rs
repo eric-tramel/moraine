@@ -17,8 +17,7 @@ use super::{
 use crate::contract::{
     format_rfc3339_utc_millis, CanonicalFileAttentionArgs, ContractError, FileAttentionArgs,
     FileAttentionGranularity, FileAttentionScope, McpEventId, McpSessionId, McpTurnId, Performance,
-    ToolEnvelope, ToolErrorCode, ToolErrorEnvelope, FILE_ATTENTION_BROAD_SLA_TARGET_MS,
-    FILE_ATTENTION_DEADLINE_MS, FILE_ATTENTION_DEFAULT_SLA_TARGET_MS,
+    ToolEnvelope, ToolErrorCode, ToolErrorEnvelope, FILE_ATTENTION_DEADLINE_MS,
     FILE_ATTENTION_MIN_TAIL_SEGMENTS, FILE_ATTENTION_TOOL,
 };
 use anyhow::{Context, Result};
@@ -37,7 +36,7 @@ const FILE_ATTENTION_SCAN_CAP: usize = 2_000;
 
 impl AppState {
     pub(crate) async fn file_attention_v1(&self, arguments: Value) -> Result<Value> {
-        let perf = request_performance(FILE_ATTENTION_DEFAULT_SLA_TARGET_MS);
+        let perf = request_performance();
         let raw_request = arguments.clone();
 
         let args = match parse_file_attention_args(arguments, self.cfg.mcp.max_results) {
@@ -45,11 +44,6 @@ impl AppState {
             Err(error) => return encode_error(raw_request, error, perf.finish()),
         };
         let canonical_request = canonical_request_json(&args);
-
-        // The Tier-0 plan still scans `tool_io` by path even when datetime
-        // bounds are present, so report against the broad target until a future
-        // indexed path/time plan can make windowed requests truly narrow.
-        let perf = perf.with_sla_target(FILE_ATTENTION_BROAD_SLA_TARGET_MS);
 
         let mut warnings: Vec<String> = Vec::new();
         let tail = resolve_tail_from(&args.path, self.launch_dir.as_deref());
@@ -911,7 +905,7 @@ mod tests {
                 ToolErrorCode::DeadlineExceeded,
                 "file_attention exceeded its response deadline",
             ),
-            Performance::builder(FILE_ATTENTION_DEFAULT_SLA_TARGET_MS).finish(),
+            Performance::builder().finish(),
         )
         .expect("deadline response");
 

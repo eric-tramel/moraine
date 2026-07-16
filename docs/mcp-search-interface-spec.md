@@ -8,7 +8,7 @@ This document specifies the desired behavior for Moraine's MCP retrieval tools:
 - `file_attention`
 
 The scope of this document is the external interface contract: accepted inputs,
-output shapes, response behavior, errors, performance targets, and success
+output shapes, response behavior, errors, performance reporting, and success
 criteria. It intentionally does not specify storage layout, indexing strategy,
 query planning, or implementation internals.
 
@@ -137,9 +137,7 @@ shape:
   "data": {},
   "warnings": [],
   "performance": {
-    "elapsed_ms": 42,
-    "sla_target_ms": 750,
-    "met_sla": true
+    "elapsed_ms": 42
   }
 }
 ```
@@ -152,8 +150,6 @@ Field rules:
 - `data` contains the tool-specific payload.
 - `warnings` is always present and is an array.
 - `performance.elapsed_ms` is the measured end-to-end tool handling time.
-- `performance.sla_target_ms` is the target that applied to this request.
-- `performance.met_sla` indicates whether the request met its target.
 
 ### Error Envelope
 
@@ -176,9 +172,7 @@ in `structuredContent`.
   },
   "warnings": [],
   "performance": {
-    "elapsed_ms": 3,
-    "sla_target_ms": 750,
-    "met_sla": true
+    "elapsed_ms": 3
   }
 }
 ```
@@ -392,9 +386,7 @@ should not compare scores across different queries.
   },
   "warnings": [],
   "performance": {
-    "elapsed_ms": 64,
-    "sla_target_ms": 750,
-    "met_sla": true
+    "elapsed_ms": 64
   }
 }
 ```
@@ -573,9 +565,7 @@ Response:
   },
   "warnings": [],
   "performance": {
-    "elapsed_ms": 64,
-    "sla_target_ms": 750,
-    "met_sla": true
+    "elapsed_ms": 64
   }
 }
 ```
@@ -649,9 +639,7 @@ Response:
   },
   "warnings": [],
   "performance": {
-    "elapsed_ms": 18,
-    "sla_target_ms": 300,
-    "met_sla": true
+    "elapsed_ms": 18
   }
 }
 ```
@@ -687,9 +675,7 @@ Response:
   },
   "warnings": [],
   "performance": {
-    "elapsed_ms": 21,
-    "sla_target_ms": 750,
-    "met_sla": true
+    "elapsed_ms": 21
   }
 }
 ```
@@ -714,9 +700,7 @@ Blank query:
   },
   "warnings": [],
   "performance": {
-    "elapsed_ms": 2,
-    "sla_target_ms": 750,
-    "met_sla": true
+    "elapsed_ms": 2
   }
 }
 ```
@@ -750,9 +734,7 @@ Unsupported event type:
   },
   "warnings": [],
   "performance": {
-    "elapsed_ms": 2,
-    "sla_target_ms": 750,
-    "met_sla": true
+    "elapsed_ms": 2
   }
 }
 ```
@@ -835,9 +817,7 @@ session metadata only:
   },
   "warnings": [],
   "performance": {
-    "elapsed_ms": 42,
-    "sla_target_ms": 300,
-    "met_sla": true
+    "elapsed_ms": 42
   }
 }
 ```
@@ -972,9 +952,7 @@ root buckets, and either session rollups or a flat event timeline:
   },
   "warnings": [],
   "performance": {
-    "elapsed_ms": 90,
-    "sla_target_ms": 1200,
-    "met_sla": true
+    "elapsed_ms": 90
   }
 }
 ```
@@ -1042,9 +1020,7 @@ All successful `open` responses use this envelope:
   },
   "warnings": [],
   "performance": {
-    "elapsed_ms": 32,
-    "sla_target_ms": 500,
-    "met_sla": true
+    "elapsed_ms": 32
   }
 }
 ```
@@ -1207,9 +1183,7 @@ Example:
   },
   "warnings": [],
   "performance": {
-    "elapsed_ms": 32,
-    "sla_target_ms": 500,
-    "met_sla": true
+    "elapsed_ms": 32
   }
 }
 ```
@@ -1374,9 +1348,7 @@ Complete turn example:
   },
   "warnings": [],
   "performance": {
-    "elapsed_ms": 19,
-    "sla_target_ms": 300,
-    "met_sla": true
+    "elapsed_ms": 19
   }
 }
 ```
@@ -1451,9 +1423,7 @@ Incomplete turn example:
   },
   "warnings": [],
   "performance": {
-    "elapsed_ms": 16,
-    "sla_target_ms": 300,
-    "met_sla": true
+    "elapsed_ms": 16
   }
 }
 ```
@@ -1558,9 +1528,7 @@ User input event example:
   },
   "warnings": [],
   "performance": {
-    "elapsed_ms": 9,
-    "sla_target_ms": 200,
-    "met_sla": true
+    "elapsed_ms": 9
   }
 }
 ```
@@ -1619,9 +1587,7 @@ Tool call event example:
   },
   "warnings": [],
   "performance": {
-    "elapsed_ms": 8,
-    "sla_target_ms": 200,
-    "met_sla": true
+    "elapsed_ms": 8
   }
 }
 ```
@@ -1677,9 +1643,7 @@ Tool response event example:
   },
   "warnings": [],
   "performance": {
-    "elapsed_ms": 10,
-    "sla_target_ms": 200,
-    "met_sla": true
+    "elapsed_ms": 10
   }
 }
 ```
@@ -1733,9 +1697,7 @@ Assistant response event example:
   },
   "warnings": [],
   "performance": {
-    "elapsed_ms": 9,
-    "sla_target_ms": 200,
-    "met_sla": true
+    "elapsed_ms": 9
   }
 }
 ```
@@ -1760,9 +1722,7 @@ Malformed ID:
   },
   "warnings": [],
   "performance": {
-    "elapsed_ms": 1,
-    "sla_target_ms": 200,
-    "met_sla": true
+    "elapsed_ms": 1
   }
 }
 ```
@@ -1785,9 +1745,7 @@ Missing object:
   },
   "warnings": [],
   "performance": {
-    "elapsed_ms": 4,
-    "sla_target_ms": 200,
-    "met_sla": true
+    "elapsed_ms": 4
   }
 }
 ```
@@ -1886,96 +1844,19 @@ Required traversal paths:
 
 Null traversal references are valid at boundaries.
 
-## Performance SLA
+## Performance Reporting
 
-These targets define what success looks like for local MCP use. They are
-measured from MCP tool invocation receipt to completed tool response
-serialization.
+Tool responses report the observed end-to-end handling time in
+`performance.elapsed_ms`. Moraine does not advertise a fixed latency target or
+classify individual responses as meeting an SLA: query cost varies with the
+amount of stored session data, request scope, event payload size, hardware, and
+concurrent work.
 
-### Definitions
-
-- `N` is the number of searchable documents visible to the request.
-- One searchable document is one event eligible for `search_sessions`.
-- Warm path means Moraine is already running and the relevant data has been
-  ingested.
-- Cold process startup is outside this SLA.
-- Extremely large event payload serialization is measured separately for
-  `open(event)`.
-
-### `search_sessions` Targets
-
-For default event types and `n_hits <= 10`:
-
-| Searchable documents | P50 | P95 | P99 |
-|---:|---:|---:|---:|
-| 100k | <= 250 ms | <= 750 ms | <= 1500 ms |
-| 500k | <= 500 ms | <= 1500 ms | <= 3000 ms |
-| 1M | <= 800 ms | <= 2500 ms | <= 5000 ms |
-
-For constrained search with `within_id=turn`:
-
-| Scope | P50 | P95 | P99 |
-|---|---:|---:|---:|
-| Any single turn with <= 500 events | <= 50 ms | <= 300 ms | <= 750 ms |
-
-For constrained search with `within_id=session`:
-
-| Scope | P50 | P95 | P99 |
-|---|---:|---:|---:|
-| Any single session with <= 250 turns | <= 100 ms | <= 500 ms | <= 1000 ms |
-
-Deadline:
-
-- `search_sessions` should return a response or `deadline_exceeded` within
-  5 seconds for warm-path requests up to 1M searchable documents.
-
-### `list_sessions` Targets
-
-For metadata-only requests with `limit <= 50`:
-
-| Scenario | P50 | P95 | P99 | Deadline |
-|---|---:|---:|---:|---:|
-| Typical window, <= 5k matching sessions | <= 50 ms | <= 300 ms | <= 750 ms | 2 s |
-| Broad window, <= 100k matching sessions | <= 200 ms | <= 1000 ms | <= 2000 ms | 3 s |
-| Single-mode filtered window, <= 100k matching sessions | <= 250 ms | <= 1200 ms | <= 2500 ms | 3 s |
-
-`list_sessions` should use session metadata or summary tables, avoid event text
-search, always enforce `limit`, and return a normal response or
-`deadline_exceeded` by the applicable deadline.
-
-The response `performance.sla_target_ms` advertises the applicable target:
-300 ms for typical metadata browse requests, 1000 ms for broad unfiltered
-windows, and 1200 ms for broad single-mode filtered windows.
-
-### `file_attention` Targets
-
-For file-attention requests with `limit <= 50`:
-
-| Scenario | P50 | P95 | P99 | Deadline |
-|---|---:|---:|---:|---:|
-| Specific repo-relative tail | <= 150 ms | <= 600 ms | <= 1200 ms | 4 s |
-| Broad or generic tail | <= 300 ms | <= 1200 ms | <= 2500 ms | 4 s |
-
-`file_attention` should bound ClickHouse execution with a per-query execution
-setting and query ID. If the MCP deadline fires, it should return
-`deadline_exceeded` and attempt to cancel the backend query by that ID.
-
-### `open` Targets
-
-| Request | P50 | P95 | P99 |
-|---|---:|---:|---:|
-| `open(event)` with payload <= 64 KiB | <= 25 ms | <= 200 ms | <= 500 ms |
-| `open(turn)` with <= 100 events | <= 50 ms | <= 300 ms | <= 750 ms |
-| `open(session)` with <= 100 turns | <= 100 ms | <= 500 ms | <= 1000 ms |
-| `open(session)` with <= 1000 turns | <= 250 ms | <= 1500 ms | <= 3000 ms |
-
-Large payload note:
-
-- `open(event)` must return full event content.
-- For event payloads over 64 KiB, latency may scale with serialized payload
-  size.
-- Large payload responses should still report `performance.elapsed_ms` and
-  `performance.met_sla` against the applicable target.
+The `list_sessions` and `file_attention` implementations retain bounded
+execution deadlines for resource safety. A deadline failure returns the
+`deadline_exceeded` error code; these safety limits are not latency guarantees.
+`open(event)` always returns full event content, so its elapsed time can scale
+with the serialized payload size.
 
 ## Success Criteria
 
@@ -2000,7 +1881,6 @@ An implementation is successful when:
 - Every hit includes event, turn, and session IDs that can be opened.
 - Snippets are compact and never substitute for full event content.
 - Empty result sets return success with `results: []`.
-- Performance meets the `search_sessions` SLA for the target corpus sizes.
 
 ### `list_sessions`
 
@@ -2018,7 +1898,6 @@ An implementation is successful when:
   or transcript text.
 - Invalid ranges, unknown fields, bad cursors, invalid modes, and invalid sort
   values produce the specified errors.
-- Performance meets the `list_sessions` SLA for target corpus sizes.
 
 ### `file_attention`
 
@@ -2043,7 +1922,6 @@ An implementation is successful when:
   without treating remote URLs or prose mentions as local file touches.
 - Display truncation and scan-cap truncation are visible to generic clients via
   `data.truncated`.
-- Performance meets the `file_attention` SLA for target corpus sizes.
 
 ### `open`
 
@@ -2060,7 +1938,6 @@ An implementation is successful when:
 - Tool names are surfaced for tool call and tool response events.
 - Incomplete turns are represented without inventing final responses.
 - Missing or malformed IDs produce the specified errors.
-- Performance meets the `open` SLA for the target object sizes.
 
 ### End-To-End Discovery
 

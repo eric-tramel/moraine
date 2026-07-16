@@ -11,9 +11,6 @@ use moraine_conversations::{
 use serde_json::{json, Map, Value};
 use std::time::Instant;
 
-const OPEN_EVENT_SLA_TARGET_MS: u64 = 500;
-const OPEN_TURN_SLA_TARGET_MS: u64 = 750;
-const OPEN_SESSION_SLA_TARGET_MS: u64 = 1_000;
 const SUMMARY_PREVIEW_CHARS: usize = 240;
 
 impl AppState {
@@ -32,7 +29,6 @@ impl AppState {
                         details: Some(json!({ "field": "id" })),
                     },
                     started_at,
-                    OPEN_EVENT_SLA_TARGET_MS,
                 );
             }
         };
@@ -40,29 +36,22 @@ impl AppState {
         let canonical = match args.validate() {
             Ok(canonical) => canonical,
             Err(err) => {
-                return contract_error_tool_response(
-                    raw_request,
-                    err,
-                    started_at,
-                    OPEN_EVENT_SLA_TARGET_MS,
-                );
+                return contract_error_tool_response(raw_request, err, started_at);
             }
         };
 
-        let sla_target_ms = open_sla_target_ms(&canonical.id);
         let request = request_for_id(&canonical.id);
 
         match &canonical.id {
             McpId::Session(id) => match self.repo.get_mcp_session(id.raw_session_id()).await {
                 Ok(Some(session)) => match open_session_data(&session) {
                     Ok((data, warnings)) => {
-                        success_tool_response(request, data, warnings, started_at, sla_target_ms)
+                        success_tool_response(request, data, warnings, started_at)
                     }
                     Err(err) => internal_error_tool_response(
                         request,
                         format!("failed to shape session open response: {err:#}"),
                         started_at,
-                        sla_target_ms,
                     ),
                 },
                 Ok(None) => not_found_tool_response(
@@ -70,26 +59,20 @@ impl AppState {
                     McpEntityKind::Session,
                     &canonical.id.to_string(),
                     started_at,
-                    sla_target_ms,
                 ),
-                Err(err) => repo_error_tool_response(request, err, started_at, sla_target_ms),
+                Err(err) => repo_error_tool_response(request, err, started_at),
             },
             McpId::Turn(id) => {
                 let (session_id, turn_seq) = id.decode();
                 match self.repo.get_mcp_turn(session_id, turn_seq).await {
                     Ok(Some(turn)) => match open_turn_data(&turn) {
-                        Ok((data, warnings)) => success_tool_response(
-                            request,
-                            data,
-                            warnings,
-                            started_at,
-                            sla_target_ms,
-                        ),
+                        Ok((data, warnings)) => {
+                            success_tool_response(request, data, warnings, started_at)
+                        }
                         Err(err) => internal_error_tool_response(
                             request,
                             format!("failed to shape turn open response: {err:#}"),
                             started_at,
-                            sla_target_ms,
                         ),
                     },
                     Ok(None) => not_found_tool_response(
@@ -97,21 +80,19 @@ impl AppState {
                         McpEntityKind::Turn,
                         &canonical.id.to_string(),
                         started_at,
-                        sla_target_ms,
                     ),
-                    Err(err) => repo_error_tool_response(request, err, started_at, sla_target_ms),
+                    Err(err) => repo_error_tool_response(request, err, started_at),
                 }
             }
             McpId::Event(id) => match self.repo.get_mcp_event(id.raw_event_uid()).await {
                 Ok(Some(event)) => match open_event_data(&event, None) {
                     Ok((data, warnings)) => {
-                        success_tool_response(request, data, warnings, started_at, sla_target_ms)
+                        success_tool_response(request, data, warnings, started_at)
                     }
                     Err(err) => internal_error_tool_response(
                         request,
                         format!("failed to shape event open response: {err:#}"),
                         started_at,
-                        sla_target_ms,
                     ),
                 },
                 Ok(None) => not_found_tool_response(
@@ -119,19 +100,10 @@ impl AppState {
                     McpEntityKind::Event,
                     &canonical.id.to_string(),
                     started_at,
-                    sla_target_ms,
                 ),
-                Err(err) => repo_error_tool_response(request, err, started_at, sla_target_ms),
+                Err(err) => repo_error_tool_response(request, err, started_at),
             },
         }
-    }
-}
-
-fn open_sla_target_ms(id: &McpId) -> u64 {
-    match id.kind() {
-        McpEntityKind::Session => OPEN_SESSION_SLA_TARGET_MS,
-        McpEntityKind::Turn => OPEN_TURN_SLA_TARGET_MS,
-        McpEntityKind::Event => OPEN_EVENT_SLA_TARGET_MS,
     }
 }
 
@@ -155,9 +127,8 @@ fn success_tool_response(
     data: Value,
     warnings: Vec<String>,
     started_at: Instant,
-    sla_target_ms: u64,
 ) -> Result<Value> {
-    let performance = Performance::from_elapsed(started_at.elapsed(), sla_target_ms);
+    let performance = Performance::from_elapsed(started_at.elapsed());
     let envelope =
         ToolEnvelope::success(OPEN_TOOL, request, data, performance).with_warnings(warnings);
     let payload = serde_json::to_value(envelope).context("failed to encode open envelope")?;
@@ -168,7 +139,6 @@ fn contract_error_tool_response(
     request: Value,
     error: ContractError,
     started_at: Instant,
-    sla_target_ms: u64,
 ) -> Result<Value> {
     let details = error
         .details()
@@ -182,7 +152,6 @@ fn contract_error_tool_response(
             details,
         },
         started_at,
-        sla_target_ms,
     )
 }
 
@@ -191,7 +160,6 @@ fn not_found_tool_response(
     kind: McpEntityKind,
     id: &str,
     started_at: Instant,
-    sla_target_ms: u64,
 ) -> Result<Value> {
     error_tool_response(
         request,
@@ -201,7 +169,6 @@ fn not_found_tool_response(
             details: Some(json!({ "id": id })),
         },
         started_at,
-        sla_target_ms,
     )
 }
 
@@ -209,7 +176,6 @@ fn repo_error_tool_response(
     request: Value,
     error: moraine_conversations::RepoError,
     started_at: Instant,
-    sla_target_ms: u64,
 ) -> Result<Value> {
     error_tool_response(
         request,
@@ -219,7 +185,6 @@ fn repo_error_tool_response(
             details: None,
         },
         started_at,
-        sla_target_ms,
     )
 }
 
@@ -227,7 +192,6 @@ fn internal_error_tool_response(
     request: Value,
     message: String,
     started_at: Instant,
-    sla_target_ms: u64,
 ) -> Result<Value> {
     error_tool_response(
         request,
@@ -237,17 +201,11 @@ fn internal_error_tool_response(
             details: None,
         },
         started_at,
-        sla_target_ms,
     )
 }
 
-fn error_tool_response(
-    request: Value,
-    error: ToolError,
-    started_at: Instant,
-    sla_target_ms: u64,
-) -> Result<Value> {
-    let performance = Performance::from_elapsed(started_at.elapsed(), sla_target_ms);
+fn error_tool_response(request: Value, error: ToolError, started_at: Instant) -> Result<Value> {
+    let performance = Performance::from_elapsed(started_at.elapsed());
     let envelope = ToolErrorEnvelope::error(OPEN_TOOL, request, error, performance);
     let payload = serde_json::to_value(envelope).context("failed to encode open error envelope")?;
     Ok(handled_tool_error_result(
@@ -919,7 +877,6 @@ mod tests {
                 details: Some(json!({ "field": "id" })),
             },
             Instant::now(),
-            OPEN_EVENT_SLA_TARGET_MS,
         )
         .expect("error response");
 

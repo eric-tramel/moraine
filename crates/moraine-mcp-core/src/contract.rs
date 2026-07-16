@@ -22,20 +22,13 @@ pub const SEARCH_SESSIONS_DEFAULT_N_HITS: u16 = 10;
 pub const SEARCH_SESSIONS_MIN_N_HITS: u16 = 1;
 pub const SEARCH_SESSIONS_MAX_N_HITS: u16 = 50;
 pub const SEARCH_SESSIONS_MAX_QUERY_CHARS: usize = 4096;
-pub const SEARCH_SESSIONS_SLA_TARGET_MS: u64 = 750;
-pub const OPEN_SLA_TARGET_MS: u64 = 500;
 pub const LIST_SESSIONS_DEFAULT_LIMIT: u16 = 20;
 pub const LIST_SESSIONS_MIN_LIMIT: u16 = 1;
-pub const LIST_SESSIONS_DEFAULT_SLA_TARGET_MS: u64 = 300;
-pub const LIST_SESSIONS_BROAD_SLA_TARGET_MS: u64 = 1_000;
-pub const LIST_SESSIONS_FILTERED_BROAD_SLA_TARGET_MS: u64 = 1_200;
 pub const LIST_SESSIONS_DEADLINE_MS: u64 = 3_000;
 pub const FILE_ATTENTION_TOOL: &str = "file_attention";
 pub const FILE_ATTENTION_SCHEMA_VERSION: &str = "moraine.mcp.file_attention.v1";
 pub const FILE_ATTENTION_MIN_LIMIT: u16 = 1;
 pub const FILE_ATTENTION_DEFAULT_LIMIT: u16 = 50;
-pub const FILE_ATTENTION_DEFAULT_SLA_TARGET_MS: u64 = 600;
-pub const FILE_ATTENTION_BROAD_SLA_TARGET_MS: u64 = 1_200;
 pub const FILE_ATTENTION_DEADLINE_MS: u64 = 4_000;
 /// Minimum number of non-empty, slash-separated segments a path tail must have
 /// before it is treated as specific enough to suffix-match without a
@@ -1031,62 +1024,36 @@ impl From<ContractError> for ToolError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Performance {
     pub elapsed_ms: u64,
-    pub sla_target_ms: u64,
-    pub met_sla: bool,
 }
 
 impl Performance {
-    pub fn from_elapsed_ms(elapsed_ms: u64, sla_target_ms: u64) -> Self {
-        Self {
-            elapsed_ms,
-            sla_target_ms,
-            met_sla: elapsed_ms <= sla_target_ms,
+    pub fn from_elapsed_ms(elapsed_ms: u64) -> Self {
+        Self { elapsed_ms }
+    }
+
+    pub fn from_elapsed(elapsed: Duration) -> Self {
+        Self::from_elapsed_ms(duration_millis_u64(elapsed))
+    }
+
+    pub fn builder() -> PerformanceBuilder {
+        PerformanceBuilder {
+            started_at: Instant::now(),
         }
     }
 
-    pub fn from_elapsed(elapsed: Duration, sla_target_ms: u64) -> Self {
-        Self::from_elapsed_ms(duration_millis_u64(elapsed), sla_target_ms)
-    }
-
-    pub fn builder(sla_target_ms: u64) -> PerformanceBuilder {
-        PerformanceBuilder::new(sla_target_ms)
-    }
-
-    pub(crate) fn builder_from(started_at: Instant, sla_target_ms: u64) -> PerformanceBuilder {
-        PerformanceBuilder::from_started_at(started_at, sla_target_ms)
+    pub(crate) fn builder_from(started_at: Instant) -> PerformanceBuilder {
+        PerformanceBuilder { started_at }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct PerformanceBuilder {
     started_at: Instant,
-    sla_target_ms: u64,
 }
 
 impl PerformanceBuilder {
-    pub fn new(sla_target_ms: u64) -> Self {
-        Self {
-            started_at: Instant::now(),
-            sla_target_ms,
-        }
-    }
-
-    fn from_started_at(started_at: Instant, sla_target_ms: u64) -> Self {
-        Self {
-            started_at,
-            sla_target_ms,
-        }
-    }
-
     pub fn finish(&self) -> Performance {
-        Performance::from_elapsed(self.started_at.elapsed(), self.sla_target_ms)
-    }
-
-    pub fn with_sla_target(&self, sla_target_ms: u64) -> Self {
-        Self {
-            started_at: self.started_at,
-            sla_target_ms,
-        }
+        Performance::from_elapsed(self.started_at.elapsed())
     }
 }
 
@@ -1771,7 +1738,7 @@ mod tests {
 
     #[test]
     fn success_and_error_envelopes_have_contract_shape() {
-        let performance = Performance::from_elapsed_ms(64, SEARCH_SESSIONS_SLA_TARGET_MS);
+        let performance = Performance::from_elapsed_ms(64);
         let success = ToolEnvelope::success(
             SEARCH_SESSIONS_TOOL,
             json!({
@@ -1808,9 +1775,7 @@ mod tests {
                 },
                 "warnings": [],
                 "performance": {
-                    "elapsed_ms": 64,
-                    "sla_target_ms": 750,
-                    "met_sla": true
+                    "elapsed_ms": 64
                 }
             })
         );
@@ -1824,7 +1789,7 @@ mod tests {
             SEARCH_SESSIONS_TOOL,
             json!({ "query": "   " }),
             error,
-            Performance::from_elapsed_ms(2, SEARCH_SESSIONS_SLA_TARGET_MS),
+            Performance::from_elapsed_ms(2),
         );
 
         assert_eq!(
@@ -1844,9 +1809,7 @@ mod tests {
                 },
                 "warnings": [],
                 "performance": {
-                    "elapsed_ms": 2,
-                    "sla_target_ms": 750,
-                    "met_sla": true
+                    "elapsed_ms": 2
                 }
             })
         );
@@ -1855,14 +1818,9 @@ mod tests {
     #[test]
     fn performance_and_time_helpers_follow_contract() {
         assert_eq!(
-            Performance::from_elapsed_ms(500, OPEN_SLA_TARGET_MS),
-            Performance {
-                elapsed_ms: 500,
-                sla_target_ms: 500,
-                met_sla: true
-            }
+            Performance::from_elapsed_ms(500),
+            Performance { elapsed_ms: 500 }
         );
-        assert!(!Performance::from_elapsed_ms(501, OPEN_SLA_TARGET_MS).met_sla);
         assert_eq!(format_rfc3339_utc_millis(0), "1970-01-01T00:00:00.000Z");
         assert_eq!(
             format_rfc3339_utc_millis(1_777_488_751_125),
