@@ -273,11 +273,11 @@ tokio::task_local! {
     static REQUEST_ACCEPTED_AT: std::time::Instant;
 }
 
-pub(crate) fn request_performance(sla_target_ms: u64) -> contract::PerformanceBuilder {
+pub(crate) fn request_performance() -> contract::PerformanceBuilder {
     let started_at = REQUEST_ACCEPTED_AT
         .try_with(|started_at| *started_at)
         .unwrap_or_else(|_| std::time::Instant::now());
-    contract::Performance::builder_from(started_at, sla_target_ms)
+    contract::Performance::builder_from(started_at)
 }
 
 pub(crate) fn request_started_at() -> std::time::Instant {
@@ -1269,7 +1269,7 @@ fn admission_error_response(
         tool.name.clone(),
         tool.request.clone(),
         error,
-        contract::Performance::from_elapsed(accepted_at.elapsed(), deadline_ms),
+        contract::Performance::from_elapsed(accepted_at.elapsed()),
     ))
     .expect("MCP admission error envelope is serializable");
     rpc_ok(

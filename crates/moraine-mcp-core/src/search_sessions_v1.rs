@@ -5,7 +5,7 @@ use super::{
 use crate::contract::{
     format_rfc3339_utc_millis, CanonicalSearchSessionsArgs, ContractError, McpEventId, McpId,
     McpSessionId, McpTurnId, Performance, SearchSessionsArgs, ToolEnvelope, ToolErrorCode,
-    ToolErrorEnvelope, SEARCH_SESSIONS_SLA_TARGET_MS, SEARCH_SESSIONS_TOOL,
+    ToolErrorEnvelope, SEARCH_SESSIONS_TOOL,
 };
 use anyhow::{Context, Result};
 use moraine_conversations::{
@@ -18,7 +18,7 @@ const MAX_SNIPPET_CHARS: usize = 600;
 
 impl AppState {
     pub(crate) async fn search_sessions_v1(&self, arguments: Value) -> Result<Value> {
-        let perf = request_performance(SEARCH_SESSIONS_SLA_TARGET_MS);
+        let perf = request_performance();
         let raw_request = arguments.clone();
 
         let args = match parse_search_sessions_args(arguments) {
