@@ -72,20 +72,20 @@ pub struct FileAttentionQuery {
     /// Opaque cancellation token assigned by the caller so timed-out requests
     /// can cancel in-flight backend work.
     pub cancellation_token: String,
-    /// Repo-relative tail to suffix-match against captured file paths. The tail
+    /// Project-relative tail to suffix-match against captured file paths. The tail
     /// is what unifies the same logical file across worktree roots.
     pub rel: String,
     /// Canonical request-project identity used by both exact and fallback
-    /// lookup. It is an opaque digest of the Git common directory, so linked
-    /// worktrees agree while unrelated repositories sharing one backend do not.
+    /// lookup. Git projects digest the common directory so linked worktrees
+    /// agree; non-Git projects digest the exact canonical launch directory.
     /// `None` keeps project-scoped queries closed; only an explicit unscoped
     /// query may omit this boundary.
     pub normalized_project_id: Option<String>,
-    /// Canonical registered roots for the request repository. These safely
+    /// Canonical registered roots for the request project. These safely
     /// admit rows written with the pre-digest project identity during the
     /// transition without widening to another repository sharing the backend.
     pub normalized_project_roots: Vec<String>,
-    /// Whether the request path was proven to be one repository-relative file
+    /// Whether the request path was proven to be one project-relative file
     /// and may therefore use structured legacy path/cwd evidence to recover a
     /// missing normalized root.
     pub derive_legacy_roots: bool,

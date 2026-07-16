@@ -861,18 +861,20 @@ Rules:
 
 - `path` is required and must name a file path string. Leading/trailing
   whitespace, `file://` URIs, and directory-style trailing slashes are invalid.
-- Absolute paths are reduced to a repo-relative tail by walking up to
-  `.moraine.toml` or `.git`. Relative paths are resolved from the client's MCP
-  launch directory, including through a central-server route, so missing files
-  still retain launch-project provenance. A plain Git checkout establishes
-  project identity; `.moraine.toml` independently selects a backend and is not
-  required. Compound shell text and multi-path
+- Absolute paths are reduced to a project-relative tail using the nearest Git
+  boundary or exact containment beneath a non-Git launch directory. Relative
+  paths are resolved from the client's MCP launch directory, including through
+  a central-server route, so missing files still retain launch-project
+  provenance. Git common-directory metadata unifies linked worktrees; without
+  Git metadata, the canonical launch directory is the identity and different
+  launch subdirectories remain separate. `.moraine.toml` independently selects
+  a backend and is not required. Compound shell text and multi-path
   captures are not interpreted as one path or root; unprovable roots remain
   `unknown`.
 - `scope` is `project` or `all`. `project` independently restricts normalized
-  and legacy fallback lookup to the launch repository's canonical
-  Git-common-directory identity and fails closed if that identity cannot be
-  established. `all` deliberately drops request-level project narrowing. A
+  and legacy fallback lookup to the launch project's canonical Git-common-
+  directory or exact working-directory identity and fails closed if neither can
+  be established. `all` deliberately drops request-level project narrowing. A
   configured `--project-only` server scope remains a hard floor, so returned IDs
   remain accepted by `open`.
 - Registered pre-digest roots are migrated into a durable project mapping, and

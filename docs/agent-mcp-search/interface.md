@@ -214,7 +214,7 @@ agent-attention history of that file — edits, reads, and aborted attempts —
 across *every* worktree of the project: the main checkout, sibling worktrees,
 and agent-isolation worktrees, including work that never landed in git. Unlike
 `git blame`, it shows the debugging session that only read the file and the edit
-that was tried and reverted. Matching is by the repo-relative path *tail*, which
+that was tried and reverted. Matching is by the project-relative path *tail*, which
 is byte-identical across worktree roots, so the roots unify by construction.
 
 Input:
@@ -234,21 +234,23 @@ Input:
 }
 ```
 
-`path` is required. Absolute paths are reduced to a repo-relative tail by walking
-up to a `.moraine.toml` / `.git` marker. Relative paths are resolved from the
-client's launch directory, including when the client is routed through the
-central MCP server, so deleted or not-yet-created files retain launch-project
-provenance. A plain Git checkout is sufficient: `.moraine.toml` is an optional
-backend-routing file and is not required for project identity. Boundary
-whitespace, `file://` URIs, and directory-style trailing
+`path` is required. Absolute paths are reduced to a project-relative tail using
+the nearest Git boundary or, for a non-Git project, exact containment beneath
+the client's launch directory. Relative paths are resolved from that launch
+directory, including when the client is routed through the central MCP server,
+so deleted or not-yet-created files retain launch-project provenance. Git
+checkouts share one identity across linked worktrees. Without Git metadata, the
+canonical launch directory is the identity and sessions launched from different
+subdirectories remain separate. `.moraine.toml` selects a backend independently
+and is not required for identity. Boundary whitespace, `file://` URIs, and directory-style trailing
 slashes are rejected rather than silently mapped to a different file. Compound
 shell text and multi-path captures are never interpreted as one path or root;
 unprovable roots remain `unknown`.
 
 `scope` is `project` (default) or `all`. `project` restricts both normalized and
-legacy fallback lookup to the launch repository's canonical Git-common-directory
-identity independently of `--project-only`, and fails closed when that identity
-cannot be established. `all` deliberately drops that request-level project
+legacy fallback lookup to the launch project's canonical Git-common-directory
+or exact working-directory identity independently of `--project-only`, and
+fails closed when neither identity can be established. `all` deliberately drops that request-level project
 narrowing. A configured `--project-only` server scope remains a hard floor so
 returned IDs stay openable. Registered pre-digest roots are migrated to a
 durable project mapping, and future normalized roots populate that mapping

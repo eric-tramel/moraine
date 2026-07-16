@@ -1452,31 +1452,49 @@ fn parse_repo_backend_ref(path: &Path) -> Option<String> {
     }
 }
 
-/// Stable, opaque identity for one Git repository and all of its linked
-/// worktrees. Identity comes only from Git metadata; the optional repo backend
-/// marker controls routing independently and is not required here.
+/// Stable, opaque identity for a project root.
+///
+/// Git repositories use their common directory so linked worktrees share one
+/// identity. A non-Git directory uses its canonical path and therefore stays
+/// scoped to that exact launch directory. The optional repo backend marker
+/// controls routing independently and is not part of either identity.
 pub fn project_id_for_repo_root(root: impl AsRef<Path>) -> Option<String> {
-    let common_dir = git_common_dir(root.as_ref())?;
-    Some(project_id_for_common_dir(&common_dir))
+    let root = root.as_ref();
+    if let Some(common_dir) = git_common_dir(root) {
+        return Some(project_id_for_common_dir(&common_dir));
+    }
+    let canonical_root = root.canonicalize().ok()?;
+    canonical_root
+        .is_dir()
+        .then(|| project_id_for_directory_root(&canonical_root))
 }
 
 fn project_id_for_common_dir(common_dir: &Path) -> String {
+    project_id_for_path(b"moraine-git-common-dir\0", "git", common_dir)
+}
+
+fn project_id_for_directory_root(root: &Path) -> String {
+    project_id_for_path(b"moraine-directory-root\0", "dir", root)
+}
+
+fn project_id_for_path(domain: &[u8], prefix: &str, path: &Path) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"moraine-git-common-dir\0");
+    hasher.update(domain);
     #[cfg(unix)]
-    hasher.update(common_dir.as_os_str().as_bytes());
+    hasher.update(path.as_os_str().as_bytes());
     #[cfg(windows)]
-    for unit in common_dir.as_os_str().encode_wide() {
+    for unit in path.as_os_str().encode_wide() {
         hasher.update(unit.to_le_bytes());
     }
     #[cfg(not(any(unix, windows)))]
-    hasher.update(common_dir.to_string_lossy().as_bytes());
-    format!("git:{:x}", hasher.finalize())
+    hasher.update(path.to_string_lossy().as_bytes());
+    format!("{prefix}:{:x}", hasher.finalize())
 }
 
-/// UTF-8 worktree roots currently registered under this repository's canonical
-/// Git common directory. These roots support a safe transition for normalized
-/// rows written before `project_id` became the common-directory digest.
+/// UTF-8 roots currently associated with this project identity.
+///
+/// Git repositories include registered linked worktrees. Non-Git projects
+/// include only the supplied directory and its canonical spelling.
 pub fn worktree_roots_for_repo_root(root: impl AsRef<Path>) -> Option<Vec<String>> {
     let pwd = std::env::var_os("PWD").map(PathBuf::from);
     worktree_roots_for_repo_root_with_pwd(root.as_ref(), pwd.as_deref())
@@ -1486,47 +1504,52 @@ fn worktree_roots_for_repo_root_with_pwd(
     root: &Path,
     logical_cwd: Option<&Path>,
 ) -> Option<Vec<String>> {
-    let common_dir = git_common_dir(root)?;
+    let common_dir = git_common_dir(root);
+    let canonical_root = root.canonicalize().ok()?;
+    if !canonical_root.is_dir() {
+        return None;
+    }
     let mut roots = vec![root.to_path_buf()];
 
-    if common_dir.file_name().is_some_and(|name| name == ".git") {
-        if let Some(main_root) = common_dir.parent() {
-            roots.push(main_root.to_path_buf());
+    if let Some(common_dir) = common_dir.as_deref() {
+        if common_dir.file_name().is_some_and(|name| name == ".git") {
+            if let Some(main_root) = common_dir.parent() {
+                roots.push(main_root.to_path_buf());
+            }
         }
-    }
 
-    if let Ok(entries) = std::fs::read_dir(common_dir.join("worktrees")) {
-        for entry in entries.flatten() {
-            let gitdir_file = entry.path().join("gitdir");
-            let Ok(content) = std::fs::read_to_string(&gitdir_file) else {
-                continue;
-            };
-            let git_marker = Path::new(content.trim());
-            let git_marker = if git_marker.is_absolute() {
-                git_marker.to_path_buf()
-            } else {
-                entry.path().join(git_marker)
-            };
-            if let Some(worktree_root) = git_marker.parent() {
-                // A stale worktree registration may point at a path that was
-                // deleted and later reused by another repository. Only roots
-                // that still resolve to this common directory are safe to add
-                // to the current mapping; already-durable deleted roots are
-                // handled by the repository layer.
-                if git_common_dir(worktree_root).as_ref() == Some(&common_dir) {
-                    roots.push(worktree_root.to_path_buf());
+        if let Ok(entries) = std::fs::read_dir(common_dir.join("worktrees")) {
+            for entry in entries.flatten() {
+                let gitdir_file = entry.path().join("gitdir");
+                let Ok(content) = std::fs::read_to_string(&gitdir_file) else {
+                    continue;
+                };
+                let git_marker = Path::new(content.trim());
+                let git_marker = if git_marker.is_absolute() {
+                    git_marker.to_path_buf()
+                } else {
+                    entry.path().join(git_marker)
+                };
+                if let Some(worktree_root) = git_marker.parent() {
+                    // A stale worktree registration may point at a path that
+                    // was deleted and later reused by another repository. Only
+                    // roots that still resolve to this common directory are
+                    // safe to add to the current mapping; already-durable
+                    // deleted roots are handled by the repository layer.
+                    if git_common_dir(worktree_root).as_deref() == Some(common_dir) {
+                        roots.push(worktree_root.to_path_buf());
+                    }
                 }
             }
         }
     }
 
-    let canonical_root = root.canonicalize().ok();
-    if let (Some(canonical_root), Some(logical_cwd)) = (&canonical_root, logical_cwd) {
+    if let Some(logical_cwd) = logical_cwd {
         if let Ok(canonical_cwd) = logical_cwd.canonicalize() {
-            if let Ok(relative_cwd) = canonical_cwd.strip_prefix(canonical_root) {
+            if let Ok(relative_cwd) = canonical_cwd.strip_prefix(&canonical_root) {
                 let depth = relative_cwd.components().count();
                 if let Some(logical_root) = logical_cwd.ancestors().nth(depth) {
-                    if logical_root.canonicalize().ok().as_ref() == Some(canonical_root) {
+                    if logical_root.canonicalize().ok().as_ref() == Some(&canonical_root) {
                         roots.push(logical_root.to_path_buf());
                     }
                 }
@@ -1660,6 +1683,75 @@ mod tests {
             assert!(roots.contains(&canonical_linked.to_string_lossy().to_string()));
             assert!(!roots.contains(&canonical_other.to_string_lossy().to_string()));
         }
+
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn project_id_scopes_non_git_projects_to_the_exact_directory() {
+        let base = std::env::temp_dir().join(format!(
+            "moraine-directory-project-id-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after unix epoch")
+                .as_nanos()
+        ));
+        let root = base.join("project");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).expect("create non-Git project directories");
+
+        let root_id = project_id_for_repo_root(&root).expect("directory project id");
+        let nested_id = project_id_for_repo_root(&nested).expect("nested directory project id");
+        assert!(root_id.starts_with("dir:"));
+        assert!(nested_id.starts_with("dir:"));
+        assert_ne!(root_id, nested_id);
+
+        let roots = worktree_roots_for_repo_root(&root).expect("directory project roots");
+        assert!(roots.contains(&root.to_string_lossy().to_string()));
+        assert!(roots.contains(
+            &root
+                .canonicalize()
+                .expect("canonical directory project root")
+                .to_string_lossy()
+                .to_string()
+        ));
+        assert_eq!(project_id_for_repo_root(root.join("missing")), None);
+
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_project_identity_unifies_logical_aliases() {
+        let base = std::env::temp_dir().join(format!(
+            "moraine-directory-project-alias-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after unix epoch")
+                .as_nanos()
+        ));
+        let physical_root = base.join("physical");
+        let logical_root = base.join("logical");
+        std::fs::create_dir_all(&physical_root).expect("create physical directory project");
+        std::os::unix::fs::symlink(&physical_root, &logical_root)
+            .expect("create logical directory alias");
+
+        assert_eq!(
+            project_id_for_repo_root(&physical_root),
+            project_id_for_repo_root(&logical_root)
+        );
+        let roots =
+            worktree_roots_for_repo_root(&logical_root).expect("logical directory project roots");
+        assert!(roots.contains(&logical_root.to_string_lossy().to_string()));
+        assert!(roots.contains(
+            &physical_root
+                .canonicalize()
+                .expect("canonical physical directory")
+                .to_string_lossy()
+                .to_string()
+        ));
 
         std::fs::remove_dir_all(base).ok();
     }

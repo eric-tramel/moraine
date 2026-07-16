@@ -1143,8 +1143,10 @@ EOF
   # Every claude event carries the record-level cwd in the native column;
   # --project-only scoping reads it to resolve the session's origin directory.
   assert_clickhouse_count "$clickhouse_url" "claude cwd column populated" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude' AND cwd = '${claude_project_dir}'" "5"
+  assert_clickhouse_count "$clickhouse_url" "claude non-Git directory identity populated" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude' AND startsWith(project_id, 'dir:') AND worktree_root = '${claude_project_dir}'" "5"
   assert_clickhouse_count "$clickhouse_url" "claude link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-claude'" "6"
   assert_clickhouse_count "$clickhouse_url" "claude tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-claude' AND tool_call_id = 'claude-tool-${run_stamp}'" "2"
+  assert_clickhouse_count "$clickhouse_url" "claude non-Git tool path normalized" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-claude' AND tool_call_id = 'claude-tool-${run_stamp}' AND tool_phase = 'request' AND startsWith(project_id, 'dir:') AND worktree_root = '${claude_project_dir}' AND repo_rel_path = 'Cargo.toml'" "1"
   assert_clickhouse_count "$clickhouse_url" "claude harness/session fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude' AND harness = 'claude-code' AND inference_provider = 'anthropic' AND session_id = '${claude_session_id}'" "5"
   assert_clickhouse_count "$clickhouse_url" "claude model fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude' AND model = 'claude-opus-4-5-20251101'" "3"
   assert_clickhouse_count "$clickhouse_url" "claude token buckets" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude' AND actor_kind = 'assistant' AND input_tokens = 9 AND output_tokens = 5 AND token_usage_buckets['input_text'] = 9 AND token_usage_buckets['output_text'] = 5" "3"
@@ -1465,7 +1467,8 @@ PY
     --working-dir "$claude_project_dir" \
     --query "$claude_keyword" \
     --expect-session-id "$claude_session_id" \
-    --expect-open-text "$claude_trace_marker"
+    --expect-open-text "$claude_trace_marker" \
+    --file-attention-path "Cargo.toml"
 
   echo "[e2e] checking named-backend HTTP route through shared daemon router"
   routed_sessions_body="$(curl -fsS \
@@ -1484,7 +1487,8 @@ PY
     --working-dir "$claude_project_dir" \
     --query "$claude_keyword" \
     --expect-session-id "$claude_session_id" \
-    --expect-open-text "$claude_trace_marker"
+    --expect-open-text "$claude_trace_marker" \
+    --file-attention-path "Cargo.toml"
   wait_for_mcp_cache_sequence "$python_bin" "$backend_log" "$routed_cache_log_baseline" 20
 
   echo "[e2e] checking named route excludes default-only content"
@@ -1513,8 +1517,10 @@ PY
   assert_clickhouse_count "$clickhouse_url" "named read schema handshake runs once despite MCP/HTTP reuse" "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND ${query_log_window} AND http_user_agent = '${expected_backend_ua}' AND position(query, 'system.tables') > 0 AND position(query, 'schema_migrations') > 0" "1"
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND ${query_log_window} AND query_kind = 'Insert' AND http_user_agent = '${expected_ingest_ua}'" 30
   local file_attention_root_insert_prefix="INSERT INTO \`${clickhouse_database}\`.\`file_attention_project_roots\`"
-  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND ${query_log_window} AND query_kind = 'Insert' AND http_user_agent = '${expected_backend_ua}' AND startsWith(query, '${file_attention_root_insert_prefix}')" 30
-  assert_clickhouse_count "$clickhouse_url" "service INSERTs use the ingest UA/PID except backend project-root mappings" "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND ${query_log_window} AND query_kind = 'Insert' AND (${attributed_service_filter}) AND http_user_agent != '${expected_ingest_ua}' AND NOT (http_user_agent = '${expected_backend_ua}' AND startsWith(query, '${file_attention_root_insert_prefix}'))" "0"
+  local routed_file_attention_root_insert_prefix="INSERT INTO \`${routed_clickhouse_database}\`.\`file_attention_project_roots\`"
+  local allowed_backend_root_insert="http_user_agent = '${expected_backend_ua}' AND (startsWith(query, '${file_attention_root_insert_prefix}') OR startsWith(query, '${routed_file_attention_root_insert_prefix}'))"
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND ${query_log_window} AND query_kind = 'Insert' AND (${allowed_backend_root_insert})" 30
+  assert_clickhouse_count "$clickhouse_url" "service INSERTs use the ingest UA/PID except backend project-root mappings" "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND ${query_log_window} AND query_kind = 'Insert' AND (${attributed_service_filter}) AND http_user_agent != '${expected_ingest_ua}' AND NOT (${allowed_backend_root_insert})" "0"
 
   echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (claude)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \

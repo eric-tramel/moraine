@@ -1383,6 +1383,79 @@ fn codex_session_meta_cwd_flows_to_later_records_via_hint() {
 }
 
 #[test]
+fn codex_session_meta_uses_non_git_cwd_as_project_identity() {
+    let root = std::env::temp_dir().join(format!(
+        "moraine-codex-directory-project-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after unix epoch")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).expect("create non-Git project directory");
+    let root_text = root.to_string_lossy().to_string();
+    let meta = json!({
+        "timestamp": "2026-02-15T03:50:40.000Z",
+        "type": "session_meta",
+        "payload": {
+            "id": "019c5f6a-49bd-7920-ac67-1dd8e33b0e96",
+            "cwd": root_text
+        }
+    });
+    let meta_out = normalize_record(
+        &meta,
+        "codex",
+        "codex",
+        "/tmp/non-git-session.jsonl",
+        1,
+        1,
+        1,
+        0,
+        "",
+        "",
+        "",
+    )
+    .expect("non-Git Codex session meta should normalize");
+    assert_eq!(meta_out.cwd_hint, root_text);
+    assert_eq!(meta_out.event_rows[0]["worktree_root"], root_text);
+    assert!(meta_out.event_rows[0]["project_id"]
+        .as_str()
+        .is_some_and(|project_id| project_id.starts_with("dir:")));
+
+    let item = json!({
+        "timestamp": "2026-02-15T03:50:43.000Z",
+        "type": "response_item",
+        "payload": {
+            "type": "function_call",
+            "call_id": "call_directory_project",
+            "name": "Read",
+            "arguments": "{\"path\":\"Cargo.toml\"}"
+        }
+    });
+    let item_out = normalize_record(
+        &item,
+        "codex",
+        "codex",
+        "/tmp/non-git-session.jsonl",
+        1,
+        1,
+        2,
+        100,
+        &meta_out.session_hint,
+        &meta_out.model_hint,
+        &meta_out.cwd_hint,
+    )
+    .expect("non-Git Codex response item should normalize");
+    assert_eq!(item_out.tool_rows[0]["repo_rel_path"], "Cargo.toml");
+    assert_eq!(item_out.tool_rows[0]["worktree_root"], root_text);
+    assert!(item_out.tool_rows[0]["project_id"]
+        .as_str()
+        .is_some_and(|project_id| project_id.starts_with("dir:")));
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn cursor_composer_workspace_path_becomes_cwd() {
     // Shape produced by `synthesize_cursor_sqlite_record` for composerData
     // rows: `workspaceIdentifier.uri.fsPath` is surfaced as `workspacePath`.
