@@ -1301,6 +1301,9 @@ Rules:
   summary exactly once from the pinned snapshot.
 - Event summaries are compact. Full event content is available through
   `open(event_id)`.
+- Encrypted reasoning payloads use the summary placeholder
+  `[encrypted reasoning omitted]`; opening the event directly still returns its
+  full opaque payload.
 - `summary.user_input` may be `null`.
 - `summary.final_response` may be `null`.
 - `summary.tools_called` must contain unique tool names in first-seen order.
