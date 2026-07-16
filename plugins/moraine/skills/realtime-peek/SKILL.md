@@ -12,7 +12,10 @@ Use this skill when the user asks about current or very recent agent activity, i
 1. Choose a recent explicit time window with timezone. For "now" questions, start with the last one to two hours and widen only if needed.
 2. Call `list_sessions` for that window, sorted newest first.
 3. Prefer sessions that are still updating, have incomplete final turns, or match the harness, branch, issue, file, or agent named by the user.
-4. Open relevant sessions or turns with `open`.
+4. Open relevant sessions or turns with id-only `open` first. If the compact
+   summary is insufficient, request a bounded page with `id` plus `limit` and
+   continue with `{ "cursor": next_cursor }` only as far as needed. Open an
+   individual event ID when exact content is required.
 5. If the user asks about a specific file, call `file_attention` and then open the returned event, turn, or session handles.
 
 ## What To Report

@@ -77,6 +77,14 @@ pub trait ConversationRepository: Send + Sync {
         turn_seq: u32,
     ) -> RepoResult<Option<McpTurnOpen>>;
 
+    async fn get_mcp_turn_summary(
+        &self,
+        session_id: &str,
+        turn_seq: u32,
+    ) -> RepoResult<Option<McpTurnOpen>> {
+        self.get_mcp_turn(session_id, turn_seq).await
+    }
+
     async fn open_event(&self, req: OpenEventRequest) -> RepoResult<OpenContext>;
 
     async fn get_mcp_event(&self, event_uid: &str) -> RepoResult<Option<McpEventOpen>>;

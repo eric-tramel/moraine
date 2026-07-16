@@ -22,20 +22,15 @@ pub const SEARCH_SESSIONS_DEFAULT_N_HITS: u16 = 10;
 pub const SEARCH_SESSIONS_MIN_N_HITS: u16 = 1;
 pub const SEARCH_SESSIONS_MAX_N_HITS: u16 = 50;
 pub const SEARCH_SESSIONS_MAX_QUERY_CHARS: usize = 4096;
-pub const SEARCH_SESSIONS_SLA_TARGET_MS: u64 = 750;
-pub const OPEN_SLA_TARGET_MS: u64 = 500;
+pub const OPEN_MIN_LIMIT: u16 = 1;
+pub const OPEN_CURSOR_MAX_CHARS: usize = 4096;
 pub const LIST_SESSIONS_DEFAULT_LIMIT: u16 = 20;
 pub const LIST_SESSIONS_MIN_LIMIT: u16 = 1;
-pub const LIST_SESSIONS_DEFAULT_SLA_TARGET_MS: u64 = 300;
-pub const LIST_SESSIONS_BROAD_SLA_TARGET_MS: u64 = 1_000;
-pub const LIST_SESSIONS_FILTERED_BROAD_SLA_TARGET_MS: u64 = 1_200;
 pub const LIST_SESSIONS_DEADLINE_MS: u64 = 3_000;
 pub const FILE_ATTENTION_TOOL: &str = "file_attention";
 pub const FILE_ATTENTION_SCHEMA_VERSION: &str = "moraine.mcp.file_attention.v1";
 pub const FILE_ATTENTION_MIN_LIMIT: u16 = 1;
 pub const FILE_ATTENTION_DEFAULT_LIMIT: u16 = 50;
-pub const FILE_ATTENTION_DEFAULT_SLA_TARGET_MS: u64 = 600;
-pub const FILE_ATTENTION_BROAD_SLA_TARGET_MS: u64 = 1_200;
 pub const FILE_ATTENTION_DEADLINE_MS: u64 = 4_000;
 /// Minimum number of non-empty, slash-separated segments a path tail must have
 /// before it is treated as specific enough to suffix-match without a
@@ -734,13 +729,41 @@ pub struct CanonicalListSessionsArgs {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OpenV1Args {
     #[serde(default)]
     pub id: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 impl OpenV1Args {
-    pub fn validate(self) -> ContractResult<CanonicalOpenV1Args> {
+    pub fn validate(self, max_results: u16) -> ContractResult<CanonicalOpenV1Args> {
+        if let Some(cursor) = self.cursor {
+            if self.id.is_some() || self.limit.is_some() {
+                return Err(invalid_request_with_field(
+                    "cursor",
+                    "cursor must be provided without id or limit",
+                ));
+            }
+            let cursor = cursor.trim().to_string();
+            if cursor.is_empty() {
+                return Err(invalid_request_with_field(
+                    "cursor",
+                    "cursor must be a non-empty string",
+                ));
+            }
+            if cursor.len() > OPEN_CURSOR_MAX_CHARS {
+                return Err(invalid_request_with_field(
+                    "cursor",
+                    format!("cursor must be at most {OPEN_CURSOR_MAX_CHARS} characters"),
+                ));
+            }
+            return Ok(CanonicalOpenV1Args::Continue { cursor });
+        }
+
         let Some(id) = self.id else {
             return Err(invalid_request_with_field("id", "id is required"));
         };
@@ -751,13 +774,73 @@ impl OpenV1Args {
             ));
         }
 
-        Ok(CanonicalOpenV1Args { id: id.parse()? })
+        let id: McpId = id.parse()?;
+        let limit = match self.limit {
+            Some(limit) => {
+                let max_limit = max_results.max(OPEN_MIN_LIMIT);
+                if !(i64::from(OPEN_MIN_LIMIT)..=i64::from(max_limit)).contains(&limit) {
+                    return Err(invalid_request_with_field(
+                        "limit",
+                        format!("limit must be between 1 and {max_limit}"),
+                    ));
+                }
+                if matches!(id, McpId::Event(_)) {
+                    return Err(invalid_request_with_field(
+                        "limit",
+                        "limit is only supported for session and turn IDs",
+                    ));
+                }
+                Some(limit as u16)
+            }
+            None => None,
+        };
+
+        Ok(CanonicalOpenV1Args::Initial { id, limit })
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct CanonicalOpenV1Args {
-    pub id: McpId,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanonicalOpenV1Args {
+    Initial { id: McpId, limit: Option<u16> },
+    Continue { cursor: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenCursor {
+    pub version: u8,
+    pub target_id: String,
+    pub limit: u16,
+    pub snapshot_slot: u8,
+    pub snapshot_generation: u64,
+    pub after: OpenCursorAfter,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OpenCursorAfter {
+    Turn { turn_seq: u32 },
+    Event { event_order: u64, event_uid: String },
+}
+
+pub fn encode_open_cursor(cursor: &OpenCursor) -> ContractResult<String> {
+    let bytes = serde_json::to_vec(cursor).map_err(|error| {
+        invalid_request_with_field("cursor", format!("failed to encode cursor: {error}"))
+    })?;
+    Ok(encode_base64_url_no_pad(&bytes))
+}
+
+pub fn decode_open_cursor(token: &str) -> ContractResult<OpenCursor> {
+    if token.len() > OPEN_CURSOR_MAX_CHARS {
+        return Err(invalid_request_with_field(
+            "cursor",
+            format!("cursor must be at most {OPEN_CURSOR_MAX_CHARS} characters"),
+        ));
+    }
+    let bytes = decode_base64_url_no_pad(token).map_err(|_| {
+        invalid_request_with_field("cursor", "cursor is malformed; reopen the target")
+    })?;
+    serde_json::from_slice(&bytes)
+        .map_err(|_| invalid_request_with_field("cursor", "cursor is malformed; reopen the target"))
 }
 
 /// How far `file_attention` widens its search.
@@ -1031,62 +1114,36 @@ impl From<ContractError> for ToolError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Performance {
     pub elapsed_ms: u64,
-    pub sla_target_ms: u64,
-    pub met_sla: bool,
 }
 
 impl Performance {
-    pub fn from_elapsed_ms(elapsed_ms: u64, sla_target_ms: u64) -> Self {
-        Self {
-            elapsed_ms,
-            sla_target_ms,
-            met_sla: elapsed_ms <= sla_target_ms,
+    pub fn from_elapsed_ms(elapsed_ms: u64) -> Self {
+        Self { elapsed_ms }
+    }
+
+    pub fn from_elapsed(elapsed: Duration) -> Self {
+        Self::from_elapsed_ms(duration_millis_u64(elapsed))
+    }
+
+    pub fn builder() -> PerformanceBuilder {
+        PerformanceBuilder {
+            started_at: Instant::now(),
         }
     }
 
-    pub fn from_elapsed(elapsed: Duration, sla_target_ms: u64) -> Self {
-        Self::from_elapsed_ms(duration_millis_u64(elapsed), sla_target_ms)
-    }
-
-    pub fn builder(sla_target_ms: u64) -> PerformanceBuilder {
-        PerformanceBuilder::new(sla_target_ms)
-    }
-
-    pub(crate) fn builder_from(started_at: Instant, sla_target_ms: u64) -> PerformanceBuilder {
-        PerformanceBuilder::from_started_at(started_at, sla_target_ms)
+    pub(crate) fn builder_from(started_at: Instant) -> PerformanceBuilder {
+        PerformanceBuilder { started_at }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct PerformanceBuilder {
     started_at: Instant,
-    sla_target_ms: u64,
 }
 
 impl PerformanceBuilder {
-    pub fn new(sla_target_ms: u64) -> Self {
-        Self {
-            started_at: Instant::now(),
-            sla_target_ms,
-        }
-    }
-
-    fn from_started_at(started_at: Instant, sla_target_ms: u64) -> Self {
-        Self {
-            started_at,
-            sla_target_ms,
-        }
-    }
-
     pub fn finish(&self) -> Performance {
-        Performance::from_elapsed(self.started_at.elapsed(), self.sla_target_ms)
-    }
-
-    pub fn with_sla_target(&self, sla_target_ms: u64) -> Self {
-        Self {
-            started_at: self.started_at,
-            sla_target_ms,
-        }
+        Performance::from_elapsed(self.started_at.elapsed())
     }
 }
 
@@ -1746,32 +1803,117 @@ mod tests {
             .to_string();
         let canonical = OpenV1Args {
             id: Some(id.clone()),
+            ..OpenV1Args::default()
         }
-        .validate()
+        .validate(50)
         .expect("valid open args");
-        assert_eq!(canonical.id.to_string(), id);
+        assert!(matches!(
+            canonical,
+            CanonicalOpenV1Args::Initial { id: parsed, limit: None } if parsed.to_string() == id
+        ));
 
-        let missing = OpenV1Args { id: None }.validate().expect_err("missing id");
+        let missing = OpenV1Args::default().validate(50).expect_err("missing id");
         assert_eq!(missing.code(), ToolErrorCode::InvalidRequest);
 
         let blank = OpenV1Args {
             id: Some(" ".to_string()),
+            ..OpenV1Args::default()
         }
-        .validate()
+        .validate(50)
         .expect_err("blank id");
         assert_eq!(blank.code(), ToolErrorCode::InvalidRequest);
 
         let malformed = OpenV1Args {
             id: Some("session:!!!!".to_string()),
+            ..OpenV1Args::default()
         }
-        .validate()
+        .validate(50)
         .expect_err("malformed id");
         assert_eq!(malformed.code(), ToolErrorCode::InvalidId);
+
+        let limited = OpenV1Args {
+            id: Some(id),
+            limit: Some(7),
+            ..OpenV1Args::default()
+        }
+        .validate(10)
+        .expect("bounded expansion");
+        assert!(matches!(
+            limited,
+            CanonicalOpenV1Args::Initial { limit: Some(7), .. }
+        ));
+
+        let continuation = OpenV1Args {
+            cursor: Some(" opaque ".to_string()),
+            ..OpenV1Args::default()
+        }
+        .validate(10)
+        .expect("cursor continuation");
+        assert_eq!(
+            continuation,
+            CanonicalOpenV1Args::Continue {
+                cursor: "opaque".to_string()
+            }
+        );
+
+        let mixed = OpenV1Args {
+            id: Some("session:c2Vzcy0x".to_string()),
+            cursor: Some("opaque".to_string()),
+            ..OpenV1Args::default()
+        }
+        .validate(10)
+        .expect_err("id and cursor are exclusive");
+        assert_eq!(mixed.code(), ToolErrorCode::InvalidRequest);
+
+        for limit in [-1, 0, 11] {
+            let error = OpenV1Args {
+                id: Some("session:c2Vzcy0x".to_string()),
+                limit: Some(limit),
+                ..OpenV1Args::default()
+            }
+            .validate(10)
+            .expect_err("invalid limit");
+            assert_eq!(error.code(), ToolErrorCode::InvalidRequest);
+        }
+
+        let event_limit = OpenV1Args {
+            id: Some(
+                McpEventId::from_raw_event_uid("event-1")
+                    .unwrap()
+                    .to_string(),
+            ),
+            limit: Some(1),
+            ..OpenV1Args::default()
+        }
+        .validate(10)
+        .expect_err("event expansion is singular");
+        assert_eq!(event_limit.code(), ToolErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn open_cursor_round_trips_and_rejects_malformed_input() {
+        let cursor = OpenCursor {
+            version: 1,
+            target_id: McpTurnId::from_raw_session_id_and_turn_seq("sess-1", 7)
+                .unwrap()
+                .to_string(),
+            limit: 5,
+            snapshot_slot: 1,
+            snapshot_generation: 42,
+            after: OpenCursorAfter::Event {
+                event_order: 9,
+                event_uid: "event-9".to_string(),
+            },
+        };
+        let encoded = encode_open_cursor(&cursor).expect("encode cursor");
+        assert!(!encoded.contains('='));
+        assert_eq!(decode_open_cursor(&encoded).expect("decode cursor"), cursor);
+        assert!(decode_open_cursor("not+url-safe").is_err());
     }
 
     #[test]
     fn success_and_error_envelopes_have_contract_shape() {
-        let performance = Performance::from_elapsed_ms(64, SEARCH_SESSIONS_SLA_TARGET_MS);
+        let performance = Performance::from_elapsed_ms(64);
         let success = ToolEnvelope::success(
             SEARCH_SESSIONS_TOOL,
             json!({
@@ -1808,9 +1950,7 @@ mod tests {
                 },
                 "warnings": [],
                 "performance": {
-                    "elapsed_ms": 64,
-                    "sla_target_ms": 750,
-                    "met_sla": true
+                    "elapsed_ms": 64
                 }
             })
         );
@@ -1824,7 +1964,7 @@ mod tests {
             SEARCH_SESSIONS_TOOL,
             json!({ "query": "   " }),
             error,
-            Performance::from_elapsed_ms(2, SEARCH_SESSIONS_SLA_TARGET_MS),
+            Performance::from_elapsed_ms(2),
         );
 
         assert_eq!(
@@ -1844,9 +1984,7 @@ mod tests {
                 },
                 "warnings": [],
                 "performance": {
-                    "elapsed_ms": 2,
-                    "sla_target_ms": 750,
-                    "met_sla": true
+                    "elapsed_ms": 2
                 }
             })
         );
@@ -1855,14 +1993,9 @@ mod tests {
     #[test]
     fn performance_and_time_helpers_follow_contract() {
         assert_eq!(
-            Performance::from_elapsed_ms(500, OPEN_SLA_TARGET_MS),
-            Performance {
-                elapsed_ms: 500,
-                sla_target_ms: 500,
-                met_sla: true
-            }
+            Performance::from_elapsed_ms(500),
+            Performance { elapsed_ms: 500 }
         );
-        assert!(!Performance::from_elapsed_ms(501, OPEN_SLA_TARGET_MS).met_sla);
         assert_eq!(format_rfc3339_utc_millis(0), "1970-01-01T00:00:00.000Z");
         assert_eq!(
             format_rfc3339_utc_millis(1_777_488_751_125),

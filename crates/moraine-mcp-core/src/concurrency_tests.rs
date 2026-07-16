@@ -534,7 +534,11 @@ async fn queued_success_reports_wall_time_from_frame_acceptance() {
         performance["elapsed_ms"].as_u64().expect("elapsed_ms") >= 750,
         "queue time must be included: {performance}"
     );
-    assert_eq!(performance["met_sla"], json!(false));
+    assert_eq!(
+        performance.as_object().expect("performance object").len(),
+        1,
+        "performance must only report elapsed time: {performance}"
+    );
 
     writer.shutdown().await.expect("half-close request stream");
     drop(writer);

@@ -5,9 +5,7 @@ use super::{
 use crate::contract::{
     format_rfc3339_utc_millis, CanonicalListSessionsArgs, ContractError, ListSessionsArgs,
     ListSessionsMode, ListSessionsSort, McpSessionId, Performance, ToolEnvelope, ToolErrorCode,
-    ToolErrorEnvelope, LIST_SESSIONS_BROAD_SLA_TARGET_MS, LIST_SESSIONS_DEADLINE_MS,
-    LIST_SESSIONS_DEFAULT_SLA_TARGET_MS, LIST_SESSIONS_FILTERED_BROAD_SLA_TARGET_MS,
-    LIST_SESSIONS_TOOL,
+    ToolErrorEnvelope, LIST_SESSIONS_DEADLINE_MS, LIST_SESSIONS_TOOL,
 };
 use anyhow::{Context, Result};
 use moraine_conversations::{
@@ -18,11 +16,9 @@ use serde_json::{json, Value};
 use tokio::time::{timeout, Duration};
 use tracing::warn;
 
-const LIST_SESSIONS_BROAD_WINDOW_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
-
 impl AppState {
     pub(crate) async fn list_sessions_v1(&self, arguments: Value) -> Result<Value> {
-        let perf = request_performance(LIST_SESSIONS_DEFAULT_SLA_TARGET_MS);
+        let perf = request_performance();
         let raw_request = arguments.clone();
 
         let args = match parse_list_sessions_args(arguments, self.cfg.mcp.max_results) {
@@ -32,8 +28,6 @@ impl AppState {
             }
         };
         let canonical_request = canonical_request_json(&args);
-        let args_perf = perf.with_sla_target(list_sessions_sla_target_ms(&args, false));
-
         let repo_filter = McpSessionListFilter {
             start_unix_ms: args.start_unix_ms,
             end_unix_ms: args.end_unix_ms,
@@ -59,7 +53,7 @@ impl AppState {
                 return encode_list_sessions_error(
                     canonical_request,
                     repo_error_to_contract_error(error),
-                    args_perf.finish(),
+                    perf.finish(),
                 );
             }
             Err(_) => {
@@ -70,17 +64,12 @@ impl AppState {
                         "list_sessions exceeded its response deadline",
                     )
                     .with_details(json!({ "deadline_ms": LIST_SESSIONS_DEADLINE_MS })),
-                    args_perf.finish(),
+                    perf.finish(),
                 );
             }
         };
 
-        let performance = perf
-            .with_sla_target(list_sessions_sla_target_ms(
-                &args,
-                page.next_cursor.is_some(),
-            ))
-            .finish();
+        let performance = perf.finish();
         let data = match list_sessions_data_json(&args, &page) {
             Ok(data) => data,
             Err(error) => {
@@ -176,20 +165,6 @@ fn list_sessions_data_json(
         "sessions": sessions,
         "next_cursor": page.next_cursor.as_deref(),
     }))
-}
-
-fn list_sessions_sla_target_ms(args: &CanonicalListSessionsArgs, has_more: bool) -> u64 {
-    let is_broad_window =
-        args.end_unix_ms.saturating_sub(args.start_unix_ms) >= LIST_SESSIONS_BROAD_WINDOW_MS;
-    if is_broad_window || has_more {
-        if args.mode.is_some() || args.harness.is_some() || args.source.is_some() {
-            LIST_SESSIONS_FILTERED_BROAD_SLA_TARGET_MS
-        } else {
-            LIST_SESSIONS_BROAD_SLA_TARGET_MS
-        }
-    } else {
-        LIST_SESSIONS_DEFAULT_SLA_TARGET_MS
-    }
 }
 
 fn session_json(rank: usize, session: &McpSessionListItem) -> Result<Value, ContractError> {
@@ -333,7 +308,7 @@ mod tests {
                 ToolErrorCode::DeadlineExceeded,
                 "list_sessions exceeded its response deadline",
             ),
-            Performance::builder(LIST_SESSIONS_DEFAULT_SLA_TARGET_MS).finish(),
+            Performance::builder().finish(),
         )
         .expect("deadline response");
 
@@ -611,39 +586,5 @@ mod tests {
         assert_eq!(data["sessions"][0]["rank"], json!(1));
         assert_eq!(data["truncated"], json!(true));
         assert_eq!(data["next_cursor"], json!("opaque-cursor"));
-    }
-
-    #[test]
-    fn selects_list_sessions_sla_for_broad_windows() {
-        let narrow = parse_list_sessions_args(
-            json!({
-                "start_datetime": "2026-04-30T09:00:00-04:00",
-                "end_datetime": "2026-04-30T13:00:00-04:00"
-            }),
-            50,
-        )
-        .expect("valid narrow args");
-        assert_eq!(
-            list_sessions_sla_target_ms(&narrow, false),
-            LIST_SESSIONS_DEFAULT_SLA_TARGET_MS
-        );
-        assert_eq!(
-            list_sessions_sla_target_ms(&narrow, true),
-            LIST_SESSIONS_BROAD_SLA_TARGET_MS
-        );
-
-        let broad_filtered = parse_list_sessions_args(
-            json!({
-                "start_datetime": "2026-01-01T00:00:00Z",
-                "end_datetime": "2026-03-01T00:00:00Z",
-                "mode": "chat"
-            }),
-            50,
-        )
-        .expect("valid broad filtered args");
-        assert_eq!(
-            list_sessions_sla_target_ms(&broad_filtered, false),
-            LIST_SESSIONS_FILTERED_BROAD_SLA_TARGET_MS
-        );
     }
 }

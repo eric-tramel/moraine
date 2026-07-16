@@ -99,7 +99,15 @@ impl ConversationRepository for ClickHouseConversationRepository {
         session_id: &str,
         turn_seq: u32,
     ) -> RepoResult<Option<McpTurnOpen>> {
-        self.get_mcp_turn_impl(session_id, turn_seq).await
+        self.get_mcp_turn_impl(session_id, turn_seq, true).await
+    }
+
+    async fn get_mcp_turn_summary(
+        &self,
+        session_id: &str,
+        turn_seq: u32,
+    ) -> RepoResult<Option<McpTurnOpen>> {
+        self.get_mcp_turn_impl(session_id, turn_seq, false).await
     }
 
     async fn open_event(&self, req: OpenEventRequest) -> RepoResult<OpenContext> {
