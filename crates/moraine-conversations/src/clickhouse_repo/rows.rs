@@ -348,6 +348,8 @@ pub(super) struct SearchMcpCandidateRow {
     pub(super) scope_exists: u8,
     pub(super) projection_ready: u8,
     pub(super) projection_clean: u8,
+    #[serde(default)]
+    pub(super) projection_revision: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -370,6 +372,8 @@ pub(super) struct SearchMcpEventRow {
     pub(super) text_preview: String,
     #[serde(default)]
     pub(super) text_content: String,
+    #[serde(default)]
+    pub(super) text_content_digest: String,
     #[serde(default)]
     pub(super) payload_json: String,
     #[serde(default)]
