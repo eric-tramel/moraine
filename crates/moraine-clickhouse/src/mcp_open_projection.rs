@@ -341,6 +341,8 @@ impl ClickHouseClient {
         let message = "(event_class = 'message' OR (event_class = 'event_msg' AND payload_type IN ('user_message', 'agent_message', 'message', 'text')))";
         let user_message = format!("(lowerUTF8(actor_role) = 'user' AND {message})");
         let assistant_message = format!("(lowerUTF8(actor_role) = 'assistant' AND {message})");
+        let final_response_message =
+            format!("({assistant_message} AND lowerUTF8(phase) != 'commentary')");
         let statement = format!(
             "INSERT INTO {database}.mcp_open_turns\n\
              (session_id, slot, generation, turn_seq, turn_id, started_at, ended_at,\n\
@@ -363,17 +365,17 @@ impl ClickHouseClient {
                  countIf(event_class = 'tool_call') AS tool_calls, countIf(event_class = 'tool_result') AS tool_results,\n\
                  countIf(event_class = 'reasoning') AS reasoning_items,\n\
                  argMinIf(summary_source, tuple(event_order, event_uid), {user_message}) AS user_input_summary_source,\n\
-                 argMaxIf(summary_source, tuple(event_order, event_uid), {assistant_message}) AS final_response_summary_source,\n\
+                 argMaxIf(summary_source, tuple(event_order, event_uid), {final_response_message}) AS final_response_summary_source,\n\
                  argMinIf(toUInt8(summary_is_payload), tuple(event_order, event_uid), {user_message}) AS user_input_summary_is_payload,\n\
-                 argMaxIf(toUInt8(summary_is_payload), tuple(event_order, event_uid), {assistant_message}) AS final_response_summary_is_payload,\n\
+                 argMaxIf(toUInt8(summary_is_payload), tuple(event_order, event_uid), {final_response_message}) AS final_response_summary_is_payload,\n\
                  argMinIf(event_uid, tuple(event_order, event_uid), {user_message}) AS user_input_event_uid,\n\
                  argMinIf(event_order, tuple(event_order, event_uid), {user_message}) AS user_input_event_order,\n\
                  argMinIf(event_time, tuple(event_order, event_uid), {user_message}) AS user_input_event_time,\n\
                  argMinIf(event_type, tuple(event_order, event_uid), {user_message}) AS user_input_event_type,\n\
-                 argMaxIf(event_uid, tuple(event_order, event_uid), {assistant_message}) AS final_response_event_uid,\n\
-                 argMaxIf(event_order, tuple(event_order, event_uid), {assistant_message}) AS final_response_event_order,\n\
-                 argMaxIf(event_time, tuple(event_order, event_uid), {assistant_message}) AS final_response_event_time,\n\
-                 argMaxIf(event_type, tuple(event_order, event_uid), {assistant_message}) AS final_response_event_type,\n\
+                 argMaxIf(event_uid, tuple(event_order, event_uid), {final_response_message}) AS final_response_event_uid,\n\
+                 argMaxIf(event_order, tuple(event_order, event_uid), {final_response_message}) AS final_response_event_order,\n\
+                 argMaxIf(event_time, tuple(event_order, event_uid), {final_response_message}) AS final_response_event_time,\n\
+                 argMaxIf(event_type, tuple(event_order, event_uid), {final_response_message}) AS final_response_event_type,\n\
                  arrayDistinct(arrayMap(x -> x.2, arraySort(groupArrayIf(tuple(event_order, tool_label), event_type = 'tool_call' AND tool_label != '')))) AS tools_called,\n\
                  arrayDistinct(arrayMap(x -> x.2, arraySort(groupArray(tuple(event_order, event_type))))) AS normalized_event_types,\n\
                  argMaxIf(toUInt8(payload_type = 'task_complete'), tuple(event_order, event_uid), payload_type IN ('task_complete', 'turn_aborted')) AS completed,\n\
