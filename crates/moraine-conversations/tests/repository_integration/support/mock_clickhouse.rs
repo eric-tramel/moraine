@@ -85,6 +85,9 @@ impl ScriptedResponse {
 #[derive(Clone, Default)]
 pub(crate) struct MockOptions {
     pub(crate) omit_second_snippet_row: bool,
+    pub(crate) dirty_projection_on_first_candidate: bool,
+    pub(crate) omit_first_mcp_detail_row: bool,
+    pub(crate) repeated_corpus_stats_barrier: Option<ScriptedBarrier>,
     pub(crate) change_projection_revision_on_second_search_page: bool,
     pub(crate) repeat_duplicate_search_pages: bool,
     pub(crate) scripted_responses: Vec<ScriptedResponse>,
@@ -798,6 +801,25 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
         }
 
         if query.contains("toUInt8(0) AS row_kind") && query.contains("projected_candidates AS") {
+            let candidate_query_count = state
+                .queries
+                .lock()
+                .expect("query lock")
+                .iter()
+                .filter(|candidate_query| {
+                    candidate_query.contains("toUInt8(0) AS row_kind")
+                        && candidate_query.contains("projected_candidates AS")
+                })
+                .count();
+            if candidate_query_count == 2 && query.contains("search_corpus_stats") {
+                if let Some(barrier) = state.options.repeated_corpus_stats_barrier.clone() {
+                    barrier.reached.notify_one();
+                    barrier.release.notified().await;
+                }
+            }
+            let projection_clean = u8::from(
+                !state.options.dirty_projection_on_first_candidate || candidate_query_count != 1,
+            );
             let projection_revision = if state
                 .options
                 .change_projection_revision_on_second_search_page
@@ -824,7 +846,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                     "total_doc_len": 5000_u64,
                     "scope_exists": 1_u8,
                     "projection_ready": 1_u8,
-                    "projection_clean": 1_u8,
+                    "projection_clean": projection_clean,
                     "projection_revision": projection_revision
                 })
             };
@@ -841,7 +863,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                 "total_doc_len": 5000_u64,
                 "scope_exists": 1_u8,
                 "projection_ready": 1_u8,
-                "projection_clean": 1_u8,
+                "projection_clean": projection_clean,
                 "projection_revision": projection_revision
             });
             let filter_clause = query
@@ -1008,6 +1030,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             ]
             .into_iter()
             .filter(|event_uid| query.contains(&format!("'{event_uid}'")))
+            .skip(usize::from(state.options.omit_first_mcp_detail_row))
             .map(detail)
             .collect::<Vec<_>>();
             return (StatusCode::OK, json_each_row(json!(event_uids)));

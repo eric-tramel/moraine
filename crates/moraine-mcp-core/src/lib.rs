@@ -46,6 +46,7 @@ impl RequestLimitSource {
 const AUTOMATIC_MAX_PARALLEL_REQUESTS: usize = 8;
 const MAX_QUEUED_REQUESTS: usize = 16;
 const REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(4);
+const SEARCH_PROJECTION_RETRY_AFTER_MS: u64 = 250;
 
 fn effective_max_parallel_requests(configured: Option<u16>) -> (usize, RequestLimitSource) {
     let (requested, source) = match configured {
@@ -773,6 +774,18 @@ pub(crate) fn repo_error_to_contract_error(error: RepoError) -> contract::Contra
         RepoError::InvalidArgument(message) | RepoError::InvalidCursor(message) => {
             contract::ContractError::new(contract::ToolErrorCode::InvalidRequest, message)
         }
+        RepoError::ReadModelChanged => contract::ContractError::new(
+            contract::ToolErrorCode::InternalError,
+            format!(
+                "MCP search read model is refreshing; retry after {} ms",
+                SEARCH_PROJECTION_RETRY_AFTER_MS
+            ),
+        )
+        .with_details(json!({
+            "reason": "read_model_refresh",
+            "retryable": true,
+            "retry_after_ms": SEARCH_PROJECTION_RETRY_AFTER_MS,
+        })),
         RepoError::Backend(message) | RepoError::Internal(message) => {
             contract::ContractError::new(contract::ToolErrorCode::InternalError, message)
         }
@@ -2122,6 +2135,17 @@ mod tests {
         AppState::embedded(AppConfig::default(), repository)
     }
 
+    fn read_model_changed_test_state() -> Arc<AppState> {
+        let repository = Arc::new(InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            InMemoryConversationResponses {
+                search_mcp_events: Some(Err(RepoError::ReadModelChanged)),
+                ..InMemoryConversationResponses::default()
+            },
+        ));
+        AppState::embedded(AppConfig::default(), repository)
+    }
+
     async fn call_tool_rpc(state: &AppState, id: u64, tool: &str, arguments: Value) -> Value {
         state
             .handle_request(RpcRequest {
@@ -2500,7 +2524,39 @@ mod tests {
         for (index, (tool, arguments)) in cases.into_iter().enumerate() {
             let response = call_tool_rpc(&state, index as u64 + 1, tool, arguments).await;
             assert_handled_tool_error_exchange(&response, tool, "internal_error");
+            assert!(response["result"]["structuredContent"]["error"]
+                .get("details")
+                .is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn search_projection_changes_are_structured_retryable_errors() {
+        let state = read_model_changed_test_state();
+        let response = call_tool_rpc(
+            &state,
+            1,
+            contract::SEARCH_SESSIONS_TOOL,
+            json!({ "query": "active ingest" }),
+        )
+        .await;
+
+        assert_handled_tool_error_exchange(
+            &response,
+            contract::SEARCH_SESSIONS_TOOL,
+            "internal_error",
+        );
+        let error = &response["result"]["structuredContent"]["error"];
+        assert_eq!(error["details"]["reason"], json!("read_model_refresh"));
+        assert_eq!(error["details"]["retryable"], json!(true));
+        assert_eq!(
+            error["details"]["retry_after_ms"],
+            json!(SEARCH_PROJECTION_RETRY_AFTER_MS)
+        );
+        assert!(error["message"]
+            .as_str()
+            .expect("freshness error message")
+            .contains("retry after 250 ms"));
     }
 
     #[tokio::test]
