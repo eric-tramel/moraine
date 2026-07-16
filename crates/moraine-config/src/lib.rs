@@ -45,6 +45,14 @@ pub struct IngestSource {
     pub format: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClickHouseRequestCompression {
+    #[default]
+    None,
+    Gzip,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClickHouseConfig {
@@ -58,6 +66,9 @@ pub struct ClickHouseConfig {
     pub password: String,
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: f64,
+    /// Compression applied to non-empty ClickHouse HTTP request bodies.
+    #[serde(default)]
+    pub request_compression: ClickHouseRequestCompression,
     #[serde(default = "default_true")]
     pub async_insert: bool,
     #[serde(default = "default_true")]
@@ -363,6 +374,7 @@ impl Default for ClickHouseConfig {
             username: default_ch_username(),
             password: String::new(),
             timeout_seconds: default_timeout_seconds(),
+            request_compression: ClickHouseRequestCompression::None,
             async_insert: true,
             wait_for_async_insert: true,
             allow_newer_server: false,
@@ -2091,6 +2103,62 @@ ruleset = "custom"
         assert_eq!(cfg.identity.author, "");
         assert!(!cfg.mcp.prewarm_on_initialize);
         assert!(!cfg.ingest.sources.is_empty());
+    }
+
+    #[test]
+    fn clickhouse_request_compression_defaults_to_none() {
+        let path = write_temp_config("", "clickhouse-request-compression-default");
+        let cfg = load_config(&path).expect("empty config should load with defaults");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            cfg.clickhouse.request_compression,
+            ClickHouseRequestCompression::None
+        );
+        assert_eq!(
+            cfg.backends[DEFAULT_BACKEND_NAME].request_compression,
+            ClickHouseRequestCompression::None
+        );
+    }
+
+    #[test]
+    fn clickhouse_request_compression_parses_gzip() {
+        let path = write_temp_config(
+            r#"
+[clickhouse]
+request_compression = "gzip"
+"#,
+            "clickhouse-request-compression-gzip",
+        );
+        let cfg = load_config(&path).expect("gzip compression should parse");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            cfg.clickhouse.request_compression,
+            ClickHouseRequestCompression::Gzip
+        );
+        assert_eq!(
+            cfg.backends[DEFAULT_BACKEND_NAME].request_compression,
+            ClickHouseRequestCompression::Gzip
+        );
+    }
+
+    #[test]
+    fn clickhouse_request_compression_rejects_unknown_values() {
+        let path = write_temp_config(
+            r#"
+[clickhouse]
+request_compression = "brotli"
+"#,
+            "clickhouse-request-compression-invalid",
+        );
+        let err = load_config(&path).expect_err("unknown compression should fail");
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            format!("{err:#}").contains("unknown variant `brotli`"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]

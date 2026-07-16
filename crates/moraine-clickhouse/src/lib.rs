@@ -1,12 +1,14 @@
 use anyhow::{anyhow, bail, Context, Result};
-use moraine_config::ClickHouseConfig;
+use flate2::{write::GzEncoder, Compression};
+use moraine_config::{ClickHouseConfig, ClickHouseRequestCompression};
 use reqwest::{
-    header::{HeaderValue, CONTENT_LENGTH, CONTENT_TYPE, USER_AGENT},
+    header::{HeaderValue, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, USER_AGENT},
     Client, RequestBuilder, Url,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::Value;
+use std::io::Write;
 
 mod mcp_open_projection;
 
@@ -148,6 +150,19 @@ impl ClickHouseClient {
         }
 
         // ClickHouse HTTP treats GET as readonly, so use POST for both reads and writes.
+        let (body, content_encoding) = match (self.cfg.request_compression, body.is_empty()) {
+            (_, true) | (ClickHouseRequestCompression::None, false) => (body, None),
+            (ClickHouseRequestCompression::Gzip, false) => {
+                let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+                encoder
+                    .write_all(&body)
+                    .context("failed to gzip ClickHouse request body")?;
+                let compressed = encoder
+                    .finish()
+                    .context("failed to finish gzip ClickHouse request body")?;
+                (compressed, Some("gzip"))
+            }
+        };
         let payload_len = body.len();
         let mut req = self
             .http
@@ -156,6 +171,10 @@ impl ClickHouseClient {
             // Some ClickHouse builds require an explicit Content-Length on POST.
             .header(CONTENT_LENGTH, payload_len)
             .body(body);
+
+        if let Some(content_encoding) = content_encoding {
+            req = req.header(CONTENT_ENCODING, content_encoding);
+        }
 
         if let Some(timeout) = options.request_timeout {
             req = req.timeout(timeout);
@@ -1015,10 +1034,12 @@ mod tests {
         routing::{get, post},
         Router,
     };
+    use flate2::read::GzDecoder;
     use moraine_config::ClickHouseConfig;
     use serde::Deserialize;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::io::Read;
     use std::sync::{Arc, Mutex};
 
     fn test_clickhouse_config(url: String) -> ClickHouseConfig {
@@ -1028,6 +1049,7 @@ mod tests {
             username: "default".to_string(),
             password: String::new(),
             timeout_seconds: 5.0,
+            request_compression: ClickHouseRequestCompression::None,
             async_insert: true,
             wait_for_async_insert: true,
             allow_newer_server: false,
@@ -1092,6 +1114,54 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind insert capture listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        format!("http://{}", addr)
+    }
+
+    #[derive(Clone)]
+    struct RequestCaptureState {
+        requests: Arc<Mutex<Vec<CapturedRequest>>>,
+    }
+
+    struct CapturedRequest {
+        params: HashMap<String, String>,
+        headers: HeaderMap,
+        body: Vec<u8>,
+    }
+
+    async fn spawn_request_capture_server(state: RequestCaptureState) -> String {
+        async fn handler(
+            State(state): State<RequestCaptureState>,
+            Query(params): Query<HashMap<String, String>>,
+            headers: HeaderMap,
+            body: Bytes,
+        ) -> (StatusCode, &'static str) {
+            state
+                .requests
+                .lock()
+                .expect("request capture mutex poisoned")
+                .push(CapturedRequest {
+                    params,
+                    headers,
+                    body: body.to_vec(),
+                });
+            (StatusCode::OK, "ok")
+        }
+
+        let app = Router::new()
+            .route("/", post(handler))
+            .layer(DefaultBodyLimit::max(
+                MAX_INSERT_PAYLOAD_BYTES.saturating_mul(2),
+            ))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind request capture listener");
         let addr = listener.local_addr().expect("listener addr");
 
         tokio::spawn(async move {
@@ -1710,6 +1780,145 @@ mod tests {
         assert!(
             result.is_err(),
             "invalid identity must fail before a request can be built"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gzip_request_compression_encodes_body_and_preserves_metadata() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let base_url = spawn_request_capture_server(RequestCaptureState {
+            requests: requests.clone(),
+        })
+        .await;
+        let mut config = test_clickhouse_config(base_url);
+        config.database = "moraine_team".to_string();
+        config.username = "svc-moraine".to_string();
+        config.password = "test-password".to_string();
+        config.request_compression = ClickHouseRequestCompression::Gzip;
+        let client = ClickHouseClient::new(config).expect("new client");
+        let payload = br#"{"payload":"synthetic trace payload"}
+"#
+        .to_vec();
+
+        client
+            .request_text_with_params(
+                "INSERT INTO tool_io FORMAT JSONEachRow",
+                Some(payload.clone()),
+                Some("moraine_team"),
+                true,
+                Some("JSONEachRow"),
+                &[("query_id", "gzip-test")],
+            )
+            .await
+            .expect("gzip request");
+
+        let requests = requests.lock().expect("request capture mutex poisoned");
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(
+            request
+                .headers
+                .get("content-encoding")
+                .and_then(|value| value.to_str().ok()),
+            Some("gzip")
+        );
+        assert_eq!(
+            request
+                .headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/plain; charset=utf-8")
+        );
+        assert_eq!(
+            request
+                .headers
+                .get("content-length")
+                .and_then(|value| value.to_str().ok()),
+            Some(request.body.len().to_string().as_str())
+        );
+        assert!(request.headers.get("authorization").is_some());
+        assert_eq!(
+            request.params.get("query").map(String::as_str),
+            Some("INSERT INTO tool_io FORMAT JSONEachRow")
+        );
+        assert_eq!(
+            request.params.get("database").map(String::as_str),
+            Some("moraine_team")
+        );
+        assert_eq!(
+            request.params.get("default_format").map(String::as_str),
+            Some("JSONEachRow")
+        );
+        assert_eq!(
+            request.params.get("async_insert").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            request
+                .params
+                .get("wait_for_async_insert")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            request.params.get("query_id").map(String::as_str),
+            Some("gzip-test")
+        );
+
+        let mut decoded = Vec::new();
+        GzDecoder::new(request.body.as_slice())
+            .read_to_end(&mut decoded)
+            .expect("decode gzip body");
+        assert_eq!(decoded, payload);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn default_request_compression_preserves_plain_body() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let base_url = spawn_request_capture_server(RequestCaptureState {
+            requests: requests.clone(),
+        })
+        .await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+        let payload = b"plain request body".to_vec();
+
+        client
+            .request_text("SELECT 1", Some(payload.clone()), None, false, None)
+            .await
+            .expect("plain request");
+
+        let requests = requests.lock().expect("request capture mutex poisoned");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].headers.get("content-encoding").is_none());
+        assert_eq!(requests[0].body, payload);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gzip_request_compression_leaves_empty_body_unencoded() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let base_url = spawn_request_capture_server(RequestCaptureState {
+            requests: requests.clone(),
+        })
+        .await;
+        let mut config = test_clickhouse_config(base_url);
+        config.request_compression = ClickHouseRequestCompression::Gzip;
+        let client = ClickHouseClient::new(config).expect("new client");
+
+        client
+            .request_text("SELECT 1", None, None, false, None)
+            .await
+            .expect("empty request");
+
+        let requests = requests.lock().expect("request capture mutex poisoned");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].headers.get("content-encoding").is_none());
+        assert!(requests[0].body.is_empty());
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("content-length")
+                .and_then(|value| value.to_str().ok()),
+            Some("0")
         );
     }
 

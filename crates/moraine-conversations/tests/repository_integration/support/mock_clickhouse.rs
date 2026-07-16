@@ -107,6 +107,7 @@ pub(crate) fn test_clickhouse_config(url: String) -> ClickHouseConfig {
         username: "default".to_string(),
         password: String::new(),
         timeout_seconds: 5.0,
+        request_compression: Default::default(),
         async_insert: true,
         wait_for_async_insert: true,
         allow_newer_server: false,
