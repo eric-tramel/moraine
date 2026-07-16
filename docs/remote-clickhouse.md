@@ -83,11 +83,33 @@ Then configure Moraine on your workstation:
 url = "https://clickhouse.example.net:8443"
 database = "moraine"
 username = "moraine"
-password = "replace-with-your-secret"
+password = { env = "CLICKHOUSE_PASSWORD" }
 timeout_seconds = 30.0
 async_insert = true
 wait_for_async_insert = true
 ```
+
+Set `CLICKHOUSE_PASSWORD` in the process environment before starting Moraine.
+Environment injectors can supply it without writing the resolved value to disk:
+
+```bash
+moraine_with_secrets() {
+  op run --env-file=/absolute/path/to/.env.1password -- moraine "$@"
+}
+moraine_with_secrets up
+```
+
+The `url`, `database`, and `username` fields support the same
+`{ env = "VARIABLE_NAME" }` form. Moraine fails config loading when a referenced
+variable is missing or is not valid Unicode. Every Moraine process loads the
+config independently, so the remaining commands in this tutorial use the
+`moraine_with_secrets` helper. It limits the injected values to Moraine instead
+of exporting them to the rest of the shell.
+
+Environment references keep resolved values out of the TOML file, but Moraine
+still holds them in process memory. Restart the Moraine services after rotating
+a value. Do not put credentials or secret query parameters in `url`; URL,
+database, and username values may appear in diagnostics.
 
 If you use an SSH tunnel instead of exposing HTTPS, point `url` at the local
 side of the tunnel:
@@ -101,29 +123,32 @@ ssh -N -L 18123:127.0.0.1:8123 user@clickhouse-host
 url = "http://127.0.0.1:18123"
 database = "moraine"
 username = "moraine"
-password = "replace-with-your-secret"
+password = { env = "CLICKHOUSE_PASSWORD" }
 ```
 
 Keep the tunnel running before starting Moraine.
 
 ## Initialize The Schema
 
+The commands below use `moraine_with_secrets` for an environment-backed config.
+If your config contains only literal values, run `moraine` in its place.
+
 Run a health check first:
 
 ```bash
-moraine db doctor
+moraine_with_secrets db doctor
 ```
 
 Apply Moraine's schema migrations to the configured default database:
 
 ```bash
-moraine db migrate
+moraine_with_secrets db migrate
 ```
 
 Run the doctor check again:
 
 ```bash
-moraine db doctor
+moraine_with_secrets db doctor
 ```
 
 If migrations fail because the user is too restricted, either grant the Moraine
@@ -136,7 +161,7 @@ operation.
 Start the stack normally:
 
 ```bash
-moraine up
+moraine_with_secrets up
 ```
 
 When the configured ClickHouse endpoint is already healthy, the `clickhouse`
@@ -147,7 +172,7 @@ database.
 Check status:
 
 ```bash
-moraine status
+moraine_with_secrets status
 ```
 
 The monitor still runs on the configured monitor address, normally:
@@ -158,14 +183,15 @@ http://127.0.0.1:8080
 
 ## Troubleshooting
 
-If `moraine up` fails for a non-local URL, Moraine did not start a local
-ClickHouse fallback. Start or repair the configured ClickHouse endpoint, then
-retry.
+If `moraine_with_secrets up` fails for a non-local URL, Moraine did not start a
+local ClickHouse fallback. Start or repair the configured ClickHouse endpoint,
+then retry.
 
-If `moraine up` starts a managed local ClickHouse when you expected Docker,
-the configured local endpoint was not healthy before startup. Start the Docker
-container or tunnel first, verify it with `moraine db doctor`, then run
-`moraine up` again.
+If `moraine_with_secrets up` starts a managed local ClickHouse when you expected
+Docker, the configured local endpoint was not healthy before startup. Start the
+Docker container or tunnel first, run the injected `db doctor` command, then
+run `moraine_with_secrets up` again.
 
-If `moraine db doctor` reports missing tables, run `moraine db migrate` against
-the same config file used by `moraine up`.
+If `moraine_with_secrets db doctor` reports missing tables, run
+`moraine_with_secrets db migrate` against the same config file used by
+`moraine_with_secrets up`.

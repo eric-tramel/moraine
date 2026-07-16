@@ -130,6 +130,50 @@ projects to additional servers, see
 | `wait_for_async_insert` | `true` | Waits for async insert completion before advancing checkpoints, so write failures are visible. |
 | `allow_newer_server` | `false` | Allows a non-default backend whose migration ledger is ahead of this Moraine build. The default backend is migrated by Moraine itself, so this is only useful on `[backends.<name>]`. |
 
+### Environment-backed ClickHouse values
+
+The `url`, `database`, `username`, and `password` fields accept either a literal
+string or an explicit environment reference. Environment references keep
+credentials out of the TOML file and work independently for every named
+backend:
+
+```toml
+[backends.team-ch]
+url = { env = "CLICKHOUSE_TEAM_URL" }
+database = { env = "CLICKHOUSE_TEAM_DATABASE" }
+username = { env = "CLICKHOUSE_TEAM_USERNAME" }
+password = { env = "CLICKHOUSE_TEAM_PASSWORD" }
+```
+
+Moraine reads the variables when it loads the config. A referenced variable
+must exist and contain valid Unicode; its value is used exactly, including an
+empty value or surrounding whitespace. Missing or invalid variables are config
+errors. Literal strings remain supported and are still the default.
+
+This works with environment injectors and secret managers. For example, a
+1Password environment can launch Moraine without writing the resolved password
+to disk:
+
+```bash
+op run --env-file=.env.1password -- moraine up
+```
+
+Every independently launched Moraine process loads the config for itself. Run
+other commands through the same injector, including `moraine status`, `moraine
+db doctor`, `moraine db migrate`, `moraine down`, `moraine logs`, `moraine
+setup`, and `moraine run mcp`. Services started by the injected `moraine up`
+process inherit its environment. If a referenced variable is unavailable,
+`moraine setup` reports an environment error and does not offer to repair or
+replace the config.
+
+An environment reference protects the resolved value from being stored in the
+TOML file. Moraine still holds the value in process memory, and a running
+service must be restarted to pick up a rotated value. Keep authentication in
+the dedicated `username` and `password` fields: do not embed credentials or
+secret query parameters in `url`, because URL, database, and username values
+may appear in diagnostics. For agent integrations, inject the environment only
+into Moraine's MCP process; see [Install by Harness](agent-mcp-search/install.md#environment-backed-clickhouse-credentials).
+
 ## Backends and Per-Project Routing
 
 A project may belong to a team with a shared ClickHouse deployment. Named
@@ -141,7 +185,7 @@ keeping the complete local history:
 url = "https://ch.team.example:8443"
 database = "moraine_team"
 username = "svc-moraine"
-password = "..."
+password = { env = "CLICKHOUSE_TEAM_PASSWORD" }
 allow_newer_server = false
 
 [[routes]]
