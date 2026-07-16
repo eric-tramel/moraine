@@ -181,7 +181,10 @@ async fn load_turn_open(
         return Ok(Some(turn.clone()));
     }
 
-    let turn = state.repo.get_mcp_turn(session_id, turn_seq).await?;
+    let turn = state
+        .repo
+        .get_mcp_turn_summary(session_id, turn_seq)
+        .await?;
     if let Some(turn) = &turn {
         cache.turns.insert(key, turn.clone());
     }
@@ -592,6 +595,8 @@ mod tests {
                 events: Vec::new(),
                 user_input_summary: None,
                 final_response_summary: None,
+                user_input_event: None,
+                final_response_event: None,
                 tools_called: Vec::new(),
                 normalized_event_types: Vec::new(),
                 completed: true,
@@ -600,6 +605,7 @@ mod tests {
                 next_turn: None,
                 first_event: None,
                 last_event: None,
+                snapshot: None,
             },
         );
 
@@ -669,11 +675,16 @@ mod tests {
                 .to_string();
             let canonical = OpenV1Args {
                 id: Some(open_id.clone()),
+                ..OpenV1Args::default()
             }
-            .validate()
+            .validate(50)
             .expect("open accepts search result id");
 
-            assert_eq!(canonical.id.to_string(), open_id);
+            assert!(matches!(
+                canonical,
+                crate::contract::CanonicalOpenV1Args::Initial { id, limit: None }
+                    if id.to_string() == open_id
+            ));
         }
     }
 

@@ -120,25 +120,42 @@ depends on exact wording, command output, payload JSON, or tool arguments.
 
 ## `open`
 
-`open` expands an ID returned by `search_sessions`, `list_sessions`, or another
-`open` response.
+`open` reads an ID returned by `search_sessions`, `list_sessions`, or another
+`open` response. Session and turn reads are summary-first so a large history
+does not enter the model context unless the agent asks for it.
 
-Input:
+There are three call shapes:
 
 ```json
-{ "id": "event:..." }
+{ "id": "turn:..." }
+{ "id": "turn:...", "limit": 20 }
+{ "cursor": "opaque-next-cursor" }
 ```
+
+- `id` alone returns session/turn metadata, compact user input and final
+  response, tools and event types, counts, and traversal handles. Its `turns`
+  or `events` array is empty and `next_cursor` is null.
+- `id` plus `limit` starts bounded forward expansion. `limit` is from 1 to the
+  server's configured maximum.
+- `{ "cursor": next_cursor }` continues the same target with the original page
+  size. Treat the cursor as opaque. If an active session changes between pages,
+  reopen the typed ID and start again.
+
+Follow `next_cursor` until it is null to recover every compact turn or event
+summary. Then open an individual `event:` ID when exact wording, full tool
+arguments/output, or payload JSON is needed. There is intentionally no
+unbounded one-call transcript mode.
 
 What comes back depends on the ID kind:
 
 | ID kind | Returned context |
 | --- | --- |
 | `event` | Full event content, payload details when available, parent turn/session summary, and traversal IDs. |
-| `turn` | Turn metadata, compact user/final-response summaries, tool names, event summaries, and previous/next turn IDs. |
-| `session` | Session metadata and compact summaries for each turn. |
+| `turn` | Summary and traversal by default; a bounded page of compact event handles when `limit` or `cursor` is used. |
+| `session` | Metadata and first/last-turn traversal by default; a bounded page of compact turn summaries when expanded. |
 
-Use event open for evidence, turn open for local context, and session open for
-orientation across the whole conversation.
+Use event open for exact evidence, id-only turn/session open for orientation,
+and expand only when the summary is insufficient.
 
 ## `list_sessions`
 
@@ -320,8 +337,11 @@ The agent should treat Moraine records as a navigable evidence graph:
 
 - A search hit says "this event probably matters."
 - `open(event)` says "this is exactly what happened at that point."
-- `open(turn)` says "this is the immediate conversational context."
-- `open(session)` says "this is the full session map."
+- Id-only `open(turn)` says "this is a bounded map of the immediate
+  conversational context."
+- Id-only `open(session)` says "this is a bounded map of the session."
+- Bounded expansion pages say "these are the next compact child handles";
+  follow their opaque cursor only when more context is needed.
 - Traversal IDs let the agent move to neighboring events or turns without
   re-running a broad search.
 
