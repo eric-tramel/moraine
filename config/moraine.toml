@@ -19,7 +19,8 @@ wait_for_async_insert = true
 # url = "https://ch.team.example:8443"
 # database = "moraine_team"
 # username = "svc-moraine"
-# password = ""
+# Any ClickHouse string field can read from the process environment instead.
+# password = { env = "CLICKHOUSE_TEAM_PASSWORD" }
 # # Accept a server whose migration ledger is ahead of this moraine build.
 # allow_newer_server = false
 

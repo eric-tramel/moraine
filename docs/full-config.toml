@@ -21,7 +21,8 @@ database = "moraine"
 # ClickHouse username used by ingest, monitor, MCP, and migrations.
 username = "default"
 
-# ClickHouse password. Leave empty for the managed local default user.
+# ClickHouse password. Leave empty for the managed local default user. Any
+# ClickHouse string field can instead use { env = "VARIABLE_NAME" }.
 password = ""
 
 # Per-request ClickHouse HTTP timeout, in seconds.
@@ -48,7 +49,7 @@ allow_newer_server = false
 # url = "https://ch.team.example:8443"
 # database = "moraine_team"
 # username = "svc-moraine"
-# password = ""
+# password = { env = "CLICKHOUSE_TEAM_PASSWORD" }
 # timeout_seconds = 30.0
 # async_insert = true
 # wait_for_async_insert = true

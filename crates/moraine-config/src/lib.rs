@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use serde::{de::DeserializeOwned, Deserialize};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -45,16 +45,25 @@ pub struct IngestSource {
     pub format: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClickHouseConfig {
-    #[serde(default = "default_ch_url")]
+    #[serde(
+        default = "default_ch_url",
+        deserialize_with = "deserialize_clickhouse_string"
+    )]
     pub url: String,
-    #[serde(default = "default_ch_database")]
+    #[serde(
+        default = "default_ch_database",
+        deserialize_with = "deserialize_clickhouse_string"
+    )]
     pub database: String,
-    #[serde(default = "default_ch_username")]
+    #[serde(
+        default = "default_ch_username",
+        deserialize_with = "deserialize_clickhouse_string"
+    )]
     pub username: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_clickhouse_string")]
     pub password: String,
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: f64,
@@ -68,6 +77,75 @@ pub struct ClickHouseConfig {
     /// itself); false means unknown server-side versions are a hard error.
     #[serde(default = "default_false")]
     pub allow_newer_server: bool,
+}
+
+fn deserialize_clickhouse_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = toml::Value::deserialize(deserializer)?;
+    match value {
+        toml::Value::String(value) => Ok(value),
+        toml::Value::Table(mut reference) => {
+            if reference.len() != 1 || !reference.contains_key("env") {
+                return Err(serde::de::Error::custom(
+                    "ClickHouse string values must be a string or `{ env = \"VARIABLE_NAME\" }`",
+                ));
+            }
+
+            let variable = match reference.remove("env") {
+                Some(toml::Value::String(variable)) => variable,
+                _ => {
+                    return Err(serde::de::Error::custom(
+                        "ClickHouse environment reference `env` must be a string",
+                    ));
+                }
+            };
+            if !is_valid_environment_variable_name(&variable) {
+                return Err(serde::de::Error::custom(format!(
+                    "invalid ClickHouse environment variable name `{variable}`; expected [A-Za-z_][A-Za-z0-9_]*"
+                )));
+            }
+
+            std::env::var(&variable).map_err(|error| match error {
+                std::env::VarError::NotPresent => serde::de::Error::custom(format!(
+                    "environment variable `{variable}` {CLICKHOUSE_ENVIRONMENT_NOT_SET_MARKER}"
+                )),
+                std::env::VarError::NotUnicode(_) => serde::de::Error::custom(format!(
+                    "environment variable `{variable}` {CLICKHOUSE_ENVIRONMENT_NOT_UNICODE_MARKER}"
+                )),
+            })
+        }
+        _ => Err(serde::de::Error::custom(
+            "ClickHouse string values must be a string or `{ env = \"VARIABLE_NAME\" }`",
+        )),
+    }
+}
+
+const CLICKHOUSE_ENVIRONMENT_NOT_SET_MARKER: &str = "referenced by ClickHouse config is not set";
+const CLICKHOUSE_ENVIRONMENT_NOT_UNICODE_MARKER: &str =
+    "referenced by ClickHouse config is not valid Unicode";
+
+/// Returns true when config loading reports that a referenced ClickHouse
+/// environment value was unavailable to the current process.
+///
+/// Callers such as setup can distinguish this transient condition from
+/// malformed TOML and must not offer destructive config repair for it.
+pub fn is_clickhouse_environment_unavailable_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let rendered = cause.to_string();
+        rendered.contains(CLICKHOUSE_ENVIRONMENT_NOT_SET_MARKER)
+            || rendered.contains(CLICKHOUSE_ENVIRONMENT_NOT_UNICODE_MARKER)
+    })
+}
+
+fn is_valid_environment_variable_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first == b'_' || first.is_ascii_alphabetic())
+        && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
 }
 
 /// Reserved name of the backend that the `[clickhouse]` block aliases. The
@@ -217,7 +295,7 @@ pub struct Bm25Config {
     pub max_query_terms: usize,
 }
 
-const REDACTED_AUTH_TOKEN: &str = "[REDACTED]";
+const REDACTED_SECRET: &str = "[REDACTED]";
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -377,8 +455,23 @@ impl fmt::Debug for BackendConfig {
             .field("bind", &self.bind)
             .field(
                 "auth_token",
-                &self.auth_token.as_ref().map(|_| REDACTED_AUTH_TOKEN),
+                &self.auth_token.as_ref().map(|_| REDACTED_SECRET),
             )
+            .finish()
+    }
+}
+
+impl fmt::Debug for ClickHouseConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClickHouseConfig")
+            .field("url", &self.url)
+            .field("database", &self.database)
+            .field("username", &self.username)
+            .field("password", &REDACTED_SECRET)
+            .field("timeout_seconds", &self.timeout_seconds)
+            .field("async_insert", &self.async_insert)
+            .field("wait_for_async_insert", &self.wait_for_async_insert)
+            .field("allow_newer_server", &self.allow_newer_server)
             .finish()
     }
 }
@@ -1605,6 +1698,35 @@ fn git_common_dir(root: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    struct ScopedEnvironmentVariable {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedEnvironmentVariable {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnvironmentVariable {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
     fn write_temp_config(contents: &str, label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "moraine-config-{label}-{}-{}.toml",
@@ -2094,6 +2216,243 @@ ruleset = "custom"
     }
 
     #[test]
+    fn clickhouse_literal_string_values_remain_compatible() {
+        const PASSWORD: &str = "literal-clickhouse-test-password";
+        let path = write_temp_config(
+            &format!(
+                r#"
+[clickhouse]
+url = "https://clickhouse.example.test:8443"
+database = "moraine_team"
+username = "svc-moraine"
+password = "{PASSWORD}"
+"#
+            ),
+            "clickhouse-literal-strings",
+        );
+        let cfg = load_config(&path).expect("literal ClickHouse strings should load");
+        std::fs::remove_file(path).ok();
+
+        assert_eq!(cfg.clickhouse.url, "https://clickhouse.example.test:8443");
+        assert_eq!(cfg.clickhouse.database, "moraine_team");
+        assert_eq!(cfg.clickhouse.username, "svc-moraine");
+        assert_eq!(cfg.clickhouse.password, PASSWORD);
+    }
+
+    #[test]
+    fn clickhouse_environment_references_resolve_for_default_and_named_backends() {
+        const DEFAULT_PASSWORD: &str = "  exact default environment password  ";
+        const TEAM_PASSWORD: &str = "exact-team-environment-password";
+        let _environment = [
+            ScopedEnvironmentVariable::set(
+                "MORAINE_TEST_DEFAULT_CLICKHOUSE_URL",
+                "https://default.example.test:8443",
+            ),
+            ScopedEnvironmentVariable::set(
+                "MORAINE_TEST_DEFAULT_CLICKHOUSE_DATABASE",
+                "moraine_default",
+            ),
+            ScopedEnvironmentVariable::set(
+                "MORAINE_TEST_DEFAULT_CLICKHOUSE_USERNAME",
+                "default-service-user",
+            ),
+            ScopedEnvironmentVariable::set(
+                "MORAINE_TEST_DEFAULT_CLICKHOUSE_PASSWORD",
+                DEFAULT_PASSWORD,
+            ),
+            ScopedEnvironmentVariable::set(
+                "MORAINE_TEST_TEAM_CLICKHOUSE_URL",
+                "https://team.example.test:8443",
+            ),
+            ScopedEnvironmentVariable::set("MORAINE_TEST_TEAM_CLICKHOUSE_DATABASE", "moraine_team"),
+            ScopedEnvironmentVariable::set(
+                "MORAINE_TEST_TEAM_CLICKHOUSE_USERNAME",
+                "team-service-user",
+            ),
+            ScopedEnvironmentVariable::set("MORAINE_TEST_TEAM_CLICKHOUSE_PASSWORD", TEAM_PASSWORD),
+        ];
+        let path = write_temp_config(
+            r#"
+[clickhouse]
+url = { env = "MORAINE_TEST_DEFAULT_CLICKHOUSE_URL" }
+database = { env = "MORAINE_TEST_DEFAULT_CLICKHOUSE_DATABASE" }
+username = { env = "MORAINE_TEST_DEFAULT_CLICKHOUSE_USERNAME" }
+password = { env = "MORAINE_TEST_DEFAULT_CLICKHOUSE_PASSWORD" }
+
+[backends.team-ch]
+url = { env = "MORAINE_TEST_TEAM_CLICKHOUSE_URL" }
+database = { env = "MORAINE_TEST_TEAM_CLICKHOUSE_DATABASE" }
+username = { env = "MORAINE_TEST_TEAM_CLICKHOUSE_USERNAME" }
+password = { env = "MORAINE_TEST_TEAM_CLICKHOUSE_PASSWORD" }
+"#,
+            "clickhouse-environment-references",
+        );
+        let cfg = load_config(&path).expect("environment references should load");
+        std::fs::remove_file(path).ok();
+
+        assert_eq!(cfg.clickhouse.url, "https://default.example.test:8443");
+        assert_eq!(cfg.clickhouse.database, "moraine_default");
+        assert_eq!(cfg.clickhouse.username, "default-service-user");
+        assert_eq!(cfg.clickhouse.password, DEFAULT_PASSWORD);
+        assert_eq!(
+            cfg.backends[DEFAULT_BACKEND_NAME].password,
+            DEFAULT_PASSWORD
+        );
+
+        let team = &cfg.backends["team-ch"];
+        assert_eq!(team.url, "https://team.example.test:8443");
+        assert_eq!(team.database, "moraine_team");
+        assert_eq!(team.username, "team-service-user");
+        assert_eq!(team.password, TEAM_PASSWORD);
+
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains(DEFAULT_PASSWORD));
+        assert!(!debug.contains(TEAM_PASSWORD));
+        assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn clickhouse_environment_references_resolve_for_backends_default_and_empty_values() {
+        const EMPTY_VARIABLE: &str = "MORAINE_TEST_DEFAULT_CLICKHOUSE_EMPTY_DATABASE";
+        const PASSWORD_VARIABLE: &str = "MORAINE_TEST_BACKENDS_DEFAULT_CLICKHOUSE_PASSWORD";
+        const PASSWORD: &str = "backends-default-environment-password";
+        let _environment = [
+            ScopedEnvironmentVariable::set(EMPTY_VARIABLE, ""),
+            ScopedEnvironmentVariable::set(PASSWORD_VARIABLE, PASSWORD),
+        ];
+        let path = write_temp_config(
+            &format!(
+                r#"
+[backends.default]
+url = "https://default.example.test:8443"
+database = {{ env = "{EMPTY_VARIABLE}" }}
+username = "default-service-user"
+password = {{ env = "{PASSWORD_VARIABLE}" }}
+"#
+            ),
+            "clickhouse-environment-backends-default-empty",
+        );
+        let cfg =
+            load_config(&path).expect("[backends.default] environment references should load");
+        std::fs::remove_file(path).ok();
+
+        assert!(cfg.clickhouse.database.is_empty());
+        assert_eq!(cfg.clickhouse.password, PASSWORD);
+        assert!(cfg.backends[DEFAULT_BACKEND_NAME].database.is_empty());
+        assert_eq!(cfg.backends[DEFAULT_BACKEND_NAME].password, PASSWORD);
+    }
+
+    #[test]
+    fn clickhouse_environment_reference_fails_when_variable_is_missing() {
+        const VARIABLE: &str = "MORAINE_TEST_CLICKHOUSE_MISSING_VALUE";
+        let _environment = ScopedEnvironmentVariable::unset(VARIABLE);
+        let path = write_temp_config(
+            &format!(
+                r#"
+[clickhouse]
+password = {{ env = "{VARIABLE}" }}
+"#
+            ),
+            "clickhouse-environment-missing",
+        );
+        let error = load_config(&path).expect_err("missing environment variable must fail");
+        std::fs::remove_file(path).ok();
+        assert!(is_clickhouse_environment_unavailable_error(&error));
+        let rendered = format!("{error:#}");
+
+        assert!(rendered.contains(VARIABLE), "unexpected error: {rendered}");
+        assert!(
+            rendered.contains("is not set"),
+            "unexpected error: {rendered}"
+        );
+    }
+
+    #[test]
+    fn clickhouse_config_errors_do_not_expose_resolved_environment_values() {
+        const VARIABLE: &str = "MORAINE_TEST_CLICKHOUSE_ERROR_SECRET";
+        const SECRET: &str = "resolved-environment-error-secret";
+        let _environment = ScopedEnvironmentVariable::set(VARIABLE, SECRET);
+        let path = write_temp_config(
+            &format!(
+                r#"
+[clickhouse]
+password = {{ env = "{VARIABLE}" }}
+
+[backend]
+bind = 8080
+"#
+            ),
+            "clickhouse-environment-neighbor-error",
+        );
+        let error = load_config(&path).expect_err("neighboring malformed config must fail");
+        std::fs::remove_file(path).ok();
+
+        for rendered in [format!("{error:#}"), format!("{error:?}")] {
+            assert!(
+                !rendered.contains(SECRET),
+                "config error leaked resolved environment value: {rendered}"
+            );
+            assert!(rendered.contains("failed to parse TOML config"));
+        }
+    }
+
+    #[test]
+    fn clickhouse_environment_reference_rejects_malformed_forms() {
+        for (label, value) in [
+            ("empty", r#"{ env = "" }"#),
+            ("invalid-name", r#"{ env = "NOT A VARIABLE" }"#),
+            ("wrong-type", r#"{ env = 7 }"#),
+            ("unknown-key", r#"{ env = "VALID_NAME", extra = "no" }"#),
+            ("not-string-or-table", "7"),
+        ] {
+            let path = write_temp_config(
+                &format!("[clickhouse]\npassword = {value}\n"),
+                &format!("clickhouse-environment-malformed-{label}"),
+            );
+            let error = load_config(&path).expect_err("malformed environment reference must fail");
+            std::fs::remove_file(path).ok();
+            assert!(!is_clickhouse_environment_unavailable_error(&error));
+            let rendered = format!("{error:#}");
+
+            assert!(
+                rendered.contains("ClickHouse"),
+                "case `{label}` returned an unexpected error: {rendered}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clickhouse_environment_reference_rejects_non_unicode_values() {
+        use std::os::unix::ffi::OsStringExt;
+
+        const VARIABLE: &str = "MORAINE_TEST_CLICKHOUSE_NON_UNICODE_VALUE";
+        let _environment = ScopedEnvironmentVariable::set(
+            VARIABLE,
+            std::ffi::OsString::from_vec(vec![b's', b'e', b'c', b'r', b'e', b't', 0xff]),
+        );
+        let path = write_temp_config(
+            &format!(
+                r#"
+[clickhouse]
+password = {{ env = "{VARIABLE}" }}
+"#
+            ),
+            "clickhouse-environment-non-unicode",
+        );
+        let error = load_config(&path).expect_err("non-Unicode environment value must fail");
+        std::fs::remove_file(path).ok();
+        assert!(is_clickhouse_environment_unavailable_error(&error));
+        let rendered = format!("{error:#}");
+
+        assert!(rendered.contains(VARIABLE), "unexpected error: {rendered}");
+        assert!(
+            rendered.contains("not valid Unicode"),
+            "unexpected error: {rendered}"
+        );
+    }
+
+    #[test]
     fn identity_author_defaults_to_empty() {
         let path = write_temp_config("", "identity-defaults");
         let cfg = load_config(&path).expect("empty config should load with defaults");
@@ -2267,8 +2626,42 @@ auth_token = "  exact token value  "
     }
 
     #[test]
+    fn clickhouse_debug_redacts_password_and_shows_non_secret_fields() {
+        const PASSWORD: &str = "unique-clickhouse-debug-password";
+        let clickhouse = ClickHouseConfig {
+            url: "https://clickhouse.example.test:8443".to_string(),
+            database: "moraine_team".to_string(),
+            username: "svc-moraine".to_string(),
+            password: PASSWORD.to_string(),
+            ..ClickHouseConfig::default()
+        };
+
+        let debug = format!("{clickhouse:?}");
+        assert!(debug.contains("https://clickhouse.example.test:8443"));
+        assert!(debug.contains("moraine_team"));
+        assert!(debug.contains("svc-moraine"));
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(PASSWORD));
+        let pretty_debug = format!("{clickhouse:#?}");
+        assert!(pretty_debug.contains("[REDACTED]"));
+        assert!(!pretty_debug.contains(PASSWORD));
+    }
+
+    #[test]
     fn app_config_debug_uses_redacted_backend_debug() {
         let mut cfg = AppConfig::default();
+        cfg.clickhouse.password = "app-config-clickhouse-password".to_string();
+        cfg.backends
+            .get_mut(DEFAULT_BACKEND_NAME)
+            .expect("default ClickHouse backend")
+            .password = "app-config-default-backend-password".to_string();
+        cfg.backends.insert(
+            "team-ch".to_string(),
+            ClickHouseConfig {
+                password: "app-config-team-backend-password".to_string(),
+                ..ClickHouseConfig::default()
+            },
+        );
         cfg.backend.start_on_up = true;
         cfg.backend.bind = "192.0.2.10".to_string();
         cfg.backend.auth_token = Some("app-config-secret-token".to_string());
@@ -2278,9 +2671,15 @@ auth_token = "  exact token value  "
             r#"backend: BackendConfig { start_on_up: true, bind: "192.0.2.10", auth_token: Some("[REDACTED]") }"#
         ));
         assert!(!debug.contains("app-config-secret-token"));
+        assert!(!debug.contains("app-config-clickhouse-password"));
+        assert!(!debug.contains("app-config-default-backend-password"));
+        assert!(!debug.contains("app-config-team-backend-password"));
         let pretty_debug = format!("{cfg:#?}");
         assert!(pretty_debug.contains("[REDACTED]"));
         assert!(!pretty_debug.contains("app-config-secret-token"));
+        assert!(!pretty_debug.contains("app-config-clickhouse-password"));
+        assert!(!pretty_debug.contains("app-config-default-backend-password"));
+        assert!(!pretty_debug.contains("app-config-team-backend-password"));
     }
 
     #[test]

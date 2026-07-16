@@ -240,6 +240,13 @@ fn setup_config(
             &backend_bind,
             args.dry_run,
         ),
+        ConfigState::EnvironmentUnavailable(message) => Ok(ConfigReport::error(
+            &target.path,
+            "environment_unavailable",
+            &format!(
+                "config could not be fully validated because a referenced ClickHouse environment value is unavailable; launch setup through the same environment injector used for Moraine services. The config was not modified and is not eligible for repair. {message}"
+            ),
+        )),
         ConfigState::Invalid(message) => {
             if args.dry_run {
                 let action = if args.repair_config {
@@ -291,6 +298,7 @@ enum ConfigState {
         backend_start_on_up: bool,
         backend_bind: String,
     },
+    EnvironmentUnavailable(String),
     Invalid(String),
     Unreadable(String),
 }
@@ -317,6 +325,9 @@ fn inspect_config(path: &Path) -> ConfigState {
             backend_start_on_up: config.backend.start_on_up,
             backend_bind: config.backend.bind,
         },
+        Err(exc) if moraine_config::is_clickhouse_environment_unavailable_error(&exc) => {
+            ConfigState::EnvironmentUnavailable(exc.to_string())
+        }
         Err(exc) => ConfigState::Invalid(exc.to_string()),
     }
 }
@@ -2628,6 +2639,28 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use toml_edit::value as toml_value;
 
+    struct ScopedEnvironmentVariable {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedEnvironmentVariable {
+        fn unset(key: &'static str) -> Self {
+            let previous = env::var_os(key);
+            env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnvironmentVariable {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                env::set_var(self.key, previous);
+            } else {
+                env::remove_var(self.key);
+            }
+        }
+    }
     #[derive(Default)]
     struct FakeRunner {
         existing: BTreeSet<String>,
@@ -3250,6 +3283,37 @@ watch_root = "~/custom"
                 .mode()
                 & 0o777,
             0o600
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unavailable_clickhouse_environment_is_not_repairable_config_corruption() {
+        const VARIABLE: &str = "MORAINE_TEST_SETUP_MISSING_CLICKHOUSE_PASSWORD";
+        let _environment = ScopedEnvironmentVariable::unset(VARIABLE);
+        let dir = temp_path("environment-unavailable-no-repair");
+        fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("config.toml");
+        let original = format!(
+            "[clickhouse]\npassword = {{ env = \"{VARIABLE}\" }}\n\n[backend]\nstart_on_up = false\n"
+        );
+        fs::write(&path, &original).expect("write config");
+
+        let report = setup_config_for_test(&path, false, true);
+
+        assert_eq!(report.status, SetupStatus::Error);
+        assert_eq!(report.action, "environment_unavailable");
+        assert!(report.backup_path.is_none());
+        assert!(report.message.contains(VARIABLE));
+        assert!(report.message.contains("config was not modified"));
+        assert_eq!(fs::read_to_string(&path).expect("config content"), original);
+        assert_eq!(
+            fs::read_dir(&dir)
+                .expect("read config dir")
+                .filter_map(Result::ok)
+                .count(),
+            1,
+            "setup must not create a backup or replacement config"
         );
         let _ = fs::remove_dir_all(dir);
     }

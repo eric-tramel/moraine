@@ -14,6 +14,49 @@ falls back to an embedded server. If you use a non-default Moraine config, pass
 it through the harness's environment support as
 `MORAINE_MCP_CONFIG=/path/to/moraine.toml`.
 
+<a id="environment-backed-clickhouse-credentials"></a>
+## Environment-backed ClickHouse credentials
+
+If the Moraine config uses `{ env = "VARIABLE_NAME" }` for a ClickHouse value,
+the MCP process needs the same environment injector as `moraine up`. Guided
+setup installs the plugin with its normal `moraine run mcp` command. Run guided
+setup first, then disable only the plugin-provided MCP server and add a custom
+server when the variables are not already present in the agent's environment.
+The plugin's skills remain enabled.
+
+For example, Codex can inject a 1Password environment into Moraine alone:
+
+```toml
+[plugins."moraine@moraine".mcp_servers.moraine]
+enabled = false
+
+[mcp_servers.moraine]
+command = "op"
+args = [
+  "run",
+  "--env-file=/absolute/path/to/.env.1password",
+  "--",
+  "moraine",
+  "run",
+  "mcp",
+]
+```
+
+Codex supports `command` and `args` for user-configured stdio servers, while a
+plugin-provided server's transport command is fixed by the plugin. Disabling
+the bundled server before adding the custom one avoids two Moraine MCP
+processes with the same purpose.
+
+Use the equivalent command-and-arguments form in other harnesses, or point the
+harness at a small wrapper executable that performs the same `op run`. Keep the
+path absolute because an MCP process may start in any repository. Do not launch
+the whole agent through the injector solely for Moraine: commands spawned by the
+agent would inherit the ClickHouse credentials too.
+
+Each MCP launch loads the config independently. The injected environment is
+therefore required even when `moraine up --backend` already started the shared
+central server; it is also required if MCP falls back to its embedded server.
+
 ## Guided setup (recommended)
 
 For default user-scoped setup, let Moraine create or repair its config and
