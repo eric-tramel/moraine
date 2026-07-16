@@ -6,6 +6,7 @@ pub(super) const CONVERSATION_CANDIDATE_MAX: usize = 20_000;
 pub(super) const CONVERSATION_RECENT_WINDOW_MS: i64 = 45_000;
 pub(super) const CONVERSATION_RECENT_CANDIDATE_LIMIT: usize = 1024;
 pub(super) const MCP_SEARCH_MAX_CANDIDATE_PAGES: u16 = 16;
+pub(super) const CODEX_FINAL_ANSWER_MIRROR_MAX_TIMESTAMP_DELTA_MS: u64 = 10;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct SearchScoreAccum<'a> {
@@ -739,6 +740,7 @@ FORMAT JSONEachRow",
       argMax(document.actor_role, document.doc_version) AS actor_role,
       argMax(document.name, document.doc_version) AS name,
       argMax(document.phase, document.doc_version) AS phase,
+      argMax(JSONExtractString(document.payload_json, 'phase'), document.doc_version) AS payload_phase,
       argMax(document.source_ref, document.doc_version) AS source_ref,
       toUInt32(argMax(document.doc_len, document.doc_version)) AS doc_len,
       argMax(leftUTF8(document.text_content, {preview}), document.doc_version) AS text_preview,
@@ -767,6 +769,7 @@ SELECT
   documents.actor_role AS actor_role,
   documents.name AS name,
   documents.phase AS phase,
+  documents.payload_phase AS payload_phase,
   documents.source_ref AS source_ref,
   documents.doc_len AS doc_len,
   documents.text_preview AS text_preview,
@@ -1560,15 +1563,71 @@ FORMAT JSONEachRow",
             McpEventType::from_normalized(&b.mcp_event_type)
         };
 
-        a.session_id == b.session_id
+        let same_content = if a.text_content_digest.is_empty() && b.text_content_digest.is_empty() {
+            a.text_content == b.text_content
+        } else {
+            a.text_content_digest == b.text_content_digest
+        };
+        let same_logical_coordinates = a.session_id == b.session_id
             && a.turn_seq == b.turn_seq
-            && a.event_unix_ms == b.event_unix_ms
             && a_event_type == b_event_type
-            && if a.text_content_digest.is_empty() && b.text_content_digest.is_empty() {
-                a.text_content == b.text_content
-            } else {
-                a.text_content_digest == b.text_content_digest
-            }
+            && same_content;
+
+        same_logical_coordinates
+            && (a.event_unix_ms == b.event_unix_ms
+                || Self::mcp_search_rows_are_codex_final_answer_mirrors(a, b))
+    }
+
+    fn mcp_search_rows_are_codex_final_answer_mirrors(
+        a: &SearchMcpEventRow,
+        b: &SearchMcpEventRow,
+    ) -> bool {
+        let is_known_representation_pair = matches!(
+            (
+                (a.event_class.as_str(), a.payload_type.as_str()),
+                (b.event_class.as_str(), b.payload_type.as_str()),
+            ),
+            (("message", "message"), ("event_msg", "agent_message"))
+                | (("event_msg", "agent_message"), ("message", "message"))
+        );
+        let is_final_answer = |row: &SearchMcpEventRow| {
+            row.phase == "final_answer" || row.payload_phase == "final_answer"
+        };
+        let Some((a_source_file, a_generation, a_line)) = Self::parse_mcp_source_ref(&a.source_ref)
+        else {
+            return false;
+        };
+        let Some((b_source_file, b_generation, b_line)) = Self::parse_mcp_source_ref(&b.source_ref)
+        else {
+            return false;
+        };
+
+        a.harness == "codex"
+            && b.harness == "codex"
+            && !a.source_name.is_empty()
+            && a.source_name == b.source_name
+            && is_known_representation_pair
+            && is_final_answer(a)
+            && is_final_answer(b)
+            && a_source_file == b_source_file
+            && a_generation == b_generation
+            && a_line.abs_diff(b_line) == 1
+            && a.event_order.abs_diff(b.event_order) == 1
+            && a.event_unix_ms.abs_diff(b.event_unix_ms)
+                <= CODEX_FINAL_ANSWER_MIRROR_MAX_TIMESTAMP_DELTA_MS
+    }
+
+    fn parse_mcp_source_ref(source_ref: &str) -> Option<(&str, u64, u64)> {
+        let (source_and_generation, source_line) = source_ref.rsplit_once(':')?;
+        let (source_file, source_generation) = source_and_generation.rsplit_once(':')?;
+        if source_file.is_empty() {
+            return None;
+        }
+        Some((
+            source_file,
+            source_generation.parse().ok()?,
+            source_line.parse().ok()?,
+        ))
     }
 
     pub(super) fn dedupe_mcp_search_rows(

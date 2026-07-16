@@ -1,5 +1,7 @@
 use super::file_attention::merge_file_attention_touches;
-use super::search::{RankedPosting, SearchScoreAccum};
+use super::search::{
+    RankedPosting, SearchScoreAccum, CODEX_FINAL_ANSWER_MIRROR_MAX_TIMESTAMP_DELTA_MS,
+};
 use super::*;
 
 fn sample_search_doc() -> SearchDocExtraCacheEntry {
@@ -70,6 +72,7 @@ fn sample_mcp_search_row(event_uid: &str, raw_score: f64, event_unix_ms: i64) ->
         actor_role: "assistant".to_string(),
         name: String::new(),
         phase: String::new(),
+        payload_phase: String::new(),
         source_ref: "source-ref".to_string(),
         doc_len: 42,
         text_preview: "preview".to_string(),
@@ -97,6 +100,31 @@ fn sample_mcp_search_row(event_uid: &str, raw_score: f64, event_unix_ms: i64) ->
         session_summary: String::new(),
         session_completed: 0,
     }
+}
+
+fn sample_codex_final_answer_mirror_rows(
+    timestamp_delta_ms: i64,
+) -> (SearchMcpEventRow, SearchMcpEventRow) {
+    let mut response_item = sample_mcp_search_row("uid-response-item", 18.0, 1_777_000_000_000);
+    response_item.harness = "codex".to_string();
+    response_item.phase = "final_answer".to_string();
+    response_item.source_ref = "/tmp/session:with-colon.jsonl:7:41".to_string();
+    response_item.event_order = 41;
+    response_item.turn_seq = 2;
+    response_item.text_content = "byte-identical final answer".to_string();
+    response_item.text_content_digest = "digest-final-answer".to_string();
+
+    let mut event_msg = response_item.clone();
+    event_msg.event_uid = "uid-event-msg".to_string();
+    event_msg.event_class = "event_msg".to_string();
+    event_msg.payload_type = "agent_message".to_string();
+    event_msg.phase = "completed".to_string();
+    event_msg.payload_phase = "final_answer".to_string();
+    event_msg.source_ref = "/tmp/session:with-colon.jsonl:7:42".to_string();
+    event_msg.event_order = 42;
+    event_msg.event_unix_ms += timestamp_delta_ms;
+
+    (response_item, event_msg)
 }
 
 fn sample_file_attention_touch(
@@ -552,6 +580,93 @@ fn dedupe_mcp_search_rows_collapses_equivalent_events_and_fills_limit() {
     assert_eq!(deduped[0].event_uid, "uid-duplicate");
     assert_eq!(deduped[1].event_uid, "uid-second");
     assert_eq!(deduped[2].event_uid, "uid-third");
+}
+
+#[test]
+fn dedupe_mcp_search_rows_collapses_codex_final_answer_mirror_with_near_ms_timestamp() {
+    let (response_item, event_msg) = sample_codex_final_answer_mirror_rows(3);
+    let deduped = ClickHouseConversationRepository::dedupe_mcp_search_rows(
+        vec![response_item.clone(), event_msg.clone()],
+        2,
+    );
+    assert_eq!(deduped.len(), 1);
+
+    let reversed =
+        ClickHouseConversationRepository::dedupe_mcp_search_rows(vec![event_msg, response_item], 2);
+    assert_eq!(reversed.len(), 1);
+
+    let (response_item, event_msg) = sample_codex_final_answer_mirror_rows(
+        CODEX_FINAL_ANSWER_MIRROR_MAX_TIMESTAMP_DELTA_MS as i64,
+    );
+    let at_boundary =
+        ClickHouseConversationRepository::dedupe_mcp_search_rows(vec![response_item, event_msg], 2);
+    assert_eq!(at_boundary.len(), 1);
+}
+
+#[test]
+fn dedupe_mcp_search_rows_preserves_non_mirror_codex_final_answers() {
+    let (response_item, event_msg) = sample_codex_final_answer_mirror_rows(3);
+    let assert_distinct = |candidate: SearchMcpEventRow| {
+        let rows = ClickHouseConversationRepository::dedupe_mcp_search_rows(
+            vec![response_item.clone(), candidate],
+            2,
+        );
+        assert_eq!(rows.len(), 2);
+    };
+
+    let mut same_representation = event_msg.clone();
+    same_representation.event_class = "message".to_string();
+    same_representation.payload_type = "message".to_string();
+    assert_distinct(same_representation);
+
+    let mut different_session = event_msg.clone();
+    different_session.session_id = "session-2".to_string();
+    assert_distinct(different_session);
+
+    let mut different_turn = event_msg.clone();
+    different_turn.turn_seq += 1;
+    assert_distinct(different_turn);
+
+    let mut not_final = event_msg.clone();
+    not_final.payload_phase.clear();
+    assert_distinct(not_final);
+
+    let mut different_source_name = event_msg.clone();
+    different_source_name.source_name = "other-source".to_string();
+    assert_distinct(different_source_name);
+
+    let mut different_source_file = event_msg.clone();
+    different_source_file.source_ref = "/tmp/other.jsonl:7:42".to_string();
+    assert_distinct(different_source_file);
+
+    let mut different_generation = event_msg.clone();
+    different_generation.source_ref = "/tmp/session:with-colon.jsonl:8:42".to_string();
+    assert_distinct(different_generation);
+
+    let mut non_adjacent_source_line = event_msg.clone();
+    non_adjacent_source_line.source_ref = "/tmp/session:with-colon.jsonl:7:43".to_string();
+    assert_distinct(non_adjacent_source_line);
+
+    let mut non_adjacent_event_order = event_msg.clone();
+    non_adjacent_event_order.event_order += 1;
+    assert_distinct(non_adjacent_event_order);
+
+    let mut malformed_source_ref = event_msg.clone();
+    malformed_source_ref.source_ref = "malformed".to_string();
+    assert_distinct(malformed_source_ref);
+
+    let (_, outside_timestamp_bound) = sample_codex_final_answer_mirror_rows(
+        CODEX_FINAL_ANSWER_MIRROR_MAX_TIMESTAMP_DELTA_MS as i64 + 1,
+    );
+    assert_distinct(outside_timestamp_bound);
+
+    let mut different_type = event_msg.clone();
+    different_type.mcp_event_type = "reasoning".to_string();
+    assert_distinct(different_type);
+
+    let mut different_content = event_msg;
+    different_content.text_content_digest = "other-digest".to_string();
+    assert_distinct(different_content);
 }
 
 #[test]
