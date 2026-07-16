@@ -1489,6 +1489,21 @@ mod tests {
     }
 
     #[test]
+    fn mcp_open_migrations_exclude_blank_session_ids() {
+        for version in ["027", "029"] {
+            let migration = bundled_migrations()
+                .into_iter()
+                .find(|migration| migration.version == version)
+                .unwrap_or_else(|| panic!("migration {version} must be registered"));
+
+            assert!(
+                migration.sql.contains("WHERE notEmpty(session_id)"),
+                "migration {version} must not enqueue blank session IDs"
+            );
+        }
+    }
+
+    #[test]
     fn migration_021_adds_file_attention_columns_without_reordering_tables() {
         let migration = bundled_migrations()
             .into_iter()

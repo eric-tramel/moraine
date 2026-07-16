@@ -40,6 +40,18 @@ struct ProjectionStateRow {
     backfill_cursor: String,
 }
 
+fn projection_session_ids<I, S>(session_ids: I) -> BTreeSet<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    session_ids
+        .into_iter()
+        .map(|session_id| session_id.as_ref().to_string())
+        .filter(|session_id| !session_id.is_empty())
+        .collect()
+}
+
 impl ClickHouseClient {
     /// Rebuild complete canonical snapshots for the affected sessions and
     /// publish each session head only after its inactive children are durable.
@@ -48,11 +60,7 @@ impl ClickHouseClient {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let session_ids = session_ids
-            .into_iter()
-            .map(|session_id| session_id.as_ref().trim().to_string())
-            .filter(|session_id| !session_id.is_empty())
-            .collect::<BTreeSet<_>>();
+        let session_ids = projection_session_ids(session_ids);
 
         stream::iter(session_ids.into_iter().map(Ok::<_, anyhow::Error>))
             .try_for_each_concurrent(REFRESH_CONCURRENCY, |session_id| async move {
@@ -90,6 +98,7 @@ impl ClickHouseClient {
                        SELECT DISTINCT session_id\n\
                        FROM {}.events FINAL\n\
                        WHERE session_id > {}\n\
+                         AND notEmpty(session_id)\n\
                      )\n\
                      ORDER BY session_id ASC\n\
                      LIMIT {}\n\
@@ -125,7 +134,8 @@ impl ClickHouseClient {
                    SELECT session_id, dirty_revision\n\
                    FROM {}.mcp_open_sessions FINAL\n\
                  ) AS s ON s.session_id = d.session_id\n\
-                 WHERE d.dirty_revision > ifNull(s.dirty_revision, 0)\n\
+                 WHERE notEmpty(d.session_id)\n\
+                   AND d.dirty_revision > ifNull(s.dirty_revision, 0)\n\
                  ORDER BY d.session_id ASC\n\
                  LIMIT {}\n\
                  FORMAT JSONEachRow",
@@ -580,4 +590,20 @@ fn event_type_sql() -> &'static str {
       event_class = 'queue_operation' OR payload_type IN ('task_started', 'task_complete', 'turn_aborted', 'item_completed', 'queue-operation'), 'runtime',\
       lowerUTF8(actor_role) = 'system' OR event_class IN ('system', 'progress', 'file_history_snapshot') OR payload_type IN ('system', 'progress', 'file-history-snapshot', 'file_history_snapshot'), 'system',\
       'unknown')"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::projection_session_ids;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn projection_session_ids_drop_only_the_empty_storage_sentinel() {
+        let ids = projection_session_ids(["", " ", "\u{a0}", "session"]);
+
+        assert_eq!(
+            ids,
+            BTreeSet::from([" ".to_string(), "\u{a0}".to_string(), "session".to_string(),])
+        );
+    }
 }
