@@ -4,6 +4,7 @@ SELECT session_id, generateSnowflakeID(), now64(3)
 FROM (
   SELECT DISTINCT session_id
   FROM moraine.events FINAL
+  WHERE notEmpty(session_id)
 );
 
 INSERT INTO moraine.mcp_open_projection_state

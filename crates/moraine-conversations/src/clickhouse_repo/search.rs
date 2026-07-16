@@ -567,6 +567,7 @@ WHERE scope_s.session_id = {session_id}{scope_origin_filter}",
     FROM (
       SELECT session_id, dirty_revision
       FROM {dirty_sessions_table} FINAL
+      WHERE notEmpty(session_id)
     ) AS dirty
     LEFT JOIN (
       SELECT session_id, dirty_revision

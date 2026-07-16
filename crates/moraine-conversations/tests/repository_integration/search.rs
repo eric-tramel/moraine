@@ -716,6 +716,7 @@ async fn search_mcp_events_uses_one_candidate_and_one_bounded_detail_query() {
         "scalar corpus metadata must expand exactly once"
     );
     assert!(queries[0].contains("mcp_open_dirty_sessions"));
+    assert!(queries[0].contains("WHERE notEmpty(session_id)"));
     assert!(queries[0].contains("AS projection_clean"));
     assert!(queries[0].contains("projected_candidates AS ("));
     assert!(queries[0].contains("event_uid IN (SELECT event_uid FROM matching_doc_ids)"));
