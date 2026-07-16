@@ -320,6 +320,32 @@ VALUES
         .request_text(&insert, None, Some(database), false, None)
         .await
         .context("failed to insert live-schema fixtures")?;
+    let commentary_insert = format!(
+        r#"INSERT INTO `{database}`.`events`
+(
+  ingested_at, event_uid, session_id, session_date, source_name, harness, source_file,
+  source_ref, record_ts, event_ts, event_kind, actor_kind, payload_type, op_kind, op_status,
+  request_id, trace_id, turn_index, model, input_tokens, output_tokens, text_content,
+  payload_json, event_version
+)
+VALUES
+(
+  now64(3), 'issue549-user', 'issue549-commentary-session', today(), 'fixture', 'codex',
+  'fixture-commentary', 'issue549-user', '2026-07-15T20:00:00.000Z', now64(3),
+  'message', 'user', 'message', '', '', 'issue549-request', 'issue549-trace', 1,
+  '', 0, 0, 'Check the repository.', '{{}}', 1
+),
+(
+  now64(3), 'issue549-commentary', 'issue549-commentary-session', today(), 'fixture',
+  'codex', 'fixture-commentary', 'issue549-commentary', '2026-07-15T20:00:01.000Z',
+  now64(3), 'message', 'assistant', 'message', '', 'commentary', 'issue549-request',
+  'issue549-trace', 1, '', 0, 0, 'I am still checking the repository.', '{{}}', 1
+)"#
+    );
+    clickhouse
+        .request_text(&commentary_insert, None, Some(database), false, None)
+        .await
+        .context("failed to insert commentary projection fixture")?;
     Ok(())
 }
 
@@ -689,6 +715,96 @@ async fn live_schema_semantics_and_teardown() -> Result<()> {
             .backfill_mcp_open_read_model()
             .await
             .context("failed to project live-schema fixtures for bounded MCP open")?;
+        let commentary_turn = repository
+            .get_mcp_turn("issue549-commentary-session", 1)
+            .await
+            .context("commentary turn projection failed")?
+            .context("commentary turn missing")?;
+        assert!(!commentary_turn.completed);
+        assert!(commentary_turn.terminal_event_uid.is_none());
+        assert!(commentary_turn.final_response_summary.is_none());
+        assert!(commentary_turn.events.iter().any(|event| {
+            event.event_uid == "issue549-commentary"
+                && event.event_type == "assistant_response"
+                && event.phase == "commentary"
+        }));
+
+        #[derive(Deserialize)]
+        struct ProjectionRevisionRow {
+            generation: u64,
+            dirty_revision: u64,
+        }
+        let commentary_head_query = format!(
+            "SELECT generation, dirty_revision \
+             FROM `{}`.`mcp_open_sessions` FINAL \
+             WHERE session_id = 'issue549-commentary-session' \
+             FORMAT JSONEachRow",
+            database.as_str()
+        );
+        let before_reset = clickhouse
+            .query_rows::<ProjectionRevisionRow>(
+                &commentary_head_query,
+                Some(database.as_str()),
+            )
+            .await
+            .context("failed to read commentary projection before reset")?
+            .into_iter()
+            .next()
+            .context("commentary projection head missing before reset")?;
+        clickhouse
+            .request_text(
+                &format!(
+                    "INSERT INTO `{0}`.`mcp_open_dirty_sessions` \
+                     (session_id, dirty_revision, observed_at) \
+                     SELECT session_id, generateSnowflakeID(), now64(3) \
+                     FROM (SELECT DISTINCT session_id FROM `{0}`.`events` FINAL)",
+                    database.as_str()
+                ),
+                None,
+                Some(database.as_str()),
+                false,
+                None,
+            )
+            .await
+            .context("failed to invalidate existing MCP open projections")?;
+        clickhouse
+            .request_text(
+                &format!(
+                    "INSERT INTO `{}`.`mcp_open_projection_state` \
+                     (state_key, ready, generation, backfill_cursor) \
+                     VALUES ('global', 0, generateSnowflakeID(), '')",
+                    database.as_str()
+                ),
+                None,
+                Some(database.as_str()),
+                false,
+                None,
+            )
+            .await
+            .context("failed to reset MCP open projection state")?;
+        clickhouse
+            .backfill_mcp_open_read_model()
+            .await
+            .context("failed to rebuild reset MCP open projections")?;
+        let after_reset = clickhouse
+            .query_rows::<ProjectionRevisionRow>(
+                &commentary_head_query,
+                Some(database.as_str()),
+            )
+            .await
+            .context("failed to read commentary projection after reset")?
+            .into_iter()
+            .next()
+            .context("commentary projection head missing after reset")?;
+        assert!(after_reset.generation > before_reset.generation);
+        assert!(after_reset.dirty_revision > before_reset.dirty_revision);
+        assert!(clickhouse.mcp_open_read_model_ready().await?);
+        let rebuilt_commentary_turn = repository
+            .get_mcp_turn("issue549-commentary-session", 1)
+            .await
+            .context("rebuilt commentary turn projection failed")?
+            .context("rebuilt commentary turn missing")?;
+        assert!(rebuilt_commentary_turn.final_response_summary.is_none());
 
         #[derive(Deserialize)]
         struct TurnTimestampTypeRow {
