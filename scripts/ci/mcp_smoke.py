@@ -413,12 +413,17 @@ def open_payload_session_id(payload: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def open_payload_source(payload: Dict[str, Any]) -> Optional[str]:
+    return nested_string(payload, "data", "session", "source")
+
+
 def assert_open_search_ids(
     proc: subprocess.Popen[str],
     next_id: int,
     open_ids: list[str],
     expect_session_id: Optional[str],
     expect_open_text: Optional[str],
+    expect_source: Optional[str] = None,
 ) -> int:
     expected_session = expected_mcp_session_id(expect_session_id)
     opened_payloads: list[Dict[str, Any]] = []
@@ -437,6 +442,12 @@ def assert_open_search_ids(
             raise AssertionError(
                 "open session mismatch: "
                 f"got={open_session_id} want={expected_session}"
+            )
+        open_source = open_payload_source(open_payload)
+        if expect_source is not None and open_source != expect_source:
+            raise AssertionError(
+                "open source mismatch: "
+                f"id={open_id} got={open_source!r} want={expect_source!r}"
             )
         opened_payloads.append(open_payload)
 
@@ -642,6 +653,7 @@ def run_smoke(
 
         assert_sessions_absent(results, absent_session_ids, "search_sessions")
 
+        selected_result: Optional[Dict[str, Any]] = None
         if expect_no_results:
             if results:
                 raise AssertionError(
@@ -714,12 +726,23 @@ def run_smoke(
                     f"got {session_metadata.get('updated_at')!r}, "
                     f"wanted {expect_updated_at!r}"
                 )
+            listed_source = nested_string(selected_session, "session", "source")
+            if listed_source is None:
+                raise AssertionError(
+                    f"list_sessions result missing configured ingest source: {selected_session}"
+                )
+            listed_open_id = open_id_from_list_sessions_result(selected_session)
+            open_ids = [listed_open_id]
+            if selected_result is not None:
+                open_ids.extend(open_ids_from_search_result(selected_result))
+                open_ids = list(dict.fromkeys(open_ids))
             next_id = assert_open_search_ids(
                 proc,
                 next_id,
-                [open_id_from_list_sessions_result(selected_session)],
+                open_ids,
                 expect_session_id,
                 expect_open_text,
+                listed_source,
             )
         elif not sessions and not expect_no_results:
             raise AssertionError("list_sessions returned no sessions for e2e fixture window")

@@ -671,7 +671,7 @@ fn open_turn_data(
         "session": {
             "id": session_id,
             "title": null,
-            "source": null
+            "source": turn.parent_session_source
         },
         "summary": {
             "user_input": user_input,
@@ -1126,6 +1126,7 @@ mod tests {
                 event_summary("event-tool", "tool_call", "", "exec_command", "call-1"),
                 event_summary("event-final", "assistant_response", "assistant", "", ""),
             ],
+            parent_session_source: Some("codex".to_string()),
             user_input_summary: Some("Please check the failing monitor startup.".to_string()),
             final_response_summary: Some("Fixed the startup guard.".to_string()),
             user_input_event: Some(event_ref("event-user", 1)),
@@ -1158,6 +1159,7 @@ mod tests {
         };
         let (data, warnings) = open_turn_data(&turn, Some(&page)).expect("turn data");
         assert_eq!(data["kind"], "turn");
+        assert_eq!(data["session"]["source"], "codex");
         assert_eq!(data["events"][1]["tool_name"], "exec_command");
         assert_eq!(data["events"][2]["terminal"], true);
         assert!(data["events"][0].get("payload").is_none());
@@ -1590,6 +1592,7 @@ mod tests {
                 ..turn_summary()
             },
             events,
+            parent_session_source: Some("codex".to_string()),
             user_input_summary: Some("Please inspect this large turn.".to_string()),
             final_response_summary: Some("The large-turn work is complete.".to_string()),
             user_input_event: Some(event_ref("event-000", 1)),

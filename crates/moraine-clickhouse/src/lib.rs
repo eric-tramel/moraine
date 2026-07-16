@@ -811,6 +811,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             name: "027_mcp_open_read_model.sql",
             sql: include_str!("../../../sql/027_mcp_open_read_model.sql"),
         },
+        Migration {
+            version: "028",
+            name: "028_refresh_mcp_open_source_metadata.sql",
+            sql: include_str!("../../../sql/028_refresh_mcp_open_source_metadata.sql"),
+        },
     ]
 }
 
