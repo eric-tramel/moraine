@@ -868,7 +868,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             } else if query.contains("LIMIT 3") {
                 vec![
                     candidate("evt-c-42", 12.5, 2, 1_767_434_520_000),
-                    candidate("evt-c-duplicate", 12.0, 2, 1_767_434_520_000),
+                    candidate("evt-c-duplicate", 12.0, 2, 1_767_434_520_003),
                     candidate("evt-a-11", 7.0, 1, 1_767_261_720_000),
                 ]
             } else {
@@ -917,6 +917,13 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                         41_u64,
                         2_u32,
                     ),
+                    "evt-c-duplicate" => (
+                        "sess_c",
+                        "2026-01-03 10:02:00.003",
+                        1_767_434_520_003_i64,
+                        43_u64,
+                        2_u32,
+                    ),
                     _ => (
                         "sess_c",
                         "2026-01-03 10:02:00",
@@ -927,6 +934,8 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                 };
                 let is_tool = event_uid == "evt-c-tool";
                 let is_user = event_uid == "evt-c-user";
+                let is_duplicate = event_uid == "evt-c-duplicate";
+                let is_canonical_response = event_uid == "evt-c-42";
                 let actor_role = if is_tool {
                     "tool"
                 } else if is_user {
@@ -955,17 +964,18 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                     "harness": "codex",
                     "inference_provider": "openai",
                     "endpoint_kind": "generation",
-                    "event_class": if is_tool { "tool_result" } else { "message" },
-                    "payload_type": if is_tool { "tool_result" } else { "text" },
+                    "event_class": if is_tool { "tool_result" } else if is_duplicate { "event_msg" } else { "message" },
+                    "payload_type": if is_tool { "tool_result" } else if is_duplicate { "agent_message" } else if is_canonical_response { "message" } else { "text" },
                     "actor_role": actor_role,
                     "name": if is_tool { "bash" } else { "" },
-                    "phase": if is_tool { "completed" } else { "" },
+                    "phase": if is_tool || is_duplicate { "completed" } else if is_canonical_response { "final_answer" } else { "" },
+                    "payload_phase": if is_duplicate || is_canonical_response { "final_answer" } else { "" },
                     "source_ref": format!("/tmp/{session_id}.jsonl:1:{event_order}"),
                     "doc_len": 19_u32,
                     "text_preview": text,
                     "text_content": text,
                     "text_content_digest": text,
-                    "payload_json": "{}",
+                    "payload_json": if is_duplicate || is_canonical_response { "{\"phase\":\"final_answer\"}" } else { "{}" },
                     "mcp_event_type": event_type,
                     "raw_score": 0.0,
                     "matched_terms": 0_u64,

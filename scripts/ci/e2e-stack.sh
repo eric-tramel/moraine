@@ -658,7 +658,8 @@ main() {
 {"timestamp":"2026-02-16T12:00:00.000Z","type":"session_meta","payload":{"id":"${codex_session_id}","cwd":"${codex_project_dir}","source":"vscode"}}
 {"timestamp":"2026-02-16T12:00:01.000Z","type":"turn_context","payload":{"turn_id":"1","model":"gpt-5.3-codex"}}
 {"timestamp":"2026-02-16T12:00:02.000Z","type":"response_item","payload":{"type":"message","role":"user","id":"msg-user-${run_stamp}","content":[{"type":"text","text":"local e2e codex user prompt ${codex_keyword}"}],"phase":"completed"}}
-{"timestamp":"2026-02-16T12:00:03.000Z","type":"response_item","parent_id":"msg-user-${run_stamp}","payload":{"type":"message","role":"assistant","id":"msg-assistant-${run_stamp}","content":[{"type":"text","text":"local e2e codex assistant reply ${codex_keyword} ${codex_trace_marker}"}],"phase":"completed"}}
+{"timestamp":"2026-02-16T12:00:03.000Z","type":"response_item","parent_id":"msg-user-${run_stamp}","payload":{"type":"message","role":"assistant","id":"msg-assistant-${run_stamp}","content":[{"type":"text","text":"local e2e codex assistant reply ${codex_keyword} ${codex_trace_marker}"}],"phase":"final_answer"}}
+{"timestamp":"2026-02-16T12:00:03.003Z","type":"event_msg","payload":{"type":"agent_message","turn_id":"1","message":"local e2e codex assistant reply ${codex_keyword} ${codex_trace_marker}","phase":"final_answer","status":"completed"}}
 {"timestamp":"2026-02-16T12:00:03.500Z","type":"response_item","payload":{"type":"function_call","call_id":"codex-tool-${run_stamp}","name":"Read","arguments":"{\"path\":\"Cargo.toml\"}"}}
 {"timestamp":"2026-02-16T12:00:03.750Z","type":"response_item","payload":{"type":"function_call_output","call_id":"codex-tool-${run_stamp}","output":"workspace = true"}}
 {"timestamp":"2026-02-16T12:00:03.900Z","type":"event_msg","payload":{"type":"token_count","turn_id":"1","info":{"last_token_usage":{"input_tokens":17,"output_tokens":4,"cached_input_tokens":3,"cache_creation_input_tokens":2,"output_tokens_details":{"reasoning_tokens":1}}},"rate_limits":{"limit_name":"GPT-5.3-Codex-Spark","limit_id":"codex_e2e","plan_type":"pro"}}}
@@ -1113,15 +1114,15 @@ EOF
   echo "[e2e] checking ClickHouse normalized ingest rows"
   assert_clickhouse_count "$clickhouse_url" "ingest errors" "SELECT count() FROM ${clickhouse_database}.ingest_errors" "0"
 
-  assert_clickhouse_count "$clickhouse_url" "codex unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-codex'" "7"
-  assert_clickhouse_count "$clickhouse_url" "codex event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex'" "7"
+  assert_clickhouse_count "$clickhouse_url" "codex unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-codex'" "8"
+  assert_clickhouse_count "$clickhouse_url" "codex event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex'" "8"
   assert_clickhouse_count "$clickhouse_url" "codex link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-codex' AND link_type = 'parent_event' AND linked_external_id = 'msg-user-${run_stamp}'" "1"
   assert_clickhouse_count "$clickhouse_url" "codex tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-codex' AND tool_call_id = 'codex-tool-${run_stamp}'" "2"
   assert_clickhouse_count "$clickhouse_url" "codex tool request fields" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-codex' AND tool_call_id = 'codex-tool-${run_stamp}' AND tool_name = 'Read' AND tool_phase = 'request'" "1"
   assert_clickhouse_count "$clickhouse_url" "codex plain-git event identity" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex' AND event_kind = 'tool_call' AND project_id != '' AND worktree_root = '${codex_project_dir}'" "1"
   assert_clickhouse_count "$clickhouse_url" "codex plain-git tool identity" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-codex' AND tool_call_id = 'codex-tool-${run_stamp}' AND tool_phase = 'request' AND project_id != '' AND repo_rel_path = 'Cargo.toml' AND worktree_root = '${codex_project_dir}'" "1"
-  assert_clickhouse_count "$clickhouse_url" "codex harness/session fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex' AND harness = 'codex' AND session_id = '${codex_session_id}'" "7"
-  assert_clickhouse_count "$clickhouse_url" "codex model fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex' AND model IN ('gpt-5.3-codex', 'gpt-5.3-codex-spark')" "6"
+  assert_clickhouse_count "$clickhouse_url" "codex harness/session fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex' AND harness = 'codex' AND session_id = '${codex_session_id}'" "8"
+  assert_clickhouse_count "$clickhouse_url" "codex model fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex' AND model IN ('gpt-5.3-codex', 'gpt-5.3-codex-spark')" "7"
   assert_clickhouse_count "$clickhouse_url" "codex token buckets" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex' AND payload_type = 'token_count' AND input_tokens = 17 AND output_tokens = 4 AND cache_read_tokens = 3 AND cache_write_tokens = 2 AND token_usage_buckets['input_text'] = 12 AND token_usage_buckets['output_text'] = 3 AND token_usage_buckets['reasoning'] = 1" "1"
 
   # Simulate rows ingested before normalized project fields existed. The MCP
@@ -1249,7 +1250,7 @@ PY
   assert_clickhouse_count "$clickhouse_url" "hermes session link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-hermes-session'" "0"
   assert_clickhouse_count "$clickhouse_url" "hermes session tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-hermes-session' AND tool_call_id = 'hermes-session-tool-${run_stamp}' AND tool_name = 'shell'" "2"
   assert_clickhouse_count "$clickhouse_url" "hermes session domain fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-hermes-session' AND harness = 'hermes' AND inference_provider = 'anthropic' AND session_id = '${hermes_raw_session_id}' AND model = 'claude-opus-4-6'" "6"
-  assert_clickhouse_count "$clickhouse_url" "token bucket map keys on all events" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE hasAll(mapKeys(token_usage_buckets), ['input_text', 'output_text', 'input_cache_read', 'input_cache_write', 'reasoning'])" "52"
+  assert_clickhouse_count "$clickhouse_url" "token bucket map keys on all events" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE hasAll(mapKeys(token_usage_buckets), ['input_text', 'output_text', 'input_cache_read', 'input_cache_write', 'reasoning'])" "53"
 
   local hermes_trajectory_session_id
   hermes_trajectory_session_id="$(clickhouse_scalar "$clickhouse_url" "SELECT any(session_id) FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-hermes-trajectory'")"
@@ -1395,7 +1396,7 @@ if not valid:
   printf '%s' "$sessions_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; expected=int(sys.argv[2]); session=next((s for s in data.get("sessions", []) if s.get("id")==sid), None); ok=session is not None and session.get("endedAt")==expected; sys.exit(0 if ok else 1)' "$codex_session_id" "1771243203900"
   local trace_body
   trace_body="$(curl -fsS "http://127.0.0.1:${monitor_port}/api/v1/tables/v_conversation_trace?limit=500")"
-  printf '%s' "$trace_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; expected=int(sys.argv[2]); count=sum(1 for row in data.get("rows", []) if row.get("session_id")==sid); sys.exit(0 if count==expected else 1)' "$codex_session_id" "7"
+  printf '%s' "$trace_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; expected=int(sys.argv[2]); count=sum(1 for row in data.get("rows", []) if row.get("session_id")==sid); sys.exit(0 if count==expected else 1)' "$codex_session_id" "8"
 
   # Capture a server-clock-bounded query_log window after `moraine up` and its
   # status probe have exited. Direct curl assertions are excluded below by
@@ -1421,7 +1422,8 @@ PY
     --query "$codex_keyword" \
     --expect-session-id "$codex_session_id" \
     --expect-open-text "$codex_trace_marker" \
-    --expect-event-count "7" \
+    --expect-matching-search-hits "1" \
+    --expect-event-count "8" \
     --expect-updated-at "2026-02-16T12:00:03.900Z" \
     --file-attention-path "Cargo.toml" \
     --file-attention-expect-absent-session-id "$claude_session_id" \
@@ -1438,7 +1440,8 @@ PY
     --query "$codex_keyword" \
     --expect-session-id "$codex_session_id" \
     --expect-open-text "$codex_trace_marker" \
-    --expect-event-count "7" \
+    --expect-matching-search-hits "1" \
+    --expect-event-count "8" \
     --expect-updated-at "2026-02-16T12:00:03.900Z" \
     --file-attention-path "Cargo.toml" \
     --file-attention-expect-absent-session-id "$claude_session_id" \
@@ -1691,7 +1694,8 @@ PY
     --query "$codex_keyword" \
     --expect-session-id "$codex_session_id" \
     --expect-open-text "$codex_trace_marker" \
-    --expect-event-count "7" \
+    --expect-matching-search-hits "1" \
+    --expect-event-count "8" \
     --expect-updated-at "2026-02-16T12:00:03.900Z" \
     --file-attention-path "Cargo.toml" \
     --file-attention-expect-absent-session-id "$claude_session_id" \

@@ -227,14 +227,13 @@ def assert_embedded_fallback(stderr: str) -> None:
 
 
 
-def select_search_sessions_result(
+def matching_search_sessions_results(
     results: list[Any],
     expect_session_id: Optional[str],
     expect_open_text: Optional[str],
-) -> Dict[str, Any]:
+) -> list[Dict[str, Any]]:
     expected_session = expected_mcp_session_id(expect_session_id)
-    candidates: list[Dict[str, Any]] = []
-
+    matches: list[Dict[str, Any]] = []
     for result in results:
         if not isinstance(result, dict):
             continue
@@ -245,7 +244,22 @@ def select_search_sessions_result(
             open_session_id,
         }:
             continue
-        candidates.append(result)
+        if expect_open_text is not None and not contains_text(result, expect_open_text):
+            continue
+        matches.append(result)
+    return matches
+
+
+def select_search_sessions_result(
+    results: list[Any],
+    expect_session_id: Optional[str],
+    expect_open_text: Optional[str],
+) -> Dict[str, Any]:
+    candidates = matching_search_sessions_results(
+        results,
+        expect_session_id,
+        None,
+    )
 
     if not candidates:
         debug_hits = [
@@ -561,6 +575,7 @@ def run_smoke(
     expect_no_results: bool = False,
     expect_event_count: Optional[int] = None,
     expect_updated_at: Optional[str] = None,
+    expect_matching_search_hits: Optional[int] = None,
     require_embedded_fallback: bool = False,
     tools_snapshot: Optional[str] = None,
 ) -> None:
@@ -652,6 +667,18 @@ def run_smoke(
             raise AssertionError(f"search_sessions returned no results array for query={query}")
 
         assert_sessions_absent(results, absent_session_ids, "search_sessions")
+        if expect_matching_search_hits is not None:
+            matching_results = matching_search_sessions_results(
+                results,
+                expect_session_id,
+                expect_open_text,
+            )
+            if len(matching_results) != expect_matching_search_hits:
+                raise AssertionError(
+                    "search_sessions returned an unexpected number of matching hits: "
+                    f"expected={expect_matching_search_hits}, actual={len(matching_results)}, "
+                    f"session_id={expect_session_id}, text={expect_open_text!r}"
+                )
 
         selected_result: Optional[Dict[str, Any]] = None
         if expect_no_results:
@@ -851,6 +878,14 @@ def main() -> int:
         help="expected canonical event_count for the selected list_sessions fixture",
     )
     parser.add_argument(
+        "--expect-matching-search-hits",
+        type=int,
+        help=(
+            "expected search_sessions hit count after filtering by "
+            "--expect-session-id and --expect-open-text"
+        ),
+    )
+    parser.add_argument(
         "--expect-updated-at",
         help="expected RFC3339 updated_at for the selected list_sessions fixture",
     )
@@ -889,6 +924,7 @@ def main() -> int:
         expect_no_results=args.expect_no_results,
         expect_event_count=args.expect_event_count,
         expect_updated_at=args.expect_updated_at,
+        expect_matching_search_hits=args.expect_matching_search_hits,
         require_embedded_fallback=args.require_embedded_fallback,
         tools_snapshot=args.write_tools_snapshot,
     )
