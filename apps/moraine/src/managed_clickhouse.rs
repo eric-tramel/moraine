@@ -1734,7 +1734,9 @@ mod tests {
             let addr = listener.local_addr().expect("ping server addr");
             let stop = Arc::new(AtomicBool::new(false));
             let thread_stop = stop.clone();
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
             let thread = thread::spawn(move || {
+                ready_tx.send(()).expect("signal ping server readiness");
                 let mut request = [0_u8; 8192];
                 while !thread_stop.load(Ordering::Relaxed) {
                     match listener.accept() {
@@ -1753,6 +1755,9 @@ mod tests {
                     }
                 }
             });
+            ready_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("ping server thread did not become ready");
             Self {
                 addr,
                 stop,
@@ -2154,7 +2159,14 @@ mod tests {
         finish_output_forwarders(&mut forwarders, &log)
             .await
             .expect("drain synthetic output");
-        assert_eq!(log.writer_count(), 1, "output tasks retained log handles");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while log.writer_count() != 1 {
+            assert!(
+                Instant::now() < deadline,
+                "output tasks retained log handles"
+            );
+            sleep(Duration::from_millis(5)).await;
+        }
         log.line("shutdown-marker")
             .await
             .expect("write shutdown marker");
