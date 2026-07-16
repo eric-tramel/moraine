@@ -401,6 +401,9 @@ FORMAT JSONEachRow",
             &row.next_turn_started_at,
             &row.next_turn_ended_at,
         );
+        let mut normalized_event_types = row.normalized_event_types;
+        normalized_event_types
+            .retain(|event_type| event_type.as_str() != McpEventType::Unknown.as_str());
         Ok(ProjectedTurn {
             compact: McpTurnCompact {
                 metadata,
@@ -417,7 +420,7 @@ FORMAT JSONEachRow",
                 user_input_event,
                 final_response_event,
                 tools_called: row.tools_called,
-                normalized_event_types: row.normalized_event_types,
+                normalized_event_types,
                 completed: row.completed != 0,
                 terminal_event_uid: non_empty_string(row.terminal_event_uid),
                 first_event,

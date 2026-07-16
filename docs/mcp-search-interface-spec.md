@@ -1142,7 +1142,9 @@ Rules:
 - `final_response` may be `null` if the turn is incomplete or ended without a
   final assistant response.
 - `tools_called` must contain unique tool names in first-seen order.
-- `event_types` must contain unique event types in first-seen order.
+- `event_types` must contain unique known event types in first-seen order;
+  `unknown` is omitted from this compact list but remains valid on individual
+  event summaries.
 - `terminal_event_id` may be `null` when `completed` is `false`.
 
 Example:
