@@ -1453,13 +1453,10 @@ fn parse_repo_backend_ref(path: &Path) -> Option<String> {
 }
 
 /// Stable, opaque identity for one Git repository and all of its linked
-/// worktrees. The repo backend marker is required, but its backend routing name
-/// is deliberately not the identity because multiple projects may share one
-/// backend.
+/// worktrees. Identity comes only from Git metadata; the optional repo backend
+/// marker controls routing independently and is not required here.
 pub fn project_id_for_repo_root(root: impl AsRef<Path>) -> Option<String> {
-    let root = root.as_ref();
-    find_repo_backend_ref(root)?;
-    let common_dir = git_common_dir(root)?;
+    let common_dir = git_common_dir(root.as_ref())?;
     Some(project_id_for_common_dir(&common_dir))
 }
 
@@ -1489,7 +1486,6 @@ fn worktree_roots_for_repo_root_with_pwd(
     root: &Path,
     logical_cwd: Option<&Path>,
 ) -> Option<Vec<String>> {
-    find_repo_backend_ref(root)?;
     let common_dir = git_common_dir(root)?;
     let mut roots = vec![root.to_path_buf()];
 
@@ -1512,7 +1508,14 @@ fn worktree_roots_for_repo_root_with_pwd(
                 entry.path().join(git_marker)
             };
             if let Some(worktree_root) = git_marker.parent() {
-                roots.push(worktree_root.to_path_buf());
+                // A stale worktree registration may point at a path that was
+                // deleted and later reused by another repository. Only roots
+                // that still resolve to this common directory are safe to add
+                // to the current mapping; already-durable deleted roots are
+                // handled by the repository layer.
+                if git_common_dir(worktree_root).as_ref() == Some(&common_dir) {
+                    roots.push(worktree_root.to_path_buf());
+                }
             }
         }
     }
@@ -1613,13 +1616,11 @@ mod tests {
         let linked = base.join("linked");
         let other = base.join("other");
         let linked_git_dir = main.join(".git/worktrees/linked");
+        let stale_git_dir = main.join(".git/worktrees/stale");
         std::fs::create_dir_all(&linked_git_dir).expect("create main git dirs");
+        std::fs::create_dir_all(&stale_git_dir).expect("create stale git dirs");
         std::fs::create_dir_all(&linked).expect("create linked worktree");
         std::fs::create_dir_all(other.join(".git")).expect("create other git dir");
-        for root in [&main, &linked, &other] {
-            std::fs::write(root.join(REPO_BACKEND_FILE), "backend = \"shared\"\n")
-                .expect("write repo backend marker");
-        }
         std::fs::write(linked_git_dir.join("commondir"), "../..\n")
             .expect("write common-dir pointer");
         std::fs::write(
@@ -1632,6 +1633,11 @@ mod tests {
             format!("gitdir: {}\n", linked_git_dir.to_string_lossy()),
         )
         .expect("write linked git pointer");
+        std::fs::write(
+            stale_git_dir.join("gitdir"),
+            format!("{}\n", other.join(".git").to_string_lossy()),
+        )
+        .expect("write stale worktree pointer");
 
         let main_id = project_id_for_repo_root(&main).expect("main project id");
         let linked_id = project_id_for_repo_root(&linked).expect("linked project id");
@@ -1639,15 +1645,20 @@ mod tests {
         assert!(main_id.starts_with("git:"));
         assert_eq!(main_id, linked_id);
         assert_ne!(main_id, other_id);
+        assert_eq!(find_repo_backend_ref(&main), None);
+        assert_eq!(find_repo_backend_ref(&linked), None);
+        assert_eq!(find_repo_backend_ref(&other), None);
         let main_roots =
             worktree_roots_for_repo_root(&main).expect("main registered worktree roots");
         let linked_roots =
             worktree_roots_for_repo_root(&linked).expect("linked registered worktree roots");
         let canonical_main = main.canonicalize().expect("canonical main");
         let canonical_linked = linked.canonicalize().expect("canonical linked");
+        let canonical_other = other.canonicalize().expect("canonical other");
         for roots in [&main_roots, &linked_roots] {
             assert!(roots.contains(&canonical_main.to_string_lossy().to_string()));
             assert!(roots.contains(&canonical_linked.to_string_lossy().to_string()));
+            assert!(!roots.contains(&canonical_other.to_string_lossy().to_string()));
         }
 
         std::fs::remove_dir_all(base).ok();
@@ -1668,11 +1679,6 @@ mod tests {
         let logical_root = base.join("logical-repo");
         std::fs::create_dir_all(physical_root.join(".git")).expect("create physical repository");
         std::fs::create_dir_all(physical_root.join("nested")).expect("create nested launch dir");
-        std::fs::write(
-            physical_root.join(REPO_BACKEND_FILE),
-            "backend = \"shared\"\n",
-        )
-        .expect("write repo backend marker");
         std::os::unix::fs::symlink(&physical_root, &logical_root)
             .expect("create logical repository alias");
 

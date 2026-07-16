@@ -221,7 +221,9 @@ Input:
 up to a `.moraine.toml` / `.git` marker. Relative paths are resolved from the
 client's launch directory, including when the client is routed through the
 central MCP server, so deleted or not-yet-created files retain launch-project
-provenance. Boundary whitespace, `file://` URIs, and directory-style trailing
+provenance. A plain Git checkout is sufficient: `.moraine.toml` is an optional
+backend-routing file and is not required for project identity. Boundary
+whitespace, `file://` URIs, and directory-style trailing
 slashes are rejected rather than silently mapped to a different file. Compound
 shell text and multi-path captures are never interpreted as one path or root;
 unprovable roots remain `unknown`.
@@ -233,7 +235,11 @@ cannot be established. `all` deliberately drops that request-level project
 narrowing. A configured `--project-only` server scope remains a hard floor so
 returned IDs stay openable. Registered pre-digest roots are migrated to a
 durable project mapping, and future normalized roots populate that mapping
-automatically. A root pruned before this mapping was installed has no stored Git
+automatically. Retained older rows with blank normalized identity can be
+recovered only when one top-level scalar structured path agrees exactly with
+the recorded working directory and that directory is itself a current or
+durable root for this project. A
+root pruned before this mapping was installed has no stored Git
 identity and cannot be attributed safely; project scope excludes it rather than
 widening across projects, and the response warns about this one-time upgrade
 limitation. `granularity` is `sessions` (default, one rollup per session) or

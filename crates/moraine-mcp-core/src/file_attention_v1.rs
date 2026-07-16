@@ -109,6 +109,7 @@ impl AppState {
                 .as_deref()
                 .and_then(moraine_config::worktree_roots_for_repo_root)
                 .unwrap_or_default(),
+            derive_legacy_roots: tail.derive_worktree_roots,
             apply_project_scope: args.scope == FileAttentionScope::Project,
             start_unix_ms: args.start_unix_ms,
             end_unix_ms: args.end_unix_ms,
@@ -361,22 +362,26 @@ fn strip_root(path: &str, root: &str) -> Option<String> {
 
 /// Walk up from a file path's parent directory looking for the nearest
 /// repository boundary, bounded at `$HOME` or the filesystem root. A linked
-/// worktree may inherit its `.moraine.toml` route from an enclosing checkout,
-/// but its own `.git` marker still defines the root reported to callers.
+/// worktree may inherit an optional `.moraine.toml` backend route from an
+/// enclosing checkout, but its own `.git` marker still defines the root
+/// reported to callers.
 fn find_project_root(file_path: &Path) -> Option<String> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let mut dir = file_path.parent();
+    let mut backend_root = None;
     while let Some(current) = dir {
-        if current.join(moraine_config::REPO_BACKEND_FILE).exists() || current.join(".git").exists()
-        {
+        if current.join(".git").exists() {
             return Some(current.to_string_lossy().to_string());
+        }
+        if backend_root.is_none() && current.join(moraine_config::REPO_BACKEND_FILE).exists() {
+            backend_root = Some(current.to_string_lossy().to_string());
         }
         if home.as_deref() == Some(current) {
             break;
         }
         dir = current.parent();
     }
-    None
+    backend_root
 }
 
 fn project_id_for_root(root: &str) -> Option<String> {
@@ -813,12 +818,22 @@ fn format_text(payload: &Value) -> String {
         "file_attention {tail} — {total} touch(es) across {sessions} session(s) in {roots} worktree root(s) [scope={scope}]."
     )];
 
-    if summary
-        .get("ambiguous")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
+    let distinct_known_roots = summary
+        .get("distinct_known_roots")
+        .and_then(Value::as_u64)
+        .unwrap_or(roots);
+    let unknown_root_touches = summary
+        .get("unknown_root_touches")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if distinct_known_roots > 1 {
         lines.push("Ambiguous tail: matched more than one worktree root (see roots).".to_string());
+    }
+    if unknown_root_touches > 0 {
+        lines.push(
+            "Worktree-root attribution is incomplete; some touches have unknown roots (see roots and matched_path)."
+                .to_string(),
+        );
     }
     for warning in payload
         .get("warnings")
@@ -1034,7 +1049,6 @@ mod tests {
         let root = dir.join("repo");
         std::fs::create_dir_all(&root).expect("mkdir root");
         std::fs::create_dir_all(root.join(".git")).expect("mkdir git dir");
-        std::fs::write(root.join(".moraine.toml"), "backend = \"x\"\n").expect("write marker");
 
         let resolved = resolve_tail_from("crates/new/file.rs", Some(&root));
         assert_eq!(resolved.rel, "crates/new/file.rs");
@@ -1056,7 +1070,8 @@ mod tests {
         let launch = root.join("crates/foo");
         std::fs::create_dir_all(root.join(".git")).expect("mkdir git dir");
         std::fs::create_dir_all(&launch).expect("mkdir launch dir");
-        std::fs::write(root.join(".moraine.toml"), "backend = \"x\"\n").expect("write marker");
+        std::fs::write(launch.join(".moraine.toml"), "backend = \"nested\"\n")
+            .expect("write nested backend route");
 
         let nested = resolve_tail_from("src/lib.rs", Some(&launch));
         assert_eq!(nested.rel, "crates/foo/src/lib.rs");
@@ -1079,7 +1094,6 @@ mod tests {
         let root = dir.join("repo");
         std::fs::create_dir_all(&root).expect("mkdir root");
         std::fs::create_dir_all(root.join(".git")).expect("mkdir git dir");
-        std::fs::write(root.join(".moraine.toml"), "backend = \"x\"\n").expect("write marker");
 
         for delimiter in ["\0", "\n", "\r", ";", "|", "&", "`"] {
             let path = format!("bad{delimiter}command/../src/lib.rs");
@@ -1099,7 +1113,6 @@ mod tests {
         let nested = root.join("crates/foo");
         std::fs::create_dir_all(&nested).expect("mkdir nested");
         std::fs::create_dir_all(root.join(".git")).expect("mkdir git dir");
-        std::fs::write(root.join(".moraine.toml"), "backend = \"x\"\n").expect("write marker");
         let file = nested.join("tee.rs");
         std::fs::write(&file, "// test").expect("write file");
 
@@ -1139,7 +1152,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_tail_keeps_linked_worktree_root_with_enclosing_project_marker() {
+    fn resolve_tail_keeps_unmarked_linked_worktree_root() {
         let dir =
             std::env::temp_dir().join(format!("moraine-fa-linked-worktree-{}", std::process::id()));
         let root = dir.join("repo");
@@ -1153,8 +1166,6 @@ mod tests {
             format!("gitdir: {}\n", linked_git_dir.to_string_lossy()),
         )
         .expect("write linked git marker");
-        std::fs::write(root.join(".moraine.toml"), "backend = \"shared\"\n").expect("write marker");
-
         let resolved = resolve_tail_from("src/lib.rs", Some(&linked));
         assert_eq!(resolved.root.as_deref(), linked.to_str());
         assert_eq!(
@@ -1386,6 +1397,56 @@ mod tests {
             .filter_map(|r| r["root"].as_str())
             .collect();
         assert!(labels.contains(&UNKNOWN_ROOT));
+    }
+
+    #[test]
+    fn format_text_describes_unknown_only_roots_as_incomplete_attribution() {
+        let payload = json!({
+            "warnings": [],
+            "data": {
+                "tail": "crates/foo/tee.rs",
+                "scope": "all",
+                "granularity": "sessions",
+                "summary": {
+                    "total_touches": 2,
+                    "distinct_sessions": 2,
+                    "distinct_roots": 1,
+                    "distinct_known_roots": 0,
+                    "unknown_root_touches": 2,
+                    "ambiguous": true
+                },
+                "sessions": []
+            }
+        });
+
+        let text = format_text(&payload);
+        assert!(text.contains("Worktree-root attribution is incomplete"));
+        assert!(!text.contains("matched more than one worktree root"));
+    }
+
+    #[test]
+    fn format_text_reports_known_root_spread_and_unknown_attribution_separately() {
+        let payload = json!({
+            "warnings": [],
+            "data": {
+                "tail": "crates/foo/tee.rs",
+                "scope": "all",
+                "granularity": "sessions",
+                "summary": {
+                    "total_touches": 3,
+                    "distinct_sessions": 3,
+                    "distinct_roots": 3,
+                    "distinct_known_roots": 2,
+                    "unknown_root_touches": 1,
+                    "ambiguous": true
+                },
+                "sessions": []
+            }
+        });
+
+        let text = format_text(&payload);
+        assert!(text.contains("matched more than one worktree root"));
+        assert!(text.contains("Worktree-root attribution is incomplete"));
     }
 
     #[test]

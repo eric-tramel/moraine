@@ -884,7 +884,9 @@ Rules:
 - Absolute paths are reduced to a repo-relative tail by walking up to
   `.moraine.toml` or `.git`. Relative paths are resolved from the client's MCP
   launch directory, including through a central-server route, so missing files
-  still retain launch-project provenance. Compound shell text and multi-path
+  still retain launch-project provenance. A plain Git checkout establishes
+  project identity; `.moraine.toml` independently selects a backend and is not
+  required. Compound shell text and multi-path
   captures are not interpreted as one path or root; unprovable roots remain
   `unknown`.
 - `scope` is `project` or `all`. `project` independently restricts normalized
@@ -894,7 +896,11 @@ Rules:
   configured `--project-only` server scope remains a hard floor, so returned IDs
   remain accepted by `open`.
 - Registered pre-digest roots are migrated into a durable project mapping, and
-  future normalized roots populate it automatically. A root pruned before that
+  future normalized roots populate it automatically. Retained older rows with
+  blank identity may be attributed only when exactly one top-level scalar
+  structured path agrees with the recorded cwd and that cwd is itself a current
+  or durable project root. A
+  root pruned before that
   mapping was installed lacks stored Git identity and cannot be attributed
   safely; `project` excludes it rather than widening and emits an upgrade
   limitation warning.

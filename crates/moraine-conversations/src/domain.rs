@@ -85,6 +85,10 @@ pub struct FileAttentionQuery {
     /// admit rows written with the pre-digest project identity during the
     /// transition without widening to another repository sharing the backend.
     pub normalized_project_roots: Vec<String>,
+    /// Whether the request path was proven to be one repository-relative file
+    /// and may therefore use structured legacy path/cwd evidence to recover a
+    /// missing normalized root.
+    pub derive_legacy_roots: bool,
     /// When true normalized request-project identity is enforced in both query
     /// paths. The repository's configured origin scope (`--project-only`) is an
     /// independent hard floor. When false (`scope:"all"`), only request-project

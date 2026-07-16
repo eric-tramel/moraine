@@ -1034,17 +1034,20 @@ fn find_file_attention_root(path: &Path) -> Option<String> {
     } else {
         path.parent()
     };
+    let mut backend_root = None;
     while let Some(current) = dir {
-        if current.join(moraine_config::REPO_BACKEND_FILE).exists() || current.join(".git").exists()
-        {
+        if current.join(".git").exists() {
             return Some(current.to_string_lossy().to_string());
+        }
+        if backend_root.is_none() && current.join(moraine_config::REPO_BACKEND_FILE).exists() {
+            backend_root = Some(current.to_string_lossy().to_string());
         }
         if home.as_deref() == Some(current) {
             break;
         }
         dir = current.parent();
     }
-    None
+    backend_root
 }
 
 fn project_id_for_root(root: &str) -> Option<String> {
@@ -1380,11 +1383,6 @@ mod tests {
         ));
         std::fs::create_dir_all(root.join("src")).expect("create repo dirs");
         std::fs::create_dir_all(root.join(".git")).expect("create git dir");
-        std::fs::write(
-            root.join(moraine_config::REPO_BACKEND_FILE),
-            "backend = \"team\"\n",
-        )
-        .expect("write repo backend marker");
         root
     }
 
@@ -1404,6 +1402,8 @@ mod tests {
     fn event_rows_capture_project_and_worktree_from_cwd() {
         let root = make_repo("event-cwd");
         let cwd = root.join("src");
+        std::fs::write(cwd.join(".moraine.toml"), "backend = \"nested\"\n")
+            .expect("write nested backend route");
         let cwd_text = cwd.to_string_lossy().to_string();
         let ctx = test_record_context(&cwd_text);
         let project_id = project_id_for_root(root.to_string_lossy().as_ref()).expect("project id");
@@ -1425,7 +1425,7 @@ mod tests {
     }
 
     #[test]
-    fn event_rows_keep_linked_worktree_root_with_enclosing_project_marker() {
+    fn event_rows_keep_unmarked_linked_worktree_root() {
         let root = make_repo("linked-worktree");
         let linked = root.join("worktrees/linked");
         let linked_git_dir = root.join(".git/worktrees/linked");
@@ -1460,7 +1460,7 @@ mod tests {
     }
 
     #[test]
-    fn event_rows_ignore_git_only_root_without_project_id() {
+    fn event_rows_capture_git_only_root_without_backend_marker() {
         let root = std::env::temp_dir().join(format!(
             "moraine-file-attention-git-only-{}",
             std::process::id()
@@ -1481,8 +1481,11 @@ mod tests {
             "{}",
         ));
 
-        assert_eq!(row["project_id"], "");
-        assert_eq!(row["worktree_root"], "");
+        assert_eq!(
+            row["project_id"],
+            project_id_for_root(root.to_string_lossy().as_ref()).expect("project id")
+        );
+        assert_eq!(row["worktree_root"], root.to_string_lossy().as_ref());
         assert_eq!(row["repo_rel_path"], "");
         std::fs::remove_dir_all(root).ok();
     }
