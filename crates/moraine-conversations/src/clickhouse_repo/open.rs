@@ -1,4 +1,5 @@
 use super::*;
+use crate::domain::McpOpenSnapshot;
 
 const MAX_MCP_OPEN_SNAPSHOT_ATTEMPTS: usize = 4;
 
@@ -262,6 +263,10 @@ FORMAT JSONEachRow",
                 turns,
                 completed: session.row.completed != 0,
                 terminal_event_uid: non_empty_string(session.row.terminal_event_uid),
+                snapshot: Some(McpOpenSnapshot {
+                    slot: session.row.slot,
+                    generation: session.row.generation,
+                }),
             }));
         }
         Err(RepoError::backend(
@@ -288,6 +293,7 @@ FORMAT JSONEachRow",
         &self,
         session_id: &str,
         turn_seq: u32,
+        include_events: bool,
     ) -> RepoResult<Option<McpTurnOpen>> {
         Self::validate_session_id(session_id)?;
         self.ensure_mcp_open_read_model_ready().await?;
@@ -301,7 +307,7 @@ FORMAT JSONEachRow",
 
             let load_started = Instant::now();
             let turn = self
-                .load_projected_turns(&session, Some(turn_seq), true)
+                .load_projected_turns(&session, Some(turn_seq), include_events)
                 .await?
                 .into_iter()
                 .next();
@@ -318,8 +324,11 @@ FORMAT JSONEachRow",
             return Ok(Some(McpTurnOpen {
                 metadata: turn.compact.metadata,
                 events: turn.events,
+                parent_session_source: non_empty_string(session.row.source),
                 user_input_summary: turn.compact.user_input_summary,
                 final_response_summary: turn.compact.final_response_summary,
+                user_input_event: turn.compact.user_input_event,
+                final_response_event: turn.compact.final_response_event,
                 tools_called: turn.compact.tools_called,
                 normalized_event_types: turn.compact.normalized_event_types,
                 completed: turn.compact.completed,
@@ -328,6 +337,10 @@ FORMAT JSONEachRow",
                 next_turn: turn.next_turn,
                 first_event: turn.compact.first_event,
                 last_event: turn.compact.last_event,
+                snapshot: Some(McpOpenSnapshot {
+                    slot: session.row.slot,
+                    generation: session.row.generation,
+                }),
             }));
         }
         Err(RepoError::backend(

@@ -860,7 +860,7 @@ async fn search_mcp_events_event_type_filter_distinguishes_user_and_assistant_me
     }));
 }
 #[tokio::test(flavor = "multi_thread")]
-async fn search_mcp_events_fetches_limit_plus_one_for_truncation() {
+async fn search_mcp_events_deduplicates_before_limit_and_reports_truncation() {
     let (repo, state) = build_repo().await;
 
     let result = repo
@@ -880,17 +880,92 @@ async fn search_mcp_events_fetches_limit_plus_one_for_truncation() {
         .expect("truncated mcp event search");
 
     assert_eq!(result.hits.len(), 2);
+    assert_eq!(result.hits[0].event_uid, "evt-c-42");
+    assert_eq!(result.hits[1].event_uid, "evt-a-11");
     assert!(result.truncated);
     assert!(result.stats.truncated);
     assert_eq!(result.stats.effective_n_hits, 2);
 
     let queries = state.queries.lock().expect("queries lock").clone();
-    let search_query = queries
+    let first_candidate_query = queries
         .iter()
-        .find(|q| q.contains("toUInt8(0) AS row_kind") && q.contains("LIMIT 3"))
-        .expect("search query should fetch limit plus one");
-    assert!(search_query.contains("LIMIT 3"));
+        .find(|query| {
+            query.contains("toUInt8(0) AS row_kind") && query.contains("LIMIT 3 OFFSET 0")
+        })
+        .expect("first bounded candidate page");
+    assert!(!first_candidate_query.contains("text_content"));
+    assert!(!first_candidate_query.contains("SHA256"));
+    assert!(queries.iter().any(|query| {
+        query.contains("toUInt8(0) AS row_kind") && query.contains("LIMIT 3 OFFSET 3")
+    }));
+    assert!(queries.iter().any(|query| {
+        query.contains("hex(SHA256(projected_events.text_content)) AS text_content_digest")
+    }));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_mcp_events_rejects_projection_changes_between_candidate_pages() {
+    let (repo, state) = build_repo_with_options(
+        100,
+        MockOptions {
+            change_projection_revision_on_second_search_page: true,
+            ..MockOptions::default()
+        },
+    )
+    .await;
+
+    let error = repo
+        .search_mcp_events(SearchMcpEventsQuery {
+            query: "hello world".to_string(),
+            n_hits: Some(2),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            ..SearchMcpEventsQuery::default()
+        })
+        .await
+        .expect_err("candidate paging must reject a changed projection revision");
+
+    assert!(error.to_string().contains("snapshot changed"), "{error}");
+    let queries = state.queries.lock().expect("queries lock");
+    assert!(queries
+        .iter()
+        .any(|query| query.contains("LIMIT 3 OFFSET 3")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_mcp_events_bounds_duplicate_candidate_pages() {
+    let (repo, state) = build_repo_with_options(
+        100,
+        MockOptions {
+            repeat_duplicate_search_pages: true,
+            ..MockOptions::default()
+        },
+    )
+    .await;
+
+    let error = repo
+        .search_mcp_events(SearchMcpEventsQuery {
+            query: "hello world".to_string(),
+            n_hits: Some(2),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            ..SearchMcpEventsQuery::default()
+        })
+        .await
+        .expect_err("duplicate paging must stop at the request work budget");
+
+    assert!(
+        error.to_string().contains("scan budget exhausted"),
+        "{error}"
+    );
+    let queries = state.queries.lock().expect("queries lock");
+    let candidate_queries = queries
+        .iter()
+        .filter(|query| query.contains("toUInt8(0) AS row_kind"))
+        .count();
+    assert_eq!(candidate_queries, 16);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn search_mcp_events_reports_event_ordinal_within_turn() {
     let (repo, _state) = build_repo().await;

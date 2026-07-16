@@ -861,20 +861,28 @@ Rules:
 
 - `path` is required and must name a file path string. Leading/trailing
   whitespace, `file://` URIs, and directory-style trailing slashes are invalid.
-- Absolute paths are reduced to a repo-relative tail by walking up to
-  `.moraine.toml` or `.git`. Relative paths are resolved from the client's MCP
-  launch directory, including through a central-server route, so missing files
-  still retain launch-project provenance. Compound shell text and multi-path
+- Absolute paths are reduced to a project-relative tail using the nearest Git
+  boundary or exact containment beneath a non-Git launch directory. Relative
+  paths are resolved from the client's MCP launch directory, including through
+  a central-server route, so missing files still retain launch-project
+  provenance. Git common-directory metadata unifies linked worktrees; without
+  Git metadata, the canonical launch directory is the identity and different
+  launch subdirectories remain separate. `.moraine.toml` independently selects
+  a backend and is not required. Compound shell text and multi-path
   captures are not interpreted as one path or root; unprovable roots remain
   `unknown`.
 - `scope` is `project` or `all`. `project` independently restricts normalized
-  and legacy fallback lookup to the launch repository's canonical
-  Git-common-directory identity and fails closed if that identity cannot be
-  established. `all` deliberately drops request-level project narrowing. A
+  and legacy fallback lookup to the launch project's canonical Git-common-
+  directory or exact working-directory identity and fails closed if neither can
+  be established. `all` deliberately drops request-level project narrowing. A
   configured `--project-only` server scope remains a hard floor, so returned IDs
   remain accepted by `open`.
 - Registered pre-digest roots are migrated into a durable project mapping, and
-  future normalized roots populate it automatically. A root pruned before that
+  future normalized roots populate it automatically. Retained older rows with
+  blank identity may be attributed only when exactly one top-level scalar
+  structured path agrees with the recorded cwd and that cwd is itself a current
+  or durable project root. A
+  root pruned before that
   mapping was installed lacks stored Git identity and cannot be attributed
   safely; `project` excludes it rather than widening and emits an upgrade
   limitation warning.
@@ -985,24 +993,50 @@ the ID kind.
 open({
   id: string
 })
+
+open({
+  id: string,
+  limit: number
+})
+
+open({
+  cursor: string
+})
 ```
 
 ### Accepted Inputs
 
 `id`:
 
-- Required.
+- Required unless `cursor` is provided.
 - Must be a string.
 - Must be a valid Moraine MCP ID returned by `search_sessions`,
   `list_sessions`, or `open`.
 - May refer to a session, turn, or event.
 
+`limit`:
+
+- Optional and valid only with a session or turn `id`.
+- Must be from 1 through the configured MCP result maximum.
+- Starts forward expansion of compact child summaries. Omit it for a
+  summary-only session or turn response.
+
+`cursor`:
+
+- Optional opaque continuation returned as `next_cursor` by an expanded open.
+- Must be provided by itself. It carries the original target, page size,
+  ordering anchor, and read-model snapshot.
+- A stale cursor returns `invalid_request` and tells the caller to reopen the
+  typed target.
+
 Invalid inputs:
 
-- Missing `id` returns `invalid_request`.
+- Missing both `id` and `cursor` returns `invalid_request`.
 - Empty or whitespace-only `id` returns `invalid_request`.
 - Malformed IDs return `invalid_id`.
 - Well-formed but unknown IDs return `not_found`.
+- `id` with `cursor`, `limit` with `cursor`, `limit` without `id`, pagination
+  arguments for an event ID, and unknown fields return `invalid_request`.
 
 ### Successful Response Shape
 
@@ -1035,7 +1069,9 @@ event
 
 ### Opening A Session
 
-Opening a session returns session metadata plus a compact list of turns.
+Opening a session returns metadata and traversal handles. Its id-only default
+is summary-only; `id + limit` or a continuation cursor returns one compact page
+of turns.
 
 It must not return full event payloads.
 
@@ -1055,9 +1091,12 @@ Session response shape:
     "event_count": 18
   },
   "turns": [],
+  "next_cursor": null,
   "traversal": {
     "previous_session_id": null,
-    "next_session_id": null
+    "next_session_id": null,
+    "first_turn_id": "turn:turn_01J9Q3P4V8BN7XM9G2K6Q1W3E4",
+    "last_turn_id": "turn:turn_01J9Q4P93SP6B2D5M8K7V1H4NC"
   }
 }
 ```
@@ -1094,8 +1133,11 @@ Turn summary shape:
 
 Rules:
 
-- `turns` are ordered by `ordinal` ascending.
-- `turns` must include every known turn in the session.
+- Id-only session opens return `turns: []` and `next_cursor: null`.
+- Expanded `turns` are ordered by `ordinal` ascending and contain at most the
+  requested page size.
+- Following every `next_cursor` until null returns every known turn exactly
+  once from the pinned snapshot.
 - `user_input` may be `null` if no user input event is known.
 - `final_response` may be `null` if the turn is incomplete or ended without a
   final assistant response.
@@ -1112,7 +1154,8 @@ Example:
   "schema_version": "moraine.mcp.open.v1",
   "tool": "open",
   "request": {
-    "id": "session:ses_01J9Q3N7W6F9A8K2M4V5R6T7Y8"
+    "id": "session:ses_01J9Q3N7W6F9A8K2M4V5R6T7Y8",
+    "limit": 2
   },
   "data": {
     "kind": "session",
@@ -1178,9 +1221,12 @@ Example:
         }
       }
     ],
+    "next_cursor": null,
     "traversal": {
       "previous_session_id": null,
-      "next_session_id": null
+      "next_session_id": null,
+      "first_turn_id": "turn:turn_01J9Q3P4V8BN7XM9G2K6Q1W3E4",
+      "last_turn_id": "turn:turn_01J9Q4P93SP6B2D5M8K7V1H4NC"
     }
   },
   "warnings": [],
@@ -1192,7 +1238,9 @@ Example:
 
 ### Opening A Turn
 
-Opening a turn returns a compact view of that turn plus ordered event handles.
+Opening a turn returns a compact summary and traversal handles. Its id-only
+default is summary-only; `id + limit` or a continuation cursor returns one page
+of ordered event handles.
 
 It must not return full payloads for every event.
 
@@ -1223,6 +1271,7 @@ Turn response shape:
     "event_types": []
   },
   "events": [],
+  "next_cursor": null,
   "traversal": {}
 }
 ```
@@ -1245,8 +1294,11 @@ Event summary shape inside `events`:
 
 Rules:
 
-- `events` are ordered by `ordinal` ascending.
-- `events` must include every known event in the turn.
+- Id-only turn opens return `events: []` and `next_cursor: null`.
+- Expanded `events` are ordered by absolute turn-local `ordinal` ascending and
+  contain at most the requested page size.
+- Following every `next_cursor` until null returns every known compact event
+  summary exactly once from the pinned snapshot.
 - Event summaries are compact. Full event content is available through
   `open(event_id)`.
 - `summary.user_input` may be `null`.
@@ -1254,14 +1306,15 @@ Rules:
 - `summary.tools_called` must contain unique tool names in first-seen order.
 - `summary.event_types` must contain unique event types in first-seen order.
 
-Complete turn example:
+Expanded complete-turn example:
 
 ```json
 {
   "schema_version": "moraine.mcp.open.v1",
   "tool": "open",
   "request": {
-    "id": "turn:turn_01J9Q3P4V8BN7XM9G2K6Q1W3E4"
+    "id": "turn:turn_01J9Q3P4V8BN7XM9G2K6Q1W3E4",
+    "limit": 4
   },
   "data": {
     "kind": "turn",
@@ -1340,6 +1393,7 @@ Complete turn example:
         "truncated": true
       }
     ],
+    "next_cursor": null,
     "traversal": {
       "session_id": "session:ses_01J9Q3N7W6F9A8K2M4V5R6T7Y8",
       "previous_turn_id": null,
@@ -1355,14 +1409,15 @@ Complete turn example:
 }
 ```
 
-Incomplete turn example:
+Expanded incomplete-turn example:
 
 ```json
 {
   "schema_version": "moraine.mcp.open.v1",
   "tool": "open",
   "request": {
-    "id": "turn:turn_01J9R1A7X2C6D5E4F3G2H1J9K8"
+    "id": "turn:turn_01J9R1A7X2C6D5E4F3G2H1J9K8",
+    "limit": 2
   },
   "data": {
     "kind": "turn",
@@ -1415,6 +1470,7 @@ Incomplete turn example:
         "truncated": false
       }
     ],
+    "next_cursor": null,
     "traversal": {
       "session_id": "session:ses_01J9R19PV0A2B3C4D5E6F7G8H9",
       "previous_turn_id": "turn:turn_01J9R18Y8W7V6T5S4R3Q2P1N0M",
@@ -1812,13 +1868,19 @@ Missing object:
 
 | Input combination | Expected behavior |
 |---|---|
-| `id=session` | Return session metadata and compact turn list. |
-| `id=turn` | Return turn metadata, compact event list, and traversal references. |
+| `id=session` | Return session metadata/traversal with an empty turn list. |
+| `id=session, limit=N` | Return the first bounded compact turn page. |
+| `id=turn` | Return turn summary/traversal with an empty event list. |
+| `id=turn, limit=N` | Return the first bounded compact event-summary page. |
+| `cursor=...` | Continue the original session/turn page with its embedded limit. |
 | `id=event` | Return event metadata, full content, and traversal references. |
-| missing `id` | Return `invalid_request`. |
+| missing both `id` and `cursor` | Return `invalid_request`. |
 | blank `id` | Return `invalid_request`. |
 | malformed `id` | Return `invalid_id`. |
 | well-formed unknown `id` | Return `not_found`. |
+| `id` or `limit` combined with `cursor` | Return `invalid_request`. |
+| pagination argument with `id=event` | Return `invalid_request`. |
+| stale or wrong-kind cursor | Return `invalid_request` with reopen guidance. |
 
 ## Traversal Contract
 
@@ -1842,7 +1904,10 @@ Required traversal paths:
   `next_turn_id`
 - Turn to first and last event: `open(turn).data.traversal.first_event_id` and
   `last_event_id`
-- Session to contained turns: `open(session).data.turns[].id`
+- Session to first and last turn:
+  `open(session).data.traversal.first_turn_id` and `last_turn_id`
+- Session/turn to every child: start with `open(id, limit)` and follow
+  `data.next_cursor` with cursor-only `open` calls until null.
 
 Null traversal references are valid at boundaries.
 
@@ -1930,9 +1995,17 @@ An implementation is successful when:
 An implementation is successful when:
 
 - `open` accepts every ID returned by `search_sessions` and `list_sessions`.
-- Session IDs return session metadata and all known turn summaries.
-- Turn IDs return turn metadata, compact summaries, all known event summaries,
-  and traversal references.
+- Id-only session opens return bounded metadata, counts, and first/last-turn
+  traversal references without embedding turn summaries.
+- Id-only turn opens return bounded metadata, compact user/final summaries,
+  tool and event-type summaries, counts, and traversal references without
+  embedding event summaries.
+- Session and turn expansion accepts a configured bounded `limit`; following
+  opaque `next_cursor` values until null returns every child exactly once in
+  stable forward order, even when event-order values tie.
+- Continuation cursors are bound to the target, page size, keyset anchor, and
+  snapshot; malformed, mismatched, and stale cursors produce structured
+  errors that tell the caller to reopen the typed ID.
 - Event IDs return full event metadata and full event content.
 - Completion and terminal status are correct at session and turn levels.
 - Parent references are correct for every opened object.
@@ -1948,9 +2021,12 @@ workflow:
 
 1. Call `search_sessions` with a vague natural-language query.
 2. Select a hit and call `open` on its event ID.
-3. Call `open` on the parent turn ID to inspect surrounding events.
-4. Call `open` on the parent session ID to inspect the broader session.
-5. Traverse adjacent events or turns using IDs returned by `open`.
+3. Call id-only `open` on the parent turn ID for compact conversational
+   orientation, then expand a bounded event page only if needed.
+4. Call id-only `open` on the parent session ID for broader orientation, then
+   expand bounded turn pages only if needed.
+5. Traverse adjacent events or turns using IDs returned by `open`, or follow
+   `next_cursor` values when deliberate sequential expansion is required.
 
 For time-window discovery, the agent can call `list_sessions`, select a
 returned `open.session_id`, and then call `open`.

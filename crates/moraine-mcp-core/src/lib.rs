@@ -494,17 +494,27 @@ impl AppState {
                 },
                 {
                     "name": contract::OPEN_TOOL,
-                    "description": "Open a Moraine MCP ID returned by search_sessions, list_sessions, or open. Accepts session, turn, and event IDs.",
+                    "description": "Open a Moraine session, turn, or event ID. Session and turn opens are summary-only by default so they stay small. Add limit to expand a bounded first page, then continue with {\"cursor\": next_cursor}. Open an event ID for its full content.",
                     "inputSchema": {
                         "type": "object",
                         "additionalProperties": false,
                         "properties": {
                             "id": {
-                                "type": "string",
-                                "description": "A session:..., turn:..., or event:... Moraine MCP ID."
+                                "type": ["string", "null"],
+                                "description": "A session:..., turn:..., or event:... Moraine MCP ID. Use alone for a bounded summary, or pair a session/turn ID with limit to start expansion."
+                            },
+                            "limit": {
+                                "type": ["integer", "null"],
+                                "minimum": contract::OPEN_MIN_LIMIT,
+                                "maximum": self.cfg.mcp.max_results.max(contract::OPEN_MIN_LIMIT),
+                                "description": "Number of compact turn or event summaries to return. Omit for summary-only output. Cannot be used with cursor."
+                            },
+                            "cursor": {
+                                "type": ["string", "null"],
+                                "maxLength": contract::OPEN_CURSOR_MAX_CHARS,
+                                "description": "Opaque next_cursor from a prior open response. Provide cursor by itself to continue with the original target and page size."
                             }
-                        },
-                        "required": ["id"]
+                        }
                     },
                     "outputSchema": {
                         "type": "object",
@@ -515,7 +525,13 @@ impl AppState {
                             "request": { "type": "object" },
                             "data": {
                                 "type": "object",
-                                "required": ["kind"]
+                                "required": ["kind"],
+                                "properties": {
+                                    "kind": { "enum": ["session", "turn", "event"] },
+                                    "turns": { "type": "array" },
+                                    "events": { "type": "array" },
+                                    "next_cursor": { "type": ["string", "null"] }
+                                }
                             },
                             "warnings": { "type": "array" },
                             "performance": { "type": "object" }
@@ -1350,7 +1366,7 @@ fn admitted_tool_call(req: &RpcRequest, max_results: u16) -> Option<AdmittedTool
         }
         contract::OPEN_TOOL => {
             serde_json::from_value::<contract::OpenV1Args>(params.arguments.clone())
-                .is_ok_and(|args| args.validate().is_ok())
+                .is_ok_and(|args| args.validate(max_results).is_ok())
         }
         contract::FILE_ATTENTION_TOOL => {
             serde_json::from_value::<contract::FileAttentionArgs>(params.arguments.clone())
@@ -2080,6 +2096,7 @@ mod tests {
             turns: Vec::new(),
             completed: false,
             terminal_event_uid: None,
+            snapshot: None,
         };
         let repository = Arc::new(InMemoryConversationRepository::with_responses(
             RepoConfig::default(),
@@ -2236,9 +2253,11 @@ mod tests {
             open["inputSchema"]["properties"]
                 .as_object()
                 .map(|props| props.len()),
-            Some(1)
+            Some(3)
         );
         assert!(open["inputSchema"]["properties"].get("id").is_some());
+        assert!(open["inputSchema"]["properties"].get("limit").is_some());
+        assert!(open["inputSchema"]["properties"].get("cursor").is_some());
 
         let search = tools
             .iter()
@@ -2908,8 +2927,6 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(root.join(".git")).expect("create test git directory");
-        std::fs::write(root.join(".moraine.toml"), "backend = \"default\"\n")
-            .expect("write repository backend marker");
         let expected_project_id =
             moraine_config::project_id_for_repo_root(&root).expect("canonical project id");
 
@@ -2965,6 +2982,7 @@ mod tests {
                 .any(|root| root == &root_text),
             "launch root must be present in registered project roots"
         );
+        assert!(query.derive_legacy_roots);
         assert!(query.apply_project_scope);
 
         shutdown_tx.send(()).expect("shutdown route server");

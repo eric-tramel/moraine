@@ -344,6 +344,8 @@ def open_ids_from_file_attention_item(result: Dict[str, Any]) -> list[str]:
 def select_file_attention_result(
     payload: Dict[str, Any],
     expect_session_id: Optional[str],
+    expect_root: Optional[str] = None,
+    absent_session_ids: Optional[list[str]] = None,
 ) -> Dict[str, Any]:
     data = payload.get("data")
     if not isinstance(data, dict):
@@ -355,13 +357,34 @@ def select_file_attention_result(
         raise AssertionError(f"file_attention returned no events: {payload}")
 
     expected_session = expected_mcp_session_id(expect_session_id)
+    forbidden_sessions = {
+        session_id
+        for raw_session_id in absent_session_ids or []
+        if (session_id := expected_mcp_session_id(raw_session_id)) is not None
+    }
+    selected: Optional[Dict[str, Any]] = None
     for event in events:
         if not isinstance(event, dict):
             continue
         session_id = nested_string(event, "event", "session_id")
         open_session_id = nested_string(event, "open", "session_id")
+        if forbidden_sessions.intersection({session_id, open_session_id}):
+            raise AssertionError(
+                "project-scoped file_attention leaked an excluded session: "
+                f"event={event}, excluded={sorted(forbidden_sessions)}"
+            )
         if expected_session is None or expected_session in {session_id, open_session_id}:
-            return event
+            selected = event
+
+    if selected is not None:
+        if expect_root is not None:
+            actual_root = nested_string(selected, "event", "worktree_root")
+            if actual_root != expect_root:
+                raise AssertionError(
+                    "file_attention returned the expected session with the wrong root: "
+                    f"got={actual_root!r}, wanted={expect_root!r}, event={selected}"
+                )
+        return selected
 
     debug_events = [
         {
@@ -390,12 +413,17 @@ def open_payload_session_id(payload: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def open_payload_source(payload: Dict[str, Any]) -> Optional[str]:
+    return nested_string(payload, "data", "session", "source")
+
+
 def assert_open_search_ids(
     proc: subprocess.Popen[str],
     next_id: int,
     open_ids: list[str],
     expect_session_id: Optional[str],
     expect_open_text: Optional[str],
+    expect_source: Optional[str] = None,
 ) -> int:
     expected_session = expected_mcp_session_id(expect_session_id)
     opened_payloads: list[Dict[str, Any]] = []
@@ -415,7 +443,64 @@ def assert_open_search_ids(
                 "open session mismatch: "
                 f"got={open_session_id} want={expected_session}"
             )
+        open_source = open_payload_source(open_payload)
+        if expect_source is not None and open_source != expect_source:
+            raise AssertionError(
+                "open source mismatch: "
+                f"id={open_id} got={open_source!r} want={expect_source!r}"
+            )
         opened_payloads.append(open_payload)
+
+        kind = nested_string(open_payload, "data", "kind")
+        child_field = "turns" if kind == "session" else "events" if kind == "turn" else None
+        if child_field is not None:
+            summary_children = open_payload["data"].get(child_field)
+            if summary_children != [] or open_payload["data"].get("next_cursor") is not None:
+                raise AssertionError(
+                    f"open({kind}) id-only response must be summary-only: {open_payload}"
+                )
+
+            page_result = call_tool(
+                proc,
+                next_id,
+                "open",
+                {"id": open_id, "limit": 1},
+            )
+            next_id += 1
+            page_payload = assert_structured_content(page_result, "open")
+            opened_payloads.append(page_payload)
+            page_children = page_payload["data"].get(child_field)
+            if not isinstance(page_children, list) or len(page_children) > 1:
+                raise AssertionError(
+                    f"open({kind}) bounded page exceeded limit: {page_payload}"
+                )
+            cursor = page_payload["data"].get("next_cursor")
+            seen_cursors: set[str] = set()
+            while cursor is not None:
+                if not isinstance(cursor, str) or not cursor:
+                    raise AssertionError(f"open({kind}) returned invalid cursor: {page_payload}")
+                if cursor in seen_cursors:
+                    raise AssertionError(f"open({kind}) repeated a cursor: {cursor}")
+                seen_cursors.add(cursor)
+                continuation_result = call_tool(
+                    proc,
+                    next_id,
+                    "open",
+                    {"cursor": cursor},
+                )
+                next_id += 1
+                continuation = assert_structured_content(continuation_result, "open")
+                opened_payloads.append(continuation)
+                if nested_string(continuation, "request", "cursor") != cursor:
+                    raise AssertionError(
+                        f"open({kind}) continuation did not echo its cursor: {continuation}"
+                    )
+                continued_children = continuation["data"].get(child_field)
+                if not isinstance(continued_children, list) or len(continued_children) > 1:
+                    raise AssertionError(
+                        f"open({kind}) continuation exceeded embedded limit: {continuation}"
+                    )
+                cursor = continuation["data"].get("next_cursor")
 
     if expect_open_text is not None and not any(
         contains_text(payload, expect_open_text) for payload in opened_payloads
@@ -472,6 +557,7 @@ def run_smoke(
     project_dir: Optional[str] = None,
     working_dir: Optional[str] = None,
     absent_session_ids: Optional[list[str]] = None,
+    file_attention_absent_session_ids: Optional[list[str]] = None,
     expect_no_results: bool = False,
     expect_event_count: Optional[int] = None,
     expect_updated_at: Optional[str] = None,
@@ -567,6 +653,7 @@ def run_smoke(
 
         assert_sessions_absent(results, absent_session_ids, "search_sessions")
 
+        selected_result: Optional[Dict[str, Any]] = None
         if expect_no_results:
             if results:
                 raise AssertionError(
@@ -639,12 +726,23 @@ def run_smoke(
                     f"got {session_metadata.get('updated_at')!r}, "
                     f"wanted {expect_updated_at!r}"
                 )
+            listed_source = nested_string(selected_session, "session", "source")
+            if listed_source is None:
+                raise AssertionError(
+                    f"list_sessions result missing configured ingest source: {selected_session}"
+                )
+            listed_open_id = open_id_from_list_sessions_result(selected_session)
+            open_ids = [listed_open_id]
+            if selected_result is not None:
+                open_ids.extend(open_ids_from_search_result(selected_result))
+                open_ids = list(dict.fromkeys(open_ids))
             next_id = assert_open_search_ids(
                 proc,
                 next_id,
-                [open_id_from_list_sessions_result(selected_session)],
+                open_ids,
                 expect_session_id,
                 expect_open_text,
+                listed_source,
             )
         elif not sessions and not expect_no_results:
             raise AssertionError("list_sessions returned no sessions for e2e fixture window")
@@ -659,7 +757,7 @@ def run_smoke(
                 "file_attention",
                 {
                     "path": file_attention_path,
-                    "scope": "project" if project_dir is not None else "all",
+                    "scope": "project" if launch_dir is not None else "all",
                     "granularity": "events",
                     "limit": 10,
                 },
@@ -671,6 +769,8 @@ def run_smoke(
             selected_touch = select_file_attention_result(
                 file_attention_payload,
                 expect_session_id,
+                expect_root=launch_dir if launch_dir is not None else None,
+                absent_session_ids=file_attention_absent_session_ids,
             )
             next_id = assert_open_search_ids(
                 proc,
@@ -732,6 +832,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--file-attention-expect-absent-session-id",
+        action="append",
+        default=[],
+        help=(
+            "raw session id that must not appear in the file_attention event "
+            "timeline (repeatable)"
+        ),
+    )
+    parser.add_argument(
         "--expect-no-results",
         action="store_true",
         help="assert search_sessions returns zero results for the query",
@@ -774,6 +883,9 @@ def main() -> int:
         project_dir=args.project_dir,
         working_dir=args.working_dir,
         absent_session_ids=args.expect_absent_session_id,
+        file_attention_absent_session_ids=(
+            args.file_attention_expect_absent_session_id
+        ),
         expect_no_results=args.expect_no_results,
         expect_event_count=args.expect_event_count,
         expect_updated_at=args.expect_updated_at,

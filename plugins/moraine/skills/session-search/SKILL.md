@@ -35,9 +35,17 @@ Start broad enough to find candidate sessions, then narrow with exact terms. Aft
 
 1. Search with concrete keywords.
 2. Open the event hit first.
-3. Open the parent turn if the event needs conversational context.
-4. Open the session only when the wider plan or sequence matters.
-5. Keep IDs opaque; pass them back to `open` exactly as returned.
+3. Open the parent turn without a limit if the event needs conversational
+   context. This returns a compact summary without pulling every event into
+   context.
+4. Open the session without a limit only when the wider plan or sequence
+   matters. This returns a compact session map without embedded turns.
+5. If a compact summary is insufficient, deliberately start bounded expansion
+   with `id` plus `limit`, then call `open` with
+   `{ "cursor": next_cursor }` until enough context has been recovered. Open
+   individual event IDs for full content; there is no unbounded transcript
+   call.
+6. Keep IDs and cursors opaque; pass them back to `open` exactly as returned.
 
 ## Evidence Hygiene
 
