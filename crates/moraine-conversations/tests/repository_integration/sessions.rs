@@ -820,6 +820,54 @@ async fn get_mcp_turn_returns_compact_events_and_incomplete_state() {
             .map(|event| event.event_uid.as_str()),
         Some("evt-inc-4")
     );
+    assert_eq!(
+        turn.snapshot.as_ref().map(|snapshot| snapshot.generation),
+        Some(100)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_mcp_turn_summary_skips_projected_event_json_and_keeps_handles() {
+    let (repo, state) = build_repo().await;
+
+    let turn = repo
+        .get_mcp_turn_summary("sess-incomplete", 2)
+        .await
+        .expect("mcp turn summary succeeds")
+        .expect("mcp turn exists");
+
+    assert!(turn.events.is_empty());
+    assert_eq!(
+        turn.user_input_event
+            .as_ref()
+            .map(|event| event.event_uid.as_str()),
+        Some("evt-inc-2")
+    );
+    assert!(turn.final_response_event.is_none());
+    assert_eq!(turn.tools_called, vec!["inspect"]);
+    assert_eq!(
+        turn.first_event
+            .as_ref()
+            .map(|event| event.event_uid.as_str()),
+        Some("evt-inc-2")
+    );
+    assert_eq!(
+        turn.last_event
+            .as_ref()
+            .map(|event| event.event_uid.as_str()),
+        Some("evt-inc-4")
+    );
+
+    let queries = state.queries.lock().expect("queries lock").clone();
+    let turn_query = queries
+        .iter()
+        .find(|query| {
+            query.contains("FROM `moraine`.`mcp_open_turns`")
+                && query.contains("t.session_id = 'sess-incomplete'")
+        })
+        .expect("turn query captured");
+    assert!(turn_query.contains("'[]' AS event_summaries_json"));
+    assert!(!turn_query.contains("  event_summaries_json AS event_summaries_json"));
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn get_mcp_event_retries_stale_lookup_generation() {

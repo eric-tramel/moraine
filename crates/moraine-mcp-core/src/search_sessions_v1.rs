@@ -495,11 +495,16 @@ mod tests {
                 .to_string();
             let canonical = OpenV1Args {
                 id: Some(open_id.clone()),
+                ..OpenV1Args::default()
             }
-            .validate()
+            .validate(50)
             .expect("open accepts search result id");
 
-            assert_eq!(canonical.id.to_string(), open_id);
+            assert!(matches!(
+                canonical,
+                crate::contract::CanonicalOpenV1Args::Initial { id, limit: None }
+                    if id.to_string() == open_id
+            ));
         }
     }
 

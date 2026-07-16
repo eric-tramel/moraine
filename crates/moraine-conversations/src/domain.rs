@@ -376,6 +376,12 @@ pub struct McpTurnCompact {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpOpenSnapshot {
+    pub slot: u8,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpSessionOpen {
     pub metadata: SessionMetadata,
     pub title: Option<String>,
@@ -387,6 +393,8 @@ pub struct McpSessionOpen {
     pub turns: Vec<McpTurnCompact>,
     pub completed: bool,
     pub terminal_event_uid: Option<String>,
+    #[serde(default)]
+    pub snapshot: Option<McpOpenSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -418,6 +426,10 @@ pub struct McpTurnOpen {
     pub events: Vec<McpEventSummary>,
     pub user_input_summary: Option<String>,
     pub final_response_summary: Option<String>,
+    #[serde(default)]
+    pub user_input_event: Option<McpEventRef>,
+    #[serde(default)]
+    pub final_response_event: Option<McpEventRef>,
     pub tools_called: Vec<String>,
     pub normalized_event_types: Vec<String>,
     pub completed: bool,
@@ -426,6 +438,8 @@ pub struct McpTurnOpen {
     pub next_turn: Option<McpTurnRef>,
     pub first_event: Option<McpEventRef>,
     pub last_event: Option<McpEventRef>,
+    #[serde(default)]
+    pub snapshot: Option<McpOpenSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

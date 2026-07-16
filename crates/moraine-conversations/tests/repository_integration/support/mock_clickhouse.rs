@@ -226,10 +226,13 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                 .nth(1)
                 .and_then(|rest| rest.split_whitespace().next())
                 .and_then(|value| value.parse::<u32>().ok());
-            return (
-                StatusCode::OK,
-                json_each_row(json!(turn_rows(session_id, turn_seq))),
-            );
+            let mut rows = turn_rows(session_id, turn_seq);
+            if query.contains("'[]' AS event_summaries_json") {
+                for row in &mut rows {
+                    row["event_summaries_json"] = json!("[]");
+                }
+            }
+            return (StatusCode::OK, json_each_row(json!(rows)));
         }
 
         if query.contains("FROM `moraine`.`mcp_open_events` FINAL")

@@ -417,6 +417,57 @@ def assert_open_search_ids(
             )
         opened_payloads.append(open_payload)
 
+        kind = nested_string(open_payload, "data", "kind")
+        child_field = "turns" if kind == "session" else "events" if kind == "turn" else None
+        if child_field is not None:
+            summary_children = open_payload["data"].get(child_field)
+            if summary_children != [] or open_payload["data"].get("next_cursor") is not None:
+                raise AssertionError(
+                    f"open({kind}) id-only response must be summary-only: {open_payload}"
+                )
+
+            page_result = call_tool(
+                proc,
+                next_id,
+                "open",
+                {"id": open_id, "limit": 1},
+            )
+            next_id += 1
+            page_payload = assert_structured_content(page_result, "open")
+            opened_payloads.append(page_payload)
+            page_children = page_payload["data"].get(child_field)
+            if not isinstance(page_children, list) or len(page_children) > 1:
+                raise AssertionError(
+                    f"open({kind}) bounded page exceeded limit: {page_payload}"
+                )
+            cursor = page_payload["data"].get("next_cursor")
+            seen_cursors: set[str] = set()
+            while cursor is not None:
+                if not isinstance(cursor, str) or not cursor:
+                    raise AssertionError(f"open({kind}) returned invalid cursor: {page_payload}")
+                if cursor in seen_cursors:
+                    raise AssertionError(f"open({kind}) repeated a cursor: {cursor}")
+                seen_cursors.add(cursor)
+                continuation_result = call_tool(
+                    proc,
+                    next_id,
+                    "open",
+                    {"cursor": cursor},
+                )
+                next_id += 1
+                continuation = assert_structured_content(continuation_result, "open")
+                opened_payloads.append(continuation)
+                if nested_string(continuation, "request", "cursor") != cursor:
+                    raise AssertionError(
+                        f"open({kind}) continuation did not echo its cursor: {continuation}"
+                    )
+                continued_children = continuation["data"].get(child_field)
+                if not isinstance(continued_children, list) or len(continued_children) > 1:
+                    raise AssertionError(
+                        f"open({kind}) continuation exceeded embedded limit: {continuation}"
+                    )
+                cursor = continuation["data"].get("next_cursor")
+
     if expect_open_text is not None and not any(
         contains_text(payload, expect_open_text) for payload in opened_payloads
     ):
