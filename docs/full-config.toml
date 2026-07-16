@@ -249,8 +249,9 @@ async_log_writes = true
 # MCP protocol version advertised by the server.
 protocol_version = "2024-11-05"
 # Maximum retrieval requests executed concurrently by this MCP server process.
-# Additional valid requests wait rather than returning a saturation error.
-# Omit to use the CPU parallelism available to the Moraine process.
+# Omit for the default of 8. At most 16 additional requests wait in FIFO order.
+# Queue time counts toward the fixed 4-second request deadline; a full queue is
+# rejected immediately with a structured retryable error.
 # max_parallel_requests = 16
 
 
@@ -331,4 +332,3 @@ clickhouse_auto_install = true
 
 # Managed ClickHouse release tag expected by this Moraine build.
 clickhouse_version = "v25.12.5.44-stable"
-

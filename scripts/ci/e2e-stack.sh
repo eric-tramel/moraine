@@ -1355,6 +1355,11 @@ if not valid:
   assert_clickhouse_scalar "$clickhouse_url" "codex session summary turn count unchanged by un-merged duplicate" "SELECT total_turns FROM ${clickhouse_database}.v_session_summary WHERE session_id = '${codex_session_id}'" "$codex_turns_before"
   # Re-enable merges now that the pre-merge assertions have passed.
   clickhouse_scalar "$clickhouse_url" "SYSTEM START MERGES ${clickhouse_database}.events" >/dev/null
+  # This fixture mutation bypasses the ingest sink, which normally refreshes
+  # the MCP read model after every event batch. Reconcile the dirty session so
+  # the retrieval smoke below exercises the same clean projection contract as
+  # production ingestion.
+  "$moraine_bin" db migrate --config "$config_path" >/dev/null
 
   # `/api/v1/sessions` intentionally keeps its dashboard shape without
   # eventCount. Derive the monitor-side canonical count through the existing

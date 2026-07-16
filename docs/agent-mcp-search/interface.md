@@ -1,7 +1,7 @@
 # MCP Interface
 
 This page explains Moraine's MCP interface as an agent user should understand
-it. For the exhaustive contract, examples, and SLA targets, see the
+it. For the exhaustive contract and examples, see the
 [MCP Search Interface Specification](../mcp-search-interface-spec.md).
 
 ## How MCP Tools Appear
@@ -319,9 +319,7 @@ Successful structured responses share this shape:
   "data": {},
   "warnings": [],
   "performance": {
-    "elapsed_ms": 12,
-    "sla_target_ms": 750,
-    "met_sla": true
+    "elapsed_ms": 12
   }
 }
 ```

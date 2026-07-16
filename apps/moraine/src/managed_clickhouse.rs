@@ -1892,22 +1892,55 @@ mod tests {
     }
 
     #[test]
-    fn materialized_config_applies_managed_runtime_limits() {
+    fn materialized_config_applies_managed_runtime_policy() {
         let root = temp_dir("thread-pool-config");
         let cfg = test_config(&root, "http://127.0.0.1:18123".to_string());
         let paths = crate::paths::runtime_paths(&cfg);
         ensure_runtime_dirs(&paths).expect("runtime dirs");
         materialize_clickhouse_config(&cfg, &paths).expect("materialize config");
-        let rendered = fs::read_to_string(&paths.clickhouse_config).expect("read config");
+        let rendered_config = fs::read_to_string(&paths.clickhouse_config).expect("read config");
+        let rendered_users = fs::read_to_string(&paths.clickhouse_users).expect("read users");
 
         assert_eq!(
-            rendered
+            rendered_config
                 .matches("<max_thread_pool_free_size>64</max_thread_pool_free_size>")
                 .count(),
             1
         );
-        assert_eq!(rendered.matches("<console>false</console>").count(), 1);
-        assert!(!rendered.contains("<max_thread_pool_size>"));
+        assert_eq!(
+            rendered_config
+                .matches("<concurrent_threads_soft_limit_num>0</concurrent_threads_soft_limit_num>")
+                .count(),
+            1
+        );
+        assert_eq!(
+            rendered_config
+                .matches(
+                    "<concurrent_threads_soft_limit_ratio_to_cores>1</concurrent_threads_soft_limit_ratio_to_cores>",
+                )
+                .count(),
+            1
+        );
+        assert_eq!(
+            rendered_config
+                .matches(
+                    "<concurrent_threads_scheduler>fair_round_robin</concurrent_threads_scheduler>",
+                )
+                .count(),
+            1
+        );
+        assert_eq!(
+            rendered_users
+                .matches("<use_concurrency_control>1</use_concurrency_control>")
+                .count(),
+            1
+        );
+        assert_eq!(
+            rendered_config.matches("<console>false</console>").count(),
+            1
+        );
+        assert!(!rendered_config.contains("<max_thread_pool_size>"));
+        assert!(!rendered_users.contains("<max_threads>"));
         let _ = fs::remove_dir_all(root);
     }
 

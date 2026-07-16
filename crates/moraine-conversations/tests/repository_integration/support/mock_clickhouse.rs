@@ -93,6 +93,7 @@ pub(crate) struct MockOptions {
 pub(crate) struct MockState {
     pub(crate) queries: Mutex<Vec<String>>,
     pub(crate) query_ids: Mutex<Vec<Option<String>>>,
+    pub(crate) request_params: Mutex<Vec<HashMap<String, String>>>,
     pub(crate) options: MockOptions,
     pub(crate) scripted_responses: Mutex<Option<VecDeque<ScriptedResponse>>>,
 }
@@ -133,6 +134,11 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             .lock()
             .expect("query id lock")
             .push(params.get("query_id").cloned());
+        state
+            .request_params
+            .lock()
+            .expect("request params lock")
+            .push(params.clone());
 
         if let Some(barrier) = state.options.query_barrier.clone() {
             if barrier
@@ -188,11 +194,15 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
 
         if query.contains("mcp_open_projection_state")
             && query.contains("WHERE state_key = 'global'")
+            && !query.contains("toUInt8(0) AS row_kind")
         {
             return (StatusCode::OK, json_each_row(json!([{ "ready": 1_u8 }])));
         }
 
-        if query.contains("FROM `moraine`.`mcp_open_sessions`") && query.contains("FINAL") {
+        if query.contains("FROM `moraine`.`mcp_open_sessions`")
+            && query.contains("FINAL")
+            && !query.contains("toUInt8(0) AS row_kind")
+        {
             let session_id = query
                 .split("session_id = '")
                 .nth(1)
@@ -202,7 +212,10 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             return (StatusCode::OK, json_each_row(json!(rows)));
         }
 
-        if query.contains("FROM `moraine`.`mcp_open_turns`") && query.contains("FINAL") {
+        if query.contains("FROM `moraine`.`mcp_open_turns`")
+            && query.contains("FINAL")
+            && !query.contains("toUInt8(0) AS row_kind")
+        {
             let session_id = query
                 .split("session_id = '")
                 .nth(1)
@@ -249,6 +262,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
 
         if query.contains("FROM `moraine`.`mcp_open_events` FINAL")
             && query.contains("event_uid IN")
+            && !query.contains("toUInt8(0) AS row_kind")
         {
             return (StatusCode::OK, json_each_row(json!(event_ref_rows())));
         }
@@ -734,8 +748,6 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             && query.contains("WHERE session_id IN")
             && query.contains("toString(ss.first_event_time) AS first_event_time")
             && query.contains("toString(ss.last_event_time) AS last_event_time")
-            && query.contains("toUnixTimestamp64Milli(ss.first_event_time)")
-            && query.contains("toUnixTimestamp64Milli(ss.last_event_time)")
         {
             return (
                 StatusCode::OK,
@@ -758,7 +770,9 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             );
         }
 
-        if query.contains("FROM `moraine`.`search_corpus_stats`") {
+        if query.contains("FROM `moraine`.`search_corpus_stats`")
+            && !query.contains("toUInt8(0) AS row_kind")
+        {
             return (
                 StatusCode::OK,
                 json_each_row(json!([
@@ -778,6 +792,195 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                     { "term": "world", "df": 10_u64 }
                 ])),
             );
+        }
+
+        if query.contains("toUInt8(0) AS row_kind") && query.contains("projected_candidates AS") {
+            let candidate = |event_uid: &str,
+                             raw_score: f64,
+                             matched_terms: u64,
+                             event_unix_ms: i64| {
+                json!({
+                    "row_kind": 0_u8,
+                    "event_uid": event_uid,
+                    "session_id": if event_uid.starts_with("evt-a") { "sess_a" } else if event_uid.starts_with("evt-b") { "sess_b" } else { "sess_c" },
+                    "slot": 0_u8,
+                    "generation": 1_u64,
+                    "raw_score": raw_score,
+                    "matched_terms": matched_terms,
+                    "event_unix_ms": event_unix_ms,
+                    "docs": 100_u64,
+                    "total_doc_len": 5000_u64,
+                    "scope_exists": 1_u8,
+                    "projection_ready": 1_u8,
+                    "projection_clean": 1_u8
+                })
+            };
+            let metadata = json!({
+                "row_kind": 1_u8,
+                "event_uid": "",
+                "session_id": "",
+                "slot": 0_u8,
+                "generation": 0_u64,
+                "raw_score": 0.0,
+                "matched_terms": 0_u64,
+                "event_unix_ms": 0_i64,
+                "docs": 100_u64,
+                "total_doc_len": 5000_u64,
+                "scope_exists": 1_u8,
+                "projection_ready": 1_u8,
+                "projection_clean": 1_u8
+            });
+            let filter_clause = query
+                .split_once("WHERE ")
+                .and_then(|(_, tail)| tail.split_once("GROUP BY p.doc_id"))
+                .map(|(filter, _)| filter)
+                .unwrap_or(query.as_str());
+            let mut rows = if query.contains("e.session_id = 'sess_c' AND e.turn_seq = 2") {
+                vec![candidate("evt-c-tool", 13.0, 2, 1_767_434_430_000)]
+            } else if query.contains("p.session_id = 'sess_a'") {
+                vec![candidate("evt-a-11", 7.0, 1, 1_767_261_720_000)]
+            } else if filter_clause.contains("lowerUTF8(p.actor_role) = 'user'")
+                && !filter_clause.contains("lowerUTF8(p.actor_role) = 'assistant'")
+            {
+                vec![candidate("evt-c-user", 11.0, 2, 1_767_434_460_000)]
+            } else if filter_clause.contains("lowerUTF8(p.actor_role) = 'assistant'")
+                && !filter_clause.contains("lowerUTF8(p.actor_role) = 'user'")
+            {
+                vec![candidate("evt-c-42", 12.5, 2, 1_767_434_520_000)]
+            } else if query.contains("LIMIT 3") {
+                vec![
+                    candidate("evt-c-42", 12.5, 2, 1_767_434_520_000),
+                    candidate("evt-a-11", 7.0, 1, 1_767_261_720_000),
+                    candidate("evt-b-9", 6.0, 1, 1_767_348_120_000),
+                ]
+            } else {
+                vec![
+                    candidate("evt-c-42", 12.5, 2, 1_767_434_520_000),
+                    candidate("evt-a-11", 7.0, 1, 1_767_261_720_000),
+                ]
+            };
+            rows.push(metadata);
+            return (StatusCode::OK, json_each_row(json!(rows)));
+        }
+
+        if query.contains("documents AS (")
+            && query.contains("AS session_started_at_unix_ms")
+            && query.contains("FROM documents")
+            && query.contains("mcp_open_events")
+        {
+            let detail = |event_uid: &str| {
+                let (session_id, event_time, event_unix_ms, event_order, turn_seq) = match event_uid
+                {
+                    "evt-a-11" => (
+                        "sess_a",
+                        "2026-01-01 10:02:00",
+                        1_767_261_720_000_i64,
+                        11_u64,
+                        1_u32,
+                    ),
+                    "evt-b-9" => (
+                        "sess_b",
+                        "2026-01-02 10:02:00",
+                        1_767_348_120_000_i64,
+                        9_u64,
+                        1_u32,
+                    ),
+                    "evt-c-tool" => (
+                        "sess_c",
+                        "2026-01-03 10:00:30",
+                        1_767_434_430_000_i64,
+                        40_u64,
+                        2_u32,
+                    ),
+                    "evt-c-user" => (
+                        "sess_c",
+                        "2026-01-03 10:01:00",
+                        1_767_434_460_000_i64,
+                        41_u64,
+                        2_u32,
+                    ),
+                    _ => (
+                        "sess_c",
+                        "2026-01-03 10:02:00",
+                        1_767_434_520_000_i64,
+                        42_u64,
+                        2_u32,
+                    ),
+                };
+                let is_tool = event_uid == "evt-c-tool";
+                let is_user = event_uid == "evt-c-user";
+                let actor_role = if is_tool {
+                    "tool"
+                } else if is_user {
+                    "user"
+                } else {
+                    "assistant"
+                };
+                let event_type = if is_tool {
+                    "tool_response"
+                } else if is_user {
+                    "user_input"
+                } else {
+                    "assistant_response"
+                };
+                let text = match event_uid {
+                    "evt-c-tool" => "cargo test failure output with stack details",
+                    "evt-c-user" => "user asked about hello world in a prompt",
+                    "evt-a-11" => "weaker assistant event in session a with extra context",
+                    "evt-b-9" => "third assistant event with extra context",
+                    _ => "best assistant event in session c with extra context",
+                };
+                json!({
+                    "event_uid": event_uid,
+                    "session_id": session_id,
+                    "source_name": "codex",
+                    "harness": "codex",
+                    "inference_provider": "openai",
+                    "endpoint_kind": "generation",
+                    "event_class": if is_tool { "tool_result" } else { "message" },
+                    "payload_type": if is_tool { "tool_result" } else { "text" },
+                    "actor_role": actor_role,
+                    "name": if is_tool { "bash" } else { "" },
+                    "phase": if is_tool { "completed" } else { "" },
+                    "source_ref": format!("/tmp/{session_id}.jsonl:1:{event_order}"),
+                    "doc_len": 19_u32,
+                    "text_preview": text,
+                    "text_content": text,
+                    "payload_json": "{}",
+                    "mcp_event_type": event_type,
+                    "raw_score": 0.0,
+                    "matched_terms": 0_u64,
+                    "event_time": event_time,
+                    "event_unix_ms": event_unix_ms,
+                    "event_order": event_order,
+                    "turn_seq": turn_seq,
+                    "event_ordinal": if is_tool { 1_u32 } else if is_user { 2_u32 } else if session_id == "sess_c" { 3_u32 } else { 1_u32 },
+                    "turn_event_count": if session_id == "sess_c" { 3_u64 } else { 1_u64 },
+                    "turn_completed": if session_id == "sess_c" { 1_u8 } else { 0_u8 },
+                    "turn_terminal_event_uid": if session_id == "sess_c" { "evt-c-42" } else { "" },
+                    "call_id": if is_tool { "call-bash-1" } else { "" },
+                    "item_id": format!("item-{event_uid}"),
+                    "model": "gpt-5.3-codex",
+                    "session_started_at_unix_ms": event_unix_ms - 120_000,
+                    "session_updated_at_unix_ms": event_unix_ms + 480_000,
+                    "session_title": if session_id == "sess_c" { "Session C summary" } else { "" },
+                    "session_slug": "",
+                    "session_summary": if session_id == "sess_c" { "Session C summary" } else { "" },
+                    "session_completed": if session_id == "sess_c" { 1_u8 } else { 0_u8 }
+                })
+            };
+            let event_uids = [
+                "evt-c-tool",
+                "evt-c-user",
+                "evt-c-42",
+                "evt-a-11",
+                "evt-b-9",
+            ]
+            .into_iter()
+            .filter(|event_uid| query.contains(&format!("'{event_uid}'")))
+            .map(detail)
+            .collect::<Vec<_>>();
+            return (StatusCode::OK, json_each_row(json!(event_uids)));
         }
 
         if query.contains("AS mcp_event_type")
@@ -1863,6 +2066,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
     let state = Arc::new(MockState {
         queries: Mutex::default(),
         query_ids: Mutex::default(),
+        request_params: Mutex::default(),
         options,
         scripted_responses: Mutex::new(scripted_responses),
     });

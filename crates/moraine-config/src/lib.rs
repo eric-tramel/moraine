@@ -174,8 +174,8 @@ pub struct McpConfig {
     #[serde(default = "default_protocol_version")]
     pub protocol_version: String,
     /// Maximum retrieval requests executed concurrently by each MCP server
-    /// process. When omitted, the server uses the process's available CPU
-    /// parallelism. Additional valid requests wait for capacity.
+    /// process. When omitted, the server executes up to eight. At most sixteen
+    /// additional requests wait in FIFO order, within the fixed wall deadline.
     #[serde(default)]
     pub max_parallel_requests: Option<u16>,
     /// When true, `moraine run mcp` first tries to reach the shared central

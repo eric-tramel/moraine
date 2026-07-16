@@ -16,15 +16,15 @@ pub use private_proxy::private_route_deadline;
 pub use private_proxy::{negotiate_private_route, PrivateProxyConnection, PrivateRouteNegotiation};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::{pending, Future};
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex as StdMutex,
 };
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::{oneshot, watch, Semaphore};
+use tokio::sync::{oneshot, watch, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
@@ -44,35 +44,224 @@ impl RequestLimitSource {
 }
 
 const AUTOMATIC_MAX_PARALLEL_REQUESTS: usize = 8;
+const MAX_QUEUED_REQUESTS: usize = 16;
+const REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(4);
 
-fn effective_max_parallel_requests(
-    configured: Option<u16>,
-    detected_parallelism: Option<usize>,
-) -> (usize, RequestLimitSource) {
+fn effective_max_parallel_requests(configured: Option<u16>) -> (usize, RequestLimitSource) {
     let (requested, source) = match configured {
         Some(configured) => (usize::from(configured), RequestLimitSource::Config),
         None => (
-            detected_parallelism
-                .unwrap_or(1)
-                .min(AUTOMATIC_MAX_PARALLEL_REQUESTS),
+            AUTOMATIC_MAX_PARALLEL_REQUESTS,
             RequestLimitSource::Automatic,
         ),
     };
     (requested.clamp(1, Semaphore::MAX_PERMITS), source)
 }
 
-fn build_request_permits(cfg: &AppConfig) -> Arc<Semaphore> {
-    let detected_parallelism = std::thread::available_parallelism()
-        .ok()
-        .map(std::num::NonZeroUsize::get);
+fn build_request_admission(cfg: &AppConfig) -> Arc<RequestAdmission> {
     let (max_parallel_requests, source) =
-        effective_max_parallel_requests(cfg.mcp.max_parallel_requests, detected_parallelism);
+        effective_max_parallel_requests(cfg.mcp.max_parallel_requests);
     info!(
         max_parallel_requests,
+        max_queued_requests = MAX_QUEUED_REQUESTS,
+        request_deadline_ms = REQUEST_DEADLINE.as_millis(),
         source = source.as_str(),
-        "configured MCP retrieval concurrency"
+        "configured bounded MCP retrieval admission"
     );
-    Arc::new(Semaphore::new(max_parallel_requests))
+    Arc::new(RequestAdmission::new(
+        max_parallel_requests,
+        MAX_QUEUED_REQUESTS,
+        REQUEST_DEADLINE,
+    ))
+}
+
+#[derive(Debug)]
+struct RequestAdmission {
+    execution: Arc<Semaphore>,
+    slots: Arc<Semaphore>,
+    waiters: StdMutex<VecDeque<u64>>,
+    next_ticket: AtomicU64,
+    changes: watch::Sender<u64>,
+    closed: AtomicBool,
+    cleanup_count: AtomicUsize,
+    max_executing: usize,
+    max_queued: usize,
+    deadline: std::time::Duration,
+}
+
+impl RequestAdmission {
+    fn new(max_executing: usize, max_queued: usize, deadline: std::time::Duration) -> Self {
+        let max_executing = max_executing.clamp(1, Semaphore::MAX_PERMITS);
+        let max_queued = max_queued.min(Semaphore::MAX_PERMITS - max_executing);
+        let (changes, _) = watch::channel(0);
+        Self {
+            execution: Arc::new(Semaphore::new(max_executing)),
+            slots: Arc::new(Semaphore::new(max_executing + max_queued)),
+            waiters: StdMutex::new(VecDeque::new()),
+            next_ticket: AtomicU64::new(0),
+            changes,
+            closed: AtomicBool::new(false),
+            cleanup_count: AtomicUsize::new(0),
+            max_executing,
+            max_queued,
+            deadline,
+        }
+    }
+
+    fn try_register(self: &Arc<Self>) -> Result<AdmissionTicket, TryAdmissionError> {
+        let slot = match self.slots.clone().try_acquire_owned() {
+            Ok(slot) => slot,
+            Err(TryAcquireError::NoPermits) => return Err(TryAdmissionError::Full),
+            Err(TryAcquireError::Closed) => return Err(TryAdmissionError::Closed),
+        };
+        if self.closed.load(Ordering::Acquire) {
+            return Err(TryAdmissionError::Closed);
+        }
+
+        let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
+        self.waiters
+            .lock()
+            .expect("request admission queue poisoned")
+            .push_back(ticket);
+        self.signal_change();
+        Ok(AdmissionTicket {
+            admission: self.clone(),
+            ticket,
+            slot: Some(slot),
+            queued: true,
+        })
+    }
+
+    fn is_front(&self, ticket: u64) -> bool {
+        self.waiters
+            .lock()
+            .expect("request admission queue poisoned")
+            .front()
+            .is_some_and(|front| *front == ticket)
+    }
+
+    fn remove_waiter(&self, ticket: u64) {
+        let mut waiters = self
+            .waiters
+            .lock()
+            .expect("request admission queue poisoned");
+        if let Some(index) = waiters.iter().position(|queued| *queued == ticket) {
+            waiters.remove(index);
+        }
+        drop(waiters);
+        self.signal_change();
+    }
+
+    fn signal_change(&self) {
+        self.changes
+            .send_modify(|version| *version = version.wrapping_add(1));
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.execution.close();
+        self.slots.close();
+        self.signal_change();
+    }
+
+    fn start_cleanup(self: &Arc<Self>) -> RequestCleanupGuard {
+        self.cleanup_count.fetch_add(1, Ordering::AcqRel);
+        self.signal_change();
+        RequestCleanupGuard {
+            admission: self.clone(),
+        }
+    }
+
+    async fn wait_for_cleanup_until(&self, deadline: tokio::time::Instant) {
+        let mut changes = self.changes.subscribe();
+        while self.cleanup_count.load(Ordering::Acquire) != 0 {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                changed = changes.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum TryAdmissionError {
+    Full,
+    Closed,
+}
+
+struct AdmissionTicket {
+    admission: Arc<RequestAdmission>,
+    ticket: u64,
+    slot: Option<OwnedSemaphorePermit>,
+    queued: bool,
+}
+
+impl AdmissionTicket {
+    async fn acquire(mut self) -> Option<RequestPermit> {
+        let mut changes = self.admission.changes.subscribe();
+        loop {
+            if self.admission.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            if self.admission.is_front(self.ticket) {
+                match self.admission.execution.clone().try_acquire_owned() {
+                    Ok(execution) => {
+                        self.admission.remove_waiter(self.ticket);
+                        self.queued = false;
+                        return Some(RequestPermit {
+                            admission: self.admission.clone(),
+                            execution: Some(execution),
+                            _slot: self
+                                .slot
+                                .take()
+                                .expect("registered admission ticket owns a slot"),
+                        });
+                    }
+                    Err(TryAcquireError::NoPermits) => {}
+                    Err(TryAcquireError::Closed) => return None,
+                }
+            }
+            if changes.changed().await.is_err() {
+                return None;
+            }
+        }
+    }
+}
+
+impl Drop for AdmissionTicket {
+    fn drop(&mut self) {
+        if self.queued {
+            self.admission.remove_waiter(self.ticket);
+        }
+    }
+}
+
+struct RequestPermit {
+    admission: Arc<RequestAdmission>,
+    execution: Option<OwnedSemaphorePermit>,
+    _slot: OwnedSemaphorePermit,
+}
+
+impl Drop for RequestPermit {
+    fn drop(&mut self) {
+        self.execution.take();
+        self.admission.signal_change();
+    }
+}
+
+struct RequestCleanupGuard {
+    admission: Arc<RequestAdmission>,
+}
+
+impl Drop for RequestCleanupGuard {
+    fn drop(&mut self) {
+        self.admission.cleanup_count.fetch_sub(1, Ordering::AcqRel);
+        self.admission.signal_change();
+    }
 }
 const QUERY_CANCELLATION_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1_000);
 const SERVICE_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(1_250);
@@ -81,6 +270,20 @@ type QueryCancellationSlot = Arc<StdMutex<Option<String>>>;
 
 tokio::task_local! {
     static REQUEST_QUERY_CANCELLATION: QueryCancellationSlot;
+    static REQUEST_ACCEPTED_AT: std::time::Instant;
+}
+
+pub(crate) fn request_performance() -> contract::PerformanceBuilder {
+    let started_at = REQUEST_ACCEPTED_AT
+        .try_with(|started_at| *started_at)
+        .unwrap_or_else(|_| std::time::Instant::now());
+    contract::Performance::builder_from(started_at)
+}
+
+pub(crate) fn request_started_at() -> std::time::Instant {
+    REQUEST_ACCEPTED_AT
+        .try_with(|started_at| *started_at)
+        .unwrap_or_else(|_| std::time::Instant::now())
 }
 
 pub(crate) fn backend_query_id(kind: &str) -> String {
@@ -122,7 +325,7 @@ struct AppState {
     repo: Arc<dyn ConversationRepository>,
     launch_dir: Option<PathBuf>,
     prewarm_started: Arc<AtomicBool>,
-    request_permits: Arc<Semaphore>,
+    request_admission: Arc<RequestAdmission>,
 }
 
 impl AppState {
@@ -591,25 +794,25 @@ impl AppState {
         repo: Arc<dyn ConversationRepository>,
         prewarm_started: Arc<AtomicBool>,
         launch_dir: Option<PathBuf>,
-        request_permits: Arc<Semaphore>,
+        request_admission: Arc<RequestAdmission>,
     ) -> Arc<AppState> {
         Arc::new(AppState {
             cfg,
             repo,
             launch_dir,
             prewarm_started,
-            request_permits,
+            request_admission,
         })
     }
 
     fn embedded(cfg: AppConfig, repo: Arc<dyn ConversationRepository>) -> Arc<AppState> {
-        let request_permits = build_request_permits(&cfg);
+        let request_admission = build_request_admission(&cfg);
         Self::with_repository(
             cfg.into(),
             repo,
             Arc::new(AtomicBool::new(false)),
             std::env::current_dir().ok(),
-            request_permits,
+            request_admission,
         )
     }
 }
@@ -646,7 +849,8 @@ impl QueryCancellationGuard {
 /// Slow repository requests execute concurrently and may complete out of order.
 /// Response encoding and writes stay on this connection task so JSON frames can
 /// never interleave. Admission is shared across socket connections; requests
-/// wait asynchronously when all execution permits are in use.
+/// wait in a finite FIFO queue when execution permits are busy, share one wall
+/// deadline from frame acceptance, and are rejected immediately when it is full.
 async fn serve_connection_with_first_line<R, W>(
     state: Arc<AppState>,
     reader: R,
@@ -826,6 +1030,10 @@ where
     }
     requests.abort_all();
     while requests.join_next().await.is_some() {}
+    state
+        .request_admission
+        .wait_for_cleanup_until(cancellation_deadline)
+        .await;
 
     if let Some(error) = connection_error {
         Err(error)
@@ -858,6 +1066,7 @@ async fn dispatch_rpc_line(
     active: &mut HashMap<String, ActiveRequest>,
     mut connection_shutdown: watch::Receiver<bool>,
 ) -> Result<Option<Value>> {
+    let accepted_at = tokio::time::Instant::now();
     let line = line.trim();
     if line.is_empty() {
         return Ok(None);
@@ -883,9 +1092,9 @@ async fn dispatch_rpc_line(
         return Ok(None);
     }
 
-    if !request_requires_admission(&req, state.cfg.mcp.max_results) {
+    let Some(admitted_tool) = admitted_tool_call(&req, state.cfg.mcp.max_results) else {
         return Ok(state.handle_request(req).await);
-    }
+    };
 
     let id = req
         .id
@@ -900,23 +1109,65 @@ async fn dispatch_rpc_line(
         )));
     }
 
+    let admission_ticket = match state.request_admission.try_register() {
+        Ok(ticket) => ticket,
+        Err(TryAdmissionError::Full) => {
+            return Ok(Some(admission_error_response(
+                id,
+                &admitted_tool,
+                accepted_at,
+                state.request_admission.deadline,
+                AdmissionErrorKind::QueueFull {
+                    max_executing: state.request_admission.max_executing,
+                    max_queued: state.request_admission.max_queued,
+                },
+            )));
+        }
+        Err(TryAdmissionError::Closed) => return Ok(None),
+    };
+
     let (cancel_tx, mut cancel_rx) = oneshot::channel();
     let request_query_id = backend_query_id("request");
     let query_cancellation = Arc::new(StdMutex::new(None));
     let task_query_cancellation = query_cancellation.clone();
     let request_state = state.clone();
     let task_key = key.clone();
+    let task_id = id.clone();
+    let deadline_duration = request_state.request_admission.deadline;
+    let deadline = accepted_at + deadline_duration;
     let task = requests.spawn(async move {
-        let permit = tokio::select! {
+        enum AdmissionOutcome {
+            Admitted(RequestPermit),
+            Cancelled,
+            DeadlineExceeded,
+        }
+
+        let admission = tokio::select! {
             biased;
-            _ = &mut cancel_rx => None,
-            _ = wait_for_connection_shutdown(&mut connection_shutdown) => None,
-            permit = request_state.request_permits.clone().acquire_owned() => permit.ok(),
+            _ = &mut cancel_rx => AdmissionOutcome::Cancelled,
+            _ = wait_for_connection_shutdown(&mut connection_shutdown) => AdmissionOutcome::Cancelled,
+            _ = tokio::time::sleep_until(deadline) => AdmissionOutcome::DeadlineExceeded,
+            permit = admission_ticket.acquire() => match permit {
+                Some(permit) => AdmissionOutcome::Admitted(permit),
+                None => AdmissionOutcome::Cancelled,
+            },
         };
-        let Some(permit) = permit else {
-            return (task_key, None);
+        let permit = match admission {
+            AdmissionOutcome::Admitted(permit) => permit,
+            AdmissionOutcome::Cancelled => return (task_key, None),
+            AdmissionOutcome::DeadlineExceeded => {
+                return (
+                    task_key,
+                    Some(admission_error_response(
+                        task_id,
+                        &admitted_tool,
+                        accepted_at,
+                        deadline_duration,
+                        AdmissionErrorKind::DeadlineExceeded,
+                    )),
+                );
+            }
         };
-        let _permit = permit;
         let query_cancellation = task_query_cancellation;
         *query_cancellation
             .lock()
@@ -925,13 +1176,18 @@ async fn dispatch_rpc_line(
         enum Outcome {
             Completed(Option<Value>),
             Cancelled,
+            DeadlineExceeded,
         }
         let outcome = {
-            let request = REQUEST_QUERY_CANCELLATION.scope(
-                query_cancellation.clone(),
-                moraine_conversations::with_repository_query_id(
-                    request_query_id,
-                    request_state.handle_request(req),
+            let request = REQUEST_ACCEPTED_AT.scope(
+                accepted_at.into_std(),
+                REQUEST_QUERY_CANCELLATION.scope(
+                    query_cancellation.clone(),
+                    moraine_conversations::with_repository_query_deadline(
+                        request_query_id,
+                        deadline,
+                        request_state.handle_request(req),
+                    ),
                 ),
             );
             tokio::pin!(request);
@@ -939,6 +1195,7 @@ async fn dispatch_rpc_line(
                 biased;
                 _ = &mut cancel_rx => Outcome::Cancelled,
                 _ = wait_for_connection_shutdown(&mut connection_shutdown) => Outcome::Cancelled,
+                _ = tokio::time::sleep_until(deadline) => Outcome::DeadlineExceeded,
                 response = &mut request => Outcome::Completed(response),
             }
         };
@@ -947,6 +1204,23 @@ async fn dispatch_rpc_line(
             Outcome::Cancelled => {
                 cancel_registered_query(&request_state, &query_cancellation).await;
                 None
+            }
+            Outcome::DeadlineExceeded => {
+                spawn_deadline_cancellation(
+                    request_state,
+                    query_cancellation,
+                    permit,
+                );
+                return (
+                    task_key,
+                    Some(admission_error_response(
+                        task_id,
+                        &admitted_tool,
+                        accepted_at,
+                        deadline_duration,
+                        AdmissionErrorKind::DeadlineExceeded,
+                    )),
+                );
             }
         };
         (task_key, response)
@@ -963,6 +1237,72 @@ async fn dispatch_rpc_line(
     Ok(None)
 }
 
+#[derive(Clone, Debug)]
+struct AdmittedToolCall {
+    name: String,
+    request: Value,
+}
+
+enum AdmissionErrorKind {
+    QueueFull {
+        max_executing: usize,
+        max_queued: usize,
+    },
+    DeadlineExceeded,
+}
+
+fn admission_error_response(
+    id: Value,
+    tool: &AdmittedToolCall,
+    accepted_at: tokio::time::Instant,
+    deadline: std::time::Duration,
+    kind: AdmissionErrorKind,
+) -> Value {
+    let deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
+    let error = match kind {
+        AdmissionErrorKind::QueueFull {
+            max_executing,
+            max_queued,
+        } => contract::ContractError::new(
+            contract::ToolErrorCode::DeadlineExceeded,
+            "MCP retrieval queue is full; retry later",
+        )
+        .with_details(json!({
+            "reason": "queue_full",
+            "max_executing": max_executing,
+            "max_queued": max_queued,
+        })),
+        AdmissionErrorKind::DeadlineExceeded => contract::ContractError::new(
+            contract::ToolErrorCode::DeadlineExceeded,
+            "MCP retrieval request exceeded its end-to-end deadline",
+        )
+        .with_details(json!({
+            "reason": "request_deadline",
+            "deadline_ms": deadline_ms,
+        })),
+    };
+    let payload = serde_json::to_value(contract::ToolErrorEnvelope::error(
+        tool.name.clone(),
+        tool.request.clone(),
+        error,
+        contract::Performance::from_elapsed(accepted_at.elapsed()),
+    ))
+    .expect("MCP admission error envelope is serializable");
+    rpc_ok(
+        id,
+        handled_tool_error_result(
+            format!(
+                "{} failed: {}",
+                tool.name,
+                payload["error"]["message"]
+                    .as_str()
+                    .unwrap_or("request failed")
+            ),
+            payload,
+        ),
+    )
+}
+
 async fn cancel_registered_query(state: &AppState, slot: &QueryCancellationSlot) {
     let query_id = slot
         .lock()
@@ -972,6 +1312,19 @@ async fn cancel_registered_query(state: &AppState, slot: &QueryCancellationSlot)
         return;
     };
     cancel_query_with_deadline(state, &query_id).await;
+}
+
+fn spawn_deadline_cancellation(
+    state: Arc<AppState>,
+    slot: QueryCancellationSlot,
+    permit: RequestPermit,
+) {
+    let cleanup = state.request_admission.start_cleanup();
+    tokio::spawn(async move {
+        let _cleanup = cleanup;
+        cancel_registered_query(&state, &slot).await;
+        drop(permit);
+    });
 }
 
 pub(crate) async fn cancel_query_with_deadline(state: &AppState, query_id: &str) {
@@ -994,31 +1347,37 @@ pub(crate) async fn cancel_query_with_deadline(state: &AppState, query_id: &str)
     }
 }
 
-fn request_requires_admission(req: &RpcRequest, max_results: u16) -> bool {
+fn admitted_tool_call(req: &RpcRequest, max_results: u16) -> Option<AdmittedToolCall> {
     if req.id.is_none() || req.method != "tools/call" {
-        return false;
+        return None;
     }
     let Ok(params) = serde_json::from_value::<ToolCallParams>(req.params.clone()) else {
-        return false;
+        return None;
     };
 
-    match params.name.as_str() {
+    let valid = match params.name.as_str() {
         contract::SEARCH_SESSIONS_TOOL => {
-            serde_json::from_value::<contract::SearchSessionsArgs>(params.arguments)
+            serde_json::from_value::<contract::SearchSessionsArgs>(params.arguments.clone())
                 .is_ok_and(|args| args.validate().is_ok())
         }
         contract::LIST_SESSIONS_TOOL => {
-            serde_json::from_value::<contract::ListSessionsArgs>(params.arguments)
+            serde_json::from_value::<contract::ListSessionsArgs>(params.arguments.clone())
                 .is_ok_and(|args| args.validate(max_results).is_ok())
         }
-        contract::OPEN_TOOL => serde_json::from_value::<contract::OpenV1Args>(params.arguments)
-            .is_ok_and(|args| args.validate(max_results).is_ok()),
+        contract::OPEN_TOOL => {
+            serde_json::from_value::<contract::OpenV1Args>(params.arguments.clone())
+                .is_ok_and(|args| args.validate(max_results).is_ok())
+        }
         contract::FILE_ATTENTION_TOOL => {
-            serde_json::from_value::<contract::FileAttentionArgs>(params.arguments)
+            serde_json::from_value::<contract::FileAttentionArgs>(params.arguments.clone())
                 .is_ok_and(|args| args.validate(max_results).is_ok())
         }
         _ => false,
-    }
+    };
+    valid.then_some(AdmittedToolCall {
+        name: params.name,
+        request: params.arguments,
+    })
 }
 
 fn request_key(id: &Value) -> Result<String> {
@@ -1115,7 +1474,7 @@ struct SocketState {
     cfg: Arc<AppConfig>,
     router: Arc<BackendRepositoryRouter>,
     prewarm_gates: BackendPrewarmGates,
-    request_permits: Arc<Semaphore>,
+    request_admission: Arc<RequestAdmission>,
     shutdown: watch::Receiver<bool>,
 }
 
@@ -1142,10 +1501,10 @@ where
     use tokio::task::JoinSet;
 
     let (connection_shutdown_tx, connection_shutdown_rx) = watch::channel(false);
-    let request_permits = build_request_permits(&cfg);
+    let request_admission = build_request_admission(&cfg);
     let state = SocketState {
         prewarm_gates: BackendPrewarmGates::new(&cfg),
-        request_permits,
+        request_admission,
         shutdown: connection_shutdown_rx,
         cfg,
         router,
@@ -1298,7 +1657,7 @@ where
         }
     }
 
-    state.request_permits.close();
+    state.request_admission.close();
     let _ = connection_shutdown_tx.send(true);
     let drain_deadline = tokio::time::Instant::now() + SERVICE_DRAIN_GRACE;
     while !connections.is_empty() {
@@ -1310,6 +1669,10 @@ where
     }
     connections.abort_all();
     while connections.join_next().await.is_some() {}
+    state
+        .request_admission
+        .wait_for_cleanup_until(drain_deadline)
+        .await;
     Ok(())
 }
 
@@ -1508,7 +1871,7 @@ async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStr
         backend.repository().clone(),
         prewarm_started,
         launch_dir,
-        state.request_permits,
+        state.request_admission,
     );
     if negotiated {
         private_proxy::write_ack(&mut write_half).await?;
@@ -1676,49 +2039,33 @@ mod tests {
     }
 
     #[test]
-    fn effective_parallel_request_limit_prefers_config_and_falls_back_safely() {
+    fn effective_parallel_request_limit_prefers_config_and_defaults_to_eight() {
         assert_eq!(
-            effective_max_parallel_requests(Some(12), Some(8)),
+            effective_max_parallel_requests(Some(12)),
             (12, RequestLimitSource::Config)
         );
         assert_eq!(
-            effective_max_parallel_requests(None, Some(1)),
-            (1, RequestLimitSource::Automatic)
-        );
-        assert_eq!(
-            effective_max_parallel_requests(None, Some(2)),
-            (2, RequestLimitSource::Automatic)
-        );
-        assert_eq!(
-            effective_max_parallel_requests(None, Some(8)),
+            effective_max_parallel_requests(None),
             (8, RequestLimitSource::Automatic)
-        );
-        assert_eq!(
-            effective_max_parallel_requests(None, None),
-            (1, RequestLimitSource::Automatic)
-        );
-        assert_eq!(
-            effective_max_parallel_requests(None, Some(12)),
-            (
-                AUTOMATIC_MAX_PARALLEL_REQUESTS,
-                RequestLimitSource::Automatic
-            )
-        );
-        assert_eq!(
-            effective_max_parallel_requests(None, Some(Semaphore::MAX_PERMITS.saturating_add(1))),
-            (
-                AUTOMATIC_MAX_PARALLEL_REQUESTS,
-                RequestLimitSource::Automatic
-            )
         );
     }
 
     #[test]
-    fn embedded_state_uses_configured_parallel_request_limit() {
+    fn embedded_state_uses_configured_execution_and_bounded_queue_limits() {
         let mut cfg = AppConfig::default();
         cfg.mcp.max_parallel_requests = Some(3);
         let state = AppState::embedded(cfg, repository_with_scope(None));
-        assert_eq!(state.request_permits.available_permits(), 3);
+        assert_eq!(state.request_admission.execution.available_permits(), 3);
+        assert_eq!(state.request_admission.slots.available_permits(), 19);
+        assert_eq!(state.request_admission.max_queued, 16);
+        assert_eq!(state.request_admission.deadline, REQUEST_DEADLINE);
+    }
+
+    #[test]
+    fn embedded_state_defaults_to_eight_executing_and_sixteen_queued() {
+        let state = test_state();
+        assert_eq!(state.request_admission.execution.available_permits(), 8);
+        assert_eq!(state.request_admission.slots.available_permits(), 24);
     }
 
     fn successful_test_state() -> Arc<AppState> {
