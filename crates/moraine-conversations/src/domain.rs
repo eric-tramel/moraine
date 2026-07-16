@@ -428,6 +428,8 @@ pub struct McpSessionListItem {
 pub struct McpTurnOpen {
     pub metadata: TurnSummary,
     pub events: Vec<McpEventSummary>,
+    #[serde(default)]
+    pub parent_session_source: Option<String>,
     pub user_input_summary: Option<String>,
     pub final_response_summary: Option<String>,
     #[serde(default)]

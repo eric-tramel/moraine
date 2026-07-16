@@ -324,6 +324,7 @@ FORMAT JSONEachRow",
             return Ok(Some(McpTurnOpen {
                 metadata: turn.compact.metadata,
                 events: turn.events,
+                parent_session_source: non_empty_string(session.row.source),
                 user_input_summary: turn.compact.user_input_summary,
                 final_response_summary: turn.compact.final_response_summary,
                 user_input_event: turn.compact.user_input_event,

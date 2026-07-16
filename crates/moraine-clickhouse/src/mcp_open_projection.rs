@@ -455,8 +455,7 @@ impl ClickHouseClient {
                  argMax(actor_role, tuple(event_time, event_order, event_uid)) AS last_actor_role,\n\
                  ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'title'), ''), tuple(event_ts, event_uid), event_class = 'session_meta'),\n\
                    ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'name'), ''), tuple(event_ts, event_uid), event_class = 'session_meta'), '')) AS title,\n\
-                 ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'source'), ''), tuple(event_ts, event_uid), event_class = 'session_meta'),\n\
-                   ifNull(argMax(nullIf(source_name, ''), tuple(event_ts, event_uid)), '')) AS source,\n\
+                 ifNull(argMax(nullIf(source_name, ''), tuple(event_ts, event_uid)), '') AS source,\n\
                  ifNull(argMax(nullIf(harness, ''), tuple(event_ts, event_uid)), '') AS harness,\n\
                  ifNull(argMax(nullIf(inference_provider, ''), tuple(event_ts, event_uid)), '') AS inference_provider,\n\
                  ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'slug'), ''), tuple(event_ts, event_uid), event_class = 'session_meta'), '') AS session_slug,\n\

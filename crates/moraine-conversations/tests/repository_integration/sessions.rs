@@ -782,6 +782,7 @@ async fn get_mcp_turn_returns_compact_events_and_incomplete_state() {
 
     assert_eq!(turn.metadata.session_id, "sess-incomplete");
     assert_eq!(turn.metadata.turn_seq, 2);
+    assert_eq!(turn.parent_session_source.as_deref(), Some("fixture"));
     assert_eq!(turn.events.len(), 3);
     assert_eq!(turn.events[0].event_uid, "evt-inc-2");
     assert_eq!(turn.events[0].event_type, "user_input");
