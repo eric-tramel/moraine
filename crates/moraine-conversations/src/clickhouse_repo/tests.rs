@@ -528,6 +528,100 @@ fn dedupe_search_rows_reasoning_mirrors_do_not_collapse_with_messages() {
     assert_eq!(deduped.len(), 2);
 }
 
+#[allow(clippy::too_many_arguments)]
+fn mcp_event_row(
+    event_uid: &str,
+    session_id: &str,
+    turn_seq: u32,
+    mcp_event_type: &str,
+    event_unix_ms: i64,
+    text: &str,
+    raw_score: f64,
+) -> SearchMcpEventRow {
+    let mut row = sample_mcp_search_row(event_uid, raw_score, event_unix_ms);
+    row.session_id = session_id.to_string();
+    row.turn_seq = turn_seq;
+    row.mcp_event_type = mcp_event_type.to_string();
+    row.text_preview = text.to_string();
+    row.text_content = text.to_string();
+    row
+}
+
+#[test]
+fn dedupe_mcp_event_rows_collapses_equivalent_events() {
+    // Two byte-identical events (same session/turn/type/timestamp/content,
+    // whitespace-normalized) surfaced under different opaque UIDs, plus two
+    // genuinely distinct hits. The duplicate must free its slot so the budget
+    // is filled with distinct results (issue #539).
+    let mut rows = vec![
+        mcp_event_row(
+            "uid-a1",
+            "sess-a",
+            3,
+            "user_input",
+            1000,
+            "hello world",
+            20.0,
+        ),
+        mcp_event_row(
+            "uid-a2",
+            "sess-a",
+            3,
+            "user_input",
+            1000,
+            "hello   world\n",
+            20.0,
+        ),
+        mcp_event_row(
+            "uid-b",
+            "sess-b",
+            5,
+            "assistant_response",
+            2000,
+            "different answer",
+            18.0,
+        ),
+        mcp_event_row(
+            "uid-c",
+            "sess-c",
+            7,
+            "assistant_response",
+            3000,
+            "another answer",
+            16.0,
+        ),
+    ];
+
+    ClickHouseConversationRepository::dedupe_mcp_event_rows(&mut rows);
+
+    let uids: Vec<&str> = rows.iter().map(|row| row.event_uid.as_str()).collect();
+    assert_eq!(uids, vec!["uid-a1", "uid-b", "uid-c"]);
+}
+
+#[test]
+fn dedupe_mcp_event_rows_keeps_events_that_differ_in_content_turn_or_time() {
+    // Same session/type but different content, or identical content in a
+    // different turn/timestamp, are distinct events and must all survive.
+    let mut rows = vec![
+        mcp_event_row("uid-1", "sess-a", 3, "user_input", 1000, "same text", 10.0),
+        mcp_event_row(
+            "uid-2",
+            "sess-a",
+            3,
+            "user_input",
+            1000,
+            "different text",
+            10.0,
+        ),
+        mcp_event_row("uid-3", "sess-a", 4, "user_input", 2000, "same text", 10.0),
+    ];
+
+    ClickHouseConversationRepository::dedupe_mcp_event_rows(&mut rows);
+
+    let uids: Vec<&str> = rows.iter().map(|row| row.event_uid.as_str()).collect();
+    assert_eq!(uids, vec!["uid-1", "uid-2", "uid-3"]);
+}
+
 #[test]
 fn low_information_system_event_classifier_targets_open_noise() {
     assert!(

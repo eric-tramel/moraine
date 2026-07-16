@@ -1492,6 +1492,29 @@ FORMAT JSONEachRow",
         });
     }
 
+    /// Collapse equivalent MCP search events that the read model can surface
+    /// under several opaque event UIDs (issue #539). Two rows are equivalent
+    /// when they share session, turn, event type, timestamp, and normalized
+    /// content — i.e. only their opaque `event_uid` differs. Without this pass a
+    /// single logical event consumes several ranked slots and starves the
+    /// requested hit budget. Rows arrive in rank order, so the first (highest
+    /// ranked) copy of each equivalence class is kept.
+    pub(super) fn dedupe_mcp_event_rows(rows: &mut Vec<SearchMcpEventRow>) {
+        let mut seen = std::collections::HashSet::new();
+        rows.retain(|row| {
+            seen.insert((
+                row.session_id.clone(),
+                row.turn_seq,
+                row.event_class.clone(),
+                row.payload_type.clone(),
+                row.mcp_event_type.clone(),
+                row.event_unix_ms,
+                Self::compact_preview_for_dedup(&row.text_preview),
+                Self::compact_preview_for_dedup(&row.text_content),
+            ))
+        });
+    }
+
     pub(super) fn dedupe_fetch_limit(limit: u16) -> u16 {
         limit.saturating_mul(3).max(limit)
     }
@@ -2888,7 +2911,10 @@ FORMAT JSONEachRow",
         let requested_n_hits = query.n_hits.unwrap_or(10).max(1);
         let effective_n_hits = requested_n_hits.min(self.cfg.max_results);
         let limit_capped = requested_n_hits > effective_n_hits;
-        let fetch_limit = effective_n_hits.saturating_add(1);
+        // Over-fetch so the dedup pass can drop equivalent duplicate events and
+        // still fill the requested budget with distinct hits (issue #539). The
+        // trailing +1 keeps a sentinel that signals more distinct results exist.
+        let fetch_limit = Self::dedupe_fetch_limit(effective_n_hits).saturating_add(1);
 
         let min_should_match = query
             .min_should_match
@@ -2933,6 +2959,7 @@ FORMAT JSONEachRow",
                     fetch_limit,
                 )
                 .await?;
+            Self::dedupe_mcp_event_rows(&mut rows);
             let avgdl = if docs == 0 {
                 0.0
             } else {
