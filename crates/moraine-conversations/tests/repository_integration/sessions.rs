@@ -191,6 +191,10 @@ async fn list_mcp_sessions_uses_overlap_filter_and_cursor_pagination() {
     assert_eq!(first.items[0].title.as_deref(), Some("Session C title"));
     assert_eq!(first.items[0].source.as_deref(), Some("codex"));
     assert_eq!(first.items[0].harness.as_deref(), Some("codex"));
+    let public_items = serde_json::to_string(&first.items).expect("serialize public list items");
+    assert!(!public_items.contains("\"originator\":"));
+    assert!(!public_items.contains("\"project\":"));
+    assert!(!public_items.contains("acme-secret-merger"));
     assert!(first.items[0].completed);
     assert_eq!(first.items[1].session_id, "sess_b");
     assert!(first.next_cursor.is_some());
