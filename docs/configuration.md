@@ -622,7 +622,7 @@ central_connect_timeout_ms = 250
 | `prewarm_on_initialize` | `false` | Warms query metadata during MCP initialize, trading startup work for lower first-search latency. |
 | `async_log_writes` | `true` | Writes MCP observability rows asynchronously so tool calls stay responsive. |
 | `protocol_version` | `2024-11-05` | MCP protocol version advertised by the server. |
-| `max_parallel_requests` | `8` | Maximum retrieval requests executed concurrently by each MCP server process. At most 16 additional requests wait in FIFO order. Queue time counts toward the fixed four-second request deadline; a full queue is rejected immediately with a structured retryable error. A configured value must be greater than zero. |
+| `max_parallel_requests` | `8` | Maximum retrieval requests executed concurrently by each MCP server process. At most 16 additional requests wait in FIFO order until capacity is available or the request is cancelled. A full queue is rejected immediately with a structured retryable error. A configured value must be greater than zero. |
 | `use_central_server` | `true` | Makes `moraine run mcp` prefer the shared central server socket, with embedded fallback. |
 | `central_socket_path` | `mcp.sock` | Unix socket path. Bare filenames resolve under `runtime.pids_dir`; absolute paths are used verbatim. |
 | `central_connect_timeout_ms` | `250` | Milliseconds a proxy client waits for the central socket before falling back to embedded mode. |
@@ -635,11 +635,12 @@ first-search latency.
 
 The shared central server applies one parallel-request budget across every MCP
 socket connection and queues at most 16 valid retrievals in FIFO order when that
-budget is busy. Queue time is part of the four-second wall deadline. A full
-queue is rejected immediately with a structured retryable tool error. An
-embedded fallback is a separate process, so its default or configured execution
-budget is process-local. Queued requests remain cancellable while validation and
-control requests continue to run.
+budget is busy. Queued and running retrievals have no fixed admission deadline;
+they continue until completion, client cancellation, disconnect, or service
+shutdown. A full queue is rejected immediately with a structured retryable tool
+error. An embedded fallback is a separate process, so its default or configured
+execution budget is process-local. Validation and control requests continue to
+run while retrievals wait.
 
 ### Shared central MCP server
 
