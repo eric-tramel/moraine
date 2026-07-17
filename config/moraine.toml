@@ -164,8 +164,9 @@ prewarm_on_initialize = false
 async_log_writes = true
 protocol_version = "2024-11-05"
 # Retrievals beyond this process-wide execution limit enter a 16-request FIFO
-# queue. Omit for the default of 8 executing requests. Queue time counts toward
-# the fixed 4-second request deadline; a full queue is rejected immediately.
+# queue. Omit for the default of 8 executing requests. Queued and running
+# retrievals have no fixed admission deadline; a full queue is rejected
+# immediately.
 # max_parallel_requests = 16
 # MCP clients first try the unified backend's Unix socket, then transparently
 # fall back to an embedded server when the socket is absent or unreachable.

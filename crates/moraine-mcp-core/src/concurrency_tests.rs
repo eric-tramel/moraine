@@ -294,19 +294,13 @@ type ClientReader = BufReader<ReadHalf<tokio::io::DuplexStream>>;
 type ClientWriter = WriteHalf<tokio::io::DuplexStream>;
 
 fn test_state(repository: Arc<BlockingRepository>, max_parallel_requests: usize) -> Arc<AppState> {
-    test_state_with_admission(
-        repository,
-        max_parallel_requests,
-        MAX_QUEUED_REQUESTS,
-        REQUEST_DEADLINE,
-    )
+    test_state_with_admission(repository, max_parallel_requests, MAX_QUEUED_REQUESTS)
 }
 
 fn test_state_with_admission(
     repository: Arc<BlockingRepository>,
     max_parallel_requests: usize,
     max_queued_requests: usize,
-    request_deadline: std::time::Duration,
 ) -> Arc<AppState> {
     AppState::with_repository(
         Arc::new(AppConfig::default()),
@@ -316,7 +310,6 @@ fn test_state_with_admission(
         Arc::new(RequestAdmission::new(
             max_parallel_requests,
             max_queued_requests,
-            request_deadline,
         )),
     )
 }
@@ -437,8 +430,7 @@ where
 #[tokio::test]
 async fn full_queue_returns_structured_overload_within_one_hundred_milliseconds() {
     let repository = Arc::new(BlockingRepository::new(DELAY_SEARCH));
-    let state =
-        test_state_with_admission(repository.clone(), 1, 2, std::time::Duration::from_secs(2));
+    let state = test_state_with_admission(repository.clone(), 1, 2);
     let admission = state.request_admission.clone();
     let (mut reader, mut writer, server) = start_connection_with_state(state);
 
@@ -506,8 +498,7 @@ async fn full_queue_returns_structured_overload_within_one_hundred_milliseconds(
 #[tokio::test]
 async fn queued_success_reports_wall_time_from_frame_acceptance() {
     let repository = Arc::new(BlockingRepository::new(DELAY_SEARCH));
-    let state =
-        test_state_with_admission(repository.clone(), 1, 1, std::time::Duration::from_secs(2));
+    let state = test_state_with_admission(repository.clone(), 1, 1);
     let (mut reader, mut writer, server) = start_connection_with_state(state);
 
     writer
@@ -550,10 +541,9 @@ async fn queued_success_reports_wall_time_from_frame_acceptance() {
 }
 
 #[tokio::test]
-async fn queued_request_deadline_starts_at_frame_acceptance_and_releases_its_slot() {
+async fn queued_request_waits_for_execution_capacity_without_expiring() {
     let repository = Arc::new(BlockingRepository::new(0));
-    let deadline = std::time::Duration::from_millis(60);
-    let state = test_state_with_admission(repository.clone(), 1, 1, deadline);
+    let state = test_state_with_admission(repository.clone(), 1, 1);
     let admission = state.request_admission.clone();
     let held = admission
         .try_register()
@@ -567,32 +557,15 @@ async fn queued_request_deadline_starts_at_frame_acceptance_and_releases_its_slo
         .write_all(search_request(1).as_bytes())
         .await
         .expect("send queued request");
-    let response = read_response(&mut reader).await;
-    assert_eq!(response["id"], json!(1));
-    assert_eq!(
-        response["result"]["structuredContent"]["error"]["code"],
-        json!("deadline_exceeded")
-    );
-    assert_eq!(
-        response["result"]["structuredContent"]["error"]["details"]["reason"],
-        json!("request_deadline")
-    );
-    assert_eq!(
-        response["result"]["structuredContent"]["error"]["details"]["deadline_ms"],
-        json!(60)
-    );
+    tokio::time::sleep(std::time::Duration::from_millis(4_100)).await;
     assert_eq!(repository.started.load(Ordering::Acquire), 0);
     assert!(repository.cancelled_queries.lock().await.is_empty());
-    assert_eq!(admission.slots.available_permits(), 1);
+    assert_eq!(admission.slots.available_permits(), 0);
 
     drop(held);
-    writer
-        .write_all(search_request(2).as_bytes())
-        .await
-        .expect("send recovery request");
-    let recovered = read_response(&mut reader).await;
-    assert_eq!(recovered["id"], json!(2));
-    assert_eq!(recovered["result"]["isError"], json!(false));
+    let response = read_response(&mut reader).await;
+    assert_eq!(response["id"], json!(1));
+    assert_eq!(response["result"]["isError"], json!(false));
 
     writer.shutdown().await.expect("half-close request stream");
     drop(writer);
@@ -606,50 +579,26 @@ async fn queued_request_deadline_starts_at_frame_acceptance_and_releases_its_slo
 }
 
 #[tokio::test]
-async fn running_request_deadline_cancels_query_and_recovers_capacity() {
-    let repository = Arc::new(BlockingRepository::new(BLOCK_SEARCH));
-    repository.block_cancellation.store(true, Ordering::Release);
-    let state = test_state_with_admission(
-        repository.clone(),
-        1,
-        1,
-        std::time::Duration::from_millis(60),
-    );
+async fn running_request_continues_past_four_seconds() {
+    let repository = Arc::new(BlockingRepository::new(DELAY_SEARCH));
+    let state = test_state_with_admission(repository.clone(), 1, 1);
     let admission = state.request_admission.clone();
     let (mut reader, mut writer, server) = start_connection_with_state(state);
 
-    let accepted_at = tokio::time::Instant::now();
     writer
-        .write_all(search_request(1).as_bytes())
+        .write_all(search_request_with_query(json!(1), "slow-deadline").as_bytes())
         .await
-        .expect("send blocked request");
+        .expect("send slow request");
     repository.wait_for_started(1).await;
-    let deadline = read_response(&mut reader).await;
-    assert_eq!(deadline["id"], json!(1));
-    assert_eq!(
-        deadline["result"]["structuredContent"]["error"]["details"]["reason"],
-        json!("request_deadline")
-    );
-    assert!(accepted_at.elapsed() < std::time::Duration::from_millis(150));
-    repository.wait_for_dropped(1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(4_100)).await;
     assert!(repository.cancelled_queries.lock().await.is_empty());
     assert_eq!(admission.execution.available_permits(), 0);
     assert_eq!(admission.slots.available_permits(), 1);
 
-    repository.release_cancellation.notify_one();
-    repository.wait_for_cancelled(1).await;
-    assert!(repository.cancelled_queries.lock().await[0].starts_with("moraine-search-sessions-"));
-    assert_eq!(admission.execution.available_permits(), 1);
-    assert_eq!(admission.slots.available_permits(), 2);
-
-    repository.mode.store(0, Ordering::Release);
-    writer
-        .write_all(search_request(2).as_bytes())
-        .await
-        .expect("send recovery request");
-    let recovered = read_response(&mut reader).await;
-    assert_eq!(recovered["id"], json!(2));
-    assert_eq!(recovered["result"]["isError"], json!(false));
+    repository.release_search.notify_one();
+    let response = read_response(&mut reader).await;
+    assert_eq!(response["id"], json!(1));
+    assert_eq!(response["result"]["isError"], json!(false));
 
     writer.shutdown().await.expect("half-close request stream");
     drop(writer);
@@ -658,13 +607,14 @@ async fn running_request_deadline_cancels_query_and_recovers_capacity() {
         .expect("connection drained")
         .expect("connection task joined")
         .expect("connection succeeded");
+    assert_eq!(admission.execution.available_permits(), 1);
+    assert_eq!(admission.slots.available_permits(), 2);
 }
 
 #[tokio::test]
 async fn queued_requests_acquire_execution_in_frame_acceptance_order() {
     let repository = Arc::new(BlockingRepository::new(DELAY_SEARCH));
-    let state =
-        test_state_with_admission(repository.clone(), 1, 3, std::time::Duration::from_secs(2));
+    let state = test_state_with_admission(repository.clone(), 1, 3);
     let admission = state.request_admission.clone();
     let held = admission
         .try_register()
