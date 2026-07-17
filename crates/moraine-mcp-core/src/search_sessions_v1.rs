@@ -345,6 +345,9 @@ fn not_found_error(kind: &str, id: String) -> ContractError {
 mod tests {
     use super::*;
     use crate::contract::{McpEventType, OpenV1Args, SearchSessionsArgs};
+    use moraine_config::AppConfig;
+    use moraine_conversations::{InMemoryConversationRepository, RepoConfig};
+    use std::sync::Arc;
 
     #[test]
     fn parses_and_canonicalizes_search_sessions_args() {
@@ -365,6 +368,79 @@ mod tests {
         assert_eq!(args.harness.as_deref(), Some("claude-code"));
         assert_eq!(args.source.as_deref(), Some("claude"));
         assert_eq!(args.n_hits, 3);
+    }
+
+    #[tokio::test]
+    async fn forwards_effective_event_types_and_reports_them_in_canonical_request() {
+        let repository = Arc::new(InMemoryConversationRepository::new(RepoConfig::default()));
+        let state = AppState::embedded(AppConfig::default(), repository.clone());
+        let cases = [
+            (
+                json!({ "query": "migration" }),
+                vec![
+                    RepoMcpEventType::UserInput,
+                    RepoMcpEventType::AssistantResponse,
+                ],
+                json!(["user_input", "assistant_response"]),
+            ),
+            (
+                json!({ "query": "migration", "event_types": null }),
+                vec![
+                    RepoMcpEventType::UserInput,
+                    RepoMcpEventType::AssistantResponse,
+                ],
+                json!(["user_input", "assistant_response"]),
+            ),
+            (
+                json!({ "query": "migration", "event_types": ["tool_call"] }),
+                vec![RepoMcpEventType::ToolCall],
+                json!(["tool_call"]),
+            ),
+            (
+                json!({ "query": "migration", "event_types": ["tool_response"] }),
+                vec![RepoMcpEventType::ToolResponse],
+                json!(["tool_response"]),
+            ),
+            (
+                json!({
+                    "query": "migration",
+                    "event_types": [
+                        "tool_response",
+                        "user_input",
+                        "tool_call",
+                        "tool_response"
+                    ]
+                }),
+                vec![
+                    RepoMcpEventType::UserInput,
+                    RepoMcpEventType::ToolCall,
+                    RepoMcpEventType::ToolResponse,
+                ],
+                json!(["user_input", "tool_call", "tool_response"]),
+            ),
+        ];
+
+        for (arguments, expected_repo_types, expected_request_types) in cases {
+            let result = state
+                .search_sessions_v1(arguments)
+                .await
+                .expect("search sessions");
+            assert_eq!(result["isError"], json!(false));
+            assert_eq!(
+                result["structuredContent"]["request"]["event_types"],
+                expected_request_types
+            );
+
+            let calls = repository.calls();
+            let query = calls
+                .search_mcp_events
+                .last()
+                .expect("repository search call");
+            assert_eq!(
+                query.event_types.as_deref(),
+                Some(expected_repo_types.as_slice())
+            );
+        }
     }
 
     #[test]

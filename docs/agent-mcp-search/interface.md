@@ -60,7 +60,7 @@ Input:
 {
   "query": "mcp open tool oneof top-level schema",
   "within_id": null,
-  "event_types": ["user_input", "assistant_response", "tool_response"],
+  "event_types": ["user_input", "assistant_response"],
   "harness": null,
   "source": null,
   "n_hits": 10
@@ -78,10 +78,12 @@ Fields:
 | `source` | Optional exact, case-sensitive ingest source filter. The default configured values are `claude`, `codex`, `cursor`, `cursor-sqlite`, `hermes`, `kimi-cli`, `omp`, `opencode`, and `pi`; each server's MCP tool instructions list its actual configured source names. |
 | `n_hits` | Optional result limit from 1 to 50. Default is 10. |
 
-The default event type filter is `user_input`, `assistant_response`, and
-`tool_response`. That default is intentionally practical: it searches what the
-user asked, what the assistant concluded, and what tools returned, while leaving
-lower-signal operational records out until you request them.
+The default event type filter is `user_input` and `assistant_response`. This
+deterministic, message-first default searches what the user asked and what the
+assistant concluded without returning raw tool evidence. Request `tool_call`
+or `tool_response` explicitly through `event_types` when that evidence is
+needed. To inspect the full context around a hit, pass its returned turn or
+session handle to `open`.
 
 Use `source` when the configured source is the distinction that matters. For
 example, the `pi` and `omp` sources both use the `pi-coding-agent` harness, so
@@ -103,7 +105,7 @@ Each result includes:
 {
   "rank": 1,
   "score": 12.34,
-  "event": { "id": "event:...", "type": "tool_response" },
+  "event": { "id": "event:...", "type": "assistant_response" },
   "turn": { "id": "turn:...", "ordinal": 7 },
   "session": { "id": "session:...", "title": "..." },
   "snippet": { "text": "...", "truncated": false },

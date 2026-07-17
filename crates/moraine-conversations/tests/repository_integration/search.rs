@@ -594,6 +594,7 @@ async fn search_mcp_events_supports_global_search_with_enriched_hits() {
             n_hits: Some(10),
             event_types: Some(vec![
                 McpEventType::ToolResponse,
+                McpEventType::ToolCall,
                 McpEventType::UserInput,
                 McpEventType::AssistantResponse,
             ]),
@@ -611,6 +612,7 @@ async fn search_mcp_events_supports_global_search_with_enriched_hits() {
         vec![
             McpEventType::UserInput,
             McpEventType::AssistantResponse,
+            McpEventType::ToolCall,
             McpEventType::ToolResponse
         ]
     );
@@ -873,6 +875,63 @@ async fn search_mcp_events_supports_turn_scoped_search() {
     assert!(search_query.contains("ALL INNER JOIN `moraine`.`mcp_open_turns` AS scope_t FINAL"));
 }
 #[tokio::test(flavor = "multi_thread")]
+async fn search_mcp_events_returns_explicit_tool_event_filters() {
+    let (repo, _state) = build_repo().await;
+
+    let tool_call_result = repo
+        .search_mcp_events(SearchMcpEventsQuery {
+            query: "hello world".to_string(),
+            n_hits: Some(5),
+            event_types: Some(vec![McpEventType::ToolCall]),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            ..SearchMcpEventsQuery::default()
+        })
+        .await
+        .expect("tool-call search");
+    let tool_response_result = repo
+        .search_mcp_events(SearchMcpEventsQuery {
+            query: "hello world".to_string(),
+            n_hits: Some(5),
+            event_types: Some(vec![McpEventType::ToolResponse]),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            ..SearchMcpEventsQuery::default()
+        })
+        .await
+        .expect("tool-response search");
+    let mixed_result = repo
+        .search_mcp_events(SearchMcpEventsQuery {
+            query: "hello world".to_string(),
+            n_hits: Some(5),
+            event_types: Some(vec![McpEventType::UserInput, McpEventType::ToolCall]),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            ..SearchMcpEventsQuery::default()
+        })
+        .await
+        .expect("mixed message and tool search");
+
+    assert_eq!(tool_call_result.hits.len(), 1);
+    assert_eq!(tool_call_result.hits[0].event_type, McpEventType::ToolCall);
+    assert_eq!(tool_call_result.hits[0].event_uid, "evt-c-tool-call");
+    assert_eq!(tool_response_result.hits.len(), 1);
+    assert_eq!(
+        tool_response_result.hits[0].event_type,
+        McpEventType::ToolResponse
+    );
+    assert_eq!(tool_response_result.hits[0].event_uid, "evt-c-tool");
+    assert_eq!(
+        mixed_result
+            .hits
+            .iter()
+            .map(|hit| hit.event_type)
+            .collect::<Vec<_>>(),
+        vec![McpEventType::ToolCall, McpEventType::UserInput]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn search_mcp_events_event_type_filter_distinguishes_user_and_assistant_messages() {
     let (repo, state) = build_repo().await;
 
@@ -898,6 +957,20 @@ async fn search_mcp_events_event_type_filter_distinguishes_user_and_assistant_me
         })
         .await
         .expect("assistant response search");
+    let message_result = repo
+        .search_mcp_events(SearchMcpEventsQuery {
+            query: "hello world".to_string(),
+            n_hits: Some(5),
+            event_types: Some(vec![
+                McpEventType::UserInput,
+                McpEventType::AssistantResponse,
+            ]),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            ..SearchMcpEventsQuery::default()
+        })
+        .await
+        .expect("message-only search");
 
     assert_eq!(user_result.hits.len(), 1);
     assert_eq!(user_result.hits[0].event_uid, "evt-c-user");
@@ -910,6 +983,14 @@ async fn search_mcp_events_event_type_filter_distinguishes_user_and_assistant_me
         McpEventType::AssistantResponse
     );
     assert_eq!(assistant_result.hits[0].actor_role, "assistant");
+    assert!(message_result.hits.iter().all(|hit| matches!(
+        hit.event_type,
+        McpEventType::UserInput | McpEventType::AssistantResponse
+    )));
+    assert_eq!(
+        message_result.event_types,
+        vec![McpEventType::UserInput, McpEventType::AssistantResponse]
+    );
 
     let queries = state.queries.lock().expect("queries lock").clone();
     assert!(queries.iter().any(|q| {

@@ -20,7 +20,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::{pending, Future};
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex as StdMutex,
 };
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -45,7 +45,6 @@ impl RequestLimitSource {
 
 const AUTOMATIC_MAX_PARALLEL_REQUESTS: usize = 8;
 const MAX_QUEUED_REQUESTS: usize = 16;
-const REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(4);
 const SEARCH_PROJECTION_RETRY_AFTER_MS: u64 = 250;
 
 fn effective_max_parallel_requests(configured: Option<u16>) -> (usize, RequestLimitSource) {
@@ -65,14 +64,12 @@ fn build_request_admission(cfg: &AppConfig) -> Arc<RequestAdmission> {
     info!(
         max_parallel_requests,
         max_queued_requests = MAX_QUEUED_REQUESTS,
-        request_deadline_ms = REQUEST_DEADLINE.as_millis(),
         source = source.as_str(),
         "configured bounded MCP retrieval admission"
     );
     Arc::new(RequestAdmission::new(
         max_parallel_requests,
         MAX_QUEUED_REQUESTS,
-        REQUEST_DEADLINE,
     ))
 }
 
@@ -84,14 +81,12 @@ struct RequestAdmission {
     next_ticket: AtomicU64,
     changes: watch::Sender<u64>,
     closed: AtomicBool,
-    cleanup_count: AtomicUsize,
     max_executing: usize,
     max_queued: usize,
-    deadline: std::time::Duration,
 }
 
 impl RequestAdmission {
-    fn new(max_executing: usize, max_queued: usize, deadline: std::time::Duration) -> Self {
+    fn new(max_executing: usize, max_queued: usize) -> Self {
         let max_executing = max_executing.clamp(1, Semaphore::MAX_PERMITS);
         let max_queued = max_queued.min(Semaphore::MAX_PERMITS - max_executing);
         let (changes, _) = watch::channel(0);
@@ -102,10 +97,8 @@ impl RequestAdmission {
             next_ticket: AtomicU64::new(0),
             changes,
             closed: AtomicBool::new(false),
-            cleanup_count: AtomicUsize::new(0),
             max_executing,
             max_queued,
-            deadline,
         }
     }
 
@@ -163,28 +156,6 @@ impl RequestAdmission {
         self.execution.close();
         self.slots.close();
         self.signal_change();
-    }
-
-    fn start_cleanup(self: &Arc<Self>) -> RequestCleanupGuard {
-        self.cleanup_count.fetch_add(1, Ordering::AcqRel);
-        self.signal_change();
-        RequestCleanupGuard {
-            admission: self.clone(),
-        }
-    }
-
-    async fn wait_for_cleanup_until(&self, deadline: tokio::time::Instant) {
-        let mut changes = self.changes.subscribe();
-        while self.cleanup_count.load(Ordering::Acquire) != 0 {
-            tokio::select! {
-                _ = tokio::time::sleep_until(deadline) => break,
-                changed = changes.changed() => {
-                    if changed.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -254,16 +225,6 @@ impl Drop for RequestPermit {
     }
 }
 
-struct RequestCleanupGuard {
-    admission: Arc<RequestAdmission>,
-}
-
-impl Drop for RequestCleanupGuard {
-    fn drop(&mut self) {
-        self.admission.cleanup_count.fetch_sub(1, Ordering::AcqRel);
-        self.admission.signal_change();
-    }
-}
 const QUERY_CANCELLATION_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1_000);
 const SERVICE_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(1_250);
 
@@ -427,7 +388,7 @@ impl AppState {
             "tools": [
                 {
                     "name": contract::SEARCH_SESSIONS_TOOL,
-                    "description": "Search Moraine session history and return compact event-ranked handles. Use open with the returned event_id, turn_id, or session_id to expand results.",
+                    "description": "Search Moraine session history and return compact event-ranked handles. By default, searches user_input and assistant_response events. Select tool_call or tool_response with event_types for raw tool evidence, then use open on a returned turn_id or session_id for full context.",
                     "inputSchema": {
                         "type": "object",
                         "additionalProperties": false,
@@ -455,7 +416,8 @@ impl AppState {
                                         "runtime"
                                     ]
                                 },
-                                "description": "Optional normalized event type filter. Defaults to user_input, assistant_response, and tool_response."
+                                "default": ["user_input", "assistant_response"],
+                                "description": "Optional normalized event type filter. Defaults to user_input and assistant_response. Select tool_call or tool_response explicitly for raw tool evidence."
                             },
                             "harness": {
                                 "type": ["string", "null"],
@@ -862,8 +824,9 @@ impl QueryCancellationGuard {
 /// Slow repository requests execute concurrently and may complete out of order.
 /// Response encoding and writes stay on this connection task so JSON frames can
 /// never interleave. Admission is shared across socket connections; requests
-/// wait in a finite FIFO queue when execution permits are busy, share one wall
-/// deadline from frame acceptance, and are rejected immediately when it is full.
+/// wait in a finite FIFO queue when execution permits are busy and are rejected
+/// immediately when the queue is full. Admitted requests run until completion
+/// or cancellation.
 async fn serve_connection_with_first_line<R, W>(
     state: Arc<AppState>,
     reader: R,
@@ -1043,10 +1006,6 @@ where
     }
     requests.abort_all();
     while requests.join_next().await.is_some() {}
-    state
-        .request_admission
-        .wait_for_cleanup_until(cancellation_deadline)
-        .await;
 
     if let Some(error) = connection_error {
         Err(error)
@@ -1129,11 +1088,8 @@ async fn dispatch_rpc_line(
                 id,
                 &admitted_tool,
                 accepted_at,
-                state.request_admission.deadline,
-                AdmissionErrorKind::QueueFull {
-                    max_executing: state.request_admission.max_executing,
-                    max_queued: state.request_admission.max_queued,
-                },
+                state.request_admission.max_executing,
+                state.request_admission.max_queued,
             )));
         }
         Err(TryAdmissionError::Closed) => return Ok(None),
@@ -1145,41 +1101,24 @@ async fn dispatch_rpc_line(
     let task_query_cancellation = query_cancellation.clone();
     let request_state = state.clone();
     let task_key = key.clone();
-    let task_id = id.clone();
-    let deadline_duration = request_state.request_admission.deadline;
-    let deadline = accepted_at + deadline_duration;
     let task = requests.spawn(async move {
         enum AdmissionOutcome {
             Admitted(RequestPermit),
             Cancelled,
-            DeadlineExceeded,
         }
 
         let admission = tokio::select! {
             biased;
             _ = &mut cancel_rx => AdmissionOutcome::Cancelled,
             _ = wait_for_connection_shutdown(&mut connection_shutdown) => AdmissionOutcome::Cancelled,
-            _ = tokio::time::sleep_until(deadline) => AdmissionOutcome::DeadlineExceeded,
             permit = admission_ticket.acquire() => match permit {
                 Some(permit) => AdmissionOutcome::Admitted(permit),
                 None => AdmissionOutcome::Cancelled,
             },
         };
-        let permit = match admission {
+        let _permit = match admission {
             AdmissionOutcome::Admitted(permit) => permit,
             AdmissionOutcome::Cancelled => return (task_key, None),
-            AdmissionOutcome::DeadlineExceeded => {
-                return (
-                    task_key,
-                    Some(admission_error_response(
-                        task_id,
-                        &admitted_tool,
-                        accepted_at,
-                        deadline_duration,
-                        AdmissionErrorKind::DeadlineExceeded,
-                    )),
-                );
-            }
         };
         let query_cancellation = task_query_cancellation;
         *query_cancellation
@@ -1189,16 +1128,14 @@ async fn dispatch_rpc_line(
         enum Outcome {
             Completed(Option<Value>),
             Cancelled,
-            DeadlineExceeded,
         }
         let outcome = {
             let request = REQUEST_ACCEPTED_AT.scope(
                 accepted_at.into_std(),
                 REQUEST_QUERY_CANCELLATION.scope(
                     query_cancellation.clone(),
-                    moraine_conversations::with_repository_query_deadline(
+                    moraine_conversations::with_repository_query_id(
                         request_query_id,
-                        deadline,
                         request_state.handle_request(req),
                     ),
                 ),
@@ -1208,7 +1145,6 @@ async fn dispatch_rpc_line(
                 biased;
                 _ = &mut cancel_rx => Outcome::Cancelled,
                 _ = wait_for_connection_shutdown(&mut connection_shutdown) => Outcome::Cancelled,
-                _ = tokio::time::sleep_until(deadline) => Outcome::DeadlineExceeded,
                 response = &mut request => Outcome::Completed(response),
             }
         };
@@ -1217,23 +1153,6 @@ async fn dispatch_rpc_line(
             Outcome::Cancelled => {
                 cancel_registered_query(&request_state, &query_cancellation).await;
                 None
-            }
-            Outcome::DeadlineExceeded => {
-                spawn_deadline_cancellation(
-                    request_state,
-                    query_cancellation,
-                    permit,
-                );
-                return (
-                    task_key,
-                    Some(admission_error_response(
-                        task_id,
-                        &admitted_tool,
-                        accepted_at,
-                        deadline_duration,
-                        AdmissionErrorKind::DeadlineExceeded,
-                    )),
-                );
             }
         };
         (task_key, response)
@@ -1256,44 +1175,22 @@ struct AdmittedToolCall {
     request: Value,
 }
 
-enum AdmissionErrorKind {
-    QueueFull {
-        max_executing: usize,
-        max_queued: usize,
-    },
-    DeadlineExceeded,
-}
-
 fn admission_error_response(
     id: Value,
     tool: &AdmittedToolCall,
     accepted_at: tokio::time::Instant,
-    deadline: std::time::Duration,
-    kind: AdmissionErrorKind,
+    max_executing: usize,
+    max_queued: usize,
 ) -> Value {
-    let deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
-    let error = match kind {
-        AdmissionErrorKind::QueueFull {
-            max_executing,
-            max_queued,
-        } => contract::ContractError::new(
-            contract::ToolErrorCode::DeadlineExceeded,
-            "MCP retrieval queue is full; retry later",
-        )
-        .with_details(json!({
-            "reason": "queue_full",
-            "max_executing": max_executing,
-            "max_queued": max_queued,
-        })),
-        AdmissionErrorKind::DeadlineExceeded => contract::ContractError::new(
-            contract::ToolErrorCode::DeadlineExceeded,
-            "MCP retrieval request exceeded its end-to-end deadline",
-        )
-        .with_details(json!({
-            "reason": "request_deadline",
-            "deadline_ms": deadline_ms,
-        })),
-    };
+    let error = contract::ContractError::new(
+        contract::ToolErrorCode::DeadlineExceeded,
+        "MCP retrieval queue is full; retry later",
+    )
+    .with_details(json!({
+        "reason": "queue_full",
+        "max_executing": max_executing,
+        "max_queued": max_queued,
+    }));
     let payload = serde_json::to_value(contract::ToolErrorEnvelope::error(
         tool.name.clone(),
         tool.request.clone(),
@@ -1325,19 +1222,6 @@ async fn cancel_registered_query(state: &AppState, slot: &QueryCancellationSlot)
         return;
     };
     cancel_query_with_deadline(state, &query_id).await;
-}
-
-fn spawn_deadline_cancellation(
-    state: Arc<AppState>,
-    slot: QueryCancellationSlot,
-    permit: RequestPermit,
-) {
-    let cleanup = state.request_admission.start_cleanup();
-    tokio::spawn(async move {
-        let _cleanup = cleanup;
-        cancel_registered_query(&state, &slot).await;
-        drop(permit);
-    });
 }
 
 pub(crate) async fn cancel_query_with_deadline(state: &AppState, query_id: &str) {
@@ -1682,10 +1566,6 @@ where
     }
     connections.abort_all();
     while connections.join_next().await.is_some() {}
-    state
-        .request_admission
-        .wait_for_cleanup_until(drain_deadline)
-        .await;
     Ok(())
 }
 
@@ -2071,7 +1951,6 @@ mod tests {
         assert_eq!(state.request_admission.execution.available_permits(), 3);
         assert_eq!(state.request_admission.slots.available_permits(), 19);
         assert_eq!(state.request_admission.max_queued, 16);
-        assert_eq!(state.request_admission.deadline, REQUEST_DEADLINE);
     }
 
     #[test]
@@ -2288,12 +2167,20 @@ mod tests {
             .find(|tool| tool["name"].as_str() == Some("search_sessions"))
             .expect("search_sessions exists");
         assert_eq!(
+            search["description"],
+            json!("Search Moraine session history and return compact event-ranked handles. By default, searches user_input and assistant_response events. Select tool_call or tool_response with event_types for raw tool evidence, then use open on a returned turn_id or session_id for full context.")
+        );
+        assert_eq!(
             search["inputSchema"]["properties"]["query"]["description"],
             json!("Keyword (BM25) search query. Matching is bag-of-words: quotes and punctuation are ignored, and a quoted phrase is matched as independent terms subject to the configured minimum-match threshold, not as an exact phrase.")
         );
         assert_eq!(
             search["inputSchema"]["properties"]["event_types"]["description"],
-            json!("Optional normalized event type filter. Defaults to user_input, assistant_response, and tool_response.")
+            json!("Optional normalized event type filter. Defaults to user_input and assistant_response. Select tool_call or tool_response explicitly for raw tool evidence.")
+        );
+        assert_eq!(
+            search["inputSchema"]["properties"]["event_types"]["default"],
+            json!(["user_input", "assistant_response"])
         );
         assert_eq!(
             search["inputSchema"]["properties"]["n_hits"]["default"],
