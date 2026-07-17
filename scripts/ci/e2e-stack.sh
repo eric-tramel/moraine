@@ -1342,7 +1342,7 @@ PY
   assert_clickhouse_count "$clickhouse_url" "hermes session link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-hermes-session'" "0"
   assert_clickhouse_count "$clickhouse_url" "hermes session tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-hermes-session' AND tool_call_id = 'hermes-session-tool-${run_stamp}' AND tool_name = 'shell'" "2"
   assert_clickhouse_count "$clickhouse_url" "hermes session domain fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-hermes-session' AND harness = 'hermes' AND inference_provider = 'anthropic' AND session_id = '${hermes_raw_session_id}' AND model = 'claude-opus-4-6'" "6"
-  assert_clickhouse_count "$clickhouse_url" "token bucket map keys on all events" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE hasAll(mapKeys(token_usage_buckets), ['input_text', 'output_text', 'input_cache_read', 'input_cache_write', 'reasoning'])" "60"
+  assert_clickhouse_count "$clickhouse_url" "token bucket map keys on all events" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE hasAll(mapKeys(token_usage_buckets), ['input_text', 'output_text', 'input_cache_read', 'input_cache_write', 'reasoning'])" "61"
 
   local hermes_trajectory_session_id
   hermes_trajectory_session_id="$(clickhouse_scalar "$clickhouse_url" "SELECT any(session_id) FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-hermes-trajectory'")"
