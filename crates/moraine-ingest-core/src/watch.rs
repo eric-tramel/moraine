@@ -514,6 +514,26 @@ mod tests {
     }
 
     #[test]
+    fn cowork_fixture_glob_discovers_transcripts_without_audit() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("fixtures/claude-cowork");
+        let pattern = root
+            .join("**/.claude/projects/**/*.jsonl")
+            .to_string_lossy()
+            .to_string();
+        let files = enumerate_tracked_files(&pattern, "jsonl").expect("enumerate Cowork fixture");
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|path| !path.ends_with("audit.jsonl")));
+        assert!(files
+            .iter()
+            .any(|path| path.ends_with("aaaaaaaa-1111-4333-8444-555555555555.jsonl")));
+        assert!(files
+            .iter()
+            .any(|path| path.ends_with("bbbbbbbb-2222-4333-8444-555555555555.jsonl")));
+    }
+
+    #[test]
     fn watcher_registration_tracks_active_watches() {
         let metrics = Arc::new(Metrics::default());
         assert_eq!(metrics.watcher_registrations.load(Ordering::Relaxed), 0);

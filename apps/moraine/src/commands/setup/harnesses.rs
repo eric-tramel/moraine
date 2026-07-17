@@ -157,6 +157,25 @@ const CODEX_INGEST: [DefaultIngestSource; 1] = [DefaultIngestSource {
     format: None,
 }];
 
+#[cfg(target_os = "macos")]
+const CLAUDE_INGEST: [DefaultIngestSource; 2] = [
+    DefaultIngestSource {
+        name: "claude",
+        harness: "claude-code",
+        glob: "~/.claude/projects/**/*.jsonl",
+        watch_root: "~/.claude/projects",
+        format: None,
+    },
+    DefaultIngestSource {
+        name: "claude-cowork",
+        harness: "claude-code",
+        glob: "~/Library/Application Support/Claude/local-agent-mode-sessions/**/.claude/projects/**/*.jsonl",
+        watch_root: "~/Library/Application Support/Claude/local-agent-mode-sessions",
+        format: None,
+    },
+];
+
+#[cfg(not(target_os = "macos"))]
 const CLAUDE_INGEST: [DefaultIngestSource; 1] = [DefaultIngestSource {
     name: "claude",
     harness: "claude-code",

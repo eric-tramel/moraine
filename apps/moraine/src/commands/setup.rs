@@ -3030,6 +3030,64 @@ mod tests {
     }
 
     #[test]
+    fn claude_ingest_selection_reconciles_platform_sources_idempotently() {
+        let mut document = "# minimal\n"
+            .parse::<DocumentMut>()
+            .expect("minimal config parses");
+        let selection = |mode| SetupTargetSelection {
+            target: SetupMcpTarget::ClaudeCode,
+            mode,
+        };
+
+        let added = apply_ingest_selections_to_document(
+            &mut document,
+            &[selection(SetupSelectionMode::IngestOnly)],
+        )
+        .expect("add Claude ingest sources");
+        let expected_sources = if cfg!(target_os = "macos") { 2 } else { 1 };
+        assert_eq!(added.added_sources, expected_sources);
+        assert_eq!(
+            sources_for_harness(&document, "claude-code").len(),
+            expected_sources
+        );
+        assert!(source_enabled(&document, "claude"));
+        #[cfg(target_os = "macos")]
+        {
+            assert!(source_enabled(&document, "claude-cowork"));
+            assert_eq!(
+                source_value(&document, "claude-cowork", "glob"),
+                Some(
+                    "~/Library/Application Support/Claude/local-agent-mode-sessions/**/.claude/projects/**/*.jsonl"
+                )
+            );
+        }
+
+        let unchanged = apply_ingest_selections_to_document(
+            &mut document,
+            &[selection(SetupSelectionMode::IngestOnly)],
+        )
+        .expect("reapply Claude ingest selection");
+        assert_eq!(unchanged, IngestSelectionUpdate::default());
+
+        let disabled = apply_ingest_selections_to_document(
+            &mut document,
+            &[selection(SetupSelectionMode::Off)],
+        )
+        .expect("disable Claude ingest sources");
+        assert_eq!(disabled.disabled_sources, expected_sources);
+        assert!(!source_enabled(&document, "claude"));
+        #[cfg(target_os = "macos")]
+        assert!(!source_enabled(&document, "claude-cowork"));
+
+        let reenabled = apply_ingest_selections_to_document(
+            &mut document,
+            &[selection(SetupSelectionMode::IngestOnly)],
+        )
+        .expect("re-enable Claude ingest sources");
+        assert_eq!(reenabled.enabled_sources, expected_sources);
+    }
+
+    #[test]
     fn ingest_selection_adds_omp_source_to_existing_pi_config() {
         let mut document = r#"
 [ingest]

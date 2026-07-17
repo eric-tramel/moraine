@@ -349,12 +349,13 @@ inferred as `opencode_sqlite`, and otherwise sources are treated as `jsonl`.
 
 ## Source Matrix
 
-The default template in `config/moraine.toml` includes these source families:
+The built-in defaults and `config/moraine.toml` reference cover these source families:
 
 | Source | Harness | Default glob | Watch root | Format |
 | --- | --- | --- | --- | --- |
 | Codex | `codex` | `~/.codex/sessions/**/*.jsonl` | `~/.codex/sessions` | inferred `jsonl` |
 | Claude Code | `claude-code` | `~/.claude/projects/**/*.jsonl` | `~/.claude/projects` | inferred `jsonl` |
+| Claude Cowork (local macOS) | `claude-code` | `~/Library/Application Support/Claude/local-agent-mode-sessions/**/.claude/projects/**/*.jsonl` | `~/Library/Application Support/Claude/local-agent-mode-sessions` | inferred `jsonl` |
 | Kimi CLI | `kimi-cli` | `~/.kimi/sessions/**/wire.jsonl` | `~/.kimi/sessions` | inferred `jsonl` |
 | OpenCode | `opencode` | `~/.local/share/opencode/opencode*.db` | `~/.local/share/opencode` | `opencode_sqlite` (default on) |
 | Cursor Agent | `cursor` | `~/.cursor/projects/*/agent-transcripts/**/*.jsonl` | `~/.cursor/projects` | inferred `jsonl` |
@@ -395,6 +396,38 @@ enabled = true
 glob = "~/.claude/projects/**/*.jsonl"
 watch_root = "~/.claude/projects"
 ```
+
+Local Claude Cowork on macOS:
+
+```toml
+[[ingest.sources]]
+name = "claude-cowork"
+harness = "claude-code"
+enabled = true
+glob = "~/Library/Application Support/Claude/local-agent-mode-sessions/**/.claude/projects/**/*.jsonl"
+watch_root = "~/Library/Application Support/Claude/local-agent-mode-sessions"
+```
+
+macOS defaults and `moraine setup` add this as a separate source while retaining
+the ordinary `claude` source. Moraine groups every nested Claude CLI transcript
+under its containing `local_*` Cowork session. The live ingest gate accepts only
+the `.claude/projects/` transcript subtree, so sibling `audit.jsonl` files are
+not ingested.
+
+Cowork root metadata is allowlisted into one `session_meta` record: session and
+nested CLI IDs, created/last-activity times, cwd, model, title, and archive/star
+flags. Account/email data, prompts, selected folders, MCP/plugin/tool settings,
+and unknown fields are not copied. Transcript `attachment`, `last-prompt`, and
+`ai-title` records remain available as raw records but do not become searchable
+events.
+Root metadata is refreshed when a transcript is created or appended. A
+metadata-only sidecar edit is picked up by the next transcript activity.
+
+This source supports the observed local macOS layout only. Claude's JSONL format
+is internal and may change. A stable signed-in Claude Desktop path has not been
+verified across Windows installer/MSIX variants, so Moraine does not ship a
+Windows Cowork glob. Remote Cowork is also outside this source; its documented
+observability path is OpenTelemetry.
 
 Kimi CLI:
 

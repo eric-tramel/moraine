@@ -92,6 +92,7 @@ pub(crate) fn normalize_record_with_ts_hint(
     );
 
     let source_ctx = SourceRecordContext {
+        source_name,
         source_file,
         session_hint,
         top_type: &top_type,

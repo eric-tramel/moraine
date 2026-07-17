@@ -16,12 +16,42 @@ all rows that leave the adapter.
 | Harness | Module | Default provider | Typical format | Notes |
 | --- | --- | --- | --- | --- |
 | `codex` | `sources/codex.rs` | `openai` | `jsonl` | OpenAI/Codex events, response items, tool calls, compaction, token counts. |
-| `claude-code` | `sources/claude_code.rs` | `anthropic` | `jsonl` | Claude Code message blocks, operational records, parent/tool external links. |
+| `claude-code` | `sources/claude_code.rs` | `anthropic` | `jsonl` | Claude Code and local macOS Cowork message blocks, operational records, parent/tool external links, and Cowork root metadata. |
 | `kimi-cli` | `sources/kimi_cli.rs` | `moonshot` | `jsonl` | Kimi `wire.jsonl`; skips metadata headers and keeps parent `SubagentEvent` envelopes raw-only. |
 | `opencode` | `sources/opencode.rs` | record-derived | `opencode_sqlite` | OpenCode `opencode*.db`; append-only conversation events synthesized into session, message, part, and session-message records. Credential/account tables are deliberately out of scope. |
 | `cursor` | `sources/cursor.rs` | `cursor` | `jsonl` or `cursor_sqlite` | Cursor Agent transcripts under `agent-transcripts/`; text blocks, tool-use blocks, and local file references. Also normalizes the synthetic `cursor_composer`/`cursor_bubble` records produced by polling `state.vscdb` (see SQLite-Polled Sources below); composer names become `session_meta` events that carry the session title. |
 | `hermes` | `sources/hermes.rs` | record-derived | `jsonl` or `session_json` | ShareGPT trajectories and live Hermes session JSON with vendor/model splitting. |
 | `pi-coding-agent` | `sources/pi.rs` | record-derived | `jsonl` | Pi and OMP session JSONL trees, model/thinking metadata, assistant tool calls, tool results, and parent links. |
+
+### Local macOS Claude Cowork
+
+Cowork reuses the `claude-code` adapter but has its own `claude-cowork`
+source/checkpoint namespace. macOS defaults and setup use:
+
+```toml
+glob = "~/Library/Application Support/Claude/local-agent-mode-sessions/**/.claude/projects/**/*.jsonl"
+watch_root = "~/Library/Application Support/Claude/local-agent-mode-sessions"
+```
+
+The watch root also contains sibling `audit.jsonl` files. Live watcher events do
+not consult the startup glob, so the dispatch ingestability gate revalidates the
+Cowork path and accepts only transcripts beneath a containing
+`local_*/.claude/projects/` subtree. The containing `local_*` name is the Moraine
+session ID; nested Claude CLI `sessionId` values do not split a resumed Cowork
+conversation.
+
+When transcript bytes are processed, dispatch reads the sibling
+`local_<id>.json` and constructs a synthetic `cowork-session-meta` record from a
+fixed safe allowlist. The original root object is never stored. `attachment`,
+`last-prompt`, and `ai-title` transcript records remain raw-only to avoid
+attachment indexing, duplicate prompts, and untimestamped metadata noise.
+Metadata is refreshed on transcript processing, not as an independent sidecar;
+a metadata-only edit is picked up by the next transcript activity.
+
+This contract is limited to the observed local macOS layout. Claude documents
+the JSONL entry format as internal and unstable. Windows local storage is not
+enabled because no path is verified across installer modes, and remote Cowork
+OpenTelemetry is a separate source surface.
 
 ### Kimi parent and sub-agent streams
 

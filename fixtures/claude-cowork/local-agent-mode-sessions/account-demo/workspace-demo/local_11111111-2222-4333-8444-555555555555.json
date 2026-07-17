@@ -1,0 +1,16 @@
+{
+  "sessionId": "wrong-root-id",
+  "cliSessionId": "bbbbbbbb-2222-4333-8444-555555555555",
+  "createdAt": 1770019200000,
+  "lastActivityAt": 1770019260000,
+  "cwd": "/sessions/synthetic-cowork",
+  "model": "claude-opus-4-6",
+  "title": "Cowork fixture title",
+  "isArchived": false,
+  "isStarred": true,
+  "accountName": "PRIVATE_ACCOUNT_SENTINEL",
+  "emailAddress": "PRIVATE_EMAIL_SENTINEL",
+  "systemPrompt": "PRIVATE_SYSTEM_PROMPT_SENTINEL",
+  "remoteMcpServersConfig": {"secret": "PRIVATE_MCP_SENTINEL"},
+  "userSelectedFolders": ["/private/fixture/path"]
+}
