@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command as TokioCommand};
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, timeout, Instant};
+use tokio::time::{interval_at, sleep, timeout, Instant, MissedTickBehavior};
 
 #[cfg(unix)]
 use std::os::unix::{
@@ -536,12 +536,82 @@ fn prompt_install_clickhouse(version: &str) -> Result<bool> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ClickHouseStartupProgress {
+    ProbingEndpoint {
+        elapsed: Duration,
+        timeout: Duration,
+    },
+    EndpointProbeFinished,
+    WaitingForHealth {
+        elapsed: Duration,
+        timeout: Duration,
+    },
+}
+
+async fn ping_with_progress<F, E>(
+    client: &ClickHouseClient,
+    started: Instant,
+    deadline: Instant,
+    refresh_interval: Duration,
+    on_progress: &mut F,
+    event: E,
+) -> Result<()>
+where
+    F: FnMut(ClickHouseStartupProgress),
+    E: Fn(Duration, Duration) -> ClickHouseStartupProgress,
+{
+    let progress_timeout = deadline.saturating_duration_since(started);
+    on_progress(event(
+        started.elapsed().min(progress_timeout),
+        progress_timeout,
+    ));
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        bail!(
+            "clickhouse health probe timed out after {:.1}s",
+            progress_timeout.as_secs_f64()
+        );
+    }
+    let ping = timeout(remaining, client.ping());
+    tokio::pin!(ping);
+    let mut ticker = interval_at(Instant::now() + refresh_interval, refresh_interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            result = &mut ping => {
+                return match result {
+                    Ok(result) => result,
+                    Err(_) => bail!(
+                        "clickhouse health probe timed out after {:.1}s",
+                        progress_timeout.as_secs_f64()
+                    ),
+                };
+            }
+            _ = ticker.tick() => {
+                on_progress(event(
+                    started.elapsed().min(progress_timeout),
+                    progress_timeout,
+                ));
+            }
+        }
+    }
+}
+
 async fn wait_for_clickhouse(cfg: &AppConfig) -> Result<()> {
+    wait_for_clickhouse_with_progress(cfg, &mut |_| {}).await
+}
+
+async fn wait_for_clickhouse_with_progress<F>(cfg: &AppConfig, on_progress: &mut F) -> Result<()>
+where
+    F: FnMut(ClickHouseStartupProgress),
+{
     let client = ClickHouseClient::new(cfg.clickhouse.clone())?;
     let startup_timeout =
         Duration::from_secs_f64(cfg.runtime.clickhouse_start_timeout_seconds.max(1.0));
     let interval = Duration::from_millis(cfg.runtime.healthcheck_interval_ms.max(100));
-    let deadline = Instant::now() + startup_timeout;
+    let started = Instant::now();
+    let deadline = started + startup_timeout;
 
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -551,8 +621,17 @@ async fn wait_for_clickhouse(cfg: &AppConfig) -> Result<()> {
                 startup_timeout.as_secs_f64()
             );
         }
-
-        if matches!(timeout(remaining, client.ping()).await, Ok(Ok(()))) {
+        if ping_with_progress(
+            &client,
+            started,
+            deadline,
+            interval,
+            on_progress,
+            |elapsed, timeout| ClickHouseStartupProgress::WaitingForHealth { elapsed, timeout },
+        )
+        .await
+        .is_ok()
+        {
             return Ok(());
         }
 
@@ -1301,8 +1380,15 @@ async fn stop_new_supervisor(child: &mut Child, pid_file: &Path, pid: u32) -> Re
     Ok(())
 }
 
-async fn wait_for_supervisor_startup(supervisor: &mut Child, cfg: &AppConfig) -> Result<()> {
-    let readiness = wait_for_clickhouse(cfg);
+async fn wait_for_supervisor_startup_with_progress<F>(
+    supervisor: &mut Child,
+    cfg: &AppConfig,
+    on_progress: &mut F,
+) -> Result<()>
+where
+    F: FnMut(ClickHouseStartupProgress),
+{
+    let readiness = wait_for_clickhouse_with_progress(cfg, on_progress);
     tokio::pin!(readiness);
     tokio::select! {
         biased;
@@ -1332,14 +1418,18 @@ async fn wait_for_supervisor_startup(supervisor: &mut Child, cfg: &AppConfig) ->
     }
 }
 
-pub(crate) async fn start_clickhouse(
+pub(crate) async fn start_clickhouse_with_progress<F>(
     config_path: &Path,
     cfg: &AppConfig,
     paths: &RuntimePaths,
-) -> Result<StartOutcome> {
+    mut on_progress: F,
+) -> Result<StartOutcome>
+where
+    F: FnMut(ClickHouseStartupProgress),
+{
     let supervisor_log = clickhouse_supervisor_log_path(paths);
     if let Some(pid) = service_running(paths, Service::ClickHouse) {
-        wait_for_clickhouse(cfg).await?;
+        wait_for_clickhouse_with_progress(cfg, &mut on_progress).await?;
         return Ok(StartOutcome {
             service: Service::ClickHouse,
             state: StartState::AlreadyRunning,
@@ -1350,7 +1440,18 @@ pub(crate) async fn start_clickhouse(
 
     let url_is_local = clickhouse_url_is_local(cfg)?;
     let client = ClickHouseClient::new(cfg.clickhouse.clone())?;
-    match client.ping().await {
+    let probe_timeout = Duration::from_secs_f64(cfg.clickhouse.timeout_seconds.max(0.1));
+    let probe_started = Instant::now();
+    let probe = ping_with_progress(
+        &client,
+        probe_started,
+        probe_started + probe_timeout,
+        Duration::from_millis(cfg.runtime.healthcheck_interval_ms.max(100)),
+        &mut on_progress,
+        |elapsed, timeout| ClickHouseStartupProgress::ProbingEndpoint { elapsed, timeout },
+    )
+    .await;
+    match probe {
         Ok(()) => {
             return Ok(StartOutcome {
                 service: Service::ClickHouse,
@@ -1365,7 +1466,7 @@ pub(crate) async fn start_clickhouse(
                 cfg.clickhouse.url
             );
         }
-        Err(_) => {}
+        Err(_) => on_progress(ClickHouseStartupProgress::EndpointProbeFinished),
     }
 
     cleanup_legacy_clickhouse_pipe_log(paths);
@@ -1411,7 +1512,9 @@ pub(crate) async fn start_clickhouse(
         };
     }
 
-    if let Err(err) = wait_for_supervisor_startup(&mut supervisor, cfg).await {
+    if let Err(err) =
+        wait_for_supervisor_startup_with_progress(&mut supervisor, cfg, &mut on_progress).await
+    {
         let cleanup =
             stop_new_supervisor(&mut supervisor, &launcher_pid_file, supervisor_pid).await;
         return match cleanup {
@@ -1820,6 +1923,105 @@ mod tests {
         cfg.runtime.healthcheck_interval_ms = 100;
         cfg.runtime.clickhouse_auto_install = false;
         cfg
+    }
+
+    #[tokio::test]
+    async fn ping_progress_refreshes_while_response_is_stalled() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalled ping server");
+        let addr = listener.local_addr().expect("stalled ping server addr");
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.expect("accept stalled ping");
+            sleep(Duration::from_secs(1)).await;
+        });
+        let mut cfg = AppConfig::default();
+        cfg.clickhouse.url = format!("http://{addr}");
+        cfg.clickhouse.timeout_seconds = 0.3;
+        let client = ClickHouseClient::new(cfg.clickhouse).expect("stalled ping client");
+        let started = Instant::now();
+        let mut elapsed_updates = Vec::new();
+
+        let error = ping_with_progress(
+            &client,
+            started,
+            started + Duration::from_millis(350),
+            Duration::from_millis(50),
+            &mut |event| match event {
+                ClickHouseStartupProgress::ProbingEndpoint { elapsed, .. } => {
+                    elapsed_updates.push(elapsed)
+                }
+                ClickHouseStartupProgress::EndpointProbeFinished => {
+                    panic!("unexpected probe-finished event")
+                }
+                ClickHouseStartupProgress::WaitingForHealth { .. } => {
+                    panic!("unexpected health-wait event")
+                }
+            },
+            |elapsed, timeout| ClickHouseStartupProgress::ProbingEndpoint { elapsed, timeout },
+        )
+        .await
+        .expect_err("stalled ping must fail");
+        server.abort();
+
+        assert!(error.to_string().contains("clickhouse"));
+        assert!(elapsed_updates
+            .first()
+            .is_some_and(|elapsed| *elapsed < Duration::from_millis(20)));
+        assert!(
+            elapsed_updates
+                .iter()
+                .any(|elapsed| *elapsed >= Duration::from_millis(100)),
+            "expected elapsed progress updates, got {elapsed_updates:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ping_progress_preserves_elapsed_time_across_fast_failures() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve unused ping port");
+        let url = format!(
+            "http://{}",
+            listener.local_addr().expect("unused ping addr")
+        );
+        drop(listener);
+        let mut cfg = AppConfig::default();
+        cfg.clickhouse.url = url;
+        cfg.clickhouse.timeout_seconds = 0.1;
+        let client = ClickHouseClient::new(cfg.clickhouse).expect("fast-failure ping client");
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(400);
+        let mut elapsed_updates = Vec::new();
+
+        for _ in 0..2 {
+            let _ = ping_with_progress(
+                &client,
+                started,
+                deadline,
+                Duration::from_millis(50),
+                &mut |event| match event {
+                    ClickHouseStartupProgress::WaitingForHealth { elapsed, .. } => {
+                        elapsed_updates.push(elapsed)
+                    }
+                    _ => panic!("unexpected endpoint-probe event"),
+                },
+                |elapsed, timeout| ClickHouseStartupProgress::WaitingForHealth { elapsed, timeout },
+            )
+            .await;
+            sleep(Duration::from_millis(120)).await;
+        }
+
+        assert!(
+            elapsed_updates
+                .last()
+                .is_some_and(|elapsed| *elapsed >= Duration::from_millis(100)),
+            "expected cumulative elapsed progress, got {elapsed_updates:?}"
+        );
+        assert!(
+            elapsed_updates.windows(2).all(|pair| pair[0] <= pair[1]),
+            "elapsed progress regressed: {elapsed_updates:?}"
+        );
     }
 
     fn test_policy() -> SupervisorPolicy {
@@ -2255,7 +2457,8 @@ mod tests {
             .spawn()
             .expect("spawn wrapper");
 
-        let err = wait_for_supervisor_startup(&mut wrapper, &cfg)
+        let mut on_progress = |_| {};
+        let err = wait_for_supervisor_startup_with_progress(&mut wrapper, &cfg, &mut on_progress)
             .await
             .expect_err("wrapper exit should fail startup");
 
@@ -2356,7 +2559,7 @@ mod tests {
         let paths = crate::paths::runtime_paths(&cfg);
         let config_path = root.join("config.toml");
 
-        let outcome = start_clickhouse(&config_path, &cfg, &paths)
+        let outcome = start_clickhouse_with_progress(&config_path, &cfg, &paths, |_| {})
             .await
             .expect("healthy external endpoint");
 
@@ -2381,7 +2584,7 @@ mod tests {
         let launcher_pid = pid_path(&paths, Service::ClickHouse);
         write_pid(&launcher_pid, sentinel_pid).expect("sentinel pid file");
 
-        let err = start_clickhouse(&root.join("config.toml"), &cfg, &paths)
+        let err = start_clickhouse_with_progress(&root.join("config.toml"), &cfg, &paths, |_| {})
             .await
             .expect_err("unhealthy sentinel should fail readiness");
 

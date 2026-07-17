@@ -59,6 +59,26 @@ pub struct Migration {
     pub sql: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationProgress {
+    Plan {
+        applied: usize,
+        pending: usize,
+    },
+    Started {
+        index: usize,
+        total: usize,
+        version: &'static str,
+        name: &'static str,
+    },
+    Applied {
+        index: usize,
+        total: usize,
+        version: &'static str,
+        name: &'static str,
+    },
+}
+
 /// Result of comparing the server's `schema_migrations` ledger against this
 /// build's `bundled_migrations()`. Both lists are sorted ascending.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
@@ -437,6 +457,13 @@ impl ClickHouseClient {
     }
 
     pub async fn run_migrations(&self) -> Result<Vec<String>> {
+        self.run_migrations_with_progress(|_| {}).await
+    }
+
+    pub async fn run_migrations_with_progress<F>(&self, mut on_progress: F) -> Result<Vec<String>>
+    where
+        F: FnMut(MigrationProgress),
+    {
         validate_identifier(&self.cfg.database)?;
 
         self.request_text(
@@ -453,12 +480,27 @@ impl ClickHouseClient {
 
         self.ensure_migration_ledger().await?;
         let applied = self.applied_migration_versions().await?;
+        let bundled = bundled_migrations();
+        let bundled_count = bundled.len();
+        let pending = bundled
+            .into_iter()
+            .filter(|migration| !applied.contains(migration.version))
+            .collect::<Vec<_>>();
+        let total = pending.len();
+        on_progress(MigrationProgress::Plan {
+            applied: bundled_count.saturating_sub(total),
+            pending: total,
+        });
 
-        let mut executed = Vec::new();
-        for migration in bundled_migrations() {
-            if applied.contains(migration.version) {
-                continue;
-            }
+        let mut executed = Vec::with_capacity(total);
+        for (offset, migration) in pending.into_iter().enumerate() {
+            let index = offset + 1;
+            on_progress(MigrationProgress::Started {
+                index,
+                total,
+                version: migration.version,
+                name: migration.name,
+            });
 
             let sql = materialize_migration_sql(migration.sql, &self.cfg.database)?;
             for statement in split_sql_statements(&sql) {
@@ -484,6 +526,12 @@ impl ClickHouseClient {
                 .with_context(|| format!("failed to record migration {}", migration.name))?;
 
             executed.push(migration.version.to_string());
+            on_progress(MigrationProgress::Applied {
+                index,
+                total,
+                version: migration.version,
+                name: migration.name,
+            });
         }
 
         Ok(executed)
@@ -1107,6 +1155,56 @@ mod tests {
         });
 
         format!("http://{}", addr)
+    }
+
+    #[derive(Clone)]
+    struct MigrationMockState {
+        applied: Arc<Vec<String>>,
+        queries: Arc<Mutex<Vec<String>>>,
+        fail_ledger_insert: bool,
+    }
+
+    async fn spawn_migration_mock_server(state: MigrationMockState) -> String {
+        async fn handler(
+            State(state): State<MigrationMockState>,
+            Query(params): Query<HashMap<String, String>>,
+        ) -> (StatusCode, String) {
+            let query = params.get("query").cloned().unwrap_or_default();
+            state
+                .queries
+                .lock()
+                .expect("migration query mutex poisoned")
+                .push(query.clone());
+
+            if query.starts_with("SELECT version FROM") {
+                let data = state
+                    .applied
+                    .iter()
+                    .map(|version| json!({ "version": version }))
+                    .collect::<Vec<_>>();
+                return (StatusCode::OK, json!({ "data": data }).to_string());
+            }
+            if state.fail_ledger_insert
+                && query.starts_with("INSERT INTO")
+                && query.contains("schema_migrations")
+            {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "ledger insert failed".to_string(),
+                );
+            }
+            (StatusCode::OK, String::new())
+        }
+
+        let app = Router::new().route("/", post(handler)).with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind migration mock listener");
+        let addr = listener.local_addr().expect("migration mock listener addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
     }
 
     async fn spawn_insert_capture_server(lengths: Arc<Mutex<Vec<usize>>>) -> String {
@@ -2081,6 +2179,128 @@ mod tests {
         assert!(msg.contains("clickhouse returned"));
         assert!(msg.contains("500"));
         assert!(msg.contains("boom"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn migration_progress_reports_current_schema_without_work() {
+        let applied = bundled_migrations()
+            .into_iter()
+            .map(|migration| migration.version.to_string())
+            .collect::<Vec<_>>();
+        let base_url = spawn_migration_mock_server(MigrationMockState {
+            applied: Arc::new(applied),
+            queries: Arc::new(Mutex::new(Vec::new())),
+            fail_ledger_insert: false,
+        })
+        .await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+        let mut events = Vec::new();
+
+        let executed = client
+            .run_migrations_with_progress(|event| events.push(event))
+            .await
+            .expect("current migrations");
+
+        assert!(executed.is_empty());
+        assert_eq!(
+            events,
+            vec![MigrationProgress::Plan {
+                applied: bundled_migrations().len(),
+                pending: 0,
+            }]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn migration_progress_applies_latest_after_ledger_write() {
+        let bundled = bundled_migrations();
+        let latest = bundled.last().expect("latest migration").clone();
+        let applied = bundled[..bundled.len() - 1]
+            .iter()
+            .map(|migration| migration.version.to_string())
+            .collect::<Vec<_>>();
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let base_url = spawn_migration_mock_server(MigrationMockState {
+            applied: Arc::new(applied),
+            queries: queries.clone(),
+            fail_ledger_insert: false,
+        })
+        .await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+        let mut events = Vec::new();
+
+        let executed = client
+            .run_migrations_with_progress(|event| events.push(event))
+            .await
+            .expect("apply latest migration");
+
+        assert_eq!(executed, vec![latest.version.to_string()]);
+        assert_eq!(
+            events,
+            vec![
+                MigrationProgress::Plan {
+                    applied: bundled.len() - 1,
+                    pending: 1,
+                },
+                MigrationProgress::Started {
+                    index: 1,
+                    total: 1,
+                    version: latest.version,
+                    name: latest.name,
+                },
+                MigrationProgress::Applied {
+                    index: 1,
+                    total: 1,
+                    version: latest.version,
+                    name: latest.name,
+                },
+            ]
+        );
+        let queries = queries.lock().expect("migration query mutex poisoned");
+        let ledger_index = queries
+            .iter()
+            .position(|query| {
+                query.starts_with("INSERT INTO") && query.contains("schema_migrations")
+            })
+            .expect("ledger insert query");
+        assert_eq!(ledger_index, queries.len() - 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn migration_progress_does_not_apply_when_ledger_write_fails() {
+        let bundled = bundled_migrations();
+        let latest = bundled.last().expect("latest migration").clone();
+        let applied = bundled[..bundled.len() - 1]
+            .iter()
+            .map(|migration| migration.version.to_string())
+            .collect::<Vec<_>>();
+        let base_url = spawn_migration_mock_server(MigrationMockState {
+            applied: Arc::new(applied),
+            queries: Arc::new(Mutex::new(Vec::new())),
+            fail_ledger_insert: true,
+        })
+        .await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+        let mut events = Vec::new();
+
+        let error = client
+            .run_migrations_with_progress(|event| events.push(event))
+            .await
+            .expect_err("ledger insert must fail");
+
+        assert!(error.to_string().contains("failed to record migration"));
+        assert_eq!(
+            events.last(),
+            Some(&MigrationProgress::Started {
+                index: 1,
+                total: 1,
+                version: latest.version,
+                name: latest.name,
+            })
+        );
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, MigrationProgress::Applied { .. })));
     }
 
     #[tokio::test(flavor = "multi_thread")]

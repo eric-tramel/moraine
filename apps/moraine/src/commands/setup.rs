@@ -4,7 +4,6 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use std::env;
-use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, IsTerminal, Write};
 #[cfg(unix)]
@@ -14,7 +13,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cli::{SetupArgs, SetupMcpTarget};
-use crate::render::{CliOutput, OutputMode};
+use crate::render::CliOutput;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table};
 
 mod harnesses;
@@ -1272,18 +1271,14 @@ fn render_setup_selection_summary(selections: &[SetupTargetSelection]) {
 }
 
 struct SetupProgress {
-    enabled: bool,
-    rich: bool,
-    unicode: bool,
+    style: crate::progress::ProgressStyle,
     started: bool,
 }
 
 impl SetupProgress {
     fn from_output(output: &CliOutput) -> Self {
         Self {
-            enabled: !output.is_json() && std::io::stderr().is_terminal(),
-            rich: output.mode == OutputMode::Rich,
-            unicode: output.unicode,
+            style: crate::progress::ProgressStyle::from_output(output),
             started: false,
         }
     }
@@ -1291,125 +1286,124 @@ impl SetupProgress {
     #[cfg(test)]
     fn disabled() -> Self {
         Self {
-            enabled: false,
-            rich: false,
-            unicode: true,
+            style: crate::progress::ProgressStyle::disabled(),
             started: false,
         }
     }
 
     fn finish(&mut self) {
-        if !self.enabled || !self.started {
+        if !self.style.enabled() || !self.started {
             return;
         }
         eprintln!(
             "{} {}",
-            self.progress_line("╰─", "`-", Style::new().bright().black()),
-            self.dim("setup summary follows")
+            self.style.branch("╰─", "`-", Style::new().bright().black()),
+            self.style.dim("setup summary follows")
         );
     }
 
     fn target_start(&mut self, target: SetupMcpTarget, plan: &McpPlan) {
-        if !self.enabled {
+        if !self.style.enabled() {
             return;
         }
         self.ensure_started();
         eprintln!(
             "{} {} {}",
-            self.progress_line("├─", "+-", Style::new().bright().black()),
-            self.bold_label(target.label()),
-            self.dim(plan.target.setup_kind())
+            self.style.branch("├─", "+-", Style::new().bright().black()),
+            self.style.bold_label(target.label()),
+            self.style.dim(plan.target.setup_kind())
         );
     }
 
     fn target_success(&self, target: SetupMcpTarget) {
-        if !self.enabled {
+        if !self.style.enabled() {
             return;
         }
         eprintln!(
             "   {} {}",
-            self.mark("✓", "[ok]", Style::new().green()),
-            self.dim(&format!("{} configured", target.label()))
+            self.style.mark("✓", "[ok]", Style::new().green()),
+            self.style.dim(&format!("{} configured", target.label()))
         );
     }
 
     fn target_error(&self, target: SetupMcpTarget) {
-        if !self.enabled {
+        if !self.style.enabled() {
             return;
         }
         eprintln!(
             "   {} {}",
-            self.mark("✗", "[err]", Style::new().red()),
-            self.dim(&format!("{} needs attention", target.label()))
+            self.style.mark("✗", "[err]", Style::new().red()),
+            self.style
+                .dim(&format!("{} needs attention", target.label()))
         );
     }
 
     fn target_skipped(&self, target: SetupMcpTarget, reason: &str) {
-        if !self.enabled {
+        if !self.style.enabled() {
             return;
         }
         eprintln!(
             "   {} {} {}",
-            self.mark("–", "[-]", Style::new().yellow()),
-            self.dim(target.label()),
-            self.dim(reason)
+            self.style.mark("–", "[-]", Style::new().yellow()),
+            self.style.dim(target.label()),
+            self.style.dim(reason)
         );
     }
 
     fn command_start(&self, step: &McpPlanStep) {
-        if !self.enabled {
+        if !self.style.enabled() {
             return;
         }
         eprintln!(
             "   {} {}",
-            self.mark("→", ">", Style::new().cyan()),
-            self.label(step.progress_label)
+            self.style.mark("→", ">", Style::new().cyan()),
+            self.style.label(step.progress_label)
         );
     }
 
     fn command_success(&self, step: &McpPlanStep) {
-        if !self.enabled {
+        if !self.style.enabled() {
             return;
         }
         eprintln!(
             "   {} {}",
-            self.mark("✓", "[ok]", Style::new().green()),
-            self.dim(step.success_label)
+            self.style.mark("✓", "[ok]", Style::new().green()),
+            self.style.dim(step.success_label)
         );
     }
 
     fn command_warning(&self, step: &McpPlanStep, warning: &str) {
-        if !self.enabled {
+        if !self.style.enabled() {
             return;
         }
         eprintln!(
             "   {} {} {}",
-            self.mark("!", "[warn]", Style::new().yellow()),
-            self.dim(step.warning_label),
-            self.dim(warning)
+            self.style.mark("!", "[warn]", Style::new().yellow()),
+            self.style.dim(step.warning_label),
+            self.style.dim(warning)
         );
     }
 
     fn command_error(&self, step: &McpPlanStep, error: &str) {
-        if !self.enabled {
+        if !self.style.enabled() {
             return;
         }
         eprintln!(
             "   {} {} {}",
-            self.mark("✗", "[err]", Style::new().red()),
-            self.dim(step.error_label),
-            self.dim(error)
+            self.style.mark("✗", "[err]", Style::new().red()),
+            self.style.dim(step.error_label),
+            self.style.dim(error)
         );
     }
 
     fn config_start(&self, write: &McpConfigWrite) {
-        if !self.enabled {
+        if !self.style.enabled() {
             return;
         }
         eprintln!(
             "   {} {}",
-            self.mark("→", ">", Style::new().cyan()),
-            self.label(&format!(
+            self.style.mark("→", ">", Style::new().cyan()),
+            self.style.label(&format!(
                 "Updating {} config at {}",
                 write.label(),
                 write.path().display()
@@ -1418,25 +1412,27 @@ impl SetupProgress {
     }
 
     fn config_success(&self, write: &McpConfigWrite) {
-        if !self.enabled {
+        if !self.style.enabled() {
             return;
         }
         eprintln!(
             "   {} {}",
-            self.mark("✓", "[ok]", Style::new().green()),
-            self.dim(&format!("Updated {}", write.path().display()))
+            self.style.mark("✓", "[ok]", Style::new().green()),
+            self.style
+                .dim(&format!("Updated {}", write.path().display()))
         );
     }
 
     fn config_error(&self, write: &McpConfigWrite, error: &str) {
-        if !self.enabled {
+        if !self.style.enabled() {
             return;
         }
         eprintln!(
             "   {} {} {}",
-            self.mark("✗", "[err]", Style::new().red()),
-            self.dim(&format!("Could not update {}", write.path().display())),
-            self.dim(error)
+            self.style.mark("✗", "[err]", Style::new().red()),
+            self.style
+                .dim(&format!("Could not update {}", write.path().display())),
+            self.style.dim(error)
         );
     }
 
@@ -1445,11 +1441,11 @@ impl SetupProgress {
             return;
         }
         self.started = true;
-        if self.rich {
+        if self.style.rich() {
             eprintln!();
             eprintln!(
                 "{} {}",
-                self.progress_line("╭─", ".-", Style::new().cyan()),
+                self.style.branch("╭─", ".-", Style::new().cyan()),
                 Style::new()
                     .cyan()
                     .bold()
@@ -1458,59 +1454,6 @@ impl SetupProgress {
             );
         } else {
             eprintln!("Installing agent integrations");
-        }
-    }
-
-    fn mark<'a>(&self, unicode: &'a str, ascii: &'a str, style: Style) -> impl fmt::Display + 'a {
-        if self.rich {
-            style
-                .for_stderr()
-                .apply_to(if self.unicode { unicode } else { ascii })
-        } else {
-            Style::new()
-                .for_stderr()
-                .apply_to(if self.unicode { unicode } else { ascii })
-        }
-    }
-
-    fn label<'a>(&self, value: &'a str) -> impl fmt::Display + 'a {
-        if self.rich {
-            Style::new().white().for_stderr().apply_to(value)
-        } else {
-            Style::new().for_stderr().apply_to(value)
-        }
-    }
-
-    fn bold_label<'a>(&self, value: &'a str) -> impl fmt::Display + 'a {
-        if self.rich {
-            Style::new().white().bold().for_stderr().apply_to(value)
-        } else {
-            Style::new().for_stderr().apply_to(value)
-        }
-    }
-
-    fn dim<'a>(&self, value: &'a str) -> impl fmt::Display + 'a {
-        if self.rich {
-            Style::new().bright().black().for_stderr().apply_to(value)
-        } else {
-            Style::new().for_stderr().apply_to(value)
-        }
-    }
-
-    fn progress_line<'a>(
-        &self,
-        unicode: &'a str,
-        ascii: &'a str,
-        style: Style,
-    ) -> impl fmt::Display + 'a {
-        if self.rich {
-            style
-                .for_stderr()
-                .apply_to(if self.unicode { unicode } else { ascii })
-        } else {
-            Style::new()
-                .for_stderr()
-                .apply_to(if self.unicode { unicode } else { ascii })
         }
     }
 }
