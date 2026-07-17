@@ -10,7 +10,7 @@ use crate::process::{
 use crate::render::{LogsSnapshot, ServiceLogSection};
 use crate::service::Service;
 
-fn tail_lines(path: &Path, lines: usize) -> Result<Vec<String>> {
+pub(super) fn tail_lines(path: &Path, lines: usize) -> Result<Vec<String>> {
     const TAIL_READ_CHUNK_BYTES: usize = 8 * 1024;
 
     if lines == 0 {

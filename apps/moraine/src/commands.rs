@@ -7,7 +7,7 @@ mod status;
 mod up;
 
 use anyhow::{bail, Context, Result};
-use moraine_clickhouse::{ClickHouseClient, DoctorReport};
+use moraine_clickhouse::{ClickHouseClient, DoctorReport, MigrationProgress};
 use moraine_config::AppConfig;
 use moraine_conversations::{ClickHouseConversationRepository, RepoConfig};
 use std::path::PathBuf;
@@ -203,26 +203,82 @@ fn conversation_repository(cfg: &AppConfig) -> Result<ClickHouseConversationRepo
 // while `export` owns a versioned row contract and schema-skew gate. Those paths keep
 // direct ClickHouse access; operational status reads go through ConversationRepository.
 
-async fn cmd_db_migrate(cfg: &AppConfig) -> Result<MigrationOutcome> {
+#[derive(Debug, Clone, Copy)]
+pub(super) enum DatabaseProgress {
+    Migration(MigrationProgress),
+    ReconciliationInspecting,
+    ReconciliationStarted { historical: bool },
+    ReconciliationAdvanced { processed: usize },
+    ReconciliationFinished { processed: usize },
+}
+
+async fn migrate_database_with_progress<F>(
+    cfg: &AppConfig,
+    mut on_progress: F,
+) -> Result<MigrationOutcome>
+where
+    F: FnMut(DatabaseProgress),
+{
     let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
-    let applied = ch.run_migrations().await?;
-    let requires_historical_backfill = !ch.mcp_open_read_model_ready().await?;
-    if requires_historical_backfill {
-        eprintln!(
-            "Building the MCP open read model from existing sessions; this one-time step may take several minutes."
-        );
-    }
+    let applied = ch
+        .run_migrations_with_progress(|event| {
+            on_progress(DatabaseProgress::Migration(event));
+        })
+        .await?;
+    on_progress(DatabaseProgress::ReconciliationInspecting);
+    let historical = !ch.mcp_open_read_model_ready().await?;
+    on_progress(DatabaseProgress::ReconciliationStarted { historical });
+
+    let mut processed = 0;
     ch.backfill_mcp_open_read_model_with_progress(|refreshed_sessions| {
-        if requires_historical_backfill {
-            eprintln!("  projected {refreshed_sessions} sessions");
-        }
+        processed = refreshed_sessions;
+        on_progress(DatabaseProgress::ReconciliationAdvanced {
+            processed: refreshed_sessions,
+        });
     })
     .await
     .context("failed to backfill MCP open read model")?;
-    if requires_historical_backfill {
-        eprintln!("MCP open read model ready.");
-    }
+    on_progress(DatabaseProgress::ReconciliationFinished { processed });
     Ok(MigrationOutcome { applied })
+}
+
+pub(super) async fn migrate_database_for_up<F>(
+    cfg: &AppConfig,
+    on_progress: F,
+) -> Result<MigrationOutcome>
+where
+    F: FnMut(DatabaseProgress),
+{
+    migrate_database_with_progress(cfg, on_progress).await
+}
+
+async fn cmd_db_migrate(cfg: &AppConfig) -> Result<MigrationOutcome> {
+    let mut historical = false;
+    migrate_database_with_progress(cfg, |event| match event {
+        DatabaseProgress::Migration(_) => {}
+        DatabaseProgress::ReconciliationInspecting => {}
+        DatabaseProgress::ReconciliationStarted {
+            historical: required,
+        } => {
+            historical = required;
+            if historical {
+                eprintln!(
+                    "Building the MCP open read model from existing sessions; this one-time step may take several minutes."
+                );
+            }
+        }
+        DatabaseProgress::ReconciliationAdvanced { processed } => {
+            if historical {
+                eprintln!("  projected {processed} sessions");
+            }
+        }
+        DatabaseProgress::ReconciliationFinished { .. } => {
+            if historical {
+                eprintln!("MCP open read model ready.");
+            }
+        }
+    })
+    .await
 }
 
 async fn cmd_db_doctor(cfg: &AppConfig) -> Result<DoctorReport> {
@@ -273,7 +329,7 @@ fn cmd_config_get(cfg: &AppConfig, key: &str) -> Result<String> {
     }
 }
 
-fn doctor_is_healthy(report: &DoctorReport) -> bool {
+pub(super) fn doctor_is_healthy(report: &DoctorReport) -> bool {
     report.clickhouse_healthy
         && report.database_exists
         && report.pending_migrations.is_empty()

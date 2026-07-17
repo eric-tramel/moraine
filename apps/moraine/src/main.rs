@@ -3,6 +3,7 @@ mod commands;
 mod managed_clickhouse;
 mod paths;
 mod process;
+mod progress;
 mod render;
 mod service;
 
