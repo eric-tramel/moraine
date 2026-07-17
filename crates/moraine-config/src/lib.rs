@@ -15,6 +15,7 @@ pub const KNOWN_INGEST_HARNESSES: &[&str] = &[
     "claude-code",
     "cursor",
     "hermes",
+    "kiro-cli",
     "kimi-cli",
     "opencode",
     "pi-coding-agent",
@@ -39,9 +40,11 @@ pub struct IngestSource {
     /// dumps), `"session_json"` (single-file-per-session JSON rewritten in
     /// place via atomic rename — used by live Hermes agent sessions),
     /// `"cursor_sqlite"` (polled Cursor `state.vscdb` SQLite databases), or
-    /// `"opencode_sqlite"` (polled OpenCode `opencode*.db` SQLite databases).
-    /// Empty means "infer": Hermes `*.json` globs use `session_json`, Cursor
-    /// `.vscdb` globs use `cursor_sqlite`, OpenCode `opencode*.db` globs use
+    /// `"opencode_sqlite"` (polled OpenCode `opencode*.db` SQLite databases),
+    /// or `"kiro_session"` (Kiro CLI JSONL transcripts paired with JSON
+    /// metadata sidecars). Empty means "infer": Hermes `*.json` globs use
+    /// `session_json`, Kiro CLI sources use `kiro_session`, Cursor `.vscdb`
+    /// globs use `cursor_sqlite`, OpenCode `opencode*.db` globs use
     /// `opencode_sqlite`, and other sources use `jsonl`.
     #[serde(default)]
     pub format: String,
@@ -586,6 +589,14 @@ fn default_sources() -> Vec<IngestSource> {
             format: String::new(),
         },
         IngestSource {
+            name: "kiro".to_string(),
+            harness: "kiro-cli".to_string(),
+            enabled: true,
+            glob: "~/.kiro/sessions/cli/*.jsonl".to_string(),
+            watch_root: "~/.kiro/sessions/cli".to_string(),
+            format: SOURCE_FORMAT_KIRO_SESSION.to_string(),
+        },
+        IngestSource {
             name: "kimi-cli".to_string(),
             harness: "kimi-cli".to_string(),
             enabled: true,
@@ -647,6 +658,7 @@ fn default_sources() -> Vec<IngestSource> {
 
 pub const SOURCE_FORMAT_JSONL: &str = "jsonl";
 pub const SOURCE_FORMAT_SESSION_JSON: &str = "session_json";
+pub const SOURCE_FORMAT_KIRO_SESSION: &str = "kiro_session";
 pub const SOURCE_FORMAT_CURSOR_SQLITE: &str = "cursor_sqlite";
 pub const SOURCE_FORMAT_OPENCODE_SQLITE: &str = "opencode_sqlite";
 
@@ -665,6 +677,9 @@ fn infer_source_format(harness: &str, glob: &str) -> &'static str {
     }
     if harness == "opencode" && opencode_db_name_matches(Path::new(&glob_lower)) {
         return SOURCE_FORMAT_OPENCODE_SQLITE;
+    }
+    if harness == "kiro-cli" {
+        return SOURCE_FORMAT_KIRO_SESSION;
     }
     let looks_like_json = !glob_lower.ends_with(".jsonl")
         && (glob_lower.ends_with(".json") || glob_lower.contains(".json"));
@@ -695,12 +710,16 @@ fn normalize_source_format(
         SOURCE_FORMAT_OPENCODE_SQLITE if harness != "opencode" => Err(anyhow::anyhow!(
             "ingest.sources[{source_idx}].format `{SOURCE_FORMAT_OPENCODE_SQLITE}` requires harness `opencode` (source `{source_name}` has harness `{harness}`); its synthetic records only normalize through the opencode adapter"
         )),
+        SOURCE_FORMAT_KIRO_SESSION if harness != "kiro-cli" => Err(anyhow::anyhow!(
+            "ingest.sources[{source_idx}].format `{SOURCE_FORMAT_KIRO_SESSION}` requires harness `kiro-cli` (source `{source_name}` has harness `{harness}`); its metadata sidecars only normalize through the Kiro CLI adapter"
+        )),
         SOURCE_FORMAT_JSONL
         | SOURCE_FORMAT_SESSION_JSON
+        | SOURCE_FORMAT_KIRO_SESSION
         | SOURCE_FORMAT_CURSOR_SQLITE
         | SOURCE_FORMAT_OPENCODE_SQLITE => Ok(resolved),
         _ => Err(anyhow::anyhow!(
-            "invalid ingest.sources[{source_idx}].format `{}` for source `{}`; expected one of: {SOURCE_FORMAT_JSONL}, {SOURCE_FORMAT_SESSION_JSON}, {SOURCE_FORMAT_CURSOR_SQLITE}, {SOURCE_FORMAT_OPENCODE_SQLITE}",
+            "invalid ingest.sources[{source_idx}].format `{}` for source `{}`; expected one of: {SOURCE_FORMAT_JSONL}, {SOURCE_FORMAT_SESSION_JSON}, {SOURCE_FORMAT_KIRO_SESSION}, {SOURCE_FORMAT_CURSOR_SQLITE}, {SOURCE_FORMAT_OPENCODE_SQLITE}",
             format.trim(),
             source_name
         )),
@@ -747,6 +766,19 @@ fn opencode_db_name_matches(path: &Path) -> bool {
 /// still enqueue (and debounce-coalesce on) the database they belong to.
 /// Anything else — including `state.vscdb.backup` — is untracked.
 pub fn map_tracked_path(format: &str, path: &str) -> Option<String> {
+    if format == SOURCE_FORMAT_KIRO_SESSION {
+        return match Path::new(path).extension().and_then(|ext| ext.to_str()) {
+            Some("jsonl") => Some(path.to_string()),
+            Some("json") => Some(
+                Path::new(path)
+                    .with_extension("jsonl")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            _ => None,
+        };
+    }
+
     let extension = format_tracked_extension(format);
     let has_extension = |candidate: &str| {
         Path::new(candidate)
@@ -2749,7 +2781,7 @@ watch_root = "~/.custom/sessions"
         std::fs::remove_file(&path).ok();
         assert!(
             format!("{err:#}").contains(
-                "expected one of: codex, claude-code, cursor, hermes, kimi-cli, opencode, pi-coding-agent"
+                "expected one of: codex, claude-code, cursor, hermes, kiro-cli, kimi-cli, opencode, pi-coding-agent"
             ),
             "unexpected error: {err:#}"
         );
@@ -2772,7 +2804,7 @@ watch_root = "~/.claude/projects"
         std::fs::remove_file(&path).ok();
         assert!(
             format!("{err:#}").contains(
-                "expected one of: codex, claude-code, cursor, hermes, kimi-cli, opencode, pi-coding-agent"
+                "expected one of: codex, claude-code, cursor, hermes, kiro-cli, kimi-cli, opencode, pi-coding-agent"
             ),
             "unexpected error: {err:#}"
         );
@@ -2978,6 +3010,25 @@ watch_root = "~/.cursor/projects"
         assert!(source.enabled, "cursor_sqlite is default on");
         assert_eq!(source.format, SOURCE_FORMAT_CURSOR_SQLITE);
         assert_eq!(source.harness, "cursor");
+    }
+
+    #[test]
+    fn shipped_template_enables_kiro_sessions_by_default() {
+        let path = write_temp_config(
+            include_str!("../../../config/moraine.toml"),
+            "shipped-template-kiro",
+        );
+        let cfg = load_config(&path).expect("shipped template must parse");
+        std::fs::remove_file(&path).ok();
+        let source = cfg
+            .ingest
+            .sources
+            .iter()
+            .find(|source| source.name == "kiro")
+            .expect("template ships a Kiro CLI source");
+        assert!(source.enabled);
+        assert_eq!(source.format, SOURCE_FORMAT_KIRO_SESSION);
+        assert_eq!(source.harness, "kiro-cli");
     }
 
     #[test]
@@ -3211,6 +3262,45 @@ format = "jsonl"
     }
 
     #[test]
+    fn default_sources_enable_kiro_sessions() {
+        let sources = default_sources();
+        let source = sources
+            .iter()
+            .find(|source| source.name == "kiro")
+            .expect("defaults include a Kiro CLI source");
+        assert!(source.enabled);
+        assert_eq!(source.harness, "kiro-cli");
+        assert_eq!(source.format, SOURCE_FORMAT_KIRO_SESSION);
+        assert_eq!(source.glob, "~/.kiro/sessions/cli/*.jsonl");
+        assert_eq!(source.watch_root, "~/.kiro/sessions/cli");
+    }
+
+    #[test]
+    fn load_config_infers_kiro_session_format() {
+        let path = write_temp_config(
+            r#"
+[[ingest.sources]]
+name = "kiro"
+harness = "kiro-cli"
+enabled = true
+glob = "~/.kiro/sessions/cli/*.jsonl"
+watch_root = "~/.kiro/sessions/cli"
+"#,
+            "kiro-session-format",
+        );
+        let cfg = load_config(&path).expect("Kiro CLI source should be accepted");
+        std::fs::remove_file(&path).ok();
+        let source = cfg
+            .ingest
+            .sources
+            .iter()
+            .find(|source| source.name == "kiro")
+            .expect("Kiro source");
+        assert_eq!(source.format, SOURCE_FORMAT_KIRO_SESSION);
+        assert_eq!(source.tracked_extension(), "jsonl");
+    }
+
+    #[test]
     fn load_config_accepts_cursor_sqlite_format() {
         let path = write_temp_config(
             r#"
@@ -3282,7 +3372,7 @@ format = "sqlite"
         std::fs::remove_file(&path).ok();
         assert!(
             format!("{err:#}")
-                .contains("expected one of: jsonl, session_json, cursor_sqlite, opencode_sqlite"),
+                .contains("expected one of: jsonl, session_json, kiro_session, cursor_sqlite, opencode_sqlite"),
             "unexpected error: {err:#}"
         );
     }
@@ -3300,6 +3390,18 @@ format = "sqlite"
         );
         assert_eq!(
             map_tracked_path(SOURCE_FORMAT_SESSION_JSON, "/tmp/a.jsonl"),
+            None
+        );
+        assert_eq!(
+            map_tracked_path(SOURCE_FORMAT_KIRO_SESSION, "/tmp/session.jsonl"),
+            Some("/tmp/session.jsonl".to_string())
+        );
+        assert_eq!(
+            map_tracked_path(SOURCE_FORMAT_KIRO_SESSION, "/tmp/session.json"),
+            Some("/tmp/session.jsonl".to_string())
+        );
+        assert_eq!(
+            map_tracked_path(SOURCE_FORMAT_KIRO_SESSION, "/tmp/session.txt"),
             None
         );
     }

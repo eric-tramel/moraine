@@ -82,6 +82,14 @@ watch_root = "~/.claude/projects"
 # watch_root = "~/Library/Application Support/Claude/local-agent-mode-sessions"
 
 [[ingest.sources]]
+name = "kiro"
+harness = "kiro-cli"
+enabled = true
+glob = "~/.kiro/sessions/cli/*.jsonl"
+watch_root = "~/.kiro/sessions/cli"
+format = "kiro_session"
+
+[[ingest.sources]]
 name = "kimi-cli"
 harness = "kimi-cli"
 enabled = true

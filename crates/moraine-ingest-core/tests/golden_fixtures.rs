@@ -156,6 +156,14 @@ fn golden_cases() -> [GoldenCase; 11] {
             format: GoldenFormat::Jsonl,
         },
         GoldenCase {
+            name: "kiro_cli",
+            harness: "kiro-cli",
+            source_name: "golden-kiro-cli",
+            fixture_rel: "fixtures/kiro/session.jsonl",
+            source_file: "/fixtures/kiro/11111111-2222-4333-8444-555555555555.jsonl",
+            format: GoldenFormat::Jsonl,
+        },
+        GoldenCase {
             name: "kimi_cli_subagent",
             harness: "kimi-cli",
             source_name: "golden-kimi-cli-subagent",

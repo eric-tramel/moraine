@@ -15,7 +15,8 @@ pub struct Checkpoint {
     /// formats, whose `last_offset`/`last_line_no` semantics are unchanged.
     #[serde(default)]
     pub cursor_json: String,
-    /// Identity hash of the underlying database file for DB-backed sources.
+    /// Identity hash of the underlying database file for DB-backed sources,
+    /// or companion metadata for paired file-backed formats.
     #[serde(default)]
     pub source_fingerprint: u64,
     /// Hash of the relevant database schema for DB-backed sources.

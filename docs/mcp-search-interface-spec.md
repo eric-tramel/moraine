@@ -284,11 +284,11 @@ search_sessions({
 - When present, each must contain at least one non-whitespace character after
   trimming; blank values return `invalid_request`.
 - Each is an exact, case-sensitive filter. Supported `harness` values are
-  `codex`, `claude-code`, `cursor`, `hermes`, `kimi-cli`, `qwen-code`,
-  `opencode`, and `pi-coding-agent`.
+  `codex`, `claude-code`, `cursor`, `hermes`, `kiro-cli`, `kimi-cli`,
+  `qwen-code`, `opencode`, and `pi-coding-agent`.
 - `source` matches a configured ingest source name. The default configured
   values are `claude`, macOS-only `claude-cowork`, `codex`, `cursor`,
-  `cursor-sqlite`, `hermes`, `kimi-cli`, `omp`, `opencode`, `pi`, and
+  `cursor-sqlite`, `hermes`, `kimi-cli`, `kiro`, `omp`, `opencode`, `pi`, and
   `qwen-code`; each server's MCP tool instructions list its actual configured
   source names.
 - When both are present, both predicates must match. Use `source` to distinguish

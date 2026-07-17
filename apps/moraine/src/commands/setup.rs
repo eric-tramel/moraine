@@ -17,7 +17,7 @@ use crate::render::CliOutput;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table};
 
 mod harnesses;
-use harnesses::{McpConfigFormat, McpConfigWrite};
+use harnesses::{ManagedFileWrite, McpConfigFormat, McpConfigWrite};
 
 const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../../../../config/moraine.toml");
 const HOST_WIDE_ACCESS_WARNING: &str =
@@ -1427,6 +1427,44 @@ impl SetupProgress {
         );
     }
 
+    fn managed_file_start(&self, write: &ManagedFileWrite) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "   {} {}",
+            self.mark("→", ">", Style::new().cyan()),
+            self.label(&format!(
+                "Updating {} at {}",
+                write.label(),
+                write.path().display()
+            ))
+        );
+    }
+
+    fn managed_file_success(&self, write: &ManagedFileWrite) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "   {} {}",
+            self.mark("✓", "[ok]", Style::new().green()),
+            self.dim(&format!("Updated {}", write.path().display()))
+        );
+    }
+
+    fn managed_file_error(&self, write: &ManagedFileWrite, error: &str) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "   {} {} {}",
+            self.mark("✗", "[err]", Style::new().red()),
+            self.dim(&format!("Could not update {}", write.path().display())),
+            self.dim(error)
+        );
+    }
+
     fn ensure_started(&mut self) {
         if self.started {
             return;
@@ -1520,7 +1558,7 @@ fn execute_mcp_plan_with_progress(
     runner: &mut dyn CommandRunner,
     progress: &mut SetupProgress,
 ) -> Result<McpTargetReport> {
-    if plan.steps.is_empty() && plan.config_writes.is_empty() {
+    if plan.steps.is_empty() && plan.config_writes.is_empty() && plan.managed_writes.is_empty() {
         return Ok(McpTargetReport::manual(plan));
     }
     let commands = plan.commands();
@@ -1595,6 +1633,25 @@ fn execute_mcp_plan_with_progress(
         }
     }
 
+    if failed.is_none() {
+        for write in &plan.managed_writes {
+            progress.managed_file_start(write);
+            match apply_managed_file_write(write) {
+                Ok(report) => {
+                    progress.managed_file_success(write);
+                    config_files.push(report);
+                }
+                Err(exc) => {
+                    let error = format!("failed to update {}: {exc}", write.path().display());
+                    progress.managed_file_error(write, &exc.to_string());
+                    config_files.push(McpConfigFileReport::managed_error(write, &exc.to_string()));
+                    failed = Some(error);
+                    break;
+                }
+            }
+        }
+    }
+
     if let Some(error) = failed {
         progress.target_error(plan.target);
         Ok(McpTargetReport {
@@ -1651,24 +1708,36 @@ struct McpPlan {
     action: McpAction,
     steps: Vec<McpPlanStep>,
     config_writes: Vec<McpConfigWrite>,
+    managed_writes: Vec<ManagedFileWrite>,
     manual_snippet: Option<String>,
 }
 
 impl McpPlan {
     fn for_target(target: SetupMcpTarget, config_target: &ConfigTarget) -> Self {
-        Self::for_target_with_home(
+        Self::for_target_with_roots(
             target,
             config_target,
             env::var_os("HOME").map(PathBuf::from),
+            env::var_os("KIRO_HOME").map(PathBuf::from),
         )
     }
 
+    #[cfg(test)]
     fn for_target_with_home(
         target: SetupMcpTarget,
         config_target: &ConfigTarget,
         home: Option<PathBuf>,
     ) -> Self {
-        harnesses::mcp_plan(target, config_target, home)
+        Self::for_target_with_roots(target, config_target, home, None)
+    }
+
+    fn for_target_with_roots(
+        target: SetupMcpTarget,
+        config_target: &ConfigTarget,
+        home: Option<PathBuf>,
+        kiro_home: Option<PathBuf>,
+    ) -> Self {
+        harnesses::mcp_plan(target, config_target, home, kiro_home)
     }
 
     fn replace_registration(
@@ -1693,6 +1762,7 @@ impl McpPlan {
                 add_step,
             ],
             config_writes: Vec::new(),
+            managed_writes: Vec::new(),
             manual_snippet: None,
         }
     }
@@ -1703,6 +1773,7 @@ impl McpPlan {
             action: McpAction::ManualInstructions,
             steps: Vec::new(),
             config_writes: Vec::new(),
+            managed_writes: Vec::new(),
             manual_snippet: Some(snippet),
         }
     }
@@ -1724,6 +1795,7 @@ impl McpPlan {
             action: McpAction::WriteConfig,
             steps: Vec::new(),
             config_writes: vec![write],
+            managed_writes: Vec::new(),
             manual_snippet: None,
         }
     }
@@ -1736,6 +1808,11 @@ impl McpPlan {
         self.config_writes
             .iter()
             .map(McpConfigFileReport::planned)
+            .chain(
+                self.managed_writes
+                    .iter()
+                    .map(McpConfigFileReport::managed_planned),
+            )
             .collect()
     }
 }
@@ -1865,6 +1942,38 @@ impl McpConfigFileReport {
             error: Some(error.to_string()),
         }
     }
+
+    fn managed_planned(write: &ManagedFileWrite) -> Self {
+        Self {
+            path: write.path().display().to_string(),
+            action: "would_update".to_string(),
+            error: None,
+        }
+    }
+
+    fn managed_written(write: &ManagedFileWrite) -> Self {
+        Self {
+            path: write.path().display().to_string(),
+            action: "updated".to_string(),
+            error: None,
+        }
+    }
+
+    fn managed_unchanged(write: &ManagedFileWrite) -> Self {
+        Self {
+            path: write.path().display().to_string(),
+            action: "unchanged".to_string(),
+            error: None,
+        }
+    }
+
+    fn managed_error(write: &ManagedFileWrite, error: &str) -> Self {
+        Self {
+            path: write.path().display().to_string(),
+            action: "error".to_string(),
+            error: Some(error.to_string()),
+        }
+    }
 }
 
 fn apply_mcp_config_write(write: &McpConfigWrite) -> Result<McpConfigFileReport> {
@@ -1872,6 +1981,22 @@ fn apply_mcp_config_write(write: &McpConfigWrite) -> Result<McpConfigFileReport>
     write.merge_into(&mut root)?;
     write_json_atomic(write.path(), &Value::Object(root))?;
     Ok(McpConfigFileReport::written(write))
+}
+
+fn apply_managed_file_write(write: &ManagedFileWrite) -> Result<McpConfigFileReport> {
+    match fs::read(write.path()) {
+        Ok(content) if content == write.content().as_bytes() => {
+            return Ok(McpConfigFileReport::managed_unchanged(write));
+        }
+        Ok(_) => {}
+        Err(exc) if exc.kind() == ErrorKind::NotFound => {}
+        Err(exc) => {
+            return Err(exc).with_context(|| format!("failed to read {}", write.path().display()));
+        }
+    }
+
+    write_bytes_atomic(write.path(), write.content().as_bytes())?;
+    Ok(McpConfigFileReport::managed_written(write))
 }
 
 fn read_json_object_or_default(path: &Path, format: McpConfigFormat) -> Result<Map<String, Value>> {
@@ -1904,6 +2029,13 @@ fn read_jsonc_value(path: &Path, content: &str) -> Result<Value> {
 }
 
 fn write_json_atomic(path: &Path, value: &Value) -> Result<()> {
+    let mut content = serde_json::to_vec_pretty(value)
+        .with_context(|| format!("failed to serialize JSON for {}", path.display()))?;
+    content.push(b'\n');
+    write_bytes_atomic(path, &content)
+}
+
+fn write_bytes_atomic(path: &Path, content: &[u8]) -> Result<()> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -1926,10 +2058,7 @@ fn write_json_atomic(path: &Path, value: &Value) -> Result<()> {
         match private_create_new_options().open(&temp_path) {
             Ok(mut file) => {
                 let result = (|| {
-                    serde_json::to_writer_pretty(&mut file, value).with_context(|| {
-                        format!("failed to serialize JSON for {}", path.display())
-                    })?;
-                    file.write_all(b"\n")
+                    file.write_all(content)
                         .with_context(|| format!("failed to write {}", temp_path.display()))?;
                     file.flush()
                         .with_context(|| format!("failed to flush {}", temp_path.display()))?;
@@ -1956,7 +2085,7 @@ fn write_json_atomic(path: &Path, value: &Value) -> Result<()> {
     }
 
     bail!(
-        "failed to create a unique temporary JSON file in {}",
+        "failed to create a unique temporary file in {}",
         parent.display()
     );
 }
@@ -3854,6 +3983,165 @@ host = "127.42.0.9"
             .expect("error")
             .contains(&commands[3].display()));
         assert_eq!(runner.ran, commands[..4]);
+    }
+
+    #[test]
+    fn kiro_setup_registers_mcp_and_writes_managed_steering() {
+        let home = temp_path("kiro-setup-home");
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/config.toml"),
+            source: ConfigTargetSource::HomeDefault,
+        };
+        let plan =
+            McpPlan::for_target_with_home(SetupMcpTarget::KiroCli, &target, Some(home.clone()));
+        assert_eq!(plan.action, McpAction::Execute);
+        let moraine_command = env::current_exe()
+            .expect("current executable")
+            .into_os_string()
+            .into_string()
+            .expect("UTF-8 executable path");
+        let commands = plan.commands();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0].args,
+            vec![
+                "mcp",
+                "add",
+                "--name",
+                "moraine",
+                "--scope",
+                "global",
+                "--command",
+                moraine_command.as_str(),
+                "--args",
+                r#"["run","mcp"]"#,
+                "--force",
+            ]
+        );
+        assert_eq!(plan.managed_writes.len(), 1);
+        assert_eq!(
+            plan.managed_writes[0].path(),
+            home.join(".kiro").join("steering").join("moraine.md")
+        );
+
+        let mut runner = FakeRunner::default()
+            .with_existing("kiro-cli")
+            .with_response(commands[0].clone(), true, "");
+        let report = execute_mcp_plan(plan, &mut runner).expect("execute Kiro setup");
+        assert_eq!(report.status, SetupStatus::Ok);
+        assert_eq!(runner.ran, commands);
+        assert_eq!(report.config_files.len(), 1);
+        assert_eq!(report.config_files[0].action, "updated");
+
+        let steering_path = home.join(".kiro").join("steering").join("moraine.md");
+        assert_eq!(
+            fs::read_to_string(&steering_path).expect("read Kiro steering"),
+            include_str!("setup/kiro-steering.md")
+        );
+        assert!(!home
+            .join(".kiro")
+            .join("steering")
+            .join("AGENTS.md")
+            .exists());
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&steering_path)
+                .expect("Kiro steering metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        let repeat_plan =
+            McpPlan::for_target_with_home(SetupMcpTarget::KiroCli, &target, Some(home.clone()));
+        let repeat_commands = repeat_plan.commands();
+        let mut repeat_runner = FakeRunner::default()
+            .with_existing("kiro-cli")
+            .with_response(repeat_commands[0].clone(), true, "");
+        let repeat_report =
+            execute_mcp_plan(repeat_plan, &mut repeat_runner).expect("repeat Kiro setup");
+        assert_eq!(repeat_report.status, SetupStatus::Ok);
+        assert_eq!(repeat_report.config_files[0].action, "unchanged");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn kiro_setup_respects_kiro_home_and_custom_moraine_config() {
+        let home = temp_path("kiro-default-home");
+        let kiro_home = temp_path("kiro-override-home");
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/custom moraine.toml"),
+            source: ConfigTargetSource::Cli,
+        };
+        let plan = McpPlan::for_target_with_roots(
+            SetupMcpTarget::KiroCli,
+            &target,
+            Some(home),
+            Some(kiro_home.clone()),
+        );
+
+        assert_eq!(
+            plan.managed_writes[0].path(),
+            kiro_home.join("steering").join("moraine.md")
+        );
+        let moraine_command = env::current_exe()
+            .expect("current executable")
+            .into_os_string()
+            .into_string()
+            .expect("UTF-8 executable path");
+        assert_eq!(
+            plan.commands()[0].args,
+            vec![
+                "mcp",
+                "add",
+                "--name",
+                "moraine",
+                "--scope",
+                "global",
+                "--command",
+                moraine_command.as_str(),
+                "--args",
+                r#"["run","mcp","--config","/tmp/custom moraine.toml"]"#,
+                "--force",
+            ]
+        );
+    }
+
+    #[test]
+    fn kiro_setup_without_home_returns_manual_instructions() {
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/custom.toml"),
+            source: ConfigTargetSource::Cli,
+        };
+        let plan = McpPlan::for_target_with_roots(SetupMcpTarget::KiroCli, &target, None, None);
+
+        assert_eq!(plan.action, McpAction::ManualInstructions);
+        let snippet = plan.manual_snippet.expect("manual Kiro instructions");
+        assert!(snippet.contains("KIRO_HOME and HOME are not set"));
+        assert!(snippet.contains("kiro-cli mcp add"));
+    }
+
+    #[test]
+    fn kiro_mcp_failure_does_not_write_steering() {
+        let home = temp_path("kiro-failed-setup-home");
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/config.toml"),
+            source: ConfigTargetSource::HomeDefault,
+        };
+        let plan =
+            McpPlan::for_target_with_home(SetupMcpTarget::KiroCli, &target, Some(home.clone()));
+        let commands = plan.commands();
+        let mut runner = FakeRunner::default()
+            .with_existing("kiro-cli")
+            .with_response(commands[0].clone(), false, "registration failed");
+
+        let report = execute_mcp_plan(plan, &mut runner).expect("execute failed Kiro setup");
+
+        assert_eq!(report.status, SetupStatus::Error);
+        assert!(report.config_files.is_empty());
+        assert!(!home.join(".kiro").join("steering").exists());
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]

@@ -14,6 +14,9 @@
 #                                 format = "session_json" path)
 #   SANDBOX_KIMI_SESSIONS_DIR     host ~/.kimi/sessions, read-only
 #                                 (wire.jsonl files written by the Kimi CLI)
+#   SANDBOX_KIRO_SESSIONS_DIR     host ~/.kiro/sessions/cli, read-only
+#                                 (paired JSONL transcripts and JSON metadata
+#                                 ingested via format = "kiro_session")
 #   SANDBOX_CURSOR_PROJECTS_DIR   host ~/.cursor/projects, read-only
 #                                 (Agent JSONL transcript files under
 #                                 agent-transcripts/)
@@ -30,5 +33,6 @@ services:
       - "${SANDBOX_CLAUDE_PROJECTS_DIR}:/host/claude/projects:ro"
       - "${SANDBOX_HERMES_SESSIONS_DIR}:/host/hermes/sessions:ro"
       - "${SANDBOX_KIMI_SESSIONS_DIR}:/host/kimi/sessions:ro"
+      - "${SANDBOX_KIRO_SESSIONS_DIR}:/host/kiro/sessions:ro"
       - "${SANDBOX_CURSOR_PROJECTS_DIR}:/host/cursor/projects:ro"
       - "${SANDBOX_CURSOR_STATE_DIR}:/host/cursor/state:ro"

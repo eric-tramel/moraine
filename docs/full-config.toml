@@ -132,8 +132,9 @@ glob = "~/.codex/sessions/**/*.jsonl"
 # the glob prefix before the first wildcard.
 watch_root = "~/.codex/sessions"
 
-# On-disk format. Use "jsonl", "session_json", "cursor_sqlite", or
-# "opencode_sqlite". Empty or omitted means Moraine infers from harness+glob.
+# On-disk format. Use "jsonl", "session_json", "kiro_session",
+# "cursor_sqlite", or "opencode_sqlite". Empty or omitted means Moraine
+# infers from harness+glob.
 format = "jsonl"
 
 [[ingest.sources]]
@@ -155,6 +156,15 @@ enabled = false
 glob = "~/Library/Application Support/Claude/local-agent-mode-sessions/**/.claude/projects/**/*.jsonl"
 watch_root = "~/Library/Application Support/Claude/local-agent-mode-sessions"
 format = "jsonl"
+
+[[ingest.sources]]
+# Kiro CLI pairs each JSONL transcript with a same-named JSON metadata file.
+name = "kiro"
+harness = "kiro-cli"
+enabled = true
+glob = "~/.kiro/sessions/cli/*.jsonl"
+watch_root = "~/.kiro/sessions/cli"
+format = "kiro_session"
 
 [[ingest.sources]]
 # Kimi CLI wire JSONL session files.
