@@ -260,7 +260,7 @@ search_sessions({
 - When omitted or `null`, defaults to:
 
 ```json
-["user_input", "assistant_response", "tool_response"]
+["user_input", "assistant_response"]
 ```
 
 - May contain any supported event type except `unknown`.
@@ -324,7 +324,6 @@ Default behavior searches:
 ```text
 user_input
 assistant_response
-tool_response
 ```
 
 This default intentionally omits:
@@ -332,6 +331,7 @@ This default intentionally omits:
 ```text
 reasoning
 tool_call
+tool_response
 compaction
 system
 runtime
@@ -339,6 +339,9 @@ unknown
 ```
 
 Callers may explicitly include supported omitted types when they need them.
+Raw tool evidence requires `tool_call` or `tool_response` in `event_types`.
+Open a returned turn or session handle to inspect the full context around a
+search hit.
 
 Examples:
 
@@ -378,7 +381,7 @@ should not compare scores across different queries.
   "request": {
     "query": "clickhouse schema migration failure",
     "within_id": null,
-    "event_types": ["user_input", "assistant_response", "tool_response"],
+    "event_types": ["user_input", "assistant_response"],
     "harness": null,
     "source": null,
     "n_hits": 10
@@ -488,7 +491,7 @@ Response:
   "request": {
     "query": "ClickHouse schema migration failure",
     "within_id": null,
-    "event_types": ["user_input", "assistant_response", "tool_response"],
+    "event_types": ["user_input", "assistant_response"],
     "n_hits": 10
   },
   "data": {
@@ -669,7 +672,7 @@ Response:
   "request": {
     "query": "nonexistent exact phrase for this index",
     "within_id": null,
-    "event_types": ["user_input", "assistant_response", "tool_response"],
+    "event_types": ["user_input", "assistant_response"],
     "n_hits": 5
   },
   "data": {
