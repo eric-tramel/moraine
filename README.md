@@ -5,9 +5,9 @@
 [![Docs](https://github.com/eric-tramel/moraine/actions/workflows/docs-deploy.yml/badge.svg)](https://eric-tramel.github.io/moraine/)
 
 Moraine is a local trace stack for agent work. It indexes sessions from agent
-harnesses such as Codex, Claude Code, Qwen Code, Kimi CLI, OpenCode, Hermes, and
-Pi Coding Agent into ClickHouse, serves a monitor UI, and exposes MCP retrieval
-over the indexed history.
+harnesses such as Codex, Claude Code, Qwen Code, Kiro CLI, Kimi CLI, OpenCode,
+Hermes, and Pi Coding Agent into ClickHouse, serves a monitor UI, and exposes MCP
+retrieval over the indexed history.
 
 Agents get searchable long-term memory through MCP. You get a unified local
 record of what happened across providers, including tools, tokens, and
@@ -39,6 +39,7 @@ Moraine ships session trace ingestion adapters for these agent harnesses:
 | --- | --- | --- |
 | [Codex](https://developers.openai.com/codex) | `codex` | JSONL session files under `~/.codex/sessions` |
 | [Claude Code](https://code.claude.com/docs/en/overview) | `claude-code` | JSONL project session files under `~/.claude/projects` |
+| [Kiro CLI](https://kiro.dev/docs/cli/) | `kiro-cli` | Paired JSONL transcripts and JSON metadata under `~/.kiro/sessions/cli` |
 | [Kimi CLI](https://moonshotai.github.io/kimi-cli/en/) | `kimi-cli` | `wire.jsonl` session traces under `~/.kimi/sessions` |
 | [Qwen Code](https://github.com/QwenLM/qwen-code) | `qwen-code` | JSONL chat records under `~/.qwen/projects/*/chats` |
 | [OpenCode](https://opencode.ai/) | `opencode` | SQLite session history from `~/.local/share/opencode/opencode*.db` (default on; `opencode_sqlite` format) |
@@ -65,14 +66,15 @@ For release bundles, upgrades, project-scoped setup, and other harnesses, see th
 ## Connect Agent Harnesses
 
 Use `moraine setup` to install or update the Moraine plugins for Claude Code,
-Codex, and Hermes, or to register Moraine MCP for supported harnesses such as
-Qwen Code, OpenCode, Cursor, Kimi CLI, and Pi Coding Agent. The integrations use
-the `moraine` CLI on your `PATH` and the running local stack.
+Codex, and Hermes; install Kiro CLI's global steering and MCP registration; or
+register Moraine MCP for supported harnesses such as Qwen Code, OpenCode,
+Cursor, Kimi CLI, and Pi Coding Agent. The integrations use the `moraine` CLI on
+your `PATH` and the running local stack.
 
-Start a new agent session after installing an integration. Claude Code, Codex,
-and Hermes sessions get `moraine:session-search`, `moraine:realtime-peek`, and
-`moraine:bug-report` guidance, and Moraine MCP tools are exposed with each
-harness's MCP naming scheme. Then ask:
+Start a new agent session after installing an integration. The Claude Code,
+Codex, and Hermes plugins provide named Moraine skills. Kiro CLI receives
+equivalent search and realtime guidance from its managed global steering file.
+Moraine MCP tools are exposed with each harness's MCP naming scheme. Then ask:
 
 ```text
 What are my agents doing right now?
@@ -85,9 +87,11 @@ user. For project-scoped setup, duplicate MCP cleanup, and other clients, see
 ## Agent Harness Guidance
 
 The Claude Code, Codex, and Hermes plugins already bundle Moraine search
-guidance. If you use manual MCP registration or another harness, add the
-following guidance to your global harness instructions, such as
-`~/.codex/AGENTS.md` for Codex or `~/.claude/CLAUDE.md` for Claude Code:
+guidance, and `moraine setup --mcp-target kiro-cli` installs it as
+`~/.kiro/steering/moraine.md` for Kiro CLI. If you use manual MCP registration
+or another harness, add the following guidance to its global instructions, such
+as that Kiro steering path, `~/.codex/AGENTS.md` for Codex, or
+`~/.claude/CLAUDE.md` for Claude Code:
 
 ```markdown
 - You have access to all past agent sessions (whether codex, claude, hermes, etc., anything) via moraine search tools.
@@ -103,6 +107,7 @@ With this you can do operations like the following:
 claude -p "What are my agents doing right now?"
 codex exec "What are my agents doing right now?"
 hermes -z "What are my agents doing right now?"
+kiro-cli chat --no-interactive "What are my agents doing right now?"
 ```
 
 ## Development
@@ -118,6 +123,11 @@ The repository-managed pre-commit hook can be installed with:
 ```bash
 make hooks-install
 ```
+
+Moraine contributor workflows are available through the repository's Codex
+plugin and Kiro workspace agent with native Agent Skills. See
+[Agent Contributor Workflows](docs/development/agent-contributor-workflows.md)
+for installation and usage.
 
 To put the current checkout (tip-of-branch, no tagged release needed) onto your
 host for testing, build and install it over the active `moraine` on your PATH:

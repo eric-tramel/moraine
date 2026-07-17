@@ -2,13 +2,14 @@ use crate::checkpoint::checkpoint_key;
 use crate::model::{Checkpoint, NormalizedRecord, RowBatch};
 use crate::normalize::{normalize_record, normalize_record_with_ts_hint};
 use crate::sources::claude_code::cowork_session_path;
+use crate::sources::kiro_cli::{load_kiro_session_metadata, KiroSessionMetadata};
 use crate::sources::shared::{format_record_ts, parse_record_ts};
 use crate::sqlite_poll::VolatilePollMap;
 use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
 use anyhow::{Context, Result};
 use moraine_config::{
     is_workflow_journal_path, map_tracked_path, AppConfig, SOURCE_FORMAT_CURSOR_SQLITE,
-    SOURCE_FORMAT_OPENCODE_SQLITE, SOURCE_FORMAT_SESSION_JSON,
+    SOURCE_FORMAT_KIRO_SESSION, SOURCE_FORMAT_OPENCODE_SQLITE, SOURCE_FORMAT_SESSION_JSON,
 };
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -875,6 +876,7 @@ pub(crate) async fn process_file(
     let file_size = meta.len();
     let cp_key = checkpoint_key(&work.source_name, source_file);
     let committed = { checkpoints.read().await.get(&cp_key).cloned() };
+    let first_ingest = committed.is_none();
 
     let mut checkpoint = committed.unwrap_or(Checkpoint {
         source_name: work.source_name.clone(),
@@ -897,15 +899,48 @@ pub(crate) async fn process_file(
         generation_changed = true;
     }
 
-    if file_size == checkpoint.last_offset && !generation_changed {
+    let kiro_metadata = if work.format == SOURCE_FORMAT_KIRO_SESSION {
+        Some(load_kiro_session_metadata(source_file))
+    } else {
+        None
+    };
+    let sidecar_fingerprint = kiro_metadata
+        .as_ref()
+        .map_or(checkpoint.source_fingerprint, |metadata| {
+            metadata.fingerprint()
+        });
+    let sidecar_changed = kiro_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.fingerprint() != checkpoint.source_fingerprint);
+    let sidecar_needs_processing =
+        kiro_metadata.is_some() && (first_ingest || generation_changed || sidecar_changed);
+
+    if file_size == checkpoint.last_offset && !generation_changed && !sidecar_needs_processing {
         return Ok(());
     }
     if !config.ingest.exclude_project_dirs.is_empty() {
-        let cwd = infer_first_source_cwd(
-            source_file,
-            &work.harness,
-            jsonl_source_line_byte_limit(config),
-        );
+        let sidecar_cwd = kiro_metadata
+            .as_ref()
+            .map(KiroSessionMetadata::cwd)
+            .unwrap_or_default();
+        let cwd = if sidecar_cwd.trim().is_empty() {
+            infer_first_source_cwd(
+                source_file,
+                &work.harness,
+                jsonl_source_line_byte_limit(config),
+            )
+        } else {
+            sidecar_cwd.to_string()
+        };
+        if work.format == SOURCE_FORMAT_KIRO_SESSION && !std::path::Path::new(&cwd).is_absolute() {
+            debug!(
+                source_name = %work.source_name,
+                harness = %work.harness,
+                source_file,
+                "skipping Kiro session because project exclusions are configured and the session cwd is unavailable"
+            );
+            return Ok(());
+        }
         if config.is_project_dir_excluded(&cwd) {
             debug!(
                 source_name = %work.source_name,
@@ -932,11 +967,31 @@ pub(crate) async fn process_file(
     } else {
         InitialSourceHints::default()
     };
-    let mut session_hint = initial_hints.session_id;
-    let mut model_hint = String::new();
-    let mut cwd_hint = initial_hints.cwd;
-    let mut record_ts_hint =
-        infer_initial_record_ts_hint(source_file, checkpoint.last_offset).unwrap_or_default();
+    let mut session_hint = kiro_metadata
+        .as_ref()
+        .map(KiroSessionMetadata::session_id)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&initial_hints.session_id)
+        .to_string();
+    let mut model_hint = kiro_metadata
+        .as_ref()
+        .map(KiroSessionMetadata::model)
+        .unwrap_or_default()
+        .to_string();
+    let mut cwd_hint = kiro_metadata
+        .as_ref()
+        .map(KiroSessionMetadata::cwd)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&initial_hints.cwd)
+        .to_string();
+    let mut record_ts_hint = kiro_metadata
+        .as_ref()
+        .map(KiroSessionMetadata::created_at)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            infer_initial_record_ts_hint(source_file, checkpoint.last_offset).unwrap_or_default()
+        });
     let mut session_cursors: HashMap<String, SessionCursor> = HashMap::new();
 
     let mut batch = RowBatch::default();
@@ -963,6 +1018,71 @@ pub(crate) async fn process_file(
         }
     }
     let source_line_byte_limit = jsonl_source_line_byte_limit(config);
+
+    if sidecar_needs_processing {
+        let metadata = kiro_metadata
+            .as_ref()
+            .expect("sidecar processing requires Kiro metadata state");
+        if let Some(error_text) = metadata.error() {
+            batch.push_error_row(json!({
+                "source_name": work.source_name,
+                "harness": work.harness,
+                "source_file": source_file,
+                "source_inode": inode,
+                "source_generation": checkpoint.source_generation,
+                "source_line_no": 0u64,
+                "source_offset": 0u64,
+                "error_kind": "kiro_session_metadata_error",
+                "error_text": error_text,
+                "raw_fragment": "",
+            }));
+        }
+
+        if let Some(record) = metadata.record() {
+            match normalize_record_with_ts_hint(
+                record,
+                &work.source_name,
+                &work.harness,
+                source_file,
+                inode,
+                checkpoint.source_generation,
+                0,
+                0,
+                &session_hint,
+                &model_hint,
+                &cwd_hint,
+                &record_ts_hint,
+            ) {
+                Ok(normalized) => {
+                    if let Some(record_ts) =
+                        normalized.raw_row.get("record_ts").and_then(Value::as_str)
+                    {
+                        if parse_record_ts(record_ts).is_some() {
+                            record_ts_hint = record_ts.to_string();
+                        }
+                    }
+                    session_hint = normalized.session_hint.clone();
+                    model_hint = normalized.model_hint.clone();
+                    cwd_hint = normalized.cwd_hint.clone();
+                    batch.extend_normalized(normalized);
+                }
+                Err(exc) => {
+                    batch.push_error_row(json!({
+                        "source_name": work.source_name,
+                        "harness": work.harness,
+                        "source_file": source_file,
+                        "source_inode": inode,
+                        "source_generation": checkpoint.source_generation,
+                        "source_line_no": 0u64,
+                        "source_offset": 0u64,
+                        "error_kind": "normalize_error",
+                        "error_text": exc.to_string(),
+                        "raw_fragment": truncate(&record.to_string(), 20_000),
+                    }));
+                }
+            }
+        }
+    }
 
     loop {
         let start_offset = offset;
@@ -1178,10 +1298,15 @@ pub(crate) async fn process_file(
         last_offset: offset,
         last_line_no: line_no,
         status: "active".to_string(),
+        source_fingerprint: sidecar_fingerprint,
         ..Default::default()
     };
 
-    if batch.row_count() > 0 || generation_changed || offset != checkpoint.last_offset {
+    if batch.row_count() > 0
+        || generation_changed
+        || sidecar_needs_processing
+        || offset != checkpoint.last_offset
+    {
         batch.checkpoint = Some(final_checkpoint);
         sink_tx
             .send(SinkMessage::Batch(batch))
@@ -1596,7 +1721,7 @@ mod tests {
     use serde_json::{json, Value};
     use std::collections::HashMap;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};

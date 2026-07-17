@@ -1,0 +1,51 @@
+{
+  "session_id": "11111111-2222-4333-8444-555555555555",
+  "cwd": "/work/kiro-demo",
+  "title": "Inspect current behavior",
+  "created_at": "2026-05-28T20:26:40Z",
+  "updated_at": "2026-05-28T20:27:10Z",
+  "session_state": {
+    "agent_name": "kiro_default",
+    "rts_model_state": {
+      "model_info": {
+        "model_id": "claude-sonnet-4"
+      }
+    },
+    "conversation_metadata": {
+      "user_turn_metadatas": [
+        {
+          "input_token_count": 120,
+          "output_token_count": 45,
+          "metering_usage": [
+            {
+              "value": 0.015625,
+              "unit": "credit",
+              "unitPlural": "credits"
+            },
+            {
+              "value": 0.00390625,
+              "unit": "credit",
+              "unitPlural": "credits"
+            },
+            {
+              "value": 1,
+              "unit": "request",
+              "unitPlural": "requests"
+            }
+          ]
+        },
+        {
+          "input_token_count": 30,
+          "output_token_count": 18,
+          "metering_usage": [
+            {
+              "value": 0.01171875,
+              "unit": "credit",
+              "unitPlural": "credits"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

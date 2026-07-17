@@ -13,22 +13,39 @@ Invoking this skill is an explicit user request for delegated multi-agent review
 
 ## Review Wave
 
-Launch exactly one delegated subagent for each persona:
+Launch exactly one delegated subagent for each focused skill. Use the
+invocation form native to the current harness:
 
-- `$moraine-dev:code-review-elegance`
-- `$moraine-dev:code-review-idomatic`
-- `$moraine-dev:code-review-correctness`
-- `$moraine-dev:code-review-completeness`
-- `$moraine-dev:code-review-security-review`
-- `$moraine-dev:code-review-yagni`
-- `$moraine-dev:code-review-scope`
+| Persona skill | Codex | Kiro |
+| --- | --- | --- |
+| `code-review-elegance` | `$moraine-dev:code-review-elegance` | `/code-review-elegance` |
+| `code-review-idomatic` | `$moraine-dev:code-review-idomatic` | `/code-review-idomatic` |
+| `code-review-correctness` | `$moraine-dev:code-review-correctness` | `/code-review-correctness` |
+| `code-review-completeness` | `$moraine-dev:code-review-completeness` | `/code-review-completeness` |
+| `code-review-security-review` | `$moraine-dev:code-review-security-review` | `/code-review-security-review` |
+| `code-review-yagni` | `$moraine-dev:code-review-yagni` | `/code-review-yagni` |
+| `code-review-scope` | `$moraine-dev:code-review-scope` | `/code-review-scope` |
+
+In another harness that discovers open Agent Skills, invoke the discovered
+skill name without a Codex plugin namespace.
 
 Give each reviewer the same raw review packet: PR description, cited issue or objective, relevant diff, changed files, validation results, and any constraints from the user. Do not include your intended fix or your private diagnosis in the prompt.
 
-Use prompts shaped like:
+In Codex, use prompts shaped like:
 
 ```text
 Use $moraine-dev:code-review-correctness to review this PR. Focus only on your persona's facet.
+Return findings first, with severity and file/line references when available.
+If there are no findings, say so and mention residual risk.
+
+Review packet:
+<PR title/body, objective, diff summary, validation, relevant files>
+```
+
+In Kiro or another harness that loads `SKILL.md` directly, simply name the skill:
+
+```text
+Use the code-review-correctness skill to review this PR. Focus only on that persona's facet.
 Return findings first, with severity and file/line references when available.
 If there are no findings, say so and mention residual risk.
 

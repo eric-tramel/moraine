@@ -71,7 +71,9 @@ Good:
 
 **Why.** Agents were repeating PR body structure differently across sessions; a shared skill gives each agent the same review contract.
 
-- Vendors `$moraine-dev:moraine-start-work`, `$moraine-dev:moraine-author-pr`, and `$moraine-dev:moraine-sandbox-qa` skills.
+- Vendors `$moraine-dev:moraine-start-work`, `$moraine-dev:moraine-author-pr`,
+  and `$moraine-dev:moraine-sandbox-qa` in Codex, with `/moraine-start-work`,
+  `/moraine-author-pr`, and `/moraine-sandbox-qa` equivalents in Kiro.
 - Documents local installation in `docs/development/agent-contributor-workflows.md`.
 
 That makes it easier for reviewers to find behavior, impact, and test evidence.
@@ -86,7 +88,7 @@ Examples:
 ````markdown
 ## Usage
 
-Run the local plugin marketplace from a checkout:
+Run the local Codex plugin marketplace from a checkout:
 
 ```bash
 codex plugin marketplace add .
@@ -96,6 +98,18 @@ Then enable `moraine-dev` and invoke:
 
 ```text
 Use $moraine-dev:moraine-author-pr to create this PR on GitHub.
+```
+
+Or launch the repository-local Kiro agent:
+
+```bash
+kiro-cli --agent moraine-dev
+```
+
+Then invoke the same shared skill:
+
+```text
+/moraine-author-pr
 ```
 ````
 

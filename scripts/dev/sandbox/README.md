@@ -23,7 +23,7 @@ worktree's code. See RFC #232.
 scripts/dev/sandbox/moraine-sandbox up
 
 # Optionally mount your host session archives (read-only), including Codex,
-# Claude Code, Cursor (Agent transcripts + SQLite state), Hermes, and Kimi
+# Claude Code, Cursor (Agent transcripts + SQLite state), Hermes, Kimi, and Kiro
 # when their default directories exist:
 scripts/dev/sandbox/moraine-sandbox up --mount-host-sessions
 
@@ -55,6 +55,7 @@ placeholder and their ingest source is skipped.
 | `~/.claude/projects` | `/host/claude/projects` | `SANDBOX_CLAUDE_PROJECTS_DIR` |
 | `~/.hermes/sessions` | `/host/hermes/sessions` | `SANDBOX_HERMES_SESSIONS_DIR` |
 | `~/.kimi/sessions` | `/host/kimi/sessions` | `SANDBOX_KIMI_SESSIONS_DIR` |
+| `~/.kiro/sessions/cli` | `/host/kiro/sessions` | `SANDBOX_KIRO_SESSIONS_DIR` |
 | `~/.cursor/projects` | `/host/cursor/projects` | `SANDBOX_CURSOR_PROJECTS_DIR` |
 | `~/Library/Application Support/Cursor/User` (macOS) or `~/.config/Cursor/User` (Linux) | `/host/cursor/state` | `SANDBOX_CURSOR_STATE_DIR` |
 

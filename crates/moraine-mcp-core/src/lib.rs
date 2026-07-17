@@ -2304,15 +2304,15 @@ mod tests {
         );
 
         let harness_description = json!(
-            "Optional exact, case-sensitive normalized harness filter. Supported values: codex, claude-code, cursor, hermes, kimi-cli, opencode, pi-coding-agent, qwen-code."
+            "Optional exact, case-sensitive normalized harness filter. Supported values: codex, claude-code, cursor, hermes, kiro-cli, kimi-cli, opencode, pi-coding-agent, qwen-code."
         );
         let source_description = if cfg!(target_os = "macos") {
             json!(
-                "Optional exact, case-sensitive ingest source filter. Configured values for this server: claude, claude-cowork, codex, cursor, cursor-sqlite, hermes, kimi-cli, omp, opencode, pi, qwen-code. Use source to distinguish sources such as pi and omp that share a harness."
+                "Optional exact, case-sensitive ingest source filter. Configured values for this server: claude, claude-cowork, codex, cursor, cursor-sqlite, hermes, kimi-cli, kiro, omp, opencode, pi, qwen-code. Use source to distinguish sources such as pi and omp that share a harness."
             )
         } else {
             json!(
-                "Optional exact, case-sensitive ingest source filter. Configured values for this server: claude, codex, cursor, cursor-sqlite, hermes, kimi-cli, omp, opencode, pi, qwen-code. Use source to distinguish sources such as pi and omp that share a harness."
+                "Optional exact, case-sensitive ingest source filter. Configured values for this server: claude, codex, cursor, cursor-sqlite, hermes, kimi-cli, kiro, omp, opencode, pi, qwen-code. Use source to distinguish sources such as pi and omp that share a harness."
             )
         };
         for tool_name in ["search_sessions", "list_sessions", "file_attention"] {

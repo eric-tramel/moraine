@@ -7,6 +7,7 @@ pub(crate) mod cursor;
 pub(crate) mod emitter;
 pub(crate) mod hermes;
 pub(crate) mod kimi_cli;
+pub(crate) mod kiro_cli;
 pub(crate) mod opencode;
 pub(crate) mod pi;
 pub(crate) mod qwen_code;
@@ -193,6 +194,7 @@ pub(crate) fn registry() -> &'static SourceRegistry {
             .register(&claude_code::CLAUDE_CODE)
             .register(&cursor::CURSOR)
             .register(&hermes::HERMES)
+            .register(&kiro_cli::KIRO_CLI)
             .register(&kimi_cli::KIMI_CLI)
             .register(&opencode::OPENCODE)
             .register(&pi::PI_CODING_AGENT)

@@ -292,6 +292,46 @@ hermes mcp list
 hermes mcp test moraine
 ```
 
+## Kiro CLI
+
+For Kiro CLI, the recommended user-scoped setup registers Moraine as a global
+MCP server and installs a dedicated global steering file with Moraine search and
+realtime guidance:
+
+```bash
+moraine setup --mcp-target kiro-cli
+```
+
+Setup writes `$KIRO_HOME/steering/moraine.md` when `KIRO_HOME` is set, or
+`~/.kiro/steering/moraine.md` otherwise. It replaces the global `moraine` MCP
+registration with one that launches `moraine run mcp` through the absolute path
+of the CLI running setup. The steering file is managed by Moraine and updated
+when setup runs again; setup does not modify `AGENTS.md` or other Kiro steering
+files. Start a new Kiro session after setup so it loads the MCP server and
+steering guidance.
+
+Kiro documents global steering files and its MCP commands here:
+[Kiro CLI steering](https://kiro.dev/docs/cli/steering/) and
+[Kiro CLI MCP](https://kiro.dev/docs/cli/mcp/).
+
+Equivalent manual MCP registration is shown below. Set `moraine_bin` to the
+explicit trusted install path when using a custom install directory; do not
+derive it from a project-local `PATH` entry.
+
+```bash
+moraine_bin="${HOME}/.local/bin/moraine"
+case "$moraine_bin" in
+  /*) ;;
+  *) echo "moraine_bin must be an absolute installed path" >&2; exit 1 ;;
+esac
+test -x "$moraine_bin" || { echo "moraine is not executable: $moraine_bin" >&2; exit 1; }
+kiro-cli mcp add --name moraine --scope global \
+  --command "$moraine_bin" --args '["run","mcp"]' --force
+```
+
+When registering MCP manually, also add the guidance from
+[Patterns](patterns.md) to a markdown file under `~/.kiro/steering/`.
+
 ## Kimi CLI
 
 Kimi CLI has built-in MCP configuration commands. Its MCP reference describes

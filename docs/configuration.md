@@ -323,10 +323,10 @@ format = "jsonl"
 | `enabled` | `true` | Keeps a source configured while allowing it to be skipped. |
 | `glob` | empty string | Files this source ingests. `~` expands during config load. |
 | `watch_root` | derived from `glob` when empty | Directory watched for changes. Set it explicitly when the glob root is ambiguous or platform-specific. |
-| `format` | inferred from `harness` and `glob` | On-disk parser: `jsonl`, `session_json`, `cursor_sqlite`, or `opencode_sqlite`. |
+| `format` | inferred from `harness` and `glob` | On-disk parser: `jsonl`, `session_json`, `kiro_session`, `cursor_sqlite`, or `opencode_sqlite`. |
 
-Supported `harness` values are `codex`, `claude-code`, `cursor`, `kimi-cli`,
-`qwen-code`, `opencode`, `hermes`, and `pi-coding-agent`. Each value maps to a
+Supported `harness` values are `codex`, `claude-code`, `cursor`, `kiro-cli`,
+`kimi-cli`, `qwen-code`, `opencode`, `hermes`, and `pi-coding-agent`. Each value maps to a
 registered ingest source adapter; see
 [Ingest Sources](development/ingest-sources.md) for the adapter contract and
 [Harness Author Workflow](development/harness-author-workflow.md) for source
@@ -339,13 +339,15 @@ for changes. `format` controls the file parser:
 | --- | --- |
 | `jsonl` | Append-only newline-delimited trace records. This is the default for most sources. |
 | `session_json` | One JSON file per live session that is rewritten in place. Moraine emits only newly appended synthetic session records. |
+| `kiro_session` | Kiro CLI append-only JSONL transcripts paired with same-named JSON metadata. Changes to either file enqueue the transcript. |
 | `cursor_sqlite` | Cursor `state.vscdb` SQLite databases. Moraine polls the database read-only and emits synthetic records for new or changed rows. |
 | `opencode_sqlite` | OpenCode `opencode*.db` SQLite databases. Moraine polls the database read-only and emits synthetic records from append-only conversation events. |
 
 When `format` is omitted, Moraine infers it. Hermes sources with a `.json` glob
-are inferred as `session_json`, Cursor globs ending in `.vscdb` are inferred as
-`cursor_sqlite`, OpenCode globs ending in `opencode.db` or `opencode*.db` are
-inferred as `opencode_sqlite`, and otherwise sources are treated as `jsonl`.
+are inferred as `session_json`, Kiro CLI sources as `kiro_session`, Cursor globs
+ending in `.vscdb` as `cursor_sqlite`, OpenCode globs ending in `opencode.db` or
+`opencode*.db` as `opencode_sqlite`, and otherwise sources are treated as
+`jsonl`.
 
 ## Source Matrix
 
@@ -356,6 +358,7 @@ The built-in defaults and `config/moraine.toml` reference cover these source fam
 | Codex | `codex` | `~/.codex/sessions/**/*.jsonl` | `~/.codex/sessions` | inferred `jsonl` |
 | Claude Code | `claude-code` | `~/.claude/projects/**/*.jsonl` | `~/.claude/projects` | inferred `jsonl` |
 | Claude Cowork (local macOS) | `claude-code` | `~/Library/Application Support/Claude/local-agent-mode-sessions/**/.claude/projects/**/*.jsonl` | `~/Library/Application Support/Claude/local-agent-mode-sessions` | inferred `jsonl` |
+| Kiro CLI | `kiro-cli` | `~/.kiro/sessions/cli/*.jsonl` | `~/.kiro/sessions/cli` | `kiro_session` |
 | Kimi CLI | `kimi-cli` | `~/.kimi/sessions/**/wire.jsonl` | `~/.kimi/sessions` | inferred `jsonl` |
 | Qwen Code | `qwen-code` | `~/.qwen/projects/*/chats/*.jsonl` | `~/.qwen/projects` | `jsonl` |
 | OpenCode | `opencode` | `~/.local/share/opencode/opencode*.db` | `~/.local/share/opencode` | `opencode_sqlite` (default on) |
@@ -372,7 +375,10 @@ harness is the same but the file format differs. Use a separate
 trace forms under one harness: Agent transcript JSONL and SQLite chat history
 (`cursor_sqlite`); both are enabled by default. OpenCode stores conversation
 history in default or channel-specific SQLite databases (`opencode_sqlite`);
-the template enables it by default.
+the template enables it by default. Kiro CLI stores transcript records in
+`<session-id>.jsonl` and session-level cwd, title, model, and token totals in
+`<session-id>.json`; the paired `kiro_session` format watches both files and
+checkpoints sidecar changes independently of transcript growth.
 
 ## Source Examples
 

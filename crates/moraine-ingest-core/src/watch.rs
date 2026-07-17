@@ -472,6 +472,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn kiro_transcript_and_metadata_events_coalesce_to_transcript_path() {
+        let mut event = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any)));
+        event.paths = vec![
+            PathBuf::from("/tmp/kiro/session-1.jsonl"),
+            PathBuf::from("/tmp/kiro/session-1.json"),
+            PathBuf::from("/tmp/kiro/session-1.tmp"),
+        ];
+
+        let tracked = event_tracked_paths(&event, "kiro_session");
+        assert_eq!(tracked, vec!["/tmp/kiro/session-1.jsonl".to_string()]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn file_backed_formats_keep_symlinked_paths_as_reported() {

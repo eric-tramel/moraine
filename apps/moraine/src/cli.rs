@@ -224,6 +224,7 @@ pub(crate) enum SetupMcpTarget {
     ClaudeCode,
     Codex,
     Hermes,
+    KiroCli,
     KimiCli,
     QwenCode,
     #[serde(rename = "opencode")]
@@ -371,6 +372,8 @@ mod tests {
             "hermes",
             "--mcp-target",
             "qwen-code",
+            "--mcp-target",
+            "kiro-cli",
         ]);
         match cli.command {
             CliCommand::Setup(setup) => {
@@ -386,6 +389,7 @@ mod tests {
                         SetupMcpTarget::ClaudeCode,
                         SetupMcpTarget::Hermes,
                         SetupMcpTarget::QwenCode,
+                        SetupMcpTarget::KiroCli,
                     ]
                 );
             }
