@@ -661,10 +661,29 @@ def run_smoke(
         )
         next_id += 1
         search_payload = assert_structured_content(search_result, "search_sessions")
+        event_types = search_payload["request"].get("event_types")
+        if event_types != ["user_input", "assistant_response"]:
+            raise AssertionError(
+                "search_sessions default event_types must be "
+                f"['user_input', 'assistant_response'], got: {event_types}"
+            )
 
         results = search_payload["data"].get("results")
         if not isinstance(results, list):
             raise AssertionError(f"search_sessions returned no results array for query={query}")
+        unexpected_event_types = []
+        for result in results:
+            if not isinstance(result, dict) or not isinstance(result.get("event"), dict):
+                unexpected_event_types.append(None)
+                continue
+            event_type = result["event"].get("type")
+            if event_type not in {"user_input", "assistant_response"}:
+                unexpected_event_types.append(event_type)
+        if unexpected_event_types:
+            raise AssertionError(
+                "search_sessions default results must contain only message events, "
+                f"got: {unexpected_event_types}"
+            )
 
         assert_sessions_absent(results, absent_session_ids, "search_sessions")
         if expect_matching_search_hits is not None:

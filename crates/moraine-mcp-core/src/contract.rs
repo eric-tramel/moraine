@@ -412,7 +412,7 @@ impl McpEventType {
     }
 
     pub fn search_defaults() -> &'static [McpEventType] {
-        &[Self::UserInput, Self::AssistantResponse, Self::ToolResponse]
+        &[Self::UserInput, Self::AssistantResponse]
     }
 
     pub fn is_searchable(self) -> bool {
@@ -1659,14 +1659,10 @@ mod tests {
     }
 
     #[test]
-    fn default_event_types_are_user_assistant_and_tool_response() {
+    fn default_event_types_are_user_and_assistant_messages() {
         assert_eq!(
             default_search_event_types(),
-            vec![
-                McpEventType::UserInput,
-                McpEventType::AssistantResponse,
-                McpEventType::ToolResponse
-            ]
+            vec![McpEventType::UserInput, McpEventType::AssistantResponse]
         );
 
         let canonical = SearchSessionsArgs {
@@ -1919,7 +1915,7 @@ mod tests {
             json!({
                 "query": "migration",
                 "within_id": null,
-                "event_types": ["user_input", "assistant_response", "tool_response"],
+                "event_types": ["user_input", "assistant_response"],
                 "n_hits": 10
             }),
             json!({
@@ -1939,7 +1935,7 @@ mod tests {
                 "request": {
                     "query": "migration",
                     "within_id": null,
-                    "event_types": ["user_input", "assistant_response", "tool_response"],
+                    "event_types": ["user_input", "assistant_response"],
                     "n_hits": 10
                 },
                 "data": {

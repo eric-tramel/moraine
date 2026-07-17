@@ -427,7 +427,7 @@ impl AppState {
             "tools": [
                 {
                     "name": contract::SEARCH_SESSIONS_TOOL,
-                    "description": "Search Moraine session history and return compact event-ranked handles. Use open with the returned event_id, turn_id, or session_id to expand results.",
+                    "description": "Search Moraine session history and return compact event-ranked handles. By default, searches user_input and assistant_response events. Select tool_call or tool_response with event_types for raw tool evidence, then use open on a returned turn_id or session_id for full context.",
                     "inputSchema": {
                         "type": "object",
                         "additionalProperties": false,
@@ -455,7 +455,8 @@ impl AppState {
                                         "runtime"
                                     ]
                                 },
-                                "description": "Optional normalized event type filter. Defaults to user_input, assistant_response, and tool_response."
+                                "default": ["user_input", "assistant_response"],
+                                "description": "Optional normalized event type filter. Defaults to user_input and assistant_response. Select tool_call or tool_response explicitly for raw tool evidence."
                             },
                             "harness": {
                                 "type": ["string", "null"],
@@ -2288,12 +2289,20 @@ mod tests {
             .find(|tool| tool["name"].as_str() == Some("search_sessions"))
             .expect("search_sessions exists");
         assert_eq!(
+            search["description"],
+            json!("Search Moraine session history and return compact event-ranked handles. By default, searches user_input and assistant_response events. Select tool_call or tool_response with event_types for raw tool evidence, then use open on a returned turn_id or session_id for full context.")
+        );
+        assert_eq!(
             search["inputSchema"]["properties"]["query"]["description"],
             json!("Keyword (BM25) search query. Matching is bag-of-words: quotes and punctuation are ignored, and a quoted phrase is matched as independent terms subject to the configured minimum-match threshold, not as an exact phrase.")
         );
         assert_eq!(
             search["inputSchema"]["properties"]["event_types"]["description"],
-            json!("Optional normalized event type filter. Defaults to user_input, assistant_response, and tool_response.")
+            json!("Optional normalized event type filter. Defaults to user_input and assistant_response. Select tool_call or tool_response explicitly for raw tool evidence.")
+        );
+        assert_eq!(
+            search["inputSchema"]["properties"]["event_types"]["default"],
+            json!(["user_input", "assistant_response"])
         );
         assert_eq!(
             search["inputSchema"]["properties"]["n_hits"]["default"],

@@ -871,18 +871,48 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                 .and_then(|(_, tail)| tail.split_once("GROUP BY p.doc_id"))
                 .map(|(filter, _)| filter)
                 .unwrap_or(query.as_str());
+            let includes_user = filter_clause.contains("lowerUTF8(p.actor_role) = 'user'");
+            let includes_assistant =
+                filter_clause.contains("lowerUTF8(p.actor_role) = 'assistant'");
+            let includes_tool_call = filter_clause.contains("p.event_class = 'tool_call'");
+            let includes_tool_response = filter_clause.contains("p.event_class = 'tool_result'");
             let mut rows = if query.contains("e.session_id = 'sess_c' AND e.turn_seq = 2") {
                 vec![candidate("evt-c-tool", 13.0, 2, 1_767_434_430_000)]
             } else if query.contains("p.session_id = 'sess_a'") {
                 vec![candidate("evt-a-11", 7.0, 1, 1_767_261_720_000)]
-            } else if filter_clause.contains("lowerUTF8(p.actor_role) = 'user'")
-                && !filter_clause.contains("lowerUTF8(p.actor_role) = 'assistant'")
+            } else if includes_user
+                && !includes_assistant
+                && !includes_tool_call
+                && !includes_tool_response
             {
                 vec![candidate("evt-c-user", 11.0, 2, 1_767_434_460_000)]
-            } else if filter_clause.contains("lowerUTF8(p.actor_role) = 'assistant'")
-                && !filter_clause.contains("lowerUTF8(p.actor_role) = 'user'")
+            } else if includes_assistant
+                && !includes_user
+                && !includes_tool_call
+                && !includes_tool_response
             {
                 vec![candidate("evt-c-42", 12.5, 2, 1_767_434_520_000)]
+            } else if includes_tool_call
+                && !includes_user
+                && !includes_assistant
+                && !includes_tool_response
+            {
+                vec![candidate("evt-c-tool-call", 13.5, 2, 1_767_434_400_000)]
+            } else if includes_tool_response
+                && !includes_user
+                && !includes_assistant
+                && !includes_tool_call
+            {
+                vec![candidate("evt-c-tool", 13.0, 2, 1_767_434_430_000)]
+            } else if includes_user
+                && includes_tool_call
+                && !includes_assistant
+                && !includes_tool_response
+            {
+                vec![
+                    candidate("evt-c-tool-call", 13.5, 2, 1_767_434_400_000),
+                    candidate("evt-c-user", 11.0, 2, 1_767_434_460_000),
+                ]
             } else if query.contains("LIMIT 3 OFFSET 3")
                 && !state.options.repeat_duplicate_search_pages
             {
@@ -925,6 +955,13 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                         9_u64,
                         1_u32,
                     ),
+                    "evt-c-tool-call" => (
+                        "sess_c",
+                        "2026-01-03 10:00:00",
+                        1_767_434_400_000_i64,
+                        39_u64,
+                        2_u32,
+                    ),
                     "evt-c-tool" => (
                         "sess_c",
                         "2026-01-03 10:00:30",
@@ -954,18 +991,21 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                         2_u32,
                     ),
                 };
-                let is_tool = event_uid == "evt-c-tool";
+                let is_tool_call = event_uid == "evt-c-tool-call";
+                let is_tool_response = event_uid == "evt-c-tool";
                 let is_user = event_uid == "evt-c-user";
                 let is_duplicate = event_uid == "evt-c-duplicate";
                 let is_canonical_response = event_uid == "evt-c-42";
-                let actor_role = if is_tool {
+                let actor_role = if is_tool_response {
                     "tool"
                 } else if is_user {
                     "user"
                 } else {
                     "assistant"
                 };
-                let event_type = if is_tool {
+                let event_type = if is_tool_call {
+                    "tool_call"
+                } else if is_tool_response {
                     "tool_response"
                 } else if is_user {
                     "user_input"
@@ -973,6 +1013,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                     "assistant_response"
                 };
                 let text = match event_uid {
+                    "evt-c-tool-call" => "assistant invoked bash for hello world",
                     "evt-c-tool" => "cargo test failure output with stack details",
                     "evt-c-user" => "user asked about hello world in a prompt",
                     "evt-a-11" => "weaker assistant event in session a with extra context",
@@ -986,11 +1027,11 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                     "harness": "codex",
                     "inference_provider": "openai",
                     "endpoint_kind": "generation",
-                    "event_class": if is_tool { "tool_result" } else if is_duplicate { "event_msg" } else { "message" },
-                    "payload_type": if is_tool { "tool_result" } else if is_duplicate { "agent_message" } else if is_canonical_response { "message" } else { "text" },
+                    "event_class": if is_tool_call { "tool_call" } else if is_tool_response { "tool_result" } else if is_duplicate { "event_msg" } else { "message" },
+                    "payload_type": if is_tool_call { "tool_use" } else if is_tool_response { "tool_result" } else if is_duplicate { "agent_message" } else if is_canonical_response { "message" } else { "text" },
                     "actor_role": actor_role,
-                    "name": if is_tool { "bash" } else { "" },
-                    "phase": if is_tool || is_duplicate { "completed" } else if is_canonical_response { "final_answer" } else { "" },
+                    "name": if is_tool_call || is_tool_response { "bash" } else { "" },
+                    "phase": if is_tool_call || is_tool_response || is_duplicate { "completed" } else if is_canonical_response { "final_answer" } else { "" },
                     "payload_phase": if is_duplicate || is_canonical_response { "final_answer" } else { "" },
                     "source_ref": format!("/tmp/{session_id}.jsonl:1:{event_order}"),
                     "doc_len": 19_u32,
@@ -1005,11 +1046,11 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                     "event_unix_ms": event_unix_ms,
                     "event_order": event_order,
                     "turn_seq": turn_seq,
-                    "event_ordinal": if is_tool { 1_u32 } else if is_user { 2_u32 } else if session_id == "sess_c" { 3_u32 } else { 1_u32 },
+                    "event_ordinal": if is_tool_call || is_tool_response { 1_u32 } else if is_user { 2_u32 } else if session_id == "sess_c" { 3_u32 } else { 1_u32 },
                     "turn_event_count": if session_id == "sess_c" { 3_u64 } else { 1_u64 },
                     "turn_completed": if session_id == "sess_c" { 1_u8 } else { 0_u8 },
                     "turn_terminal_event_uid": if session_id == "sess_c" { "evt-c-42" } else { "" },
-                    "call_id": if is_tool { "call-bash-1" } else { "" },
+                    "call_id": if is_tool_call || is_tool_response { "call-bash-1" } else { "" },
                     "item_id": format!("item-{event_uid}"),
                     "model": "gpt-5.3-codex",
                     "session_started_at_unix_ms": event_unix_ms - 120_000,
@@ -1021,6 +1062,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                 })
             };
             let event_uids = [
+                "evt-c-tool-call",
                 "evt-c-tool",
                 "evt-c-user",
                 "evt-c-42",
