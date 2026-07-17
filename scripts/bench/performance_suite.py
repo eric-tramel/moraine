@@ -48,6 +48,18 @@ from performance_protocol import (
     validate_document,
     write_json_atomic,
 )
+from native_central_burst import (
+    DEFAULT_COLD_REPETITIONS as NATIVE_BURST_DEFAULT_COLD_REPETITIONS,
+    DEFAULT_COLD_P95_LIMIT_MS as NATIVE_BURST_DEFAULT_COLD_P95_LIMIT_MS,
+    DEFAULT_MAX_LATENCY_MS as NATIVE_BURST_DEFAULT_MAX_LATENCY_MS,
+    DEFAULT_MIN_COLD_SAMPLES as NATIVE_BURST_DEFAULT_MIN_COLD_SAMPLES,
+    DEFAULT_MODES as NATIVE_BURST_DEFAULT_MODES,
+    DEFAULT_WARM_P95_LIMIT_MS as NATIVE_BURST_DEFAULT_WARM_P95_LIMIT_MS,
+    NativeBurstFailure,
+    run_native_central_burst,
+    validate_native_burst_artifact,
+    write_native_burst_artifact,
+)
 from performance_runtime import (
     BuildIdentity,
     FixedEnvelope,
@@ -1067,6 +1079,8 @@ def validate_path(path: Path) -> None:
         raise SuiteFailure(f"cannot load {path}: {error}") from error
     if isinstance(document, dict) and document.get("document_type") == "suite_manifest":
         load_suite_manifest(path)
+    elif isinstance(document, dict) and document.get("document_type") == "native_central_burst":
+        validate_native_burst_artifact(document)
     elif isinstance(document, dict) and "document_type" in document:
         validate_document(document)
     elif isinstance(document, dict) and "recipe_version" in document:
@@ -1659,6 +1673,59 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     smoke_parser = commands.add_parser("smoke")
     smoke_parser.add_argument("--repo", type=Path, default=Path.cwd())
     smoke_parser.add_argument("--output", type=Path, required=True)
+    native_parser = commands.add_parser(
+        "native-central-burst",
+        help="run synchronized search_sessions bursts through an owned native macOS daemon",
+    )
+    native_parser.add_argument("--mcp-binary", type=Path, required=True)
+    native_parser.add_argument("--config", type=Path, required=True)
+    native_parser.add_argument("--route-cwd", type=Path, default=Path.cwd())
+    native_parser.add_argument("--profile", choices=("smoke", "full"), default="full")
+    native_parser.add_argument(
+        "--split",
+        choices=("research", "holdout", "stress"),
+        default="research",
+    )
+    native_parser.add_argument("--modes", nargs="+", default=list(NATIVE_BURST_DEFAULT_MODES))
+    native_parser.add_argument("--cases-per-mode", type=int, default=1)
+    native_parser.add_argument("--bursts-per-case", type=int, default=25)
+    native_parser.add_argument(
+        "--cold-repetitions",
+        type=int,
+        default=NATIVE_BURST_DEFAULT_COLD_REPETITIONS,
+        help="fresh-daemon first-query repetitions per concurrency",
+    )
+    native_parser.add_argument(
+        "--minimum-cold-samples",
+        type=int,
+        default=NATIVE_BURST_DEFAULT_MIN_COLD_SAMPLES,
+    )
+    native_parser.add_argument(
+        "--warm-p95-limit-ms",
+        type=float,
+        default=NATIVE_BURST_DEFAULT_WARM_P95_LIMIT_MS,
+        help="inclusive per-mode steady-state p95 gate",
+    )
+    native_parser.add_argument(
+        "--cold-p95-limit-ms",
+        type=float,
+        default=NATIVE_BURST_DEFAULT_COLD_P95_LIMIT_MS,
+        help="inclusive cold hydration/common and session-scope p95 gate",
+    )
+    native_parser.add_argument(
+        "--max-latency-ms",
+        type=float,
+        default=NATIVE_BURST_DEFAULT_MAX_LATENCY_MS,
+        help="inclusive maximum over every raw request sample",
+    )
+    native_parser.add_argument(
+        "--collect-query-log",
+        action="store_true",
+        help="fail closed unless owned candidate/detail ClickHouse costs are captured",
+    )
+    native_parser.add_argument("--timeout-seconds", type=float, default=5.0)
+    native_parser.add_argument("--startup-timeout-seconds", type=float, default=30.0)
+    native_parser.add_argument("--output", type=Path, required=True)
     run_parser = commands.add_parser("run")
     run_parser.add_argument(
         "--mode",
@@ -1690,6 +1757,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             write_json_atomic(args.output, evaluate_repeatability(args.manifests))
         elif args.command == "smoke":
             run_baseline({"baseline": args.repo.resolve()}, "smoke", args.output)
+        elif args.command == "native-central-burst":
+            document = run_native_central_burst(
+                mcp_binary=args.mcp_binary.resolve(),
+                config_path=args.config.resolve(),
+                route_cwd=args.route_cwd.resolve(),
+                profile=args.profile,
+                split=args.split,
+                modes=tuple(args.modes),
+                cases_per_mode=args.cases_per_mode,
+                bursts_per_case=args.bursts_per_case,
+                timeout_s=args.timeout_seconds,
+                startup_timeout_s=args.startup_timeout_seconds,
+                cold_repetitions=args.cold_repetitions,
+                min_cold_samples=args.minimum_cold_samples,
+                warm_p95_limit_ms=args.warm_p95_limit_ms,
+                cold_p95_limit_ms=args.cold_p95_limit_ms,
+                max_latency_ms=args.max_latency_ms,
+                collect_query_log=args.collect_query_log,
+            )
+            write_native_burst_artifact(args.output, document)
+            if document["status"] != "pass":
+                raise SuiteFailure(
+                    "native central burst failed requests, latency gates, or query-log evidence; "
+                    "artifact retained"
+                )
         elif args.mode == "local":
             if args.candidate is None:
                 raise SuiteFailure("local comparison requires --candidate")
@@ -1730,6 +1822,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except (
         ProtocolError,
         RuntimeFailure,
+        NativeBurstFailure,
         ScenarioError,
         SuiteFailure,
         OSError,

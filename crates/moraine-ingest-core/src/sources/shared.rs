@@ -880,7 +880,8 @@ fn event_file_attention_fields(cwd: &str) -> FileAttentionFields {
         return FileAttentionFields::default();
     }
 
-    let Some(root) = find_file_attention_root(Path::new(&cwd)) else {
+    let Some(root) = find_file_attention_root(Path::new(&cwd)).or_else(|| directory_root(&cwd))
+    else {
         return FileAttentionFields::default();
     };
     let Some(project_id) = project_id_for_root(&root) else {
@@ -927,17 +928,20 @@ fn resolve_tool_path_fields(cwd: &str, raw_path: &str) -> Option<FileAttentionFi
         return None;
     }
 
+    let cwd = normalize_path_text(cwd.trim());
+    if cwd.is_empty() || !cwd.starts_with('/') {
+        return None;
+    }
+
     let absolute = if normalized.starts_with('/') {
         normalized
     } else {
-        let cwd = normalize_path_text(cwd.trim());
-        if cwd.is_empty() || !cwd.starts_with('/') {
-            return None;
-        }
         normalize_path_text(&format!("{}/{}", cwd.trim_end_matches('/'), normalized))
     };
 
-    let root = find_file_attention_root(Path::new(&absolute))?;
+    let root = find_file_attention_root(Path::new(&absolute)).or_else(|| {
+        (Path::new(&cwd).is_dir() && strip_root(&absolute, &cwd).is_some()).then(|| cwd.clone())
+    })?;
     let project_id = project_id_for_root(&root)?;
     let repo_rel_path = strip_root(&absolute, &root)?;
     if repo_rel_path.is_empty() {
@@ -1035,8 +1039,7 @@ fn find_file_attention_root(path: &Path) -> Option<String> {
         path.parent()
     };
     while let Some(current) = dir {
-        if current.join(moraine_config::REPO_BACKEND_FILE).exists() || current.join(".git").exists()
-        {
+        if current.join(".git").exists() {
             return Some(current.to_string_lossy().to_string());
         }
         if home.as_deref() == Some(current) {
@@ -1045,6 +1048,10 @@ fn find_file_attention_root(path: &Path) -> Option<String> {
         dir = current.parent();
     }
     None
+}
+
+fn directory_root(path: &str) -> Option<String> {
+    Path::new(path).is_dir().then(|| path.to_string())
 }
 
 fn project_id_for_root(root: &str) -> Option<String> {
@@ -1380,11 +1387,6 @@ mod tests {
         ));
         std::fs::create_dir_all(root.join("src")).expect("create repo dirs");
         std::fs::create_dir_all(root.join(".git")).expect("create git dir");
-        std::fs::write(
-            root.join(moraine_config::REPO_BACKEND_FILE),
-            "backend = \"team\"\n",
-        )
-        .expect("write repo backend marker");
         root
     }
 
@@ -1404,6 +1406,8 @@ mod tests {
     fn event_rows_capture_project_and_worktree_from_cwd() {
         let root = make_repo("event-cwd");
         let cwd = root.join("src");
+        std::fs::write(cwd.join(".moraine.toml"), "backend = \"nested\"\n")
+            .expect("write nested backend route");
         let cwd_text = cwd.to_string_lossy().to_string();
         let ctx = test_record_context(&cwd_text);
         let project_id = project_id_for_root(root.to_string_lossy().as_ref()).expect("project id");
@@ -1425,7 +1429,7 @@ mod tests {
     }
 
     #[test]
-    fn event_rows_keep_linked_worktree_root_with_enclosing_project_marker() {
+    fn event_rows_keep_unmarked_linked_worktree_root() {
         let root = make_repo("linked-worktree");
         let linked = root.join("worktrees/linked");
         let linked_git_dir = root.join(".git/worktrees/linked");
@@ -1460,7 +1464,7 @@ mod tests {
     }
 
     #[test]
-    fn event_rows_ignore_git_only_root_without_project_id() {
+    fn event_rows_capture_git_only_root_without_backend_marker() {
         let root = std::env::temp_dir().join(format!(
             "moraine-file-attention-git-only-{}",
             std::process::id()
@@ -1481,10 +1485,48 @@ mod tests {
             "{}",
         ));
 
-        assert_eq!(row["project_id"], "");
-        assert_eq!(row["worktree_root"], "");
+        assert_eq!(
+            row["project_id"],
+            project_id_for_root(root.to_string_lossy().as_ref()).expect("project id")
+        );
+        assert_eq!(row["worktree_root"], root.to_string_lossy().as_ref());
         assert_eq!(row["repo_rel_path"], "");
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn event_rows_use_exact_cwd_for_non_git_project_identity() {
+        let base = std::env::temp_dir().join(format!(
+            "moraine-file-attention-directory-only-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let cwd = base.join("project/nested");
+        std::fs::create_dir_all(&cwd).expect("create non-Git cwd");
+        std::fs::write(base.join(".moraine.toml"), "backend = \"default\"\n")
+            .expect("write independent routing marker");
+        let cwd_text = cwd.to_string_lossy().to_string();
+        let ctx = test_record_context(&cwd_text);
+
+        let row = Value::Object(base_event_obj(
+            &ctx,
+            "e1",
+            "message",
+            "message",
+            "assistant",
+            "hello",
+            "{}",
+        ));
+
+        assert!(row["project_id"]
+            .as_str()
+            .is_some_and(|project_id| project_id.starts_with("dir:")));
+        assert_eq!(row["worktree_root"], cwd_text);
+        assert_eq!(row["repo_rel_path"], "");
+        std::fs::remove_dir_all(base).ok();
     }
 
     #[test]
@@ -1533,6 +1575,58 @@ mod tests {
         );
         assert_eq!(relative_row["repo_rel_path"], "src/lib.rs");
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn tool_rows_use_non_git_cwd_and_reject_paths_outside_it() {
+        let base = std::env::temp_dir().join(format!(
+            "moraine-file-attention-directory-tools-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let cwd = base.join("project");
+        std::fs::create_dir_all(cwd.join("src")).expect("create non-Git project");
+        let cwd_text = cwd.to_string_lossy().to_string();
+        let ctx = test_record_context(&cwd_text);
+
+        let relative = build_tool_row(
+            &ctx,
+            "e1",
+            "call-1",
+            "",
+            "Read",
+            "request",
+            0,
+            r#"{"path":"src/lib.rs"}"#,
+            "",
+            "",
+        );
+        assert!(relative["project_id"]
+            .as_str()
+            .is_some_and(|project_id| project_id.starts_with("dir:")));
+        assert_eq!(relative["worktree_root"], cwd_text);
+        assert_eq!(relative["repo_rel_path"], "src/lib.rs");
+
+        let outside = build_tool_row(
+            &ctx,
+            "e2",
+            "call-2",
+            "",
+            "Read",
+            "request",
+            0,
+            &json!({"path": base.join("outside.rs")}).to_string(),
+            "",
+            "",
+        );
+        assert_eq!(outside["project_id"], "");
+        assert_eq!(outside["worktree_root"], "");
+        assert_eq!(outside["repo_rel_path"], "");
+
+        std::fs::remove_dir_all(base).ok();
     }
 
     #[test]

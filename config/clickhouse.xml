@@ -21,6 +21,9 @@
   <interserver_http_port>__CLICKHOUSE_INTERSERVER_HTTP_PORT__</interserver_http_port>
 
   <max_connections>2048</max_connections>
+  <concurrent_threads_soft_limit_num>0</concurrent_threads_soft_limit_num>
+  <concurrent_threads_soft_limit_ratio_to_cores>1</concurrent_threads_soft_limit_ratio_to_cores>
+  <concurrent_threads_scheduler>fair_round_robin</concurrent_threads_scheduler>
   <max_concurrent_queries>500</max_concurrent_queries>
   <max_thread_pool_free_size>64</max_thread_pool_free_size>
   <uncompressed_cache_size>536870912</uncompressed_cache_size>

@@ -105,6 +105,7 @@ database = "moraine"
 username = "default"
 password = ""
 timeout_seconds = 30.0
+request_compression = "none"
 async_insert = true
 wait_for_async_insert = true
 allow_newer_server = false
@@ -126,6 +127,7 @@ projects to additional servers, see
 | `username` | `default` | ClickHouse user for ingest, monitor, MCP, and migrations. |
 | `password` | empty | ClickHouse password. |
 | `timeout_seconds` | `30.0` | Per-request ClickHouse HTTP timeout. |
+| `request_compression` | `none` | Compression for non-empty HTTP request bodies. Supported values are `none` and `gzip`. |
 | `async_insert` | `true` | Enables ClickHouse async insert mode on writes. |
 | `wait_for_async_insert` | `true` | Waits for async insert completion before advancing checkpoints, so write failures are visible. |
 | `allow_newer_server` | `false` | Allows a non-default backend whose migration ledger is ahead of this Moraine build. The default backend is migrated by Moraine itself, so this is only useful on `[backends.<name>]`. |
@@ -142,6 +144,7 @@ url = "https://ch.team.example:8443"
 database = "moraine_team"
 username = "svc-moraine"
 password = "..."
+request_compression = "gzip"
 allow_newer_server = false
 
 [[routes]]
@@ -608,7 +611,7 @@ default_exclude_codex_mcp = true
 prewarm_on_initialize = false
 async_log_writes = true
 protocol_version = "2024-11-05"
-# max_parallel_requests = 16 # optional; omitted uses available CPU parallelism
+# max_parallel_requests = 16 # optional; omitted defaults to 8
 use_central_server = true
 central_socket_path = "mcp.sock"
 central_connect_timeout_ms = 250
@@ -625,7 +628,7 @@ central_connect_timeout_ms = 250
 | `prewarm_on_initialize` | `false` | Warms query metadata during MCP initialize, trading startup work for lower first-search latency. |
 | `async_log_writes` | `true` | Writes MCP observability rows asynchronously so tool calls stay responsive. |
 | `protocol_version` | `2024-11-05` | MCP protocol version advertised by the server. |
-| `max_parallel_requests` | automatic | Maximum retrieval requests executed concurrently by each MCP server process. Omitted uses the CPU parallelism available to that process; additional valid requests wait for capacity. A configured value must be greater than zero. |
+| `max_parallel_requests` | `8` | Maximum retrieval requests executed concurrently by each MCP server process. At most 16 additional requests wait in FIFO order until capacity is available or the request is cancelled. A full queue is rejected immediately with a structured retryable error. A configured value must be greater than zero. |
 | `use_central_server` | `true` | Makes `moraine run mcp` prefer the shared central server socket, with embedded fallback. |
 | `central_socket_path` | `mcp.sock` | Unix socket path. Bare filenames resolve under `runtime.pids_dir`; absolute paths are used verbatim. |
 | `central_connect_timeout_ms` | `250` | Milliseconds a proxy client waits for the central socket before falling back to embedded mode. |
@@ -637,11 +640,13 @@ processes at once; enabling it trades startup CPU/database work for lower
 first-search latency.
 
 The shared central server applies one parallel-request budget across every MCP
-socket connection and queues valid retrievals when that budget is busy. An
-embedded fallback is a separate process, so its automatic or configured budget
-is process-local. Saturation does not produce a `server busy` JSON-RPC error;
-queued requests remain cancellable while validation and control requests
-continue to run.
+socket connection and queues at most 16 valid retrievals in FIFO order when that
+budget is busy. Queued and running retrievals have no fixed admission deadline;
+they continue until completion, client cancellation, disconnect, or service
+shutdown. A full queue is rejected immediately with a structured retryable tool
+error. An embedded fallback is a separate process, so its default or configured
+execution budget is process-local. Validation and control requests continue to
+run while retrievals wait.
 
 ### Shared central MCP server
 
@@ -794,3 +799,10 @@ delegates to the unified backend; `moraine up` never manages it separately.
 | `healthcheck_interval_ms` | `500` | Milliseconds between readiness checks while a managed ClickHouse process generation starts. This is not a permanent health-poll interval after readiness. |
 | `clickhouse_auto_install` | `true` | Automatically installs the managed ClickHouse binary when needed. |
 | `clickhouse_version` | `v25.12.5.44-stable` | Managed ClickHouse release tag expected by this Moraine build. |
+
+Moraine's managed ClickHouse uses concurrency control with fair round-robin
+scheduling and a soft aggregate query-thread limit equal to the detected CPU
+core count. Individual repository reads do not override `max_threads`, so an
+idle query can scale up while concurrent queries share the aggregate budget.
+These defaults apply only to Moraine-managed ClickHouse; external ClickHouse
+deployments retain their administrator-defined scheduling policy.

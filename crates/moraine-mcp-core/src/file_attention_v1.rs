@@ -1,7 +1,7 @@
 //! `file_attention` (Phase 0 / Tier 0): every captured session that touched a
 //! file, across every worktree, drillable through `open`.
 //!
-//! Given a path, this suffix-matches the repo-relative tail against the raw
+//! Given a path, this suffix-matches the project-relative tail against the raw
 //! `file_path` (and `notebook_path` / `path`) recorded in `tool_io`, plus a
 //! substring fallback for shell commands. Matching the tail is what unifies the
 //! main checkout, sibling worktrees, and agent-isolation worktrees (which share
@@ -11,13 +11,13 @@
 
 use super::{
     backend_query_id, cancel_query_with_deadline, handled_tool_error_result, internal_id_error,
-    repo_error_to_contract_error, tool_success_result, AppState, QueryCancellationGuard,
+    repo_error_to_contract_error, request_performance, tool_success_result, AppState,
+    QueryCancellationGuard,
 };
 use crate::contract::{
     format_rfc3339_utc_millis, CanonicalFileAttentionArgs, ContractError, FileAttentionArgs,
     FileAttentionGranularity, FileAttentionScope, McpEventId, McpSessionId, McpTurnId, Performance,
-    ToolEnvelope, ToolErrorCode, ToolErrorEnvelope, FILE_ATTENTION_BROAD_SLA_TARGET_MS,
-    FILE_ATTENTION_DEADLINE_MS, FILE_ATTENTION_DEFAULT_SLA_TARGET_MS,
+    ToolEnvelope, ToolErrorCode, ToolErrorEnvelope, FILE_ATTENTION_DEADLINE_MS,
     FILE_ATTENTION_MIN_TAIL_SEGMENTS, FILE_ATTENTION_TOOL,
 };
 use anyhow::{Context, Result};
@@ -36,7 +36,7 @@ const FILE_ATTENTION_SCAN_CAP: usize = 2_000;
 
 impl AppState {
     pub(crate) async fn file_attention_v1(&self, arguments: Value) -> Result<Value> {
-        let perf = Performance::builder(FILE_ATTENTION_DEFAULT_SLA_TARGET_MS);
+        let perf = request_performance();
         let raw_request = arguments.clone();
 
         let args = match parse_file_attention_args(arguments, self.cfg.mcp.max_results) {
@@ -44,11 +44,6 @@ impl AppState {
             Err(error) => return encode_error(raw_request, error, perf.finish()),
         };
         let canonical_request = canonical_request_json(&args);
-
-        // The Tier-0 plan still scans `tool_io` by path even when datetime
-        // bounds are present, so report against the broad target until a future
-        // indexed path/time plan can make windowed requests truly narrow.
-        let perf = perf.with_sla_target(FILE_ATTENTION_BROAD_SLA_TARGET_MS);
 
         let mut warnings: Vec<String> = Vec::new();
         let tail = resolve_tail_from(&args.path, self.launch_dir.as_deref());
@@ -60,30 +55,35 @@ impl AppState {
         }
         if tail.tail_is_absolute {
             warnings.push(format!(
-                "could not reduce {:?} to a repo-relative tail (no .moraine.toml/.git marker found above it); matching the absolute path literally, so other worktrees of the same file will not be unified. Pass a repo-relative path for cross-worktree coverage.",
+                "could not reduce {:?} to a project-relative tail (no Git boundary or launch-directory containment could be proven); matching the absolute path literally, so other roots of the same file will not be unified. Pass a project-relative path for cross-root coverage.",
                 args.path
             ));
         }
         if !tail.derive_worktree_roots {
             warnings.push(
-                "could not prove the path is a repo-relative file in this checkout; roots are derived only from exact relative captures with cwd, otherwise reported as unknown to avoid mislabeling arbitrary suffix matches."
+                "could not prove the path is a project-relative file in this launch scope; roots are derived only from exact relative captures with cwd, otherwise reported as unknown to avoid mislabeling arbitrary suffix matches."
                     .to_string(),
             );
         }
         let depth = tail_segments(&tail.rel);
         if depth < FILE_ATTENTION_MIN_TAIL_SEGMENTS {
             warnings.push(format!(
-                "{:?} is a generic tail (depth {depth}); results may include unrelated files. Pass a longer repo-relative path, and check the surfaced roots.",
+                "{:?} is a generic tail (depth {depth}); results may include unrelated files. Pass a longer project-relative path, and check the surfaced roots.",
                 tail.rel
             ));
         }
         if args.scope == FileAttentionScope::Project && tail.project_id.is_none() {
             warnings.push(
-                "scope=\"project\" could not establish the launch project's normalized identity; the repository query remains closed rather than widening across projects."
+                "scope=\"project\" could not establish the launch project's normalized identity; the project query remains closed rather than widening across projects."
                     .to_string(),
             );
         }
-        if args.scope == FileAttentionScope::Project {
+        if args.scope == FileAttentionScope::Project
+            && tail
+                .project_id
+                .as_deref()
+                .is_some_and(|project_id| project_id.starts_with("git:"))
+        {
             warnings.push(
                 "pre-digest worktree roots pruned before durable project mapping was installed cannot be attributed safely and remain excluded; currently registered roots are migrated and future normalized roots remain durable."
                     .to_string(),
@@ -108,6 +108,7 @@ impl AppState {
                 .as_deref()
                 .and_then(moraine_config::worktree_roots_for_repo_root)
                 .unwrap_or_default(),
+            derive_legacy_roots: tail.derive_worktree_roots,
             apply_project_scope: args.scope == FileAttentionScope::Project,
             start_unix_ms: args.start_unix_ms,
             end_unix_ms: args.end_unix_ms,
@@ -196,14 +197,14 @@ fn canonical_request_json(args: &CanonicalFileAttentionArgs) -> Value {
     })
 }
 
-/// The repo-relative tail a query path reduces to, plus the launch-side root it
+/// The project-relative tail a query path reduces to, plus the launch-side root it
 /// was stripped against (informational).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TailResolution {
     rel: String,
     root: Option<String>,
     project_id: Option<String>,
-    /// The path was absolute and could not be reduced to a repo-relative tail,
+    /// The path was absolute and could not be reduced to a project-relative tail,
     /// so `rel` is the absolute path matched literally.
     tail_is_absolute: bool,
     /// Syntactic cleanup changed the path before matching.
@@ -213,7 +214,7 @@ struct TailResolution {
     derive_worktree_roots: bool,
 }
 
-/// Reduce a query `path` to the repo-relative tail used for suffix matching.
+/// Reduce a query `path` to the project-relative tail used for suffix matching.
 ///
 /// Relative paths are resolved lexically against the launch directory, so a
 /// deleted or not-yet-created file still carries the launch project's identity.
@@ -232,7 +233,7 @@ fn resolve_tail_from(path: &str, launch_dir: Option<&Path>) -> TailResolution {
     let normalized_is_single_path = is_single_path_candidate(&normalized);
     let launch_project = launch_dir.and_then(|cwd| {
         let scope_probe = cwd.join(".moraine-project-scope");
-        let root = find_project_root(&scope_probe)?;
+        let root = find_project_root(&scope_probe).or_else(|| directory_root(cwd))?;
         let project_id = project_id_for_root(&root)?;
         Some((root, project_id))
     });
@@ -270,7 +271,14 @@ fn resolve_tail_from(path: &str, launch_dir: Option<&Path>) -> TailResolution {
     }
 
     if raw_is_single_path && normalized_is_single_path {
-        if let Some(root) = find_project_root(Path::new(&normalized)) {
+        let target_root = find_project_root(Path::new(&normalized)).or_else(|| {
+            launch_project.as_ref().and_then(|(root, _)| {
+                strip_root(&normalized, root)
+                    .is_some()
+                    .then(|| root.clone())
+            })
+        });
+        if let Some(root) = target_root {
             if let Some(rel) = strip_root(&normalized, &root) {
                 if !rel.is_empty() {
                     let target_project_id = project_id_for_root(&root);
@@ -358,16 +366,14 @@ fn strip_root(path: &str, root: &str) -> Option<String> {
         .map(|tail| tail.to_string())
 }
 
-/// Walk up from a file path's parent directory looking for the nearest
-/// repository boundary, bounded at `$HOME` or the filesystem root. A linked
-/// worktree may inherit its `.moraine.toml` route from an enclosing checkout,
-/// but its own `.git` marker still defines the root reported to callers.
+/// Walk up from a file path's parent directory looking for the nearest Git
+/// boundary, bounded at `$HOME` or the filesystem root. Backend routing markers
+/// are deliberately ignored because they do not define project identity.
 fn find_project_root(file_path: &Path) -> Option<String> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let mut dir = file_path.parent();
     while let Some(current) = dir {
-        if current.join(moraine_config::REPO_BACKEND_FILE).exists() || current.join(".git").exists()
-        {
+        if current.join(".git").exists() {
             return Some(current.to_string_lossy().to_string());
         }
         if home.as_deref() == Some(current) {
@@ -376,6 +382,10 @@ fn find_project_root(file_path: &Path) -> Option<String> {
         dir = current.parent();
     }
     None
+}
+
+fn directory_root(path: &Path) -> Option<String> {
+    path.is_dir().then(|| path.to_string_lossy().to_string())
 }
 
 fn project_id_for_root(root: &str) -> Option<String> {
@@ -812,12 +822,22 @@ fn format_text(payload: &Value) -> String {
         "file_attention {tail} — {total} touch(es) across {sessions} session(s) in {roots} worktree root(s) [scope={scope}]."
     )];
 
-    if summary
-        .get("ambiguous")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
+    let distinct_known_roots = summary
+        .get("distinct_known_roots")
+        .and_then(Value::as_u64)
+        .unwrap_or(roots);
+    let unknown_root_touches = summary
+        .get("unknown_root_touches")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if distinct_known_roots > 1 {
         lines.push("Ambiguous tail: matched more than one worktree root (see roots).".to_string());
+    }
+    if unknown_root_touches > 0 {
+        lines.push(
+            "Worktree-root attribution is incomplete; some touches have unknown roots (see roots and matched_path)."
+                .to_string(),
+        );
     }
     for warning in payload
         .get("warnings")
@@ -910,7 +930,7 @@ mod tests {
                 ToolErrorCode::DeadlineExceeded,
                 "file_attention exceeded its response deadline",
             ),
-            Performance::builder(FILE_ATTENTION_DEFAULT_SLA_TARGET_MS).finish(),
+            Performance::builder().finish(),
         )
         .expect("deadline response");
 
@@ -1033,7 +1053,6 @@ mod tests {
         let root = dir.join("repo");
         std::fs::create_dir_all(&root).expect("mkdir root");
         std::fs::create_dir_all(root.join(".git")).expect("mkdir git dir");
-        std::fs::write(root.join(".moraine.toml"), "backend = \"x\"\n").expect("write marker");
 
         let resolved = resolve_tail_from("crates/new/file.rs", Some(&root));
         assert_eq!(resolved.rel, "crates/new/file.rs");
@@ -1048,6 +1067,38 @@ mod tests {
     }
 
     #[test]
+    fn resolve_tail_uses_exact_launch_directory_without_git() {
+        let dir = std::env::temp_dir().join(format!(
+            "moraine-fa-directory-project-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after unix epoch")
+                .as_nanos()
+        ));
+        let launch = dir.join("project/subproject");
+        std::fs::create_dir_all(&launch).expect("create non-Git launch directory");
+        std::fs::write(dir.join(".moraine.toml"), "backend = \"default\"\n")
+            .expect("write routing marker above launch directory");
+
+        let resolved = resolve_tail_from("src/new.rs", Some(&launch));
+        assert_eq!(resolved.rel, "src/new.rs");
+        assert_eq!(resolved.root.as_deref(), launch.to_str());
+        assert!(resolved
+            .project_id
+            .as_deref()
+            .is_some_and(|project_id| project_id.starts_with("dir:")));
+        assert!(resolved.derive_worktree_roots);
+
+        let escaped = resolve_tail_from("../outside.rs", Some(&launch));
+        assert!(escaped.project_id.is_none());
+        assert!(escaped.root.is_none());
+        assert!(!escaped.derive_worktree_roots);
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn resolve_tail_makes_nested_launch_paths_repository_relative() {
         let dir =
             std::env::temp_dir().join(format!("moraine-fa-nested-launch-{}", std::process::id()));
@@ -1055,7 +1106,8 @@ mod tests {
         let launch = root.join("crates/foo");
         std::fs::create_dir_all(root.join(".git")).expect("mkdir git dir");
         std::fs::create_dir_all(&launch).expect("mkdir launch dir");
-        std::fs::write(root.join(".moraine.toml"), "backend = \"x\"\n").expect("write marker");
+        std::fs::write(launch.join(".moraine.toml"), "backend = \"nested\"\n")
+            .expect("write nested backend route");
 
         let nested = resolve_tail_from("src/lib.rs", Some(&launch));
         assert_eq!(nested.rel, "crates/foo/src/lib.rs");
@@ -1078,7 +1130,6 @@ mod tests {
         let root = dir.join("repo");
         std::fs::create_dir_all(&root).expect("mkdir root");
         std::fs::create_dir_all(root.join(".git")).expect("mkdir git dir");
-        std::fs::write(root.join(".moraine.toml"), "backend = \"x\"\n").expect("write marker");
 
         for delimiter in ["\0", "\n", "\r", ";", "|", "&", "`"] {
             let path = format!("bad{delimiter}command/../src/lib.rs");
@@ -1098,7 +1149,6 @@ mod tests {
         let nested = root.join("crates/foo");
         std::fs::create_dir_all(&nested).expect("mkdir nested");
         std::fs::create_dir_all(root.join(".git")).expect("mkdir git dir");
-        std::fs::write(root.join(".moraine.toml"), "backend = \"x\"\n").expect("write marker");
         let file = nested.join("tee.rs");
         std::fs::write(&file, "// test").expect("write file");
 
@@ -1138,7 +1188,34 @@ mod tests {
     }
 
     #[test]
-    fn resolve_tail_keeps_linked_worktree_root_with_enclosing_project_marker() {
+    fn resolve_tail_closes_directory_scope_for_absolute_path_outside_launch() {
+        let dir = std::env::temp_dir().join(format!(
+            "moraine-fa-directory-cross-project-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after unix epoch")
+                .as_nanos()
+        ));
+        let launch = dir.join("launch");
+        let outside = dir.join("outside/file.rs");
+        std::fs::create_dir_all(&launch).expect("create non-Git launch directory");
+        std::fs::create_dir_all(outside.parent().expect("outside parent"))
+            .expect("create outside directory");
+        std::fs::write(&outside, "// outside").expect("write outside file");
+
+        let resolved = resolve_tail_from(outside.to_str().expect("utf8 path"), Some(&launch));
+        assert_eq!(resolved.rel, outside.to_string_lossy());
+        assert!(resolved.tail_is_absolute);
+        assert!(resolved.project_id.is_none());
+        assert!(resolved.root.is_none());
+        assert!(!resolved.derive_worktree_roots);
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn resolve_tail_keeps_unmarked_linked_worktree_root() {
         let dir =
             std::env::temp_dir().join(format!("moraine-fa-linked-worktree-{}", std::process::id()));
         let root = dir.join("repo");
@@ -1152,8 +1229,6 @@ mod tests {
             format!("gitdir: {}\n", linked_git_dir.to_string_lossy()),
         )
         .expect("write linked git marker");
-        std::fs::write(root.join(".moraine.toml"), "backend = \"shared\"\n").expect("write marker");
-
         let resolved = resolve_tail_from("src/lib.rs", Some(&linked));
         assert_eq!(resolved.root.as_deref(), linked.to_str());
         assert_eq!(
@@ -1385,6 +1460,56 @@ mod tests {
             .filter_map(|r| r["root"].as_str())
             .collect();
         assert!(labels.contains(&UNKNOWN_ROOT));
+    }
+
+    #[test]
+    fn format_text_describes_unknown_only_roots_as_incomplete_attribution() {
+        let payload = json!({
+            "warnings": [],
+            "data": {
+                "tail": "crates/foo/tee.rs",
+                "scope": "all",
+                "granularity": "sessions",
+                "summary": {
+                    "total_touches": 2,
+                    "distinct_sessions": 2,
+                    "distinct_roots": 1,
+                    "distinct_known_roots": 0,
+                    "unknown_root_touches": 2,
+                    "ambiguous": true
+                },
+                "sessions": []
+            }
+        });
+
+        let text = format_text(&payload);
+        assert!(text.contains("Worktree-root attribution is incomplete"));
+        assert!(!text.contains("matched more than one worktree root"));
+    }
+
+    #[test]
+    fn format_text_reports_known_root_spread_and_unknown_attribution_separately() {
+        let payload = json!({
+            "warnings": [],
+            "data": {
+                "tail": "crates/foo/tee.rs",
+                "scope": "all",
+                "granularity": "sessions",
+                "summary": {
+                    "total_touches": 3,
+                    "distinct_sessions": 3,
+                    "distinct_roots": 3,
+                    "distinct_known_roots": 2,
+                    "unknown_root_touches": 1,
+                    "ambiguous": true
+                },
+                "sessions": []
+            }
+        });
+
+        let text = format_text(&payload);
+        assert!(text.contains("matched more than one worktree root"));
+        assert!(text.contains("Worktree-root attribution is incomplete"));
     }
 
     #[test]

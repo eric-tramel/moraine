@@ -1,8 +1,9 @@
 -- Forward-only normalization columns for file_attention Phase 1.
 --
 -- Existing rows read these as defaults. New ingest rows fill them only when a
--- repo/worktree root, Git common-directory identity, and project backend marker
--- can be proven; Tier 0 suffix matching remains the permanent fallback for
+-- project root and either Git common-directory or exact working-directory
+-- identity can be proven. The optional project backend marker controls routing
+-- independently; Tier 0 suffix matching remains the permanent fallback for
 -- legacy and unnormalizable rows.
 
 ALTER TABLE moraine.events

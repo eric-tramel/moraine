@@ -356,7 +356,36 @@ python3 scripts/bench/performance_suite.py repeatability \
   <baseline-1.json> <baseline-2.json> <baseline-3.json> \
   <baseline-4.json> <baseline-5.json> <baseline-6.json> <baseline-7.json> \
   --output target/bench/performance/repeatability.json
+
+# On native arm64 macOS, gate the central MCP search path against a separately
+# owned, migrated, full-profile fixture database. Never point this at ~/.moraine.
+python3 scripts/bench/performance_suite.py native-central-burst \
+  --mcp-binary ./target/release/moraine-mcp \
+  --config /tmp/moraine-native-fixture/config.toml \
+  --profile full --split research \
+  --cold-repetitions 100 --minimum-cold-samples 100 \
+  --bursts-per-case 25 \
+  --warm-p95-limit-ms 750 --cold-p95-limit-ms 2000 \
+  --max-latency-ms 5000 \
+  --collect-query-log \
+  --output target/bench/performance/native-central-burst.json
 ```
+
+The native central burst is a T3 manual native regression probe, not a substitute
+for the fixed-resource Linux comparison and not merge/release evidence. Its
+`cold_lifecycle` phase restarts the central daemon before every first query
+(startup remains outside the timing boundary), while `steady_state` warms each
+selected query before synchronized
+C1/C4/C8 bursts. The defaults require at least 100 successful cold samples per
+concurrency, require every warm-mode p95 to be at most 750 ms, require cold
+high-hydration/common and session-scope p95 to be at most two seconds, and cap
+every raw sample at five seconds. The command rejects live/default or routed
+backends and verifies exact fixture/index/projection state before and after the
+run. `--collect-query-log` additionally requires exact candidate/detail counts
+for every cold lifecycle and zero measured ClickHouse statements after each
+steady-state warmup; any other owned-family statement fails the inventory. See
+`scripts/bench/README-native-central-burst.md` for fixture ownership, ClickHouse
+permissions, artifact fields, and cleanup details.
 
 Local mode uses the same scenarios, fresh physical sandboxes, semantic oracles, and
 frozen binaries, but reports `authoritative: false` because it observes rather than

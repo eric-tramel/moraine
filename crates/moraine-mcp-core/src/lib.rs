@@ -16,7 +16,7 @@ pub use private_proxy::private_route_deadline;
 pub use private_proxy::{negotiate_private_route, PrivateProxyConnection, PrivateRouteNegotiation};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::{pending, Future};
 use std::path::PathBuf;
 use std::sync::{
@@ -24,7 +24,7 @@ use std::sync::{
     Arc, Mutex as StdMutex,
 };
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::{oneshot, watch, Semaphore};
+use tokio::sync::{oneshot, watch, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
@@ -44,36 +44,187 @@ impl RequestLimitSource {
 }
 
 const AUTOMATIC_MAX_PARALLEL_REQUESTS: usize = 8;
+const MAX_QUEUED_REQUESTS: usize = 16;
+const SEARCH_PROJECTION_RETRY_AFTER_MS: u64 = 250;
 
-fn effective_max_parallel_requests(
-    configured: Option<u16>,
-    detected_parallelism: Option<usize>,
-) -> (usize, RequestLimitSource) {
+fn effective_max_parallel_requests(configured: Option<u16>) -> (usize, RequestLimitSource) {
     let (requested, source) = match configured {
         Some(configured) => (usize::from(configured), RequestLimitSource::Config),
         None => (
-            detected_parallelism
-                .unwrap_or(1)
-                .min(AUTOMATIC_MAX_PARALLEL_REQUESTS),
+            AUTOMATIC_MAX_PARALLEL_REQUESTS,
             RequestLimitSource::Automatic,
         ),
     };
     (requested.clamp(1, Semaphore::MAX_PERMITS), source)
 }
 
-fn build_request_permits(cfg: &AppConfig) -> Arc<Semaphore> {
-    let detected_parallelism = std::thread::available_parallelism()
-        .ok()
-        .map(std::num::NonZeroUsize::get);
+fn build_request_admission(cfg: &AppConfig) -> Arc<RequestAdmission> {
     let (max_parallel_requests, source) =
-        effective_max_parallel_requests(cfg.mcp.max_parallel_requests, detected_parallelism);
+        effective_max_parallel_requests(cfg.mcp.max_parallel_requests);
     info!(
         max_parallel_requests,
+        max_queued_requests = MAX_QUEUED_REQUESTS,
         source = source.as_str(),
-        "configured MCP retrieval concurrency"
+        "configured bounded MCP retrieval admission"
     );
-    Arc::new(Semaphore::new(max_parallel_requests))
+    Arc::new(RequestAdmission::new(
+        max_parallel_requests,
+        MAX_QUEUED_REQUESTS,
+    ))
 }
+
+#[derive(Debug)]
+struct RequestAdmission {
+    execution: Arc<Semaphore>,
+    slots: Arc<Semaphore>,
+    waiters: StdMutex<VecDeque<u64>>,
+    next_ticket: AtomicU64,
+    changes: watch::Sender<u64>,
+    closed: AtomicBool,
+    max_executing: usize,
+    max_queued: usize,
+}
+
+impl RequestAdmission {
+    fn new(max_executing: usize, max_queued: usize) -> Self {
+        let max_executing = max_executing.clamp(1, Semaphore::MAX_PERMITS);
+        let max_queued = max_queued.min(Semaphore::MAX_PERMITS - max_executing);
+        let (changes, _) = watch::channel(0);
+        Self {
+            execution: Arc::new(Semaphore::new(max_executing)),
+            slots: Arc::new(Semaphore::new(max_executing + max_queued)),
+            waiters: StdMutex::new(VecDeque::new()),
+            next_ticket: AtomicU64::new(0),
+            changes,
+            closed: AtomicBool::new(false),
+            max_executing,
+            max_queued,
+        }
+    }
+
+    fn try_register(self: &Arc<Self>) -> Result<AdmissionTicket, TryAdmissionError> {
+        let slot = match self.slots.clone().try_acquire_owned() {
+            Ok(slot) => slot,
+            Err(TryAcquireError::NoPermits) => return Err(TryAdmissionError::Full),
+            Err(TryAcquireError::Closed) => return Err(TryAdmissionError::Closed),
+        };
+        if self.closed.load(Ordering::Acquire) {
+            return Err(TryAdmissionError::Closed);
+        }
+
+        let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
+        self.waiters
+            .lock()
+            .expect("request admission queue poisoned")
+            .push_back(ticket);
+        self.signal_change();
+        Ok(AdmissionTicket {
+            admission: self.clone(),
+            ticket,
+            slot: Some(slot),
+            queued: true,
+        })
+    }
+
+    fn is_front(&self, ticket: u64) -> bool {
+        self.waiters
+            .lock()
+            .expect("request admission queue poisoned")
+            .front()
+            .is_some_and(|front| *front == ticket)
+    }
+
+    fn remove_waiter(&self, ticket: u64) {
+        let mut waiters = self
+            .waiters
+            .lock()
+            .expect("request admission queue poisoned");
+        if let Some(index) = waiters.iter().position(|queued| *queued == ticket) {
+            waiters.remove(index);
+        }
+        drop(waiters);
+        self.signal_change();
+    }
+
+    fn signal_change(&self) {
+        self.changes
+            .send_modify(|version| *version = version.wrapping_add(1));
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.execution.close();
+        self.slots.close();
+        self.signal_change();
+    }
+}
+
+#[derive(Debug)]
+enum TryAdmissionError {
+    Full,
+    Closed,
+}
+
+struct AdmissionTicket {
+    admission: Arc<RequestAdmission>,
+    ticket: u64,
+    slot: Option<OwnedSemaphorePermit>,
+    queued: bool,
+}
+
+impl AdmissionTicket {
+    async fn acquire(mut self) -> Option<RequestPermit> {
+        let mut changes = self.admission.changes.subscribe();
+        loop {
+            if self.admission.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            if self.admission.is_front(self.ticket) {
+                match self.admission.execution.clone().try_acquire_owned() {
+                    Ok(execution) => {
+                        self.admission.remove_waiter(self.ticket);
+                        self.queued = false;
+                        return Some(RequestPermit {
+                            admission: self.admission.clone(),
+                            execution: Some(execution),
+                            _slot: self
+                                .slot
+                                .take()
+                                .expect("registered admission ticket owns a slot"),
+                        });
+                    }
+                    Err(TryAcquireError::NoPermits) => {}
+                    Err(TryAcquireError::Closed) => return None,
+                }
+            }
+            if changes.changed().await.is_err() {
+                return None;
+            }
+        }
+    }
+}
+
+impl Drop for AdmissionTicket {
+    fn drop(&mut self) {
+        if self.queued {
+            self.admission.remove_waiter(self.ticket);
+        }
+    }
+}
+
+struct RequestPermit {
+    admission: Arc<RequestAdmission>,
+    execution: Option<OwnedSemaphorePermit>,
+    _slot: OwnedSemaphorePermit,
+}
+
+impl Drop for RequestPermit {
+    fn drop(&mut self) {
+        self.execution.take();
+        self.admission.signal_change();
+    }
+}
+
 const QUERY_CANCELLATION_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1_000);
 const SERVICE_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(1_250);
 
@@ -81,6 +232,20 @@ type QueryCancellationSlot = Arc<StdMutex<Option<String>>>;
 
 tokio::task_local! {
     static REQUEST_QUERY_CANCELLATION: QueryCancellationSlot;
+    static REQUEST_ACCEPTED_AT: std::time::Instant;
+}
+
+pub(crate) fn request_performance() -> contract::PerformanceBuilder {
+    let started_at = REQUEST_ACCEPTED_AT
+        .try_with(|started_at| *started_at)
+        .unwrap_or_else(|_| std::time::Instant::now());
+    contract::Performance::builder_from(started_at)
+}
+
+pub(crate) fn request_started_at() -> std::time::Instant {
+    REQUEST_ACCEPTED_AT
+        .try_with(|started_at| *started_at)
+        .unwrap_or_else(|_| std::time::Instant::now())
 }
 
 pub(crate) fn backend_query_id(kind: &str) -> String {
@@ -122,7 +287,7 @@ struct AppState {
     repo: Arc<dyn ConversationRepository>,
     launch_dir: Option<PathBuf>,
     prewarm_started: Arc<AtomicBool>,
-    request_permits: Arc<Semaphore>,
+    request_admission: Arc<RequestAdmission>,
 }
 
 impl AppState {
@@ -223,7 +388,7 @@ impl AppState {
             "tools": [
                 {
                     "name": contract::SEARCH_SESSIONS_TOOL,
-                    "description": "Search Moraine session history and return compact event-ranked handles. Use open with the returned event_id, turn_id, or session_id to expand results.",
+                    "description": "Search Moraine session history and return compact event-ranked handles. By default, searches user_input and assistant_response events. Select tool_call or tool_response with event_types for raw tool evidence, then use open on a returned turn_id or session_id for full context.",
                     "inputSchema": {
                         "type": "object",
                         "additionalProperties": false,
@@ -251,7 +416,8 @@ impl AppState {
                                         "runtime"
                                     ]
                                 },
-                                "description": "Optional normalized event type filter. Defaults to user_input, assistant_response, and tool_response."
+                                "default": ["user_input", "assistant_response"],
+                                "description": "Optional normalized event type filter. Defaults to user_input and assistant_response. Select tool_call or tool_response explicitly for raw tool evidence."
                             },
                             "harness": {
                                 "type": ["string", "null"],
@@ -291,17 +457,27 @@ impl AppState {
                 },
                 {
                     "name": contract::OPEN_TOOL,
-                    "description": "Open a Moraine MCP ID returned by search_sessions, list_sessions, or open. Accepts session, turn, and event IDs.",
+                    "description": "Open a Moraine session, turn, or event ID. Session and turn opens are summary-only by default so they stay small. Add limit to expand a bounded first page, then continue with {\"cursor\": next_cursor}. Open an event ID for its full content.",
                     "inputSchema": {
                         "type": "object",
                         "additionalProperties": false,
                         "properties": {
                             "id": {
-                                "type": "string",
-                                "description": "A session:..., turn:..., or event:... Moraine MCP ID."
+                                "type": ["string", "null"],
+                                "description": "A session:..., turn:..., or event:... Moraine MCP ID. Use alone for a bounded summary, or pair a session/turn ID with limit to start expansion."
+                            },
+                            "limit": {
+                                "type": ["integer", "null"],
+                                "minimum": contract::OPEN_MIN_LIMIT,
+                                "maximum": self.cfg.mcp.max_results.max(contract::OPEN_MIN_LIMIT),
+                                "description": "Number of compact turn or event summaries to return. Omit for summary-only output. Cannot be used with cursor."
+                            },
+                            "cursor": {
+                                "type": ["string", "null"],
+                                "maxLength": contract::OPEN_CURSOR_MAX_CHARS,
+                                "description": "Opaque next_cursor from a prior open response. Provide cursor by itself to continue with the original target and page size."
                             }
-                        },
-                        "required": ["id"]
+                        }
                     },
                     "outputSchema": {
                         "type": "object",
@@ -312,7 +488,13 @@ impl AppState {
                             "request": { "type": "object" },
                             "data": {
                                 "type": "object",
-                                "required": ["kind"]
+                                "required": ["kind"],
+                                "properties": {
+                                    "kind": { "enum": ["session", "turn", "event"] },
+                                    "turns": { "type": "array" },
+                                    "events": { "type": "array" },
+                                    "next_cursor": { "type": ["string", "null"] }
+                                }
                             },
                             "warnings": { "type": "array" },
                             "performance": { "type": "object" }
@@ -554,6 +736,18 @@ pub(crate) fn repo_error_to_contract_error(error: RepoError) -> contract::Contra
         RepoError::InvalidArgument(message) | RepoError::InvalidCursor(message) => {
             contract::ContractError::new(contract::ToolErrorCode::InvalidRequest, message)
         }
+        RepoError::ReadModelChanged => contract::ContractError::new(
+            contract::ToolErrorCode::InternalError,
+            format!(
+                "MCP search read model is refreshing; retry after {} ms",
+                SEARCH_PROJECTION_RETRY_AFTER_MS
+            ),
+        )
+        .with_details(json!({
+            "reason": "read_model_refresh",
+            "retryable": true,
+            "retry_after_ms": SEARCH_PROJECTION_RETRY_AFTER_MS,
+        })),
         RepoError::Backend(message) | RepoError::Internal(message) => {
             contract::ContractError::new(contract::ToolErrorCode::InternalError, message)
         }
@@ -575,25 +769,25 @@ impl AppState {
         repo: Arc<dyn ConversationRepository>,
         prewarm_started: Arc<AtomicBool>,
         launch_dir: Option<PathBuf>,
-        request_permits: Arc<Semaphore>,
+        request_admission: Arc<RequestAdmission>,
     ) -> Arc<AppState> {
         Arc::new(AppState {
             cfg,
             repo,
             launch_dir,
             prewarm_started,
-            request_permits,
+            request_admission,
         })
     }
 
     fn embedded(cfg: AppConfig, repo: Arc<dyn ConversationRepository>) -> Arc<AppState> {
-        let request_permits = build_request_permits(&cfg);
+        let request_admission = build_request_admission(&cfg);
         Self::with_repository(
             cfg.into(),
             repo,
             Arc::new(AtomicBool::new(false)),
             std::env::current_dir().ok(),
-            request_permits,
+            request_admission,
         )
     }
 }
@@ -630,7 +824,9 @@ impl QueryCancellationGuard {
 /// Slow repository requests execute concurrently and may complete out of order.
 /// Response encoding and writes stay on this connection task so JSON frames can
 /// never interleave. Admission is shared across socket connections; requests
-/// wait asynchronously when all execution permits are in use.
+/// wait in a finite FIFO queue when execution permits are busy and are rejected
+/// immediately when the queue is full. Admitted requests run until completion
+/// or cancellation.
 async fn serve_connection_with_first_line<R, W>(
     state: Arc<AppState>,
     reader: R,
@@ -842,6 +1038,7 @@ async fn dispatch_rpc_line(
     active: &mut HashMap<String, ActiveRequest>,
     mut connection_shutdown: watch::Receiver<bool>,
 ) -> Result<Option<Value>> {
+    let accepted_at = tokio::time::Instant::now();
     let line = line.trim();
     if line.is_empty() {
         return Ok(None);
@@ -867,9 +1064,9 @@ async fn dispatch_rpc_line(
         return Ok(None);
     }
 
-    if !request_requires_admission(&req, state.cfg.mcp.max_results) {
+    let Some(admitted_tool) = admitted_tool_call(&req, state.cfg.mcp.max_results) else {
         return Ok(state.handle_request(req).await);
-    }
+    };
 
     let id = req
         .id
@@ -884,6 +1081,20 @@ async fn dispatch_rpc_line(
         )));
     }
 
+    let admission_ticket = match state.request_admission.try_register() {
+        Ok(ticket) => ticket,
+        Err(TryAdmissionError::Full) => {
+            return Ok(Some(admission_error_response(
+                id,
+                &admitted_tool,
+                accepted_at,
+                state.request_admission.max_executing,
+                state.request_admission.max_queued,
+            )));
+        }
+        Err(TryAdmissionError::Closed) => return Ok(None),
+    };
+
     let (cancel_tx, mut cancel_rx) = oneshot::channel();
     let request_query_id = backend_query_id("request");
     let query_cancellation = Arc::new(StdMutex::new(None));
@@ -891,16 +1102,24 @@ async fn dispatch_rpc_line(
     let request_state = state.clone();
     let task_key = key.clone();
     let task = requests.spawn(async move {
-        let permit = tokio::select! {
+        enum AdmissionOutcome {
+            Admitted(RequestPermit),
+            Cancelled,
+        }
+
+        let admission = tokio::select! {
             biased;
-            _ = &mut cancel_rx => None,
-            _ = wait_for_connection_shutdown(&mut connection_shutdown) => None,
-            permit = request_state.request_permits.clone().acquire_owned() => permit.ok(),
+            _ = &mut cancel_rx => AdmissionOutcome::Cancelled,
+            _ = wait_for_connection_shutdown(&mut connection_shutdown) => AdmissionOutcome::Cancelled,
+            permit = admission_ticket.acquire() => match permit {
+                Some(permit) => AdmissionOutcome::Admitted(permit),
+                None => AdmissionOutcome::Cancelled,
+            },
         };
-        let Some(permit) = permit else {
-            return (task_key, None);
+        let _permit = match admission {
+            AdmissionOutcome::Admitted(permit) => permit,
+            AdmissionOutcome::Cancelled => return (task_key, None),
         };
-        let _permit = permit;
         let query_cancellation = task_query_cancellation;
         *query_cancellation
             .lock()
@@ -911,11 +1130,14 @@ async fn dispatch_rpc_line(
             Cancelled,
         }
         let outcome = {
-            let request = REQUEST_QUERY_CANCELLATION.scope(
-                query_cancellation.clone(),
-                moraine_conversations::with_repository_query_id(
-                    request_query_id,
-                    request_state.handle_request(req),
+            let request = REQUEST_ACCEPTED_AT.scope(
+                accepted_at.into_std(),
+                REQUEST_QUERY_CANCELLATION.scope(
+                    query_cancellation.clone(),
+                    moraine_conversations::with_repository_query_id(
+                        request_query_id,
+                        request_state.handle_request(req),
+                    ),
                 ),
             );
             tokio::pin!(request);
@@ -945,6 +1167,50 @@ async fn dispatch_rpc_line(
         },
     );
     Ok(None)
+}
+
+#[derive(Clone, Debug)]
+struct AdmittedToolCall {
+    name: String,
+    request: Value,
+}
+
+fn admission_error_response(
+    id: Value,
+    tool: &AdmittedToolCall,
+    accepted_at: tokio::time::Instant,
+    max_executing: usize,
+    max_queued: usize,
+) -> Value {
+    let error = contract::ContractError::new(
+        contract::ToolErrorCode::DeadlineExceeded,
+        "MCP retrieval queue is full; retry later",
+    )
+    .with_details(json!({
+        "reason": "queue_full",
+        "max_executing": max_executing,
+        "max_queued": max_queued,
+    }));
+    let payload = serde_json::to_value(contract::ToolErrorEnvelope::error(
+        tool.name.clone(),
+        tool.request.clone(),
+        error,
+        contract::Performance::from_elapsed(accepted_at.elapsed()),
+    ))
+    .expect("MCP admission error envelope is serializable");
+    rpc_ok(
+        id,
+        handled_tool_error_result(
+            format!(
+                "{} failed: {}",
+                tool.name,
+                payload["error"]["message"]
+                    .as_str()
+                    .unwrap_or("request failed")
+            ),
+            payload,
+        ),
+    )
 }
 
 async fn cancel_registered_query(state: &AppState, slot: &QueryCancellationSlot) {
@@ -978,31 +1244,37 @@ pub(crate) async fn cancel_query_with_deadline(state: &AppState, query_id: &str)
     }
 }
 
-fn request_requires_admission(req: &RpcRequest, max_results: u16) -> bool {
+fn admitted_tool_call(req: &RpcRequest, max_results: u16) -> Option<AdmittedToolCall> {
     if req.id.is_none() || req.method != "tools/call" {
-        return false;
+        return None;
     }
     let Ok(params) = serde_json::from_value::<ToolCallParams>(req.params.clone()) else {
-        return false;
+        return None;
     };
 
-    match params.name.as_str() {
+    let valid = match params.name.as_str() {
         contract::SEARCH_SESSIONS_TOOL => {
-            serde_json::from_value::<contract::SearchSessionsArgs>(params.arguments)
+            serde_json::from_value::<contract::SearchSessionsArgs>(params.arguments.clone())
                 .is_ok_and(|args| args.validate().is_ok())
         }
         contract::LIST_SESSIONS_TOOL => {
-            serde_json::from_value::<contract::ListSessionsArgs>(params.arguments)
+            serde_json::from_value::<contract::ListSessionsArgs>(params.arguments.clone())
                 .is_ok_and(|args| args.validate(max_results).is_ok())
         }
-        contract::OPEN_TOOL => serde_json::from_value::<contract::OpenV1Args>(params.arguments)
-            .is_ok_and(|args| args.validate().is_ok()),
+        contract::OPEN_TOOL => {
+            serde_json::from_value::<contract::OpenV1Args>(params.arguments.clone())
+                .is_ok_and(|args| args.validate(max_results).is_ok())
+        }
         contract::FILE_ATTENTION_TOOL => {
-            serde_json::from_value::<contract::FileAttentionArgs>(params.arguments)
+            serde_json::from_value::<contract::FileAttentionArgs>(params.arguments.clone())
                 .is_ok_and(|args| args.validate(max_results).is_ok())
         }
         _ => false,
-    }
+    };
+    valid.then_some(AdmittedToolCall {
+        name: params.name,
+        request: params.arguments,
+    })
 }
 
 fn request_key(id: &Value) -> Result<String> {
@@ -1099,7 +1371,7 @@ struct SocketState {
     cfg: Arc<AppConfig>,
     router: Arc<BackendRepositoryRouter>,
     prewarm_gates: BackendPrewarmGates,
-    request_permits: Arc<Semaphore>,
+    request_admission: Arc<RequestAdmission>,
     shutdown: watch::Receiver<bool>,
 }
 
@@ -1126,10 +1398,10 @@ where
     use tokio::task::JoinSet;
 
     let (connection_shutdown_tx, connection_shutdown_rx) = watch::channel(false);
-    let request_permits = build_request_permits(&cfg);
+    let request_admission = build_request_admission(&cfg);
     let state = SocketState {
         prewarm_gates: BackendPrewarmGates::new(&cfg),
-        request_permits,
+        request_admission,
         shutdown: connection_shutdown_rx,
         cfg,
         router,
@@ -1282,7 +1554,7 @@ where
         }
     }
 
-    state.request_permits.close();
+    state.request_admission.close();
     let _ = connection_shutdown_tx.send(true);
     let drain_deadline = tokio::time::Instant::now() + SERVICE_DRAIN_GRACE;
     while !connections.is_empty() {
@@ -1492,7 +1764,7 @@ async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStr
         backend.repository().clone(),
         prewarm_started,
         launch_dir,
-        state.request_permits,
+        state.request_admission,
     );
     if negotiated {
         private_proxy::write_ack(&mut write_half).await?;
@@ -1660,49 +1932,32 @@ mod tests {
     }
 
     #[test]
-    fn effective_parallel_request_limit_prefers_config_and_falls_back_safely() {
+    fn effective_parallel_request_limit_prefers_config_and_defaults_to_eight() {
         assert_eq!(
-            effective_max_parallel_requests(Some(12), Some(8)),
+            effective_max_parallel_requests(Some(12)),
             (12, RequestLimitSource::Config)
         );
         assert_eq!(
-            effective_max_parallel_requests(None, Some(1)),
-            (1, RequestLimitSource::Automatic)
-        );
-        assert_eq!(
-            effective_max_parallel_requests(None, Some(2)),
-            (2, RequestLimitSource::Automatic)
-        );
-        assert_eq!(
-            effective_max_parallel_requests(None, Some(8)),
+            effective_max_parallel_requests(None),
             (8, RequestLimitSource::Automatic)
-        );
-        assert_eq!(
-            effective_max_parallel_requests(None, None),
-            (1, RequestLimitSource::Automatic)
-        );
-        assert_eq!(
-            effective_max_parallel_requests(None, Some(12)),
-            (
-                AUTOMATIC_MAX_PARALLEL_REQUESTS,
-                RequestLimitSource::Automatic
-            )
-        );
-        assert_eq!(
-            effective_max_parallel_requests(None, Some(Semaphore::MAX_PERMITS.saturating_add(1))),
-            (
-                AUTOMATIC_MAX_PARALLEL_REQUESTS,
-                RequestLimitSource::Automatic
-            )
         );
     }
 
     #[test]
-    fn embedded_state_uses_configured_parallel_request_limit() {
+    fn embedded_state_uses_configured_execution_and_bounded_queue_limits() {
         let mut cfg = AppConfig::default();
         cfg.mcp.max_parallel_requests = Some(3);
         let state = AppState::embedded(cfg, repository_with_scope(None));
-        assert_eq!(state.request_permits.available_permits(), 3);
+        assert_eq!(state.request_admission.execution.available_permits(), 3);
+        assert_eq!(state.request_admission.slots.available_permits(), 19);
+        assert_eq!(state.request_admission.max_queued, 16);
+    }
+
+    #[test]
+    fn embedded_state_defaults_to_eight_executing_and_sixteen_queued() {
+        let state = test_state();
+        assert_eq!(state.request_admission.execution.available_permits(), 8);
+        assert_eq!(state.request_admission.slots.available_permits(), 24);
     }
 
     fn successful_test_state() -> Arc<AppState> {
@@ -1733,6 +1988,7 @@ mod tests {
             turns: Vec::new(),
             completed: false,
             terminal_event_uid: None,
+            snapshot: None,
         };
         let repository = Arc::new(InMemoryConversationRepository::with_responses(
             RepoConfig::default(),
@@ -1752,6 +2008,17 @@ mod tests {
                 list_mcp_sessions: Some(Err(RepoError::backend("list failed"))),
                 search_mcp_events: Some(Err(RepoError::internal("search failed"))),
                 file_attention: Some(Err(RepoError::backend("attention failed"))),
+                ..InMemoryConversationResponses::default()
+            },
+        ));
+        AppState::embedded(AppConfig::default(), repository)
+    }
+
+    fn read_model_changed_test_state() -> Arc<AppState> {
+        let repository = Arc::new(InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            InMemoryConversationResponses {
+                search_mcp_events: Some(Err(RepoError::ReadModelChanged)),
                 ..InMemoryConversationResponses::default()
             },
         ));
@@ -1889,21 +2156,31 @@ mod tests {
             open["inputSchema"]["properties"]
                 .as_object()
                 .map(|props| props.len()),
-            Some(1)
+            Some(3)
         );
         assert!(open["inputSchema"]["properties"].get("id").is_some());
+        assert!(open["inputSchema"]["properties"].get("limit").is_some());
+        assert!(open["inputSchema"]["properties"].get("cursor").is_some());
 
         let search = tools
             .iter()
             .find(|tool| tool["name"].as_str() == Some("search_sessions"))
             .expect("search_sessions exists");
         assert_eq!(
+            search["description"],
+            json!("Search Moraine session history and return compact event-ranked handles. By default, searches user_input and assistant_response events. Select tool_call or tool_response with event_types for raw tool evidence, then use open on a returned turn_id or session_id for full context.")
+        );
+        assert_eq!(
             search["inputSchema"]["properties"]["query"]["description"],
             json!("Keyword (BM25) search query. Matching is bag-of-words: quotes and punctuation are ignored, and a quoted phrase is matched as independent terms subject to the configured minimum-match threshold, not as an exact phrase.")
         );
         assert_eq!(
             search["inputSchema"]["properties"]["event_types"]["description"],
-            json!("Optional normalized event type filter. Defaults to user_input, assistant_response, and tool_response.")
+            json!("Optional normalized event type filter. Defaults to user_input and assistant_response. Select tool_call or tool_response explicitly for raw tool evidence.")
+        );
+        assert_eq!(
+            search["inputSchema"]["properties"]["event_types"]["default"],
+            json!(["user_input", "assistant_response"])
         );
         assert_eq!(
             search["inputSchema"]["properties"]["n_hits"]["default"],
@@ -2134,7 +2411,39 @@ mod tests {
         for (index, (tool, arguments)) in cases.into_iter().enumerate() {
             let response = call_tool_rpc(&state, index as u64 + 1, tool, arguments).await;
             assert_handled_tool_error_exchange(&response, tool, "internal_error");
+            assert!(response["result"]["structuredContent"]["error"]
+                .get("details")
+                .is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn search_projection_changes_are_structured_retryable_errors() {
+        let state = read_model_changed_test_state();
+        let response = call_tool_rpc(
+            &state,
+            1,
+            contract::SEARCH_SESSIONS_TOOL,
+            json!({ "query": "active ingest" }),
+        )
+        .await;
+
+        assert_handled_tool_error_exchange(
+            &response,
+            contract::SEARCH_SESSIONS_TOOL,
+            "internal_error",
+        );
+        let error = &response["result"]["structuredContent"]["error"];
+        assert_eq!(error["details"]["reason"], json!("read_model_refresh"));
+        assert_eq!(error["details"]["retryable"], json!(true));
+        assert_eq!(
+            error["details"]["retry_after_ms"],
+            json!(SEARCH_PROJECTION_RETRY_AFTER_MS)
+        );
+        assert!(error["message"]
+            .as_str()
+            .expect("freshness error message")
+            .contains("retry after 250 ms"));
     }
 
     #[tokio::test]
@@ -2561,8 +2870,6 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(root.join(".git")).expect("create test git directory");
-        std::fs::write(root.join(".moraine.toml"), "backend = \"default\"\n")
-            .expect("write repository backend marker");
         let expected_project_id =
             moraine_config::project_id_for_repo_root(&root).expect("canonical project id");
 
@@ -2618,6 +2925,7 @@ mod tests {
                 .any(|root| root == &root_text),
             "launch root must be present in registered project roots"
         );
+        assert!(query.derive_legacy_roots);
         assert!(query.apply_project_scope);
 
         shutdown_tx.send(()).expect("shutdown route server");

@@ -40,6 +40,18 @@ struct ProjectionStateRow {
     backfill_cursor: String,
 }
 
+fn projection_session_ids<I, S>(session_ids: I) -> BTreeSet<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    session_ids
+        .into_iter()
+        .map(|session_id| session_id.as_ref().to_string())
+        .filter(|session_id| !session_id.is_empty())
+        .collect()
+}
+
 impl ClickHouseClient {
     /// Rebuild complete canonical snapshots for the affected sessions and
     /// publish each session head only after its inactive children are durable.
@@ -48,11 +60,7 @@ impl ClickHouseClient {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let session_ids = session_ids
-            .into_iter()
-            .map(|session_id| session_id.as_ref().trim().to_string())
-            .filter(|session_id| !session_id.is_empty())
-            .collect::<BTreeSet<_>>();
+        let session_ids = projection_session_ids(session_ids);
 
         stream::iter(session_ids.into_iter().map(Ok::<_, anyhow::Error>))
             .try_for_each_concurrent(REFRESH_CONCURRENCY, |session_id| async move {
@@ -90,6 +98,7 @@ impl ClickHouseClient {
                        SELECT DISTINCT session_id\n\
                        FROM {}.events FINAL\n\
                        WHERE session_id > {}\n\
+                         AND notEmpty(session_id)\n\
                      )\n\
                      ORDER BY session_id ASC\n\
                      LIMIT {}\n\
@@ -125,7 +134,8 @@ impl ClickHouseClient {
                    SELECT session_id, dirty_revision\n\
                    FROM {}.mcp_open_sessions FINAL\n\
                  ) AS s ON s.session_id = d.session_id\n\
-                 WHERE d.dirty_revision > ifNull(s.dirty_revision, 0)\n\
+                 WHERE notEmpty(d.session_id)\n\
+                   AND d.dirty_revision > ifNull(s.dirty_revision, 0)\n\
                  ORDER BY d.session_id ASC\n\
                  LIMIT {}\n\
                  FORMAT JSONEachRow",
@@ -341,6 +351,8 @@ impl ClickHouseClient {
         let message = "(event_class = 'message' OR (event_class = 'event_msg' AND payload_type IN ('user_message', 'agent_message', 'message', 'text')))";
         let user_message = format!("(lowerUTF8(actor_role) = 'user' AND {message})");
         let assistant_message = format!("(lowerUTF8(actor_role) = 'assistant' AND {message})");
+        let final_response_message =
+            format!("({assistant_message} AND lowerUTF8(phase) != 'commentary')");
         let statement = format!(
             "INSERT INTO {database}.mcp_open_turns\n\
              (session_id, slot, generation, turn_seq, turn_id, started_at, ended_at,\n\
@@ -363,17 +375,17 @@ impl ClickHouseClient {
                  countIf(event_class = 'tool_call') AS tool_calls, countIf(event_class = 'tool_result') AS tool_results,\n\
                  countIf(event_class = 'reasoning') AS reasoning_items,\n\
                  argMinIf(summary_source, tuple(event_order, event_uid), {user_message}) AS user_input_summary_source,\n\
-                 argMaxIf(summary_source, tuple(event_order, event_uid), {assistant_message}) AS final_response_summary_source,\n\
+                 argMaxIf(summary_source, tuple(event_order, event_uid), {final_response_message}) AS final_response_summary_source,\n\
                  argMinIf(toUInt8(summary_is_payload), tuple(event_order, event_uid), {user_message}) AS user_input_summary_is_payload,\n\
-                 argMaxIf(toUInt8(summary_is_payload), tuple(event_order, event_uid), {assistant_message}) AS final_response_summary_is_payload,\n\
+                 argMaxIf(toUInt8(summary_is_payload), tuple(event_order, event_uid), {final_response_message}) AS final_response_summary_is_payload,\n\
                  argMinIf(event_uid, tuple(event_order, event_uid), {user_message}) AS user_input_event_uid,\n\
                  argMinIf(event_order, tuple(event_order, event_uid), {user_message}) AS user_input_event_order,\n\
                  argMinIf(event_time, tuple(event_order, event_uid), {user_message}) AS user_input_event_time,\n\
                  argMinIf(event_type, tuple(event_order, event_uid), {user_message}) AS user_input_event_type,\n\
-                 argMaxIf(event_uid, tuple(event_order, event_uid), {assistant_message}) AS final_response_event_uid,\n\
-                 argMaxIf(event_order, tuple(event_order, event_uid), {assistant_message}) AS final_response_event_order,\n\
-                 argMaxIf(event_time, tuple(event_order, event_uid), {assistant_message}) AS final_response_event_time,\n\
-                 argMaxIf(event_type, tuple(event_order, event_uid), {assistant_message}) AS final_response_event_type,\n\
+                 argMaxIf(event_uid, tuple(event_order, event_uid), {final_response_message}) AS final_response_event_uid,\n\
+                 argMaxIf(event_order, tuple(event_order, event_uid), {final_response_message}) AS final_response_event_order,\n\
+                 argMaxIf(event_time, tuple(event_order, event_uid), {final_response_message}) AS final_response_event_time,\n\
+                 argMaxIf(event_type, tuple(event_order, event_uid), {final_response_message}) AS final_response_event_type,\n\
                  arrayDistinct(arrayMap(x -> x.2, arraySort(groupArrayIf(tuple(event_order, tool_label), event_type = 'tool_call' AND tool_label != '')))) AS tools_called,\n\
                  arrayDistinct(arrayMap(x -> x.2, arraySort(groupArray(tuple(event_order, event_type))))) AS normalized_event_types,\n\
                  argMaxIf(toUInt8(payload_type = 'task_complete'), tuple(event_order, event_uid), payload_type IN ('task_complete', 'turn_aborted')) AS completed,\n\
@@ -455,8 +467,7 @@ impl ClickHouseClient {
                  argMax(actor_role, tuple(event_time, event_order, event_uid)) AS last_actor_role,\n\
                  ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'title'), ''), tuple(event_ts, event_uid), event_class = 'session_meta'),\n\
                    ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'name'), ''), tuple(event_ts, event_uid), event_class = 'session_meta'), '')) AS title,\n\
-                 ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'source'), ''), tuple(event_ts, event_uid), event_class = 'session_meta'),\n\
-                   ifNull(argMax(nullIf(source_name, ''), tuple(event_ts, event_uid)), '')) AS source,\n\
+                 ifNull(argMax(nullIf(source_name, ''), tuple(event_ts, event_uid)), '') AS source,\n\
                  ifNull(argMax(nullIf(harness, ''), tuple(event_ts, event_uid)), '') AS harness,\n\
                  ifNull(argMax(nullIf(inference_provider, ''), tuple(event_ts, event_uid)), '') AS inference_provider,\n\
                  ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'slug'), ''), tuple(event_ts, event_uid), event_class = 'session_meta'), '') AS session_slug,\n\
@@ -579,4 +590,20 @@ fn event_type_sql() -> &'static str {
       event_class = 'queue_operation' OR payload_type IN ('task_started', 'task_complete', 'turn_aborted', 'item_completed', 'queue-operation'), 'runtime',\
       lowerUTF8(actor_role) = 'system' OR event_class IN ('system', 'progress', 'file_history_snapshot') OR payload_type IN ('system', 'progress', 'file-history-snapshot', 'file_history_snapshot'), 'system',\
       'unknown')"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::projection_session_ids;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn projection_session_ids_drop_only_the_empty_storage_sentinel() {
+        let ids = projection_session_ids(["", " ", "\u{a0}", "session"]);
+
+        assert_eq!(
+            ids,
+            BTreeSet::from([" ".to_string(), "\u{a0}".to_string(), "session".to_string(),])
+        );
+    }
 }

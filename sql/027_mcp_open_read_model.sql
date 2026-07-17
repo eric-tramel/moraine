@@ -139,6 +139,7 @@ SELECT
   generateSnowflakeID() AS dirty_revision,
   now64(3) AS observed_at
 FROM moraine.events
+WHERE notEmpty(session_id)
 GROUP BY session_id;
 
 CREATE TABLE IF NOT EXISTS moraine.mcp_open_projection_state (

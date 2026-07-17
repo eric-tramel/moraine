@@ -27,6 +27,10 @@ password = ""
 # Per-request ClickHouse HTTP timeout, in seconds.
 timeout_seconds = 30.0
 
+# Compress non-empty ClickHouse HTTP request bodies. Supported values are
+# "none" and "gzip". Gzip can reduce network transfer for trace payloads.
+request_compression = "none"
+
 # Add async_insert=1 to writes so ClickHouse can acknowledge batched inserts
 # before fully flushing them.
 async_insert = true
@@ -50,6 +54,7 @@ allow_newer_server = false
 # username = "svc-moraine"
 # password = ""
 # timeout_seconds = 30.0
+# request_compression = "gzip"
 # async_insert = true
 # wait_for_async_insert = true
 # allow_newer_server = false
@@ -259,8 +264,9 @@ async_log_writes = true
 # MCP protocol version advertised by the server.
 protocol_version = "2024-11-05"
 # Maximum retrieval requests executed concurrently by this MCP server process.
-# Additional valid requests wait rather than returning a saturation error.
-# Omit to use the CPU parallelism available to the Moraine process.
+# Omit for the default of 8. At most 16 additional requests wait in FIFO order.
+# Queued and running retrievals have no fixed admission deadline; a full queue
+# is rejected immediately with a structured retryable error.
 # max_parallel_requests = 16
 
 
@@ -341,4 +347,3 @@ clickhouse_auto_install = true
 
 # Managed ClickHouse release tag expected by this Moraine build.
 clickhouse_version = "v25.12.5.44-stable"
-

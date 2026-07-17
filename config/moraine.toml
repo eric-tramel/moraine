@@ -4,6 +4,7 @@ database = "moraine"
 username = "default"
 password = ""
 timeout_seconds = 30.0
+request_compression = "none"
 async_insert = true
 wait_for_async_insert = true
 
@@ -20,6 +21,7 @@ wait_for_async_insert = true
 # database = "moraine_team"
 # username = "svc-moraine"
 # password = ""
+# request_compression = "gzip"
 # # Accept a server whose migration ledger is ahead of this moraine build.
 # allow_newer_server = false
 
@@ -169,8 +171,10 @@ default_exclude_codex_mcp = true
 prewarm_on_initialize = false
 async_log_writes = true
 protocol_version = "2024-11-05"
-# Valid retrievals beyond this process-wide parallel limit wait for capacity.
-# Omit to use the CPU parallelism available to the Moraine process.
+# Retrievals beyond this process-wide execution limit enter a 16-request FIFO
+# queue. Omit for the default of 8 executing requests. Queued and running
+# retrievals have no fixed admission deadline; a full queue is rejected
+# immediately.
 # max_parallel_requests = 16
 # MCP clients first try the unified backend's Unix socket, then transparently
 # fall back to an embedded server when the socket is absent or unreachable.

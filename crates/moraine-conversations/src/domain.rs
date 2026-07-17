@@ -72,19 +72,23 @@ pub struct FileAttentionQuery {
     /// Opaque cancellation token assigned by the caller so timed-out requests
     /// can cancel in-flight backend work.
     pub cancellation_token: String,
-    /// Repo-relative tail to suffix-match against captured file paths. The tail
+    /// Project-relative tail to suffix-match against captured file paths. The tail
     /// is what unifies the same logical file across worktree roots.
     pub rel: String,
     /// Canonical request-project identity used by both exact and fallback
-    /// lookup. It is an opaque digest of the Git common directory, so linked
-    /// worktrees agree while unrelated repositories sharing one backend do not.
+    /// lookup. Git projects digest the common directory so linked worktrees
+    /// agree; non-Git projects digest the exact canonical launch directory.
     /// `None` keeps project-scoped queries closed; only an explicit unscoped
     /// query may omit this boundary.
     pub normalized_project_id: Option<String>,
-    /// Canonical registered roots for the request repository. These safely
+    /// Canonical registered roots for the request project. These safely
     /// admit rows written with the pre-digest project identity during the
     /// transition without widening to another repository sharing the backend.
     pub normalized_project_roots: Vec<String>,
+    /// Whether the request path was proven to be one project-relative file
+    /// and may therefore use structured legacy path/cwd evidence to recover a
+    /// missing normalized root.
+    pub derive_legacy_roots: bool,
     /// When true normalized request-project identity is enforced in both query
     /// paths. The repository's configured origin scope (`--project-only`) is an
     /// independent hard floor. When false (`scope:"all"`), only request-project
@@ -376,6 +380,12 @@ pub struct McpTurnCompact {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpOpenSnapshot {
+    pub slot: u8,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpSessionOpen {
     pub metadata: SessionMetadata,
     pub title: Option<String>,
@@ -387,6 +397,8 @@ pub struct McpSessionOpen {
     pub turns: Vec<McpTurnCompact>,
     pub completed: bool,
     pub terminal_event_uid: Option<String>,
+    #[serde(default)]
+    pub snapshot: Option<McpOpenSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -416,8 +428,14 @@ pub struct McpSessionListItem {
 pub struct McpTurnOpen {
     pub metadata: TurnSummary,
     pub events: Vec<McpEventSummary>,
+    #[serde(default)]
+    pub parent_session_source: Option<String>,
     pub user_input_summary: Option<String>,
     pub final_response_summary: Option<String>,
+    #[serde(default)]
+    pub user_input_event: Option<McpEventRef>,
+    #[serde(default)]
+    pub final_response_event: Option<McpEventRef>,
     pub tools_called: Vec<String>,
     pub normalized_event_types: Vec<String>,
     pub completed: bool,
@@ -426,6 +444,8 @@ pub struct McpTurnOpen {
     pub next_turn: Option<McpTurnRef>,
     pub first_event: Option<McpEventRef>,
     pub last_event: Option<McpEventRef>,
+    #[serde(default)]
+    pub snapshot: Option<McpOpenSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -758,11 +778,17 @@ pub struct SearchMcpEventHit {
     pub event_order: u64,
     pub event_ordinal: u32,
     pub turn_event_count: u64,
+    #[serde(default)]
+    pub turn_completed: bool,
+    #[serde(default)]
+    pub turn_terminal_event_uid: Option<String>,
     pub session_started_at_unix_ms: Option<i64>,
     pub session_updated_at_unix_ms: Option<i64>,
     pub session_title: Option<String>,
     pub session_slug: Option<String>,
     pub session_summary: Option<String>,
+    #[serde(default)]
+    pub session_completed: bool,
     pub source_name: Option<String>,
     pub harness: Option<String>,
     pub inference_provider: Option<String>,
@@ -792,9 +818,17 @@ pub struct SearchMcpEventsResult {
     pub query: String,
     pub terms: Vec<String>,
     pub event_types: Vec<McpEventType>,
+    /// Whether a requested session/turn scope exists and is visible to this
+    /// repository. Unscoped searches always report `true`.
+    #[serde(default = "default_true")]
+    pub scope_exists: bool,
     pub truncated: bool,
     pub stats: SearchMcpEventsStats,
     pub hits: Vec<SearchMcpEventHit>,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

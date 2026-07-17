@@ -1,12 +1,113 @@
 use super::*;
 
 #[tokio::test(flavor = "multi_thread")]
+async fn search_mcp_events_distinguishes_unready_and_dirty_projection_snapshots() {
+    for (projection_ready, projection_clean) in [(0_u8, 1_u8), (1_u8, 0_u8)] {
+        let metadata = json!({
+            "row_kind": 1_u8,
+            "event_uid": "",
+            "session_id": "",
+            "slot": 0_u8,
+            "generation": 0_u64,
+            "raw_score": 0.0,
+            "matched_terms": 0_u64,
+            "event_unix_ms": 0_i64,
+            "docs": 100_u64,
+            "total_doc_len": 5000_u64,
+            "scope_exists": 1_u8,
+            "projection_ready": projection_ready,
+            "projection_clean": projection_clean
+        });
+        let (repo, state) = build_scripted_repo(vec![ScriptedResponse::rows(
+            &["toUInt8(0) AS row_kind"],
+            json!([metadata]),
+        )])
+        .await;
+
+        let error = repo
+            .search_mcp_events(SearchMcpEventsQuery {
+                query: "projection health".to_string(),
+                n_hits: Some(5),
+                min_score: Some(0.0),
+                min_should_match: Some(1),
+                ..SearchMcpEventsQuery::default()
+            })
+            .await
+            .expect_err("unhealthy projection must fail closed");
+        if projection_ready == 0 {
+            assert!(error.to_string().contains("not ready"), "{error}");
+        } else {
+            assert!(matches!(error, RepoError::ReadModelChanged));
+        }
+        assert_script_consumed(&state, 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_mcp_events_immediate_retry_finishes_within_request_deadline() {
+    let repeated_scan_reached = Arc::new(Notify::new());
+    let repeated_scan_release = Arc::new(Notify::new());
+    let (repo, state) = build_repo_with_options(
+        100,
+        MockOptions {
+            dirty_projection_on_first_candidate: true,
+            repeated_corpus_stats_barrier: Some(ScriptedBarrier {
+                reached: repeated_scan_reached.clone(),
+                release: repeated_scan_release,
+            }),
+            ..MockOptions::default()
+        },
+    )
+    .await;
+    let query = || SearchMcpEventsQuery {
+        query: "active ingest".to_string(),
+        n_hits: Some(10),
+        min_score: Some(0.0),
+        min_should_match: Some(1),
+        ..SearchMcpEventsQuery::default()
+    };
+
+    let first = repo
+        .search_mcp_events(query())
+        .await
+        .expect_err("dirty projection must return retry guidance");
+    assert!(matches!(first, RepoError::ReadModelChanged));
+
+    let retry_deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    let retry = tokio::time::timeout(
+        Duration::from_secs(4),
+        with_repository_query_deadline(
+            "active-ingest-retry".to_string(),
+            retry_deadline,
+            repo.search_mcp_events(query()),
+        ),
+    )
+    .await
+    .expect("published retry must finish inside the request deadline")
+    .expect("published retry must succeed");
+    assert_eq!(retry.hits.len(), 2);
+
+    let queries = state.queries.lock().expect("queries lock");
+    let candidate_queries = queries
+        .iter()
+        .filter(|query| {
+            query.contains("toUInt8(0) AS row_kind") && query.contains("projected_candidates AS")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(candidate_queries.len(), 2);
+    assert!(candidate_queries[0].contains("search_corpus_stats"));
+    assert!(!candidate_queries[1].contains("search_corpus_stats"));
+    assert!(candidate_queries[1].contains("tuple(toUInt64(100), toUInt64(5000)) AS corpus_stats"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn search_mcp_events_applies_session_origin_scope() {
-    let (repo, state) = build_scoped_repo(&["/work/project"]).await;
+    let (repo, state) = build_scoped_repo(&["/work/s.origin_cwd/project"]).await;
 
     repo.search_mcp_events(SearchMcpEventsQuery {
         query: "hello world".to_string(),
         n_hits: Some(10),
+        session_id: Some("sess_a".to_string()),
         event_types: Some(vec![
             McpEventType::UserInput,
             McpEventType::AssistantResponse,
@@ -23,14 +124,15 @@ async fn search_mcp_events_applies_session_origin_scope() {
     let queries = state.queries.lock().expect("queries lock").clone();
     let search_query = queries
         .iter()
-        .find(|q| q.contains("AS mcp_event_type") && q.contains("AS raw_score"))
+        .find(|q| q.contains("toUInt8(0) AS row_kind") && q.contains("AS raw_score"))
         .expect("search query should be captured");
 
-    assert!(search_query.contains("d.session_id IN (SELECT session_id FROM ("));
-    assert!(search_query.contains("origin_cwd = '/work/project'"));
-    assert!(search_query.contains("startsWith(origin_cwd, '/work/project/')"));
-    assert!(search_query.contains("d.harness = 'claude-code'"));
-    assert!(search_query.contains("d.source_name = 'claude'"));
+    assert!(search_query.contains("s.origin_cwd = '/work/s.origin_cwd/project'"));
+    assert!(search_query.contains("startsWith(s.origin_cwd, '/work/s.origin_cwd/project/')"));
+    assert!(search_query.contains("scope_s.origin_cwd = '/work/s.origin_cwd/project'"));
+    assert!(!search_query.contains("'/work/scope_s.origin_cwd/project'"));
+    assert!(search_query.contains("p.harness = 'claude-code'"));
+    assert!(search_query.contains("p.source_name = 'claude'"));
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn search_session_metadata_returns_summary_only_matches() {
@@ -492,6 +594,7 @@ async fn search_mcp_events_supports_global_search_with_enriched_hits() {
             n_hits: Some(10),
             event_types: Some(vec![
                 McpEventType::ToolResponse,
+                McpEventType::ToolCall,
                 McpEventType::UserInput,
                 McpEventType::AssistantResponse,
             ]),
@@ -509,6 +612,7 @@ async fn search_mcp_events_supports_global_search_with_enriched_hits() {
         vec![
             McpEventType::UserInput,
             McpEventType::AssistantResponse,
+            McpEventType::ToolCall,
             McpEventType::ToolResponse
         ]
     );
@@ -609,73 +713,98 @@ async fn repository_query_context_attaches_id_without_query_model_token() {
         observed.len()
     );
 }
+
 #[tokio::test(flavor = "multi_thread")]
-async fn search_mcp_events_does_not_serialize_independent_enrichment_queries() {
-    let reached = Arc::new(Notify::new());
-    let release = Arc::new(Notify::new());
-    let (repo, state) = build_repo_with_options(
-        100,
-        MockOptions {
-            query_barrier: Some(QueryBarrier {
-                required: vec!["FROM `moraine`.`v_session_summary`", "WHERE session_id IN"],
-                reached: reached.clone(),
-                release: release.clone(),
-            }),
-            ..MockOptions::default()
-        },
+async fn repository_query_context_passes_remaining_deadline_to_every_read() {
+    let (repo, state) = build_repo().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+
+    with_repository_query_deadline(
+        "mcp-deadline-context-test".to_string(),
+        deadline,
+        repo.search_mcp_events(SearchMcpEventsQuery {
+            query: "hello world".to_string(),
+            cancellation_token: Some("nested-search-query".to_string()),
+            n_hits: Some(2),
+            event_types: Some(vec![McpEventType::AssistantResponse]),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            ..SearchMcpEventsQuery::default()
+        }),
     )
-    .await;
-    let repo = Arc::new(repo);
-    let search = {
-        let repo = Arc::clone(&repo);
-        tokio::spawn(async move {
-            repo.search_mcp_events(SearchMcpEventsQuery {
-                query: "hello world".to_string(),
-                n_hits: Some(10),
-                event_types: Some(vec![
-                    McpEventType::ToolResponse,
-                    McpEventType::UserInput,
-                    McpEventType::AssistantResponse,
-                ]),
-                min_score: Some(0.0),
-                min_should_match: Some(1),
-                ..SearchMcpEventsQuery::default()
-            })
-            .await
-        })
-    };
-
-    tokio::time::timeout(Duration::from_secs(2), reached.notified())
-        .await
-        .expect("session-time enrichment query reached the wire barrier");
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let (metadata_started, event_enrichment_started) = {
-                let queries = state.queries.lock().expect("queries lock");
-                (
-                    queries
-                        .iter()
-                        .any(|query| query.contains("event_kind = 'session_meta'")),
-                    queries
-                        .iter()
-                        .any(|query| query.contains("AS event_ordinal")),
-                )
-            };
-            if metadata_started && event_enrichment_started {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
     .await
-    .expect("metadata and event enrichment reached ClickHouse concurrently");
+    .expect("deadline-scoped search");
 
-    release.notify_one();
-    let result = search
+    let request_params = state.request_params.lock().expect("request params lock");
+    assert_eq!(request_params.len(), 2);
+    for params in request_params.iter() {
+        let remaining = params["max_execution_time"]
+            .parse::<f64>()
+            .expect("numeric remaining ClickHouse deadline");
+        assert!(remaining > 0.0 && remaining <= 2.0);
+        assert_eq!(params["timeout_overflow_mode"], "throw");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_mcp_events_uses_one_candidate_and_one_bounded_detail_query() {
+    let (repo, state) = build_repo().await;
+
+    let result = repo
+        .search_mcp_events(SearchMcpEventsQuery {
+            query: "hello world".to_string(),
+            n_hits: Some(10),
+            event_types: Some(vec![
+                McpEventType::ToolResponse,
+                McpEventType::UserInput,
+                McpEventType::AssistantResponse,
+            ]),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            ..SearchMcpEventsQuery::default()
+        })
         .await
-        .expect("search task joins")
-        .expect("parallel enrichment succeeds");
+        .expect("two-stage search succeeds");
     assert_eq!(result.hits.len(), 2);
+
+    let queries = state.queries.lock().expect("queries lock");
+    assert_eq!(queries.len(), 2, "cold search must issue exactly two reads");
+    assert!(queries[0].contains("toUInt8(0) AS row_kind"));
+    assert!(queries[0].contains("ORDER BY raw_score DESC, event_unix_ms DESC, event_uid ASC"));
+    assert_eq!(
+        queries[0].matches("search_corpus_stats").count(),
+        1,
+        "scalar corpus metadata must expand exactly once"
+    );
+    assert!(queries[0].contains("mcp_open_dirty_sessions"));
+    assert!(queries[0].contains("WHERE notEmpty(session_id)"));
+    assert!(queries[0].contains("AS projection_clean"));
+    assert!(queries[0].contains("projected_candidates AS ("));
+    assert!(queries[0].contains("event_uid IN (SELECT event_uid FROM matching_doc_ids)"));
+    assert!(queries[0].contains("greatest(toFloat64(corpus_docs), toFloat64(p.df))"));
+    assert!(!queries[0].contains("uniqExact"));
+    assert!(queries[1].contains("documents AS ("));
+    assert!(queries[1].contains("candidate_heads AS ("));
+    assert!(queries[1].contains("sessions.generation = candidate.generation"));
+    assert!(queries[1].contains("WHERE document.event_uid IN event_uids"));
+    assert!(queries[1].contains("argMax(leftUTF8(document.text_content"));
+    assert!(queries[1].contains("argMax(leftUTF8(document.payload_json"));
+    assert!(!queries[1].contains("argMax(leftUTF8(text_content"));
+    assert!(!queries[1].contains("argMax(leftUTF8(payload_json"));
+    assert!(!queries[1].contains("leftUTF8(argMax(text_content"));
+    assert!(!queries[1].contains("leftUTF8(argMax(payload_json"));
+    assert!(
+        queries.iter().all(|query| query
+            .lines()
+            .filter(|line| line.contains("INNER JOIN"))
+            .all(|line| line.trim_start().starts_with("ALL INNER JOIN"))),
+        "search stages must explicitly preserve inner-join multiplicity"
+    );
+    assert!(queries.iter().all(|query| {
+        !query.contains("v_conversation_trace")
+            && !query.contains("v_session_summary")
+            && !query.contains("event_kind = 'session_meta'")
+    }));
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn search_mcp_events_supports_session_scoped_search() {
@@ -701,9 +830,9 @@ async fn search_mcp_events_supports_session_scoped_search() {
     let queries = state.queries.lock().expect("queries lock").clone();
     let search_query = queries
         .iter()
-        .find(|q| q.contains("AS mcp_event_type") && q.contains("d.session_id = 'sess_a'"))
+        .find(|q| q.contains("toUInt8(0) AS row_kind") && q.contains("p.session_id = 'sess_a'"))
         .expect("session-scoped search query should be captured");
-    assert!(search_query.contains("d.session_id = 'sess_a'"));
+    assert!(search_query.contains("p.session_id = 'sess_a'"));
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn search_mcp_events_supports_turn_scoped_search() {
@@ -738,12 +867,70 @@ async fn search_mcp_events_supports_turn_scoped_search() {
     let search_query = queries
         .iter()
         .find(|q| {
-            q.contains("AS mcp_event_type")
-                && q.contains("tr.session_id = 'sess_c' AND tr.turn_seq = 2")
+            q.contains("toUInt8(0) AS row_kind")
+                && q.contains("e.session_id = 'sess_c' AND e.turn_seq = 2")
         })
         .expect("turn-scoped search query should be captured");
-    assert!(search_query.contains("tr.session_id = 'sess_c' AND tr.turn_seq = 2"));
+    assert!(search_query.contains("e.session_id = 'sess_c' AND e.turn_seq = 2"));
+    assert!(search_query.contains("ALL INNER JOIN `moraine`.`mcp_open_turns` AS scope_t FINAL"));
 }
+#[tokio::test(flavor = "multi_thread")]
+async fn search_mcp_events_returns_explicit_tool_event_filters() {
+    let (repo, _state) = build_repo().await;
+
+    let tool_call_result = repo
+        .search_mcp_events(SearchMcpEventsQuery {
+            query: "hello world".to_string(),
+            n_hits: Some(5),
+            event_types: Some(vec![McpEventType::ToolCall]),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            ..SearchMcpEventsQuery::default()
+        })
+        .await
+        .expect("tool-call search");
+    let tool_response_result = repo
+        .search_mcp_events(SearchMcpEventsQuery {
+            query: "hello world".to_string(),
+            n_hits: Some(5),
+            event_types: Some(vec![McpEventType::ToolResponse]),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            ..SearchMcpEventsQuery::default()
+        })
+        .await
+        .expect("tool-response search");
+    let mixed_result = repo
+        .search_mcp_events(SearchMcpEventsQuery {
+            query: "hello world".to_string(),
+            n_hits: Some(5),
+            event_types: Some(vec![McpEventType::UserInput, McpEventType::ToolCall]),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            ..SearchMcpEventsQuery::default()
+        })
+        .await
+        .expect("mixed message and tool search");
+
+    assert_eq!(tool_call_result.hits.len(), 1);
+    assert_eq!(tool_call_result.hits[0].event_type, McpEventType::ToolCall);
+    assert_eq!(tool_call_result.hits[0].event_uid, "evt-c-tool-call");
+    assert_eq!(tool_response_result.hits.len(), 1);
+    assert_eq!(
+        tool_response_result.hits[0].event_type,
+        McpEventType::ToolResponse
+    );
+    assert_eq!(tool_response_result.hits[0].event_uid, "evt-c-tool");
+    assert_eq!(
+        mixed_result
+            .hits
+            .iter()
+            .map(|hit| hit.event_type)
+            .collect::<Vec<_>>(),
+        vec![McpEventType::ToolCall, McpEventType::UserInput]
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn search_mcp_events_event_type_filter_distinguishes_user_and_assistant_messages() {
     let (repo, state) = build_repo().await;
@@ -770,6 +957,20 @@ async fn search_mcp_events_event_type_filter_distinguishes_user_and_assistant_me
         })
         .await
         .expect("assistant response search");
+    let message_result = repo
+        .search_mcp_events(SearchMcpEventsQuery {
+            query: "hello world".to_string(),
+            n_hits: Some(5),
+            event_types: Some(vec![
+                McpEventType::UserInput,
+                McpEventType::AssistantResponse,
+            ]),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            ..SearchMcpEventsQuery::default()
+        })
+        .await
+        .expect("message-only search");
 
     assert_eq!(user_result.hits.len(), 1);
     assert_eq!(user_result.hits[0].event_uid, "evt-c-user");
@@ -782,17 +983,25 @@ async fn search_mcp_events_event_type_filter_distinguishes_user_and_assistant_me
         McpEventType::AssistantResponse
     );
     assert_eq!(assistant_result.hits[0].actor_role, "assistant");
+    assert!(message_result.hits.iter().all(|hit| matches!(
+        hit.event_type,
+        McpEventType::UserInput | McpEventType::AssistantResponse
+    )));
+    assert_eq!(
+        message_result.event_types,
+        vec![McpEventType::UserInput, McpEventType::AssistantResponse]
+    );
 
     let queries = state.queries.lock().expect("queries lock").clone();
     assert!(queries.iter().any(|q| {
-        q.contains("AS mcp_event_type") && q.contains("lowerUTF8(d.actor_role) = 'user'")
+        q.contains("toUInt8(0) AS row_kind") && q.contains("lowerUTF8(p.actor_role) = 'user'")
     }));
     assert!(queries.iter().any(|q| {
-        q.contains("AS mcp_event_type") && q.contains("lowerUTF8(d.actor_role) = 'assistant'")
+        q.contains("toUInt8(0) AS row_kind") && q.contains("lowerUTF8(p.actor_role) = 'assistant'")
     }));
 }
 #[tokio::test(flavor = "multi_thread")]
-async fn search_mcp_events_fetches_limit_plus_one_for_truncation() {
+async fn search_mcp_events_deduplicates_before_limit_and_reports_truncation() {
     let (repo, state) = build_repo().await;
 
     let result = repo
@@ -812,17 +1021,128 @@ async fn search_mcp_events_fetches_limit_plus_one_for_truncation() {
         .expect("truncated mcp event search");
 
     assert_eq!(result.hits.len(), 2);
+    assert_eq!(result.hits[0].event_uid, "evt-c-42");
+    assert_eq!(result.hits[1].event_uid, "evt-a-11");
+    assert!(result
+        .hits
+        .iter()
+        .all(|hit| hit.event_uid != "evt-c-duplicate"));
     assert!(result.truncated);
     assert!(result.stats.truncated);
     assert_eq!(result.stats.effective_n_hits, 2);
 
     let queries = state.queries.lock().expect("queries lock").clone();
-    let search_query = queries
+    let first_candidate_query = queries
         .iter()
-        .find(|q| q.contains("AS mcp_event_type") && q.contains("LIMIT 3"))
-        .expect("search query should fetch limit plus one");
-    assert!(search_query.contains("LIMIT 3"));
+        .find(|query| {
+            query.contains("toUInt8(0) AS row_kind") && query.contains("LIMIT 3 OFFSET 0")
+        })
+        .expect("first bounded candidate page");
+    assert!(!first_candidate_query.contains("text_content"));
+    assert!(!first_candidate_query.contains("SHA256"));
+    assert!(queries.iter().any(|query| {
+        query.contains("toUInt8(0) AS row_kind") && query.contains("LIMIT 3 OFFSET 3")
+    }));
+    assert!(queries.iter().any(|query| {
+        query.contains("hex(SHA256(projected_events.text_content)) AS text_content_digest")
+    }));
+    assert!(queries.iter().any(|query| {
+        query.contains("JSONExtractString(document.payload_json, 'phase')")
+            && query.contains("AS payload_phase")
+    }));
+    assert!(queries
+        .iter()
+        .any(|query| { query.contains("documents AS (") && query.contains("'evt-b-9'") }));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_mcp_events_rejects_projection_changes_between_candidate_pages() {
+    let (repo, state) = build_repo_with_options(
+        100,
+        MockOptions {
+            change_projection_revision_on_second_search_page: true,
+            ..MockOptions::default()
+        },
+    )
+    .await;
+
+    let error = repo
+        .search_mcp_events(SearchMcpEventsQuery {
+            query: "hello world".to_string(),
+            n_hits: Some(2),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            ..SearchMcpEventsQuery::default()
+        })
+        .await
+        .expect_err("candidate paging must reject a changed projection revision");
+
+    assert!(matches!(error, RepoError::ReadModelChanged));
+    let queries = state.queries.lock().expect("queries lock");
+    assert!(queries
+        .iter()
+        .any(|query| query.contains("LIMIT 3 OFFSET 3")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_mcp_events_classifies_hydration_projection_movement() {
+    let (repo, _state) = build_repo_with_options(
+        100,
+        MockOptions {
+            omit_first_mcp_detail_row: true,
+            ..MockOptions::default()
+        },
+    )
+    .await;
+
+    let error = repo
+        .search_mcp_events(SearchMcpEventsQuery {
+            query: "hello world".to_string(),
+            n_hits: Some(2),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            ..SearchMcpEventsQuery::default()
+        })
+        .await
+        .expect_err("missing pinned detail must report projection movement");
+
+    assert!(matches!(error, RepoError::ReadModelChanged));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_mcp_events_bounds_duplicate_candidate_pages() {
+    let (repo, state) = build_repo_with_options(
+        100,
+        MockOptions {
+            repeat_duplicate_search_pages: true,
+            ..MockOptions::default()
+        },
+    )
+    .await;
+
+    let error = repo
+        .search_mcp_events(SearchMcpEventsQuery {
+            query: "hello world".to_string(),
+            n_hits: Some(2),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            ..SearchMcpEventsQuery::default()
+        })
+        .await
+        .expect_err("duplicate paging must stop at the request work budget");
+
+    assert!(
+        error.to_string().contains("scan budget exhausted"),
+        "{error}"
+    );
+    let queries = state.queries.lock().expect("queries lock");
+    let candidate_queries = queries
+        .iter()
+        .filter(|query| query.contains("toUInt8(0) AS row_kind"))
+        .count();
+    assert_eq!(candidate_queries, 16);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn search_mcp_events_reports_event_ordinal_within_turn() {
     let (repo, _state) = build_repo().await;
