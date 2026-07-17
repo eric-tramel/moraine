@@ -112,17 +112,24 @@ When the user asks you to take on new development work,
 check out a fresh worktree with an appropriate name for your work to prevent multi-agent collision.
 
 ## Development: Agent Contributor Workflows
-This repo vendors developer-only agent workflows as a local Codex plugin:
+This repo vendors developer-only agent workflows for Codex and Kiro:
 
 - Marketplace: `.agents/plugins/marketplace.json`
-- Plugin: `plugins/moraine-dev/.codex-plugin/plugin.json`
-- Skills: `plugins/moraine-dev/skills/`
+- Codex plugin: `plugins/moraine-dev/.codex-plugin/plugin.json`
+- Kiro workspace agent: `.kiro/agents/moraine-dev.json`
+- Shared Agent Skills: `plugins/moraine-dev/skills/`
 
 The marketplace is named `moraine` and also exposes the end-user `moraine`
 runtime plugin; contributor automation should install only `moraine-dev`.
+Kiro CLI discovers the workspace agent when launched from this repository; use
+`kiro-cli --agent moraine-dev`. The agent loads the shared `SKILL.md` files
+natively through Kiro's `skill://` resource scheme.
 
 Use `$moraine-dev:moraine-start-work` when beginning contributor work, `$moraine-dev:crystallize` when turning rough input into an ignored ready-to-implement plan under `plans/`, `$moraine-dev:moraine-author-pr` when drafting a PR title or description, `$moraine-dev:moraine-sandbox-qa` for ingest/MCP/monitor/schema/stack-facing validation, `$moraine-dev:code-review` for a full multi-persona review wave, and the `$moraine-dev:code-review-*` persona skills for focused PR review. Using `$moraine-dev:code-review` is an explicit request for its delegated reviewer subagents. When prior or active agent context matters, use the Moraine MCP tools directly. These skills are for repository contributors and automation agents, not end-user Moraine behavior.
 Use `$moraine-dev:release` when cutting and publishing a Moraine release from a target version.
+In Kiro, invoke the same workflows as slash commands such as
+`/moraine-start-work`, `/code-review`, `/moraine-sandbox-qa`,
+`/moraine-author-pr`, and `/release`.
 
 ## Writing PRs
 History uses concise, Conventional-Commit-like subjects such as:

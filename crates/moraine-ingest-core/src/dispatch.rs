@@ -1,13 +1,14 @@
 use crate::checkpoint::checkpoint_key;
 use crate::model::{Checkpoint, NormalizedRecord, RowBatch};
 use crate::normalize::{normalize_record, normalize_record_with_ts_hint};
+use crate::sources::kiro_cli::{load_kiro_session_metadata, KiroSessionMetadata};
 use crate::sources::shared::{format_record_ts, parse_record_ts};
 use crate::sqlite_poll::VolatilePollMap;
 use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
 use anyhow::{Context, Result};
 use moraine_config::{
     is_workflow_journal_path, map_tracked_path, AppConfig, SOURCE_FORMAT_CURSOR_SQLITE,
-    SOURCE_FORMAT_OPENCODE_SQLITE, SOURCE_FORMAT_SESSION_JSON,
+    SOURCE_FORMAT_KIRO_SESSION, SOURCE_FORMAT_OPENCODE_SQLITE, SOURCE_FORMAT_SESSION_JSON,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -773,6 +774,7 @@ pub(crate) async fn process_file(
     let file_size = meta.len();
     let cp_key = checkpoint_key(&work.source_name, source_file);
     let committed = { checkpoints.read().await.get(&cp_key).cloned() };
+    let first_ingest = committed.is_none();
 
     let mut checkpoint = committed.unwrap_or(Checkpoint {
         source_name: work.source_name.clone(),
@@ -795,15 +797,48 @@ pub(crate) async fn process_file(
         generation_changed = true;
     }
 
-    if file_size == checkpoint.last_offset && !generation_changed {
+    let kiro_metadata = if work.format == SOURCE_FORMAT_KIRO_SESSION {
+        Some(load_kiro_session_metadata(source_file))
+    } else {
+        None
+    };
+    let sidecar_fingerprint = kiro_metadata
+        .as_ref()
+        .map_or(checkpoint.source_fingerprint, |metadata| {
+            metadata.fingerprint()
+        });
+    let sidecar_changed = kiro_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.fingerprint() != checkpoint.source_fingerprint);
+    let sidecar_needs_processing =
+        kiro_metadata.is_some() && (first_ingest || generation_changed || sidecar_changed);
+
+    if file_size == checkpoint.last_offset && !generation_changed && !sidecar_needs_processing {
         return Ok(());
     }
     if !config.ingest.exclude_project_dirs.is_empty() {
-        let cwd = infer_first_source_cwd(
-            source_file,
-            &work.harness,
-            jsonl_source_line_byte_limit(config),
-        );
+        let sidecar_cwd = kiro_metadata
+            .as_ref()
+            .map(KiroSessionMetadata::cwd)
+            .unwrap_or_default();
+        let cwd = if sidecar_cwd.trim().is_empty() {
+            infer_first_source_cwd(
+                source_file,
+                &work.harness,
+                jsonl_source_line_byte_limit(config),
+            )
+        } else {
+            sidecar_cwd.to_string()
+        };
+        if work.format == SOURCE_FORMAT_KIRO_SESSION && !std::path::Path::new(&cwd).is_absolute() {
+            debug!(
+                source_name = %work.source_name,
+                harness = %work.harness,
+                source_file,
+                "skipping Kiro session because project exclusions are configured and the session cwd is unavailable"
+            );
+            return Ok(());
+        }
         if config.is_project_dir_excluded(&cwd) {
             debug!(
                 source_name = %work.source_name,
@@ -829,15 +864,100 @@ pub(crate) async fn process_file(
     } else {
         InitialSourceHints::default()
     };
-    let mut session_hint = initial_hints.session_id;
-    let mut model_hint = String::new();
-    let mut cwd_hint = initial_hints.cwd;
-    let mut record_ts_hint =
-        infer_initial_record_ts_hint(source_file, checkpoint.last_offset).unwrap_or_default();
+    let mut session_hint = kiro_metadata
+        .as_ref()
+        .map(KiroSessionMetadata::session_id)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&initial_hints.session_id)
+        .to_string();
+    let mut model_hint = kiro_metadata
+        .as_ref()
+        .map(KiroSessionMetadata::model)
+        .unwrap_or_default()
+        .to_string();
+    let mut cwd_hint = kiro_metadata
+        .as_ref()
+        .map(KiroSessionMetadata::cwd)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&initial_hints.cwd)
+        .to_string();
+    let mut record_ts_hint = kiro_metadata
+        .as_ref()
+        .map(KiroSessionMetadata::created_at)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            infer_initial_record_ts_hint(source_file, checkpoint.last_offset).unwrap_or_default()
+        });
     let mut session_cursors: HashMap<String, SessionCursor> = HashMap::new();
 
     let mut batch = RowBatch::default();
     let source_line_byte_limit = jsonl_source_line_byte_limit(config);
+
+    if sidecar_needs_processing {
+        let metadata = kiro_metadata
+            .as_ref()
+            .expect("sidecar processing requires Kiro metadata state");
+        if let Some(error_text) = metadata.error() {
+            batch.push_error_row(json!({
+                "source_name": work.source_name,
+                "harness": work.harness,
+                "source_file": source_file,
+                "source_inode": inode,
+                "source_generation": checkpoint.source_generation,
+                "source_line_no": 0u64,
+                "source_offset": 0u64,
+                "error_kind": "kiro_session_metadata_error",
+                "error_text": error_text,
+                "raw_fragment": "",
+            }));
+        }
+
+        if let Some(record) = metadata.record() {
+            match normalize_record_with_ts_hint(
+                record,
+                &work.source_name,
+                &work.harness,
+                source_file,
+                inode,
+                checkpoint.source_generation,
+                0,
+                0,
+                &session_hint,
+                &model_hint,
+                &cwd_hint,
+                &record_ts_hint,
+            ) {
+                Ok(normalized) => {
+                    if let Some(record_ts) =
+                        normalized.raw_row.get("record_ts").and_then(Value::as_str)
+                    {
+                        if parse_record_ts(record_ts).is_some() {
+                            record_ts_hint = record_ts.to_string();
+                        }
+                    }
+                    session_hint = normalized.session_hint.clone();
+                    model_hint = normalized.model_hint.clone();
+                    cwd_hint = normalized.cwd_hint.clone();
+                    batch.extend_normalized(normalized);
+                }
+                Err(exc) => {
+                    batch.push_error_row(json!({
+                        "source_name": work.source_name,
+                        "harness": work.harness,
+                        "source_file": source_file,
+                        "source_inode": inode,
+                        "source_generation": checkpoint.source_generation,
+                        "source_line_no": 0u64,
+                        "source_offset": 0u64,
+                        "error_kind": "normalize_error",
+                        "error_text": exc.to_string(),
+                        "raw_fragment": truncate(&record.to_string(), 20_000),
+                    }));
+                }
+            }
+        }
+    }
 
     loop {
         let start_offset = offset;
@@ -1053,10 +1173,15 @@ pub(crate) async fn process_file(
         last_offset: offset,
         last_line_no: line_no,
         status: "active".to_string(),
+        source_fingerprint: sidecar_fingerprint,
         ..Default::default()
     };
 
-    if batch.row_count() > 0 || generation_changed || offset != checkpoint.last_offset {
+    if batch.row_count() > 0
+        || generation_changed
+        || sidecar_needs_processing
+        || offset != checkpoint.last_offset
+    {
         batch.checkpoint = Some(final_checkpoint);
         sink_tx
             .send(SinkMessage::Batch(batch))
@@ -1471,7 +1596,7 @@ mod tests {
     use serde_json::{json, Value};
     use std::collections::HashMap;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1873,6 +1998,363 @@ mod tests {
             out.push(batch);
         }
         out
+    }
+
+    fn kiro_sidecar(session_id: &str, title: &str, input_tokens: u64, credits: f64) -> Value {
+        json!({
+            "session_id": session_id,
+            "cwd": "/work/kiro-demo",
+            "title": title,
+            "created_at": "2026-05-28T20:26:40Z",
+            "updated_at": "2026-05-28T20:27:10Z",
+            "session_state": {
+                "agent_name": "kiro_default",
+                "rts_model_state": {
+                    "model_info": {"model_id": "claude-sonnet-4"}
+                },
+                "conversation_metadata": {
+                    "user_turn_metadatas": [{
+                        "input_token_count": input_tokens,
+                        "output_token_count": 7,
+                        "metering_usage": [{
+                            "value": credits,
+                            "unit": "credit",
+                            "unitPlural": "credits"
+                        }]
+                    }]
+                }
+            }
+        })
+    }
+
+    fn kiro_work(path: &Path) -> WorkItem {
+        WorkItem {
+            source_name: "kiro".to_string(),
+            harness: "kiro-cli".to_string(),
+            format: "kiro_session".to_string(),
+            path: path.to_string_lossy().to_string(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_kiro_session_refreshes_changed_sidecar_without_replaying_transcript() {
+        let path = unique_test_file("kiro-sidecar-refresh");
+        let sidecar_path = path.with_extension("json");
+        let session_id = "11111111-2222-4333-8444-555555555555";
+        let prompt = json!({
+            "version": "v1",
+            "kind": "Prompt",
+            "data": {
+                "message_id": "msg-user-1",
+                "content": [{"kind": "text", "data": "Inspect src/lib.rs"}],
+                "meta": {"timestamp": 1780000000u64}
+            }
+        });
+        let assistant = json!({
+            "version": "v1",
+            "kind": "AssistantMessage",
+            "data": {
+                "message_id": "msg-assistant-1",
+                "content": [{"kind": "text", "data": "The function returns 42."}]
+            }
+        });
+        let body = format!("{prompt}\n{assistant}\n");
+        fs::write(&path, &body).expect("write Kiro transcript");
+        fs::write(
+            &sidecar_path,
+            serde_json::to_vec_pretty(&kiro_sidecar(session_id, "Initial title", 11, 0.25))
+                .expect("serialize Kiro sidecar"),
+        )
+        .expect("write Kiro sidecar");
+
+        let config = moraine_config::AppConfig::default();
+        let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(16);
+        let work = kiro_work(&path);
+
+        process_file(
+            &config,
+            &work,
+            checkpoints.clone(),
+            &VolatilePollMap::new(),
+            sink_tx.clone(),
+            &metrics,
+        )
+        .await
+        .expect("first Kiro ingest");
+
+        let first = drain_batches(&mut sink_rx).await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].raw_rows.len(), 3, "metadata plus two JSONL rows");
+        assert_eq!(first[0].event_rows.len(), 3);
+        assert!(first[0].raw_rows.iter().all(|row| {
+            row.get("session_id").and_then(Value::as_str) == Some(session_id)
+                && row.get("cwd").and_then(Value::as_str) == Some("/work/kiro-demo")
+        }));
+        assert!(first[0]
+            .event_rows
+            .iter()
+            .all(|row| { row.get("model").and_then(Value::as_str) == Some("claude-sonnet-4") }));
+        let metadata_event = first[0]
+            .event_rows
+            .iter()
+            .find(|row| row.get("event_kind").and_then(Value::as_str) == Some("session_meta"))
+            .expect("session metadata event");
+        assert_eq!(
+            metadata_event.get("input_tokens").and_then(Value::as_u64),
+            Some(11)
+        );
+        assert_eq!(
+            metadata_event
+                .pointer("/token_usage_native_units/credits")
+                .and_then(Value::as_f64),
+            Some(0.25)
+        );
+        let metadata_uid = metadata_event["event_uid"]
+            .as_str()
+            .expect("metadata event uid")
+            .to_string();
+        let first_checkpoint = first[0].checkpoint.as_ref().expect("checkpoint").clone();
+        assert_ne!(first_checkpoint.source_fingerprint, 0);
+        assert_eq!(first_checkpoint.last_offset, body.len() as u64);
+        {
+            checkpoints.write().await.insert(
+                crate::checkpoint::checkpoint_key(&work.source_name, &work.path),
+                first_checkpoint.clone(),
+            );
+        }
+
+        fs::write(
+            &sidecar_path,
+            serde_json::to_vec_pretty(&kiro_sidecar(session_id, "Updated title", 19, 0.5))
+                .expect("serialize changed Kiro sidecar"),
+        )
+        .expect("update Kiro sidecar");
+        process_file(
+            &config,
+            &work,
+            checkpoints.clone(),
+            &VolatilePollMap::new(),
+            sink_tx.clone(),
+            &metrics,
+        )
+        .await
+        .expect("Kiro sidecar-only refresh");
+
+        let second = drain_batches(&mut sink_rx).await;
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].raw_rows.len(), 1, "only metadata re-emits");
+        assert_eq!(second[0].event_rows.len(), 1);
+        assert_eq!(second[0].event_rows[0]["event_uid"], metadata_uid);
+        assert_eq!(
+            second[0].event_rows[0]
+                .get("input_tokens")
+                .and_then(Value::as_u64),
+            Some(19)
+        );
+        assert_eq!(
+            second[0].event_rows[0]
+                .pointer("/token_usage_native_units/credits")
+                .and_then(Value::as_f64),
+            Some(0.5)
+        );
+        let second_checkpoint = second[0].checkpoint.as_ref().expect("checkpoint").clone();
+        assert_eq!(second_checkpoint.last_offset, first_checkpoint.last_offset);
+        assert_ne!(
+            second_checkpoint.source_fingerprint,
+            first_checkpoint.source_fingerprint
+        );
+        {
+            checkpoints.write().await.insert(
+                crate::checkpoint::checkpoint_key(&work.source_name, &work.path),
+                second_checkpoint,
+            );
+        }
+
+        process_file(
+            &config,
+            &work,
+            checkpoints,
+            &VolatilePollMap::new(),
+            sink_tx,
+            &metrics,
+        )
+        .await
+        .expect("unchanged Kiro session is a no-op");
+        assert!(drain_batches(&mut sink_rx).await.is_empty());
+
+        let _ = fs::remove_file(&sidecar_path);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_kiro_session_checkpoints_malformed_sidecar_error() {
+        let path = unique_test_file("kiro-malformed-sidecar");
+        let sidecar_path = path.with_extension("json");
+        fs::write(
+            &path,
+            json!({
+                "version": "v1",
+                "kind": "Prompt",
+                "data": {
+                    "message_id": "msg-user-1",
+                    "content": [{"kind": "text", "data": "hello"}],
+                    "meta": {"timestamp": 1780000000u64}
+                }
+            })
+            .to_string()
+                + "\n",
+        )
+        .expect("write Kiro transcript");
+        fs::write(&sidecar_path, "{not-json").expect("write malformed sidecar");
+
+        let config = moraine_config::AppConfig::default();
+        let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(8);
+        let work = kiro_work(&path);
+
+        process_file(
+            &config,
+            &work,
+            checkpoints.clone(),
+            &VolatilePollMap::new(),
+            sink_tx.clone(),
+            &metrics,
+        )
+        .await
+        .expect("malformed sidecar should not fail transcript ingestion");
+        let first = drain_batches(&mut sink_rx).await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].raw_rows.len(), 1, "transcript still ingests");
+        assert_eq!(first[0].error_rows.len(), 1);
+        assert_eq!(
+            first[0].error_rows[0]
+                .get("error_kind")
+                .and_then(Value::as_str),
+            Some("kiro_session_metadata_error")
+        );
+        let checkpoint = first[0].checkpoint.as_ref().expect("checkpoint").clone();
+        assert_ne!(checkpoint.source_fingerprint, 0);
+        checkpoints.write().await.insert(
+            crate::checkpoint::checkpoint_key(&work.source_name, &work.path),
+            checkpoint,
+        );
+
+        process_file(
+            &config,
+            &work,
+            checkpoints,
+            &VolatilePollMap::new(),
+            sink_tx,
+            &metrics,
+        )
+        .await
+        .expect("unchanged malformed sidecar should be checkpointed");
+        assert!(drain_batches(&mut sink_rx).await.is_empty());
+
+        let _ = fs::remove_file(&sidecar_path);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_kiro_session_with_exclusions_skips_when_sidecar_cwd_is_unavailable() {
+        for case in ["missing", "malformed", "relative"] {
+            let path = unique_test_file(&format!("kiro-{case}-sidecar-with-exclusions"));
+            let sidecar_path = path.with_extension("json");
+            fs::write(
+                &path,
+                json!({
+                    "version": "v1",
+                    "kind": "Prompt",
+                    "data": {
+                        "message_id": "msg-user-1",
+                        "content": [{"kind": "text", "data": "hello"}],
+                        "meta": {"timestamp": 1780000000u64}
+                    }
+                })
+                .to_string()
+                    + "\n",
+            )
+            .expect("write Kiro transcript");
+            match case {
+                "missing" => {}
+                "malformed" => {
+                    fs::write(&sidecar_path, "{not-json").expect("write malformed Kiro sidecar");
+                }
+                "relative" => {
+                    let mut sidecar = kiro_sidecar("kiro-relative", "Relative", 1, 0.25);
+                    sidecar["cwd"] = json!(".");
+                    fs::write(
+                        &sidecar_path,
+                        serde_json::to_vec(&sidecar).expect("serialize sidecar"),
+                    )
+                    .expect("write relative-cwd Kiro sidecar");
+                }
+                _ => unreachable!("fixed test case"),
+            }
+
+            let mut config = moraine_config::AppConfig::default();
+            config.ingest.exclude_project_dirs = vec!["/work/excluded/**".to_string()];
+            let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+            let metrics = Arc::new(Metrics::default());
+            let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(4);
+            let work = kiro_work(&path);
+
+            process_file(
+                &config,
+                &work,
+                checkpoints.clone(),
+                &VolatilePollMap::new(),
+                sink_tx,
+                &metrics,
+            )
+            .await
+            .expect("Kiro session without a trusted cwd should be skipped");
+            assert!(drain_batches(&mut sink_rx).await.is_empty());
+            assert!(checkpoints.read().await.is_empty());
+
+            let _ = fs::remove_file(&sidecar_path);
+            let _ = fs::remove_file(&path);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_kiro_session_uses_sidecar_cwd_for_project_exclusion() {
+        let path = unique_test_file("kiro-excluded-sidecar-cwd");
+        let sidecar_path = path.with_extension("json");
+        fs::write(&path, "{}\n").expect("write Kiro transcript");
+        let mut sidecar = kiro_sidecar("kiro-excluded", "Excluded", 1, 0.25);
+        sidecar["cwd"] = json!("/work/excluded");
+        fs::write(
+            &sidecar_path,
+            serde_json::to_vec(&sidecar).expect("serialize Kiro sidecar"),
+        )
+        .expect("write Kiro sidecar");
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.exclude_project_dirs = vec!["/work/excluded/**".to_string()];
+        let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(4);
+        let work = kiro_work(&path);
+
+        process_file(
+            &config,
+            &work,
+            checkpoints.clone(),
+            &VolatilePollMap::new(),
+            sink_tx,
+            &metrics,
+        )
+        .await
+        .expect("excluded Kiro session should be skipped cleanly");
+        assert!(drain_batches(&mut sink_rx).await.is_empty());
+        assert!(checkpoints.read().await.is_empty());
+
+        let _ = fs::remove_file(&sidecar_path);
+        let _ = fs::remove_file(&path);
     }
 
     #[tokio::test(flavor = "multi_thread")]

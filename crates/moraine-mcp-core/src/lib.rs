@@ -1917,10 +1917,10 @@ mod tests {
         );
 
         let harness_description = json!(
-            "Optional exact, case-sensitive normalized harness filter. Supported values: codex, claude-code, cursor, hermes, kimi-cli, opencode, pi-coding-agent."
+            "Optional exact, case-sensitive normalized harness filter. Supported values: codex, claude-code, cursor, hermes, kiro-cli, kimi-cli, opencode, pi-coding-agent."
         );
         let source_description = json!(
-            "Optional exact, case-sensitive ingest source filter. Configured values for this server: claude, codex, cursor, cursor-sqlite, hermes, kimi-cli, omp, opencode, pi. Use source to distinguish sources such as pi and omp that share a harness."
+            "Optional exact, case-sensitive ingest source filter. Configured values for this server: claude, codex, cursor, cursor-sqlite, hermes, kimi-cli, kiro, omp, opencode, pi. Use source to distinguish sources such as pi and omp that share a harness."
         );
         for tool_name in ["search_sessions", "list_sessions", "file_attention"] {
             let tool = tools

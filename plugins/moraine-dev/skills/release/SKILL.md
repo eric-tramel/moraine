@@ -1,17 +1,18 @@
 ---
 name: release
-description: Cut and publish Moraine releases from a version argument such as /release X.Y.Z or a request to use $moraine-dev:release. Use when Codex is asked to run Moraine's release process, bump release-managed versions, create and merge the release PR, push the vX.Y.Z tag, update GitHub release notes for a general audience, verify the release-moraine workflow, and confirm the PyPI moraine-cli package. Start or continue a Codex goal for the release.
+description: Cut and publish Moraine releases from a version argument such as /release X.Y.Z in Kiro or a request to use $moraine-dev:release in Codex. Use when any supported agent harness is asked to run Moraine's release process, bump release-managed versions, create and merge the release PR, push the vX.Y.Z tag, update GitHub release notes for a general audience, verify the release-moraine workflow, and confirm the PyPI moraine-cli package. In Codex, start or continue a durable goal for the release.
 ---
 
 # Release
 
-Run Moraine releases end to end from the repo-local `moraine-dev` developer
-plugin. A `/release X.Y.Z` invocation means: publish `vX.Y.Z`, not just
-prepare a plan.
+Run Moraine releases end to end with the shared `moraine-dev` contributor
+workflow. Invoke it as `$moraine-dev:release X.Y.Z` in Codex, `/release X.Y.Z`
+in Kiro, or the discovered `release` skill in another Agent Skills harness.
+Every form means: publish `vX.Y.Z`, not just prepare a plan.
 
 ## Goal Contract
 
-Make the release a Codex goal before doing release work.
+In Codex, make the release a durable goal before doing release work:
 
 - If `create_goal` is available and there is no active goal, call it with:
   `Cut Moraine vX.Y.Z, including version bump PR, merged code, annotated repo tag, GitHub release notes, release workflow verification, and PyPI package verification.`
@@ -20,6 +21,11 @@ Make the release a Codex goal before doing release work.
 - Do not call `update_goal(status="complete")` until all public release
   evidence exists: merged PR, pushed tag, successful workflow, GitHub release
   body/assets, and PyPI `moraine-cli` artifacts.
+
+In Kiro or another harness without Codex goal tools, use its durable task
+mechanism when available; otherwise maintain an explicit checklist in the
+session. Do not mark the release complete until the same public release
+evidence exists.
 
 ## Preconditions
 
@@ -51,11 +57,19 @@ Before editing:
 ## Branch And Context
 
 Do release edits in a dedicated worktree from fresh `origin/main` unless the
-user explicitly says otherwise:
+user explicitly says otherwise. Set `branch` using the current harness's
+convention:
+
+| Harness | Branch value |
+| --- | --- |
+| Codex | `codex/release-$TAG` |
+| Kiro | `kiro/release-$TAG` |
+| Other | `release/$TAG` |
 
 ```bash
-git worktree add -b "codex/release-$TAG" \
-  "/Users/eric/src/moraine-worktrees/release-$TAG" origin/main
+worktree_root="${MORAINE_WORKTREE_ROOT:-../moraine-worktrees}"
+mkdir -p "$worktree_root"
+git worktree add -b "$branch" "$worktree_root/release-$TAG" origin/main
 ```
 
 Gather the changes since the previous stable release:
@@ -104,11 +118,13 @@ cargo fmt --all -- --check
 cargo test --workspace --locked
 ```
 
-Use `$moraine-dev:moraine-sandbox-qa` when the release includes ingest, MCP,
-monitor, ClickHouse schema, source-format, or stack-behavior changes since the
-previous tag. If that developer skill is unavailable, follow the dev sandbox
-commands required by `AGENTS.md`: capture the sandbox id with `--quiet`, run
-focused checks inside it, and tear it down before reporting completion.
+Use `$moraine-dev:moraine-sandbox-qa` in Codex or `/moraine-sandbox-qa` in Kiro
+when the release includes ingest, MCP, monitor, ClickHouse schema,
+source-format, or stack-behavior changes since the previous tag. In another
+Agent Skills harness, invoke the discovered `moraine-sandbox-qa` skill. If that
+workflow is unavailable, follow the dev sandbox commands required by
+`AGENTS.md`: capture the sandbox id with `--quiet`, run focused checks inside
+it, and tear it down before reporting completion.
 
 Typical sandbox checks:
 
@@ -131,7 +147,7 @@ Create a focused release commit:
 ```bash
 git add Cargo.lock apps crates .github README.md docs
 git commit -m "chore(release): cut $TAG"
-git push -u origin "codex/release-$TAG"
+git push -u origin "$branch"
 ```
 
 Open a PR to `main` titled `chore(release): cut $TAG`. The PR body must include:

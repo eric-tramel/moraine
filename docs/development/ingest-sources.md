@@ -17,6 +17,7 @@ all rows that leave the adapter.
 | --- | --- | --- | --- | --- |
 | `codex` | `sources/codex.rs` | `openai` | `jsonl` | OpenAI/Codex events, response items, tool calls, compaction, token counts. |
 | `claude-code` | `sources/claude_code.rs` | `anthropic` | `jsonl` | Claude Code message blocks, operational records, parent/tool external links. |
+| `kiro-cli` | `sources/kiro_cli.rs` | `kiro` | `kiro_session` | Kiro CLI prompt, assistant, tool-result, and compaction records. A same-named JSON sidecar supplies session cwd, title, model, and aggregate token/credit metadata. |
 | `kimi-cli` | `sources/kimi_cli.rs` | `moonshot` | `jsonl` | Kimi `wire.jsonl`; skips metadata headers and keeps parent `SubagentEvent` envelopes raw-only. |
 | `opencode` | `sources/opencode.rs` | record-derived | `opencode_sqlite` | OpenCode `opencode*.db`; append-only conversation events synthesized into session, message, part, and session-message records. Credential/account tables are deliberately out of scope. |
 | `cursor` | `sources/cursor.rs` | `cursor` | `jsonl` or `cursor_sqlite` | Cursor Agent transcripts under `agent-transcripts/`; text blocks, tool-use blocks, and local file references. Also normalizes the synthetic `cursor_composer`/`cursor_bubble` records produced by polling `state.vscdb` (see SQLite-Polled Sources below); composer names become `session_meta` events that carry the session title. |
@@ -59,6 +60,18 @@ Each adapter implements `IngestSource` from `sources/mod.rs`:
 `normalize()` receives a `RecordContext`. That context has already been stamped
 with source name, harness, provider, session id, source file coordinates, and
 parsed timestamps. Adapters should not rebuild those fields by hand.
+
+### Kiro paired sessions
+
+Kiro CLI writes `<session-id>.jsonl` and `<session-id>.json` under
+`~/.kiro/sessions/cli`. The transcript remains the canonical checkpoint path.
+Watcher events for either file coalesce to that JSONL path; the sidecar's
+fingerprint is persisted in the checkpoint so metadata-only changes re-emit a
+stable `session_meta` event without replaying transcript lines. Missing
+sidecars do not block transcript ingestion, while malformed sidecars produce a
+checkpointed ingest error. Kiro's per-turn metering entries are summed into
+`token_usage_native_units["credits"]` on that session metadata event; token
+counts remain populated independently when Kiro supplies them.
 
 ## Shared Helpers
 

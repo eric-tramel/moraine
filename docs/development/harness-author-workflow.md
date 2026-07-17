@@ -112,6 +112,8 @@ Choose `format` carefully:
 - Use `jsonl` for append-only newline-delimited trace records.
 - Use `session_json` for one JSON file per live session that is rewritten in
   place. The session processor emits only newly appended synthetic records.
+- Use `kiro_session` only for Kiro CLI's paired `<session-id>.jsonl` transcript
+  and `<session-id>.json` metadata files.
 - Use `cursor_sqlite` for Cursor `state.vscdb` databases. A DB-polling format
   is only appropriate when the harness keeps its history in a live local
   database with no append-only trace files; the polling engine in
@@ -159,9 +161,10 @@ run the functional stack:
 bash scripts/ci/e2e-stack.sh
 ```
 
-That script ingests Codex, Claude Code, Kimi CLI, Hermes trajectory, and Hermes
-session JSON fixtures into ClickHouse, then verifies row counts, representative
-fields, token buckets, monitor routes, and MCP search/open/list behavior.
+That script exercises the maintained harness matrix with generated fixtures,
+including Kiro CLI's paired JSONL transcript and JSON metadata sidecar. It then
+verifies row counts, representative fields, token buckets, monitor routes, and
+MCP search/open/list behavior.
 
 ## 8. Use The Dev Sandbox For QA
 

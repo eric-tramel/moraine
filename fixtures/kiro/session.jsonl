@@ -1,0 +1,6 @@
+{"version":"v1","kind":"Prompt","data":{"message_id":"msg-user-1","content":[{"kind":"text","data":"Inspect src/lib.rs and report the current behavior."},{"kind":"image","data":{"format":"png","source":"<redacted-image>"}}],"meta":{"timestamp":1780000000}}}
+{"version":"v1","kind":"AssistantMessage","data":{"message_id":"msg-assistant-1","content":[{"kind":"thinking","data":{"text":"I should read the requested file first."}},{"kind":"text","data":"I will inspect the file."},{"kind":"toolUse","data":{"toolUseId":"tool-1","name":"read_file","input":{"path":"src/lib.rs"},"modelId":"claude-sonnet-4"}}]}}
+{"version":"v1","kind":"ToolResults","data":{"message_id":"msg-tool-1","content":[{"kind":"toolResult","data":{"toolUseId":"tool-1","status":"success","content":[{"kind":"text","data":"pub fn answer() -> u32 { 42 }"}]}}],"results":{"tool-1":{"tool":{"kind":{"BuiltIn":{"Read":{}}}}}}}}
+{"version":"v1","kind":"AssistantMessage","data":{"message_id":"msg-assistant-2","content":[{"kind":"text","data":"The function currently returns 42."}]}}
+{"version":"v1","kind":"Compaction","data":{"summary":"The session inspected src/lib.rs.","strategy":"summary"}}
+{"version":"v1","kind":"FutureRecord","data":{"message":"A future Kiro record remains visible as unknown."}}

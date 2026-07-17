@@ -43,6 +43,7 @@ SANDBOX_STATE_ROOT="${MORAINE_SANDBOX_STATE_ROOT:-/tmp}"
 : "${SANDBOX_CLAUDE_PROJECTS_DIR:=/dev/null}"
 : "${SANDBOX_HERMES_SESSIONS_DIR:=/dev/null}"
 : "${SANDBOX_KIMI_SESSIONS_DIR:=/dev/null}"
+: "${SANDBOX_KIRO_SESSIONS_DIR:=/dev/null}"
 : "${SANDBOX_CURSOR_PROJECTS_DIR:=/dev/null}"
 : "${SANDBOX_CURSOR_STATE_DIR:=/dev/null}"
 : "${SANDBOX_MONITOR_HOST_PORT:=0}"
@@ -57,7 +58,8 @@ SANDBOX_OWNERSHIP_COMPOSE_FILE=""
 MORAINE_PERFORMANCE_CGROUP_PARENT=""
 export SANDBOX_REPO_ROOT SANDBOX_BIN_DIR SANDBOX_WEB_DIR SANDBOX_CONFIG_DIR
 export SANDBOX_CODEX_SESSIONS_DIR SANDBOX_CLAUDE_PROJECTS_DIR SANDBOX_HERMES_SESSIONS_DIR
-export SANDBOX_KIMI_SESSIONS_DIR SANDBOX_CURSOR_PROJECTS_DIR SANDBOX_CURSOR_STATE_DIR
+export SANDBOX_KIMI_SESSIONS_DIR SANDBOX_KIRO_SESSIONS_DIR SANDBOX_CURSOR_PROJECTS_DIR
+export SANDBOX_CURSOR_STATE_DIR
 export SANDBOX_MONITOR_HOST_PORT SANDBOX_CLICKHOUSE_HTTP_HOST_PORT SANDBOX_CLICKHOUSE_TCP_HOST_PORT
 export SANDBOX_CLICKHOUSE_IMAGE
 export MORAINE_PERFORMANCE_CGROUP_PARENT SANDBOX_PERFORMANCE SANDBOX_LOCAL_PERFORMANCE SANDBOX_OWNERSHIP_COMPOSE_FILE
@@ -297,6 +299,7 @@ ensure_compose_env() {
     : "${SANDBOX_CLAUDE_PROJECTS_DIR:=/tmp}"
     : "${SANDBOX_HERMES_SESSIONS_DIR:=/tmp}"
     : "${SANDBOX_KIMI_SESSIONS_DIR:=/tmp}"
+    : "${SANDBOX_KIRO_SESSIONS_DIR:=/tmp}"
     : "${SANDBOX_CURSOR_PROJECTS_DIR:=/tmp}"
     : "${SANDBOX_CURSOR_STATE_DIR:=/tmp}"
     : "${SANDBOX_SCCACHE_HOST_DIR:=/tmp}"
@@ -306,8 +309,8 @@ ensure_compose_env() {
         SANDBOX_REPO_ROOT SANDBOX_WEB_DIR SANDBOX_CONFIG_DIR \
         SANDBOX_ENTRYPOINT SANDBOX_CODEX_SESSIONS_DIR SANDBOX_CLAUDE_PROJECTS_DIR \
         SANDBOX_HERMES_SESSIONS_DIR SANDBOX_KIMI_SESSIONS_DIR \
-        SANDBOX_CURSOR_PROJECTS_DIR SANDBOX_CURSOR_STATE_DIR \
-        SANDBOX_SCCACHE_HOST_DIR SANDBOX_REBUILD
+        SANDBOX_KIRO_SESSIONS_DIR SANDBOX_CURSOR_PROJECTS_DIR \
+        SANDBOX_CURSOR_STATE_DIR SANDBOX_SCCACHE_HOST_DIR SANDBOX_REBUILD
     : "${SANDBOX_BIN_DIR:=/dev/null}"
     : "${SANDBOX_PERFORMANCE:=0}"
     : "${SANDBOX_LOCAL_PERFORMANCE:=0}"
@@ -789,9 +792,10 @@ for proj in data:
 #   $5 claude_projects_dir (host) — may be ""
 #   $6 hermes_sessions_dir (host) — may be ""
 #   $7 kimi_sessions_dir (host) — may be ""
-#   $8 cursor_projects_dir (host) — may be ""
-#   $9 cursor_state_dir (host) — may be ""
-#   $10 clickhouse_version
+#   $8 kiro_sessions_dir (host) — may be ""
+#   $9 cursor_projects_dir (host) — may be ""
+#   $10 cursor_state_dir (host) — may be ""
+#   $11 clickhouse_version
 generate_moraine_toml() {
     local config_dir="$1"
     local id="$2"
@@ -800,9 +804,10 @@ generate_moraine_toml() {
     local claude_dir="$5"
     local hermes_dir="$6"
     local kimi_dir="$7"
-    local cursor_dir="$8"
-    local cursor_state_dir="$9"
-    local ch_version="${10}"
+    local kiro_dir="$8"
+    local cursor_dir="$9"
+    local cursor_state_dir="${10}"
+    local ch_version="${11}"
 
     mkdir -p "$config_dir"
 
@@ -810,6 +815,7 @@ generate_moraine_toml() {
     local claude_src_block=""
     local hermes_src_block=""
     local kimi_src_block=""
+    local kiro_src_block=""
     local cursor_src_block=""
     local cursor_sqlite_src_block=""
 
@@ -834,6 +840,11 @@ generate_moraine_toml() {
         else
             warn "host kimi sessions dir not found (${kimi_dir}); skipping that source"
         fi
+        if [[ -n "$kiro_dir" && -d "$kiro_dir" ]]; then
+            kiro_src_block=$'[[ingest.sources]]\nname = "host-kiro"\nharness = "kiro-cli"\nenabled = true\nglob = "/host/kiro/sessions/*.jsonl"\nwatch_root = "/host/kiro/sessions"\nformat = "kiro_session"\n'
+        else
+            warn "host kiro sessions dir not found (${kiro_dir}); skipping that source"
+        fi
         if [[ -n "$cursor_dir" && -d "$cursor_dir" ]]; then
             cursor_src_block=$'[[ingest.sources]]\nname = "host-cursor"\nharness = "cursor"\nenabled = true\nglob = "/host/cursor/projects/*/agent-transcripts/**/*.jsonl"\nwatch_root = "/host/cursor/projects"\n'
         else
@@ -855,11 +866,13 @@ generate_moraine_toml() {
         mkdir -p "${config_dir}/fixtures/claude/projects"
         mkdir -p "${config_dir}/fixtures/hermes/sessions"
         mkdir -p "${config_dir}/fixtures/kimi/sessions"
+        mkdir -p "${config_dir}/fixtures/kiro/sessions"
         mkdir -p "${config_dir}/fixtures/cursor/projects"
         codex_src_block=$'[[ingest.sources]]\nname = "fixture-codex"\nharness = "codex"\nenabled = true\nglob = "/sandbox/fixtures/codex/sessions/**/*.jsonl"\nwatch_root = "/sandbox/fixtures/codex/sessions"\n'
         claude_src_block=$'[[ingest.sources]]\nname = "fixture-claude"\nharness = "claude-code"\nenabled = true\nglob = "/sandbox/fixtures/claude/projects/**/*.jsonl"\nwatch_root = "/sandbox/fixtures/claude/projects"\n'
         hermes_src_block=$'[[ingest.sources]]\nname = "fixture-hermes"\nharness = "hermes"\nenabled = true\nglob = "/sandbox/fixtures/hermes/sessions/session_*.json"\nwatch_root = "/sandbox/fixtures/hermes/sessions"\nformat = "session_json"\n'
         kimi_src_block=$'[[ingest.sources]]\nname = "fixture-kimi"\nharness = "kimi-cli"\nenabled = true\nglob = "/sandbox/fixtures/kimi/sessions/**/wire.jsonl"\nwatch_root = "/sandbox/fixtures/kimi/sessions"\n'
+        kiro_src_block=$'[[ingest.sources]]\nname = "fixture-kiro"\nharness = "kiro-cli"\nenabled = true\nglob = "/sandbox/fixtures/kiro/sessions/*.jsonl"\nwatch_root = "/sandbox/fixtures/kiro/sessions"\nformat = "kiro_session"\n'
         cursor_src_block=$'[[ingest.sources]]\nname = "fixture-cursor"\nharness = "cursor"\nenabled = true\nglob = "/sandbox/fixtures/cursor/projects/*/agent-transcripts/**/*.jsonl"\nwatch_root = "/sandbox/fixtures/cursor/projects"\n'
     fi
 
@@ -887,6 +900,7 @@ ${codex_src_block}
 ${claude_src_block}
 ${hermes_src_block}
 ${kimi_src_block}
+${kiro_src_block}
 ${cursor_src_block}
 ${cursor_sqlite_src_block}
 [backend]
@@ -1224,6 +1238,8 @@ cmd_up() {
     [[ -z "$hermes_dir" || "$hermes_dir" == "/dev/null" ]] && hermes_dir="${HOME}/.hermes/sessions"
     local kimi_dir="$SANDBOX_KIMI_SESSIONS_DIR"
     [[ -z "$kimi_dir" || "$kimi_dir" == "/dev/null" ]] && kimi_dir="${HOME}/.kimi/sessions"
+    local kiro_dir="$SANDBOX_KIRO_SESSIONS_DIR"
+    [[ -z "$kiro_dir" || "$kiro_dir" == "/dev/null" ]] && kiro_dir="${HOME}/.kiro/sessions/cli"
     local cursor_dir="$SANDBOX_CURSOR_PROJECTS_DIR"
     [[ -z "$cursor_dir" || "$cursor_dir" == "/dev/null" ]] && cursor_dir="${HOME}/.cursor/projects"
     local cursor_state_dir="$SANDBOX_CURSOR_STATE_DIR"
@@ -1242,8 +1258,8 @@ cmd_up() {
         generate_performance_toml "$config_dir" "$id" "$ch_version"
     else
         generate_moraine_toml "$config_dir" "$id" "$mount_sessions" \
-            "$codex_dir" "$claude_dir" "$hermes_dir" "$kimi_dir" "$cursor_dir" \
-            "$cursor_state_dir" "$ch_version"
+            "$codex_dir" "$claude_dir" "$hermes_dir" "$kimi_dir" "$kiro_dir" \
+            "$cursor_dir" "$cursor_state_dir" "$ch_version"
     fi
     maybe_failpoint after-config
     local config_path="${config_dir}/moraine.toml"
@@ -1301,6 +1317,11 @@ cmd_up() {
             export SANDBOX_KIMI_SESSIONS_DIR="$kimi_dir"
         else
             export SANDBOX_KIMI_SESSIONS_DIR="/dev/null"
+        fi
+        if [[ -d "$kiro_dir" ]]; then
+            export SANDBOX_KIRO_SESSIONS_DIR="$kiro_dir"
+        else
+            export SANDBOX_KIRO_SESSIONS_DIR="/dev/null"
         fi
         if [[ -d "$cursor_dir" ]]; then
             export SANDBOX_CURSOR_PROJECTS_DIR="$cursor_dir"
@@ -1970,6 +1991,9 @@ ENVIRONMENT:
     SANDBOX_KIMI_SESSIONS_DIR   override host kimi-cli sessions dir (default
                                 ~/.kimi/sessions). Ingests wire.jsonl files
                                 written by the Kimi CLI.
+    SANDBOX_KIRO_SESSIONS_DIR   override host Kiro CLI sessions dir (default
+                                ~/.kiro/sessions/cli). Ingests paired JSONL and
+                                JSON files via the kiro_session format.
     SANDBOX_CURSOR_PROJECTS_DIR  override host Cursor projects dir (default
                                 ~/.cursor/projects). Ingests Agent JSONL
                                 transcripts under agent-transcripts/.

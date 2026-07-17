@@ -529,6 +529,7 @@ main() {
   local codex_keyword="${base_keyword}_codex_${run_stamp}"
   local claude_keyword="${base_keyword}_claude_${run_stamp}"
   local kimi_keyword="${base_keyword}_kimi_${run_stamp}"
+  local kiro_keyword="${base_keyword}_kiro_${run_stamp}"
   local cursor_keyword="${base_keyword}_cursor_${run_stamp}"
   local cursor_fallback_keyword="${base_keyword}_cursor_fallback_${run_stamp}"
   local cursor_sqlite_keyword="${base_keyword}_cursorsqlite_${run_stamp}"
@@ -546,6 +547,12 @@ main() {
   local claude_session_id="00000000-0000-4000-8000-${claude_session_suffix}"
   local kimi_session_id="kimi-${run_stamp}"
   local kimi_raw_session_id="kimi-cli:${kimi_session_id}"
+  local kiro_session_suffix
+  kiro_session_suffix="$(printf '%06x%06x' "$RANDOM" "$RANDOM")"
+  local kiro_session_id="00000000-0000-4000-8000-${kiro_session_suffix}"
+  local kiro_session_title="Kiro e2e ${kiro_keyword}"
+  local kiro_updated_session_title="Updated Kiro e2e ${kiro_keyword}"
+  local kiro_cwd="/workspace/kiro-e2e"
   local cursor_session_suffix
   cursor_session_suffix="$(printf '%06x%06x' "$RANDOM" "$RANDOM")"
   local cursor_session_id="00000000-0000-4000-8000-${cursor_session_suffix}"
@@ -566,6 +573,7 @@ main() {
   local codex_trace_marker="mcp_codex_trace_marker_${run_stamp}"
   local claude_trace_marker="mcp_claude_trace_marker_${run_stamp}"
   local kimi_trace_marker="mcp_kimi_trace_marker_${run_stamp}"
+  local kiro_trace_marker="mcp_kiro_trace_marker_${run_stamp}"
   local cursor_trace_marker="mcp_cursor_trace_marker_${run_stamp}"
   local cursor_sqlite_trace_marker="mcp_cursor_sqlite_trace_marker_${run_stamp}"
   local pi_trace_marker="mcp_pi_trace_marker_${run_stamp}"
@@ -623,6 +631,8 @@ main() {
   local codex_fixture_file="$fixtures_root/codex/sessions/2026/02/16/session-${codex_session_id}.jsonl"
   local claude_fixture_file="$fixtures_root/claude/projects/e2e/session-${claude_session_id}.jsonl"
   local kimi_fixture_file="$fixtures_root/kimi/sessions/${kimi_session_id}/wire.jsonl"
+  local kiro_fixture_file="$fixtures_root/kiro/sessions/${kiro_session_id}.jsonl"
+  local kiro_metadata_file="$fixtures_root/kiro/sessions/${kiro_session_id}.json"
   local cursor_fixture_file="$fixtures_root/cursor/projects/e2e/agent-transcripts/${cursor_session_id}/${cursor_session_id}.jsonl"
   local cursor_fallback_fixture_file="$fixtures_root/cursor/projects/e2e-fallback/agent-transcripts/${cursor_fallback_session_id}/${cursor_fallback_session_id}.jsonl"
   local cursor_sqlite_fixture_file="$fixtures_root/cursor-sqlite/User/globalStorage/state.vscdb"
@@ -640,6 +650,7 @@ main() {
   mkdir -p "$(dirname "$claude_fixture_file")"
   mkdir -p "$(dirname "$kimi_fixture_file")"
   mkdir -p "$(dirname "$cursor_fixture_file")"
+  mkdir -p "$(dirname "$kiro_fixture_file")"
   mkdir -p "$(dirname "$cursor_fallback_fixture_file")"
   mkdir -p "$(dirname "$cursor_sqlite_fixture_file")"
   mkdir -p "$(dirname "$pi_fixture_file")"
@@ -673,6 +684,37 @@ EOF
 {"timestamp":1771243206.500000,"message":{"type":"ToolResult","payload":{"tool_call_id":"kimi-tool-${run_stamp}","return_value":{"is_error":false,"output":"{\"ok\":true}","message":"Read file","display":[],"extras":null}}}}
 {"timestamp":1771243207.000000,"message":{"type":"StatusUpdate","payload":{"context_usage":0.1,"context_tokens":100,"max_context_tokens":1000,"token_usage":{"input_other":10,"output":5,"input_cache_read":2,"input_cache_creation":1},"message_id":"chatcmpl-${run_stamp}","plan_mode":false,"mcp_status":null}}}
 {"timestamp":1771243207.500000,"message":{"type":"SubagentEvent","payload":{"agent_id":"sub-${run_stamp}","event":{"type":"ContentPart","payload":{"type":"text","text":"sub-agent echo"}}}}}
+EOF
+
+  # Kiro stores each CLI session as a paired JSONL transcript and JSON sidecar.
+  # The sidecar supplies session metadata and is rewritten independently.
+  cat > "$kiro_fixture_file" <<EOF
+{"version":"v1","kind":"Prompt","data":{"message_id":"kiro-user-${run_stamp}","content":[{"kind":"text","data":"local e2e kiro user prompt ${kiro_keyword}"}],"meta":{"timestamp":1771243208}}}
+{"version":"v1","kind":"AssistantMessage","data":{"message_id":"kiro-assistant-${run_stamp}","content":[{"kind":"thinking","data":{"text":"I should inspect the target file."}},{"kind":"text","data":"I will inspect the target file."},{"kind":"toolUse","data":{"toolUseId":"kiro-tool-${run_stamp}","name":"read_file","input":{"path":"/workspace/kiro-e2e.txt"},"modelId":"claude-sonnet-4"}}]}}
+{"version":"v1","kind":"ToolResults","data":{"message_id":"kiro-tool-result-${run_stamp}","content":[{"kind":"toolResult","data":{"toolUseId":"kiro-tool-${run_stamp}","status":"success","content":[{"kind":"text","data":"kiro tool output"}]}}],"results":{"kiro-tool-${run_stamp}":{"tool":{"kind":{"BuiltIn":{"Read":{}}}}}}}}
+{"version":"v1","kind":"AssistantMessage","data":{"message_id":"kiro-final-${run_stamp}","content":[{"kind":"text","data":"local e2e kiro assistant reply ${kiro_keyword} ${kiro_trace_marker}"}]}}
+{"version":"v1","kind":"Compaction","data":{"summary":"Kiro E2E session compacted after inspecting the target file.","strategy":"summary"}}
+EOF
+
+  cat > "$kiro_metadata_file" <<EOF
+{
+  "session_id": "${kiro_session_id}",
+  "cwd": "${kiro_cwd}",
+  "title": "${kiro_session_title}",
+  "created_at": "2026-02-16T12:00:08Z",
+  "updated_at": "2026-02-16T12:00:13Z",
+  "session_state": {
+    "agent_name": "kiro_default",
+    "rts_model_state": {
+      "model_info": {"model_id": "claude-sonnet-4"}
+    },
+    "conversation_metadata": {
+      "user_turn_metadatas": [
+        {"input_token_count": 23, "output_token_count": 11, "metering_usage": [{"value": 0.75, "unit": "credit", "unitPlural": "credits"}]}
+      ]
+    }
+  }
+}
 EOF
 
   # Cursor Agent transcripts observed under ~/.cursor/projects/.../agent-transcripts
@@ -939,6 +981,14 @@ glob = "${fixtures_root}/kimi/sessions/**/wire.jsonl"
 watch_root = "${fixtures_root}/kimi/sessions"
 
 [[ingest.sources]]
+name = "ci-kiro"
+harness = "kiro-cli"
+format = "kiro_session"
+enabled = true
+glob = "${fixtures_root}/kiro/sessions/*.jsonl"
+watch_root = "${fixtures_root}/kiro/sessions"
+
+[[ingest.sources]]
 name = "ci-cursor"
 harness = "cursor"
 enabled = true
@@ -1022,6 +1072,7 @@ EOF
   echo "[e2e] codex fixture: ${codex_fixture_file}"
   echo "[e2e] claude fixture: ${claude_fixture_file}"
   echo "[e2e] kimi fixture: ${kimi_fixture_file}"
+  echo "[e2e] kiro fixture: ${kiro_fixture_file}"
   echo "[e2e] cursor fixture: ${cursor_fixture_file}"
   echo "[e2e] cursor fallback fixture: ${cursor_fallback_fixture_file}"
   echo "[e2e] cursor sqlite fixture: ${cursor_sqlite_fixture_file}"
@@ -1087,6 +1138,9 @@ EOF
   assert_clickhouse_count "$clickhouse_url" "named backend excludes default-only codex session" "SELECT count() FROM ${routed_clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${codex_keyword}') > 0" "0"
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${kimi_keyword}') > 0" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${kimi_keyword}'" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${kiro_keyword}') > 0" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${kiro_keyword}'" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.tool_io WHERE source_name = 'ci-kiro' AND tool_call_id = 'kiro-tool-${run_stamp}'" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${cursor_keyword}') > 0" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${cursor_keyword}'" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.event_links WHERE source_name = 'ci-cursor' AND linked_external_id = '/workspace/cursor-e2e.txt'" 120
@@ -1132,6 +1186,44 @@ EOF
   assert_clickhouse_count "$clickhouse_url" "kimi tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-kimi' AND tool_call_id = 'kimi-tool-${run_stamp}'" "2"
   assert_clickhouse_count "$clickhouse_url" "kimi domain fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kimi' AND harness = 'kimi-cli' AND inference_provider = 'moonshot' AND session_id = '${kimi_raw_session_id}' AND model = 'kimi-cli'" "7"
   assert_clickhouse_count "$clickhouse_url" "kimi token buckets" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kimi' AND payload_type = 'token_count' AND input_tokens = 13 AND output_tokens = 5 AND cache_read_tokens = 2 AND cache_write_tokens = 1 AND token_usage_buckets['input_text'] = 10 AND token_usage_buckets['output_text'] = 5 AND token_usage_buckets['input_cache_read'] = 2 AND token_usage_buckets['input_cache_write'] = 1" "1"
+
+  assert_clickhouse_count "$clickhouse_url" "kiro unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-kiro'" "6"
+  assert_clickhouse_count "$clickhouse_url" "kiro event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kiro'" "8"
+  assert_clickhouse_count "$clickhouse_url" "kiro link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-kiro'" "0"
+  assert_clickhouse_count "$clickhouse_url" "kiro tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-kiro' AND tool_call_id = 'kiro-tool-${run_stamp}'" "2"
+  assert_clickhouse_count "$clickhouse_url" "kiro file path searchable" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kiro' AND event_kind = 'tool_call' AND position(text_content, '/workspace/kiro-e2e.txt') > 0" "1"
+  assert_clickhouse_count "$clickhouse_url" "kiro domain fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kiro' AND harness = 'kiro-cli' AND inference_provider = 'kiro' AND session_id = '${kiro_session_id}' AND model = 'claude-sonnet-4' AND cwd = '${kiro_cwd}'" "8"
+  assert_clickhouse_count "$clickhouse_url" "kiro metadata fields and credits" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kiro' AND event_kind = 'session_meta' AND JSONExtractString(payload_json, 'title') = '${kiro_session_title}' AND input_tokens = 23 AND output_tokens = 11 AND token_usage_native_units['credits'] = 0.75" "1"
+
+  # Kiro rewrites only the JSON sidecar when title and token metadata change.
+  # The watcher must refresh session_meta without replaying the JSONL transcript.
+  echo "[e2e] kiro sidecar update: refreshing metadata without transcript changes"
+  cat > "$kiro_metadata_file" <<EOF
+{
+  "session_id": "${kiro_session_id}",
+  "cwd": "${kiro_cwd}",
+  "title": "${kiro_updated_session_title}",
+  "created_at": "2026-02-16T12:00:08Z",
+  "updated_at": "2026-02-16T12:00:14Z",
+  "session_state": {
+    "agent_name": "kiro_default",
+    "rts_model_state": {
+      "model_info": {"model_id": "claude-sonnet-4"}
+    },
+    "conversation_metadata": {
+      "user_turn_metadatas": [
+        {"input_token_count": 31, "output_token_count": 13, "metering_usage": [{"value": 1.25, "unit": "credit", "unitPlural": "credits"}]}
+      ]
+    }
+  }
+}
+EOF
+
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kiro' AND event_kind = 'session_meta' AND JSONExtractString(payload_json, 'title') = '${kiro_updated_session_title}' AND input_tokens = 31 AND output_tokens = 13 AND token_usage_native_units['credits'] = 1.25" 120
+  assert_clickhouse_count "$clickhouse_url" "kiro unique raw rows after sidecar update" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-kiro'" "7"
+  assert_clickhouse_count "$clickhouse_url" "kiro event rows after sidecar update" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kiro'" "8"
+  assert_clickhouse_count "$clickhouse_url" "kiro session_meta collapses on re-emit" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kiro' AND event_kind = 'session_meta'" "1"
+  assert_clickhouse_count "$clickhouse_url" "ingest errors after kiro sidecar update" "SELECT count() FROM ${clickhouse_database}.ingest_errors" "0"
 
   assert_clickhouse_count "$clickhouse_url" "cursor unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-cursor'" "5"
   assert_clickhouse_count "$clickhouse_url" "cursor event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-cursor'" "6"
@@ -1224,7 +1316,7 @@ PY
   assert_clickhouse_count "$clickhouse_url" "hermes session link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-hermes-session'" "0"
   assert_clickhouse_count "$clickhouse_url" "hermes session tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-hermes-session' AND tool_call_id = 'hermes-session-tool-${run_stamp}' AND tool_name = 'shell'" "2"
   assert_clickhouse_count "$clickhouse_url" "hermes session domain fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-hermes-session' AND harness = 'hermes' AND inference_provider = 'anthropic' AND session_id = '${hermes_raw_session_id}' AND model = 'claude-opus-4-6'" "6"
-  assert_clickhouse_count "$clickhouse_url" "token bucket map keys on all events" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE hasAll(mapKeys(token_usage_buckets), ['input_text', 'output_text', 'input_cache_read', 'input_cache_write', 'reasoning'])" "52"
+  assert_clickhouse_count "$clickhouse_url" "token bucket map keys on all events" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE hasAll(mapKeys(token_usage_buckets), ['input_text', 'output_text', 'input_cache_read', 'input_cache_write', 'reasoning'])" "60"
 
   local hermes_trajectory_session_id
   hermes_trajectory_session_id="$(clickhouse_scalar "$clickhouse_url" "SELECT any(session_id) FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-hermes-trajectory'")"
@@ -1315,6 +1407,7 @@ if not valid:
   sessions_body="$(curl -fsS "http://127.0.0.1:${monitor_port}/api/v1/sessions?since=all&limit=200")"
   printf '%s' "$sessions_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; ok=any(s.get("id")==sid and s.get("harness",{}).get("id")=="cursor" for s in data.get("sessions", [])); sys.exit(0 if ok else 1)' "$cursor_session_id"
   printf '%s' "$sessions_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; ok=any(s.get("id")==sid and s.get("harness",{}).get("id")=="pi-coding-agent" for s in data.get("sessions", [])); sys.exit(0 if ok else 1)' "$pi_session_id"
+  printf '%s' "$sessions_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; ok=any(s.get("id")==sid and s.get("harness",{}).get("id")=="kiro-cli" for s in data.get("sessions", [])); sys.exit(0 if ok else 1)' "$kiro_session_id"
 
   # Regression for #388: turn_seq is computed by a running user-message window
   # over the events ReplacingMergeTree. Re-ingestion can briefly leave a
@@ -1493,6 +1586,16 @@ PY
     --expect-session-id "$kimi_raw_session_id" \
     --expect-open-text "$kimi_trace_marker" \
     --file-attention-path "manifest.json"
+
+  echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (kiro)"
+  "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --query "$kiro_keyword" \
+    --expect-session-id "$kiro_session_id" \
+    --expect-open-text "$kiro_trace_marker" \
+    --expect-event-count "8" \
+    --file-attention-path "/workspace/kiro-e2e.txt"
 
   echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (cursor)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \

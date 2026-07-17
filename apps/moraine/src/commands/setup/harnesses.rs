@@ -11,6 +11,7 @@ use super::{CommandSpec, ConfigTarget, McpPlan, McpPlanStep, SetupMcpTarget};
 
 const HERMES_PLUGIN_REMOTE_IDENTIFIER: &str = "eric-tramel/moraine/plugins/hermes-moraine";
 const HERMES_PLUGIN_RELATIVE_PATH: &str = "plugins/hermes-moraine";
+const KIRO_STEERING: &str = include_str!("kiro-steering.md");
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct DefaultIngestSourceUpdate {
@@ -173,6 +174,14 @@ const HERMES_INGEST: [DefaultIngestSource; 1] = [DefaultIngestSource {
     format: Some("session_json"),
 }];
 
+const KIRO_INGEST: [DefaultIngestSource; 1] = [DefaultIngestSource {
+    name: "kiro",
+    harness: "kiro-cli",
+    glob: "~/.kiro/sessions/cli/*.jsonl",
+    watch_root: "~/.kiro/sessions/cli",
+    format: Some("kiro_session"),
+}];
+
 const KIMI_INGEST: [DefaultIngestSource; 1] = [DefaultIngestSource {
     name: "kimi-cli",
     harness: "kimi-cli",
@@ -232,7 +241,7 @@ const PI_INGEST: [DefaultIngestSource; 2] = [
     },
 ];
 
-const SPECS: [HarnessSpec; 7] = [
+const SPECS: [HarnessSpec; 8] = [
     HarnessSpec {
         target: SetupMcpTarget::ClaudeCode,
         label: "Claude Code",
@@ -256,6 +265,14 @@ const SPECS: [HarnessSpec; 7] = [
         programs: &["hermes"],
         probe_paths: ProbePaths::None,
         ingest_sources: &HERMES_INGEST,
+    },
+    HarnessSpec {
+        target: SetupMcpTarget::KiroCli,
+        label: "Kiro CLI",
+        setup_kind: "MCP + steering",
+        programs: &["kiro-cli"],
+        probe_paths: ProbePaths::None,
+        ingest_sources: &KIRO_INGEST,
     },
     HarnessSpec {
         target: SetupMcpTarget::KimiCli,
@@ -310,6 +327,7 @@ pub(super) fn mcp_plan(
     target: SetupMcpTarget,
     config_target: &ConfigTarget,
     home: Option<PathBuf>,
+    kiro_home: Option<PathBuf>,
 ) -> McpPlan {
     match target {
         SetupMcpTarget::ClaudeCode if config_target.requires_explicit_mcp_config() => {
@@ -384,6 +402,7 @@ pub(super) fn mcp_plan(
                 ),
             ],
             config_writes: Vec::new(),
+            managed_writes: Vec::new(),
             manual_snippet: None,
         },
         SetupMcpTarget::Codex if config_target.requires_explicit_mcp_config() => {
@@ -446,6 +465,7 @@ pub(super) fn mcp_plan(
                 ),
             ],
             config_writes: Vec::new(),
+            managed_writes: Vec::new(),
             manual_snippet: None,
         },
         SetupMcpTarget::Hermes if config_target.requires_explicit_mcp_config() => {
@@ -490,8 +510,48 @@ pub(super) fn mcp_plan(
                 ),
             ],
             config_writes: Vec::new(),
+            managed_writes: Vec::new(),
             manual_snippet: None,
         },
+        SetupMcpTarget::KiroCli => {
+            let Some(moraine_command) = kiro_moraine_command() else {
+                return McpPlan::manual(
+                    target,
+                    "Moraine could not resolve the absolute path of its running executable. Register Kiro MCP manually with an absolute, trusted path to the moraine CLI.".to_string(),
+                );
+            };
+            let registration_args = kiro_args(config_target, &moraine_command);
+
+            let Some(kiro_home) = kiro_home.or_else(|| home.map(|home| home.join(".kiro")))
+            else {
+                let command = CommandSpec::new("kiro-cli", registration_args);
+                return McpPlan::manual(
+                    target,
+                    format!(
+                        "KIRO_HOME and HOME are not set, so Moraine cannot choose Kiro's global steering directory. Set one of them, then run:\n{}",
+                        command.display()
+                    ),
+                );
+            };
+
+            McpPlan {
+                target,
+                action: super::McpAction::Execute,
+                steps: vec![McpPlanStep::required(CommandSpec::new(
+                    "kiro-cli",
+                    registration_args,
+                ))
+                .with_progress(
+                    "Registering Moraine MCP in Kiro CLI",
+                    "Kiro CLI MCP registered",
+                    "Kiro CLI MCP registration warning",
+                    "Kiro CLI MCP registration failed",
+                )],
+                config_writes: Vec::new(),
+                managed_writes: vec![ManagedFileWrite::kiro_steering(&kiro_home)],
+                manual_snippet: None,
+            }
+        }
         SetupMcpTarget::KimiCli => McpPlan::replace_registration(
             target,
             CommandSpec::new("kimi", ["mcp", "remove", "moraine"]),
@@ -538,6 +598,35 @@ pub(super) fn mcp_plan(
             }
             plan
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ManagedFileWrite {
+    path: PathBuf,
+    label: &'static str,
+    content: &'static str,
+}
+
+impl ManagedFileWrite {
+    fn kiro_steering(kiro_home: &Path) -> Self {
+        Self {
+            path: kiro_home.join("steering").join("moraine.md"),
+            label: "Kiro steering",
+            content: KIRO_STEERING,
+        }
+    }
+
+    pub(super) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(super) fn label(&self) -> &'static str {
+        self.label
+    }
+
+    pub(super) fn content(&self) -> &'static str {
+        self.content
     }
 }
 
@@ -827,6 +916,32 @@ fn kimi_args(config_target: &ConfigTarget) -> Vec<String> {
     ];
     args.extend(mcp_run_args(config_target));
     args
+}
+
+fn kiro_moraine_command() -> Option<String> {
+    let executable = env::current_exe().ok()?;
+    if !executable.is_absolute() {
+        return None;
+    }
+    executable.into_os_string().into_string().ok()
+}
+
+pub(super) fn kiro_args(config_target: &ConfigTarget, moraine_command: &str) -> Vec<String> {
+    let command_args = serde_json::to_string(&mcp_run_args(config_target))
+        .expect("Moraine MCP arguments always serialize as JSON");
+    vec![
+        "mcp".to_string(),
+        "add".to_string(),
+        "--name".to_string(),
+        "moraine".to_string(),
+        "--scope".to_string(),
+        "global".to_string(),
+        "--command".to_string(),
+        moraine_command.to_string(),
+        "--args".to_string(),
+        command_args,
+        "--force".to_string(),
+    ]
 }
 
 fn cursor_snippet(config_target: &ConfigTarget) -> String {
