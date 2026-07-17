@@ -96,6 +96,9 @@ fn normalize_pi_record(
         "custom_message" => handle_pi_custom_message(record, base_uid, &mut emitter),
         "label" => handle_pi_label(record, base_uid, &mut emitter),
         "session_info" => handle_pi_session_info(record, base_uid, &mut emitter),
+        "title" | "title_change" if ctx.source_name == "omp" => {
+            handle_omp_title(record, top_type, base_uid, &mut emitter)
+        }
         _ => handle_pi_unknown(record, top_type, base_uid, &mut emitter),
     }
 
@@ -115,6 +118,26 @@ fn handle_pi_session(record: &Value, base_uid: &str, emitter: &mut SourceEmitter
             record,
         )
         .item_id(to_str(record.get("id")));
+    emitter.push_event(event);
+}
+
+fn handle_omp_title(
+    record: &Value,
+    top_type: &str,
+    base_uid: &str,
+    emitter: &mut SourceEmitter<'_>,
+) {
+    let event = emitter
+        .event_for_json(
+            base_uid,
+            "session_meta",
+            "session_meta",
+            "system",
+            &to_str(record.get("title")),
+            record,
+        )
+        .item_id(to_str(record.get("id")))
+        .op_kind(top_type);
     emitter.push_event(event);
 }
 

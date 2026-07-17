@@ -1533,6 +1533,28 @@ fn current_omp_event_types_normalize_with_pi_adapter() {
     let cases = [
         (
             json!({
+                "type": "title",
+                "v": 1,
+                "title": "Review scope changes",
+                "source": "auto",
+                "updatedAt": "2026-07-10T02:43:10.562Z"
+            }),
+            "session_meta",
+        ),
+        (
+            json!({
+                "type": "title_change",
+                "id": "title-change-1",
+                "parentId": "parent-1",
+                "timestamp": "2026-07-10T02:45:40.168Z",
+                "title": "Review scope changes",
+                "source": "auto",
+                "trigger": "replan"
+            }),
+            "session_meta",
+        ),
+        (
+            json!({
                 "type": "custom",
                 "customType": "tool_execution_start",
                 "data": {"toolCallId": "call-1", "toolName": "read"},
@@ -1618,6 +1640,96 @@ fn current_omp_event_types_normalize_with_pi_adapter() {
             Some(expected_event_kind)
         );
     }
+}
+
+#[test]
+fn omp_title_records_preserve_source_metadata() {
+    for top_type in ["title", "title_change"] {
+        let record = json!({
+            "type": top_type,
+            "id": "title-1",
+            "timestamp": "2026-07-10T02:45:40.168Z",
+            "title": "Review scope changes",
+            "source": "auto"
+        });
+
+        let out = normalize_record(
+            &record,
+            "omp",
+            "pi-coding-agent",
+            "/Users/demo/.omp/agent/sessions/project/ReviewScope-2.jsonl",
+            1,
+            1,
+            1,
+            0,
+            "11111111-2222-4333-8444-555555555555",
+            "",
+            "/work/omp-demo",
+        )
+        .expect("OMP title record should normalize");
+
+        let row = &out.event_rows[0];
+        assert_eq!(
+            row.get("event_kind").and_then(Value::as_str),
+            Some("session_meta")
+        );
+        assert_eq!(
+            row.get("payload_type").and_then(Value::as_str),
+            Some("session_meta")
+        );
+        assert_eq!(
+            row.get("text_content").and_then(Value::as_str),
+            Some("Review scope changes")
+        );
+        assert_eq!(row.get("op_kind").and_then(Value::as_str), Some(top_type));
+
+        let payload: Value = serde_json::from_str(
+            row.get("payload_json")
+                .and_then(Value::as_str)
+                .expect("title event payload"),
+        )
+        .expect("valid title event payload");
+        assert_eq!(
+            payload.get("title").and_then(Value::as_str),
+            Some("Review scope changes")
+        );
+    }
+}
+
+#[test]
+fn historical_pi_title_records_remain_unknown() {
+    let record = json!({
+        "type": "title",
+        "v": 1,
+        "title": "Historical Pi title",
+        "updatedAt": "2026-07-10T02:43:10.562Z"
+    });
+
+    let out = normalize_record(
+        &record,
+        "pi",
+        "pi-coding-agent",
+        "/Users/demo/.pi/agent/sessions/project/session.jsonl",
+        1,
+        1,
+        1,
+        0,
+        "11111111-2222-4333-8444-555555555555",
+        "",
+        "/work/pi-demo",
+    )
+    .expect("Pi title record should remain on the generic path");
+
+    assert_eq!(
+        out.event_rows[0].get("event_kind").and_then(Value::as_str),
+        Some("unknown")
+    );
+    assert_eq!(
+        out.event_rows[0]
+            .get("payload_type")
+            .and_then(Value::as_str),
+        Some("unknown")
+    );
 }
 
 #[test]

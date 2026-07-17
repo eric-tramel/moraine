@@ -3,8 +3,9 @@ use moraine_clickhouse::ClickHouseClient;
 use moraine_config::{AppConfig, ClickHouseConfig, DEFAULT_BACKEND_NAME};
 use moraine_conversations::{
     with_repository_query_id, AnalyticsRange, BackendRepositoryRouter,
-    ClickHouseConversationRepository, ConversationRepository, PageRequest, RepoConfig,
-    SessionAnalyticsQuery, SessionLookback, TurnListFilter,
+    ClickHouseConversationRepository, ConversationListSort, ConversationRepository,
+    McpSessionListFilter, PageRequest, RepoConfig, SessionAnalyticsQuery, SessionLookback,
+    TurnListFilter,
 };
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
@@ -346,6 +347,160 @@ VALUES
         .request_text(&commentary_insert, None, Some(database), false, None)
         .await
         .context("failed to insert commentary projection fixture")?;
+    let omp_insert = format!(
+        r#"INSERT INTO `{database}`.`events`
+(
+  ingested_at, event_uid, session_id, session_date, source_name, harness, source_file,
+  source_ref, record_ts, event_ts, event_kind, actor_kind, payload_type, op_kind, request_id,
+  trace_id, turn_index, model, input_tokens, output_tokens, text_content, payload_json,
+  event_version
+)
+VALUES
+(
+  now64(3), 'issue568-explicit-title', 'issue568-explicit-session', today(),
+  'omp', 'pi-coding-agent', '/tmp/omp/ExplicitTask.jsonl', 'issue568-explicit-title',
+  '2026-07-17T01:00:00.000Z', '2026-07-17 01:00:00.000', 'unknown', 'system',
+  'unknown', 'title_change', '', 'issue568-explicit-trace', 1, '', 0, 0,
+  'Explicit OMP Title', '{{"type":"title_change","title":"Explicit OMP Title"}}', 1
+),
+(
+  now64(3), 'issue568-later-name', 'issue568-explicit-session', today(),
+  'omp', 'pi-coding-agent', '/tmp/omp/ExplicitTask.jsonl', 'issue568-later-name',
+  '2026-07-17T01:00:01.000Z', '2026-07-17 01:00:01.000', 'session_meta', 'system',
+  'session_meta', 'session_info', '', 'issue568-explicit-trace', 1, '', 0, 0,
+  '', '{{"name":"Later Lower Priority Name"}}', 1
+),
+(
+  now64(3), 'issue568-windows-fallback', 'issue568-windows-session', today(),
+  'omp', 'pi-coding-agent',
+  'C:\\Users\\alice\\.omp\\agent\\sessions\\project\\ReviewScope-2.jsonl',
+  'issue568-windows-fallback', '2026-07-17T01:01:00.000Z', '2026-07-17 01:01:00.000',
+  'message', 'user', 'user_message', '', '', 'issue568-windows-trace', 1, '', 0, 0,
+  'private prompt', '{{}}', 1
+),
+(
+  now64(3), 'issue568-main-file', '11111111-2222-4333-8444-555555555568', today(),
+  'omp', 'pi-coding-agent',
+  '/tmp/omp/11111111-2222-4333-8444-555555555568.jsonl',
+  'issue568-main-file', '2026-07-17T01:02:00.000Z', '2026-07-17 01:02:00.000',
+  'message', 'user', 'user_message', '', '', 'issue568-main-trace', 1, '', 0, 0,
+  'private main prompt', '{{}}', 1
+),
+(
+  now64(3), 'issue568-pi-title', 'issue568-pi-session', today(),
+  'pi', 'pi-coding-agent', '/tmp/pi/session.jsonl', 'issue568-pi-title',
+  '2026-07-17T01:03:00.000Z', '2026-07-17 01:03:00.000', 'session_meta', 'system',
+  'session_meta', 'session', '', 'issue568-pi-trace', 1, '', 0, 0,
+  'Pi Title', '{{"title":"Pi Title"}}', 1
+),
+(
+  now64(3), 'issue568-pi-name', 'issue568-pi-session', today(),
+  'pi', 'pi-coding-agent', '/tmp/pi/session.jsonl', 'issue568-pi-name',
+  '2026-07-17T01:03:01.000Z', '2026-07-17 01:03:01.000', 'session_meta', 'system',
+  'session_meta', 'session_info', '', 'issue568-pi-trace', 1, '', 0, 0,
+  '', '{{"name":"Later Pi Name"}}', 1
+),
+(
+  now64(3), 'issue568-pi-summary', 'issue568-pi-summary-session', today(),
+  'pi', 'pi-coding-agent', '/tmp/pi/summary-session.jsonl', 'issue568-pi-summary',
+  '2026-07-17T01:04:00.000Z', '2026-07-17 01:04:00.000', 'session_meta', 'system',
+  'session_meta', 'session_info', '', 'issue568-pi-summary-trace', 1, '', 0, 0,
+  '', '{{"summary":"Pi Summary"}}', 1
+)"#
+    );
+    clickhouse
+        .request_text(&omp_insert, None, Some(database), false, None)
+        .await
+        .context("failed to insert OMP session metadata fixtures")?;
+    Ok(())
+}
+
+async fn assert_omp_session_metadata(repository: &ClickHouseConversationRepository) -> Result<()> {
+    let listed = repository
+        .list_mcp_sessions(
+            McpSessionListFilter {
+                start_unix_ms: 0,
+                end_unix_ms: 4_102_444_800_000,
+                mode: None,
+                sort: ConversationListSort::Asc,
+                harness: None,
+                source_name: None,
+            },
+            PageRequest {
+                limit: 100,
+                cursor: None,
+            },
+        )
+        .await
+        .context("failed to list OMP session metadata fixtures")?;
+
+    let explicit = listed
+        .items
+        .iter()
+        .find(|session| session.session_id == "issue568-explicit-session")
+        .context("explicit OMP session missing from listing")?;
+    assert_eq!(explicit.title.as_deref(), Some("Explicit OMP Title"));
+    assert_eq!(
+        explicit.session_summary.as_deref(),
+        Some("Explicit OMP Title")
+    );
+
+    let windows = listed
+        .items
+        .iter()
+        .find(|session| session.session_id == "issue568-windows-session")
+        .context("Windows-path OMP session missing from listing")?;
+    assert_eq!(windows.title.as_deref(), Some("ReviewScope-2"));
+    assert_eq!(windows.session_summary.as_deref(), Some("ReviewScope-2"));
+
+    let main = listed
+        .items
+        .iter()
+        .find(|session| session.session_id == "11111111-2222-4333-8444-555555555568")
+        .context("UUID main-file OMP session missing from listing")?;
+    assert!(main.title.is_none());
+    assert!(main.session_summary.is_none());
+
+    let pi = listed
+        .items
+        .iter()
+        .find(|session| session.session_id == "issue568-pi-session")
+        .context("Pi precedence fixture missing from listing")?;
+    assert_eq!(pi.title.as_deref(), Some("Later Pi Name"));
+    assert_eq!(pi.session_summary.as_deref(), Some("Later Pi Name"));
+
+    let pi_summary = listed
+        .items
+        .iter()
+        .find(|session| session.session_id == "issue568-pi-summary-session")
+        .context("Pi summary-only fixture missing from listing")?;
+    assert_eq!(pi_summary.title.as_deref(), Some("Pi Summary"));
+    assert_eq!(pi_summary.session_summary.as_deref(), Some("Pi Summary"));
+
+    for (session_id, expected_title, expected_summary) in [
+        (
+            "issue568-explicit-session",
+            Some("Explicit OMP Title"),
+            Some("Explicit OMP Title"),
+        ),
+        (
+            "issue568-windows-session",
+            Some("ReviewScope-2"),
+            Some("ReviewScope-2"),
+        ),
+        ("11111111-2222-4333-8444-555555555568", None, None),
+        ("issue568-pi-session", Some("Pi Title"), Some("Pi Title")),
+        ("issue568-pi-summary-session", None, Some("Pi Summary")),
+    ] {
+        let opened = repository
+            .get_mcp_session(session_id)
+            .await
+            .with_context(|| format!("failed to open session metadata fixture {session_id}"))?
+            .with_context(|| format!("session metadata fixture {session_id} missing"))?;
+        assert_eq!(opened.title.as_deref(), expected_title);
+        assert_eq!(opened.session_summary.as_deref(), expected_summary);
+    }
+
     Ok(())
 }
 
@@ -715,6 +870,7 @@ async fn live_schema_semantics_and_teardown() -> Result<()> {
             .backfill_mcp_open_read_model()
             .await
             .context("failed to project live-schema fixtures for bounded MCP open")?;
+        assert_omp_session_metadata(&repository).await?;
         let commentary_turn = repository
             .get_mcp_turn("issue549-commentary-session", 1)
             .await

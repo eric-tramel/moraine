@@ -465,15 +465,21 @@ impl ClickHouseClient {
                  argMin(event_uid, tuple(event_time, event_order, event_uid)) AS first_event_uid,\n\
                  argMax(event_uid, tuple(event_time, event_order, event_uid)) AS last_event_uid,\n\
                  argMax(actor_role, tuple(event_time, event_order, event_uid)) AS last_actor_role,\n\
-                 ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'title'), ''), tuple(event_ts, event_uid), event_class = 'session_meta'),\n\
-                   ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'name'), ''), tuple(event_ts, event_uid), event_class = 'session_meta'), '')) AS title,\n\
+                 ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'title'), ''),\n\
+                   tuple(event_ts, event_uid), event_class = 'session_meta'\n\
+                     OR (source_name = 'omp' AND JSONExtractString(payload_json, 'type') IN ('title', 'title_change'))), '') AS latest_metadata_title,\n\
+                 ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'name'), ''),\n\
+                   tuple(event_ts, event_uid), event_class = 'session_meta'), '') AS latest_metadata_name,\n\
+                 ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'summary'), ''),\n\
+                   tuple(event_ts, event_uid), event_class = 'session_meta'), '') AS latest_metadata_summary,\n\
+                 ifNull(argMinIf(nullIf(trimBoth(replaceRegexpOne(arrayElement(splitByChar('/', replaceAll(source_file, '\\\\', '/')), -1), '[.]jsonl$', '')), ''),\n\
+                   tuple(event_ts, event_uid), source_name = 'omp' AND notEmpty(session_id)\n\
+                     AND endsWith(source_file, '.jsonl')\n\
+                     AND NOT endsWith(source_file, concat(session_id, '.jsonl'))), '') AS omp_dispatch_title,\n\
                  ifNull(argMax(nullIf(source_name, ''), tuple(event_ts, event_uid)), '') AS source,\n\
                  ifNull(argMax(nullIf(harness, ''), tuple(event_ts, event_uid)), '') AS harness,\n\
                  ifNull(argMax(nullIf(inference_provider, ''), tuple(event_ts, event_uid)), '') AS inference_provider,\n\
                  ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'slug'), ''), tuple(event_ts, event_uid), event_class = 'session_meta'), '') AS session_slug,\n\
-                 ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'summary'), ''), tuple(event_ts, event_uid), event_class = 'session_meta'),\n\
-                   ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'title'), ''), tuple(event_ts, event_uid), event_class = 'session_meta'),\n\
-                     ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'name'), ''), tuple(event_ts, event_uid), event_class = 'session_meta'), ''))) AS session_summary,\n\
                  ifNull(argMinIf(cwd, tuple(event_ts, event_uid), cwd != ''), '') AS origin_cwd\n\
                FROM enriched\n\
                GROUP BY session_id\n\
@@ -495,8 +501,10 @@ impl ClickHouseClient {
                h.session_id, {slot}, {generation}, h.source_revision, {dirty_revision},\n\
                h.first_event_time, h.last_event_time, h.total_turns, h.total_events,\n\
                h.user_messages, h.assistant_messages, h.tool_calls, h.tool_results, h.mode,\n\
-               h.first_event_uid, h.last_event_uid, h.last_actor_role, h.title, h.source,\n\
-               h.harness, h.inference_provider, h.session_slug, h.session_summary,\n\
+               h.first_event_uid, h.last_event_uid, h.last_actor_role,\n\
+               if(h.source = 'omp', coalesce(nullIf(h.latest_metadata_title, ''), nullIf(h.latest_metadata_name, ''), nullIf(h.latest_metadata_summary, ''), nullIf(h.omp_dispatch_title, ''), ''), coalesce(nullIf(h.latest_metadata_title, ''), nullIf(h.latest_metadata_name, ''), '')), h.source,\n\
+               h.harness, h.inference_provider, h.session_slug,\n\
+               if(h.source = 'omp', coalesce(nullIf(h.latest_metadata_summary, ''), nullIf(h.latest_metadata_title, ''), nullIf(h.latest_metadata_name, ''), nullIf(h.omp_dispatch_title, ''), ''), coalesce(nullIf(h.latest_metadata_summary, ''), nullIf(h.latest_metadata_title, ''), nullIf(h.latest_metadata_name, ''), '')),\n\
                ifNull(t.completed, 0), ifNull(t.terminal_event_uid, ''), h.origin_cwd\n\
              FROM header AS h\n\
              CROSS JOIN current_dirty AS d\n\
