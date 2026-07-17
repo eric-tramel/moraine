@@ -289,17 +289,7 @@ event_rollups AS (
         event_kind = 'session_meta'
       ),
       ''
-    ) AS title,
-    ifNull(argMax(nullIf(e.harness, ''), tuple(event_ts, event_uid)), '') AS latest_harness,
-    ifNull(argMax(nullIf(e.source_name, ''), tuple(event_ts, event_uid)), '') AS latest_source_name,
-    ifNull(
-      argMaxIf(
-        nullIf(JSONExtractString(payload_json, 'slug'), ''),
-        tuple(event_ts, event_uid),
-        event_kind = 'session_meta'
-      ),
-      ''
-    ) AS session_slug,
+    ) AS latest_session_meta_title,
     ifNull(
       argMaxIf(
         coalesce(
@@ -311,7 +301,62 @@ event_rollups AS (
         event_kind = 'session_meta'
       ),
       ''
-    ) AS session_summary
+    ) AS latest_session_meta_summary,
+    ifNull(
+      argMaxIf(
+        nullIf(JSONExtractString(payload_json, 'title'), ''),
+        tuple(event_ts, event_uid),
+        event_kind = 'session_meta'
+          OR (e.source_name = 'omp' AND JSONExtractString(e.payload_json, 'type') IN ('title', 'title_change'))
+      ),
+      ''
+    ) AS latest_metadata_title,
+    ifNull(
+      argMaxIf(
+        nullIf(JSONExtractString(payload_json, 'name'), ''),
+        tuple(event_ts, event_uid),
+        event_kind = 'session_meta'
+      ),
+      ''
+    ) AS latest_metadata_name,
+    ifNull(
+      argMaxIf(
+        nullIf(JSONExtractString(payload_json, 'summary'), ''),
+        tuple(event_ts, event_uid),
+        event_kind = 'session_meta'
+      ),
+      ''
+    ) AS latest_metadata_summary,
+    ifNull(
+      argMinIf(
+        nullIf(
+          trimBoth(
+            replaceRegexpOne(
+              arrayElement(splitByChar('/', replaceAll(e.source_file, '\\\\', '/')), -1),
+              '[.]jsonl$',
+              ''
+            )
+          ),
+          ''
+        ),
+        tuple(event_ts, event_uid),
+        e.source_name = 'omp'
+          AND notEmpty(e.session_id)
+          AND endsWith(e.source_file, '.jsonl')
+          AND NOT endsWith(e.source_file, concat(e.session_id, '.jsonl'))
+      ),
+      ''
+    ) AS omp_dispatch_title,
+    ifNull(argMax(nullIf(e.harness, ''), tuple(event_ts, event_uid)), '') AS latest_harness,
+    ifNull(argMax(nullIf(e.source_name, ''), tuple(event_ts, event_uid)), '') AS latest_source_name,
+    ifNull(
+      argMaxIf(
+        nullIf(JSONExtractString(payload_json, 'slug'), ''),
+        tuple(event_ts, event_uid),
+        event_kind = 'session_meta'
+      ),
+      ''
+    ) AS session_slug
   FROM {events_source} AS e
   WHERE session_id IN (SELECT session_id FROM window_sessions)
   GROUP BY session_id
@@ -330,11 +375,31 @@ candidate_sessions AS (
       ifNull(r.latest_terminal_turn_seq, toUInt32(0)) = w.total_turns
       AND ifNull(r.latest_terminal_payload_type, '') = 'task_complete'
     ) AS completed,
-    ifNull(r.title, '') AS title,
+    if(
+      ifNull(r.latest_source_name, '') = 'omp',
+      coalesce(
+        nullIf(r.latest_metadata_title, ''),
+        nullIf(r.latest_metadata_name, ''),
+        nullIf(r.latest_metadata_summary, ''),
+        nullIf(r.omp_dispatch_title, ''),
+        ''
+      ),
+      ifNull(r.latest_session_meta_title, '')
+    ) AS title,
     ifNull(r.latest_source_name, '') AS source,
     ifNull(r.latest_harness, '') AS harness,
     ifNull(r.session_slug, '') AS session_slug,
-    ifNull(r.session_summary, '') AS session_summary
+    if(
+      ifNull(r.latest_source_name, '') = 'omp',
+      coalesce(
+        nullIf(r.latest_metadata_summary, ''),
+        nullIf(r.latest_metadata_title, ''),
+        nullIf(r.latest_metadata_name, ''),
+        nullIf(r.omp_dispatch_title, ''),
+        ''
+      ),
+      ifNull(r.latest_session_meta_summary, '')
+    ) AS session_summary
   FROM window_sessions AS w
   LEFT JOIN event_rollups AS r ON r.session_id = w.session_id
   {event_filter_sql}ORDER BY w.last_event_unix_ms {order_dir}, w.session_id {order_dir}

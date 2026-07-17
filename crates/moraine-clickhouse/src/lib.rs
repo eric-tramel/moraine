@@ -848,6 +848,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             name: "029_reset_mcp_open_projection.sql",
             sql: include_str!("../../../sql/029_reset_mcp_open_projection.sql"),
         },
+        Migration {
+            version: "030",
+            name: "030_refresh_omp_session_metadata.sql",
+            sql: include_str!("../../../sql/030_refresh_omp_session_metadata.sql"),
+        },
     ]
 }
 
@@ -1568,7 +1573,7 @@ mod tests {
 
     #[test]
     fn mcp_open_migrations_exclude_blank_session_ids() {
-        for version in ["027", "029"] {
+        for version in ["027", "029", "030"] {
             let migration = bundled_migrations()
                 .into_iter()
                 .find(|migration| migration.version == version)
@@ -1579,6 +1584,17 @@ mod tests {
                 "migration {version} must not enqueue blank session IDs"
             );
         }
+    }
+
+    #[test]
+    fn migration_030_refreshes_only_omp_session_heads() {
+        let migration = bundled_migrations()
+            .into_iter()
+            .find(|migration| migration.version == "030")
+            .expect("migration 030 must be registered");
+
+        assert!(migration.sql.contains("FROM moraine.events FINAL"));
+        assert!(migration.sql.contains("source_name = 'omp'"));
     }
 
     #[test]

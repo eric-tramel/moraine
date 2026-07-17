@@ -223,6 +223,18 @@ async fn list_mcp_sessions_uses_overlap_filter_and_cursor_pagination() {
     assert!(list_query.contains("r.latest_harness = 'codex'"));
     assert!(list_query.contains("r.latest_source_name = 'codex'"));
     assert!(list_query.contains("ifNull(r.latest_source_name, '') AS source"));
+    assert!(list_query.contains(
+        "e.source_name = 'omp' AND JSONExtractString(e.payload_json, 'type') IN ('title', 'title_change')"
+    ));
+    assert!(list_query.contains("replaceRegexpOne("));
+    assert!(list_query.contains("replaceAll(e.source_file, '\\\\', '/')"));
+    assert!(list_query.contains("NOT endsWith(e.source_file, concat(e.session_id, '.jsonl'))"));
+    assert!(list_query.contains("nullIf(r.latest_metadata_title, '')"));
+    assert!(list_query.contains("nullIf(r.latest_metadata_name, '')"));
+    assert!(list_query.contains("nullIf(r.latest_metadata_summary, '')"));
+    assert!(list_query.contains("nullIf(r.omp_dispatch_title, '')"));
+    assert!(list_query.contains("ifNull(r.latest_session_meta_title, '')"));
+    assert!(list_query.contains("ifNull(r.latest_session_meta_summary, '')"));
     assert!(list_query.contains("ORDER BY w.last_event_unix_ms DESC, w.session_id DESC"));
     assert!(list_query.contains("payload_type IN ('task_complete', 'turn_aborted')"));
     // Blank session_id rows are filtered at the source so they never consume a
