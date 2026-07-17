@@ -186,7 +186,8 @@ pub struct McpConfig {
     pub protocol_version: String,
     /// Maximum retrieval requests executed concurrently by each MCP server
     /// process. When omitted, the server executes up to eight. At most sixteen
-    /// additional requests wait in FIFO order, within the fixed wall deadline.
+    /// additional requests wait in FIFO order until capacity becomes available
+    /// or the request is cancelled.
     #[serde(default)]
     pub max_parallel_requests: Option<u16>,
     /// When true, `moraine run mcp` first tries to reach the shared central

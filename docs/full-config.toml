@@ -255,8 +255,8 @@ async_log_writes = true
 protocol_version = "2024-11-05"
 # Maximum retrieval requests executed concurrently by this MCP server process.
 # Omit for the default of 8. At most 16 additional requests wait in FIFO order.
-# Queue time counts toward the fixed 4-second request deadline; a full queue is
-# rejected immediately with a structured retryable error.
+# Queued and running retrievals have no fixed admission deadline; a full queue
+# is rejected immediately with a structured retryable error.
 # max_parallel_requests = 16
 
 
