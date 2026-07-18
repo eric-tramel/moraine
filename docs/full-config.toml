@@ -146,6 +146,17 @@ watch_root = "~/.claude/projects"
 format = "jsonl"
 
 [[ingest.sources]]
+# macOS-only local Claude Cowork transcripts. Moraine groups nested Claude CLI
+# files by their containing local_* Cowork session and excludes audit.jsonl.
+# Keep disabled on other platforms; no stable Windows storage path is known.
+name = "claude-cowork"
+harness = "claude-code"
+enabled = false
+glob = "~/Library/Application Support/Claude/local-agent-mode-sessions/**/.claude/projects/**/*.jsonl"
+watch_root = "~/Library/Application Support/Claude/local-agent-mode-sessions"
+format = "jsonl"
+
+[[ingest.sources]]
 # Kimi CLI wire JSONL session files.
 name = "kimi-cli"
 harness = "kimi-cli"

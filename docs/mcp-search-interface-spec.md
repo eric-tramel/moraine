@@ -287,9 +287,9 @@ search_sessions({
   `codex`, `claude-code`, `cursor`, `hermes`, `kimi-cli`, `opencode`, and
   `pi-coding-agent`.
 - `source` matches a configured ingest source name. The default configured
-  values are `claude`, `codex`, `cursor`, `cursor-sqlite`, `hermes`, `kimi-cli`,
-  `omp`, `opencode`, and `pi`; each server's MCP tool instructions list its
-  actual configured source names.
+  values are `claude`, macOS-only `claude-cowork`, `codex`, `cursor`,
+  `cursor-sqlite`, `hermes`, `kimi-cli`, `omp`, `opencode`, and `pi`; each
+  server's MCP tool instructions list its actual configured source names.
 - When both are present, both predicates must match. Use `source` to distinguish
   `pi` and `omp`, which share the `pi-coding-agent` harness.
 

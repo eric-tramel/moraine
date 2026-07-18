@@ -44,6 +44,7 @@ impl SourceMetadata {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SourceRecordContext<'a> {
+    pub(crate) source_name: &'a str,
     pub(crate) source_file: &'a str,
     pub(crate) session_hint: &'a str,
     pub(crate) top_type: &'a str,

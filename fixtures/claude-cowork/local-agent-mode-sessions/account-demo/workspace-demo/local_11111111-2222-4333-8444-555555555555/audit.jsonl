@@ -1,0 +1,2 @@
+{"type":"user","sessionId":"aaaaaaaa-1111-4333-8444-555555555555","timestamp":"2026-02-02T10:00:01.000Z","message":{"role":"user","content":"AUDIT_SHOULD_NOT_INGEST"}}
+{"type":"user","sessionId":"aaaaaaaa-1111-4333-8444-555555555555","timestamp":"2026-02-02T10:02:01.000Z","message":{"role":"user","content":"LIVE_AUDIT_SHOULD_NOT_INGEST"}}

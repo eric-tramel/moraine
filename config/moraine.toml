@@ -71,6 +71,16 @@ enabled = true
 glob = "~/.claude/projects/**/*.jsonl"
 watch_root = "~/.claude/projects"
 
+# macOS local Claude Cowork sessions use the same claude-code normalizer.
+# `moraine setup` adds this source on macOS; the exact default Claude source
+# above also gains it in memory during config loading. Custom configs can add:
+# [[ingest.sources]]
+# name = "claude-cowork"
+# harness = "claude-code"
+# enabled = true
+# glob = "~/Library/Application Support/Claude/local-agent-mode-sessions/**/.claude/projects/**/*.jsonl"
+# watch_root = "~/Library/Application Support/Claude/local-agent-mode-sessions"
+
 [[ingest.sources]]
 name = "kimi-cli"
 harness = "kimi-cli"

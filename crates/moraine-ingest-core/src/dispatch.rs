@@ -1,6 +1,7 @@
 use crate::checkpoint::checkpoint_key;
 use crate::model::{Checkpoint, NormalizedRecord, RowBatch};
 use crate::normalize::{normalize_record, normalize_record_with_ts_hint};
+use crate::sources::claude_code::cowork_session_path;
 use crate::sources::shared::{format_record_ts, parse_record_ts};
 use crate::sqlite_poll::VolatilePollMap;
 use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
@@ -9,7 +10,7 @@ use moraine_config::{
     is_workflow_journal_path, map_tracked_path, AppConfig, SOURCE_FORMAT_CURSOR_SQLITE,
     SOURCE_FORMAT_OPENCODE_SQLITE, SOURCE_FORMAT_SESSION_JSON,
 };
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 #[cfg(not(unix))]
 use std::hash::{Hash, Hasher};
@@ -72,6 +73,10 @@ fn work_item_is_ingestable(work: &WorkItem) -> bool {
         );
         return false;
     }
+    if work.source_name == "claude-cowork" && cowork_session_path(&work.path).is_none() {
+        debug!("skipping non-transcript Claude Cowork path {}", work.path);
+        return false;
+    }
     if work.harness == "claude-code" && is_workflow_journal_path(&work.path) {
         debug!(
             "skipping workflow orchestration journal {} (no sessionId; issue #386)",
@@ -80,6 +85,96 @@ fn work_item_is_ingestable(work: &WorkItem) -> bool {
         return false;
     }
     true
+}
+
+struct CoworkCompanionRecord {
+    record: Value,
+    source_file: String,
+    source_inode: u64,
+}
+
+fn load_cowork_companion_record(work: &WorkItem) -> Option<CoworkCompanionRecord> {
+    if work.source_name != "claude-cowork" {
+        return None;
+    }
+    let cowork = cowork_session_path(&work.path)?;
+    let metadata_path = cowork.metadata_path();
+    let metadata = match std::fs::metadata(&metadata_path) {
+        Ok(metadata) => metadata,
+        Err(exc) => {
+            warn!(
+                source_file = %work.path,
+                metadata_file = %metadata_path.display(),
+                "Claude Cowork metadata unavailable: {exc}"
+            );
+            return None;
+        }
+    };
+    let raw = match std::fs::File::open(&metadata_path)
+        .ok()
+        .and_then(|file| serde_json::from_reader::<_, Value>(file).ok())
+    {
+        Some(Value::Object(raw)) => raw,
+        Some(_) | None => {
+            warn!(
+                source_file = %work.path,
+                metadata_file = %metadata_path.display(),
+                "Claude Cowork metadata is not a valid JSON object"
+            );
+            return None;
+        }
+    };
+
+    let mut record = Map::new();
+    record.insert(
+        "type".to_string(),
+        Value::String("cowork-session-meta".to_string()),
+    );
+    for key in [
+        "cliSessionId",
+        "createdAt",
+        "lastActivityAt",
+        "cwd",
+        "model",
+        "title",
+        "isArchived",
+        "isStarred",
+    ] {
+        if let Some(value) = raw.get(key) {
+            record.insert(key.to_string(), value.clone());
+        }
+    }
+    record.insert(
+        "sessionId".to_string(),
+        Value::String(cowork.session_id.to_owned()),
+    );
+
+    let record_ts = ["lastActivityAt", "createdAt"]
+        .into_iter()
+        .filter_map(|key| raw.get(key))
+        .find_map(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+                .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+                .map(|timestamp| format_record_ts(&timestamp))
+        })
+        .or_else(|| {
+            metadata.modified().ok().map(|modified| {
+                let timestamp: chrono::DateTime<chrono::Utc> = modified.into();
+                format_record_ts(&timestamp)
+            })
+        });
+    if let Some(record_ts) = record_ts {
+        record.insert("timestamp".to_string(), Value::String(record_ts));
+    }
+
+    let source_file = metadata_path.to_string_lossy().to_string();
+    Some(CoworkCompanionRecord {
+        record: Value::Object(record),
+        source_inode: source_inode_for_file(&source_file, &metadata),
+        source_file,
+    })
 }
 
 /// Best-effort mapping from a Hermes session `base_url` to an inference
@@ -387,7 +482,11 @@ struct InitialSourceHints {
 /// use descriptive filenames and begin with a title record before the session
 /// header. Priming both hints prevents resumed rows from losing cwd and leading
 /// OMP rows from creating an empty-ID pseudo-session.
-fn infer_initial_source_hints(source_file: &str, harness: &str) -> InitialSourceHints {
+fn infer_initial_source_hints(
+    source_file: &str,
+    source_name: &str,
+    harness: &str,
+) -> InitialSourceHints {
     const MAX_HEAD_LINES: usize = 25;
     const MAX_HEAD_BYTES: u64 = 512 * 1024;
 
@@ -418,6 +517,7 @@ fn infer_initial_source_hints(source_file: &str, harness: &str) -> InitialSource
             let session_id = source.session_id(
                 &record,
                 &crate::sources::SourceRecordContext {
+                    source_name,
                     source_file,
                     session_hint: "",
                     top_type: &top_type,
@@ -815,6 +915,7 @@ pub(crate) async fn process_file(
             return Ok(());
         }
     }
+    let cowork_companion = load_cowork_companion_record(work);
 
     let mut file = std::fs::File::open(source_file)
         .with_context(|| format!("failed to open {}", source_file))?;
@@ -825,7 +926,7 @@ pub(crate) async fn process_file(
     let mut offset = checkpoint.last_offset;
     let mut line_no = checkpoint.last_line_no;
     let initial_hints = if checkpoint.last_offset > 0 || work.harness == "pi-coding-agent" {
-        infer_initial_source_hints(source_file, &work.harness)
+        infer_initial_source_hints(source_file, &work.source_name, &work.harness)
     } else {
         InitialSourceHints::default()
     };
@@ -837,6 +938,28 @@ pub(crate) async fn process_file(
     let mut session_cursors: HashMap<String, SessionCursor> = HashMap::new();
 
     let mut batch = RowBatch::default();
+    if let Some(companion) = cowork_companion {
+        match normalize_record(
+            &companion.record,
+            &work.source_name,
+            &work.harness,
+            &companion.source_file,
+            companion.source_inode,
+            1,
+            1,
+            0,
+            "",
+            "",
+            "",
+        ) {
+            Ok(normalized) => batch.extend_normalized(normalized),
+            Err(exc) => warn!(
+                source_file,
+                metadata_file = %companion.source_file,
+                "Claude Cowork metadata normalization failed: {exc}"
+            ),
+        }
+    }
     let source_line_byte_limit = jsonl_source_line_byte_limit(config);
 
     loop {
@@ -1752,6 +1875,26 @@ mod tests {
         assert!(work_item_is_ingestable(&codex_journal));
     }
 
+    #[test]
+    fn cowork_gate_accepts_transcripts_and_rejects_audit_paths() {
+        let root = "/Users/test/Library/Application Support/Claude/local-agent-mode-sessions/account/workspace/local_11111111-2222-4333-8444-555555555555";
+        let cowork = |path: String| WorkItem {
+            source_name: "claude-cowork".to_string(),
+            harness: "claude-code".to_string(),
+            format: "jsonl".to_string(),
+            path,
+        };
+        assert!(work_item_is_ingestable(&cowork(format!(
+            "{root}/.claude/projects/-sessions-demo/aaaaaaaa-1111-4333-8444-555555555555.jsonl"
+        ))));
+        assert!(!work_item_is_ingestable(&cowork(format!(
+            "{root}/audit.jsonl"
+        ))));
+        assert!(!work_item_is_ingestable(&cowork(format!(
+            "{root}/unrelated.jsonl"
+        ))));
+    }
+
     /// End-to-end through the dispatch gate: a workflow journal enqueued from
     /// any entry point (backfill/reconcile/watcher all call `enqueue_work`)
     /// must never reach the processor channel or the dispatch state, while a
@@ -1873,6 +2016,171 @@ mod tests {
             out.push(batch);
         }
         out
+    }
+
+    fn cowork_fixture_transcripts() -> Vec<PathBuf> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("fixtures/claude-cowork/local-agent-mode-sessions/account-demo/workspace-demo")
+            .join("local_11111111-2222-4333-8444-555555555555")
+            .join(".claude/projects/-sessions-synthetic");
+        vec![
+            root.join("aaaaaaaa-1111-4333-8444-555555555555.jsonl"),
+            root.join("bbbbbbbb-2222-4333-8444-555555555555.jsonl"),
+        ]
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_file_normalizes_cowork_fixture_under_one_root() {
+        let config = moraine_config::AppConfig::default();
+        let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(8);
+
+        for path in cowork_fixture_transcripts() {
+            let work = WorkItem {
+                source_name: "claude-cowork".to_string(),
+                harness: "claude-code".to_string(),
+                format: "jsonl".to_string(),
+                path: path.to_string_lossy().to_string(),
+            };
+            process_file(
+                &config,
+                &work,
+                checkpoints.clone(),
+                &VolatilePollMap::new(),
+                sink_tx.clone(),
+                &metrics,
+            )
+            .await
+            .expect("Cowork fixture transcript should process");
+        }
+        drop(sink_tx);
+
+        let batches = drain_batches(&mut sink_rx).await;
+        let raw_rows = batches
+            .iter()
+            .flat_map(|batch| batch.raw_rows.iter())
+            .collect::<Vec<_>>();
+        let event_rows = batches
+            .iter()
+            .flat_map(|batch| batch.event_rows.iter())
+            .collect::<Vec<_>>();
+        let tool_rows = batches
+            .iter()
+            .flat_map(|batch| batch.tool_rows.iter())
+            .collect::<Vec<_>>();
+        let error_rows = batches
+            .iter()
+            .flat_map(|batch| batch.error_rows.iter())
+            .collect::<Vec<_>>();
+
+        let root_session = "local_11111111-2222-4333-8444-555555555555";
+        assert!(!raw_rows.is_empty());
+        assert!(!event_rows.is_empty());
+        assert!(
+            raw_rows.iter().all(|row| row["session_id"] == root_session),
+            "unexpected raw session ids: {:?}",
+            raw_rows
+                .iter()
+                .map(|row| (&row["top_type"], &row["session_id"]))
+                .collect::<Vec<_>>()
+        );
+        assert!(event_rows
+            .iter()
+            .all(|row| row["session_id"] == root_session));
+        assert!(event_rows
+            .iter()
+            .all(|row| row["source_name"] == "claude-cowork"));
+        assert!(error_rows.is_empty(), "Cowork metadata must not add errors");
+
+        for raw_only_type in ["attachment", "last-prompt", "ai-title"] {
+            assert!(raw_rows.iter().any(|row| row["top_type"] == raw_only_type));
+            assert!(!event_rows
+                .iter()
+                .any(|row| row["payload_type"] == raw_only_type));
+        }
+
+        assert!(event_rows.iter().any(|row| {
+            row["event_kind"] == "message"
+                && row["text_content"] == "Inspect the synthetic project."
+        }));
+        assert!(event_rows.iter().any(|row| {
+            row["event_kind"] == "reasoning"
+                && row["text_content"] == "I should inspect the fixture."
+        }));
+        assert!(event_rows
+            .iter()
+            .any(|row| row["event_kind"] == "tool_call"));
+        assert!(event_rows
+            .iter()
+            .any(|row| row["event_kind"] == "tool_result"));
+        assert!(event_rows.iter().any(|row| {
+            row["event_kind"] == "message"
+                && row["text_content"] == "Continue with the synthetic project."
+        }));
+        assert_eq!(tool_rows.len(), 2);
+
+        let session_meta = event_rows
+            .iter()
+            .filter(|row| row["event_kind"] == "session_meta")
+            .collect::<Vec<_>>();
+        assert_eq!(session_meta.len(), 2);
+        assert_eq!(
+            session_meta
+                .iter()
+                .map(|row| row["event_uid"].as_str().expect("metadata event uid"))
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            1,
+            "both nested transcripts reuse one companion metadata identity"
+        );
+        let payload: Value = serde_json::from_str(
+            session_meta[0]["payload_json"]
+                .as_str()
+                .expect("session metadata payload"),
+        )
+        .expect("valid session metadata payload");
+        assert_eq!(payload["sessionId"], root_session);
+        assert_eq!(payload["title"], "Cowork fixture title");
+        assert_eq!(payload["model"], "claude-opus-4-6");
+        assert_eq!(
+            payload
+                .as_object()
+                .expect("metadata object")
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "cliSessionId",
+                "createdAt",
+                "cwd",
+                "isArchived",
+                "isStarred",
+                "lastActivityAt",
+                "model",
+                "sessionId",
+                "timestamp",
+                "title",
+                "type",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        );
+
+        let event_json = serde_json::to_string(&event_rows).expect("serialize event rows");
+        assert!(!event_json.contains("PRIVATE_ATTACHMENT_SENTINEL"));
+        assert!(!event_json.contains("PRIVATE_ACCOUNT_SENTINEL"));
+        assert!(!event_json.contains("PRIVATE_EMAIL_SENTINEL"));
+        assert!(!event_json.contains("PRIVATE_SYSTEM_PROMPT_SENTINEL"));
+        assert!(!event_json.contains("PRIVATE_MCP_SENTINEL"));
+        let raw_json = serde_json::to_string(&raw_rows).expect("serialize raw rows");
+        assert!(raw_json.contains("PRIVATE_ATTACHMENT_SENTINEL"));
+        assert!(!raw_json.contains("PRIVATE_ACCOUNT_SENTINEL"));
+        assert!(!raw_json.contains("PRIVATE_EMAIL_SENTINEL"));
+        assert!(!raw_json.contains("PRIVATE_SYSTEM_PROMPT_SENTINEL"));
+        assert!(!raw_json.contains("PRIVATE_MCP_SENTINEL"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

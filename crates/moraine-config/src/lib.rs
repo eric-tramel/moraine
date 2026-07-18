@@ -547,7 +547,7 @@ fn default_sources() -> Vec<IngestSource> {
     } else {
         "~/.config/Cursor/User"
     };
-    vec![
+    let mut sources = vec![
         IngestSource {
             name: "codex".to_string(),
             harness: "codex".to_string(),
@@ -564,6 +564,18 @@ fn default_sources() -> Vec<IngestSource> {
             watch_root: "~/.claude/projects".to_string(),
             format: String::new(),
         },
+    ];
+    #[cfg(target_os = "macos")]
+    sources.push(IngestSource {
+        name: "claude-cowork".to_string(),
+        harness: "claude-code".to_string(),
+        enabled: true,
+        glob: "~/Library/Application Support/Claude/local-agent-mode-sessions/**/.claude/projects/**/*.jsonl".to_string(),
+        watch_root:
+            "~/Library/Application Support/Claude/local-agent-mode-sessions".to_string(),
+        format: String::new(),
+    });
+    sources.extend([
         IngestSource {
             name: "hermes".to_string(),
             harness: "hermes".to_string(),
@@ -620,7 +632,8 @@ fn default_sources() -> Vec<IngestSource> {
             watch_root: "~/.omp/agent/sessions".to_string(),
             format: String::new(),
         },
-    ]
+    ]);
+    sources
 }
 
 pub const SOURCE_FORMAT_JSONL: &str = "jsonl";
@@ -1170,6 +1183,44 @@ fn normalize_backends_and_routes(cfg: &mut AppConfig) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn migrate_legacy_claude_source(sources: &mut Vec<IngestSource>) {
+    if sources
+        .iter()
+        .any(|source| source.name.trim() == "claude-cowork")
+    {
+        return;
+    }
+
+    let Some(enabled) = sources
+        .iter()
+        .find(|source| {
+            source.name.trim() == "claude"
+                && source.harness.trim() == "claude-code"
+                && source.glob.trim() == "~/.claude/projects/**/*.jsonl"
+                && source.watch_root.trim() == "~/.claude/projects"
+                && (source.format.trim().is_empty()
+                    || source
+                        .format
+                        .trim()
+                        .eq_ignore_ascii_case(SOURCE_FORMAT_JSONL))
+        })
+        .map(|source| source.enabled)
+    else {
+        return;
+    };
+
+    sources.push(IngestSource {
+        name: "claude-cowork".to_string(),
+        harness: "claude-code".to_string(),
+        enabled,
+        glob: "~/Library/Application Support/Claude/local-agent-mode-sessions/**/.claude/projects/**/*.jsonl".to_string(),
+        watch_root:
+            "~/Library/Application Support/Claude/local-agent-mode-sessions".to_string(),
+        format: String::new(),
+    });
+}
+
 fn migrate_legacy_pi_source(sources: &mut Vec<IngestSource>) {
     if sources.iter().any(|source| source.name.trim() == "omp") {
         return;
@@ -1230,6 +1281,8 @@ fn normalize_config(mut cfg: AppConfig) -> Result<AppConfig> {
         })?;
     }
 
+    #[cfg(target_os = "macos")]
+    migrate_legacy_claude_source(&mut cfg.ingest.sources);
     migrate_legacy_pi_source(&mut cfg.ingest.sources);
     for (source_idx, source) in cfg.ingest.sources.iter_mut().enumerate() {
         source.harness = normalize_harness(&source.harness, source_idx, &source.name)?;
@@ -2687,6 +2740,89 @@ watch_root = "~/.claude/projects"
         assert_eq!(source.harness, "claude-code");
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn load_config_migrates_only_the_default_claude_source_to_cowork() {
+        let default_path = write_temp_config(
+            r#"
+[[ingest.sources]]
+name = "claude"
+harness = "claude-code"
+enabled = false
+glob = "~/.claude/projects/**/*.jsonl"
+watch_root = "~/.claude/projects"
+format = "jsonl"
+"#,
+            "legacy-default-claude-source",
+        );
+        let default_cfg = load_config(&default_path).expect("default Claude config should load");
+        std::fs::remove_file(&default_path).ok();
+        let cowork = default_cfg
+            .ingest
+            .sources
+            .iter()
+            .find(|source| source.name == "claude-cowork")
+            .expect("default Claude source should gain Cowork");
+        assert!(!cowork.enabled, "Cowork inherits the Claude enabled state");
+        assert_eq!(cowork.harness, "claude-code");
+        assert!(cowork.glob.ends_with(
+            "/Library/Application Support/Claude/local-agent-mode-sessions/**/.claude/projects/**/*.jsonl"
+        ));
+        assert!(cowork
+            .watch_root
+            .ends_with("/Library/Application Support/Claude/local-agent-mode-sessions"));
+
+        let custom_path = write_temp_config(
+            r#"
+[[ingest.sources]]
+name = "claude"
+harness = "claude-code"
+enabled = true
+glob = "~/custom/claude/**/*.jsonl"
+watch_root = "~/custom/claude"
+"#,
+            "custom-claude-source",
+        );
+        let custom_cfg = load_config(&custom_path).expect("custom Claude config should load");
+        std::fs::remove_file(&custom_path).ok();
+        assert!(custom_cfg
+            .ingest
+            .sources
+            .iter()
+            .all(|source| source.name != "claude-cowork"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn load_config_does_not_duplicate_preexisting_cowork_source() {
+        let path = write_temp_config(
+            r#"
+[[ingest.sources]]
+name = "claude"
+harness = "claude-code"
+glob = "~/.claude/projects/**/*.jsonl"
+watch_root = "~/.claude/projects"
+
+[[ingest.sources]]
+name = "claude-cowork"
+harness = "claude-code"
+glob = "~/custom/cowork/**/*.jsonl"
+watch_root = "~/custom/cowork"
+"#,
+            "existing-cowork-source",
+        );
+        let cfg = load_config(&path).expect("preexisting Cowork config should load");
+        std::fs::remove_file(&path).ok();
+        let cowork = cfg
+            .ingest
+            .sources
+            .iter()
+            .filter(|source| source.name == "claude-cowork")
+            .collect::<Vec<_>>();
+        assert_eq!(cowork.len(), 1);
+        assert!(cowork[0].glob.ends_with("/custom/cowork/**/*.jsonl"));
+    }
+
     #[test]
     fn load_config_accepts_hermes_harness_value() {
         let path = write_temp_config(
@@ -2875,6 +3011,28 @@ watch_root = "~/.cursor/projects"
         assert!(pi.watch_root.ends_with("/.pi/agent/sessions"));
         assert!(omp.glob.ends_with("/.omp/agent/sessions/**/*.jsonl"));
         assert!(omp.watch_root.ends_with("/.omp/agent/sessions"));
+    }
+
+    #[test]
+    fn default_sources_gate_cowork_to_macos() {
+        let sources = default_sources();
+        let cowork = sources.iter().find(|source| source.name == "claude-cowork");
+        #[cfg(target_os = "macos")]
+        {
+            let cowork = cowork.expect("macOS defaults include Claude Cowork");
+            assert!(cowork.enabled);
+            assert_eq!(cowork.harness, "claude-code");
+            assert_eq!(
+                cowork.glob,
+                "~/Library/Application Support/Claude/local-agent-mode-sessions/**/.claude/projects/**/*.jsonl"
+            );
+            assert_eq!(
+                cowork.watch_root,
+                "~/Library/Application Support/Claude/local-agent-mode-sessions"
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        assert!(cowork.is_none(), "non-macOS defaults must omit Cowork");
     }
 
     #[test]

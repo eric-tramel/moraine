@@ -4,10 +4,78 @@ use super::{
     IngestSource, NormalizedPartials, SourceRecordContext,
 };
 use serde_json::Value;
+use std::path::{Component, Path, PathBuf};
 
 pub(crate) static CLAUDE_CODE: ClaudeCode = ClaudeCode;
 
 pub(crate) struct ClaudeCode;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CoworkSessionPath<'a> {
+    pub(crate) session_id: &'a str,
+    pub(crate) session_dir: &'a Path,
+}
+
+impl CoworkSessionPath<'_> {
+    pub(crate) fn metadata_path(&self) -> PathBuf {
+        self.session_dir
+            .parent()
+            .expect("classified Cowork session has a parent")
+            .join(format!("{}.json", self.session_id))
+    }
+}
+
+pub(crate) fn cowork_session_path(source_file: &str) -> Option<CoworkSessionPath<'_>> {
+    let path = Path::new(source_file);
+    if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl")
+        || path.file_name().and_then(|name| name.to_str()) == Some("audit.jsonl")
+    {
+        return None;
+    }
+
+    for session_dir in path.ancestors() {
+        let Some(session_id) = session_dir.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(session_suffix) = session_id.strip_prefix("local_") else {
+            continue;
+        };
+        if session_suffix.is_empty()
+            || !session_dir.ancestors().any(|ancestor| {
+                ancestor.file_name().and_then(|name| name.to_str())
+                    == Some("local-agent-mode-sessions")
+            })
+        {
+            continue;
+        }
+
+        let Ok(relative) = path.strip_prefix(session_dir) else {
+            continue;
+        };
+        let mut components = relative.components();
+        if components.next() != Some(Component::Normal(".claude".as_ref()))
+            || components.next() != Some(Component::Normal("projects".as_ref()))
+        {
+            continue;
+        }
+        let Some(Component::Normal(_)) = components.next() else {
+            continue;
+        };
+        let Some(Component::Normal(_)) = components.next() else {
+            continue;
+        };
+        if components.any(|component| !matches!(component, Component::Normal(_))) {
+            continue;
+        }
+
+        return Some(CoworkSessionPath {
+            session_id,
+            session_dir,
+        });
+    }
+
+    None
+}
 
 impl IngestSource for ClaudeCode {
     fn harness(&self) -> &'static str {
@@ -19,6 +87,14 @@ impl IngestSource for ClaudeCode {
     }
 
     fn session_id(&self, record: &Value, ctx: &SourceRecordContext<'_>) -> String {
+        if ctx.source_name == "claude-cowork" {
+            if !ctx.session_hint.is_empty() {
+                return ctx.session_hint.to_string();
+            }
+            if let Some(cowork) = cowork_session_path(ctx.source_file) {
+                return cowork.session_id.to_string();
+            }
+        }
         let session_id = to_str(record.get("sessionId"));
         if !session_id.is_empty() {
             session_id
@@ -58,6 +134,14 @@ fn normalize_claude_event(
 ) -> NormalizedPartials {
     let record = ClaudeRecord::new(record, top_type, base_uid);
     let mut emitter = SourceEmitter::new(ctx);
+
+    if top_type == "cowork-session-meta" {
+        normalize_cowork_session_meta(&record, &mut emitter);
+        return emitter.finish();
+    }
+    if matches!(top_type, "attachment" | "last-prompt" | "ai-title") {
+        return emitter.finish();
+    }
 
     if record.is_message_record() {
         normalize_claude_message_record(&record, &mut emitter);
@@ -375,6 +459,22 @@ fn normalize_claude_scalar_message(
     emitter.push_event(event);
 }
 
+fn normalize_cowork_session_meta(record: &ClaudeRecord<'_>, emitter: &mut SourceEmitter<'_>) {
+    let title = to_str(record.record.get("title"));
+    let model = canonicalize_model("claude-code", &to_str(record.record.get("model")));
+    let event = emitter
+        .event(
+            record.base_uid,
+            "session_meta",
+            "session_meta",
+            "system",
+            &title,
+            &compact_json(record.record),
+        )
+        .model(model);
+    emitter.push_event(event);
+}
+
 fn normalize_claude_operational_record(record: &ClaudeRecord<'_>, emitter: &mut SourceEmitter<'_>) {
     let event_kind = claude_event_kind_for_top_type(record.top_type);
     let payload_type = claude_payload_type(record);
@@ -472,4 +572,86 @@ fn append_claude_record_links(
 fn null_value<'a>() -> &'a Value {
     static NULL_VALUE: Value = Value::Null;
     &NULL_VALUE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const COWORK_ROOT: &str =
+        "/Users/test/Library/Application Support/Claude/local-agent-mode-sessions/account/workspace/local_11111111-2222-4333-8444-555555555555";
+
+    #[test]
+    fn cowork_path_classification_requires_the_transcript_subtree() {
+        let transcript = format!(
+            "{COWORK_ROOT}/.claude/projects/-sessions-demo/aaaaaaaa-1111-4333-8444-555555555555.jsonl"
+        );
+        let classified = cowork_session_path(&transcript).expect("valid Cowork transcript");
+        assert_eq!(
+            classified.session_id,
+            "local_11111111-2222-4333-8444-555555555555"
+        );
+        assert_eq!(classified.session_dir, Path::new(COWORK_ROOT));
+        assert_eq!(
+            classified.metadata_path(),
+            Path::new(COWORK_ROOT)
+                .parent()
+                .expect("Cowork root parent")
+                .join("local_11111111-2222-4333-8444-555555555555.json")
+        );
+
+        assert!(cowork_session_path(&format!("{COWORK_ROOT}/audit.jsonl")).is_none());
+        assert!(cowork_session_path(
+            "/Users/test/.claude/projects/local_demo/aaaaaaaa-1111-4333-8444-555555555555.jsonl"
+        )
+        .is_none());
+        assert!(cowork_session_path(
+            "/tmp/local-agent-mode-sessions/account/workspace/local_demo/session.jsonl"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn cowork_source_uses_root_identity_without_changing_normal_claude() {
+        let record = json!({"sessionId": "nested-cli-id"});
+        let transcript = format!(
+            "{COWORK_ROOT}/.claude/projects/-sessions-demo/aaaaaaaa-1111-4333-8444-555555555555.jsonl"
+        );
+        let cowork = ClaudeCode.session_id(
+            &record,
+            &SourceRecordContext {
+                source_name: "claude-cowork",
+                source_file: &transcript,
+                session_hint: "",
+                top_type: "user",
+                base_uid: "",
+            },
+        );
+        assert_eq!(cowork, "local_11111111-2222-4333-8444-555555555555");
+
+        let resumed = ClaudeCode.session_id(
+            &record,
+            &SourceRecordContext {
+                source_name: "claude-cowork",
+                source_file: "/invalid/after-the-first-record.jsonl",
+                session_hint: "local_11111111-2222-4333-8444-555555555555",
+                top_type: "user",
+                base_uid: "",
+            },
+        );
+        assert_eq!(resumed, "local_11111111-2222-4333-8444-555555555555");
+
+        let ordinary = ClaudeCode.session_id(
+            &record,
+            &SourceRecordContext {
+                source_name: "claude",
+                source_file: "/Users/test/.claude/projects/local_demo/session.jsonl",
+                session_hint: "",
+                top_type: "user",
+                base_uid: "",
+            },
+        );
+        assert_eq!(ordinary, "nested-cli-id");
+    }
 }
