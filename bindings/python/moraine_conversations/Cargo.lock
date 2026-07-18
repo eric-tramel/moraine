@@ -619,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "moraine-clickhouse"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "flate2",
@@ -634,7 +634,7 @@ dependencies = [
 
 [[package]]
 name = "moraine-config"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "glob",
@@ -645,7 +645,7 @@ dependencies = [
 
 [[package]]
 name = "moraine-conversations"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "ahash",
  "anyhow",

@@ -82,6 +82,7 @@ python3 plugins/moraine-dev/skills/release/scripts/bump-version.py "$VERSION"
 Then inspect the diff. Expected version-only files are normally:
 
 - `Cargo.lock`
+- `bindings/python/moraine_conversations/Cargo.lock` path-dependency entries
 - release-managed `apps/*/Cargo.toml`
 - release-managed `crates/*/Cargo.toml`
 - `.github/workflows/release-moraine.yml` example tag, if it still contains
@@ -91,8 +92,10 @@ Then inspect the diff. Expected version-only files are normally:
 - install docs only if they contain an explicit `MORAINE_INSTALL_VERSION`
   example for the old tag
 
-Do not bump `bindings/python/moraine_conversations`; it is a separate internal
-Python extension package.
+Do not bump the package version in
+`bindings/python/moraine_conversations/Cargo.toml`; it is a separate internal
+Python extension package. Its lockfile must still track the release-managed
+path dependencies.
 
 ## Validation
 

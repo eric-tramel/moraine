@@ -36,6 +36,12 @@ MANAGED_PACKAGE_NAMES = {
     "moraine-monitor-core",
 }
 
+BINDING_LOCK_PACKAGES = {
+    "moraine-clickhouse",
+    "moraine-config",
+    "moraine-conversations",
+}
+
 RUNTIME_PLUGIN_JSON_MANIFESTS = [
     ("Claude", "plugins/moraine/.claude-plugin/plugin.json"),
     ("Codex", "plugins/moraine/.codex-plugin/plugin.json"),
@@ -148,9 +154,15 @@ def bump_cargo_tomls(repo_root: Path, target_version: str, *, dry_run: bool) -> 
 
 
 def bump_lockfile(
-    repo_root: Path, current_version: str, target_version: str, *, dry_run: bool
+    repo_root: Path,
+    relpath: str,
+    package_names: set[str],
+    current_version: str,
+    target_version: str,
+    *,
+    dry_run: bool,
 ) -> None:
-    path = repo_root / "Cargo.lock"
+    path = repo_root / relpath
     text = read_text(path)
     blocks = re.split(r"(?=^\[\[package\]\]\n)", text, flags=re.MULTILINE)
     changed_names: set[str] = set()
@@ -158,7 +170,7 @@ def bump_lockfile(
 
     for block in blocks:
         name_match = re.search(r'(?m)^name = "([^"]+)"$', block)
-        if name_match and name_match.group(1) in MANAGED_PACKAGE_NAMES:
+        if name_match and name_match.group(1) in package_names:
             version_match = re.search(r'(?m)^version = "([^"]+)"$', block)
             if not version_match:
                 raise SystemExit(f"lockfile package has no version: {name_match.group(1)}")
@@ -176,15 +188,15 @@ def bump_lockfile(
             changed_names.add(name_match.group(1))
         new_blocks.append(block)
 
-    missing = MANAGED_PACKAGE_NAMES - changed_names
+    missing = package_names - changed_names
     if missing:
         raise SystemExit(
-            "lockfile did not contain managed packages: " + ", ".join(sorted(missing))
+            f"{relpath} did not contain managed packages: " + ", ".join(sorted(missing))
         )
 
     new_text = "".join(new_blocks)
     write_text(path, new_text, dry_run=dry_run)
-    print(f"Cargo.lock: updated {len(changed_names)} managed package entries")
+    print(f"{relpath}: updated {len(changed_names)} managed package entries")
 
 
 def replace_optional_file(
@@ -290,7 +302,20 @@ def main() -> int:
         repo_root, target_version, dry_run=args.dry_run
     )
     bump_lockfile(
-        repo_root, current_version, target_version, dry_run=args.dry_run
+        repo_root,
+        "Cargo.lock",
+        MANAGED_PACKAGE_NAMES,
+        current_version,
+        target_version,
+        dry_run=args.dry_run,
+    )
+    bump_lockfile(
+        repo_root,
+        "bindings/python/moraine_conversations/Cargo.lock",
+        BINDING_LOCK_PACKAGES,
+        current_version,
+        target_version,
+        dry_run=args.dry_run,
     )
     bump_release_examples(
         repo_root, current_version, target_version, dry_run=args.dry_run
