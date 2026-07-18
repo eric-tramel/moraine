@@ -805,6 +805,7 @@ session metadata only:
         "session": {
           "id": "session:c2Vzcy0x",
           "title": "Build failure triage",
+          "display_label": "Build failure triage",
           "source": "codex",
           "harness": "codex",
           "started_at": "2026-04-30T13:00:00.000Z",
@@ -834,6 +835,9 @@ session metadata only:
 payloads. To inspect a listed session, pass `open.session_id` to `open`.
 The returned `session.harness` and `session.source` identify the normalized
 harness and configured ingest source that the corresponding filters match.
+When a session has no explicit title, summary, or slug, `session.display_label`
+uses already exposed metadata such as harness, mode, update time, and turn count
+rather than transcript text.
 
 ## Tool: `file_attention`
 

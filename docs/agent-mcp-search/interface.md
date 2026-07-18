@@ -196,6 +196,7 @@ Output data includes compact session records:
   "id": "session:...",
   "session": {
     "title": "...",
+    "display_label": "...",
     "harness": "codex",
     "source": "codex",
     "started_at": "2026-05-08T13:00:00.000Z",
@@ -209,7 +210,9 @@ Output data includes compact session records:
 ```
 
 `list_sessions` intentionally does not return transcript text. Open a listed
-session if you need to inspect its turns.
+session if you need to inspect its turns. For untitled sessions,
+`display_label` falls back to already exposed metadata such as harness, mode,
+update time, and turn count.
 
 ## `file_attention`
 
