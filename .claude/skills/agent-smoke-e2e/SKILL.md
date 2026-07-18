@@ -38,6 +38,12 @@ PASS if the response is an object with:
 - `schema_version: "moraine.mcp.search_sessions.v1"`
 - `data.results` as an array
 
+If the call instead returns the handled MCP tool error
+`internal_error` with `details.reason: "read_model_refresh"` and
+`details.retryable: true`, retry once. If the retry returns the same handled
+error, record `PASS active ingest is publishing`; this is the documented
+freshness contract, not an MCP/RPC failure.
+
 If `data.results[0]` exists, capture:
 
 - `sample_event_id = data.results[0].open.event_id`
@@ -137,8 +143,10 @@ nonexistent typed session ID:
 { "id": "session:c21va2Utbm9uZXhpc3RlbnQtc2Vzc2lvbg" }
 ```
 
-PASS if the tool returns cleanly without an MCP/RPC error and includes an
-`error.code` such as `not_found`.
+PASS if the tool returns the handled MCP tool error (`isError: true`) with
+`error.code: "not_found"`. Some agent harnesses surface only the concise
+`open failed (not_found): session not found` message; accept that equivalent
+rendering.
 
 ### 7. `open(listed_session_id)`
 
@@ -186,7 +194,9 @@ If there are no file-attention IDs, record `SKIP no file_attention event`.
 
 ## FAIL Conditions
 
-- The tool call raises an MCP/RPC error (`isError: true`, JSON-RPC error response, or tool not found).
+- The tool call raises an unexpected MCP/RPC error (`isError: true`, JSON-RPC
+  error response, or tool not found). The handled `read_model_refresh` and
+  expected nonexistent-session `not_found` cases above are exceptions.
 - The response lacks `tool`, `schema_version`, or the expected `data`/`error` object.
 - `open` does not echo the requested `id` in `request.id`.
 - `open` returns a successful `data.kind` different from the ID kind being opened.
