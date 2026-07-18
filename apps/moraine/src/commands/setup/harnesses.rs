@@ -32,10 +32,6 @@ impl DefaultIngestSource {
         self.name
     }
 
-    pub(super) fn harness(self) -> &'static str {
-        self.harness
-    }
-
     pub(super) fn to_table(self, enabled: bool) -> Table {
         let mut table = Table::new();
         table["name"] = toml_value(self.name);
@@ -200,6 +196,14 @@ const KIMI_INGEST: [DefaultIngestSource; 1] = [DefaultIngestSource {
     format: Some("jsonl"),
 }];
 
+const QWEN_CODE_INGEST: [DefaultIngestSource; 1] = [DefaultIngestSource {
+    name: "qwen-code",
+    harness: "qwen-code",
+    glob: "~/.qwen/projects/*/chats/*.jsonl",
+    watch_root: "~/.qwen/projects",
+    format: Some("jsonl"),
+}];
+
 const OPENCODE_INGEST: [DefaultIngestSource; 1] = [DefaultIngestSource {
     name: "opencode",
     harness: "opencode",
@@ -251,7 +255,7 @@ const PI_INGEST: [DefaultIngestSource; 2] = [
     },
 ];
 
-const SPECS: [HarnessSpec; 7] = [
+const SPECS: [HarnessSpec; 8] = [
     HarnessSpec {
         target: SetupMcpTarget::ClaudeCode,
         label: "Claude Code",
@@ -283,6 +287,14 @@ const SPECS: [HarnessSpec; 7] = [
         programs: &["kimi"],
         probe_paths: ProbePaths::None,
         ingest_sources: &KIMI_INGEST,
+    },
+    HarnessSpec {
+        target: SetupMcpTarget::QwenCode,
+        label: "Qwen Code",
+        setup_kind: "MCP",
+        programs: &["qwen"],
+        probe_paths: ProbePaths::None,
+        ingest_sources: &QWEN_CODE_INGEST,
     },
     HarnessSpec {
         target: SetupMcpTarget::OpenCode,
@@ -522,6 +534,21 @@ pub(super) fn mcp_plan(
                     "Kimi CLI MCP registration failed",
                 ),
         ),
+        SetupMcpTarget::QwenCode => McpPlan {
+            target,
+            action: super::McpAction::Execute,
+            steps: vec![
+                McpPlanStep::required(CommandSpec::new("qwen", qwen_args(config_target)))
+                    .with_progress(
+                        "Registering Moraine MCP in Qwen Code",
+                        "Qwen Code MCP registered",
+                        "Qwen Code MCP registration warning",
+                        "Qwen Code MCP registration failed",
+                    ),
+            ],
+            config_writes: Vec::new(),
+            manual_snippet: None,
+        },
         SetupMcpTarget::OpenCode => McpPlan::write_config(
             target,
             home.as_ref()
@@ -843,6 +870,22 @@ fn kimi_args(config_target: &ConfigTarget) -> Vec<String> {
         "moraine".to_string(),
         "--".to_string(),
         "moraine".to_string(),
+    ];
+    args.extend(mcp_run_args(config_target));
+    args
+}
+
+fn qwen_args(config_target: &ConfigTarget) -> Vec<String> {
+    let mut args = vec![
+        "mcp".to_string(),
+        "add".to_string(),
+        "--scope".to_string(),
+        "user".to_string(),
+        "--transport".to_string(),
+        "stdio".to_string(),
+        "moraine".to_string(),
+        "moraine".to_string(),
+        "--".to_string(),
     ];
     args.extend(mcp_run_args(config_target));
     args

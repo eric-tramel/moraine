@@ -18,6 +18,7 @@ all rows that leave the adapter.
 | `codex` | `sources/codex.rs` | `openai` | `jsonl` | OpenAI/Codex events, response items, tool calls, compaction, token counts. |
 | `claude-code` | `sources/claude_code.rs` | `anthropic` | `jsonl` | Claude Code and local macOS Cowork message blocks, operational records, parent/tool external links, and Cowork root metadata. |
 | `kimi-cli` | `sources/kimi_cli.rs` | `moonshot` | `jsonl` | Kimi `wire.jsonl`; skips metadata headers and keeps parent `SubagentEvent` envelopes raw-only. |
+| `qwen-code` | `sources/qwen_code.rs` | unset unless recorded | `jsonl` | Qwen Code `ChatRecord` envelopes, ordered message parts, parent/rewind links, tools, and Google-style usage metadata. |
 | `opencode` | `sources/opencode.rs` | record-derived | `opencode_sqlite` | OpenCode `opencode*.db`; append-only conversation events synthesized into session, message, part, and session-message records. Credential/account tables are deliberately out of scope. |
 | `cursor` | `sources/cursor.rs` | `cursor` | `jsonl` or `cursor_sqlite` | Cursor Agent transcripts under `agent-transcripts/`; text blocks, tool-use blocks, and local file references. Also normalizes the synthetic `cursor_composer`/`cursor_bubble` records produced by polling `state.vscdb` (see SQLite-Polled Sources below); composer names become `session_meta` events that carry the session title. |
 | `hermes` | `sources/hermes.rs` | record-derived | `jsonl` or `session_json` | ShareGPT trajectories and live Hermes session JSON with vendor/model splitting. |
@@ -69,6 +70,39 @@ parent wire. That envelope remains available in `raw_events`, but it does not
 emit a normalized event; the event from the sub-agent's own `wire.jsonl` is the
 single normalized copy. This prevents sub-agent activity from being counted
 once in the standalone sub-agent session and again as parent-session progress.
+
+### Qwen Code records and branches
+
+The `qwen-code` source watches append-only
+`~/.qwen/projects/*/chats/*.jsonl` files. Moraine preserves each persisted
+record as raw data and expands recognized text, thought, function-call,
+function-response, title, compression, and rewind shapes into canonical rows.
+Each emitted event links to its record's non-empty `parentUuid`. Rewind does not
+delete history: abandoned and replacement branches remain queryable and are
+distinguished by their parent links.
+
+Assistant parts retain source order. `functionCall.id` is the request identity;
+responses prefer `toolCallResult.callId`, then `functionResponse.id`, then the
+record UUID. Fully qualified names such as
+`mcp__moraine__search_sessions` are preserved on tool rows while the shared MCP
+classifier recognizes them as Moraine-internal. Assistant usage is applied once
+per record. Google-style totals populate legacy token columns, while cache,
+reasoning, tool-use, and modality values remain non-additive bucket breakdowns.
+The adapter never infers a provider from the model because Qwen supports
+multiple providers.
+
+Unknown record types, unknown system variants, telemetry, file-history and
+attribution snapshots, and binary-only parts remain raw-only. Compression rows
+retain bounded metrics but do not copy replay history into searchable content.
+Malformed timestamps use generic ingest error routing without dropping adjacent
+records.
+
+This compatibility boundary is pinned by sanitized Qwen Code 0.19.x fixtures.
+Qwen's persistence shape is an upstream internal contract, not a stable public
+API. See the upstream
+[ChatRecord persistence source](https://github.com/QwenLM/qwen-code/blob/v0.19.0/packages/core/src/services/chatRecordingService.ts),
+[rewind reconstruction](https://github.com/QwenLM/qwen-code/blob/v0.19.0/packages/core/src/services/sessionService.ts),
+and [MCP documentation](https://github.com/QwenLM/qwen-code/blob/v0.19.0/docs/users/features/mcp.md).
 
 ## Adapter Contract
 

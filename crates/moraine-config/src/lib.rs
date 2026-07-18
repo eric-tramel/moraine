@@ -17,6 +17,7 @@ pub const KNOWN_INGEST_HARNESSES: &[&str] = &[
     "kimi-cli",
     "opencode",
     "pi-coding-agent",
+    "qwen-code",
 ];
 
 #[derive(Debug, Clone, Deserialize)]
@@ -591,6 +592,14 @@ fn default_sources() -> Vec<IngestSource> {
             glob: "~/.kimi/sessions/**/wire.jsonl".to_string(),
             watch_root: "~/.kimi/sessions".to_string(),
             format: String::new(),
+        },
+        IngestSource {
+            name: "qwen-code".to_string(),
+            harness: "qwen-code".to_string(),
+            enabled: true,
+            glob: "~/.qwen/projects/*/chats/*.jsonl".to_string(),
+            watch_root: "~/.qwen/projects".to_string(),
+            format: SOURCE_FORMAT_JSONL.to_string(),
         },
         IngestSource {
             name: "opencode".to_string(),
@@ -3068,6 +3077,20 @@ watch_root = "~/.cursor/projects"
         assert_eq!(pi.watch_root, "~/.pi/agent/sessions");
         assert_eq!(omp.glob, "~/.omp/agent/sessions/**/*.jsonl");
         assert_eq!(omp.watch_root, "~/.omp/agent/sessions");
+    }
+
+    #[test]
+    fn default_sources_enable_qwen_code_jsonl() {
+        let sources = default_sources();
+        let source = sources
+            .iter()
+            .find(|source| source.name == "qwen-code")
+            .expect("defaults include a qwen-code source");
+        assert!(source.enabled);
+        assert_eq!(source.harness, "qwen-code");
+        assert_eq!(source.glob, "~/.qwen/projects/*/chats/*.jsonl");
+        assert_eq!(source.watch_root, "~/.qwen/projects");
+        assert_eq!(source.format, SOURCE_FORMAT_JSONL);
     }
 
     #[test]

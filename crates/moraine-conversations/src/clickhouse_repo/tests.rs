@@ -173,6 +173,33 @@ fn repository_reads_leave_thread_scheduling_to_clickhouse() {
 }
 
 #[test]
+fn mcp_search_sql_excludes_internal_tool_calls() {
+    let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
+        .expect("build ClickHouse client");
+    let repo = ClickHouseConversationRepository::new(client, RepoConfig::default());
+    let sql = repo
+        .build_search_mcp_events_sql(
+            &["needle".to_string()],
+            &[McpEventType::ToolCall],
+            None,
+            None,
+            None,
+            None,
+            1,
+            0.0,
+            Some((1, 1)),
+            20,
+            0,
+        )
+        .expect("build MCP event search SQL");
+
+    assert!(sql.contains("p.source_name != 'codex-mcp'"));
+    assert!(sql.contains("splitByString('__', lowerUTF8(trimBoth(p.name)))"));
+    assert!(sql.contains("arrayElement"));
+    assert!(sql.contains("= 'moraine'"));
+}
+
+#[test]
 fn safe_filter_value_validation() {
     assert!(is_safe_filter_value("session_123"));
     assert!(is_safe_filter_value("a/b.c:d@e-1"));
@@ -298,17 +325,46 @@ fn search_doc_filters_exclude_codex_by_flag() {
 }
 
 #[test]
-fn search_doc_filters_exclude_codex_by_tool_name() {
+fn search_doc_filters_exclude_bare_and_qwen_qualified_moraine_tools() {
     let mut row = sample_search_doc();
-    for name in ["search", "open", "list_sessions", "file_attention"] {
+    for leaf in moraine_clickhouse::mcp_tool_names::INTERNAL_TOOL_NAMES {
+        for name in [
+            (*leaf).to_string(),
+            format!("mcp__moraine__{leaf}"),
+            format!("MCP__MORAINE__{}", leaf.to_ascii_uppercase()),
+        ] {
+            row.name = name.clone();
+            assert!(
+                !ClickHouseConversationRepository::passes_search_doc_filters(
+                    &row, false, None, true, None, None
+                ),
+                "{name} should be treated as an internal MCP tool"
+            );
+        }
+    }
+
+    for name in [
+        "mcp__other__search_sessions",
+        "mcp__moraine__unrelated",
+        "mcp__moraine__open__extra",
+    ] {
         row.name = name.to_string();
         assert!(
-            !ClickHouseConversationRepository::passes_search_doc_filters(
+            ClickHouseConversationRepository::passes_search_doc_filters(
                 &row, false, None, true, None, None
             ),
-            "{name} should be treated as an internal MCP tool"
+            "{name} must remain an ordinary tool"
         );
     }
+}
+
+#[test]
+fn mode_sql_uses_shared_structured_mcp_tool_predicate() {
+    let sql = ClickHouseConversationRepository::mode_aggregate_sql();
+    assert!(sql.contains("splitByString('__', lowerUTF8(trimBoth(tool_name)))"));
+    assert!(sql.contains("= 'moraine'"));
+    assert!(sql.contains("'search_sessions'"));
+    assert!(sql.contains("'mcp_internal'"));
 }
 
 #[test]

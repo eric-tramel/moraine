@@ -443,6 +443,7 @@ impl ClickHouseClient {
     ) -> Result<bool> {
         let database = escape_identifier(&self.cfg.database);
         let ctes = projection_ctes(&database, session_id, expected_source_revision);
+        let mcp_name_predicate = crate::mcp_tool_names::sql_predicate("name");
         let statement = format!(
             "INSERT INTO {database}.mcp_open_sessions\n\
              (session_id, slot, generation, source_revision, dirty_revision, first_event_time,\n\
@@ -460,7 +461,7 @@ impl ClickHouseClient {
                  countIf(event_class = 'tool_call') AS tool_calls, countIf(event_class = 'tool_result') AS tool_results,\n\
                  multiIf(\n\
                    countIf(payload_type = 'web_search_call' OR payload_type = 'search_results_received' OR (payload_type = 'tool_use' AND name IN ('WebSearch', 'WebFetch'))) > 0, 'web_search',\n\
-                   countIf(source_name = 'codex-mcp' OR lowerUTF8(name) IN ('search', 'open', 'list_sessions', 'file_attention')) > 0, 'mcp_internal',\n\
+                   countIf(source_name = 'codex-mcp' OR {mcp_name_predicate}) > 0, 'mcp_internal',\n\
                    countIf(event_class IN ('tool_call', 'tool_result') OR payload_type = 'tool_use') > 0, 'tool_calling', 'chat') AS mode,\n\
                  argMin(event_uid, tuple(event_time, event_order, event_uid)) AS first_event_uid,\n\
                  argMax(event_uid, tuple(event_time, event_order, event_uid)) AS last_event_uid,\n\

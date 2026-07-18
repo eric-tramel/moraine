@@ -298,6 +298,29 @@ kimi mcp list
 kimi mcp test moraine
 ```
 
+## Qwen Code
+
+For user-scoped Qwen setup, run:
+
+```bash
+moraine setup --mcp-target qwen-code
+```
+
+Moraine invokes Qwen's native CLI to add or update only the user-scoped
+`moraine` stdio server. The equivalent manual command is:
+
+```bash
+qwen mcp add --scope user --transport stdio moraine moraine -- run mcp
+```
+
+This launches `moraine run mcp`; an explicit Moraine config adds
+`--config /path/to/config.toml` as separate arguments. Moraine does not pass
+Qwen's `--trust` option, so tool trust remains disabled. Restart Qwen Code after
+registration so a new session loads the server. See Qwen's
+[MCP documentation](https://github.com/QwenLM/qwen-code/blob/v0.19.0/docs/users/features/mcp.md).
+Qwen's setup command owns user scope only; project-scoped registration is not
+managed by `moraine setup`.
+
 ## OpenCode
 
 OpenCode reads MCP servers from the `mcp` object in its config. For global use,

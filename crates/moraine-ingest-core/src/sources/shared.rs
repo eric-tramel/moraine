@@ -332,6 +332,77 @@ impl TokenAccounting {
             .with_raw_usage(usage)
     }
 
+    pub(crate) fn google_generation(usage: Option<&Value>) -> Self {
+        let prompt_total = to_u64(usage.and_then(|value| value.get("promptTokenCount")));
+        let output_total = to_u64(usage.and_then(|value| value.get("candidatesTokenCount")));
+        let cache_read = to_u64(usage.and_then(|value| value.get("cachedContentTokenCount")));
+        let reasoning = to_u64(usage.and_then(|value| value.get("thoughtsTokenCount")));
+        let server_tool_use = to_u64(usage.and_then(|value| value.get("toolUsePromptTokenCount")));
+        let prompt_details = usage.and_then(|value| value.get("promptTokensDetails"));
+        let output_details = usage.and_then(|value| value.get("candidatesTokensDetails"));
+
+        let modality_tokens = |details: Option<&Value>, expected: &str| -> u64 {
+            details
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|detail| to_str(detail.get("modality")).eq_ignore_ascii_case(expected))
+                .map(|detail| to_u64(detail.get("tokenCount")))
+                .sum()
+        };
+        let other_modality_tokens = |details: Option<&Value>| -> u64 {
+            details
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|detail| {
+                    !matches!(
+                        to_str(detail.get("modality")).to_ascii_lowercase().as_str(),
+                        "" | "text" | "image" | "audio"
+                    )
+                })
+                .map(|detail| to_u64(detail.get("tokenCount")))
+                .sum()
+        };
+
+        let input_image = modality_tokens(prompt_details, "image");
+        let input_audio = modality_tokens(prompt_details, "audio");
+        let output_image = modality_tokens(output_details, "image");
+        let output_audio = modality_tokens(output_details, "audio");
+        let input_other = other_modality_tokens(prompt_details);
+        let output_other = other_modality_tokens(output_details);
+        let input_text = prompt_total.saturating_sub(
+            cache_read
+                .saturating_add(input_image)
+                .saturating_add(input_audio)
+                .saturating_add(input_other)
+                .saturating_add(server_tool_use),
+        );
+        let output_text = output_total.saturating_sub(
+            reasoning
+                .saturating_add(output_image)
+                .saturating_add(output_audio)
+                .saturating_add(output_other),
+        );
+
+        Self::new(TokenEndpointKind::Generation)
+            .with_buckets(&[
+                ("input_text", input_text),
+                ("output_text", output_text),
+                ("input_cache_read", cache_read),
+                ("input_cache_write", 0),
+                ("input_image", input_image),
+                ("output_image", output_image),
+                ("input_audio", input_audio),
+                ("output_audio", output_audio),
+                ("reasoning", reasoning),
+                ("server_tool_use", server_tool_use),
+                ("other", input_other.saturating_add(output_other)),
+            ])
+            .with_legacy_scalars(prompt_total, output_total, cache_read, 0)
+            .with_raw_usage(usage)
+    }
+
     pub(crate) fn kimi_generation(token_usage: Option<&Value>) -> Self {
         let input_other = to_u64(token_usage.and_then(|v| v.get("input_other")));
         let cache_read = to_u64(token_usage.and_then(|v| v.get("input_cache_read")));
@@ -1290,6 +1361,7 @@ pub(crate) fn build_external_link_row(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_tool_row(
     ctx: &RecordContext<'_>,
     event_uid: &str,
@@ -1913,6 +1985,47 @@ mod tests {
         assert_eq!(accounting.bucket("output_text"), 38);
         assert_eq!(accounting.bucket("reasoning"), 7);
         assert_eq!(accounting.bucket("server_tool_use"), 5);
+        assert_eq!(accounting.token_usage_json(), compact_json(&usage));
+    }
+
+    #[test]
+    fn google_generation_usage_preserves_totals_and_modality_breakdowns() {
+        let usage = json!({
+            "promptTokenCount": 120,
+            "cachedContentTokenCount": 20,
+            "candidatesTokenCount": 80,
+            "thoughtsTokenCount": 7,
+            "toolUsePromptTokenCount": 5,
+            "totalTokenCount": 200,
+            "promptTokensDetails": [
+                {"modality": "TEXT", "tokenCount": 101},
+                {"modality": "IMAGE", "tokenCount": 4},
+                {"modality": "AUDIO", "tokenCount": 3},
+                {"modality": "VIDEO", "tokenCount": 2}
+            ],
+            "candidatesTokensDetails": [
+                {"modality": "TEXT", "tokenCount": 54},
+                {"modality": "IMAGE", "tokenCount": 11},
+                {"modality": "AUDIO", "tokenCount": 5},
+                {"modality": "VIDEO", "tokenCount": 3}
+            ]
+        });
+
+        let accounting = TokenAccounting::google_generation(Some(&usage));
+
+        assert_eq!(accounting.input_tokens(), 120);
+        assert_eq!(accounting.output_tokens(), 80);
+        assert_eq!(accounting.cache_read_tokens(), 20);
+        assert_eq!(accounting.cache_write_tokens(), 0);
+        assert_eq!(accounting.bucket("input_text"), 86);
+        assert_eq!(accounting.bucket("output_text"), 54);
+        assert_eq!(accounting.bucket("input_image"), 4);
+        assert_eq!(accounting.bucket("input_audio"), 3);
+        assert_eq!(accounting.bucket("output_image"), 11);
+        assert_eq!(accounting.bucket("output_audio"), 5);
+        assert_eq!(accounting.bucket("reasoning"), 7);
+        assert_eq!(accounting.bucket("server_tool_use"), 5);
+        assert_eq!(accounting.bucket("other"), 5);
         assert_eq!(accounting.token_usage_json(), compact_json(&usage));
     }
 

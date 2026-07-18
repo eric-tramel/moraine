@@ -359,7 +359,8 @@ GROUP BY t.event_uid)"
                 );
             }
             where_clauses.push(format!(
-                "lowerUTF8(d.name) NOT IN ({MCP_INTERNAL_TOOL_NAMES_SQL})"
+                "NOT {}",
+                moraine_clickhouse::mcp_tool_names::sql_predicate("d.name")
             ));
         }
 
@@ -485,6 +486,11 @@ FORMAT JSONEachRow",
         if let Some(source_name) = source_name {
             posting_clauses.push(format!("p.source_name = {}", sql_quote(source_name)));
         }
+        posting_clauses.push("p.source_name != 'codex-mcp'".to_string());
+        posting_clauses.push(format!(
+            "NOT {}",
+            moraine_clickhouse::mcp_tool_names::sql_predicate("p.name")
+        ));
         posting_clauses.push(Self::mcp_event_type_filter_clause(
             "p.event_class",
             "p.payload_type",
@@ -1962,7 +1968,8 @@ FORMAT JSONEachRow",
         if exclude_codex_mcp {
             postings_filters.push("p.source_name != 'codex-mcp'".to_string());
             postings_filters.push(format!(
-                "lowerUTF8(p.name) NOT IN ({MCP_INTERNAL_TOOL_NAMES_SQL})"
+                "NOT {}",
+                moraine_clickhouse::mcp_tool_names::sql_predicate("p.name")
             ));
         }
 

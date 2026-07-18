@@ -11,6 +11,7 @@ use serde_json::Value;
 use std::io::Write;
 
 mod mcp_open_projection;
+pub mod mcp_tool_names;
 
 const MAX_INSERT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 use std::collections::{BTreeSet, HashSet};

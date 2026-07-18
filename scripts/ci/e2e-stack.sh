@@ -529,6 +529,7 @@ main() {
   local codex_keyword="${base_keyword}_codex_${run_stamp}"
   local claude_keyword="${base_keyword}_claude_${run_stamp}"
   local kimi_keyword="${base_keyword}_kimi_${run_stamp}"
+  local qwen_keyword="${base_keyword}_qwen_${run_stamp}"
   local cursor_keyword="${base_keyword}_cursor_${run_stamp}"
   local cursor_fallback_keyword="${base_keyword}_cursor_fallback_${run_stamp}"
   local cursor_sqlite_keyword="${base_keyword}_cursorsqlite_${run_stamp}"
@@ -548,6 +549,7 @@ main() {
   local claude_session_id="00000000-0000-4000-8000-${claude_session_suffix}"
   local kimi_session_id="kimi-${run_stamp}"
   local kimi_raw_session_id="kimi-cli:${kimi_session_id}"
+  local qwen_session_id="qwen-${run_stamp}"
   local cursor_session_suffix
   cursor_session_suffix="$(printf '%06x%06x' "$RANDOM" "$RANDOM")"
   local cursor_session_id="00000000-0000-4000-8000-${cursor_session_suffix}"
@@ -568,11 +570,13 @@ main() {
   local codex_trace_marker="mcp_codex_trace_marker_${run_stamp}"
   local claude_trace_marker="mcp_claude_trace_marker_${run_stamp}"
   local kimi_trace_marker="mcp_kimi_trace_marker_${run_stamp}"
+  local qwen_trace_marker="mcp_qwen_trace_marker_${run_stamp}"
   local cursor_trace_marker="mcp_cursor_trace_marker_${run_stamp}"
   local cursor_sqlite_trace_marker="mcp_cursor_sqlite_trace_marker_${run_stamp}"
   local pi_trace_marker="mcp_pi_trace_marker_${run_stamp}"
   local hermes_trace_marker="mcp_hermes_trace_marker_${run_stamp}"
   local hermes_session_trace_marker="mcp_hermes_session_trace_marker_${run_stamp}"
+  local qwen_self_keyword="mcp_qwen_self_keyword_${run_stamp}"
 
   need_cmd curl
   need_cmd "$python_bin"
@@ -625,6 +629,7 @@ main() {
   local codex_fixture_file="$fixtures_root/codex/sessions/2026/02/16/session-${codex_session_id}.jsonl"
   local claude_fixture_file="$fixtures_root/claude/projects/e2e/session-${claude_session_id}.jsonl"
   local kimi_fixture_file="$fixtures_root/kimi/sessions/${kimi_session_id}/wire.jsonl"
+  local qwen_fixture_file="$fixtures_root/qwen/projects/e2e/chats/${qwen_session_id}.jsonl"
   local cursor_fixture_file="$fixtures_root/cursor/projects/e2e/agent-transcripts/${cursor_session_id}/${cursor_session_id}.jsonl"
   local cursor_fallback_fixture_file="$fixtures_root/cursor/projects/e2e-fallback/agent-transcripts/${cursor_fallback_session_id}/${cursor_fallback_session_id}.jsonl"
   local cursor_sqlite_fixture_file="$fixtures_root/cursor-sqlite/User/globalStorage/state.vscdb"
@@ -647,6 +652,7 @@ main() {
   mkdir -p "$(dirname "$claude_fixture_file")"
   mkdir -p "$(dirname "$kimi_fixture_file")"
   mkdir -p "$(dirname "$cursor_fixture_file")"
+  mkdir -p "$(dirname "$qwen_fixture_file")"
   mkdir -p "$(dirname "$cursor_fallback_fixture_file")"
   mkdir -p "$(dirname "$cursor_sqlite_fixture_file")"
   mkdir -p "$(dirname "$pi_fixture_file")"
@@ -681,6 +687,24 @@ EOF
 {"timestamp":1771243206.500000,"message":{"type":"ToolResult","payload":{"tool_call_id":"kimi-tool-${run_stamp}","return_value":{"is_error":false,"output":"{\"ok\":true}","message":"Read file","display":[],"extras":null}}}}
 {"timestamp":1771243207.000000,"message":{"type":"StatusUpdate","payload":{"context_usage":0.1,"context_tokens":100,"max_context_tokens":1000,"token_usage":{"input_other":10,"output":5,"input_cache_read":2,"input_cache_creation":1},"message_id":"chatcmpl-${run_stamp}","plan_mode":false,"mcp_status":null}}}
 {"timestamp":1771243207.500000,"message":{"type":"SubagentEvent","payload":{"agent_id":"sub-${run_stamp}","event":{"type":"ContentPart","payload":{"type":"text","text":"sub-agent echo"}}}}}
+EOF
+
+  cat > "$qwen_fixture_file" <<EOF
+{"uuid":"qwen-user-${run_stamp}","parentUuid":null,"sessionId":"${qwen_session_id}","timestamp":"2026-02-16T12:00:30.000Z","type":"user","cwd":"${tmp_root}/qwen-project","version":"0.19.11","gitBranch":"main","message":{"role":"user","parts":[{"text":"local e2e qwen user prompt ${qwen_keyword}"}]}}
+{"uuid":"qwen-assistant-${run_stamp}","parentUuid":"qwen-user-${run_stamp}","sessionId":"${qwen_session_id}","timestamp":"2026-02-16T12:00:31.000Z","type":"assistant","cwd":"${tmp_root}/qwen-project","version":"0.19.11","gitBranch":"main","model":"Qwen3-Coder-Plus","message":{"role":"model","parts":[{"text":"I should search Moraine before replying.","thought":true},{"text":"local e2e qwen assistant reply ${qwen_keyword} ${qwen_trace_marker}"},{"functionCall":{"id":"qwen-call-search-${run_stamp}","name":"mcp__moraine__search_sessions","args":{"query":"${qwen_self_keyword}"}}}]},"usageMetadata":{"promptTokenCount":120,"candidatesTokenCount":80,"cachedContentTokenCount":20,"thoughtsTokenCount":7,"toolUsePromptTokenCount":5,"totalTokenCount":200,"promptTokensDetails":[{"modality":"TEXT","tokenCount":91},{"modality":"IMAGE","tokenCount":4}],"candidatesTokensDetails":[{"modality":"TEXT","tokenCount":62},{"modality":"AUDIO","tokenCount":11}]}}
+{"uuid":"qwen-result-${run_stamp}","parentUuid":"qwen-assistant-${run_stamp}","sessionId":"${qwen_session_id}","timestamp":"2026-02-16T12:00:32.000Z","type":"tool_result","cwd":"${tmp_root}/qwen-project","version":"0.19.11","gitBranch":"main","message":{"role":"user","parts":[{"functionResponse":{"id":"qwen-response-${run_stamp}","name":"mcp__moraine__search_sessions","response":{"output":"Three matching sessions."}}}]},"toolCallResult":{"callId":"qwen-call-search-${run_stamp}","status":"success","durationMs":25}}
+{"uuid":"qwen-fail-call-${run_stamp}","parentUuid":"qwen-result-${run_stamp}","sessionId":"${qwen_session_id}","timestamp":"2026-02-16T12:00:33.000Z","type":"assistant","cwd":"${tmp_root}/qwen-project","version":"0.19.11","gitBranch":"main","model":"Qwen3-Coder-Plus","message":{"role":"model","parts":[{"functionCall":{"id":"qwen-call-fail-${run_stamp}","name":"shell","args":{"command":"false"}}}]}}
+{"uuid":"qwen-fail-result-${run_stamp}","parentUuid":"qwen-fail-call-${run_stamp}","sessionId":"${qwen_session_id}","timestamp":"2026-02-16T12:00:34.000Z","type":"tool_result","cwd":"${tmp_root}/qwen-project","version":"0.19.11","gitBranch":"main","message":{"role":"user","parts":[{"functionResponse":{"id":"qwen-fail-response-${run_stamp}","name":"shell","response":{"error":"command failed"}}}]},"toolCallResult":{"callId":"qwen-call-fail-${run_stamp}","status":"failed","durationMs":42,"error":{"message":"command failed"}}}
+{"uuid":"qwen-title-${run_stamp}","parentUuid":"qwen-fail-result-${run_stamp}","sessionId":"${qwen_session_id}","timestamp":"2026-02-16T12:00:35.000Z","type":"system","subtype":"custom_title","cwd":"${tmp_root}/qwen-project","version":"0.19.11","gitBranch":"main","systemPayload":{"customTitle":"Qwen e2e ${run_stamp}","titleSource":"model"}}
+{"uuid":"qwen-compression-${run_stamp}","parentUuid":"qwen-title-${run_stamp}","sessionId":"${qwen_session_id}","timestamp":"2026-02-16T12:00:36.000Z","type":"system","subtype":"chat_compression","cwd":"${tmp_root}/qwen-project","version":"0.19.11","gitBranch":"main","systemPayload":{"info":{"originalTokenCount":4096,"newTokenCount":1024,"compressionStatus":"completed","triggerReason":"token_limit"},"compressedHistory":[{"role":"user","parts":[{"text":"must remain raw only"}]}]}}
+{"uuid":"qwen-abandoned-${run_stamp}","parentUuid":"qwen-compression-${run_stamp}","sessionId":"${qwen_session_id}","timestamp":"2026-02-16T12:00:37.000Z","type":"assistant","cwd":"${tmp_root}/qwen-project","version":"0.19.11","gitBranch":"main","model":"Qwen3-Coder-Plus","message":{"role":"model","parts":[{"text":"Qwen abandoned branch ${run_stamp}"}]}}
+{"uuid":"qwen-rewind-${run_stamp}","parentUuid":"qwen-compression-${run_stamp}","sessionId":"${qwen_session_id}","timestamp":"2026-02-16T12:00:38.000Z","type":"system","subtype":"rewind","cwd":"${tmp_root}/qwen-project","version":"0.19.11","gitBranch":"main","systemPayload":{"truncatedCount":1,"targetUuid":"qwen-compression-${run_stamp}"}}
+{"uuid":"qwen-replacement-user-${run_stamp}","parentUuid":"qwen-compression-${run_stamp}","sessionId":"${qwen_session_id}","timestamp":"2026-02-16T12:00:39.000Z","type":"user","subtype":"mid_turn_user_message","cwd":"${tmp_root}/qwen-project","version":"0.19.11","gitBranch":"main","message":{"role":"user","parts":[{"text":"Qwen replacement branch prompt ${run_stamp}"}]}}
+{"uuid":"qwen-replacement-assistant-${run_stamp}","parentUuid":"qwen-replacement-user-${run_stamp}","sessionId":"${qwen_session_id}","timestamp":"2026-02-16T12:00:40.000Z","type":"assistant","cwd":"${tmp_root}/qwen-project","version":"0.19.11","gitBranch":"main","model":"Qwen3-Coder-Plus","message":{"role":"model","parts":[{"text":"Qwen replacement branch answer ${run_stamp}"}]}}
+{"uuid":"qwen-unknown-${run_stamp}","parentUuid":"qwen-replacement-assistant-${run_stamp}","sessionId":"${qwen_session_id}","timestamp":"2026-02-16T12:00:41.000Z","type":"future_record","cwd":"${tmp_root}/qwen-project","version":"0.19.11","payload":{"text":"unknown must remain raw"}}
+{"uuid":"qwen-snapshot-${run_stamp}","parentUuid":"qwen-unknown-${run_stamp}","sessionId":"${qwen_session_id}","timestamp":"2026-02-16T12:00:42.000Z","type":"system","subtype":"file_history_snapshot","cwd":"${tmp_root}/qwen-project","version":"0.19.11","systemPayload":{"snapshots":[{"path":"secret.txt","content":"snapshot must remain raw"}]}}
+{"uuid":"qwen-binary-${run_stamp}","parentUuid":"qwen-snapshot-${run_stamp}","sessionId":"${qwen_session_id}","timestamp":"2026-02-16T12:00:43.000Z","type":"user","cwd":"${tmp_root}/qwen-project","version":"0.19.11","message":{"role":"user","parts":[{"inlineData":{"mimeType":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"}}]}}
+{"uuid":"qwen-bad-ts-${run_stamp}","parentUuid":"qwen-replacement-assistant-${run_stamp}","sessionId":"${qwen_session_id}","timestamp":"not-a-timestamp","type":"user","cwd":"${tmp_root}/qwen-project","version":"0.19.11","message":{"role":"user","parts":[{"text":"Qwen malformed timestamp neighbor ${run_stamp}"}]}}
 EOF
 
   # Cursor Agent transcripts observed under ~/.cursor/projects/.../agent-transcripts
@@ -947,6 +971,14 @@ glob = "${fixtures_root}/kimi/sessions/**/wire.jsonl"
 watch_root = "${fixtures_root}/kimi/sessions"
 
 [[ingest.sources]]
+name = "qwen-code"
+harness = "qwen-code"
+enabled = true
+glob = "${fixtures_root}/qwen/projects/*/chats/*.jsonl"
+watch_root = "${fixtures_root}/qwen/projects"
+format = "jsonl"
+
+[[ingest.sources]]
 name = "ci-cursor"
 harness = "cursor"
 enabled = true
@@ -1095,6 +1127,8 @@ EOF
   assert_clickhouse_count "$clickhouse_url" "named backend excludes default-only codex session" "SELECT count() FROM ${routed_clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${codex_keyword}') > 0" "0"
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${kimi_keyword}') > 0" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${kimi_keyword}'" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${qwen_keyword}') > 0" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${qwen_keyword}'" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${cursor_keyword}') > 0" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${cursor_keyword}'" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.event_links WHERE source_name = 'ci-cursor' AND linked_external_id = '/workspace/cursor-e2e.txt'" 120
@@ -1112,7 +1146,9 @@ EOF
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${hermes_session_keyword}'" 120
 
   echo "[e2e] checking ClickHouse normalized ingest rows"
-  assert_clickhouse_count "$clickhouse_url" "ingest errors" "SELECT count() FROM ${clickhouse_database}.ingest_errors" "0"
+  assert_clickhouse_count "$clickhouse_url" "non-Qwen ingest errors" "SELECT count() FROM ${clickhouse_database}.ingest_errors WHERE source_name != 'qwen-code'" "0"
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.ingest_errors WHERE source_name = 'qwen-code' AND error_kind = 'timestamp_parse_error'" 120
+  assert_clickhouse_count "$clickhouse_url" "Qwen malformed timestamp logical error" "SELECT uniqExact(tuple(source_file, source_generation, source_line_no, error_kind)) FROM ${clickhouse_database}.ingest_errors WHERE source_name = 'qwen-code' AND error_kind = 'timestamp_parse_error'" "1"
 
   assert_clickhouse_count "$clickhouse_url" "codex unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-codex'" "8"
   assert_clickhouse_count "$clickhouse_url" "codex event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex'" "8"
@@ -1158,6 +1194,28 @@ EOF
   assert_clickhouse_count "$clickhouse_url" "kimi tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-kimi' AND tool_call_id = 'kimi-tool-${run_stamp}'" "2"
   assert_clickhouse_count "$clickhouse_url" "kimi domain fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kimi' AND harness = 'kimi-cli' AND inference_provider = 'moonshot' AND session_id = '${kimi_raw_session_id}' AND model = 'kimi-cli'" "7"
   assert_clickhouse_count "$clickhouse_url" "kimi token buckets" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kimi' AND payload_type = 'token_count' AND input_tokens = 13 AND output_tokens = 5 AND cache_read_tokens = 2 AND cache_write_tokens = 1 AND token_usage_buckets['input_text'] = 10 AND token_usage_buckets['output_text'] = 5 AND token_usage_buckets['input_cache_read'] = 2 AND token_usage_buckets['input_cache_write'] = 1" "1"
+
+  # raw_events is append-only and its sink is intentionally at-least-once; count
+  # persisted record identities rather than physical retry copies.
+  assert_clickhouse_count "$clickhouse_url" "Qwen logical raw rows" "SELECT count() FROM (SELECT source_file, source_generation, source_line_no, source_offset, raw_json_hash FROM ${clickhouse_database}.raw_events WHERE source_name = 'qwen-code' GROUP BY source_file, source_generation, source_line_no, source_offset, raw_json_hash)" "15"
+  assert_clickhouse_count "$clickhouse_url" "Qwen event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code'" "14"
+  assert_clickhouse_count "$clickhouse_url" "Qwen parent links" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'qwen-code' AND link_type = 'parent_event'" "13"
+  assert_clickhouse_count "$clickhouse_url" "Qwen raw-only records" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND item_id IN ('qwen-unknown-${run_stamp}', 'qwen-snapshot-${run_stamp}', 'qwen-binary-${run_stamp}')" "0"
+  assert_clickhouse_count "$clickhouse_url" "Qwen domain fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND harness = 'qwen-code' AND session_id = '${qwen_session_id}' AND cwd = '${tmp_root}/qwen-project'" "14"
+  assert_clickhouse_count "$clickhouse_url" "Qwen model without provider" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND model = 'qwen3-coder-plus' AND inference_provider = ''" "13"
+  assert_clickhouse_count "$clickhouse_url" "Qwen token accounting" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND item_id = 'qwen-assistant-${run_stamp}' AND event_kind = 'reasoning' AND input_tokens = 120 AND output_tokens = 80 AND cache_read_tokens = 20 AND cache_write_tokens = 0 AND token_usage_buckets['input_text'] = 91 AND token_usage_buckets['output_text'] = 62 AND token_usage_buckets['input_image'] = 4 AND token_usage_buckets['output_audio'] = 11 AND token_usage_buckets['reasoning'] = 7 AND token_usage_buckets['server_tool_use'] = 5" "1"
+  assert_clickhouse_count "$clickhouse_url" "Qwen title projection" "SELECT count() FROM ${clickhouse_database}.mcp_open_sessions FINAL WHERE session_id = '${qwen_session_id}' AND title = 'Qwen e2e ${run_stamp}'" "1"
+  assert_clickhouse_count "$clickhouse_url" "Qwen reasoning row" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND item_id = 'qwen-assistant-${run_stamp}' AND event_kind = 'reasoning' AND has_reasoning = 1" "1"
+  assert_clickhouse_count "$clickhouse_url" "Qwen projected assistant part order" "SELECT count() FROM ${clickhouse_database}.mcp_open_events FINAL WHERE session_id = '${qwen_session_id}' AND item_id = 'qwen-assistant-${run_stamp}' AND ((event_ordinal = 2 AND event_class = 'reasoning') OR (event_ordinal = 3 AND event_class = 'message') OR (event_ordinal = 4 AND event_class = 'tool_call'))" "3"
+  assert_clickhouse_count "$clickhouse_url" "Qwen tool request and response rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'qwen-code' AND tool_call_id IN ('qwen-call-search-${run_stamp}', 'qwen-call-fail-${run_stamp}')" "4"
+  assert_clickhouse_count "$clickhouse_url" "Qwen failed tool response" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'qwen-code' AND tool_call_id = 'qwen-call-fail-${run_stamp}' AND tool_phase = 'response' AND tool_error = 1" "1"
+  assert_clickhouse_count "$clickhouse_url" "Qwen rewind event" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND item_id = 'qwen-rewind-${run_stamp}' AND op_kind = 'rewind'" "1"
+  assert_clickhouse_count "$clickhouse_url" "Qwen abandoned branch parent" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'qwen-code' AND linked_external_id = 'qwen-compression-${run_stamp}' AND event_uid IN (SELECT event_uid FROM ${clickhouse_database}.events FINAL WHERE item_id = 'qwen-abandoned-${run_stamp}')" "1"
+  assert_clickhouse_count "$clickhouse_url" "Qwen replacement branch parent" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'qwen-code' AND linked_external_id = 'qwen-replacement-user-${run_stamp}' AND event_uid IN (SELECT event_uid FROM ${clickhouse_database}.events FINAL WHERE item_id = 'qwen-replacement-assistant-${run_stamp}')" "1"
+  assert_clickhouse_count "$clickhouse_url" "Qwen both rewind branches preserved" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND (position(text_content, 'Qwen abandoned branch ${run_stamp}') > 0 OR position(text_content, 'Qwen replacement branch answer ${run_stamp}') > 0)" "2"
+  assert_clickhouse_count "$clickhouse_url" "Qwen compression is bounded" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND item_id = 'qwen-compression-${run_stamp}' AND event_kind = 'summary' AND text_content = '' AND position(payload_json, 'compressedHistory') = 0" "1"
+  assert_clickhouse_count "$clickhouse_url" "Qwen malformed timestamp neighbor retained" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND item_id = 'qwen-bad-ts-${run_stamp}'" "1"
+  assert_clickhouse_count "$clickhouse_url" "Qwen qualified Moraine mode" "SELECT count() FROM ${clickhouse_database}.mcp_open_sessions FINAL WHERE session_id = '${qwen_session_id}' AND mode = 'mcp_internal'" "1"
 
   assert_clickhouse_count "$clickhouse_url" "cursor unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-cursor'" "5"
   assert_clickhouse_count "$clickhouse_url" "cursor event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-cursor'" "6"
@@ -1250,7 +1308,7 @@ PY
   assert_clickhouse_count "$clickhouse_url" "hermes session link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-hermes-session'" "0"
   assert_clickhouse_count "$clickhouse_url" "hermes session tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-hermes-session' AND tool_call_id = 'hermes-session-tool-${run_stamp}' AND tool_name = 'shell'" "2"
   assert_clickhouse_count "$clickhouse_url" "hermes session domain fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-hermes-session' AND harness = 'hermes' AND inference_provider = 'anthropic' AND session_id = '${hermes_raw_session_id}' AND model = 'claude-opus-4-6'" "6"
-  assert_clickhouse_count "$clickhouse_url" "token bucket map keys on all events" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE hasAll(mapKeys(token_usage_buckets), ['input_text', 'output_text', 'input_cache_read', 'input_cache_write', 'reasoning'])" "53"
+  assert_clickhouse_count "$clickhouse_url" "token bucket map keys on all events" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE hasAll(mapKeys(token_usage_buckets), ['input_text', 'output_text', 'input_cache_read', 'input_cache_write', 'reasoning'])" "67"
 
   local hermes_trajectory_session_id
   hermes_trajectory_session_id="$(clickhouse_scalar "$clickhouse_url" "SELECT any(session_id) FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-hermes-trajectory'")"
@@ -1542,6 +1600,27 @@ PY
     --expect-session-id "$kimi_raw_session_id" \
     --expect-open-text "$kimi_trace_marker" \
     --file-attention-path "manifest.json"
+
+  echo "[e2e] checking MCP exact harness/source filters (qwen)"
+  "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --query "$qwen_keyword" \
+    --expect-session-id "$qwen_session_id" \
+    --expect-open-text "$qwen_trace_marker" \
+    --harness-filter "qwen-code" \
+    --source-filter "qwen-code"
+
+  echo "[e2e] checking Qwen-qualified Moraine calls are excluded from default search"
+  "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --query "$qwen_self_keyword" \
+    --expect-session-id "$qwen_session_id" \
+    --expect-no-results \
+    --event-type "tool_call" \
+    --harness-filter "qwen-code" \
+    --source-filter "qwen-code"
 
   echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (cursor)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \

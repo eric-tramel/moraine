@@ -222,6 +222,7 @@ fn jsonl_source_line_byte_limit(config: &AppConfig) -> usize {
         .clamp(1, DEFAULT_JSONL_SOURCE_LINE_BYTE_LIMIT)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn oversized_source_line_error_row(
     work: &WorkItem,
     source_file: &str,
@@ -258,6 +259,7 @@ struct SerializedRowSize {
     bytes: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn oversized_normalized_row_error_row(
     work: &WorkItem,
     source_file: &str,

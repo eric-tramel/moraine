@@ -90,6 +90,14 @@ watch_root = "~/.kimi/sessions"
 format = "jsonl"
 
 [[ingest.sources]]
+name = "qwen-code"
+harness = "qwen-code"
+enabled = true
+glob = "~/.qwen/projects/*/chats/*.jsonl"
+watch_root = "~/.qwen/projects"
+format = "jsonl"
+
+[[ingest.sources]]
 name = "opencode"
 harness = "opencode"
 enabled = true
