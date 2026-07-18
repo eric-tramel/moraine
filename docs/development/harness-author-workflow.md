@@ -114,12 +114,13 @@ Choose `format` carefully:
   place. The session processor emits only newly appended synthetic records.
 - Use `kiro_session` only for Kiro CLI's paired `<session-id>.jsonl` transcript
   and `<session-id>.json` metadata files.
-- Use `cursor_sqlite` for Cursor `state.vscdb` databases. A DB-polling format
-  is only appropriate when the harness keeps its history in a live local
-  database with no append-only trace files; the polling engine in
-  `sqlite_poll.rs` diffs the database against a persisted cursor and routes
-  synthetic records through the normal adapter path (see
-  [Ingest Sources → SQLite-Polled Sources](ingest-sources.md#sqlite-polled-sources)).
+- Use the dedicated database format for live SQLite stores:
+  `cursor_sqlite`, `nac_sqlite`, or `opencode_sqlite`. A DB-polling format is
+  appropriate only when the harness has no append-only trace file. Keep shared
+  open/stat/sidecar primitives in `sqlite_poll.rs`, source-specific lifecycle
+  code in `sqlite_poll/<source>.rs`, and route synthetic records through the
+  normal adapter path (see [Ingest Sources → SQLite-Polled
+  Sources](ingest-sources.md#sqlite-polled-sources)).
 
 ## 6. Add Fixtures
 
@@ -161,11 +162,10 @@ run the functional stack:
 bash scripts/ci/e2e-stack.sh
 ```
 
-That script ingests Codex, Claude Code, Qwen Code, Kiro CLI, Kimi CLI, Cursor,
-OpenCode, Pi, Hermes trajectory, and Hermes session JSON fixtures into
-ClickHouse, then
-verifies row counts, representative fields, token buckets, monitor routes, and
-MCP search/open/list behavior.
+That script ingests Codex, Claude Code, Qwen Code, Kiro CLI, Kimi CLI, NAC,
+OpenCode, Cursor JSONL and SQLite, Hermes trajectory/session, and Pi/OMP fixtures
+into ClickHouse, then verifies row counts, representative fields, token buckets,
+source lifecycles, monitor routes, and MCP search/open/list behavior.
 
 ## 8. Use The Dev Sandbox For QA
 

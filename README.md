@@ -5,9 +5,9 @@
 [![Docs](https://github.com/eric-tramel/moraine/actions/workflows/docs-deploy.yml/badge.svg)](https://eric-tramel.github.io/moraine/)
 
 Moraine is a local trace stack for agent work. It indexes sessions from agent
-harnesses such as Codex, Claude Code, Qwen Code, Kiro CLI, Kimi CLI, OpenCode,
-Hermes, and Pi Coding Agent into ClickHouse, serves a monitor UI, and exposes MCP
-retrieval over the indexed history.
+harnesses such as Codex, Claude Code, Qwen Code, Kiro CLI, Kimi CLI, NAC,
+OpenCode, Hermes, and Pi Coding Agent into ClickHouse, serves a monitor UI, and
+exposes MCP retrieval over the indexed history.
 
 Agents get searchable long-term memory through MCP. You get a unified local
 record of what happened across providers, including tools, tokens, and
@@ -42,6 +42,7 @@ Moraine ships session trace ingestion adapters for these agent harnesses:
 | [Kiro CLI](https://kiro.dev/docs/cli/) | `kiro-cli` | Paired JSONL transcripts and JSON metadata under `$KIRO_HOME/sessions/cli` when set, or `~/.kiro/sessions/cli` |
 | [Kimi CLI](https://moonshotai.github.io/kimi-cli/en/) | `kimi-cli` | `wire.jsonl` session traces under `~/.kimi/sessions` |
 | [Qwen Code](https://github.com/QwenLM/qwen-code) | `qwen-code` | JSONL chat records under `~/.qwen/projects/*/chats` |
+| [NAC](https://github.com/arcee-ai/nac) | `nac` | Parent sessions and managed-worker episodes from setup-resolved `store.db` (`nac_sqlite` format) |
 | [OpenCode](https://opencode.ai/) | `opencode` | SQLite session history from `~/.local/share/opencode/opencode*.db` (default on; `opencode_sqlite` format) |
 | [Cursor](https://cursor.com/docs) | `cursor` | Agent transcript JSONL under `~/.cursor/projects` (default on); Cursor IDE chat history from `state.vscdb` SQLite databases (default on; `cursor_sqlite` format) |
 | [Hermes](https://hermes-agent.nousresearch.com/docs/) | `hermes` | Live session JSON and trajectory JSONL traces |
@@ -58,6 +59,11 @@ moraine up
 `moraine setup` creates or repairs `~/.moraine/config.toml` and guides plugin or
 MCP registration for detected agent harnesses.
 
+For NAC, setup preserves unrelated `config.toml` settings, registers
+`[mcp_servers.moraine]`, and adds the resolved SQLite store only when its path
+is stable and absolute. Relative or per-launch `--store-path` databases require
+the manual source snippet printed by setup.
+
 The monitor UI runs at `http://127.0.0.1:8080` by default.
 
 For release bundles, upgrades, project-scoped setup, and other harnesses, see the
@@ -67,10 +73,10 @@ For release bundles, upgrades, project-scoped setup, and other harnesses, see th
 
 Use `moraine setup` to install or update the Moraine plugins for Claude Code,
 Codex, and Hermes; install Kiro CLI's global steering and MCP registration; or
-register Moraine MCP for supported harnesses such as Qwen Code, OpenCode,
+register Moraine MCP for supported harnesses such as Qwen Code, NAC, OpenCode,
 Cursor, Kimi CLI, and Pi Coding Agent. The integrations use the `moraine` CLI on
-your `PATH` and the running local stack.
-For Kiro CLI, Moraine also resolves the default `kiro` ingest source from `KIRO_HOME`.
+your `PATH` and the running local stack. For Kiro CLI, Moraine also resolves the
+default `kiro` ingest source from `KIRO_HOME`.
 
 Start a new agent session after installing an integration. The Claude Code,
 Codex, and Hermes plugins provide named Moraine skills. Kiro CLI receives

@@ -97,6 +97,7 @@ glob = "~/.kimi/sessions/**/wire.jsonl"
 watch_root = "~/.kimi/sessions"
 format = "jsonl"
 
+
 [[ingest.sources]]
 name = "qwen-code"
 harness = "qwen-code"

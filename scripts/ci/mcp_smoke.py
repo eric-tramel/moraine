@@ -5,6 +5,7 @@ import json
 import os
 import select
 import subprocess
+import time
 from typing import Any, Dict, Optional
 
 
@@ -82,19 +83,36 @@ def call_tool(
     name: str,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
-    response = send_request(
-        proc,
-        {
-            "jsonrpc": "2.0",
-            "id": expected_id,
-            "method": "tools/call",
-            "params": {
-                "name": name,
-                "arguments": arguments,
-            },
+    payload = {
+        "jsonrpc": "2.0",
+        "id": expected_id,
+        "method": "tools/call",
+        "params": {
+            "name": name,
+            "arguments": arguments,
         },
-    )
-    return assert_tool_success(assert_rpc_ok(response, expected_id))
+    }
+    retry_deadline = time.monotonic() + 30
+    while True:
+        result = assert_rpc_ok(send_request(proc, payload), expected_id)
+        if result.get("isError") is False:
+            return result
+
+        structured = result.get("structuredContent")
+        error = structured.get("error") if isinstance(structured, dict) else None
+        details = error.get("details") if isinstance(error, dict) else None
+        if (
+            not isinstance(details, dict)
+            or details.get("retryable") is not True
+            or time.monotonic() >= retry_deadline
+        ):
+            return assert_tool_success(result)
+
+        retry_after_ms = details.get("retry_after_ms", 250)
+        if not isinstance(retry_after_ms, (int, float)) or retry_after_ms < 0:
+            retry_after_ms = 250
+        remaining = retry_deadline - time.monotonic()
+        time.sleep(min(retry_after_ms / 1_000, 2, remaining))
 
 
 def call_tool_expect_handled_error(
@@ -620,6 +638,7 @@ def run_smoke(
     expect_no_results: bool = False,
     expect_event_count: Optional[int] = None,
     expect_updated_at: Optional[str] = None,
+    expect_mode: Optional[str] = None,
     expect_matching_search_hits: Optional[int] = None,
     require_embedded_fallback: bool = False,
     tools_snapshot: Optional[str] = None,
@@ -861,6 +880,11 @@ def run_smoke(
                     f"got {session_metadata.get('updated_at')!r}, "
                     f"wanted {expect_updated_at!r}"
                 )
+            if expect_mode is not None and session_metadata.get("mode") != expect_mode:
+                raise AssertionError(
+                    "list_sessions mode parity failed: "
+                    f"got {session_metadata.get('mode')!r}, wanted {expect_mode!r}"
+                )
             listed_source = nested_string(selected_session, "session", "source")
             if listed_source is None:
                 raise AssertionError(
@@ -1020,6 +1044,10 @@ def main() -> int:
         help="expected RFC3339 updated_at for the selected list_sessions fixture",
     )
     parser.add_argument(
+        "--expect-mode",
+        help="expected canonical mode for the selected list_sessions fixture",
+    )
+    parser.add_argument(
         "--require-embedded-fallback",
         action="store_true",
         help=(
@@ -1054,6 +1082,7 @@ def main() -> int:
         expect_no_results=args.expect_no_results,
         expect_event_count=args.expect_event_count,
         expect_updated_at=args.expect_updated_at,
+        expect_mode=args.expect_mode,
         expect_matching_search_hits=args.expect_matching_search_hits,
         require_embedded_fallback=args.require_embedded_fallback,
         tools_snapshot=args.write_tools_snapshot,

@@ -6,15 +6,15 @@ MCP server so agents can search prior sessions.
 
 Use Moraine when you want a private record of what your agents did across
 harnesses such as Codex, Claude Code, Qwen Code, Cursor, Kiro CLI, Kimi CLI,
-OpenCode, Hermes, and Pi Coding Agent. The default setup runs on your machine
-and writes runtime state under `~/.moraine`.
+NAC, OpenCode, Hermes, and Pi Coding Agent. The default setup runs on your
+machine and writes runtime state under `~/.moraine`.
 
 ## What You Get
 
 - **Unified trace database.** Conversation turns, tool calls, token counts, and
   timestamps land in ClickHouse under a consistent schema.
 - **Realtime local ingest.** Moraine watches Codex, Claude Code, Qwen Code,
-  Cursor, Kiro CLI, Kimi CLI, OpenCode, Hermes, and Pi Coding Agent session
+  Cursor, Kiro CLI, Kimi CLI, NAC, OpenCode, Hermes, and Pi Coding Agent session
   stores and backfills existing history on startup.
 - **Monitor UI.** Browse sessions, inspect indexing health, and check what has
   been captured at `http://127.0.0.1:8080`.
@@ -39,6 +39,8 @@ Moraine ships session trace ingestion adapters for these agent harnesses:
 | [Kiro CLI](https://kiro.dev/docs/cli/) | `kiro-cli` | Paired JSONL transcripts and JSON metadata under `$KIRO_HOME/sessions/cli` when set, or `~/.kiro/sessions/cli` |
 | [Kimi CLI](https://moonshotai.github.io/kimi-cli/en/) | `kimi-cli` | `wire.jsonl` session traces under `~/.kimi/sessions` |
 | [Qwen Code](https://github.com/QwenLM/qwen-code) | `qwen-code` | JSONL chat records under `~/.qwen/projects/*/chats` |
+| [NAC](https://github.com/arcee-ai/nac) | `nac` | Parent sessions and managed-worker episodes from setup-resolved `store.db` (`nac_sqlite` format) |
+| [OpenCode](https://opencode.ai/) | `opencode` | SQLite session history from `~/.local/share/opencode/opencode*.db` (default on; `opencode_sqlite` format) |
 | [Cursor](https://cursor.com/docs) | `cursor` | Agent transcript JSONL under `~/.cursor/projects` (default on); Cursor IDE chat history from `state.vscdb` SQLite databases (default on; `cursor_sqlite` format) |
 | [Hermes](https://hermes-agent.nousresearch.com/docs/) | `hermes` | Live session JSON and trajectory JSONL traces |
 | [Pi Coding Agent](https://pi.dev/docs/latest) / OMP | `pi-coding-agent` | JSONL session trees under `~/.pi/agent/sessions` and `~/.omp/agent/sessions` |

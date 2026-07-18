@@ -43,6 +43,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, warn};
 
+mod nac;
+pub(crate) use nac::process_nac_sqlite_db;
+
 mod opencode;
 pub(crate) use opencode::process_opencode_sqlite_db;
 
@@ -1332,6 +1335,7 @@ fn truncate_chars_local(input: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::model::RowBatch;
+    use moraine_config::SourceFormat;
     use serde_json::json;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1475,7 +1479,8 @@ mod tests {
         WorkItem {
             source_name: "cursor-sqlite-test".to_string(),
             harness: "cursor".to_string(),
-            format: SOURCE_FORMAT_CURSOR_SQLITE.to_string(),
+            format: SourceFormat::CursorSqlite,
+            source_glob: String::new(),
             path: path.to_string_lossy().to_string(),
         }
     }

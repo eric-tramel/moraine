@@ -227,6 +227,7 @@ pub(crate) enum SetupMcpTarget {
     KiroCli,
     KimiCli,
     QwenCode,
+    Nac,
     #[serde(rename = "opencode")]
     #[value(name = "opencode")]
     OpenCode,

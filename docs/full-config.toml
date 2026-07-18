@@ -185,6 +185,16 @@ watch_root = "~/.qwen/projects"
 format = "jsonl"
 
 [[ingest.sources]]
+# NAC SQLite parent-session and managed-worker history, polled read-only.
+# `moraine setup` resolves NAC_HOME and an absolute storage.store_path.
+name = "nac"
+harness = "nac"
+enabled = true
+glob = "~/.config/nac/store.db"
+watch_root = "~/.config/nac"
+format = "nac_sqlite"
+
+[[ingest.sources]]
 # OpenCode SQLite conversation databases, read-only.
 name = "opencode"
 harness = "opencode"

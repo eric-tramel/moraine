@@ -370,6 +370,76 @@ registration so a new session loads the server. See Qwen's
 Qwen's setup command owns user scope only; project-scoped registration is not
 managed by `moraine setup`.
 
+## NAC
+
+NAC reads MCP server definitions from `config.toml`. For global use:
+
+```bash
+moraine setup --mcp-target nac
+```
+
+Setup chooses the config directory in this order:
+
+1. `NAC_HOME` when set.
+2. `${XDG_CONFIG_HOME}/nac` when `XDG_CONFIG_HOME` is set.
+3. `~/.config/nac`.
+
+It creates or updates only `[mcp_servers.moraine]`; existing model, storage,
+sandbox, and unrelated MCP settings are preserved. The equivalent manual
+configuration is:
+
+```toml
+[mcp_servers.moraine]
+enabled = true
+transport = "stdio"
+command = "moraine"
+args = ["run", "mcp"]
+```
+
+When NAC is also selected as an ingest source in regular guided
+`moraine setup`, setup resolves its SQLite store. The default is
+`<resolved config directory>/store.db`; an absolute `storage.store_path` in
+NAC's config is followed directly. A relative `storage.store_path` is resolved
+by NAC from its launch directory, so setup does not add a potentially wrong
+source and instead prints a ready-to-copy `[[ingest.sources]]` snippet. The same
+manual step is required when launching NAC with `--store-path`, because that
+per-process override is not present in `config.toml`.
+For that manual case, add the resolved absolute database path and its parent
+directory to Moraine's `moraine.toml`:
+
+```toml
+[[ingest.sources]]
+name = "nac"
+harness = "nac"
+enabled = true
+glob = "/absolute/path/to/store.db"
+watch_root = "/absolute/path/to"
+format = "nac_sqlite"
+materialize = true
+```
+
+Replace both paths with the location NAC actually uses. Do not use a relative
+path in this source: Moraine and NAC may have different launch directories.
+
+Review the preview before applying custom paths:
+
+```bash
+moraine setup --dry-run --mcp-target nac
+```
+
+Setup-owned writes are atomic and idempotent. Re-running the targeted command
+repairs only the Moraine MCP table; re-running guided setup can also reconcile
+the setup-owned NAC ingest source. A differently named custom NAC source is
+preserved, so do not point two enabled sources at the same database unless
+duplicate ingestion is intentional.
+
+To roll back setup, remove only `[mcp_servers.moraine]` from NAC's
+`config.toml`. If guided setup also added the setup-owned ingest entry, remove
+the `[[ingest.sources]]` table whose `name` is `nac` from Moraine's
+`moraine.toml`; leave differently named custom sources untouched. Remove that
+ingest table before running the same configuration with an older Moraine
+release, which does not recognize the `nac_sqlite` format.
+
 ## OpenCode
 
 OpenCode reads MCP servers from the `mcp` object in its config. For global use,

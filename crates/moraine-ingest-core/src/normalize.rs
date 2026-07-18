@@ -66,7 +66,6 @@ pub(crate) fn normalize_record_with_ts_hint(
             sources.known_harnesses().join(", ")
         ));
     };
-    let _source_format = source.format();
 
     let record = match source.preflight(record) {
         Preflight::Keep(record) => record,

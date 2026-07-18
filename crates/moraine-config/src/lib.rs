@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use serde::{de::DeserializeOwned, Deserialize};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -17,10 +17,107 @@ pub const KNOWN_INGEST_HARNESSES: &[&str] = &[
     "hermes",
     "kiro-cli",
     "kimi-cli",
+    "nac",
     "opencode",
     "pi-coding-agent",
     "qwen-code",
 ];
+
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceFormat {
+    #[default]
+    #[serde(rename = "")]
+    Infer,
+    Jsonl,
+    SessionJson,
+    KiroSession,
+    CursorSqlite,
+    NacSqlite,
+    #[serde(rename = "opencode_sqlite")]
+    OpenCodeSqlite,
+}
+
+impl SourceFormat {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Infer => "",
+            Self::Jsonl => SOURCE_FORMAT_JSONL,
+            Self::SessionJson => SOURCE_FORMAT_SESSION_JSON,
+            Self::KiroSession => SOURCE_FORMAT_KIRO_SESSION,
+            Self::CursorSqlite => SOURCE_FORMAT_CURSOR_SQLITE,
+            Self::NacSqlite => SOURCE_FORMAT_NAC_SQLITE,
+            Self::OpenCodeSqlite => SOURCE_FORMAT_OPENCODE_SQLITE,
+        }
+    }
+
+    pub const fn uses_recursive_watch(self) -> bool {
+        match self {
+            Self::Infer => panic!("source format must be normalized before selecting watch scope"),
+            Self::Jsonl
+            | Self::SessionJson
+            | Self::KiroSession
+            | Self::CursorSqlite
+            | Self::OpenCodeSqlite => true,
+            Self::NacSqlite => false,
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.is_empty() {
+            Some(Self::Infer)
+        } else if value.eq_ignore_ascii_case(SOURCE_FORMAT_JSONL) {
+            Some(Self::Jsonl)
+        } else if value.eq_ignore_ascii_case(SOURCE_FORMAT_SESSION_JSON) {
+            Some(Self::SessionJson)
+        } else if value.eq_ignore_ascii_case(SOURCE_FORMAT_KIRO_SESSION) {
+            Some(Self::KiroSession)
+        } else if value.eq_ignore_ascii_case(SOURCE_FORMAT_CURSOR_SQLITE) {
+            Some(Self::CursorSqlite)
+        } else if value.eq_ignore_ascii_case(SOURCE_FORMAT_NAC_SQLITE) {
+            Some(Self::NacSqlite)
+        } else if value.eq_ignore_ascii_case(SOURCE_FORMAT_OPENCODE_SQLITE) {
+            Some(Self::OpenCodeSqlite)
+        } else {
+            None
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SourceFormat {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).ok_or_else(|| {
+            serde::de::Error::unknown_variant(
+                value.trim(),
+                &[
+                    "",
+                    SOURCE_FORMAT_JSONL,
+                    SOURCE_FORMAT_SESSION_JSON,
+                    SOURCE_FORMAT_KIRO_SESSION,
+                    SOURCE_FORMAT_CURSOR_SQLITE,
+                    SOURCE_FORMAT_NAC_SQLITE,
+                    SOURCE_FORMAT_OPENCODE_SQLITE,
+                ],
+            )
+        })
+    }
+}
+impl AsRef<str> for SourceFormat {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for SourceFormat {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -35,19 +132,9 @@ pub struct IngestSource {
     pub glob: String,
     #[serde(default)]
     pub watch_root: String,
-    /// On-disk trace format: `"jsonl"` (append-only newline-delimited records,
-    /// the default used by Codex, Claude Code, Kimi CLI, and Hermes ShareGPT
-    /// dumps), `"session_json"` (single-file-per-session JSON rewritten in
-    /// place via atomic rename — used by live Hermes agent sessions),
-    /// `"cursor_sqlite"` (polled Cursor `state.vscdb` SQLite databases), or
-    /// `"opencode_sqlite"` (polled OpenCode `opencode*.db` SQLite databases),
-    /// or `"kiro_session"` (Kiro CLI JSONL transcripts paired with JSON
-    /// metadata sidecars). Empty means "infer": Hermes `*.json` globs use
-    /// `session_json`, Kiro CLI sources use `kiro_session`, Cursor `.vscdb`
-    /// globs use `cursor_sqlite`, OpenCode `opencode*.db` globs use
-    /// `opencode_sqlite`, and other sources use `jsonl`.
+    /// On-disk trace format. Empty means infer from harness and glob.
     #[serde(default)]
-    pub format: String,
+    pub format: SourceFormat,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -558,7 +645,7 @@ fn default_sources() -> Vec<IngestSource> {
             enabled: true,
             glob: "~/.codex/sessions/**/*.jsonl".to_string(),
             watch_root: "~/.codex/sessions".to_string(),
-            format: String::new(),
+            format: SourceFormat::Infer,
         },
         IngestSource {
             name: "claude".to_string(),
@@ -566,7 +653,7 @@ fn default_sources() -> Vec<IngestSource> {
             enabled: true,
             glob: "~/.claude/projects/**/*.jsonl".to_string(),
             watch_root: "~/.claude/projects".to_string(),
-            format: String::new(),
+            format: SourceFormat::Infer,
         },
     ];
     #[cfg(target_os = "macos")]
@@ -577,7 +664,7 @@ fn default_sources() -> Vec<IngestSource> {
         glob: "~/Library/Application Support/Claude/local-agent-mode-sessions/**/.claude/projects/**/*.jsonl".to_string(),
         watch_root:
             "~/Library/Application Support/Claude/local-agent-mode-sessions".to_string(),
-        format: String::new(),
+        format: SourceFormat::Infer,
     });
     sources.extend([
         IngestSource {
@@ -586,7 +673,7 @@ fn default_sources() -> Vec<IngestSource> {
             enabled: true,
             glob: "~/.hermes/sessions/session_*.json".to_string(),
             watch_root: "~/.hermes/sessions".to_string(),
-            format: String::new(),
+            format: SourceFormat::Infer,
         },
         IngestSource {
             name: "kiro".to_string(),
@@ -594,7 +681,7 @@ fn default_sources() -> Vec<IngestSource> {
             enabled: true,
             glob: "~/.kiro/sessions/cli/*.jsonl".to_string(),
             watch_root: "~/.kiro/sessions/cli".to_string(),
-            format: SOURCE_FORMAT_KIRO_SESSION.to_string(),
+            format: SourceFormat::KiroSession,
         },
         IngestSource {
             name: "kimi-cli".to_string(),
@@ -602,7 +689,7 @@ fn default_sources() -> Vec<IngestSource> {
             enabled: true,
             glob: "~/.kimi/sessions/**/wire.jsonl".to_string(),
             watch_root: "~/.kimi/sessions".to_string(),
-            format: String::new(),
+            format: SourceFormat::Infer,
         },
         IngestSource {
             name: "qwen-code".to_string(),
@@ -610,7 +697,7 @@ fn default_sources() -> Vec<IngestSource> {
             enabled: true,
             glob: "~/.qwen/projects/*/chats/*.jsonl".to_string(),
             watch_root: "~/.qwen/projects".to_string(),
-            format: SOURCE_FORMAT_JSONL.to_string(),
+            format: SourceFormat::Jsonl,
         },
         IngestSource {
             name: "opencode".to_string(),
@@ -618,7 +705,7 @@ fn default_sources() -> Vec<IngestSource> {
             enabled: true,
             glob: "~/.local/share/opencode/opencode*.db".to_string(),
             watch_root: "~/.local/share/opencode".to_string(),
-            format: SOURCE_FORMAT_OPENCODE_SQLITE.to_string(),
+            format: SourceFormat::OpenCodeSqlite,
         },
         IngestSource {
             name: "cursor".to_string(),
@@ -626,7 +713,7 @@ fn default_sources() -> Vec<IngestSource> {
             enabled: true,
             glob: "~/.cursor/projects/*/agent-transcripts/**/*.jsonl".to_string(),
             watch_root: "~/.cursor/projects".to_string(),
-            format: String::new(),
+            format: SourceFormat::Infer,
         },
         IngestSource {
             name: "cursor-sqlite".to_string(),
@@ -634,7 +721,7 @@ fn default_sources() -> Vec<IngestSource> {
             enabled: true,
             glob: format!("{cursor_state_root}/**/state.vscdb"),
             watch_root: cursor_state_root.to_string(),
-            format: SOURCE_FORMAT_CURSOR_SQLITE.to_string(),
+            format: SourceFormat::CursorSqlite,
         },
         IngestSource {
             name: "pi".to_string(),
@@ -642,7 +729,7 @@ fn default_sources() -> Vec<IngestSource> {
             enabled: true,
             glob: "~/.pi/agent/sessions/**/*.jsonl".to_string(),
             watch_root: "~/.pi/agent/sessions".to_string(),
-            format: String::new(),
+            format: SourceFormat::Infer,
         },
         IngestSource {
             name: "omp".to_string(),
@@ -650,7 +737,7 @@ fn default_sources() -> Vec<IngestSource> {
             enabled: true,
             glob: "~/.omp/agent/sessions/**/*.jsonl".to_string(),
             watch_root: "~/.omp/agent/sessions".to_string(),
-            format: String::new(),
+            format: SourceFormat::Infer,
         },
     ]);
     sources
@@ -660,6 +747,7 @@ pub const SOURCE_FORMAT_JSONL: &str = "jsonl";
 pub const SOURCE_FORMAT_SESSION_JSON: &str = "session_json";
 pub const SOURCE_FORMAT_KIRO_SESSION: &str = "kiro_session";
 pub const SOURCE_FORMAT_CURSOR_SQLITE: &str = "cursor_sqlite";
+pub const SOURCE_FORMAT_NAC_SQLITE: &str = "nac_sqlite";
 pub const SOURCE_FORMAT_OPENCODE_SQLITE: &str = "opencode_sqlite";
 
 /// SQLite WAL sidecar suffixes that must map back to the canonical database
@@ -667,62 +755,87 @@ pub const SOURCE_FORMAT_OPENCODE_SQLITE: &str = "opencode_sqlite";
 /// so dropping them would miss updates entirely (issue #361, decision 5).
 const SQLITE_SIDECAR_SUFFIXES: &[&str] = &["-wal", "-shm"];
 
-fn infer_source_format(harness: &str, glob: &str) -> &'static str {
+fn infer_source_format(harness: &str, glob: &str) -> SourceFormat {
     let glob_lower = glob.to_ascii_lowercase();
-    // Harness-gated like the hermes branch below: cursor_sqlite synthetic
-    // records only normalize through the cursor adapter, so inferring it for
-    // another harness would silently produce junk events.
     if harness == "cursor" && glob_lower.ends_with(".vscdb") {
-        return SOURCE_FORMAT_CURSOR_SQLITE;
+        return SourceFormat::CursorSqlite;
+    }
+    if harness == "nac"
+        && Path::new(&glob_lower)
+            .file_name()
+            .and_then(|name| name.to_str())
+            == Some("store.db")
+    {
+        return SourceFormat::NacSqlite;
     }
     if harness == "opencode" && opencode_db_name_matches(Path::new(&glob_lower)) {
-        return SOURCE_FORMAT_OPENCODE_SQLITE;
+        return SourceFormat::OpenCodeSqlite;
     }
     if harness == "kiro-cli" {
-        return SOURCE_FORMAT_KIRO_SESSION;
+        return SourceFormat::KiroSession;
     }
     let looks_like_json = !glob_lower.ends_with(".jsonl")
         && (glob_lower.ends_with(".json") || glob_lower.contains(".json"));
     if harness == "hermes" && looks_like_json {
-        SOURCE_FORMAT_SESSION_JSON
+        SourceFormat::SessionJson
     } else {
-        SOURCE_FORMAT_JSONL
+        SourceFormat::Jsonl
     }
 }
 
 fn normalize_source_format(
-    format: &str,
+    format: SourceFormat,
     harness: &str,
     glob: &str,
     source_idx: usize,
     source_name: &str,
-) -> Result<String> {
-    let trimmed = format.trim().to_ascii_lowercase();
-    let resolved = if trimmed.is_empty() {
-        infer_source_format(harness, glob).to_string()
+) -> Result<SourceFormat> {
+    let resolved = if format == SourceFormat::Infer {
+        infer_source_format(harness, glob)
     } else {
-        trimmed
+        format
     };
-    match resolved.as_str() {
-        SOURCE_FORMAT_CURSOR_SQLITE if harness != "cursor" => Err(anyhow::anyhow!(
-            "ingest.sources[{source_idx}].format `{SOURCE_FORMAT_CURSOR_SQLITE}` requires harness `cursor` (source `{source_name}` has harness `{harness}`); its synthetic records only normalize through the cursor adapter"
-        )),
-        SOURCE_FORMAT_OPENCODE_SQLITE if harness != "opencode" => Err(anyhow::anyhow!(
-            "ingest.sources[{source_idx}].format `{SOURCE_FORMAT_OPENCODE_SQLITE}` requires harness `opencode` (source `{source_name}` has harness `{harness}`); its synthetic records only normalize through the opencode adapter"
-        )),
-        SOURCE_FORMAT_KIRO_SESSION if harness != "kiro-cli" => Err(anyhow::anyhow!(
-            "ingest.sources[{source_idx}].format `{SOURCE_FORMAT_KIRO_SESSION}` requires harness `kiro-cli` (source `{source_name}` has harness `{harness}`); its metadata sidecars only normalize through the Kiro CLI adapter"
-        )),
-        SOURCE_FORMAT_JSONL
-        | SOURCE_FORMAT_SESSION_JSON
-        | SOURCE_FORMAT_KIRO_SESSION
-        | SOURCE_FORMAT_CURSOR_SQLITE
-        | SOURCE_FORMAT_OPENCODE_SQLITE => Ok(resolved),
-        _ => Err(anyhow::anyhow!(
-            "invalid ingest.sources[{source_idx}].format `{}` for source `{}`; expected one of: {SOURCE_FORMAT_JSONL}, {SOURCE_FORMAT_SESSION_JSON}, {SOURCE_FORMAT_KIRO_SESSION}, {SOURCE_FORMAT_CURSOR_SQLITE}, {SOURCE_FORMAT_OPENCODE_SQLITE}",
-            format.trim(),
-            source_name
-        )),
+    match resolved {
+        SourceFormat::Infer => {
+            unreachable!("source format inference must resolve to a concrete format")
+        }
+        SourceFormat::Jsonl | SourceFormat::SessionJson => Ok(resolved),
+        SourceFormat::KiroSession => {
+            if harness == "kiro-cli" {
+                Ok(resolved)
+            } else {
+                Err(anyhow::anyhow!(
+                    "ingest.sources[{source_idx}].format `{SOURCE_FORMAT_KIRO_SESSION}` requires harness `kiro-cli` (source `{source_name}` has harness `{harness}`); its metadata sidecars only normalize through the Kiro CLI adapter"
+                ))
+            }
+        }
+        SourceFormat::CursorSqlite => {
+            if harness == "cursor" {
+                Ok(resolved)
+            } else {
+                Err(anyhow::anyhow!(
+                    "ingest.sources[{source_idx}].format `{SOURCE_FORMAT_CURSOR_SQLITE}` requires harness `cursor` (source `{source_name}` has harness `{harness}`); its synthetic records only normalize through the cursor adapter"
+                ))
+            }
+        }
+        SourceFormat::NacSqlite => {
+            if harness == "nac" {
+                Ok(resolved)
+            } else {
+                Err(anyhow::anyhow!(
+                    "ingest.sources[{source_idx}].format `{SOURCE_FORMAT_NAC_SQLITE}` requires harness `nac` (source `{source_name}` has harness `{harness}`); its synthetic records only normalize through the nac adapter"
+                ))
+            }
+        }
+        SourceFormat::OpenCodeSqlite => {
+            if harness == "opencode" {
+                Ok(resolved)
+            } else {
+                Err(anyhow::anyhow!(
+                    "ingest.sources[{source_idx}].format `{SOURCE_FORMAT_OPENCODE_SQLITE}` requires harness `opencode` (source `{source_name}` has harness `{harness}`); its synthetic records only normalize through the opencode adapter"
+                ))
+            }
+        }
     }
 }
 
@@ -730,16 +843,19 @@ impl IngestSource {
     /// Returns the file extension (without leading `.`) this source's format
     /// records are stored in: `jsonl`, `json`, `vscdb`, or `db`.
     pub fn tracked_extension(&self) -> &'static str {
-        format_tracked_extension(&self.format)
+        format_tracked_extension(self.format)
+            .expect("source format must be normalized before selecting a tracked extension")
     }
 }
 
-fn format_tracked_extension(format: &str) -> &'static str {
+fn format_tracked_extension(format: SourceFormat) -> Option<&'static str> {
     match format {
-        SOURCE_FORMAT_SESSION_JSON => "json",
-        SOURCE_FORMAT_CURSOR_SQLITE => "vscdb",
-        SOURCE_FORMAT_OPENCODE_SQLITE => "db",
-        _ => "jsonl",
+        SourceFormat::Infer => None,
+        SourceFormat::Jsonl => Some("jsonl"),
+        SourceFormat::SessionJson => Some("json"),
+        SourceFormat::KiroSession => Some("jsonl"),
+        SourceFormat::CursorSqlite => Some("vscdb"),
+        SourceFormat::NacSqlite | SourceFormat::OpenCodeSqlite => Some("db"),
     }
 }
 
@@ -760,63 +876,90 @@ fn opencode_db_name_matches(path: &Path) -> bool {
 /// tracked path for `format`, or `None` when the path is not tracked.
 ///
 /// For file-backed formats this is an extension filter that returns the path
-/// unchanged. For SQLite-backed formats the canonical path is the base
-/// database file: `state.vscdb` maps to itself, while the `state.vscdb-wal` /
-/// `state.vscdb-shm` sidecars map back to `state.vscdb` so WAL-only writes
-/// still enqueue (and debounce-coalesce on) the database they belong to.
+/// unchanged. SQLite sidecars map back to their base database. NAC is stricter:
+/// its configured glob must equal `glob::Pattern::escape(candidate)`, so only
+/// the literal configured database and its exact WAL/SHM sidecars are accepted.
 /// Anything else — including `state.vscdb.backup` — is untracked.
-pub fn map_tracked_path(format: &str, path: &str) -> Option<String> {
-    if format == SOURCE_FORMAT_KIRO_SESSION {
-        return match Path::new(path).extension().and_then(|ext| ext.to_str()) {
-            Some("jsonl") => Some(path.to_string()),
-            Some("json") => Some(
-                Path::new(path)
-                    .with_extension("jsonl")
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-            _ => None,
-        };
-    }
-
-    let extension = format_tracked_extension(format);
-    let has_extension = |candidate: &str| {
+pub fn map_tracked_path(format: impl AsRef<str>, source_glob: &str, path: &str) -> Option<String> {
+    let format = SourceFormat::parse(format.as_ref())?;
+    let has_extension = |candidate: &str, extension: &str| {
         Path::new(candidate)
             .extension()
             .and_then(|s| s.to_str())
             .map(|ext| ext == extension)
             .unwrap_or(false)
     };
-
-    if format == SOURCE_FORMAT_OPENCODE_SQLITE {
-        if opencode_db_name_matches(Path::new(path)) {
+    let map_extension_or_sidecar = |extension: &str| {
+        if has_extension(path, extension) {
             return Some(path.to_string());
         }
         for suffix in SQLITE_SIDECAR_SUFFIXES {
             if let Some(base) = path.strip_suffix(suffix) {
-                if opencode_db_name_matches(Path::new(base)) {
+                if has_extension(base, extension) {
                     return Some(base.to_string());
                 }
             }
         }
-        return None;
-    }
+        None
+    };
 
-    if has_extension(path) {
-        return Some(path.to_string());
-    }
-
-    if format == SOURCE_FORMAT_CURSOR_SQLITE {
-        for suffix in SQLITE_SIDECAR_SUFFIXES {
-            if let Some(base) = path.strip_suffix(suffix) {
-                if has_extension(base) {
-                    return Some(base.to_string());
-                }
+    match format {
+        SourceFormat::Infer => None,
+        SourceFormat::Jsonl | SourceFormat::SessionJson => {
+            let extension = format_tracked_extension(format)
+                .expect("concrete file format must have a tracked extension");
+            has_extension(path, extension).then(|| path.to_string())
+        }
+        SourceFormat::KiroSession => {
+            match Path::new(path).extension().and_then(|ext| ext.to_str()) {
+                Some("jsonl") => Some(path.to_string()),
+                Some("json") => Some(
+                    Path::new(path)
+                        .with_extension("jsonl")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                _ => None,
             }
         }
+        SourceFormat::CursorSqlite => map_extension_or_sidecar(
+            format_tracked_extension(format)
+                .expect("concrete SQLite format must have a tracked extension"),
+        ),
+        SourceFormat::NacSqlite => {
+            let matches_configured =
+                |candidate: &str| escape_literal_glob(candidate) == source_glob;
+            if matches_configured(path) {
+                return Some(path.to_string());
+            }
+            for suffix in SQLITE_SIDECAR_SUFFIXES {
+                if let Some(base) = path.strip_suffix(suffix) {
+                    if matches_configured(base) {
+                        return Some(base.to_string());
+                    }
+                }
+            }
+            None
+        }
+        SourceFormat::OpenCodeSqlite => {
+            if opencode_db_name_matches(Path::new(path)) {
+                return Some(path.to_string());
+            }
+            for suffix in SQLITE_SIDECAR_SUFFIXES {
+                if let Some(base) = path.strip_suffix(suffix) {
+                    if opencode_db_name_matches(Path::new(base)) {
+                        return Some(base.to_string());
+                    }
+                }
+            }
+            None
+        }
     }
+}
 
-    None
+/// Escapes a literal filesystem path for storage in a glob field.
+pub fn escape_literal_glob(path: &str) -> String {
+    glob::Pattern::escape(path)
 }
 
 /// True for Claude Code `Workflow` orchestration journals, which share the
@@ -1240,11 +1383,7 @@ fn migrate_legacy_claude_source(sources: &mut Vec<IngestSource>) {
                 && source.harness.trim() == "claude-code"
                 && source.glob.trim() == "~/.claude/projects/**/*.jsonl"
                 && source.watch_root.trim() == "~/.claude/projects"
-                && (source.format.trim().is_empty()
-                    || source
-                        .format
-                        .trim()
-                        .eq_ignore_ascii_case(SOURCE_FORMAT_JSONL))
+                && matches!(source.format, SourceFormat::Infer | SourceFormat::Jsonl)
         })
         .map(|source| source.enabled)
     else {
@@ -1258,7 +1397,7 @@ fn migrate_legacy_claude_source(sources: &mut Vec<IngestSource>) {
         glob: "~/Library/Application Support/Claude/local-agent-mode-sessions/**/.claude/projects/**/*.jsonl".to_string(),
         watch_root:
             "~/Library/Application Support/Claude/local-agent-mode-sessions".to_string(),
-        format: String::new(),
+        format: SourceFormat::Infer,
     });
 }
 
@@ -1274,11 +1413,7 @@ fn migrate_legacy_pi_source(sources: &mut Vec<IngestSource>) {
                 && source.harness.trim() == "pi-coding-agent"
                 && source.glob.trim() == "~/.pi/agent/sessions/**/*.jsonl"
                 && source.watch_root.trim() == "~/.pi/agent/sessions"
-                && (source.format.trim().is_empty()
-                    || source
-                        .format
-                        .trim()
-                        .eq_ignore_ascii_case(SOURCE_FORMAT_JSONL))
+                && matches!(source.format, SourceFormat::Infer | SourceFormat::Jsonl)
         })
         .map(|source| source.enabled)
     else {
@@ -1297,7 +1432,7 @@ fn migrate_legacy_pi_source(sources: &mut Vec<IngestSource>) {
         enabled,
         glob: "~/.omp/agent/sessions/**/*.jsonl".to_string(),
         watch_root: "~/.omp/agent/sessions".to_string(),
-        format: String::new(),
+        format: SourceFormat::Infer,
     });
 }
 
@@ -1353,7 +1488,7 @@ fn normalize_config(mut cfg: AppConfig) -> Result<AppConfig> {
             expand_ingest_source_path(source, &source.watch_root, kiro_home.as_deref())
         };
         source.format = normalize_source_format(
-            &source.format,
+            source.format,
             &source.harness,
             &source.glob,
             source_idx,
@@ -2800,7 +2935,7 @@ watch_root = "~/.custom/sessions"
         std::fs::remove_file(&path).ok();
         assert!(
             format!("{err:#}").contains(
-                "expected one of: codex, claude-code, cursor, hermes, kiro-cli, kimi-cli, opencode, pi-coding-agent"
+                "expected one of: codex, claude-code, cursor, hermes, kiro-cli, kimi-cli, nac, opencode, pi-coding-agent, qwen-code"
             ),
             "unexpected error: {err:#}"
         );
@@ -2823,7 +2958,7 @@ watch_root = "~/.claude/projects"
         std::fs::remove_file(&path).ok();
         assert!(
             format!("{err:#}").contains(
-                "expected one of: codex, claude-code, cursor, hermes, kiro-cli, kimi-cli, opencode, pi-coding-agent"
+                "expected one of: codex, claude-code, cursor, hermes, kiro-cli, kimi-cli, nac, opencode, pi-coding-agent, qwen-code"
             ),
             "unexpected error: {err:#}"
         );
@@ -2983,7 +3118,7 @@ watch_root = "~/.kimi/sessions"
             .iter()
             .find(|source| source.harness == "kimi-cli")
             .expect("kimi-cli source");
-        assert_eq!(source.format, SOURCE_FORMAT_JSONL);
+        assert_eq!(source.format, SourceFormat::Jsonl);
         assert_eq!(source.tracked_extension(), "jsonl");
     }
 
@@ -3008,7 +3143,7 @@ watch_root = "~/.cursor/projects"
             .iter()
             .find(|source| source.harness == "cursor")
             .expect("cursor source");
-        assert_eq!(source.format, SOURCE_FORMAT_JSONL);
+        assert_eq!(source.format, SourceFormat::Jsonl);
         assert_eq!(source.tracked_extension(), "jsonl");
     }
 
@@ -3027,7 +3162,7 @@ watch_root = "~/.cursor/projects"
             .find(|source| source.name == "cursor-sqlite")
             .expect("template ships a cursor-sqlite source");
         assert!(source.enabled, "cursor_sqlite is default on");
-        assert_eq!(source.format, SOURCE_FORMAT_CURSOR_SQLITE);
+        assert_eq!(source.format, SourceFormat::CursorSqlite);
         assert_eq!(source.harness, "cursor");
     }
 
@@ -3164,7 +3299,7 @@ watch_root = "~/.cursor/projects"
         for source in [pi, omp] {
             assert!(source.enabled);
             assert_eq!(source.harness, "pi-coding-agent");
-            assert_eq!(source.format, SOURCE_FORMAT_JSONL);
+            assert_eq!(source.format, SourceFormat::Jsonl);
         }
         assert!(pi.glob.ends_with("/.pi/agent/sessions/**/*.jsonl"));
         assert!(pi.watch_root.ends_with("/.pi/agent/sessions"));
@@ -3202,7 +3337,7 @@ watch_root = "~/.cursor/projects"
             .find(|source| source.name == "cursor-sqlite")
             .expect("defaults include a cursor-sqlite source");
         assert!(source.enabled, "cursor_sqlite is default on");
-        assert_eq!(source.format, SOURCE_FORMAT_CURSOR_SQLITE);
+        assert_eq!(source.format, SourceFormat::CursorSqlite);
         assert!(source.glob.ends_with("/**/state.vscdb"));
     }
 
@@ -3221,7 +3356,7 @@ watch_root = "~/.cursor/projects"
         for source in [pi, omp] {
             assert!(source.enabled);
             assert_eq!(source.harness, "pi-coding-agent");
-            assert!(source.format.is_empty());
+            assert_eq!(source.format, SourceFormat::Infer);
         }
         assert_eq!(pi.glob, "~/.pi/agent/sessions/**/*.jsonl");
         assert_eq!(pi.watch_root, "~/.pi/agent/sessions");
@@ -3267,7 +3402,7 @@ format = "jsonl"
             .expect("legacy default Pi config should gain OMP");
         assert!(omp.enabled);
         assert_eq!(omp.harness, "pi-coding-agent");
-        assert_eq!(omp.format, SOURCE_FORMAT_JSONL);
+        assert_eq!(omp.format, SourceFormat::Jsonl);
         assert!(omp.glob.ends_with("/.omp/agent/sessions/**/*.jsonl"));
 
         let custom_path = write_temp_config(
@@ -3303,7 +3438,7 @@ format = "jsonl"
             .expect("defaults include an opencode source");
         assert!(source.enabled, "opencode_sqlite is default on");
         assert_eq!(source.harness, "opencode");
-        assert_eq!(source.format, SOURCE_FORMAT_OPENCODE_SQLITE);
+        assert_eq!(source.format, SourceFormat::OpenCodeSqlite);
         assert_eq!(source.glob, "~/.local/share/opencode/opencode*.db");
     }
 
@@ -3368,7 +3503,7 @@ format = "cursor_sqlite"
             .iter()
             .find(|source| source.name == "cursor-sqlite")
             .expect("cursor-sqlite source");
-        assert_eq!(source.format, SOURCE_FORMAT_CURSOR_SQLITE);
+        assert_eq!(source.format, SourceFormat::CursorSqlite);
         assert_eq!(source.tracked_extension(), "vscdb");
         assert!(!source.enabled);
     }
@@ -3395,7 +3530,7 @@ format = "opencode_sqlite"
             .iter()
             .find(|source| source.name == "opencode")
             .expect("opencode source");
-        assert_eq!(source.format, SOURCE_FORMAT_OPENCODE_SQLITE);
+        assert_eq!(source.format, SourceFormat::OpenCodeSqlite);
         assert_eq!(source.tracked_extension(), "db");
         assert!(!source.enabled);
     }
@@ -3416,79 +3551,132 @@ format = "sqlite"
         );
         let err = load_config(&path).expect_err("unknown format should fail");
         std::fs::remove_file(&path).ok();
-        assert!(
-            format!("{err:#}")
-                .contains("expected one of: jsonl, session_json, kiro_session, cursor_sqlite, opencode_sqlite"),
-            "unexpected error: {err:#}"
+        let message = format!("{err:#}");
+        for expected in [
+            "jsonl",
+            "session_json",
+            "kiro_session",
+            "cursor_sqlite",
+            "nac_sqlite",
+            "opencode_sqlite",
+        ] {
+            assert!(message.contains(expected), "unexpected error: {message}");
+        }
+    }
+
+    #[test]
+    fn format_path_capabilities_reject_unresolved_and_unknown_formats() {
+        assert_eq!(format_tracked_extension(SourceFormat::Infer), None);
+        assert_eq!(
+            map_tracked_path(SourceFormat::Infer, "", "/tmp/a.jsonl"),
+            None
         );
+        assert_eq!(map_tracked_path("future_format", "", "/tmp/a.jsonl"), None);
+
+        for (format, extension) in [
+            (SourceFormat::Jsonl, "jsonl"),
+            (SourceFormat::SessionJson, "json"),
+            (SourceFormat::KiroSession, "jsonl"),
+            (SourceFormat::CursorSqlite, "vscdb"),
+            (SourceFormat::NacSqlite, "db"),
+            (SourceFormat::OpenCodeSqlite, "db"),
+        ] {
+            assert_eq!(format_tracked_extension(format), Some(extension));
+        }
     }
 
     #[test]
     fn map_tracked_path_filters_by_extension_for_file_formats() {
         assert_eq!(
-            map_tracked_path(SOURCE_FORMAT_JSONL, "/tmp/a.jsonl"),
+            map_tracked_path(SOURCE_FORMAT_JSONL, "", "/tmp/a.jsonl"),
             Some("/tmp/a.jsonl".to_string())
         );
-        assert_eq!(map_tracked_path(SOURCE_FORMAT_JSONL, "/tmp/a.json"), None);
         assert_eq!(
-            map_tracked_path(SOURCE_FORMAT_SESSION_JSON, "/tmp/session_a.json"),
-            Some("/tmp/session_a.json".to_string())
-        );
-        assert_eq!(
-            map_tracked_path(SOURCE_FORMAT_SESSION_JSON, "/tmp/a.jsonl"),
+            map_tracked_path(SOURCE_FORMAT_JSONL, "", "/tmp/a.json"),
             None
         );
         assert_eq!(
-            map_tracked_path(SOURCE_FORMAT_KIRO_SESSION, "/tmp/session.jsonl"),
+            map_tracked_path(SOURCE_FORMAT_SESSION_JSON, "", "/tmp/session_a.json"),
+            Some("/tmp/session_a.json".to_string())
+        );
+        assert_eq!(
+            map_tracked_path(SOURCE_FORMAT_SESSION_JSON, "", "/tmp/a.jsonl"),
+            None
+        );
+        assert_eq!(
+            map_tracked_path(SOURCE_FORMAT_KIRO_SESSION, "", "/tmp/session.jsonl"),
             Some("/tmp/session.jsonl".to_string())
         );
         assert_eq!(
-            map_tracked_path(SOURCE_FORMAT_KIRO_SESSION, "/tmp/session.json"),
+            map_tracked_path(SOURCE_FORMAT_KIRO_SESSION, "", "/tmp/session.json"),
             Some("/tmp/session.jsonl".to_string())
         );
         assert_eq!(
-            map_tracked_path(SOURCE_FORMAT_KIRO_SESSION, "/tmp/session.txt"),
+            map_tracked_path(SOURCE_FORMAT_KIRO_SESSION, "", "/tmp/session.txt"),
             None
         );
     }
 
     #[test]
     fn map_tracked_path_maps_sqlite_sidecars_to_canonical_db() {
-        let base = "/tmp/User/globalStorage/state.vscdb";
+        let cursor = "/tmp/User/globalStorage/state.vscdb";
         assert_eq!(
-            map_tracked_path(SOURCE_FORMAT_CURSOR_SQLITE, base),
-            Some(base.to_string())
+            map_tracked_path(SOURCE_FORMAT_CURSOR_SQLITE, "", cursor),
+            Some(cursor.to_string())
         );
         assert_eq!(
-            map_tracked_path(SOURCE_FORMAT_CURSOR_SQLITE, "/tmp/User/state.vscdb-wal"),
+            map_tracked_path(SOURCE_FORMAT_CURSOR_SQLITE, "", "/tmp/User/state.vscdb-wal"),
             Some("/tmp/User/state.vscdb".to_string())
         );
         assert_eq!(
-            map_tracked_path(SOURCE_FORMAT_CURSOR_SQLITE, "/tmp/User/state.vscdb-shm"),
+            map_tracked_path(SOURCE_FORMAT_CURSOR_SQLITE, "", "/tmp/User/state.vscdb-shm"),
             Some("/tmp/User/state.vscdb".to_string())
         );
-        // Backups and unrelated files must stay untracked.
         assert_eq!(
-            map_tracked_path(SOURCE_FORMAT_CURSOR_SQLITE, "/tmp/User/state.vscdb.backup"),
+            map_tracked_path(
+                SOURCE_FORMAT_CURSOR_SQLITE,
+                "",
+                "/tmp/User/state.vscdb.backup"
+            ),
             None
         );
         assert_eq!(
-            map_tracked_path(SOURCE_FORMAT_CURSOR_SQLITE, "/tmp/User/state.db-wal"),
+            map_tracked_path(SOURCE_FORMAT_CURSOR_SQLITE, "", "/tmp/User/state.db-wal"),
             None
         );
         assert_eq!(
-            map_tracked_path(SOURCE_FORMAT_CURSOR_SQLITE, "/tmp/User/notes.jsonl"),
+            map_tracked_path(SOURCE_FORMAT_CURSOR_SQLITE, "", "/tmp/User/notes.jsonl"),
+            None
+        );
+
+        let nac = "/tmp/nac/[workspace]*/store?.db";
+        let nac_glob = glob::Pattern::escape(nac);
+        assert_eq!(
+            map_tracked_path(SOURCE_FORMAT_NAC_SQLITE, &nac_glob, nac),
+            Some(nac.to_string())
+        );
+        assert_eq!(
+            map_tracked_path(SOURCE_FORMAT_NAC_SQLITE, &nac_glob, &format!("{nac}-wal")),
+            Some(nac.to_string())
+        );
+        assert_eq!(
+            map_tracked_path(
+                SOURCE_FORMAT_NAC_SQLITE,
+                &nac_glob,
+                "/tmp/nac/other/store.db"
+            ),
             None
         );
 
         let opencode = "/tmp/opencode/opencode.db";
         assert_eq!(
-            map_tracked_path(SOURCE_FORMAT_OPENCODE_SQLITE, opencode),
+            map_tracked_path(SOURCE_FORMAT_OPENCODE_SQLITE, "", opencode),
             Some(opencode.to_string())
         );
         assert_eq!(
             map_tracked_path(
                 SOURCE_FORMAT_OPENCODE_SQLITE,
+                "",
                 "/tmp/opencode/opencode-local.db"
             ),
             Some("/tmp/opencode/opencode-local.db".to_string())
@@ -3496,6 +3684,7 @@ format = "sqlite"
         assert_eq!(
             map_tracked_path(
                 SOURCE_FORMAT_OPENCODE_SQLITE,
+                "",
                 "/tmp/opencode/opencode.db-wal"
             ),
             Some("/tmp/opencode/opencode.db".to_string())
@@ -3503,17 +3692,23 @@ format = "sqlite"
         assert_eq!(
             map_tracked_path(
                 SOURCE_FORMAT_OPENCODE_SQLITE,
+                "",
                 "/tmp/opencode/opencode.db-shm"
             ),
             Some("/tmp/opencode/opencode.db".to_string())
         );
         assert_eq!(
-            map_tracked_path(SOURCE_FORMAT_OPENCODE_SQLITE, "/tmp/opencode/unrelated.db"),
+            map_tracked_path(
+                SOURCE_FORMAT_OPENCODE_SQLITE,
+                "",
+                "/tmp/opencode/unrelated.db"
+            ),
             None
         );
         assert_eq!(
             map_tracked_path(
                 SOURCE_FORMAT_OPENCODE_SQLITE,
+                "",
                 "/tmp/opencode/unrelated.db-wal"
             ),
             None
@@ -4029,7 +4224,7 @@ watch_root = "~/.pi/agent/sessions"
             .iter()
             .find(|source| source.harness == "pi-coding-agent")
             .expect("pi source");
-        assert_eq!(source.format, SOURCE_FORMAT_JSONL);
+        assert_eq!(source.format, SourceFormat::Jsonl);
         assert_eq!(source.tracked_extension(), "jsonl");
     }
 }

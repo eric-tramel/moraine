@@ -3,14 +3,11 @@ use crate::model::{Checkpoint, NormalizedRecord, RowBatch};
 use crate::normalize::{normalize_record, normalize_record_with_ts_hint};
 use crate::sources::claude_code::cowork_session_path;
 use crate::sources::kiro_cli::{load_kiro_session_metadata, KiroSessionMetadata};
-use crate::sources::shared::{format_record_ts, parse_record_ts};
+use crate::sources::shared::{format_record_ts, infer_vendor_from_base_url, parse_record_ts};
 use crate::sqlite_poll::VolatilePollMap;
 use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
 use anyhow::{Context, Result};
-use moraine_config::{
-    is_workflow_journal_path, map_tracked_path, AppConfig, SOURCE_FORMAT_CURSOR_SQLITE,
-    SOURCE_FORMAT_KIRO_SESSION, SOURCE_FORMAT_OPENCODE_SQLITE, SOURCE_FORMAT_SESSION_JSON,
-};
+use moraine_config::{is_workflow_journal_path, map_tracked_path, AppConfig, SourceFormat};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -36,7 +33,7 @@ use std::time::UNIX_EPOCH;
 /// the checkpoint key and `event_uid` derivation stay stable across saves.
 const SESSION_JSON_INODE: u64 = 0;
 const SESSION_JSON_GENERATION: u32 = 1;
-const CLICKHOUSE_JSON_OBJECT_BYTE_LIMIT: usize = 10 * 1024 * 1024;
+pub(crate) const CLICKHOUSE_JSON_OBJECT_BYTE_LIMIT: usize = 10 * 1024 * 1024;
 /// Keep per-line JSONL rows below ClickHouse's hard JSONEachRow object limit
 /// after Moraine wraps the source record into raw/event rows. The default
 /// ingest batch byte budget is 8 MiB; capping source lines there leaves room
@@ -71,7 +68,8 @@ fn encode_kiro_checkpoint_cursor(cursor: &KiroCheckpointCursor) -> String {
 /// tracked path for its format (sidecar paths are canonicalized at the
 /// watcher; anything else here is a stray event for an untracked file).
 fn work_path_is_canonical(work: &WorkItem) -> bool {
-    map_tracked_path(&work.format, &work.path).as_deref() == Some(work.path.as_str())
+    map_tracked_path(work.format, &work.source_glob, &work.path).as_deref()
+        == Some(work.path.as_str())
 }
 
 /// The single gate before a path becomes ingest work: every entry point
@@ -201,28 +199,6 @@ fn load_cowork_companion_record(work: &WorkItem) -> Option<CoworkCompanionRecord
     })
 }
 
-/// Best-effort mapping from a Hermes session `base_url` to an inference
-/// provider vendor. The session file only carries the bare model name (e.g.
-/// `claude-opus-4-6`), so we pre-prepend the vendor here to match the
-/// `vendor/model` convention the Hermes normalizer expects and downstream
-/// `inference_provider` queries need.
-fn infer_vendor_from_base_url(base_url: &str) -> &'static str {
-    let lower = base_url.to_ascii_lowercase();
-    if lower.contains("anthropic.com") {
-        "anthropic"
-    } else if lower.contains("openai.com") || lower.contains("openai.azure.com") {
-        "openai"
-    } else if lower.contains("openrouter") {
-        "openrouter"
-    } else if lower.contains("bedrock") {
-        "bedrock"
-    } else if lower.contains("googleapis") || lower.contains("google.com") {
-        "google"
-    } else {
-        ""
-    }
-}
-
 fn compose_hermes_model(model: &str, base_url: &str) -> String {
     let trimmed = model.trim();
     if trimmed.is_empty() {
@@ -278,9 +254,9 @@ fn oversized_source_line_error_row(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SerializedRowSize {
-    table: &'static str,
-    bytes: usize,
+pub(crate) struct SerializedRowSize {
+    pub(crate) table: &'static str,
+    pub(crate) bytes: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -325,7 +301,9 @@ fn serialized_json_object_bytes(row: &Value) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-fn largest_serialized_normalized_row(normalized: &NormalizedRecord) -> Option<SerializedRowSize> {
+pub(crate) fn largest_serialized_normalized_row(
+    normalized: &NormalizedRecord,
+) -> Option<SerializedRowSize> {
     let mut largest: Option<SerializedRowSize> = None;
 
     let mut observe = |table: &'static str, row: &Value| {
@@ -893,30 +871,50 @@ pub(crate) async fn process_file(
     sink_tx: mpsc::Sender<SinkMessage>,
     metrics: &Arc<Metrics>,
 ) -> Result<()> {
-    if work.format == SOURCE_FORMAT_SESSION_JSON {
-        return process_session_json_file(config, work, checkpoints, sink_tx, metrics).await;
-    }
-    if work.format == SOURCE_FORMAT_CURSOR_SQLITE {
-        return crate::sqlite_poll::process_cursor_sqlite_db(
-            config,
-            work,
-            checkpoints,
-            poll_state,
-            sink_tx,
-            metrics,
-        )
-        .await;
-    }
-    if work.format == SOURCE_FORMAT_OPENCODE_SQLITE {
-        return crate::sqlite_poll::process_opencode_sqlite_db(
-            config,
-            work,
-            checkpoints,
-            poll_state,
-            sink_tx,
-            metrics,
-        )
-        .await;
+    match work.format {
+        SourceFormat::Infer => {
+            anyhow::bail!(
+                "source format must be normalized before ingest processor dispatch for {}",
+                work.source_name
+            );
+        }
+        SourceFormat::Jsonl | SourceFormat::KiroSession => {}
+        SourceFormat::SessionJson => {
+            return process_session_json_file(config, work, checkpoints, sink_tx, metrics).await;
+        }
+        SourceFormat::CursorSqlite => {
+            return crate::sqlite_poll::process_cursor_sqlite_db(
+                config,
+                work,
+                checkpoints,
+                poll_state,
+                sink_tx,
+                metrics,
+            )
+            .await;
+        }
+        SourceFormat::NacSqlite => {
+            return crate::sqlite_poll::process_nac_sqlite_db(
+                config,
+                work,
+                checkpoints,
+                poll_state,
+                sink_tx,
+                metrics,
+            )
+            .await;
+        }
+        SourceFormat::OpenCodeSqlite => {
+            return crate::sqlite_poll::process_opencode_sqlite_db(
+                config,
+                work,
+                checkpoints,
+                poll_state,
+                sink_tx,
+                metrics,
+            )
+            .await;
+        }
     }
 
     let source_file = &work.path;
@@ -957,7 +955,7 @@ pub(crate) async fn process_file(
         generation_changed = true;
     }
 
-    let kiro_metadata = if work.format == SOURCE_FORMAT_KIRO_SESSION {
+    let kiro_metadata = if work.format == SourceFormat::KiroSession {
         Some(load_kiro_session_metadata(source_file))
     } else {
         None
@@ -1006,7 +1004,7 @@ pub(crate) async fn process_file(
         } else {
             sidecar_cwd.to_string()
         };
-        if work.format == SOURCE_FORMAT_KIRO_SESSION && !std::path::Path::new(&cwd).is_absolute() {
+        if work.format == SourceFormat::KiroSession && !std::path::Path::new(&cwd).is_absolute() {
             debug!(
                 source_name = %work.source_name,
                 harness = %work.harness,
@@ -1066,7 +1064,7 @@ pub(crate) async fn process_file(
     let persisted_kiro_record_ts = (!kiro_cursor.record_ts_hint.is_empty()
         && parse_record_ts(&kiro_cursor.record_ts_hint).is_some())
     .then(|| kiro_cursor.record_ts_hint.clone());
-    let mut record_ts_hint = if work.format == SOURCE_FORMAT_KIRO_SESSION {
+    let mut record_ts_hint = if work.format == SourceFormat::KiroSession {
         if checkpoint.last_offset > 0 {
             persisted_kiro_record_ts
                 .or_else(|| {
@@ -1803,15 +1801,15 @@ fn truncate(input: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         complete_work, compose_hermes_model, enqueue_work, enrich_claude_model_latency,
-        infer_vendor_from_base_url, jsonl_source_line_byte_limit, process_file,
-        process_session_json_file, run_work_item, source_inode_for_file, work_item_is_ingestable,
-        work_path_is_canonical, SessionCursor, CLICKHOUSE_JSON_OBJECT_BYTE_LIMIT,
-        ERROR_KIND_NORMALIZED_ROW_TOO_LARGE, ERROR_KIND_SOURCE_LINE_TOO_LARGE,
-        SESSION_JSON_GENERATION, SESSION_JSON_INODE,
+        jsonl_source_line_byte_limit, process_file, process_session_json_file, run_work_item,
+        source_inode_for_file, work_item_is_ingestable, work_path_is_canonical, SessionCursor,
+        CLICKHOUSE_JSON_OBJECT_BYTE_LIMIT, ERROR_KIND_NORMALIZED_ROW_TOO_LARGE,
+        ERROR_KIND_SOURCE_LINE_TOO_LARGE, SESSION_JSON_GENERATION, SESSION_JSON_INODE,
     };
     use crate::model::Checkpoint;
     use crate::sqlite_poll::VolatilePollMap;
     use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
+    use moraine_config::SourceFormat;
     use serde_json::{json, Value};
     use std::collections::HashMap;
     use std::fs;
@@ -1826,7 +1824,8 @@ mod tests {
         WorkItem {
             source_name: "test-source".to_string(),
             harness: "test-harness".to_string(),
-            format: "jsonl".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: String::new(),
             path: path.to_string(),
         }
     }
@@ -1953,7 +1952,8 @@ mod tests {
         let work = WorkItem {
             source_name: "test-source".to_string(),
             harness: "test-harness".to_string(),
-            format: "jsonl".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: String::new(),
             path: path.to_string_lossy().to_string(),
         };
         let key = work.key();
@@ -2020,7 +2020,8 @@ mod tests {
         let jsonl = WorkItem {
             source_name: "s".to_string(),
             harness: "hermes".to_string(),
-            format: "jsonl".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: String::new(),
             path: "/tmp/x.jsonl".to_string(),
         };
         assert!(work_path_is_canonical(&jsonl));
@@ -2028,7 +2029,8 @@ mod tests {
         let session = WorkItem {
             source_name: "s".to_string(),
             harness: "hermes".to_string(),
-            format: "session_json".to_string(),
+            format: SourceFormat::SessionJson,
+            source_glob: String::new(),
             path: "/tmp/session_x.json".to_string(),
         };
         assert!(work_path_is_canonical(&session));
@@ -2042,7 +2044,8 @@ mod tests {
         let sqlite = WorkItem {
             source_name: "s".to_string(),
             harness: "cursor".to_string(),
-            format: "cursor_sqlite".to_string(),
+            format: SourceFormat::CursorSqlite,
+            source_glob: String::new(),
             path: "/tmp/User/state.vscdb".to_string(),
         };
         assert!(work_path_is_canonical(&sqlite));
@@ -2055,12 +2058,44 @@ mod tests {
         assert!(!work_path_is_canonical(&sidecar));
     }
 
+    #[tokio::test]
+    async fn process_file_rejects_unresolved_infer_format() {
+        let config = moraine_config::AppConfig::default();
+        let work = WorkItem {
+            source_name: "unresolved".to_string(),
+            harness: "hermes".to_string(),
+            format: SourceFormat::Infer,
+            source_glob: String::new(),
+            path: "/tmp/unresolved.jsonl".to_string(),
+        };
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (sink_tx, _sink_rx) = mpsc::channel(1);
+
+        let error = process_file(
+            &config,
+            &work,
+            checkpoints,
+            &VolatilePollMap::new(),
+            sink_tx,
+            &metrics,
+        )
+        .await
+        .expect_err("Infer must not select an ingest processor");
+
+        assert!(
+            error.to_string().contains("must be normalized"),
+            "unexpected error: {error:#}"
+        );
+    }
+
     #[test]
     fn workflow_journals_are_not_ingestable_but_sessions_and_subagents_are() {
         let claude = |path: &str| WorkItem {
             source_name: "claude".to_string(),
             harness: "claude-code".to_string(),
-            format: "jsonl".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: String::new(),
             path: path.to_string(),
         };
         let proj = "/Users/x/.claude/projects/-Users-x-src-moraine";
@@ -2090,7 +2125,8 @@ mod tests {
         let codex_journal = WorkItem {
             source_name: "codex".to_string(),
             harness: "codex".to_string(),
-            format: "jsonl".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: String::new(),
             path: format!("{proj}/{sid}/subagents/workflows/wf_x/journal.jsonl"),
         };
         assert!(work_item_is_ingestable(&codex_journal));
@@ -2102,7 +2138,8 @@ mod tests {
         let cowork = |path: String| WorkItem {
             source_name: "claude-cowork".to_string(),
             harness: "claude-code".to_string(),
-            format: "jsonl".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: String::new(),
             path,
         };
         assert!(work_item_is_ingestable(&cowork(format!(
@@ -2132,7 +2169,8 @@ mod tests {
         let journal = WorkItem {
             source_name: "claude".to_string(),
             harness: "claude-code".to_string(),
-            format: "jsonl".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: String::new(),
             path: format!("{proj}/{sid}/subagents/workflows/wf_12dc2994-7e9/journal.jsonl"),
         };
 
@@ -2163,27 +2201,6 @@ mod tests {
             .expect("real session transcript must be forwarded");
         assert_eq!(forwarded.key(), session.key());
         assert_eq!(metrics.queue_depth.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn base_url_vendor_inference_covers_common_providers() {
-        assert_eq!(
-            infer_vendor_from_base_url("https://api.anthropic.com"),
-            "anthropic"
-        );
-        assert_eq!(
-            infer_vendor_from_base_url("https://api.openai.com/v1"),
-            "openai"
-        );
-        assert_eq!(
-            infer_vendor_from_base_url("https://openrouter.ai"),
-            "openrouter"
-        );
-        assert_eq!(infer_vendor_from_base_url(""), "");
-        assert_eq!(
-            infer_vendor_from_base_url("https://unknown.example.com"),
-            ""
-        );
     }
 
     #[test]
@@ -2735,7 +2752,8 @@ mod tests {
             let work = WorkItem {
                 source_name: "claude-cowork".to_string(),
                 harness: "claude-code".to_string(),
-                format: "jsonl".to_string(),
+                format: SourceFormat::Jsonl,
+                source_glob: String::new(),
                 path: path.to_string_lossy().to_string(),
             };
             process_file(
@@ -2917,7 +2935,8 @@ mod tests {
         let work = WorkItem {
             source_name: "codex".to_string(),
             harness: "codex".to_string(),
-            format: "jsonl".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: String::new(),
             path: path.to_string_lossy().to_string(),
         };
 
@@ -2977,7 +2996,8 @@ mod tests {
         let work = WorkItem {
             source_name: "codex".to_string(),
             harness: "codex".to_string(),
-            format: "jsonl".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: String::new(),
             path: path.to_string_lossy().to_string(),
         };
 
@@ -3031,7 +3051,8 @@ mod tests {
         let work = WorkItem {
             source_name: "codex".to_string(),
             harness: "codex".to_string(),
-            format: "jsonl".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: String::new(),
             path: source_file,
         };
 
@@ -3102,7 +3123,8 @@ mod tests {
         let work = WorkItem {
             source_name: "codex".to_string(),
             harness: "codex".to_string(),
-            format: "jsonl".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: String::new(),
             path: source_file.clone(),
         };
 
@@ -3197,7 +3219,8 @@ mod tests {
         let work = WorkItem {
             source_name: "omp".to_string(),
             harness: "pi-coding-agent".to_string(),
-            format: "jsonl".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: String::new(),
             path: source_file,
         };
         let config = moraine_config::AppConfig::default();
@@ -3281,7 +3304,8 @@ mod tests {
         let work = WorkItem {
             source_name: "claude".to_string(),
             harness: "claude-code".to_string(),
-            format: "jsonl".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: String::new(),
             path: source_file,
         };
 
@@ -3349,7 +3373,8 @@ mod tests {
         let work = WorkItem {
             source_name: "pi".to_string(),
             harness: "pi-coding-agent".to_string(),
-            format: "jsonl".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: String::new(),
             path: source_file,
         };
 
@@ -3438,7 +3463,8 @@ mod tests {
         let work = WorkItem {
             source_name: "codex".to_string(),
             harness: "codex".to_string(),
-            format: "jsonl".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: String::new(),
             path: source_file.clone(),
         };
 
@@ -3598,7 +3624,8 @@ mod tests {
         let work = WorkItem {
             source_name: "codex".to_string(),
             harness: "codex".to_string(),
-            format: "jsonl".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: String::new(),
             path: source_file.clone(),
         };
 
@@ -3710,7 +3737,8 @@ mod tests {
         let work = WorkItem {
             source_name: "hermes-live".to_string(),
             harness: "hermes".to_string(),
-            format: "session_json".to_string(),
+            format: SourceFormat::SessionJson,
+            source_glob: String::new(),
             path: source_file.clone(),
         };
 
@@ -3825,7 +3853,8 @@ mod tests {
         let work = WorkItem {
             source_name: "hermes-live".to_string(),
             harness: "hermes".to_string(),
-            format: "session_json".to_string(),
+            format: SourceFormat::SessionJson,
+            source_glob: String::new(),
             path: source_file.clone(),
         };
 

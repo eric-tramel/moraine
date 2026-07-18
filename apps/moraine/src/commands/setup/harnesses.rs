@@ -1,18 +1,209 @@
-use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::collections::BTreeSet;
 use std::env;
 use std::iter;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::{Map, Value};
 use toml_edit::{value as toml_value, Table};
 
 use super::{CommandSpec, ConfigTarget, McpPlan, McpPlanStep, SetupMcpTarget};
 
+pub(super) mod nac;
+
 const HERMES_PLUGIN_REMOTE_IDENTIFIER: &str = "eric-tramel/moraine/plugins/hermes-moraine";
 const HERMES_PLUGIN_RELATIVE_PATH: &str = "plugins/hermes-moraine";
 const KIRO_STEERING: &str = include_str!("kiro-steering.md");
+
+#[derive(Debug, Clone)]
+pub(super) struct SetupPathContext {
+    pub(super) launch_cwd: PathBuf,
+    pub(super) home: Option<PathBuf>,
+    pub(super) xdg_config_home: Option<PathBuf>,
+    pub(super) kiro_home: Option<PathBuf>,
+    pub(super) nac_home: Option<PathBuf>,
+    pub(super) nac_snapshot: OnceCell<std::result::Result<nac::ConfigSnapshot, String>>,
+    pub(super) nac_expected_content: OnceCell<Vec<u8>>,
+}
+
+impl SetupPathContext {
+    pub(super) fn from_env() -> Result<Self> {
+        Ok(Self {
+            launch_cwd: env::current_dir().context("failed to resolve setup launch directory")?,
+            home: env::var_os("HOME").map(PathBuf::from),
+            xdg_config_home: env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+            kiro_home: env::var_os("KIRO_HOME").map(PathBuf::from),
+            nac_home: env::var_os("NAC_HOME").map(PathBuf::from),
+            nac_snapshot: OnceCell::new(),
+            nac_expected_content: OnceCell::new(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_home(home: Option<PathBuf>) -> Self {
+        Self {
+            launch_cwd: PathBuf::from("/"),
+            home,
+            xdg_config_home: None,
+            kiro_home: None,
+            nac_home: None,
+            nac_snapshot: OnceCell::new(),
+            nac_expected_content: OnceCell::new(),
+        }
+    }
+
+    fn resolve_from_launch(&self, path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.launch_cwd.join(path)
+        }
+    }
+
+    fn nac_home_resolution(&self) -> (PathBuf, bool) {
+        if let Some(path) = &self.nac_home {
+            return (self.resolve_from_launch(path), path.is_absolute());
+        }
+        if let Some(path) = &self.xdg_config_home {
+            return (
+                self.resolve_from_launch(path).join("nac"),
+                path.is_absolute(),
+            );
+        }
+        if let Some(path) = &self.home {
+            return (
+                self.resolve_from_launch(path).join(".config").join("nac"),
+                path.is_absolute(),
+            );
+        }
+        (self.launch_cwd.join(".nac"), false)
+    }
+
+    pub(super) fn nac_home_dir(&self) -> PathBuf {
+        self.nac_home_resolution().0
+    }
+
+    pub(super) fn nac_config_path(&self) -> PathBuf {
+        self.nac_home_dir().join("config.toml")
+    }
+
+    pub(super) fn nac_config_snapshot(&self) -> Result<nac::ConfigSnapshot> {
+        self.nac_snapshot
+            .get_or_init(|| {
+                nac::ConfigSnapshot::read(self.nac_config_path()).map_err(|exc| format!("{exc:#}"))
+            })
+            .clone()
+            .map_err(|message| anyhow::anyhow!(message))
+    }
+
+    pub(super) fn resolve_nac_store(&self) -> Result<nac::StoreResolution> {
+        let snapshot = self.nac_config_snapshot()?;
+        let (nac_home, stable_home) = self.nac_home_resolution();
+        let store = snapshot.resolve_store(&self.launch_cwd, nac_home, stable_home)?;
+        store.validate_paths()?;
+        Ok(store)
+    }
+
+    pub(super) fn nac_manual_ingest_guidance(&self) -> Result<Option<String>> {
+        self.resolve_nac_store()?.manual_guidance()
+    }
+
+    pub(super) fn mark_nac_mcp_applied(&self, config_target: &ConfigTarget) -> Result<()> {
+        let snapshot = self.nac_config_snapshot()?;
+        let prepared = snapshot.prepare_mcp_write(&mcp_run_args(config_target))?;
+        snapshot.verify_current(Some(prepared.rendered()))?;
+        let _ = self.nac_expected_content.set(prepared.rendered().to_vec());
+        Ok(())
+    }
+
+    pub(super) fn verify_nac_snapshot_current(&self) -> Result<()> {
+        let Some(snapshot) = self.nac_snapshot.get() else {
+            return Ok(());
+        };
+        let snapshot = snapshot
+            .clone()
+            .map_err(|message| anyhow::anyhow!(message))?;
+        snapshot.verify_current(
+            self.nac_expected_content
+                .get()
+                .map(|content| content.as_slice()),
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ResolvedIngestSource {
+    name: String,
+    harness: String,
+    glob: String,
+    watch_root: String,
+    format: Option<String>,
+    materialize: bool,
+}
+
+impl ResolvedIngestSource {
+    pub(super) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(super) fn harness(&self) -> &str {
+        &self.harness
+    }
+    pub(super) fn materializes(&self) -> bool {
+        self.materialize
+    }
+
+    pub(super) fn to_table(&self, enabled: bool) -> Table {
+        let mut table = Table::new();
+        table["name"] = toml_value(&self.name);
+        table["harness"] = toml_value(&self.harness);
+        table["enabled"] = toml_value(enabled);
+        table["glob"] = toml_value(&self.glob);
+        table["watch_root"] = toml_value(&self.watch_root);
+        if let Some(format) = &self.format {
+            table["format"] = toml_value(format);
+        }
+        table
+    }
+
+    pub(super) fn reconcile_table(
+        &self,
+        table: &mut Table,
+        enabled: bool,
+    ) -> DefaultIngestSourceUpdate {
+        let effective_enabled = enabled && self.materialize;
+        let enabled_changed = set_bool(table, "enabled", effective_enabled);
+        let mut metadata_changed = false;
+        if self.materialize {
+            metadata_changed |= set_str(table, "name", &self.name);
+            metadata_changed |= set_str(table, "harness", &self.harness);
+            metadata_changed |= set_str(table, "glob", &self.glob);
+            metadata_changed |= set_str(table, "watch_root", &self.watch_root);
+            metadata_changed |= match &self.format {
+                Some(format) => set_str(table, "format", format),
+                None => table.remove("format").is_some(),
+            };
+        }
+        DefaultIngestSourceUpdate {
+            enabled_changed,
+            metadata_changed,
+        }
+    }
+}
+
+impl From<DefaultIngestSource> for ResolvedIngestSource {
+    fn from(source: DefaultIngestSource) -> Self {
+        Self {
+            name: source.name.to_string(),
+            harness: source.harness.to_string(),
+            glob: source.glob.to_string(),
+            watch_root: source.watch_root.to_string(),
+            format: source.format.map(str::to_string),
+            materialize: true,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct DefaultIngestSourceUpdate {
@@ -27,66 +218,6 @@ pub(super) struct DefaultIngestSource {
     glob: &'static str,
     watch_root: &'static str,
     format: Option<&'static str>,
-}
-
-impl DefaultIngestSource {
-    pub(super) fn name(self) -> &'static str {
-        self.name
-    }
-
-    pub(super) fn to_table(self, enabled: bool, kiro_home: Option<&Path>) -> Table {
-        let (glob, watch_root) = self.resolved_paths(kiro_home);
-        let mut table = Table::new();
-        table["name"] = toml_value(self.name);
-        table["harness"] = toml_value(self.harness);
-        table["enabled"] = toml_value(enabled);
-        table["glob"] = toml_value(glob.as_ref());
-        table["watch_root"] = toml_value(watch_root.as_ref());
-        if let Some(format) = self.format {
-            table["format"] = toml_value(format);
-        }
-        table
-    }
-
-    pub(super) fn reconcile_table(
-        self,
-        table: &mut Table,
-        enabled: bool,
-        kiro_home: Option<&Path>,
-    ) -> DefaultIngestSourceUpdate {
-        let (glob, watch_root) = self.resolved_paths(kiro_home);
-        let enabled_changed = set_bool(table, "enabled", enabled);
-        let mut metadata_changed = false;
-
-        metadata_changed |= set_str(table, "name", self.name);
-        metadata_changed |= set_str(table, "harness", self.harness);
-        metadata_changed |= set_str(table, "glob", glob.as_ref());
-        metadata_changed |= set_str(table, "watch_root", watch_root.as_ref());
-        metadata_changed |= match self.format {
-            Some(format) => set_str(table, "format", format),
-            None => table.remove("format").is_some(),
-        };
-
-        DefaultIngestSourceUpdate {
-            enabled_changed,
-            metadata_changed,
-        }
-    }
-
-    fn resolved_paths(self, kiro_home: Option<&Path>) -> (Cow<'static, str>, Cow<'static, str>) {
-        if self.harness != "kiro-cli" {
-            return (Cow::Borrowed(self.glob), Cow::Borrowed(self.watch_root));
-        }
-
-        let Some(kiro_home) = kiro_home else {
-            return (Cow::Borrowed(self.glob), Cow::Borrowed(self.watch_root));
-        };
-        let sessions_dir = kiro_home.join("sessions").join("cli");
-        (
-            Cow::Owned(sessions_dir.join("*.jsonl").to_string_lossy().into_owned()),
-            Cow::Owned(sessions_dir.to_string_lossy().into_owned()),
-        )
-    }
 }
 
 fn set_str(table: &mut Table, key: &str, expected: &str) -> bool {
@@ -110,6 +241,7 @@ enum ProbePaths {
     None,
     OpenCode,
     Cursor,
+    Nac,
     Pi,
 }
 
@@ -128,6 +260,7 @@ impl ProbePaths {
                     .join("Cursor"),
                 home.join(".config").join("Cursor"),
             ],
+            ProbePaths::Nac => vec![home.join(".config").join("nac")],
             ProbePaths::Pi => vec![home.join(".pi").join("agent")],
         }
     }
@@ -156,8 +289,16 @@ impl HarnessSpec {
         self.programs
     }
 
-    pub(super) fn default_probe_paths(self, home: &Path) -> Vec<PathBuf> {
-        self.probe_paths.paths(home)
+    pub(super) fn default_probe_paths(self, paths: &SetupPathContext) -> Vec<PathBuf> {
+        if matches!(self.probe_paths, ProbePaths::Nac) {
+            vec![paths.nac_home_dir()]
+        } else {
+            paths
+                .home
+                .as_deref()
+                .map(|home| self.probe_paths.paths(home))
+                .unwrap_or_default()
+        }
     }
 
     pub(super) fn ingest_sources(self) -> &'static [DefaultIngestSource] {
@@ -283,7 +424,8 @@ const PI_INGEST: [DefaultIngestSource; 2] = [
     },
 ];
 
-const SPECS: [HarnessSpec; 9] = [
+const NAC_INGEST: [DefaultIngestSource; 0] = [];
+const SPECS: [HarnessSpec; 10] = [
     HarnessSpec {
         target: SetupMcpTarget::ClaudeCode,
         label: "Claude Code",
@@ -333,6 +475,14 @@ const SPECS: [HarnessSpec; 9] = [
         ingest_sources: &QWEN_CODE_INGEST,
     },
     HarnessSpec {
+        target: SetupMcpTarget::Nac,
+        label: "NAC",
+        setup_kind: "MCP config",
+        programs: &["nac"],
+        probe_paths: ProbePaths::Nac,
+        ingest_sources: &NAC_INGEST,
+    },
+    HarnessSpec {
         target: SetupMcpTarget::OpenCode,
         label: "OpenCode",
         setup_kind: "MCP config",
@@ -369,17 +519,59 @@ pub(super) fn spec(target: SetupMcpTarget) -> &'static HarnessSpec {
         .expect("every setup target has a harness spec")
 }
 
-pub(super) fn default_ingest_sources(target: SetupMcpTarget) -> &'static [DefaultIngestSource] {
-    spec(target).ingest_sources()
+pub(super) fn default_ingest_sources(
+    target: SetupMcpTarget,
+    paths: &SetupPathContext,
+    enabled: bool,
+) -> Result<Vec<ResolvedIngestSource>> {
+    if target != SetupMcpTarget::Nac {
+        let mut sources = spec(target)
+            .ingest_sources()
+            .iter()
+            .copied()
+            .map(ResolvedIngestSource::from)
+            .collect::<Vec<_>>();
+        if target == SetupMcpTarget::KiroCli {
+            if let Some(kiro_home) = paths.kiro_home.as_deref() {
+                let sessions_dir = kiro_home.join("sessions").join("cli");
+                let source = sources
+                    .first_mut()
+                    .expect("Kiro CLI has one default ingest source");
+                source.glob = sessions_dir.join("*.jsonl").to_string_lossy().into_owned();
+                source.watch_root = sessions_dir.to_string_lossy().into_owned();
+            }
+        }
+        return Ok(sources);
+    }
+    if !enabled {
+        return Ok(vec![ResolvedIngestSource {
+            name: "nac".to_string(),
+            harness: "nac".to_string(),
+            glob: String::new(),
+            watch_root: String::new(),
+            format: None,
+            materialize: false,
+        }]);
+    }
+    let store = paths.resolve_nac_store()?;
+    let (glob, watch_root) = store.source_paths()?;
+    Ok(vec![ResolvedIngestSource {
+        name: "nac".to_string(),
+        harness: "nac".to_string(),
+        glob,
+        watch_root,
+        format: Some("nac_sqlite".to_string()),
+        materialize: store.auto_ingest,
+    }])
 }
 
 pub(super) fn mcp_plan(
     target: SetupMcpTarget,
     config_target: &ConfigTarget,
-    home: Option<PathBuf>,
-    kiro_home: Option<PathBuf>,
-) -> McpPlan {
-    match target {
+    paths: &SetupPathContext,
+) -> Result<McpPlan> {
+    let home = &paths.home;
+    Ok(match target {
         SetupMcpTarget::ClaudeCode if config_target.requires_explicit_mcp_config() => {
             let mut args = vec![
                 "mcp".to_string(),
@@ -585,23 +777,26 @@ pub(super) fn mcp_plan(
         },
         SetupMcpTarget::KiroCli => {
             let Some(moraine_command) = kiro_moraine_command() else {
-                return McpPlan::manual(
+                return Ok(McpPlan::manual(
                     target,
                     "Moraine could not resolve the absolute path of its running executable. Register Kiro MCP manually with an absolute, trusted path to the moraine CLI.".to_string(),
-                );
+                ));
             };
             let registration_args = kiro_args(config_target, &moraine_command);
 
-            let Some(kiro_home) = kiro_home.or_else(|| home.map(|home| home.join(".kiro")))
+            let Some(kiro_home) = paths
+                .kiro_home
+                .clone()
+                .or_else(|| home.as_ref().map(|home| home.join(".kiro")))
             else {
                 let command = CommandSpec::new("kiro-cli", registration_args);
-                return McpPlan::manual(
+                return Ok(McpPlan::manual(
                     target,
                     format!(
                         "KIRO_HOME and HOME are not set, so Moraine cannot choose Kiro's global steering directory. Set one of them, then run:\n{}",
                         command.display()
                     ),
-                );
+                ));
             };
 
             McpPlan {
@@ -649,6 +844,7 @@ pub(super) fn mcp_plan(
             managed_writes: Vec::new(),
             manual_snippet: None,
         },
+        SetupMcpTarget::Nac => nac_mcp_plan(paths, config_target)?,
         SetupMcpTarget::OpenCode => McpPlan::write_config(
             target,
             home.as_ref()
@@ -684,7 +880,28 @@ pub(super) fn mcp_plan(
             }
             plan
         }
-    }
+    })
+}
+
+fn nac_mcp_plan(paths: &SetupPathContext, config_target: &ConfigTarget) -> Result<McpPlan> {
+    let snapshot = paths.nac_config_snapshot()?;
+    let write = McpConfigWrite::nac(snapshot, config_target)?;
+    Ok(McpPlan::write_config(
+        SetupMcpTarget::Nac,
+        Some(write),
+        nac_mcp_snippet(config_target),
+    ))
+}
+
+fn nac_mcp_snippet(config_target: &ConfigTarget) -> String {
+    let args = mcp_run_args(config_target)
+        .into_iter()
+        .map(|arg| format!("\"{}\"", arg.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "[mcp_servers.moraine]\nenabled = true\ntransport = \"stdio\"\ncommand = \"moraine\"\nargs = [{args}]"
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -735,13 +952,14 @@ pub(super) fn opencode_command(config_target: &ConfigTarget) -> Vec<String> {
 pub(super) enum McpConfigFormat {
     Json,
     Jsonc,
+    Toml,
 }
-
 #[derive(Debug, Clone)]
 pub(super) struct McpConfigWrite {
     path: PathBuf,
     kind: McpConfigKind,
     command: Vec<String>,
+    nac_write: Option<nac::PreparedMcpWrite>,
 }
 
 impl McpConfigWrite {
@@ -750,6 +968,7 @@ impl McpConfigWrite {
             path: home.join(".cursor").join("mcp.json"),
             kind: McpConfigKind::Cursor,
             command: mcp_run_args(config_target),
+            nac_write: None,
         }
     }
 
@@ -758,6 +977,7 @@ impl McpConfigWrite {
             path: home.join(".pi").join("agent").join("mcp.json"),
             kind: McpConfigKind::Pi,
             command: mcp_run_args(config_target),
+            nac_write: None,
         }
     }
 
@@ -766,7 +986,24 @@ impl McpConfigWrite {
             path: home.join(".config").join("opencode").join("opencode.json"),
             kind: McpConfigKind::OpenCode,
             command: opencode_command(config_target),
+            nac_write: None,
         }
+    }
+
+    pub(super) fn nac(snapshot: nac::ConfigSnapshot, config_target: &ConfigTarget) -> Result<Self> {
+        let command = mcp_run_args(config_target);
+        let nac_write = snapshot.prepare_mcp_write(&command)?;
+        Ok(Self {
+            path: nac_write.path().to_path_buf(),
+            kind: McpConfigKind::Nac,
+            command,
+            nac_write: Some(nac_write),
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn nac_path(path: PathBuf, config_target: &ConfigTarget) -> Result<Self> {
+        Self::nac(nac::ConfigSnapshot::read(path)?, config_target)
     }
 
     pub(super) fn path(&self) -> &Path {
@@ -779,6 +1016,23 @@ impl McpConfigWrite {
 
     pub(super) fn format(&self) -> McpConfigFormat {
         self.kind.format()
+    }
+
+    pub(super) fn nac_rendered(&self) -> Option<&[u8]> {
+        self.nac_write.as_ref().map(|write| write.rendered())
+    }
+
+    pub(super) fn nac_is_unchanged(&self) -> bool {
+        self.nac_write
+            .as_ref()
+            .is_some_and(nac::PreparedMcpWrite::is_unchanged)
+    }
+
+    pub(super) fn verify_nac_snapshot_current(&self) -> Result<()> {
+        self.nac_write
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("{} is not a NAC MCP write", self.label()))?
+            .verify_snapshot_current()
     }
 
     pub(super) fn merge_into(&self, root: &mut Map<String, Value>) -> Result<()> {
@@ -797,6 +1051,7 @@ impl McpConfigWrite {
                 let servers = object_entry_mut(root, "mcp")?;
                 servers.insert("moraine".to_string(), self.server_value());
             }
+            McpConfigKind::Nac => bail!("NAC MCP config uses TOML, not JSON"),
         }
         Ok(())
     }
@@ -819,10 +1074,11 @@ impl McpConfigWrite {
                 "command": self.command.clone(),
                 "enabled": true,
             }),
+            McpConfigKind::Nac => Value::Null,
         }
     }
 
-    fn snippet_root(&self) -> Map<String, Value> {
+    pub(super) fn snippet_root(&self) -> Map<String, Value> {
         let mut root = Map::new();
         self.merge_into(&mut root)
             .expect("snippet roots are built from empty JSON objects");
@@ -830,11 +1086,12 @@ impl McpConfigWrite {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum McpConfigKind {
     Cursor,
     Pi,
     OpenCode,
+    Nac,
 }
 
 impl McpConfigKind {
@@ -843,6 +1100,7 @@ impl McpConfigKind {
             McpConfigKind::Cursor => "Cursor",
             McpConfigKind::Pi => "Pi",
             McpConfigKind::OpenCode => "OpenCode",
+            McpConfigKind::Nac => "NAC",
         }
     }
 
@@ -850,6 +1108,7 @@ impl McpConfigKind {
         match self {
             McpConfigKind::Cursor | McpConfigKind::Pi => McpConfigFormat::Json,
             McpConfigKind::OpenCode => McpConfigFormat::Jsonc,
+            McpConfigKind::Nac => McpConfigFormat::Toml,
         }
     }
 }
@@ -1075,4 +1334,315 @@ fn snippet(intro: &str, value: Value) -> String {
         "{intro}:\n{}",
         serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "moraine-nac-setup-{name}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn cursor_probes_include_linux_config_location() {
+        let home = Path::new("/home/example");
+        assert!(ProbePaths::Cursor
+            .paths(home)
+            .contains(&home.join(".config").join("Cursor")));
+    }
+
+    #[test]
+    fn nac_home_obeys_explicit_and_xdg_precedence() {
+        let home = PathBuf::from("/home/example");
+        let xdg = PathBuf::from("/xdg");
+        let explicit = PathBuf::from("/custom/nac");
+        let mut paths = SetupPathContext {
+            launch_cwd: PathBuf::from("/workspace"),
+            home: Some(home),
+            xdg_config_home: Some(xdg.clone()),
+            nac_home: None,
+            nac_snapshot: OnceCell::new(),
+            nac_expected_content: OnceCell::new(),
+        };
+        assert_eq!(paths.nac_home_dir(), xdg.join("nac"));
+        paths.xdg_config_home = None;
+        assert_eq!(
+            paths.nac_home_dir(),
+            PathBuf::from("/home/example/.config/nac")
+        );
+        paths.xdg_config_home = Some(xdg);
+        paths.nac_home = Some(explicit.clone());
+        assert_eq!(paths.nac_home_dir(), explicit);
+    }
+
+    #[test]
+    fn nac_default_store_becomes_an_absolute_ingest_source() {
+        let nac_home = temp_dir("default-store");
+        let paths = SetupPathContext {
+            launch_cwd: PathBuf::from("/workspace"),
+            home: None,
+            xdg_config_home: None,
+            nac_home: Some(nac_home.clone()),
+            nac_snapshot: OnceCell::new(),
+            nac_expected_content: OnceCell::new(),
+        };
+        let sources =
+            default_ingest_sources(SetupMcpTarget::Nac, &paths, true).expect("resolve NAC source");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].name, "nac");
+        assert_eq!(sources[0].harness, "nac");
+        assert_eq!(sources[0].glob, nac_home.join("store.db").to_string_lossy());
+        assert_eq!(sources[0].watch_root, nac_home.to_string_lossy());
+        assert_eq!(sources[0].format.as_deref(), Some("nac_sqlite"));
+    }
+
+    #[test]
+    fn nac_source_uses_shared_literal_glob_escaping() {
+        let root = temp_dir("glob-metacharacters");
+        let nac_home = root.join("nac");
+        fs::create_dir_all(&nac_home).expect("create NAC home");
+        let store = root.join("[workspace]*?").join("store.db");
+        fs::write(
+            nac_home.join("config.toml"),
+            format!(
+                "[storage]\nstore_path = {:?}\n",
+                store.to_str().expect("UTF-8 test path")
+            ),
+        )
+        .expect("write NAC config");
+        let paths = SetupPathContext {
+            launch_cwd: root.clone(),
+            home: None,
+            xdg_config_home: None,
+            nac_home: Some(nac_home),
+            nac_snapshot: OnceCell::new(),
+            nac_expected_content: OnceCell::new(),
+        };
+
+        let sources = default_ingest_sources(SetupMcpTarget::Nac, &paths, true)
+            .expect("resolve escaped NAC source");
+        assert_eq!(
+            sources[0].glob,
+            moraine_config::escape_literal_glob(store.to_str().expect("UTF-8 test path"))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nac_relative_store_is_not_silently_ingested() {
+        let root = temp_dir("relative-store");
+        let nac_home = root.join("config");
+        fs::create_dir_all(&nac_home).expect("create NAC config dir");
+        fs::write(
+            nac_home.join("config.toml"),
+            "[storage]\nstore_path = \"state/store.db\"\n",
+        )
+        .expect("write NAC config");
+        let paths = SetupPathContext {
+            launch_cwd: root.join("workspace"),
+            home: None,
+            xdg_config_home: None,
+            nac_home: Some(nac_home),
+            nac_snapshot: OnceCell::new(),
+            nac_expected_content: OnceCell::new(),
+        };
+        let sources = default_ingest_sources(SetupMcpTarget::Nac, &paths, true)
+            .expect("resolve relative NAC source");
+        assert_eq!(sources.len(), 1);
+        assert!(!sources[0].materializes());
+        let manual = paths
+            .nac_manual_ingest_guidance()
+            .expect("resolve manual guidance")
+            .expect("relative-store instructions");
+        assert!(manual.contains("launch-directory-relative"));
+        assert!(manual.contains("format = \"nac_sqlite\""));
+        assert!(manual.contains("name = \"nac-workspace\""));
+        assert!(manual.contains("unique source name"));
+        assert!(!manual.contains("name = \"nac\"\n"));
+        let expected_store = root.join("workspace/state/store.db");
+        assert!(manual.contains(expected_store.to_string_lossy().as_ref()));
+        let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn missing_home_variables_use_launch_scoped_fallback() {
+        let paths = SetupPathContext {
+            launch_cwd: PathBuf::from("/workspace/project"),
+            home: None,
+            xdg_config_home: None,
+            nac_home: None,
+            nac_snapshot: OnceCell::new(),
+            nac_expected_content: OnceCell::new(),
+        };
+        assert_eq!(
+            paths.nac_home_dir(),
+            PathBuf::from("/workspace/project/.nac")
+        );
+        let store = paths.resolve_nac_store().expect("resolve launch fallback");
+        assert_eq!(
+            store.path,
+            PathBuf::from("/workspace/project/.nac/store.db")
+        );
+        assert!(!store.auto_ingest);
+    }
+
+    #[test]
+    fn relative_nac_home_is_launch_scoped_and_requires_manual_ingest() {
+        let paths = SetupPathContext {
+            launch_cwd: PathBuf::from("/workspace/project"),
+            home: Some(PathBuf::from("/home/example")),
+            xdg_config_home: None,
+            nac_home: Some(PathBuf::from("nac-state")),
+            nac_snapshot: OnceCell::new(),
+            nac_expected_content: OnceCell::new(),
+        };
+        assert_eq!(
+            paths.nac_config_path(),
+            PathBuf::from("/workspace/project/nac-state/config.toml")
+        );
+        let store = paths
+            .resolve_nac_store()
+            .expect("resolve relative NAC_HOME");
+        assert_eq!(
+            store.path,
+            PathBuf::from("/workspace/project/nac-state/store.db")
+        );
+        assert!(!store.auto_ingest);
+        assert_eq!(
+            spec(SetupMcpTarget::Nac).default_probe_paths(&paths),
+            vec![PathBuf::from("/workspace/project/nac-state")]
+        );
+    }
+
+    #[test]
+    fn absolute_store_override_is_safe_even_with_relative_nac_home() {
+        let root = temp_dir("absolute-override");
+        let launch = root.join("workspace");
+        let nac_home = launch.join("relative-nac");
+        fs::create_dir_all(&nac_home).expect("create relative NAC home");
+        let absolute_store = root.join("durable/store.db");
+        fs::write(
+            nac_home.join("config.toml"),
+            format!(
+                "storage = {{ store_path = {:?} }}\n",
+                absolute_store.to_string_lossy()
+            ),
+        )
+        .expect("write inline storage config");
+        let paths = SetupPathContext {
+            launch_cwd: launch,
+            home: None,
+            xdg_config_home: None,
+            nac_home: Some(PathBuf::from("relative-nac")),
+            nac_snapshot: OnceCell::new(),
+            nac_expected_content: OnceCell::new(),
+        };
+        let store = paths
+            .resolve_nac_store()
+            .expect("resolve absolute override");
+        assert_eq!(store.path, absolute_store);
+        assert!(store.auto_ingest);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nac_store_config_is_parsed_once_per_setup_context() {
+        let nac_home = temp_dir("parse-once");
+        fs::create_dir_all(&nac_home).expect("create NAC home");
+        let config_path = nac_home.join("config.toml");
+        fs::write(
+            &config_path,
+            "[storage]\nstore_path = \"/first/store.db\"\n",
+        )
+        .expect("write first NAC config");
+        let paths = SetupPathContext {
+            launch_cwd: PathBuf::from("/workspace"),
+            home: None,
+            xdg_config_home: None,
+            nac_home: Some(nac_home.clone()),
+            nac_snapshot: OnceCell::new(),
+            nac_expected_content: OnceCell::new(),
+        };
+        assert_eq!(
+            paths.resolve_nac_store().expect("first resolution").path,
+            PathBuf::from("/first/store.db")
+        );
+        fs::write(
+            &config_path,
+            "[storage]\nstore_path = \"/second/store.db\"\n",
+        )
+        .expect("rewrite NAC config");
+        assert_eq!(
+            paths.resolve_nac_store().expect("cached resolution").path,
+            PathBuf::from("/first/store.db")
+        );
+        let _ = fs::remove_dir_all(nac_home);
+    }
+
+    #[test]
+    fn nac_store_resolution_rejects_malformed_storage_without_guessing() {
+        for (name, content, expected) in [
+            (
+                "bad-storage",
+                "storage = 7\n",
+                "storage must be a TOML table",
+            ),
+            (
+                "bad-store-path",
+                "[storage]\nstore_path = 7\n",
+                "storage.store_path must be a TOML string",
+            ),
+            ("bad-toml", "storage = [\n", "is not valid NAC TOML"),
+        ] {
+            let nac_home = temp_dir(name);
+            fs::create_dir_all(&nac_home).expect("create malformed NAC home");
+            fs::write(nac_home.join("config.toml"), content).expect("write malformed NAC config");
+            let paths = SetupPathContext {
+                launch_cwd: PathBuf::from("/workspace"),
+                home: None,
+                xdg_config_home: None,
+                nac_home: Some(nac_home.clone()),
+                nac_snapshot: OnceCell::new(),
+                nac_expected_content: OnceCell::new(),
+            };
+            let error = paths
+                .resolve_nac_store()
+                .expect_err("reject malformed NAC storage");
+            assert!(
+                format!("{error:#}").contains(expected),
+                "unexpected error: {error:#}"
+            );
+            let _ = fs::remove_dir_all(nac_home);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nac_source_rejects_non_utf8_resolved_paths() {
+        let invalid_component = std::ffi::OsString::from_vec(vec![b'n', b'a', b'c', b'-', 0xff]);
+        let nac_home = temp_dir("non-utf8-parent").join(invalid_component);
+        let paths = SetupPathContext {
+            launch_cwd: PathBuf::from("/workspace"),
+            home: None,
+            xdg_config_home: None,
+            nac_home: Some(nac_home),
+            nac_snapshot: OnceCell::new(),
+            nac_expected_content: OnceCell::new(),
+        };
+
+        let error = default_ingest_sources(SetupMcpTarget::Nac, &paths, true)
+            .expect_err("reject non-UTF-8 store/watch paths");
+        assert!(format!("{error:#}").contains("not valid UTF-8"));
+    }
 }

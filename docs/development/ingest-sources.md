@@ -20,6 +20,7 @@ all rows that leave the adapter.
 | `kiro-cli` | `sources/kiro_cli.rs` | `kiro` | `kiro_session` | Kiro CLI prompt, assistant, tool-result, and compaction records. A same-named JSON sidecar supplies session cwd, title, model, and aggregate token/credit metadata. |
 | `kimi-cli` | `sources/kimi_cli.rs` | `moonshot` | `jsonl` | Kimi `wire.jsonl`; skips metadata headers and keeps parent `SubagentEvent` envelopes raw-only. |
 | `qwen-code` | `sources/qwen_code.rs` | unset unless recorded | `jsonl` | Qwen Code `ChatRecord` envelopes, ordered message parts, parent/rewind links, tools, and Google-style usage metadata. |
+| `nac` | `sources/nac.rs` | record-derived | `nac_sqlite` | NAC parent sessions and managed-worker episodes synthesized from `store.db`; remote bodies are retained without local project attribution, while credential-bearing columns remain excluded. |
 | `opencode` | `sources/opencode.rs` | record-derived | `opencode_sqlite` | OpenCode `opencode*.db`; append-only conversation events synthesized into session, message, part, and session-message records. Credential/account tables are deliberately out of scope. |
 | `cursor` | `sources/cursor.rs` | `cursor` | `jsonl` or `cursor_sqlite` | Cursor Agent transcripts under `agent-transcripts/`; text blocks, tool-use blocks, and local file references. Also normalizes the synthetic `cursor_composer`/`cursor_bubble` records produced by polling `state.vscdb` (see SQLite-Polled Sources below); composer names become `session_meta` events that carry the session title. |
 | `hermes` | `sources/hermes.rs` | record-derived | `jsonl` or `session_json` | ShareGPT trajectories and live Hermes session JSON with vendor/model splitting. |
@@ -212,16 +213,14 @@ Adapters must emit rows that already satisfy the normalized schema domain:
 ## SQLite-Polled Sources
 
 Some harnesses keep history in a live SQLite database instead of append-only
-trace files. `crates/moraine-ingest-core/src/sqlite_poll.rs` holds the Cursor
-`cursor_sqlite` poller (Cursor `state.vscdb`) together with the small leaf
-helpers shared across SQLite sources: read-only opens, stat/WAL fingerprints,
-the `SyntheticRecord` shape, and the error-kind constants. Each SQLite source
-owns its own poll lifecycle and synthesizes one record per relevant row, then
-feeds it through `normalize_record`, so the source adapter stays
-format-agnostic — `sources/cursor.rs` handles the synthetic
-`cursor_composer`/`cursor_bubble` records the same way it handles JSONL lines,
-and `sources/opencode.rs` does the same for `opencode_*` rows. The
-`opencode_sqlite` poller lives alongside it in `sqlite_poll/opencode.rs`.
+trace files. `crates/moraine-ingest-core/src/sqlite_poll.rs` holds the shared
+read-only open, stat/WAL fingerprint, `SyntheticRecord`, and error helpers.
+Cursor's `cursor_sqlite` poller remains in that module; OpenCode and NAC own
+their source-specific lifecycles in `sqlite_poll/opencode.rs` and
+`sqlite_poll/nac.rs`. Every poller synthesizes records and feeds them through
+`normalize_record`, so the source adapters stay format-agnostic:
+`sources/cursor.rs`, `sources/opencode.rs`, and `sources/nac.rs` normalize the
+same synthetic shapes independently of the database scan.
 
 Mechanics that differ from file-backed sources:
 
@@ -236,6 +235,18 @@ Mechanics that differ from file-backed sources:
   `event_sequence`, persists the last `seq` seen for each aggregate id, and
   synthesizes records from new durable events. Repeated updates for the same
   message or part coalesce to one synthetic record with a stable logical UID.
+- **Hybrid NAC cursors.** NAC sessions are keyed by immutable session ID. The
+  cursor keeps a metadata hash plus per-logical-message hashes so an updated
+  session emits only changed parts; worker episodes advance by immutable
+  integer ID, while per-worker metadata hashes prevent duplicate worker-session
+  rows. Local and remote durable history is ingested; a non-empty remote
+  `host_id` suppresses local project/worktree attribution without selecting the
+  host identifier or credential values.
+- **Bounded NAC scans.** NAC requires only the `sessions` and `episodes`
+  allowlisted columns. Polls cap sessions, episodes, synthetic records, text,
+  individual JSON values, total scan bytes, and each fully normalized
+  ClickHouse JSON object. Schema drift, malformed required JSON, or an oversized
+  normalized row fails without advancing the cursor.
 - **Bounded prefix scans.** Only the `composerData:` and `bubbleId:` key
   prefixes are scanned, in pages, with a 10,000-key ceiling. Larger key spaces
   fail the poll instead of persisting an oversized cursor. `agentKv:*`,
@@ -249,23 +260,26 @@ Mechanics that differ from file-backed sources:
   of persisting an oversized checkpoint.
 - **Stable logical event UIDs.** Cursor UID material derives from the kv key,
   not the mutable payload, so a rewritten row re-emits the same event UIDs with
-  a newer `event_version` and `ReplacingMergeTree` collapses them. OpenCode UID
-  material derives from the synthetic logical record (`session`, `message`,
-  `part`, or `session_message`) plus source id, so multiple append-only updates
-  for the same message or part coalesce to the same normalized event identity.
+  a newer `event_version`. OpenCode UID material derives from the synthetic
+  logical record (`session`, `message`, `part`, or `session_message`) plus
+  source id, so repeated updates coalesce to the same normalized identity.
+  NAC uses namespace-prefixed parent IDs, immutable episode IDs, message index,
+  fixed per-kind line slots, and tool-call IDs so optional message parts cannot
+  move surviving event coordinates across polls.
 - **Sidecar watching.** `moraine_config::map_tracked_path` maps SQLite
   `-wal`/`-shm` filesystem events back to the canonical database path so
-  WAL-only writes trigger polls. Cursor tracks `state.vscdb` sidecars;
-  OpenCode tracks only `opencode*.db` sidecars; unrelated backups or SQLite
-  files are untracked. Databases are opened read-only with a short busy
-  timeout, and Moraine never checkpoints another application's WAL.
+  WAL-only writes trigger polls. Cursor tracks `state.vscdb` sidecars; NAC
+  tracks only `store.db`; OpenCode tracks only `opencode*.db` sidecars.
+  Unrelated backups or SQLite files are untracked. Databases are opened
+  read-only with a short busy timeout, and Moraine never checkpoints another
+  application's WAL.
 - **Rate-limited errors.** Failures surface as `ingest_errors` rows with kinds
   `sqlite_open_error`, `sqlite_schema_mismatch`, `sqlite_cursor_too_large`, and
   `sqlite_scan_error`. The cursor records the last reported kind so a
   persistent failure is emitted once rather than on every reconcile tick, and
   the data cursor is left untouched so the next poll retries.
-- **Volatile no-op poll state (issue #443).** Cursor touches its DB/WAL/SHM
-  sidecars continuously without changing any transcript-relevant key. A scan
+- **Volatile no-op poll state (issue #443).** Cursor, NAC, and OpenCode can
+  touch DB/WAL/SHM sidecars without changing transcript-relevant rows. A scan
   that emits no records and changes nothing else the durable checkpoint
   carries persists *nothing*: the stat fingerprint it covered is recorded
   only in a per-pipeline in-memory map (`sqlite_poll::VolatilePollMap`), so
@@ -279,15 +293,46 @@ Mechanics that differ from file-backed sources:
   (~15–30 s including the reconcile tick); a process restart merely costs
   one redundant no-op scan per database.
 
+### NAC SQLite contract
+
+NAC stores parent sessions in `sessions` and managed-worker activity in
+`episodes`. Moraine reads both through an immutable query projection:
+
+- Parent sessions emit one stable `session_meta` row plus message parts in
+  source order. User, assistant, reasoning, tool request, and tool response
+  roles are retained; multiple tool calls in one assistant message are paired
+  by call ID rather than adjacency.
+- Each worker episode becomes its own Moraine session. Its `session_meta` row
+  links back to the parent with `subagent_parent`; action and result rows retain
+  the episode ID and thread label. Remote parent and worker bodies remain
+  retrievable, but do not receive local project/worktree attribution.
+- Parent metadata updates reuse the canonical `session_meta` UID and event
+  timestamp, so `ReplacingMergeTree` replaces the row instead of creating a
+  second metadata event. Message and episode identities likewise remain stable
+  across retries and live updates.
+- NAC usage maps `input_tokens`, `output_tokens`, `cache_read_tokens`,
+  `cache_write_tokens`, and `reasoning_tokens` to Moraine's schema-controlled
+  token buckets. Provider attribution is derived from the stored base URL;
+  OpenRouter model names map to `openrouter`.
+- The allowlisted query never selects API-key environment names, extra headers,
+  or host identifiers. Raw records are compact projections, not copies of
+  NAC's credential-bearing session rows.
+- Replacing `store.db` at the same path changes the SQLite schema/data
+  fingerprint, advances `source_generation`, and archives the previous
+  generation after the replacement scan commits. A malformed or mixed
+  DB/WAL/SHM snapshot fails closed and leaves both the data cursor and durable
+  checkpoint unchanged for retry.
+
 Fixtures: `fixtures/cursor/state-vscdb-kv.jsonl` stores `cursorDiskKV` rows as
-JSONL (`key`/`value` pairs), and `fixtures/opencode/session.jsonl` stores the
-OpenCode synthetic record shapes expected from event scans. Golden contract
-tests feed records through the production normalization path, so output cannot
-drift silently from adapters. Unit tests in `sqlite_poll.rs` and
-`sqlite_poll/opencode/tests.rs` build temporary `rusqlite` databases to cover
-first-poll emission, no-op repolls, in-place mutation re-emitting stable UIDs,
-payload hygiene, and schema-mismatch/error paths; sidecar path mapping is
-tested in `moraine-config`.
+JSONL (`key`/`value` pairs), `fixtures/opencode/session.jsonl` stores OpenCode
+synthetic records, and `fixtures/nac/store.sql` builds a representative NAC
+database whose normalized shapes are frozen in `fixtures/nac/normalized.jsonl`.
+Golden contract tests feed records through the production normalization path,
+so output cannot drift silently from adapters. Unit tests in `sqlite_poll.rs`,
+`sqlite_poll/opencode/tests.rs`, and `sqlite_poll/nac.rs` cover first-poll
+emission, no-op repolls, incremental updates, stable UIDs, tool pairing,
+worker-parent links, schema/credential boundaries, and error paths; sidecar
+path mapping is tested in `moraine-config`.
 
 ## Fixtures And Contracts
 

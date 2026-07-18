@@ -484,7 +484,7 @@ async fn discover_startup_backend_targets(context: &TeeRouterContext) -> BTreeSe
 
     let metrics = Arc::new(Metrics::default());
     for source in context.sources.iter() {
-        let files = match enumerate_tracked_files(&source.glob, &source.format) {
+        let files = match enumerate_tracked_files(&source.glob, source.format) {
             Ok(files) => files,
             Err(exc) => {
                 warn!(
@@ -520,7 +520,8 @@ async fn discover_file_backend_targets(
     let work = WorkItem {
         source_name: source.name.clone(),
         harness: source.harness.clone(),
-        format: source.format.clone(),
+        format: source.format,
+        source_glob: source.glob.clone(),
         path,
     };
     let process = process_file(
@@ -808,7 +809,7 @@ async fn run_replay_pass(
     reported_lost: &mut HashSet<String>,
 ) {
     for source in sources {
-        let files = match enumerate_tracked_files(&source.glob, &source.format) {
+        let files = match enumerate_tracked_files(&source.glob, source.format) {
             Ok(files) => files,
             Err(exc) => {
                 warn!(
@@ -851,7 +852,8 @@ async fn run_replay_pass(
             let work = WorkItem {
                 source_name: source.name.clone(),
                 harness: source.harness.clone(),
-                format: source.format.clone(),
+                format: source.format,
+                source_glob: source.glob.clone(),
                 path,
             };
             // Sends are awaited: replay backpressure is bounded by the
@@ -888,6 +890,7 @@ mod tests {
         routing::post,
         Router,
     };
+    use moraine_config::SourceFormat;
     use serde_json::json;
     use std::fs;
     use std::path::PathBuf;
@@ -982,7 +985,7 @@ mod tests {
                 enabled: true,
                 glob: path.to_string_lossy().to_string(),
                 watch_root: std::env::temp_dir().to_string_lossy().to_string(),
-                format: "jsonl".to_string(),
+                format: SourceFormat::Jsonl,
             }]),
             resolver,
             registry: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1572,7 +1575,7 @@ mod tests {
             enabled: true,
             glob: path.to_string_lossy().to_string(),
             watch_root: std::env::temp_dir().to_string_lossy().to_string(),
-            format: "jsonl".to_string(),
+            format: SourceFormat::Jsonl,
         }];
         let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
         let metrics = Arc::new(Metrics::default());

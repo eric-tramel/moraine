@@ -132,13 +132,13 @@ rerunning setup after installing a new harness CLI. Direct targets do not change
 ingest source selections:
 
 ```bash
-moraine setup --yes --mcp-target claude-code --mcp-target codex --mcp-target hermes --mcp-target kiro-cli --mcp-target kimi-cli --mcp-target qwen-code --mcp-target opencode --mcp-target cursor --mcp-target pi-coding-agent
+moraine setup --yes --mcp-target claude-code --mcp-target codex --mcp-target hermes --mcp-target kiro-cli --mcp-target kimi-cli --mcp-target qwen-code --mcp-target nac --mcp-target opencode --mcp-target cursor --mcp-target pi-coding-agent
 ```
 
 Preview targeted MCP/plugin changes without touching host agent config:
 
 ```bash
-moraine setup --dry-run --mcp-target claude-code --mcp-target codex --mcp-target hermes --mcp-target kiro-cli --mcp-target kimi-cli --mcp-target qwen-code --mcp-target opencode --mcp-target cursor --mcp-target pi-coding-agent
+moraine setup --dry-run --mcp-target claude-code --mcp-target codex --mcp-target hermes --mcp-target kiro-cli --mcp-target kimi-cli --mcp-target qwen-code --mcp-target nac --mcp-target opencode --mcp-target cursor --mcp-target pi-coding-agent
 ```
 
 The Claude Code, Codex, and Hermes plugins bundle Moraine search, realtime, and
@@ -148,10 +148,16 @@ managed search and realtime guidance under `$KIRO_HOME/steering` when
 `KIRO_HOME` is set (or `~/.kiro/steering` otherwise), and points the setup-owned
 ingest source at the matching `sessions/cli` directory. It also registers MCP
 directly or writes global MCP config for supported harnesses such as Qwen Code,
-Kimi CLI, OpenCode, Cursor, and Pi Coding Agent. These user-scoped integrations
-can search the host-wide Moraine history visible to your user, so enable them
-only in trusted harness environments. Qwen registration does not enable Qwen's
-MCP trust option.
+Kimi CLI, NAC, OpenCode,
+Cursor, and Pi Coding Agent. For NAC, setup merges `[mcp_servers.moraine]` into the config at
+`NAC_HOME`, then `XDG_CONFIG_HOME/nac`, then `~/.config/nac`, without replacing
+model, storage, sandbox, or unrelated MCP settings. It adds a `nac_sqlite`
+source only for the default store or an absolute `storage.store_path`; relative
+paths and per-launch `nac --store-path` overrides need the manual source snippet
+described in [Agent MCP Search → NAC](agent-mcp-search/install.md#nac).
+These user-scoped integrations can search the host-wide Moraine history visible
+to your user, so enable them only in trusted harness environments.
+Qwen registration does not enable Qwen's MCP trust option.
 
 The same Codex marketplace also contains the contributor-only `moraine-dev`
 plugin for Moraine maintainers; end users should install `moraine@moraine`.

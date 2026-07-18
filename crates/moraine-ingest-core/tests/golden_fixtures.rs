@@ -197,6 +197,14 @@ fn golden_cases() -> [GoldenCase; 12] {
             format: GoldenFormat::CursorSqlite,
         },
         GoldenCase {
+            name: "nac",
+            harness: "nac",
+            source_name: "golden-nac",
+            fixture_rel: "fixtures/nac/normalized.jsonl",
+            source_file: "/fixtures/nac/store.db",
+            format: GoldenFormat::Jsonl,
+        },
+        GoldenCase {
             name: "hermes_trajectory",
             harness: "hermes",
             source_name: "golden-hermes-trajectory",
