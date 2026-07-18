@@ -1,6 +1,6 @@
 [package]
 name = "moraine-monitor"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 description = "Deprecated alias for the unified Moraine backend"
 
