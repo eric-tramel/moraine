@@ -380,12 +380,112 @@ fn format_list_sessions_error_text(payload: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use moraine_config::AppConfig;
+    use moraine_clickhouse::ClickHouseClient;
+    use moraine_config::{AppConfig, ClickHouseConfig};
     use moraine_conversations::{
-        ConversationMode, InMemoryConversationRepository, InMemoryConversationResponses, RepoConfig,
+        ClickHouseConversationRepository, ConversationMode, InMemoryConversationRepository,
+        InMemoryConversationResponses, RepoConfig,
     };
     use std::collections::BTreeSet;
+    use std::env;
     use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const LIVE_CLICKHOUSE_URL_ENV: &str = "MORAINE_BENCH_CLICKHOUSE_URL";
+
+    fn live_test_database_name(prefix: &str) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock must be after unix epoch")
+            .as_nanos();
+        format!("moraine_test_{prefix}_{}_{}", std::process::id(), now)
+    }
+
+    fn validate_live_test_database_name(database: &str) -> Result<()> {
+        let Some(suffix) = database.strip_prefix("moraine_test_") else {
+            anyhow::bail!("live test database must use moraine_test_ prefix");
+        };
+        if suffix.is_empty()
+            || !database
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            anyhow::bail!("unsafe live test database name {database:?}");
+        }
+        Ok(())
+    }
+
+    fn live_test_clickhouse(database: &str) -> Result<ClickHouseClient> {
+        validate_live_test_database_name(database)?;
+        let opt_in = env::var("MORAINE_ALLOW_DESTRUCTIVE_TESTS")
+            .context("MORAINE_ALLOW_DESTRUCTIVE_TESTS is required")?;
+        if opt_in != "1" {
+            anyhow::bail!("MORAINE_ALLOW_DESTRUCTIVE_TESTS must equal 1");
+        }
+        let url = env::var(LIVE_CLICKHOUSE_URL_ENV)
+            .with_context(|| format!("{LIVE_CLICKHOUSE_URL_ENV} is required"))?;
+        let username =
+            env::var("MORAINE_BENCH_CLICKHOUSE_USER").unwrap_or_else(|_| "default".to_string());
+        let password = env::var("MORAINE_BENCH_CLICKHOUSE_PASSWORD").unwrap_or_default();
+        ClickHouseClient::new(ClickHouseConfig {
+            url,
+            database: database.to_string(),
+            username,
+            password,
+            ..ClickHouseConfig::default()
+        })
+        .context("failed to construct live test ClickHouse client")
+    }
+
+    async fn drop_live_test_database(clickhouse: &ClickHouseClient, database: &str) -> Result<()> {
+        validate_live_test_database_name(database)?;
+        clickhouse
+            .request_text(
+                &format!("DROP DATABASE IF EXISTS `{database}` SYNC"),
+                None,
+                Some("system"),
+                false,
+                None,
+            )
+            .await
+            .with_context(|| format!("failed to drop live test database {database}"))?;
+        Ok(())
+    }
+
+    async fn seed_cwd_bearing_list_session_events(
+        clickhouse: &ClickHouseClient,
+        database: &str,
+    ) -> Result<()> {
+        let insert = format!(
+            r#"INSERT INTO `{database}`.`events`
+(
+  ingested_at, event_uid, session_id, session_date, source_name, harness, source_file,
+  source_ref, record_ts, event_ts, event_kind, actor_kind, payload_type, op_kind, op_status,
+  request_id, trace_id, turn_index, model, input_tokens, output_tokens, text_content,
+  payload_json, cwd, event_version
+)
+VALUES
+(
+  now64(3), 'issue580-user', 'issue580-sensitive-cwd-session', toDate('2026-04-30'),
+  'codex', 'codex', '/tmp/issue580.jsonl', 'issue580-user',
+  '2026-04-30T13:00:00.000Z', '2026-04-30 13:00:00.000', 'message', 'user',
+  'message', '', '', 'issue580-request', 'issue580-trace', 1, '', 0, 0,
+  'Question with sensitive cwd', '{{}}', '/work/acme-secret-merger', 1
+),
+(
+  now64(3), 'issue580-assistant', 'issue580-sensitive-cwd-session', toDate('2026-04-30'),
+  'codex', 'codex', '/tmp/issue580.jsonl', 'issue580-assistant',
+  '2026-04-30T13:10:00.000Z', '2026-04-30 13:10:00.000', 'message', 'assistant',
+  'message', '', '', 'issue580-request', 'issue580-trace', 29, '', 0, 0,
+  'Answer with sensitive cwd', '{{}}', '/work/acme-secret-merger', 1
+)"#
+        );
+        clickhouse
+            .request_text(&insert, None, Some(database), false, None)
+            .await
+            .context("failed to seed cwd-bearing canonical event fixture")?;
+        Ok(())
+    }
 
     #[test]
     fn deadline_envelope_is_a_handled_tool_error() {
@@ -578,6 +678,123 @@ mod tests {
         assert_eq!(filter.source_name.as_deref(), Some("codex"));
         assert_eq!(page.limit, 1);
         assert_eq!(page.cursor, None);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires wrapper-owned live ClickHouse and destructive opt-in"]
+    async fn live_public_list_sessions_omits_cwd_derived_metadata_from_structured_and_text_output()
+    {
+        let database = live_test_database_name("issue580");
+        let clickhouse = live_test_clickhouse(&database).expect("live ClickHouse client");
+        let outcome = async {
+            clickhouse
+                .run_migrations()
+                .await
+                .context("failed to migrate live test database")?;
+            seed_cwd_bearing_list_session_events(&clickhouse, &database).await?;
+            let repository = Arc::new(ClickHouseConversationRepository::new(
+                clickhouse.clone(),
+                RepoConfig::default(),
+            ));
+            let state = AppState::embedded(AppConfig::default(), repository);
+
+            let result = state
+                .list_sessions_v1(json!({
+                    "start_datetime": "2026-04-30T12:00:00Z",
+                    "end_datetime": "2026-04-30T14:00:00Z",
+                    "limit": 10
+                }))
+                .await
+                .expect("list sessions");
+            assert_eq!(result["isError"], json!(false));
+
+            let structured = serde_json::to_string(&result["structuredContent"])
+                .expect("structured content JSON");
+            assert!(!structured.contains("/work/acme-secret-merger"));
+            assert!(!structured.contains("acme-secret-merger"));
+            assert!(!structured.contains("\"originator\""));
+            assert!(!structured.contains("\"project\""));
+            assert_eq!(
+                result["structuredContent"]["data"]["sessions"][0]["session"]["display_label"],
+                json!("Codex, chat, Apr 30 13:10 UTC, 29 turns")
+            );
+
+            let text = result["content"][0]["text"]
+                .as_str()
+                .expect("rendered text output");
+            assert!(!text.contains("/work/acme-secret-merger"));
+            assert!(!text.contains("acme-secret-merger"));
+            assert!(!text.contains("originator"));
+            assert!(!text.contains("project"));
+            assert!(text.contains("Codex, chat, Apr 30 13:10 UTC, 29 turns"));
+
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        let cleanup = drop_live_test_database(&clickhouse, &database).await;
+        if let Err(cleanup_error) = cleanup {
+            panic!("{outcome:?}; cleanup failed: {cleanup_error:#}");
+        }
+        outcome.expect("live list_sessions privacy regression");
+    }
+
+    #[tokio::test]
+    async fn public_list_sessions_omits_cwd_derived_metadata_from_structured_and_text_output() {
+        let page = Page {
+            items: vec![McpSessionListItem {
+                session_id: "sess-sensitive-cwd".to_string(),
+                first_event_time: "2026-04-30 09:00:00".to_string(),
+                first_event_unix_ms: 1_777_554_000_000,
+                last_event_time: "2026-04-30 09:10:00".to_string(),
+                last_event_unix_ms: 1_777_554_600_000,
+                total_turns: 29,
+                total_events: 553,
+                mode: ConversationMode::WebSearch,
+                completed: false,
+                title: None,
+                source: Some("codex".to_string()),
+                harness: Some("codex".to_string()),
+                session_slug: None,
+                session_summary: None,
+            }],
+            next_cursor: None,
+        };
+        let repository = Arc::new(InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            InMemoryConversationResponses {
+                list_mcp_sessions: Some(Ok(page)),
+                ..InMemoryConversationResponses::default()
+            },
+        ));
+        let state = AppState::embedded(AppConfig::default(), repository);
+
+        let result = state
+            .list_sessions_v1(json!({
+                "start_datetime": "2026-04-30T09:00:00-04:00",
+                "end_datetime": "2026-04-30T13:00:00-04:00",
+                "limit": 10
+            }))
+            .await
+            .expect("list sessions");
+        assert_eq!(result["isError"], json!(false));
+
+        let structured =
+            serde_json::to_string(&result["structuredContent"]).expect("structured content JSON");
+        assert!(!structured.contains("acme-secret-merger"));
+        assert!(!structured.contains("\"originator\""));
+        assert!(!structured.contains("\"project\""));
+        assert_eq!(
+            result["structuredContent"]["data"]["sessions"][0]["session"]["display_label"],
+            json!("Codex, web search, Apr 30 13:10 UTC, 29 turns")
+        );
+
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("rendered text output");
+        assert!(!text.contains("acme-secret-merger"));
+        assert!(!text.contains("originator"));
+        assert!(!text.contains("project"));
+        assert!(text.contains("Codex, web search, Apr 30 13:10 UTC, 29 turns"));
     }
 
     #[test]

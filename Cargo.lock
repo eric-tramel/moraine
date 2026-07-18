@@ -1300,6 +1300,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "libc",
+ "moraine-clickhouse",
  "moraine-config",
  "moraine-conversations",
  "serde",

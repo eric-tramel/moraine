@@ -32,3 +32,4 @@ libc = "0.2"
 # dropped "macros".
 tokio = { version = "1.40", features = ["macros"] }
 async-trait = "0.1"
+moraine-clickhouse = { path = "../moraine-clickhouse" }
