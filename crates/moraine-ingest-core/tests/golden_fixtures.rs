@@ -9,6 +9,7 @@ use moraine_ingest_core::model::NormalizedRecord;
 use moraine_ingest_core::normalize::normalize_record;
 use moraine_ingest_core::sqlite_poll::synthesize_cursor_sqlite_record;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 const UPDATE_ENV: &str = "MORAINE_UPDATE_INGEST_GOLDENS";
 const CI_ENV: &str = "CI";
@@ -35,6 +36,9 @@ enum GoldenFormat {
 
 const SCHEMA_SQL: &str = include_str!("../../../sql/001_schema.sql");
 const TOKEN_SQL: &str = include_str!("../../../sql/014_harmonized_token_accounting.sql");
+const NAC_SQL_FIXTURE: &str = include_str!("../../../fixtures/nac/store.sql");
+const NAC_SQL_FIXTURE_SHA256: &str =
+    "675b845bfa476d19d3fb90cec83f710ec1f2a663e25dce1800f57287f1a810bf";
 
 const EVENT_REQUIRED_STRING_FIELDS: &[&str] = &[
     "event_uid",
@@ -1114,6 +1118,18 @@ fn assert_source_contract(
         case.name
     );
     assert_tool_phase_pairing(records, case);
+}
+
+#[test]
+fn nac_sql_fixture_is_pinned_and_inspectable() {
+    assert!(NAC_SQL_FIXTURE.contains("arcee-ai/nac@a23a3041b383e68c55cc358709096c97c58cfcd4"));
+    assert!(
+        NAC_SQL_FIXTURE.contains("sqlite3 sanitized-nac-store.db '.dump' > fixtures/nac/store.sql")
+    );
+    assert_eq!(
+        format!("{:x}", Sha256::digest(NAC_SQL_FIXTURE.as_bytes())),
+        NAC_SQL_FIXTURE_SHA256
+    );
 }
 
 #[test]

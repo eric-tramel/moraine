@@ -1,3 +1,8 @@
+-- Sanitized fixture for arcee-ai/nac@a23a3041b383e68c55cc358709096c97c58cfcd4.
+-- Schema source: crates/nac-core/src/store/schema.rs at that revision.
+-- Regenerate after creating a sanitized database with the pinned schema:
+--   sqlite3 sanitized-nac-store.db '.dump' > fixtures/nac/store.sql
+
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
 

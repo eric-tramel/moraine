@@ -1861,8 +1861,10 @@ mod tests {
             .await
             .insert(checkpoint_key("nac-fixture", &source_file), checkpoint);
 
+        let replacement = path.with_extension("replacement");
+        std::fs::write(&replacement, b"not a sqlite database").expect("write invalid replacement");
         std::fs::remove_file(&path).expect("remove fixture database");
-        std::fs::write(&path, b"not a sqlite database").expect("write invalid replacement");
+        std::fs::rename(&replacement, &path).expect("install invalid replacement");
         process_nac_sqlite_db(&config, &work, checkpoints, &poll_state, sink_tx, &metrics)
             .await
             .expect("failed replacement is reported as a batch");
