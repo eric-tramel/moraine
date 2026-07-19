@@ -582,6 +582,10 @@ main() {
   need_cmd "$python_bin"
   need_cmd ps
 
+  # Cache assertions below consume info-level events from the managed backend.
+  # Keep the test deterministic when the caller has a stricter global filter.
+  export RUST_LOG=info
+
   if [[ -z "$monitor_port" ]]; then
     monitor_port="$(pick_open_port "$python_bin")"
   fi
@@ -934,7 +938,7 @@ mode = "mirror"
 
 [backend]
 bind = "127.0.0.1"
-start_on_up = true
+start_on_up = false
 
 [monitor]
 port = ${monitor_port}
@@ -1044,6 +1048,9 @@ database = "${routed_clickhouse_database}"
 [backend]
 start_on_up = false
 
+[monitor]
+port = ${monitor_port}
+
 [runtime]
 root_dir = "${runtime_root}"
 logs_dir = "logs"
@@ -1077,6 +1084,7 @@ EOF
 
   echo "[e2e] bootstrapping distinct named-backend schema"
   "$moraine_bin" up --config "$routed_bootstrap_config_path" --no-ingest
+  "$moraine_bin" down --config "$routed_bootstrap_config_path"
 
   echo "[e2e] starting stack"
   "$moraine_bin" up --config "$config_path"

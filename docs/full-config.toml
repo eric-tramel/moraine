@@ -319,9 +319,10 @@ bind = "127.0.0.1"
 # authentication; requests remain unauthenticated.
 # auth_token = "<generate-a-random-guard-token>"
 
-# Start the unified MCP + monitor backend daemon with "moraine up". This is
-# intentionally off by default for the first compatibility release.
-start_on_up = false
+# Compatibility key retained for upgrades. The unified MCP + monitor backend
+# starts with every "moraine up"; loopback false values are accepted but
+# ignored. Non-loopback binds require this explicit true value.
+start_on_up = true
 
 [monitor]
 # Monitor HTTP port.

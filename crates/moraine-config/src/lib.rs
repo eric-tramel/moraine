@@ -3,6 +3,7 @@ use serde::{de::DeserializeOwned, Deserialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::net::IpAddr;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(windows)]
@@ -204,8 +205,8 @@ pub struct McpConfig {
     /// An absolute path is used verbatim.
     #[serde(default = "default_mcp_socket")]
     pub central_socket_path: String,
-    /// Primary deprecated compatibility key. When `[backend].start_on_up` is
-    /// absent, an explicitly configured `true` value maps to the unified backend.
+    /// Deprecated compatibility key. Its value is validated but no longer
+    /// gates the unified backend started by `moraine up`.
     #[serde(default = "default_true")]
     pub start_central_on_up: bool,
     /// Upper bound, in milliseconds, on how long a proxy client waits to
@@ -235,9 +236,9 @@ const REDACTED_AUTH_TOKEN: &str = "[REDACTED]";
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackendConfig {
-    /// Launch the unified MCP socket + monitor HTTP daemon from `moraine up`.
-    /// This remains off by default for the first backend-daemon release.
-    #[serde(default = "default_false")]
+    /// Deprecated compatibility input. The unified backend always launches
+    /// from `moraine up`; loaded configurations normalize this value to true.
+    #[serde(default = "default_true")]
     pub start_on_up: bool,
     /// Host or interface for the monitor HTTP listener; `monitor.port`
     /// remains the port configuration.
@@ -280,13 +281,12 @@ pub struct RuntimeConfig {
     pub clickhouse_auto_install: bool,
     #[serde(default = "default_clickhouse_version")]
     pub clickhouse_version: String,
-    /// Primary deprecated compatibility key. When `[backend].start_on_up` is
-    /// absent, an explicitly configured `true` value maps to the unified backend.
+    /// Deprecated compatibility key. Its value is validated but no longer
+    /// gates the unified backend started by `moraine up`.
     #[serde(default = "default_true")]
     pub start_monitor_on_up: bool,
-    /// Tertiary deprecated compatibility alias retained for configs written by
-    /// v0.6.0. It maps to the unified backend only when explicitly set to `true`
-    /// and `[backend].start_on_up` is absent.
+    /// Deprecated compatibility key retained for configs written by v0.6.0.
+    /// Its value is validated but no longer gates backend startup.
     #[serde(default = "default_false")]
     pub start_mcp_on_up: bool,
 }
@@ -400,7 +400,7 @@ impl fmt::Debug for BackendConfig {
 impl Default for BackendConfig {
     fn default() -> Self {
         Self {
-            start_on_up: false,
+            start_on_up: true,
             bind: default_backend_bind(),
             auth_token: None,
         }
@@ -1376,31 +1376,44 @@ fn raw_config_bool(raw: &toml::Value, section: &str, field: &str) -> Option<bool
         .and_then(toml::Value::as_bool)
 }
 
-fn normalize_backend_start_on_up(cfg: &mut AppConfig, raw: &toml::Value) {
-    // The canonical field is authoritative whenever present, including when
-    // explicitly false. AppConfig deserialization has already validated its
-    // type, so presence in the raw document is the distinction that matters.
-    if raw
-        .get("backend")
-        .and_then(|backend| backend.get("start_on_up"))
-        .is_some()
-    {
-        return;
+fn is_explicit_loopback_bind(bind: &str) -> bool {
+    let ip_literal = bind
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(bind);
+    ip_literal
+        .parse::<IpAddr>()
+        .map(|address| address.is_loopback())
+        .unwrap_or(false)
+}
+
+fn backend_launch_was_explicitly_enabled(raw: &toml::Value) -> bool {
+    match raw_config_bool(raw, "backend", "start_on_up") {
+        Some(enabled) => enabled,
+        None => {
+            raw_config_bool(raw, "runtime", "start_monitor_on_up").unwrap_or(false)
+                || raw_config_bool(raw, "runtime", "start_mcp_on_up").unwrap_or(false)
+                || raw_config_bool(raw, "mcp", "start_central_on_up").unwrap_or(false)
+        }
+    }
+}
+
+fn validate_non_loopback_backend_upgrade(cfg: &AppConfig, raw: &toml::Value) -> Result<()> {
+    if is_explicit_loopback_bind(&cfg.backend.bind) || backend_launch_was_explicitly_enabled(raw) {
+        return Ok(());
     }
 
-    // These two launch keys are the primary compatibility inputs. Inspect the
-    // raw document so their historical serde defaults do not opt in a config
-    // that omitted them.
-    let primary_legacy_start_on_up = raw_config_bool(raw, "runtime", "start_monitor_on_up")
-        .unwrap_or(false)
-        || raw_config_bool(raw, "mcp", "start_central_on_up").unwrap_or(false);
+    Err(anyhow::anyhow!(
+        "refusing to automatically enable the backend on non-loopback bind `{}`: set backend.start_on_up = true to acknowledge startup, or change backend.bind to an explicit loopback IP",
+        cfg.backend.bind
+    ))
+}
 
-    // start_mcp_on_up predates start_central_on_up and remains a separately
-    // named tertiary alias for configs written during that release window.
-    let tertiary_legacy_start_on_up =
-        raw_config_bool(raw, "runtime", "start_mcp_on_up").unwrap_or(false);
-
-    cfg.backend.start_on_up = primary_legacy_start_on_up || tertiary_legacy_start_on_up;
+fn normalize_backend_start_on_up(cfg: &mut AppConfig, _raw: &toml::Value) {
+    // Deserialization above still validates the canonical and legacy launch
+    // keys so existing configuration files remain load-compatible. Their
+    // values no longer gate startup: every `moraine up` includes the backend.
+    cfg.backend.start_on_up = true;
 }
 
 fn normalize_backend_bind(cfg: &mut AppConfig, raw: &toml::Value) {
@@ -1459,8 +1472,9 @@ fn load_config_with_home_path(path: &Path, home_path: Option<PathBuf>) -> Result
             "config declares both [clickhouse] and [backends.default]; they are aliases for the same backend — keep exactly one"
         ));
     }
-    normalize_backend_start_on_up(&mut cfg, &raw);
     normalize_backend_bind(&mut cfg, &raw);
+    validate_non_loopback_backend_upgrade(&cfg, &raw)?;
+    normalize_backend_start_on_up(&mut cfg, &raw);
 
     if cfg.redaction.dangerously_skip_secret_redaction
         && !path_is_home_config(path, home_path.as_deref())
@@ -2317,7 +2331,7 @@ max_parallel_requests = 0
     }
 
     fn assert_backend_defaults(backend: &BackendConfig) {
-        assert!(!backend.start_on_up);
+        assert!(backend.start_on_up);
         assert_eq!(backend.bind, "127.0.0.1");
         assert_eq!(backend.auth_token, None);
     }
@@ -2374,7 +2388,7 @@ auth_token = "  exact token value  "
         assert_eq!(empty_token.auth_token.as_deref(), Some(""));
         assert_eq!(
             format!("{empty_token:?}"),
-            r#"BackendConfig { start_on_up: false, bind: "127.0.0.1", auth_token: Some("[REDACTED]") }"#
+            r#"BackendConfig { start_on_up: true, bind: "127.0.0.1", auth_token: Some("[REDACTED]") }"#
         );
     }
 
@@ -2417,7 +2431,7 @@ auth_token = "  exact token value  "
     #[test]
     fn explicit_legacy_monitor_host_maps_to_backend_bind() {
         let path = write_temp_config(
-            "[monitor]\nhost = \"192.0.2.20\"\n",
+            "[backend]\nstart_on_up = true\n\n[monitor]\nhost = \"192.0.2.20\"\n",
             "backend-legacy-monitor-host",
         );
         let cfg = load_config(&path).expect("legacy monitor host should load");
@@ -2430,7 +2444,7 @@ auth_token = "  exact token value  "
     #[test]
     fn explicit_backend_bind_wins_over_legacy_monitor_host() {
         let path = write_temp_config(
-            "[backend]\nbind = \"0.0.0.0\"\n\n[monitor]\nhost = \"192.0.2.20\"\n",
+            "[backend]\nbind = \"0.0.0.0\"\nstart_on_up = true\n\n[monitor]\nhost = \"192.0.2.20\"\n",
             "backend-bind-precedence",
         );
         let cfg = load_config(&path).expect("canonical and legacy bind config should load");
@@ -2441,9 +2455,9 @@ auth_token = "  exact token value  "
     }
 
     #[test]
-    fn backend_start_on_up_defaults_and_missing_states_are_off() {
-        assert!(!BackendConfig::default().start_on_up);
-        assert!(!AppConfig::default().backend.start_on_up);
+    fn backend_start_on_up_is_effectively_on_for_missing_and_false_states() {
+        assert!(BackendConfig::default().start_on_up);
+        assert!(AppConfig::default().backend.start_on_up);
 
         for (label, contents) in [
             ("backend-empty-config", ""),
@@ -2469,12 +2483,55 @@ auth_token = "  exact token value  "
                 "[runtime]\nstart_monitor_on_up = false\nstart_mcp_on_up = false\n\n[mcp]\nstart_central_on_up = false\n",
             ),
         ] {
-            assert_backend_start_on_up(label, contents, false);
+            assert_backend_start_on_up(label, contents, true);
         }
     }
 
     #[test]
-    fn backend_start_on_up_maps_all_primary_legacy_alias_states() {
+    fn non_loopback_backend_requires_prior_launch_opt_in() {
+        for (label, contents) in [
+            (
+                "missing-launch-switch",
+                "[backend]\nbind = \"0.0.0.0\"\nauth_token = \"guard\"\n",
+            ),
+            (
+                "canonical-false",
+                "[backend]\nbind = \"0.0.0.0\"\nauth_token = \"guard\"\nstart_on_up = false\n",
+            ),
+            (
+                "canonical-false-overrides-legacy-true",
+                "[backend]\nbind = \"0.0.0.0\"\nauth_token = \"guard\"\nstart_on_up = false\n\n[runtime]\nstart_monitor_on_up = true\n",
+            ),
+            (
+                "legacy-false",
+                "[backend]\nbind = \"0.0.0.0\"\nauth_token = \"guard\"\n\n[runtime]\nstart_monitor_on_up = false\n",
+            ),
+        ] {
+            let path = write_temp_config(contents, label);
+            let error = load_config(&path).expect_err("non-loopback auto-enable must fail closed");
+            std::fs::remove_file(path).ok();
+            assert!(
+                error.to_string().contains("set backend.start_on_up = true"),
+                "{label}: {error:#}"
+            );
+        }
+
+        for (label, contents) in [
+            (
+                "canonical-true",
+                "[backend]\nbind = \"0.0.0.0\"\nauth_token = \"guard\"\nstart_on_up = true\n",
+            ),
+            (
+                "legacy-true",
+                "[backend]\nbind = \"0.0.0.0\"\nauth_token = \"guard\"\n\n[mcp]\nstart_central_on_up = true\n",
+            ),
+        ] {
+            assert_backend_start_on_up(label, contents, true);
+        }
+    }
+
+    #[test]
+    fn backend_start_on_up_ignores_all_primary_legacy_alias_states() {
         for monitor in [false, true] {
             for central in [false, true] {
                 let content = format!(
@@ -2483,26 +2540,22 @@ auth_token = "  exact token value  "
                 assert_backend_start_on_up(
                     &format!("backend-primary-{monitor}-{central}"),
                     &content,
-                    monitor || central,
+                    true,
                 );
             }
         }
     }
 
     #[test]
-    fn backend_start_on_up_maps_tertiary_runtime_mcp_alias_only_when_true() {
+    fn backend_start_on_up_ignores_tertiary_runtime_mcp_alias() {
         for start_mcp in [false, true] {
             let content = format!("[runtime]\nstart_mcp_on_up = {start_mcp}\n");
-            assert_backend_start_on_up(
-                &format!("backend-tertiary-{start_mcp}"),
-                &content,
-                start_mcp,
-            );
+            assert_backend_start_on_up(&format!("backend-tertiary-{start_mcp}"), &content, true);
         }
     }
 
     #[test]
-    fn explicit_backend_start_on_up_wins_over_all_legacy_alias_states() {
+    fn explicit_backend_start_on_up_is_accepted_but_effectively_on() {
         for explicit in [false, true] {
             for monitor in [false, true] {
                 for central in [false, true] {
@@ -2515,7 +2568,7 @@ auth_token = "  exact token value  "
                                 "backend-precedence-{explicit}-{monitor}-{central}-{start_mcp}"
                             ),
                             &content,
-                            explicit,
+                            true,
                         );
                     }
                 }
@@ -2934,8 +2987,8 @@ watch_root = "~/.cursor/projects"
 
         assert_eq!(
             raw_config_bool(&raw, "backend", "start_on_up"),
-            Some(false),
-            "template must explicitly opt out of backend launch"
+            Some(true),
+            "template must explicitly enable backend launch"
         );
         assert_eq!(
             raw.get("backend")
@@ -2980,10 +3033,10 @@ watch_root = "~/.cursor/projects"
             "template must not ship the tertiary MCP launch key"
         );
 
-        let path = write_temp_config(contents, "shipped-template-backend-off");
+        let path = write_temp_config(contents, "shipped-template-backend-on");
         let cfg = load_config(&path).expect("shipped template must load");
         std::fs::remove_file(&path).ok();
-        assert!(!cfg.backend.start_on_up);
+        assert!(cfg.backend.start_on_up);
         assert_eq!(cfg.backend.bind, "127.0.0.1");
         assert_eq!(cfg.backend.auth_token, None);
         assert!(cfg.mcp.use_central_server);

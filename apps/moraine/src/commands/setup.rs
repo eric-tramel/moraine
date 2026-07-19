@@ -230,15 +230,9 @@ fn setup_config(
                 "default config written",
             ))
         }
-        ConfigState::Valid {
-            backend_start_on_up,
-            backend_bind,
-        } => migrate_backend_config(
-            &target.path,
-            backend_start_on_up,
-            &backend_bind,
-            args.dry_run,
-        ),
+        ConfigState::Valid { backend_bind } => {
+            migrate_backend_config(&target.path, &backend_bind, args.dry_run)
+        }
         ConfigState::Invalid(message) => {
             if args.dry_run {
                 let action = if args.repair_config {
@@ -286,10 +280,7 @@ fn setup_config(
 
 enum ConfigState {
     Missing,
-    Valid {
-        backend_start_on_up: bool,
-        backend_bind: String,
-    },
+    Valid { backend_bind: String },
     Invalid(String),
     Unreadable(String),
 }
@@ -313,7 +304,6 @@ fn inspect_config(path: &Path) -> ConfigState {
     }
     match moraine_config::load_config(path) {
         Ok(config) => ConfigState::Valid {
-            backend_start_on_up: config.backend.start_on_up,
             backend_bind: config.backend.bind,
         },
         Err(exc) => ConfigState::Invalid(exc.to_string()),
@@ -487,17 +477,18 @@ fn timestamp_suffix() -> String {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct BackendConfigMigration {
     materialized_start_on_up: bool,
+    updated_start_on_up: bool,
     materialized_bind: bool,
     removed_monitor_host: bool,
     removed_monitor_alias: bool,
     removed_mcp_alias: bool,
     removed_central_alias: bool,
-    start_on_up: bool,
 }
 
 impl BackendConfigMigration {
     fn has_changes(&self) -> bool {
         self.materialized_start_on_up
+            || self.updated_start_on_up
             || self.materialized_bind
             || self.removed_monitor_host
             || self.removed_launch_alias_count() > 0
@@ -513,12 +504,21 @@ impl BackendConfigMigration {
         let mut changes = Vec::new();
         if self.materialized_start_on_up {
             changes.push(format!(
-                "backend.start_on_up={} {}",
-                self.start_on_up,
+                "backend.start_on_up=true {}",
                 if dry_run {
                     "would be materialized"
                 } else {
                     "materialized"
+                }
+            ));
+        }
+        if self.updated_start_on_up {
+            changes.push(format!(
+                "backend.start_on_up=true {}",
+                if dry_run {
+                    "would be updated"
+                } else {
+                    "updated"
                 }
             ));
         }
@@ -559,18 +559,9 @@ impl BackendConfigMigration {
     }
 }
 
-fn migrate_backend_config(
-    path: &Path,
-    backend_start_on_up: bool,
-    backend_bind: &str,
-    dry_run: bool,
-) -> Result<ConfigReport> {
+fn migrate_backend_config(path: &Path, backend_bind: &str, dry_run: bool) -> Result<ConfigReport> {
     let mut document = read_config_document(path)?;
-    let migration = apply_backend_config_migration_to_document(
-        &mut document,
-        backend_start_on_up,
-        backend_bind,
-    )?;
+    let migration = apply_backend_config_migration_to_document(&mut document, backend_bind)?;
     if !migration.has_changes() {
         return Ok(ConfigReport::ok(
             path,
@@ -597,15 +588,16 @@ fn migrate_backend_config(
 
 fn apply_backend_config_migration_to_document(
     document: &mut DocumentMut,
-    backend_start_on_up: bool,
     backend_bind: &str,
 ) -> Result<BackendConfigMigration> {
-    let backend_start_explicit = document
+    let backend_start_value = document
         .as_table()
         .get("backend")
         .and_then(Item::as_table_like)
         .and_then(|backend| backend.get("start_on_up"))
-        .is_some();
+        .and_then(Item::as_bool);
+    let backend_start_explicit = backend_start_value.is_some();
+    let updated_start_on_up = backend_start_value == Some(false);
     let backend_bind_explicit = document
         .as_table()
         .get("backend")
@@ -638,8 +630,8 @@ fn apply_backend_config_migration_to_document(
         .get_mut("backend")
         .and_then(Item::as_table_like_mut)
         .ok_or_else(|| anyhow::anyhow!("backend must be a TOML table"))?;
-    if !backend_start_explicit {
-        let _ = backend.insert("start_on_up", toml_edit::value(backend_start_on_up));
+    if !backend_start_explicit || updated_start_on_up {
+        let _ = backend.insert("start_on_up", toml_edit::value(true));
     }
     if !backend_bind_explicit {
         match legacy_monitor_host {
@@ -660,12 +652,12 @@ fn apply_backend_config_migration_to_document(
 
     Ok(BackendConfigMigration {
         materialized_start_on_up: !backend_start_explicit,
+        updated_start_on_up,
         materialized_bind: !backend_bind_explicit,
         removed_monitor_host,
         removed_monitor_alias,
         removed_mcp_alias,
         removed_central_alias,
-        start_on_up: backend_start_on_up,
     })
 }
 
@@ -3360,7 +3352,7 @@ watch_root = "~/custom"
             .expect("parse migrated config");
         assert_eq!(
             config_item(&document, "backend", "start_on_up").and_then(Item::as_bool),
-            Some(false)
+            Some(true)
         );
         assert_eq!(
             config_item(&document, "backend", "bind").and_then(Item::as_str),
@@ -3431,7 +3423,7 @@ watch_root = "~/custom"
     }
 
     #[test]
-    fn setup_materializes_backend_off_without_legacy_keys() {
+    fn setup_materializes_backend_on_without_legacy_keys() {
         let path = temp_path("backend-no-legacy");
         let original =
             "# minimal config\n\n[monitor]\n# preserve host comment\nhost = \"127.0.0.1\"\n";
@@ -3440,7 +3432,7 @@ watch_root = "~/custom"
         let report = setup_config_for_test(&path, false, false);
 
         assert_eq!(report.action, "migrated");
-        assert!(report.message.contains("backend.start_on_up=false"));
+        assert!(report.message.contains("backend.start_on_up=true"));
         assert!(report.message.contains("backend.bind"));
         assert!(report.message.contains("obsolete monitor.host removed"));
         let content = fs::read_to_string(&path).expect("migrated config");
@@ -3451,7 +3443,7 @@ watch_root = "~/custom"
             .expect("parse migrated config");
         assert_eq!(
             config_item(&document, "backend", "start_on_up").and_then(Item::as_bool),
-            Some(false)
+            Some(true)
         );
         assert_eq!(
             config_item(&document, "backend", "bind").and_then(Item::as_str),
@@ -3462,7 +3454,7 @@ watch_root = "~/custom"
     }
 
     #[test]
-    fn setup_materializes_backend_off_when_all_legacy_aliases_are_false() {
+    fn setup_materializes_backend_on_when_all_legacy_aliases_are_false() {
         let path = temp_path("backend-all-aliases-false");
         fs::write(
             &path,
@@ -3476,13 +3468,13 @@ watch_root = "~/custom"
         let document = read_toml_document(&path);
         assert_eq!(
             config_item(&document, "backend", "start_on_up").and_then(Item::as_bool),
-            Some(false)
+            Some(true)
         );
         assert!(config_item(&document, "runtime", "start_monitor_on_up").is_none());
         assert!(config_item(&document, "runtime", "start_mcp_on_up").is_none());
         assert!(config_item(&document, "mcp", "start_central_on_up").is_none());
         assert!(
-            !moraine_config::load_config(&path)
+            moraine_config::load_config(&path)
                 .expect("migrated config loads")
                 .backend
                 .start_on_up
@@ -3491,7 +3483,7 @@ watch_root = "~/custom"
     }
 
     #[test]
-    fn setup_preserves_explicit_backend_and_removes_conflicting_aliases() {
+    fn setup_enables_explicit_backend_and_removes_conflicting_aliases() {
         for explicit in [false, true] {
             let legacy = !explicit;
             let path = temp_path(&format!("backend-explicit-{explicit}"));
@@ -3506,22 +3498,24 @@ watch_root = "~/custom"
             let report = setup_config_for_test(&path, false, false);
 
             assert_eq!(report.action, "migrated");
-            assert!(!report.message.contains("backend.start_on_up"));
+            assert_eq!(
+                report.message.contains("backend.start_on_up=true updated"),
+                !explicit
+            );
             assert!(report.message.contains("3 obsolete launch keys removed"));
             let document = read_toml_document(&path);
             assert_eq!(
                 config_item(&document, "backend", "start_on_up").and_then(Item::as_bool),
-                Some(explicit)
+                Some(true)
             );
             assert!(config_item(&document, "runtime", "start_monitor_on_up").is_none());
             assert!(config_item(&document, "runtime", "start_mcp_on_up").is_none());
             assert!(config_item(&document, "mcp", "start_central_on_up").is_none());
-            assert_eq!(
+            assert!(
                 moraine_config::load_config(&path)
                     .expect("migrated config loads")
                     .backend
-                    .start_on_up,
-                explicit
+                    .start_on_up
             );
             let _ = fs::remove_file(path);
         }
@@ -3534,7 +3528,7 @@ watch_root = "~/custom"
         fs::write(
             &path,
             format!(
-                "[backend]\nbind = \"0.0.0.0\"\nauth_token = \"{secret}\"\n\n[monitor]\nhost = \"127.0.0.1\"\n"
+                "[backend]\nbind = \"0.0.0.0\"\nstart_on_up = true\nauth_token = \"{secret}\"\n\n[monitor]\nhost = \"127.0.0.1\"\n"
             ),
         )
         .expect("write token config");
@@ -3575,7 +3569,7 @@ watch_root = "~/custom"
             .expect("parse migrated config");
         assert_eq!(
             config_item(&document, "backend", "start_on_up").and_then(Item::as_bool),
-            Some(false)
+            Some(true)
         );
         let _ = fs::remove_file(path);
     }
@@ -3661,7 +3655,7 @@ host = "127.42.0.9"
             .expect("parse migrated config");
         assert_eq!(
             config_item(&document, "backend", "start_on_up").and_then(Item::as_bool),
-            Some(false)
+            Some(true)
         );
         assert_eq!(
             config_item(&document, "backend", "bind").and_then(Item::as_str),
@@ -4431,7 +4425,7 @@ watch_root = "~/.codex/sessions"
         assert!(report
             .config
             .message
-            .contains("backend.start_on_up=false would be materialized"));
+            .contains("backend.start_on_up=true would be materialized"));
         assert_eq!(fs::read_to_string(&path).expect("config content"), original);
         assert_eq!(
             report

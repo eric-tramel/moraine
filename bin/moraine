@@ -51,83 +51,6 @@ has_flag() {
   return 1
 }
 
-resolve_config_path() {
-  local config_path=""
-  local skip_next=0
-  local arg
-  for arg in "$@"; do
-    if [[ "$skip_next" == "1" ]]; then
-      config_path="$arg"
-      skip_next=0
-      continue
-    fi
-    case "$arg" in
-      --config)
-        skip_next=1
-        ;;
-      --config=*)
-        config_path="${arg#--config=}"
-        ;;
-    esac
-  done
-
-  if [[ -n "$config_path" ]]; then
-    printf '%s\n' "$config_path"
-    return 0
-  fi
-
-  if [[ -n "${MORAINE_CONFIG:-}" ]]; then
-    printf '%s\n' "$MORAINE_CONFIG"
-    return 0
-  fi
-
-  local home_cfg=""
-  if [[ -n "${HOME:-}" ]]; then
-    home_cfg="${HOME}/.moraine/config.toml"
-    if [[ -f "$home_cfg" ]]; then
-      printf '%s\n' "$home_cfg"
-      return 0
-    fi
-  fi
-
-  if [[ -f "$PROJECT_ROOT/config/moraine.toml" ]]; then
-    printf '%s\n' "$PROJECT_ROOT/config/moraine.toml"
-    return 0
-  fi
-
-  if [[ -n "$home_cfg" ]]; then
-    printf '%s\n' "$home_cfg"
-  else
-    printf '%s\n' "$PROJECT_ROOT/config/moraine.toml"
-  fi
-}
-
-backend_enabled_for_up() {
-  if has_flag "--backend" "$@" || has_flag "--monitor" "$@" || has_flag "--mcp" "$@"; then
-    return 0
-  fi
-
-  local cfg_path
-  cfg_path="$(resolve_config_path "$@")"
-  if [[ ! -f "$cfg_path" ]]; then
-    return 1
-  fi
-
-  local value=""
-  if ! value="$("$BIN_PATH" --output plain --config "$cfg_path" config get backend.start_on_up 2>/dev/null)"; then
-    return 1
-  fi
-
-  case "$value" in
-    true)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-}
-
 ensure_monitor_frontend() {
   local dist_dir="$PROJECT_ROOT/web/monitor/dist"
   if ! monitor_frontend_needs_build; then
@@ -222,10 +145,8 @@ export MORAINE_SOURCE_TREE_MODE
 
 command_name="$(first_non_flag_arg "$@" || true)"
 if [[ "$command_name" == "up" ]]; then
-  if backend_enabled_for_up "$@"; then
-    ensure_monitor_frontend
-    build_binary "$PROJECT_ROOT/apps/moraine-mcp/Cargo.toml"
-  fi
+  ensure_monitor_frontend
+  build_binary "$PROJECT_ROOT/apps/moraine-mcp/Cargo.toml"
 fi
 
 if [[ "$command_name" == "run" ]]; then

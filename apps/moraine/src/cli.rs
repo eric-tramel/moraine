@@ -48,13 +48,13 @@ pub(crate) enum CliCommand {
 pub(crate) struct UpArgs {
     #[arg(long)]
     pub(crate) no_ingest: bool,
-    /// Start the unified MCP socket and monitor HTTP backend.
+    /// Deprecated compatibility flag; the backend now always starts.
     #[arg(long)]
     pub(crate) backend: bool,
-    /// Deprecated compatibility alias for `--backend`.
+    /// Deprecated compatibility flag; the backend now always starts.
     #[arg(long)]
     pub(crate) monitor: bool,
-    /// Deprecated compatibility alias for `--backend`.
+    /// Deprecated compatibility flag; the backend now always starts.
     #[arg(long)]
     pub(crate) mcp: bool,
 }

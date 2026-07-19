@@ -457,7 +457,7 @@ pub(super) async fn handle_args(
     args: &UpArgs,
 ) -> Result<ExitCode> {
     let paths = runtime_paths(cfg);
-    let services_to_start = selected_up_services(args, cfg);
+    let services_to_start = selected_up_services(args);
     let mut progress = StartupProgress::from_output(output);
     progress.startup_plan(&services_to_start);
 
@@ -590,14 +590,12 @@ where
     }
 }
 
-fn selected_up_services(args: &UpArgs, cfg: &AppConfig) -> Vec<Service> {
+fn selected_up_services(args: &UpArgs) -> Vec<Service> {
     let mut services = Vec::new();
     if !args.no_ingest {
         services.push(Service::Ingest);
     }
-    if args.backend || args.monitor || args.mcp || cfg.backend.start_on_up {
-        services.push(Service::Backend);
-    }
+    services.push(Service::Backend);
     services
 }
 
@@ -736,24 +734,15 @@ mod tests {
     }
 
     #[test]
-    fn selected_up_services_uses_only_normalized_backend_switch_and_deduplicates_aliases() {
-        let mut cfg = AppConfig::default();
-        cfg.backend.start_on_up = false;
-        cfg.runtime.start_monitor_on_up = true;
-        cfg.runtime.start_mcp_on_up = true;
-        cfg.mcp.start_central_on_up = true;
-
+    fn selected_up_services_always_includes_backend_and_deduplicates_aliases() {
         assert_eq!(
-            selected_up_services(
-                &UpArgs {
-                    no_ingest: false,
-                    backend: false,
-                    monitor: false,
-                    mcp: false,
-                },
-                &cfg
-            ),
-            vec![Service::Ingest]
+            selected_up_services(&UpArgs {
+                no_ingest: false,
+                backend: false,
+                monitor: false,
+                mcp: false,
+            }),
+            vec![Service::Ingest, Service::Backend]
         );
 
         for (backend, monitor, mcp) in [
@@ -763,32 +752,15 @@ mod tests {
             (true, true, true),
         ] {
             assert_eq!(
-                selected_up_services(
-                    &UpArgs {
-                        no_ingest: true,
-                        backend,
-                        monitor,
-                        mcp,
-                    },
-                    &cfg
-                ),
+                selected_up_services(&UpArgs {
+                    no_ingest: true,
+                    backend,
+                    monitor,
+                    mcp,
+                }),
                 vec![Service::Backend],
                 "backend={backend} monitor={monitor} mcp={mcp}"
             );
         }
-
-        cfg.backend.start_on_up = true;
-        assert_eq!(
-            selected_up_services(
-                &UpArgs {
-                    no_ingest: false,
-                    backend: false,
-                    monitor: false,
-                    mcp: false,
-                },
-                &cfg
-            ),
-            vec![Service::Ingest, Service::Backend]
-        );
     }
 }
