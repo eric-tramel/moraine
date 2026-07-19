@@ -56,7 +56,7 @@ Most users only need to override paths, ports, or watched sources:
 ```toml
 [backend]
 bind = "127.0.0.1"
-start_on_up = false
+start_on_up = true
 
 [monitor]
 port = 8080
@@ -709,10 +709,9 @@ run while retrievals wait.
 
 When the backend daemon is running, Moraine uses one repository, ClickHouse
 client, and warm cache set for every MCP proxy session and the monitor HTTP
-server. The shipped configuration leaves the daemon off until `moraine up
---backend` is run or `backend.start_on_up` is enabled. `use_central_server`
-controls whether `moraine run mcp` attempts that shared socket before falling
-back to an embedded server:
+server. Every `moraine up` starts the daemon. `use_central_server` controls
+whether `moraine run mcp` attempts that shared socket before falling back to an
+embedded server:
 
 | Field | Default | Purpose |
 | --- | --- | --- |
@@ -740,12 +739,12 @@ See
 
 The up-managed MCP service is the unified backend daemon; the legacy per-`up`
 stdio daemon and standalone monitor service are gone. The old
-`runtime.start_monitor_on_up`, `mcp.start_central_on_up`, and
-`runtime.start_mcp_on_up` keys remain load-only compatibility aliases for one
-release. When `backend.start_on_up` is absent, any explicitly true alias maps
-to true. An explicitly configured canonical value always wins, including
-`false`. `moraine setup` materializes the prior effective value at
-`backend.start_on_up` and atomically removes all three obsolete keys.
+`backend.start_on_up`, `runtime.start_monitor_on_up`,
+`mcp.start_central_on_up`, and `runtime.start_mcp_on_up` launch switches remain
+load-compatible for upgrades, but their values no longer gate startup. Every
+well-typed combination loads with an effective `backend.start_on_up = true`.
+`moraine setup` canonicalizes the value to true and atomically removes the three
+obsolete aliases.
 
 ## Search Ranking
 
@@ -772,25 +771,28 @@ Most installations should keep these defaults.
 
 ## Backend Daemon
 
-`[backend]` controls the unified daemon's startup behavior and HTTP listener:
+`[backend]` controls the unified daemon's HTTP listener:
 
 ```toml
 [backend]
 bind = "127.0.0.1"
 # auth_token = "<generate-a-random-guard-token>"
-start_on_up = false
+start_on_up = true
 ```
 
 | Field | Default | Purpose |
 | --- | --- | --- |
 | `bind` | `127.0.0.1` | Interface for the monitor HTTP listener. Keep the loopback default for local-only access. |
 | `auth_token` | unset | Experimental startup prerequisite for a non-loopback effective bind. It does not authenticate HTTP requests. |
-| `start_on_up` | `false` | Starts one `moraine-mcp --serve socket` backend process that serves the MCP socket, monitor HTTP API, and static UI from one shared repository/cache set. |
+| `start_on_up` | `true` | Deprecated compatibility key. Every `moraine up` starts one unified backend; an existing loopback `false` value is accepted but ignored. |
 
-Use `moraine up --backend` for an explicit one-time start without changing the
-configuration. `moraine up --monitor` and `moraine up --mcp` remain deprecated
-CLI aliases for the same single backend process; they never launch separate
-services.
+`moraine up --backend`, `moraine up --monitor`, and `moraine up --mcp` remain
+deprecated, redundant compatibility forms. They never launch separate services.
+For upgrade safety, a non-loopback `backend.bind` also requires an affirmative
+existing launch setting (`backend.start_on_up = true`, or a legacy true alias);
+otherwise config loading fails rather than unexpectedly exposing the
+unauthenticated monitor API. Loopback configs normalize existing false values
+to true automatically.
 
 ### Experimental HTTP bind guard
 

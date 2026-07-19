@@ -952,7 +952,7 @@ watch_root = "/sandbox/fixtures/codex/sessions"
 [backend]
 bind = "0.0.0.0"
 auth_token = "${guard_token}"
-start_on_up = false
+start_on_up = true
 
 [monitor]
 port = 8080

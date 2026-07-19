@@ -37,6 +37,7 @@ fn write_executable(path: &Path, contents: &str) {
 
 fn write_config(root: &Path, port: u16) -> PathBuf {
     let runtime = root.join("runtime");
+    write_executable(&root.join("services/moraine-mcp"), "#!/bin/sh\nexit 0\n");
     let config = root.join("config path with spaces.toml");
     fs::write(
         &config,

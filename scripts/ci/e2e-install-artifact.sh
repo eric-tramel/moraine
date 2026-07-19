@@ -59,6 +59,7 @@ main() {
   local bundle_version="ci-e2e-${run_stamp}"
 
   need_cmd curl
+  need_cmd cmp
   need_cmd "$python_bin"
   need_cmd tar
   need_cmd bash
@@ -101,6 +102,28 @@ main() {
     exit 1
   fi
   "$installed_moraine" config get clickhouse.url --config "$installed_config" >/dev/null
+  if [[ "$("$installed_moraine" config get backend.start_on_up --config "$installed_config")" != "true" ]]; then
+    echo "fresh installed config must enable the backend" >&2
+    exit 1
+  fi
+
+  echo "[e2e-install] reinstalling over preserved backend-off config"
+  local preserved_config
+  preserved_config=$'# preserved upgrade config\n\n[backend]\nstart_on_up = false\n'
+  printf '%s' "$preserved_config" > "$installed_config"
+  MORAINE_INSTALL_ASSET_BASE_URL="$asset_base_url" \
+    MORAINE_INSTALL_VERSION="$bundle_version" \
+    MORAINE_INSTALL_SKIP_CLICKHOUSE=1 \
+    MORAINE_INSTALL_DIR="$installed_bin_dir" \
+    bash "$install_script"
+  if ! cmp -s "$installed_config" <(printf '%s' "$preserved_config"); then
+    echo "reinstall must preserve the existing config" >&2
+    exit 1
+  fi
+  if [[ "$("$installed_moraine" config get backend.start_on_up --config "$installed_config")" != "true" ]]; then
+    echo "preserved backend-off config must load as effectively enabled" >&2
+    exit 1
+  fi
 
   echo "[e2e-install] running functional stack + MCP smoke with installed moraine"
   unset MORAINE_SOURCE_TREE_MODE
