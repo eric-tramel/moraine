@@ -26,9 +26,6 @@ invocation form native to the current harness:
 | `code-review-yagni` | `$moraine-dev:code-review-yagni` | `/code-review-yagni` |
 | `code-review-scope` | `$moraine-dev:code-review-scope` | `/code-review-scope` |
 
-In another harness that discovers open Agent Skills, invoke the discovered
-skill name without a Codex plugin namespace.
-
 Give each reviewer the same raw review packet: PR description, cited issue or objective, relevant diff, changed files, validation results, and any constraints from the user. Do not include your intended fix or your private diagnosis in the prompt.
 
 In Codex, use prompts shaped like:
@@ -42,7 +39,7 @@ Review packet:
 <PR title/body, objective, diff summary, validation, relevant files>
 ```
 
-In Kiro or another harness that loads `SKILL.md` directly, simply name the skill:
+In Kiro, simply name the skill:
 
 ```text
 Use the code-review-correctness skill to review this PR. Focus only on that persona's facet.

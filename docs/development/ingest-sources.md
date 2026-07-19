@@ -128,14 +128,20 @@ parsed timestamps. Adapters should not rebuild those fields by hand.
 ### Kiro paired sessions
 
 Kiro CLI writes `<session-id>.jsonl` and `<session-id>.json` under
-`~/.kiro/sessions/cli`. The transcript remains the canonical checkpoint path.
-Watcher events for either file coalesce to that JSONL path; the sidecar's
-fingerprint is persisted in the checkpoint so metadata-only changes re-emit a
-stable `session_meta` event without replaying transcript lines. Missing
-sidecars do not block transcript ingestion, while malformed sidecars produce a
-checkpointed ingest error. Kiro's per-turn metering entries are summed into
-`token_usage_native_units["credits"]` on that session metadata event; token
-counts remain populated independently when Kiro supplies them.
+`$KIRO_HOME/sessions/cli` when `KIRO_HOME` is set, or
+`~/.kiro/sessions/cli` otherwise. The transcript remains the canonical
+checkpoint path. Watcher events for either file coalesce to that JSONL path;
+the sidecar's fingerprint is persisted in the checkpoint so title, usage, and
+credit changes re-emit a stable `session_meta` event without replaying
+transcript lines. Missing sidecars do not block transcript ingestion. When a
+valid sidecar first appears, or when its session id, cwd, or model changes,
+Moraine replays the transcript once with stable event IDs to backfill those
+searchable fields. Malformed sidecars produce a checkpointed ingest error. The
+checkpoint cursor also preserves the last transcript timestamp so live tails
+do not need to rescan prior records. Kiro's per-turn
+metering entries are summed into `token_usage_native_units["credits"]` on that
+session metadata event; token counts remain populated independently when Kiro
+supplies them.
 
 ## Shared Helpers
 

@@ -143,9 +143,10 @@ moraine setup --dry-run --mcp-target claude-code --mcp-target codex --mcp-target
 
 The Claude Code, Codex, and Hermes plugins bundle Moraine search, realtime, and
 sanitized bug-report guidance. `moraine setup` installs those plugins for
-default user-scoped setup. For Kiro CLI, setup registers global MCP and installs
+default user-scoped setup. For Kiro CLI, setup registers global MCP, installs
 managed search and realtime guidance under `$KIRO_HOME/steering` when
-`KIRO_HOME` is set, or `~/.kiro/steering` otherwise. It also registers MCP
+`KIRO_HOME` is set (or `~/.kiro/steering` otherwise), and points the setup-owned
+ingest source at the matching `sessions/cli` directory. It also registers MCP
 directly or writes global MCP config for supported harnesses such as Qwen Code,
 Kimi CLI, OpenCode, Cursor, and Pi Coding Agent. These user-scoped integrations
 can search the host-wide Moraine history visible to your user, so enable them

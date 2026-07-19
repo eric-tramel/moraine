@@ -358,7 +358,7 @@ The built-in defaults and `config/moraine.toml` reference cover these source fam
 | Codex | `codex` | `~/.codex/sessions/**/*.jsonl` | `~/.codex/sessions` | inferred `jsonl` |
 | Claude Code | `claude-code` | `~/.claude/projects/**/*.jsonl` | `~/.claude/projects` | inferred `jsonl` |
 | Claude Cowork (local macOS) | `claude-code` | `~/Library/Application Support/Claude/local-agent-mode-sessions/**/.claude/projects/**/*.jsonl` | `~/Library/Application Support/Claude/local-agent-mode-sessions` | inferred `jsonl` |
-| Kiro CLI | `kiro-cli` | `~/.kiro/sessions/cli/*.jsonl` | `~/.kiro/sessions/cli` | `kiro_session` |
+| Kiro CLI | `kiro-cli` | `$KIRO_HOME/sessions/cli/*.jsonl` when set; otherwise `~/.kiro/sessions/cli/*.jsonl` | matching `sessions/cli` directory | `kiro_session` |
 | Kimi CLI | `kimi-cli` | `~/.kimi/sessions/**/wire.jsonl` | `~/.kimi/sessions` | inferred `jsonl` |
 | Qwen Code | `qwen-code` | `~/.qwen/projects/*/chats/*.jsonl` | `~/.qwen/projects` | `jsonl` |
 | OpenCode | `opencode` | `~/.local/share/opencode/opencode*.db` | `~/.local/share/opencode` | `opencode_sqlite` (default on) |
@@ -378,7 +378,9 @@ history in default or channel-specific SQLite databases (`opencode_sqlite`);
 the template enables it by default. Kiro CLI stores transcript records in
 `<session-id>.jsonl` and session-level cwd, title, model, and token totals in
 `<session-id>.json`; the paired `kiro_session` format watches both files and
-checkpoints sidecar changes independently of transcript growth.
+checkpoints sidecar changes independently of transcript growth. Running
+`moraine setup` with the Kiro target rewrites the setup-owned `kiro` source to
+use `$KIRO_HOME/sessions/cli` when `KIRO_HOME` is set.
 
 ## Source Examples
 

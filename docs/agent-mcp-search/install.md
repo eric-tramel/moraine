@@ -303,12 +303,14 @@ moraine setup --mcp-target kiro-cli
 ```
 
 Setup writes `$KIRO_HOME/steering/moraine.md` when `KIRO_HOME` is set, or
-`~/.kiro/steering/moraine.md` otherwise. It replaces the global `moraine` MCP
-registration with one that launches `moraine run mcp` through the absolute path
-of the CLI running setup. The steering file is managed by Moraine and updated
-when setup runs again; setup does not modify `AGENTS.md` or other Kiro steering
-files. Start a new Kiro session after setup so it loads the MCP server and
-steering guidance.
+`~/.kiro/steering/moraine.md` otherwise. Moraine resolves the setup-owned
+`kiro` ingest source under `$KIRO_HOME/sessions/cli` when the override is set;
+without it, the source remains `~/.kiro/sessions/cli`. Setup replaces the
+global `moraine` MCP registration with one that launches `moraine run mcp`
+through the absolute path of the CLI running setup. The steering file is managed
+by Moraine and updated when setup runs again; setup does not modify `AGENTS.md`
+or other Kiro steering files. Start a new Kiro session after setup so it loads
+the MCP server and steering guidance.
 
 Kiro documents global steering files and its MCP commands here:
 [Kiro CLI steering](https://kiro.dev/docs/cli/steering/) and
@@ -330,7 +332,8 @@ kiro-cli mcp add --name moraine --scope global \
 ```
 
 When registering MCP manually, also add the guidance from
-[Patterns](patterns.md) to a markdown file under `~/.kiro/steering/`.
+[Patterns](patterns.md) to a markdown file under `$KIRO_HOME/steering` when set,
+or `~/.kiro/steering` otherwise.
 
 ## Kimi CLI
 

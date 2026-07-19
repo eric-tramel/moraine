@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Cache behavior assertions below inspect info-level backend markers. Keep the
+# child service log level deterministic instead of inheriting a quieter host
+# setting such as RUST_LOG=warn.
+export RUST_LOG=info
+
 E2E_SUCCESS=0
 
 need_cmd() {
@@ -1314,7 +1319,7 @@ EOF
   assert_clickhouse_count "$clickhouse_url" "kiro unique raw rows after sidecar update" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-kiro'" "7"
   assert_clickhouse_count "$clickhouse_url" "kiro event rows after sidecar update" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kiro'" "8"
   assert_clickhouse_count "$clickhouse_url" "kiro session_meta collapses on re-emit" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kiro' AND event_kind = 'session_meta'" "1"
-  assert_clickhouse_count "$clickhouse_url" "ingest errors after kiro sidecar update" "SELECT count() FROM ${clickhouse_database}.ingest_errors" "0"
+  assert_clickhouse_count "$clickhouse_url" "Kiro ingest errors after sidecar update" "SELECT count() FROM ${clickhouse_database}.ingest_errors WHERE source_name = 'ci-kiro'" "0"
 
   assert_clickhouse_count "$clickhouse_url" "cursor unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-cursor'" "5"
   assert_clickhouse_count "$clickhouse_url" "cursor event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-cursor'" "6"

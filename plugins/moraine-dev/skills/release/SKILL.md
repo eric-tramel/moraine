@@ -1,14 +1,13 @@
 ---
 name: release
-description: Cut and publish Moraine releases from a version argument such as /release X.Y.Z in Kiro or a request to use $moraine-dev:release in Codex. Use when any supported agent harness is asked to run Moraine's release process, bump release-managed versions, create and merge the release PR, push the vX.Y.Z tag, update GitHub release notes for a general audience, verify the release-moraine workflow, and confirm the PyPI moraine-cli package. In Codex, start or continue a durable goal for the release.
+description: Cut and publish Moraine releases from a version argument such as /release X.Y.Z in Kiro or a request to use $moraine-dev:release in Codex. Use when Codex or Kiro is asked to run Moraine's release process, bump release-managed versions, create and merge the release PR, push the vX.Y.Z tag, update GitHub release notes for a general audience, verify the release-moraine workflow, and confirm the PyPI moraine-cli package. In Codex, start or continue a durable goal for the release.
 ---
 
 # Release
 
 Run Moraine releases end to end with the shared `moraine-dev` contributor
-workflow. Invoke it as `$moraine-dev:release X.Y.Z` in Codex, `/release X.Y.Z`
-in Kiro, or the discovered `release` skill in another Agent Skills harness.
-Every form means: publish `vX.Y.Z`, not just prepare a plan.
+workflow. Invoke it as `$moraine-dev:release X.Y.Z` in Codex or `/release
+X.Y.Z` in Kiro. Both forms mean: publish `vX.Y.Z`, not just prepare a plan.
 
 ## Goal Contract
 
@@ -22,10 +21,8 @@ In Codex, make the release a durable goal before doing release work:
   evidence exists: merged PR, pushed tag, successful workflow, GitHub release
   body/assets, and PyPI `moraine-cli` artifacts.
 
-In Kiro or another harness without Codex goal tools, use its durable task
-mechanism when available; otherwise maintain an explicit checklist in the
-session. Do not mark the release complete until the same public release
-evidence exists.
+In Kiro, maintain an explicit checklist in the session. Do not mark the release
+complete until the same public release evidence exists.
 
 ## Preconditions
 
@@ -64,7 +61,6 @@ convention:
 | --- | --- |
 | Codex | `codex/release-$TAG` |
 | Kiro | `kiro/release-$TAG` |
-| Other | `release/$TAG` |
 
 ```bash
 worktree_root="${MORAINE_WORKTREE_ROOT:-../moraine-worktrees}"
@@ -123,8 +119,7 @@ cargo test --workspace --locked
 
 Use `$moraine-dev:moraine-sandbox-qa` in Codex or `/moraine-sandbox-qa` in Kiro
 when the release includes ingest, MCP, monitor, ClickHouse schema,
-source-format, or stack-behavior changes since the previous tag. In another
-Agent Skills harness, invoke the discovered `moraine-sandbox-qa` skill. If that
+source-format, or stack-behavior changes since the previous tag. If that
 workflow is unavailable, follow the dev sandbox commands required by
 `AGENTS.md`: capture the sandbox id with `--quiet`, run focused checks inside
 it, and tear it down before reporting completion.

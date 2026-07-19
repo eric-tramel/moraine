@@ -42,9 +42,7 @@ metadata at startup, loads full instructions on demand, and exposes each skill
 as a slash command.
 
 The shared skill bodies preserve harness-native invocation forms instead of
-assuming one client: `$moraine-dev:<skill>` for Codex, `/<skill>` for Kiro,
-and the discovered skill name for other clients that implement open Agent
-Skills.
+assuming one client: `$moraine-dev:<skill>` for Codex and `/<skill>` for Kiro.
 
 ## Codex
 
@@ -115,8 +113,7 @@ Invoke workflows directly:
 
 ## Planning
 
-Use `$moraine-dev:crystallize` in Codex, `/crystallize` in Kiro, or the
-discovered `crystallize` skill in another Agent Skills harness when the user
+Use `$moraine-dev:crystallize` in Codex or `/crystallize` in Kiro when the user
 has a rough idea, feature sketch, bug report, or architecture direction that
 needs research and debate before implementation. The skill writes a uniquely
 named Markdown plan under a local gitignored `plans/` directory. Do not commit
@@ -125,8 +122,7 @@ artifact to be versioned.
 
 ## Review Personas
 
-Use `$moraine-dev:code-review` in Codex, `/code-review` in Kiro, or the
-discovered `code-review` skill in another Agent Skills harness for the whole
+Use `$moraine-dev:code-review` in Codex or `/code-review` in Kiro for the whole
 review set. Invoking the skill is an explicit request for delegated multi-agent
 review; agents should not ask for separate permission to spawn reviewer
 subagents, and should not replace the review wave with a local single-agent
@@ -151,9 +147,8 @@ tools directly: `search_sessions`, `list_sessions`, `open`, and
 
 ## Releases
 
-Use `$moraine-dev:release X.Y.Z` in Codex, `/release X.Y.Z` in Kiro, or the
-discovered `release` skill in another Agent Skills harness. It owns the release
-goal, version bump, release PR, annotated tag, GitHub release notes,
+Use `$moraine-dev:release X.Y.Z` in Codex or `/release X.Y.Z` in Kiro. It owns
+the release goal, version bump, release PR, annotated tag, GitHub release notes,
 tag-triggered workflow verification, and PyPI verification.
 
 ## Maintenance
