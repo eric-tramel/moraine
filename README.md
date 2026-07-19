@@ -39,7 +39,7 @@ Moraine ships session trace ingestion adapters for these agent harnesses:
 | --- | --- | --- |
 | [Codex](https://developers.openai.com/codex) | `codex` | JSONL session files under `~/.codex/sessions` |
 | [Claude Code](https://code.claude.com/docs/en/overview) | `claude-code` | JSONL project session files under `~/.claude/projects` |
-| [Kiro CLI](https://kiro.dev/docs/cli/) | `kiro-cli` | Paired JSONL transcripts and JSON metadata under `~/.kiro/sessions/cli` |
+| [Kiro CLI](https://kiro.dev/docs/cli/) | `kiro-cli` | Paired JSONL transcripts and JSON metadata under `$KIRO_HOME/sessions/cli` when set, or `~/.kiro/sessions/cli` |
 | [Kimi CLI](https://moonshotai.github.io/kimi-cli/en/) | `kimi-cli` | `wire.jsonl` session traces under `~/.kimi/sessions` |
 | [Qwen Code](https://github.com/QwenLM/qwen-code) | `qwen-code` | JSONL chat records under `~/.qwen/projects/*/chats` |
 | [OpenCode](https://opencode.ai/) | `opencode` | SQLite session history from `~/.local/share/opencode/opencode*.db` (default on; `opencode_sqlite` format) |
@@ -70,6 +70,7 @@ Codex, and Hermes; install Kiro CLI's global steering and MCP registration; or
 register Moraine MCP for supported harnesses such as Qwen Code, OpenCode,
 Cursor, Kimi CLI, and Pi Coding Agent. The integrations use the `moraine` CLI on
 your `PATH` and the running local stack.
+For Kiro CLI, Moraine also resolves the default `kiro` ingest source from `KIRO_HOME`.
 
 Start a new agent session after installing an integration. The Claude Code,
 Codex, and Hermes plugins provide named Moraine skills. Kiro CLI receives
@@ -87,9 +88,10 @@ user. For project-scoped setup, duplicate MCP cleanup, and other clients, see
 ## Agent Harness Guidance
 
 The Claude Code, Codex, and Hermes plugins already bundle Moraine search
-guidance, and `moraine setup --mcp-target kiro-cli` installs it as
-`~/.kiro/steering/moraine.md` for Kiro CLI. If you use manual MCP registration
-or another harness, add the following guidance to its global instructions, such
+guidance, and `moraine setup --mcp-target kiro-cli` installs it under
+`$KIRO_HOME/steering` when set, or `~/.kiro/steering` otherwise. If you use
+manual MCP registration or another harness, add the following guidance to its
+global instructions, such
 as that Kiro steering path, `~/.codex/AGENTS.md` for Codex, or
 `~/.claude/CLAUDE.md` for Claude Code:
 

@@ -73,6 +73,7 @@ impl IngestSource for KiroCli {
 pub(crate) struct KiroSessionMetadata {
     record: Option<Value>,
     fingerprint: u64,
+    transcript_fingerprint: u64,
     error: Option<String>,
     session_id: String,
     cwd: String,
@@ -87,6 +88,10 @@ impl KiroSessionMetadata {
 
     pub(crate) fn fingerprint(&self) -> u64 {
         self.fingerprint
+    }
+
+    pub(crate) fn transcript_fingerprint(&self) -> u64 {
+        self.transcript_fingerprint
     }
 
     pub(crate) fn error(&self) -> Option<&str> {
@@ -119,6 +124,7 @@ pub(crate) fn load_kiro_session_metadata(source_file: &str) -> KiroSessionMetada
             return KiroSessionMetadata {
                 record: None,
                 fingerprint: 0,
+                transcript_fingerprint: 0,
                 error: None,
                 session_id: fallback_session_id,
                 cwd: String::new(),
@@ -130,6 +136,7 @@ pub(crate) fn load_kiro_session_metadata(source_file: &str) -> KiroSessionMetada
             return KiroSessionMetadata {
                 record: None,
                 fingerprint: 0,
+                transcript_fingerprint: 0,
                 error: Some(format!(
                     "failed to read Kiro session metadata {}: {exc}",
                     sidecar.display()
@@ -173,6 +180,7 @@ pub(crate) fn load_kiro_session_metadata(source_file: &str) -> KiroSessionMetada
     let title = to_str(document.get("title"));
     let agent_name = to_str(document.pointer("/session_state/agent_name"));
     let model = to_str(document.pointer("/session_state/rts_model_state/model_info/model_id"));
+    let transcript_fingerprint = fingerprint_transcript_metadata(&session_id, &cwd, &model);
     let turns = document
         .pointer("/session_state/conversation_metadata/user_turn_metadatas")
         .and_then(Value::as_array);
@@ -212,6 +220,7 @@ pub(crate) fn load_kiro_session_metadata(source_file: &str) -> KiroSessionMetada
     KiroSessionMetadata {
         record: Some(record),
         fingerprint,
+        transcript_fingerprint,
         error: None,
         session_id,
         cwd,
@@ -229,6 +238,7 @@ fn invalid_kiro_session_metadata(
     KiroSessionMetadata {
         record: None,
         fingerprint,
+        transcript_fingerprint: 0,
         error: Some(format!(
             "failed to parse Kiro session metadata {}: {reason}",
             sidecar.display()
@@ -251,6 +261,12 @@ fn fingerprint_bytes(body: &[u8]) -> u64 {
             .try_into()
             .expect("SHA-256 digest always has at least eight bytes"),
     )
+}
+
+fn fingerprint_transcript_metadata(session_id: &str, cwd: &str, model: &str) -> u64 {
+    let encoded = serde_json::to_vec(&(session_id, cwd, model))
+        .expect("Kiro transcript metadata tuple is serializable");
+    fingerprint_bytes(&encoded)
 }
 
 fn non_empty_or(value: String, fallback: &str) -> String {

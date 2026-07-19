@@ -1301,6 +1301,24 @@ fn migrate_legacy_pi_source(sources: &mut Vec<IngestSource>) {
     });
 }
 
+fn expand_ingest_source_path(
+    source: &IngestSource,
+    path: &str,
+    kiro_home: Option<&Path>,
+) -> String {
+    if source.name == "kiro" && source.harness == "kiro-cli" {
+        if let (Some(kiro_home), Some(relative)) = (kiro_home, path.strip_prefix("~/.kiro")) {
+            if relative.is_empty() || relative.starts_with('/') {
+                return kiro_home
+                    .join(relative.trim_start_matches('/'))
+                    .to_string_lossy()
+                    .into_owned();
+            }
+        }
+    }
+    expand_path(path)
+}
+
 fn normalize_config(mut cfg: AppConfig) -> Result<AppConfig> {
     if cfg.mcp.max_parallel_requests == Some(0) {
         return Err(anyhow::anyhow!(
@@ -1325,13 +1343,14 @@ fn normalize_config(mut cfg: AppConfig) -> Result<AppConfig> {
     #[cfg(target_os = "macos")]
     migrate_legacy_claude_source(&mut cfg.ingest.sources);
     migrate_legacy_pi_source(&mut cfg.ingest.sources);
+    let kiro_home = std::env::var_os("KIRO_HOME").map(PathBuf::from);
     for (source_idx, source) in cfg.ingest.sources.iter_mut().enumerate() {
         source.harness = normalize_harness(&source.harness, source_idx, &source.name)?;
-        source.glob = expand_path(&source.glob);
+        source.glob = expand_ingest_source_path(source, &source.glob, kiro_home.as_deref());
         source.watch_root = if source.watch_root.trim().is_empty() {
             watch_root_from_glob(&source.glob)
         } else {
-            expand_path(&source.watch_root)
+            expand_ingest_source_path(source, &source.watch_root, kiro_home.as_deref())
         };
         source.format = normalize_source_format(
             &source.format,
@@ -3029,6 +3048,33 @@ watch_root = "~/.cursor/projects"
         assert!(source.enabled);
         assert_eq!(source.format, SOURCE_FORMAT_KIRO_SESSION);
         assert_eq!(source.harness, "kiro-cli");
+    }
+
+    #[test]
+    fn kiro_default_source_paths_follow_kiro_home() {
+        let source = IngestSource {
+            name: "kiro".to_string(),
+            harness: "kiro-cli".to_string(),
+            enabled: true,
+            glob: "~/.kiro/sessions/cli/*.jsonl".to_string(),
+            watch_root: "~/.kiro/sessions/cli".to_string(),
+            format: SOURCE_FORMAT_KIRO_SESSION.to_string(),
+        };
+        let kiro_home = Path::new("/tmp/custom-kiro-home");
+
+        assert_eq!(
+            expand_ingest_source_path(&source, &source.glob, Some(kiro_home)),
+            "/tmp/custom-kiro-home/sessions/cli/*.jsonl"
+        );
+        assert_eq!(
+            expand_ingest_source_path(&source, &source.watch_root, Some(kiro_home)),
+            "/tmp/custom-kiro-home/sessions/cli"
+        );
+        assert_eq!(
+            expand_ingest_source_path(&source, "/custom/kiro/*.jsonl", Some(kiro_home)),
+            "/custom/kiro/*.jsonl",
+            "an explicit custom source path must not be rewritten"
+        );
     }
 
     #[test]

@@ -9,10 +9,9 @@ description: Start Moraine repository development work safely. Use when an agent
 
 Use this workflow to start a Moraine contributor task with the same orientation every time: verify the checkout, isolate the branch, read governing instructions, and choose the right validation path before editing.
 
-Using `$moraine-dev:code-review` in Codex, `/code-review` in Kiro, or the
-discovered `code-review` skill in another Agent Skills harness is an explicit
-user request for delegated reviewer subagents. You have permission to launch
-that review wave when the follow-on workflow reaches that step.
+Using `$moraine-dev:code-review` in Codex or `/code-review` in Kiro is an
+explicit user request for delegated reviewer subagents. You have permission to
+launch that review wave when the follow-on workflow reaches that step.
 
 ## Harness Invocation
 
@@ -24,9 +23,6 @@ Use the invocation form native to the current harness:
 | `code-review` | `$moraine-dev:code-review` | `/code-review` |
 | `moraine-sandbox-qa` | `$moraine-dev:moraine-sandbox-qa` | `/moraine-sandbox-qa` |
 | `moraine-author-pr` | `$moraine-dev:moraine-author-pr` | `/moraine-author-pr` |
-
-In another harness that discovers open Agent Skills, invoke the discovered
-skill name without a Codex plugin namespace.
 
 ## Follow-On Workflow
 

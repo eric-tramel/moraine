@@ -71,10 +71,19 @@ fn run_setup(
             let config_allows_ingest = config.status == SetupStatus::Ok
                 || (args.dry_run && config.action == "would_migrate");
             if selections.apply_ingest && !args.skip_config && config_allows_ingest {
+                let kiro_home = env::var_os("KIRO_HOME").map(PathBuf::from);
                 let ingest_update = if args.dry_run {
-                    preview_ingest_selections_for_config(&target.path, &selections.targets)
+                    preview_ingest_selections_for_config(
+                        &target.path,
+                        &selections.targets,
+                        kiro_home.as_deref(),
+                    )
                 } else {
-                    apply_ingest_selections_to_config(&target.path, &selections.targets)
+                    apply_ingest_selections_to_config(
+                        &target.path,
+                        &selections.targets,
+                        kiro_home.as_deref(),
+                    )
                 };
                 match ingest_update {
                     Ok(update) => config.apply_ingest_update(update, args.dry_run),
@@ -743,17 +752,20 @@ impl IngestSelectionUpdate {
 fn preview_ingest_selections_for_config(
     path: &Path,
     selections: &[SetupTargetSelection],
+    kiro_home: Option<&Path>,
 ) -> Result<IngestSelectionUpdate> {
     let mut document = read_config_document(path)?;
-    apply_ingest_selections_to_document(&mut document, selections)
+    apply_ingest_selections_to_document_with_kiro_home(&mut document, selections, kiro_home)
 }
 
 fn apply_ingest_selections_to_config(
     path: &Path,
     selections: &[SetupTargetSelection],
+    kiro_home: Option<&Path>,
 ) -> Result<IngestSelectionUpdate> {
     let mut document = read_config_document(path)?;
-    let update = apply_ingest_selections_to_document(&mut document, selections)?;
+    let update =
+        apply_ingest_selections_to_document_with_kiro_home(&mut document, selections, kiro_home)?;
     if update.has_changes() {
         write_toml_atomic(path, &document.to_string())?;
     }
@@ -768,9 +780,18 @@ fn read_config_document(path: &Path) -> Result<DocumentMut> {
         .with_context(|| format!("{} is not valid TOML", path.display()))
 }
 
+#[cfg(test)]
 fn apply_ingest_selections_to_document(
     document: &mut DocumentMut,
     selections: &[SetupTargetSelection],
+) -> Result<IngestSelectionUpdate> {
+    apply_ingest_selections_to_document_with_kiro_home(document, selections, None)
+}
+
+fn apply_ingest_selections_to_document_with_kiro_home(
+    document: &mut DocumentMut,
+    selections: &[SetupTargetSelection],
+    kiro_home: Option<&Path>,
 ) -> Result<IngestSelectionUpdate> {
     let mut update = IngestSelectionUpdate::default();
 
@@ -786,7 +807,8 @@ fn apply_ingest_selections_to_document(
                     let source_table = sources
                         .get_mut(source_idx)
                         .expect("source index came from the same array");
-                    let source_update = setup_source.reconcile_table(source_table, enabled);
+                    let source_update =
+                        setup_source.reconcile_table(source_table, enabled, kiro_home);
                     if source_update.enabled_changed {
                         if enabled {
                             update.enabled_sources += 1;
@@ -800,7 +822,7 @@ fn apply_ingest_selections_to_document(
                 }
                 None if enabled => {
                     let sources = ensure_ingest_sources_mut(document)?;
-                    sources.push(setup_source.to_table(enabled));
+                    sources.push(setup_source.to_table(enabled, kiro_home));
                     update.added_sources += 1;
                 }
                 None => {}
@@ -1428,13 +1450,13 @@ impl SetupProgress {
     }
 
     fn managed_file_start(&self, write: &ManagedFileWrite) {
-        if !self.enabled {
+        if !self.style.enabled() {
             return;
         }
         eprintln!(
             "   {} {}",
-            self.mark("→", ">", Style::new().cyan()),
-            self.label(&format!(
+            self.style.mark("→", ">", Style::new().cyan()),
+            self.style.label(&format!(
                 "Updating {} at {}",
                 write.label(),
                 write.path().display()
@@ -1443,25 +1465,27 @@ impl SetupProgress {
     }
 
     fn managed_file_success(&self, write: &ManagedFileWrite) {
-        if !self.enabled {
+        if !self.style.enabled() {
             return;
         }
         eprintln!(
             "   {} {}",
-            self.mark("✓", "[ok]", Style::new().green()),
-            self.dim(&format!("Updated {}", write.path().display()))
+            self.style.mark("✓", "[ok]", Style::new().green()),
+            self.style
+                .dim(&format!("Updated {}", write.path().display()))
         );
     }
 
     fn managed_file_error(&self, write: &ManagedFileWrite, error: &str) {
-        if !self.enabled {
+        if !self.style.enabled() {
             return;
         }
         eprintln!(
             "   {} {} {}",
-            self.mark("✗", "[err]", Style::new().red()),
-            self.dim(&format!("Could not update {}", write.path().display())),
-            self.dim(error)
+            self.style.mark("✗", "[err]", Style::new().red()),
+            self.style
+                .dim(&format!("Could not update {}", write.path().display())),
+            self.style.dim(error)
         );
     }
 
@@ -3148,6 +3172,51 @@ mod tests {
         )
         .expect("re-enable Claude ingest sources");
         assert_eq!(reenabled.enabled_sources, expected_sources);
+    }
+
+    #[test]
+    fn kiro_ingest_selection_uses_kiro_home_for_session_paths() {
+        let mut document = DEFAULT_CONFIG_TEMPLATE
+            .parse::<DocumentMut>()
+            .expect("template parses");
+        let selection = SetupTargetSelection {
+            target: SetupMcpTarget::KiroCli,
+            mode: SetupSelectionMode::IngestOnly,
+        };
+        let kiro_home = Path::new("/tmp/custom-kiro-home");
+
+        let update = apply_ingest_selections_to_document_with_kiro_home(
+            &mut document,
+            &[selection],
+            Some(kiro_home),
+        )
+        .expect("reconcile Kiro source");
+
+        assert_eq!(
+            update,
+            IngestSelectionUpdate {
+                enabled_sources: 0,
+                disabled_sources: 0,
+                added_sources: 0,
+                updated_sources: 1,
+            }
+        );
+        assert_eq!(
+            source_value(&document, "kiro", "glob"),
+            Some("/tmp/custom-kiro-home/sessions/cli/*.jsonl")
+        );
+        assert_eq!(
+            source_value(&document, "kiro", "watch_root"),
+            Some("/tmp/custom-kiro-home/sessions/cli")
+        );
+
+        let unchanged = apply_ingest_selections_to_document_with_kiro_home(
+            &mut document,
+            &[selection],
+            Some(kiro_home),
+        )
+        .expect("reapply Kiro source");
+        assert_eq!(unchanged, IngestSelectionUpdate::default());
     }
 
     #[test]

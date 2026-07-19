@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::env;
 use std::iter;
@@ -33,13 +34,14 @@ impl DefaultIngestSource {
         self.name
     }
 
-    pub(super) fn to_table(self, enabled: bool) -> Table {
+    pub(super) fn to_table(self, enabled: bool, kiro_home: Option<&Path>) -> Table {
+        let (glob, watch_root) = self.resolved_paths(kiro_home);
         let mut table = Table::new();
         table["name"] = toml_value(self.name);
         table["harness"] = toml_value(self.harness);
         table["enabled"] = toml_value(enabled);
-        table["glob"] = toml_value(self.glob);
-        table["watch_root"] = toml_value(self.watch_root);
+        table["glob"] = toml_value(glob.as_ref());
+        table["watch_root"] = toml_value(watch_root.as_ref());
         if let Some(format) = self.format {
             table["format"] = toml_value(format);
         }
@@ -50,14 +52,16 @@ impl DefaultIngestSource {
         self,
         table: &mut Table,
         enabled: bool,
+        kiro_home: Option<&Path>,
     ) -> DefaultIngestSourceUpdate {
+        let (glob, watch_root) = self.resolved_paths(kiro_home);
         let enabled_changed = set_bool(table, "enabled", enabled);
         let mut metadata_changed = false;
 
         metadata_changed |= set_str(table, "name", self.name);
         metadata_changed |= set_str(table, "harness", self.harness);
-        metadata_changed |= set_str(table, "glob", self.glob);
-        metadata_changed |= set_str(table, "watch_root", self.watch_root);
+        metadata_changed |= set_str(table, "glob", glob.as_ref());
+        metadata_changed |= set_str(table, "watch_root", watch_root.as_ref());
         metadata_changed |= match self.format {
             Some(format) => set_str(table, "format", format),
             None => table.remove("format").is_some(),
@@ -67,6 +71,21 @@ impl DefaultIngestSource {
             enabled_changed,
             metadata_changed,
         }
+    }
+
+    fn resolved_paths(self, kiro_home: Option<&Path>) -> (Cow<'static, str>, Cow<'static, str>) {
+        if self.harness != "kiro-cli" {
+            return (Cow::Borrowed(self.glob), Cow::Borrowed(self.watch_root));
+        }
+
+        let Some(kiro_home) = kiro_home else {
+            return (Cow::Borrowed(self.glob), Cow::Borrowed(self.watch_root));
+        };
+        let sessions_dir = kiro_home.join("sessions").join("cli");
+        (
+            Cow::Owned(sessions_dir.join("*.jsonl").to_string_lossy().into_owned()),
+            Cow::Owned(sessions_dir.to_string_lossy().into_owned()),
+        )
     }
 }
 
@@ -264,7 +283,7 @@ const PI_INGEST: [DefaultIngestSource; 2] = [
     },
 ];
 
-const SPECS: [HarnessSpec; 8] = [
+const SPECS: [HarnessSpec; 9] = [
     HarnessSpec {
         target: SetupMcpTarget::ClaudeCode,
         label: "Claude Code",
@@ -627,6 +646,7 @@ pub(super) fn mcp_plan(
                     ),
             ],
             config_writes: Vec::new(),
+            managed_writes: Vec::new(),
             manual_snippet: None,
         },
         SetupMcpTarget::OpenCode => McpPlan::write_config(
