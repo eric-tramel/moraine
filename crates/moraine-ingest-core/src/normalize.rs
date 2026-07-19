@@ -99,7 +99,8 @@ pub(crate) fn normalize_record_with_ts_hint(
         base_uid: &base_uid,
     };
     let session_id = source.session_id(record, &source_ctx);
-    let cwd = resolve_cwd(&source.cwd(record), cwd_hint);
+    let path_cwd = source.cwd_from_source_file(source_file);
+    let cwd = resolve_cwd(&source.cwd(record), cwd_hint, &path_cwd);
 
     let raw_row = json!({
         "source_name": source_name,
@@ -177,14 +178,20 @@ pub(crate) fn normalize_record_with_ts_hint(
 }
 
 /// Record-level cwd wins; otherwise fall back to the session-level hint
-/// chained in by the caller. Whitespace-only values count as absent.
-fn resolve_cwd(record_cwd: &str, cwd_hint: &str) -> String {
+/// chained in by the caller, then path/sidecar recovery. Whitespace-only
+/// values count as absent.
+fn resolve_cwd(record_cwd: &str, cwd_hint: &str, path_cwd: &str) -> String {
     let trimmed = record_cwd.trim();
     if !trimmed.is_empty() {
         return trimmed.to_string();
     }
 
-    cwd_hint.trim().to_string()
+    let hint = cwd_hint.trim();
+    if !hint.is_empty() {
+        return hint.to_string();
+    }
+
+    path_cwd.trim().to_string()
 }
 
 fn resolve_record_ts(
@@ -206,6 +213,12 @@ fn resolve_record_ts(
     if harness == "codex" {
         if let Some(file_ts) = infer_rollout_record_ts_from_file(source_file) {
             return file_ts;
+        }
+    }
+
+    if harness == "grok" {
+        if let Some(ts) = crate::sources::grok::grok_summary_record_ts(source_file) {
+            return ts;
         }
     }
 
