@@ -1,10 +1,12 @@
 use serde_json::Value;
 use std::sync::OnceLock;
 
+pub(crate) mod antigravity;
 pub(crate) mod claude_code;
 pub(crate) mod codex;
 pub(crate) mod cursor;
 pub(crate) mod emitter;
+pub(crate) mod grok;
 pub(crate) mod hermes;
 pub(crate) mod kimi_cli;
 pub(crate) mod opencode;
@@ -131,6 +133,13 @@ pub(crate) trait IngestSource: Send + Sync {
         String::new()
     }
 
+    /// Working directory recovered from the source file path (or a sibling
+    /// sidecar next to it). Used when the JSON records themselves do not carry
+    /// cwd, e.g. Grok sessions under URL-encoded path segments.
+    fn cwd_from_source_file(&self, _source_file: &str) -> String {
+        String::new()
+    }
+
     fn session_id(&self, _record: &Value, ctx: &SourceRecordContext<'_>) -> String {
         if ctx.session_hint.is_empty() {
             infer_session_id_from_file(ctx.source_file)
@@ -197,6 +206,8 @@ pub(crate) fn registry() -> &'static SourceRegistry {
             .register(&opencode::OPENCODE)
             .register(&pi::PI_CODING_AGENT)
             .register(&qwen_code::QWEN_CODE)
+            .register(&grok::GROK)
+            .register(&antigravity::ANTIGRAVITY)
     })
 }
 

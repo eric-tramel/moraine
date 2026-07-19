@@ -1,0 +1,9 @@
+{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-07-18T11:00:00Z","content":"<USER_REQUEST>\nList the project root and open README.md\n</USER_REQUEST>"}
+{"step_index":1,"source":"SYSTEM","type":"CONVERSATION_HISTORY","status":"DONE","created_at":"2026-07-18T11:00:00Z"}
+{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-07-18T11:00:01Z","content":"I will list the directory and then read README.md.","thinking":"Start with list_dir then view_file.","tool_calls":[{"name":"list_dir","args":{"DirectoryPath":"/work/antigravity-demo","toolAction":"List project root","toolSummary":"List root"}}]}
+{"step_index":3,"source":"MODEL","type":"LIST_DIRECTORY","status":"DONE","created_at":"2026-07-18T11:00:02Z","content":"Created At: 2026-07-18T11:00:02Z\nCompleted At: 2026-07-18T11:00:02Z\n{\"name\":\"README.md\",\"sizeBytes\":\"120\"}"}
+{"step_index":4,"source":"MODEL","type":"VIEW_FILE","status":"DONE","created_at":"2026-07-18T11:00:03Z","content":"File Path: `file:///work/antigravity-demo/README.md`\n# Demo\nHello from antigravity fixture."}
+{"step_index":5,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-07-18T11:00:04Z","content":"The project root contains README.md describing the demo."}
+{"step_index":6,"source":"SYSTEM","type":"CHECKPOINT","status":"DONE","created_at":"2026-07-18T11:00:05Z","content":"{{ CHECKPOINT 0 }}\nSummarized earlier list and read steps."}
+{"step_index":7,"source":"MODEL","type":"INVOKE_SUBAGENT","status":"DONE","created_at":"2026-07-18T11:00:06Z","content":"Created the following subagents:\n{\n  \"conversationId\": \"bbbbbbbb-cccc-4ddd-8eee-ffffffffffff\",\n  \"logAbsoluteUri\": \"file:///tmp/sub.jsonl\"\n}"}
+{"step_index":8,"source":"SYSTEM","type":"ERROR_MESSAGE","status":"DONE","created_at":"2026-07-18T11:00:07Z","content":"Error invalid tool call: demo error","error":"invalid_args"}

@@ -121,7 +121,7 @@ const TOKEN_NATIVE_UNIT_KEYS: &[&str] = &[
     "output_images",
 ];
 
-fn golden_cases() -> [GoldenCase; 11] {
+fn golden_cases() -> [GoldenCase; 13] {
     [
         GoldenCase {
             name: "codex",
@@ -210,6 +210,22 @@ fn golden_cases() -> [GoldenCase; 11] {
             source_name: "golden-pi",
             fixture_rel: "fixtures/pi/session.jsonl",
             source_file: "/fixtures/pi/session.jsonl",
+            format: GoldenFormat::Jsonl,
+        },
+        GoldenCase {
+            name: "grok",
+            harness: "grok",
+            source_name: "golden-grok",
+            fixture_rel: "fixtures/grok/sessions/%2Fwork%2Fdemo/11111111-2222-4333-8444-555555555555/chat_history.jsonl",
+            source_file: "/fixtures/grok/sessions/%2Fwork%2Fdemo/11111111-2222-4333-8444-555555555555/chat_history.jsonl",
+            format: GoldenFormat::Jsonl,
+        },
+        GoldenCase {
+            name: "antigravity",
+            harness: "antigravity",
+            source_name: "golden-antigravity",
+            fixture_rel: "fixtures/antigravity/brain/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee/.system_generated/logs/transcript.jsonl",
+            source_file: "/fixtures/antigravity/brain/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee/.system_generated/logs/transcript.jsonl",
             format: GoldenFormat::Jsonl,
         },
     ]

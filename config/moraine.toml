@@ -171,6 +171,25 @@ format = "session_json"
 # watch_root = "~/trajectories"
 # format = "jsonl"
 
+# Grok Build sessions: append-only chat_history under ~/.grok/sessions.
+[[ingest.sources]]
+name = "grok"
+harness = "grok"
+enabled = true
+glob = "~/.grok/sessions/**/chat_history.jsonl"
+watch_root = "~/.grok/sessions"
+format = "jsonl"
+
+# Antigravity CLI brain transcripts (JSONL). Prefer these over conversations/*.db
+# protobuf databases.
+[[ingest.sources]]
+name = "antigravity"
+harness = "antigravity"
+enabled = true
+glob = "~/.gemini/antigravity-cli/brain/**/.system_generated/logs/transcript.jsonl"
+watch_root = "~/.gemini/antigravity-cli/brain"
+format = "jsonl"
+
 [mcp]
 max_results = 25
 preview_chars = 320
