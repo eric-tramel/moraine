@@ -541,6 +541,13 @@ fn infer_initial_source_hints(
         }
     }
 
+    if hints.cwd.is_empty() {
+        let path_cwd = source.cwd_from_source_file(source_file);
+        if !path_cwd.trim().is_empty() {
+            hints.cwd = path_cwd;
+        }
+    }
+
     hints
 }
 
@@ -556,6 +563,10 @@ fn infer_first_source_cwd(source_file: &str, harness: &str, max_line_bytes: usiz
     };
     if !source.jsonl_carries_cwd() {
         return String::new();
+    }
+    let path_cwd = source.cwd_from_source_file(source_file);
+    if std::path::Path::new(path_cwd.trim()).is_absolute() {
+        return path_cwd;
     }
     let Ok(file) = std::fs::File::open(source_file) else {
         return String::new();

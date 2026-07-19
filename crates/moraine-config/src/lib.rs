@@ -18,6 +18,8 @@ pub const KNOWN_INGEST_HARNESSES: &[&str] = &[
     "opencode",
     "pi-coding-agent",
     "qwen-code",
+    "grok",
+    "antigravity",
 ];
 
 #[derive(Debug, Clone, Deserialize)]
@@ -639,6 +641,23 @@ fn default_sources() -> Vec<IngestSource> {
             enabled: true,
             glob: "~/.omp/agent/sessions/**/*.jsonl".to_string(),
             watch_root: "~/.omp/agent/sessions".to_string(),
+            format: String::new(),
+        },
+        IngestSource {
+            name: "grok".to_string(),
+            harness: "grok".to_string(),
+            enabled: true,
+            glob: "~/.grok/sessions/**/chat_history.jsonl".to_string(),
+            watch_root: "~/.grok/sessions".to_string(),
+            format: String::new(),
+        },
+        IngestSource {
+            name: "antigravity".to_string(),
+            harness: "antigravity".to_string(),
+            enabled: true,
+            glob: "~/.gemini/antigravity-cli/brain/**/.system_generated/logs/transcript.jsonl"
+                .to_string(),
+            watch_root: "~/.gemini/antigravity-cli/brain".to_string(),
             format: String::new(),
         },
     ]);
@@ -2696,7 +2715,7 @@ watch_root = "~/.custom/sessions"
         std::fs::remove_file(&path).ok();
         assert!(
             format!("{err:#}").contains(
-                "expected one of: codex, claude-code, cursor, hermes, kimi-cli, opencode, pi-coding-agent"
+                "expected one of: codex, claude-code, cursor, hermes, kimi-cli, opencode, pi-coding-agent, qwen-code, grok, antigravity"
             ),
             "unexpected error: {err:#}"
         );
@@ -2719,7 +2738,7 @@ watch_root = "~/.claude/projects"
         std::fs::remove_file(&path).ok();
         assert!(
             format!("{err:#}").contains(
-                "expected one of: codex, claude-code, cursor, hermes, kimi-cli, opencode, pi-coding-agent"
+                "expected one of: codex, claude-code, cursor, hermes, kimi-cli, opencode, pi-coding-agent, qwen-code, grok, antigravity"
             ),
             "unexpected error: {err:#}"
         );
