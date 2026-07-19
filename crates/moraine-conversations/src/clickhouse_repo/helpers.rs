@@ -1,14 +1,12 @@
 use super::*;
 
-pub(super) const MCP_INTERNAL_TOOL_NAMES_SQL: &str =
-    "'search', 'open', 'list_sessions', 'file_attention'";
-
 impl ClickHouseConversationRepository {
     pub(super) fn mode_subquery(&self) -> String {
         self.mode_subquery_for_sessions(None)
     }
 
     pub(super) fn mode_aggregate_sql() -> String {
+        let mcp_name_predicate = moraine_clickhouse::mcp_tool_names::sql_predicate("tool_name");
         format!(
             "multiIf(
     countIf(
@@ -17,7 +15,7 @@ impl ClickHouseConversationRepository {
       OR (payload_type = 'tool_use' AND tool_name IN ('WebSearch', 'WebFetch'))
     ) > 0,
     'web_search',
-    countIf(source_name = 'codex-mcp' OR lowerUTF8(tool_name) IN ({MCP_INTERNAL_TOOL_NAMES_SQL})) > 0,
+    countIf(source_name = 'codex-mcp' OR {mcp_name_predicate}) > 0,
     'mcp_internal',
     countIf(event_kind IN ('tool_call', 'tool_result') OR payload_type = 'tool_use') > 0,
     'tool_calling',
@@ -42,10 +40,7 @@ FROM {events_source}
     }
 
     pub(super) fn is_mcp_internal_tool_name(name: &str) -> bool {
-        matches!(
-            name.to_ascii_lowercase().as_str(),
-            "search" | "open" | "list_sessions" | "file_attention"
-        )
+        moraine_clickhouse::mcp_tool_names::is_internal_tool_name(name)
     }
 
     pub(super) fn parse_mode(raw: &str) -> ConversationMode {

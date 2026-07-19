@@ -430,6 +430,11 @@ def open_payload_session_id(payload: Dict[str, Any]) -> Optional[str]:
 def open_payload_source(payload: Dict[str, Any]) -> Optional[str]:
     return nested_string(payload, "data", "session", "source")
 
+def open_payload_harness(payload: Dict[str, Any]) -> Optional[str]:
+    return nested_string(payload, "data", "session", "harness")
+
+
+
 
 def assert_open_search_ids(
     proc: subprocess.Popen[str],
@@ -438,6 +443,7 @@ def assert_open_search_ids(
     expect_session_id: Optional[str],
     expect_open_text: Optional[str],
     expect_source: Optional[str] = None,
+    expect_harness: Optional[str] = None,
 ) -> int:
     expected_session = expected_mcp_session_id(expect_session_id)
     opened_payloads: list[Dict[str, Any]] = []
@@ -462,6 +468,17 @@ def assert_open_search_ids(
             raise AssertionError(
                 "open source mismatch: "
                 f"id={open_id} got={open_source!r} want={expect_source!r}"
+            )
+        open_kind = nested_string(open_payload, "data", "kind")
+        open_harness = open_payload_harness(open_payload)
+        if (
+            expect_harness is not None
+            and open_kind == "session"
+            and open_harness != expect_harness
+        ):
+            raise AssertionError(
+                "open session harness mismatch: "
+                f"id={open_id} got={open_harness!r} want={expect_harness!r}"
             )
         opened_payloads.append(open_payload)
 
@@ -516,6 +533,15 @@ def assert_open_search_ids(
                     )
                 cursor = continuation["data"].get("next_cursor")
 
+    if expect_harness is not None and not any(
+        nested_string(payload, "data", "kind") == "session"
+        and open_payload_harness(payload) == expect_harness
+        for payload in opened_payloads
+    ):
+        raise AssertionError(
+            f"open responses did not include a session with harness={expect_harness!r}"
+        )
+
     if expect_open_text is not None and not any(
         contains_text(payload, expect_open_text) for payload in opened_payloads
     ):
@@ -548,6 +574,25 @@ def assert_sessions_absent(
                 )
 
 
+def assert_session_filters(
+    results: list[Any],
+    harness: Optional[str],
+    source: Optional[str],
+    tool_name: str,
+) -> None:
+    for result in results:
+        if not isinstance(result, dict):
+            raise AssertionError(f"{tool_name} returned a non-object result: {result!r}")
+        if harness is not None and nested_string(result, "session", "harness") != harness:
+            raise AssertionError(
+                f"{tool_name} returned a session outside harness={harness!r}: {result}"
+            )
+        if source is not None and nested_string(result, "session", "source") != source:
+            raise AssertionError(
+                f"{tool_name} returned a session outside source={source!r}: {result}"
+            )
+
+
 def assert_open_not_found(
     proc: subprocess.Popen[str],
     next_id: int,
@@ -578,6 +623,9 @@ def run_smoke(
     expect_matching_search_hits: Optional[int] = None,
     require_embedded_fallback: bool = False,
     tools_snapshot: Optional[str] = None,
+    harness_filter: Optional[str] = None,
+    source_filter: Optional[str] = None,
+    event_types_filter: Optional[list[str]] = None,
 ) -> None:
     absent_session_ids = absent_session_ids or []
     argv = [moraine, "run", "mcp", "--config", config]
@@ -650,42 +698,65 @@ def run_smoke(
             write_tools_snapshot(tools_snapshot, tools_result)
 
         next_id = 3
+        search_arguments: Dict[str, Any] = {
+            "query": query,
+            "n_hits": 20,
+        }
+        if harness_filter is not None:
+            search_arguments["harness"] = harness_filter
+        if source_filter is not None:
+            search_arguments["source"] = source_filter
+        expected_event_types = event_types_filter or [
+            "user_input",
+            "assistant_response",
+        ]
+        if event_types_filter is not None:
+            search_arguments["event_types"] = event_types_filter
         search_result = call_tool(
             proc,
             next_id,
             "search_sessions",
-            {
-                "query": query,
-                "n_hits": 20,
-            },
+            search_arguments,
         )
         next_id += 1
         search_payload = assert_structured_content(search_result, "search_sessions")
         event_types = search_payload["request"].get("event_types")
-        if event_types != ["user_input", "assistant_response"]:
+        if event_types != expected_event_types:
             raise AssertionError(
-                "search_sessions default event_types must be "
-                f"['user_input', 'assistant_response'], got: {event_types}"
+                "search_sessions did not preserve the expected event_types: "
+                f"expected={expected_event_types}, got={event_types}"
+            )
+        if search_payload["request"].get("harness") != harness_filter:
+            raise AssertionError(
+                "search_sessions did not preserve the exact harness filter: "
+                f"{search_payload['request'].get('harness')!r}"
+            )
+        if search_payload["request"].get("source") != source_filter:
+            raise AssertionError(
+                "search_sessions did not preserve the exact source filter: "
+                f"{search_payload['request'].get('source')!r}"
             )
 
         results = search_payload["data"].get("results")
         if not isinstance(results, list):
             raise AssertionError(f"search_sessions returned no results array for query={query}")
         unexpected_event_types = []
+        expected_event_type_set = set(expected_event_types)
         for result in results:
             if not isinstance(result, dict) or not isinstance(result.get("event"), dict):
                 unexpected_event_types.append(None)
                 continue
             event_type = result["event"].get("type")
-            if event_type not in {"user_input", "assistant_response"}:
+            if event_type not in expected_event_type_set:
                 unexpected_event_types.append(event_type)
         if unexpected_event_types:
             raise AssertionError(
-                "search_sessions default results must contain only message events, "
+                "search_sessions returned event types outside the request, "
                 f"got: {unexpected_event_types}"
             )
 
         assert_sessions_absent(results, absent_session_ids, "search_sessions")
+        assert_session_filters(results, harness_filter, source_filter, "search_sessions")
         if expect_matching_search_hits is not None:
             matching_results = matching_search_sessions_results(
                 results,
@@ -719,25 +790,43 @@ def run_smoke(
                 open_ids_from_search_result(selected_result),
                 expect_session_id,
                 expect_open_text,
+                source_filter,
+                harness_filter,
             )
 
+        list_arguments: Dict[str, Any] = {
+            "start_datetime": "2026-02-16T11:59:00Z",
+            "end_datetime": "2026-02-16T12:01:00Z",
+            "limit": 20,
+        }
+        if harness_filter is not None:
+            list_arguments["harness"] = harness_filter
+        if source_filter is not None:
+            list_arguments["source"] = source_filter
         list_result = call_tool(
             proc,
             next_id,
             "list_sessions",
-            {
-                "start_datetime": "2026-02-16T11:59:00Z",
-                "end_datetime": "2026-02-16T12:01:00Z",
-                "limit": 20,
-            },
+            list_arguments,
         )
         next_id += 1
         list_payload = assert_structured_content(list_result, "list_sessions")
+        if list_payload["request"].get("harness") != harness_filter:
+            raise AssertionError(
+                "list_sessions did not preserve the exact harness filter: "
+                f"{list_payload['request'].get('harness')!r}"
+            )
+        if list_payload["request"].get("source") != source_filter:
+            raise AssertionError(
+                "list_sessions did not preserve the exact source filter: "
+                f"{list_payload['request'].get('source')!r}"
+            )
         sessions = list_payload["data"].get("sessions")
         if not isinstance(sessions, list):
             raise AssertionError("list_sessions returned no sessions array")
 
         assert_sessions_absent(sessions, absent_session_ids, "list_sessions")
+        assert_session_filters(sessions, harness_filter, source_filter, "list_sessions")
 
         # Verifying the in-scope session is reachable runs even in the
         # expect_no_results case (where the search query is for an out-of-scope
@@ -789,6 +878,7 @@ def run_smoke(
                 expect_session_id,
                 expect_open_text,
                 listed_source,
+                harness_filter,
             )
         elif not sessions and not expect_no_results:
             raise AssertionError("list_sessions returned no sessions for e2e fixture window")
@@ -849,6 +939,27 @@ def main() -> int:
     parser.add_argument("--query", required=True)
     parser.add_argument("--expect-session-id")
     parser.add_argument("--expect-open-text")
+    parser.add_argument("--harness-filter")
+    parser.add_argument("--source-filter")
+    parser.add_argument(
+        "--event-type",
+        action="append",
+        choices=[
+            "user_input",
+            "assistant_response",
+            "reasoning",
+            "tool_call",
+            "tool_response",
+            "compaction",
+            "system",
+            "runtime",
+            "unknown",
+        ],
+        help=(
+            "explicit search_sessions event type; repeat to request multiple "
+            "(default: user_input and assistant_response)"
+        ),
+    )
     parser.add_argument(
         "--file-attention-path",
         help="also call file_attention for this path and open one returned touch",
@@ -946,6 +1057,9 @@ def main() -> int:
         expect_matching_search_hits=args.expect_matching_search_hits,
         require_embedded_fallback=args.require_embedded_fallback,
         tools_snapshot=args.write_tools_snapshot,
+        harness_filter=args.harness_filter,
+        source_filter=args.source_filter,
+        event_types_filter=args.event_type,
     )
     print("mcp smoke passed")
     return 0

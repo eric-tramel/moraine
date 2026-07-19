@@ -326,8 +326,8 @@ format = "jsonl"
 | `format` | inferred from `harness` and `glob` | On-disk parser: `jsonl`, `session_json`, `cursor_sqlite`, or `opencode_sqlite`. |
 
 Supported `harness` values are `codex`, `claude-code`, `cursor`, `kimi-cli`,
-`opencode`, `hermes`, and `pi-coding-agent`. Each value maps to a registered
-ingest source adapter; see
+`qwen-code`, `opencode`, `hermes`, and `pi-coding-agent`. Each value maps to a
+registered ingest source adapter; see
 [Ingest Sources](development/ingest-sources.md) for the adapter contract and
 [Harness Author Workflow](development/harness-author-workflow.md) for source
 development steps.
@@ -357,6 +357,7 @@ The built-in defaults and `config/moraine.toml` reference cover these source fam
 | Claude Code | `claude-code` | `~/.claude/projects/**/*.jsonl` | `~/.claude/projects` | inferred `jsonl` |
 | Claude Cowork (local macOS) | `claude-code` | `~/Library/Application Support/Claude/local-agent-mode-sessions/**/.claude/projects/**/*.jsonl` | `~/Library/Application Support/Claude/local-agent-mode-sessions` | inferred `jsonl` |
 | Kimi CLI | `kimi-cli` | `~/.kimi/sessions/**/wire.jsonl` | `~/.kimi/sessions` | inferred `jsonl` |
+| Qwen Code | `qwen-code` | `~/.qwen/projects/*/chats/*.jsonl` | `~/.qwen/projects` | `jsonl` |
 | OpenCode | `opencode` | `~/.local/share/opencode/opencode*.db` | `~/.local/share/opencode` | `opencode_sqlite` (default on) |
 | Cursor Agent | `cursor` | `~/.cursor/projects/*/agent-transcripts/**/*.jsonl` | `~/.cursor/projects` | inferred `jsonl` |
 | Cursor SQLite history | `cursor` | `~/Library/Application Support/Cursor/User/**/state.vscdb` (macOS) | `~/Library/Application Support/Cursor/User` | `cursor_sqlite` (default on) |
@@ -440,6 +441,35 @@ glob = "~/.kimi/sessions/**/wire.jsonl"
 watch_root = "~/.kimi/sessions"
 format = "jsonl"
 ```
+
+Qwen Code:
+
+```toml
+[[ingest.sources]]
+name = "qwen-code"
+harness = "qwen-code"
+enabled = true
+glob = "~/.qwen/projects/*/chats/*.jsonl"
+watch_root = "~/.qwen/projects"
+format = "jsonl"
+```
+
+For a custom Qwen storage root, keep the normalized `qwen-code` harness and use
+a distinct source name so `moraine setup` leaves the custom entry untouched:
+
+```toml
+[[ingest.sources]]
+name = "qwen-code-archive"
+harness = "qwen-code"
+enabled = true
+glob = "/srv/qwen-archive/projects/*/chats/*.jsonl"
+watch_root = "/srv/qwen-archive/projects"
+format = "jsonl"
+```
+
+The built-in adapter is fixture-tested against Qwen Code 0.19.x's internal
+append-only `ChatRecord` shape; that upstream persistence format is not a stable
+public API.
 
 OpenCode:
 

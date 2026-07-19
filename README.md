@@ -5,8 +5,9 @@
 [![Docs](https://github.com/eric-tramel/moraine/actions/workflows/docs-deploy.yml/badge.svg)](https://eric-tramel.github.io/moraine/)
 
 Moraine is a local trace stack for agent work. It indexes sessions from agent
-harnesses such as Codex, Claude Code, Kimi CLI, OpenCode, Hermes, and Pi Coding Agent into ClickHouse,
-serves a monitor UI, and exposes MCP retrieval over the indexed history.
+harnesses such as Codex, Claude Code, Qwen Code, Kimi CLI, OpenCode, Hermes, and
+Pi Coding Agent into ClickHouse, serves a monitor UI, and exposes MCP retrieval
+over the indexed history.
 
 Agents get searchable long-term memory through MCP. You get a unified local
 record of what happened across providers, including tools, tokens, and
@@ -39,6 +40,7 @@ Moraine ships session trace ingestion adapters for these agent harnesses:
 | [Codex](https://developers.openai.com/codex) | `codex` | JSONL session files under `~/.codex/sessions` |
 | [Claude Code](https://code.claude.com/docs/en/overview) | `claude-code` | JSONL project session files under `~/.claude/projects` |
 | [Kimi CLI](https://moonshotai.github.io/kimi-cli/en/) | `kimi-cli` | `wire.jsonl` session traces under `~/.kimi/sessions` |
+| [Qwen Code](https://github.com/QwenLM/qwen-code) | `qwen-code` | JSONL chat records under `~/.qwen/projects/*/chats` |
 | [OpenCode](https://opencode.ai/) | `opencode` | SQLite session history from `~/.local/share/opencode/opencode*.db` (default on; `opencode_sqlite` format) |
 | [Cursor](https://cursor.com/docs) | `cursor` | Agent transcript JSONL under `~/.cursor/projects` (default on); Cursor IDE chat history from `state.vscdb` SQLite databases (default on; `cursor_sqlite` format) |
 | [Hermes](https://hermes-agent.nousresearch.com/docs/) | `hermes` | Live session JSON and trajectory JSONL traces |
@@ -64,8 +66,8 @@ For release bundles, upgrades, project-scoped setup, and other harnesses, see th
 
 Use `moraine setup` to install or update the Moraine plugins for Claude Code,
 Codex, and Hermes, or to register Moraine MCP for supported harnesses such as
-OpenCode, Cursor, Kimi CLI, and Pi Coding Agent. The integrations use the
-`moraine` CLI on your `PATH` and the running local stack.
+Qwen Code, OpenCode, Cursor, Kimi CLI, and Pi Coding Agent. The integrations use
+the `moraine` CLI on your `PATH` and the running local stack.
 
 Start a new agent session after installing an integration. Claude Code, Codex,
 and Hermes sessions get `moraine:session-search`, `moraine:realtime-peek`, and

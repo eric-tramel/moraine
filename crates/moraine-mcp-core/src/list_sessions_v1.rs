@@ -226,6 +226,7 @@ fn readable_harness(harness: &str) -> &str {
         "kimi-cli" => "Kimi CLI",
         "opencode" => "OpenCode",
         "pi-coding-agent" => "Pi Coding Agent",
+        "qwen-code" => "Qwen Code",
         _ => harness,
     }
 }
@@ -685,6 +686,7 @@ mod tests {
             ("kimi-cli", "Kimi CLI"),
             ("opencode", "OpenCode"),
             ("pi-coding-agent", "Pi Coding Agent"),
+            ("qwen-code", "Qwen Code"),
             ("future-harness", "future-harness"),
         ];
 

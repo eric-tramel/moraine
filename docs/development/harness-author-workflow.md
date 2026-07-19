@@ -159,9 +159,10 @@ run the functional stack:
 bash scripts/ci/e2e-stack.sh
 ```
 
-That script ingests Codex, Claude Code, Kimi CLI, Hermes trajectory, and Hermes
-session JSON fixtures into ClickHouse, then verifies row counts, representative
-fields, token buckets, monitor routes, and MCP search/open/list behavior.
+That script ingests Codex, Claude Code, Qwen Code, Kimi CLI, Cursor, OpenCode,
+Pi, Hermes trajectory, and Hermes session JSON fixtures into ClickHouse, then
+verifies row counts, representative fields, token buckets, monitor routes, and
+MCP search/open/list behavior.
 
 ## 8. Use The Dev Sandbox For QA
 

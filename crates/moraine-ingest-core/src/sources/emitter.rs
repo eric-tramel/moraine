@@ -149,6 +149,7 @@ impl<'a> SourceEmitter<'a> {
         self.push_link(row)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn tool_row(
         &self,
         event_uid: &str,
@@ -197,6 +198,7 @@ impl<'a> SourceEmitter<'a> {
         self.push_tool(row)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn push_tool_response(
         &mut self,
         event_uid: &str,

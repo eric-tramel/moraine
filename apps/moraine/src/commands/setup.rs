@@ -826,10 +826,9 @@ fn ingest_source_index(
     let Some(sources) = ingest_sources_mut(document)? else {
         return Ok(None);
     };
-    Ok(sources.iter().position(|source| {
-        source.get("name").and_then(Item::as_str) == Some(setup_source.name())
-            && source.get("harness").and_then(Item::as_str) == Some(setup_source.harness())
-    }))
+    Ok(sources
+        .iter()
+        .position(|source| source.get("name").and_then(Item::as_str) == Some(setup_source.name())))
 }
 
 fn ensure_ingest_sources_mut(document: &mut DocumentMut) -> Result<&mut ArrayOfTables> {
@@ -3031,6 +3030,79 @@ mod tests {
     }
 
     #[test]
+    fn qwen_ingest_selection_repairs_setup_source_and_preserves_custom_sources() {
+        let mut document = r#"
+[[ingest.sources]]
+name = "qwen-code"
+harness = "codex"
+enabled = false
+glob = "~/stale/*.jsonl"
+watch_root = "~/stale"
+
+[[ingest.sources]]
+name = "qwen-archive"
+harness = "qwen-code"
+enabled = false
+glob = "~/archive/**/*.jsonl"
+watch_root = "~/archive"
+"#
+        .parse::<DocumentMut>()
+        .expect("fixture config parses");
+
+        let update = apply_ingest_selections_to_document(
+            &mut document,
+            &[SetupTargetSelection {
+                target: SetupMcpTarget::QwenCode,
+                mode: SetupSelectionMode::IngestOnly,
+            }],
+        )
+        .expect("reconcile Qwen source");
+
+        assert_eq!(
+            update,
+            IngestSelectionUpdate {
+                enabled_sources: 1,
+                disabled_sources: 0,
+                added_sources: 0,
+                updated_sources: 1,
+            }
+        );
+        assert_eq!(sources_for_harness(&document, "qwen-code").len(), 2);
+        assert_eq!(
+            source_value(&document, "qwen-code", "harness"),
+            Some("qwen-code")
+        );
+        assert_eq!(
+            source_value(&document, "qwen-code", "glob"),
+            Some("~/.qwen/projects/*/chats/*.jsonl")
+        );
+        assert_eq!(
+            source_value(&document, "qwen-code", "watch_root"),
+            Some("~/.qwen/projects")
+        );
+        assert_eq!(
+            source_value(&document, "qwen-code", "format"),
+            Some("jsonl")
+        );
+        assert!(source_enabled(&document, "qwen-code"));
+        assert!(!source_enabled(&document, "qwen-archive"));
+        assert_eq!(
+            source_value(&document, "qwen-archive", "glob"),
+            Some("~/archive/**/*.jsonl")
+        );
+
+        let unchanged = apply_ingest_selections_to_document(
+            &mut document,
+            &[SetupTargetSelection {
+                target: SetupMcpTarget::QwenCode,
+                mode: SetupSelectionMode::IngestOnly,
+            }],
+        )
+        .expect("reapply Qwen source");
+        assert_eq!(unchanged, IngestSelectionUpdate::default());
+    }
+
+    #[test]
     fn ingest_selection_adds_omp_source_to_existing_pi_config() {
         let mut document = r#"
 [ingest]
@@ -3947,6 +4019,117 @@ host = "127.42.0.9"
             .manual_snippet
             .expect("manual snippet")
             .contains("--config /tmp/custom.toml"));
+    }
+
+    #[test]
+    fn qwen_setup_detects_cli_and_builds_exact_registration_commands() {
+        assert!(SetupMcpTarget::QwenCode
+            .is_available_for_setup(&FakeRunner::default().with_existing("qwen")));
+        assert!(!SetupMcpTarget::QwenCode.is_available_for_setup(&FakeRunner::default()));
+
+        let default_target = ConfigTarget {
+            path: PathBuf::from("/tmp/config.toml"),
+            source: ConfigTargetSource::HomeDefault,
+        };
+        let default_plan = McpPlan::for_target(SetupMcpTarget::QwenCode, &default_target);
+        let default_commands = default_plan.commands();
+        assert_eq!(default_commands.len(), 1);
+        assert_eq!(default_commands[0].program, "qwen");
+        assert_eq!(
+            default_commands[0].args,
+            vec![
+                "mcp",
+                "add",
+                "--scope",
+                "user",
+                "--transport",
+                "stdio",
+                "moraine",
+                "moraine",
+                "--",
+                "run",
+                "mcp",
+            ]
+        );
+        assert!(!default_commands[0].args.iter().any(|arg| arg == "--trust"));
+
+        let custom_target = ConfigTarget {
+            path: PathBuf::from("/tmp/Qwen Config/config.toml"),
+            source: ConfigTargetSource::Cli,
+        };
+        let custom_commands =
+            McpPlan::for_target(SetupMcpTarget::QwenCode, &custom_target).commands();
+        assert_eq!(
+            custom_commands[0].args,
+            vec![
+                "mcp",
+                "add",
+                "--scope",
+                "user",
+                "--transport",
+                "stdio",
+                "moraine",
+                "moraine",
+                "--",
+                "run",
+                "mcp",
+                "--config",
+                "/tmp/Qwen Config/config.toml",
+            ]
+        );
+    }
+
+    #[test]
+    fn qwen_dry_run_reports_command_without_execution() {
+        let plan = McpPlan::for_target(
+            SetupMcpTarget::QwenCode,
+            &ConfigTarget {
+                path: PathBuf::from("/tmp/config.toml"),
+                source: ConfigTargetSource::HomeDefault,
+            },
+        );
+        let report = McpTargetReport::planned(plan);
+        assert_eq!(report.status, SetupStatus::Planned);
+        assert_eq!(report.action, McpAction::Execute);
+        assert_eq!(report.commands.len(), 1);
+        assert!(report.commands[0].display().starts_with("qwen mcp add "));
+    }
+
+    #[test]
+    fn qwen_missing_and_failing_cli_are_never_reported_as_success() {
+        let args = SetupArgs {
+            yes: true,
+            dry_run: false,
+            skip_config: true,
+            skip_mcp: false,
+            repair_config: false,
+            mcp_targets: vec![SetupMcpTarget::QwenCode],
+        };
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/config.toml"),
+            source: ConfigTargetSource::HomeDefault,
+        };
+        let missing = setup_mcp_target(
+            &args,
+            &target,
+            SetupMcpTarget::QwenCode,
+            false,
+            true,
+            &mut FakeRunner::default(),
+        )
+        .expect("missing Qwen report");
+        assert_eq!(missing.status, SetupStatus::Skipped);
+
+        let plan = McpPlan::for_target(SetupMcpTarget::QwenCode, &target);
+        let commands = plan.commands();
+        let mut runner = FakeRunner::default().with_existing("qwen").with_response(
+            commands[0].clone(),
+            false,
+            "registration failed",
+        );
+        let failed = execute_mcp_plan(plan, &mut runner).expect("failed Qwen report");
+        assert_eq!(failed.status, SetupStatus::Error);
+        assert_eq!(runner.ran, commands);
     }
 
     #[test]

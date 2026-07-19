@@ -9,6 +9,7 @@ pub(crate) mod hermes;
 pub(crate) mod kimi_cli;
 pub(crate) mod opencode;
 pub(crate) mod pi;
+pub(crate) mod qwen_code;
 pub(crate) mod record_view;
 pub(crate) mod shared;
 
@@ -195,6 +196,7 @@ pub(crate) fn registry() -> &'static SourceRegistry {
             .register(&kimi_cli::KIMI_CLI)
             .register(&opencode::OPENCODE)
             .register(&pi::PI_CODING_AGENT)
+            .register(&qwen_code::QWEN_CODE)
     })
 }
 

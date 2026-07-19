@@ -290,6 +290,70 @@ struct AppState {
     request_admission: Arc<RequestAdmission>,
 }
 
+fn tool_output_schema(tool: &str, data_schema: Value) -> Value {
+    json!({
+        "type": "object",
+        "required": ["schema_version", "tool", "request", "warnings", "performance"],
+        "properties": {
+            "schema_version": { "type": "string" },
+            "tool": { "const": tool },
+            "request": {},
+            "data": data_schema,
+            "error": {
+                "type": "object",
+                "required": ["code", "message"],
+                "properties": {
+                    "code": {
+                        "enum": [
+                            "invalid_request",
+                            "invalid_id",
+                            "not_found",
+                            "unsupported_event_type",
+                            "deadline_exceeded",
+                            "internal_error"
+                        ]
+                    },
+                    "message": { "type": "string" },
+                    "details": {}
+                }
+            },
+            "warnings": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+            "performance": {
+                "type": "object",
+                "required": ["elapsed_ms"],
+                "properties": {
+                    "elapsed_ms": {
+                        "type": "integer",
+                        "minimum": 0
+                    }
+                }
+            }
+        },
+        "oneOf": [
+            {
+                "required": ["data"],
+                "properties": {
+                    "schema_version": {
+                        "const": contract::tool_schema_version(tool)
+                    },
+                    "request": { "type": "object" }
+                }
+            },
+            {
+                "required": ["error"],
+                "properties": {
+                    "schema_version": {
+                        "const": contract::ERROR_SCHEMA_VERSION
+                    }
+                }
+            }
+        ]
+    })
+}
+
 impl AppState {
     async fn handle_request(&self, req: RpcRequest) -> Option<Value> {
         let id = req.id.clone();
@@ -436,21 +500,13 @@ impl AppState {
                         },
                         "required": ["query"]
                     },
-                    "outputSchema": {
-                        "type": "object",
-                        "required": ["schema_version", "tool", "request", "data", "warnings", "performance"],
-                        "properties": {
-                            "schema_version": { "type": "string" },
-                            "tool": { "const": contract::SEARCH_SESSIONS_TOOL },
-                            "request": { "type": "object" },
-                            "data": {
-                                "type": "object",
-                                "required": ["result_count", "limit", "truncated", "results"]
-                            },
-                            "warnings": { "type": "array" },
-                            "performance": { "type": "object" }
-                        }
-                    },
+                    "outputSchema": tool_output_schema(
+                        contract::SEARCH_SESSIONS_TOOL,
+                        json!({
+                            "type": "object",
+                            "required": ["result_count", "limit", "truncated", "results"]
+                        })
+                    ),
                     "annotations": {
                         "readOnlyHint": true
                     }
@@ -479,27 +535,19 @@ impl AppState {
                             }
                         }
                     },
-                    "outputSchema": {
-                        "type": "object",
-                        "required": ["schema_version", "tool", "request", "data", "warnings", "performance"],
-                        "properties": {
-                            "schema_version": { "type": "string" },
-                            "tool": { "const": contract::OPEN_TOOL },
-                            "request": { "type": "object" },
-                            "data": {
-                                "type": "object",
-                                "required": ["kind"],
-                                "properties": {
-                                    "kind": { "enum": ["session", "turn", "event"] },
-                                    "turns": { "type": "array" },
-                                    "events": { "type": "array" },
-                                    "next_cursor": { "type": ["string", "null"] }
-                                }
-                            },
-                            "warnings": { "type": "array" },
-                            "performance": { "type": "object" }
-                        }
-                    },
+                    "outputSchema": tool_output_schema(
+                        contract::OPEN_TOOL,
+                        json!({
+                            "type": "object",
+                            "required": ["kind"],
+                            "properties": {
+                                "kind": { "enum": ["session", "turn", "event"] },
+                                "turns": { "type": "array" },
+                                "events": { "type": "array" },
+                                "next_cursor": { "type": ["string", "null"] }
+                            }
+                        })
+                    ),
                     "annotations": {
                         "readOnlyHint": true
                     }
@@ -561,21 +609,13 @@ impl AppState {
                         },
                         "required": ["start_datetime", "end_datetime"]
                     },
-                    "outputSchema": {
-                        "type": "object",
-                        "required": ["schema_version", "tool", "request", "data", "warnings", "performance"],
-                        "properties": {
-                            "schema_version": { "type": "string" },
-                            "tool": { "const": contract::LIST_SESSIONS_TOOL },
-                            "request": { "type": "object" },
-                            "data": {
-                                "type": "object",
-                                "required": ["result_count", "limit", "truncated", "sessions", "next_cursor"]
-                            },
-                            "warnings": { "type": "array" },
-                            "performance": { "type": "object" }
-                        }
-                    },
+                    "outputSchema": tool_output_schema(
+                        contract::LIST_SESSIONS_TOOL,
+                        json!({
+                            "type": "object",
+                            "required": ["result_count", "limit", "truncated", "sessions", "next_cursor"]
+                        })
+                    ),
                     "annotations": {
                         "readOnlyHint": true
                     }
@@ -642,21 +682,13 @@ impl AppState {
                         },
                         "required": ["path"]
                     },
-                    "outputSchema": {
-                        "type": "object",
-                        "required": ["schema_version", "tool", "request", "data", "warnings", "performance"],
-                        "properties": {
-                            "schema_version": { "type": "string" },
-                            "tool": { "const": contract::FILE_ATTENTION_TOOL },
-                            "request": { "type": "object" },
-                            "data": {
-                                "type": "object",
-                                "required": ["tail", "scope", "granularity", "summary", "roots", "result_count", "truncated"]
-                            },
-                            "warnings": { "type": "array" },
-                            "performance": { "type": "object" }
-                        }
-                    },
+                    "outputSchema": tool_output_schema(
+                        contract::FILE_ATTENTION_TOOL,
+                        json!({
+                            "type": "object",
+                            "required": ["tail", "scope", "granularity", "summary", "roots", "result_count", "truncated"]
+                        })
+                    ),
                     "annotations": {
                         "readOnlyHint": true
                     }
@@ -2039,6 +2071,82 @@ mod tests {
             .expect("tools/call response")
     }
 
+    fn schema_keywords_match(schema: &Value, instance: &Value) -> bool {
+        if let Some(expected_type) = schema.get("type").and_then(Value::as_str) {
+            let type_matches = match expected_type {
+                "array" => instance.is_array(),
+                "boolean" => instance.is_boolean(),
+                "integer" => instance.as_i64().is_some() || instance.as_u64().is_some(),
+                "null" => instance.is_null(),
+                "number" => instance.is_number(),
+                "object" => instance.is_object(),
+                "string" => instance.is_string(),
+                _ => false,
+            };
+            if !type_matches {
+                return false;
+            }
+        }
+
+        if let Some(expected) = schema.get("const") {
+            if instance != expected {
+                return false;
+            }
+        }
+
+        if let Some(required) = schema.get("required").and_then(Value::as_array) {
+            if required.iter().any(|field| {
+                field
+                    .as_str()
+                    .is_none_or(|field| instance.get(field).is_none())
+            }) {
+                return false;
+            }
+        }
+
+        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+            if properties.iter().any(|(field, property_schema)| {
+                instance
+                    .get(field)
+                    .is_some_and(|value| !schema_keywords_match(property_schema, value))
+            }) {
+                return false;
+            }
+        }
+
+        if let Some(one_of) = schema.get("oneOf").and_then(Value::as_array) {
+            if one_of
+                .iter()
+                .filter(|branch| schema_keywords_match(branch, instance))
+                .count()
+                != 1
+            {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn assert_published_output_schema_matches(response: &Value, tool: &str) {
+        let state = test_state();
+        let tools = state.tools_list_result();
+        let schema = tools["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|candidate| candidate["name"].as_str() == Some(tool))
+            .map(|candidate| &candidate["outputSchema"])
+            .expect("tool output schema");
+        let structured_content = &response["result"]["structuredContent"];
+
+        assert!(
+            schema_keywords_match(schema, structured_content),
+            "{tool} structured content must match its published output envelope: \
+             schema={schema}, structuredContent={structured_content}"
+        );
+    }
+
     fn assert_successful_tool_exchange(response: &Value, tool: &str) {
         assert_eq!(response["jsonrpc"], "2.0");
         assert!(
@@ -2051,6 +2159,7 @@ mod tests {
             contract::ERROR_SCHEMA_VERSION
         );
         assert_eq!(response["result"]["structuredContent"]["tool"], tool);
+        assert_published_output_schema_matches(response, tool);
     }
 
     fn assert_handled_tool_error_exchange(response: &Value, tool: &str, code: &str) {
@@ -2069,6 +2178,7 @@ mod tests {
             response["result"]["structuredContent"]["error"]["code"],
             code
         );
+        assert_published_output_schema_matches(response, tool);
     }
 
     #[tokio::test]
@@ -2194,15 +2304,15 @@ mod tests {
         );
 
         let harness_description = json!(
-            "Optional exact, case-sensitive normalized harness filter. Supported values: codex, claude-code, cursor, hermes, kimi-cli, opencode, pi-coding-agent."
+            "Optional exact, case-sensitive normalized harness filter. Supported values: codex, claude-code, cursor, hermes, kimi-cli, opencode, pi-coding-agent, qwen-code."
         );
         let source_description = if cfg!(target_os = "macos") {
             json!(
-                "Optional exact, case-sensitive ingest source filter. Configured values for this server: claude, claude-cowork, codex, cursor, cursor-sqlite, hermes, kimi-cli, omp, opencode, pi. Use source to distinguish sources such as pi and omp that share a harness."
+                "Optional exact, case-sensitive ingest source filter. Configured values for this server: claude, claude-cowork, codex, cursor, cursor-sqlite, hermes, kimi-cli, omp, opencode, pi, qwen-code. Use source to distinguish sources such as pi and omp that share a harness."
             )
         } else {
             json!(
-                "Optional exact, case-sensitive ingest source filter. Configured values for this server: claude, codex, cursor, cursor-sqlite, hermes, kimi-cli, omp, opencode, pi. Use source to distinguish sources such as pi and omp that share a harness."
+                "Optional exact, case-sensitive ingest source filter. Configured values for this server: claude, codex, cursor, cursor-sqlite, hermes, kimi-cli, omp, opencode, pi, qwen-code. Use source to distinguish sources such as pi and omp that share a harness."
             )
         };
         for tool_name in ["search_sessions", "list_sessions", "file_attention"] {
@@ -2366,6 +2476,22 @@ mod tests {
         for (index, (tool, arguments, code)) in cases.into_iter().enumerate() {
             let response = call_tool_rpc(&state, index as u64 + 1, tool, arguments).await;
             assert_handled_tool_error_exchange(&response, tool, code);
+        }
+    }
+
+    #[tokio::test]
+    async fn every_retrieval_tool_error_schema_accepts_non_object_requests() {
+        let state = test_state();
+        let cases = [
+            (contract::SEARCH_SESSIONS_TOOL, Value::Null),
+            (contract::LIST_SESSIONS_TOOL, json!("invalid")),
+            (contract::OPEN_TOOL, json!([])),
+            (contract::FILE_ATTENTION_TOOL, json!(false)),
+        ];
+
+        for (index, (tool, arguments)) in cases.into_iter().enumerate() {
+            let response = call_tool_rpc(&state, index as u64 + 1, tool, arguments).await;
+            assert_handled_tool_error_exchange(&response, tool, "invalid_request");
         }
     }
 
