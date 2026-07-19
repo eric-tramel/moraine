@@ -395,6 +395,16 @@ pub(super) fn mcp_plan(
                 ),
                 McpPlanStep::required(CommandSpec::new(
                     "claude",
+                    ["plugin", "marketplace", "update", "moraine"],
+                ))
+                .with_progress(
+                    "Refreshing Claude Code plugin marketplace",
+                    "Claude Code marketplace refreshed",
+                    "Claude Code marketplace refresh warning",
+                    "Claude Code marketplace refresh failed",
+                ),
+                McpPlanStep::required(CommandSpec::new(
+                    "claude",
                     ["plugin", "install", "moraine@moraine"],
                 ))
                 .with_progress(
@@ -402,6 +412,16 @@ pub(super) fn mcp_plan(
                     "Claude Code plugin installed",
                     "Claude Code plugin install warning",
                     "Claude Code plugin install failed",
+                ),
+                McpPlanStep::required(CommandSpec::new(
+                    "claude",
+                    ["plugin", "update", "moraine@moraine"],
+                ))
+                .with_progress(
+                    "Updating Claude Code Moraine plugin",
+                    "Claude Code plugin updated",
+                    "Claude Code plugin update warning",
+                    "Claude Code plugin update failed",
                 ),
                 McpPlanStep::warn_and_continue(
                     CommandSpec::new("claude", ["mcp", "remove", "moraine", "--scope", "user"]),

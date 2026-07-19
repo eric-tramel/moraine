@@ -3751,14 +3751,14 @@ host = "127.42.0.9"
     }
 
     #[test]
-    fn claude_default_config_installs_plugin_and_cleans_manual_mcp() {
+    fn claude_default_config_installs_updates_and_cleans_manual_mcp() {
         let target = ConfigTarget {
             path: PathBuf::from("/tmp/config.toml"),
             source: ConfigTargetSource::HomeDefault,
         };
         let plan = McpPlan::for_target(SetupMcpTarget::ClaudeCode, &target);
         let commands = plan.commands();
-        assert_eq!(commands.len(), 3);
+        assert_eq!(commands.len(), 5);
         assert_eq!(
             commands[0].args,
             vec![
@@ -3773,12 +3773,93 @@ host = "127.42.0.9"
         );
         assert_eq!(
             commands[1].args,
-            vec!["plugin", "install", "moraine@moraine"]
+            vec!["plugin", "marketplace", "update", "moraine"]
         );
         assert_eq!(
             commands[2].args,
+            vec!["plugin", "install", "moraine@moraine"]
+        );
+        assert_eq!(
+            commands[3].args,
+            vec!["plugin", "update", "moraine@moraine"]
+        );
+        assert_eq!(
+            commands[4].args,
             vec!["mcp", "remove", "moraine", "--scope", "user"]
         );
+    }
+
+    #[test]
+    fn claude_marketplace_add_failure_continues_to_refresh() {
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/config.toml"),
+            source: ConfigTargetSource::HomeDefault,
+        };
+        let plan = McpPlan::for_target(SetupMcpTarget::ClaudeCode, &target);
+        let commands = plan.commands();
+        let mut runner = FakeRunner::default()
+            .with_existing("claude")
+            .with_response(commands[0].clone(), false, "marketplace already exists")
+            .with_response(commands[1].clone(), true, "")
+            .with_response(commands[2].clone(), true, "")
+            .with_response(commands[3].clone(), true, "")
+            .with_response(commands[4].clone(), true, "");
+
+        let report = execute_mcp_plan(plan, &mut runner).expect("execute Claude plan");
+
+        assert_eq!(report.status, SetupStatus::Ok);
+        assert!(!report.warnings.is_empty());
+        assert_eq!(runner.ran, commands);
+    }
+
+    #[test]
+    fn claude_marketplace_update_failure_stops_setup() {
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/config.toml"),
+            source: ConfigTargetSource::HomeDefault,
+        };
+        let plan = McpPlan::for_target(SetupMcpTarget::ClaudeCode, &target);
+        let commands = plan.commands();
+        let mut runner = FakeRunner::default()
+            .with_existing("claude")
+            .with_response(commands[0].clone(), true, "")
+            .with_response(commands[1].clone(), false, "marketplace update failed");
+
+        let report = execute_mcp_plan(plan, &mut runner).expect("execute Claude plan");
+
+        assert_eq!(report.status, SetupStatus::Error);
+        assert!(report
+            .error
+            .as_deref()
+            .expect("error")
+            .contains(&commands[1].display()));
+        assert_eq!(runner.ran, commands[..2]);
+    }
+
+    #[test]
+    fn claude_plugin_update_failure_stops_before_cleanup() {
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/config.toml"),
+            source: ConfigTargetSource::HomeDefault,
+        };
+        let plan = McpPlan::for_target(SetupMcpTarget::ClaudeCode, &target);
+        let commands = plan.commands();
+        let mut runner = FakeRunner::default()
+            .with_existing("claude")
+            .with_response(commands[0].clone(), true, "")
+            .with_response(commands[1].clone(), true, "")
+            .with_response(commands[2].clone(), true, "")
+            .with_response(commands[3].clone(), false, "plugin update failed");
+
+        let report = execute_mcp_plan(plan, &mut runner).expect("execute Claude plan");
+
+        assert_eq!(report.status, SetupStatus::Error);
+        assert!(report
+            .error
+            .as_deref()
+            .expect("error")
+            .contains(&commands[3].display()));
+        assert_eq!(runner.ran, commands[..4]);
     }
 
     #[test]

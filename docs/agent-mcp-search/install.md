@@ -51,12 +51,23 @@ uv tool upgrade moraine-cli
 moraine up
 ```
 
-Add the marketplace from this repository and install the plugin:
+For a first-time plugin install, add the marketplace and install the plugin:
 
 ```bash
 claude plugin marketplace add eric-tramel/moraine --sparse .claude-plugin plugins
 claude plugin install moraine@moraine
 ```
+
+For an existing plugin installation, refresh the marketplace and update the
+plugin after upgrading the CLI:
+
+```bash
+claude plugin marketplace update moraine
+claude plugin update moraine@moraine
+```
+
+Start a new Claude Code session after installation or update so it loads the
+current plugin version.
 
 The Claude plugin MCP launcher looks for `moraine` on `PATH` and then runs
 `moraine run mcp`. If the CLI is missing, it reports a `binary_missing` message
