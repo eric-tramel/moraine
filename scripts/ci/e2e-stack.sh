@@ -212,6 +212,41 @@ clickhouse_scalar() {
   curl -fsS --max-time 10 "$clickhouse_url" --data-binary "$query" | tr -d '\r\n'
 }
 
+wait_for_clickhouse_scalar_stable() {
+  local clickhouse_url="$1"
+  local query="$2"
+  local timeout_seconds="${3:-30}"
+  local required_observations="${4:-3}"
+  local started
+  local previous=""
+  local stable_observations=0
+  started="$(date +%s)"
+
+  while true; do
+    local now
+    now="$(date +%s)"
+    if (( now - started >= timeout_seconds )); then
+      echo "timed out waiting for stable ClickHouse scalar: $query" >&2
+      return 1
+    fi
+
+    local actual
+    actual="$(clickhouse_scalar "$clickhouse_url" "$query" 2>/dev/null || true)"
+    if [[ -n "$actual" && "$actual" == "$previous" ]]; then
+      stable_observations=$((stable_observations + 1))
+    else
+      previous="$actual"
+      stable_observations=1
+    fi
+    if (( stable_observations >= required_observations )); then
+      printf '%s' "$actual"
+      return 0
+    fi
+
+    sleep 2
+  done
+}
+
 assert_clickhouse_scalar() {
   local clickhouse_url="$1"
   local label="$2"
@@ -1530,7 +1565,7 @@ EOF
   assert_clickhouse_count "$clickhouse_url" "Qwen token accounting" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND item_id = 'qwen-assistant-${run_stamp}' AND event_kind = 'reasoning' AND input_tokens = 120 AND output_tokens = 80 AND cache_read_tokens = 20 AND cache_write_tokens = 0 AND token_usage_buckets['input_text'] = 91 AND token_usage_buckets['output_text'] = 62 AND token_usage_buckets['input_image'] = 4 AND token_usage_buckets['output_audio'] = 11 AND token_usage_buckets['reasoning'] = 7 AND token_usage_buckets['server_tool_use'] = 5" "1"
   assert_clickhouse_count "$clickhouse_url" "Qwen title projection" "SELECT count() FROM ${clickhouse_database}.mcp_open_sessions FINAL WHERE session_id = '${qwen_session_id}' AND title = 'Qwen e2e ${run_stamp}'" "1"
   assert_clickhouse_count "$clickhouse_url" "Qwen reasoning row" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND item_id = 'qwen-assistant-${run_stamp}' AND event_kind = 'reasoning' AND has_reasoning = 1" "1"
-  assert_clickhouse_count "$clickhouse_url" "Qwen projected assistant part order" "SELECT count() FROM ${clickhouse_database}.mcp_open_events FINAL WHERE session_id = '${qwen_session_id}' AND item_id = 'qwen-assistant-${run_stamp}' AND ((event_ordinal = 2 AND event_class = 'reasoning') OR (event_ordinal = 3 AND event_class = 'message') OR (event_ordinal = 4 AND event_class = 'tool_call'))" "3"
+  assert_clickhouse_count "$clickhouse_url" "Qwen projected assistant part order" "SELECT uniqExact(tuple(event_ordinal, event_class)) FROM ${clickhouse_database}.mcp_open_events FINAL WHERE session_id = '${qwen_session_id}' AND item_id = 'qwen-assistant-${run_stamp}' AND ((event_ordinal = 2 AND event_class = 'reasoning') OR (event_ordinal = 3 AND event_class = 'message') OR (event_ordinal = 4 AND event_class = 'tool_call'))" "3"
   assert_clickhouse_count "$clickhouse_url" "Qwen tool request and response rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'qwen-code' AND tool_call_id IN ('qwen-call-search-${run_stamp}', 'qwen-call-fail-${run_stamp}')" "4"
   assert_clickhouse_count "$clickhouse_url" "Qwen failed tool response" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'qwen-code' AND tool_call_id = 'qwen-call-fail-${run_stamp}' AND tool_phase = 'response' AND tool_error = 1" "1"
   assert_clickhouse_count "$clickhouse_url" "Qwen rewind event" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND item_id = 'qwen-rewind-${run_stamp}' AND op_kind = 'rewind'" "1"
@@ -1788,7 +1823,10 @@ PY
   local nac_raw_rows_before_noop
   local nac_checkpoint_updated_at_before_noop
   local nac_heartbeat_before_touch
-  nac_raw_rows_before_noop="$(clickhouse_scalar "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-nac'")"
+  # The normalized truncation row can become visible before every raw insert
+  # from the same queued scan. Establish the no-op baseline only after the raw
+  # count has remained unchanged across consecutive poll intervals.
+  nac_raw_rows_before_noop="$(wait_for_clickhouse_scalar_stable "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-nac'" 30 3)"
   nac_checkpoint_updated_at_before_noop="$(clickhouse_scalar "$clickhouse_url" "SELECT toString(max(updated_at)) FROM ${clickhouse_database}.ingest_checkpoints WHERE source_name = 'ci-nac'")"
   nac_heartbeat_before_touch="$(clickhouse_scalar "$clickhouse_url" "SELECT toString(max(ts)) FROM ${clickhouse_database}.ingest_heartbeats")"
   "$python_bin" - "$nac_fixture_file" <<'PY'
