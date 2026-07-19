@@ -147,9 +147,6 @@ impl ResolvedIngestSource {
         &self.name
     }
 
-    pub(super) fn harness(&self) -> &str {
-        &self.harness
-    }
     pub(super) fn materializes(&self) -> bool {
         self.materialize
     }

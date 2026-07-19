@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, warn};
+use url::Origin;
 
 use super::{
     hash_str, open_read_only, stat_fingerprint, truncate_chars_local, StatFingerprint,
@@ -731,17 +732,41 @@ fn scan_nac_rows(
         prior.episode_high_water
     };
     let mut last_episode_id = scan_from;
+    let episode_bytes = "length(CAST(COALESCE(thread_name, '') AS BLOB)) + \
+        length(CAST(COALESCE(session_id, '') AS BLOB)) + \
+        length(CAST(COALESCE(action, '') AS BLOB)) + \
+        length(CAST(COALESCE(content, '') AS BLOB)) + \
+        length(CAST(COALESCE(created_at, '') AS BLOB))";
+    let guarded_episode = |name: &str| {
+        format!(
+            "CASE WHEN ({episode_bytes}) <= {SCAN_PAGE_MAX_BYTES} THEN {name} ELSE NULL END AS {name}"
+        )
+    };
+    let episode_sql = format!(
+        "SELECT id, {}, {}, {}, {}, {}, ({episode_bytes}) AS estimated_bytes \
+         FROM episodes WHERE id > ?1 ORDER BY id LIMIT ?2",
+        guarded_episode("thread_name"),
+        guarded_episode("session_id"),
+        guarded_episode("action"),
+        guarded_episode("content"),
+        guarded_episode("created_at")
+    );
     loop {
-        let mut stmt = connection.prepare_cached(
-            "SELECT id, thread_name, session_id, action, content, created_at \
-             FROM episodes WHERE id > ?1 ORDER BY id LIMIT ?2",
-        )?;
+        let mut stmt = connection.prepare_cached(&episode_sql)?;
         let mut rows = stmt.query(params![last_episode_id, SCAN_PAGE_SIZE as i64])?;
         let mut page_rows = 0usize;
         while let Some(row) = rows.next()? {
             let id: i64 = row.get(0)?;
+            let row_bytes = checked_row_bytes(row.get(6)?, "NAC episode", id)?;
+            if row_bytes > SCAN_PAGE_MAX_BYTES {
+                return Err(NacScanError::TooLarge(format!(
+                    "NAC episode {id} is {row_bytes} bytes, exceeding the {SCAN_PAGE_MAX_BYTES} byte row ceiling"
+                )));
+            }
             let thread_name: String = row.get(1)?;
             let raw_session_id: String = row.get(2)?;
+            let action: String = row.get(3)?;
+            let content: String = row.get(4)?;
             let created_at_raw: String = row.get(5)?;
             page_rows += 1;
             total_rows = total_rows.saturating_add(1);
@@ -749,12 +774,6 @@ fn scan_nac_rows(
                 return Err(NacScanError::TooLarge(format!(
                     "NAC session and episode rows exceed the {} row ceiling",
                     MAX_NAC_SESSIONS + MAX_NAC_EPISODES
-                )));
-            }
-            let mut row_bytes = thread_name.len() + raw_session_id.len() + created_at_raw.len();
-            if row_bytes > SCAN_PAGE_MAX_BYTES {
-                return Err(NacScanError::TooLarge(format!(
-                    "NAC episode {id} is {row_bytes} bytes, exceeding the {SCAN_PAGE_MAX_BYTES} byte row ceiling"
                 )));
             }
             total_bytes = total_bytes.saturating_add(row_bytes as u64);
@@ -784,20 +803,6 @@ fn scan_nac_rows(
                     id as u64,
                     &created_at_raw,
                 )?);
-            }
-            let action: String = row.get(3)?;
-            let content: String = row.get(4)?;
-            row_bytes = row_bytes.saturating_add(action.len() + content.len());
-            if row_bytes > SCAN_PAGE_MAX_BYTES {
-                return Err(NacScanError::TooLarge(format!(
-                    "NAC episode {id} is {row_bytes} bytes, exceeding the {SCAN_PAGE_MAX_BYTES} byte row ceiling"
-                )));
-            }
-            total_bytes = total_bytes.saturating_add((action.len() + content.len()) as u64);
-            if total_bytes > MAX_NAC_SCAN_BYTES {
-                return Err(NacScanError::TooLarge(format!(
-                    "NAC scan bytes exceed the {MAX_NAC_SCAN_BYTES} byte ceiling"
-                )));
             }
             let timestamp = normalize_nac_timestamp(&created_at_raw, false)?;
             records.push(worker_event_record(
@@ -835,34 +840,71 @@ fn scan_nac_rows(
 }
 
 fn session_projection(columns: &BTreeSet<String>) -> String {
-    let optional = |name: &str, fallback: &str| {
+    let mut byte_columns = vec![
+        "session_id",
+        "cwd",
+        "model",
+        "base_url",
+        "messages_json",
+        "created_at",
+        "updated_at",
+    ];
+    for optional_name in [
+        "backend",
+        "reasoning_effort",
+        "sandbox_json",
+        "last_response_duration_ms",
+        "previous_response_duration_ms",
+        "response_durations_json",
+        "token_usages_json",
+        "host_id",
+    ] {
+        if columns.contains(optional_name) {
+            byte_columns.push(optional_name);
+        }
+    }
+    let estimated_bytes = byte_columns
+        .into_iter()
+        .map(|name| format!("length(CAST(COALESCE({name}, '') AS BLOB))"))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let guarded = |expression: &str, alias: &str| {
+        format!(
+            "CASE WHEN ({estimated_bytes}) <= {SCAN_PAGE_MAX_BYTES} THEN {expression} ELSE NULL END AS {alias}"
+        )
+    };
+    let guarded_optional = |name: &str, fallback: &str| {
         if columns.contains(name) {
-            name.to_string()
+            guarded(name, name)
         } else {
             format!("{fallback} AS {name}")
         }
     };
     let remote = if columns.contains("host_id") {
-        "CASE WHEN host_id IS NOT NULL AND host_id <> '' THEN 1 ELSE 0 END AS is_remote".to_string()
+        guarded(
+            "CASE WHEN length(CAST(COALESCE(host_id, '') AS BLOB)) > 0 THEN 1 ELSE 0 END",
+            "is_remote",
+        )
     } else {
         "NULL AS is_remote".to_string()
     };
     [
-        "session_id".to_string(),
-        "cwd".to_string(),
-        "model".to_string(),
-        "base_url".to_string(),
-        optional("backend", "''"),
-        optional("reasoning_effort", "''"),
-        optional("sandbox_json", "NULL"),
-        "messages_json".to_string(),
-        optional("last_response_duration_ms", "NULL"),
-        optional("previous_response_duration_ms", "NULL"),
-        optional("response_durations_json", "NULL"),
-        optional("token_usages_json", "NULL"),
-        "created_at".to_string(),
-        "updated_at".to_string(),
+        guarded("session_id", "session_id"),
+        guarded("cwd", "cwd"),
+        guarded("model", "model"),
+        guarded("base_url", "base_url"),
+        guarded_optional("backend", "''"),
+        guarded_optional("reasoning_effort", "''"),
+        guarded_optional("sandbox_json", "NULL"),
+        guarded("messages_json", "messages_json"),
+        guarded_optional("last_response_duration_ms", "NULL"),
+        guarded_optional("previous_response_duration_ms", "NULL"),
+        guarded_optional("response_durations_json", "NULL"),
+        guarded_optional("token_usages_json", "NULL"),
+        guarded("created_at", "created_at"),
+        guarded("updated_at", "updated_at"),
         remote,
+        format!("({estimated_bytes}) AS estimated_bytes"),
     ]
     .join(", ")
 }
@@ -871,10 +913,16 @@ fn read_session_row(
     row: &rusqlite::Row<'_>,
     columns: &BTreeSet<String>,
 ) -> std::result::Result<NacSessionRow, NacScanError> {
+    let estimated_bytes = checked_row_bytes(row.get(15)?, "NAC session row", 0)?;
+    if estimated_bytes > SCAN_PAGE_MAX_BYTES {
+        return Err(NacScanError::TooLarge(format!(
+            "NAC session row is {estimated_bytes} bytes, exceeding the {SCAN_PAGE_MAX_BYTES} byte row ceiling"
+        )));
+    }
     let raw_session_id: String = row.get(0)?;
     let cwd: String = row.get(1)?;
     let model: String = row.get(2)?;
-    let base_url: String = row.get(3)?;
+    let base_url = sanitize_base_url(&row.get::<_, String>(3)?);
     let backend = row.get::<_, Option<String>>(4)?.unwrap_or_default();
     let reasoning_effort = row.get::<_, Option<String>>(5)?.unwrap_or_default();
     let sandbox_raw: Option<String> = row.get(6)?;
@@ -886,19 +934,6 @@ fn read_session_row(
     let created_at: String = row.get(12)?;
     let updated_at: String = row.get(13)?;
     let remote: Option<i64> = row.get(14)?;
-    let estimated_bytes = raw_session_id.len()
-        + cwd.len()
-        + model.len()
-        + base_url.len()
-        + backend.len()
-        + reasoning_effort.len()
-        + sandbox_raw.as_ref().map_or(0, String::len)
-        + messages_raw.len()
-        + durations_raw.as_ref().map_or(0, String::len)
-        + usages_raw.as_ref().map_or(0, String::len)
-        + created_at.len()
-        + updated_at.len()
-        + 3 * std::mem::size_of::<i64>();
     let parse_json = |label: &str, raw: Option<&str>, default: Value| {
         let Some(raw) = raw.filter(|raw| !raw.trim().is_empty()) else {
             return Ok(default);
@@ -947,6 +982,28 @@ fn read_session_row(
 
 fn estimated_session_bytes(session: &NacSessionRow) -> usize {
     session.estimated_bytes
+}
+
+fn checked_row_bytes(
+    raw: i64,
+    label: &str,
+    row_id: i64,
+) -> std::result::Result<usize, NacScanError> {
+    usize::try_from(raw).map_err(|_| {
+        NacScanError::Scan(anyhow::anyhow!(
+            "{label} {row_id} returned an invalid negative byte length"
+        ))
+    })
+}
+
+fn sanitize_base_url(raw: &str) -> String {
+    let Ok(parsed) = url::Url::parse(raw) else {
+        return String::new();
+    };
+    match parsed.origin() {
+        Origin::Tuple(_, _, _) => parsed.origin().ascii_serialization(),
+        Origin::Opaque(_) => String::new(),
+    }
 }
 
 fn synthesize_session(
@@ -1539,6 +1596,8 @@ mod tests {
             "model",
             "base_url",
             "messages_json",
+            "last_response_duration_ms",
+            "previous_response_duration_ms",
             "created_at",
             "updated_at",
             "host_id",
@@ -1553,12 +1612,27 @@ mod tests {
         assert!(!projection.contains("api_key_env"));
         assert!(!projection.contains("extra_headers_json"));
         assert!(!projection.contains("store_path"));
-        assert!(projection.contains("host_id IS NOT NULL"));
+        assert!(projection
+            .contains("THEN CASE WHEN length(CAST(COALESCE(host_id, '') AS BLOB)) > 0 THEN 1"));
         assert!(!projection.split(',').any(|field| field.trim() == "host_id"));
         assert!(projection.contains("messages_json"));
         assert!(!projection.contains("THEN '[]'"));
         assert!(projection.contains("response_durations_json"));
         assert!(!projection.contains("response_durations_ms_json"));
+        assert!(projection.contains("AS estimated_bytes"));
+        assert!(projection.contains("THEN messages_json ELSE NULL END AS messages_json"));
+        assert!(projection.contains("COALESCE(last_response_duration_ms, '') AS BLOB"));
+        assert!(projection.contains("COALESCE(previous_response_duration_ms, '') AS BLOB"));
+        assert!(projection.contains("COALESCE(host_id, '') AS BLOB"));
+    }
+
+    #[test]
+    fn base_url_persistence_omits_credentials_paths_and_queries() {
+        assert_eq!(
+            sanitize_base_url("https://user:secret@proxy.example:8443/v1?sig=private#token"),
+            "https://proxy.example:8443"
+        );
+        assert_eq!(sanitize_base_url("not a URL"), "");
     }
 
     static FIXTURE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

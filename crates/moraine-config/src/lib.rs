@@ -3375,7 +3375,7 @@ watch_root = "~/.cursor/projects"
         assert_eq!(source.harness, "qwen-code");
         assert_eq!(source.glob, "~/.qwen/projects/*/chats/*.jsonl");
         assert_eq!(source.watch_root, "~/.qwen/projects");
-        assert_eq!(source.format, SOURCE_FORMAT_JSONL);
+        assert_eq!(source.format, SourceFormat::Jsonl);
     }
 
     #[test]

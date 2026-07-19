@@ -375,6 +375,8 @@ mod tests {
             "qwen-code",
             "--mcp-target",
             "kiro-cli",
+            "--mcp-target",
+            "nac",
         ]);
         match cli.command {
             CliCommand::Setup(setup) => {
@@ -391,6 +393,7 @@ mod tests {
                         SetupMcpTarget::Hermes,
                         SetupMcpTarget::QwenCode,
                         SetupMcpTarget::KiroCli,
+                        SetupMcpTarget::Nac,
                     ]
                 );
             }

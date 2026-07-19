@@ -541,6 +541,8 @@ main() {
   local cursor_sqlite_keyword="${base_keyword}_cursorsqlite_${run_stamp}"
   local nac_keyword="${base_keyword}_nac_${run_stamp}"
   local nac_live_keyword="${base_keyword}_nac_live_${run_stamp}"
+  local nac_worker_keyword="${base_keyword}_nac_worker_${run_stamp}"
+  local nac_replacement_keyword="${base_keyword}_nac_replacement_${run_stamp}"
   local nac_mcp_sentinel="${base_keyword}_nac_mcp_only_${run_stamp}"
   local nac_remote_keyword="${base_keyword}_nac_remote_${run_stamp}"
   local cursor_sqlite_live_keyword="${base_keyword}_cursorsqlite_live_${run_stamp}"
@@ -991,6 +993,7 @@ EOF
     "$nac_remote_worker_id" \
     "$nac_project_dir" \
     "$nac_keyword" \
+    "$nac_worker_keyword" \
     "$nac_mcp_sentinel" \
     "$nac_remote_keyword" \
     "$nac_secret_sentinel" \
@@ -1006,11 +1009,12 @@ import sys
     remote_worker_id,
     cwd,
     keyword,
+    worker_keyword,
     mcp_sentinel,
     remote_keyword,
     secret,
     tool_call_id,
-) = sys.argv[1:11]
+) = sys.argv[1:12]
 
 connection = sqlite3.connect(db_path)
 connection.executescript(
@@ -1165,7 +1169,7 @@ connection.executemany(
             local_worker_id,
             parent_id,
             "report result",
-            f"local worker result for {keyword}",
+            f"local worker result for {worker_keyword}",
             "2026-02-16 12:00:10",
         ),
         (
@@ -1198,6 +1202,14 @@ db_path, raw_session_id = sys.argv[1:3]
 material = f"ci-nac\n{db_path}\n1".encode()
 namespace = sha256(material).hexdigest()[:16]
 print(f"nac:{namespace}:{raw_session_id}")
+PY
+)"
+  local nac_normalized_local_worker_id
+  nac_normalized_local_worker_id="$nac_normalized_session_id:nac-worker:$($python_bin - "$nac_local_worker_id" <<'PY'
+from hashlib import sha256
+import sys
+
+print(sha256(sys.argv[1].encode()).hexdigest()[:16])
 PY
 )"
 
@@ -2182,6 +2194,71 @@ PY
     --expect-event-count "8" \
     --expect-updated-at "2026-02-16T12:00:05.000Z" \
     --expect-mode "mcp_internal"
+
+  echo "[e2e] checking NAC worker search/open/list behavior"
+  "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --working-dir "$nac_project_dir" \
+    --query "$nac_worker_keyword" \
+    --expect-session-id "$nac_normalized_local_worker_id" \
+    --expect-open-text "$nac_worker_keyword" \
+    --expect-event-count "5"
+
+  echo "[e2e] nac sqlite same-path database replacement"
+  "$python_bin" - "$nac_fixture_file" "$nac_session_id" "$nac_replacement_keyword" <<'PY'
+import json
+import os
+import sqlite3
+import sys
+
+db_path, session_id, marker = sys.argv[1:4]
+replacement = f"{db_path}.replacement"
+try:
+    os.remove(replacement)
+except FileNotFoundError:
+    pass
+
+source = sqlite3.connect(db_path, timeout=30)
+target = sqlite3.connect(replacement, timeout=30)
+source.backup(target)
+source.close()
+messages = json.loads(
+    target.execute(
+        "SELECT messages_json FROM sessions WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()[0]
+)
+messages.append({"role": "assistant", "content": f"replacement generation {marker}"})
+target.execute(
+    "UPDATE sessions SET messages_json = ?, updated_at = ? WHERE session_id = ?",
+    (json.dumps(messages), "2026-02-16 12:00:24.000000000", session_id),
+)
+target.commit()
+target.close()
+os.replace(replacement, db_path)
+PY
+  local nac_replacement_session_id
+  nac_replacement_session_id="$($python_bin - "$nac_canonical_db" "$nac_session_id" <<'PY'
+from hashlib import sha256
+import sys
+
+db_path, raw_session_id = sys.argv[1:3]
+material = f"ci-nac\n{db_path}\n2".encode()
+namespace = sha256(material).hexdigest()[:16]
+print(f"nac:{namespace}:{raw_session_id}")
+PY
+)"
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND source_generation = 2 AND session_id = '${nac_replacement_session_id}' AND position(text_content, '${nac_replacement_keyword}') > 0" 120
+  assert_clickhouse_count "$clickhouse_url" "nac replacement advances source generation" "SELECT count() FROM ${clickhouse_database}.ingest_checkpoints WHERE source_name = 'ci-nac' AND source_generation = 2" "1"
+  "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --working-dir "$nac_project_dir" \
+    --query "$nac_replacement_keyword" \
+    --expect-session-id "$nac_replacement_session_id" \
+    --expect-open-text "$nac_replacement_keyword" \
+    --expect-event-count "8"
 
   echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (pi)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \

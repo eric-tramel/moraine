@@ -363,7 +363,7 @@
           "op_kind": "",
           "op_status": "",
           "origin_event_id": "",
-          "origin_tool_call_id": "mcp__moraine__search",
+          "origin_tool_call_id": "",
           "output_tokens": 0,
           "parent_tool_call_id": "",
           "payload_json": "{\"base_url\":\"https://openrouter.ai/api/v1\",\"cwd\":\"/workspace/local\",\"cwd_scope\":\"local\",\"input\":{\"query\":\"nac\"},\"logical_id\":\"session:session-local:message:2:tool:0\",\"model\":\"z-ai/glm-5.2\",\"raw_session_id\":\"session-local\",\"raw_tool_name\":\"mcp__moraine__search\",\"session_id\":\"nac_fixture_session-local\",\"timestamp\":\"2026-07-18T12:15:51.775682Z\",\"tool_call_id\":\"call-1\",\"tool_name\":\"search\",\"turn_index\":1,\"type\":\"tool_request\"}",

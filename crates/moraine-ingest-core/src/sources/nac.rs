@@ -173,7 +173,6 @@ fn normalize_tool_request(record: &Value, ctx: &RecordContext<'_>) -> Normalized
     let uid = stable_uid(&emitter, record, "tool_request");
     let call_id = to_str(record.get("tool_call_id"));
     let canonical_name = to_str(record.get("tool_name"));
-    let raw_name = to_str(record.get("raw_tool_name"));
     let input = record.get("input").cloned().unwrap_or(Value::Null);
     let input_json = compact_json(&input);
     let event = apply_common_event_fields(
@@ -182,7 +181,6 @@ fn normalize_tool_request(record: &Value, ctx: &RecordContext<'_>) -> Normalized
             .tool_call_id(&call_id)
             .tool_name(&canonical_name)
             .tool_phase("request")
-            .origin_tool_call_id(raw_name)
             .content_types(["tool_call"]),
         record,
     );
