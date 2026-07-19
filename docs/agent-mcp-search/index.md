@@ -2,9 +2,9 @@
 
 Moraine gives agent harnesses a shared, local memory over prior agent sessions.
 The MCP server exposes that memory as read-only search and navigation tools, so
-Codex, Claude Code, Qwen Code, Hermes, Kiro CLI, Cursor, Kimi CLI, OpenCode, Pi,
-and other MCP clients can find past decisions, commands, errors, and active agent
-work without copying session logs by hand.
+Codex, Claude Code, Qwen Code, Hermes, Kiro CLI, Cursor, Kimi CLI, NAC, OpenCode,
+Pi, and other MCP clients can find past decisions, commands, errors, and active
+agent work without copying session logs by hand.
 
 Start with these pages:
 

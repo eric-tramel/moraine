@@ -767,6 +767,27 @@ fn dedupe_mcp_search_rows_uses_full_content_digest_beyond_preview() {
 }
 
 #[test]
+fn mcp_internal_classifier_covers_every_public_retrieval_tool() {
+    for name in [
+        "search",
+        "search_sessions",
+        "open",
+        "list_sessions",
+        "file_attention",
+    ] {
+        assert!(
+            ClickHouseConversationRepository::is_mcp_internal_tool_name(name),
+            "{name} must classify as mcp_internal"
+        );
+        assert!(
+            ClickHouseConversationRepository::mode_aggregate_sql().contains(&format!("'{name}'")),
+            "{name} must be present in SQL mode classification"
+        );
+    }
+    assert!(!ClickHouseConversationRepository::is_mcp_internal_tool_name("read_file"));
+}
+
+#[test]
 fn low_information_system_event_classifier_targets_open_noise() {
     assert!(
         ClickHouseConversationRepository::is_low_information_system_event("system", "progress")

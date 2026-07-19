@@ -1,6 +1,7 @@
 use super::*;
 use crate::checkpoint::checkpoint_key;
 use crate::model::{Checkpoint, RowBatch};
+use moraine_config::SourceFormat;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::timeout;
@@ -487,7 +488,8 @@ fn opencode_sqlite_work(path: &Path) -> WorkItem {
     WorkItem {
         source_name: "opencode-sqlite-test".to_string(),
         harness: "opencode".to_string(),
-        format: SOURCE_FORMAT_OPENCODE_SQLITE.to_string(),
+        format: SourceFormat::OpenCodeSqlite,
+        source_glob: String::new(),
         path: path.to_string_lossy().to_string(),
     }
 }

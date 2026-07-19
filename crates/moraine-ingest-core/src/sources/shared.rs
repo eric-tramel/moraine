@@ -595,6 +595,26 @@ pub(crate) fn canonicalize_model(harness: &str, raw_model: &str) -> String {
     model
 }
 
+/// Best-effort mapping from a source session's base URL to an inference
+/// provider. Sources with a bare model name use this shared policy so provider
+/// classification stays consistent across harnesses.
+pub(crate) fn infer_vendor_from_base_url(base_url: &str) -> &'static str {
+    let lower = base_url.to_ascii_lowercase();
+    if lower.contains("anthropic.com") {
+        "anthropic"
+    } else if lower.contains("openai.com") || lower.contains("openai.azure.com") {
+        "openai"
+    } else if lower.contains("openrouter") {
+        "openrouter"
+    } else if lower.contains("bedrock") {
+        "bedrock"
+    } else if lower.contains("googleapis") || lower.contains("google.com") {
+        "google"
+    } else {
+        ""
+    }
+}
+
 pub(crate) fn resolve_model_hint(event_rows: &[Value], harness: &str, fallback: &str) -> String {
     for row in event_rows.iter().rev() {
         if let Some(model) = row.get("model").and_then(Value::as_str) {
@@ -1445,6 +1465,22 @@ mod tests {
             source_offset: 1,
             record_ts: "2026-02-15T03:50:50.838Z",
             event_ts: "2026-02-15 03:50:50.838",
+        }
+    }
+
+    #[test]
+    fn base_url_vendor_inference_covers_shared_provider_policy() {
+        for (base_url, expected) in [
+            ("https://api.anthropic.com", "anthropic"),
+            ("https://api.openai.com/v1", "openai"),
+            ("https://example.openai.azure.com", "openai"),
+            ("HTTPS://OPENROUTER.AI/API/V1", "openrouter"),
+            ("https://bedrock-runtime.us-east-1.amazonaws.com", "bedrock"),
+            ("https://generativelanguage.googleapis.com", "google"),
+            ("https://unknown.example.com", ""),
+            ("", ""),
+        ] {
+            assert_eq!(infer_vendor_from_base_url(base_url), expected);
         }
     }
 

@@ -2304,7 +2304,7 @@ mod tests {
         );
 
         let harness_description = json!(
-            "Optional exact, case-sensitive normalized harness filter. Supported values: codex, claude-code, cursor, hermes, kiro-cli, kimi-cli, opencode, pi-coding-agent, qwen-code."
+            "Optional exact, case-sensitive normalized harness filter. Supported values: codex, claude-code, cursor, hermes, kiro-cli, kimi-cli, nac, opencode, pi-coding-agent, qwen-code."
         );
         let source_description = if cfg!(target_os = "macos") {
             json!(

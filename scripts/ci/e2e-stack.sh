@@ -212,6 +212,41 @@ clickhouse_scalar() {
   curl -fsS --max-time 10 "$clickhouse_url" --data-binary "$query" | tr -d '\r\n'
 }
 
+wait_for_clickhouse_scalar_stable() {
+  local clickhouse_url="$1"
+  local query="$2"
+  local timeout_seconds="${3:-30}"
+  local required_observations="${4:-3}"
+  local started
+  local previous=""
+  local stable_observations=0
+  started="$(date +%s)"
+
+  while true; do
+    local now
+    now="$(date +%s)"
+    if (( now - started >= timeout_seconds )); then
+      echo "timed out waiting for stable ClickHouse scalar: $query" >&2
+      return 1
+    fi
+
+    local actual
+    actual="$(clickhouse_scalar "$clickhouse_url" "$query" 2>/dev/null || true)"
+    if [[ -n "$actual" && "$actual" == "$previous" ]]; then
+      stable_observations=$((stable_observations + 1))
+    else
+      previous="$actual"
+      stable_observations=1
+    fi
+    if (( stable_observations >= required_observations )); then
+      printf '%s' "$actual"
+      return 0
+    fi
+
+    sleep 2
+  done
+}
+
 assert_clickhouse_scalar() {
   local clickhouse_url="$1"
   local label="$2"
@@ -539,6 +574,12 @@ main() {
   local cursor_keyword="${base_keyword}_cursor_${run_stamp}"
   local cursor_fallback_keyword="${base_keyword}_cursor_fallback_${run_stamp}"
   local cursor_sqlite_keyword="${base_keyword}_cursorsqlite_${run_stamp}"
+  local nac_keyword="${base_keyword}_nac_${run_stamp}"
+  local nac_live_keyword="${base_keyword}_nac_live_${run_stamp}"
+  local nac_worker_keyword="${base_keyword}_nac_worker_${run_stamp}"
+  local nac_replacement_keyword="${base_keyword}_nac_replacement_${run_stamp}"
+  local nac_mcp_sentinel="${base_keyword}_nac_mcp_only_${run_stamp}"
+  local nac_remote_keyword="${base_keyword}_nac_remote_${run_stamp}"
   local cursor_sqlite_live_keyword="${base_keyword}_cursorsqlite_live_${run_stamp}"
   local pi_keyword="${base_keyword}_pi_${run_stamp}"
   local hermes_keyword="${base_keyword}_hermes_trajectory_${run_stamp}"
@@ -550,6 +591,11 @@ main() {
   local codex_session_id="00000000-0000-4000-8000-${codex_session_suffix}"
   local codex_multi_path_session_id="00000000-0000-4000-8001-${codex_session_suffix}"
   local codex_nested_path_session_id="00000000-0000-4000-8002-${codex_session_suffix}"
+  local nac_session_id="nac-parent-${run_stamp}"
+  local nac_local_worker_id="nac-local-worker-${run_stamp}"
+  local nac_remote_worker_id="nac-remote-worker-${run_stamp}"
+  local nac_tool_call_id="nac-tool-${run_stamp}"
+  local nac_secret_sentinel="NAC_FIXTURE_SECRET_${run_stamp}"
   local claude_session_suffix
   claude_session_suffix="$(printf '%06x%06x' "$RANDOM" "$RANDOM")"
   local claude_session_id="00000000-0000-4000-8000-${claude_session_suffix}"
@@ -655,6 +701,9 @@ main() {
   local pi_fixture_file="$fixtures_root/pi/agent/sessions/--tmp-moraine-e2e--/2026-02-16T12-00-08-000Z_${pi_session_id}.jsonl"
   local hermes_fixture_file="$fixtures_root/hermes/trajectories/001-${run_stamp}.jsonl"
   local hermes_session_fixture_file="$fixtures_root/hermes/sessions/${hermes_session_id}.json"
+  local nac_fixture_dir="$fixtures_root/nac"
+  local nac_fixture_file="$nac_fixture_dir/store.db"
+  local nac_project_dir="$tmp_root/nac-project"
   # Codex records the launch cwd in session_meta. Keep this as a plain Git
   # repository with no .moraine.toml so bundled MCP project identity and ingest
   # normalization exercise the default, unconfigured repository path.
@@ -666,6 +715,8 @@ main() {
   # MCP server from inside it.
   local claude_project_dir="$tmp_root/claude-project"
   mkdir -p "$claude_project_dir"
+  mkdir -p "$nac_project_dir"
+  printf '[workspace]\nresolver = "2"\n' > "$nac_project_dir/Cargo.toml"
 
   mkdir -p "$(dirname "$codex_fixture_file")"
   mkdir -p "$(dirname "$claude_fixture_file")"
@@ -678,6 +729,7 @@ main() {
   mkdir -p "$(dirname "$pi_fixture_file")"
   mkdir -p "$(dirname "$hermes_fixture_file")"
   mkdir -p "$(dirname "$hermes_session_fixture_file")"
+  mkdir -p "$nac_fixture_dir"
   mkdir -p "$runtime_root"
 
   cat > "$codex_fixture_file" <<EOF
@@ -969,6 +1021,233 @@ EOF
 }
 EOF
 
+  "$python_bin" - \
+    "$nac_fixture_file" \
+    "$nac_session_id" \
+    "$nac_local_worker_id" \
+    "$nac_remote_worker_id" \
+    "$nac_project_dir" \
+    "$nac_keyword" \
+    "$nac_worker_keyword" \
+    "$nac_mcp_sentinel" \
+    "$nac_remote_keyword" \
+    "$nac_secret_sentinel" \
+    "$nac_tool_call_id" <<'PY'
+import json
+import sqlite3
+import sys
+
+(
+    db_path,
+    parent_id,
+    local_worker_id,
+    remote_worker_id,
+    cwd,
+    keyword,
+    worker_keyword,
+    mcp_sentinel,
+    remote_keyword,
+    secret,
+    tool_call_id,
+) = sys.argv[1:12]
+
+connection = sqlite3.connect(db_path)
+connection.executescript(
+    """
+    PRAGMA foreign_keys = ON;
+    PRAGMA journal_mode = WAL;
+
+    CREATE TABLE sessions (
+        session_id TEXT PRIMARY KEY,
+        cwd TEXT NOT NULL,
+        model TEXT NOT NULL,
+        base_url TEXT NOT NULL,
+        backend TEXT NOT NULL,
+        reasoning_effort TEXT,
+        sandbox_json TEXT,
+        messages_json TEXT NOT NULL,
+        api_key_env TEXT,
+        extra_headers_json TEXT,
+        last_response_duration_ms INTEGER,
+        previous_response_duration_ms INTEGER,
+        response_durations_json TEXT,
+        token_usages_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        host_id TEXT
+    );
+    CREATE TABLE episodes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        thread_name TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        content TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    );
+    CREATE INDEX idx_episodes_session_id_id ON episodes(session_id, id);
+    """
+)
+
+messages = [
+    {
+        "role": "user",
+        "content": f"inspect the nac canonical stack marker {keyword}",
+    },
+    {
+        "role": "assistant",
+        "content": f"nac parent response for {keyword}",
+        "reasoning_text": "bounded fixture reasoning",
+    },
+    {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": tool_call_id,
+                "type": "function",
+                "function": {
+                    "name": "mcp__moraine__search",
+                    "arguments": json.dumps(
+                        {"query": mcp_sentinel, "path": "Cargo.toml"},
+                        separators=(",", ":"),
+                    ),
+                },
+            }
+        ],
+    },
+    {
+        "role": "tool",
+        "content": f"canonical tool result for {mcp_sentinel}",
+        "tool_call_id": tool_call_id,
+        "name": "mcp__moraine__search",
+    },
+]
+connection.execute(
+    """
+    INSERT INTO sessions (
+        session_id, cwd, model, base_url, backend, reasoning_effort,
+        sandbox_json, messages_json, api_key_env, extra_headers_json,
+        last_response_duration_ms, previous_response_duration_ms,
+        response_durations_json, token_usages_json,
+        created_at, updated_at, host_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """,
+    (
+        parent_id,
+        cwd,
+        "z-ai/glm-5.2",
+        "https://openrouter.ai/api/v1",
+        "together-chat",
+        "high",
+        json.dumps({"enabled": False}),
+        json.dumps(messages),
+        secret,
+        json.dumps({"Authorization": f"Bearer {secret}"}),
+        2100,
+        1800,
+        json.dumps([2100]),
+        json.dumps(
+            [
+                {
+                    "input_tokens": 13,
+                    "output_tokens": 5,
+                    "cache_read_tokens": 2,
+                    "cache_write_tokens": 1,
+                    "reasoning_tokens": 3,
+                }
+            ]
+        ),
+        "2026-02-16 12:00:05.000000000",
+        "2026-02-16 12:00:08.000000000",
+        None,
+    ),
+)
+connection.execute(
+    """
+    INSERT INTO sessions (
+        session_id, cwd, model, base_url, backend, messages_json,
+        created_at, updated_at, host_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """,
+    (
+        remote_worker_id,
+        "/remote/private/path",
+        "z-ai/glm-5.2",
+        "https://openrouter.ai/api/v1",
+        "together-chat",
+        json.dumps(
+            [
+                {"role": "user", "content": f"remote question {remote_keyword}"},
+                {"role": "assistant", "content": f"remote answer {remote_keyword}"},
+            ]
+        ),
+        "2026-02-16 12:00:11.000000000",
+        "2026-02-16 12:00:12.000000000",
+        "remote-host",
+    ),
+)
+connection.executemany(
+    """
+    INSERT INTO episodes (thread_name, session_id, action, content, created_at)
+    VALUES (?, ?, ?, ?, ?)
+    """,
+    [
+        (
+            local_worker_id,
+            parent_id,
+            "search repository",
+            "local worker action complete",
+            "2026-02-16 12:00:09",
+        ),
+        (
+            local_worker_id,
+            parent_id,
+            "report result",
+            f"local worker result for {worker_keyword}",
+            "2026-02-16 12:00:10",
+        ),
+        (
+            remote_worker_id,
+            remote_worker_id,
+            f"remote action {remote_keyword}",
+            f"remote response {remote_keyword}",
+            "2026-02-16 12:00:11",
+        ),
+    ],
+)
+connection.commit()
+connection.close()
+PY
+
+  local nac_canonical_db
+  nac_canonical_db="$("$python_bin" - "$nac_fixture_file" <<'PY'
+from pathlib import Path
+import sys
+
+print(Path(sys.argv[1]).resolve())
+PY
+)"
+  local nac_normalized_session_id
+  nac_normalized_session_id="$("$python_bin" - "$nac_canonical_db" "$nac_session_id" <<'PY'
+from hashlib import sha256
+import sys
+
+db_path, raw_session_id = sys.argv[1:3]
+material = f"ci-nac\n{db_path}\n1".encode()
+namespace = sha256(material).hexdigest()[:16]
+print(f"nac:{namespace}:{raw_session_id}")
+PY
+)"
+  local nac_normalized_local_worker_id
+  nac_normalized_local_worker_id="$nac_normalized_session_id:nac-worker:$($python_bin - "$nac_local_worker_id" <<'PY'
+from hashlib import sha256
+import sys
+
+print(sha256(sys.argv[1].encode()).hexdigest()[:16])
+PY
+)"
+
   cat > "$config_path" <<EOF
 [backends.default]
 url = "${clickhouse_url}"
@@ -1079,10 +1358,19 @@ enabled = true
 glob = "${fixtures_root}/hermes/sessions/*.json"
 watch_root = "${fixtures_root}/hermes/sessions"
 
+[[ingest.sources]]
+name = "ci-nac"
+harness = "nac"
+enabled = true
+glob = "${nac_fixture_file}"
+watch_root = "${nac_fixture_dir}"
+format = "nac_sqlite"
+
 [mcp]
 # Exercise the unified backend end to end: the canonical backend launch switch
 # makes 'moraine up' host both the central MCP socket and monitor HTTP surface.
 # mcp_smoke.py must proxy through it until the explicit crash check below.
+
 use_central_server = true
 
 [runtime]
@@ -1131,6 +1419,7 @@ EOF
   echo "[e2e] pi fixture: ${pi_fixture_file}"
   echo "[e2e] hermes fixture: ${hermes_fixture_file}"
   echo "[e2e] hermes session fixture: ${hermes_session_fixture_file}"
+  echo "[e2e] nac sqlite fixture: ${nac_fixture_file}"
 
   echo "[e2e] installing managed ClickHouse"
   "$moraine_bin" clickhouse install --config "$config_path"
@@ -1211,6 +1500,9 @@ EOF
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${hermes_keyword}'" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${hermes_session_keyword}') > 0" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${hermes_session_keyword}'" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${nac_keyword}') > 0" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${nac_keyword}'" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.tool_io WHERE source_name = 'ci-nac' AND tool_call_id = '${nac_tool_call_id}'" 120
 
   echo "[e2e] checking ClickHouse normalized ingest rows"
   assert_clickhouse_count "$clickhouse_url" "non-Qwen ingest errors" "SELECT count() FROM ${clickhouse_database}.ingest_errors WHERE source_name != 'qwen-code'" "0"
@@ -1273,7 +1565,7 @@ EOF
   assert_clickhouse_count "$clickhouse_url" "Qwen token accounting" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND item_id = 'qwen-assistant-${run_stamp}' AND event_kind = 'reasoning' AND input_tokens = 120 AND output_tokens = 80 AND cache_read_tokens = 20 AND cache_write_tokens = 0 AND token_usage_buckets['input_text'] = 91 AND token_usage_buckets['output_text'] = 62 AND token_usage_buckets['input_image'] = 4 AND token_usage_buckets['output_audio'] = 11 AND token_usage_buckets['reasoning'] = 7 AND token_usage_buckets['server_tool_use'] = 5" "1"
   assert_clickhouse_count "$clickhouse_url" "Qwen title projection" "SELECT count() FROM ${clickhouse_database}.mcp_open_sessions FINAL WHERE session_id = '${qwen_session_id}' AND title = 'Qwen e2e ${run_stamp}'" "1"
   assert_clickhouse_count "$clickhouse_url" "Qwen reasoning row" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND item_id = 'qwen-assistant-${run_stamp}' AND event_kind = 'reasoning' AND has_reasoning = 1" "1"
-  assert_clickhouse_count "$clickhouse_url" "Qwen projected assistant part order" "SELECT count() FROM ${clickhouse_database}.mcp_open_events FINAL WHERE session_id = '${qwen_session_id}' AND item_id = 'qwen-assistant-${run_stamp}' AND ((event_ordinal = 2 AND event_class = 'reasoning') OR (event_ordinal = 3 AND event_class = 'message') OR (event_ordinal = 4 AND event_class = 'tool_call'))" "3"
+  assert_clickhouse_count "$clickhouse_url" "Qwen projected assistant part order" "SELECT uniqExact(tuple(event_ordinal, event_class)) FROM ${clickhouse_database}.mcp_open_events FINAL WHERE session_id = '${qwen_session_id}' AND item_id = 'qwen-assistant-${run_stamp}' AND ((event_ordinal = 2 AND event_class = 'reasoning') OR (event_ordinal = 3 AND event_class = 'message') OR (event_ordinal = 4 AND event_class = 'tool_call'))" "3"
   assert_clickhouse_count "$clickhouse_url" "Qwen tool request and response rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'qwen-code' AND tool_call_id IN ('qwen-call-search-${run_stamp}', 'qwen-call-fail-${run_stamp}')" "4"
   assert_clickhouse_count "$clickhouse_url" "Qwen failed tool response" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'qwen-code' AND tool_call_id = 'qwen-call-fail-${run_stamp}' AND tool_phase = 'response' AND tool_error = 1" "1"
   assert_clickhouse_count "$clickhouse_url" "Qwen rewind event" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND item_id = 'qwen-rewind-${run_stamp}' AND op_kind = 'rewind'" "1"
@@ -1406,13 +1698,175 @@ PY
   assert_clickhouse_count "$clickhouse_url" "hermes trajectory link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-hermes-trajectory'" "0"
   assert_clickhouse_count "$clickhouse_url" "hermes trajectory tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-hermes-trajectory' AND tool_call_id = 'hermes-tool-${run_stamp}' AND tool_name = 'weather'" "2"
   assert_clickhouse_count "$clickhouse_url" "hermes trajectory domain fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-hermes-trajectory' AND harness = 'hermes' AND inference_provider = 'anthropic' AND model = 'claude-sonnet-4.6'" "6"
+  # NAC initial snapshot: one seven-record local parent, one three-record
+  # remote parent, one five-record local worker, and one three-record remote
+  # worker. Remote durable history is ingested without local project
+  # attribution; forbidden credential/host columns never enter storage.
+  assert_clickhouse_count "$clickhouse_url" "nac unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-nac'" "18"
+  assert_clickhouse_count "$clickhouse_url" "nac event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac'" "18"
+  assert_clickhouse_count "$clickhouse_url" "nac parent event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND session_id = '${nac_normalized_session_id}'" "7"
+  assert_clickhouse_count "$clickhouse_url" "nac local worker rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND agent_label = '${nac_local_worker_id}'" "5"
+  assert_clickhouse_count "$clickhouse_url" "nac remote metadata rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND event_kind = 'session_meta' AND JSONExtractString(payload_json, 'cwd_scope') = 'remote'" "2"
+  assert_clickhouse_count "$clickhouse_url" "nac remote rows have no local project attribution" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND JSONExtractString(payload_json, 'cwd_scope') = 'remote' AND project_id = '' AND worktree_root = ''" "6"
+  assert_clickhouse_count "$clickhouse_url" "nac remote bodies retained in raw storage" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-nac' AND position(raw_json, '${nac_remote_keyword}') > 0" "4"
+  assert_clickhouse_count "$clickhouse_url" "nac remote bodies retained in normalized storage" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND (position(text_content, '${nac_remote_keyword}') > 0 OR position(payload_json, '${nac_remote_keyword}') > 0)" "4"
+  assert_clickhouse_count "$clickhouse_url" "nac credentials absent from raw storage" "SELECT count() FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-nac' AND position(raw_json, '${nac_secret_sentinel}') > 0" "0"
+  assert_clickhouse_count "$clickhouse_url" "nac credentials absent from normalized storage" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND (position(text_content, '${nac_secret_sentinel}') > 0 OR position(payload_json, '${nac_secret_sentinel}') > 0)" "0"
+  assert_clickhouse_count "$clickhouse_url" "nac credentials absent from search" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${nac_secret_sentinel}') > 0" "0"
+  assert_clickhouse_count "$clickhouse_url" "nac provider and model fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND inference_provider = 'openrouter' AND model = 'z-ai/glm-5.2'" "18"
+  assert_clickhouse_count "$clickhouse_url" "nac token buckets" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND actor_kind = 'assistant' AND input_tokens = 13 AND output_tokens = 5 AND cache_read_tokens = 2 AND cache_write_tokens = 1 AND token_usage_buckets['input_text'] = 10 AND token_usage_buckets['output_text'] = 2 AND token_usage_buckets['reasoning'] = 3" "1"
+  assert_clickhouse_count "$clickhouse_url" "nac response duration" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND actor_kind = 'assistant' AND latency_ms = 2100" "1"
+  assert_clickhouse_count "$clickhouse_url" "nac canonical tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-nac' AND tool_call_id = '${nac_tool_call_id}' AND tool_name = 'search'" "2"
+  assert_clickhouse_count "$clickhouse_url" "nac qualified tool provenance" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND tool_call_id = '${nac_tool_call_id}' AND JSONExtractString(payload_json, 'raw_tool_name') = 'mcp__moraine__search'" "2"
+  assert_clickhouse_count "$clickhouse_url" "nac worker parent links" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-nac' AND link_type = 'subagent_parent'" "2"
+  assert_clickhouse_count "$clickhouse_url" "nac tool response link" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-nac' AND link_type = 'tool_use_id'" "1"
+
+  echo "[e2e] nac sqlite live update: appending an assistant message"
+  "$python_bin" - "$nac_fixture_file" "$nac_session_id" "$nac_live_keyword" <<'PY'
+import json
+import sqlite3
+import sys
+
+db_path, session_id, live_keyword = sys.argv[1:4]
+connection = sqlite3.connect(db_path, timeout=30)
+messages = json.loads(
+    connection.execute(
+        "SELECT messages_json FROM sessions WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()[0]
+)
+messages.append({"role": "assistant", "content": f"nac live reply {live_keyword}"})
+connection.execute(
+    "UPDATE sessions SET messages_json = ?, updated_at = ? WHERE session_id = ?",
+    (json.dumps(messages), "2026-02-16 12:00:20.000000000", session_id),
+)
+connection.commit()
+connection.close()
+PY
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events WHERE source_name = 'ci-nac' AND positionCaseInsensitiveUTF8(text_content, '${nac_live_keyword}') > 0" 120
+  assert_clickhouse_count "$clickhouse_url" "nac unique raw rows after live update" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-nac'" "20"
+  assert_clickhouse_count "$clickhouse_url" "nac event rows after live update" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac'" "19"
+  assert_clickhouse_count "$clickhouse_url" "nac parent rows after live update" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND session_id = '${nac_normalized_session_id}'" "8"
+  assert_clickhouse_count "$clickhouse_url" "nac parent metadata collapses on live update" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND session_id = '${nac_normalized_session_id}' AND event_kind = 'session_meta'" "1"
+
+  echo "[e2e] nac sqlite config-only update"
+  "$python_bin" - "$nac_fixture_file" "$nac_session_id" <<'PY'
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1], timeout=30)
+connection.execute(
+    "UPDATE sessions SET reasoning_effort = 'low', updated_at = ? WHERE session_id = ?",
+    ("2026-02-16 12:00:21.000000000", sys.argv[2]),
+)
+connection.commit()
+connection.close()
+PY
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND session_id = '${nac_normalized_session_id}' AND event_kind = 'session_meta' AND JSONExtractString(payload_json, 'reasoning_effort') = 'low'" 120
+  assert_clickhouse_count "$clickhouse_url" "nac config-only update preserves canonical event count" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac'" "19"
+
+  echo "[e2e] nac sqlite prior-message replacement"
+  "$python_bin" - "$nac_fixture_file" "$nac_session_id" <<'PY'
+import json
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1], timeout=30)
+messages = json.loads(
+    connection.execute(
+        "SELECT messages_json FROM sessions WHERE session_id = ?",
+        (sys.argv[2],),
+    ).fetchone()[0]
+)
+messages[0]["content"] += " NAC_PRIOR_MESSAGE_REPLACED"
+connection.execute(
+    "UPDATE sessions SET messages_json = ?, updated_at = ? WHERE session_id = ?",
+    (json.dumps(messages), "2026-02-16 12:00:22.000000000", sys.argv[2]),
+)
+connection.commit()
+connection.close()
+PY
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND session_id = '${nac_normalized_session_id}' AND position(text_content, 'NAC_PRIOR_MESSAGE_REPLACED') > 0" 120
+  assert_clickhouse_count "$clickhouse_url" "nac prior-message replacement preserves canonical event count" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac'" "19"
+  assert_clickhouse_count "$clickhouse_url" "nac prior-message replacement reuses one coordinate" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND session_id = '${nac_normalized_session_id}' AND source_offset = 1 AND position(text_content, 'NAC_PRIOR_MESSAGE_REPLACED') > 0" "1"
+
+  echo "[e2e] nac sqlite truncation preserves archived history"
+  "$python_bin" - "$nac_fixture_file" "$nac_session_id" <<'PY'
+import json
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1], timeout=30)
+messages = json.loads(
+    connection.execute(
+        "SELECT messages_json FROM sessions WHERE session_id = ?",
+        (sys.argv[2],),
+    ).fetchone()[0]
+)
+messages.pop()
+connection.execute(
+    "UPDATE sessions SET messages_json = ?, updated_at = ? WHERE session_id = ?",
+    (json.dumps(messages), "2026-02-16 12:00:23.000000000", sys.argv[2]),
+)
+connection.commit()
+connection.close()
+PY
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND session_id = '${nac_normalized_session_id}' AND event_kind = 'session_meta' AND JSONExtractString(payload_json, 'updated_at') = '2026-02-16T12:00:23.000000Z'" 120
+  assert_clickhouse_count "$clickhouse_url" "nac truncated message remains archived" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND positionCaseInsensitiveUTF8(text_content, '${nac_live_keyword}') > 0" "1"
+  assert_clickhouse_count "$clickhouse_url" "nac truncation preserves canonical event count" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac'" "19"
+  local nac_heartbeat_before_noop
+  nac_heartbeat_before_noop="$(clickhouse_scalar "$clickhouse_url" "SELECT toString(max(ts)) FROM ${clickhouse_database}.ingest_heartbeats")"
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.ingest_heartbeats WHERE ts > parseDateTime64BestEffort('${nac_heartbeat_before_noop}') AND queue_depth = 0 AND files_active = 0" 120
+
+  # A stat-only change must be consumed by the volatile poll state without
+  # appending raw history or persisting a durable checkpoint.
+  local nac_raw_rows_before_noop
+  local nac_checkpoint_updated_at_before_noop
+  local nac_heartbeat_before_touch
+  # The normalized truncation row can become visible before every raw insert
+  # from the same queued scan. Establish the no-op baseline only after the raw
+  # count has remained unchanged across consecutive poll intervals.
+  nac_raw_rows_before_noop="$(wait_for_clickhouse_scalar_stable "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-nac'" 30 3)"
+  nac_checkpoint_updated_at_before_noop="$(clickhouse_scalar "$clickhouse_url" "SELECT toString(max(updated_at)) FROM ${clickhouse_database}.ingest_checkpoints WHERE source_name = 'ci-nac'")"
+  nac_heartbeat_before_touch="$(clickhouse_scalar "$clickhouse_url" "SELECT toString(max(ts)) FROM ${clickhouse_database}.ingest_heartbeats")"
+  "$python_bin" - "$nac_fixture_file" <<'PY'
+import os
+import sys
+
+os.utime(sys.argv[1], None)
+PY
+  sleep 3
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.ingest_heartbeats WHERE ts > parseDateTime64BestEffort('${nac_heartbeat_before_touch}') AND queue_depth = 0 AND files_active = 0" 120
+  assert_clickhouse_scalar "$clickhouse_url" "nac stat-only no-op writes no raw rows" "SELECT count() FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-nac'" "$nac_raw_rows_before_noop"
+  assert_clickhouse_scalar "$clickhouse_url" "nac stat-only no-op writes no durable checkpoint" "SELECT toString(max(updated_at)) FROM ${clickhouse_database}.ingest_checkpoints WHERE source_name = 'ci-nac'" "$nac_checkpoint_updated_at_before_noop"
+
+  # Removing the highest episode forces a high-water reset. The source-side
+  # deletion is archival: previously indexed remote metadata and durable bodies
+  # remain retrievable.
+  echo "[e2e] nac sqlite source deletion follows archival policy"
+  "$python_bin" - "$nac_fixture_file" "$nac_remote_worker_id" <<'PY'
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1], timeout=30)
+connection.execute(
+    "DELETE FROM episodes WHERE session_id = ?",
+    (sys.argv[2],),
+)
+connection.commit()
+connection.close()
+PY
+  sleep 3
+  assert_clickhouse_count "$clickhouse_url" "nac deleted remote metadata remains archived" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND event_kind = 'session_meta' AND JSONExtractString(payload_json, 'cwd_scope') = 'remote'" "2"
+  assert_clickhouse_count "$clickhouse_url" "nac deleted remote body remains archived" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND (position(text_content, '${nac_remote_keyword}') > 0 OR position(payload_json, '${nac_remote_keyword}') > 0)" "4"
+
 
   assert_clickhouse_count "$clickhouse_url" "hermes session unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-hermes-session'" "5"
   assert_clickhouse_count "$clickhouse_url" "hermes session event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-hermes-session'" "6"
   assert_clickhouse_count "$clickhouse_url" "hermes session link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-hermes-session'" "0"
   assert_clickhouse_count "$clickhouse_url" "hermes session tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-hermes-session' AND tool_call_id = 'hermes-session-tool-${run_stamp}' AND tool_name = 'shell'" "2"
   assert_clickhouse_count "$clickhouse_url" "hermes session domain fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-hermes-session' AND harness = 'hermes' AND inference_provider = 'anthropic' AND session_id = '${hermes_raw_session_id}' AND model = 'claude-opus-4-6'" "6"
-  assert_clickhouse_count "$clickhouse_url" "token bucket map keys on all events" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE hasAll(mapKeys(token_usage_buckets), ['input_text', 'output_text', 'input_cache_read', 'input_cache_write', 'reasoning'])" "75"
+  assert_clickhouse_count "$clickhouse_url" "token bucket map keys on all events" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE NOT hasAll(mapKeys(token_usage_buckets), ['input_text', 'output_text', 'input_cache_read', 'input_cache_write', 'reasoning'])" "0"
 
   local hermes_trajectory_session_id
   hermes_trajectory_session_id="$(clickhouse_scalar "$clickhouse_url" "SELECT any(session_id) FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-hermes-trajectory'")"
@@ -1679,7 +2133,7 @@ PY
 
   echo "[e2e] checking bounded ClickHouse query ownership"
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND ${query_log_window} AND query_kind = 'Select' AND http_user_agent = '${expected_backend_ua}'" 30
-  assert_clickhouse_count "$clickhouse_url" "all service SELECTs use the backend UA/PID" "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND ${query_log_window} AND query_kind = 'Select' AND (${attributed_service_filter}) AND http_user_agent != '${expected_backend_ua}'" "0"
+  assert_clickhouse_count "$clickhouse_url" "service SELECTs use the backend or ingest UA/PID" "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND ${query_log_window} AND query_kind = 'Select' AND (${attributed_service_filter}) AND http_user_agent NOT IN ('${expected_backend_ua}', '${expected_ingest_ua}')" "0"
   assert_clickhouse_count "$clickhouse_url" "named read schema handshake runs once despite MCP/HTTP reuse" "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND ${query_log_window} AND http_user_agent = '${expected_backend_ua}' AND position(query, 'system.tables') > 0 AND position(query, 'schema_migrations') > 0" "1"
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND ${query_log_window} AND query_kind = 'Insert' AND http_user_agent = '${expected_ingest_ua}'" 30
   local file_attention_root_insert_prefix="INSERT INTO \`${clickhouse_database}\`.\`file_attention_project_roots\`"
@@ -1753,6 +2207,98 @@ PY
     --expect-session-id "$cursor_sqlite_session_id" \
     --expect-open-text "$cursor_sqlite_trace_marker" \
     --file-attention-path "/workspace/cursor-sqlite-e2e.txt"
+
+  echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (nac sqlite)"
+  "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --working-dir "$nac_project_dir" \
+    --query "$nac_keyword" \
+    --expect-session-id "$nac_normalized_session_id" \
+    --expect-open-text "NAC_PRIOR_MESSAGE_REPLACED" \
+    --expect-event-count "8" \
+    --expect-updated-at "2026-02-16T12:00:05.000Z" \
+    --expect-mode "mcp_internal" \
+    --file-attention-path "Cargo.toml"
+
+  echo "[e2e] checking NAC internal MCP result is excluded from default search"
+  "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --working-dir "$nac_project_dir" \
+    --query "$nac_mcp_sentinel" \
+    --expect-no-results \
+    --expect-session-id "$nac_normalized_session_id" \
+    --expect-event-count "8" \
+    --expect-updated-at "2026-02-16T12:00:05.000Z" \
+    --expect-mode "mcp_internal"
+
+  echo "[e2e] checking NAC worker search/open/list behavior"
+  "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --working-dir "$nac_project_dir" \
+    --query "$nac_worker_keyword" \
+    --expect-session-id "$nac_normalized_local_worker_id" \
+    --expect-open-text "$nac_worker_keyword" \
+    --expect-event-count "5"
+
+  echo "[e2e] nac sqlite same-path database replacement"
+  "$python_bin" - "$nac_fixture_file" "$nac_session_id" "$nac_replacement_keyword" <<'PY'
+import json
+import os
+import sqlite3
+import sys
+
+db_path, session_id, marker = sys.argv[1:4]
+replacement = f"{db_path}.replacement"
+try:
+    os.remove(replacement)
+except FileNotFoundError:
+    pass
+
+source = sqlite3.connect(db_path, timeout=30)
+target = sqlite3.connect(replacement, timeout=30)
+source.backup(target)
+source.close()
+messages = json.loads(
+    target.execute(
+        "SELECT messages_json FROM sessions WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()[0]
+)
+messages.append({"role": "assistant", "content": f"replacement generation {marker}"})
+target.execute(
+    "UPDATE sessions SET messages_json = ?, updated_at = ? WHERE session_id = ?",
+    (json.dumps(messages), "2026-02-16 12:00:24.000000000", session_id),
+)
+target.commit()
+target.close()
+os.replace(replacement, db_path)
+PY
+  local nac_replacement_session_id
+  nac_replacement_session_id="$($python_bin - "$nac_canonical_db" "$nac_session_id" <<'PY'
+from hashlib import sha256
+import sys
+
+db_path, raw_session_id = sys.argv[1:3]
+material = f"ci-nac\n{db_path}\n2".encode()
+namespace = sha256(material).hexdigest()[:16]
+print(f"nac:{namespace}:{raw_session_id}")
+PY
+)"
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND source_generation = 2 AND session_id = '${nac_replacement_session_id}' AND position(text_content, '${nac_replacement_keyword}') > 0" 120
+  assert_clickhouse_count "$clickhouse_url" "nac replacement advances source generation" "SELECT count() FROM ${clickhouse_database}.ingest_checkpoints FINAL WHERE source_name = 'ci-nac' AND source_generation = 2" "1"
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM (SELECT session_id, generation, dirty_revision, total_events FROM ${clickhouse_database}.mcp_open_sessions FINAL WHERE session_id = '${nac_replacement_session_id}') AS projected INNER JOIN (SELECT session_id, dirty_revision FROM ${clickhouse_database}.mcp_open_dirty_sessions FINAL WHERE session_id = '${nac_replacement_session_id}') AS dirty USING (session_id) WHERE projected.total_events = 8 AND projected.dirty_revision = dirty.dirty_revision" 120
+  wait_for_clickhouse_scalar_stable "$clickhouse_url" "SELECT concat(toString(slot), ':', toString(generation), ':', toString(source_revision), ':', toString(dirty_revision), ':', toString(total_events)) FROM ${clickhouse_database}.mcp_open_sessions FINAL WHERE session_id = '${nac_replacement_session_id}' LIMIT 1" 60 5 >/dev/null
+  "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --working-dir "$nac_project_dir" \
+    --query "$nac_replacement_keyword" \
+    --expect-session-id "$nac_replacement_session_id" \
+    --expect-open-text "$nac_replacement_keyword" \
+    --expect-event-count "8"
 
   echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (pi)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \

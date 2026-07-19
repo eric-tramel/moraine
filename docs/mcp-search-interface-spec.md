@@ -284,13 +284,13 @@ search_sessions({
 - When present, each must contain at least one non-whitespace character after
   trimming; blank values return `invalid_request`.
 - Each is an exact, case-sensitive filter. Supported `harness` values are
-  `codex`, `claude-code`, `cursor`, `hermes`, `kiro-cli`, `kimi-cli`,
-  `qwen-code`, `opencode`, and `pi-coding-agent`.
-- `source` matches a configured ingest source name. The default configured
-  values are `claude`, macOS-only `claude-cowork`, `codex`, `cursor`,
-  `cursor-sqlite`, `hermes`, `kimi-cli`, `kiro`, `omp`, `opencode`, `pi`, and
-  `qwen-code`; each server's MCP tool instructions list its actual configured
-  source names.
+  `codex`, `claude-code`, `cursor`, `hermes`, `kiro-cli`, `kimi-cli`, `nac`,
+  `opencode`, `pi-coding-agent`, and `qwen-code`.
+- `source` matches a configured ingest source name. Standard source names
+  include `claude`, macOS-only `claude-cowork`, `codex`, `cursor`,
+  `cursor-sqlite`, `hermes`, `kimi-cli`, `kiro`, setup-managed `nac`, `omp`,
+  `opencode`, `pi`, and `qwen-code`; each server's MCP tool instructions list
+  its actual configured source names.
 - When both are present, both predicates must match. Use `source` to distinguish
   `pi` and `omp`, which share the `pi-coding-agent` harness.
 
@@ -343,6 +343,14 @@ Callers may explicitly include supported omitted types when they need them.
 Raw tool evidence requires `tool_call` or `tool_response` in `event_types`.
 Open a returned turn or session handle to inspect the full context around a
 search hit.
+
+For NAC records, provider-qualified MCP spellings such as
+`mcp__moraine__search_sessions` are normalized to the canonical Moraine tool
+name for classification and tool I/O. The original spelling remains available
+in event provenance. Because tool events are omitted by default, a search for a
+Moraine tool name does not return NAC's own retrieval calls unless
+`event_types` explicitly includes `tool_call` or `tool_response`; `open` still
+returns those events as part of the requested session or turn.
 
 Examples:
 

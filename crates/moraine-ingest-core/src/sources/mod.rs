@@ -8,6 +8,7 @@ pub(crate) mod emitter;
 pub(crate) mod hermes;
 pub(crate) mod kimi_cli;
 pub(crate) mod kiro_cli;
+pub(crate) mod nac;
 pub(crate) mod opencode;
 pub(crate) mod pi;
 pub(crate) mod qwen_code;
@@ -15,13 +16,6 @@ pub(crate) mod record_view;
 pub(crate) mod shared;
 
 use shared::{infer_session_id_from_file, RecordContext};
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SourceFormat {
-    Jsonl,
-    SessionJson,
-}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Preflight<'a> {
@@ -95,10 +89,6 @@ pub(crate) trait IngestSource: Send + Sync {
     fn harness(&self) -> &'static str;
 
     fn default_inference_provider(&self) -> Option<&'static str>;
-
-    fn format(&self) -> SourceFormat {
-        SourceFormat::Jsonl
-    }
 
     fn preflight<'a>(&self, record: &'a Value) -> Preflight<'a> {
         Preflight::Keep(record)
@@ -196,6 +186,7 @@ pub(crate) fn registry() -> &'static SourceRegistry {
             .register(&hermes::HERMES)
             .register(&kiro_cli::KIRO_CLI)
             .register(&kimi_cli::KIMI_CLI)
+            .register(&nac::NAC)
             .register(&opencode::OPENCODE)
             .register(&pi::PI_CODING_AGENT)
             .register(&qwen_code::QWEN_CODE)

@@ -23,7 +23,9 @@ use crate::tee::{
 use crate::watch::{enumerate_tracked_files, spawn_watcher_threads};
 use anyhow::{Context, Result};
 use moraine_clickhouse::ClickHouseClient;
-use moraine_config::{AppConfig, ClickHouseConfig, IngestSource, DEFAULT_BACKEND_NAME};
+use moraine_config::{
+    AppConfig, ClickHouseConfig, IngestSource, SourceFormat, DEFAULT_BACKEND_NAME,
+};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,7 +42,8 @@ pub(crate) const WATCHER_BACKEND_MIXED: u64 = 3;
 pub(crate) struct WorkItem {
     pub(crate) source_name: String,
     pub(crate) harness: String,
-    pub(crate) format: String,
+    pub(crate) format: SourceFormat,
+    pub(crate) source_glob: String,
     pub(crate) path: String,
 }
 
@@ -315,7 +318,7 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
     if config.ingest.backfill_on_start {
         let mut backfill_sources = Vec::new();
         for source in &enabled_sources {
-            let files = enumerate_tracked_files(&source.glob, &source.format)?;
+            let files = enumerate_tracked_files(&source.glob, source.format)?;
             info!(
                 "startup backfill queueing {} files for source={} (format={})",
                 files.len(),
@@ -334,7 +337,8 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
                         WorkItem {
                             source_name: source.name.clone(),
                             harness: source.harness.clone(),
-                            format: source.format.clone(),
+                            format: source.format,
+                            source_glob: source.glob.clone(),
                             path,
                         },
                         &process_tx,

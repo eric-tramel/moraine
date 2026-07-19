@@ -1,7 +1,7 @@
 use super::shared::*;
 use super::{
     emitter::{EventBuilder, SourceEmitter},
-    IngestSource, NormalizedPartials, SourceFormat, SourceMetadata, SourceRecordContext,
+    IngestSource, NormalizedPartials, SourceMetadata, SourceRecordContext,
 };
 use serde_json::{json, Map, Value};
 
@@ -18,10 +18,6 @@ impl IngestSource for QwenCode {
 
     fn default_inference_provider(&self) -> Option<&'static str> {
         None
-    }
-
-    fn format(&self) -> SourceFormat {
-        SourceFormat::Jsonl
     }
 
     fn source_metadata(&self, record: &Value) -> SourceMetadata {

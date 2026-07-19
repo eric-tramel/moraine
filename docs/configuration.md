@@ -323,10 +323,11 @@ format = "jsonl"
 | `enabled` | `true` | Keeps a source configured while allowing it to be skipped. |
 | `glob` | empty string | Files this source ingests. `~` expands during config load. |
 | `watch_root` | derived from `glob` when empty | Directory watched for changes. Set it explicitly when the glob root is ambiguous or platform-specific. |
-| `format` | inferred from `harness` and `glob` | On-disk parser: `jsonl`, `session_json`, `kiro_session`, `cursor_sqlite`, or `opencode_sqlite`. |
+| `format` | inferred from `harness` and `glob` | On-disk parser: `jsonl`, `session_json`, `kiro_session`, `cursor_sqlite`, `nac_sqlite`, or `opencode_sqlite`. |
 
-Supported `harness` values are `codex`, `claude-code`, `cursor`, `kiro-cli`,
-`kimi-cli`, `qwen-code`, `opencode`, `hermes`, and `pi-coding-agent`. Each value maps to a
+Supported `harness` values are `codex`, `claude-code`, `cursor`, `hermes`,
+`kiro-cli`, `kimi-cli`, `nac`, `opencode`, `pi-coding-agent`, and `qwen-code`.
+Each value maps to a
 registered ingest source adapter; see
 [Ingest Sources](development/ingest-sources.md) for the adapter contract and
 [Harness Author Workflow](development/harness-author-workflow.md) for source
@@ -341,13 +342,14 @@ for changes. `format` controls the file parser:
 | `session_json` | One JSON file per live session that is rewritten in place. Moraine emits only newly appended synthetic session records. |
 | `kiro_session` | Kiro CLI append-only JSONL transcripts paired with same-named JSON metadata. Changes to either file enqueue the transcript. |
 | `cursor_sqlite` | Cursor `state.vscdb` SQLite databases. Moraine polls the database read-only and emits synthetic records for new or changed rows. |
+| `nac_sqlite` | NAC `store.db` databases. Moraine polls parent sessions and managed-worker episodes read-only with a persisted incremental cursor. |
 | `opencode_sqlite` | OpenCode `opencode*.db` SQLite databases. Moraine polls the database read-only and emits synthetic records from append-only conversation events. |
 
 When `format` is omitted, Moraine infers it. Hermes sources with a `.json` glob
 are inferred as `session_json`, Kiro CLI sources as `kiro_session`, Cursor globs
-ending in `.vscdb` as `cursor_sqlite`, OpenCode globs ending in `opencode.db` or
-`opencode*.db` as `opencode_sqlite`, and otherwise sources are treated as
-`jsonl`.
+ending in `.vscdb` as `cursor_sqlite`, NAC globs whose filename is `store.db` as
+`nac_sqlite`, OpenCode globs ending in `opencode.db` or `opencode*.db` as
+`opencode_sqlite`, and otherwise sources are treated as `jsonl`.
 
 ## Source Matrix
 
@@ -361,6 +363,7 @@ The built-in defaults and `config/moraine.toml` reference cover these source fam
 | Kiro CLI | `kiro-cli` | `$KIRO_HOME/sessions/cli/*.jsonl` when set; otherwise `~/.kiro/sessions/cli/*.jsonl` | matching `sessions/cli` directory | `kiro_session` |
 | Kimi CLI | `kimi-cli` | `~/.kimi/sessions/**/wire.jsonl` | `~/.kimi/sessions` | inferred `jsonl` |
 | Qwen Code | `qwen-code` | `~/.qwen/projects/*/chats/*.jsonl` | `~/.qwen/projects` | `jsonl` |
+| NAC | `nac` | setup-resolved `store.db` | resolved NAC config directory | `nac_sqlite` (setup-managed) |
 | OpenCode | `opencode` | `~/.local/share/opencode/opencode*.db` | `~/.local/share/opencode` | `opencode_sqlite` (default on) |
 | Cursor Agent | `cursor` | `~/.cursor/projects/*/agent-transcripts/**/*.jsonl` | `~/.cursor/projects` | inferred `jsonl` |
 | Cursor SQLite history | `cursor` | `~/Library/Application Support/Cursor/User/**/state.vscdb` (macOS) | `~/Library/Application Support/Cursor/User` | `cursor_sqlite` (default on) |
@@ -373,14 +376,16 @@ Hermes supports both live session JSON and offline trajectory JSONL because the
 harness is the same but the file format differs. Use a separate
 `[[ingest.sources]]` entry for each watched directory. Cursor likewise has two
 trace forms under one harness: Agent transcript JSONL and SQLite chat history
-(`cursor_sqlite`); both are enabled by default. OpenCode stores conversation
-history in default or channel-specific SQLite databases (`opencode_sqlite`);
-the template enables it by default. Kiro CLI stores transcript records in
+(`cursor_sqlite`); both are enabled by default. Kiro CLI stores transcript records in
 `<session-id>.jsonl` and session-level cwd, title, model, and token totals in
 `<session-id>.json`; the paired `kiro_session` format watches both files and
 checkpoints sidecar changes independently of transcript growth. Running
 `moraine setup` with the Kiro target rewrites the setup-owned `kiro` source to
-use `$KIRO_HOME/sessions/cli` when `KIRO_HOME` is set.
+use `$KIRO_HOME/sessions/cli` when `KIRO_HOME` is set. NAC stores parent sessions and
+managed-worker episodes in `store.db` (`nac_sqlite`); guided `moraine setup`
+materializes this source only when NAC's effective store path is stable.
+OpenCode stores conversation history in default or channel-specific SQLite databases
+(`opencode_sqlite`); the template enables it by default.
 
 ## Source Examples
 
@@ -478,6 +483,43 @@ format = "jsonl"
 The built-in adapter is fixture-tested against Qwen Code 0.19.x's internal
 append-only `ChatRecord` shape; that upstream persistence format is not a stable
 public API.
+
+NAC:
+
+```toml
+[[ingest.sources]]
+name = "nac"
+harness = "nac"
+enabled = true
+glob = "~/.config/nac/store.db"
+watch_root = "~/.config/nac"
+format = "nac_sqlite"
+```
+
+This source polls NAC's SQLite store read-only. It indexes parent sessions,
+assistant reasoning, tool request/response pairs, token usage, and
+managed-worker episodes. Durable remote-session and remote-worker bodies are
+retained but receive no local project/worktree attribution. Credential-bearing
+columns and host identifiers are never selected. Qualified NAC tool names such
+as `mcp__moraine__search_sessions` normalize to canonical Moraine tool names
+while their raw names remain in event provenance.
+
+`moraine setup --mcp-target nac` resolves the NAC config directory in this
+order: `NAC_HOME`, `XDG_CONFIG_HOME/nac`, then `~/.config/nac`, and merges only
+the owned `[mcp_servers.moraine]` table. Model, storage, sandbox, and unrelated
+MCP settings are preserved.
+
+When NAC is selected as an ingest source in regular guided `moraine setup`, its
+automatic path follows an absolute `storage.store_path`, or the default
+`<NAC config dir>/store.db` when the config home is stable. A relative store
+path depends on NAC's launch directory, and a per-launch `nac --store-path`
+override is invisible to setup, so use the manual snippet it prints instead of
+silently following the wrong database.
+
+Replacing a NAC database at the same path starts a new source generation and
+reconciles the old rows after the replacement snapshot is durable. WAL-only
+changes are picked up through `store.db-wal` and `store.db-shm`; unrelated
+SQLite files and backups are ignored.
 
 OpenCode:
 

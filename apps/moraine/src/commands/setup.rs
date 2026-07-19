@@ -52,6 +52,18 @@ fn run_setup(
     interactive: bool,
     runner: &mut dyn CommandRunner,
 ) -> Result<SetupReport> {
+    let path_context = harnesses::SetupPathContext::from_env()?;
+    run_setup_with_paths(output, args, target, interactive, runner, &path_context)
+}
+
+fn run_setup_with_paths(
+    output: &CliOutput,
+    args: &SetupArgs,
+    target: ConfigTarget,
+    interactive: bool,
+    runner: &mut dyn CommandRunner,
+    path_context: &harnesses::SetupPathContext,
+) -> Result<SetupReport> {
     if output.is_json() && !args.yes && !args.dry_run {
         bail!("`moraine --output json setup` requires --yes or --dry-run");
     }
@@ -70,23 +82,99 @@ fn run_setup(
             let selections = setup_target_selections(args, interactive, runner)?;
             let config_allows_ingest = config.status == SetupStatus::Ok
                 || (args.dry_run && config.action == "would_migrate");
-            if selections.apply_ingest && !args.skip_config && config_allows_ingest {
-                let kiro_home = env::var_os("KIRO_HOME").map(PathBuf::from);
+            let should_update_ingest =
+                selections.apply_ingest && !args.skip_config && config_allows_ingest;
+            let nac_ingest_selection = should_update_ingest
+                .then(|| {
+                    selections.targets.iter().copied().find(|selection| {
+                        selection.target == SetupMcpTarget::Nac
+                            && selection.mode.configures_ingest()
+                    })
+                })
+                .flatten();
+            let nac_combined = nac_ingest_selection
+                .is_some_and(|selection| selection.mode == SetupSelectionMode::IngestAndHarness);
+            let mut nac_ingest_blocked = false;
+            let mut nac_manual_guidance = None;
+            if nac_ingest_selection.is_some() {
+                match path_context.nac_manual_ingest_guidance() {
+                    Ok(guidance) => nac_manual_guidance = guidance,
+                    Err(exc) => {
+                        nac_ingest_blocked = true;
+                        mcp_targets.push(McpTargetReport::error(
+                            SetupMcpTarget::Nac,
+                            &format!("failed to resolve NAC ingest source: {exc:#}"),
+                        ));
+                    }
+                }
+            }
+
+            let mut harness_targets = selections.harness_targets();
+            let can_run_harness =
+                config.status == SetupStatus::Ok || args.skip_config || args.dry_run;
+            let mut progress = SetupProgress::from_output(output);
+            let mcp_context = McpSetupContext {
+                config_target: &target,
+                paths: path_context,
+            };
+
+            // NAC's combined mode writes its MCP table before persisting the source
+            // derived from that same snapshot. A parse, merge, or conflict failure
+            // therefore cannot leave a newly materialized source behind.
+            if nac_combined {
+                harness_targets.retain(|target| *target != SetupMcpTarget::Nac);
+                if can_run_harness && !nac_ingest_blocked {
+                    let mut report = setup_mcp_target_with_progress(
+                        args,
+                        &mcp_context,
+                        SetupMcpTarget::Nac,
+                        interactive,
+                        selections.confirmed_harness,
+                        &mut progress,
+                        runner,
+                    )?;
+                    if report.status == SetupStatus::Ok && !args.dry_run {
+                        if let Err(exc) = path_context.mark_nac_mcp_applied(&target) {
+                            report.status = SetupStatus::Error;
+                            report.error = Some(format!(
+                                "NAC config changed after setup applied its MCP merge: {exc:#}"
+                            ));
+                        }
+                    }
+                    if let Some(guidance) = nac_manual_guidance.clone() {
+                        report.manual_snippet = Some(guidance);
+                    }
+                    nac_ingest_blocked = report.status == SetupStatus::Error;
+                    mcp_targets.push(report);
+                } else if !can_run_harness && !nac_ingest_blocked {
+                    nac_ingest_blocked = true;
+                    mcp_targets.push(McpTargetReport::skipped(
+                        SetupMcpTarget::Nac,
+                        "config setup did not complete; skipping MCP/plugin setup",
+                    ));
+                }
+            }
+
+            let mut ingest_targets = selections.targets.clone();
+            if nac_ingest_blocked {
+                ingest_targets.retain(|selection| selection.target != SetupMcpTarget::Nac);
+            }
+            let mut ingest_update_succeeded = false;
+            if should_update_ingest {
                 let ingest_update = if args.dry_run {
                     preview_ingest_selections_for_config(
                         &target.path,
-                        &selections.targets,
-                        kiro_home.as_deref(),
+                        &ingest_targets,
+                        path_context,
                     )
                 } else {
-                    apply_ingest_selections_to_config(
-                        &target.path,
-                        &selections.targets,
-                        kiro_home.as_deref(),
-                    )
+                    apply_ingest_selections_to_config(&target.path, &ingest_targets, path_context)
                 };
                 match ingest_update {
-                    Ok(update) => config.apply_ingest_update(update, args.dry_run),
+                    Ok(update) => {
+                        ingest_update_succeeded = true;
+                        config.apply_ingest_update(update, args.dry_run);
+                    }
                     Err(exc) => {
                         config = ConfigReport::error(
                             &target.path,
@@ -97,17 +185,22 @@ fn run_setup(
                 }
             }
 
-            let harness_targets = selections.harness_targets();
+            if ingest_update_succeeded {
+                if let Some(report) =
+                    nac_ingest_manual_report(nac_ingest_selection, nac_manual_guidance)
+                {
+                    mcp_targets.push(report);
+                }
+            }
+
             if config.status == SetupStatus::Ok || args.skip_config || args.dry_run {
-                let targets_confirmed_by_selection = selections.confirmed_harness;
-                let mut progress = SetupProgress::from_output(output);
                 for mcp_target in harness_targets {
                     let report = setup_mcp_target_with_progress(
                         args,
-                        &target,
+                        &mcp_context,
                         mcp_target,
                         interactive,
-                        targets_confirmed_by_selection,
+                        selections.confirmed_harness,
                         &mut progress,
                         runner,
                     )?;
@@ -122,6 +215,13 @@ fn run_setup(
                     ));
                 }
             }
+            mcp_targets.sort_by_key(|report| {
+                selections
+                    .targets
+                    .iter()
+                    .position(|selection| selection.target == report.target)
+                    .unwrap_or(usize::MAX)
+            });
         } else {
             for mcp_target in dedup_targets(&args.mcp_targets) {
                 mcp_targets.push(McpTargetReport::skipped(
@@ -142,6 +242,16 @@ fn run_setup(
         config,
         mcp_targets,
     })
+}
+
+fn nac_ingest_manual_report(
+    selection: Option<SetupTargetSelection>,
+    guidance: Option<String>,
+) -> Option<McpTargetReport> {
+    if !selection.is_some_and(|selection| selection.mode == SetupSelectionMode::IngestOnly) {
+        return None;
+    }
+    guidance.map(|guidance| McpTargetReport::manual(McpPlan::manual(SetupMcpTarget::Nac, guidance)))
 }
 
 #[derive(Debug, Clone)]
@@ -752,24 +862,38 @@ impl IngestSelectionUpdate {
 fn preview_ingest_selections_for_config(
     path: &Path,
     selections: &[SetupTargetSelection],
-    kiro_home: Option<&Path>,
+    paths: &harnesses::SetupPathContext,
 ) -> Result<IngestSelectionUpdate> {
     let mut document = read_config_document(path)?;
-    apply_ingest_selections_to_document_with_kiro_home(&mut document, selections, kiro_home)
+    let update = apply_ingest_selections_to_document_with_paths(&mut document, selections, paths)?;
+    verify_nac_ingest_snapshot(selections, paths)?;
+    Ok(update)
 }
 
 fn apply_ingest_selections_to_config(
     path: &Path,
     selections: &[SetupTargetSelection],
-    kiro_home: Option<&Path>,
+    paths: &harnesses::SetupPathContext,
 ) -> Result<IngestSelectionUpdate> {
     let mut document = read_config_document(path)?;
-    let update =
-        apply_ingest_selections_to_document_with_kiro_home(&mut document, selections, kiro_home)?;
+    let update = apply_ingest_selections_to_document_with_paths(&mut document, selections, paths)?;
+    verify_nac_ingest_snapshot(selections, paths)?;
     if update.has_changes() {
         write_toml_atomic(path, &document.to_string())?;
     }
     Ok(update)
+}
+
+fn verify_nac_ingest_snapshot(
+    selections: &[SetupTargetSelection],
+    paths: &harnesses::SetupPathContext,
+) -> Result<()> {
+    if selections.iter().any(|selection| {
+        selection.target == SetupMcpTarget::Nac && selection.mode.configures_ingest()
+    }) {
+        paths.verify_nac_snapshot_current()?;
+    }
+    Ok(())
 }
 
 fn read_config_document(path: &Path) -> Result<DocumentMut> {
@@ -780,26 +904,18 @@ fn read_config_document(path: &Path) -> Result<DocumentMut> {
         .with_context(|| format!("{} is not valid TOML", path.display()))
 }
 
-#[cfg(test)]
-fn apply_ingest_selections_to_document(
+fn apply_ingest_selections_to_document_with_paths(
     document: &mut DocumentMut,
     selections: &[SetupTargetSelection],
-) -> Result<IngestSelectionUpdate> {
-    apply_ingest_selections_to_document_with_kiro_home(document, selections, None)
-}
-
-fn apply_ingest_selections_to_document_with_kiro_home(
-    document: &mut DocumentMut,
-    selections: &[SetupTargetSelection],
-    kiro_home: Option<&Path>,
+    paths: &harnesses::SetupPathContext,
 ) -> Result<IngestSelectionUpdate> {
     let mut update = IngestSelectionUpdate::default();
 
     for selection in selections {
         let enabled = selection.mode.configures_ingest();
 
-        for setup_source in harnesses::default_ingest_sources(selection.target) {
-            let source_index = ingest_source_index(document, *setup_source)?;
+        for setup_source in harnesses::default_ingest_sources(selection.target, paths, enabled)? {
+            let source_index = ingest_source_index(document, &setup_source)?;
 
             match source_index {
                 Some(source_idx) => {
@@ -807,10 +923,13 @@ fn apply_ingest_selections_to_document_with_kiro_home(
                     let source_table = sources
                         .get_mut(source_idx)
                         .expect("source index came from the same array");
-                    let source_update =
-                        setup_source.reconcile_table(source_table, enabled, kiro_home);
+                    let source_update = setup_source.reconcile_table(source_table, enabled);
                     if source_update.enabled_changed {
-                        if enabled {
+                        if source_table
+                            .get("enabled")
+                            .and_then(Item::as_bool)
+                            .unwrap_or(true)
+                        {
                             update.enabled_sources += 1;
                         } else {
                             update.disabled_sources += 1;
@@ -820,9 +939,9 @@ fn apply_ingest_selections_to_document_with_kiro_home(
                         update.updated_sources += 1;
                     }
                 }
-                None if enabled => {
+                None if enabled && setup_source.materializes() => {
                     let sources = ensure_ingest_sources_mut(document)?;
-                    sources.push(setup_source.to_table(enabled, kiro_home));
+                    sources.push(setup_source.to_table(enabled));
                     update.added_sources += 1;
                 }
                 None => {}
@@ -832,10 +951,18 @@ fn apply_ingest_selections_to_document_with_kiro_home(
 
     Ok(update)
 }
+#[cfg(test)]
+fn apply_ingest_selections_to_document(
+    document: &mut DocumentMut,
+    selections: &[SetupTargetSelection],
+) -> Result<IngestSelectionUpdate> {
+    let paths = harnesses::SetupPathContext::with_home(None);
+    apply_ingest_selections_to_document_with_paths(document, selections, &paths)
+}
 
 fn ingest_source_index(
     document: &mut DocumentMut,
-    setup_source: harnesses::DefaultIngestSource,
+    setup_source: &harnesses::ResolvedIngestSource,
 ) -> Result<Option<usize>> {
     let Some(sources) = ingest_sources_mut(document)? else {
         return Ok(None);
@@ -878,6 +1005,24 @@ fn ingest_sources_mut(document: &mut DocumentMut) -> Result<Option<&mut ArrayOfT
 }
 
 fn write_toml_atomic(path: &Path, content: &str) -> Result<()> {
+    write_toml_atomic_inner(path, content, true, None)
+}
+
+fn write_external_toml_atomic(path: &Path, content: &str, expected: &McpConfigWrite) -> Result<()> {
+    write_toml_atomic_inner(path, content, false, Some(expected))
+}
+
+fn write_toml_atomic_inner(
+    path: &Path,
+    content: &str,
+    validate_moraine: bool,
+    expected: Option<&McpConfigWrite>,
+) -> Result<()> {
+    if !validate_moraine {
+        content
+            .parse::<DocumentMut>()
+            .with_context(|| format!("updated {} is not valid TOML", path.display()))?;
+    }
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -904,12 +1049,17 @@ fn write_toml_atomic(path: &Path, content: &str) -> Result<()> {
                         .with_context(|| format!("failed to write {}", temp_path.display()))?;
                     file.flush()
                         .with_context(|| format!("failed to flush {}", temp_path.display()))?;
-                    moraine_config::load_config(&temp_path).with_context(|| {
-                        format!(
-                            "updated config failed validation at {}",
-                            temp_path.display()
-                        )
-                    })?;
+                    if validate_moraine {
+                        moraine_config::load_config(&temp_path).with_context(|| {
+                            format!(
+                                "updated config failed validation at {}",
+                                temp_path.display()
+                            )
+                        })?;
+                    }
+                    if let Some(expected) = expected {
+                        expected.verify_nac_snapshot_current()?;
+                    }
                     fs::rename(&temp_path, path).with_context(|| {
                         format!(
                             "failed to persist {} to {}",
@@ -1511,6 +1661,11 @@ impl SetupProgress {
     }
 }
 
+struct McpSetupContext<'a> {
+    config_target: &'a ConfigTarget,
+    paths: &'a harnesses::SetupPathContext,
+}
+
 #[cfg(test)]
 fn setup_mcp_target(
     args: &SetupArgs,
@@ -1521,9 +1676,13 @@ fn setup_mcp_target(
     runner: &mut dyn CommandRunner,
 ) -> Result<McpTargetReport> {
     let mut progress = SetupProgress::disabled();
+    let paths = harnesses::SetupPathContext::from_env()?;
     setup_mcp_target_with_progress(
         args,
-        config_target,
+        &McpSetupContext {
+            config_target,
+            paths: &paths,
+        },
         target,
         interactive,
         already_confirmed,
@@ -1534,14 +1693,17 @@ fn setup_mcp_target(
 
 fn setup_mcp_target_with_progress(
     args: &SetupArgs,
-    config_target: &ConfigTarget,
+    context: &McpSetupContext<'_>,
     target: SetupMcpTarget,
     interactive: bool,
     already_confirmed: bool,
     progress: &mut SetupProgress,
     runner: &mut dyn CommandRunner,
 ) -> Result<McpTargetReport> {
-    let plan = McpPlan::for_target(target, config_target);
+    let plan = match McpPlan::for_target_with_paths(target, context.config_target, context.paths) {
+        Ok(plan) => plan,
+        Err(exc) => return Ok(McpTargetReport::error(target, &format!("{exc:#}"))),
+    };
     if args.dry_run {
         return Ok(McpTargetReport::planned(plan));
     }
@@ -1737,13 +1899,12 @@ struct McpPlan {
 }
 
 impl McpPlan {
+    #[cfg(test)]
     fn for_target(target: SetupMcpTarget, config_target: &ConfigTarget) -> Self {
-        Self::for_target_with_roots(
-            target,
-            config_target,
-            env::var_os("HOME").map(PathBuf::from),
-            env::var_os("KIRO_HOME").map(PathBuf::from),
-        )
+        let paths = harnesses::SetupPathContext::from_env()
+            .expect("setup path context should resolve the current directory");
+        Self::for_target_with_paths(target, config_target, &paths)
+            .expect("test MCP plan should be valid")
     }
 
     #[cfg(test)]
@@ -1755,13 +1916,25 @@ impl McpPlan {
         Self::for_target_with_roots(target, config_target, home, None)
     }
 
+    #[cfg(test)]
     fn for_target_with_roots(
         target: SetupMcpTarget,
         config_target: &ConfigTarget,
         home: Option<PathBuf>,
         kiro_home: Option<PathBuf>,
     ) -> Self {
-        harnesses::mcp_plan(target, config_target, home, kiro_home)
+        let mut paths = harnesses::SetupPathContext::with_home(home);
+        paths.kiro_home = kiro_home;
+        Self::for_target_with_paths(target, config_target, &paths)
+            .expect("test MCP plan should be valid")
+    }
+
+    fn for_target_with_paths(
+        target: SetupMcpTarget,
+        config_target: &ConfigTarget,
+        paths: &harnesses::SetupPathContext,
+    ) -> Result<Self> {
+        harnesses::mcp_plan(target, config_target, paths)
     }
 
     fn replace_registration(
@@ -1958,6 +2131,13 @@ impl McpConfigFileReport {
             error: None,
         }
     }
+    fn unchanged(write: &McpConfigWrite) -> Self {
+        Self {
+            path: write.path().display().to_string(),
+            action: "unchanged".to_string(),
+            error: None,
+        }
+    }
 
     fn error(write: &McpConfigWrite, error: &str) -> Self {
         Self {
@@ -2001,6 +2181,19 @@ impl McpConfigFileReport {
 }
 
 fn apply_mcp_config_write(write: &McpConfigWrite) -> Result<McpConfigFileReport> {
+    if matches!(write.format(), McpConfigFormat::Toml) {
+        write.verify_nac_snapshot_current()?;
+        if write.nac_is_unchanged() {
+            return Ok(McpConfigFileReport::unchanged(write));
+        }
+        let rendered = write
+            .nac_rendered()
+            .ok_or_else(|| anyhow::anyhow!("NAC MCP write is missing its prepared snapshot"))?;
+        let rendered = std::str::from_utf8(rendered).expect("toml_edit renders UTF-8");
+        write_external_toml_atomic(write.path(), rendered, write)?;
+        return Ok(McpConfigFileReport::written(write));
+    }
+
     let mut root = read_json_object_or_default(write.path(), write.format())?;
     write.merge_into(&mut root)?;
     write_json_atomic(write.path(), &Value::Object(root))?;
@@ -2037,6 +2230,7 @@ fn read_json_object_or_default(path: &Path, format: McpConfigFormat) -> Result<M
     }
 
     let value = match format {
+        McpConfigFormat::Toml => bail!("{} uses TOML, not JSON", path.display()),
         McpConfigFormat::Jsonc => read_jsonc_value(path, &content)?,
         McpConfigFormat::Json => serde_json::from_str(&content)
             .with_context(|| format!("{} is not valid JSON", path.display()))?,
@@ -2691,18 +2885,17 @@ impl SetupMcpTarget {
         {
             return true;
         }
-        self.default_probe_paths().iter().any(|path| path.exists())
+        let Ok(paths) = harnesses::SetupPathContext::from_env() else {
+            return false;
+        };
+        harnesses::spec(self)
+            .default_probe_paths(&paths)
+            .iter()
+            .any(|path| path.exists())
     }
 
     fn program_candidates(self) -> &'static [&'static str] {
         harnesses::spec(self).program_candidates()
-    }
-
-    fn default_probe_paths(self) -> Vec<PathBuf> {
-        let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
-            return Vec::new();
-        };
-        harnesses::spec(self).default_probe_paths(&home)
     }
 }
 
@@ -3117,6 +3310,215 @@ mod tests {
     }
 
     #[test]
+    fn relative_nac_store_does_not_materialize_a_fresh_source() {
+        let root = temp_path("relative-nac-source");
+        let nac_home = root.join("nac");
+        fs::create_dir_all(&nac_home).expect("create NAC home");
+        fs::write(
+            nac_home.join("config.toml"),
+            "[storage]\nstore_path = \"state/store.db\"\n",
+        )
+        .expect("write NAC config");
+        let paths = harnesses::SetupPathContext {
+            launch_cwd: root.join("launch"),
+            home: None,
+            xdg_config_home: None,
+            kiro_home: None,
+            nac_home: Some(nac_home),
+            nac_snapshot: std::cell::OnceCell::new(),
+            nac_expected_content: std::cell::OnceCell::new(),
+        };
+        let selection = [SetupTargetSelection {
+            target: SetupMcpTarget::Nac,
+            mode: SetupSelectionMode::IngestOnly,
+        }];
+
+        let mut document = "# minimal\n"
+            .parse::<DocumentMut>()
+            .expect("minimal config parses");
+        let update =
+            apply_ingest_selections_to_document_with_paths(&mut document, &selection, &paths)
+                .expect("apply relative NAC selection");
+        assert_eq!(update, IngestSelectionUpdate::default());
+        assert!(document.get("ingest").is_none());
+
+        let mut document = DEFAULT_CONFIG_TEMPLATE
+            .parse::<DocumentMut>()
+            .expect("template config parses");
+        push_source(
+            &mut document,
+            "nac",
+            "nac",
+            true,
+            "/previous/store.db",
+            "/previous",
+        );
+        push_source(
+            &mut document,
+            "nac-workspace",
+            "nac",
+            true,
+            "/custom/store.db",
+            "/custom",
+        );
+        let update =
+            apply_ingest_selections_to_document_with_paths(&mut document, &selection, &paths)
+                .expect("disable unsafe existing NAC selection");
+        assert_eq!(update.disabled_sources, 1);
+        assert!(!source_enabled(&document, "nac"));
+        assert_eq!(
+            source_value(&document, "nac", "glob"),
+            Some("/previous/store.db")
+        );
+        assert!(source_enabled(&document, "nac-workspace"));
+        assert_eq!(
+            source_value(&document, "nac-workspace", "glob"),
+            Some("/custom/store.db")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ingest_only_relative_nac_store_returns_manual_guidance() {
+        let root = temp_path("nac-ingest-only-guidance");
+        let nac_home = root.join("nac");
+        fs::create_dir_all(&nac_home).expect("create NAC home");
+        fs::write(
+            nac_home.join("config.toml"),
+            "[storage]\nstore_path = \"workspace/store.db\"\n",
+        )
+        .expect("write relative NAC store");
+        let paths = harnesses::SetupPathContext {
+            launch_cwd: root.join("launch"),
+            home: None,
+            xdg_config_home: None,
+            kiro_home: None,
+            nac_home: Some(nac_home),
+            nac_snapshot: std::cell::OnceCell::new(),
+            nac_expected_content: std::cell::OnceCell::new(),
+        };
+        let selection = SetupTargetSelection {
+            target: SetupMcpTarget::Nac,
+            mode: SetupSelectionMode::IngestOnly,
+        };
+        let guidance = paths
+            .nac_manual_ingest_guidance()
+            .expect("resolve manual guidance");
+
+        let report = nac_ingest_manual_report(Some(selection), guidance)
+            .expect("ingest-only guidance report");
+        assert_eq!(report.target, SetupMcpTarget::Nac);
+        assert_eq!(report.action, McpAction::ManualInstructions);
+        let snippet = report.manual_snippet.expect("manual source snippet");
+        assert!(snippet.contains("name = \"nac-workspace\""));
+        assert!(snippet.contains("unique source name"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn combined_nac_conflict_does_not_persist_snapshot_source() {
+        let root = temp_path("nac-combined-conflict");
+        let nac_home = root.join("nac");
+        fs::create_dir_all(&nac_home).expect("create NAC home");
+        let nac_path = nac_home.join("config.toml");
+        fs::write(&nac_path, "[storage]\nstore_path = \"/first/store.db\"\n")
+            .expect("write initial NAC config");
+        let paths = harnesses::SetupPathContext {
+            launch_cwd: root.join("launch"),
+            home: None,
+            xdg_config_home: None,
+            kiro_home: None,
+            nac_home: Some(nac_home),
+            nac_snapshot: std::cell::OnceCell::new(),
+            nac_expected_content: std::cell::OnceCell::new(),
+        };
+        paths
+            .nac_config_snapshot()
+            .expect("capture initial NAC snapshot");
+        let concurrent = "[storage]\nstore_path = \"/concurrent/store.db\"\n";
+        fs::write(&nac_path, concurrent).expect("write concurrent NAC config");
+
+        let moraine_path = root.join("moraine.toml");
+        fs::write(&moraine_path, DEFAULT_CONFIG_TEMPLATE).expect("write Moraine config");
+        let args = SetupArgs {
+            yes: true,
+            dry_run: false,
+            skip_config: false,
+            skip_mcp: false,
+            repair_config: false,
+            mcp_targets: Vec::new(),
+        };
+        let mut runner = FakeRunner::default();
+        let report = run_setup_with_paths(
+            &plain_output(),
+            &args,
+            ConfigTarget {
+                path: moraine_path.clone(),
+                source: ConfigTargetSource::Cli,
+            },
+            false,
+            &mut runner,
+            &paths,
+        )
+        .expect("combined setup report");
+
+        let nac_report = report
+            .mcp_targets
+            .iter()
+            .find(|target| target.target == SetupMcpTarget::Nac)
+            .expect("NAC setup report");
+        assert_eq!(nac_report.status, SetupStatus::Error);
+        assert!(nac_report
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("changed after setup read it")));
+        assert!(sources_for_harness(&read_toml_document(&moraine_path), "nac").is_empty());
+        assert_eq!(
+            fs::read_to_string(&nac_path).expect("read concurrent NAC config"),
+            concurrent
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn malformed_nac_config_leaves_moraine_config_unchanged() {
+        let root = temp_path("invalid-nac-source");
+        let nac_home = root.join("nac");
+        fs::create_dir_all(&nac_home).expect("create NAC home");
+        let nac_original = "[storage]\nstore_path = 7\n";
+        fs::write(nac_home.join("config.toml"), nac_original).expect("write invalid NAC config");
+        let moraine_path = root.join("moraine.toml");
+        let moraine_original = "# existing\n[backend]\nstart_on_up = false\n";
+        fs::write(&moraine_path, moraine_original).expect("write Moraine config");
+        let paths = harnesses::SetupPathContext {
+            launch_cwd: root.join("launch"),
+            home: None,
+            xdg_config_home: None,
+            kiro_home: None,
+            nac_home: Some(nac_home.clone()),
+            nac_snapshot: std::cell::OnceCell::new(),
+            nac_expected_content: std::cell::OnceCell::new(),
+        };
+        let selection = [SetupTargetSelection {
+            target: SetupMcpTarget::Nac,
+            mode: SetupSelectionMode::IngestOnly,
+        }];
+
+        let error = apply_ingest_selections_to_config(&moraine_path, &selection, &paths)
+            .expect_err("reject invalid NAC storage");
+        assert!(format!("{error:#}").contains("storage.store_path must be a TOML string"));
+        assert_eq!(
+            fs::read_to_string(&moraine_path).expect("read Moraine config"),
+            moraine_original
+        );
+        assert_eq!(
+            fs::read_to_string(nac_home.join("config.toml")).expect("read NAC config"),
+            nac_original
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn claude_ingest_selection_reconciles_platform_sources_idempotently() {
         let mut document = "# minimal\n"
             .parse::<DocumentMut>()
@@ -3184,13 +3586,12 @@ mod tests {
             mode: SetupSelectionMode::IngestOnly,
         };
         let kiro_home = Path::new("/tmp/custom-kiro-home");
+        let mut paths = harnesses::SetupPathContext::with_home(None);
+        paths.kiro_home = Some(kiro_home.to_path_buf());
 
-        let update = apply_ingest_selections_to_document_with_kiro_home(
-            &mut document,
-            &[selection],
-            Some(kiro_home),
-        )
-        .expect("reconcile Kiro source");
+        let update =
+            apply_ingest_selections_to_document_with_paths(&mut document, &[selection], &paths)
+                .expect("reconcile Kiro source");
 
         assert_eq!(
             update,
@@ -3210,12 +3611,9 @@ mod tests {
             Some("/tmp/custom-kiro-home/sessions/cli")
         );
 
-        let unchanged = apply_ingest_selections_to_document_with_kiro_home(
-            &mut document,
-            &[selection],
-            Some(kiro_home),
-        )
-        .expect("reapply Kiro source");
+        let unchanged =
+            apply_ingest_selections_to_document_with_paths(&mut document, &[selection], &paths)
+                .expect("reapply Kiro source");
         assert_eq!(unchanged, IngestSelectionUpdate::default());
     }
 
@@ -4524,6 +4922,239 @@ host = "127.42.0.9"
             0o600
         );
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn nac_config_write_preserves_model_and_storage_toml() {
+        let nac_home = temp_path("nac-home");
+        fs::create_dir_all(&nac_home).expect("create NAC config dir");
+        let path = nac_home.join("config.toml");
+        fs::write(
+            &path,
+            "[model]\nbackend = \"together-chat\"\nmodel = \"z-ai/glm-5.2\"\n\n[storage]\nstore_path = \"/tmp/nac-store.db\"\n",
+        )
+        .expect("write existing NAC config");
+
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/custom-moraine.toml"),
+            source: ConfigTargetSource::Cli,
+        };
+        let write = McpConfigWrite::nac_path(path.clone(), &target).expect("prepare NAC config");
+        let report = apply_mcp_config_write(&write).expect("write NAC config");
+        assert_eq!(report.action, "updated");
+
+        let document = fs::read_to_string(&path)
+            .expect("read NAC config")
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse NAC config");
+        assert_eq!(document["model"]["backend"].as_str(), Some("together-chat"));
+        assert_eq!(document["model"]["model"].as_str(), Some("z-ai/glm-5.2"));
+        assert_eq!(
+            document["storage"]["store_path"].as_str(),
+            Some("/tmp/nac-store.db")
+        );
+        assert_eq!(
+            document["mcp_servers"]["moraine"]["enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            document["mcp_servers"]["moraine"]["transport"].as_str(),
+            Some("stdio")
+        );
+        assert_eq!(
+            document["mcp_servers"]["moraine"]["command"].as_str(),
+            Some("moraine")
+        );
+        assert_eq!(
+            document["mcp_servers"]["moraine"]["args"]
+                .as_array()
+                .expect("NAC MCP args")
+                .iter()
+                .filter_map(toml_edit::Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["run", "mcp", "--config", "/tmp/custom-moraine.toml"]
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("NAC config metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let _ = fs::remove_dir_all(nac_home);
+    }
+
+    #[test]
+    fn nac_config_write_preserves_foreign_tables_and_is_idempotent() {
+        let nac_home = temp_path("nac-foreign-toml");
+        fs::create_dir_all(&nac_home).expect("create NAC config dir");
+        let path = nac_home.join("config.toml");
+        let original = "# keep top comment\n[mcp_servers.other]\ncommand = \"node\"\n\n# keep before owned table\n[mcp_servers.moraine]\nenabled = false\nstale = \"remove me\"\n\n[after]\nvalue = 7\n";
+        fs::write(&path, original).expect("write existing NAC config");
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/config.toml"),
+            source: ConfigTargetSource::Cli,
+        };
+        let write = McpConfigWrite::nac_path(path.clone(), &target).expect("prepare NAC config");
+
+        assert_eq!(
+            apply_mcp_config_write(&write)
+                .expect("merge NAC config")
+                .action,
+            "updated"
+        );
+        let merged = fs::read_to_string(&path).expect("read merged NAC config");
+        assert!(merged.contains("# keep top comment"));
+        assert!(merged.contains("# keep before owned table"));
+        assert!(merged.contains("[mcp_servers.other]\ncommand = \"node\""));
+        assert!(merged.contains("[after]\nvalue = 7"));
+        assert!(!merged.contains("stale"));
+        assert!(
+            merged.find("[mcp_servers.other]").expect("other position")
+                < merged
+                    .find("[mcp_servers.moraine]")
+                    .expect("Moraine position")
+        );
+        assert!(
+            merged
+                .find("[mcp_servers.moraine]")
+                .expect("Moraine position")
+                < merged.find("[after]").expect("after position")
+        );
+
+        let repeat_write =
+            McpConfigWrite::nac_path(path.clone(), &target).expect("prepare repeated NAC config");
+        assert_eq!(
+            apply_mcp_config_write(&repeat_write)
+                .expect("repeat NAC merge")
+                .action,
+            "unchanged"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("read idempotent NAC config"),
+            merged
+        );
+        let _ = fs::remove_dir_all(nac_home);
+    }
+
+    #[test]
+    fn nac_config_write_supports_inline_mcp_tables() {
+        let nac_home = temp_path("nac-inline-toml");
+        fs::create_dir_all(&nac_home).expect("create NAC config dir");
+        let path = nac_home.join("config.toml");
+        fs::write(
+            &path,
+            "mcp_servers = { other = { command = \"node\" }, moraine = { enabled = false, stale = \"remove\" } }\n",
+        )
+        .expect("write inline NAC config");
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/config.toml"),
+            source: ConfigTargetSource::Cli,
+        };
+        let write =
+            McpConfigWrite::nac_path(path.clone(), &target).expect("prepare inline NAC config");
+
+        apply_mcp_config_write(&write).expect("merge inline NAC config");
+        let document = fs::read_to_string(&path)
+            .expect("read inline NAC config")
+            .parse::<DocumentMut>()
+            .expect("parse inline NAC config");
+        assert_eq!(
+            document["mcp_servers"]["other"]["command"].as_str(),
+            Some("node")
+        );
+        assert_eq!(
+            document["mcp_servers"]["moraine"]["enabled"].as_bool(),
+            Some(true)
+        );
+        assert!(document["mcp_servers"]["moraine"].get("stale").is_none());
+        assert!(document["mcp_servers"].is_inline_table());
+        let _ = fs::remove_dir_all(nac_home);
+    }
+
+    #[test]
+    fn nac_config_write_rejects_non_table_mcp_shapes_without_mutation() {
+        let nac_home = temp_path("nac-invalid-mcp-toml");
+        fs::create_dir_all(&nac_home).expect("create NAC config dir");
+        let path = nac_home.join("config.toml");
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/config.toml"),
+            source: ConfigTargetSource::Cli,
+        };
+        for original in [
+            "mcp_servers = 7\n",
+            "[mcp_servers]\nmoraine = \"not a table\"\n",
+        ] {
+            fs::write(&path, original).expect("write invalid MCP shape");
+            let error = McpConfigWrite::nac_path(path.clone(), &target)
+                .expect_err("reject invalid MCP shape");
+            assert!(format!("{error:#}").contains("must be a TOML table"));
+            assert_eq!(
+                fs::read_to_string(&path).expect("read unchanged invalid config"),
+                original
+            );
+        }
+        let _ = fs::remove_dir_all(nac_home);
+    }
+
+    #[test]
+    fn nac_mcp_write_ignores_malformed_ingestion_storage() {
+        let nac_home = temp_path("nac-mcp-storage-independent");
+        fs::create_dir_all(&nac_home).expect("create NAC config dir");
+        let path = nac_home.join("config.toml");
+        fs::write(&path, "[storage]\nstore_path = 7\n")
+            .expect("write ingestion-only storage error");
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/config.toml"),
+            source: ConfigTargetSource::HomeDefault,
+        };
+        let paths = harnesses::SetupPathContext {
+            launch_cwd: nac_home.clone(),
+            home: None,
+            xdg_config_home: None,
+            kiro_home: None,
+            nac_home: Some(nac_home.clone()),
+            nac_snapshot: std::cell::OnceCell::new(),
+            nac_expected_content: std::cell::OnceCell::new(),
+        };
+        let plan = McpPlan::for_target_with_paths(SetupMcpTarget::Nac, &target, &paths)
+            .expect("MCP plan must not validate storage");
+        let mut runner = FakeRunner::default();
+        let report = execute_mcp_plan(plan, &mut runner).expect("apply MCP-only NAC merge");
+        assert_eq!(report.status, SetupStatus::Ok);
+
+        let document = read_toml_document(&path);
+        assert_eq!(document["storage"]["store_path"].as_integer(), Some(7));
+        assert_eq!(
+            document["mcp_servers"]["moraine"]["enabled"].as_bool(),
+            Some(true)
+        );
+        let _ = fs::remove_dir_all(nac_home);
+    }
+
+    #[test]
+    fn nac_mcp_write_rejects_concurrent_snapshot_change() {
+        let nac_home = temp_path("nac-config-conflict");
+        fs::create_dir_all(&nac_home).expect("create NAC config dir");
+        let path = nac_home.join("config.toml");
+        fs::write(&path, "[model]\nmodel = \"first\"\n").expect("write initial NAC config");
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/config.toml"),
+            source: ConfigTargetSource::HomeDefault,
+        };
+        let write = McpConfigWrite::nac_path(path.clone(), &target).expect("prepare NAC snapshot");
+        let concurrent = "[model]\nmodel = \"concurrent\"\n";
+        fs::write(&path, concurrent).expect("write concurrent NAC config");
+
+        let error = apply_mcp_config_write(&write).expect_err("reject snapshot conflict");
+        assert!(format!("{error:#}").contains("changed after setup read it"));
+        assert_eq!(
+            fs::read_to_string(&path).expect("read concurrent config"),
+            concurrent
+        );
+        let _ = fs::remove_dir_all(nac_home);
     }
 
     #[test]
