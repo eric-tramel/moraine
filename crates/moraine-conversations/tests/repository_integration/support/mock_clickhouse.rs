@@ -426,9 +426,6 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                         "title": "Session C title",
                         "source": "codex",
                         "harness": "codex",
-                        "originator": "Codex Desktop",
-                        "origin_cwd": "/work/acme-secret-merger",
-                        "project": "acme-secret-merger",
                         "session_slug": "project-c",
                         "session_summary": "Session C summary"
                     },
