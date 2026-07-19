@@ -2288,7 +2288,7 @@ print(f"nac:{namespace}:{raw_session_id}")
 PY
 )"
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND source_generation = 2 AND session_id = '${nac_replacement_session_id}' AND position(text_content, '${nac_replacement_keyword}') > 0" 120
-  assert_clickhouse_count "$clickhouse_url" "nac replacement advances source generation" "SELECT count() FROM ${clickhouse_database}.ingest_checkpoints WHERE source_name = 'ci-nac' AND source_generation = 2" "1"
+  assert_clickhouse_count "$clickhouse_url" "nac replacement advances source generation" "SELECT count() FROM ${clickhouse_database}.ingest_checkpoints FINAL WHERE source_name = 'ci-nac' AND source_generation = 2" "1"
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM (SELECT session_id, generation, dirty_revision, total_events FROM ${clickhouse_database}.mcp_open_sessions FINAL WHERE session_id = '${nac_replacement_session_id}') AS projected INNER JOIN (SELECT session_id, dirty_revision FROM ${clickhouse_database}.mcp_open_dirty_sessions FINAL WHERE session_id = '${nac_replacement_session_id}') AS dirty USING (session_id) WHERE projected.total_events = 8 AND projected.dirty_revision = dirty.dirty_revision" 120
   wait_for_clickhouse_scalar_stable "$clickhouse_url" "SELECT concat(toString(slot), ':', toString(generation), ':', toString(source_revision), ':', toString(dirty_revision), ':', toString(total_events)) FROM ${clickhouse_database}.mcp_open_sessions FINAL WHERE session_id = '${nac_replacement_session_id}' LIMIT 1" 60 5 >/dev/null
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
