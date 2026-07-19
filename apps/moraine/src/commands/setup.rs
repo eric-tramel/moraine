@@ -1916,6 +1916,7 @@ impl McpPlan {
         Self::for_target_with_roots(target, config_target, home, None)
     }
 
+    #[cfg(test)]
     fn for_target_with_roots(
         target: SetupMcpTarget,
         config_target: &ConfigTarget,
@@ -3322,6 +3323,7 @@ mod tests {
             launch_cwd: root.join("launch"),
             home: None,
             xdg_config_home: None,
+            kiro_home: None,
             nac_home: Some(nac_home),
             nac_snapshot: std::cell::OnceCell::new(),
             nac_expected_content: std::cell::OnceCell::new(),
@@ -3390,6 +3392,7 @@ mod tests {
             launch_cwd: root.join("launch"),
             home: None,
             xdg_config_home: None,
+            kiro_home: None,
             nac_home: Some(nac_home),
             nac_snapshot: std::cell::OnceCell::new(),
             nac_expected_content: std::cell::OnceCell::new(),
@@ -3424,6 +3427,7 @@ mod tests {
             launch_cwd: root.join("launch"),
             home: None,
             xdg_config_home: None,
+            kiro_home: None,
             nac_home: Some(nac_home),
             nac_snapshot: std::cell::OnceCell::new(),
             nac_expected_content: std::cell::OnceCell::new(),
@@ -3490,6 +3494,7 @@ mod tests {
             launch_cwd: root.join("launch"),
             home: None,
             xdg_config_home: None,
+            kiro_home: None,
             nac_home: Some(nac_home.clone()),
             nac_snapshot: std::cell::OnceCell::new(),
             nac_expected_content: std::cell::OnceCell::new(),
@@ -3581,13 +3586,12 @@ mod tests {
             mode: SetupSelectionMode::IngestOnly,
         };
         let kiro_home = Path::new("/tmp/custom-kiro-home");
+        let mut paths = harnesses::SetupPathContext::with_home(None);
+        paths.kiro_home = Some(kiro_home.to_path_buf());
 
-        let update = apply_ingest_selections_to_document_with_kiro_home(
-            &mut document,
-            &[selection],
-            Some(kiro_home),
-        )
-        .expect("reconcile Kiro source");
+        let update =
+            apply_ingest_selections_to_document_with_paths(&mut document, &[selection], &paths)
+                .expect("reconcile Kiro source");
 
         assert_eq!(
             update,
@@ -3607,12 +3611,9 @@ mod tests {
             Some("/tmp/custom-kiro-home/sessions/cli")
         );
 
-        let unchanged = apply_ingest_selections_to_document_with_kiro_home(
-            &mut document,
-            &[selection],
-            Some(kiro_home),
-        )
-        .expect("reapply Kiro source");
+        let unchanged =
+            apply_ingest_selections_to_document_with_paths(&mut document, &[selection], &paths)
+                .expect("reapply Kiro source");
         assert_eq!(unchanged, IngestSelectionUpdate::default());
     }
 
@@ -5113,6 +5114,7 @@ host = "127.42.0.9"
             launch_cwd: nac_home.clone(),
             home: None,
             xdg_config_home: None,
+            kiro_home: None,
             nac_home: Some(nac_home.clone()),
             nac_snapshot: std::cell::OnceCell::new(),
             nac_expected_content: std::cell::OnceCell::new(),

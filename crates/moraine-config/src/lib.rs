@@ -3181,7 +3181,7 @@ watch_root = "~/.cursor/projects"
             .find(|source| source.name == "kiro")
             .expect("template ships a Kiro CLI source");
         assert!(source.enabled);
-        assert_eq!(source.format, SOURCE_FORMAT_KIRO_SESSION);
+        assert_eq!(source.format, SourceFormat::KiroSession);
         assert_eq!(source.harness, "kiro-cli");
     }
 
@@ -3193,7 +3193,7 @@ watch_root = "~/.cursor/projects"
             enabled: true,
             glob: "~/.kiro/sessions/cli/*.jsonl".to_string(),
             watch_root: "~/.kiro/sessions/cli".to_string(),
-            format: SOURCE_FORMAT_KIRO_SESSION.to_string(),
+            format: SourceFormat::KiroSession,
         };
         let kiro_home = Path::new("/tmp/custom-kiro-home");
 
@@ -3451,7 +3451,7 @@ format = "jsonl"
             .expect("defaults include a Kiro CLI source");
         assert!(source.enabled);
         assert_eq!(source.harness, "kiro-cli");
-        assert_eq!(source.format, SOURCE_FORMAT_KIRO_SESSION);
+        assert_eq!(source.format, SourceFormat::KiroSession);
         assert_eq!(source.glob, "~/.kiro/sessions/cli/*.jsonl");
         assert_eq!(source.watch_root, "~/.kiro/sessions/cli");
     }
@@ -3477,7 +3477,7 @@ watch_root = "~/.kiro/sessions/cli"
             .iter()
             .find(|source| source.name == "kiro")
             .expect("Kiro source");
-        assert_eq!(source.format, SOURCE_FORMAT_KIRO_SESSION);
+        assert_eq!(source.format, SourceFormat::KiroSession);
         assert_eq!(source.tracked_extension(), "jsonl");
     }
 

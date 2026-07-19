@@ -2287,7 +2287,8 @@ mod tests {
         WorkItem {
             source_name: "kiro".to_string(),
             harness: "kiro-cli".to_string(),
-            format: "kiro_session".to_string(),
+            format: SourceFormat::KiroSession,
+            source_glob: String::new(),
             path: path.to_string_lossy().to_string(),
         }
     }

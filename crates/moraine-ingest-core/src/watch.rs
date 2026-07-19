@@ -540,7 +540,7 @@ mod tests {
             PathBuf::from("/tmp/kiro/session-1.tmp"),
         ];
 
-        let tracked = event_tracked_paths(&event, "kiro_session");
+        let tracked = event_tracked_paths(&event, SourceFormat::KiroSession, "");
         assert_eq!(tracked, vec!["/tmp/kiro/session-1.jsonl".to_string()]);
     }
 

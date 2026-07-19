@@ -125,7 +125,7 @@ const TOKEN_NATIVE_UNIT_KEYS: &[&str] = &[
     "output_images",
 ];
 
-fn golden_cases() -> [GoldenCase; 12] {
+fn golden_cases() -> [GoldenCase; 13] {
     [
         GoldenCase {
             name: "codex",
