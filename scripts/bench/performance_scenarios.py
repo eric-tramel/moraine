@@ -109,13 +109,13 @@ class QpsPolicy:
 
 SMOKE_QPS_POLICY = QpsPolicy(
     profile="smoke",
-    duration_s=float(POLICY["smoke_qps_trial_seconds"]),
+    duration_s=int(POLICY["smoke_qps_trial_seconds"]),
     replicates=1,
     maximum_qps=int(POLICY["smoke_qps_max"]),
 )
 FULL_QPS_POLICY = QpsPolicy(
     profile="full",
-    duration_s=float(POLICY["qps_trial_seconds"]),
+    duration_s=int(POLICY["qps_trial_seconds"]),
     replicates=int(POLICY["qps_replicates"]),
     maximum_qps=int(POLICY["qps_max"]),
 )

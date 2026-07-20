@@ -20,11 +20,13 @@ from performance_fixtures import FixtureError, build_recipe  # noqa: E402
 from performance_protocol import _validate_qps  # noqa: E402
 from performance_scenarios import (  # noqa: E402
     AdmissionRejected,
+    FULL_QPS_POLICY,
     McpProtocolError,
     OwnedSandboxQpsControl,
     QpsPolicy,
     QpsTrialSpec,
     RequestTimeout,
+    SMOKE_QPS_POLICY,
     _QpsTrialExecution,
     STDIO_LINE_LIMIT_BYTES,
     _StdioJsonRpcClient,
@@ -504,6 +506,15 @@ class ExactOracleAdapterTests(unittest.TestCase):
 
 
 class QpsProtocolIntegrationTests(unittest.TestCase):
+    def test_protocol_policies_emit_integer_duration_samples(self) -> None:
+        for policy in (SMOKE_QPS_POLICY, FULL_QPS_POLICY):
+            sample = _empty_qps_sample(
+                QpsTrialSpec(policy.profile, 1, 1, policy.duration_s),
+                int(policy.duration_s),
+            )
+            self.assertIs(type(policy.duration_s), int)
+            self.assertIs(type(sample["duration_s"]), int)
+
     def test_full_sweep_shape_and_bracket_are_accepted_by_protocol(self) -> None:
         script = ScriptedSweep(5)
         policy = QpsPolicy(
