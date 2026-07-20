@@ -196,6 +196,56 @@ class EvidenceTests(unittest.TestCase):
         result = ScenarioResult("fail", {}, (), 0)
         self.assertTrue(suite._scenario_pass(result, "qps"))
 
+    def test_loaded_etd_scenario_gate_includes_background_query_outcomes(self) -> None:
+        metrics = {
+            "event_count": 1,
+            "operational": {
+                "planned": 1,
+                "started": 1,
+                "completed": 1,
+                "scheduler_p99_slip_ms": 0.0,
+                "first_started_ns": 1,
+                "last_completed_ns": 2,
+            },
+            "loaded_query": {
+                "planned": 1,
+                "started": 1,
+                "completed": 1,
+                "schedule_delivered": True,
+                "drained": True,
+                "backlog": 0,
+                "scheduler_p99_slip_ms": 0.0,
+                "first_start_slip_ms": 0.0,
+                "coverage_ns": 1,
+                "failure_count": 0,
+                "semantic_failures": 0,
+            },
+        }
+        result = ScenarioResult("pass", metrics, ({"valid": True},), 0)
+        self.assertTrue(suite._scenario_pass(result, "etd_loaded"))
+
+        metrics["loaded_query"]["failure_count"] = 1
+        self.assertFalse(suite._scenario_pass(result, "etd_loaded"))
+
+    def test_etd_scenario_gate_includes_operational_evidence(self) -> None:
+        metrics = {
+            "event_count": 1,
+            "operational": {
+                "planned": 1,
+                "started": 1,
+                "completed": 1,
+                "scheduler_p99_slip_ms": 0.0,
+                "first_started_ns": 1,
+                "last_completed_ns": 2,
+            },
+            "loaded_query": None,
+        }
+        result = ScenarioResult("pass", metrics, ({"valid": True},), 0)
+        self.assertTrue(suite._scenario_pass(result, "etd_idle"))
+
+        metrics["operational"]["completed"] = 0
+        self.assertFalse(suite._scenario_pass(result, "etd_idle"))
+
     def test_local_qps_goodput_calibrates_follow_on_load_without_passing_gate(self) -> None:
         result = ScenarioResult(
             "fail",
