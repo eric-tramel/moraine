@@ -33,6 +33,7 @@ from performance_fixtures import (
 )
 from performance_protocol import (
     PAIR_ORDER,
+    POLICY,
     ProtocolError,
     _validate_resources,
     compare_manifests,
@@ -1760,7 +1761,39 @@ def _scenario_pass(result: ScenarioResult, scenario: str) -> bool:
     if scenario == "ttr":
         return all(bool(sample["valid"]) for sample in result.samples)  # type: ignore[arg-type]
     if scenario in {"etd_idle", "etd_loaded"}:
-        return all(bool(sample["valid"]) for sample in result.samples)  # type: ignore[arg-type]
+        samples_valid = all(bool(sample["valid"]) for sample in result.samples)  # type: ignore[arg-type]
+        metrics = result.metrics
+        operational = metrics["operational"]
+        event_count = int(metrics["event_count"])
+        operational_valid = bool(
+            int(operational["planned"]) == event_count
+            and int(operational["started"]) == event_count
+            and int(operational["completed"]) == event_count
+            and float(operational["scheduler_p99_slip_ms"])
+            <= POLICY["scheduler_p99_start_slip_ms_max"]
+            and int(operational["first_started_ns"])
+            <= int(operational["last_completed_ns"])
+        )
+        loaded_query_valid = True
+        if scenario == "etd_loaded":
+            load = metrics["loaded_query"]
+            loaded_query_valid = bool(
+                load is not None
+                and int(load["planned"]) > 0
+                and int(load["started"]) == int(load["planned"])
+                and int(load["completed"]) == int(load["planned"])
+                and load["schedule_delivered"] is True
+                and load["drained"] is True
+                and int(load["backlog"]) == 0
+                and float(load["scheduler_p99_slip_ms"])
+                <= POLICY["scheduler_p99_start_slip_ms_max"]
+                and float(load["first_start_slip_ms"])
+                <= POLICY["scheduler_p99_start_slip_ms_max"]
+                and int(load["coverage_ns"]) > 0
+                and int(load["failure_count"]) == 0
+                and int(load["semantic_failures"]) == 0
+            )
+        return samples_valid and operational_valid and loaded_query_valid
     gates = result.metrics["mixed_gates"]
     return all(bool(value) for value in gates.values()) and result.metrics["lost_events"] == 0 and result.metrics["duplicate_events"] == 0
 
