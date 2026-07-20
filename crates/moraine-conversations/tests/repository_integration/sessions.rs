@@ -1,6 +1,32 @@
 use super::*;
 
 #[tokio::test(flavor = "multi_thread")]
+async fn publication_snapshot_combines_head_and_fence_round_trips() {
+    let (repo, state) = build_repo().await;
+
+    repo.list_conversations(ConversationListFilter::default(), PageRequest::default())
+        .await
+        .expect("list conversations with a stable publication snapshot");
+
+    let queries = state
+        .publication_snapshot_queries
+        .lock()
+        .expect("publication snapshot query lock");
+    assert_eq!(
+        queries.len(),
+        2,
+        "capture and revalidation should each use one request"
+    );
+    assert!(queries[0].contains("moraine:publication_snapshot:capture"));
+    assert!(queries[0].contains("moraine:append_fence:capture"));
+    assert!(queries[1].contains("moraine:publication_snapshot:revalidate"));
+    assert!(queries[1].contains("moraine:append_fence:revalidate"));
+    assert!(queries
+        .iter()
+        .all(|query| query.matches("UNION ALL").count() == 1));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn list_conversations_applies_filters_and_cursor_pagination() {
     let (repo, state) = build_repo().await;
 

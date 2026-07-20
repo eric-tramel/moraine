@@ -1984,9 +1984,11 @@ mod tests {
     struct MockClickHouseState {
         calls_by_table: Arc<Mutex<HashMap<String, usize>>>,
         rows_by_table: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+        queries: Arc<Mutex<Vec<String>>>,
         fail_once_by_table: Arc<Mutex<HashMap<String, usize>>>,
         fail_always_by_table: Arc<Mutex<HashMap<String, String>>>,
         append_control_response: Arc<Mutex<Option<String>>>,
+        live_event_exists: Arc<Mutex<bool>>,
     }
 
     impl MockClickHouseState {
@@ -2039,6 +2041,29 @@ mod tests {
                 .unwrap_or(0)
         }
 
+        fn seed_rows(&self, table: &str, rows: Vec<Value>) {
+            self.rows_by_table
+                .lock()
+                .expect("mock rows mutex poisoned")
+                .insert(table.to_string(), rows);
+        }
+
+        fn query_count(&self, needle: &str) -> usize {
+            self.queries
+                .lock()
+                .expect("mock queries mutex poisoned")
+                .iter()
+                .filter(|query| query.contains(needle))
+                .count()
+        }
+
+        fn set_live_event_exists(&self, exists: bool) {
+            *self
+                .live_event_exists
+                .lock()
+                .expect("mock live_event_exists mutex poisoned") = exists;
+        }
+
         fn set_append_control_response(&self, response: Value) {
             *self
                 .append_control_response
@@ -2085,6 +2110,11 @@ mod tests {
             .get("query")
             .map(String::as_str)
             .unwrap_or(body.as_str());
+        state
+            .queries
+            .lock()
+            .expect("mock queries mutex poisoned")
+            .push(query.to_string());
         if query.contains("v_current_ingest_append_control") {
             return (
                 StatusCode::OK,
@@ -2096,9 +2126,39 @@ mod tests {
                     .unwrap_or_default(),
             );
         }
-        if query.contains("max(transitions.checkpoint_revision)) AS revision") {
-            let revision = state.max_u64("ingest_checkpoint_transitions", "checkpoint_revision");
-            return (StatusCode::OK, format!("{{\"revision\":{revision}}}\n"));
+        if query.contains("maxIf(transitions.checkpoint_revision") {
+            let rows = state.rows("ingest_checkpoint_transitions");
+            let max_revision = rows
+                .iter()
+                .filter_map(|row| row.get("checkpoint_revision").and_then(Value::as_u64))
+                .max()
+                .unwrap_or(0);
+            let operation_revision = rows
+                .iter()
+                .filter(|row| {
+                    row.get("operation_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|operation_id| {
+                            query.contains(&format!("transitions.operation_id = '{operation_id}'"))
+                        })
+                })
+                .filter_map(|row| row.get("checkpoint_revision").and_then(Value::as_u64))
+                .max()
+                .unwrap_or(0);
+            let row = format!(
+                "{{\"operation_revision\":{operation_revision},\"max_revision\":{max_revision}}}"
+            );
+            return (
+                StatusCode::OK,
+                if params
+                    .get("default_format")
+                    .is_some_and(|format| format == "JSON")
+                {
+                    format!("{{\"data\":[{row}]}}\n")
+                } else {
+                    format!("{row}\n")
+                },
+            );
         }
         if query.contains("max(readiness.readiness_revision)) AS revision") {
             let revision = state.max_u64(
@@ -2106,6 +2166,24 @@ mod tests {
                 "readiness_revision",
             );
             return (StatusCode::OK, format!("{{\"revision\":{revision}}}\n"));
+        }
+        if query.contains("toUInt8(1) AS existing") && query.contains("v_live_events") {
+            let existing = *state
+                .live_event_exists
+                .lock()
+                .expect("mock live_event_exists mutex poisoned");
+            let json_envelope = params
+                .get("default_format")
+                .is_some_and(|format| format == "JSON");
+            return (
+                StatusCode::OK,
+                match (existing, json_envelope) {
+                    (true, true) => "{\"data\":[{\"existing\":1}]}\n".to_string(),
+                    (true, false) => "{\"existing\":1}\n".to_string(),
+                    (false, true) => "{\"data\":[]}\n".to_string(),
+                    (false, false) => String::new(),
+                },
+            );
         }
         if query.contains("existing_count") {
             return (StatusCode::OK, "{\"existing_count\":0}\n".to_string());
@@ -3188,6 +3266,136 @@ mod tests {
         );
         assert_eq!(error.get("source_inode").and_then(Value::as_u64), Some(0));
         assert_eq!(metrics.err_rows_written.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn checkpoint_transition_allocates_from_one_aggregate_lookup() {
+        let state = MockClickHouseState::default();
+        state.seed_rows(
+            "ingest_checkpoint_transitions",
+            vec![
+                json!({"checkpoint_revision": 4, "operation_id": "earlier-a"}),
+                json!({"checkpoint_revision": 7, "operation_id": "earlier-b"}),
+            ],
+        );
+        let (clickhouse, mock_state) = spawn_mock_clickhouse_with_state(state).await;
+        let actor = PublicationActor::new(
+            clickhouse,
+            "test-host".to_string(),
+            "test-publisher".to_string(),
+        );
+        let mut transition = CheckpointTransition::from_checkpoint(sample_checkpoint());
+
+        let ack = actor
+            .persist_transition(&mut transition)
+            .await
+            .expect("persist checkpoint transition");
+
+        assert_eq!(ack.checkpoint_revision, 8);
+        assert_eq!(transition.checkpoint_revision, 8);
+        assert_eq!(mock_state.rows("ingest_checkpoint_transitions").len(), 3);
+        assert_eq!(
+            mock_state.query_count("maxIf(transitions.checkpoint_revision"),
+            1,
+            "operation idempotence and max revision should share one query"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn checkpoint_transition_response_loss_retry_reuses_original_revision() {
+        let mut transition = CheckpointTransition::from_checkpoint(sample_checkpoint());
+        let operation_id = transition.operation_id.clone();
+        let state = MockClickHouseState::default();
+        state.seed_rows(
+            "ingest_checkpoint_transitions",
+            vec![
+                json!({"checkpoint_revision": 3, "operation_id": operation_id}),
+                json!({"checkpoint_revision": 8, "operation_id": "later-operation"}),
+            ],
+        );
+        let (clickhouse, mock_state) = spawn_mock_clickhouse_with_state(state).await;
+        let actor = PublicationActor::new(
+            clickhouse,
+            "test-host".to_string(),
+            "test-publisher".to_string(),
+        );
+
+        let ack = actor
+            .persist_transition(&mut transition)
+            .await
+            .expect("retry persisted transition after response loss");
+
+        assert_eq!(ack.checkpoint_revision, 3);
+        assert_eq!(transition.checkpoint_revision, 3);
+        assert_eq!(
+            mock_state.rows("ingest_checkpoint_transitions").len(),
+            2,
+            "retry must not append a duplicate transition"
+        );
+        assert_eq!(
+            mock_state.query_count("maxIf(transitions.checkpoint_revision"),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn checkpoint_transition_revision_overflow_remains_an_error() {
+        let state = MockClickHouseState::default();
+        state.seed_rows(
+            "ingest_checkpoint_transitions",
+            vec![json!({
+                "checkpoint_revision": u64::MAX,
+                "operation_id": "different-operation",
+            })],
+        );
+        let (clickhouse, mock_state) = spawn_mock_clickhouse_with_state(state).await;
+        let actor = PublicationActor::new(
+            clickhouse,
+            "test-host".to_string(),
+            "test-publisher".to_string(),
+        );
+        let mut transition = CheckpointTransition::from_checkpoint(sample_checkpoint());
+
+        let error = actor
+            .persist_transition(&mut transition)
+            .await
+            .expect_err("checkpoint revision overflow must fail closed");
+
+        assert!(error.to_string().contains("checkpoint revision exhausted"));
+        assert_eq!(mock_state.rows("ingest_checkpoint_transitions").len(), 1);
+        assert_eq!(
+            mock_state.query_count("maxIf(transitions.checkpoint_revision"),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn insert_only_proof_stops_after_the_first_matching_live_event() {
+        let state = MockClickHouseState::default();
+        let (clickhouse, mock_state) = spawn_mock_clickhouse_with_state(state).await;
+        let actor = PublicationActor::new(
+            clickhouse,
+            "test-host".to_string(),
+            "test-publisher".to_string(),
+        );
+        let mut manifest = AppendManifest::default();
+        manifest.event_uids.insert("event-1".to_string());
+        manifest.session_ids.insert("session-1".to_string());
+
+        assert!(actor
+            .prove_insert_only(&mut manifest)
+            .await
+            .expect("prove absent replacement keys"));
+
+        mock_state.set_live_event_exists(true);
+        assert!(!actor
+            .prove_insert_only(&mut manifest)
+            .await
+            .expect("detect an existing replacement key"));
+        assert_eq!(mock_state.query_count("toUInt8(1) AS existing"), 2);
+        assert_eq!(mock_state.query_count("v_live_events"), 2);
+        assert_eq!(mock_state.query_count("LIMIT 1"), 2);
+        assert_eq!(mock_state.query_count("count()) AS existing_count"), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -42,6 +42,29 @@ struct AppendControlRow {
     manifest: Option<AppendManifestScope>,
 }
 
+/// One row in the combined publication-head/append-fence snapshot query.
+///
+/// ClickHouse requires every `UNION ALL` arm to have the same shape, so the
+/// inactive half of each row is populated with typed zero values. `row_kind`
+/// selects which half is meaningful: zero is a publication host and one is an
+/// append control.
+#[derive(Clone, Debug, Deserialize)]
+struct PublicationSnapshotRow {
+    row_kind: u8,
+    source_host: String,
+    publication_revision: u64,
+    head_count: u64,
+    head_fingerprint: String,
+    host: String,
+    control_revision: u64,
+    cache_epoch: u64,
+    state: String,
+    batch_id: String,
+    publisher_id: String,
+    manifest_json: String,
+    insert_only: u8,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
 struct PublicationSourceKey {
     source_host: String,
@@ -451,22 +474,19 @@ impl ClickHouseConversationRepository {
         )
     }
 
-    async fn capture_publication_snapshot(
-        &self,
-        phase: &'static str,
-    ) -> RepoResult<PublicationSnapshot> {
+    fn publication_snapshot_query(&self, phase: &'static str) -> String {
         let heads_marker = match phase {
             "capture" => "/* moraine:publication_snapshot:capture */",
             "revalidate" => "/* moraine:publication_snapshot:revalidate */",
             _ => unreachable!("publication snapshot phase is internal"),
         };
-        let heads_query = match self.publication_mode {
+        let heads_select = match self.publication_mode {
             PublicationConsistencyMode::Local => {
                 // The local publication actor allocates one globally monotonic
                 // revision, so its maximum is the complete request token.
                 let history = self.table_ref("published_source_generations");
                 format!(
-                    "{heads_marker}\nSELECT\n  toUInt64(ifNull(max(publication_revision), 0)) AS publication_revision\nFROM {history}\nFORMAT JSONEachRow"
+                    "SELECT\n  toUInt8(0) AS row_kind,\n  '' AS source_host,\n  toUInt64(ifNull(max(publication_revision), 0)) AS publication_revision,\n  toUInt64(0) AS head_count,\n  '' AS head_fingerprint,\n  '' AS host,\n  toUInt64(0) AS control_revision,\n  toUInt64(0) AS cache_epoch,\n  '' AS state,\n  '' AS batch_id,\n  '' AS publisher_id,\n  '' AS manifest_json,\n  toUInt8(0) AS insert_only\nFROM {history}"
                 )
             }
             PublicationConsistencyMode::Shared => {
@@ -475,12 +495,64 @@ impl ClickHouseConversationRepository {
                 // output alias `publication_revision` back into this groupArray.
                 let canonical_fingerprint = "hex(SHA256(arrayStringConcat(arraySort(groupArray(toJSONString(tuple(heads.source_host, heads.source_name, heads.source_file, heads.source_generation, heads.publication_revision)))), '\\0')))";
                 format!(
-                    "{heads_marker}\nSELECT\n  heads.source_host AS source_host,\n  toUInt64(ifNull(max(heads.publication_revision), 0)) AS publication_revision,\n  toUInt64(count()) AS head_count,\n  {canonical_fingerprint} AS head_fingerprint\nFROM {current_heads} AS heads\nGROUP BY heads.source_host\nORDER BY heads.source_host\nFORMAT JSONEachRow"
+                    "SELECT\n  toUInt8(0) AS row_kind,\n  toString(heads.source_host) AS source_host,\n  toUInt64(ifNull(max(heads.publication_revision), 0)) AS publication_revision,\n  toUInt64(count()) AS head_count,\n  toString({canonical_fingerprint}) AS head_fingerprint,\n  '' AS host,\n  toUInt64(0) AS control_revision,\n  toUInt64(0) AS cache_epoch,\n  '' AS state,\n  '' AS batch_id,\n  '' AS publisher_id,\n  '' AS manifest_json,\n  toUInt8(0) AS insert_only\nFROM {current_heads} AS heads\nGROUP BY heads.source_host"
                 )
             }
         };
-        let hosts: Vec<PublicationHostState> =
-            self.map_backend(self.query_rows(&heads_query, None).await)?;
+        let fence_marker = match phase {
+            "capture" => "/* moraine:append_fence:capture */",
+            "revalidate" => "/* moraine:append_fence:revalidate */",
+            _ => unreachable!("publication snapshot phase is internal"),
+        };
+        let controls_select = format!(
+            "SELECT\n  toUInt8(1) AS row_kind,\n  '' AS source_host,\n  toUInt64(0) AS publication_revision,\n  toUInt64(0) AS head_count,\n  '' AS head_fingerprint,\n  toString(host) AS host,\n  toUInt64(control_revision) AS control_revision,\n  toUInt64(cache_epoch) AS cache_epoch,\n  toString(state) AS state,\n  toString(batch_id) AS batch_id,\n  toString(publisher_id) AS publisher_id,\n  toString(manifest_json) AS manifest_json,\n  toUInt8(insert_only) AS insert_only\nFROM {}",
+            self.table_ref("v_current_ingest_append_control")
+        );
+
+        format!(
+            "{heads_marker}\n{fence_marker}\nSELECT\n  row_kind,\n  source_host,\n  publication_revision,\n  head_count,\n  head_fingerprint,\n  host,\n  control_revision,\n  cache_epoch,\n  state,\n  batch_id,\n  publisher_id,\n  manifest_json,\n  insert_only\nFROM (\n{heads_select}\nUNION ALL\n{controls_select}\n) AS snapshot_rows\nORDER BY row_kind, source_host, host\nFORMAT JSONEachRow"
+        )
+    }
+
+    async fn capture_publication_snapshot(
+        &self,
+        phase: &'static str,
+    ) -> RepoResult<PublicationSnapshot> {
+        let query = self.publication_snapshot_query(phase);
+        let rows: Vec<PublicationSnapshotRow> =
+            self.map_backend(self.query_rows(&query, None).await)?;
+        let mut hosts = Vec::new();
+        let mut controls = Vec::new();
+        for row in rows {
+            match row.row_kind {
+                0 => hosts.push(PublicationHostState {
+                    source_host: row.source_host,
+                    publication_revision: row.publication_revision,
+                    head_count: row.head_count,
+                    head_fingerprint: row.head_fingerprint,
+                }),
+                1 => controls.push(AppendControlRow {
+                    host: row.host,
+                    control_revision: row.control_revision,
+                    cache_epoch: row.cache_epoch,
+                    state: row.state,
+                    batch_id: row.batch_id,
+                    publisher_id: row.publisher_id,
+                    manifest_json: row.manifest_json,
+                    insert_only: row.insert_only,
+                    manifest: None,
+                }),
+                row_kind => {
+                    return Err(RepoError::backend(format!(
+                        "publication snapshot contains unknown row kind {row_kind}"
+                    )))
+                }
+            }
+        }
+        // Keep token construction deterministic even if a proxy or future
+        // query rewrite fails to retain the query's final ordering.
+        hosts.sort_by(|left, right| left.source_host.cmp(&right.source_host));
+        controls.sort_by(|left, right| left.host.cmp(&right.host));
 
         if self.publication_mode == PublicationConsistencyMode::Shared
             && hosts.iter().any(|host| host.source_host.is_empty())
@@ -490,17 +562,6 @@ impl ClickHouseConversationRepository {
             ));
         }
 
-        let fence_marker = match phase {
-            "capture" => "/* moraine:append_fence:capture */",
-            "revalidate" => "/* moraine:append_fence:revalidate */",
-            _ => unreachable!("publication snapshot phase is internal"),
-        };
-        let controls_query = format!(
-            "{fence_marker}\nSELECT\n  host,\n  toUInt64(control_revision) AS control_revision,\n  toUInt64(cache_epoch) AS cache_epoch,\n  state,\n  batch_id,\n  publisher_id,\n  manifest_json,\n  toUInt8(insert_only) AS insert_only\nFROM {}\nORDER BY host\nFORMAT JSONEachRow",
-            self.table_ref("v_current_ingest_append_control")
-        );
-        let mut controls: Vec<AppendControlRow> =
-            self.map_backend(self.query_rows(&controls_query, None).await)?;
         for control in &mut controls {
             control.parse_manifest();
         }
@@ -684,6 +745,47 @@ mod tests {
             BTreeSet::new(),
             BTreeSet::new(),
         )
+    }
+
+    fn repository_with_publication_mode(
+        mode: PublicationConsistencyMode,
+    ) -> ClickHouseConversationRepository {
+        let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
+            .expect("build ClickHouse client");
+        ClickHouseConversationRepository::new_with_publication_mode(
+            client,
+            RepoConfig::default(),
+            mode,
+        )
+    }
+
+    #[test]
+    fn local_snapshot_query_captures_heads_and_fences_in_one_ordered_statement() {
+        let repository = repository_with_publication_mode(PublicationConsistencyMode::Local);
+        let query = repository.publication_snapshot_query("capture");
+
+        assert!(query.contains("/* moraine:publication_snapshot:capture */"));
+        assert!(query.contains("/* moraine:append_fence:capture */"));
+        assert!(query.contains("FROM `moraine`.`published_source_generations`"));
+        assert!(query.contains("FROM `moraine`.`v_current_ingest_append_control`"));
+        assert_eq!(query.matches("UNION ALL").count(), 1);
+        assert_eq!(query.matches("FORMAT JSONEachRow").count(), 1);
+        assert!(query.contains("ORDER BY row_kind, source_host, host"));
+    }
+
+    #[test]
+    fn shared_snapshot_query_retains_host_head_proof_and_revalidation_markers() {
+        let repository = repository_with_publication_mode(PublicationConsistencyMode::Shared);
+        let query = repository.publication_snapshot_query("revalidate");
+
+        assert!(query.contains("/* moraine:publication_snapshot:revalidate */"));
+        assert!(query.contains("/* moraine:append_fence:revalidate */"));
+        assert!(query.contains("FROM `moraine`.`v_current_published_source_generations` AS heads"));
+        assert!(query.contains("GROUP BY heads.source_host"));
+        assert!(query.contains("heads.source_generation"));
+        assert!(query.contains("heads.publication_revision"));
+        assert!(query.contains("AS head_fingerprint"));
+        assert_eq!(query.matches("UNION ALL").count(), 1);
     }
 
     #[test]

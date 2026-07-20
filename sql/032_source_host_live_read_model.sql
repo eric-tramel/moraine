@@ -131,6 +131,9 @@ ALL INNER JOIN
 CREATE MATERIALIZED VIEW moraine.mv_search_documents_from_events
 TO moraine.search_documents
 AS
+-- Emit one replacement version for every event revision.  Empty and
+-- otherwise unsearchable text is a document tombstone: it supersedes older
+-- searchable text while the postings MV below naturally emits no terms.
 SELECT
   event_version AS doc_version,
   ingested_at,
@@ -159,8 +162,61 @@ SELECT
   token_usage_json,
   token_usage_buckets,
   token_usage_native_units
-FROM moraine.events
-WHERE lengthUTF8(replaceRegexpAll(text_content, '\\s+', '')) > 0;
+FROM moraine.events;
+
+-- Reconcile every current event version that is missing from the document
+-- index.  This both creates zero-length tombstones for revisions skipped by
+-- older MVs and closes the migration window while the MV above was absent:
+-- an event inserted by a concurrent writer during that window must not leave
+-- an older document version live.  Concurrent duplicate insertion is safe
+-- under the versioned ReplacingMergeTree key.
+INSERT INTO moraine.search_documents
+  (doc_version, ingested_at, event_uid, compacted_parent_uid, session_id,
+   session_date, source_host, source_name, harness, inference_provider,
+   endpoint_kind, source_file, source_generation, source_line_no,
+   source_offset, source_ref, record_ts, event_class, payload_type, actor_role,
+   name, phase, text_content, payload_json, token_usage_json,
+   token_usage_buckets, token_usage_native_units)
+SELECT
+  e.event_version AS doc_version,
+  e.ingested_at,
+  e.event_uid,
+  e.origin_event_id AS compacted_parent_uid,
+  e.session_id,
+  e.session_date,
+  e.source_host,
+  e.source_name,
+  e.harness,
+  e.inference_provider,
+  e.endpoint_kind,
+  e.source_file,
+  e.source_generation,
+  e.source_line_no,
+  e.source_offset,
+  e.source_ref,
+  e.record_ts,
+  e.event_kind AS event_class,
+  e.payload_type,
+  e.actor_kind AS actor_role,
+  e.tool_name AS name,
+  if(e.tool_phase != '', e.tool_phase, e.op_status) AS phase,
+  e.text_content,
+  e.payload_json,
+  e.token_usage_json,
+  e.token_usage_buckets,
+  e.token_usage_native_units
+FROM
+(
+  SELECT * FROM moraine.events FINAL
+) AS e
+LEFT ANTI JOIN
+(
+  SELECT source_host, event_uid, doc_version
+  FROM moraine.search_documents
+) AS d
+  ON e.source_host = d.source_host
+ AND e.event_uid = d.event_uid
+ AND e.event_version = d.doc_version;
 
 CREATE MATERIALIZED VIEW moraine.mv_search_postings
 TO moraine.search_postings
@@ -307,6 +363,9 @@ SELECT
   toUInt32(1) AS event_freq
 FROM moraine.search_postings;
 
+-- FINAL selects the latest document/tombstone version.  Its captured source
+-- identity can therefore be authorized directly by the published head;
+-- joining the much wider live-events relation is unnecessary.
 CREATE VIEW moraine.v_live_search_documents AS
 SELECT d.*
 FROM
@@ -346,23 +405,11 @@ FROM
     has_codex_mcp
   FROM moraine.search_documents FINAL
 ) AS d
-ALL INNER JOIN
-(
-  SELECT
-    source_host,
-    source_name,
-    source_file,
-    source_generation,
-    event_uid,
-    event_version
-  FROM moraine.v_live_events
-) AS e
-  ON d.source_host = e.source_host
- AND d.source_name = e.source_name
- AND d.source_file = e.source_file
- AND d.source_generation = e.source_generation
- AND d.event_uid = e.event_uid
- AND d.doc_version = e.event_version
+ALL INNER JOIN moraine.v_current_published_source_generations AS h
+  ON d.source_host = h.source_host
+ AND d.source_name = h.source_name
+ AND d.source_file = h.source_file
+ AND d.source_generation = h.source_generation
 WHERE d.doc_len > 0
   AND lengthUTF8(replaceRegexpAll(d.text_content, '\\s+', '')) > 0;
 
