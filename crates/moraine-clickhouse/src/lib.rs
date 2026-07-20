@@ -1911,6 +1911,40 @@ mod tests {
             }),
             "032 must not silently omit MATERIALIZED search columns"
         );
+        let document_mv = sql
+            .split_once("CREATE MATERIALIZED VIEW moraine.mv_search_documents_from_events")
+            .and_then(|(_, tail)| {
+                tail.split_once("INSERT INTO moraine.search_documents")
+                    .map(|(mv, _)| mv)
+            })
+            .expect("032 must materialize search documents before backfilling tombstones");
+        assert!(document_mv.contains("FROM moraine.events"));
+        assert!(
+            !document_mv.contains("WHERE"),
+            "032 must materialize one document version for every future event revision"
+        );
+        let tombstone_backfill = sql
+            .split_once("INSERT INTO moraine.search_documents")
+            .and_then(|(_, tail)| {
+                tail.split_once("CREATE MATERIALIZED VIEW moraine.mv_search_postings")
+                    .map(|(backfill, _)| backfill)
+            })
+            .expect("032 must reconcile missing latest-event document versions");
+        assert!(tombstone_backfill.contains("FROM moraine.events FINAL"));
+        assert!(tombstone_backfill.contains("e.event_version AS doc_version"));
+        assert!(tombstone_backfill.contains("source_host"));
+        assert!(tombstone_backfill.contains("LEFT ANTI JOIN"));
+        assert!(tombstone_backfill.contains("FROM moraine.search_documents"));
+        for identity in [
+            "e.source_host = d.source_host",
+            "e.event_uid = d.event_uid",
+            "e.event_version = d.doc_version",
+        ] {
+            assert!(
+                tombstone_backfill.contains(identity),
+                "032 document reconciliation must match `{identity}`"
+            );
+        }
         assert_eq!(
             sql.matches("ALL INNER JOIN").count(),
             6,
@@ -1918,9 +1952,50 @@ mod tests {
         );
         assert!(!sql.contains("ANY INNER JOIN"));
         assert!(!sql.contains("\nINNER JOIN"));
-        assert!(sql.contains("AND d.doc_version = e.event_version"));
+        let live_documents_view = sql
+            .split_once("CREATE VIEW moraine.v_live_search_documents AS")
+            .and_then(|(_, tail)| {
+                tail.split_once("CREATE VIEW moraine.v_live_search_postings AS")
+                    .map(|(view, _)| view)
+            })
+            .expect("032 must define a bounded live search-document view");
+        assert!(live_documents_view
+            .contains("ALL INNER JOIN moraine.v_current_published_source_generations AS h"));
+        assert!(!live_documents_view.contains("moraine.v_live_events"));
+        for identity in [
+            "d.source_host = h.source_host",
+            "d.source_name = h.source_name",
+            "d.source_file = h.source_file",
+            "d.source_generation = h.source_generation",
+        ] {
+            assert!(
+                live_documents_view.contains(identity),
+                "032 live search documents must authorize `{identity}`"
+            );
+        }
+        assert!(live_documents_view.contains("WHERE d.doc_len > 0"));
         assert!(sql.contains("CREATE VIEW moraine.v_live_search_postings"));
-        assert!(sql.contains("AND p.post_version = d.doc_version"));
+        let live_postings_view = sql
+            .split_once("CREATE VIEW moraine.v_live_search_postings AS")
+            .and_then(|(_, tail)| {
+                tail.split_once("CREATE VIEW moraine.search_term_stats AS")
+                    .map(|(view, _)| view)
+            })
+            .expect("032 must define a bounded live search-postings view");
+        assert!(live_postings_view.contains("FROM moraine.v_live_search_documents"));
+        for identity in [
+            "p.source_host = d.source_host",
+            "p.source_name = d.source_name",
+            "p.source_file = d.source_file",
+            "p.source_generation = d.source_generation",
+            "p.doc_id = d.event_uid",
+            "p.post_version = d.doc_version",
+        ] {
+            assert!(
+                live_postings_view.contains(identity),
+                "032 live search postings must authorize `{identity}`"
+            );
+        }
         assert!(sql.contains("FROM moraine.v_live_search_postings\nGROUP BY term"));
         assert!(sql.contains("FROM moraine.v_live_search_documents;"));
         assert!(sql.contains("INSERT INTO moraine.search_postings"));

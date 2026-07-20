@@ -430,6 +430,12 @@ struct TransitionRevisionRow {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+struct CheckpointRevisionStateRow {
+    operation_revision: u64,
+    max_revision: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
 struct AppendControlRow {
     control_revision: u64,
     cache_epoch: u64,
@@ -447,6 +453,12 @@ struct AppendControlRow {
 struct CountRow {
     #[serde(default)]
     existing_count: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ExistenceRow {
+    #[serde(default)]
+    existing: u8,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -863,7 +875,11 @@ impl PublicationActor {
         transition: &mut CheckpointTransition,
     ) -> Result<ReplayBarrierAck> {
         transition.canonicalize_source(&self.source_host);
-        if let Some(revision) = self.transition_revision(&transition.operation_id).await? {
+        let revision_state = self
+            .checkpoint_revision_state(&transition.operation_id)
+            .await?;
+        if revision_state.operation_revision > 0 {
+            let revision = revision_state.operation_revision;
             transition.checkpoint_revision = revision;
             transition.checkpoint.checkpoint_revision = revision;
             return Ok(ReplayBarrierAck {
@@ -871,7 +887,10 @@ impl PublicationActor {
                 operation_id: transition.operation_id.clone(),
             });
         }
-        let revision = self.next_checkpoint_revision().await?;
+        let revision = revision_state
+            .max_revision
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("checkpoint revision exhausted"))?;
         self.clickhouse
             .insert_json_rows_sync(
                 "ingest_checkpoint_transitions",
@@ -1306,17 +1325,14 @@ impl PublicationActor {
         let event_uids = sql_string_list(&manifest.event_uids);
         let session_ids = sql_string_list(&manifest.session_ids);
         let query = format!(
-            "SELECT toUInt64(count()) AS existing_count FROM {}.v_live_events \
-             WHERE event_uid IN ({}) OR session_id IN ({})",
+            "SELECT toUInt8(1) AS existing FROM {}.v_live_events \
+             WHERE event_uid IN ({}) OR session_id IN ({}) LIMIT 1",
             quote_ident(&self.clickhouse.config().database),
             event_uids,
             session_ids,
         );
-        let rows: Vec<CountRow> = self.clickhouse.query_rows(&query, None).await?;
-        let insert_only = rows
-            .first()
-            .map(|row| row.existing_count == 0)
-            .unwrap_or(false);
+        let rows: Vec<ExistenceRow> = self.clickhouse.query_rows(&query, None).await?;
+        let insert_only = rows.first().is_none_or(|row| row.existing == 0);
         manifest.insert_only = insert_only;
         // The digest covers the classification as well as the affected rows.
         manifest.digest = manifest.compute_digest();
@@ -1417,15 +1433,23 @@ impl PublicationActor {
             .filter(|revision| *revision > 0))
     }
 
-    async fn next_checkpoint_revision(&self) -> Result<u64> {
+    async fn checkpoint_revision_state(
+        &self,
+        operation_id: &str,
+    ) -> Result<CheckpointRevisionStateRow> {
         let query = format!(
-            "SELECT toUInt64(max(transitions.checkpoint_revision)) AS revision \
+            "SELECT toUInt64(maxIf(transitions.checkpoint_revision, \
+                                    transitions.operation_id = '{}')) AS operation_revision, \
+                    toUInt64(max(transitions.checkpoint_revision)) AS max_revision \
              FROM {}.ingest_checkpoint_transitions AS transitions \
              WHERE transitions.host = '{}'",
+            escape_string(operation_id),
             quote_ident(&self.clickhouse.config().database),
             escape_string(&self.source_host),
         );
-        self.next_revision(&query, "checkpoint").await
+        let rows: Vec<CheckpointRevisionStateRow> =
+            self.clickhouse.query_rows(&query, None).await?;
+        Ok(rows.into_iter().next().unwrap_or_default())
     }
 
     async fn next_publication_revision(&self) -> Result<u64> {

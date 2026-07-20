@@ -578,10 +578,17 @@ impl ClickHouseClient {
                 bail!("cannot prepare a non-tombstone MCP session with no authorized events");
             }
             let dirty_revision = self.session_dirty_revision(session_id).await?;
-            if let Some(candidate) = self
-                .mcp_open_candidate_header(session_id, candidate_publication_id)
-                .await?
-            {
+            // The first ordinary-append attempt embeds the Snowflake allocated
+            // by this invocation in its candidate id, so that id cannot exist
+            // yet. Stable replacement ids and retry attempts still probe for
+            // a durable candidate, preserving response-loss recovery.
+            let candidate = if attempt == 0 && first_generation.is_some() {
+                None
+            } else {
+                self.mcp_open_candidate_header(session_id, candidate_publication_id)
+                    .await?
+            };
+            if let Some(candidate) = candidate {
                 if candidate.source_revision == source_revision
                     && candidate.dirty_revision == dirty_revision
                     && candidate.required_heads_fingerprint
@@ -729,20 +736,7 @@ impl ClickHouseClient {
         session_id: &str,
         required_heads: &[McpOpenSourceHead],
     ) -> Result<u64> {
-        let query = format!(
-            "SELECT\n\
-               if(count() = 0, toUInt64(0), toUInt64(cityHash64(arraySort(groupArray(tuple(event_uid, event_version)))))) AS source_revision\n\
-             FROM (\n\
-               SELECT event_uid, event_version\n\
-               FROM {}.events AS e FINAL\n\
-               WHERE session_id = {} AND ({})\n\
-               ORDER BY event_uid ASC\n\
-             )\n\
-             FORMAT JSONEachRow",
-            escape_identifier(&self.cfg.database),
-            escape_literal(session_id),
-            source_head_filter(required_heads, "e"),
-        );
+        let query = session_source_revision_sql(&self.cfg.database, session_id, required_heads);
         let rows: Vec<SourceRevisionRow> = self
             .query_json_each_row(&query, Some(&self.cfg.database))
             .await?;
@@ -1038,7 +1032,13 @@ impl ClickHouseClient {
         required_heads: &[McpOpenSourceHead],
     ) -> Result<()> {
         let database = escape_identifier(&self.cfg.database);
-        let ctes = projection_ctes(&database, session_id, source_revision, required_heads);
+        let ctes = projection_ctes(
+            &database,
+            session_id,
+            source_revision,
+            required_heads,
+            false,
+        );
         let statement = format!(
             "INSERT INTO {database}.mcp_open_events\n\
              (event_uid, slot, candidate_generation, generation, session_id, event_order, turn_seq,\n\
@@ -1069,7 +1069,13 @@ impl ClickHouseClient {
         required_heads: &[McpOpenSourceHead],
     ) -> Result<()> {
         let database = escape_identifier(&self.cfg.database);
-        let ctes = projection_ctes(&database, session_id, source_revision, required_heads);
+        let ctes = projection_ctes(
+            &database,
+            session_id,
+            source_revision,
+            required_heads,
+            false,
+        );
         let message = "(event_class = 'message' OR (event_class = 'event_msg' AND payload_type IN ('user_message', 'agent_message', 'message', 'text')))";
         let user_message = format!("(lowerUTF8(actor_role) = 'user' AND {message})");
         let assistant_message = format!("(lowerUTF8(actor_role) = 'assistant' AND {message})");
@@ -1176,6 +1182,7 @@ impl ClickHouseClient {
             session_id,
             expected_source_revision,
             required_heads,
+            true,
         );
         let mcp_name_predicate = crate::mcp_tool_names::sql_predicate("name");
         let required_heads_sql = source_heads_sql(required_heads);
@@ -1299,6 +1306,27 @@ fn publish_legacy_candidate_heads_sql(
     )
 }
 
+fn session_source_revision_sql(
+    database: &str,
+    session_id: &str,
+    required_heads: &[McpOpenSourceHead],
+) -> String {
+    format!(
+        "SELECT\n\
+           if(count() = 0, toUInt64(0), toUInt64(cityHash64(arraySort(groupArray(tuple(event_uid, event_version)))))) AS source_revision\n\
+         FROM (\n\
+           SELECT event_uid, event_version\n\
+           FROM {}.events AS e FINAL\n\
+           PREWHERE e.session_id = {}\n\
+           WHERE {}\n\
+         )\n\
+         FORMAT JSONEachRow",
+        escape_identifier(database),
+        escape_literal(session_id),
+        source_head_filter(required_heads, "e"),
+    )
+}
+
 fn current_session_source_heads_sql(database: &str, session_id: &str) -> String {
     let database = escape_identifier(database);
     format!(
@@ -1322,7 +1350,7 @@ fn current_session_source_heads_sql(database: &str, session_id: &str) -> String 
          INNER JOIN current_heads AS h\n\
            ON h.source_host = e.source_host AND h.source_name = e.source_name\n\
           AND h.source_file = e.source_file AND h.source_generation = e.source_generation\n\
-         WHERE e.session_id = {}\n\
+         PREWHERE e.session_id = {}\n\
          ORDER BY source_host, source_name, source_file\n\
          FORMAT JSONEachRow",
         escape_literal(session_id),
@@ -1346,8 +1374,8 @@ fn session_source_heads_for_snapshot_sql(
            toUInt64(tupleElement(head, 5)) AS publication_revision\n\
          FROM {database}.events AS e FINAL\n\
          ARRAY JOIN desired_heads AS head\n\
-         WHERE e.session_id = {session_id}\n\
-           AND e.source_host = tupleElement(head, 1)\n\
+         PREWHERE e.session_id = {session_id}\n\
+         WHERE e.source_host = tupleElement(head, 1)\n\
            AND e.source_name = tupleElement(head, 2)\n\
            AND e.source_file = tupleElement(head, 3)\n\
            AND e.source_generation = tupleElement(head, 4)\n\
@@ -1362,9 +1390,28 @@ fn projection_ctes(
     session_id: &str,
     source_revision: u64,
     required_heads: &[McpOpenSourceHead],
+    revalidate_source_revision: bool,
 ) -> String {
     let session_id = escape_literal(session_id);
     let event_type = event_type_sql();
+    let (canonical_revision, projected_source_revision, source_revision_gate) =
+        if revalidate_source_revision {
+            (
+                "canonical_revision AS (\n\
+                   SELECT if(count() = 0, toUInt64(0), toUInt64(cityHash64(arraySort(groupArray(tuple(event_uid, event_version)))))) AS source_revision\n\
+                   FROM canonical\n\
+                 ),\n\
+                 ",
+                "revision.source_revision".to_string(),
+                format!(
+                    "CROSS JOIN canonical_revision AS revision\n\
+                     WHERE revision.source_revision = {source_revision}\n\
+                     "
+                ),
+            )
+        } else {
+            ("", format!("toUInt64({source_revision})"), String::new())
+        };
     format!(
         "WITH\n\
          canonical AS (\n\
@@ -1376,21 +1423,18 @@ fn projection_ctes(
              text_content, payload_json, token_usage_json, endpoint_kind, token_usage_buckets,\n\
              token_usage_native_units, cwd, event_version\n\
            FROM {database}.events AS e FINAL\n\
-           WHERE session_id = {session_id} AND ({source_head_filter})\n\
+           PREWHERE e.session_id = {session_id}\n\
+           WHERE {source_head_filter}\n\
          ),\n\
-         canonical_revision AS (\n\
-           SELECT if(count() = 0, toUInt64(0), toUInt64(cityHash64(arraySort(groupArray(tuple(event_uid, event_version)))))) AS source_revision\n\
-           FROM canonical\n\
-         ),\n\
+         {canonical_revision}\
          ordered AS (\n\
            SELECT canonical.*,\n\
              ifNull(parseDateTime64BestEffortOrNull(record_ts), ingested_at) AS event_time,\n\
              row_number() OVER canonical_window AS event_order,\n\
              if(toUInt32(turn_index) > 0, toUInt32(turn_index), greatest(toUInt32(1), toUInt32(sum(if(actor_role = 'user' AND event_class = 'message', 1, 0)) OVER canonical_rows))) AS turn_seq,\n\
-             revision.source_revision AS source_revision\n\
+             {projected_source_revision} AS source_revision\n\
            FROM canonical\n\
-           CROSS JOIN canonical_revision AS revision\n\
-           WHERE revision.source_revision = {source_revision}\n\
+           {source_revision_gate}\
            WINDOW\n\
              canonical_window AS (PARTITION BY session_id ORDER BY ifNull(parseDateTime64BestEffortOrNull(record_ts), ingested_at), source_host, source_file, source_generation, source_offset, source_line_no, event_uid),\n\
              canonical_rows AS (PARTITION BY session_id ORDER BY ifNull(parseDateTime64BestEffortOrNull(record_ts), ingested_at), source_host, source_file, source_generation, source_offset, source_line_no, event_uid ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)\n\
@@ -1444,8 +1488,8 @@ mod tests {
     use super::{
         canonical_source_heads, current_session_source_heads_sql, projection_ctes,
         projection_session_ids, publish_legacy_candidate_heads_sql,
-        session_source_heads_for_snapshot_sql, source_head_filter, source_heads_fingerprint,
-        McpOpenSourceHead, SourceHeadRow,
+        session_source_heads_for_snapshot_sql, session_source_revision_sql, source_head_filter,
+        source_heads_fingerprint, McpOpenSourceHead, SourceHeadRow,
     };
     use std::collections::BTreeSet;
 
@@ -1486,14 +1530,31 @@ mod tests {
         assert!(filter.contains("e.source_host = 'host-b'"));
         assert!(filter.contains("e.source_generation = 7"));
 
-        let ctes = projection_ctes("moraine", "shared-session", 42, &canonical);
+        let ctes = projection_ctes("moraine", "shared-session", 42, &canonical, true);
         let unsupported_final_alias = ["FINAL", "AS"].join(" ");
-        assert!(ctes.contains("session_id = 'shared-session'"));
+        assert!(ctes.contains("PREWHERE e.session_id = 'shared-session'"));
         assert!(ctes.contains("FROM moraine.events AS e FINAL"));
         assert!(!ctes.contains(&unsupported_final_alias));
         assert!(ctes.contains("e.source_host = 'host-a'"));
         assert!(ctes.contains("e.source_host = 'host-b'"));
         assert!(ctes.contains("source_host, source_file, source_generation"));
+        assert!(ctes.contains("canonical_revision AS"));
+        assert!(ctes.contains("WHERE revision.source_revision = 42"));
+
+        let child_ctes = projection_ctes("moraine", "shared-session", 42, &canonical, false);
+        assert!(!child_ctes.contains("canonical_revision AS"));
+        assert!(!child_ctes.contains("CROSS JOIN canonical_revision"));
+        assert!(child_ctes.contains("toUInt64(42) AS source_revision"));
+    }
+
+    #[test]
+    fn source_revision_scan_prewhere_has_no_redundant_ordering() {
+        let required = [head("host-a", "/sessions/a.jsonl", 3, 10)];
+        let sql = session_source_revision_sql("moraine", "session-a", &required);
+
+        assert!(sql.contains("FROM `moraine`.events AS e FINAL"));
+        assert!(sql.contains("PREWHERE e.session_id = 'session-a'"));
+        assert!(!sql.contains("ORDER BY event_uid"));
     }
 
     #[test]
@@ -1517,6 +1578,7 @@ mod tests {
         assert!(sql.contains("h.source_host AS source_host"));
         assert!(sql.contains("h.source_name AS source_name"));
         assert!(sql.contains("h.source_file AS source_file"));
+        assert!(sql.contains("PREWHERE e.session_id = 'session-a'"));
         assert!(!sql.contains("tuple(source_generation, publication_revision)"));
         assert!(!sql.contains("max(publication_revision)"));
     }
@@ -1529,6 +1591,7 @@ mod tests {
         assert!(sql.contains("e.source_host AS source_host"));
         assert!(sql.contains("e.source_name AS source_name"));
         assert!(sql.contains("e.source_file AS source_file"));
+        assert!(sql.contains("PREWHERE e.session_id = 'session-a'"));
 
         let row: SourceHeadRow = serde_json::from_str(
             r#"{"source_host":"host-a","source_name":"codex","source_file":"/sessions/a.jsonl","source_generation":3,"publication_revision":10}"#,

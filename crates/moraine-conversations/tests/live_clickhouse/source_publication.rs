@@ -786,9 +786,29 @@ async fn assert_durable_boundary_state(
         ),
     )
     .await?;
-    if physical_event_count != 4 || physical_document_count != 3 {
+    let empty_tombstone_count = scalar_u64(
+        clickhouse,
+        database,
+        &format!(
+            "SELECT toUInt64(count()) AS value FROM `{}`.`search_documents` FINAL \
+             WHERE source_host = '{}' AND source_name = '{}' AND source_file = '{}' \
+               AND source_generation = 2 AND event_uid = '{}' \
+               AND doc_version = 2 AND doc_len = 0 AND text_content = '' \
+             FORMAT JSONEachRow",
+            database.as_str(),
+            HOST_A,
+            SOURCE,
+            SOURCE_FILE,
+            EMPTY_UIDS.at(2),
+        ),
+    )
+    .await?;
+    // Every event revision now has a search-document replacement row. The
+    // fourth row is the empty-text tombstone that keeps an older searchable
+    // version from resurfacing; v_live_search_documents still filters it.
+    if physical_event_count != 4 || physical_document_count != 4 || empty_tombstone_count != 1 {
         bail!(
-            "{boundary}: reconstructed physical generation was incomplete: events={physical_event_count}, documents={physical_document_count}"
+            "{boundary}: reconstructed physical generation was incomplete: events={physical_event_count}, documents={physical_document_count}, empty_tombstones={empty_tombstone_count}"
         );
     }
 
@@ -1588,6 +1608,17 @@ pub(super) async fn run(
             "changed-session",
             "replacementterm commonterm",
             2,
+        ),
+        event(
+            HOST_A,
+            SOURCE,
+            SOURCE_FILE,
+            2,
+            4,
+            EMPTY_UIDS.at(2),
+            "empty-session",
+            "oldemptyterm commonterm",
+            1,
         ),
         event(
             HOST_A,

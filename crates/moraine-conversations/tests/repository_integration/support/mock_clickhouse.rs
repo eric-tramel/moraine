@@ -97,6 +97,7 @@ pub(crate) struct MockOptions {
 #[derive(Default)]
 pub(crate) struct MockState {
     pub(crate) queries: Mutex<Vec<String>>,
+    pub(crate) publication_snapshot_queries: Mutex<Vec<String>>,
     pub(crate) query_ids: Mutex<Vec<Option<String>>>,
     pub(crate) request_params: Mutex<Vec<HashMap<String, String>>>,
     pub(crate) options: MockOptions,
@@ -133,31 +134,47 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
         // Publication capture/revalidation is repository infrastructure, not
         // part of the individual query scripts below. Keep the legacy
         // fixtures focused on the operation under test while returning one
-        // stable published source and an idle append fence.
+        // combined, stable publication-head and append-fence snapshot.
         if query.contains("moraine:publication_snapshot:") {
+            state
+                .publication_snapshot_queries
+                .lock()
+                .expect("publication snapshot query lock")
+                .push(query);
             return (
                 StatusCode::OK,
-                json_each_row(json!([{
-                    "source_host": "",
-                    "publication_revision": 1_u64,
-                    "head_count": 1_u64,
-                    "head_fingerprint": "fixture-heads-v1"
-                }])),
-            );
-        }
-        if query.contains("moraine:append_fence:") {
-            return (
-                StatusCode::OK,
-                json_each_row(json!([{
-                    "host": "host-a",
-                    "control_revision": 1_u64,
-                    "cache_epoch": 1_u64,
-                    "state": "idle",
-                    "batch_id": "",
-                    "publisher_id": "publisher-a",
-                    "manifest_json": "",
-                    "insert_only": 0_u8
-                }])),
+                json_each_row(json!([
+                    {
+                        "row_kind": 0_u8,
+                        "source_host": "",
+                        "publication_revision": 1_u64,
+                        "head_count": 0_u64,
+                        "head_fingerprint": "",
+                        "host": "",
+                        "control_revision": 0_u64,
+                        "cache_epoch": 0_u64,
+                        "state": "",
+                        "batch_id": "",
+                        "publisher_id": "",
+                        "manifest_json": "",
+                        "insert_only": 0_u8
+                    },
+                    {
+                        "row_kind": 1_u8,
+                        "source_host": "",
+                        "publication_revision": 0_u64,
+                        "head_count": 0_u64,
+                        "head_fingerprint": "",
+                        "host": "host-a",
+                        "control_revision": 1_u64,
+                        "cache_epoch": 1_u64,
+                        "state": "idle",
+                        "batch_id": "",
+                        "publisher_id": "publisher-a",
+                        "manifest_json": "",
+                        "insert_only": 0_u8
+                    }
+                ])),
             );
         }
         state
@@ -2208,6 +2225,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
         .then(|| options.scripted_responses.iter().cloned().collect());
     let state = Arc::new(MockState {
         queries: Mutex::default(),
+        publication_snapshot_queries: Mutex::default(),
         query_ids: Mutex::default(),
         request_params: Mutex::default(),
         options,
