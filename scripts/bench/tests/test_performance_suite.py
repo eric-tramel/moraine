@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import tempfile
 import unittest
 from unittest import mock
@@ -299,6 +300,41 @@ class EvidenceTests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.TestCase):
+    def test_prepare_builds_canonicalizes_relative_output_for_sandbox_mount(self) -> None:
+        class StopAfterBuildPath(Exception):
+            pass
+
+        observed: dict[str, Path] = {}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "candidate"
+            repository.mkdir()
+            absolute_output = root / "output"
+            relative_output = Path(os.path.relpath(absolute_output, Path.cwd()))
+
+            def stop_after_path(_repo, build_output, **_kwargs):
+                observed["output"] = build_output
+                raise StopAfterBuildPath
+
+            with (
+                mock.patch.object(suite, "_require_clean"),
+                mock.patch.object(suite, "ensure_runtime_build_image"),
+                mock.patch.object(
+                    suite,
+                    "build_release_binaries_in_docker",
+                    side_effect=stop_after_path,
+                ),
+            ):
+                with self.assertRaises(StopAfterBuildPath):
+                    suite._prepare_builds(
+                        {"candidate": repository},
+                        relative_output,
+                        authoritative=False,
+                    )
+
+        self.assertTrue(observed["output"].is_absolute())
+        self.assertEqual(observed["output"], absolute_output.resolve() / "candidate")
+
     def test_setup_failure_reports_each_owned_cleanup_failure(self) -> None:
         envelope = mock.Mock()
         envelope.owned_id = "perf-0123456789abcdef"
