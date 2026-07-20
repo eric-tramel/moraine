@@ -277,6 +277,8 @@ impl CheckpointTransition {
         hasher.update(self.checkpoint.last_offset.to_le_bytes());
         hasher.update(self.checkpoint.last_line_no.to_le_bytes());
         hasher.update(self.checkpoint.cursor_json.as_bytes());
+        hasher.update(self.checkpoint.source_fingerprint.to_le_bytes());
+        hasher.update(self.checkpoint.schema_fingerprint.to_le_bytes());
         hasher.update(self.scan_inode.to_le_bytes());
         hasher.update(self.scan_boundary.to_le_bytes());
         hasher.update([self.final_scan_complete as u8]);
@@ -1755,6 +1757,38 @@ mod tests {
         assert_ne!(
             left.operation_id,
             CheckpointTransition::begin_replay(&checkpoint(3), 42, 100, "policy").operation_id
+        );
+    }
+
+    #[test]
+    fn checkpoint_operation_identity_tracks_cursor_but_not_append_fence() {
+        let mut value = checkpoint(1);
+        value.compatibility_prepared = true;
+        value.backend_caught_up = true;
+        let original = CheckpointTransition::from_checkpoint(value.clone()).operation_id;
+
+        value.append_batch_id = "retry-fence".to_string();
+        value.cache_epoch = 99;
+        assert_eq!(
+            CheckpointTransition::from_checkpoint(value.clone()).operation_id,
+            original,
+            "a response-loss retry may establish a new append fence"
+        );
+
+        value.source_fingerprint = 7;
+        let source_changed = CheckpointTransition::from_checkpoint(value.clone()).operation_id;
+        assert_ne!(source_changed, original);
+
+        value.schema_fingerprint = 11;
+        assert_ne!(
+            CheckpointTransition::from_checkpoint(value.clone()).operation_id,
+            source_changed
+        );
+
+        value.last_offset += 1;
+        assert_ne!(
+            CheckpointTransition::from_checkpoint(value).operation_id,
+            original
         );
     }
 
