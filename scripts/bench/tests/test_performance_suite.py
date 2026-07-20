@@ -599,6 +599,32 @@ class CliArtifactTests(unittest.TestCase):
         with self.assertRaisesRegex(suite.SuiteFailure, "non-authoritative"):
             suite._validate_local_comparison(document)
 
+    def test_validate_path_accepts_local_comparison(self) -> None:
+        artifact_path = "candidate/pair-1/artifacts/qps-research.json"
+        suite_identity = digest("local-suite")
+        candidate_identity = digest("candidate-build")
+        document = {
+            "schema_version": "moraine-local-comparison-v1",
+            "mode": "local_comparative",
+            "authoritative": False,
+            "pairs": 1,
+            "pair_results": [{}],
+            "suite_definition_sha256": suite_identity,
+            "builds": {"candidate": candidate_identity},
+            "artifacts": [artifact_path],
+            "artifact_bindings": {
+                artifact_path: {
+                    "suite_definition_sha256": suite_identity,
+                    "build_identity_sha256": candidate_identity,
+                    "semantic_oracle_sha256": digest("oracle"),
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "local-comparison.json"
+            path.write_text(json.dumps(document), encoding="utf-8")
+            validate_path(path)
+
     def test_autoresearch_metrics_use_candidate_end_to_end_evidence(self) -> None:
         pair_results = [
             {

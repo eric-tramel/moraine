@@ -2119,7 +2119,12 @@ def validate_path(path: Path) -> None:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise SuiteFailure(f"cannot load {path}: {error}") from error
-    if isinstance(document, dict) and document.get("document_type") == "suite_manifest":
+    if (
+        isinstance(document, dict)
+        and document.get("schema_version") == "moraine-local-comparison-v1"
+    ):
+        _validate_local_comparison(document)
+    elif isinstance(document, dict) and document.get("document_type") == "suite_manifest":
         load_suite_manifest(path)
     elif isinstance(document, dict) and document.get("document_type") == "native_central_burst":
         validate_native_burst_artifact(document)
