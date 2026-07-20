@@ -555,6 +555,13 @@ def _publication_append_warmup_timeout(timeout_s: float) -> float:
     return max(PUBLICATION_APPEND_WARMUP_MIN_TIMEOUT_S, timeout_s)
 
 
+def _publication_append_term_count(timeout_s: float) -> int:
+    return max(
+        64,
+        math.ceil(timeout_s / PUBLICATION_APPEND_POLL_INTERVAL_S) + 2,
+    )
+
+
 def _validate_publication_capture_storage(
     control_tables: Mapping[str, Mapping[str, int]], *, logical_head_count: int
 ) -> None:
@@ -1580,15 +1587,16 @@ def run_source_publication_append_probe(
             )
         ]
         source_host_before = _source_host_column_resources(url)
-        term_count = max(
-            64,
-            math.ceil(timeout_s / PUBLICATION_APPEND_POLL_INTERVAL_S) + 2,
+        warmup_timeout_s = _publication_append_warmup_timeout(timeout_s)
+        events = build_append_probe_events(
+            samples + 1,
+            term_count=_publication_append_term_count(timeout_s),
+            first_term_count=_publication_append_term_count(warmup_timeout_s),
         )
-        events = build_append_probe_events(samples + 1, term_count=term_count)
         warmup = run_owned_sandbox_append_probe(
             sandbox,
             events[:1],
-            timeout_s=_publication_append_warmup_timeout(timeout_s),
+            timeout_s=warmup_timeout_s,
             poll_interval_s=PUBLICATION_APPEND_POLL_INTERVAL_S,
         )
         if warmup.status != "pass":

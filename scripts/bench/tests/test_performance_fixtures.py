@@ -241,8 +241,28 @@ class ScheduleAndTermBankTests(unittest.TestCase):
         )
         self.assertEqual(events, build_append_probe_events(3, term_count=4))
 
+        expanded_warmup = build_append_probe_events(
+            3, term_count=4, first_term_count=7
+        )
+        self.assertEqual(
+            [len(event["probe_terms"]) for event in expanded_warmup],
+            [7, 4, 4],
+        )
+        self.assertEqual(
+            [event["expected_source_offset"] for event in expanded_warmup],
+            sorted(event["expected_source_offset"] for event in expanded_warmup),
+        )
+        self.assertEqual(
+            expanded_warmup,
+            build_append_probe_events(3, term_count=4, first_term_count=7),
+        )
+
         with self.assertRaisesRegex(FixtureError, "bounded positive"):
             build_append_probe_events(0)
+        with self.assertRaisesRegex(FixtureError, "bounded positive"):
+            build_append_probe_events(1, first_term_count=0)
+        with self.assertRaisesRegex(FixtureError, "bounded positive"):
+            build_append_probe_events(1, first_term_count=1.5)  # type: ignore[arg-type]
 
     def test_query_schedule_is_open_deterministic_and_response_independent(self) -> None:
         schedule = open_query_schedule(self.recipe, "research", 4)
