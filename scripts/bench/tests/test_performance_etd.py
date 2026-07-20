@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import os
 import sys
 import tempfile
@@ -324,6 +325,88 @@ class EtdScenarioTests(unittest.TestCase):
         timed_out = self.run_event(self.always_miss, timeout_s=0.003)
         self.assertEqual(timed_out.samples[0]["error_code"], "visibility_timeout")
         self.assertEqual(timed_out.metrics["source_etd_p95"]["censoring"], "right")
+
+    def test_search_failures_retain_the_safe_protocol_class(self) -> None:
+        cases = (
+            (scenarios.EtdSampleFailure("probe_specific"), "probe_specific"),
+            (scenarios.RequestTimeout("timeout"), "search_timeout"),
+            (
+                scenarios.AdmissionRejected("admission"),
+                "search_admission_rejected",
+            ),
+            (scenarios.McpToolError("tool"), "search_tool_error"),
+            (scenarios.McpProtocolError("protocol"), "search_protocol_error"),
+            (
+                scenarios.MalformedResult("malformed"),
+                "search_malformed_result",
+            ),
+            (scenarios.ScenarioError("scenario"), "search_scenario_error"),
+        )
+        for error, expected in cases:
+            with self.subTest(expected=expected):
+                def factory(_clock, _event, failure=error):
+                    def probe(_query):
+                        raise failure
+
+                    return probe
+
+                result = self.run_event(factory)
+                self.assertEqual(result.samples[0]["error_code"], expected)
+
+    def test_retryable_read_model_refresh_is_not_a_terminal_search_error(self) -> None:
+        attempts = 0
+
+        def factory(clock, _event):
+            def probe(_query):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise scenarios.McpReadModelRefreshing(1.0)
+                clock.advance_ms(1)
+                return scenarios.EtdProbeResult(
+                    True, visible_result(self.event), 1.0
+                )
+
+            return probe
+
+        result = self.run_event(factory)
+        self.assertEqual(result.status, "pass")
+        self.assertEqual(attempts, 2)
+        self.assertEqual(result.samples[0]["term_use_count"], 2)
+        self.assertIsNone(result.samples[0]["last_miss_ms"])
+        self.assertEqual(result.samples[0]["source_interval"]["censoring"], "left")
+
+    def test_search_result_decodes_only_the_exact_refresh_contract_as_retryable(self) -> None:
+        refresh = {
+            "isError": True,
+            "structuredContent": {
+                "error": {
+                    "code": "internal_error",
+                    "details": {
+                        "reason": "read_model_refresh",
+                        "retryable": True,
+                        "retry_after_ms": 250,
+                    },
+                }
+            },
+        }
+        with self.assertRaises(scenarios.McpReadModelRefreshing) as raised:
+            scenarios._StdioJsonRpcClient.decode_search_result(refresh)
+        self.assertEqual(raised.exception.retry_after_ms, 250.0)
+
+        changed = copy.deepcopy(refresh)
+        changed["structuredContent"]["error"]["details"]["reason"] = "other"
+        with self.assertRaises(scenarios.McpToolError):
+            scenarios._StdioJsonRpcClient.decode_search_result(changed)
+
+        for invalid_delay in (True, 0, 2_001, float("nan")):
+            with self.subTest(invalid_delay=invalid_delay):
+                changed = copy.deepcopy(refresh)
+                changed["structuredContent"]["error"]["details"][
+                    "retry_after_ms"
+                ] = invalid_delay
+                with self.assertRaises(scenarios.McpToolError):
+                    scenarios._StdioJsonRpcClient.decode_search_result(changed)
 
     def test_materialized_insert_ack_failure_does_not_claim_visibility_success(self) -> None:
         result = self.run_event(self.immediate_hit, ack_reader=lambda: [], timeout_s=0.005)
