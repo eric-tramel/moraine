@@ -1642,7 +1642,10 @@ def run_source_publication_append_probe(
     finally:
         sandbox.down()
     if measured.status != "pass":
-        raise SuiteFailure("source-publication append probe contained invalid samples")
+        raise SuiteFailure(
+            "source-publication append probe contained invalid samples: "
+            f"diagnostics={list(measured.diagnostics)!r}"
+        )
     append = _append_probe_latency(list(measured.samples))
     head = {
         "before": head_before,
