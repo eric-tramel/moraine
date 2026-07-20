@@ -1005,6 +1005,11 @@ def _prepare_builds(
 ) -> tuple[dict[str, PreparedBuild], Mapping[str, Any]]:
     prepared: dict[str, PreparedBuild] = {}
     common_recipe: Optional[Mapping[str, Any]] = None
+    # The sandbox mounts this directory into a container and deliberately
+    # rejects relative/symlinked paths. CLI examples use repository-relative
+    # output directories, so canonicalize the build subtree before exporting
+    # any binary identity from it.
+    output = output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     ensure_runtime_build_image(SUITE_ROOT)
     for index, (arm, repo) in enumerate(repositories.items()):
