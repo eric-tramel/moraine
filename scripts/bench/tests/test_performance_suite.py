@@ -920,7 +920,7 @@ FORMAT JSONEachRow""",
                     source_host_before, source_host_after
                 ),
             },
-            "resources": {"authoritative": False},
+            "resources": suite.non_authoritative_resource_evidence(),
             "artifact_sha256": "",
         }
         document["artifact_sha256"] = sha256_json(
@@ -947,6 +947,11 @@ FORMAT JSONEachRow""",
         changed = copy.deepcopy(document)
         changed["publication_head"]["head_write_count"] = 1
         with self.assertRaisesRegex(suite.SuiteFailure, "control evidence"):
+            suite.validate_source_publication_probe(changed)
+
+        changed = copy.deepcopy(document)
+        changed["resources"]["memory_peak_bytes"] = -1
+        with self.assertRaisesRegex(suite.SuiteFailure, "memory_peak_bytes"):
             suite.validate_source_publication_probe(changed)
 
 

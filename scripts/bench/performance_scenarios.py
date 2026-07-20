@@ -1603,6 +1603,7 @@ ETD_SAMPLE_KEYS = frozenset(
         "term_sha256",
         "batch_sequence",
         "publication_durable_ms",
+        "db_ack_lower_ms",
         "db_ack_ms",
         "last_miss_ms",
         "first_hit_ms",
@@ -1900,6 +1901,7 @@ def _failed_etd_sample(event: Mapping[str, Any], error_code: str) -> dict[str, A
         "term_sha256": _term_sha256(None),
         "batch_sequence": None,
         "publication_durable_ms": None,
+        "db_ack_lower_ms": None,
         "db_ack_ms": None,
         "last_miss_ms": None,
         "first_hit_ms": None,
@@ -2080,6 +2082,7 @@ def _run_one_etd_event(
                 "term_sha256": _term_sha256(last_term),
                 "batch_sequence": ack.batch_sequence,
                 "publication_durable_ms": _milliseconds(publication_durable_ns, t0_ns),
+                "db_ack_lower_ms": _milliseconds(ack_lower_ns, t0_ns),
                 "db_ack_ms": _milliseconds(ack_upper_ns, t0_ns),
                 "last_miss_ms": (
                     _milliseconds(last_miss_ns, t0_ns) if last_miss_ns is not None else None
@@ -2111,6 +2114,11 @@ def _run_one_etd_event(
                 "publication_durable_ms": (
                     _milliseconds(publication_durable_ns, t0_ns)
                     if publication_durable_ns is not None and t0_ns is not None
+                    else None
+                ),
+                "db_ack_lower_ms": (
+                    _milliseconds(max(ack.observed_lower_ns, t0_ns), t0_ns)
+                    if ack is not None and t0_ns is not None
                     else None
                 ),
                 "db_ack_ms": (
