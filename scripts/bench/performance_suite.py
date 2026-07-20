@@ -97,6 +97,7 @@ PUBLICATION_CAPTURE_HEAD_COUNTS = (1, 10_000, 100_000)
 PUBLICATION_CAPTURE_WARMUP_REPETITIONS = 2
 PUBLICATION_CAPTURE_REPETITIONS = 10
 PUBLICATION_APPEND_POLL_INTERVAL_S = 0.05
+PUBLICATION_APPEND_WARMUP_MIN_TIMEOUT_S = 30.0
 PUBLICATION_CONTROL_TABLE_PATTERN = (
     "(?i)publish|append.*(fence|control)|checkpoint|generation_readiness"
 )
@@ -548,6 +549,10 @@ def _publication_capture_query_log_summary(
         "max_memory_bytes": max(int(sample["memory_usage_bytes"]) for sample in samples),
         "raw_samples": [dict(sample) for sample in samples],
     }
+
+
+def _publication_append_warmup_timeout(timeout_s: float) -> float:
+    return max(PUBLICATION_APPEND_WARMUP_MIN_TIMEOUT_S, timeout_s)
 
 
 def _validate_publication_capture_storage(
@@ -1583,11 +1588,14 @@ def run_source_publication_append_probe(
         warmup = run_owned_sandbox_append_probe(
             sandbox,
             events[:1],
-            timeout_s=timeout_s,
+            timeout_s=_publication_append_warmup_timeout(timeout_s),
             poll_interval_s=PUBLICATION_APPEND_POLL_INTERVAL_S,
         )
         if warmup.status != "pass":
-            raise SuiteFailure("source-publication append warmup did not become live")
+            raise SuiteFailure(
+                "source-publication append warmup did not become live: "
+                f"diagnostics={list(warmup.diagnostics)!r}"
+            )
         head_before = _publication_head_snapshot(url)
         controls_before = _publication_control_resources(url)
         measured = run_owned_sandbox_append_probe(

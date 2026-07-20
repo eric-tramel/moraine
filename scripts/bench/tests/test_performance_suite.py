@@ -882,6 +882,10 @@ FORMAT JSONEachRow""",
                 logical_head_count=2,
             )
 
+    def test_publication_append_warmup_has_an_unmeasured_readiness_budget(self) -> None:
+        self.assertEqual(suite._publication_append_warmup_timeout(5.0), 30.0)
+        self.assertEqual(suite._publication_append_warmup_timeout(45.0), 45.0)
+
     def test_source_publication_probe_validates_samples_head_and_control_deltas(self) -> None:
         before_controls = {
             "published_source_generations": {
