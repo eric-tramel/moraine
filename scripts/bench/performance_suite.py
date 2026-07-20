@@ -22,6 +22,7 @@ from performance_fixtures import (
     FreshSeedTarget,
     build_append_probe_events,
     build_recipe,
+    codex_event_lines,
     mixed_control_schedules,
     open_event_schedule,
     open_query_schedule,
@@ -35,6 +36,7 @@ from performance_protocol import (
     PAIR_ORDER,
     POLICY,
     ProtocolError,
+    _validate_etd_sample,
     _validate_resources,
     compare_manifests,
     create_build_identity,
@@ -679,6 +681,109 @@ def _append_probe_latency(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any
         "fsync_to_live_p95_ms": _nearest_rank(latencies, 95.0),
         "fsync_to_live_max_ms": max(latencies),
         "raw_fsync_to_live_ms": latencies,
+    }
+
+
+def _term_digest(term: str) -> str:
+    return "sha256:" + hashlib.sha256(term.encode("utf-8")).hexdigest()
+
+
+def _append_probe_query_evidence(
+    events: Sequence[Mapping[str, Any]],
+    samples: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Describe the indexed-target/unindexed-nonce query stream exactly."""
+
+    if len(events) != len(samples) or not events:
+        raise SuiteFailure("append query evidence does not align with ETD samples")
+    targets: list[str] = []
+    cache_busters: list[str] = []
+    payload_bank: Optional[tuple[str, ...]] = None
+    issued_query_count = 0
+    per_sample: list[dict[str, Any]] = []
+    for event, sample in zip(events, samples, strict=True):
+        target = event.get("indexed_target_term")
+        busters = event.get("probe_terms")
+        payload = event.get("indexed_payload_terms")
+        query_count = sample.get("term_use_count")
+        if (
+            not isinstance(target, str)
+            or not target
+            or not isinstance(busters, list)
+            or not busters
+            or any(not isinstance(term, str) or not term for term in busters)
+            or len(busters) != len(set(busters))
+            or not isinstance(payload, list)
+            or not payload
+            or any(not isinstance(term, str) or not term for term in payload)
+            or len(payload) != len(set(payload))
+            or isinstance(query_count, bool)
+            or not isinstance(query_count, int)
+            or query_count < 1
+            or query_count > len(busters)
+        ):
+            raise SuiteFailure("append query fixture or term-use evidence is invalid")
+        if target in busters or target in payload or set(busters) & set(payload):
+            raise SuiteFailure("append indexed and cache-buster terms overlap")
+        current_payload_bank = tuple(payload)
+        if payload_bank is None:
+            payload_bank = current_payload_bank
+        elif current_payload_bank != payload_bank:
+            raise SuiteFailure("append indexed payload term bank is not fixed")
+        source_text = codex_event_lines(event).decode("utf-8")
+        if source_text.count(target) != 1 or any(
+            cache_buster in source_text for cache_buster in busters
+        ):
+            raise SuiteFailure("append cache-buster terms leaked into indexed fixture text")
+        expected_event_digest = event.get("expected_ack_digest")
+        if not isinstance(expected_event_digest, str):
+            raise SuiteFailure("append event identity digest is missing")
+        event_digest = "sha256:" + expected_event_digest
+        last_query_digest = _term_digest(
+            f"{target} {busters[query_count - 1]}"
+        )
+        if (
+            sample.get("event_identity_sha256") != event_digest
+            or sample.get("term_sha256") != last_query_digest
+        ):
+            raise SuiteFailure("append sample differs from its indexed-target query stream")
+        targets.append(target)
+        cache_busters.extend(busters)
+        issued_query_count += query_count
+        per_sample.append(
+            {
+                "event_identity_sha256": event_digest,
+                "indexed_target_sha256": _term_digest(target),
+                "cache_buster_bank_size": len(busters),
+                "queries_issued": query_count,
+                "last_query_sha256": last_query_digest,
+            }
+        )
+    if len(targets) != len(set(targets)) or len(cache_busters) != len(
+        set(cache_busters)
+    ):
+        raise SuiteFailure("append indexed target or cache-buster terms are reused")
+    assert payload_bank is not None
+    return {
+        "query_shape": "indexed_target_plus_unindexed_nonce",
+        "event_count": len(events),
+        "issued_query_count": issued_query_count,
+        "indexed_target_terms": {
+            "distinct_count": len(targets),
+            "fixture_text_occurrences": len(targets),
+            "query_use_count": issued_query_count,
+        },
+        "cache_buster_terms": {
+            "distinct_count": len(cache_busters),
+            "fixture_text_occurrences": 0,
+            "bank_capacity": len(cache_busters),
+            "query_use_count": issued_query_count,
+        },
+        "indexed_payload_terms": {
+            "distinct_count": len(payload_bank),
+            "configured_occurrences": len(payload_bank) * len(events),
+        },
+        "per_sample": per_sample,
     }
 
 
@@ -1359,6 +1464,137 @@ def _validate_publication_capture_scaling(value: Any) -> None:
         )
 
 
+def _valid_sha256_digest(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith("sha256:")
+        and len(value) == 71
+        and all(character in "0123456789abcdef" for character in value[7:])
+    )
+
+
+def _validate_append_probe_query_evidence(
+    value: Any, samples: Any
+) -> None:
+    required = {
+        "query_shape",
+        "event_count",
+        "issued_query_count",
+        "indexed_target_terms",
+        "cache_buster_terms",
+        "indexed_payload_terms",
+        "per_sample",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise SuiteFailure("append query evidence fields differ")
+    if (
+        value["query_shape"] != "indexed_target_plus_unindexed_nonce"
+        or isinstance(value["event_count"], bool)
+        or not isinstance(value["event_count"], int)
+        or value["event_count"] < 1
+        or isinstance(value["issued_query_count"], bool)
+        or not isinstance(value["issued_query_count"], int)
+        or value["issued_query_count"] < value["event_count"]
+        or not isinstance(samples, list)
+        or len(samples) != value["event_count"]
+    ):
+        raise SuiteFailure("append query evidence identity or counts are invalid")
+    target = value["indexed_target_terms"]
+    busters = value["cache_buster_terms"]
+    payload = value["indexed_payload_terms"]
+    if (
+        not isinstance(target, dict)
+        or set(target)
+        != {"distinct_count", "fixture_text_occurrences", "query_use_count"}
+        or not isinstance(busters, dict)
+        or set(busters)
+        != {
+            "distinct_count",
+            "fixture_text_occurrences",
+            "bank_capacity",
+            "query_use_count",
+        }
+        or not isinstance(payload, dict)
+        or set(payload) != {"distinct_count", "configured_occurrences"}
+        or any(
+            isinstance(item, bool) or not isinstance(item, int) or item < 0
+            for item in (*target.values(), *busters.values(), *payload.values())
+        )
+        or target["distinct_count"] != value["event_count"]
+        or target["fixture_text_occurrences"] != value["event_count"]
+        or target["query_use_count"] != value["issued_query_count"]
+        or busters["distinct_count"] != busters["bank_capacity"]
+        or busters["fixture_text_occurrences"] != 0
+        or busters["query_use_count"] != value["issued_query_count"]
+        or busters["bank_capacity"] < value["issued_query_count"]
+        or payload["distinct_count"] < 1
+        or payload["configured_occurrences"]
+        != payload["distinct_count"] * value["event_count"]
+    ):
+        raise SuiteFailure("append indexed/cache-buster term counts differ")
+    per_sample = value["per_sample"]
+    if not isinstance(per_sample, list) or len(per_sample) != len(samples):
+        raise SuiteFailure("append per-sample query evidence differs")
+    event_digests: set[str] = set()
+    target_digests: set[str] = set()
+    last_query_digests: set[str] = set()
+    issued = 0
+    capacity = 0
+    for index, (entry, sample) in enumerate(zip(per_sample, samples, strict=True)):
+        if (
+            not isinstance(entry, dict)
+            or set(entry)
+            != {
+                "event_identity_sha256",
+                "indexed_target_sha256",
+                "cache_buster_bank_size",
+                "queries_issued",
+                "last_query_sha256",
+            }
+            or any(
+                not _valid_sha256_digest(entry[name])
+                for name in (
+                    "event_identity_sha256",
+                    "indexed_target_sha256",
+                    "last_query_sha256",
+                )
+            )
+            or isinstance(entry["cache_buster_bank_size"], bool)
+            or not isinstance(entry["cache_buster_bank_size"], int)
+            or isinstance(entry["queries_issued"], bool)
+            or not isinstance(entry["queries_issued"], int)
+            or entry["queries_issued"] < 1
+            or entry["queries_issued"] > entry["cache_buster_bank_size"]
+        ):
+            raise SuiteFailure("append per-sample term-use evidence is invalid")
+        try:
+            valid, _, _ = _validate_etd_sample(sample, f"$.etd_samples[{index}]")
+        except ProtocolError as error:
+            raise SuiteFailure(
+                f"append ETD sample is invalid: {error}"
+            ) from error
+        if (
+            valid is not True
+            or sample["event_identity_sha256"] != entry["event_identity_sha256"]
+            or sample["term_sha256"] != entry["last_query_sha256"]
+            or sample["term_use_count"] != entry["queries_issued"]
+        ):
+            raise SuiteFailure("append ETD sample and query evidence differ")
+        event_digests.add(entry["event_identity_sha256"])
+        target_digests.add(entry["indexed_target_sha256"])
+        last_query_digests.add(entry["last_query_sha256"])
+        issued += entry["queries_issued"]
+        capacity += entry["cache_buster_bank_size"]
+    if (
+        len(event_digests) != len(samples)
+        or len(target_digests) != len(samples)
+        or len(last_query_digests) != len(samples)
+        or issued != value["issued_query_count"]
+        or capacity != busters["bank_capacity"]
+    ):
+        raise SuiteFailure("append query identity or term-use totals differ")
+
+
 def validate_source_publication_probe(document: Any) -> None:
     required = {
         "document_type",
@@ -1367,6 +1603,8 @@ def validate_source_publication_probe(document: Any) -> None:
         "git_commit",
         "run",
         "append",
+        "query_evidence",
+        "etd_samples",
         "publication_head",
         "control_tables",
         "control_capture_scaling",
@@ -1378,7 +1616,7 @@ def validate_source_publication_probe(document: Any) -> None:
         raise SuiteFailure("source-publication probe document fields differ")
     if (
         document.get("document_type") != "source_publication_append_probe"
-        or document.get("schema_version") != "moraine.source-publication-probe.v1"
+        or document.get("schema_version") != "moraine.source-publication-probe.v2"
         or document.get("status") not in {"pass", "fail"}
         or not isinstance(document.get("git_commit"), str)
         or len(document["git_commit"]) != 40
@@ -1387,6 +1625,8 @@ def validate_source_publication_probe(document: Any) -> None:
         raise SuiteFailure("source-publication probe identity is invalid")
     run = document.get("run")
     append = document.get("append")
+    query_evidence = document.get("query_evidence")
+    etd_samples = document.get("etd_samples")
     head = document.get("publication_head")
     controls = document.get("control_tables")
     scaling = document.get("control_capture_scaling")
@@ -1442,6 +1682,7 @@ def validate_source_publication_probe(document: Any) -> None:
     ):
         raise SuiteFailure("source-publication probe resource authority differs")
     _validate_publication_capture_scaling(scaling)
+    _validate_append_probe_query_evidence(query_evidence, etd_samples)
     _validate_source_host_column_resources(source_host_columns["before"])
     _validate_source_host_column_resources(source_host_columns["after"])
     _validate_source_host_column_resources(
@@ -1488,6 +1729,17 @@ def validate_source_publication_probe(document: Any) -> None:
         for name, value in expected_latency.items()
     ):
         raise SuiteFailure("source-publication probe latency summary differs")
+    if len(etd_samples) != len(samples) or any(
+        not math.isclose(
+            float(sample["first_valid_ms"])
+            - float(sample["publication_durable_ms"]),
+            float(latency),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+        for sample, latency in zip(etd_samples, samples, strict=True)
+    ):
+        raise SuiteFailure("source-publication latency and ETD samples differ")
     before = head["before"]
     after = head["after"]
     _validate_control_table_resources(controls["before"])
@@ -1648,6 +1900,8 @@ def run_source_publication_append_probe(
             f"diagnostics={list(measured.diagnostics)!r}"
         )
     append = _append_probe_latency(list(measured.samples))
+    etd_samples = [dict(sample) for sample in measured.samples]
+    query_evidence = _append_probe_query_evidence(events[1:], etd_samples)
     head = {
         "before": head_before,
         "after": head_after,
@@ -1671,7 +1925,7 @@ def run_source_publication_append_probe(
     }
     document: dict[str, Any] = {
         "document_type": "source_publication_append_probe",
-        "schema_version": "moraine.source-publication-probe.v1",
+        "schema_version": "moraine.source-publication-probe.v2",
         "status": "pass"
         if (
             head["head_write_count"] == 0
@@ -1687,6 +1941,8 @@ def run_source_publication_append_probe(
             "timeout_seconds": timeout_s,
         },
         "append": append,
+        "query_evidence": query_evidence,
+        "etd_samples": etd_samples,
         "publication_head": head,
         "control_tables": controls,
         "control_capture_scaling": control_capture_scaling,

@@ -13,6 +13,7 @@ if str(BENCH) not in sys.path:
     sys.path.insert(0, str(BENCH))
 
 from performance_fixtures import (  # noqa: E402
+    APPEND_INDEXED_PAYLOAD_TERMS,
     FINGERPRINT_FIELDS,
     FreshSeedTarget,
     FixtureError,
@@ -239,6 +240,37 @@ class ScheduleAndTermBankTests(unittest.TestCase):
             len({event["normalized_event_uid"] for event in events}),
             len(events),
         )
+        self.assertEqual(
+            len({event["indexed_target_term"] for event in events}),
+            len(events),
+        )
+        self.assertEqual(
+            {tuple(event["indexed_payload_terms"]) for event in events},
+            {tuple(APPEND_INDEXED_PAYLOAD_TERMS)},
+        )
+        queries: list[str] = []
+        for event in events:
+            source_text = codex_event_lines(event).decode("utf-8")
+            self.assertEqual(source_text.count(event["indexed_target_term"]), 1)
+            self.assertTrue(
+                all(term in source_text for term in event["indexed_payload_terms"])
+            )
+            self.assertTrue(
+                all(term not in source_text for term in event["probe_terms"])
+            )
+            bank = OneUseTermBank(event)
+            event_queries = [
+                bank.claim_query()["query"] for _ in event["probe_terms"]
+            ]
+            self.assertEqual(
+                event_queries,
+                [
+                    f"{event['indexed_target_term']} {cache_buster}"
+                    for cache_buster in event["probe_terms"]
+                ],
+            )
+            queries.extend(event_queries)
+        self.assertEqual(len(queries), len(set(queries)))
         self.assertEqual(events, build_append_probe_events(3, term_count=4))
 
         expanded_warmup = build_append_probe_events(
@@ -305,6 +337,12 @@ class ScheduleAndTermBankTests(unittest.TestCase):
             + 1
         )
         self.assertGreaterEqual(len(claimed), required)
+
+        query_bank = OneUseTermBank(event)
+        self.assertEqual(
+            query_bank.claim_query(),
+            {"query": event["probe_terms"][0], "n_hits": 10},
+        )
 
 
 class SeedTests(unittest.TestCase):

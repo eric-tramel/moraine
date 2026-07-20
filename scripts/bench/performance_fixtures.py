@@ -87,6 +87,20 @@ FINGERPRINT_FIELDS = (
     "schedule_templates_sha256",
 )
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+APPEND_INDEXED_PAYLOAD_TERMS = (
+    "source",
+    "publication",
+    "append",
+    "ingest",
+    "session",
+    "assistant",
+    "response",
+    "visibility",
+    "generation",
+    "checkpoint",
+    "search",
+    "index",
+)
 
 
 class FixtureError(ValueError):
@@ -119,7 +133,7 @@ class FreshSeedTarget:
 class OneUseTermBank:
     """Hands each ETD probe term out once and fails closed on exhaustion."""
 
-    __slots__ = ("case_id", "_terms", "_index", "_used")
+    __slots__ = ("case_id", "_indexed_target", "_terms", "_index", "_used")
 
     def __init__(self, event: Mapping[str, Any]) -> None:
         case_id = event.get("case_id")
@@ -130,7 +144,15 @@ class OneUseTermBank:
             raise FixtureError("ETD probe bank contains an invalid term")
         if len(terms) != len(set(terms)):
             raise FixtureError("ETD probe bank contains reused terms")
+        indexed_target = event.get("indexed_target_term")
+        if indexed_target is not None and (
+            not isinstance(indexed_target, str)
+            or not indexed_target
+            or indexed_target in terms
+        ):
+            raise FixtureError("ETD indexed target term is invalid")
         self.case_id = case_id
+        self._indexed_target = indexed_target
         self._terms = tuple(terms)
         self._index = 0
         self._used: set[str] = set()
@@ -150,7 +172,13 @@ class OneUseTermBank:
         return term
 
     def claim_query(self) -> dict[str, Any]:
-        return {"query": self.claim(), "n_hits": 10}
+        cache_buster = self.claim()
+        query = (
+            f"{self._indexed_target} {cache_buster}"
+            if self._indexed_target is not None
+            else cache_buster
+        )
+        return {"query": query, "n_hits": 10}
 
 
 def public_id(prefix: str, raw: str) -> str:
@@ -515,8 +543,10 @@ def build_append_probe_events(
             .isoformat(timespec="milliseconds")
             .replace("+00:00", "Z"),
             "marker": f"perfpublicationmarker{index:05d}",
+            "indexed_target_term": f"perfpublicationtarget{index:05d}",
+            "indexed_payload_terms": list(APPEND_INDEXED_PAYLOAD_TERMS),
             "probe_terms": [
-                f"{prefix}{probe:03d}" for probe in range(event_term_count)
+                f"{prefix}nonce{probe:03d}" for probe in range(event_term_count)
             ],
         }
         source_bytes = codex_event_lines(event)
@@ -1033,6 +1063,23 @@ def codex_event_lines(event: Mapping[str, Any]) -> bytes:
             "cli_version": "benchmark",
         },
     }
+    indexed_target = event.get("indexed_target_term")
+    if indexed_target is None:
+        content_terms = list(event["probe_terms"])
+    else:
+        indexed_payload_terms = event.get("indexed_payload_terms")
+        if (
+            not isinstance(indexed_target, str)
+            or not indexed_target
+            or not isinstance(indexed_payload_terms, list)
+            or not indexed_payload_terms
+            or any(
+                not isinstance(term, str) or not term
+                for term in indexed_payload_terms
+            )
+        ):
+            raise FixtureError("ETD indexed probe payload is invalid")
+        content_terms = [indexed_target, *indexed_payload_terms]
     message = {
         "timestamp": event["recorded_at"],
         "type": "response_item",
@@ -1044,7 +1091,7 @@ def codex_event_lines(event: Mapping[str, Any]) -> bytes:
             "content": [
                 {
                     "type": "output_text",
-                    "text": " ".join([event["marker"], *event["probe_terms"]]),
+                    "text": " ".join([event["marker"], *content_terms]),
                 }
             ],
         },
