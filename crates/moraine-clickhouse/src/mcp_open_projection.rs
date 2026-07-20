@@ -263,11 +263,11 @@ impl ClickHouseClient {
                 if required_heads.is_empty() {
                     return Ok(());
                 }
-                let candidate_publication_id = format!(
-                    "append:{}:{}",
-                    session_id,
-                    self.next_projection_generation().await?
-                );
+                // One Snowflake can identify both this one-session candidate
+                // and its first immutable child snapshot.
+                let first_generation = self.next_projection_generation().await?;
+                let candidate_publication_id =
+                    format!("append:{}:{}", session_id, first_generation);
                 self.refresh_mcp_open_session(
                     &session_id,
                     &candidate_publication_id,
@@ -275,6 +275,7 @@ impl ClickHouseClient {
                     "ordinary-append",
                     &required_heads,
                     true,
+                    Some(first_generation),
                 )
                 .await
                 .map(|_| ())
@@ -351,6 +352,7 @@ impl ClickHouseClient {
                         &request.publisher_id,
                         &session_heads,
                         false,
+                        None,
                     )
                     .await?;
                 prepared_session_count += 1;
@@ -566,8 +568,9 @@ impl ClickHouseClient {
         publisher_id: &str,
         required_heads: &[McpOpenSourceHead],
         publish_legacy_head: bool,
+        first_generation: Option<u64>,
     ) -> Result<CandidateHeaderRow> {
-        for _ in 0..MAX_UNSTABLE_REFRESH_ATTEMPTS {
+        for attempt in 0..MAX_UNSTABLE_REFRESH_ATTEMPTS {
             let source_revision = self
                 .session_source_revision_for_heads(session_id, required_heads)
                 .await?;
@@ -585,8 +588,11 @@ impl ClickHouseClient {
                         == source_heads_fingerprint(required_heads)
                 {
                     if publish_legacy_head {
-                        self.publish_legacy_candidate_heads(candidate_publication_id)
-                            .await?;
+                        self.publish_legacy_session_candidate_head(
+                            session_id,
+                            candidate_publication_id,
+                        )
+                        .await?;
                     }
                     return Ok(candidate);
                 }
@@ -596,7 +602,10 @@ impl ClickHouseClient {
             let slot = head
                 .as_ref()
                 .map_or(0, |head| 1_u8.saturating_sub(head.slot));
-            let generation = self.next_projection_generation().await?;
+            let generation = match (attempt, first_generation) {
+                (0, Some(generation)) => generation,
+                _ => self.next_projection_generation().await?,
+            };
 
             self.insert_projected_events(
                 session_id,
@@ -615,14 +624,10 @@ impl ClickHouseClient {
             )
             .await?;
 
-            if self
-                .session_source_revision_for_heads(session_id, required_heads)
-                .await?
-                != source_revision
-                || self.session_dirty_revision(session_id).await? != dirty_revision
-            {
-                continue;
-            }
+            // The header statement recomputes the canonical source revision
+            // and gates the current dirty revision atomically. A miss returns
+            // no candidate and retries, so separate revalidation reads here
+            // only lengthen the publication window.
             let inserted = self
                 .insert_projected_publication_header(CandidateHeaderInsert {
                     session_id,
@@ -638,8 +643,11 @@ impl ClickHouseClient {
                 .await?;
             if let Some(candidate) = inserted {
                 if publish_legacy_head {
-                    self.publish_legacy_candidate_heads(candidate_publication_id)
-                        .await?;
+                    self.publish_legacy_session_candidate_head(
+                        session_id,
+                        candidate_publication_id,
+                    )
+                    .await?;
                 }
                 return Ok(candidate);
             }
@@ -999,22 +1007,22 @@ impl ClickHouseClient {
     }
 
     async fn publish_legacy_candidate_heads(&self, candidate_publication_id: &str) -> Result<()> {
-        let database = escape_identifier(&self.cfg.database);
-        let statement = format!(
-            "INSERT INTO {database}.mcp_open_sessions\n\
-             (session_id, slot, generation, source_revision, dirty_revision, first_event_time,\n\
-              last_event_time, total_turns, total_events, user_messages, assistant_messages,\n\
-              tool_calls, tool_results, mode, first_event_uid, last_event_uid, last_actor_role,\n\
-              title, source, harness, inference_provider, session_slug, session_summary, completed,\n\
-              terminal_event_uid, origin_cwd)\n\
-             SELECT session_id, slot, generation, source_revision, dirty_revision, first_event_time,\n\
-              last_event_time, total_turns, total_events, user_messages, assistant_messages,\n\
-              tool_calls, tool_results, mode, first_event_uid, last_event_uid, last_actor_role,\n\
-              title, source, harness, inference_provider, session_slug, session_summary, completed,\n\
-              terminal_event_uid, origin_cwd\n\
-             FROM {database}.mcp_open_publication_headers FINAL\n\
-             WHERE candidate_publication_id = {candidate_id} AND tombstone = 0",
-            candidate_id = escape_literal(candidate_publication_id),
+        let statement =
+            publish_legacy_candidate_heads_sql(&self.cfg.database, candidate_publication_id, None);
+        self.request_text(&statement, None, Some(&self.cfg.database), false, None)
+            .await?;
+        Ok(())
+    }
+
+    async fn publish_legacy_session_candidate_head(
+        &self,
+        session_id: &str,
+        candidate_publication_id: &str,
+    ) -> Result<()> {
+        let statement = publish_legacy_candidate_heads_sql(
+            &self.cfg.database,
+            candidate_publication_id,
+            Some(session_id),
         );
         self.request_text(&statement, None, Some(&self.cfg.database), false, None)
             .await?;
@@ -1264,6 +1272,33 @@ impl ClickHouseClient {
     }
 }
 
+fn publish_legacy_candidate_heads_sql(
+    database: &str,
+    candidate_publication_id: &str,
+    session_id: Option<&str>,
+) -> String {
+    let database = escape_identifier(database);
+    let session_filter = session_id.map_or_else(String::new, |session_id| {
+        format!(" AND session_id = {}", escape_literal(session_id))
+    });
+    format!(
+        "INSERT INTO {database}.mcp_open_sessions\n\
+         (session_id, slot, generation, source_revision, dirty_revision, first_event_time,\n\
+          last_event_time, total_turns, total_events, user_messages, assistant_messages,\n\
+          tool_calls, tool_results, mode, first_event_uid, last_event_uid, last_actor_role,\n\
+          title, source, harness, inference_provider, session_slug, session_summary, completed,\n\
+          terminal_event_uid, origin_cwd)\n\
+         SELECT session_id, slot, generation, source_revision, dirty_revision, first_event_time,\n\
+          last_event_time, total_turns, total_events, user_messages, assistant_messages,\n\
+          tool_calls, tool_results, mode, first_event_uid, last_event_uid, last_actor_role,\n\
+          title, source, harness, inference_provider, session_slug, session_summary, completed,\n\
+          terminal_event_uid, origin_cwd\n\
+         FROM {database}.mcp_open_publication_headers FINAL\n\
+         WHERE candidate_publication_id = {candidate_id}{session_filter} AND tombstone = 0",
+        candidate_id = escape_literal(candidate_publication_id),
+    )
+}
+
 fn current_session_source_heads_sql(database: &str, session_id: &str) -> String {
     let database = escape_identifier(database);
     format!(
@@ -1408,8 +1443,9 @@ fn event_type_sql() -> &'static str {
 mod tests {
     use super::{
         canonical_source_heads, current_session_source_heads_sql, projection_ctes,
-        projection_session_ids, session_source_heads_for_snapshot_sql, source_head_filter,
-        source_heads_fingerprint, McpOpenSourceHead, SourceHeadRow,
+        projection_session_ids, publish_legacy_candidate_heads_sql,
+        session_source_heads_for_snapshot_sql, source_head_filter, source_heads_fingerprint,
+        McpOpenSourceHead, SourceHeadRow,
     };
     use std::collections::BTreeSet;
 
@@ -1501,6 +1537,18 @@ mod tests {
         assert_eq!(row.source_host, "host-a");
         assert_eq!(row.source_generation, 3);
         assert_eq!(row.publication_revision, 10);
+    }
+
+    #[test]
+    fn ordinary_legacy_head_publish_includes_session_predicate() {
+        let ordinary =
+            publish_legacy_candidate_heads_sql("moraine", "append:session-a:42", Some("session-a"));
+        assert!(ordinary.contains("candidate_publication_id = 'append:session-a:42'"));
+        assert!(ordinary.contains("session_id = 'session-a'"));
+
+        let replacement = publish_legacy_candidate_heads_sql("moraine", "replacement:42", None);
+        assert!(replacement.contains("candidate_publication_id = 'replacement:42'"));
+        assert!(!replacement.contains("session_id ="));
     }
 
     #[test]
