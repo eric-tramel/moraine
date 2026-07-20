@@ -934,7 +934,7 @@ FROM numbers({documents})
 def seed_publication_control_sql(
     target: FreshSeedTarget, recipe: Mapping[str, Any]
 ) -> tuple[str, ...]:
-    """Seed causal readiness and one live head after the fixture event insert."""
+    """Seed causal readiness, publish one head, then enqueue its live sessions."""
 
     if not isinstance(target, FreshSeedTarget):
         raise FixtureError("seed_publication_control_sql requires FreshSeedTarget evidence")
@@ -987,7 +987,18 @@ VALUES
   'performance-fixture', '{operation_id}:head'
 )
 """.strip()
-    return checkpoint, readiness, head
+    dirty = f"""
+INSERT INTO {database}.mcp_open_dirty_sessions
+  (session_id, dirty_revision, observed_at)
+SELECT session_id, generateSnowflakeID(), now64(3)
+FROM
+(
+  SELECT DISTINCT session_id
+  FROM {database}.v_live_events
+  WHERE notEmpty(session_id)
+)
+""".strip()
+    return checkpoint, readiness, head, dirty
 
 
 def codex_event_lines(event: Mapping[str, Any]) -> bytes:

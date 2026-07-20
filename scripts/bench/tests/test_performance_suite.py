@@ -30,7 +30,7 @@ from performance_suite import (
     freeze,
     validate_path,
 )
-from performance_runtime import LocalEnvelope
+from performance_runtime import LocalEnvelope, OwnedSandbox
 
 
 def digest(label: str) -> str:
@@ -369,6 +369,69 @@ class LifecycleTests(unittest.TestCase):
                 )
         sandbox.down.assert_called_once()
         envelope.remove.assert_called_once()
+
+    def test_seed_reconciles_projection_before_measurement(self) -> None:
+        recipe = build_recipe("smoke")
+        expected = str(recipe["corpus"]["document_count"])
+        search_counts = iter(("0", expected))
+        queries: list[str] = []
+
+        def query(_url, sql, **_kwargs):
+            queries.append(sql)
+            if sql == "SELECT count() FROM moraine.search_documents":
+                return next(search_counts)
+            if "FROM system.tables" in sql:
+                return "1"
+            if "mcp_open_projection_state" in sql:
+                return "1"
+            if "countIf(dirty.dirty_revision" in sql:
+                return "0"
+            return ""
+
+        sandbox = mock.Mock(
+            clickhouse_port=8123,
+            sandbox_id="sb-123abc",
+        )
+        with mock.patch.object(suite, "_clickhouse_query", side_effect=query):
+            suite._seed_owned_sandbox(sandbox, recipe)
+
+        sandbox.reconcile_seeded_read_model.assert_called_once_with()
+        sandbox.checkpoint.assert_called_once_with("seeded")
+        self.assertTrue(any("mcp_open_projection_state" in sql for sql in queries))
+        self.assertTrue(any("countIf(dirty.dirty_revision" in sql for sql in queries))
+
+    def test_owned_sandbox_reconciles_with_frozen_binary(self) -> None:
+        sandbox = OwnedSandbox(
+            Path("/repo"),
+            Path("/sandbox-tool"),
+            "sb-123abc",
+            "project",
+            8873,
+            8123,
+            Path("/tmp/sandbox-config"),
+            "sha256:" + "a" * 64,
+            mock.Mock(),
+        )
+        process = mock.Mock(returncode=0, stderr="")
+        with mock.patch("performance_runtime._run", return_value=process) as run:
+            sandbox.reconcile_seeded_read_model()
+
+        run.assert_called_once_with(
+            [
+                "/sandbox-tool",
+                "exec-loadgen",
+                "sb-123abc",
+                "--cwd",
+                "/home/moraine",
+                "--",
+                "/opt/moraine/bin/moraine",
+                "db",
+                "migrate",
+                "--config",
+                "/sandbox/moraine.toml",
+            ],
+            timeout=600,
+        )
 
 
     def test_local_envelope_checks_docker_without_claiming_cgroup_control(self) -> None:

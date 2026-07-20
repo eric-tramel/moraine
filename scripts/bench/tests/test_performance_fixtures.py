@@ -328,13 +328,15 @@ class SeedTests(unittest.TestCase):
         self.assertNotIn(expected_id, sql)
         self.assertNotIn("ordered_identities", serialized_manifest)
 
-    def test_publication_control_seed_is_causal_and_publishes_the_head_last(self) -> None:
+    def test_publication_control_seed_is_causal_and_dirties_after_the_head(self) -> None:
         statements = seed_publication_control_sql(self.target, self.recipe)
 
-        self.assertEqual(len(statements), 3)
+        self.assertEqual(len(statements), 4)
         self.assertIn("ingest_checkpoint_transitions", statements[0])
         self.assertIn("source_generation_publication_readiness", statements[1])
         self.assertIn("published_source_generations", statements[2])
+        self.assertIn("mcp_open_dirty_sessions", statements[3])
+        self.assertIn("v_live_events", statements[3])
         self.assertIn("'active'", statements[0])
         self.assertIn("final_scan_complete", statements[0])
         self.assertIn("compatibility_prepared", statements[1])
