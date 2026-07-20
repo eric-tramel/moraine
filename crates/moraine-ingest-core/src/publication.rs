@@ -418,6 +418,10 @@ fn is_current_initial_head(head: &CurrentHeadRow) -> bool {
     head.source_generation == 1
 }
 
+fn is_original_initial_publication(head: &CurrentHeadRow, operation_id: &str) -> bool {
+    is_current_initial_head(head) && head.operation_id == operation_id
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 struct TransitionRevisionRow {
     checkpoint_revision: u64,
@@ -1044,6 +1048,20 @@ impl PublicationActor {
             // already become authoritative.
             if !is_current_initial_head(&head) {
                 return Ok(None);
+            }
+            // A generation-1 source remains published while its inode grows.
+            // Later ordinary checkpoints have their own operation identity;
+            // persist that causal cursor without reactivating (or rebuilding)
+            // the source-wide candidate prepared by the initial publication.
+            // Only the original operation can represent a crash after the
+            // source head became durable but before compatibility activation.
+            if !is_original_initial_publication(&head, &transition.operation_id) {
+                let checkpoint = self.persist_transition_locked(transition).await?;
+                return Ok(Some(PublicationAck {
+                    checkpoint_revision: checkpoint.checkpoint_revision,
+                    publication_revision: head.publication_revision,
+                    already_published: true,
+                }));
             }
             if transition.checkpoint_revision == 0 {
                 if let Some(revision) = self.transition_revision(&transition.operation_id).await? {
@@ -1768,6 +1786,7 @@ mod tests {
         let generation_one = CurrentHeadRow {
             source_generation: 1,
             publication_revision: 7,
+            operation_id: "initial-operation".to_string(),
             ..CurrentHeadRow::default()
         };
         let generation_two = CurrentHeadRow {
@@ -1778,6 +1797,18 @@ mod tests {
 
         assert!(is_current_initial_head(&generation_one));
         assert!(!is_current_initial_head(&generation_two));
+        assert!(is_original_initial_publication(
+            &generation_one,
+            "initial-operation"
+        ));
+        assert!(!is_original_initial_publication(
+            &generation_one,
+            "later-append-operation"
+        ));
+        assert!(!is_original_initial_publication(
+            &generation_two,
+            "initial-operation"
+        ));
     }
 
     #[test]
