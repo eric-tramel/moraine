@@ -97,6 +97,9 @@ PUBLICATION_CAPTURE_HEAD_COUNTS = (1, 10_000, 100_000)
 PUBLICATION_CAPTURE_WARMUP_REPETITIONS = 2
 PUBLICATION_CAPTURE_REPETITIONS = 10
 PUBLICATION_APPEND_POLL_INTERVAL_S = 0.05
+PUBLICATION_CONTROL_TABLE_PATTERN = (
+    "(?i)publish|append.*(fence|control)|checkpoint|generation_readiness"
+)
 SOURCE_HOST_PHYSICAL_TABLES = (
     "raw_events",
     "events",
@@ -279,7 +282,7 @@ def _publication_control_resources(
         "sum(data_compressed_bytes) AS compressed_bytes "
         "FROM system.parts "
         f"WHERE active AND database = '{database}' "
-        "AND match(table, '(?i)publication|append.*(fence|control)|checkpoint|generation_readiness') "
+        f"AND match(table, '{PUBLICATION_CONTROL_TABLE_PATTERN}') "
         "GROUP BY table ORDER BY table FORMAT JSONEachRow",
     )
     resources: dict[str, dict[str, int]] = {}
@@ -562,7 +565,8 @@ def _validate_publication_capture_storage(
         or physical_rows < logical_head_count
     ):
         raise SuiteFailure(
-            "publication capture storage rows are fewer than logical head count"
+            "publication capture storage rows are fewer than logical head count: "
+            f"physical={physical_rows!r} logical={logical_head_count}"
         )
 
 

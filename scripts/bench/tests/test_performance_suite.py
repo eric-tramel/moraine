@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import tempfile
 import unittest
 from unittest import mock
@@ -863,6 +864,12 @@ FORMAT JSONEachRow""",
         self.assertEqual(summary["max_memory_bytes"], 8192)
 
     def test_publication_capture_storage_allows_physical_history_rows(self) -> None:
+        self.assertIsNotNone(
+            re.search(
+                suite.PUBLICATION_CONTROL_TABLE_PATTERN,
+                "published_source_generations",
+            )
+        )
         suite._validate_publication_capture_storage(
             {"published_source_generations": {"rows": 3}},
             logical_head_count=2,
