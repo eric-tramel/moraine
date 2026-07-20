@@ -212,10 +212,34 @@ def _seed_owned_sandbox(sandbox: Any, recipe: Mapping[str, Any]) -> None:
     if publication_schema == "1":
         for statement in seed_publication_control_sql(target, recipe):
             _clickhouse_query(url, statement)
+    sandbox.reconcile_seeded_read_model()
     expected = recipe["corpus"]["document_count"]
     observed = _clickhouse_query(url, f"SELECT count() FROM {database}.search_documents")
     if observed != str(expected):
         raise SuiteFailure(f"seed cardinality mismatch: expected {expected}, observed {observed}")
+    projection_ready = _clickhouse_query(
+        url,
+        f"""SELECT if(count() = 0, 0, max(ready))
+FROM {database}.mcp_open_projection_state FINAL
+WHERE state_key = 'global'""",
+    )
+    projection_dirty = _clickhouse_query(
+        url,
+        f"""SELECT countIf(dirty.dirty_revision > ifNull(published.dirty_revision, 0))
+FROM
+(
+  SELECT session_id, dirty_revision
+  FROM {database}.mcp_open_dirty_sessions FINAL
+  WHERE notEmpty(session_id)
+) AS dirty
+LEFT JOIN
+(
+  SELECT session_id, dirty_revision
+  FROM {database}.mcp_open_sessions FINAL
+) AS published ON published.session_id = dirty.session_id""",
+    )
+    if projection_ready != "1" or projection_dirty != "0":
+        raise SuiteFailure("seeded MCP read model did not reconcile completely")
     sandbox.checkpoint("seeded")
 
 

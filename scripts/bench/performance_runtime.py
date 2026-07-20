@@ -1774,6 +1774,31 @@ class OwnedSandbox:
         if os.environ.get("MORAINE_PERFORMANCE_FAILPOINT") == phase:
             raise RuntimeFailure(f"performance failpoint reached: {phase}")
 
+    def reconcile_seeded_read_model(self) -> None:
+        """Project a directly seeded fixture before any measured MCP request."""
+
+        proc = _run(
+            [
+                str(self.script),
+                "exec-loadgen",
+                self.sandbox_id,
+                "--cwd",
+                "/home/moraine",
+                "--",
+                "/opt/moraine/bin/moraine",
+                "db",
+                "migrate",
+                "--config",
+                "/sandbox/moraine.toml",
+            ],
+            timeout=600,
+        )
+        if proc.returncode:
+            raise RuntimeFailure(
+                "cannot reconcile seeded MCP read model: "
+                f"{proc.stderr[-2048:].strip()}"
+            )
+
     def spawn_stdio_route(
         self,
         *,
