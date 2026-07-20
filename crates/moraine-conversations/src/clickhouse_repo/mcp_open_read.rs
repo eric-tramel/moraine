@@ -7,7 +7,12 @@ pub(super) struct ProjectedSession {
 
 impl ProjectedSession {
     pub(super) fn same_snapshot(&self, other: &Self) -> bool {
-        self.row.slot == other.row.slot && self.row.generation == other.row.generation
+        self.row.candidate_publication_id == other.row.candidate_publication_id
+            && self.row.slot == other.row.slot
+            && self.row.generation == other.row.generation
+            && self.row.source_revision == other.row.source_revision
+            && self.row.dirty_revision == other.row.dirty_revision
+            && self.row.required_heads_fingerprint == other.row.required_heads_fingerprint
     }
 }
 
@@ -44,10 +49,40 @@ impl ClickHouseConversationRepository {
         &self,
         session_id: &str,
     ) -> RepoResult<Option<ProjectedSession>> {
-        let sessions = self.table_ref("mcp_open_sessions");
+        let snapshot = active_publication_snapshot();
+        let (sessions, snapshot_cte, authorization, revision_columns, ordering) = if let Some(
+            snapshot,
+        ) =
+            snapshot.as_ref()
+        {
+            let history = self.table_ref("v_published_source_generation_history");
+            let captured_heads = snapshot.captured_source_heads_sql(&history);
+            let live_events = self.live_events_source();
+            (
+                    self.table_ref("mcp_open_publication_headers"),
+                    format!("WITH {captured_heads} AS captured_heads\n"),
+                    format!(
+                        "\n  AND length(s.required_source_heads) > 0\n  AND arrayAll(required_head -> has(captured_heads, required_head), s.required_source_heads)\n  AND s.dirty_revision = (\n    SELECT if(count() = 0, toUInt64(0), toUInt64(max(dirty.dirty_revision)))\n    FROM {} AS dirty FINAL WHERE dirty.session_id = {}\n  )\n  AND s.source_revision = (\n    SELECT if(count() = 0, toUInt64(0), toUInt64(cityHash64(arraySort(groupArray(tuple(e.event_uid, e.event_version))))))\n    FROM {live_events} AS e WHERE e.session_id = {}\n  )",
+                        self.table_ref("mcp_open_dirty_sessions"),
+                        sql_quote(session_id),
+                        sql_quote(session_id),
+                    ),
+                    "candidate_publication_id, toUInt64(source_revision) AS source_revision, toUInt64(dirty_revision) AS dirty_revision, toUInt8(tombstone) AS tombstone, required_heads_fingerprint,",
+                    "ORDER BY header_revision DESC",
+                )
+        } else {
+            (
+                    self.table_ref("mcp_open_sessions"),
+                    String::new(),
+                    String::new(),
+                    "'' AS candidate_publication_id, toUInt64(source_revision) AS source_revision, toUInt64(dirty_revision) AS dirty_revision, toUInt8(0) AS tombstone, '' AS required_heads_fingerprint,",
+                    "",
+                )
+        };
         let query = format!(
-            "SELECT
+            "{snapshot_cte}SELECT
   session_id,
+  {revision_columns}
   toUInt8(slot) AS slot,
   toUInt64(generation) AS generation,
   toString(s.first_event_time) AS first_event_time,
@@ -74,13 +109,28 @@ impl ClickHouseConversationRepository {
   terminal_event_uid,
   origin_cwd
 FROM {sessions} AS s FINAL
-WHERE s.session_id = {}
+WHERE s.session_id = {}{authorization}
+{ordering}
 LIMIT 1
 FORMAT JSONEachRow",
             sql_quote(session_id),
         );
         let rows: Vec<McpOpenSessionRow> = self.map_backend(self.query_rows(&query, None).await)?;
-        Ok(rows.into_iter().next().map(|row| {
+        let Some(row) = rows.into_iter().next() else {
+            if let Some(snapshot) = snapshot.as_ref() {
+                if self
+                    .canonical_session_exists_in_snapshot(session_id, snapshot)
+                    .await?
+                {
+                    return Err(RepoError::ReadModelChanged);
+                }
+            }
+            return Ok(None);
+        };
+        if row.tombstone != 0 {
+            return Ok(None);
+        }
+        Ok(Some({
             let metadata = SessionMetadata {
                 session_id: row.session_id.clone(),
                 first_event_time: row.first_event_time.clone(),
@@ -100,6 +150,44 @@ FORMAT JSONEachRow",
             };
             ProjectedSession { row, metadata }
         }))
+    }
+
+    pub(super) async fn canonical_session_exists_in_snapshot(
+        &self,
+        session_id: &str,
+        _snapshot: &PublicationSnapshot,
+    ) -> RepoResult<bool> {
+        #[derive(Deserialize)]
+        struct ExistsRow {
+            exists: u8,
+        }
+        let query = format!(
+            "SELECT toUInt8(count() > 0) AS exists\nFROM {} AS e\nWHERE e.session_id = {}\nFORMAT JSONEachRow",
+            self.live_events_source(),
+            sql_quote(session_id),
+        );
+        let rows: Vec<ExistsRow> = self.map_backend(self.query_rows(&query, None).await)?;
+        Ok(rows.first().is_some_and(|row| row.exists != 0))
+    }
+
+    pub(super) async fn canonical_event_exists_in_snapshot(
+        &self,
+        event_uid: &str,
+    ) -> RepoResult<bool> {
+        #[derive(Deserialize)]
+        struct ExistsRow {
+            exists: u8,
+        }
+        let Some(_snapshot) = active_publication_snapshot() else {
+            return Ok(false);
+        };
+        let query = format!(
+            "SELECT toUInt8(count() > 0) AS exists\nFROM {} AS e\nWHERE e.event_uid = {}\nFORMAT JSONEachRow",
+            self.live_events_source(),
+            sql_quote(event_uid),
+        );
+        let rows: Vec<ExistsRow> = self.map_backend(self.query_rows(&query, None).await)?;
+        Ok(rows.first().is_some_and(|row| row.exists != 0))
     }
 
     pub(super) fn projected_session_in_scope(&self, session: &ProjectedSession) -> bool {
@@ -207,6 +295,7 @@ FORMAT JSONEachRow",
 FROM {events} FINAL
 WHERE event_uid = {}
 ORDER BY generation DESC
+LIMIT 64
 FORMAT JSONEachRow",
             sql_quote(event_uid),
         );

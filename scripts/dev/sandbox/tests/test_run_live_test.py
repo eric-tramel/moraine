@@ -445,6 +445,12 @@ class RunLiveTestTests(unittest.TestCase):
             "analytics-parity", "live_monitor_repository_semantic_parity"
         )
 
+    def test_source_publication_mode_runs_only_exact_ignored_function(self) -> None:
+        self.assert_exact_invocation(
+            "source-publication",
+            "live_source_publication_cutover_crash_recovery",
+        )
+
     def test_missing_and_unknown_modes_fail_before_boot(self) -> None:
         missing = self.run_wrapper()
         unknown = self.run_wrapper("all-ignored")

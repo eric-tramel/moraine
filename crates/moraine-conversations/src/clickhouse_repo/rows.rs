@@ -170,8 +170,14 @@ pub(super) struct OpenTargetRow {
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct McpOpenSessionRow {
     pub(super) session_id: String,
+    #[serde(default)]
+    pub(super) candidate_publication_id: String,
     pub(super) slot: u8,
     pub(super) generation: u64,
+    #[serde(default)]
+    pub(super) source_revision: u64,
+    #[serde(default)]
+    pub(super) dirty_revision: u64,
     pub(super) first_event_time: String,
     pub(super) first_event_unix_ms: i64,
     pub(super) last_event_time: String,
@@ -195,6 +201,10 @@ pub(super) struct McpOpenSessionRow {
     pub(super) completed: u8,
     pub(super) terminal_event_uid: String,
     pub(super) origin_cwd: String,
+    #[serde(default)]
+    pub(super) tombstone: u8,
+    #[serde(default)]
+    pub(super) required_heads_fingerprint: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

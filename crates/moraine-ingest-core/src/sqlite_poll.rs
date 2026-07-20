@@ -302,6 +302,72 @@ fn project_exclusions_hash(config: &AppConfig) -> u64 {
     )
 }
 
+fn sqlite_policy_fingerprint(format: &str, exclusions_hash: u64) -> String {
+    format!("sqlite-publication-v1:{format}:{exclusions_hash:016x}")
+}
+
+fn database_scan_still_valid(source_file: &str, scan_inode: u64) -> Result<()> {
+    let metadata = std::fs::metadata(source_file)
+        .with_context(|| format!("database disappeared while scanning {source_file}"))?;
+    let final_inode = source_inode_for_file(source_file, &metadata);
+    anyhow::ensure!(
+        final_inode == scan_inode,
+        "database inode changed while scanning {source_file}: {scan_inode} -> {final_inode}"
+    );
+    Ok(())
+}
+
+async fn begin_database_replay(
+    sink_tx: &mpsc::Sender<SinkMessage>,
+    checkpoint: &Checkpoint,
+    scan_boundary: u64,
+    policy_fingerprint: &str,
+) -> Result<()> {
+    let transition = crate::CheckpointTransition::begin_replay(
+        checkpoint,
+        checkpoint.source_inode,
+        scan_boundary,
+        policy_fingerprint,
+    );
+    crate::publication::send_begin_replay(sink_tx, transition).await?;
+    Ok(())
+}
+
+async fn finalize_database_replay(
+    sink_tx: &mpsc::Sender<SinkMessage>,
+    checkpoint: &Checkpoint,
+    scan_boundary: u64,
+    policy_fingerprint: &str,
+) -> Result<()> {
+    let transition = crate::CheckpointTransition::finalize_replay(
+        checkpoint,
+        checkpoint.source_inode,
+        scan_boundary,
+        policy_fingerprint,
+    );
+    match crate::publication::send_finalize_replay(sink_tx, transition).await? {
+        crate::FinalizeReplayOutcome::Published(_) => {}
+        crate::FinalizeReplayOutcome::StagedForMirror => {
+            tracing::debug!(
+                source = %checkpoint.source_name,
+                path = %checkpoint.source_file,
+                "replacement finalization staged until mirror catch-up barrier"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn block_database_replay(
+    sink_tx: &mpsc::Sender<SinkMessage>,
+    checkpoint: &Checkpoint,
+    reason: impl Into<String>,
+) -> Result<()> {
+    let transition = crate::CheckpointTransition::blocked(checkpoint, reason.into());
+    crate::publication::send_block_replay(sink_tx, transition).await?;
+    Ok(())
+}
+
 fn stat_fingerprint(db_path: &str) -> Option<StatFingerprint> {
     fn len_and_mtime(path: &str) -> (u64, u64) {
         match std::fs::metadata(path) {
@@ -386,21 +452,46 @@ pub(crate) async fn process_cursor_sqlite_db(
 
     let mut state = CursorState::parse(&checkpoint.cursor_json);
     let current_exclusions_hash = project_exclusions_hash(config);
+    let policy_fingerprint =
+        sqlite_policy_fingerprint(SOURCE_FORMAT_CURSOR_SQLITE, current_exclusions_hash);
 
     // A replaced database file is a new generation: every logical identity
     // (and therefore every event UID) starts over, and the hash cursor is
     // meaningless for the new file's contents. A changed exclusion set also
     // replays the database so rows skipped under the prior policy can return.
-    let generation_changed = checkpoint.source_inode != inode;
-    let exclusions_changed = state.project_exclusions_hash != current_exclusions_hash;
-    if generation_changed {
+    let generation_changed = had_committed && checkpoint.source_inode != inode;
+    let exclusions_changed =
+        had_committed && state.project_exclusions_hash != current_exclusions_hash;
+    let retry_blocked_replay = checkpoint.status == "replaying"
+        || (checkpoint.status == "error" && !checkpoint.block_reason.is_empty());
+    let starts_replacement = generation_changed || exclusions_changed;
+    if starts_replacement {
         checkpoint.source_inode = inode;
-        checkpoint.source_generation = checkpoint.source_generation.saturating_add(1).max(1);
+        checkpoint.source_generation =
+            crate::publication::checked_next_generation(checkpoint.source_generation)
+                .context("source generation exhausted while replacing cursor_sqlite database")?;
+        checkpoint.last_offset = 0;
+        checkpoint.last_line_no = 0;
     }
-    if generation_changed || exclusions_changed {
+    let replacement_replay = starts_replacement || retry_blocked_replay;
+    if replacement_replay {
         state = CursorState::fresh();
     }
     state.project_exclusions_hash = current_exclusions_hash;
+    checkpoint.policy_fingerprint = policy_fingerprint.clone();
+    checkpoint.status = if replacement_replay {
+        "replaying".to_string()
+    } else {
+        "active".to_string()
+    };
+    checkpoint.block_reason.clear();
+    let scan_boundary = checkpoint
+        .last_offset
+        .checked_add(1)
+        .context("cursor_sqlite poll sequence exhausted")?;
+    if replacement_replay {
+        begin_database_replay(&sink_tx, &checkpoint, scan_boundary, &policy_fingerprint).await?;
+    }
 
     // Cheap no-change short-circuit: nothing touched the database or its WAL
     // sidecars since the last successful poll.
@@ -443,8 +534,8 @@ pub(crate) async fn process_cursor_sqlite_db(
                 prior
             };
             let scan_is_noop = had_committed
-                && !generation_changed
-                && !exclusions_changed
+                && !starts_replacement
+                && !retry_blocked_replay
                 && records.is_empty()
                 && checkpoint.status == "active"
                 && new_state == prior_state_covered
@@ -455,7 +546,18 @@ pub(crate) async fn process_cursor_sqlite_db(
                 return Ok(());
             }
 
+            if let Err(exc) = database_scan_still_valid(&source_file, inode) {
+                if replacement_replay {
+                    let mut blocked = checkpoint.clone();
+                    blocked.status = "error".to_string();
+                    blocked.block_reason = exc.to_string();
+                    block_database_replay(&sink_tx, &blocked, exc.to_string()).await?;
+                }
+                return Err(exc);
+            }
+
             let mut batch = RowBatch::default();
+            let mut replay_block_reason = None::<String>;
             for synthetic in &records {
                 if crate::dispatch::record_project_dir_is_excluded(
                     config,
@@ -490,6 +592,12 @@ pub(crate) async fn process_cursor_sqlite_db(
                         batch.lines_processed = batch.lines_processed.saturating_add(1);
                     }
                     Err(exc) => {
+                        if replacement_replay && replay_block_reason.is_none() {
+                            replay_block_reason = Some(format!(
+                                "cursor_sqlite row {} failed normalization: {exc}",
+                                synthetic.source_line_no
+                            ));
+                        }
                         batch.push_error_row(json!({
                             "source_name": work.source_name,
                             "harness": work.harness,
@@ -523,19 +631,59 @@ pub(crate) async fn process_cursor_sqlite_db(
                 // Monotone poll sequence: `merge_checkpoint` resolves
                 // same-generation conflicts by `last_offset >=`, so the
                 // cursor payload must ride a strictly increasing value.
-                last_offset: checkpoint.last_offset.saturating_add(1),
+                last_offset: scan_boundary,
                 last_line_no: relevant_keys,
-                status: "active".to_string(),
+                status: if replacement_replay {
+                    "replaying".to_string()
+                } else {
+                    "active".to_string()
+                },
                 cursor_json: new_state.serialize(),
                 source_fingerprint: inode,
                 schema_fingerprint,
+                policy_fingerprint: policy_fingerprint.clone(),
+                scan_inode: inode,
+                scan_boundary,
+                final_scan_complete: !replacement_replay,
+                compatibility_prepared: !replacement_replay,
+                backend_caught_up: !replacement_replay,
+                ..checkpoint.clone()
             };
 
-            batch.checkpoint = Some(final_checkpoint);
+            batch.checkpoint = Some(final_checkpoint.clone());
             sink_tx
                 .send(SinkMessage::Batch(batch))
                 .await
                 .context("sink channel closed while sending final cursor_sqlite batch")?;
+            if replacement_replay {
+                if let Some(reason) = replay_block_reason {
+                    let blocked_checkpoint = Checkpoint {
+                        status: "error".to_string(),
+                        final_scan_complete: false,
+                        compatibility_prepared: false,
+                        backend_caught_up: false,
+                        block_reason: reason.clone(),
+                        ..final_checkpoint
+                    };
+                    block_database_replay(&sink_tx, &blocked_checkpoint, reason).await?;
+                    poll_state.clear(&cp_key);
+                    return Ok(());
+                }
+                let active_checkpoint = Checkpoint {
+                    status: "active".to_string(),
+                    final_scan_complete: true,
+                    compatibility_prepared: true,
+                    backend_caught_up: true,
+                    ..final_checkpoint
+                };
+                finalize_database_replay(
+                    &sink_tx,
+                    &active_checkpoint,
+                    scan_boundary,
+                    &policy_fingerprint,
+                )
+                .await?;
+            }
             poll_state.clear(&cp_key);
 
             if emitted > 0 {
@@ -578,7 +726,7 @@ pub(crate) async fn process_cursor_sqlite_db(
                 "source_line_no": 0u64,
                 "source_offset": 0u64,
                 "error_kind": error_kind,
-                "error_text": error_text,
+                "error_text": error_text.clone(),
                 "raw_fragment": "",
             }));
 
@@ -591,23 +739,42 @@ pub(crate) async fn process_cursor_sqlite_db(
             // cursor.
             let mut error_state = state.clone();
             error_state.last_error = error_kind.to_string();
-            batch.checkpoint = Some(Checkpoint {
+            let error_checkpoint = Checkpoint {
                 source_name: work.source_name.clone(),
                 source_file: source_file.clone(),
                 source_inode: inode,
                 source_generation: checkpoint.source_generation,
                 last_offset: checkpoint.last_offset,
                 last_line_no: checkpoint.last_line_no,
-                status: "active".to_string(),
+                status: if replacement_replay {
+                    "error".to_string()
+                } else {
+                    "active".to_string()
+                },
                 cursor_json: error_state.serialize(),
                 source_fingerprint: inode,
                 schema_fingerprint: checkpoint.schema_fingerprint,
-            });
+                policy_fingerprint: policy_fingerprint.clone(),
+                scan_inode: inode,
+                scan_boundary,
+                block_reason: if replacement_replay {
+                    error_text.clone()
+                } else {
+                    String::new()
+                },
+                ..checkpoint.clone()
+            };
+            if !replacement_replay {
+                batch.checkpoint = Some(error_checkpoint.clone());
+            }
 
             sink_tx
                 .send(SinkMessage::Batch(batch))
                 .await
                 .context("sink channel closed while sending cursor_sqlite error batch")?;
+            if replacement_replay {
+                block_database_replay(&sink_tx, &error_checkpoint, error_text).await?;
+            }
             Ok(())
         }
     }
@@ -1510,22 +1677,59 @@ mod tests {
         let config = moraine_config::AppConfig::default();
         let metrics = Arc::new(Metrics::default());
         let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(64);
-
-        process_cursor_sqlite_db(
+        let process = process_cursor_sqlite_db(
             &config,
             work,
             checkpoints.clone(),
             poll_state,
             sink_tx,
             &metrics,
-        )
-        .await
-        .expect("cursor_sqlite poll should succeed");
-        let batches = drain_batches(&mut sink_rx).await;
+        );
+        tokio::pin!(process);
+        let mut batches = Vec::new();
+        let mut finalized = None;
+        loop {
+            tokio::select! {
+                result = &mut process => {
+                    result.expect("cursor_sqlite poll should succeed");
+                    break;
+                }
+                message = sink_rx.recv() => match message.expect("cursor test sink remains open") {
+                    SinkMessage::Batch(batch) => batches.push(batch),
+                    SinkMessage::BeginReplay { transition, ack }
+                    | SinkMessage::BlockReplay { transition, ack }
+                    | SinkMessage::MirrorCaughtUp { transition, ack } => {
+                        let _ = ack.send(Ok(crate::publication::ReplayBarrierAck {
+                            checkpoint_revision: 1,
+                            operation_id: transition.operation_id,
+                        }));
+                    }
+                    SinkMessage::FinalizeReplay { transition, ack } => {
+                        finalized = Some(transition.checkpoint);
+                        let _ = ack.send(Ok(
+                            crate::publication::FinalizeReplayOutcome::Published(
+                                crate::publication::PublicationAck {
+                                    checkpoint_revision: 2,
+                                    publication_revision: 1,
+                                    already_published: false,
+                                },
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        while let Ok(message) = sink_rx.try_recv() {
+            if let SinkMessage::Batch(batch) = message {
+                batches.push(batch);
+            }
+        }
 
         // Apply the final checkpoint exactly like the sink would after a
         // successful flush.
-        if let Some(cp) = batches.last().and_then(|batch| batch.checkpoint.clone()) {
+        if let Some(cp) =
+            finalized.or_else(|| batches.last().and_then(|batch| batch.checkpoint.clone()))
+        {
             let key = checkpoint_key(&cp.source_name, &cp.source_file);
             checkpoints.write().await.insert(key, cp);
         }
@@ -1666,17 +1870,59 @@ mod tests {
 
         let included_config = moraine_config::AppConfig::default();
         let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(64);
-        process_cursor_sqlite_db(
+        let process = process_cursor_sqlite_db(
             &included_config,
             &work,
-            checkpoints,
+            checkpoints.clone(),
             &poll_state,
             sink_tx,
             &metrics,
-        )
-        .await
-        .expect("Cursor replay after exclusion removal");
-        let replayed = drain_batches(&mut sink_rx).await;
+        );
+        tokio::pin!(process);
+        let mut replayed = Vec::new();
+        let mut final_checkpoint = None;
+        loop {
+            tokio::select! {
+                result = &mut process => {
+                    result.expect("Cursor replay after exclusion removal");
+                    break;
+                }
+                message = sink_rx.recv() => match message.expect("cursor replay sink remains open") {
+                    SinkMessage::Batch(batch) => replayed.push(batch),
+                    SinkMessage::BeginReplay { transition, ack } => {
+                        assert_eq!(transition.checkpoint.source_generation, 2);
+                        let _ = ack.send(Ok(crate::publication::ReplayBarrierAck {
+                            checkpoint_revision: 1,
+                            operation_id: transition.operation_id,
+                        }));
+                    }
+                    SinkMessage::FinalizeReplay { transition, ack } => {
+                        final_checkpoint = Some(transition.checkpoint);
+                        let _ = ack.send(Ok(
+                            crate::publication::FinalizeReplayOutcome::Published(
+                                crate::publication::PublicationAck {
+                                    checkpoint_revision: 2,
+                                    publication_revision: 2,
+                                    already_published: false,
+                                },
+                            ),
+                        ));
+                    }
+                    SinkMessage::BlockReplay { .. } | SinkMessage::MirrorCaughtUp { .. } => {
+                        panic!("successful exclusion replay must not block")
+                    }
+                }
+            }
+        }
+        while let Ok(SinkMessage::Batch(batch)) = sink_rx.try_recv() {
+            replayed.push(batch);
+        }
+        let final_checkpoint = final_checkpoint.expect("final replay transition");
+        assert_eq!(final_checkpoint.status, "active");
+        checkpoints.write().await.insert(
+            checkpoint_key(&final_checkpoint.source_name, &final_checkpoint.source_file),
+            final_checkpoint,
+        );
         assert!(
             !all_event_rows(&replayed).is_empty(),
             "removing exclusions must replay previously skipped rows"

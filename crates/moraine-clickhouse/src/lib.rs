@@ -11,6 +11,9 @@ use serde_json::Value;
 use std::io::Write;
 
 mod mcp_open_projection;
+pub use mcp_open_projection::{
+    McpOpenGenerationReadiness, McpOpenPublicationRequest, McpOpenSourceHead,
+};
 pub mod mcp_tool_names;
 
 const MAX_INSERT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
@@ -105,7 +108,37 @@ pub struct DoctorReport {
     pub applied_migrations: Vec<String>,
     pub pending_migrations: Vec<String>,
     pub missing_tables: Vec<String>,
+    pub publication: Option<PublicationDiagnostics>,
     pub errors: Vec<String>,
+}
+
+/// Aggregate readiness facts for atomic source-generation publication.
+///
+/// Replaying generations, append preparations, and mirror catch-up are normal
+/// transient states. Ambiguous legacy ownership, blocked generations, and
+/// writer conflicts require operator attention and make publication degraded.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct PublicationDiagnostics {
+    pub ambiguous_hostless_rows: u64,
+    pub replaying_generations: u64,
+    pub blocked_generations: u64,
+    pub append_preparations: u64,
+    pub blocked_append_preparations: u64,
+    pub mirror_catchup_pending: u64,
+    pub writer_conflicts: u64,
+    #[serde(default)]
+    pub issues: Vec<String>,
+}
+
+impl PublicationDiagnostics {
+    /// Whether current reads are protected without a known fail-closed
+    /// publication condition.
+    pub fn is_healthy(&self) -> bool {
+        self.ambiguous_hostless_rows == 0
+            && self.blocked_generations == 0
+            && self.blocked_append_preparations == 0
+            && self.writer_conflicts == 0
+    }
 }
 
 impl ClickHouseClient {
@@ -575,6 +608,7 @@ impl ClickHouseClient {
             applied_migrations: Vec::new(),
             pending_migrations: Vec::new(),
             missing_tables: Vec::new(),
+            publication: None,
             errors: Vec::new(),
         };
 
@@ -674,10 +708,30 @@ impl ClickHouseClient {
             "mcp_open_events",
             "mcp_open_dirty_sessions",
             "mcp_open_projection_state",
+            "mcp_open_publication_headers",
+            "mcp_open_generation_readiness",
+            "published_source_generations",
+            "ingest_checkpoint_transitions",
+            "source_generation_publication_readiness",
+            "ingest_append_control",
+            "publication_diagnostic_events",
+            "v_published_source_generation_history",
+            "v_current_published_source_generations",
+            "v_current_ingest_checkpoint_transitions",
+            "v_current_source_generation_publication_readiness",
+            "v_current_ingest_append_control",
+            "v_live_events",
+            "v_live_event_links",
+            "v_live_tool_io",
+            "v_live_search_documents",
+            "v_live_search_postings",
+            "v_mcp_open_publication_headers",
+            "v_current_mcp_open_generation_readiness",
+            "v_publication_diagnostics",
             "schema_migrations",
         ];
 
-        match self
+        let existing_tables = match self
             .query_json_data::<TableRow>(&table_query, Some("system"))
             .await
         {
@@ -688,11 +742,49 @@ impl ClickHouseClient {
                     .filter(|name| !existing.contains(**name))
                     .map(|name| (*name).to_string())
                     .collect();
+                Some(existing)
             }
-            Err(err) => report.errors.push(format!("table listing failed: {err}")),
+            Err(err) => {
+                report.errors.push(format!("table listing failed: {err}"));
+                None
+            }
+        };
+
+        if existing_tables
+            .as_ref()
+            .is_some_and(|tables| tables.contains("v_publication_diagnostics"))
+        {
+            match self.publication_diagnostics().await {
+                Ok(diagnostics) => report.publication = Some(diagnostics),
+                Err(err) => report
+                    .errors
+                    .push(format!("publication diagnostics failed: {err}")),
+            }
         }
 
         Ok(report)
+    }
+
+    /// Read the single-row publication readiness aggregate installed by the
+    /// atomic source-publication schema migration.
+    pub async fn publication_diagnostics(&self) -> Result<PublicationDiagnostics> {
+        let query = format!(
+            "SELECT ambiguous_hostless_rows, replaying_generations, blocked_generations, \
+             append_preparations, blocked_append_preparations, mirror_catchup_pending, \
+             writer_conflicts, issues \
+             FROM {}.v_publication_diagnostics FORMAT JSONEachRow",
+            escape_identifier(&self.cfg.database)
+        );
+        let rows: Vec<PublicationDiagnostics> = self
+            .query_json_each_row(&query, Some(&self.cfg.database))
+            .await?;
+        match rows.as_slice() {
+            [diagnostics] => Ok(diagnostics.clone()),
+            _ => Err(anyhow!(
+                "publication diagnostics view returned {} rows; expected exactly one",
+                rows.len()
+            )),
+        }
     }
 
     async fn ensure_migration_ledger(&self) -> Result<()> {
@@ -901,6 +993,21 @@ pub fn bundled_migrations() -> Vec<Migration> {
             version: "030",
             name: "030_refresh_omp_session_metadata.sql",
             sql: include_str!("../../../sql/030_refresh_omp_session_metadata.sql"),
+        },
+        Migration {
+            version: "031",
+            name: "031_atomic_source_publication_control.sql",
+            sql: include_str!("../../../sql/031_atomic_source_publication_control.sql"),
+        },
+        Migration {
+            version: "032",
+            name: "032_source_host_live_read_model.sql",
+            sql: include_str!("../../../sql/032_source_host_live_read_model.sql"),
+        },
+        Migration {
+            version: "033",
+            name: "033_mcp_atomic_publication_bridge.sql",
+            sql: include_str!("../../../sql/033_mcp_atomic_publication_bridge.sql"),
         },
     ]
 }
@@ -1672,7 +1779,7 @@ mod tests {
 
     #[test]
     fn mcp_open_migrations_exclude_blank_session_ids() {
-        for version in ["027", "029", "030"] {
+        for version in ["027", "029", "030", "033"] {
             let migration = bundled_migrations()
                 .into_iter()
                 .find(|migration| migration.version == version)
@@ -1694,6 +1801,158 @@ mod tests {
 
         assert!(migration.sql.contains("FROM moraine.events FINAL"));
         assert!(migration.sql.contains("source_name = 'omp'"));
+    }
+
+    #[test]
+    fn migration_031_preserves_publication_history_and_causal_checkpoint_tuples() {
+        let migration = bundled_migrations()
+            .into_iter()
+            .find(|migration| migration.version == "031")
+            .expect("migration 031 must be registered");
+        let sql = migration.sql;
+
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS moraine.published_source_generations"));
+        assert!(sql.contains("ReplacingMergeTree(publication_revision)"));
+        assert!(sql.contains("ORDER BY (source_host, source_name, source_file, source_generation)"));
+        assert!(sql.contains("tuple(publication_revision, publisher_id, operation_id)"));
+        assert!(sql.contains("tuple(control_revision, publisher_id, batch_id, state)"));
+        assert!(
+            sql.contains("CREATE VIEW IF NOT EXISTS moraine.v_published_source_generation_history")
+        );
+        assert!(sql.contains("FROM moraine.v_published_source_generation_history\n)"));
+        assert!(sql.contains(") NOT IN\n("));
+        assert!(sql.contains("base_revision + toUInt64(row_number()"));
+        assert!(sql.contains("cursor_json String DEFAULT ''"));
+        assert!(sql.contains("source_fingerprint UInt64 DEFAULT 0"));
+        assert!(sql.contains("schema_fingerprint UInt64 DEFAULT 0"));
+        assert!(sql.contains("argMax(\n      tuple("));
+        assert!(!sql.contains("DELETE WHERE"));
+        assert!(!sql.contains("TRUNCATE TABLE"));
+    }
+
+    #[test]
+    fn migration_032_authorizes_search_before_statistics() {
+        let migration = bundled_migrations()
+            .into_iter()
+            .find(|migration| migration.version == "032")
+            .expect("migration 032 must be registered");
+        let sql = migration.sql;
+
+        for table in [
+            "raw_events",
+            "events",
+            "event_links",
+            "tool_io",
+            "ingest_errors",
+            "search_documents",
+            "search_postings",
+        ] {
+            assert!(
+                sql.contains(&format!("ALTER TABLE moraine.{table}")),
+                "032 must migrate {table}"
+            );
+        }
+        assert!(sql.contains("CREATE VIEW moraine.v_live_events"));
+        assert!(sql.contains("CREATE VIEW moraine.v_live_search_documents"));
+        assert!(
+            !sql.contains("ANY INNER JOIN"),
+            "032 authorization joins must preserve every matching left-side row"
+        );
+        let live_documents_projection = sql
+            .split_once("CREATE VIEW moraine.v_live_search_documents AS")
+            .and_then(|(_, tail)| tail.split_once(") AS d\nALL INNER JOIN"))
+            .map(|(projection, _)| projection)
+            .expect("032 must define the live search-document projection");
+        let projected_columns = live_documents_projection
+            .lines()
+            .map(str::trim)
+            .map(|line| line.trim_end_matches(','))
+            .collect::<HashSet<_>>();
+        for column in [
+            "doc_version",
+            "ingested_at",
+            "event_uid",
+            "compacted_parent_uid",
+            "session_id",
+            "session_date",
+            "source_host",
+            "source_name",
+            "harness",
+            "inference_provider",
+            "endpoint_kind",
+            "source_file",
+            "source_generation",
+            "source_line_no",
+            "source_offset",
+            "source_ref",
+            "record_ts",
+            "event_class",
+            "payload_type",
+            "actor_role",
+            "name",
+            "phase",
+            "text_content",
+            "payload_json",
+            "token_usage_json",
+            "token_usage_buckets",
+            "token_usage_native_units",
+            "doc_len",
+            "has_codex_mcp",
+        ] {
+            assert!(
+                projected_columns.contains(column),
+                "032 live search documents omitted `{column}`: {live_documents_projection}"
+            );
+        }
+        assert!(
+            !live_documents_projection.lines().any(|line| {
+                let line = line.trim();
+                line == "SELECT *" || line.starts_with("SELECT *,")
+            }),
+            "032 must not silently omit MATERIALIZED search columns"
+        );
+        assert_eq!(
+            sql.matches("ALL INNER JOIN").count(),
+            6,
+            "032 authorization joins must preserve every matching event, dependency, document, posting, and dirty session"
+        );
+        assert!(!sql.contains("ANY INNER JOIN"));
+        assert!(!sql.contains("\nINNER JOIN"));
+        assert!(sql.contains("AND d.doc_version = e.event_version"));
+        assert!(sql.contains("CREATE VIEW moraine.v_live_search_postings"));
+        assert!(sql.contains("AND p.post_version = d.doc_version"));
+        assert!(sql.contains("FROM moraine.v_live_search_postings\nGROUP BY term"));
+        assert!(sql.contains("FROM moraine.v_live_search_documents;"));
+        assert!(sql.contains("INSERT INTO moraine.search_postings"));
+        let drop_compat = sql
+            .find("DROP VIEW IF EXISTS moraine.mv_search_conversation_terms")
+            .expect("compatibility MV must be paused");
+        let rebuild_postings = sql
+            .find("INSERT INTO moraine.search_postings")
+            .expect("legacy postings must be regenerated");
+        let recreate_compat = sql
+            .find("CREATE MATERIALIZED VIEW moraine.mv_search_conversation_terms")
+            .expect("compatibility MV must resume");
+        assert!(drop_compat < rebuild_postings && rebuild_postings < recreate_compat);
+    }
+
+    #[test]
+    fn migration_033_keeps_candidate_headers_and_children_independent() {
+        let migration = bundled_migrations()
+            .into_iter()
+            .find(|migration| migration.version == "033")
+            .expect("migration 033 must be registered");
+        let sql = migration.sql;
+
+        assert!(sql.contains("ADD COLUMN IF NOT EXISTS candidate_generation UInt64"));
+        assert!(sql.contains("MODIFY ORDER BY (event_uid, slot, candidate_generation)"));
+        assert!(sql.contains("MODIFY ORDER BY (session_id, slot, turn_seq, candidate_generation)"));
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS moraine.mcp_open_publication_headers"));
+        assert!(sql.contains("ORDER BY (session_id, candidate_publication_id)"));
+        assert!(sql.contains("required_source_heads Array(Tuple("));
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS moraine.mcp_open_generation_readiness"));
+        assert!(sql.contains("VALUES ('global', 0, generateSnowflakeID(), '')"));
+        assert!(sql.contains("blocked_append_preparations"));
     }
 
     #[test]

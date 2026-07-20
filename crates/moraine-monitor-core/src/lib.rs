@@ -12,9 +12,9 @@ use axum::{
 use moraine_config::AppConfig;
 use moraine_conversations::{
     AnalyticsRange, BackendRepository, BackendRepositoryRouter, IngestHeartbeat,
-    IngestHeartbeatRead, RepoError, SessionAnalytics, SessionAnalyticsQuery, SessionLookback,
-    SessionStep, SessionTurn, StoreConnectionMetrics, StoreHealth, StoreProbe, TablePreviewQuery,
-    TableSummaries,
+    IngestHeartbeatRead, PublicationDiagnostics, RepoError, SessionAnalytics,
+    SessionAnalyticsQuery, SessionLookback, SessionStep, SessionTurn, StoreConnectionMetrics,
+    StoreHealth, StoreProbe, TablePreviewQuery, TableSummaries,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -375,23 +375,29 @@ async fn api_health(Extension(backend): Extension<Arc<BackendRepository>>) -> Re
                     "database": backend.clickhouse_database(),
                     "error": message,
                     "connections": {"total": Value::Null, "error": message},
+                    "publication": {
+                        "available": false,
+                        "healthy": false,
+                        "error": "publication readiness unavailable while store health is unavailable",
+                    },
                 }),
                 StatusCode::SERVICE_UNAVAILABLE,
             );
         }
     };
     let connections = connection_payload(&health.connections);
+    let publication = publication_payload(&health.publication);
 
     let ping_ms = match &health.ping {
         StoreProbe::Available(value) => *value,
         StoreProbe::Failed { message } => {
-            return health_failure_response(&backend, message, connections);
+            return health_failure_response(&backend, message, connections, publication);
         }
     };
     let version = match &health.version {
         StoreProbe::Available(value) => value,
         StoreProbe::Failed { message } => {
-            return health_failure_response(&backend, message, connections);
+            return health_failure_response(&backend, message, connections, publication);
         }
     };
     let heartbeat = heartbeat.map(monitor_heartbeat_status).unwrap_or_default();
@@ -404,6 +410,7 @@ async fn api_health(Extension(backend): Extension<Arc<BackendRepository>>) -> Re
             "version": version,
             "ping_ms": ping_ms,
             "connections": connections,
+            "publication": publication,
             "ingestor": health_heartbeat_payload(&heartbeat),
         }),
         StatusCode::OK,
@@ -414,6 +421,7 @@ fn health_failure_response(
     backend: &BackendRepository,
     message: &str,
     connections: Value,
+    publication: Value,
 ) -> Response {
     json_response(
         json!({
@@ -422,6 +430,7 @@ fn health_failure_response(
             "database": backend.clickhouse_database(),
             "error": message,
             "connections": connections,
+            "publication": publication,
         }),
         StatusCode::SERVICE_UNAVAILABLE,
     )
@@ -457,11 +466,13 @@ async fn api_status(Extension(backend): Extension<Arc<BackendRepository>>) -> Re
 
     let estimated_total_rows = tables.iter().map(|table| table.rows).sum::<u64>();
     let clickhouse = status_clickhouse_payload(&backend, &health, database_exists);
+    let publication = publication_payload(&health.publication);
 
     json_response(
         json!({
             "ok": true,
             "clickhouse": clickhouse,
+            "publication": publication,
             "database": {
                 "exists": database_exists,
                 "table_count": tables.len(),
@@ -486,6 +497,10 @@ fn unavailable_store_health(message: String) -> StoreHealth {
             message: message.clone(),
         },
         connections: StoreProbe::Failed { message },
+        publication: StoreProbe::Failed {
+            message: "publication readiness unavailable while store health is unavailable"
+                .to_string(),
+        },
     }
 }
 
@@ -541,10 +556,36 @@ fn connection_payload(probe: &StoreProbe<StoreConnectionMetrics>) -> Value {
     }
 }
 
+fn publication_payload(probe: &StoreProbe<PublicationDiagnostics>) -> Value {
+    match probe {
+        StoreProbe::Available(diagnostics) => json!({
+            "available": true,
+            "healthy": diagnostics.is_healthy(),
+            "ambiguous_hostless_rows": diagnostics.ambiguous_hostless_rows,
+            "replaying_generations": diagnostics.replaying_generations,
+            "blocked_generations": diagnostics.blocked_generations,
+            "append_preparations": diagnostics.append_preparations,
+            "blocked_append_preparations": diagnostics.blocked_append_preparations,
+            "mirror_catchup_pending": diagnostics.mirror_catchup_pending,
+            "writer_conflicts": diagnostics.writer_conflicts,
+            "issues": diagnostics.issues,
+        }),
+        StoreProbe::Failed { message } => json!({
+            "available": false,
+            "healthy": false,
+            "error": message,
+        }),
+    }
+}
+
 async fn api_tables(Extension(backend): Extension<Arc<BackendRepository>>) -> Response {
     match backend.repository().list_table_summaries().await {
         Ok(tables) => json_response(
-            json!({"ok": true, "tables": monitor_table_summaries(tables)}),
+            json!({
+                "ok": true,
+                "read_model": "audit",
+                "tables": monitor_table_summaries(tables),
+            }),
             StatusCode::OK,
         ),
         Err(error) => json_response(
@@ -585,6 +626,7 @@ async fn api_web_searches(
     json_response(
         json!({
             "ok": true,
+            "read_model": "live",
             "table": "web_searches",
             "limit": limit,
             "schema": [
@@ -622,6 +664,7 @@ async fn api_analytics(
     json_response(
         json!({
             "ok": true,
+            "read_model": "live",
             "range": {
                 "key": snapshot.window.range.as_str(),
                 "label": format!("Last {}", snapshot.window.range.as_str()),
@@ -675,7 +718,10 @@ async fn api_sessions(
         .map(|session| monitor_session_json(session, now_ms))
         .collect::<Vec<_>>();
 
-    json_response(json!({"ok": true, "sessions": sessions}), StatusCode::OK)
+    json_response(
+        json!({"ok": true, "read_model": "live", "sessions": sessions}),
+        StatusCode::OK,
+    )
 }
 
 fn resolve_session_lookback(value: Option<&str>) -> SessionLookback {
@@ -1040,6 +1086,7 @@ async fn api_table_rows(
             json_response(
                 json!({
                     "ok": true,
+                    "read_model": "audit",
                     "table": preview.table,
                     "limit": preview.limit,
                     "schema": schema,
@@ -1306,6 +1353,7 @@ mod tests {
                 postgres: 5,
                 interserver: 1,
             }),
+            publication: StoreProbe::Available(PublicationDiagnostics::default()),
         }
     }
 
@@ -1572,6 +1620,8 @@ mod tests {
         assert_eq!(health["ok"], json!(true));
         assert_eq!(health["version"], json!("25.1.1"));
         assert_eq!(health["connections"]["total"], json!(15));
+        assert_eq!(health["publication"]["available"], json!(true));
+        assert_eq!(health["publication"]["healthy"], json!(true));
         assert_eq!(
             health["ingestor"]["latest"],
             json!({"backend_sinks": {"team-ch": "healthy"}})
@@ -1583,6 +1633,7 @@ mod tests {
         assert_eq!(status["database"]["exists"], json!(true));
         assert_eq!(status["database"]["table_count"], json!(1));
         assert_eq!(status["database"]["estimated_total_rows"], json!(7));
+        assert_eq!(status["publication"]["healthy"], json!(true));
         assert_eq!(status["ingestor"]["latest"]["host"], json!("host-a"));
         let status_latest = status["ingestor"]["latest"]
             .as_object()
@@ -1595,6 +1646,7 @@ mod tests {
         let response = api_tables(Extension(backend.clone())).await;
         assert_eq!(response.status(), StatusCode::OK);
         let tables = response_json(response).await;
+        assert_eq!(tables["read_model"], json!("audit"));
         assert_eq!(tables["tables"][0]["is_temporary"], json!(0));
 
         let response = api_web_searches(
@@ -1604,6 +1656,7 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let web_searches = response_json(response).await;
+        assert_eq!(web_searches["read_model"], json!("live"));
         assert_eq!(web_searches["limit"], json!(1_000));
         assert_eq!(web_searches["schema"].as_array().unwrap().len(), 9);
         assert_eq!(web_searches["rows"][0]["search_query"], json!("moraine"));
@@ -1617,6 +1670,7 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let analytics = response_json(response).await;
+        assert_eq!(analytics["read_model"], json!("live"));
         assert_eq!(analytics["range"]["key"], json!("7d"));
         assert_eq!(analytics["range"]["label"], json!("Last 7d"));
         assert_eq!(analytics["series"]["tokens"][0]["tokens"], json!(4));
@@ -1631,6 +1685,7 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let sessions = response_json(response).await;
+        assert_eq!(sessions["read_model"], json!("live"));
         let session = &sessions["sessions"][0];
         assert_eq!(session["id"], json!("session-1"));
         assert_eq!(session["endedAt"], json!(1_771_243_203_900_i64));
@@ -1652,6 +1707,7 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let preview = response_json(response).await;
+        assert_eq!(preview["read_model"], json!("audit"));
         assert_eq!(preview["limit"], json!(500));
         assert_eq!(preview["schema"][0]["type"], json!("String"));
 
@@ -1795,6 +1851,73 @@ mod tests {
         assert_eq!(latest["backend_sinks"]["team-ch"], json!("healthy"));
         assert!(!latest.contains_key("host"));
         assert!(!latest.contains_key("last_error"));
+    }
+
+    #[tokio::test]
+    async fn health_and_status_expose_publication_progress_and_fail_closed_diagnostics() {
+        let diagnostics = PublicationDiagnostics {
+            ambiguous_hostless_rows: 7,
+            replaying_generations: 2,
+            blocked_generations: 1,
+            append_preparations: 3,
+            blocked_append_preparations: 2,
+            mirror_catchup_pending: 4,
+            writer_conflicts: 1,
+            issues: vec!["host identity cannot be proven".to_string()],
+        };
+        let (backend, _) = fake_backend(InMemoryConversationResponses {
+            read_store_health: Some(Ok(StoreHealth {
+                publication: StoreProbe::Available(diagnostics),
+                ..sample_health()
+            })),
+            latest_ingest_heartbeat: Some(Ok(sample_heartbeat())),
+            list_table_summaries: Some(Ok(TableSummaries::default())),
+            ..Default::default()
+        })
+        .await;
+
+        let health = response_json(api_health(Extension(backend.clone())).await).await;
+        assert_eq!(health["ok"], json!(true));
+        assert_eq!(health["publication"]["healthy"], json!(false));
+        assert_eq!(health["publication"]["ambiguous_hostless_rows"], json!(7));
+        assert_eq!(health["publication"]["blocked_generations"], json!(1));
+        assert_eq!(health["publication"]["writer_conflicts"], json!(1));
+        assert_eq!(health["publication"]["replaying_generations"], json!(2));
+        assert_eq!(health["publication"]["append_preparations"], json!(3));
+        assert_eq!(
+            health["publication"]["blocked_append_preparations"],
+            json!(2)
+        );
+        assert_eq!(health["publication"]["mirror_catchup_pending"], json!(4));
+
+        let status = response_json(api_status(Extension(backend)).await).await;
+        assert_eq!(status["publication"], health["publication"]);
+    }
+
+    #[tokio::test]
+    async fn publication_probe_failure_is_diagnostic_without_hiding_store_liveness() {
+        let (backend, _) = fake_backend(InMemoryConversationResponses {
+            read_store_health: Some(Ok(StoreHealth {
+                publication: StoreProbe::Failed {
+                    message: "publication control schema unavailable".to_string(),
+                },
+                ..sample_health()
+            })),
+            latest_ingest_heartbeat: Some(Ok(sample_heartbeat())),
+            ..Default::default()
+        })
+        .await;
+
+        let response = api_health(Extension(backend)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let health = response_json(response).await;
+        assert_eq!(health["ok"], json!(true));
+        assert_eq!(health["publication"]["available"], json!(false));
+        assert_eq!(health["publication"]["healthy"], json!(false));
+        assert_eq!(
+            health["publication"]["error"],
+            json!("publication control schema unavailable")
+        );
     }
 
     #[tokio::test]

@@ -390,7 +390,7 @@ async fn build_checked_clickhouse_repository_with_user_agent(
     })?;
     enforce_remote_schema_policy(backend_name, &skew, allow_newer_server)?;
 
-    Ok(Arc::new(ClickHouseConversationRepository::new(
+    Ok(Arc::new(ClickHouseConversationRepository::new_shared(
         client, config,
     )))
 }

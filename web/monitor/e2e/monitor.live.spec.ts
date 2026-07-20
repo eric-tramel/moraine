@@ -17,6 +17,10 @@ interface HealthResponse extends ApiBaseResponse {
   connections?: {
     total?: number | null;
   };
+  publication?: {
+    available: boolean;
+    healthy: boolean;
+  };
 }
 
 interface StatusResponse extends ApiBaseResponse {
@@ -178,6 +182,15 @@ test('live monitor UI reflects ingested fixture data', async ({ page }) => {
 
   if (health.database) {
     await expect(healthGroup).toContainText(health.database);
+  }
+  if (health.publication?.available) {
+    const publicationChip = healthGroup
+      .locator('.ss-chip')
+      .filter({ hasText: 'publication' })
+      .first();
+    await expect(publicationChip).toContainText(
+      health.publication.healthy ? 'healthy' : 'degraded',
+    );
   }
 
   const ingestorGroup = page.locator('#ingestorGroup');

@@ -81,7 +81,7 @@ impl ClickHouseConversationRepository {
         let session_summary = self.table_ref("v_session_summary");
         let turn_summary = self.table_ref("v_turn_summary");
         let trace = self.table_ref("v_conversation_trace");
-        let canonical_events = canonical_events_source(&self.table_ref("events"));
+        let canonical_events = self.live_events_source();
         let mode_subquery = self.mode_subquery();
         let lookback_clause = query
             .lookback
@@ -215,15 +215,24 @@ FORMAT JSONEachRow"
         let slot = &self.analytics_cache[analytics_range_index(range)];
         let mut entry = slot.lock().await;
         let now = Instant::now();
-        if let Some(cached) = entry.as_ref().filter(|cached| cached.is_fresh(now)) {
-            return Ok(cached.snapshot.clone());
+        let publication_token = publication_cache_key(&format!("analytics:{range:?}"));
+        if let Some(publication_token) = publication_token.as_deref() {
+            if let Some(cached) = entry
+                .as_ref()
+                .filter(|cached| cached.is_fresh(now, publication_token))
+            {
+                return Ok(cached.snapshot.clone());
+            }
         }
 
         let snapshot = self.load_analytics_snapshot(range).await?;
-        *entry = Some(AnalyticsCacheEntry {
-            snapshot: snapshot.clone(),
-            fetched_at: Instant::now(),
-        });
+        if let Some(publication_token) = publication_token {
+            *entry = Some(AnalyticsCacheEntry {
+                publication_token,
+                snapshot: snapshot.clone(),
+                fetched_at: Instant::now(),
+            });
+        }
         Ok(snapshot)
     }
 
@@ -231,7 +240,7 @@ FORMAT JSONEachRow"
         &self,
         range: AnalyticsRange,
     ) -> RepoResult<AnalyticsSnapshot> {
-        let canonical_events = canonical_events_source(&self.table_ref("events"));
+        let canonical_events = self.live_events_source();
         let window_seconds = range.window_seconds();
         let bucket_seconds = range.bucket_seconds();
         let anchor_query = format!(
@@ -396,7 +405,7 @@ FORMAT JSONEachRow"
         &self,
         limit: u16,
     ) -> RepoResult<Vec<WebSearchEvent>> {
-        let canonical_events = canonical_events_source(&self.table_ref("events"));
+        let canonical_events = self.live_events_source();
         let limit = limit.clamp(1, 1000);
         let query = format!(
             "SELECT
@@ -823,16 +832,19 @@ mod tests {
 
         let now = Instant::now();
         let fresh = AnalyticsCacheEntry {
+            publication_token: "snapshot-a".to_string(),
             snapshot: AnalyticsSnapshot::default(),
             fetched_at: now,
         };
         let stale = AnalyticsCacheEntry {
+            publication_token: "snapshot-a".to_string(),
             snapshot: AnalyticsSnapshot::default(),
             fetched_at: now
                 .checked_sub(ANALYTICS_CACHE_TTL + Duration::from_secs(1))
                 .expect("test instant"),
         };
-        assert!(fresh.is_fresh(now));
-        assert!(!stale.is_fresh(now));
+        assert!(fresh.is_fresh(now, "snapshot-a"));
+        assert!(!fresh.is_fresh(now, "snapshot-b"));
+        assert!(!stale.is_fresh(now, "snapshot-a"));
     }
 }

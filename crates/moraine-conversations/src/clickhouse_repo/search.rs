@@ -24,6 +24,86 @@ pub(super) struct RankedPosting<'a> {
 }
 
 impl ClickHouseConversationRepository {
+    /// Session headers that are authorized by the operation's captured source
+    /// heads and by the current canonical session contents. The legacy
+    /// session-only pointer is retained only for direct SQL-builder tests that
+    /// do not install a publication snapshot.
+    pub(super) fn mcp_search_sessions_source(&self) -> String {
+        let Some(snapshot) = active_publication_snapshot() else {
+            return format!(
+                "(SELECT * FROM {} FINAL)",
+                self.table_ref("mcp_open_sessions")
+            );
+        };
+
+        let headers = self.table_ref("mcp_open_publication_headers");
+        let history = self.table_ref("v_published_source_generation_history");
+        let dirty_sessions = self.table_ref("mcp_open_dirty_sessions");
+        let captured_heads = snapshot.captured_source_heads_sql(&history);
+        let live_events = self.live_events_source();
+
+        format!(
+            "(WITH
+  {captured_heads} AS captured_heads,
+  head_authorized_headers AS (
+    SELECT h.*
+    FROM {headers} AS h FINAL
+    WHERE h.tombstone = 0
+      AND length(h.required_source_heads) > 0
+      AND arrayAll(
+        required_head -> has(captured_heads, required_head),
+        h.required_source_heads
+      )
+  ),
+  current_sources AS (
+    SELECT
+      e.session_id AS session_id,
+      toUInt64(cityHash64(arraySort(groupArray(tuple(e.event_uid, e.event_version))))) AS source_revision
+    FROM {live_events} AS e
+    WHERE notEmpty(e.session_id)
+      AND e.session_id IN (SELECT session_id FROM head_authorized_headers)
+    GROUP BY e.session_id
+  ),
+  current_dirty AS (
+    SELECT
+      dirty.session_id AS session_id,
+      toUInt64(max(dirty.dirty_revision)) AS dirty_revision
+    FROM {dirty_sessions} AS dirty FINAL
+    WHERE notEmpty(dirty.session_id)
+      AND dirty.session_id IN (SELECT session_id FROM head_authorized_headers)
+    GROUP BY dirty.session_id
+  )
+SELECT
+  h.session_id AS session_id,
+  toUInt8(h.slot) AS slot,
+  toUInt64(h.generation) AS generation,
+  toUInt64(h.source_revision) AS source_revision,
+  toUInt64(h.dirty_revision) AS dirty_revision,
+  h.first_event_time AS first_event_time,
+  h.last_event_time AS last_event_time,
+  toUInt32(h.total_turns) AS total_turns,
+  toUInt64(h.total_events) AS total_events,
+  toUInt64(h.user_messages) AS user_messages,
+  toUInt64(h.assistant_messages) AS assistant_messages,
+  toUInt64(h.tool_calls) AS tool_calls,
+  toUInt64(h.tool_results) AS tool_results,
+  h.title AS title,
+  h.session_slug AS session_slug,
+  h.session_summary AS session_summary,
+  toUInt8(h.completed) AS completed,
+  h.origin_cwd AS origin_cwd
+FROM head_authorized_headers AS h
+ALL INNER JOIN current_sources AS source
+  ON source.session_id = h.session_id
+ANY LEFT JOIN current_dirty AS dirty
+  ON dirty.session_id = h.session_id
+WHERE h.source_revision = source.source_revision
+  AND h.dirty_revision = ifNull(dirty.dirty_revision, toUInt64(0))
+ORDER BY h.session_id ASC, h.header_revision DESC
+LIMIT 1 BY h.session_id)"
+        )
+    }
+
     pub async fn search_session_metadata(
         &self,
         query: SessionMetadataSearchQuery,
@@ -113,7 +193,7 @@ impl ClickHouseConversationRepository {
             ));
         }
 
-        let events_source = canonical_events_source(&self.table_ref("events"));
+        let events_source = self.live_events_source();
         let session_summary_table = self.table_ref("v_session_summary");
         let mode_subquery = self.mode_subquery();
         let terms_array_sql = sql_array_strings(terms);
@@ -265,8 +345,8 @@ FORMAT JSONEachRow",
             ));
         }
 
-        let postings_table = self.table_ref("search_postings");
-        let documents_table = self.table_ref("search_documents");
+        let postings_table = self.table_ref("v_live_search_postings");
+        let documents_table = self.table_ref("v_live_search_documents");
         let terms_array_sql = sql_array_strings(terms);
         let idf_vals: Vec<f64> = terms
             .iter()
@@ -446,13 +526,15 @@ FORMAT JSONEachRow",
             ));
         }
 
-        let postings_table = self.table_ref("search_postings");
+        let postings_table = self.table_ref("v_live_search_postings");
         let corpus_table = self.table_ref("search_corpus_stats");
         let projection_state_table = self.table_ref("mcp_open_projection_state");
-        let sessions_table = self.table_ref("mcp_open_sessions");
+        let sessions_source = self.mcp_search_sessions_source();
+        let sessions_table = "authorized_sessions";
         let turns_table = self.table_ref("mcp_open_turns");
         let events_table = self.table_ref("mcp_open_events");
         let dirty_sessions_table = self.table_ref("mcp_open_dirty_sessions");
+        let live_events_source = self.live_events_source();
         let terms_array_sql = sql_array_strings(terms);
         let corpus_stats_sql = match corpus_stats {
             Some((docs, total_doc_len)) => {
@@ -530,7 +612,7 @@ FORMAT JSONEachRow",
         let scope_state_sql = match (session_id, turn_seq) {
             (Some(session_id), Some(turn_seq)) => format!(
                 "SELECT toUInt8(count() > 0) AS scope_exists
-FROM {sessions_table} AS scope_s FINAL
+FROM {sessions_table} AS scope_s
 ALL INNER JOIN {turns_table} AS scope_t FINAL
   ON scope_t.session_id = scope_s.session_id
   AND scope_t.slot = scope_s.slot
@@ -541,7 +623,7 @@ WHERE scope_s.session_id = {session_id}
             ),
             (Some(session_id), None) => format!(
                 "SELECT toUInt8(count() > 0) AS scope_exists
-FROM {sessions_table} AS scope_s FINAL
+FROM {sessions_table} AS scope_s
 WHERE scope_s.session_id = {session_id}{scope_origin_filter}",
                 session_id = sql_quote(session_id),
             ),
@@ -557,6 +639,13 @@ WHERE scope_s.session_id = {session_id}{scope_origin_filter}",
 
         Ok(format!(
             "WITH
+  authorized_sessions AS {sessions_source},
+  live_session_ids AS (
+    SELECT e.session_id AS session_id
+    FROM {live_events_source} AS e
+    WHERE notEmpty(e.session_id)
+    GROUP BY e.session_id
+  ),
   {k1:.6} AS k1,
   {b:.6} AS b,
   {terms_array_sql} AS q_terms,
@@ -581,10 +670,11 @@ WHERE scope_s.session_id = {session_id}{scope_origin_filter}",
       SELECT session_id, dirty_revision
       FROM {dirty_sessions_table} FINAL
       WHERE notEmpty(session_id)
+        AND session_id IN (SELECT session_id FROM live_session_ids)
     ) AS dirty
-    LEFT JOIN (
+    ANY LEFT JOIN (
       SELECT session_id, dirty_revision
-      FROM {sessions_table} FINAL
+      FROM {sessions_table}
     ) AS published ON published.session_id = dirty.session_id
   ) AS projection_status,
   tupleElement(projection_status, 1) AS projection_clean,
@@ -595,12 +685,12 @@ WHERE scope_s.session_id = {session_id}{scope_origin_filter}",
       p.*,
       toUInt64(count() OVER (PARTITION BY p.term)) AS df
     FROM {postings_table} AS p FINAL
-    PREWHERE p.term IN q_terms
+    WHERE p.term IN q_terms
   ),
   matching_doc_ids AS (
     SELECT p.doc_id AS event_uid
     FROM {postings_table} AS p FINAL
-    ALL INNER JOIN {sessions_table} AS s FINAL ON s.session_id = p.session_id
+    ALL INNER JOIN {sessions_table} AS s ON s.session_id = p.session_id
     WHERE p.term IN q_terms
       AND {posting_where_sql}
       AND projection_ready = 1
@@ -608,7 +698,7 @@ WHERE scope_s.session_id = {session_id}{scope_origin_filter}",
   ),
   projected_candidates AS (
     SELECT event_uid, session_id, slot, generation, event_time, turn_seq
-    FROM {events_table} FINAL
+    FROM {events_table}
     WHERE event_uid IN (SELECT event_uid FROM matching_doc_ids)
   ),
   ranked AS (
@@ -626,7 +716,7 @@ WHERE scope_s.session_id = {session_id}{scope_origin_filter}",
       toUInt64(count()) AS matched_terms,
       toInt64(toUnixTimestamp64Milli(any(e.event_time))) AS event_unix_ms
     FROM term_postings AS p
-    ALL INNER JOIN {sessions_table} AS s FINAL ON s.session_id = p.session_id
+    ALL INNER JOIN {sessions_table} AS s ON s.session_id = p.session_id
     ALL INNER JOIN projected_candidates AS e
       ON e.event_uid = p.doc_id
       AND e.session_id = s.session_id
@@ -680,7 +770,9 @@ SETTINGS max_bytes_before_external_group_by = 67108864,
 FORMAT JSONEachRow",
             postings_table = postings_table,
             projection_state_table = projection_state_table,
+            sessions_source = sessions_source,
             sessions_table = sessions_table,
+            live_events_source = live_events_source,
             events_table = events_table,
             dirty_sessions_table = dirty_sessions_table,
         ))
@@ -696,11 +788,12 @@ FORMAT JSONEachRow",
             ));
         }
 
-        let documents_table = self.table_ref("search_documents");
-        let sessions_table = self.table_ref("mcp_open_sessions");
+        let documents_table = self.table_ref("v_live_search_documents");
+        let sessions_source = self.mcp_search_sessions_source();
+        let sessions_table = "authorized_sessions";
         let turns_table = self.table_ref("mcp_open_turns");
         let projected_events_table = self.table_ref("mcp_open_events");
-        let events_table = self.table_ref("events");
+        let events_table = self.table_ref("v_live_events");
         let event_uids = candidates
             .iter()
             .map(|candidate| candidate.event_uid.clone())
@@ -725,6 +818,7 @@ FORMAT JSONEachRow",
 
         Ok(format!(
             "WITH
+  authorized_sessions AS {sessions_source},
   {event_uids_sql} AS event_uids,
   candidate_heads AS (
     SELECT
@@ -805,7 +899,7 @@ SELECT
 FROM documents
 ALL INNER JOIN candidate_heads AS candidate
   ON candidate.event_uid = documents.event_uid
-ALL INNER JOIN {sessions_table} AS sessions FINAL
+ALL INNER JOIN {sessions_table} AS sessions
   ON sessions.session_id = candidate.session_id
   AND sessions.slot = candidate.slot
   AND sessions.generation = candidate.generation
@@ -835,7 +929,7 @@ FORMAT JSONEachRow",
                 "cannot hydrate search rows for empty event_uids",
             ));
         }
-        let documents_table = self.table_ref("search_documents");
+        let documents_table = self.table_ref("v_live_search_documents");
         let event_uids_array = sql_array_strings(event_uids);
         let text_content_limit = usize::from(self.cfg.preview_chars).saturating_mul(4);
         let payload_json_limit = usize::from(self.cfg.preview_chars).saturating_mul(8);
@@ -1126,7 +1220,11 @@ FORMAT JSONEachRow",
         {
             let cache = self.term_postings_cache.read().await;
             for term in terms {
-                if let Some(entry) = cache.get(term) {
+                let cache_key = publication_cache_key(&format!("posting:{term}"));
+                if let Some(entry) = cache_key
+                    .as_deref()
+                    .and_then(|cache_key| cache.get(cache_key))
+                {
                     if now.duration_since(entry.fetched_at) <= TERM_POSTINGS_CACHE_TTL {
                         by_term.insert(term.clone(), Arc::clone(&entry.rows));
                         continue;
@@ -1137,7 +1235,7 @@ FORMAT JSONEachRow",
         }
 
         if !missing_terms.is_empty() {
-            let postings_table = self.table_ref("search_postings");
+            let postings_table = self.table_ref("v_live_search_postings");
             let terms_array = sql_array_strings(&missing_terms);
             let query = format!(
                 "SELECT
@@ -1168,13 +1266,15 @@ FORMAT JSONEachRow",
                 let rows: Arc<[CachedPostingRow]> = Arc::from(rows_vec.into_boxed_slice());
                 by_term.insert(term.clone(), Arc::clone(&rows));
                 if rows.len() <= TERM_POSTINGS_CACHE_MAX_ROWS_PER_TERM {
-                    cache.insert(
-                        term,
-                        TermPostingsCacheEntry {
-                            rows,
-                            fetched_at: now,
-                        },
-                    );
+                    if let Some(cache_key) = publication_cache_key(&format!("posting:{term}")) {
+                        cache.insert(
+                            cache_key,
+                            TermPostingsCacheEntry {
+                                rows,
+                                fetched_at: now,
+                            },
+                        );
+                    }
                 }
             }
 
@@ -1216,7 +1316,11 @@ FORMAT JSONEachRow",
         {
             let cache = self.search_doc_extra_cache.read().await;
             for uid in event_uids {
-                if let Some(entry) = cache.get(uid) {
+                let cache_key = publication_cache_key(&format!("document:{uid}"));
+                if let Some(entry) = cache_key
+                    .as_deref()
+                    .and_then(|cache_key| cache.get(cache_key))
+                {
                     if now.duration_since(entry.fetched_at) <= SEARCH_DOC_EXTRA_CACHE_TTL {
                         by_uid.insert(uid.clone(), entry.clone());
                         continue;
@@ -1255,7 +1359,11 @@ FORMAT JSONEachRow",
                     fetched_at: now,
                 };
                 by_uid.insert(row.event_uid.clone(), entry.clone());
-                cache.insert(row.event_uid, entry);
+                if let Some(cache_key) =
+                    publication_cache_key(&format!("document:{}", row.event_uid))
+                {
+                    cache.insert(cache_key, entry);
+                }
             }
 
             while cache.len() > SEARCH_DOC_EXTRA_CACHE_MAX_ENTRIES {
@@ -1933,7 +2041,7 @@ FORMAT JSONEachRow",
         to_unix_ms: Option<i64>,
         recent_from_unix_ms: Option<i64>,
         candidate_session_ids: Option<&[String]>,
-    ) -> (String, String, String) {
+    ) -> (String, String) {
         let terms_array_sql = sql_array_strings(terms);
         let mut postings_filters = vec![format!("p.term IN {}", terms_array_sql)];
         let mut document_filters = Vec::new();
@@ -1982,19 +2090,15 @@ FORMAT JSONEachRow",
             }
         }
 
-        let prewhere_sql = postings_filters.join("\n      AND ");
-        let where_sql = if document_filters.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", document_filters.join("\n      AND "))
-        };
         let docs_join_sql = if document_filters.is_empty() {
             String::new()
         } else {
-            let documents_table = self.table_ref("search_documents");
+            let documents_table = self.table_ref("v_live_search_documents");
             format!("ANY INNER JOIN {documents_table} AS d ON d.event_uid = p.doc_id")
         };
-        (docs_join_sql, prewhere_sql, where_sql)
+        postings_filters.extend(document_filters);
+        let filter_sql = format!("WHERE {}", postings_filters.join("\n      AND "));
+        (docs_join_sql, filter_sql)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2016,15 +2120,14 @@ FORMAT JSONEachRow",
             ));
         }
 
-        let postings_table = self.table_ref("search_postings");
-        let conversation_terms_table = self.table_ref("search_conversation_terms");
+        let postings_table = self.table_ref("v_live_search_postings");
         let terms_array_sql = sql_array_strings(terms);
         let idf_vals: Vec<f64> = terms
             .iter()
             .map(|t| *idf_by_term.get(t).unwrap_or(&0.0))
             .collect();
         let idf_array_sql = sql_array_f64(&idf_vals);
-        let (docs_join_sql, prewhere_sql, where_sql) = self.build_conversation_postings_filter_sql(
+        let (docs_join_sql, filter_sql) = self.build_conversation_postings_filter_sql(
             terms,
             include_tool_events,
             exclude_codex_mcp,
@@ -2050,26 +2153,35 @@ FORMAT JSONEachRow",
         Ok(format!(
             "WITH
   {terms_array_sql} AS q_terms,
-  {idf_array_sql} AS q_idf
+  {idf_array_sql} AS q_idf,
+  eligible_sessions AS (
+    SELECT DISTINCT p.session_id
+    FROM {postings_table} AS p
+    {docs_join_sql}
+    {filter_sql}
+  ),
+  session_terms AS (
+    SELECT
+      p.session_id AS session_id,
+      toString(p.term) AS term,
+      sum(p.tf) AS tf_sum
+    FROM {postings_table} AS p
+    ALL INNER JOIN eligible_sessions AS eligible
+      ON eligible.session_id = p.session_id
+    WHERE p.term IN q_terms
+    GROUP BY p.session_id, p.term
+  )
 SELECT
   c.session_id AS session_id,
   c.score AS score,
   toUInt16(c.matched_terms) AS matched_terms
 FROM (
   SELECT
-    ct.session_id,
-    sum(transform(ct.term, q_terms, q_idf, 0.0) * log1p(toFloat64(ct.tf_sum))) AS score,
-    toUInt16(countDistinct(ct.term)) AS matched_terms
-  FROM {conversation_terms_table} AS ct
-  ANY INNER JOIN (
-    SELECT DISTINCT p.session_id
-    FROM {postings_table} AS p
-    {docs_join_sql}
-    PREWHERE {prewhere_sql}
-    {where_sql}
-  ) AS eligible ON eligible.session_id = ct.session_id
-  WHERE ct.term IN {terms_array_sql}
-  GROUP BY ct.session_id
+    terms.session_id,
+    sum(transform(terms.term, q_terms, q_idf, 0.0) * log1p(toFloat64(terms.tf_sum))) AS score,
+    toUInt16(countDistinct(terms.term)) AS matched_terms
+  FROM session_terms AS terms
+  GROUP BY terms.session_id
 ) AS c
 {mode_join_sql}
 WHERE c.matched_terms >= {min_should_match}
@@ -2077,11 +2189,9 @@ WHERE c.matched_terms >= {min_should_match}
 ORDER BY c.score DESC, c.session_id ASC
 LIMIT {limit}
 FORMAT JSONEachRow",
-            conversation_terms_table = conversation_terms_table,
             postings_table = postings_table,
             docs_join_sql = docs_join_sql,
-            prewhere_sql = prewhere_sql,
-            where_sql = where_sql,
+            filter_sql = filter_sql,
             mode_join_sql = mode_join_sql,
             mode_filter_sql = mode_filter_sql,
             min_should_match = min_should_match,
@@ -2108,7 +2218,7 @@ FORMAT JSONEachRow",
             ));
         }
 
-        let postings_table = self.table_ref("search_postings");
+        let postings_table = self.table_ref("v_live_search_postings");
         let terms_array_sql = sql_array_strings(terms);
         let idf_vals: Vec<f64> = terms
             .iter()
@@ -2121,7 +2231,7 @@ FORMAT JSONEachRow",
             Some(from) => from.max(recent_floor),
             None => recent_floor,
         };
-        let (docs_join_sql, prewhere_sql, where_sql) = self.build_conversation_postings_filter_sql(
+        let (docs_join_sql, filter_sql) = self.build_conversation_postings_filter_sql(
             terms,
             include_tool_events,
             exclude_codex_mcp,
@@ -2159,8 +2269,7 @@ FROM (
     toUInt16(countDistinct(p.term)) AS matched_terms
   FROM {postings_table} AS p
   {docs_join_sql}
-  PREWHERE {prewhere_sql}
-  {where_sql}
+  {filter_sql}
   GROUP BY p.session_id
 ) AS c
 {mode_join_sql}
@@ -2171,8 +2280,7 @@ LIMIT {limit}
 FORMAT JSONEachRow",
             postings_table = postings_table,
             docs_join_sql = docs_join_sql,
-            prewhere_sql = prewhere_sql,
-            where_sql = where_sql,
+            filter_sql = filter_sql,
             mode_join_sql = mode_join_sql,
             mode_filter_sql = mode_filter_sql,
             min_should_match = min_should_match,
@@ -2293,7 +2401,7 @@ FORMAT JSONEachRow",
             ));
         }
 
-        let postings_table = self.table_ref("search_postings");
+        let postings_table = self.table_ref("v_live_search_postings");
         let session_summary_table = self.table_ref("v_session_summary");
         let terms_array_sql = sql_array_strings(terms);
         let idf_vals: Vec<f64> = terms
@@ -2301,7 +2409,7 @@ FORMAT JSONEachRow",
             .map(|t| *idf_by_term.get(t).unwrap_or(&0.0))
             .collect();
         let idf_array_sql = sql_array_f64(&idf_vals);
-        let (docs_join_sql, prewhere_sql, where_sql) = self.build_conversation_postings_filter_sql(
+        let (docs_join_sql, filter_sql) = self.build_conversation_postings_filter_sql(
             terms,
             include_tool_events,
             exclude_codex_mcp,
@@ -2398,8 +2506,7 @@ FROM (
       ) AS event_score
     FROM {postings_table} AS p
     {docs_join_sql}
-    PREWHERE {prewhere_sql}
-    {where_sql}
+    {filter_sql}
     GROUP BY p.doc_id
   ) AS e
   GROUP BY e.session_id
@@ -2414,8 +2521,7 @@ LIMIT {limit}
 FORMAT JSONEachRow",
             postings_table = postings_table,
             docs_join_sql = docs_join_sql,
-            prewhere_sql = prewhere_sql,
-            where_sql = where_sql,
+            filter_sql = filter_sql,
             outer_matched_terms_sql = outer_matched_terms_sql,
             inner_matched_terms_sql = inner_matched_terms_sql,
             term_bits_with_sql = term_bits_with_sql,
@@ -2436,7 +2542,7 @@ FORMAT JSONEachRow",
             return Ok(HashMap::new());
         }
 
-        let documents_table = self.table_ref("search_documents");
+        let documents_table = self.table_ref("v_live_search_documents");
         let event_uids_sql = sql_array_strings(event_uids);
         let text_content_limit = usize::from(self.cfg.preview_chars).saturating_mul(4);
         let payload_json_limit = usize::from(self.cfg.preview_chars).saturating_mul(8);
@@ -2677,7 +2783,7 @@ FORMAT JSONEachRow",
             return Ok(HashMap::new());
         }
 
-        let events_source = canonical_events_source(&self.table_ref("events"));
+        let events_source = self.live_events_source();
         let session_ids_sql = sql_array_strings(session_ids);
         let sql = format!(
             "SELECT
@@ -2790,6 +2896,21 @@ FORMAT JSONEachRow",
             })
             .collect();
 
+        let Some(PublicationEffect::SearchTelemetry {
+            query_row,
+            hit_rows,
+        }) = defer_publication_effect(PublicationEffect::SearchTelemetry {
+            query_row,
+            hit_rows,
+        })
+        .await
+        else {
+            return;
+        };
+        self.write_search_log_rows(query_row, hit_rows).await;
+    }
+
+    pub(super) async fn write_search_log_rows(&self, query_row: Value, hit_rows: Vec<Value>) {
         let ch = self.ch.clone();
         if self.cfg.async_log_writes {
             tokio::spawn(async move {
@@ -2915,7 +3036,8 @@ FORMAT JSONEachRow",
         let avgdl = (total_doc_len as f64 / docs as f64).max(1.0);
         let fetch_limit = Self::dedupe_fetch_limit(limit);
 
-        let hits = if bypass_cache {
+        let publication_cache_available = publication_cache_key("").is_some();
+        let hits = if bypass_cache || !publication_cache_available {
             let rows = self
                 .search_events_rows_by_strategy(
                     effective_strategy_hint,
@@ -2935,7 +3057,7 @@ FORMAT JSONEachRow",
             let rows = Self::dedupe_search_rows(rows, limit);
             self.map_search_rows_to_hits(rows).await?
         } else {
-            let cache_key = Self::search_events_cache_key(
+            let cache_key = publication_cache_key(&Self::search_events_cache_key(
                 &terms,
                 effective_strategy_hint,
                 include_tool_events,
@@ -2946,7 +3068,8 @@ FORMAT JSONEachRow",
                 min_should_match,
                 min_score,
                 limit,
-            );
+            ))
+            .expect("publication cache availability was checked above");
 
             if let Some(cached_hits) = self.search_events_cache_get(&cache_key).await {
                 cached_hits
@@ -3065,7 +3188,7 @@ FORMAT JSONEachRow",
             .max(1)
             .min(terms.len() as u16);
         let min_score = query.min_score.unwrap_or(self.cfg.bm25_default_min_score);
-        let cache_key = Self::search_mcp_events_cache_key(
+        let cache_key = publication_cache_key(&Self::search_mcp_events_cache_key(
             &terms,
             &event_types,
             query.session_id.as_deref(),
@@ -3075,8 +3198,11 @@ FORMAT JSONEachRow",
             min_should_match,
             min_score,
             effective_n_hits,
-        );
-        let cached_result = self.search_mcp_events_cache_get(&cache_key).await;
+        ));
+        let cached_result = match cache_key.as_deref() {
+            Some(cache_key) => self.search_mcp_events_cache_get(cache_key).await,
+            None => None,
+        };
         let cache_hit = cached_result.is_some();
         tracing::info!(cache_hit, "mcp_search_cache");
 
@@ -3116,8 +3242,10 @@ FORMAT JSONEachRow",
             // empty answer become positive immediately. Preserve that
             // visibility by caching only stable, published-corpus results.
             if scope_exists && docs > 0 {
-                self.search_mcp_events_cache_put(cache_key, &hits, truncated, docs, avgdl)
-                    .await;
+                if let Some(cache_key) = cache_key {
+                    self.search_mcp_events_cache_put(cache_key, &hits, truncated, docs, avgdl)
+                        .await;
+                }
             }
             (hits, truncated, docs, avgdl, scope_exists)
         };

@@ -438,15 +438,31 @@ fn repo_error_tool_response(
     error: moraine_conversations::RepoError,
     started_at: Instant,
 ) -> Result<Value> {
-    error_tool_response(
-        request,
-        ToolError {
-            code: ToolErrorCode::InternalError,
-            message: format!("repository error: {error}"),
-            details: None,
-        },
-        started_at,
-    )
+    match error {
+        moraine_conversations::RepoError::ReadModelChanged => {
+            let error = crate::repo_error_to_contract_error(
+                moraine_conversations::RepoError::ReadModelChanged,
+            );
+            error_tool_response(
+                request,
+                ToolError {
+                    code: error.code(),
+                    message: error.message().to_string(),
+                    details: error.details().cloned(),
+                },
+                started_at,
+            )
+        }
+        error => error_tool_response(
+            request,
+            ToolError {
+                code: ToolErrorCode::InternalError,
+                message: format!("repository error: {error}"),
+                details: None,
+            },
+            started_at,
+        ),
+    }
 }
 
 fn internal_error_tool_response(
@@ -1543,6 +1559,47 @@ mod tests {
             "moraine.mcp.error.v1"
         );
         assert_eq!(result["structuredContent"]["error"]["code"], "invalid_id");
+    }
+
+    #[test]
+    fn repository_error_response_only_special_cases_publication_changes() {
+        for (repo_error, expected_message) in [
+            (
+                moraine_conversations::RepoError::InvalidArgument("bad argument".to_string()),
+                "repository error: invalid argument: bad argument",
+            ),
+            (
+                moraine_conversations::RepoError::InvalidCursor("bad cursor".to_string()),
+                "repository error: invalid cursor: bad cursor",
+            ),
+            (
+                moraine_conversations::RepoError::Backend("backend failed".to_string()),
+                "repository error: backend error: backend failed",
+            ),
+            (
+                moraine_conversations::RepoError::Internal("internal failed".to_string()),
+                "repository error: internal error: internal failed",
+            ),
+        ] {
+            let result = repo_error_tool_response(json!({}), repo_error, Instant::now())
+                .expect("handled repository error");
+            let error = &result["structuredContent"]["error"];
+
+            assert_eq!(error["code"], "internal_error");
+            assert_eq!(error["message"], expected_message);
+            assert!(error.get("details").is_none());
+        }
+
+        let result = repo_error_tool_response(
+            json!({}),
+            moraine_conversations::RepoError::ReadModelChanged,
+            Instant::now(),
+        )
+        .expect("handled publication change");
+        let error = &result["structuredContent"]["error"];
+        assert_eq!(error["code"], "internal_error");
+        assert_eq!(error["details"]["reason"], "read_model_refresh");
+        assert_eq!(error["details"]["retryable"], true);
     }
 
     fn session_metadata() -> SessionMetadata {

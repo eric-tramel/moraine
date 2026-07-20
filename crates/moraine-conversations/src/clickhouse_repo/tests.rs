@@ -197,6 +197,114 @@ fn mcp_search_sql_excludes_internal_tool_calls() {
     assert!(sql.contains("splitByString('__', lowerUTF8(trimBoth(p.name)))"));
     assert!(sql.contains("arrayElement"));
     assert!(sql.contains("= 'moraine'"));
+    assert!(sql.contains("FROM `moraine`.`v_live_search_postings` AS p FINAL"));
+    assert!(sql.contains("WHERE p.term IN q_terms"));
+    assert!(!sql.contains("PREWHERE"));
+}
+
+#[test]
+fn live_search_queries_use_the_full_document_view_contract() {
+    let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
+        .expect("build ClickHouse client");
+    let repo = ClickHouseConversationRepository::new(client, RepoConfig::default());
+    let terms = vec!["needle".to_string()];
+    let idf = HashMap::from([("needle".to_string(), 1.0)]);
+
+    let ranking_sql = repo
+        .build_search_events_sql(
+            &terms, &idf, 10.0, true, None, true, true, None, None, 1, 0.0, 20,
+        )
+        .expect("build live search ranking SQL");
+    let hydration_sql = repo
+        .build_search_events_hydrate_sql(&["event-a".to_string()], true)
+        .expect("build live search hydration SQL");
+
+    for sql in [&ranking_sql, &hydration_sql] {
+        assert!(sql.contains("FROM `moraine`.`v_live_search_documents` AS t"));
+        for required in [
+            "t.event_uid",
+            "t.session_id",
+            "t.record_ts",
+            "t.source_name",
+            "t.harness",
+            "t.inference_provider",
+            "t.event_class",
+            "t.payload_type",
+            "t.actor_role",
+            "t.name",
+            "t.phase",
+            "t.source_ref",
+            "t.doc_len",
+            "t.text_content",
+            "t.payload_json",
+            "t.has_codex_mcp",
+        ] {
+            assert!(
+                sql.contains(required),
+                "live search SQL omitted {required}: {sql}"
+            );
+        }
+    }
+}
+
+#[test]
+fn conversation_candidates_aggregate_live_term_frequency_before_scoring() {
+    let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
+        .expect("build ClickHouse client");
+    let repo = ClickHouseConversationRepository::new(client, RepoConfig::default());
+    let terms = vec!["needle".to_string()];
+    let idf = HashMap::from([("needle".to_string(), 1.0)]);
+
+    let sql = repo
+        .build_search_conversation_candidates_sql(
+            &terms, &idf, true, false, 1, 20, None, None, None,
+        )
+        .expect("build conversation candidate SQL");
+
+    assert!(sql.contains("sum(p.tf) AS tf_sum"));
+    assert!(sql.contains("GROUP BY p.session_id, p.term"));
+    assert!(sql.contains("log1p(toFloat64(terms.tf_sum))"));
+    assert!(!sql.contains("log1p(toFloat64(p.tf))"));
+}
+
+#[test]
+fn conversation_candidate_document_filters_only_select_eligible_sessions() {
+    let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
+        .expect("build ClickHouse client");
+    let repo = ClickHouseConversationRepository::new(client, RepoConfig::default());
+    let terms = vec!["needle".to_string()];
+    let idf = HashMap::from([("needle".to_string(), 1.0)]);
+
+    let sql = repo
+        .build_search_conversation_candidates_sql(
+            &terms,
+            &idf,
+            false,
+            true,
+            1,
+            20,
+            Some(1_000),
+            Some(2_000),
+            None,
+        )
+        .expect("build filtered conversation candidate SQL");
+    let (_, after_eligible) = sql
+        .split_once("eligible_sessions AS (\n")
+        .expect("eligible-session CTE");
+    let (eligible, after_eligible) = after_eligible
+        .split_once("  ),\n  session_terms AS (\n")
+        .expect("session-term CTE boundary");
+    let (session_terms, _) = after_eligible
+        .split_once("  )\nSELECT")
+        .expect("session-term CTE end");
+
+    assert!(eligible.contains("v_live_search_documents"));
+    assert!(eligible.contains("toUnixTimestamp64Milli(d.ingested_at) >= 1000"));
+    assert!(eligible.contains("toUnixTimestamp64Milli(d.ingested_at) < 2000"));
+    assert!(session_terms.contains("ALL INNER JOIN eligible_sessions AS eligible"));
+    assert!(session_terms.contains("WHERE p.term IN q_terms"));
+    assert!(!session_terms.contains("v_live_search_documents"));
+    assert!(!session_terms.contains("d.ingested_at"));
 }
 
 #[test]

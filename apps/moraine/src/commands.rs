@@ -7,7 +7,9 @@ mod status;
 mod up;
 
 use anyhow::{bail, Context, Result};
-use moraine_clickhouse::{ClickHouseClient, DoctorReport, MigrationProgress};
+use moraine_clickhouse::{
+    ClickHouseClient, DoctorReport, MigrationProgress, PublicationDiagnostics,
+};
 use moraine_config::AppConfig;
 use moraine_conversations::{ClickHouseConversationRepository, RepoConfig};
 use std::path::PathBuf;
@@ -334,6 +336,10 @@ pub(super) fn doctor_is_healthy(report: &DoctorReport) -> bool {
         && report.database_exists
         && report.pending_migrations.is_empty()
         && report.missing_tables.is_empty()
+        && report
+            .publication
+            .as_ref()
+            .is_some_and(PublicationDiagnostics::is_healthy)
         && report.errors.is_empty()
 }
 
@@ -423,6 +429,37 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("unsupported config key"));
         assert!(!message.contains(TOKEN_SENTINEL));
+    }
+
+    #[test]
+    fn doctor_health_distinguishes_publication_progress_from_blocking_state() {
+        let mut report = DoctorReport {
+            clickhouse_healthy: true,
+            clickhouse_version: Some("25.8".to_string()),
+            database: "moraine".to_string(),
+            database_exists: true,
+            applied_migrations: Vec::new(),
+            pending_migrations: Vec::new(),
+            missing_tables: Vec::new(),
+            publication: Some(PublicationDiagnostics {
+                replaying_generations: 2,
+                append_preparations: 1,
+                mirror_catchup_pending: 1,
+                ..PublicationDiagnostics::default()
+            }),
+            errors: Vec::new(),
+        };
+        assert!(doctor_is_healthy(&report));
+
+        report
+            .publication
+            .as_mut()
+            .expect("publication diagnostics")
+            .blocked_append_preparations = 1;
+        assert!(!doctor_is_healthy(&report));
+
+        report.publication = None;
+        assert!(!doctor_is_healthy(&report));
     }
 
     #[tokio::test(flavor = "multi_thread")]

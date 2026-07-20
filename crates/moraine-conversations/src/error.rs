@@ -12,7 +12,7 @@ pub enum RepoError {
     Backend(String),
     #[error("internal error: {0}")]
     Internal(String),
-    #[error("search read model changed during ingest")]
+    #[error("publication read model changed during request")]
     ReadModelChanged,
 }
 

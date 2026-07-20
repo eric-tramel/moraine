@@ -390,7 +390,7 @@ async fn analytics_different_ranges_fill_concurrently() {
         ScriptedResponse::rows(
             &[
                 "toInt64(toUnixTimestamp(now())) AS database_now_unix",
-                "FROM (SELECT * FROM `moraine`.`events` FINAL) AS e",
+                "FROM `moraine`.`v_published_source_generation_history` AS history",
             ],
             anchor_row.clone(),
         )

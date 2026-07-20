@@ -12,6 +12,7 @@ import json
 import math
 import os
 import queue
+import stat
 import subprocess
 import threading
 import time
@@ -1814,6 +1815,64 @@ def publish_event_durably(
                 pass
 
 
+def append_event_durably(
+    watched_dir: os.PathLike[str] | str,
+    destination_filename: str,
+    payload: bytes,
+    *,
+    clock_ns: Callable[[], int] = time.perf_counter_ns,
+) -> PublicationEvidence:
+    """Durably append one complete record group to an owned watched JSONL file."""
+
+    if not isinstance(payload, bytes) or not payload:
+        raise ScenarioError("append publication payload must be nonempty bytes")
+    destination = _safe_event_destination(watched_dir, destination_filename)
+    existed = os.path.exists(destination)
+    file_fd: Optional[int] = None
+    directory_fd: Optional[int] = None
+    phase = "append_open"
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        file_fd = os.open(destination, flags, 0o600)
+        metadata = os.fstat(file_fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise OSError("append destination is not one owned regular file")
+        phase = "append_write"
+        t0_ns = clock_ns()
+        view = memoryview(payload)
+        written = 0
+        while written < len(view):
+            count = os.write(file_fd, view[written:])
+            if count <= 0:
+                raise OSError("short append write")
+            written += count
+        phase = "append_file_fsync"
+        os.fsync(file_fd)
+        if not existed:
+            phase = "append_directory_open"
+            directory_fd = os.open(
+                os.fspath(watched_dir), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            )
+            phase = "append_directory_fsync"
+            os.fsync(directory_fd)
+        publication_durable_ns = clock_ns()
+        return PublicationEvidence(t0_ns, publication_durable_ns)
+    except OSError as exc:
+        raise EtdSampleFailure(f"publication_{phase}_failed") from exc
+    finally:
+        if file_fd is not None:
+            try:
+                os.close(file_fd)
+            except OSError:
+                pass
+        if directory_fd is not None:
+            try:
+                os.close(directory_fd)
+            except OSError:
+                pass
+
+
 def _milliseconds(later_ns: int, earlier_ns: int) -> float:
     return max(0.0, (later_ns - earlier_ns) / 1_000_000.0)
 
@@ -2360,6 +2419,97 @@ def run_etd_scenario(
         semantic_failures,
         tuple(sorted(set(diagnostics))),
     )
+
+
+def run_serial_append_etd_scenario(
+    events: Sequence[Mapping[str, Any]],
+    watched_dir: os.PathLike[str] | str,
+    probe: Callable[[Mapping[str, Any]], EtdProbeResult],
+    ack_reader: Callable[[], Sequence[Mapping[str, Any]]],
+    watcher_ready: Callable[[], bool],
+    *,
+    timeout_s: float,
+    poll_interval_s: float = 0.05,
+    clock_ns: Callable[[], int] = time.perf_counter_ns,
+    sleeper: Callable[[float], None] = time.sleep,
+    publisher: Callable[..., PublicationEvidence] = append_event_durably,
+) -> ScenarioResult:
+    """Measure one same-file append at a time from durable fsync to live query."""
+
+    if not events or timeout_s <= 0 or poll_interval_s <= 0:
+        raise ScenarioError("serial append ETD requires events and positive timing policy")
+    case_ids = [event.get("case_id") for event in events]
+    if None in case_ids or len(case_ids) != len(set(case_ids)):
+        raise ScenarioError("serial append ETD event identities are missing or duplicated")
+    if watcher_ready() is not True:
+        failed = tuple(_failed_etd_sample(event, "watcher_not_ready") for event in events)
+        return ScenarioResult(
+            "fail",
+            {
+                "direction": "lower",
+                "event_count": len(events),
+                "source_etd_p95": _aggregate_etd_interval(failed, "source_interval"),
+                "db_ack_etd_p95": _aggregate_etd_interval(failed, "db_ack_interval"),
+                "operational": {
+                    "planned": len(events),
+                    "started": 0,
+                    "completed": 0,
+                },
+            },
+            failed,
+            diagnostics=("watcher_not_ready",),
+        )
+
+    ack_cursor = IngestAckCursor(ack_reader)
+    samples: list[dict[str, Any]] = []
+    semantic_failures = 0
+    first_started_ns: Optional[int] = None
+    last_completed_ns: Optional[int] = None
+    for event in events:
+        scheduled_ns = clock_ns()
+        if first_started_ns is None:
+            first_started_ns = scheduled_ns
+        sample, semantic_failure, _released_ns, completed_ns = _run_one_etd_event(
+            event,
+            scheduled_ns,
+            watched_dir,
+            probe,
+            ack_cursor,
+            watcher_ready,
+            timeout_s,
+            poll_interval_s,
+            clock_ns,
+            sleeper,
+            publisher,
+        )
+        samples.append(sample)
+        semantic_failures += int(semantic_failure)
+        last_completed_ns = completed_ns
+    ordered = tuple(samples)
+    diagnostics = tuple(
+        sorted(
+            {
+                str(sample["error_code"])
+                for sample in ordered
+                if sample["error_code"] is not None
+            }
+        )
+    )
+    metrics = {
+        "direction": "lower",
+        "event_count": len(events),
+        "source_etd_p95": _aggregate_etd_interval(ordered, "source_interval"),
+        "db_ack_etd_p95": _aggregate_etd_interval(ordered, "db_ack_interval"),
+        "operational": {
+            "planned": len(events),
+            "started": len(samples),
+            "completed": len(samples),
+            "first_started_ns": first_started_ns,
+            "last_completed_ns": last_completed_ns,
+        },
+    }
+    status = "pass" if all(sample["valid"] for sample in ordered) else "fail"
+    return ScenarioResult(status, metrics, ordered, semantic_failures, diagnostics)
 
 
 # ---------------------------------------------------------------------------
@@ -2953,6 +3103,30 @@ def run_owned_sandbox_etd_scenario(
             result.samples,
             result.semantic_failures,
             result.diagnostics,
+        )
+    finally:
+        runtime.close()
+
+
+def run_owned_sandbox_append_probe(
+    sandbox: OwnedSandboxEtdPrimitives,
+    events: Sequence[Mapping[str, Any]],
+    *,
+    timeout_s: float,
+    poll_interval_s: float = 0.05,
+) -> ScenarioResult:
+    """Run the serial same-generation append probe through production ingest/MCP."""
+
+    runtime = make_owned_sandbox_etd_runtime(sandbox, timeout_s=timeout_s)
+    try:
+        return run_serial_append_etd_scenario(
+            events,
+            runtime.watched_dir,
+            runtime.probe,
+            runtime.ack_reader,
+            runtime.watcher_ready,
+            timeout_s=timeout_s,
+            poll_interval_s=poll_interval_s,
         )
     finally:
         runtime.close()

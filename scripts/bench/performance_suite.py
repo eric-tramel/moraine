@@ -11,18 +11,22 @@ import shutil
 import statistics
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from performance_fixtures import (
     FreshSeedTarget,
+    build_append_probe_events,
     build_recipe,
     mixed_control_schedules,
     open_event_schedule,
     open_query_schedule,
     required_split_usage,
+    seed_publication_control_sql,
     seed_search_sql,
     validate_recipe,
     validate_split_usage,
@@ -81,9 +85,32 @@ from performance_scenarios import (
     make_owned_sandbox_query_load,
     make_owned_sandbox_ttr_runtime_factory,
     run_mixed_scenario,
+    run_owned_sandbox_append_probe,
     run_owned_sandbox_etd_scenario,
     run_qps_scenario,
     run_ttr_scenario,
+)
+
+
+PUBLICATION_CAPTURE_HEAD_COUNTS = (1, 10_000, 100_000)
+PUBLICATION_CAPTURE_WARMUP_REPETITIONS = 2
+PUBLICATION_CAPTURE_REPETITIONS = 10
+PUBLICATION_APPEND_POLL_INTERVAL_S = 0.05
+SOURCE_HOST_PHYSICAL_TABLES = (
+    "raw_events",
+    "events",
+    "event_links",
+    "tool_io",
+    "ingest_errors",
+    "search_documents",
+    "search_postings",
+)
+SOURCE_HOST_COLUMN_RESOURCE_FIELDS = (
+    "rows",
+    "active_parts",
+    "compressed_bytes",
+    "uncompressed_bytes",
+    "bytes_on_disk",
 )
 
 SUITE_ROOT = Path(__file__).resolve().parents[2]
@@ -131,8 +158,28 @@ def _require_clean(repo: Path) -> None:
         raise SuiteFailure(f"benchmark worktree is dirty: {repo}")
 
 
-def _clickhouse_query(url: str, sql: str, *, timeout_s: float = 600.0) -> str:
-    request = Request(url, data=sql.encode("utf-8"), headers={"Content-Type": "text/plain"}, method="POST")
+def _clickhouse_query(
+    url: str,
+    sql: str,
+    *,
+    timeout_s: float = 600.0,
+    query_id: Optional[str] = None,
+) -> str:
+    endpoint = url
+    if query_id is not None:
+        if not query_id or len(query_id) > 160 or any(
+            character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+            for character in query_id
+        ):
+            raise SuiteFailure("ClickHouse query ID is invalid")
+        separator = "&" if "?" in endpoint else "?"
+        endpoint = f"{endpoint}{separator}query_id={quote(query_id, safe='')}"
+    request = Request(
+        endpoint,
+        data=sql.encode("utf-8"),
+        headers={"Content-Type": "text/plain"},
+        method="POST",
+    )
     try:
         with urlopen(request, timeout=timeout_s) as response:
             return response.read().decode("utf-8").strip()
@@ -154,11 +201,426 @@ def _seed_owned_sandbox(sandbox: Any, recipe: Mapping[str, Any]) -> None:
         empty_database=True,
     )
     _clickhouse_query(url, seed_search_sql(target, recipe))
+    publication_schema = _clickhouse_query(
+        url,
+        "SELECT count() FROM system.tables WHERE database = 'moraine' "
+        "AND name = 'published_source_generations'",
+    )
+    if publication_schema not in {"0", "1"}:
+        raise SuiteFailure("publication schema preflight returned an invalid count")
+    if publication_schema == "1":
+        for statement in seed_publication_control_sql(target, recipe):
+            _clickhouse_query(url, statement)
     expected = recipe["corpus"]["document_count"]
     observed = _clickhouse_query(url, f"SELECT count() FROM {database}.search_documents")
     if observed != str(expected):
         raise SuiteFailure(f"seed cardinality mismatch: expected {expected}, observed {observed}")
     sandbox.checkpoint("seeded")
+
+
+def _publication_head_snapshot(url: str, database: str = "moraine") -> dict[str, int]:
+    available = _clickhouse_query(
+        url,
+        "SELECT count() FROM system.columns "
+        f"WHERE database = '{database}' "
+        "AND table = 'published_source_generations' "
+        "AND name = 'publication_revision'",
+    )
+    if available != "1":
+        raise SuiteFailure("source-publication probe requires publication-aware schema")
+    raw = _clickhouse_query(
+        url,
+        f"SELECT count(), ifNull(max(publication_revision), 0) "
+        f"FROM {database}.published_source_generations FORMAT TSVRaw",
+    )
+    fields = raw.split("\t")
+    if len(fields) != 2:
+        raise SuiteFailure("publication head snapshot has an invalid shape")
+    try:
+        rows, revision = (int(field) for field in fields)
+    except ValueError as error:
+        raise SuiteFailure("publication head snapshot is not numeric") from error
+    if rows < 0 or revision < 0:
+        raise SuiteFailure("publication head snapshot contains a negative counter")
+    return {"row_count": rows, "max_publication_revision": revision}
+
+
+def _publication_control_resources(
+    url: str, database: str = "moraine"
+) -> dict[str, dict[str, int]]:
+    raw = _clickhouse_query(
+        url,
+        "SELECT table, sum(rows) AS rows, count() AS active_parts, "
+        "sum(data_compressed_bytes) AS compressed_bytes "
+        "FROM system.parts "
+        f"WHERE active AND database = '{database}' "
+        "AND match(table, '(?i)publication|append.*(fence|control)|checkpoint|generation_readiness') "
+        "GROUP BY table ORDER BY table FORMAT JSONEachRow",
+    )
+    resources: dict[str, dict[str, int]] = {}
+    for line in raw.splitlines():
+        try:
+            row = json.loads(line)
+            table = row["table"]
+            values = {
+                name: int(row[name])
+                for name in ("rows", "active_parts", "compressed_bytes")
+            }
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise SuiteFailure("publication control resource row is malformed") from error
+        if (
+            not isinstance(table, str)
+            or not table
+            or table in resources
+            or any(value < 0 for value in values.values())
+        ):
+            raise SuiteFailure("publication control resource row is invalid")
+        resources[table] = values
+    return resources
+
+
+def _source_host_column_resources(
+    url: str, database: str = "moraine"
+) -> dict[str, dict[str, int]]:
+    encoded_tables = ", ".join(f"'{table}'" for table in SOURCE_HOST_PHYSICAL_TABLES)
+    raw = _clickhouse_query(
+        url,
+        "SELECT table, sum(rows) AS rows, count() AS active_parts, "
+        "sum(column_data_compressed_bytes) AS compressed_bytes, "
+        "sum(column_data_uncompressed_bytes) AS uncompressed_bytes, "
+        "sum(column_bytes_on_disk) AS bytes_on_disk "
+        "FROM system.parts_columns "
+        f"WHERE active AND database = '{database}' AND column = 'source_host' "
+        f"AND table IN ({encoded_tables}) "
+        "GROUP BY table ORDER BY table FORMAT JSONEachRow",
+    )
+    resources = {
+        table: {
+            "rows": 0,
+            "active_parts": 0,
+            "compressed_bytes": 0,
+            "uncompressed_bytes": 0,
+            "bytes_on_disk": 0,
+        }
+        for table in SOURCE_HOST_PHYSICAL_TABLES
+    }
+    observed: set[str] = set()
+    for line in raw.splitlines():
+        try:
+            row = json.loads(line)
+            table = row["table"]
+            values = {
+                name: int(row[name])
+                for name in SOURCE_HOST_COLUMN_RESOURCE_FIELDS
+            }
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise SuiteFailure("source_host column resource row is malformed") from error
+        if (
+            table not in resources
+            or table in observed
+            or any(value < 0 for value in values.values())
+        ):
+            raise SuiteFailure("source_host column resource row is invalid")
+        observed.add(table)
+        resources[table] = values
+    return resources
+
+
+def _nearest_rank(values: Sequence[float], percentile: float) -> float:
+    if not values:
+        raise SuiteFailure("source-publication probe has no latency samples")
+    ordered = sorted(values)
+    index = max(0, math.ceil(percentile / 100.0 * len(ordered)) - 1)
+    return float(ordered[index])
+
+
+def _latency_summary(values: Sequence[float]) -> dict[str, Any]:
+    normalized = [float(value) for value in values]
+    if not normalized or any(
+        not math.isfinite(value) or value < 0 for value in normalized
+    ):
+        raise SuiteFailure("publication capture latency samples are invalid")
+    return {
+        "sample_count": len(normalized),
+        "p50_ms": _nearest_rank(normalized, 50.0),
+        "p95_ms": _nearest_rank(normalized, 95.0),
+        "max_ms": max(normalized),
+        "raw_ms": normalized,
+    }
+
+
+def _logical_publication_head_snapshot(
+    url: str, database: str = "moraine"
+) -> dict[str, int]:
+    raw = _clickhouse_query(
+        url,
+        f"SELECT count(), ifNull(max(publication_revision), 0) "
+        f"FROM {database}.v_current_published_source_generations FORMAT TSVRaw",
+    )
+    fields = raw.split("\t")
+    if len(fields) != 2:
+        raise SuiteFailure("logical publication head snapshot has an invalid shape")
+    try:
+        rows, revision = (int(field) for field in fields)
+    except ValueError as error:
+        raise SuiteFailure("logical publication head snapshot is not numeric") from error
+    if rows < 0 or revision < 0:
+        raise SuiteFailure("logical publication head snapshot contains a negative counter")
+    return {"head_count": rows, "max_publication_revision": revision}
+
+
+def _seed_publication_heads_to(
+    url: str,
+    *,
+    current_count: int,
+    target_count: int,
+    database: str = "moraine",
+) -> dict[str, int]:
+    if current_count < 1 or target_count < current_count:
+        raise SuiteFailure("publication capture scaling bounds are invalid")
+    initial = _logical_publication_head_snapshot(url, database)
+    if initial["head_count"] != current_count:
+        raise SuiteFailure(
+            "publication capture scale seed started from an unexpected head count"
+        )
+    additional = target_count - current_count
+    if additional:
+        first_revision = initial["max_publication_revision"] + 1
+        _clickhouse_query(
+            url,
+            f"""
+INSERT INTO {database}.published_source_generations
+(
+  source_host, source_name, source_file, source_generation,
+  publication_revision, publisher_id, operation_id
+)
+SELECT
+  '',
+  'performance-scale',
+  concat('publication-scale-', leftPad(toString(number + {current_count}), 12, '0'), '.jsonl'),
+  toUInt32(1),
+  toUInt64(number + {first_revision}),
+  'performance-scale',
+  concat('performance-scale:', toString(number + {current_count}))
+FROM numbers({additional})
+""".strip(),
+        )
+    snapshot = _logical_publication_head_snapshot(url, database)
+    if snapshot != {
+        "head_count": target_count,
+        "max_publication_revision": initial["max_publication_revision"] + additional,
+    }:
+        raise SuiteFailure(
+            "publication capture scale seed differs: "
+            f"expected {target_count}, observed {snapshot}"
+        )
+    return snapshot
+
+
+def _publication_capture_sql(database: str = "moraine") -> str:
+    quoted_database = database.replace("`", "``")
+    return f"""/* moraine:publication_snapshot:capture */
+SELECT
+  toUInt64(ifNull(max(publication_revision), 0)) AS publication_revision
+FROM `{quoted_database}`.`published_source_generations`
+FORMAT JSONEachRow"""
+
+
+def _validate_publication_capture_result(
+    raw: str, *, publication_revision: int
+) -> None:
+    try:
+        lines = raw.splitlines()
+        if len(lines) != 1:
+            raise ValueError("capture row count differs")
+        row = json.loads(lines[0])
+        if set(row) != {"publication_revision"}:
+            raise ValueError("capture fields differ")
+        if int(row["publication_revision"]) != publication_revision:
+            raise ValueError("capture values differ")
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise SuiteFailure("publication capture result is malformed") from error
+
+
+def _publication_capture_query_log_samples(
+    url: str, query_ids: Sequence[str]
+) -> list[dict[str, Any]]:
+    if not query_ids or len(query_ids) != len(set(query_ids)):
+        raise SuiteFailure("publication capture query IDs are invalid")
+    _clickhouse_query(url, "SYSTEM FLUSH LOGS")
+    encoded_ids = ", ".join(f"'{query_id}'" for query_id in query_ids)
+    raw = _clickhouse_query(
+        url,
+        f"""SELECT
+  query_id,
+  type,
+  toFloat64(query_duration_ms) AS query_duration_ms,
+  toUInt64(read_rows) AS read_rows,
+  toUInt64(read_bytes) AS read_bytes,
+  toUInt64(result_rows) AS result_rows,
+  toUInt64(greatest(memory_usage, 0)) AS memory_usage_bytes
+FROM system.query_log
+WHERE query_id IN ({encoded_ids})
+  AND type IN ('QueryFinish', 'ExceptionBeforeStart', 'ExceptionWhileProcessing')
+ORDER BY query_id, type
+FORMAT JSONEachRow""",
+    )
+    expected = set(query_ids)
+    observed: set[str] = set()
+    samples: list[dict[str, Any]] = []
+    exceptions = 0
+    for line in raw.splitlines():
+        try:
+            row = json.loads(line)
+            query_id = row["query_id"]
+            row_type = row["type"]
+            if query_id not in expected or query_id in observed:
+                raise ValueError("query identity differs")
+            observed.add(query_id)
+            if row_type != "QueryFinish":
+                exceptions += 1
+                continue
+            sample = {
+                "query_duration_ms": float(row["query_duration_ms"]),
+                "read_rows": int(row["read_rows"]),
+                "read_bytes": int(row["read_bytes"]),
+                "result_rows": int(row["result_rows"]),
+                "memory_usage_bytes": int(row["memory_usage_bytes"]),
+            }
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise SuiteFailure("publication capture query-log row is malformed") from error
+        if (
+            not math.isfinite(sample["query_duration_ms"])
+            or sample["query_duration_ms"] < 0
+            or any(sample[name] < 0 for name in sample if name != "query_duration_ms")
+        ):
+            raise SuiteFailure("publication capture query-log row is invalid")
+        samples.append(sample)
+    if observed != expected or exceptions or len(samples) != len(query_ids):
+        raise SuiteFailure(
+            "publication capture query-log coverage differs: "
+            f"expected={len(query_ids)} observed={len(observed)} exceptions={exceptions}"
+        )
+    return samples
+
+
+def _publication_capture_query_log_summary(
+    samples: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    durations = [float(sample["query_duration_ms"]) for sample in samples]
+    latency = _latency_summary(durations)
+    return {
+        "sample_count": len(samples),
+        "duration_p50_ms": latency["p50_ms"],
+        "duration_p95_ms": latency["p95_ms"],
+        "duration_max_ms": latency["max_ms"],
+        "read_rows_total": sum(int(sample["read_rows"]) for sample in samples),
+        "read_bytes_total": sum(int(sample["read_bytes"]) for sample in samples),
+        "result_rows_total": sum(int(sample["result_rows"]) for sample in samples),
+        "max_memory_bytes": max(int(sample["memory_usage_bytes"]) for sample in samples),
+        "raw_samples": [dict(sample) for sample in samples],
+    }
+
+
+def _measure_publication_capture_point(
+    url: str,
+    snapshot: Mapping[str, int],
+    *,
+    query_prefix: str,
+    database: str = "moraine",
+) -> dict[str, Any]:
+    target_count = snapshot.get("head_count")
+    publication_revision = snapshot.get("max_publication_revision")
+    if (
+        isinstance(target_count, bool)
+        or not isinstance(target_count, int)
+        or target_count < 1
+        or isinstance(publication_revision, bool)
+        or not isinstance(publication_revision, int)
+        or publication_revision < 1
+        or _logical_publication_head_snapshot(url, database) != dict(snapshot)
+    ):
+        raise SuiteFailure("publication capture point identity is invalid")
+    capture_sql = _publication_capture_sql(database)
+    for iteration in range(PUBLICATION_CAPTURE_WARMUP_REPETITIONS):
+        raw = _clickhouse_query(
+            url,
+            capture_sql,
+            query_id=f"{query_prefix}-{target_count}-warm-{iteration}",
+        )
+        _validate_publication_capture_result(
+            raw,
+            publication_revision=publication_revision,
+        )
+    client_latencies: list[float] = []
+    query_ids: list[str] = []
+    for iteration in range(PUBLICATION_CAPTURE_REPETITIONS):
+        query_id = f"{query_prefix}-{target_count}-measured-{iteration}"
+        started_ns = time.perf_counter_ns()
+        raw = _clickhouse_query(url, capture_sql, query_id=query_id)
+        completed_ns = time.perf_counter_ns()
+        _validate_publication_capture_result(
+            raw,
+            publication_revision=publication_revision,
+        )
+        query_ids.append(query_id)
+        client_latencies.append((completed_ns - started_ns) / 1_000_000.0)
+    query_log_samples = _publication_capture_query_log_samples(url, query_ids)
+    control_tables = _publication_control_resources(url, database)
+    head_storage = control_tables.get("published_source_generations")
+    if head_storage is None or head_storage.get("rows") != target_count:
+        raise SuiteFailure(
+            "publication capture storage rows differ from logical head count"
+        )
+    return {
+        **snapshot,
+        "client_latency": _latency_summary(client_latencies),
+        "query_log": _publication_capture_query_log_summary(query_log_samples),
+        "control_tables": control_tables,
+    }
+
+
+def _publication_capture_scaling_artifact(
+    points: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    if [point.get("head_count") for point in points] != list(
+        PUBLICATION_CAPTURE_HEAD_COUNTS
+    ):
+        raise SuiteFailure("publication capture scaling points differ")
+    return {
+        "publication_mode": "local",
+        "capture_query": "raw_history_max_publication_revision",
+        "head_counts": list(PUBLICATION_CAPTURE_HEAD_COUNTS),
+        "warmup_repetitions": PUBLICATION_CAPTURE_WARMUP_REPETITIONS,
+        "measured_repetitions": PUBLICATION_CAPTURE_REPETITIONS,
+        "points": [dict(point) for point in points],
+    }
+
+
+def _append_probe_latency(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    latencies: list[float] = []
+    for sample in samples:
+        durable = sample.get("publication_durable_ms")
+        visible = sample.get("first_valid_ms")
+        if (
+            sample.get("valid") is not True
+            or isinstance(durable, bool)
+            or not isinstance(durable, (int, float))
+            or isinstance(visible, bool)
+            or not isinstance(visible, (int, float))
+            or not math.isfinite(float(durable))
+            or not math.isfinite(float(visible))
+            or float(visible) < float(durable)
+        ):
+            raise SuiteFailure("source-publication append sample is invalid or censored")
+        latencies.append(float(visible) - float(durable))
+    return {
+        "sample_count": len(latencies),
+        "fsync_to_live_p50_ms": _nearest_rank(latencies, 50.0),
+        "fsync_to_live_p95_ms": _nearest_rank(latencies, 95.0),
+        "fsync_to_live_max_ms": max(latencies),
+        "raw_fsync_to_live_ms": latencies,
+    }
 
 
 def _image_recipe_sha256(repo: Path) -> str:
@@ -585,6 +1047,581 @@ def _prepare_builds(
     if common_recipe is None:
         raise SuiteFailure("no build repositories were supplied")
     return prepared, common_recipe
+
+
+def _control_resource_delta(
+    before: Mapping[str, Mapping[str, int]],
+    after: Mapping[str, Mapping[str, int]],
+) -> dict[str, dict[str, int]]:
+    fields = ("rows", "active_parts", "compressed_bytes")
+    return {
+        table: {
+            field: int(after.get(table, {}).get(field, 0))
+            - int(before.get(table, {}).get(field, 0))
+            for field in fields
+        }
+        for table in sorted(set(before) | set(after))
+    }
+
+
+def _source_host_column_resource_delta(
+    before: Mapping[str, Mapping[str, int]],
+    after: Mapping[str, Mapping[str, int]],
+) -> dict[str, dict[str, int]]:
+    return {
+        table: {
+            field: int(after.get(table, {}).get(field, 0))
+            - int(before.get(table, {}).get(field, 0))
+            for field in SOURCE_HOST_COLUMN_RESOURCE_FIELDS
+        }
+        for table in SOURCE_HOST_PHYSICAL_TABLES
+    }
+
+
+def _validate_control_table_resources(
+    value: Any, *, allow_negative: bool = False
+) -> None:
+    if not isinstance(value, dict) or not value:
+        raise SuiteFailure("source-publication control resource map is invalid")
+    for table, counters in value.items():
+        if (
+            not isinstance(table, str)
+            or not table
+            or not isinstance(counters, dict)
+            or set(counters) != {"rows", "active_parts", "compressed_bytes"}
+        ):
+            raise SuiteFailure("source-publication control resource fields differ")
+        for counter in counters.values():
+            if (
+                isinstance(counter, bool)
+                or not isinstance(counter, int)
+                or (not allow_negative and counter < 0)
+            ):
+                raise SuiteFailure("source-publication control resource counter is invalid")
+
+
+def _validate_source_host_column_resources(
+    value: Any, *, allow_negative: bool = False
+) -> None:
+    if not isinstance(value, dict) or set(value) != set(SOURCE_HOST_PHYSICAL_TABLES):
+        raise SuiteFailure("source_host column resource tables differ")
+    for counters in value.values():
+        if not isinstance(counters, dict) or set(counters) != set(
+            SOURCE_HOST_COLUMN_RESOURCE_FIELDS
+        ):
+            raise SuiteFailure("source_host column resource fields differ")
+        if any(
+            isinstance(counter, bool)
+            or not isinstance(counter, int)
+            or (not allow_negative and counter < 0)
+            for counter in counters.values()
+        ):
+            raise SuiteFailure("source_host column resource counter is invalid")
+
+
+def _validate_latency_summary(
+    value: Any, *, sample_count: int, context: str
+) -> None:
+    if not isinstance(value, dict) or set(value) != {
+        "sample_count",
+        "p50_ms",
+        "p95_ms",
+        "max_ms",
+        "raw_ms",
+    }:
+        raise SuiteFailure(f"{context} latency fields differ")
+    samples = value["raw_ms"]
+    if (
+        value["sample_count"] != sample_count
+        or not isinstance(samples, list)
+        or len(samples) != sample_count
+        or any(
+            isinstance(sample, bool)
+            or not isinstance(sample, (int, float))
+            or not math.isfinite(float(sample))
+            or float(sample) < 0
+            for sample in samples
+        )
+    ):
+        raise SuiteFailure(f"{context} latency samples are invalid")
+    expected = _latency_summary(samples)
+    if any(
+        isinstance(value[name], bool)
+        or not isinstance(value[name], (int, float))
+        or not math.isfinite(float(value[name]))
+        or float(value[name]) < 0
+        for name in ("p50_ms", "p95_ms", "max_ms")
+    ):
+        raise SuiteFailure(f"{context} latency summary is invalid")
+    if any(
+        not math.isclose(
+            float(value[name]), float(expected[name]), rel_tol=0.0, abs_tol=1e-9
+        )
+        for name in ("p50_ms", "p95_ms", "max_ms")
+    ):
+        raise SuiteFailure(f"{context} latency summary differs")
+
+
+def _validate_publication_capture_scaling(value: Any) -> None:
+    if not isinstance(value, dict) or set(value) != {
+        "publication_mode",
+        "capture_query",
+        "head_counts",
+        "warmup_repetitions",
+        "measured_repetitions",
+        "points",
+    }:
+        raise SuiteFailure("publication capture scaling fields differ")
+    if (
+        value["publication_mode"] != "local"
+        or value["capture_query"] != "raw_history_max_publication_revision"
+        or value["head_counts"] != list(PUBLICATION_CAPTURE_HEAD_COUNTS)
+        or value["warmup_repetitions"]
+        != PUBLICATION_CAPTURE_WARMUP_REPETITIONS
+        or value["measured_repetitions"] != PUBLICATION_CAPTURE_REPETITIONS
+        or not isinstance(value["points"], list)
+        or len(value["points"]) != len(PUBLICATION_CAPTURE_HEAD_COUNTS)
+    ):
+        raise SuiteFailure("publication capture scaling policy differs")
+    previous_revision = 0
+    for expected_count, point in zip(
+        PUBLICATION_CAPTURE_HEAD_COUNTS, value["points"]
+    ):
+        if not isinstance(point, dict) or set(point) != {
+            "head_count",
+            "max_publication_revision",
+            "client_latency",
+            "query_log",
+            "control_tables",
+        }:
+            raise SuiteFailure("publication capture scale-point fields differ")
+        if (
+            isinstance(point["head_count"], bool)
+            or not isinstance(point["head_count"], int)
+            or isinstance(point["max_publication_revision"], bool)
+            or not isinstance(point["max_publication_revision"], int)
+            or point["head_count"] != expected_count
+            or point["max_publication_revision"] <= previous_revision
+        ):
+            raise SuiteFailure("publication capture scale-point identity differs")
+        previous_revision = point["max_publication_revision"]
+        _validate_latency_summary(
+            point["client_latency"],
+            sample_count=PUBLICATION_CAPTURE_REPETITIONS,
+            context="publication capture client",
+        )
+        query_log = point["query_log"]
+        if not isinstance(query_log, dict) or set(query_log) != {
+            "sample_count",
+            "duration_p50_ms",
+            "duration_p95_ms",
+            "duration_max_ms",
+            "read_rows_total",
+            "read_bytes_total",
+            "result_rows_total",
+            "max_memory_bytes",
+            "raw_samples",
+        }:
+            raise SuiteFailure("publication capture query-log fields differ")
+        raw_samples = query_log["raw_samples"]
+        if (
+            query_log["sample_count"] != PUBLICATION_CAPTURE_REPETITIONS
+            or not isinstance(raw_samples, list)
+            or len(raw_samples) != PUBLICATION_CAPTURE_REPETITIONS
+        ):
+            raise SuiteFailure("publication capture query-log coverage differs")
+        for sample in raw_samples:
+            if not isinstance(sample, dict) or set(sample) != {
+                "query_duration_ms",
+                "read_rows",
+                "read_bytes",
+                "result_rows",
+                "memory_usage_bytes",
+            }:
+                raise SuiteFailure("publication capture query-log sample fields differ")
+            if (
+                isinstance(sample["query_duration_ms"], bool)
+                or not isinstance(sample["query_duration_ms"], (int, float))
+                or not math.isfinite(float(sample["query_duration_ms"]))
+                or float(sample["query_duration_ms"]) < 0
+                or any(
+                    isinstance(sample[name], bool)
+                    or not isinstance(sample[name], int)
+                    or sample[name] < 0
+                    for name in (
+                        "read_rows",
+                        "read_bytes",
+                        "result_rows",
+                        "memory_usage_bytes",
+                    )
+                )
+            ):
+                raise SuiteFailure("publication capture query-log sample is invalid")
+        expected_log = _publication_capture_query_log_summary(raw_samples)
+        for name in (
+            "read_rows_total",
+            "read_bytes_total",
+            "result_rows_total",
+            "max_memory_bytes",
+        ):
+            if (
+                isinstance(query_log[name], bool)
+                or not isinstance(query_log[name], int)
+                or query_log[name] < 0
+                or query_log[name] != expected_log[name]
+            ):
+                raise SuiteFailure("publication capture query-log totals differ")
+        for name in (
+            "duration_p50_ms",
+            "duration_p95_ms",
+            "duration_max_ms",
+        ):
+            if (
+                isinstance(query_log[name], bool)
+                or not isinstance(query_log[name], (int, float))
+                or not math.isfinite(float(query_log[name]))
+                or float(query_log[name]) < 0
+                or not math.isclose(
+                    float(query_log[name]),
+                    float(expected_log[name]),
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+            ):
+                raise SuiteFailure("publication capture query-log summary differs")
+        _validate_control_table_resources(point["control_tables"])
+        head_storage = point["control_tables"].get(
+            "published_source_generations"
+        )
+        if head_storage is None or head_storage["rows"] != expected_count:
+            raise SuiteFailure("publication capture storage evidence differs")
+
+
+def validate_source_publication_probe(document: Any) -> None:
+    required = {
+        "document_type",
+        "schema_version",
+        "status",
+        "git_commit",
+        "run",
+        "append",
+        "publication_head",
+        "control_tables",
+        "control_capture_scaling",
+        "source_host_columns",
+        "resources",
+        "artifact_sha256",
+    }
+    if not isinstance(document, dict) or set(document) != required:
+        raise SuiteFailure("source-publication probe document fields differ")
+    if (
+        document.get("document_type") != "source_publication_append_probe"
+        or document.get("schema_version") != "moraine.source-publication-probe.v1"
+        or document.get("status") not in {"pass", "fail"}
+        or not isinstance(document.get("git_commit"), str)
+        or len(document["git_commit"]) != 40
+        or any(character not in "0123456789abcdef" for character in document["git_commit"])
+    ):
+        raise SuiteFailure("source-publication probe identity is invalid")
+    run = document.get("run")
+    append = document.get("append")
+    head = document.get("publication_head")
+    controls = document.get("control_tables")
+    scaling = document.get("control_capture_scaling")
+    source_host_columns = document.get("source_host_columns")
+    if (
+        not isinstance(run, dict)
+        or set(run)
+        != {"authoritative", "minimum_samples", "p95_limit_ms", "timeout_seconds"}
+        or not isinstance(append, dict)
+        or set(append)
+        != {
+            "sample_count",
+            "fsync_to_live_p50_ms",
+            "fsync_to_live_p95_ms",
+            "fsync_to_live_max_ms",
+            "raw_fsync_to_live_ms",
+        }
+        or not isinstance(head, dict)
+        or set(head)
+        != {
+            "before",
+            "after",
+            "head_write_count",
+            "publication_revision_unchanged",
+        }
+        or not isinstance(controls, dict)
+        or set(controls) != {"before", "after", "delta"}
+        or not isinstance(source_host_columns, dict)
+        or set(source_host_columns) != {"before", "after", "delta"}
+    ):
+        raise SuiteFailure("source-publication probe evidence shape differs")
+    if (
+        not isinstance(run["authoritative"], bool)
+        or isinstance(run["minimum_samples"], bool)
+        or not isinstance(run["minimum_samples"], int)
+        or run["minimum_samples"] < 100
+        or any(
+            isinstance(run[name], bool)
+            or not isinstance(run[name], (int, float))
+            or not math.isfinite(float(run[name]))
+            or float(run[name]) <= 0
+            for name in ("p95_limit_ms", "timeout_seconds")
+        )
+    ):
+        raise SuiteFailure("source-publication probe run policy is invalid")
+    _validate_publication_capture_scaling(scaling)
+    _validate_source_host_column_resources(source_host_columns["before"])
+    _validate_source_host_column_resources(source_host_columns["after"])
+    _validate_source_host_column_resources(
+        source_host_columns["delta"], allow_negative=True
+    )
+    if source_host_columns["delta"] != _source_host_column_resource_delta(
+        source_host_columns["before"], source_host_columns["after"]
+    ):
+        raise SuiteFailure("source_host column resource delta differs")
+    samples = append["raw_fsync_to_live_ms"]
+    minimum = run["minimum_samples"]
+    if (
+        not isinstance(samples, list)
+        or isinstance(append["sample_count"], bool)
+        or not isinstance(append["sample_count"], int)
+        or append["sample_count"] != len(samples)
+        or len(samples) < minimum
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0
+            for value in samples
+        )
+    ):
+        raise SuiteFailure("source-publication probe samples are invalid")
+    expected_latency = {
+        "fsync_to_live_p50_ms": _nearest_rank(samples, 50.0),
+        "fsync_to_live_p95_ms": _nearest_rank(samples, 95.0),
+        "fsync_to_live_max_ms": max(samples),
+    }
+    if any(
+        isinstance(append[name], bool)
+        or not isinstance(append[name], (int, float))
+        or not math.isfinite(float(append[name]))
+        or float(append[name]) < 0
+        for name in expected_latency
+    ):
+        raise SuiteFailure("source-publication probe latency summary is invalid")
+    if any(
+        not math.isclose(
+            float(append[name]), value, rel_tol=0.0, abs_tol=1e-9
+        )
+        for name, value in expected_latency.items()
+    ):
+        raise SuiteFailure("source-publication probe latency summary differs")
+    before = head["before"]
+    after = head["after"]
+    _validate_control_table_resources(controls["before"])
+    _validate_control_table_resources(controls["after"])
+    _validate_control_table_resources(controls["delta"], allow_negative=True)
+    if (
+        not isinstance(before, dict)
+        or not isinstance(after, dict)
+        or set(before) != {"row_count", "max_publication_revision"}
+        or set(after) != set(before)
+        or any(
+            isinstance(snapshot[name], bool)
+            or not isinstance(snapshot[name], int)
+            or snapshot[name] < 0
+            for snapshot in (before, after)
+            for name in ("row_count", "max_publication_revision")
+        )
+        or isinstance(head["head_write_count"], bool)
+        or not isinstance(head["head_write_count"], int)
+        or head["head_write_count"] < 0
+        or not isinstance(head["publication_revision_unchanged"], bool)
+        or head["head_write_count"] != after["row_count"] - before["row_count"]
+        or head["publication_revision_unchanged"]
+        is not (
+            before["max_publication_revision"]
+            == after["max_publication_revision"]
+        )
+        or controls["delta"]
+        != _control_resource_delta(controls["before"], controls["after"])
+    ):
+        raise SuiteFailure("source-publication probe control evidence differs")
+    passed = bool(
+        head["head_write_count"] == 0
+        and head["publication_revision_unchanged"] is True
+        and float(append["fsync_to_live_p95_ms"]) <= float(run["p95_limit_ms"])
+    )
+    if document["status"] != ("pass" if passed else "fail"):
+        raise SuiteFailure("source-publication probe status contradicts gates")
+    expected_hash = sha256_json(
+        {key: value for key, value in document.items() if key != "artifact_sha256"}
+    )
+    if document["artifact_sha256"] != expected_hash:
+        raise SuiteFailure("source-publication probe artifact hash differs")
+
+
+def run_source_publication_append_probe(
+    repo: Path,
+    *,
+    output: Path,
+    samples: int = 100,
+    timeout_s: float = 5.0,
+    p95_limit_ms: float = 2_000.0,
+    authoritative: bool = False,
+) -> Path:
+    """Run a real same-file append probe and retain PR-ready resource evidence."""
+
+    if (
+        isinstance(samples, bool)
+        or samples < 100
+        or not math.isfinite(timeout_s)
+        or timeout_s <= 0
+        or not math.isfinite(p95_limit_ms)
+        or p95_limit_ms <= 0
+    ):
+        raise SuiteFailure("source-publication probe requires >=100 samples and positive limits")
+    output.mkdir(parents=True, exist_ok=False)
+    recipe = build_recipe("smoke")
+    prepared_builds, _build_recipe = _prepare_builds(
+        {"candidate": repo}, output / "builds", authoritative=authoritative
+    )
+    prepared = prepared_builds["candidate"]
+    collector = EvidenceCollector()
+    sandbox = _start_measured_sandbox(
+        repo,
+        prepared.runtime,
+        str(prepared.protocol["image_digest"]),
+        recipe,
+        collector,
+        reset_role="source_publication_append_probe",
+        authoritative=authoritative,
+    )
+    try:
+        url = f"http://127.0.0.1:{sandbox.clickhouse_port}"
+        scale_query_prefix = f"moraine-publication-capture-{run_id()}"
+        initial_scale_snapshot = _logical_publication_head_snapshot(url)
+        if initial_scale_snapshot != {
+            "head_count": 1,
+            "max_publication_revision": 1,
+        }:
+            raise SuiteFailure(
+                "publication capture scaling requires exactly one seeded head"
+            )
+        scale_points = [
+            _measure_publication_capture_point(
+                url,
+                initial_scale_snapshot,
+                query_prefix=scale_query_prefix,
+            )
+        ]
+        source_host_before = _source_host_column_resources(url)
+        term_count = max(
+            64,
+            math.ceil(timeout_s / PUBLICATION_APPEND_POLL_INTERVAL_S) + 2,
+        )
+        events = build_append_probe_events(samples + 1, term_count=term_count)
+        warmup = run_owned_sandbox_append_probe(
+            sandbox,
+            events[:1],
+            timeout_s=timeout_s,
+            poll_interval_s=PUBLICATION_APPEND_POLL_INTERVAL_S,
+        )
+        if warmup.status != "pass":
+            raise SuiteFailure("source-publication append warmup did not become live")
+        head_before = _publication_head_snapshot(url)
+        controls_before = _publication_control_resources(url)
+        measured = run_owned_sandbox_append_probe(
+            sandbox,
+            events[1:],
+            timeout_s=timeout_s,
+            poll_interval_s=PUBLICATION_APPEND_POLL_INTERVAL_S,
+        )
+        sandbox.wait_ingest_drained(timeout_s=max(30.0, timeout_s * 2))
+        head_after = _publication_head_snapshot(url)
+        controls_after = _publication_control_resources(url)
+        source_host_after = _source_host_column_resources(url)
+        current_scale_snapshot = _logical_publication_head_snapshot(url)
+        if current_scale_snapshot["head_count"] != 2:
+            raise SuiteFailure(
+                "ordinary append warmup did not add exactly one logical source head"
+            )
+        current_count = current_scale_snapshot["head_count"]
+        for target_count in PUBLICATION_CAPTURE_HEAD_COUNTS[1:]:
+            current_scale_snapshot = _seed_publication_heads_to(
+                url,
+                current_count=current_count,
+                target_count=target_count,
+            )
+            scale_points.append(
+                _measure_publication_capture_point(
+                    url,
+                    current_scale_snapshot,
+                    query_prefix=scale_query_prefix,
+                )
+            )
+            current_count = target_count
+        control_capture_scaling = _publication_capture_scaling_artifact(
+            scale_points
+        )
+    finally:
+        sandbox.down()
+    if measured.status != "pass":
+        raise SuiteFailure("source-publication append probe contained invalid samples")
+    append = _append_probe_latency(list(measured.samples))
+    head = {
+        "before": head_before,
+        "after": head_after,
+        "head_write_count": head_after["row_count"] - head_before["row_count"],
+        "publication_revision_unchanged": (
+            head_after["max_publication_revision"]
+            == head_before["max_publication_revision"]
+        ),
+    }
+    controls = {
+        "before": controls_before,
+        "after": controls_after,
+        "delta": _control_resource_delta(controls_before, controls_after),
+    }
+    source_host_columns = {
+        "before": source_host_before,
+        "after": source_host_after,
+        "delta": _source_host_column_resource_delta(
+            source_host_before, source_host_after
+        ),
+    }
+    document: dict[str, Any] = {
+        "document_type": "source_publication_append_probe",
+        "schema_version": "moraine.source-publication-probe.v1",
+        "status": "pass"
+        if (
+            head["head_write_count"] == 0
+            and head["publication_revision_unchanged"]
+            and append["fsync_to_live_p95_ms"] <= p95_limit_ms
+        )
+        else "fail",
+        "git_commit": str(prepared.protocol["git_commit"]),
+        "run": {
+            "authoritative": authoritative,
+            "minimum_samples": samples,
+            "p95_limit_ms": p95_limit_ms,
+            "timeout_seconds": timeout_s,
+        },
+        "append": append,
+        "publication_head": head,
+        "control_tables": controls,
+        "control_capture_scaling": control_capture_scaling,
+        "source_host_columns": source_host_columns,
+        "resources": collector.resource_artifact(authoritative=authoritative),
+        "artifact_sha256": "",
+    }
+    document["artifact_sha256"] = sha256_json(
+        {key: value for key, value in document.items() if key != "artifact_sha256"}
+    )
+    path = output / "source-publication-append-probe.json"
+    write_json_atomic(path, document, validator=validate_source_publication_probe)
+    return path
 
 
 def _semantic_evidence(
@@ -1081,6 +2118,11 @@ def validate_path(path: Path) -> None:
         load_suite_manifest(path)
     elif isinstance(document, dict) and document.get("document_type") == "native_central_burst":
         validate_native_burst_artifact(document)
+    elif (
+        isinstance(document, dict)
+        and document.get("document_type") == "source_publication_append_probe"
+    ):
+        validate_source_publication_probe(document)
     elif isinstance(document, dict) and "document_type" in document:
         validate_document(document)
     elif isinstance(document, dict) and "recipe_version" in document:
@@ -1473,6 +2515,7 @@ def run_local_comparison(
                     ],
                     "semantic_oracle_sha256": document["semantic"]["oracle_sha256"],
                 }
+        baseline = by_arm["baseline"]
         candidate = by_arm["candidate"]
         baseline_qps = float(baseline["qps"]["metrics"]["sustainable_qps"])
         candidate_qps = float(candidate["qps"]["metrics"]["sustainable_qps"])
@@ -1726,6 +2769,21 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     native_parser.add_argument("--timeout-seconds", type=float, default=5.0)
     native_parser.add_argument("--startup-timeout-seconds", type=float, default=30.0)
     native_parser.add_argument("--output", type=Path, required=True)
+    publication_parser = commands.add_parser(
+        "source-publication-append-probe",
+        help=(
+            "measure 1/10k/100k head capture and >=100 durable same-file "
+            "appends through production ingest and MCP"
+        ),
+    )
+    publication_parser.add_argument("--repo", type=Path, default=Path.cwd())
+    publication_parser.add_argument("--samples", type=int, default=100)
+    publication_parser.add_argument("--timeout-seconds", type=float, default=5.0)
+    publication_parser.add_argument("--p95-limit-ms", type=float, default=2_000.0)
+    publication_parser.add_argument(
+        "--mode", choices=("local", "authoritative"), default="local"
+    )
+    publication_parser.add_argument("--output", type=Path, required=True)
     run_parser = commands.add_parser("run")
     run_parser.add_argument(
         "--mode",
@@ -1781,6 +2839,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 raise SuiteFailure(
                     "native central burst failed requests, latency gates, or query-log evidence; "
                     "artifact retained"
+                )
+        elif args.command == "source-publication-append-probe":
+            artifact = run_source_publication_append_probe(
+                args.repo.resolve(),
+                output=args.output,
+                samples=args.samples,
+                timeout_s=args.timeout_seconds,
+                p95_limit_ms=args.p95_limit_ms,
+                authoritative=args.mode == "authoritative",
+            )
+            document = json.loads(artifact.read_text(encoding="utf-8"))
+            validate_source_publication_probe(document)
+            if document["status"] != "pass":
+                raise SuiteFailure(
+                    "source-publication append p95/head-write gates failed; artifact retained"
                 )
         elif args.mode == "local":
             if args.candidate is None:

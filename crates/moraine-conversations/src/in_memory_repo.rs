@@ -500,9 +500,9 @@ mod tests {
 
     use crate::domain::{
         AnalyticsRange, AnalyticsSnapshot, AnalyticsWindow, ConversationMode, ConversationSummary,
-        IngestHeartbeatRead, SessionAnalytics, SessionAnalyticsQuery, SessionLookback,
-        StoreConnectionMetrics, StoreDiagnostics, StoreHealth, StoreProbe, TablePreview,
-        TablePreviewQuery, TableSummaries, WebSearchEvent,
+        IngestHeartbeatRead, PublicationDiagnostics, SessionAnalytics, SessionAnalyticsQuery,
+        SessionLookback, StoreConnectionMetrics, StoreDiagnostics, StoreHealth, StoreProbe,
+        TablePreview, TablePreviewQuery, TableSummaries, WebSearchEvent,
     };
     use crate::error::RepoError;
 
@@ -652,6 +652,7 @@ mod tests {
             version: StoreProbe::Available("25.1".to_string()),
             database_exists: StoreProbe::Available(true),
             connections: StoreProbe::Available(StoreConnectionMetrics::default()),
+            publication: StoreProbe::Available(PublicationDiagnostics::default()),
         };
         let diagnostics = StoreDiagnostics {
             healthy: true,
