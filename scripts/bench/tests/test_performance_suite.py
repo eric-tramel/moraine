@@ -862,6 +862,19 @@ FORMAT JSONEachRow""",
         self.assertEqual(summary["read_rows_total"], 20_000)
         self.assertEqual(summary["max_memory_bytes"], 8192)
 
+    def test_publication_capture_storage_allows_physical_history_rows(self) -> None:
+        suite._validate_publication_capture_storage(
+            {"published_source_generations": {"rows": 3}},
+            logical_head_count=2,
+        )
+        with self.assertRaisesRegex(
+            suite.SuiteFailure, "fewer than logical head count"
+        ):
+            suite._validate_publication_capture_storage(
+                {"published_source_generations": {"rows": 1}},
+                logical_head_count=2,
+            )
+
     def test_source_publication_probe_validates_samples_head_and_control_deltas(self) -> None:
         before_controls = {
             "published_source_generations": {
@@ -930,7 +943,7 @@ FORMAT JSONEachRow""",
                     ),
                     "control_tables": {
                         "published_source_generations": {
-                            "rows": head_count,
+                            "rows": head_count + 1,
                             "active_parts": 1,
                             "compressed_bytes": head_count * 32,
                         }
