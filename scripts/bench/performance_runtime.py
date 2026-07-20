@@ -38,6 +38,7 @@ CENTRAL_STATUS_SCHEMA = "moraine-performance-central-v1"
 OWNED_ID_RE = re.compile(r"^perf-[0-9a-f]{12}$")
 SANDBOX_ID_RE = re.compile(r"^sb-[0-9a-f]{6}$")
 SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 RELEASE_BINARIES = ("moraine", "moraine-ingest", "moraine-monitor", "moraine-mcp")
 RUNNING_SERVER_BINARIES = ("moraine-ingest", "moraine-mcp")
 BUILD_ENV_ALLOWLIST = (
@@ -1725,7 +1726,8 @@ class OwnedSandbox:
             raise RuntimeFailure(f"cannot read owned benchmark logs: {proc.stderr[-2048:].strip()}")
         observations: list[AckObservation] = []
         marker_fields = ("batch_sequence=", "event_identity_digests=", "ack_monotonic_ns=")
-        for line in (*proc.stdout.splitlines(), *proc.stderr.splitlines()):
+        for raw_line in (*proc.stdout.splitlines(), *proc.stderr.splitlines()):
+            line = ANSI_CSI_RE.sub("", raw_line)
             present = tuple(field in line for field in marker_fields)
             if not any(present):
                 continue

@@ -565,9 +565,11 @@ class RuntimeAdapterTests(unittest.TestCase):
         sandbox = self.sandbox()
         digest = "b" * 64
         line = (
-            "INFO batch_sequence=7 "
-            f'event_identity_digests=["{digest}"] '
-            "ack_monotonic_ns=123456\n"
+            "\x1b[2mINFO\x1b[0m "
+            "\x1b[3mbatch_sequence\x1b[0m\x1b[2m=\x1b[0m7 "
+            "\x1b[3mevent_identity_digests\x1b[0m\x1b[2m=\x1b[0m"
+            f'\x1b[32m["{digest}"]\x1b[0m '
+            "\x1b[3mack_monotonic_ns\x1b[0m\x1b[2m=\x1b[0m123456\n"
         )
         completed = subprocess.CompletedProcess([], 0, "", line)
         with mock.patch.object(runtime, "_run", return_value=completed):
