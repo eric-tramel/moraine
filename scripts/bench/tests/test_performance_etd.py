@@ -442,9 +442,11 @@ class EtdScenarioTests(unittest.TestCase):
 
     def test_serial_append_scenario_correlates_each_same_file_ack(self) -> None:
         events = fixtures.build_append_probe_events(2, term_count=4)
-        term_events = {
-            term: event for event in events for term in event["probe_terms"]
-        }
+        term_events = {}
+        for event in events:
+            bank = fixtures.OneUseTermBank(event)
+            for _ in event["probe_terms"]:
+                term_events[bank.claim_query()["query"]] = event
         clock = FakeClock()
         published = 0
         emitted = 0

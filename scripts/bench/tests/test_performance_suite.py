@@ -16,7 +16,7 @@ if str(BENCH) not in sys.path:
 
 
 import performance_suite as suite
-from performance_fixtures import build_recipe
+from performance_fixtures import build_append_probe_events, build_recipe
 from performance_protocol import create_build_identity, create_build_recipe, sha256_json
 from performance_scenarios import ScenarioResult
 from performance_suite import (
@@ -959,6 +959,54 @@ FORMAT JSONEachRow""",
             },
         }
         raw = [float(value) for value in range(100)]
+        append_events = build_append_probe_events(100, term_count=4)
+        etd_samples = []
+        for index, (event, latency) in enumerate(
+            zip(append_events, raw, strict=True), 1
+        ):
+            term_use_count = 1 + (index - 1) % len(event["probe_terms"])
+            last_query = (
+                f"{event['indexed_target_term']} "
+                f"{event['probe_terms'][term_use_count - 1]}"
+            )
+            first_valid_ms = 1.0 + latency
+            etd_samples.append(
+                {
+                    "event_identity_sha256": "sha256:"
+                    + event["expected_ack_digest"],
+                    "term_sha256": suite._term_digest(last_query),
+                    "batch_sequence": index,
+                    "publication_durable_ms": 1.0,
+                    "db_ack_lower_ms": 0.5,
+                    "db_ack_ms": 0.5,
+                    "last_miss_ms": None,
+                    "first_hit_ms": first_valid_ms,
+                    "first_valid_ms": first_valid_ms,
+                    "source_interval": {
+                        "lower_ms": 0.0,
+                        "upper_ms": first_valid_ms,
+                        "censoring": "left",
+                    },
+                    "db_ack_interval": {
+                        "lower_ms": 0.0,
+                        "upper_ms": first_valid_ms - 0.5,
+                        "censoring": "left",
+                    },
+                    "term_use_count": term_use_count,
+                    "cache_bypass": {
+                        "result": True,
+                        "document_frequency": True,
+                        "posting": True,
+                        "corpus": True,
+                        "hydration": True,
+                    },
+                    "valid": True,
+                    "error_code": None,
+                }
+            )
+        query_evidence = suite._append_probe_query_evidence(
+            append_events, etd_samples
+        )
         source_host_before = {
             table: {
                 "rows": 0,
@@ -1015,7 +1063,7 @@ FORMAT JSONEachRow""",
             )
         document = {
             "document_type": "source_publication_append_probe",
-            "schema_version": "moraine.source-publication-probe.v1",
+            "schema_version": "moraine.source-publication-probe.v2",
             "status": "pass",
             "git_commit": "a" * 40,
             "run": {
@@ -1031,6 +1079,8 @@ FORMAT JSONEachRow""",
                 "fsync_to_live_max_ms": 99.0,
                 "raw_fsync_to_live_ms": raw,
             },
+            "query_evidence": query_evidence,
+            "etd_samples": etd_samples,
             "publication_head": {
                 "before": {"row_count": 2, "max_publication_revision": 2},
                 "after": {"row_count": 2, "max_publication_revision": 2},
@@ -1071,6 +1121,10 @@ FORMAT JSONEachRow""",
         )
 
         suite.validate_source_publication_probe(document)
+        legacy_version = copy.deepcopy(document)
+        legacy_version["schema_version"] = "moraine.source-publication-probe.v1"
+        with self.assertRaisesRegex(suite.SuiteFailure, "identity"):
+            suite.validate_source_publication_probe(legacy_version)
         args = suite._parse_args(
             [
                 "source-publication-append-probe",
@@ -1091,6 +1145,18 @@ FORMAT JSONEachRow""",
         changed = copy.deepcopy(document)
         changed["resources"]["memory_peak_bytes"] = -1
         with self.assertRaisesRegex(suite.SuiteFailure, "memory_peak_bytes"):
+            suite.validate_source_publication_probe(changed)
+
+        changed = copy.deepcopy(document)
+        changed["query_evidence"]["cache_buster_terms"][
+            "fixture_text_occurrences"
+        ] = 1
+        with self.assertRaisesRegex(suite.SuiteFailure, "term counts"):
+            suite.validate_source_publication_probe(changed)
+
+        changed = copy.deepcopy(document)
+        changed["etd_samples"][0]["term_use_count"] = 2
+        with self.assertRaisesRegex(suite.SuiteFailure, "sample and query evidence"):
             suite.validate_source_publication_probe(changed)
 
 
