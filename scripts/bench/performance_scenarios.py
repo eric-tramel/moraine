@@ -47,6 +47,14 @@ class McpToolError(ScenarioError):
     """The MCP tool returned a non-admission error."""
 
 
+class McpReadModelRefreshing(McpToolError):
+    """The MCP tool asked the caller to retry a changing read model."""
+
+    def __init__(self, retry_after_ms: float) -> None:
+        super().__init__("MCP read model is refreshing")
+        self.retry_after_ms = retry_after_ms
+
+
 class CentralCrashed(ScenarioError):
     """The measured central process exited before the sample completed."""
 
@@ -1108,6 +1116,24 @@ class _StdioJsonRpcClient:
     @staticmethod
     def decode_search_result(result: Mapping[str, Any]) -> Mapping[str, Any]:
         if result.get("isError") is True:
+            structured = result.get("structuredContent")
+            error = structured.get("error") if isinstance(structured, Mapping) else None
+            details = error.get("details") if isinstance(error, Mapping) else None
+            retry_after_ms = (
+                details.get("retry_after_ms") if isinstance(details, Mapping) else None
+            )
+            if (
+                isinstance(error, Mapping)
+                and error.get("code") == "internal_error"
+                and isinstance(details, Mapping)
+                and details.get("reason") == "read_model_refresh"
+                and details.get("retryable") is True
+                and not isinstance(retry_after_ms, bool)
+                and isinstance(retry_after_ms, (int, float))
+                and math.isfinite(float(retry_after_ms))
+                and 0 < float(retry_after_ms) <= 2_000
+            ):
+                raise McpReadModelRefreshing(float(retry_after_ms))
             raise McpToolError("search_sessions returned a tool error")
         structured = result.get("structuredContent")
         if not isinstance(structured, Mapping):
@@ -2015,10 +2041,31 @@ def _run_one_etd_event(
             term_use_count += 1
             try:
                 observation = probe(query)
-            except TimeoutError as exc:
-                raise EtdSampleFailure("search_timeout") from exc
+            except McpReadModelRefreshing as exc:
+                remaining_ns = deadline_ns - clock_ns()
+                if remaining_ns <= 0:
+                    raise EtdSampleFailure("visibility_timeout") from exc
+                sleeper(
+                    min(
+                        max(poll_interval_s, exc.retry_after_ms / 1_000.0),
+                        remaining_ns / 1_000_000_000.0,
+                    )
+                )
+                continue
             except EtdSampleFailure:
                 raise
+            except (TimeoutError, RequestTimeout) as exc:
+                raise EtdSampleFailure("search_timeout") from exc
+            except AdmissionRejected as exc:
+                raise EtdSampleFailure("search_admission_rejected") from exc
+            except McpToolError as exc:
+                raise EtdSampleFailure("search_tool_error") from exc
+            except McpProtocolError as exc:
+                raise EtdSampleFailure("search_protocol_error") from exc
+            except MalformedResult as exc:
+                raise EtdSampleFailure("search_malformed_result") from exc
+            except ScenarioError as exc:
+                raise EtdSampleFailure("search_scenario_error") from exc
             except Exception as exc:
                 raise EtdSampleFailure("search_error") from exc
             observed_ns = clock_ns()
