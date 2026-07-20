@@ -547,6 +547,25 @@ def _publication_capture_query_log_summary(
     }
 
 
+def _validate_publication_capture_storage(
+    control_tables: Mapping[str, Mapping[str, int]], *, logical_head_count: int
+) -> None:
+    head_storage = control_tables.get("published_source_generations")
+    physical_rows = None if head_storage is None else head_storage.get("rows")
+    # published_source_generations is a ReplacingMergeTree that deliberately
+    # retains publication history and may temporarily retain response-loss
+    # retries.  Physical rows therefore bound logical heads from below; they
+    # are not expected to equal the current logical head count.
+    if (
+        isinstance(physical_rows, bool)
+        or not isinstance(physical_rows, int)
+        or physical_rows < logical_head_count
+    ):
+        raise SuiteFailure(
+            "publication capture storage rows are fewer than logical head count"
+        )
+
+
 def _measure_publication_capture_point(
     url: str,
     snapshot: Mapping[str, int],
@@ -592,11 +611,9 @@ def _measure_publication_capture_point(
         client_latencies.append((completed_ns - started_ns) / 1_000_000.0)
     query_log_samples = _publication_capture_query_log_samples(url, query_ids)
     control_tables = _publication_control_resources(url, database)
-    head_storage = control_tables.get("published_source_generations")
-    if head_storage is None or head_storage.get("rows") != target_count:
-        raise SuiteFailure(
-            "publication capture storage rows differ from logical head count"
-        )
+    _validate_publication_capture_storage(
+        control_tables, logical_head_count=target_count
+    )
     return {
         **snapshot,
         "client_latency": _latency_summary(client_latencies),
@@ -1320,11 +1337,9 @@ def _validate_publication_capture_scaling(value: Any) -> None:
             ):
                 raise SuiteFailure("publication capture query-log summary differs")
         _validate_control_table_resources(point["control_tables"])
-        head_storage = point["control_tables"].get(
-            "published_source_generations"
+        _validate_publication_capture_storage(
+            point["control_tables"], logical_head_count=expected_count
         )
-        if head_storage is None or head_storage["rows"] != expected_count:
-            raise SuiteFailure("publication capture storage evidence differs")
 
 
 def validate_source_publication_probe(document: Any) -> None:
