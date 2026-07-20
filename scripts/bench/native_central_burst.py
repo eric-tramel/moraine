@@ -62,6 +62,14 @@ FORBIDDEN_INTERNAL_TOOLS = ("search_mcp_events",)
 COLD_SLO_MODES = ("hydration", "session_scope")
 COLD_PHASE = "cold_lifecycle"
 STEADY_PHASE = "steady_state"
+CONTROL_QUERY_STAGES = (
+    "publication_capture",
+    "append_fence_capture",
+    "publication_revalidate",
+    "append_fence_revalidate",
+)
+BUSINESS_QUERY_STAGES = ("candidate", "detail")
+QUERY_STAGES = (*CONTROL_QUERY_STAGES, *BUSINESS_QUERY_STAGES, "unknown")
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -976,6 +984,37 @@ def _fixture_database_sql(endpoint: ClickHouseEndpoint, recipe: Mapping[str, Any
    WHERE d.dirty_revision > ifNull(s.dirty_revision, 0)) AS dirty_session_count,
   (SELECT countIf(state_key = 'global' AND ready = 1 AND backfill_cursor = '')
    FROM {database}.mcp_open_projection_state FINAL) AS projection_ready_rows
+  ,(SELECT countIf(
+      source_host = ''
+      AND source_name = {source_name}
+      AND source_file = {source_file}
+      AND source_generation = 1
+    ) FROM {database}.v_current_published_source_generations)
+    AS publication_head_count
+  ,(SELECT countIf(
+      host = ''
+      AND source_name = {source_name}
+      AND source_file = {source_file}
+      AND source_generation = 1
+      AND lifecycle = 'active'
+      AND final_scan_complete = 1
+      AND block_reason = ''
+    ) FROM {database}.v_current_ingest_checkpoint_transitions)
+    AS active_checkpoint_count
+  ,(SELECT countIf(
+      source_host = ''
+      AND source_name = {source_name}
+      AND source_file = {source_file}
+      AND source_generation = 1
+      AND complete = 1
+      AND block_reason = ''
+      AND compatibility_prepared = 1
+      AND backend_caught_up = 1
+    ) FROM {database}.v_current_source_generation_publication_readiness)
+    AS publication_readiness_count
+  ,(SELECT countIf(host = '' AND state = 'idle')
+    FROM {database}.v_current_ingest_append_control)
+    AS idle_append_control_count
 FORMAT JSONEachRow"""
 
 
@@ -1009,6 +1048,10 @@ def _validate_fixture_database_evidence(
         "projected_events",
         "dirty_session_count",
         "projection_ready_rows",
+        "publication_head_count",
+        "active_checkpoint_count",
+        "publication_readiness_count",
+        "idle_append_control_count",
         "pass",
     }
     if not isinstance(evidence, dict) or set(evidence) != expected_fields:
@@ -1064,6 +1107,10 @@ def _validate_fixture_database_evidence(
         and evidence["projected_events"] == expected_documents
         and evidence["dirty_session_count"] == 0
         and evidence["projection_ready_rows"] == 1
+        and evidence["publication_head_count"] == 1
+        and evidence["active_checkpoint_count"] == 1
+        and evidence["publication_readiness_count"] == 1
+        and evidence["idle_append_control_count"] == 1
     )
     if evidence.get("pass") is not passed:
         raise NativeBurstFailure("native fixture database evidence status differs")
@@ -1104,6 +1151,10 @@ def _fixture_database_evidence(
         "projected_events",
         "dirty_session_count",
         "projection_ready_rows",
+        "publication_head_count",
+        "active_checkpoint_count",
+        "publication_readiness_count",
+        "idle_append_control_count",
     }
     string_fields = {
         "event_min_uid",
@@ -1160,6 +1211,14 @@ def _query_log_rows_sql(
     return f"""SELECT
   query_id,
   multiIf(
+    position(query, '/* moraine:publication_snapshot:capture */') > 0,
+      'publication_capture',
+    position(query, '/* moraine:append_fence:capture */') > 0,
+      'append_fence_capture',
+    position(query, '/* moraine:publication_snapshot:revalidate */') > 0,
+      'publication_revalidate',
+    position(query, '/* moraine:append_fence:revalidate */') > 0,
+      'append_fence_revalidate',
     position(query, 'projected_candidates AS') > 0, 'candidate',
     position(query, 'candidate_heads AS') > 0, 'detail',
     'unknown'
@@ -1178,6 +1237,37 @@ WHERE type IN ('QueryFinish', 'ExceptionBeforeStart', 'ExceptionWhileProcessing'
   AND ({prefix_filter})
 ORDER BY event_time_us, query_id, type
 FORMAT JSONEachRow"""
+
+
+def _empty_stage_counters() -> dict[str, int]:
+    return {
+        f"{stage}_{suffix}": 0
+        for stage in QUERY_STAGES
+        for suffix in ("queries", "exceptions")
+    }
+
+
+def _expected_stage_queries(
+    *,
+    phase: str,
+    concurrency: int,
+    steady_warmup_case_count: int,
+    steady_measured_requests_per_client: int,
+) -> tuple[dict[str, int], dict[str, int]]:
+    if phase == COLD_PHASE:
+        expected = {stage: concurrency for stage in (*CONTROL_QUERY_STAGES, *BUSINESS_QUERY_STAGES)}
+        return expected, dict(expected)
+    measured = concurrency * steady_measured_requests_per_client
+    total = {
+        stage: steady_warmup_case_count + measured
+        for stage in CONTROL_QUERY_STAGES
+    }
+    total.update(
+        {stage: steady_warmup_case_count for stage in BUSINESS_QUERY_STAGES}
+    )
+    measured_queries = {stage: measured for stage in CONTROL_QUERY_STAGES}
+    measured_queries.update({stage: 0 for stage in BUSINESS_QUERY_STAGES})
+    return total, measured_queries
 
 
 class QueryLogCollector:
@@ -1201,7 +1291,17 @@ class QueryLogCollector:
         ownership: Sequence[Mapping[str, Any]],
         *,
         steady_warmup_case_count: int,
+        steady_measured_requests_per_client: int,
     ) -> dict[str, Any]:
+        if (
+            isinstance(steady_warmup_case_count, bool)
+            or not isinstance(steady_warmup_case_count, int)
+            or steady_warmup_case_count < 1
+            or isinstance(steady_measured_requests_per_client, bool)
+            or not isinstance(steady_measured_requests_per_client, int)
+            or steady_measured_requests_per_client < 1
+        ):
+            raise NativeBurstFailure("query-log statement budget is invalid")
         prefixes = [str(item.get("query_id_prefix", "")) for item in ownership]
         if not prefixes or any(not prefix for prefix in prefixes):
             raise NativeBurstFailure("query-log evidence has no owned central query prefixes")
@@ -1226,9 +1326,7 @@ class QueryLogCollector:
         sql = _query_log_rows_sql(self.started_at_us, ended_at_us, prefixes)
         raw = _clickhouse_query(self.endpoint, sql)
         stage_rows: dict[str, list[dict[str, Any]]] = {
-            "candidate": [],
-            "detail": [],
-            "unknown": [],
+            stage: [] for stage in QUERY_STAGES
         }
         lifecycle_rows: dict[tuple[str, int, int], dict[str, Any]] = {}
         ownership_by_prefix = {str(item["query_id_prefix"]): item for item in ownership}
@@ -1244,22 +1342,8 @@ class QueryLogCollector:
                 "phase": identity[0],
                 "concurrency": identity[1],
                 "lifecycle_iteration": identity[2],
-                "total": {
-                    "candidate_queries": 0,
-                    "detail_queries": 0,
-                    "candidate_exceptions": 0,
-                    "detail_exceptions": 0,
-                    "unknown_queries": 0,
-                    "unknown_exceptions": 0,
-                },
-                "measured": {
-                    "candidate_queries": 0,
-                    "detail_queries": 0,
-                    "candidate_exceptions": 0,
-                    "detail_exceptions": 0,
-                    "unknown_queries": 0,
-                    "unknown_exceptions": 0,
-                },
+                "total": _empty_stage_counters(),
+                "measured": _empty_stage_counters(),
             }
         for line in raw.splitlines():
             try:
@@ -1272,7 +1356,7 @@ class QueryLogCollector:
             query_id = row.get("query_id")
             query_type = row.get("type")
             if (
-                stage not in {"candidate", "detail", "unknown"}
+                stage not in QUERY_STAGES
                 or not isinstance(query_id, str)
                 or query_type
                 not in {"QueryFinish", "ExceptionBeforeStart", "ExceptionWhileProcessing"}
@@ -1335,35 +1419,30 @@ class QueryLogCollector:
         by_lifecycle: list[dict[str, Any]] = []
         for identity in sorted(lifecycle_rows):
             item = lifecycle_rows[identity]
-            if item["phase"] == COLD_PHASE:
-                expected_total = {
-                    "candidate_queries": item["concurrency"],
-                    "detail_queries": item["concurrency"],
-                }
-                expected_measured = dict(expected_total)
-            else:
-                expected_total = {
-                    "candidate_queries": steady_warmup_case_count,
-                    "detail_queries": steady_warmup_case_count,
-                }
-                expected_measured = {"candidate_queries": 0, "detail_queries": 0}
+            expected_total, expected_measured = _expected_stage_queries(
+                phase=item["phase"],
+                concurrency=item["concurrency"],
+                steady_warmup_case_count=steady_warmup_case_count,
+                steady_measured_requests_per_client=steady_measured_requests_per_client,
+            )
             item["expected_total_queries"] = expected_total
             item["expected_measured_queries"] = expected_measured
             item["pass"] = bool(
-                item["total"]["candidate_queries"] == expected_total["candidate_queries"]
-                and item["total"]["detail_queries"] == expected_total["detail_queries"]
-                and item["measured"]["candidate_queries"]
-                == expected_measured["candidate_queries"]
-                and item["measured"]["detail_queries"]
-                == expected_measured["detail_queries"]
-                and item["total"]["candidate_exceptions"] == 0
-                and item["total"]["detail_exceptions"] == 0
-                and item["measured"]["candidate_exceptions"] == 0
-                and item["measured"]["detail_exceptions"] == 0
+                all(
+                    item["total"][f"{stage}_queries"] == count
+                    for stage, count in expected_total.items()
+                )
+                and all(
+                    item["measured"][f"{stage}_queries"] == count
+                    for stage, count in expected_measured.items()
+                )
+                and all(
+                    item[scope][f"{stage}_exceptions"] == 0
+                    for scope in ("total", "measured")
+                    for stage in QUERY_STAGES
+                )
                 and item["total"]["unknown_queries"] == 0
-                and item["total"]["unknown_exceptions"] == 0
                 and item["measured"]["unknown_queries"] == 0
-                and item["measured"]["unknown_exceptions"] == 0
             )
             by_lifecycle.append(item)
         coverage_by_phase = {
@@ -1421,6 +1500,7 @@ def _validate_query_log_evidence(
     requested: bool,
     lifecycles: Sequence[Mapping[str, Any]],
     steady_warmup_case_count: int,
+    steady_measured_requests_per_client: int,
 ) -> bool:
     expected_fields = {
         "requested",
@@ -1455,7 +1535,7 @@ def _validate_query_log_evidence(
         or not isinstance(evidence.get("owned_query_prefix_count"), int)
         or evidence["owned_query_prefix_count"] != len(lifecycles)
         or not isinstance(evidence.get("by_stage"), dict)
-        or set(evidence["by_stage"]) != {"candidate", "detail", "unknown"}
+        or set(evidence["by_stage"]) != set(QUERY_STAGES)
         or not isinstance(evidence.get("by_lifecycle"), list)
         or len(evidence["by_lifecycle"]) != len(lifecycles)
     ):
@@ -1501,14 +1581,7 @@ def _validate_query_log_evidence(
         elif not float(latency[0]) <= float(latency[1]) <= float(latency[2]):
             raise NativeBurstFailure("native burst query-log percentiles are unordered")
 
-    counter_fields = {
-        "candidate_queries",
-        "detail_queries",
-        "candidate_exceptions",
-        "detail_exceptions",
-        "unknown_queries",
-        "unknown_exceptions",
-    }
+    counter_fields = set(_empty_stage_counters())
     expected_identities = {
         (item.get("phase"), item.get("concurrency"), item.get("lifecycle_iteration"))
         for item in lifecycles
@@ -1541,45 +1614,36 @@ def _validate_query_log_evidence(
                 )
             ):
                 raise NativeBurstFailure("native burst query-log lifecycle counters differ")
-        expected_total = (
-            {
-                "candidate_queries": item["concurrency"],
-                "detail_queries": item["concurrency"],
-            }
-            if item["phase"] == COLD_PHASE
-            else {
-                "candidate_queries": steady_warmup_case_count,
-                "detail_queries": steady_warmup_case_count,
-            }
-        )
-        expected_measured = (
-            dict(expected_total)
-            if item["phase"] == COLD_PHASE
-            else {"candidate_queries": 0, "detail_queries": 0}
+        expected_total, expected_measured = _expected_stage_queries(
+            phase=item["phase"],
+            concurrency=item["concurrency"],
+            steady_warmup_case_count=steady_warmup_case_count,
+            steady_measured_requests_per_client=steady_measured_requests_per_client,
         )
         passed = bool(
             item["expected_total_queries"] == expected_total
             and item["expected_measured_queries"] == expected_measured
-            and item["total"]["candidate_queries"] == expected_total["candidate_queries"]
-            and item["total"]["detail_queries"] == expected_total["detail_queries"]
-            and item["measured"]["candidate_queries"]
-            == expected_measured["candidate_queries"]
-            and item["measured"]["detail_queries"]
-            == expected_measured["detail_queries"]
-            and item["total"]["candidate_exceptions"] == 0
-            and item["total"]["detail_exceptions"] == 0
-            and item["measured"]["candidate_exceptions"] == 0
-            and item["measured"]["detail_exceptions"] == 0
+            and all(
+                item["total"][f"{stage}_queries"] == count
+                for stage, count in expected_total.items()
+            )
+            and all(
+                item["measured"][f"{stage}_queries"] == count
+                for stage, count in expected_measured.items()
+            )
+            and all(
+                item[scope][f"{stage}_exceptions"] == 0
+                for scope in ("total", "measured")
+                for stage in QUERY_STAGES
+            )
             and item["total"]["unknown_queries"] == 0
-            and item["total"]["unknown_exceptions"] == 0
             and item["measured"]["unknown_queries"] == 0
-            and item["measured"]["unknown_exceptions"] == 0
         )
         if item.get("pass") is not passed:
             raise NativeBurstFailure("native burst query-log lifecycle status differs")
     if observed_identities != expected_identities:
         raise NativeBurstFailure("native burst query-log lifecycle coverage differs")
-    for stage in ("candidate", "detail", "unknown"):
+    for stage in QUERY_STAGES:
         if evidence["by_stage"][stage]["query_count"] != sum(
             item["total"][f"{stage}_queries"] for item in evidence["by_lifecycle"]
         ) or evidence["by_stage"][stage]["exception_count"] != sum(
@@ -1796,6 +1860,7 @@ def run_native_central_burst(
             query_log = query_log_collector.collect(
                 cleanups,
                 steady_warmup_case_count=len(cases),
+                steady_measured_requests_per_client=len(cases) * bursts_per_case,
             )
         fixture_after = _fixture_database_evidence(selection, recipe)
 
@@ -2307,6 +2372,7 @@ def validate_native_burst_artifact(document: Any) -> Mapping[str, Any]:
         requested=run["collect_query_log"],
         lifecycles=lifecycles,
         steady_warmup_case_count=len(cases),
+        steady_measured_requests_per_client=len(cases) * bursts_per_case,
     )
     expected_status = (
         "pass"

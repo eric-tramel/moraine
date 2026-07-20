@@ -43,13 +43,37 @@
     const connectionsLabel =
       connections === null || connections === undefined ? 'n/a' : `${Number(connections).toLocaleString()}`;
 
-    return [
+    const chips: Chip[] = [
       { key: 'ClickHouse', value: host, ok: true },
       { key: 'db', value: data.database ?? 'unknown', ok: false },
       { key: 'ver', value: data.version ?? 'n/a', ok: false },
       { key: 'ping', value: formatPing(data.ping_ms), ok: false },
       { key: 'conns', value: connectionsLabel, ok: false },
     ];
+
+    const publication = data.publication;
+    if (!publication || !publication.available) {
+      chips.push({ key: 'publication', value: 'unavailable', ok: false, tone: 'warn' });
+    } else if (!publication.healthy) {
+      chips.push({ key: 'publication', value: 'degraded', ok: false, tone: 'bad' });
+    } else {
+      chips.push({ key: 'publication', value: 'healthy', ok: true });
+    }
+
+    const activePublicationWork =
+      (publication?.replaying_generations ?? 0) +
+      (publication?.append_preparations ?? 0) +
+      (publication?.mirror_catchup_pending ?? 0);
+    if (activePublicationWork > 0) {
+      chips.push({
+        key: 'publication work',
+        value: `${activePublicationWork} active`,
+        ok: false,
+        tone: 'warn',
+      });
+    }
+
+    return chips;
   }
 
   function buildIngestorChips(data: StatusResponse | null, error: string | null): Chip[] {

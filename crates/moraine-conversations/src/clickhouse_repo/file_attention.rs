@@ -94,8 +94,8 @@ impl ClickHouseConversationRepository {
     ) -> RepoResult<Vec<FileAttentionTouch>> {
         let rel = query.rel.as_str();
 
-        let tool_io = self.table_ref("tool_io");
-        let events_source = canonical_events_source(&self.table_ref("events"));
+        let tool_io = self.table_ref("v_live_tool_io");
+        let events_source = self.live_events_source();
         let trace = self.table_ref("v_conversation_trace");
         let rel_sql = sql_quote(rel);
         let project_predicate = if query.apply_project_scope {
@@ -162,7 +162,7 @@ impl ClickHouseConversationRepository {
         let sql = format!(
             "WITH matched AS (
     SELECT session_id, event_uid, tool_call_id, harness, tool_name, tool_phase, input_preview, output_preview, repo_rel_path, worktree_root
-    FROM {tool_io} FINAL
+    FROM {tool_io}
     WHERE {match_predicate}
   )
   SELECT
@@ -235,7 +235,20 @@ impl ClickHouseConversationRepository {
 SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
             sql_quote(project_id)
         );
-        self.map_backend(self.ch.request_text(&sql, None, None, false, None).await)
+        let Some(PublicationEffect::FileAttentionProjectRootsWrite { sql }) =
+            defer_publication_effect(PublicationEffect::FileAttentionProjectRootsWrite { sql })
+                .await
+        else {
+            return Ok(());
+        };
+        self.execute_file_attention_project_roots_write(&sql).await
+    }
+
+    pub(super) async fn execute_file_attention_project_roots_write(
+        &self,
+        sql: &str,
+    ) -> RepoResult<()> {
+        self.map_backend(self.ch.request_text(sql, None, None, false, None).await)
             .map(|_| ())
     }
 
@@ -247,8 +260,8 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
     ) -> RepoResult<Vec<FileAttentionTouch>> {
         let rel = query.rel.as_str();
 
-        let tool_io = self.table_ref("tool_io");
-        let events_source = canonical_events_source(&self.table_ref("events"));
+        let tool_io = self.table_ref("v_live_tool_io");
+        let events_source = self.live_events_source();
         let trace = self.table_ref("v_conversation_trace");
         let rel_sql = sql_quote(rel);
         let slash_rel_sql = sql_quote(&format!("/{rel}"));
@@ -482,7 +495,7 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
         let sql = format!(
             "WITH {project_roots_with}matched AS (
     SELECT session_id, event_uid, tool_call_id, harness, tool_name, tool_phase, input_json, input_preview, output_preview{normalized_tool_columns}
-    FROM {tool_io} FINAL
+    FROM {tool_io}
     WHERE {match_predicate}
   )
   SELECT

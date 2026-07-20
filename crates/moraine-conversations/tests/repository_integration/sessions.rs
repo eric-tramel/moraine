@@ -442,7 +442,7 @@ async fn scoped_point_lookups_hide_out_of_scope_sessions() {
         queries
             .iter()
             .filter(|query| {
-                query.contains("FROM `moraine`.`mcp_open_sessions`")
+                query.contains("FROM `moraine`.`mcp_open_publication_headers`")
                     && query.contains("session_id = 'sess-out-of-scope'")
             })
             .count()
@@ -691,15 +691,17 @@ async fn get_mcp_session_uses_only_bounded_projection_queries() {
     let queries = state.queries.lock().expect("queries lock").clone();
     assert_eq!(queries.len(), 4);
     assert!(queries[0].contains("mcp_open_projection_state"));
-    assert!(queries[1].contains("FROM `moraine`.`mcp_open_sessions`"));
+    assert!(queries[1].contains("FROM `moraine`.`mcp_open_publication_headers`"));
     assert!(queries[1].contains("WHERE s.session_id = 'sess-open'"));
     assert!(queries[2].contains("FROM `moraine`.`mcp_open_turns`"));
     assert!(queries[2]
         .contains("WHERE t.session_id = 'sess-open' AND t.slot = 0 AND t.generation = 100"));
-    assert!(queries[3].contains("FROM `moraine`.`mcp_open_sessions`"));
+    assert!(queries[3].contains("FROM `moraine`.`mcp_open_publication_headers`"));
     assert!(queries
         .iter()
-        .all(|query| !query.contains("v_conversation_trace") && !query.contains("events FINAL")));
+        .all(|query| !query.contains("v_conversation_trace")));
+    assert!(queries[1].contains("required_source_heads"));
+    assert!(queries[1].contains("v_published_source_generation_history"));
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn get_mcp_session_retries_when_projection_head_changes_during_open() {
@@ -715,7 +717,7 @@ async fn get_mcp_session_retries_when_projection_head_changes_during_open() {
         ),
         ScriptedResponse::rows(
             &[
-                "FROM `moraine`.`mcp_open_sessions`",
+                "FROM `moraine`.`mcp_open_publication_headers`",
                 "s.session_id = 'sess-open'",
             ],
             json!([generation_100]),
@@ -726,14 +728,14 @@ async fn get_mcp_session_retries_when_projection_head_changes_during_open() {
         ),
         ScriptedResponse::rows(
             &[
-                "FROM `moraine`.`mcp_open_sessions`",
+                "FROM `moraine`.`mcp_open_publication_headers`",
                 "s.session_id = 'sess-open'",
             ],
             json!([generation_101.clone()]),
         ),
         ScriptedResponse::rows(
             &[
-                "FROM `moraine`.`mcp_open_sessions`",
+                "FROM `moraine`.`mcp_open_publication_headers`",
                 "s.session_id = 'sess-open'",
             ],
             json!([generation_101.clone()]),
@@ -744,7 +746,7 @@ async fn get_mcp_session_retries_when_projection_head_changes_during_open() {
         ),
         ScriptedResponse::rows(
             &[
-                "FROM `moraine`.`mcp_open_sessions`",
+                "FROM `moraine`.`mcp_open_publication_headers`",
                 "s.session_id = 'sess-open'",
             ],
             json!([generation_101]),
@@ -771,10 +773,17 @@ async fn get_mcp_session_missing_committed_header_skips_child_queries() {
         ),
         ScriptedResponse::rows(
             &[
-                "FROM `moraine`.`mcp_open_sessions`",
+                "FROM `moraine`.`mcp_open_publication_headers`",
                 "WHERE s.session_id = 'sess-missing-projection'",
             ],
             json!([]),
+        ),
+        ScriptedResponse::rows(
+            &[
+                "toUInt8(count() > 0) AS exists",
+                "e.session_id = 'sess-missing-projection'",
+            ],
+            json!([{ "exists": 0_u8 }]),
         ),
     ];
     let (repo, state) = build_scripted_repo(responses).await;
@@ -784,7 +793,7 @@ async fn get_mcp_session_missing_committed_header_skips_child_queries() {
         .await
         .expect("missing committed header is a not-found result");
     assert!(session.is_none());
-    assert_script_consumed(&state, 2);
+    assert_script_consumed(&state, 3);
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn get_mcp_turn_returns_compact_events_and_incomplete_state() {
@@ -908,10 +917,21 @@ async fn get_mcp_event_retries_stale_lookup_generation() {
         ),
         ScriptedResponse::rows(
             &[
-                "FROM `moraine`.`mcp_open_sessions`",
+                "FROM `moraine`.`mcp_open_publication_headers`",
                 "s.session_id = 'sess-event'",
             ],
             json!([current_session.clone()]),
+        ),
+        ScriptedResponse::rows(
+            &[
+                "toUInt8(count() > 0) AS exists",
+                "e.event_uid = 'evt-open-full'",
+            ],
+            json!([{ "exists": 1_u8 }]),
+        ),
+        ScriptedResponse::rows(
+            &["mcp_open_projection_state", "state_key = 'global'"],
+            json!([{ "ready": 1_u8 }]),
         ),
         ScriptedResponse::rows(
             &[
@@ -922,7 +942,7 @@ async fn get_mcp_event_retries_stale_lookup_generation() {
         ),
         ScriptedResponse::rows(
             &[
-                "FROM `moraine`.`mcp_open_sessions`",
+                "FROM `moraine`.`mcp_open_publication_headers`",
                 "s.session_id = 'sess-event'",
             ],
             json!([current_session.clone()]),
@@ -941,7 +961,7 @@ async fn get_mcp_event_retries_stale_lookup_generation() {
         ),
         ScriptedResponse::rows(
             &[
-                "FROM `moraine`.`mcp_open_sessions`",
+                "FROM `moraine`.`mcp_open_publication_headers`",
                 "s.session_id = 'sess-event'",
             ],
             json!([current_session]),
@@ -956,7 +976,7 @@ async fn get_mcp_event_retries_stale_lookup_generation() {
         .expect("event exists");
 
     assert_eq!(event.event.event_uid, "evt-open-full");
-    assert_script_consumed(&state, 9);
+    assert_script_consumed(&state, 11);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1004,7 +1024,7 @@ async fn get_mcp_event_returns_full_content_and_navigation_refs() {
     assert_eq!(queries.len(), 7);
     assert!(queries.iter().all(|query| {
         query.contains("mcp_open_projection_state")
-            || query.contains("mcp_open_sessions")
+            || query.contains("mcp_open_publication_headers")
             || query.contains("mcp_open_turns")
             || query.contains("mcp_open_events")
     }));
@@ -1191,7 +1211,7 @@ async fn list_session_events_rejects_cursor_with_mismatched_direction() {
 async fn web_feed_covers_variants_precedence_limit_order_and_canonical_source() {
     let response = ScriptedResponse::rows(
         &[
-            "FROM (SELECT * FROM `moraine`.`events` FINAL) AS e",
+            "FROM `moraine`.`v_published_source_generation_history` AS history",
             "e.payload_type = 'web_search_call'",
             "e.payload_type = 'tool_use' AND e.tool_name IN ('WebSearch', 'WebFetch')",
             "e.payload_type = 'search_results_received'",
@@ -1260,12 +1280,12 @@ async fn web_feed_covers_variants_precedence_limit_order_and_canonical_source() 
 async fn web_feed_propagates_backend_and_json_each_row_decode_errors() {
     let scenarios = [
         ScriptedResponse::failure(
-            &["FROM (SELECT * FROM `moraine`.`events` FINAL) AS e"],
+            &["FROM `moraine`.`v_published_source_generation_history` AS history"],
             "web feed backend failed",
         ),
         ScriptedResponse::raw(
             &[
-                "FROM (SELECT * FROM `moraine`.`events` FINAL) AS e",
+                "FROM `moraine`.`v_published_source_generation_history` AS history",
                 "FORMAT JSONEachRow",
             ],
             "not-json\n",

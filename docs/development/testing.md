@@ -23,7 +23,7 @@ Run focused suites first, then expand according to the changed contract.
 | Frontend deterministic checks | `cd web/monitor && bun install --frozen-lockfile && bun run typecheck && bun run test` | Svelte/TypeScript plus Vitest; not Playwright. |
 | Mocked browser | `cd web/monitor && bun install --frozen-lockfile && bunx playwright@1.58.2 install chromium && bun run test:e2e:mocked` | Exactly two Chromium cases, one worker, no retries. |
 | Python binding smoke | See [Binding suite](#binding-suite) | Binding-local locked venv, maturin build, and pytest. |
-| Live ClickHouse schema/parity | `scripts/dev/sandbox/run-live-test analytics-schema` or `scripts/dev/sandbox/run-live-test analytics-parity` | Fresh owned sandbox and exact ignored test. |
+| Live ClickHouse schema/parity/publication | `scripts/dev/sandbox/run-live-test analytics-schema`, `scripts/dev/sandbox/run-live-test analytics-parity`, or `scripts/dev/sandbox/run-live-test source-publication` | Fresh owned sandbox and exact ignored test. |
 | Fixed-resource performance suite | `python3 scripts/bench/performance_suite.py validate <artifact.json> [...]` | Validates scenario, comparison, repeatability, and root suite documents. |
 
 Rare/manual benchmark, paid-agent, and raw ignored-test commands stay direct and are
@@ -94,7 +94,7 @@ it returns.
 | Owner / target | Class and tags | Exact command | Prerequisites, resources, cleanup | Tier and result |
 | --- | --- | --- | --- | --- |
 | `moraine-conversations/repository_integration` | `integration`; repository, SQL-wire, cache, search, sessions, analytics | `cargo test -p moraine-conversations --test repository_integration --locked` | Rust/Cargo. One executable uses owned Axum mock-ClickHouse listeners on `127.0.0.1:0`; Tokio owns task/socket teardown; no real ClickHouse or persistent files. | T0; the owning CI job supplies the wall-clock timeout. The 67-test move map is `crates/moraine-conversations/tests/repository_integration/test-name-map.json`. |
-| `moraine-conversations/live_clickhouse` deterministic support | `integration`; destructive guards, ownership, cleanup composition, analytics schema/parity semantics, bounded-open corpus oracle | `cargo test -p moraine-conversations --test live_clickhouse --locked` | Rust/Cargo; deterministic tests use no live endpoint. The three ignored functions are separately owned below and remain unexecuted by this command. | T0; zero/failure is fail, exactly three live functions remain ignored. |
+| `moraine-conversations/live_clickhouse` deterministic support | `integration`; destructive guards, ownership, cleanup composition, analytics schema/parity semantics, bounded-open corpus oracle | `cargo test -p moraine-conversations --test live_clickhouse --locked` | Rust/Cargo; deterministic tests use no live endpoint. The four ignored functions are separately owned below and remain unexecuted by this command. | T0; zero/failure is fail, exactly four live functions remain ignored. |
 | `moraine-ingest-core/golden_fixtures` | `integration`; golden, normalization, schema | `cargo test -p moraine-ingest-core --test golden_fixtures --locked` | Rust/Cargo and committed raw/golden families; read-only unless the explicit update mode below is used. | T0; byte drift fails. |
 | `moraine-ingest-core/hermes_fixture` | `integration`; ingest, serialization | `cargo test -p moraine-ingest-core --test hermes_fixture --locked` | Committed Hermes trajectory; no external service. | T0. |
 | `moraine-ingest-core/hermes_session_fixture` | `integration`; ingest, serialization | `cargo test -p moraine-ingest-core --test hermes_session_fixture --locked` | Committed Hermes session JSON; no external service. | T0. |
@@ -139,7 +139,7 @@ coverage for the standalone binding or legacy trees.
 
 ## Live ClickHouse suites
 
-Only these three ignored tests are supported. Never use a blanket `--ignored` command.
+Only these four ignored tests are supported. Never use a blanket `--ignored` command.
 The wrapper is the contributor entry point where listed; the raw commands document exact routing
 and intentionally fail unless `MORAINE_ALLOW_DESTRUCTIVE_TESTS=1` and the endpoint is
 the wrapper-owned sandbox.
@@ -148,6 +148,7 @@ the wrapper-owned sandbox.
 | --- | --- | --- | --- |
 | `moraine-conversations/live_clickhouse::live_schema_semantics_and_teardown` | `scripts/dev/sandbox/run-live-test analytics-schema`; raw: `cargo test -p moraine-conversations --test live_clickhouse --locked live_schema_semantics_and_teardown -- --exact --ignored --nocapture` | Bash, Docker/Compose, sandbox toolchain. Default wrapper timeout 1,800s (`MORAINE_LIVE_TEST_TIMEOUT_SECONDS` accepts a positive integer). Wrapper owns a fresh `sb-xxxxxx` sandbox and Rust generates an uncaller-controlled `moraine_test_<uuid>` database. Empty, `moraine`, or non-prefix names are refused before SQL. | T3 manual/scheduled. Direct missing/unsafe prerequisites fail. Success and every catchable failure with successful cleanup leave no owned sandbox/database. |
 | `moraine-conversations/live_clickhouse::live_monitor_repository_semantic_parity` | `scripts/dev/sandbox/run-live-test analytics-parity`; raw: `cargo test -p moraine-conversations --test live_clickhouse --locked live_monitor_repository_semantic_parity -- --exact --ignored --nocapture` | Same owned sandbox; both arms use the same generated database/dataset. Cardinality, digest, or oracle mismatch fails independently of timing. | T3 unless the same semantics are already proven in T1. Timing is not the pass condition. |
+| `moraine-conversations/live_clickhouse::live_source_publication_cutover_crash_recovery` | `scripts/dev/sandbox/run-live-test source-publication`; raw: `cargo test -p moraine-conversations --test live_clickhouse --locked live_source_publication_cutover_crash_recovery -- --exact --ignored --nocapture` | Same owned sandbox and generated database. The fixture exercises g1/g2 cutover, causal checkpoint selection, stale-reader revalidation, and head/append response-loss idempotency. It uses newly constructed writer clients for each protocol stage and reconstructs a fresh ClickHouse HTTP client plus repository with empty in-memory caches after durable replaying-checkpoint/physical-row staging, compatibility preparation, final checkpoint persistence, final readiness persistence, source-head insertion before compatibility activation, the identical-head retry, and post-activation. It pins the physical and candidate cardinalities, rejects pre-head activation, verifies the legacy pointer separately, and requires every reconstructed reader to observe an old-complete or new-complete model while emitting content-free control evidence. This is deterministic durable-state/client/repository restart injection; it neither instantiates the production `PublicationActor` nor sends a process `SIGKILL`. Runner `SIGKILL` cleanup behavior is covered separately below. | T3 manual/scheduled and required for source-publication, checkpoint, liveness-view, or publication-consistency changes. Direct failure is fail; wrapper cleanup rules are identical to the other live modes. |
 | `moraine-conversations/live_clickhouse::live_mcp_open_boundedness_benchmark` | Raw: `cargo test -p moraine-conversations --test live_clickhouse --locked live_mcp_open_boundedness_benchmark -- --exact --ignored --nocapture` inside a caller-owned sandbox | Same owned database guard and cleanup. Opens separate realistic targets spanning 100 turns, 500 full-payload events, and a 1,000-event compact turn; then seeds 100,000 unrelated sessions and 1,000,000 substantial unrelated events into both canonical `events` and the bounded MCP read model. Compares exact session/turn/event semantics before and after growth, exercises sequential/concurrent/recovery opens, and records labeled `system.query_log` latency, throughput, errors, rows, bytes, and memory. Fails on SLA misses, errors, semantic drift, or corpus-linear row/byte/memory growth. Requires about 2 GB free. | T3 manual regression benchmark. Timing and bounded-cost assertions are pass conditions. |
 
 Each wrapper run records its sandbox ID, exact Cargo command, generated database and a
@@ -371,6 +372,13 @@ python3 scripts/bench/performance_suite.py native-central-burst \
   --max-latency-ms 5000 \
   --collect-query-log \
   --output target/bench/performance/native-central-burst.json
+
+# Candidate-only real-ingest check for issue #602. The first event publishes
+# generation 1; the next 100 records append to that same inode/generation.
+python3 scripts/bench/performance_suite.py source-publication-append-probe \
+  --mode local --repo <clean-candidate-worktree> --samples 100 \
+  --p95-limit-ms 2000 \
+  --output target/bench/performance/source-publication-append
 ```
 
 The native central burst is a T3 manual native regression probe, not a substitute
@@ -383,11 +391,63 @@ concurrency, require every warm-mode p95 to be at most 750 ms, require cold
 high-hydration/common and session-scope p95 to be at most two seconds, and cap
 every raw sample at five seconds. The command rejects live/default or routed
 backends and verifies exact fixture/index/projection state before and after the
-run. `--collect-query-log` additionally requires exact candidate/detail counts
-for every cold lifecycle and zero measured ClickHouse statements after each
-steady-state warmup; any other owned-family statement fails the inventory. See
+run. `--collect-query-log` additionally classifies publication-head capture,
+append-fence capture, candidate, detail, publication revalidation, and append-fence
+revalidation separately. Every cold request must execute exactly one of each. A
+steady warmup executes all six; a measured cache hit executes the four control
+statements and no candidate/detail statement. Counts scale exactly with C1/C4/C8
+and the declared burst count; any unknown owned-family statement fails the inventory. See
 `scripts/bench/README-native-central-burst.md` for fixture ownership, ClickHouse
 permissions, artifact fields, and cleanup details.
+
+The append probe is a T3 manual production-path diagnostic. It uses a clean,
+pinned worktree, builds frozen binaries, owns a fresh performance sandbox, and
+publishes one shared JSONL file with file fsync (plus directory fsync on create).
+It measures publication capture first with one seeded head, runs the append
+stream on the resulting two-source fixture, then expands the head table
+insert-only to exactly 10,000 and 100,000 logical heads. At each reported scale
+point it runs two fixed warmups and ten measured copies of the exact local-mode
+capture statement (`max(publication_revision)` over raw head history). Separate
+untimed logical-head and storage checks prove the reported scale identity. The
+artifact retains client and server latency,
+`read_rows`, `read_bytes`, result rows, peak query memory, and control-table rows,
+active parts, and compressed bytes for every scale point. It then reports every
+raw fsync-to-first-valid-live-query sample, p50/p95/max,
+process CPU and peak memory evidence, and before/after control-table storage. It
+also reports before/after compressed, uncompressed, and on-disk bytes for the
+new `source_host` column across all seven physical event/index tables (including
+zero-filled empty tables). It fails unless at least 100 measured appends complete,
+p95 is at most two seconds, the publication revision is unchanged, and source-head
+history receives zero append writes. Local mode is explicitly non-authoritative; use
+`--mode authoritative` only on the dedicated cgroup-v2 benchmark host.
+The run-level CPU and memory counters cover both bounded capture-scaling and
+append phases; they are not presented as append-only process costs.
+
+### Atomic source-publication PR report
+
+An issue #602 PR records the following in its description; omitted or unavailable
+measurements are labeled as such rather than inferred:
+
+- pinned baseline/candidate SHAs, fixture cardinality, host/container limits,
+  warmup, repetitions, and exact commands;
+- paired local or authoritative values/deltas for list/open/search latency and
+  ClickHouse `read_rows`, `read_bytes`, and `memory_usage`;
+- append-probe p50/p95 and head-write invariants from
+  `source-publication-append-probe.json`;
+- replacement replay wall time, process CPU, peak RSS, throttling/disk bytes,
+  replay-batch count, and compatibility refresh count (one activation refresh,
+  none per chunk) from a dedicated replay/resource capture; the acceptance
+  fixture supplies migration/control-storage evidence, not process metrics;
+- migration/backfill duration and control-table rows, active parts, and
+  compressed bytes for source-head history, causal checkpoints, append control,
+  generation readiness, and MCP compatibility headers;
+- persistent bytes per retained inactive replacement generation. Those rows are
+  persistent overhead; reclamation belongs to #603 and must not be called temporary.
+
+Generated search fixtures seed an active causal checkpoint, generation readiness,
+and the publication head after canonical/search rows. Older baseline binaries
+without the publication schema keep the legacy one-insert seed path, which permits
+a pinned pre-#602 baseline to run in the same paired harness.
 
 Local mode uses the same scenarios, fresh physical sandboxes, semantic oracles, and
 frozen binaries, but reports `authoritative: false` because it observes rather than
@@ -480,6 +540,7 @@ benchmarks:
 ```bash
 scripts/dev/sandbox/run-live-test analytics-schema
 scripts/dev/sandbox/run-live-test analytics-parity
+scripts/dev/sandbox/run-live-test source-publication
 ```
 
 ## CI ownership and promotion

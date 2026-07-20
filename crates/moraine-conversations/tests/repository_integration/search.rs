@@ -18,11 +18,11 @@ async fn search_mcp_events_distinguishes_unready_and_dirty_projection_snapshots(
             "projection_ready": projection_ready,
             "projection_clean": projection_clean
         });
-        let (repo, state) = build_scripted_repo(vec![ScriptedResponse::rows(
-            &["toUInt8(0) AS row_kind"],
-            json!([metadata]),
-        )])
-        .await;
+        let attempts = if projection_clean == 0 { 4 } else { 1 };
+        let responses = (0..attempts)
+            .map(|_| ScriptedResponse::rows(&["toUInt8(0) AS row_kind"], json!([metadata.clone()])))
+            .collect();
+        let (repo, state) = build_scripted_repo(responses).await;
 
         let error = repo
             .search_mcp_events(SearchMcpEventsQuery {
@@ -39,22 +39,16 @@ async fn search_mcp_events_distinguishes_unready_and_dirty_projection_snapshots(
         } else {
             assert!(matches!(error, RepoError::ReadModelChanged));
         }
-        assert_script_consumed(&state, 1);
+        assert_script_consumed(&state, attempts);
     }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn search_mcp_events_immediate_retry_finishes_within_request_deadline() {
-    let repeated_scan_reached = Arc::new(Notify::new());
-    let repeated_scan_release = Arc::new(Notify::new());
     let (repo, state) = build_repo_with_options(
         100,
         MockOptions {
             dirty_projection_on_first_candidate: true,
-            repeated_corpus_stats_barrier: Some(ScriptedBarrier {
-                reached: repeated_scan_reached.clone(),
-                release: repeated_scan_release,
-            }),
             ..MockOptions::default()
         },
     )
@@ -67,12 +61,6 @@ async fn search_mcp_events_immediate_retry_finishes_within_request_deadline() {
         ..SearchMcpEventsQuery::default()
     };
 
-    let first = repo
-        .search_mcp_events(query())
-        .await
-        .expect_err("dirty projection must return retry guidance");
-    assert!(matches!(first, RepoError::ReadModelChanged));
-
     let retry_deadline = tokio::time::Instant::now() + Duration::from_secs(4);
     let retry = tokio::time::timeout(
         Duration::from_secs(4),
@@ -83,8 +71,8 @@ async fn search_mcp_events_immediate_retry_finishes_within_request_deadline() {
         ),
     )
     .await
-    .expect("published retry must finish inside the request deadline")
-    .expect("published retry must succeed");
+    .expect("bounded internal retry must finish inside the request deadline")
+    .expect("dirty-then-published operation must succeed");
     assert_eq!(retry.hits.len(), 2);
 
     let queries = state.queries.lock().expect("queries lock");
@@ -214,9 +202,7 @@ async fn search_session_metadata_applies_time_mode_filters_and_caps_limit() {
     let metadata_search_query = queries
         .iter()
         .find(|q| {
-            q.contains("FROM (SELECT * FROM `moraine`.`events` FINAL) AS e")
-                && q.contains("WHERE e.event_kind = 'session_meta'")
-                && q.contains("AS meta_event_uid")
+            q.contains("WHERE e.event_kind = 'session_meta'") && q.contains("AS meta_event_uid")
         })
         .expect("session metadata search query should be captured");
 
@@ -464,7 +450,9 @@ async fn search_conversations_without_time_window_uses_postings_only_fast_path()
         .find(|q| q.contains("GROUP BY e.session_id"))
         .expect("aggregated conversation query should be captured");
 
-    assert!(agg_query.contains("PREWHERE"));
+    assert!(agg_query.contains("FROM `moraine`.`v_live_search_postings` AS p"));
+    assert!(agg_query.contains("WHERE p.term IN"));
+    assert!(!agg_query.contains("PREWHERE"));
     assert!(agg_query.contains("bitCount(groupBitOr(e.term_mask))"));
     assert!(!agg_query.contains("JOIN `moraine`.`search_documents` AS d"));
 }
@@ -778,6 +766,8 @@ async fn search_mcp_events_uses_one_candidate_and_one_bounded_detail_query() {
     );
     assert!(queries[0].contains("mcp_open_dirty_sessions"));
     assert!(queries[0].contains("WHERE notEmpty(session_id)"));
+    assert!(queries[0].contains("live_session_ids AS ("));
+    assert!(queries[0].contains("session_id IN (SELECT session_id FROM live_session_ids)"));
     assert!(queries[0].contains("AS projection_clean"));
     assert!(queries[0].contains("projected_candidates AS ("));
     assert!(queries[0].contains("event_uid IN (SELECT event_uid FROM matching_doc_ids)"));

@@ -32,6 +32,19 @@ async fn store_health_maps_all_successful_probe_facts() {
                 { "metric": "TCPConnection", "value": 1_u64 }
             ]),
         ),
+        ScriptedResponse::rows(
+            &["FROM `moraine`.v_publication_diagnostics", "FORMAT JSONEachRow"],
+            json!([{
+                "ambiguous_hostless_rows": 0_u64,
+                "replaying_generations": 2_u64,
+                "blocked_generations": 0_u64,
+                "append_preparations": 1_u64,
+                "blocked_append_preparations": 0_u64,
+                "mirror_catchup_pending": 3_u64,
+                "writer_conflicts": 0_u64,
+                "issues": ["mirror host-b catching up"]
+            }]),
+        ),
     ];
     let (repo, state) = build_scripted_repo(responses).await;
 
@@ -57,7 +70,16 @@ async fn store_health_maps_all_successful_probe_facts() {
         }
         other => panic!("expected connection metrics, got {other:?}"),
     }
-    assert_script_consumed(&state, 4);
+    match health.publication {
+        StoreProbe::Available(diagnostics) => {
+            assert!(diagnostics.is_healthy());
+            assert_eq!(diagnostics.replaying_generations, 2);
+            assert_eq!(diagnostics.append_preparations, 1);
+            assert_eq!(diagnostics.mirror_catchup_pending, 3);
+        }
+        other => panic!("expected publication diagnostics, got {other:?}"),
+    }
+    assert_script_consumed(&state, 5);
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn store_health_keeps_each_probe_failure_independent() {
@@ -66,6 +88,10 @@ async fn store_health_keeps_each_probe_failure_independent() {
         ScriptedResponse::failure(&["SELECT version() AS version"], "health version failed"),
         ScriptedResponse::failure(&["FROM system.databases"], "health database failed"),
         ScriptedResponse::failure(&["FROM system.metrics"], "health connections failed"),
+        ScriptedResponse::failure(
+            &["FROM `moraine`.v_publication_diagnostics"],
+            "health publication failed",
+        ),
     ];
     let (repo, state) = build_scripted_repo(responses).await;
 
@@ -90,7 +116,11 @@ async fn store_health_keeps_each_probe_failure_independent() {
         health.connections,
         StoreProbe::Failed { ref message } if message.contains("health connections failed")
     ));
-    assert_script_consumed(&state, 4);
+    assert!(matches!(
+        health.publication,
+        StoreProbe::Failed { ref message } if message.contains("health publication failed")
+    ));
+    assert_script_consumed(&state, 5);
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn diagnostics_maps_doctor_partial_report_and_ping_short_circuit() {
@@ -109,7 +139,8 @@ async fn diagnostics_maps_doctor_partial_report_and_ping_short_circuit() {
         { "name": "search_query_log" },
         { "name": "search_hit_log" },
         { "name": "search_interaction_log" },
-        { "name": "schema_migrations" }
+        { "name": "schema_migrations" },
+        { "name": "v_publication_diagnostics" }
     ]);
     let responses = vec![
         ScriptedResponse::raw(&["SELECT 1"], "1\n"),
@@ -131,6 +162,19 @@ async fn diagnostics_maps_doctor_partial_report_and_ping_short_circuit() {
             &["SELECT name FROM system.tables WHERE database = 'moraine'"],
             json_envelope(required_tables),
         ),
+        ScriptedResponse::rows(
+            &["FROM `moraine`.v_publication_diagnostics", "FORMAT JSONEachRow"],
+            json!([{
+                "ambiguous_hostless_rows": 4_u64,
+                "replaying_generations": 1_u64,
+                "blocked_generations": 2_u64,
+                "append_preparations": 3_u64,
+                "blocked_append_preparations": 1_u64,
+                "mirror_catchup_pending": 1_u64,
+                "writer_conflicts": 1_u64,
+                "issues": ["legacy ownership ambiguous", "publisher conflict"]
+            }]),
+        ),
     ];
     let (repo, state) = build_scripted_repo(responses).await;
 
@@ -145,6 +189,14 @@ async fn diagnostics_maps_doctor_partial_report_and_ping_short_circuit() {
     assert!(diagnostics.database_exists);
     assert!(diagnostics.applied_schema_versions.is_empty());
     assert!(!diagnostics.pending_schema_versions.is_empty());
+    let publication = diagnostics
+        .publication
+        .as_ref()
+        .expect("publication diagnostics map");
+    assert!(!publication.is_healthy());
+    assert_eq!(publication.ambiguous_hostless_rows, 4);
+    assert_eq!(publication.blocked_generations, 2);
+    assert_eq!(publication.writer_conflicts, 1);
     assert_eq!(
         diagnostics.missing_tables,
         vec![
@@ -154,6 +206,25 @@ async fn diagnostics_maps_doctor_partial_report_and_ping_short_circuit() {
             "mcp_open_events",
             "mcp_open_dirty_sessions",
             "mcp_open_projection_state",
+            "mcp_open_publication_headers",
+            "mcp_open_generation_readiness",
+            "published_source_generations",
+            "ingest_checkpoint_transitions",
+            "source_generation_publication_readiness",
+            "ingest_append_control",
+            "publication_diagnostic_events",
+            "v_published_source_generation_history",
+            "v_current_published_source_generations",
+            "v_current_ingest_checkpoint_transitions",
+            "v_current_source_generation_publication_readiness",
+            "v_current_ingest_append_control",
+            "v_live_events",
+            "v_live_event_links",
+            "v_live_tool_io",
+            "v_live_search_documents",
+            "v_live_search_postings",
+            "v_mcp_open_publication_headers",
+            "v_current_mcp_open_generation_readiness",
         ]
     );
     assert_eq!(diagnostics.errors.len(), 2);
@@ -161,7 +232,7 @@ async fn diagnostics_maps_doctor_partial_report_and_ping_short_circuit() {
     assert!(diagnostics.errors[0].contains("doctor version probe failed"));
     assert!(diagnostics.errors[1].contains("failed to read migration ledger"));
     assert!(diagnostics.errors[1].contains("doctor ledger read failed"));
-    assert_script_consumed(&state, 5);
+    assert_script_consumed(&state, 6);
 
     let (down_repo, down_state) = build_scripted_repo(vec![ScriptedResponse::failure(
         &["SELECT 1"],

@@ -771,7 +771,7 @@ pub(crate) fn repo_error_to_contract_error(error: RepoError) -> contract::Contra
         RepoError::ReadModelChanged => contract::ContractError::new(
             contract::ToolErrorCode::InternalError,
             format!(
-                "MCP search read model is refreshing; retry after {} ms",
+                "MCP read model is refreshing; retry after {} ms",
                 SEARCH_PROJECTION_RETRY_AFTER_MS
             ),
         )
@@ -2050,6 +2050,7 @@ mod tests {
         let repository = Arc::new(InMemoryConversationRepository::with_responses(
             RepoConfig::default(),
             InMemoryConversationResponses {
+                get_mcp_session: Some(Err(RepoError::ReadModelChanged)),
                 search_mcp_events: Some(Err(RepoError::ReadModelChanged)),
                 ..InMemoryConversationResponses::default()
             },
@@ -2576,6 +2577,21 @@ mod tests {
             .as_str()
             .expect("freshness error message")
             .contains("retry after 250 ms"));
+    }
+
+    #[tokio::test]
+    async fn open_publication_changes_are_structured_retryable_errors() {
+        let state = read_model_changed_test_state();
+        let open_id = contract::McpSessionId::from_raw_session_id("session-changing")
+            .expect("valid session id")
+            .to_string();
+        let response =
+            call_tool_rpc(&state, 1, contract::OPEN_TOOL, json!({ "id": open_id })).await;
+
+        assert_handled_tool_error_exchange(&response, contract::OPEN_TOOL, "internal_error");
+        let error = &response["result"]["structuredContent"]["error"];
+        assert_eq!(error["details"]["reason"], json!("read_model_refresh"));
+        assert_eq!(error["details"]["retryable"], json!(true));
     }
 
     #[tokio::test]

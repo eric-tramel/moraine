@@ -1,10 +1,15 @@
 use crate::checkpoint::merge_checkpoint;
 use crate::heartbeat::host_name;
 use crate::model::{Checkpoint, RowBatch};
+use crate::publication::{
+    AppendManifest, CheckpointLifecycle, CheckpointTransition, FinalizeReplayOutcome,
+    PublicationActor,
+};
+use crate::publication_identity::PublicationIdentity;
 use crate::redaction::{RedactionAudit, SecretRedactor};
 use crate::sources::shared::truncate_chars;
 use crate::tee::{
-    backend_sinks_json, filter_batch_for_backend, BackendSinkCell, ReplayFloor,
+    backend_sinks_json, filter_batch_for_backend, BackendSinkCell, BackendSinkStatus, ReplayFloor,
     SharedRouteResolver, StatusRegistry,
 };
 use crate::{
@@ -107,6 +112,7 @@ impl IngestAckObserver {
 #[derive(Default)]
 struct PendingAckBatch {
     event_identity_digests: Vec<String>,
+    projection_session_ids: BTreeSet<String>,
 }
 
 impl PendingAckBatch {
@@ -117,6 +123,12 @@ impl PendingAckBatch {
 
     fn clear(&mut self) {
         self.event_identity_digests.clear();
+        self.projection_session_ids.clear();
+    }
+
+    fn extend_projection(&mut self, session_ids: &BTreeSet<String>) {
+        self.projection_session_ids
+            .extend(session_ids.iter().cloned());
     }
 }
 
@@ -179,6 +191,31 @@ pub(crate) enum SinkRole {
     },
 }
 
+fn publication_ready_for_role(role: &SinkRole) -> bool {
+    match role {
+        SinkRole::Default { .. } => true,
+        SinkRole::Backend { cell, .. } => cell.publication_ready(),
+    }
+}
+
+fn publication_ready_for_sink(role: &SinkRole, shared_legacy_ambiguous: bool) -> bool {
+    !shared_legacy_ambiguous && publication_ready_for_role(role)
+}
+
+fn publication_host_for_role<'a>(role: &SinkRole, identity: &'a PublicationIdentity) -> &'a str {
+    match role {
+        SinkRole::Backend { .. } => identity.host_id(),
+        SinkRole::Default { .. } => "",
+    }
+}
+
+fn account_barrier_flush(flushed: bool, pending_batch_bytes: &mut usize) -> bool {
+    if flushed {
+        *pending_batch_bytes = 0;
+    }
+    flushed
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SinkAuthorConfig {
     author: String,
@@ -202,6 +239,22 @@ impl SinkAuthorConfig {
     fn apply_to_batch(&self, batch: &mut RowBatch) {
         batch.stamp_author(&self.author, self.raw_events_column, self.events_column);
     }
+}
+
+fn stamp_source_host(batch: &mut RowBatch, source_host: &str) {
+    for row in batch
+        .raw_rows
+        .iter_mut()
+        .chain(&mut batch.event_rows)
+        .chain(&mut batch.link_rows)
+        .chain(&mut batch.tool_rows)
+        .chain(&mut batch.error_rows)
+    {
+        if let Some(object) = row.as_object_mut() {
+            object.insert("source_host".to_string(), json!(source_host));
+        }
+    }
+    batch.recompute_approx_bytes();
 }
 
 /// Backend-role health bookkeeping after a flush attempt; no-op for the
@@ -320,6 +373,7 @@ pub(crate) fn spawn_sink_task(
     metrics: Arc<Metrics>,
     mut rx: mpsc::Receiver<SinkMessage>,
     checkpoint_cursor_columns: bool,
+    publication_identity: PublicationIdentity,
     author: SinkAuthorConfig,
     role: SinkRole,
 ) -> JoinHandle<()> {
@@ -341,10 +395,73 @@ pub(crate) fn spawn_sink_task(
         // present by the schema handshake). The default backend stays
         // single-writer and keeps writing host-less rows, which also keeps
         // it working before `moraine db migrate` adds the column locally.
-        let checkpoint_host = match &role {
-            SinkRole::Backend { .. } => host_name(),
-            SinkRole::Default { .. } => String::new(),
+        let checkpoint_host = publication_host_for_role(&role, &publication_identity).to_string();
+        let publication_actor = PublicationActor::new(
+            clickhouse.clone(),
+            checkpoint_host.clone(),
+            publication_identity.publisher_id().to_string(),
+        );
+        let default_publication_ready = matches!(&role, SinkRole::Default { .. });
+        if !default_publication_ready {
+            match publication_actor.block_orphaned_append_on_startup().await {
+                Ok(true) => {
+                    warn!(
+                        "an unresolved shared-backend append manifest remains blocked after restart"
+                    );
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    let detail = format!(
+                        "failed to repair shared-backend append publication control: {error}"
+                    );
+                    warn!("{detail}");
+                    *metrics
+                        .last_error
+                        .lock()
+                        .expect("metrics last_error mutex poisoned") = detail;
+                    if let SinkRole::Backend { cell, .. } = &role {
+                        cell.set_status(BackendSinkStatus::Unreachable);
+                    }
+                    return;
+                }
+            }
+        }
+        let shared_legacy_ambiguous = if default_publication_ready {
+            false
+        } else {
+            match publication_actor.diagnose_shared_legacy_ambiguity().await {
+                Ok(ambiguous) => {
+                    if ambiguous {
+                        warn!(
+                            "shared backend contains hostless legacy events; publication remains fail-closed"
+                        );
+                    }
+                    ambiguous
+                }
+                Err(error) => {
+                    warn!("failed to prove shared legacy ownership; publication remains fail-closed: {error}");
+                    true
+                }
+            }
         };
+        if default_publication_ready {
+            let repair_candidates = checkpoints
+                .read()
+                .await
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            if let Err(error) = publication_actor
+                .repair_ready_publications(repair_candidates)
+                .await
+            {
+                warn!("startup publication repair failed closed: {error}");
+                *metrics
+                    .last_error
+                    .lock()
+                    .expect("metrics last_error mutex poisoned") = error.to_string();
+            }
+        }
 
         let flush_interval = duration_from_config_seconds(
             config.ingest.flush_interval_seconds,
@@ -377,7 +494,7 @@ pub(crate) fn spawn_sink_task(
                     &checkpoint_updates,
                 )
             {
-                let flush_ok = flush_pending_with_ack(
+                let flush_ok = flush_pending_with_publication(
                     &clickhouse,
                     &checkpoints,
                     &metrics,
@@ -391,6 +508,8 @@ pub(crate) fn spawn_sink_task(
                     &checkpoint_host,
                     &ack_observer,
                     &mut pending_ack,
+                    &publication_actor,
+                    publication_ready_for_sink(&role, shared_legacy_ambiguous),
                 )
                 .await;
                 note_flush_outcome(&role, &checkpoints, flush_ok, rx.is_empty()).await;
@@ -433,6 +552,7 @@ pub(crate) fn spawn_sink_task(
                                 }
                                 SinkRole::Default { .. } => batch,
                             };
+                            stamp_source_host(&mut batch, &checkpoint_host);
                             author.apply_to_batch(&mut batch);
                             pending_batch_bytes =
                                 pending_batch_bytes.saturating_add(batch.approx_bytes());
@@ -449,7 +569,7 @@ pub(crate) fn spawn_sink_task(
                             if total_rows >= config.ingest.batch_size
                                 || pending_batch_bytes >= config.ingest.max_batch_bytes.max(1)
                             {
-                                let flush_ok = flush_pending_with_ack(
+                                let flush_ok = flush_pending_with_publication(
                                     &clickhouse,
                                     &checkpoints,
                                     &metrics,
@@ -463,6 +583,8 @@ pub(crate) fn spawn_sink_task(
                                     &checkpoint_host,
                     &ack_observer,
                     &mut pending_ack,
+                                    &publication_actor,
+                                    publication_ready_for_sink(&role, shared_legacy_ambiguous),
                                 ).await;
                                 note_flush_outcome(&role, &checkpoints, flush_ok, rx.is_empty()).await;
                                 if !flush_ok {
@@ -478,12 +600,237 @@ pub(crate) fn spawn_sink_task(
                                 }
                             }
                         }
+                        Some(SinkMessage::BeginReplay { mut transition, ack }) => {
+                            let flushed = account_barrier_flush(
+                                flush_for_barrier(
+                                    &clickhouse,
+                                    &checkpoints,
+                                    &metrics,
+                                    &mut raw_rows,
+                                    &mut event_rows,
+                                    &mut link_rows,
+                                    &mut tool_rows,
+                                    &mut error_rows,
+                                    &mut checkpoint_updates,
+                                    checkpoint_cursor_columns,
+                                    &checkpoint_host,
+                                    &ack_observer,
+                                    &mut pending_ack,
+                                    &publication_actor,
+                                    publication_ready_for_sink(&role, shared_legacy_ambiguous),
+                                )
+                                .await,
+                                &mut pending_batch_bytes,
+                            );
+                            let result = if !flushed {
+                                throttling_flush_retries = true;
+                                Err("failed to flush batches preceding begin-replay barrier".to_string())
+                            } else {
+                                match transition.validate_begin_replay() {
+                                    Err(error) => Err(error.to_string()),
+                                    Ok(()) => match publication_actor.persist_transition(&mut transition).await {
+                                        Ok(barrier) => {
+                                            merge_checkpoint(
+                                                &mut *checkpoints.write().await,
+                                                transition.checkpoint.clone(),
+                                            );
+                                            Ok(barrier)
+                                        }
+                                        Err(error) => Err(error.to_string()),
+                                    },
+                                }
+                            };
+                            let _ = ack.send(result);
+                        }
+                        Some(SinkMessage::FinalizeReplay { mut transition, ack }) => {
+                            let flushed = account_barrier_flush(
+                                flush_for_barrier(
+                                    &clickhouse,
+                                    &checkpoints,
+                                    &metrics,
+                                    &mut raw_rows,
+                                    &mut event_rows,
+                                    &mut link_rows,
+                                    &mut tool_rows,
+                                    &mut error_rows,
+                                    &mut checkpoint_updates,
+                                    checkpoint_cursor_columns,
+                                    &checkpoint_host,
+                                    &ack_observer,
+                                    &mut pending_ack,
+                                    &publication_actor,
+                                    publication_ready_for_sink(&role, shared_legacy_ambiguous),
+                                )
+                                .await,
+                                &mut pending_batch_bytes,
+                            );
+                            let result = if !flushed {
+                                throttling_flush_retries = true;
+                                Err("failed to flush replay batches before final publication".to_string())
+                            } else {
+                                let publication_ready = publication_ready_for_sink(
+                                    &role,
+                                    shared_legacy_ambiguous,
+                                );
+                                transition.set_backend_caught_up(publication_ready);
+                                if !publication_ready {
+                                    let staged = match publication_actor
+                                        .persist_staged_mirror_final(&mut transition)
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            merge_checkpoint(
+                                                &mut *checkpoints.write().await,
+                                                transition.checkpoint.clone(),
+                                            );
+                                            Ok(FinalizeReplayOutcome::StagedForMirror)
+                                        }
+                                        Err(error) => Err(error.to_string()),
+                                    };
+                                    let _ = ack.send(staged);
+                                    continue;
+                                }
+                                match publication_actor.publish_final(&mut transition).await {
+                                    Ok(publication) => {
+                                        merge_checkpoint(
+                                            &mut *checkpoints.write().await,
+                                            transition.checkpoint.clone(),
+                                        );
+                                        Ok(FinalizeReplayOutcome::Published(publication))
+                                    }
+                                    Err(error) => Err(error.to_string()),
+                                }
+                            };
+                            let _ = ack.send(result);
+                        }
+                        Some(SinkMessage::BlockReplay { mut transition, ack }) => {
+                            let flushed = account_barrier_flush(
+                                flush_for_barrier(
+                                    &clickhouse,
+                                    &checkpoints,
+                                    &metrics,
+                                    &mut raw_rows,
+                                    &mut event_rows,
+                                    &mut link_rows,
+                                    &mut tool_rows,
+                                    &mut error_rows,
+                                    &mut checkpoint_updates,
+                                    checkpoint_cursor_columns,
+                                    &checkpoint_host,
+                                    &ack_observer,
+                                    &mut pending_ack,
+                                    &publication_actor,
+                                    publication_ready_for_sink(&role, shared_legacy_ambiguous),
+                                )
+                                .await,
+                                &mut pending_batch_bytes,
+                            );
+                            let result = if !flushed {
+                                throttling_flush_retries = true;
+                                Err("failed to flush batches preceding replay-block barrier".to_string())
+                            } else if transition.block_reason.is_empty() {
+                                Err("blocked replay transition requires a block reason".to_string())
+                            } else {
+                                transition.lifecycle = CheckpointLifecycle::Error;
+                                transition.checkpoint.status = "error".to_string();
+                                match publication_actor.persist_transition(&mut transition).await {
+                                    Ok(barrier) => {
+                                        merge_checkpoint(
+                                            &mut *checkpoints.write().await,
+                                            transition.checkpoint.clone(),
+                                        );
+                                        Ok(barrier)
+                                    }
+                                    Err(error) => Err(error.to_string()),
+                                }
+                            };
+                            let _ = ack.send(result);
+                        }
+                        Some(SinkMessage::MirrorCaughtUp { mut transition, ack }) => {
+                            let flushed = account_barrier_flush(
+                                flush_for_barrier(
+                                    &clickhouse,
+                                    &checkpoints,
+                                    &metrics,
+                                    &mut raw_rows,
+                                    &mut event_rows,
+                                    &mut link_rows,
+                                    &mut tool_rows,
+                                    &mut error_rows,
+                                    &mut checkpoint_updates,
+                                    checkpoint_cursor_columns,
+                                    &checkpoint_host,
+                                    &ack_observer,
+                                    &mut pending_ack,
+                                    &publication_actor,
+                                    publication_ready_for_sink(&role, shared_legacy_ambiguous),
+                                )
+                                .await,
+                                &mut pending_batch_bytes,
+                            );
+                            let mut result = if flushed && shared_legacy_ambiguous {
+                                Err(
+                                    "shared legacy source ownership is ambiguous; publication remains disabled"
+                                        .to_string(),
+                                )
+                            } else if flushed {
+                                let key = crate::checkpoint::checkpoint_key(
+                                    &transition.source.source_name,
+                                    &transition.source.source_file,
+                                );
+                                if let Some(mut latest) =
+                                    checkpoints.read().await.get(&key).cloned()
+                                {
+                                    // The barrier may have waited behind replay
+                                    // batches. Persist readiness against the
+                                    // cursor that actually flushed, never the
+                                    // placeholder captured by the supervisor.
+                                    latest.checkpoint_revision = 0;
+                                    latest.operation_id.clear();
+                                    transition = CheckpointTransition::from_checkpoint(latest);
+                                }
+                                transition.set_backend_caught_up(true);
+                                publication_actor
+                                    .persist_mirror_caught_up(&mut transition)
+                                    .await
+                                    .map_err(|error| error.to_string())
+                            } else {
+                                throttling_flush_retries = true;
+                                Err("failed to flush batches preceding mirror catch-up barrier".to_string())
+                            };
+                            if result.is_ok() {
+                                merge_checkpoint(
+                                    &mut *checkpoints.write().await,
+                                    transition.checkpoint.clone(),
+                                );
+                                let repair_candidates =
+                                    checkpoints.read().await.values().cloned().collect::<Vec<_>>();
+                                if let Err(error) = publication_actor
+                                    .repair_ready_publications(repair_candidates)
+                                    .await
+                                {
+                                    let failure = format!(
+                                        "mirror catch-up is durable but publication repair failed: {error}"
+                                    );
+                                    result = match publication_actor
+                                        .record_publication_repair_failure(&transition)
+                                        .await
+                                    {
+                                        Ok(()) => Err(failure),
+                                        Err(diagnostic_error) => Err(format!(
+                                            "{failure}; failed to persist publication-repair diagnostic: {diagnostic_error}"
+                                        )),
+                                    };
+                                }
+                            }
+                            let _ = ack.send(result);
+                        }
                         None => break,
                     }
                 }
                 _ = flush_tick.tick() => {
                     if has_pending_data(&raw_rows, &event_rows, &link_rows, &tool_rows, &error_rows, &checkpoint_updates) {
-                        let flush_ok = flush_pending_with_ack(
+                        let flush_ok = flush_pending_with_publication(
                             &clickhouse,
                             &checkpoints,
                             &metrics,
@@ -497,6 +844,8 @@ pub(crate) fn spawn_sink_task(
                             &checkpoint_host,
                     &ack_observer,
                     &mut pending_ack,
+                            &publication_actor,
+                            publication_ready_for_sink(&role, shared_legacy_ambiguous),
                         ).await;
                         note_flush_outcome(&role, &checkpoints, flush_ok, rx.is_empty()).await;
                         if !flush_ok {
@@ -526,7 +875,7 @@ pub(crate) fn spawn_sink_task(
             &error_rows,
             &checkpoint_updates,
         ) {
-            let flush_ok = flush_pending_with_ack(
+            let flush_ok = flush_pending_with_publication(
                 &clickhouse,
                 &checkpoints,
                 &metrics,
@@ -540,6 +889,8 @@ pub(crate) fn spawn_sink_task(
                 &checkpoint_host,
                 &ack_observer,
                 &mut pending_ack,
+                &publication_actor,
+                publication_ready_for_sink(&role, shared_legacy_ambiguous),
             )
             .await;
             note_flush_outcome(&role, &checkpoints, flush_ok, true).await;
@@ -655,6 +1006,7 @@ enum SinkStage {
     ToolIo,
     IngestErrors,
     IngestCheckpoints,
+    AppendControl,
 }
 
 impl SinkStage {
@@ -667,6 +1019,7 @@ impl SinkStage {
             Self::ToolIo => "tool_io",
             Self::IngestErrors => "ingest_errors",
             Self::IngestCheckpoints => "ingest_checkpoints",
+            Self::AppendControl => "ingest_append_control",
         }
     }
 }
@@ -713,6 +1066,7 @@ impl PendingSinkData<'_> {
             SinkStage::ToolIo => self.tool_rows,
             SinkStage::IngestErrors => self.error_rows,
             SinkStage::IngestCheckpoints => &[],
+            SinkStage::AppendControl => &[],
         };
 
         if let [row] = stage_rows {
@@ -740,6 +1094,7 @@ impl PendingSinkData<'_> {
             SinkStage::ToolIo => self.tool_rows.len(),
             SinkStage::IngestErrors => self.error_rows.len(),
             SinkStage::IngestCheckpoints => self.checkpoint_updates.len(),
+            SinkStage::AppendControl => self.checkpoint_updates.len(),
         }
     }
 
@@ -854,22 +1209,62 @@ async fn commit_checkpoint_updates(
     checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
     checkpoint_rows: &[Value],
     checkpoint_updates: &HashMap<String, Checkpoint>,
+    publication: Option<&PublicationActor>,
+    publication_ready: bool,
 ) -> anyhow::Result<()> {
     if checkpoint_rows.is_empty() {
         return Ok(());
     }
 
+    let mut committed = Vec::with_capacity(checkpoint_updates.len());
+    for checkpoint in checkpoint_updates.values() {
+        let mut transition = CheckpointTransition::from_checkpoint(checkpoint.clone());
+        let initial_local = transition.lifecycle == CheckpointLifecycle::Active
+            && transition.checkpoint.source_generation == 1
+            && checkpoint_rows.iter().all(|row| {
+                row.get("host")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .is_empty()
+            });
+        if initial_local {
+            // Empty host is the local backend and is already caught up with
+            // itself. A mirror must receive the ordered catch-up barrier.
+            transition.set_backend_caught_up(true);
+        } else if !publication_ready {
+            // Adapter checkpoints describe source-scan completeness, not
+            // mirror coverage. Until the ordered catch-up barrier is durable,
+            // a backend transition must stay staged even if the adapter set
+            // its ordinary generation-1 readiness defaults to true.
+            transition.set_backend_caught_up(false);
+        }
+        if let Some(publication) = publication {
+            if !initial_local {
+                publication.persist_transition(&mut transition).await?;
+            }
+        }
+        committed.push(transition);
+    }
+
     clickhouse
-        .insert_json_rows("ingest_checkpoints", checkpoint_rows)
+        .insert_json_rows_sync("ingest_checkpoints", checkpoint_rows)
         .await
         .context("failed to insert ingest checkpoint rows")?;
+
+    if let Some(publication) = publication {
+        for transition in &mut committed {
+            if transition.backend_caught_up && transition.checkpoint.source_generation == 1 {
+                publication.publish_initial_if_absent(transition).await?;
+            }
+        }
+    }
 
     // Offset-monotone merge, not a blind insert: a backend map has two
     // producers (live router batches and catch-up replay), so an out-of-order
     // flush must never regress what the map already committed.
     let mut state = checkpoints.write().await;
-    for cp in checkpoint_updates.values() {
-        merge_checkpoint(&mut state, cp.clone());
+    for transition in committed {
+        merge_checkpoint(&mut state, transition.checkpoint);
     }
     Ok(())
 }
@@ -987,6 +1382,7 @@ async fn flush_pending(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn flush_pending_with_ack(
     clickhouse: &ClickHouseClient,
     checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
@@ -1002,45 +1398,214 @@ async fn flush_pending_with_ack(
     ack_observer: &IngestAckObserver,
     pending_ack: &mut PendingAckBatch,
 ) -> bool {
+    flush_pending_inner(
+        clickhouse,
+        checkpoints,
+        metrics,
+        raw_rows,
+        event_rows,
+        link_rows,
+        tool_rows,
+        error_rows,
+        checkpoint_updates,
+        checkpoint_cursor_columns,
+        checkpoint_host,
+        ack_observer,
+        pending_ack,
+        None,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn flush_pending_with_publication(
+    clickhouse: &ClickHouseClient,
+    checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
+    metrics: &Arc<Metrics>,
+    raw_rows: &mut Vec<Value>,
+    event_rows: &mut Vec<Value>,
+    link_rows: &mut Vec<Value>,
+    tool_rows: &mut Vec<Value>,
+    error_rows: &mut Vec<Value>,
+    checkpoint_updates: &mut HashMap<String, Checkpoint>,
+    checkpoint_cursor_columns: bool,
+    checkpoint_host: &str,
+    ack_observer: &IngestAckObserver,
+    pending_ack: &mut PendingAckBatch,
+    publication: &PublicationActor,
+    publication_ready: bool,
+) -> bool {
+    flush_pending_inner(
+        clickhouse,
+        checkpoints,
+        metrics,
+        raw_rows,
+        event_rows,
+        link_rows,
+        tool_rows,
+        error_rows,
+        checkpoint_updates,
+        checkpoint_cursor_columns,
+        checkpoint_host,
+        ack_observer,
+        pending_ack,
+        Some(publication),
+        publication_ready,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn flush_for_barrier(
+    clickhouse: &ClickHouseClient,
+    checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
+    metrics: &Arc<Metrics>,
+    raw_rows: &mut Vec<Value>,
+    event_rows: &mut Vec<Value>,
+    link_rows: &mut Vec<Value>,
+    tool_rows: &mut Vec<Value>,
+    error_rows: &mut Vec<Value>,
+    checkpoint_updates: &mut HashMap<String, Checkpoint>,
+    checkpoint_cursor_columns: bool,
+    checkpoint_host: &str,
+    ack_observer: &IngestAckObserver,
+    pending_ack: &mut PendingAckBatch,
+    publication: &PublicationActor,
+    publication_ready: bool,
+) -> bool {
+    if !has_pending_data(
+        raw_rows,
+        event_rows,
+        link_rows,
+        tool_rows,
+        error_rows,
+        checkpoint_updates,
+    ) {
+        return true;
+    }
+    flush_pending_with_publication(
+        clickhouse,
+        checkpoints,
+        metrics,
+        raw_rows,
+        event_rows,
+        link_rows,
+        tool_rows,
+        error_rows,
+        checkpoint_updates,
+        checkpoint_cursor_columns,
+        checkpoint_host,
+        ack_observer,
+        pending_ack,
+        publication,
+        publication_ready,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn flush_pending_inner(
+    clickhouse: &ClickHouseClient,
+    checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
+    metrics: &Arc<Metrics>,
+    raw_rows: &mut Vec<Value>,
+    event_rows: &mut Vec<Value>,
+    link_rows: &mut Vec<Value>,
+    tool_rows: &mut Vec<Value>,
+    error_rows: &mut Vec<Value>,
+    checkpoint_updates: &mut HashMap<String, Checkpoint>,
+    checkpoint_cursor_columns: bool,
+    checkpoint_host: &str,
+    ack_observer: &IngestAckObserver,
+    pending_ack: &mut PendingAckBatch,
+    publication: Option<&PublicationActor>,
+    publication_ready: bool,
+) -> bool {
     let started = Instant::now();
 
-    let checkpoint_rows: Vec<Value> = checkpoint_updates
-        .values()
-        .map(|cp| {
-            let mut row = json!({
-                "source_name": cp.source_name,
-                "source_file": cp.source_file,
-                "source_inode": cp.source_inode,
-                "source_generation": cp.source_generation,
-                "last_offset": cp.last_offset,
-                "last_line_no": cp.last_line_no,
-                "status": cp.status,
-            });
-            // Older schemas (pre-015) reject unknown columns at insert time,
-            // so the SQLite cursor fields are attached only when present.
-            if checkpoint_cursor_columns {
-                if let Some(obj) = row.as_object_mut() {
-                    obj.insert("cursor_json".to_string(), json!(cp.cursor_json));
-                    obj.insert(
-                        "source_fingerprint".to_string(),
-                        json!(cp.source_fingerprint),
-                    );
-                    obj.insert(
-                        "schema_fingerprint".to_string(),
-                        json!(cp.schema_fingerprint),
-                    );
+    let mut append_manifest = AppendManifest::from_pending(
+        checkpoint_host,
+        raw_rows,
+        event_rows,
+        link_rows,
+        tool_rows,
+        error_rows,
+        checkpoint_updates.values().cloned(),
+    );
+    let mut append_fence = None;
+    let projection_all_sources = publication.is_none() || checkpoint_updates.is_empty();
+    let mut live_projection_sources = BTreeSet::<(String, String, String, u32)>::new();
+    if let Some(publication) = publication {
+        let mut has_live_append = false;
+        for checkpoint in checkpoint_updates.values() {
+            let transition = CheckpointTransition::from_checkpoint(checkpoint.clone());
+            let published = match publication
+                .has_published_generation(
+                    &transition.source,
+                    transition.checkpoint.source_generation,
+                )
+                .await
+            {
+                Ok(published) => published,
+                Err(error) => {
+                    metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
+                    *metrics
+                        .last_error
+                        .lock()
+                        .expect("metrics last_error mutex poisoned") = error.to_string();
+                    warn!("failed to inspect current source head before flush: {error}");
+                    return false;
+                }
+            };
+            let active = transition.lifecycle == CheckpointLifecycle::Active
+                && transition.block_reason.is_empty();
+            if active && published {
+                live_projection_sources.insert((
+                    checkpoint_host.to_string(),
+                    transition.source.source_name.clone(),
+                    transition.source.source_file.clone(),
+                    transition.checkpoint.source_generation,
+                ));
+            }
+            has_live_append |= active && published;
+        }
+        if has_live_append {
+            if let Err(error) = publication.prove_insert_only(&mut append_manifest).await {
+                // Classification is an optimization only. Query failure is
+                // fail-closed to the backend-wide hard fence, not data loss.
+                append_manifest.insert_only = false;
+                warn!("append insert-only preflight failed; using hard fence: {error}");
+            }
+            append_fence = match publication.begin_append(&append_manifest).await {
+                Ok(fence) => fence,
+                Err(error) => {
+                    metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
+                    *metrics
+                        .last_error
+                        .lock()
+                        .expect("metrics last_error mutex poisoned") = error.to_string();
+                    warn!("failed to establish append cache fence: {error}");
+                    return false;
+                }
+            };
+            if let Some((batch_id, cache_epoch)) = append_fence.as_ref() {
+                let Some(target_epoch) = cache_epoch.checked_add(1) else {
+                    metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
+                    *metrics
+                        .last_error
+                        .lock()
+                        .expect("metrics last_error mutex poisoned") =
+                        "append cache epoch exhausted".to_string();
+                    return false;
+                };
+                for checkpoint in checkpoint_updates.values_mut() {
+                    checkpoint.append_batch_id = batch_id.clone();
+                    checkpoint.cache_epoch = target_epoch;
                 }
             }
-            // Backend-role only (migration 018): scopes rows in a shared
-            // team table to this host. Empty for the default sink.
-            if !checkpoint_host.is_empty() {
-                if let Some(obj) = row.as_object_mut() {
-                    obj.insert("host".to_string(), json!(checkpoint_host));
-                }
-            }
-            row
-        })
-        .collect();
+        }
+    }
 
     let quarantined = match (|| -> anyhow::Result<usize> {
         Ok(
@@ -1062,6 +1627,12 @@ async fn flush_pending_with_ack(
         }
     };
     if quarantined > 0 {
+        for checkpoint in checkpoint_updates.values_mut() {
+            checkpoint.status = "error".to_string();
+            checkpoint.final_scan_complete = false;
+            checkpoint.block_reason =
+                format!("{quarantined} oversized row(s) quarantined during generation flush");
+        }
         warn!(
             rows = quarantined,
             max_bytes = CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES,
@@ -1069,8 +1640,63 @@ async fn flush_pending_with_ack(
         );
     }
 
+    let mut checkpoint_rows: Vec<Value> = checkpoint_updates
+        .values()
+        .map(|cp| {
+            let mut row = json!({
+                "source_name": cp.source_name,
+                "source_file": cp.source_file,
+                "source_inode": cp.source_inode,
+                "source_generation": cp.source_generation,
+                "last_offset": cp.last_offset,
+                "last_line_no": cp.last_line_no,
+                "status": cp.status,
+            });
+            if checkpoint_cursor_columns {
+                if let Some(obj) = row.as_object_mut() {
+                    obj.insert("cursor_json".to_string(), json!(cp.cursor_json));
+                    obj.insert(
+                        "source_fingerprint".to_string(),
+                        json!(cp.source_fingerprint),
+                    );
+                    obj.insert(
+                        "schema_fingerprint".to_string(),
+                        json!(cp.schema_fingerprint),
+                    );
+                }
+            }
+            if !checkpoint_host.is_empty() {
+                if let Some(obj) = row.as_object_mut() {
+                    obj.insert("host".to_string(), json!(checkpoint_host));
+                }
+            }
+            row
+        })
+        .collect();
+
     let projected_session_ids = event_rows
         .iter()
+        .filter(|row| {
+            projection_all_sources
+                || live_projection_sources.contains(&(
+                    row.get("source_host")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    row.get("source_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    row.get("source_file")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    row.get("source_generation")
+                        .and_then(Value::as_u64)
+                        .and_then(|value| u32::try_from(value).ok())
+                        .unwrap_or_default(),
+                ))
+        })
         .filter_map(|row| {
             row.get("session_id")
                 .and_then(Value::as_str)
@@ -1081,10 +1707,14 @@ async fn flush_pending_with_ack(
 
     let flush_result = async {
         if !raw_rows.is_empty() {
-            clickhouse
-                .insert_json_rows("raw_events", raw_rows)
-                .await
-                .map_err(|error| SinkFlushFailure::new(SinkStage::RawEvents, error))?;
+            let insert = if publication.is_some() {
+                clickhouse
+                    .insert_json_rows_sync("raw_events", raw_rows)
+                    .await
+            } else {
+                clickhouse.insert_json_rows("raw_events", raw_rows).await
+            };
+            insert.map_err(|error| SinkFlushFailure::new(SinkStage::RawEvents, error))?;
             metrics
                 .raw_rows_written
                 .fetch_add(raw_rows.len() as u64, Ordering::Relaxed);
@@ -1104,44 +1734,69 @@ async fn flush_pending_with_ack(
                 .insert_json_rows_sync("events", event_rows)
                 .await
                 .map_err(|error| SinkFlushFailure::new(SinkStage::Events, error))?;
-            clickhouse
-                .refresh_mcp_open_read_model(projected_session_ids.iter().map(String::as_str))
-                .await
-                .map_err(|error| SinkFlushFailure::new(SinkStage::McpOpenProjection, error))?;
             metrics
                 .event_rows_written
                 .fetch_add(event_rows.len() as u64, Ordering::Relaxed);
             if ack_observer.enabled {
                 pending_ack.extend(event_rows);
             }
+            pending_ack.extend_projection(&projected_session_ids);
             event_rows.clear();
         }
 
         if !link_rows.is_empty() {
-            clickhouse
-                .insert_json_rows("event_links", link_rows)
-                .await
-                .map_err(|error| SinkFlushFailure::new(SinkStage::EventLinks, error))?;
+            let insert = if publication.is_some() {
+                clickhouse
+                    .insert_json_rows_sync("event_links", link_rows)
+                    .await
+            } else {
+                clickhouse.insert_json_rows("event_links", link_rows).await
+            };
+            insert.map_err(|error| SinkFlushFailure::new(SinkStage::EventLinks, error))?;
             link_rows.clear();
         }
 
         if !tool_rows.is_empty() {
-            clickhouse
-                .insert_json_rows("tool_io", tool_rows)
-                .await
-                .map_err(|error| SinkFlushFailure::new(SinkStage::ToolIo, error))?;
+            let insert = if publication.is_some() {
+                clickhouse.insert_json_rows_sync("tool_io", tool_rows).await
+            } else {
+                clickhouse.insert_json_rows("tool_io", tool_rows).await
+            };
+            insert.map_err(|error| SinkFlushFailure::new(SinkStage::ToolIo, error))?;
             tool_rows.clear();
         }
 
         if !error_rows.is_empty() {
-            clickhouse
-                .insert_json_rows("ingest_errors", error_rows)
-                .await
-                .map_err(|error| SinkFlushFailure::new(SinkStage::IngestErrors, error))?;
+            let insert = if publication.is_some() {
+                clickhouse
+                    .insert_json_rows_sync("ingest_errors", error_rows)
+                    .await
+            } else {
+                clickhouse
+                    .insert_json_rows("ingest_errors", error_rows)
+                    .await
+            };
+            insert.map_err(|error| SinkFlushFailure::new(SinkStage::IngestErrors, error))?;
             metrics
                 .err_rows_written
                 .fetch_add(error_rows.len() as u64, Ordering::Relaxed);
             error_rows.clear();
+        }
+
+        // Compatibility preparation is dependency-ordered: canonical events,
+        // links, tools, and errors are durable before the candidate is built;
+        // the causal checkpoint and source head remain later stages.
+        if !pending_ack.projection_session_ids.is_empty() {
+            clickhouse
+                .refresh_mcp_open_read_model(
+                    pending_ack
+                        .projection_session_ids
+                        .iter()
+                        .map(String::as_str),
+                )
+                .await
+                .map_err(|error| SinkFlushFailure::new(SinkStage::McpOpenProjection, error))?;
+            pending_ack.projection_session_ids.clear();
         }
 
         if !checkpoint_rows.is_empty() {
@@ -1150,11 +1805,27 @@ async fn flush_pending_with_ack(
                 checkpoints,
                 &checkpoint_rows,
                 checkpoint_updates,
+                publication,
+                publication_ready,
             )
             .await
             .map_err(|error| SinkFlushFailure::new(SinkStage::IngestCheckpoints, error))?;
-            checkpoint_updates.clear();
         }
+
+        if let (Some(publication), Some((batch_id, _))) = (publication, append_fence.as_ref()) {
+            if quarantined > 0 {
+                publication
+                    .block_append(batch_id, &append_manifest)
+                    .await
+                    .map_err(|error| SinkFlushFailure::new(SinkStage::AppendControl, error))?;
+            } else {
+                publication
+                    .commit_append(batch_id)
+                    .await
+                    .map_err(|error| SinkFlushFailure::new(SinkStage::AppendControl, error))?;
+            }
+        }
+        checkpoint_updates.clear();
 
         metrics
             .last_flush_ms
@@ -1175,6 +1846,20 @@ async fn flush_pending_with_ack(
             if failure.stage != SinkStage::McpOpenProjection
                 && is_oversized_json_each_row_insert_error(&failure.error)
             {
+                let block_reason = format!(
+                    "non-retryable sink failure at {}: {error_text}",
+                    failure.stage.table()
+                );
+                for checkpoint in checkpoint_updates.values_mut() {
+                    checkpoint.status = "error".to_string();
+                    checkpoint.final_scan_complete = false;
+                    checkpoint.block_reason = block_reason.clone();
+                }
+                for row in &mut checkpoint_rows {
+                    if let Some(object) = row.as_object_mut() {
+                        object.insert("status".to_string(), json!("error"));
+                    }
+                }
                 let last_error = format!(
                     "non-retryable sink flush failure at {}: {error_text}",
                     failure.stage.table()
@@ -1224,6 +1909,8 @@ async fn flush_pending_with_ack(
                     checkpoints,
                     &checkpoint_rows,
                     checkpoint_updates,
+                    publication,
+                    publication_ready,
                 )
                 .await
                 {
@@ -1241,6 +1928,14 @@ async fn flush_pending_with_ack(
                         "{last_error}"
                     );
                     return false;
+                }
+                if let (Some(publication), Some((batch_id, _))) =
+                    (publication, append_fence.as_ref())
+                {
+                    if let Err(error) = publication.block_append(batch_id, &append_manifest).await {
+                        warn!("failed to block append fence after non-retryable sink failure: {error}");
+                        return false;
+                    }
                 }
                 metrics
                     .last_flush_ms
@@ -1291,6 +1986,7 @@ mod tests {
         rows_by_table: Arc<Mutex<HashMap<String, Vec<Value>>>>,
         fail_once_by_table: Arc<Mutex<HashMap<String, usize>>>,
         fail_always_by_table: Arc<Mutex<HashMap<String, String>>>,
+        append_control_response: Arc<Mutex<Option<String>>>,
     }
 
     impl MockClickHouseState {
@@ -1334,6 +2030,22 @@ mod tests {
                 .cloned()
                 .unwrap_or_default()
         }
+
+        fn max_u64(&self, table: &str, field: &str) -> u64 {
+            self.rows(table)
+                .into_iter()
+                .filter_map(|row| row.get(field).and_then(Value::as_u64))
+                .max()
+                .unwrap_or(0)
+        }
+
+        fn set_append_control_response(&self, response: Value) {
+            *self
+                .append_control_response
+                .lock()
+                .expect("mock append_control_response mutex poisoned") =
+                Some(format!("{response}\n"));
+        }
     }
 
     fn inserted_table_name(query: &str) -> Option<&'static str> {
@@ -1351,6 +2063,14 @@ mod tests {
             Some("ingest_heartbeats")
         } else if query.contains("`events`") {
             Some("events")
+        } else if query.contains("`ingest_checkpoint_transitions`") {
+            Some("ingest_checkpoint_transitions")
+        } else if query.contains("`source_generation_publication_readiness`") {
+            Some("source_generation_publication_readiness")
+        } else if query.contains("`publication_diagnostic_events`") {
+            Some("publication_diagnostic_events")
+        } else if query.contains("`ingest_append_control`") {
+            Some("ingest_append_control")
         } else {
             None
         }
@@ -1361,8 +2081,39 @@ mod tests {
         Query(params): Query<HashMap<String, String>>,
         body: String,
     ) -> (StatusCode, String) {
-        let query = params.get("query").cloned().unwrap_or_default();
-        let Some(table) = inserted_table_name(&query) else {
+        let query = params
+            .get("query")
+            .map(String::as_str)
+            .unwrap_or(body.as_str());
+        if query.contains("v_current_ingest_append_control") {
+            return (
+                StatusCode::OK,
+                state
+                    .append_control_response
+                    .lock()
+                    .expect("mock append_control_response mutex poisoned")
+                    .clone()
+                    .unwrap_or_default(),
+            );
+        }
+        if query.contains("max(transitions.checkpoint_revision)) AS revision") {
+            let revision = state.max_u64("ingest_checkpoint_transitions", "checkpoint_revision");
+            return (StatusCode::OK, format!("{{\"revision\":{revision}}}\n"));
+        }
+        if query.contains("max(readiness.readiness_revision)) AS revision") {
+            let revision = state.max_u64(
+                "source_generation_publication_readiness",
+                "readiness_revision",
+            );
+            return (StatusCode::OK, format!("{{\"revision\":{revision}}}\n"));
+        }
+        if query.contains("existing_count") {
+            return (StatusCode::OK, "{\"existing_count\":0}\n".to_string());
+        }
+        if query.contains("SELECT") && !query.contains("INSERT INTO") {
+            return (StatusCode::OK, String::new());
+        }
+        let Some(table) = inserted_table_name(query) else {
             return (
                 StatusCode::BAD_REQUEST,
                 format!("unexpected query payload: {query}"),
@@ -1462,6 +2213,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn successful_drain_clears_bytes_before_empty_block_reason_rejection() {
+        let mut pending_batch_bytes = 4_096;
+        let flushed = account_barrier_flush(true, &mut pending_batch_bytes);
+        let transition = CheckpointTransition::blocked(&sample_checkpoint(), "");
+
+        let result: std::result::Result<(), String> = if !flushed {
+            Err("failed to flush batches preceding replay-block barrier".to_string())
+        } else if transition.block_reason.is_empty() {
+            Err("blocked replay transition requires a block reason".to_string())
+        } else {
+            Ok(())
+        };
+
+        assert_eq!(pending_batch_bytes, 0);
+        assert_eq!(
+            result.unwrap_err(),
+            "blocked replay transition requires a block reason"
+        );
+    }
+
+    #[test]
+    fn successful_drain_clears_bytes_before_shared_legacy_ambiguity_rejection() {
+        let mut pending_batch_bytes = 4_096;
+        let flushed = account_barrier_flush(true, &mut pending_batch_bytes);
+        let shared_legacy_ambiguous = true;
+
+        let result: std::result::Result<(), String> = if flushed && shared_legacy_ambiguous {
+            Err(
+                "shared legacy source ownership is ambiguous; publication remains disabled"
+                    .to_string(),
+            )
+        } else {
+            Ok(())
+        };
+
+        assert_eq!(pending_batch_bytes, 0);
+        assert_eq!(
+            result.unwrap_err(),
+            "shared legacy source ownership is ambiguous; publication remains disabled"
+        );
+    }
+
     fn single_row_batch(id: u64) -> SinkMessage {
         let mut batch = RowBatch::default();
         batch.raw_rows.push(json!({ "id": id }));
@@ -1477,6 +2271,23 @@ mod tests {
 
     fn test_redaction_audit() -> Arc<RedactionAudit> {
         Arc::new(RedactionAudit::default())
+    }
+
+    fn test_publication_identity() -> PublicationIdentity {
+        PublicationIdentity::for_test("11111111-1111-4111-8111-111111111111")
+    }
+
+    fn test_backend_role(cell: Arc<BackendSinkCell>) -> SinkRole {
+        SinkRole::Backend {
+            cell,
+            resolver: Arc::new(Mutex::new(crate::tee::RouteResolver::new(Arc::new(
+                moraine_config::AppConfig::default(),
+            )))),
+            replay_notify: Arc::new(Notify::new()),
+            replay_floor: Arc::new(Mutex::new(None)),
+            redactor: test_redactor(),
+            redactions: test_redaction_audit(),
+        }
     }
 
     fn default_role() -> SinkRole {
@@ -1713,6 +2524,7 @@ mod tests {
             metrics,
             rx,
             true,
+            test_publication_identity(),
             SinkAuthorConfig::fully_supported(String::new()),
             default_role(),
         );
@@ -2379,6 +3191,391 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn backend_initial_checkpoint_stays_staged_before_catch_up_barrier() {
+        let (clickhouse, mock_state) =
+            spawn_mock_clickhouse_with_state(MockClickHouseState::default()).await;
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.heartbeat_interval_seconds = 60.0;
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (tx, rx) = mpsc::channel::<SinkMessage>(8);
+        let cell = Arc::new(BackendSinkCell::new("team-ch"));
+        let publication_identity = test_publication_identity();
+        let expected_host = publication_identity.host_id().to_string();
+        let handle = spawn_sink_task(
+            config,
+            clickhouse,
+            checkpoints.clone(),
+            metrics,
+            rx,
+            true,
+            publication_identity,
+            SinkAuthorConfig::fully_supported(String::new()),
+            test_backend_role(cell),
+        );
+
+        let mut checkpoint = sample_checkpoint();
+        checkpoint.final_scan_complete = true;
+        checkpoint.compatibility_prepared = true;
+        checkpoint.backend_caught_up = true;
+        let key = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
+        let mut batch = RowBatch::default();
+        batch.checkpoint = Some(checkpoint);
+        tx.send(SinkMessage::Batch(batch))
+            .await
+            .expect("send initial backend checkpoint");
+        drop(tx);
+
+        timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("backend sink should finish")
+            .expect("backend sink task should not panic");
+
+        let committed = checkpoints
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .expect("backend checkpoint committed");
+        assert!(
+            !committed.backend_caught_up,
+            "adapter readiness must be revoked until MirrorCaughtUp is ordered and durable"
+        );
+        let transitions = mock_state.rows("ingest_checkpoint_transitions");
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(
+            transitions[0]
+                .get("backend_caught_up")
+                .and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            transitions[0].get("host").and_then(Value::as_str),
+            Some(expected_host.as_str())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backend_replay_finalization_returns_typed_staged_success() {
+        let (clickhouse, mock_state) =
+            spawn_mock_clickhouse_with_state(MockClickHouseState::default()).await;
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.heartbeat_interval_seconds = 60.0;
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (tx, rx) = mpsc::channel::<SinkMessage>(8);
+        let cell = Arc::new(BackendSinkCell::new("team-ch"));
+        let handle = spawn_sink_task(
+            config,
+            clickhouse,
+            checkpoints,
+            metrics,
+            rx,
+            true,
+            test_publication_identity(),
+            SinkAuthorConfig::fully_supported(String::new()),
+            test_backend_role(cell),
+        );
+
+        let mut checkpoint = sample_checkpoint();
+        checkpoint.source_generation = 2;
+        let transition = CheckpointTransition::finalize_replay(
+            &checkpoint,
+            checkpoint.source_inode,
+            checkpoint.last_offset,
+            "policy-fingerprint",
+        );
+        assert_eq!(
+            crate::publication::send_finalize_replay(&tx, transition)
+                .await
+                .expect("staged mirror finalization is successful"),
+            FinalizeReplayOutcome::StagedForMirror
+        );
+        assert!(
+            mock_state.rows("published_source_generations").is_empty(),
+            "a staged mirror finalization must not publish its source head"
+        );
+        let readiness = mock_state.rows("source_generation_publication_readiness");
+        assert_eq!(readiness.len(), 1);
+        let transitions = mock_state.rows("ingest_checkpoint_transitions");
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(
+            readiness[0].get("complete").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            readiness[0]
+                .get("source_generation")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            readiness[0]
+                .get("backend_caught_up")
+                .and_then(Value::as_u64),
+            Some(0),
+            "staged completion must remain visible as mirror catch-up pending"
+        );
+        assert_eq!(
+            readiness[0]
+                .get("compatibility_prepared")
+                .and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            readiness[0].get("block_reason").and_then(Value::as_str),
+            Some("")
+        );
+        assert_eq!(
+            readiness[0].get("checkpoint_revision"),
+            transitions[0].get("checkpoint_revision")
+        );
+        assert_eq!(
+            readiness[0].get("operation_id"),
+            transitions[0].get("operation_id")
+        );
+
+        drop(tx);
+        timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("backend sink should finish")
+            .expect("backend sink task should not panic");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backend_staged_final_waits_for_durable_readiness_before_ack() {
+        let (clickhouse, mock_state) =
+            spawn_mock_clickhouse_with_state(MockClickHouseState::with_permanent_failure(
+                "source_generation_publication_readiness",
+                "intentional staged-readiness failure",
+            ))
+            .await;
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.heartbeat_interval_seconds = 60.0;
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel::<SinkMessage>(8);
+        let handle = spawn_sink_task(
+            config,
+            clickhouse,
+            checkpoints.clone(),
+            Arc::new(Metrics::default()),
+            rx,
+            true,
+            test_publication_identity(),
+            SinkAuthorConfig::fully_supported(String::new()),
+            test_backend_role(Arc::new(BackendSinkCell::new("team-ch"))),
+        );
+
+        let mut checkpoint = sample_checkpoint();
+        checkpoint.source_generation = 2;
+        let transition = CheckpointTransition::finalize_replay(
+            &checkpoint,
+            checkpoint.source_inode,
+            checkpoint.last_offset,
+            "policy-fingerprint",
+        );
+        let error = crate::publication::send_finalize_replay(&tx, transition)
+            .await
+            .expect_err("readiness failure must reject staged success");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to persist source-generation publication readiness"),
+            "unexpected staged-readiness error: {error:#}"
+        );
+        assert_eq!(
+            mock_state.rows("ingest_checkpoint_transitions").len(),
+            1,
+            "the checkpoint may commit before the readiness failure"
+        );
+        assert!(mock_state
+            .rows("source_generation_publication_readiness")
+            .is_empty());
+        assert!(
+            checkpoints.read().await.is_empty(),
+            "failed readiness must not merge or acknowledge the staged checkpoint"
+        );
+        assert!(mock_state.rows("published_source_generations").is_empty());
+
+        drop(tx);
+        timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("backend sink should finish")
+            .expect("backend sink task should not panic");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn staged_mirror_readiness_reports_pending_until_catch_up_supersedes_it() {
+        let (clickhouse, mock_state) =
+            spawn_mock_clickhouse_with_state(MockClickHouseState::default()).await;
+        let identity = test_publication_identity();
+        let expected_host = identity.host_id().to_string();
+        let actor = PublicationActor::new(
+            clickhouse,
+            expected_host.clone(),
+            identity.publisher_id().to_string(),
+        );
+        let mut checkpoint = sample_checkpoint();
+        checkpoint.source_generation = 2;
+        let mut transition = CheckpointTransition::finalize_replay(
+            &checkpoint,
+            checkpoint.source_inode,
+            checkpoint.last_offset,
+            "policy-fingerprint",
+        );
+
+        let staged = actor
+            .persist_staged_mirror_final(&mut transition)
+            .await
+            .expect("persist staged mirror final");
+        let staged_operation_id = transition.operation_id.clone();
+        let staged_readiness = mock_state.rows("source_generation_publication_readiness");
+        assert_eq!(staged_readiness.len(), 1);
+        let staged_row = &staged_readiness[0];
+        assert_eq!(staged_row.get("complete").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            staged_row.get("backend_caught_up").and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            staged_row
+                .get("checkpoint_revision")
+                .and_then(Value::as_u64),
+            Some(staged.checkpoint_revision)
+        );
+        assert_eq!(
+            staged_row.get("source_host").and_then(Value::as_str),
+            Some(expected_host.as_str())
+        );
+        let staged_revision = staged_row
+            .get("readiness_revision")
+            .and_then(Value::as_u64)
+            .expect("staged readiness revision");
+        assert!(
+            staged_row.get("complete").and_then(Value::as_u64) == Some(1)
+                && staged_row.get("backend_caught_up").and_then(Value::as_u64) == Some(0),
+            "the diagnostics predicate must report a pending mirror"
+        );
+
+        transition.set_backend_caught_up(true);
+        let caught_up = actor
+            .persist_mirror_caught_up(&mut transition)
+            .await
+            .expect("persist mirror catch-up");
+        assert_ne!(transition.operation_id, staged_operation_id);
+        assert!(caught_up.checkpoint_revision > staged.checkpoint_revision);
+
+        let mut readiness = mock_state.rows("source_generation_publication_readiness");
+        readiness.sort_by_key(|row| {
+            row.get("readiness_revision")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+        });
+        assert_eq!(readiness.len(), 2);
+        let current = readiness.last().expect("current readiness row");
+        assert!(current
+            .get("readiness_revision")
+            .and_then(Value::as_u64)
+            .is_some_and(|revision| revision > staged_revision));
+        assert_eq!(current.get("complete").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            current.get("backend_caught_up").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            current
+                .get("compatibility_prepared")
+                .and_then(Value::as_u64),
+            Some(0),
+            "catch-up readiness precedes compatibility publication"
+        );
+        assert!(
+            !(current.get("complete").and_then(Value::as_u64) == Some(1)
+                && current.get("backend_caught_up").and_then(Value::as_u64) == Some(0)),
+            "the current diagnostics predicate must clear mirror catch-up pending"
+        );
+
+        actor
+            .record_publication_repair_failure(&transition)
+            .await
+            .expect("persist publication-repair diagnostic");
+        let mut readiness = mock_state.rows("source_generation_publication_readiness");
+        readiness.sort_by_key(|row| {
+            row.get("readiness_revision")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+        });
+        let diagnostic = readiness.last().expect("diagnostic readiness row");
+        assert_eq!(
+            diagnostic.get("block_reason").and_then(Value::as_str),
+            Some("publication_repair_failed")
+        );
+        assert_eq!(
+            diagnostic.get("backend_caught_up").and_then(Value::as_u64),
+            Some(1),
+            "publication failure must not roll back durable mirror catch-up"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backend_sink_repairs_its_orphaned_append_before_intake() {
+        let state = MockClickHouseState::default();
+        state.set_append_control_response(json!({
+            "control_revision": 7,
+            "cache_epoch": 3,
+            "state": "preparing",
+            "batch_id": "append-from-prior-process",
+            "publisher_id": "host:prior-pid",
+            "manifest_json": "{invalid",
+            "insert_only": 1,
+        }));
+        let (clickhouse, mock_state) = spawn_mock_clickhouse_with_state(state).await;
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.heartbeat_interval_seconds = 60.0;
+        let (tx, rx) = mpsc::channel::<SinkMessage>(8);
+        let cell = Arc::new(BackendSinkCell::new("team-ch"));
+        let publication_identity = test_publication_identity();
+        let expected_host = publication_identity.host_id().to_string();
+        let handle = spawn_sink_task(
+            config,
+            clickhouse,
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(Metrics::default()),
+            rx,
+            true,
+            publication_identity,
+            SinkAuthorConfig::fully_supported(String::new()),
+            test_backend_role(cell),
+        );
+        drop(tx);
+
+        timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("backend sink should finish")
+            .expect("backend sink task should not panic");
+
+        let controls = mock_state.rows("ingest_append_control");
+        assert_eq!(
+            controls.len(),
+            1,
+            "orphan repair writes one terminal control"
+        );
+        assert_eq!(
+            controls[0].get("state").and_then(Value::as_str),
+            Some("blocked")
+        );
+        assert_eq!(
+            controls[0].get("batch_id").and_then(Value::as_str),
+            Some("append-from-prior-process")
+        );
+        assert_eq!(
+            controls[0].get("host").and_then(Value::as_str),
+            Some(expected_host.as_str()),
+            "each shared backend repairs this host's own append fence"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn backend_sink_filters_intake_to_routed_sessions() {
         let (clickhouse, mock_state) = spawn_mock_clickhouse("unused-table").await;
 
@@ -2402,6 +3599,9 @@ mod tests {
         let metrics = Arc::new(Metrics::default());
         let redactions = test_redaction_audit();
         let (tx, rx) = mpsc::channel::<SinkMessage>(8);
+        let cell = Arc::new(BackendSinkCell::new("team-ch"));
+        let publication_identity = test_publication_identity();
+        let expected_host = publication_identity.host_id().to_string();
 
         let handle = spawn_sink_task(
             config,
@@ -2410,16 +3610,32 @@ mod tests {
             metrics,
             rx,
             true,
+            publication_identity,
             SinkAuthorConfig::fully_supported(String::new()),
             SinkRole::Backend {
-                cell: Arc::new(BackendSinkCell::new("team-ch")),
-                resolver,
+                cell: cell.clone(),
+                resolver: resolver.clone(),
                 replay_notify: Arc::new(Notify::new()),
                 replay_floor: Arc::new(Mutex::new(None)),
                 redactor: test_redactor(),
                 redactions: redactions.clone(),
             },
         );
+
+        // The supervisor normally performs this sequence after its replay
+        // pass. A backend sink starts fail-closed; routing becomes converged
+        // only after the durable catch-up barrier is acknowledged.
+        let mut catch_up_checkpoint = sample_checkpoint();
+        catch_up_checkpoint.source_name = "catch-up-placeholder".to_string();
+        catch_up_checkpoint.source_file = "/tmp/catch-up-placeholder.jsonl".to_string();
+        catch_up_checkpoint.status = "replaying".to_string();
+        catch_up_checkpoint.final_scan_complete = false;
+        let catch_up = CheckpointTransition::from_checkpoint(catch_up_checkpoint);
+        crate::publication::send_mirror_caught_up(&tx, catch_up)
+            .await
+            .expect("initial mirror catch-up barrier");
+        cell.mark_publication_ready();
+        assert!(cell.publication_ready());
 
         let raw_secret = "ghp_abcdefghijklmnopqrstuvwxyzABCDE12345";
         let mut batch = RowBatch::default();
@@ -2455,6 +3671,11 @@ mod tests {
             Some("team-session")
         );
         assert_eq!(
+            raw_rows[0].get("source_host").and_then(Value::as_str),
+            Some(expected_host.as_str()),
+            "shared physical rows use the durable publication identity"
+        );
+        assert_eq!(
             raw_rows[0].get("raw_json").and_then(Value::as_str),
             Some("{\"token\":\"[REDACTED:github-token]\"}"),
             "backend sink backstop redacts the remote copy after route filtering"
@@ -2473,7 +3694,7 @@ mod tests {
         );
         assert_eq!(
             checkpoint_rows[0].get("host").and_then(Value::as_str),
-            Some(host_name().as_str()),
+            Some(expected_host.as_str()),
             "backend checkpoint rows are host-scoped: team backends share one \
              ingest_checkpoints table across members"
         );
@@ -2587,6 +3808,52 @@ mod tests {
                 .await
                 .is_ok(),
             "recovery must schedule a replay pass"
+        );
+    }
+
+    #[test]
+    fn durable_identity_scopes_only_shared_backend_rows() {
+        let identity = test_publication_identity();
+        let backend = test_backend_role(Arc::new(BackendSinkCell::new("team-ch")));
+
+        assert_eq!(
+            publication_host_for_role(&backend, &identity),
+            identity.host_id()
+        );
+        assert_eq!(
+            publication_host_for_role(&default_role(), &identity),
+            "",
+            "default-local physical rows retain the hostless source_host contract"
+        );
+    }
+
+    #[test]
+    fn backend_publication_readiness_tracks_each_catch_up_revocation() {
+        let cell = Arc::new(BackendSinkCell::new("team-ch"));
+        let role = SinkRole::Backend {
+            cell: cell.clone(),
+            resolver: Arc::new(Mutex::new(crate::tee::RouteResolver::new(Arc::new(
+                moraine_config::AppConfig::default(),
+            )))),
+            replay_notify: Arc::new(Notify::new()),
+            replay_floor: Arc::new(Mutex::new(None)),
+            redactor: test_redactor(),
+            redactions: test_redaction_audit(),
+        };
+
+        assert!(!publication_ready_for_role(&role));
+        assert!(!publication_ready_for_sink(&role, false));
+        cell.mark_publication_ready();
+        assert!(publication_ready_for_role(&role));
+        assert!(publication_ready_for_sink(&role, false));
+        assert!(
+            !publication_ready_for_sink(&role, true),
+            "legacy ownership ambiguity must override a stale ready latch"
+        );
+        cell.request_catch_up();
+        assert!(
+            !publication_ready_for_role(&role),
+            "the sink must observe a later mirror gap instead of retaining its first ready latch"
         );
     }
 

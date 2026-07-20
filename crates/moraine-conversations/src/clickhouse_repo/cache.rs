@@ -5,6 +5,8 @@ pub(super) const ANALYTICS_CACHE_TTL: Duration = Duration::from_secs(30);
 pub(super) const ANALYTICS_RANGE_COUNT: usize = AnalyticsRange::ALL.len();
 pub(super) const CORPUS_STATS_CACHE_TTL: Duration = Duration::from_secs(30);
 pub(super) const TERM_DF_CACHE_TTL: Duration = Duration::from_secs(300);
+pub(super) const TERM_DF_CACHE_MAX_ENTRIES: usize = 16_384;
+pub(super) const SCOPED_SESSION_CACHE_MAX_ENTRIES: usize = 16_384;
 pub(super) const SEARCH_SCHEMA_CACHE_TTL: Duration = Duration::from_secs(60);
 pub(super) const SEARCH_RESULT_CACHE_TTL: Duration = Duration::from_secs(15);
 pub(super) const SEARCH_RESULT_CACHE_MAX_ENTRIES: usize = 256;
@@ -29,15 +31,18 @@ pub(super) const SEARCH_DOC_EXTRA_CACHE_MAX_ENTRIES: usize = 65536;
 
 #[derive(Debug, Clone)]
 pub(super) struct AnalyticsCacheEntry {
+    pub(super) publication_token: String,
     pub(super) snapshot: AnalyticsSnapshot,
     pub(super) fetched_at: Instant,
 }
 
 impl AnalyticsCacheEntry {
-    pub(super) fn is_fresh(&self, now: Instant) -> bool {
-        now.checked_duration_since(self.fetched_at)
-            .unwrap_or_default()
-            <= ANALYTICS_CACHE_TTL
+    pub(super) fn is_fresh(&self, now: Instant, publication_token: &str) -> bool {
+        self.publication_token == publication_token
+            && now
+                .checked_duration_since(self.fetched_at)
+                .unwrap_or_default()
+                <= ANALYTICS_CACHE_TTL
     }
 }
 
@@ -54,6 +59,7 @@ pub(super) const fn analytics_range_index(range: AnalyticsRange) -> usize {
 
 #[derive(Debug, Clone)]
 pub(super) struct CorpusStatsCacheEntry {
+    pub(super) publication_token: String,
     pub(super) docs: u64,
     pub(super) total_doc_len: u64,
     pub(super) fetched_at: Instant,
@@ -61,8 +67,19 @@ pub(super) struct CorpusStatsCacheEntry {
 
 #[derive(Debug, Clone)]
 pub(super) struct TermDfCacheEntry {
+    pub(super) publication_token: String,
     pub(super) df: u64,
     pub(super) fetched_at: Instant,
+}
+
+impl TermDfCacheEntry {
+    fn is_fresh(&self, now: Instant, publication_token: &str) -> bool {
+        self.publication_token == publication_token
+            && now
+                .checked_duration_since(self.fetched_at)
+                .unwrap_or_default()
+                <= TERM_DF_CACHE_TTL
+    }
 }
 
 #[derive(Debug, Default)]
@@ -70,6 +87,72 @@ pub(super) struct SearchStatsCache {
     pub(super) corpus_stats: Option<CorpusStatsCacheEntry>,
     pub(super) term_df_by_term: HashMap<String, TermDfCacheEntry>,
     pub(super) has_codex_flag_column: Option<(bool, Instant)>,
+}
+
+fn insert_term_df_cache_entry(
+    cache: &mut HashMap<String, TermDfCacheEntry>,
+    term: String,
+    entry: TermDfCacheEntry,
+    max_entries: usize,
+) {
+    if max_entries == 0 {
+        return;
+    }
+
+    while !cache.contains_key(&term) && cache.len() >= max_entries {
+        // Prefer an entry from another publication revision. If concurrent
+        // operations race, evicting either revision can only cost a cache hit:
+        // lookups still require an exact token match.
+        let eviction = cache
+            .iter()
+            .find(|(_, cached)| cached.publication_token != entry.publication_token)
+            .or_else(|| cache.iter().min_by_key(|(_, cached)| cached.fetched_at))
+            .map(|(term, _)| term.clone());
+        let Some(eviction) = eviction else {
+            break;
+        };
+        cache.remove(&eviction);
+    }
+
+    cache.insert(term, entry);
+}
+
+pub(super) fn scoped_session_cache_contains(
+    cache: &HashMap<String, String>,
+    session_id: &str,
+    publication_token: &str,
+) -> bool {
+    cache
+        .get(session_id)
+        .is_some_and(|cached_token| cached_token == publication_token)
+}
+
+pub(super) fn insert_scoped_session_cache_entry(
+    cache: &mut HashMap<String, String>,
+    session_id: String,
+    publication_token: String,
+    max_entries: usize,
+) {
+    if max_entries == 0 {
+        return;
+    }
+
+    while !cache.contains_key(&session_id) && cache.len() >= max_entries {
+        // An entry from another revision cannot hit for this operation, so it
+        // is the best eviction candidate. Arbitrary same-revision eviction is
+        // still correctness-neutral when the cache is full.
+        let eviction = cache
+            .iter()
+            .find(|(_, cached_token)| *cached_token != &publication_token)
+            .or_else(|| cache.iter().next())
+            .map(|(session_id, _)| session_id.clone());
+        let Some(eviction) = eviction else {
+            break;
+        };
+        cache.remove(&eviction);
+    }
+
+    cache.insert(session_id, publication_token);
 }
 
 #[derive(Debug, Clone)]
@@ -355,10 +438,12 @@ impl ClickHouseConversationRepository {
     }
 
     pub(super) async fn cached_corpus_stats(&self) -> Option<(u64, u64)> {
+        let publication_token = publication_cache_key("corpus-stats")?;
         let now = Instant::now();
         let cache = self.stats_cache.read().await;
         cache.corpus_stats.as_ref().and_then(|entry| {
-            (now.duration_since(entry.fetched_at) <= CORPUS_STATS_CACHE_TTL)
+            (entry.publication_token == publication_token
+                && now.duration_since(entry.fetched_at) <= CORPUS_STATS_CACHE_TTL)
                 .then_some((entry.docs, entry.total_doc_len))
         })
     }
@@ -386,8 +471,8 @@ impl ClickHouseConversationRepository {
         }
 
         let fallback_query = format!(
-            "SELECT toUInt64(count()) AS docs, toUInt64(ifNull(sum(doc_len), 0)) AS total_doc_len FROM {} FINAL WHERE doc_len > 0 FORMAT JSONEachRow",
-            self.table_ref("search_documents")
+            "SELECT toUInt64(count()) AS docs, toUInt64(ifNull(sum(doc_len), 0)) AS total_doc_len FROM {} WHERE doc_len > 0 FORMAT JSONEachRow",
+            self.table_ref("v_live_search_documents")
         );
         let fallback: Vec<CorpusStatsRow> =
             self.map_backend(self.query_rows(&fallback_query, None).await)?;
@@ -397,12 +482,15 @@ impl ClickHouseConversationRepository {
             (0, 0)
         };
 
-        let mut cache = self.stats_cache.write().await;
-        cache.corpus_stats = Some(CorpusStatsCacheEntry {
-            docs: resolved.0,
-            total_doc_len: resolved.1,
-            fetched_at: now,
-        });
+        if let Some(publication_token) = publication_cache_key("corpus-stats") {
+            let mut cache = self.stats_cache.write().await;
+            cache.corpus_stats = Some(CorpusStatsCacheEntry {
+                publication_token,
+                docs: resolved.0,
+                total_doc_len: resolved.1,
+                fetched_at: now,
+            });
+        }
         Ok(resolved)
     }
 
@@ -412,12 +500,15 @@ impl ClickHouseConversationRepository {
         total_doc_len: u64,
         fetched_at: Instant,
     ) {
-        let mut cache = self.stats_cache.write().await;
-        cache.corpus_stats = Some(CorpusStatsCacheEntry {
-            docs,
-            total_doc_len,
-            fetched_at,
-        });
+        if let Some(publication_token) = publication_cache_key("corpus-stats") {
+            let mut cache = self.stats_cache.write().await;
+            cache.corpus_stats = Some(CorpusStatsCacheEntry {
+                publication_token,
+                docs,
+                total_doc_len,
+                fetched_at,
+            });
+        }
     }
 
     pub(super) async fn cache_term_df_values(
@@ -426,12 +517,30 @@ impl ClickHouseConversationRepository {
         map: &HashMap<String, u64>,
         fetched_at: Instant,
     ) {
+        let Some(publication_token) = publication_cache_token() else {
+            return;
+        };
         let mut cache = self.stats_cache.write().await;
+        if cache.term_df_by_term.len() >= TERM_DF_CACHE_MAX_ENTRIES {
+            cache.term_df_by_term.retain(|_, entry| {
+                fetched_at
+                    .checked_duration_since(entry.fetched_at)
+                    .unwrap_or_default()
+                    <= TERM_DF_CACHE_TTL
+            });
+        }
         for term in terms {
             let df = *map.get(&term).unwrap_or(&0);
-            cache
-                .term_df_by_term
-                .insert(term, TermDfCacheEntry { df, fetched_at });
+            insert_term_df_cache_entry(
+                &mut cache.term_df_by_term,
+                term,
+                TermDfCacheEntry {
+                    publication_token: publication_token.clone(),
+                    df,
+                    fetched_at,
+                },
+                TERM_DF_CACHE_MAX_ENTRIES,
+            );
         }
     }
 
@@ -464,7 +573,8 @@ FORMAT JSONEachRow",
 
     pub(super) async fn df_map(&self, terms: &[String]) -> RepoResult<HashMap<String, u64>> {
         let now = Instant::now();
-        let postings_table = self.table_ref("search_postings");
+        let publication_token = publication_cache_token();
+        let postings_table = self.table_ref("v_live_search_postings");
 
         let mut map = HashMap::<String, u64>::new();
         let mut missing_terms = Vec::<String>::new();
@@ -472,11 +582,14 @@ FORMAT JSONEachRow",
         {
             let cache = self.stats_cache.read().await;
             for term in terms {
-                if let Some(entry) = cache.term_df_by_term.get(term) {
-                    if now.duration_since(entry.fetched_at) <= TERM_DF_CACHE_TTL {
-                        map.insert(term.clone(), entry.df);
-                        continue;
-                    }
+                if let Some(entry) = publication_token.as_deref().and_then(|token| {
+                    cache
+                        .term_df_by_term
+                        .get(term)
+                        .filter(|entry| entry.is_fresh(now, token))
+                }) {
+                    map.insert(term.clone(), entry.df);
+                    continue;
                 }
                 missing_terms.push(term.clone());
             }
@@ -501,5 +614,103 @@ FORMAT JSONEachRow",
 
         self.cache_term_df_values(missing_terms, &map, now).await;
         Ok(map)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn term_df_entry(publication_token: &str, fetched_at: Instant) -> TermDfCacheEntry {
+        TermDfCacheEntry {
+            publication_token: publication_token.to_string(),
+            df: 1,
+            fetched_at,
+        }
+    }
+
+    #[test]
+    fn term_df_cache_replaces_revisions_and_remains_bounded() {
+        const TEST_LIMIT: usize = 8;
+        let now = Instant::now();
+        let mut cache = HashMap::new();
+
+        for revision in 0..64 {
+            insert_term_df_cache_entry(
+                &mut cache,
+                "repeat".to_string(),
+                term_df_entry(&format!("revision-{revision}"), now),
+                TEST_LIMIT,
+            );
+            assert_eq!(cache.len(), 1);
+        }
+        assert_eq!(cache["repeat"].publication_token, "revision-63");
+
+        for revision in 0..64 {
+            insert_term_df_cache_entry(
+                &mut cache,
+                format!("term-{revision}"),
+                term_df_entry(&format!("revision-{revision}"), now),
+                TEST_LIMIT,
+            );
+            assert!(cache.len() <= TEST_LIMIT);
+        }
+    }
+
+    #[test]
+    fn term_df_cache_never_reuses_a_concurrent_revision() {
+        let now = Instant::now();
+        let mut cache = HashMap::new();
+
+        insert_term_df_cache_entry(&mut cache, "term".to_string(), term_df_entry("new", now), 1);
+        // An older operation can finish its cache population after a newer
+        // operation. Last-writer-wins may cost the newer revision a hit, but
+        // the exact-token check prevents it from consuming the old value.
+        insert_term_df_cache_entry(&mut cache, "term".to_string(), term_df_entry("old", now), 1);
+
+        assert!(cache["term"].is_fresh(now, "old"));
+        assert!(!cache["term"].is_fresh(now, "new"));
+    }
+
+    #[test]
+    fn scoped_session_cache_replaces_revisions_and_remains_bounded() {
+        const TEST_LIMIT: usize = 8;
+        let mut cache = HashMap::new();
+
+        for revision in 0..64 {
+            insert_scoped_session_cache_entry(
+                &mut cache,
+                "repeat".to_string(),
+                format!("revision-{revision}"),
+                TEST_LIMIT,
+            );
+            assert_eq!(cache.len(), 1);
+        }
+        assert!(scoped_session_cache_contains(
+            &cache,
+            "repeat",
+            "revision-63"
+        ));
+
+        for revision in 0..64 {
+            insert_scoped_session_cache_entry(
+                &mut cache,
+                format!("session-{revision}"),
+                format!("revision-{revision}"),
+                TEST_LIMIT,
+            );
+            assert!(cache.len() <= TEST_LIMIT);
+        }
+    }
+
+    #[test]
+    fn scoped_session_cache_never_authorizes_a_concurrent_revision() {
+        let mut cache = HashMap::new();
+
+        insert_scoped_session_cache_entry(&mut cache, "session".to_string(), "new".to_string(), 1);
+        insert_scoped_session_cache_entry(&mut cache, "session".to_string(), "old".to_string(), 1);
+
+        assert!(scoped_session_cache_contains(&cache, "session", "old"));
+        assert!(!scoped_session_cache_contains(&cache, "session", "new"));
     }
 }

@@ -196,7 +196,7 @@ pub(crate) async fn process_nac_sqlite_db(
     let cp_key = checkpoint_key(&work.source_name, &source_file);
     let committed = { checkpoints.read().await.get(&cp_key).cloned() };
     let had_committed = committed.is_some();
-    let checkpoint = committed.unwrap_or(Checkpoint {
+    let mut checkpoint = committed.unwrap_or(Checkpoint {
         source_name: work.source_name.clone(),
         source_file: source_file.clone(),
         source_inode: inode,
@@ -205,29 +205,55 @@ pub(crate) async fn process_nac_sqlite_db(
         ..Default::default()
     });
     let committed_state = NacState::parse(&checkpoint.cursor_json);
-    let generation_changed = checkpoint.source_inode != inode;
     let current_exclusions_hash = super::project_exclusions_hash(config);
-    let exclusions_changed = committed_state.project_exclusions_hash != current_exclusions_hash;
-    let source_generation = if generation_changed {
-        checkpoint.source_generation.saturating_add(1).max(1)
-    } else {
-        checkpoint.source_generation
-    };
-    let mut scan_state = if generation_changed || exclusions_changed {
+    let policy_fingerprint =
+        super::sqlite_policy_fingerprint(SOURCE_FORMAT_NAC_SQLITE, current_exclusions_hash);
+    let generation_changed = had_committed && checkpoint.source_inode != inode;
+    let exclusions_changed =
+        had_committed && committed_state.project_exclusions_hash != current_exclusions_hash;
+    let retry_blocked_replay = checkpoint.status == "replaying"
+        || (checkpoint.status == "error" && !checkpoint.block_reason.is_empty());
+    let starts_replacement = generation_changed || exclusions_changed;
+    if starts_replacement {
+        checkpoint.source_generation =
+            crate::publication::checked_next_generation(checkpoint.source_generation)
+                .context("source generation exhausted while replacing nac_sqlite database")?;
+        checkpoint.source_inode = inode;
+        checkpoint.last_offset = 0;
+        checkpoint.last_line_no = 0;
+    }
+    let replacement_replay = starts_replacement || retry_blocked_replay;
+    let source_generation = checkpoint.source_generation;
+    let mut scan_state = if replacement_replay {
         NacState::default()
     } else {
         committed_state.clone()
     };
     scan_state.project_exclusions_hash = current_exclusions_hash;
-    if !generation_changed
-        && !exclusions_changed
+    checkpoint.policy_fingerprint = policy_fingerprint.clone();
+    checkpoint.status = if replacement_replay {
+        "replaying".to_string()
+    } else {
+        "active".to_string()
+    };
+    checkpoint.block_reason.clear();
+    let scan_boundary = checkpoint
+        .last_offset
+        .checked_add(1)
+        .context("nac_sqlite poll sequence exhausted")?;
+    if replacement_replay {
+        super::begin_database_replay(&sink_tx, &checkpoint, scan_boundary, &policy_fingerprint)
+            .await?;
+    }
+    if !starts_replacement
+        && !retry_blocked_replay
         && scan_state.stat == current_stat
         && scan_state.last_error.is_empty()
         && scan_state.schema_fingerprint != 0
     {
         return Ok(());
     }
-    if !exclusions_changed && poll_state.should_skip_poll(&cp_key, source_generation, &current_stat)
+    if !replacement_replay && poll_state.should_skip_poll(&cp_key, source_generation, &current_stat)
     {
         return Ok(());
     }
@@ -312,8 +338,8 @@ pub(crate) async fn process_nac_sqlite_db(
                 prior
             };
             let scan_is_noop = had_committed
-                && !generation_changed
-                && !exclusions_changed
+                && !starts_replacement
+                && !retry_blocked_replay
                 && records.is_empty()
                 && checkpoint.status == "active"
                 && new_state == prior_state_covered
@@ -323,7 +349,18 @@ pub(crate) async fn process_nac_sqlite_db(
                 return Ok(());
             }
 
+            if let Err(exc) = super::database_scan_still_valid(&source_file, inode) {
+                if replacement_replay {
+                    let mut blocked = checkpoint.clone();
+                    blocked.status = "error".to_string();
+                    blocked.block_reason = exc.to_string();
+                    super::block_database_replay(&sink_tx, &blocked, exc.to_string()).await?;
+                }
+                return Err(exc);
+            }
+
             let mut batch = RowBatch::default();
+            let mut replay_block_reason = None::<String>;
             for synthetic in &records {
                 if crate::dispatch::record_project_dir_is_excluded(
                     config,
@@ -352,18 +389,26 @@ pub(crate) async fn process_nac_sqlite_db(
                         batch.extend_normalized(normalized);
                         batch.lines_processed = batch.lines_processed.saturating_add(1);
                     }
-                    Err(exc) => batch.push_error_row(json!({
-                        "source_name": work.source_name,
-                        "harness": work.harness,
-                        "source_file": source_file,
-                        "source_inode": inode,
-                        "source_generation": source_generation,
-                        "source_line_no": synthetic.source_line_no,
-                        "source_offset": synthetic.source_offset,
-                        "error_kind": "normalize_error",
-                        "error_text": exc.to_string(),
-                        "raw_fragment": truncate_chars_local(&raw_json, 20_000),
-                    })),
+                    Err(exc) => {
+                        if replacement_replay && replay_block_reason.is_none() {
+                            replay_block_reason = Some(format!(
+                                "nac_sqlite row {} failed normalization: {exc}",
+                                synthetic.source_line_no
+                            ));
+                        }
+                        batch.push_error_row(json!({
+                            "source_name": work.source_name,
+                            "harness": work.harness,
+                            "source_file": source_file,
+                            "source_inode": inode,
+                            "source_generation": source_generation,
+                            "source_line_no": synthetic.source_line_no,
+                            "source_offset": synthetic.source_offset,
+                            "error_kind": "normalize_error",
+                            "error_text": exc.to_string(),
+                            "raw_fragment": truncate_chars_local(&raw_json, 20_000),
+                        }));
+                    }
                 }
                 if batch.exceeds_limits(config.ingest.batch_size, config.ingest.max_batch_bytes) {
                     let chunk = batch.drain_to_chunk();
@@ -375,22 +420,63 @@ pub(crate) async fn process_nac_sqlite_db(
             }
 
             let emitted = records.len();
-            batch.checkpoint = Some(Checkpoint {
+            let final_checkpoint = Checkpoint {
                 source_name: work.source_name.clone(),
                 source_file: source_file.clone(),
                 source_inode: inode,
                 source_generation,
-                last_offset: checkpoint.last_offset.saturating_add(1),
+                last_offset: scan_boundary,
                 last_line_no: relevant_rows,
-                status: "active".to_string(),
+                status: if replacement_replay {
+                    "replaying".to_string()
+                } else {
+                    "active".to_string()
+                },
                 cursor_json,
                 source_fingerprint: inode,
                 schema_fingerprint,
-            });
+                policy_fingerprint: policy_fingerprint.clone(),
+                scan_inode: inode,
+                scan_boundary,
+                final_scan_complete: !replacement_replay,
+                compatibility_prepared: !replacement_replay,
+                backend_caught_up: !replacement_replay,
+                ..checkpoint.clone()
+            };
+            batch.checkpoint = Some(final_checkpoint.clone());
             sink_tx
                 .send(SinkMessage::Batch(batch))
                 .await
                 .context("sink channel closed while sending final nac_sqlite batch")?;
+            if replacement_replay {
+                if let Some(reason) = replay_block_reason {
+                    let blocked_checkpoint = Checkpoint {
+                        status: "error".to_string(),
+                        final_scan_complete: false,
+                        compatibility_prepared: false,
+                        backend_caught_up: false,
+                        block_reason: reason.clone(),
+                        ..final_checkpoint
+                    };
+                    super::block_database_replay(&sink_tx, &blocked_checkpoint, reason).await?;
+                    poll_state.clear(&cp_key);
+                    return Ok(());
+                }
+                let active_checkpoint = Checkpoint {
+                    status: "active".to_string(),
+                    final_scan_complete: true,
+                    compatibility_prepared: true,
+                    backend_caught_up: true,
+                    ..final_checkpoint
+                };
+                super::finalize_database_replay(
+                    &sink_tx,
+                    &active_checkpoint,
+                    scan_boundary,
+                    &policy_fingerprint,
+                )
+                .await?;
+            }
             poll_state.clear(&cp_key);
             if emitted > 0 {
                 debug!(
@@ -406,7 +492,7 @@ pub(crate) async fn process_nac_sqlite_db(
             error_text,
         } => {
             poll_state.record_failed_scan(&cp_key);
-            if committed_state.last_error == error_kind {
+            if !replacement_replay && committed_state.last_error == error_kind {
                 return Ok(());
             }
             warn!(
@@ -423,27 +509,46 @@ pub(crate) async fn process_nac_sqlite_db(
                 "source_line_no": 0u64,
                 "source_offset": 0u64,
                 "error_kind": error_kind,
-                "error_text": error_text,
+                "error_text": error_text.clone(),
                 "raw_fragment": "",
             }));
             let mut failed_state = committed_state;
             failed_state.last_error = error_kind.to_string();
-            batch.checkpoint = Some(Checkpoint {
+            let error_checkpoint = Checkpoint {
                 source_name: work.source_name.clone(),
                 source_file: source_file.clone(),
-                source_inode: checkpoint.source_inode,
-                source_generation: checkpoint.source_generation,
+                source_inode: inode,
+                source_generation,
                 last_offset: checkpoint.last_offset,
                 last_line_no: checkpoint.last_line_no,
-                status: "active".to_string(),
+                status: if replacement_replay {
+                    "error".to_string()
+                } else {
+                    "active".to_string()
+                },
                 cursor_json: failed_state.serialize()?,
-                source_fingerprint: checkpoint.source_fingerprint,
+                source_fingerprint: inode,
                 schema_fingerprint: checkpoint.schema_fingerprint,
-            });
+                policy_fingerprint: policy_fingerprint.clone(),
+                scan_inode: inode,
+                scan_boundary,
+                block_reason: if replacement_replay {
+                    error_text.clone()
+                } else {
+                    String::new()
+                },
+                ..checkpoint.clone()
+            };
+            if !replacement_replay {
+                batch.checkpoint = Some(error_checkpoint.clone());
+            }
             sink_tx
                 .send(SinkMessage::Batch(batch))
                 .await
                 .context("sink channel closed while sending nac_sqlite error batch")?;
+            if replacement_replay {
+                super::block_database_replay(&sink_tx, &error_checkpoint, error_text).await?;
+            }
             Ok(())
         }
     }
@@ -1576,6 +1681,76 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    async fn drive_nac_poll(
+        config: &AppConfig,
+        work: &WorkItem,
+        checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
+        poll_state: &VolatilePollMap,
+    ) -> (Vec<RowBatch>, Vec<crate::CheckpointTransition>) {
+        let metrics = Arc::new(Metrics::default());
+        let (sink_tx, mut sink_rx) = mpsc::channel(8);
+        let process = process_nac_sqlite_db(
+            config,
+            work,
+            checkpoints.clone(),
+            poll_state,
+            sink_tx,
+            &metrics,
+        );
+        tokio::pin!(process);
+        let mut batches = Vec::new();
+        let mut transitions = Vec::new();
+        let mut committed = None;
+        loop {
+            tokio::select! {
+                result = &mut process => {
+                    result.expect("NAC poll should complete");
+                    break;
+                }
+                message = sink_rx.recv() => match message.expect("NAC test sink remains open") {
+                    SinkMessage::Batch(batch) => batches.push(batch),
+                    SinkMessage::BeginReplay { transition, ack }
+                    | SinkMessage::BlockReplay { transition, ack }
+                    | SinkMessage::MirrorCaughtUp { transition, ack } => {
+                        committed = Some(transition.checkpoint.clone());
+                        let _ = ack.send(Ok(crate::publication::ReplayBarrierAck {
+                            checkpoint_revision: 1,
+                            operation_id: transition.operation_id.clone(),
+                        }));
+                        transitions.push(transition);
+                    }
+                    SinkMessage::FinalizeReplay { transition, ack } => {
+                        committed = Some(transition.checkpoint.clone());
+                        let _ = ack.send(Ok(
+                            crate::publication::FinalizeReplayOutcome::Published(
+                                crate::publication::PublicationAck {
+                                    checkpoint_revision: 2,
+                                    publication_revision: 1,
+                                    already_published: false,
+                                },
+                            ),
+                        ));
+                        transitions.push(transition);
+                    }
+                }
+            }
+        }
+        while let Ok(message) = sink_rx.try_recv() {
+            if let SinkMessage::Batch(batch) = message {
+                batches.push(batch);
+            }
+        }
+        if let Some(checkpoint) =
+            committed.or_else(|| batches.last().and_then(|batch| batch.checkpoint.clone()))
+        {
+            checkpoints.write().await.insert(
+                checkpoint_key(&checkpoint.source_name, &checkpoint.source_file),
+                checkpoint,
+            );
+        }
+        (batches, transitions)
+    }
+
     #[test]
     fn normalizes_both_nac_timestamp_precisions() {
         assert_eq!(
@@ -1828,41 +2003,18 @@ mod tests {
         };
         let checkpoints = Arc::new(RwLock::new(HashMap::new()));
         let poll_state = VolatilePollMap::new();
-        let metrics = Arc::new(Metrics::default());
-        let (sink_tx, mut sink_rx) = mpsc::channel(4);
         let mut excluded = AppConfig::default();
         excluded.ingest.exclude_project_dirs = vec!["/workspace/local/**".to_string()];
 
-        process_nac_sqlite_db(
-            &excluded,
-            &work,
-            checkpoints.clone(),
-            &poll_state,
-            sink_tx.clone(),
-            &metrics,
-        )
-        .await
-        .expect("scan with local project excluded");
-        let SinkMessage::Batch(first_batch) = sink_rx.recv().await.expect("first NAC batch");
+        let (first, _) = drive_nac_poll(&excluded, &work, &checkpoints, &poll_state).await;
+        let first_batch = first.last().expect("first NAC batch");
         assert_eq!(first_batch.raw_rows.len(), 6);
-        let checkpoint = first_batch.checkpoint.expect("first checkpoint");
-        checkpoints
-            .write()
-            .await
-            .insert(checkpoint_key("nac-fixture", &source_file), checkpoint);
 
         let included = AppConfig::default();
-        process_nac_sqlite_db(
-            &included,
-            &work,
-            checkpoints,
-            &poll_state,
-            sink_tx,
-            &metrics,
-        )
-        .await
-        .expect("replay after exclusion changes");
-        let SinkMessage::Batch(replayed_batch) = sink_rx.recv().await.expect("replayed NAC batch");
+        let (replayed, transitions) =
+            drive_nac_poll(&included, &work, &checkpoints, &poll_state).await;
+        assert_eq!(transitions.len(), 2, "begin and final replay barriers");
+        let replayed_batch = replayed.last().expect("replayed NAC batch");
         assert_eq!(
             replayed_batch.raw_rows.len(),
             19,
@@ -1901,7 +2053,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_replacement_does_not_checkpoint_a_phantom_generation() {
+    async fn failed_replacement_durably_blocks_the_candidate_generation() {
         let path = fixture_db();
         let source_file = path.to_string_lossy().to_string();
         let work = WorkItem {
@@ -1914,45 +2066,36 @@ mod tests {
         let config = AppConfig::default();
         let checkpoints = Arc::new(RwLock::new(HashMap::new()));
         let poll_state = VolatilePollMap::new();
-        let metrics = Arc::new(Metrics::default());
-        let (sink_tx, mut sink_rx) = mpsc::channel(4);
-        process_nac_sqlite_db(
-            &config,
-            &work,
-            checkpoints.clone(),
-            &poll_state,
-            sink_tx.clone(),
-            &metrics,
-        )
-        .await
-        .expect("initial valid scan");
-        let SinkMessage::Batch(initial_batch) = sink_rx.recv().await.expect("initial NAC batch");
-        let checkpoint = initial_batch.checkpoint.expect("initial checkpoint");
-        let committed_inode = checkpoint.source_inode;
+        let (initial, _) = drive_nac_poll(&config, &work, &checkpoints, &poll_state).await;
+        let checkpoint = initial
+            .last()
+            .and_then(|batch| batch.checkpoint.as_ref())
+            .expect("initial checkpoint");
         let committed_generation = checkpoint.source_generation;
-        checkpoints
-            .write()
-            .await
-            .insert(checkpoint_key("nac-fixture", &source_file), checkpoint);
 
         let replacement = path.with_extension("replacement");
         std::fs::write(&replacement, b"not a sqlite database").expect("write invalid replacement");
         std::fs::remove_file(&path).expect("remove fixture database");
         std::fs::rename(&replacement, &path).expect("install invalid replacement");
-        process_nac_sqlite_db(&config, &work, checkpoints, &poll_state, sink_tx, &metrics)
-            .await
-            .expect("failed replacement is reported as a batch");
-        let SinkMessage::Batch(failed_batch) = sink_rx.recv().await.expect("failed NAC batch");
+        let (failed, transitions) = drive_nac_poll(&config, &work, &checkpoints, &poll_state).await;
+        let failed_batch = failed.last().expect("failed NAC batch");
         assert_eq!(failed_batch.error_rows.len(), 1);
         assert_eq!(
             failed_batch.error_rows[0]["source_generation"],
             committed_generation.saturating_add(1)
         );
-        let retained = failed_batch
-            .checkpoint
-            .expect("failure checkpoint retains committed identity");
-        assert_eq!(retained.source_inode, committed_inode);
-        assert_eq!(retained.source_generation, committed_generation);
+        assert!(
+            failed_batch.checkpoint.is_none(),
+            "an error batch cannot make a replacement generation active"
+        );
+        assert_eq!(transitions.len(), 2, "begin then durable block");
+        let blocked = transitions.last().expect("blocked transition");
+        assert_eq!(blocked.lifecycle.as_str(), "error");
+        assert_eq!(
+            blocked.checkpoint.source_generation,
+            committed_generation + 1
+        );
+        assert!(!blocked.block_reason.is_empty());
 
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(format!("{}-wal", path.display())).ok();
@@ -2006,7 +2149,10 @@ mod tests {
         )
         .await
         .expect("oversized scan reports an ingest error");
-        let SinkMessage::Batch(batch) = sink_rx.recv().await.expect("oversized failure batch");
+        let SinkMessage::Batch(batch) = sink_rx.recv().await.expect("oversized failure batch")
+        else {
+            panic!("expected oversized failure batch");
+        };
         assert!(batch.raw_rows.is_empty());
         assert!(batch.event_rows.is_empty());
         assert!(batch.tool_rows.is_empty());

@@ -331,7 +331,7 @@ async fn file_attention_all_scope_keeps_the_configured_server_floor_only() {
     let queries = state.queries.lock().expect("queries lock").clone();
     let attention_queries = queries
         .iter()
-        .filter(|query| query.contains("FROM `moraine`.`tool_io` FINAL"))
+        .filter(|query| query.contains("FROM `moraine`.`v_live_tool_io`"))
         .collect::<Vec<_>>();
     assert_eq!(attention_queries.len(), 2);
     for query in attention_queries {

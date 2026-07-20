@@ -18,14 +18,16 @@ performance-fixture oracle and timed outside the process with
 
 The command intentionally does not install ClickHouse, migrate a database, or
 seed user state. Point `--config` at a caller-owned, migrated database already
-seeded with the matching `scripts/bench/performance_fixtures.py` profile. The
+seeded with the matching `scripts/bench/performance_fixtures.py` profile,
+including its active causal checkpoint, readiness row, and generation-1 source
+head. The
 config must live outside `~/.moraine`, explicitly select a loopback ClickHouse
 HTTP endpoint and a non-default database name, and resolve only the default
 backend. Non-default `[[routes]]` and repository `.moraine.toml` backend markers
 are rejected. The harness executes from an owned neutral directory, verifies
 that ClickHouse itself is a Darwin build, and checks exact event/search-index
-cardinality plus MCP projection readiness and dirty-session lag before and
-after measurement. These checks prevent an innocent `--route-cwd` from silently
+cardinality, publication/checkpoint/append-control state, plus MCP projection
+readiness and dirty-session lag before and after measurement. These checks prevent an innocent `--route-cwd` from silently
 selecting Docker, a remote server, or live state.
 
 Use a native arm64 release binary; debug binaries and non-native Python
@@ -62,11 +64,13 @@ gate miss makes the artifact fail.
 
 `--collect-query-log` reads the configured ClickHouse `system.query_log` after
 the owned daemons stop. It filters on their exact generated query-id prefixes
-and retains only numeric candidate/detail counts, latency, rows, bytes, result
-rows, memory, and exception counts. Every cold lifecycle must show exactly one
-candidate and one detail statement per accepted request. A steady lifecycle may
-show exactly one warmup pair per selected case, but its measured window must
-show zero statements (completed-result cache hits). Missing, extra, exceptional,
+and retains only numeric publication capture, append-fence capture, candidate,
+detail, publication revalidation, and append-fence revalidation counts,
+latency, rows, bytes, result rows, memory, and exception counts. Every cold
+lifecycle must show exactly one of all six statements per accepted request. A
+steady lifecycle shows one six-statement warmup per selected case; its measured
+cache hits must show the four control statements and zero candidate/detail
+statements. Missing, extra, exceptional,
 unknown-shape, or unattributed statements fail the run. SQL, query text, credentials, and
 responses are never retained. Evidence requests revalidate the loopback URL and
 explicitly disable environment HTTP proxies. The ClickHouse account in

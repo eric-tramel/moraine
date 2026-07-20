@@ -18,6 +18,7 @@ from performance_fixtures import (  # noqa: E402
     FixtureError,
     OneUseTermBank,
     SPLITS,
+    build_append_probe_events,
     build_recipe,
     codex_event_lines,
     compute_fingerprints,
@@ -27,6 +28,7 @@ from performance_fixtures import (  # noqa: E402
     open_query_schedule,
     required_split_usage,
     seed_manifest,
+    seed_publication_control_sql,
     seed_search_sql,
     validate_event_result,
     validate_query_result,
@@ -214,6 +216,34 @@ class ScheduleAndTermBankTests(unittest.TestCase):
     def setUp(self) -> None:
         self.recipe = build_recipe("smoke")
 
+    def test_append_probe_events_share_one_generation_and_track_exact_offsets(self) -> None:
+        events = build_append_probe_events(3, term_count=4)
+
+        self.assertEqual(
+            {event["destination_filename"] for event in events},
+            {"source-publication-append.jsonl"},
+        )
+        self.assertEqual(
+            [event["expected_source_generation"] for event in events],
+            [1, 1, 1],
+        )
+        self.assertEqual(
+            [event["expected_source_line_no"] for event in events],
+            [2, 4, 6],
+        )
+        self.assertEqual(
+            [event["expected_source_offset"] for event in events],
+            sorted(event["expected_source_offset"] for event in events),
+        )
+        self.assertEqual(
+            len({event["normalized_event_uid"] for event in events}),
+            len(events),
+        )
+        self.assertEqual(events, build_append_probe_events(3, term_count=4))
+
+        with self.assertRaisesRegex(FixtureError, "bounded positive"):
+            build_append_probe_events(0)
+
     def test_query_schedule_is_open_deterministic_and_response_independent(self) -> None:
         schedule = open_query_schedule(self.recipe, "research", 4)
         self.assertEqual(schedule, open_query_schedule(self.recipe, "research", 4))
@@ -297,6 +327,20 @@ class SeedTests(unittest.TestCase):
         self.assertNotIn(expected_id, serialized_manifest)
         self.assertNotIn(expected_id, sql)
         self.assertNotIn("ordered_identities", serialized_manifest)
+
+    def test_publication_control_seed_is_causal_and_publishes_the_head_last(self) -> None:
+        statements = seed_publication_control_sql(self.target, self.recipe)
+
+        self.assertEqual(len(statements), 3)
+        self.assertIn("ingest_checkpoint_transitions", statements[0])
+        self.assertIn("source_generation_publication_readiness", statements[1])
+        self.assertIn("published_source_generations", statements[2])
+        self.assertIn("'active'", statements[0])
+        self.assertIn("final_scan_complete", statements[0])
+        self.assertIn("compatibility_prepared", statements[1])
+        self.assertIn("publication_revision", statements[2])
+        self.assertTrue(all("DROP " not in sql.upper() for sql in statements))
+        self.assertTrue(all("TRUNCATE" not in sql.upper() for sql in statements))
 
     def test_event_serializer_binds_publish_filename_ack_and_every_probe(self) -> None:
         event = self.recipe["event_splits"]["holdout"][0]

@@ -107,6 +107,7 @@ use crate::repo::ConversationRepository;
 
 mod analytics;
 mod cache;
+mod consistency;
 mod file_attention;
 mod helpers;
 mod list;
@@ -123,6 +124,7 @@ mod sql;
 mod tests;
 
 use cache::*;
+use consistency::*;
 use helpers::*;
 use rows::*;
 use sql::*;
@@ -131,32 +133,45 @@ use sql::*;
 pub struct ClickHouseConversationRepository {
     ch: ClickHouseClient,
     cfg: RepoConfig,
+    publication_mode: PublicationConsistencyMode,
     stats_cache: Arc<RwLock<SearchStatsCache>>,
     search_cache: Arc<RwLock<HashMap<String, SearchEventsCacheEntry>>>,
     mcp_search_cache: Arc<RwLock<HashMap<String, SearchMcpEventsCacheEntry>>>,
     term_postings_cache: Arc<RwLock<HashMap<String, TermPostingsCacheEntry>>>,
     search_doc_extra_cache: Arc<RwLock<HashMap<String, SearchDocExtraCacheEntry>>>,
     analytics_cache: Arc<[Mutex<Option<AnalyticsCacheEntry>>; ANALYTICS_RANGE_COUNT]>,
-    /// Sessions already proven to fall inside `cfg.session_scope`. A session's
-    /// origin directory is its first recorded cwd and never changes, so
-    /// positive results are cacheable forever. Negative results are NOT
-    /// cached: a freshly started session may not have ingested its first
-    /// cwd-bearing event yet.
-    scoped_session_cache: Arc<RwLock<std::collections::HashSet<String>>>,
+    /// Sessions already proven to fall inside `cfg.session_scope`, mapped to
+    /// the publication token under which that proof was obtained. A new proof
+    /// replaces the prior revision for the same session, and the total entry
+    /// count is bounded. Negative results are not cached.
+    scoped_session_cache: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl ClickHouseConversationRepository {
     pub fn new(ch: ClickHouseClient, cfg: RepoConfig) -> Self {
+        Self::new_with_publication_mode(ch, cfg, PublicationConsistencyMode::Local)
+    }
+
+    pub(crate) fn new_shared(ch: ClickHouseClient, cfg: RepoConfig) -> Self {
+        Self::new_with_publication_mode(ch, cfg, PublicationConsistencyMode::Shared)
+    }
+
+    pub(crate) fn new_with_publication_mode(
+        ch: ClickHouseClient,
+        cfg: RepoConfig,
+        publication_mode: PublicationConsistencyMode,
+    ) -> Self {
         Self {
             ch,
             cfg,
+            publication_mode,
             stats_cache: Arc::new(RwLock::new(SearchStatsCache::default())),
             search_cache: Arc::new(RwLock::new(HashMap::new())),
             mcp_search_cache: Arc::new(RwLock::new(HashMap::new())),
             term_postings_cache: Arc::new(RwLock::new(HashMap::new())),
             search_doc_extra_cache: Arc::new(RwLock::new(HashMap::new())),
             analytics_cache: Arc::new(std::array::from_fn(|_| Mutex::new(None))),
-            scoped_session_cache: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            scoped_session_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 

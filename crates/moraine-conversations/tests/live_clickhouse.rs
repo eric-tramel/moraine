@@ -4,8 +4,8 @@ use moraine_config::{AppConfig, ClickHouseConfig, DEFAULT_BACKEND_NAME};
 use moraine_conversations::{
     with_repository_query_id, AnalyticsRange, BackendRepositoryRouter,
     ClickHouseConversationRepository, ConversationListSort, ConversationRepository,
-    McpSessionListFilter, PageRequest, RepoConfig, SessionAnalyticsQuery, SessionLookback,
-    TurnListFilter,
+    McpSessionListFilter, PageRequest, RepoConfig, RepoError, SessionAnalyticsQuery,
+    SessionLookback, TurnListFilter,
 };
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+#[path = "live_clickhouse/source_publication.rs"]
+mod source_publication;
 #[path = "live_clickhouse/support.rs"]
 mod support;
 
@@ -412,6 +414,90 @@ VALUES
         .request_text(&omp_insert, None, Some(database), false, None)
         .await
         .context("failed to insert OMP session metadata fixtures")?;
+    Ok(())
+}
+
+async fn publish_missing_schema_fixture_sources(
+    clickhouse: &ClickHouseClient,
+    database: &OwnedDatabaseName,
+) -> Result<()> {
+    let database = database.as_str();
+    let publish = format!(
+        r#"INSERT INTO `{database}`.`published_source_generations`
+(
+  source_host, source_name, source_file, source_generation, publication_revision,
+  publisher_id, operation_id, published_at
+)
+WITH
+  (
+    SELECT ifNull(max(publication_revision), toUInt64(0))
+    FROM `{database}`.`v_published_source_generation_history`
+  ) AS base_revision
+SELECT
+  source_host,
+  source_name,
+  source_file,
+  source_generation,
+  base_revision + toUInt64(row_number() OVER (
+    ORDER BY source_host, source_name, source_file
+  )) AS publication_revision,
+  'live-schema-fixture' AS publisher_id,
+  concat('live-schema-fixture:', hex(cityHash64(
+    source_host, source_name, source_file, source_generation
+  ))) AS operation_id,
+  now64(3) AS published_at
+FROM
+(
+  SELECT
+    source_host,
+    source_name,
+    source_file,
+    max(source_generation) AS source_generation
+  FROM `{database}`.`events` FINAL
+  WHERE tuple(source_host, toString(source_name), source_file) NOT IN
+  (
+    SELECT tuple(source_host, toString(source_name), source_file)
+    FROM `{database}`.`v_current_published_source_generations`
+  )
+  GROUP BY source_host, source_name, source_file
+)"#
+    );
+    clickhouse
+        .request_text(&publish, None, Some(database), false, None)
+        .await
+        .context("failed to publish live-schema fixture source heads")?;
+
+    #[derive(Deserialize)]
+    struct MissingHeadCount {
+        value: u64,
+    }
+    let missing = clickhouse
+        .query_rows::<MissingHeadCount>(
+            &format!(
+                r#"SELECT count() AS value
+FROM
+(
+  SELECT DISTINCT source_host, source_name, source_file, source_generation
+  FROM `{database}`.`events` FINAL
+) AS events
+LEFT ANTI JOIN `{database}`.`v_current_published_source_generations` AS heads
+  ON events.source_host = heads.source_host
+ AND events.source_name = heads.source_name
+ AND events.source_file = heads.source_file
+ AND events.source_generation = heads.source_generation
+FORMAT JSONEachRow"#
+            ),
+            Some(database),
+        )
+        .await
+        .context("failed to verify live-schema fixture source heads")?
+        .into_iter()
+        .next()
+        .context("live-schema fixture source-head verification returned no row")?
+        .value;
+    if missing != 0 {
+        bail!("live-schema fixture has {missing} unpublished source generation(s)");
+    }
     Ok(())
 }
 
@@ -866,6 +952,10 @@ async fn live_schema_semantics_and_teardown() -> Result<()> {
         assert!(legacy_heartbeat.latest.is_none());
 
         install_schema_fixture(&clickhouse, &database).await?;
+        // This fixture writes physical rows directly rather than exercising the
+        // ingest publication actor. Mirror the actor's final authorization step
+        // so canonical live views can observe only the fixture's published rows.
+        publish_missing_schema_fixture_sources(&clickhouse, &database).await?;
         clickhouse
             .backfill_mcp_open_read_model()
             .await
@@ -1262,12 +1352,11 @@ SELECT
             )
             .await
             .context("failed to insert unprojected canonical replacement")?;
-        let still_committed = populated_repository
-            .get_mcp_event("issue454-dedup")
-            .await
-            .context("committed event read failed during dirty window")?
-            .context("committed event missing during dirty window")?;
-        assert_eq!(still_committed.event.text_content, "replacement-final");
+        let dirty_read = populated_repository.get_mcp_event("issue454-dedup").await;
+        assert!(
+            matches!(dirty_read, Err(RepoError::ReadModelChanged)),
+            "strict MCP open must fence a compatibility header whose source digest is stale: {dirty_read:?}"
+        );
         clickhouse
             .backfill_mcp_open_read_model()
             .await
@@ -1306,6 +1395,7 @@ VALUES
             )
             .await
             .context("failed to insert ordering fixture")?;
+        publish_missing_schema_fixture_sources(&clickhouse, &database).await?;
         clickhouse
             .refresh_mcp_open_read_model(["issue532-order-session"])
             .await
@@ -1819,6 +1909,30 @@ async fn live_monitor_repository_semantic_parity() -> Result<()> {
             .context("failed to remove owned monitor static directory");
         let monitor_cleanup = finish_with_cleanup(server_result, static_cleanup);
         finish_with_cleanup(parity, monitor_cleanup)
+    }
+    .await;
+
+    let cleanup = cleanup_database(&clickhouse, &database).await;
+    let census = assert_owned_database_census_empty(&clickhouse, "after cleanup").await;
+    finish_with_cleanup(outcome, finish_with_cleanup(cleanup, census))
+}
+
+#[tokio::test]
+#[ignore = "requires wrapper-owned live ClickHouse and destructive opt-in"]
+async fn live_source_publication_cutover_crash_recovery() -> Result<()> {
+    let prerequisites = LivePrerequisites::load()?;
+    let database = prepare_owned_database_identity(&prerequisites.sandbox_id)?;
+    let clickhouse = live_client(&prerequisites, &database)?;
+    assert_owned_database_census_empty(&clickhouse, "before mutation").await?;
+
+    let outcome = async {
+        let migration_started = Instant::now();
+        clickhouse
+            .run_migrations()
+            .await
+            .context("failed to migrate source-publication database")?;
+        let migration_ms = migration_started.elapsed().as_millis() as u64;
+        source_publication::run(&clickhouse, &database, migration_ms).await
     }
     .await;
 

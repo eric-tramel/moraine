@@ -1,8 +1,9 @@
 use super::{escape_identifier, escape_literal, ClickHouseClient};
 use anyhow::{bail, Context, Result};
 use futures_util::{stream, TryStreamExt};
-use serde::Deserialize;
-use std::collections::BTreeSet;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 
 const BACKFILL_PAGE_SIZE: usize = 64;
 const REFRESH_CONCURRENCY: usize = 4;
@@ -10,12 +11,76 @@ const MAX_UNSTABLE_REFRESH_ATTEMPTS: usize = 8;
 const MAX_PROJECTED_TEXT_SUMMARY_CHARS: usize = 65_536;
 const MAX_PROJECTED_PAYLOAD_SUMMARY_CHARS: usize = 131_071;
 
+/// One exact source head required by a prepared MCP compatibility candidate.
+///
+/// Ordering is part of the durable protocol: callers may supply heads in any
+/// order, but the projector always stores and fingerprints the canonical
+/// sorted, de-duplicated representation.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct McpOpenSourceHead {
+    pub source_host: String,
+    pub source_name: String,
+    pub source_file: String,
+    pub source_generation: u32,
+    pub publication_revision: u64,
+}
+
+/// A bounded replacement-generation compatibility preparation request.
+///
+/// `required_source_heads` is the complete desired backend head set. The
+/// projector stores only the subset required by each affected session, plus
+/// the target source head so a disappearance tombstone cannot authorize
+/// before the source cutover.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpOpenPublicationRequest {
+    pub candidate_publication_id: String,
+    pub operation_id: String,
+    pub publisher_id: String,
+    pub source_host: String,
+    pub source_name: String,
+    pub source_file: String,
+    pub previous_source_generation: Option<u32>,
+    pub source_generation: u32,
+    pub required_source_heads: Vec<McpOpenSourceHead>,
+}
+
+/// Durable preparation facts consumed by the source-publication actor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpOpenGenerationReadiness {
+    pub candidate_publication_id: String,
+    pub affected_session_count: u64,
+    pub prepared_session_count: u64,
+    pub tombstone_count: u64,
+    pub required_heads_fingerprint: String,
+    pub candidate_digest: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct SessionHeadRow {
+    slot: u8,
+}
+
+#[derive(Debug, Deserialize)]
+struct CandidateHeaderRow {
+    session_id: String,
     slot: u8,
     generation: u64,
     source_revision: u64,
     dirty_revision: u64,
+    tombstone: u8,
+    required_heads_fingerprint: String,
+}
+
+struct CandidateHeaderInsert<'a> {
+    session_id: &'a str,
+    candidate_publication_id: &'a str,
+    operation_id: &'a str,
+    publisher_id: &'a str,
+    slot: u8,
+    generation: u64,
+    source_revision: u64,
+    dirty_revision: u64,
+    required_heads: &'a [McpOpenSourceHead],
 }
 
 #[derive(Debug, Deserialize)]
@@ -31,6 +96,25 @@ struct DirtyRevisionRow {
 #[derive(Debug, Deserialize)]
 struct SessionIdRow {
     session_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SourceHeadRow {
+    source_host: String,
+    source_name: String,
+    source_file: String,
+    source_generation: u32,
+    publication_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RequiredHeadsRow {
+    required_source_heads: Vec<SourceHeadRow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadyRow {
+    ready: u8,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,6 +136,117 @@ where
         .collect()
 }
 
+fn canonical_source_heads(heads: &[McpOpenSourceHead]) -> Result<Vec<McpOpenSourceHead>> {
+    let mut by_key = BTreeMap::new();
+    for head in heads {
+        let key = (
+            head.source_host.clone(),
+            head.source_name.clone(),
+            head.source_file.clone(),
+        );
+        if let Some(previous) = by_key.insert(key.clone(), head.clone()) {
+            if previous != *head {
+                bail!(
+                    "conflicting MCP source heads for ({:?}, {:?}, {:?})",
+                    key.0,
+                    key.1,
+                    key.2
+                );
+            }
+        }
+    }
+    Ok(by_key.into_values().collect())
+}
+
+fn source_heads_fingerprint(heads: &[McpOpenSourceHead]) -> String {
+    let mut hasher = Sha256::new();
+    for head in heads {
+        for value in [
+            head.source_host.as_bytes(),
+            head.source_name.as_bytes(),
+            head.source_file.as_bytes(),
+        ] {
+            hasher.update((value.len() as u64).to_be_bytes());
+            hasher.update(value);
+        }
+        hasher.update(head.source_generation.to_be_bytes());
+        hasher.update(head.publication_revision.to_be_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn source_heads_sql(heads: &[McpOpenSourceHead]) -> String {
+    let rows = heads
+        .iter()
+        .map(|head| {
+            format!(
+                "tuple({}, {}, {}, toUInt32({}), toUInt64({}))",
+                escape_literal(&head.source_host),
+                escape_literal(&head.source_name),
+                escape_literal(&head.source_file),
+                head.source_generation,
+                head.publication_revision,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{rows}]")
+}
+
+fn source_head_filter(heads: &[McpOpenSourceHead], alias: &str) -> String {
+    if heads.is_empty() {
+        return "0".to_string();
+    }
+    heads
+        .iter()
+        .map(|head| {
+            format!(
+                "({alias}.source_host = {} AND {alias}.source_name = {} AND {alias}.source_file = {} AND {alias}.source_generation = {})",
+                escape_literal(&head.source_host),
+                escape_literal(&head.source_name),
+                escape_literal(&head.source_file),
+                head.source_generation,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+fn source_head_key_eq(left: &McpOpenSourceHead, right: &McpOpenSourceHead) -> bool {
+    left.source_host == right.source_host
+        && left.source_name == right.source_name
+        && left.source_file == right.source_file
+}
+
+fn source_head_from_row(row: SourceHeadRow) -> McpOpenSourceHead {
+    McpOpenSourceHead {
+        source_host: row.source_host,
+        source_name: row.source_name,
+        source_file: row.source_file,
+        source_generation: row.source_generation,
+        publication_revision: row.publication_revision,
+    }
+}
+
+fn candidate_headers_digest(rows: &[CandidateHeaderRow]) -> String {
+    let mut hasher = Sha256::new();
+    for row in rows {
+        for value in [
+            row.session_id.as_bytes(),
+            row.required_heads_fingerprint.as_bytes(),
+        ] {
+            hasher.update((value.len() as u64).to_be_bytes());
+            hasher.update(value);
+        }
+        hasher.update([row.slot]);
+        hasher.update(row.generation.to_be_bytes());
+        hasher.update(row.source_revision.to_be_bytes());
+        hasher.update(row.dirty_revision.to_be_bytes());
+        hasher.update([row.tombstone]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 impl ClickHouseClient {
     /// Rebuild complete canonical snapshots for the affected sessions and
     /// publish each session head only after its inactive children are durable.
@@ -64,9 +259,166 @@ impl ClickHouseClient {
 
         stream::iter(session_ids.into_iter().map(Ok::<_, anyhow::Error>))
             .try_for_each_concurrent(REFRESH_CONCURRENCY, |session_id| async move {
-                self.refresh_mcp_open_session(&session_id).await
+                let required_heads = self.current_session_source_heads(&session_id).await?;
+                if required_heads.is_empty() {
+                    return Ok(());
+                }
+                let candidate_publication_id = format!(
+                    "append:{}:{}",
+                    session_id,
+                    self.next_projection_generation().await?
+                );
+                self.refresh_mcp_open_session(
+                    &session_id,
+                    &candidate_publication_id,
+                    &candidate_publication_id,
+                    "ordinary-append",
+                    &required_heads,
+                    true,
+                )
+                .await
+                .map(|_| ())
             })
             .await
+    }
+
+    /// Prepare one replacement generation's complete old/new affected-session
+    /// union without changing the legacy session pointer or source head.
+    ///
+    /// The returned readiness row is persisted only after every candidate
+    /// header (including disappearances) is durable. Callers must switch the
+    /// source head after this succeeds, then invoke
+    /// [`activate_mcp_open_publication`](Self::activate_mcp_open_publication)
+    /// once to reconcile the compatibility pointer.
+    pub async fn prepare_mcp_open_publication(
+        &self,
+        request: &McpOpenPublicationRequest,
+    ) -> Result<McpOpenGenerationReadiness> {
+        if request.candidate_publication_id.trim().is_empty() {
+            bail!("MCP candidate publication id cannot be empty");
+        }
+        if request.operation_id.trim().is_empty() {
+            bail!("MCP publication operation id cannot be empty");
+        }
+
+        let required_heads = canonical_source_heads(&request.required_source_heads)?;
+        let target_head = McpOpenSourceHead {
+            source_host: request.source_host.clone(),
+            source_name: request.source_name.clone(),
+            source_file: request.source_file.clone(),
+            source_generation: request.source_generation,
+            publication_revision: required_heads
+                .iter()
+                .find(|head| {
+                    head.source_host == request.source_host
+                        && head.source_name == request.source_name
+                        && head.source_file == request.source_file
+                        && head.source_generation == request.source_generation
+                })
+                .map(|head| head.publication_revision)
+                .context("desired MCP source head is absent from required_source_heads")?,
+        };
+        let affected_sessions = self
+            .mcp_open_affected_sessions(request.previous_source_generation, &target_head)
+            .await?;
+        let affected_session_count = affected_sessions.len() as u64;
+        let mut prepared_session_count = 0_u64;
+        let mut tombstone_count = 0_u64;
+        let mut candidate_rows = Vec::with_capacity(affected_sessions.len());
+
+        for session_id in affected_sessions {
+            let mut session_heads = self
+                .session_source_heads_for_snapshot(&session_id, &required_heads)
+                .await?;
+            if !session_heads
+                .iter()
+                .any(|head| source_head_key_eq(head, &target_head))
+            {
+                session_heads.push(target_head.clone());
+                session_heads = canonical_source_heads(&session_heads)?;
+            }
+
+            let has_live_events = self
+                .session_source_revision_for_heads(&session_id, &session_heads)
+                .await?
+                != 0;
+            let candidate = if has_live_events {
+                let candidate = self
+                    .refresh_mcp_open_session(
+                        &session_id,
+                        &request.candidate_publication_id,
+                        &request.operation_id,
+                        &request.publisher_id,
+                        &session_heads,
+                        false,
+                    )
+                    .await?;
+                prepared_session_count += 1;
+                candidate
+            } else {
+                tombstone_count += 1;
+                prepared_session_count += 1;
+                self.insert_mcp_open_tombstone(
+                    &session_id,
+                    &request.candidate_publication_id,
+                    &request.operation_id,
+                    &request.publisher_id,
+                    &session_heads,
+                )
+                .await?
+            };
+            candidate_rows.push(candidate);
+        }
+
+        candidate_rows.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+        let candidate_digest = candidate_headers_digest(&candidate_rows);
+        let required_heads_fingerprint = source_heads_fingerprint(&required_heads);
+        let readiness = McpOpenGenerationReadiness {
+            candidate_publication_id: request.candidate_publication_id.clone(),
+            affected_session_count,
+            prepared_session_count,
+            tombstone_count,
+            required_heads_fingerprint,
+            candidate_digest,
+        };
+        self.insert_mcp_open_generation_readiness(request, &required_heads, &readiness, true, "")
+            .await?;
+        Ok(readiness)
+    }
+
+    /// Revalidate an already prepared candidate against the now-current source
+    /// heads and dirty/source revisions, then update the legacy compatibility
+    /// session pointers. Header authorization remains the primary read path.
+    pub async fn activate_mcp_open_publication(
+        &self,
+        candidate_publication_id: &str,
+    ) -> Result<bool> {
+        let candidates = self
+            .mcp_open_candidate_headers(candidate_publication_id)
+            .await?;
+        if candidates.is_empty() {
+            return self
+                .mcp_open_candidate_generation_ready(candidate_publication_id)
+                .await;
+        }
+        for candidate in &candidates {
+            let heads = self
+                .mcp_open_candidate_required_heads(&candidate.session_id, candidate_publication_id)
+                .await?;
+            if !self.source_heads_are_current(&heads).await?
+                || self.session_dirty_revision(&candidate.session_id).await?
+                    != candidate.dirty_revision
+                || self
+                    .session_source_revision_for_heads(&candidate.session_id, &heads)
+                    .await?
+                    != candidate.source_revision
+            {
+                return Ok(false);
+            }
+        }
+        self.publish_legacy_candidate_heads(candidate_publication_id)
+            .await?;
+        Ok(true)
     }
 
     /// Resume the historical projection and reconcile sessions dirtied while
@@ -96,7 +448,7 @@ impl ClickHouseClient {
                     "SELECT session_id\n\
                      FROM (\n\
                        SELECT DISTINCT session_id\n\
-                       FROM {}.events FINAL\n\
+                       FROM {}.v_live_events\n\
                        WHERE session_id > {}\n\
                          AND notEmpty(session_id)\n\
                      )\n\
@@ -130,6 +482,11 @@ impl ClickHouseClient {
                    SELECT session_id, dirty_revision\n\
                    FROM {}.mcp_open_dirty_sessions FINAL\n\
                  ) AS d\n\
+                 INNER JOIN (\n\
+                   SELECT DISTINCT session_id\n\
+                   FROM {}.v_live_events\n\
+                   WHERE notEmpty(session_id)\n\
+                 ) AS live ON live.session_id = d.session_id\n\
                  LEFT JOIN (\n\
                    SELECT session_id, dirty_revision\n\
                    FROM {}.mcp_open_sessions FINAL\n\
@@ -139,6 +496,7 @@ impl ClickHouseClient {
                  ORDER BY d.session_id ASC\n\
                  LIMIT {}\n\
                  FORMAT JSONEachRow",
+                escape_identifier(&self.cfg.database),
                 escape_identifier(&self.cfg.database),
                 escape_identifier(&self.cfg.database),
                 BACKFILL_PAGE_SIZE,
@@ -172,9 +530,13 @@ impl ClickHouseClient {
             "SELECT ready, backfill_cursor\n\
              FROM {}.mcp_open_projection_state FINAL\n\
              WHERE state_key = 'global'\n\
+               AND (SELECT count() FROM system.tables\n\
+                    WHERE database = {}\n\
+                      AND name IN ('mcp_open_publication_headers', 'mcp_open_generation_readiness')) = 2\n\
              LIMIT 1\n\
              FORMAT JSONEachRow",
             escape_identifier(&self.cfg.database),
+            escape_literal(&self.cfg.database),
         );
         let rows: Vec<ProjectionStateRow> = self
             .query_json_each_row(&query, Some(&self.cfg.database))
@@ -196,46 +558,90 @@ impl ClickHouseClient {
         Ok(())
     }
 
-    async fn refresh_mcp_open_session(&self, session_id: &str) -> Result<()> {
+    async fn refresh_mcp_open_session(
+        &self,
+        session_id: &str,
+        candidate_publication_id: &str,
+        operation_id: &str,
+        publisher_id: &str,
+        required_heads: &[McpOpenSourceHead],
+        publish_legacy_head: bool,
+    ) -> Result<CandidateHeaderRow> {
         for _ in 0..MAX_UNSTABLE_REFRESH_ATTEMPTS {
-            let source_revision = self.session_source_revision(session_id).await?;
+            let source_revision = self
+                .session_source_revision_for_heads(session_id, required_heads)
+                .await?;
             if source_revision == 0 {
-                return Ok(());
+                bail!("cannot prepare a non-tombstone MCP session with no authorized events");
             }
             let dirty_revision = self.session_dirty_revision(session_id).await?;
-            let head = self.mcp_open_session_head(session_id).await?;
-            if head.as_ref().is_some_and(|head| {
-                head.source_revision == source_revision && head.dirty_revision == dirty_revision
-            }) {
-                return Ok(());
+            if let Some(candidate) = self
+                .mcp_open_candidate_header(session_id, candidate_publication_id)
+                .await?
+            {
+                if candidate.source_revision == source_revision
+                    && candidate.dirty_revision == dirty_revision
+                    && candidate.required_heads_fingerprint
+                        == source_heads_fingerprint(required_heads)
+                {
+                    if publish_legacy_head {
+                        self.publish_legacy_candidate_heads(candidate_publication_id)
+                            .await?;
+                    }
+                    return Ok(candidate);
+                }
             }
 
+            let head = self.mcp_open_session_head(session_id).await?;
             let slot = head
                 .as_ref()
                 .map_or(0, |head| 1_u8.saturating_sub(head.slot));
             let generation = self.next_projection_generation().await?;
 
-            self.insert_projected_events(session_id, slot, generation, source_revision)
-                .await?;
-            self.insert_projected_turns(session_id, slot, generation, source_revision)
-                .await?;
+            self.insert_projected_events(
+                session_id,
+                slot,
+                generation,
+                source_revision,
+                required_heads,
+            )
+            .await?;
+            self.insert_projected_turns(
+                session_id,
+                slot,
+                generation,
+                source_revision,
+                required_heads,
+            )
+            .await?;
 
-            if self.session_source_revision(session_id).await? != source_revision
+            if self
+                .session_source_revision_for_heads(session_id, required_heads)
+                .await?
+                != source_revision
                 || self.session_dirty_revision(session_id).await? != dirty_revision
             {
                 continue;
             }
-            if self
-                .insert_projected_session_head(
+            let inserted = self
+                .insert_projected_publication_header(CandidateHeaderInsert {
                     session_id,
+                    candidate_publication_id,
+                    operation_id,
+                    publisher_id,
                     slot,
                     generation,
                     source_revision,
                     dirty_revision,
-                )
-                .await?
-            {
-                return Ok(());
+                    required_heads,
+                })
+                .await?;
+            if let Some(candidate) = inserted {
+                if publish_legacy_head {
+                    self.publish_legacy_candidate_heads(candidate_publication_id)
+                        .await?;
+                }
+                return Ok(candidate);
             }
         }
 
@@ -247,7 +653,7 @@ impl ClickHouseClient {
 
     async fn mcp_open_session_head(&self, session_id: &str) -> Result<Option<SessionHeadRow>> {
         let query = format!(
-            "SELECT slot, generation, source_revision, dirty_revision\n\
+            "SELECT slot\n\
              FROM {}.mcp_open_sessions FINAL\n\
              WHERE session_id = {}\n\
              LIMIT 1\n\
@@ -273,19 +679,61 @@ impl ClickHouseClient {
             .context("ClickHouse did not allocate an MCP open projection generation")
     }
 
-    async fn session_source_revision(&self, session_id: &str) -> Result<u64> {
+    async fn current_session_source_heads(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<McpOpenSourceHead>> {
+        let query = current_session_source_heads_sql(&self.cfg.database, session_id);
+        let rows: Vec<SourceHeadRow> = self
+            .query_json_each_row(&query, Some(&self.cfg.database))
+            .await?;
+        canonical_source_heads(
+            &rows
+                .into_iter()
+                .map(source_head_from_row)
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    async fn session_source_heads_for_snapshot(
+        &self,
+        session_id: &str,
+        desired_heads: &[McpOpenSourceHead],
+    ) -> Result<Vec<McpOpenSourceHead>> {
+        if desired_heads.is_empty() {
+            return Ok(Vec::new());
+        }
+        let query =
+            session_source_heads_for_snapshot_sql(&self.cfg.database, session_id, desired_heads);
+        let rows: Vec<SourceHeadRow> = self
+            .query_json_each_row(&query, Some(&self.cfg.database))
+            .await?;
+        canonical_source_heads(
+            &rows
+                .into_iter()
+                .map(source_head_from_row)
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    async fn session_source_revision_for_heads(
+        &self,
+        session_id: &str,
+        required_heads: &[McpOpenSourceHead],
+    ) -> Result<u64> {
         let query = format!(
             "SELECT\n\
                if(count() = 0, toUInt64(0), toUInt64(cityHash64(arraySort(groupArray(tuple(event_uid, event_version)))))) AS source_revision\n\
              FROM (\n\
                SELECT event_uid, event_version\n\
-               FROM {}.events FINAL\n\
-               WHERE session_id = {}\n\
+               FROM {}.events AS e FINAL\n\
+               WHERE session_id = {} AND ({})\n\
                ORDER BY event_uid ASC\n\
              )\n\
              FORMAT JSONEachRow",
             escape_identifier(&self.cfg.database),
             escape_literal(session_id),
+            source_head_filter(required_heads, "e"),
         );
         let rows: Vec<SourceRevisionRow> = self
             .query_json_each_row(&query, Some(&self.cfg.database))
@@ -309,25 +757,290 @@ impl ClickHouseClient {
         Ok(rows.first().map_or(0, |row| row.dirty_revision))
     }
 
+    async fn mcp_open_affected_sessions(
+        &self,
+        previous_generation: Option<u32>,
+        target: &McpOpenSourceHead,
+    ) -> Result<Vec<String>> {
+        let generation_predicate = previous_generation.map_or_else(
+            || format!("source_generation = {}", target.source_generation),
+            |previous| {
+                format!(
+                    "source_generation IN ({previous}, {})",
+                    target.source_generation
+                )
+            },
+        );
+        let query = format!(
+            "SELECT DISTINCT session_id\n\
+             FROM {}.events FINAL\n\
+             WHERE source_host = {} AND source_name = {} AND source_file = {}\n\
+               AND {generation_predicate} AND notEmpty(session_id)\n\
+             ORDER BY session_id\n\
+             FORMAT JSONEachRow",
+            escape_identifier(&self.cfg.database),
+            escape_literal(&target.source_host),
+            escape_literal(&target.source_name),
+            escape_literal(&target.source_file),
+        );
+        let rows: Vec<SessionIdRow> = self
+            .query_json_each_row(&query, Some(&self.cfg.database))
+            .await?;
+        Ok(rows.into_iter().map(|row| row.session_id).collect())
+    }
+
+    async fn mcp_open_candidate_header(
+        &self,
+        session_id: &str,
+        candidate_publication_id: &str,
+    ) -> Result<Option<CandidateHeaderRow>> {
+        let query = format!(
+            "SELECT session_id, slot, generation, source_revision, dirty_revision, tombstone, required_heads_fingerprint\n\
+             FROM {}.mcp_open_publication_headers FINAL\n\
+             WHERE session_id = {} AND candidate_publication_id = {}\n\
+             LIMIT 1 FORMAT JSONEachRow",
+            escape_identifier(&self.cfg.database),
+            escape_literal(session_id),
+            escape_literal(candidate_publication_id),
+        );
+        let rows: Vec<CandidateHeaderRow> = self
+            .query_json_each_row(&query, Some(&self.cfg.database))
+            .await?;
+        Ok(rows.into_iter().next())
+    }
+
+    async fn mcp_open_candidate_headers(
+        &self,
+        candidate_publication_id: &str,
+    ) -> Result<Vec<CandidateHeaderRow>> {
+        let query = format!(
+            "SELECT session_id, slot, generation, source_revision, dirty_revision, tombstone, required_heads_fingerprint\n\
+             FROM {}.mcp_open_publication_headers FINAL\n\
+             WHERE candidate_publication_id = {}\n\
+             ORDER BY session_id FORMAT JSONEachRow",
+            escape_identifier(&self.cfg.database),
+            escape_literal(candidate_publication_id),
+        );
+        self.query_json_each_row(&query, Some(&self.cfg.database))
+            .await
+    }
+
+    async fn mcp_open_candidate_generation_ready(
+        &self,
+        candidate_publication_id: &str,
+    ) -> Result<bool> {
+        let query = format!(
+            "SELECT toUInt8(countIf(ready = 1) > 0) AS ready\n\
+             FROM {}.v_current_mcp_open_generation_readiness\n\
+             WHERE candidate_publication_id = {} FORMAT JSONEachRow",
+            escape_identifier(&self.cfg.database),
+            escape_literal(candidate_publication_id),
+        );
+        let rows: Vec<ReadyRow> = self
+            .query_json_each_row(&query, Some(&self.cfg.database))
+            .await?;
+        Ok(rows.first().is_some_and(|row| row.ready != 0))
+    }
+
+    async fn mcp_open_candidate_required_heads(
+        &self,
+        session_id: &str,
+        candidate_publication_id: &str,
+    ) -> Result<Vec<McpOpenSourceHead>> {
+        let query = format!(
+            "SELECT required_source_heads\n\
+             FROM {}.mcp_open_publication_headers FINAL\n\
+             WHERE session_id = {} AND candidate_publication_id = {}\n\
+             LIMIT 1 FORMAT JSONEachRow",
+            escape_identifier(&self.cfg.database),
+            escape_literal(session_id),
+            escape_literal(candidate_publication_id),
+        );
+        let rows: Vec<RequiredHeadsRow> = self
+            .query_json_each_row(&query, Some(&self.cfg.database))
+            .await?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(Vec::new());
+        };
+        canonical_source_heads(
+            &row.required_source_heads
+                .into_iter()
+                .map(source_head_from_row)
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    async fn source_heads_are_current(&self, required: &[McpOpenSourceHead]) -> Result<bool> {
+        if required.is_empty() {
+            return Ok(false);
+        }
+        let key_filter = required
+            .iter()
+            .map(|head| {
+                format!(
+                    "(source_host = {} AND source_name = {} AND source_file = {})",
+                    escape_literal(&head.source_host),
+                    escape_literal(&head.source_name),
+                    escape_literal(&head.source_file),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let query = format!(
+            "SELECT source_host, source_name, source_file, source_generation, publication_revision\n\
+             FROM {}.v_current_published_source_generations\n\
+             WHERE {key_filter}\n\
+             ORDER BY source_host, source_name, source_file FORMAT JSONEachRow",
+            escape_identifier(&self.cfg.database),
+        );
+        let rows: Vec<SourceHeadRow> = self
+            .query_json_each_row(&query, Some(&self.cfg.database))
+            .await?;
+        let current = canonical_source_heads(
+            &rows
+                .into_iter()
+                .map(source_head_from_row)
+                .collect::<Vec<_>>(),
+        )?;
+        Ok(current == canonical_source_heads(required)?)
+    }
+
+    async fn insert_mcp_open_tombstone(
+        &self,
+        session_id: &str,
+        candidate_publication_id: &str,
+        operation_id: &str,
+        publisher_id: &str,
+        required_heads: &[McpOpenSourceHead],
+    ) -> Result<CandidateHeaderRow> {
+        let dirty_revision = self.session_dirty_revision(session_id).await?;
+        if let Some(existing) = self
+            .mcp_open_candidate_header(session_id, candidate_publication_id)
+            .await?
+        {
+            if existing.tombstone != 0
+                && existing.required_heads_fingerprint == source_heads_fingerprint(required_heads)
+                && existing.dirty_revision == dirty_revision
+            {
+                return Ok(existing);
+            }
+        }
+        let active = self.mcp_open_session_head(session_id).await?;
+        let slot = active
+            .as_ref()
+            .map_or(0, |head| 1_u8.saturating_sub(head.slot));
+        let generation = self.next_projection_generation().await?;
+        let required_heads_fingerprint = source_heads_fingerprint(required_heads);
+        let statement = format!(
+            "INSERT INTO {database}.mcp_open_publication_headers\n\
+             (session_id, candidate_publication_id, slot, generation, source_revision, dirty_revision,\n\
+              first_event_time, last_event_time, total_turns, total_events, user_messages, assistant_messages,\n\
+              tool_calls, tool_results, mode, first_event_uid, last_event_uid, last_actor_role, title, source,\n\
+              harness, inference_provider, session_slug, session_summary, completed, terminal_event_uid, origin_cwd,\n\
+              tombstone, required_source_heads, required_heads_fingerprint, header_revision, publisher_id, operation_id)\n\
+             SELECT {session_id}, {candidate_publication_id}, {slot}, {generation}, toUInt64(0),\n\
+               toUInt64({dirty_revision}), toDateTime64(0, 3), toDateTime64(0, 3), toUInt32(0),\n\
+               toUInt64(0), toUInt64(0), toUInt64(0), toUInt64(0), toUInt64(0), '', '', '', '', '', '',\n\
+               '', '', '', '', toUInt8(0), '', '', toUInt8(1), {required_heads},\n\
+               {required_heads_fingerprint}, {generation}, {publisher_id}, {operation_id}",
+            database = escape_identifier(&self.cfg.database),
+            session_id = escape_literal(session_id),
+            candidate_publication_id = escape_literal(candidate_publication_id),
+            dirty_revision = dirty_revision,
+            required_heads = source_heads_sql(required_heads),
+            required_heads_fingerprint = escape_literal(&required_heads_fingerprint),
+            publisher_id = escape_literal(publisher_id),
+            operation_id = escape_literal(operation_id),
+        );
+        self.request_text(&statement, None, Some(&self.cfg.database), false, None)
+            .await?;
+        self.mcp_open_candidate_header(session_id, candidate_publication_id)
+            .await?
+            .context("MCP tombstone header was not durable after insert")
+    }
+
+    async fn insert_mcp_open_generation_readiness(
+        &self,
+        request: &McpOpenPublicationRequest,
+        required_heads: &[McpOpenSourceHead],
+        readiness: &McpOpenGenerationReadiness,
+        ready: bool,
+        block_reason: &str,
+    ) -> Result<()> {
+        let readiness_revision = self.next_projection_generation().await?;
+        let statement = format!(
+            "INSERT INTO {database}.mcp_open_generation_readiness\n\
+             (candidate_publication_id, source_host, source_name, source_file, source_generation,\n\
+              readiness_revision, operation_id, affected_session_count, prepared_session_count,\n\
+              tombstone_count, required_source_heads, required_heads_fingerprint, candidate_digest,\n\
+              ready, block_reason)\n\
+             VALUES ({candidate_id}, {source_host}, {source_name}, {source_file}, {source_generation},\n\
+              {readiness_revision}, {operation_id}, {affected}, {prepared}, {tombstones},\n\
+              {required_heads}, {fingerprint}, {digest}, {ready}, {block_reason})",
+            database = escape_identifier(&self.cfg.database),
+            candidate_id = escape_literal(&request.candidate_publication_id),
+            source_host = escape_literal(&request.source_host),
+            source_name = escape_literal(&request.source_name),
+            source_file = escape_literal(&request.source_file),
+            source_generation = request.source_generation,
+            operation_id = escape_literal(&request.operation_id),
+            affected = readiness.affected_session_count,
+            prepared = readiness.prepared_session_count,
+            tombstones = readiness.tombstone_count,
+            required_heads = source_heads_sql(required_heads),
+            fingerprint = escape_literal(&readiness.required_heads_fingerprint),
+            digest = escape_literal(&readiness.candidate_digest),
+            ready = u8::from(ready),
+            block_reason = escape_literal(block_reason),
+        );
+        self.request_text(&statement, None, Some(&self.cfg.database), false, None)
+            .await?;
+        Ok(())
+    }
+
+    async fn publish_legacy_candidate_heads(&self, candidate_publication_id: &str) -> Result<()> {
+        let database = escape_identifier(&self.cfg.database);
+        let statement = format!(
+            "INSERT INTO {database}.mcp_open_sessions\n\
+             (session_id, slot, generation, source_revision, dirty_revision, first_event_time,\n\
+              last_event_time, total_turns, total_events, user_messages, assistant_messages,\n\
+              tool_calls, tool_results, mode, first_event_uid, last_event_uid, last_actor_role,\n\
+              title, source, harness, inference_provider, session_slug, session_summary, completed,\n\
+              terminal_event_uid, origin_cwd)\n\
+             SELECT session_id, slot, generation, source_revision, dirty_revision, first_event_time,\n\
+              last_event_time, total_turns, total_events, user_messages, assistant_messages,\n\
+              tool_calls, tool_results, mode, first_event_uid, last_event_uid, last_actor_role,\n\
+              title, source, harness, inference_provider, session_slug, session_summary, completed,\n\
+              terminal_event_uid, origin_cwd\n\
+             FROM {database}.mcp_open_publication_headers FINAL\n\
+             WHERE candidate_publication_id = {candidate_id} AND tombstone = 0",
+            candidate_id = escape_literal(candidate_publication_id),
+        );
+        self.request_text(&statement, None, Some(&self.cfg.database), false, None)
+            .await?;
+        Ok(())
+    }
+
     async fn insert_projected_events(
         &self,
         session_id: &str,
         slot: u8,
         generation: u64,
         source_revision: u64,
+        required_heads: &[McpOpenSourceHead],
     ) -> Result<()> {
         let database = escape_identifier(&self.cfg.database);
-        let ctes = projection_ctes(&database, session_id, source_revision);
+        let ctes = projection_ctes(&database, session_id, source_revision, required_heads);
         let statement = format!(
             "INSERT INTO {database}.mcp_open_events\n\
-             (event_uid, slot, generation, session_id, event_order, turn_seq,\n\
+             (event_uid, slot, candidate_generation, generation, session_id, event_order, turn_seq,\n\
               event_time, actor_role, event_class, payload_type, event_type, event_ordinal,\n\
               call_id, name, phase, item_id, source_ref, text_content, payload_json,\n\
               token_usage_json, endpoint_kind, token_usage_buckets, token_usage_native_units,\n\
               previous_event_uid, next_event_uid)\n\
              {ctes}\n\
              SELECT\n\
-               event_uid, {slot}, {generation}, session_id, event_order, turn_seq,\n\
+               event_uid, {slot}, {generation}, {generation}, session_id, event_order, turn_seq,\n\
                event_time, actor_role, event_class, payload_type, event_type, event_ordinal,\n\
                call_id, name, phase, item_id, source_ref, text_content, payload_json,\n\
                token_usage_json, endpoint_kind, token_usage_buckets, token_usage_native_units,\n\
@@ -345,9 +1058,10 @@ impl ClickHouseClient {
         slot: u8,
         generation: u64,
         source_revision: u64,
+        required_heads: &[McpOpenSourceHead],
     ) -> Result<()> {
         let database = escape_identifier(&self.cfg.database);
-        let ctes = projection_ctes(&database, session_id, source_revision);
+        let ctes = projection_ctes(&database, session_id, source_revision, required_heads);
         let message = "(event_class = 'message' OR (event_class = 'event_msg' AND payload_type IN ('user_message', 'agent_message', 'message', 'text')))";
         let user_message = format!("(lowerUTF8(actor_role) = 'user' AND {message})");
         let assistant_message = format!("(lowerUTF8(actor_role) = 'assistant' AND {message})");
@@ -355,7 +1069,7 @@ impl ClickHouseClient {
             format!("({assistant_message} AND lowerUTF8(phase) != 'commentary')");
         let statement = format!(
             "INSERT INTO {database}.mcp_open_turns\n\
-             (session_id, slot, generation, turn_seq, turn_id, started_at, ended_at,\n\
+             (session_id, slot, candidate_generation, generation, turn_seq, turn_id, started_at, ended_at,\n\
               total_events, user_messages, assistant_messages, tool_calls, tool_results, reasoning_items,\n\
               user_input_summary_source, final_response_summary_source, user_input_summary_is_payload, final_response_summary_is_payload,\n\
               user_input_event_uid, user_input_event_order, user_input_event_time, user_input_event_type,\n\
@@ -416,7 +1130,7 @@ impl ClickHouseClient {
                WINDOW turn_window AS (PARTITION BY session_id ORDER BY turn_seq ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)\n\
              )\n\
              SELECT\n\
-               session_id, {slot}, {generation}, turn_seq, turn_id, started_at, ended_at,\n\
+               session_id, {slot}, {generation}, {generation}, turn_seq, turn_id, started_at, ended_at,\n\
                total_events, user_messages, assistant_messages, tool_calls, tool_results, reasoning_items,\n\
                user_input_summary_source, final_response_summary_source, user_input_summary_is_payload, final_response_summary_is_payload,\n\
                user_input_event_uid, user_input_event_order, user_input_event_time, user_input_event_type,\n\
@@ -433,28 +1147,43 @@ impl ClickHouseClient {
         Ok(())
     }
 
-    async fn insert_projected_session_head(
+    async fn insert_projected_publication_header(
         &self,
-        session_id: &str,
-        slot: u8,
-        generation: u64,
-        expected_source_revision: u64,
-        dirty_revision: u64,
-    ) -> Result<bool> {
+        insert: CandidateHeaderInsert<'_>,
+    ) -> Result<Option<CandidateHeaderRow>> {
+        let CandidateHeaderInsert {
+            session_id,
+            candidate_publication_id,
+            operation_id,
+            publisher_id,
+            slot,
+            generation,
+            source_revision: expected_source_revision,
+            dirty_revision,
+            required_heads,
+        } = insert;
         let database = escape_identifier(&self.cfg.database);
-        let ctes = projection_ctes(&database, session_id, expected_source_revision);
+        let ctes = projection_ctes(
+            &database,
+            session_id,
+            expected_source_revision,
+            required_heads,
+        );
         let mcp_name_predicate = crate::mcp_tool_names::sql_predicate("name");
+        let required_heads_sql = source_heads_sql(required_heads);
+        let required_heads_fingerprint = source_heads_fingerprint(required_heads);
         let statement = format!(
-            "INSERT INTO {database}.mcp_open_sessions\n\
-             (session_id, slot, generation, source_revision, dirty_revision, first_event_time,\n\
+            "INSERT INTO {database}.mcp_open_publication_headers\n\
+             (session_id, candidate_publication_id, slot, generation, source_revision, dirty_revision, first_event_time,\n\
               last_event_time, total_turns, total_events, user_messages, assistant_messages,\n\
               tool_calls, tool_results, mode, first_event_uid, last_event_uid, last_actor_role,\n\
               title, source, harness, inference_provider, session_slug, session_summary,\n\
-              completed, terminal_event_uid, origin_cwd)\n\
+              completed, terminal_event_uid, origin_cwd, tombstone, required_source_heads,\n\
+              required_heads_fingerprint, header_revision, publisher_id, operation_id)\n\
              {ctes},\n\
              header AS (\n\
                SELECT\n\
-                 session_id, max(source_revision) AS source_revision, min(event_time) AS first_event_time,\n\
+                 session_id, max(projected.source_revision) AS source_revision, min(event_time) AS first_event_time,\n\
                  max(event_time) AS last_event_time, toUInt32(max(turn_seq)) AS total_turns, count() AS total_events,\n\
                  countIf(actor_role = 'user' AND event_class = 'message') AS user_messages,\n\
                  countIf(actor_role = 'assistant' AND event_class = 'message') AS assistant_messages,\n\
@@ -482,14 +1211,14 @@ impl ClickHouseClient {
                  ifNull(argMax(nullIf(inference_provider, ''), tuple(event_ts, event_uid)), '') AS inference_provider,\n\
                  ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'slug'), ''), tuple(event_ts, event_uid), event_class = 'session_meta'), '') AS session_slug,\n\
                  ifNull(argMinIf(cwd, tuple(event_ts, event_uid), cwd != ''), '') AS origin_cwd\n\
-               FROM enriched\n\
+               FROM enriched AS projected\n\
                GROUP BY session_id\n\
                HAVING source_revision = {expected_source_revision}\n\
              ),\n\
              current_dirty AS (\n\
-               SELECT if(count() = 0, toUInt64(0), toUInt64(max(dirty_revision))) AS dirty_revision\n\
-               FROM {database}.mcp_open_dirty_sessions FINAL\n\
-               WHERE session_id = {session_sql}\n\
+               SELECT if(count() = 0, toUInt64(0), toUInt64(max(dirty.dirty_revision))) AS dirty_revision\n\
+               FROM {database}.mcp_open_dirty_sessions AS dirty FINAL\n\
+               WHERE dirty.session_id = {session_sql}\n\
              ),\n\
              terminal AS (\n\
                SELECT\n\
@@ -499,47 +1228,120 @@ impl ClickHouseClient {
                GROUP BY session_id\n\
              )\n\
              SELECT\n\
-               h.session_id, {slot}, {generation}, h.source_revision, {dirty_revision},\n\
+               h.session_id, {candidate_publication_id}, {slot}, {generation}, h.source_revision, {dirty_revision},\n\
                h.first_event_time, h.last_event_time, h.total_turns, h.total_events,\n\
                h.user_messages, h.assistant_messages, h.tool_calls, h.tool_results, h.mode,\n\
                h.first_event_uid, h.last_event_uid, h.last_actor_role,\n\
                if(h.source = 'omp', coalesce(nullIf(h.latest_metadata_title, ''), nullIf(h.latest_metadata_name, ''), nullIf(h.latest_metadata_summary, ''), nullIf(h.omp_dispatch_title, ''), ''), coalesce(nullIf(h.latest_metadata_title, ''), nullIf(h.latest_metadata_name, ''), '')), h.source,\n\
                h.harness, h.inference_provider, h.session_slug,\n\
                if(h.source = 'omp', coalesce(nullIf(h.latest_metadata_summary, ''), nullIf(h.latest_metadata_title, ''), nullIf(h.latest_metadata_name, ''), nullIf(h.omp_dispatch_title, ''), ''), coalesce(nullIf(h.latest_metadata_summary, ''), nullIf(h.latest_metadata_title, ''), nullIf(h.latest_metadata_name, ''), '')),\n\
-               ifNull(t.completed, 0), ifNull(t.terminal_event_uid, ''), h.origin_cwd\n\
+               ifNull(t.completed, 0), ifNull(t.terminal_event_uid, ''), h.origin_cwd,\n\
+               toUInt8(0), {required_heads_sql}, {required_heads_fingerprint}, {generation},\n\
+               {publisher_id}, {operation_id}\n\
              FROM header AS h\n\
              CROSS JOIN current_dirty AS d\n\
              LEFT JOIN terminal AS t ON t.session_id = h.session_id\n\
              WHERE d.dirty_revision = {dirty_revision}",
             session_sql = escape_literal(session_id),
+            candidate_publication_id = escape_literal(candidate_publication_id),
+            required_heads_fingerprint = escape_literal(&required_heads_fingerprint),
+            publisher_id = escape_literal(publisher_id),
+            operation_id = escape_literal(operation_id),
         );
         self.request_text(&statement, None, Some(&self.cfg.database), false, None)
             .await?;
-        let head = self.mcp_open_session_head(session_id).await?;
-        Ok(head.is_some_and(|head| {
+        let candidate = self
+            .mcp_open_candidate_header(session_id, candidate_publication_id)
+            .await?;
+        Ok(candidate.filter(|head| {
             head.generation == generation
                 && head.slot == slot
                 && head.source_revision == expected_source_revision
                 && head.dirty_revision == dirty_revision
+                && head.tombstone == 0
+                && head.required_heads_fingerprint == required_heads_fingerprint
         }))
     }
 }
 
-fn projection_ctes(database: &str, session_id: &str, source_revision: u64) -> String {
+fn current_session_source_heads_sql(database: &str, session_id: &str) -> String {
+    let database = escape_identifier(database);
+    format!(
+        "WITH current_heads AS (\n\
+           SELECT\n\
+             heads.source_host AS source_host,\n\
+             heads.source_name AS source_name,\n\
+             heads.source_file AS source_file,\n\
+             tupleElement(argMax(tuple(heads.source_generation, heads.publication_revision), heads.publication_revision), 1) AS source_generation,\n\
+             max(heads.publication_revision) AS publication_revision\n\
+           FROM {database}.published_source_generations AS heads\n\
+           GROUP BY heads.source_host, heads.source_name, heads.source_file\n\
+         )\n\
+         SELECT DISTINCT\n\
+           h.source_host AS source_host,\n\
+           h.source_name AS source_name,\n\
+           h.source_file AS source_file,\n\
+           toUInt32(h.source_generation) AS source_generation,\n\
+           toUInt64(h.publication_revision) AS publication_revision\n\
+         FROM {database}.events AS e FINAL\n\
+         INNER JOIN current_heads AS h\n\
+           ON h.source_host = e.source_host AND h.source_name = e.source_name\n\
+          AND h.source_file = e.source_file AND h.source_generation = e.source_generation\n\
+         WHERE e.session_id = {}\n\
+         ORDER BY source_host, source_name, source_file\n\
+         FORMAT JSONEachRow",
+        escape_literal(session_id),
+    )
+}
+
+fn session_source_heads_for_snapshot_sql(
+    database: &str,
+    session_id: &str,
+    desired_heads: &[McpOpenSourceHead],
+) -> String {
+    let database = escape_identifier(database);
+    let heads_sql = source_heads_sql(desired_heads);
+    format!(
+        "WITH {heads_sql} AS desired_heads\n\
+         SELECT DISTINCT\n\
+           e.source_host AS source_host,\n\
+           e.source_name AS source_name,\n\
+           e.source_file AS source_file,\n\
+           toUInt32(e.source_generation) AS source_generation,\n\
+           toUInt64(tupleElement(head, 5)) AS publication_revision\n\
+         FROM {database}.events AS e FINAL\n\
+         ARRAY JOIN desired_heads AS head\n\
+         WHERE e.session_id = {session_id}\n\
+           AND e.source_host = tupleElement(head, 1)\n\
+           AND e.source_name = tupleElement(head, 2)\n\
+           AND e.source_file = tupleElement(head, 3)\n\
+           AND e.source_generation = tupleElement(head, 4)\n\
+         ORDER BY source_host, source_name, source_file\n\
+         FORMAT JSONEachRow",
+        session_id = escape_literal(session_id),
+    )
+}
+
+fn projection_ctes(
+    database: &str,
+    session_id: &str,
+    source_revision: u64,
+    required_heads: &[McpOpenSourceHead],
+) -> String {
     let session_id = escape_literal(session_id);
     let event_type = event_type_sql();
     format!(
         "WITH\n\
          canonical AS (\n\
            SELECT\n\
-             ingested_at, event_uid, session_id, source_name, harness, inference_provider, source_file,\n\
+             ingested_at, event_uid, session_id, source_host, source_name, harness, inference_provider, source_file,\n\
              source_generation, source_line_no, source_offset, source_ref, record_ts, event_ts,\n\
              event_kind AS event_class, actor_kind AS actor_role, payload_type, turn_index, toString(turn_index) AS turn_id, item_id,\n\
              tool_call_id AS call_id, tool_name AS name, if(tool_phase != '', tool_phase, op_status) AS phase,\n\
              text_content, payload_json, token_usage_json, endpoint_kind, token_usage_buckets,\n\
              token_usage_native_units, cwd, event_version\n\
-           FROM {database}.events FINAL\n\
-           WHERE session_id = {session_id}\n\
+           FROM {database}.events AS e FINAL\n\
+           WHERE session_id = {session_id} AND ({source_head_filter})\n\
          ),\n\
          canonical_revision AS (\n\
            SELECT if(count() = 0, toUInt64(0), toUInt64(cityHash64(arraySort(groupArray(tuple(event_uid, event_version)))))) AS source_revision\n\
@@ -555,8 +1357,8 @@ fn projection_ctes(database: &str, session_id: &str, source_revision: u64) -> St
            CROSS JOIN canonical_revision AS revision\n\
            WHERE revision.source_revision = {source_revision}\n\
            WINDOW\n\
-             canonical_window AS (PARTITION BY session_id ORDER BY ifNull(parseDateTime64BestEffortOrNull(record_ts), ingested_at), source_file, source_generation, source_offset, source_line_no, event_uid),\n\
-             canonical_rows AS (PARTITION BY session_id ORDER BY ifNull(parseDateTime64BestEffortOrNull(record_ts), ingested_at), source_file, source_generation, source_offset, source_line_no, event_uid ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)\n\
+             canonical_window AS (PARTITION BY session_id ORDER BY ifNull(parseDateTime64BestEffortOrNull(record_ts), ingested_at), source_host, source_file, source_generation, source_offset, source_line_no, event_uid),\n\
+             canonical_rows AS (PARTITION BY session_id ORDER BY ifNull(parseDateTime64BestEffortOrNull(record_ts), ingested_at), source_host, source_file, source_generation, source_offset, source_line_no, event_uid ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)\n\
          ),\n\
          typed AS (\n\
            SELECT *, {event_type} AS event_type,\n\
@@ -585,6 +1387,7 @@ fn projection_ctes(database: &str, session_id: &str, source_revision: u64) -> St
          )",
         payload_summary_chars = MAX_PROJECTED_PAYLOAD_SUMMARY_CHARS,
         text_summary_chars = MAX_PROJECTED_TEXT_SUMMARY_CHARS,
+        source_head_filter = source_head_filter(required_heads, "e"),
     )
 }
 
@@ -603,7 +1406,11 @@ fn event_type_sql() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::projection_session_ids;
+    use super::{
+        canonical_source_heads, current_session_source_heads_sql, projection_ctes,
+        projection_session_ids, session_source_heads_for_snapshot_sql, source_head_filter,
+        source_heads_fingerprint, McpOpenSourceHead, SourceHeadRow,
+    };
     use std::collections::BTreeSet;
 
     #[test]
@@ -614,5 +1421,96 @@ mod tests {
             ids,
             BTreeSet::from([" ".to_string(), "\u{a0}".to_string(), "session".to_string(),])
         );
+    }
+
+    fn head(host: &str, file: &str, generation: u32, revision: u64) -> McpOpenSourceHead {
+        McpOpenSourceHead {
+            source_host: host.to_string(),
+            source_name: "codex".to_string(),
+            source_file: file.to_string(),
+            source_generation: generation,
+            publication_revision: revision,
+        }
+    }
+
+    #[test]
+    fn cross_source_heads_are_canonical_and_fingerprint_every_host() {
+        let host_b = head("host-b", "/sessions/b.jsonl", 7, 11);
+        let host_a = head("host-a", "/sessions/a.jsonl", 3, 10);
+        let canonical = canonical_source_heads(&[host_b.clone(), host_a.clone(), host_a.clone()])
+            .expect("matching duplicates canonicalize");
+
+        assert_eq!(canonical, vec![host_a.clone(), host_b.clone()]);
+        assert_ne!(
+            source_heads_fingerprint(&canonical),
+            source_heads_fingerprint(&[host_a])
+        );
+        let filter = source_head_filter(&canonical, "e");
+        assert!(filter.contains("e.source_host = 'host-a'"));
+        assert!(filter.contains("e.source_host = 'host-b'"));
+        assert!(filter.contains("e.source_generation = 7"));
+
+        let ctes = projection_ctes("moraine", "shared-session", 42, &canonical);
+        let unsupported_final_alias = ["FINAL", "AS"].join(" ");
+        assert!(ctes.contains("session_id = 'shared-session'"));
+        assert!(ctes.contains("FROM moraine.events AS e FINAL"));
+        assert!(!ctes.contains(&unsupported_final_alias));
+        assert!(ctes.contains("e.source_host = 'host-a'"));
+        assert!(ctes.contains("e.source_host = 'host-b'"));
+        assert!(ctes.contains("source_host, source_file, source_generation"));
+    }
+
+    #[test]
+    fn production_projection_sql_never_places_final_before_an_alias() {
+        let source = include_str!("mcp_open_projection.rs");
+        let unsupported_final_alias = ["FINAL", "AS"].join(" ");
+
+        assert!(!source.contains(&unsupported_final_alias));
+    }
+
+    #[test]
+    fn current_head_aggregation_qualifies_raw_revision_inputs() {
+        let sql = current_session_source_heads_sql("moraine", "session-a");
+
+        assert!(sql.contains(
+            "argMax(tuple(heads.source_generation, heads.publication_revision), heads.publication_revision)"
+        ));
+        assert!(sql.contains("max(heads.publication_revision) AS publication_revision"));
+        assert!(sql.contains("FROM `moraine`.published_source_generations AS heads"));
+        assert!(sql.contains("GROUP BY heads.source_host, heads.source_name, heads.source_file"));
+        assert!(sql.contains("h.source_host AS source_host"));
+        assert!(sql.contains("h.source_name AS source_name"));
+        assert!(sql.contains("h.source_file AS source_file"));
+        assert!(!sql.contains("tuple(source_generation, publication_revision)"));
+        assert!(!sql.contains("max(publication_revision)"));
+    }
+
+    #[test]
+    fn source_head_queries_emit_deserializable_json_field_names() {
+        let desired = [head("host-a", "/sessions/a.jsonl", 3, 10)];
+        let sql = session_source_heads_for_snapshot_sql("moraine", "session-a", &desired);
+
+        assert!(sql.contains("e.source_host AS source_host"));
+        assert!(sql.contains("e.source_name AS source_name"));
+        assert!(sql.contains("e.source_file AS source_file"));
+
+        let row: SourceHeadRow = serde_json::from_str(
+            r#"{"source_host":"host-a","source_name":"codex","source_file":"/sessions/a.jsonl","source_generation":3,"publication_revision":10}"#,
+        )
+        .expect("aliased JSONEachRow fields deserialize into SourceHeadRow");
+        assert_eq!(row.source_host, "host-a");
+        assert_eq!(row.source_generation, 3);
+        assert_eq!(row.publication_revision, 10);
+    }
+
+    #[test]
+    fn conflicting_generation_for_one_source_key_is_rejected() {
+        let error = canonical_source_heads(&[
+            head("host-a", "/sessions/a.jsonl", 1, 4),
+            head("host-a", "/sessions/a.jsonl", 2, 5),
+        ])
+        .expect_err("one source key cannot require two heads");
+
+        assert!(error.to_string().contains("conflicting MCP source heads"));
     }
 }

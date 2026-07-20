@@ -3,6 +3,8 @@ mod dispatch;
 mod heartbeat;
 pub mod model;
 pub mod normalize;
+pub(crate) mod publication;
+mod publication_identity;
 mod reconcile;
 mod redaction;
 mod sink;
@@ -14,6 +16,11 @@ mod watch;
 use crate::checkpoint::checkpoint_key;
 use crate::dispatch::{enqueue_work, run_work_item, spawn_debounce_task};
 use crate::model::RowBatch;
+pub(crate) use crate::publication::{
+    CheckpointTransition, FinalizeReplayOutcome, ReplayBarrierAck,
+};
+use crate::publication::{PublicationActor, PublicationOwnerLock};
+use crate::publication_identity::{PublicationIdentity, PUBLICATION_HOST_ID_FILE_NAME};
 use crate::reconcile::spawn_reconcile_task;
 use crate::redaction::{RedactionAudit, SecretRedactor};
 use crate::sink::{spawn_sink_task, SinkAuthorConfig, SinkRole};
@@ -30,7 +37,7 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio::sync::{mpsc, oneshot, RwLock, Semaphore};
 use tracing::{info, warn};
 
 pub(crate) const WATCHER_BACKEND_UNKNOWN: u64 = 0;
@@ -82,6 +89,28 @@ pub(crate) struct Metrics {
 #[derive(Debug)]
 pub(crate) enum SinkMessage {
     Batch(RowBatch),
+    /// A durable replay-start barrier. The sink flushes all earlier batches,
+    /// persists the causal replay transition synchronously, then acknowledges.
+    BeginReplay {
+        transition: CheckpointTransition,
+        ack: oneshot::Sender<std::result::Result<ReplayBarrierAck, String>>,
+    },
+    /// Final source-boundary validation and publication. The head switch is
+    /// the last durable operation before acknowledgement.
+    FinalizeReplay {
+        transition: CheckpointTransition,
+        ack: oneshot::Sender<std::result::Result<FinalizeReplayOutcome, String>>,
+    },
+    /// Persist a fail-closed replay transition without changing source heads.
+    BlockReplay {
+        transition: CheckpointTransition,
+        ack: oneshot::Sender<std::result::Result<ReplayBarrierAck, String>>,
+    },
+    /// Persist mirror catch-up readiness through the ordered sink channel.
+    MirrorCaughtUp {
+        transition: CheckpointTransition,
+        ack: oneshot::Sender<std::result::Result<ReplayBarrierAck, String>>,
+    },
 }
 
 fn build_ingest_clickhouse_client(config: ClickHouseConfig) -> Result<ClickHouseClient> {
@@ -108,8 +137,102 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         ));
     }
 
+    let has_named_backends = config
+        .backends
+        .keys()
+        .any(|name| name != DEFAULT_BACKEND_NAME);
+    // Config loading expands `ingest.state_dir` before the runtime receives
+    // it. Establish one identity before the owner lock or any sink/backend
+    // task, then thread this exact value through every writer.
+    let publication_identity = PublicationIdentity::load_or_create(&config.ingest.state_dir)
+        .context("failed to establish durable publication host identity")?;
+    if publication_identity.was_created() {
+        if has_named_backends {
+            warn!(
+                publication_host_id = publication_identity.host_id(),
+                identity_file = %std::path::Path::new(&config.ingest.state_dir)
+                    .join(PUBLICATION_HOST_ID_FILE_NAME)
+                    .display(),
+                "created durable publication host identity; legacy shared-backend checkpoint/source host keys derived from HOSTNAME or USER are deliberately not adopted, remain separate, and may require backend cleanup before mirror catch-up replays tracked sources under the new identity"
+            );
+        } else {
+            info!(
+                publication_host_id = publication_identity.host_id(),
+                "created durable publication host identity"
+            );
+        }
+    }
+
     let clickhouse = build_ingest_clickhouse_client(config.clickhouse.clone())?;
     clickhouse.ping().await.context("clickhouse ping failed")?;
+
+    // The advisory lock is acquired before any sink can write. It rejects a
+    // duplicate local publisher instead of allowing two processes to race
+    // `max(revision) + 1` for the same host identity. The diagnostic is
+    // durable so monitor/doctor can explain the fail-closed startup.
+    let _publication_owner = match PublicationOwnerLock::acquire(
+        &config.ingest.state_dir,
+        publication_identity.publisher_id(),
+    ) {
+        Ok(owner) => {
+            if let Err(error) = record_publication_writer_conflict(&clickhouse, false, "").await {
+                warn!("failed to clear publication writer-conflict diagnostic: {error}");
+            }
+            owner
+        }
+        Err(lock_error) => {
+            let detail = "another local ingest process owns this publication identity";
+            if let Err(error) = record_publication_writer_conflict(&clickhouse, true, detail).await
+            {
+                warn!("failed to record publication writer-conflict diagnostic: {error}");
+            }
+            return Err(lock_error).context("failed to acquire publication ownership");
+        }
+    };
+
+    for (table, column) in [
+        ("published_source_generations", "publication_revision"),
+        ("ingest_checkpoint_transitions", "checkpoint_revision"),
+        (
+            "source_generation_publication_readiness",
+            "readiness_revision",
+        ),
+        ("ingest_append_control", "control_revision"),
+        ("publication_diagnostic_events", "diagnostic_revision"),
+        ("mcp_open_publication_headers", "candidate_publication_id"),
+        ("mcp_open_generation_readiness", "candidate_publication_id"),
+        ("raw_events", "source_host"),
+        ("events", "source_host"),
+        ("event_links", "source_host"),
+        ("tool_io", "source_host"),
+        ("ingest_errors", "source_host"),
+    ] {
+        if !table_column_available(&clickhouse, table, column)
+            .await
+            .with_context(|| {
+                format!("failed to inspect required publication column {table}.{column}")
+            })?
+        {
+            return Err(anyhow::anyhow!(
+                "publication-aware ingest requires {table}.{column}; run `moraine db migrate` before restarting ingest"
+            ));
+        }
+    }
+
+    let startup_publication = PublicationActor::new(
+        clickhouse.clone(),
+        String::new(),
+        publication_identity.publisher_id().to_string(),
+    );
+    if startup_publication
+        .block_orphaned_append_on_startup()
+        .await
+        .context("failed to repair append publication control")?
+    {
+        warn!(
+            "an unresolved append manifest remains blocked after restart; affected strict reads stay fail-closed"
+        );
+    }
 
     let checkpoint_cursor_columns = checkpoint_cursor_columns_available(&clickhouse)
         .await
@@ -134,10 +257,6 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         enabled_sources.len()
     );
 
-    let has_named_backends = config
-        .backends
-        .keys()
-        .any(|name| name != DEFAULT_BACKEND_NAME);
     let raw_events_author_column = table_column_available(&clickhouse, "raw_events", "author")
         .await
         .context("failed to inspect raw_events author column")?;
@@ -226,6 +345,7 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         metrics.clone(),
         default_sink_rx,
         checkpoint_cursor_columns,
+        publication_identity.clone(),
         SinkAuthorConfig::new(
             config.identity.author.clone(),
             raw_events_author_column,
@@ -248,6 +368,7 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         resolver,
         backend_statuses,
         RedactionContext::new(redactor, redaction_audit),
+        publication_identity,
     );
 
     let sem = Arc::new(Semaphore::new(config.ingest.max_file_workers.max(1)));
@@ -377,6 +498,33 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
     Ok(())
 }
 
+async fn record_publication_writer_conflict(
+    clickhouse: &ClickHouseClient,
+    active: bool,
+    detail: &str,
+) -> Result<()> {
+    let revision = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64;
+    clickhouse
+        .insert_json_rows_sync(
+            "publication_diagnostic_events",
+            &[serde_json::json!({
+                "source_host": "",
+                "source_name": "",
+                "source_file": "",
+                "diagnostic_kind": "writer_conflict",
+                "diagnostic_revision": revision,
+                "detail": detail,
+                "active": u8::from(active),
+            })],
+        )
+        .await
+        .context("failed to write publication writer-conflict diagnostic")
+}
+
 #[derive(Deserialize)]
 struct CheckpointRow {
     source_name: String,
@@ -392,6 +540,43 @@ struct CheckpointRow {
     source_fingerprint: u64,
     #[serde(default)]
     schema_fingerprint: u64,
+}
+
+#[derive(Deserialize)]
+struct CausalCheckpointRow {
+    source_name: String,
+    source_file: String,
+    source_inode: u64,
+    source_generation: u32,
+    last_offset: u64,
+    last_line_no: u64,
+    status: String,
+    #[serde(default)]
+    cursor_json: String,
+    #[serde(default)]
+    source_fingerprint: u64,
+    #[serde(default)]
+    schema_fingerprint: u64,
+    checkpoint_revision: u64,
+    operation_id: String,
+    #[serde(default)]
+    scan_inode: u64,
+    #[serde(default)]
+    scan_boundary: u64,
+    #[serde(default)]
+    policy_fingerprint: String,
+    #[serde(default)]
+    final_scan_complete: u8,
+    #[serde(default)]
+    block_reason: String,
+    #[serde(default)]
+    compatibility_prepared: u8,
+    #[serde(default)]
+    backend_caught_up: u8,
+    #[serde(default)]
+    append_batch_id: String,
+    #[serde(default)]
+    cache_epoch: u64,
 }
 
 /// Returns whether `ingest_checkpoints` carries the SQLite cursor columns
@@ -476,11 +661,96 @@ fn checkpoints_query(database: &str, cursor_columns: bool, host: Option<&str>) -
     )
 }
 
+/// Loads one indivisible causal checkpoint tuple. Tuple-valued `argMax`
+/// avoids manufacturing a state from independently selected equal-timestamp
+/// legacy columns.
+fn causal_checkpoints_query(database: &str, host: Option<&str>) -> String {
+    let host = host
+        .unwrap_or_default()
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'");
+    format!(
+        "SELECT \
+            source_name, source_file, \
+            toUInt64(tupleElement(current, 1)) AS source_inode, \
+            toUInt32(tupleElement(current, 2)) AS source_generation, \
+            toUInt64(tupleElement(current, 3)) AS last_offset, \
+            toUInt64(tupleElement(current, 4)) AS last_line_no, \
+            tupleElement(current, 5) AS status, \
+            tupleElement(current, 6) AS cursor_json, \
+            toUInt64(tupleElement(current, 7)) AS source_fingerprint, \
+            toUInt64(tupleElement(current, 8)) AS schema_fingerprint, \
+            toUInt64(tupleElement(current, 9)) AS checkpoint_revision, \
+            tupleElement(current, 10) AS operation_id, \
+            toUInt64(tupleElement(current, 11)) AS scan_inode, \
+            toUInt64(tupleElement(current, 12)) AS scan_boundary, \
+            tupleElement(current, 13) AS policy_fingerprint, \
+            toUInt8(tupleElement(current, 14)) AS final_scan_complete, \
+            tupleElement(current, 15) AS block_reason, \
+            toUInt8(tupleElement(current, 16)) AS compatibility_prepared, \
+            toUInt8(tupleElement(current, 17)) AS backend_caught_up, \
+            tupleElement(current, 18) AS append_batch_id, \
+            toUInt64(tupleElement(current, 19)) AS cache_epoch \
+         FROM (SELECT source_name, source_file, \
+            argMax(tuple(inode, source_generation, last_offset, last_line, lifecycle, \
+                         cursor_json, source_fingerprint, schema_fingerprint, checkpoint_revision, \
+                         operation_id, scan_inode, scan_boundary, policy_fingerprint, \
+                         final_scan_complete, block_reason, compatibility_prepared, \
+                         backend_caught_up, append_batch_id, cache_epoch), \
+                   tuple(source_generation, checkpoint_revision)) AS current \
+            FROM {}.ingest_checkpoint_transitions WHERE host = '{}' \
+            GROUP BY source_name, source_file)",
+        database, host
+    )
+}
+
 async fn load_checkpoints(
     clickhouse: &ClickHouseClient,
     cursor_columns: bool,
     host: Option<&str>,
 ) -> Result<HashMap<String, model::Checkpoint>> {
+    if table_column_available(
+        clickhouse,
+        "ingest_checkpoint_transitions",
+        "checkpoint_revision",
+    )
+    .await?
+    {
+        let query = causal_checkpoints_query(&clickhouse.config().database, host);
+        let rows: Vec<CausalCheckpointRow> = clickhouse.query_rows(&query, None).await?;
+        let mut map = HashMap::<String, model::Checkpoint>::new();
+        for row in rows {
+            let key = checkpoint_key(&row.source_name, &row.source_file);
+            map.insert(
+                key,
+                model::Checkpoint {
+                    source_name: row.source_name,
+                    source_file: row.source_file,
+                    source_inode: row.source_inode,
+                    source_generation: row.source_generation.max(1),
+                    last_offset: row.last_offset,
+                    last_line_no: row.last_line_no,
+                    status: row.status,
+                    cursor_json: row.cursor_json,
+                    source_fingerprint: row.source_fingerprint,
+                    schema_fingerprint: row.schema_fingerprint,
+                    policy_fingerprint: row.policy_fingerprint,
+                    checkpoint_revision: row.checkpoint_revision,
+                    operation_id: row.operation_id,
+                    scan_inode: row.scan_inode,
+                    scan_boundary: row.scan_boundary,
+                    final_scan_complete: row.final_scan_complete != 0,
+                    block_reason: row.block_reason,
+                    compatibility_prepared: row.compatibility_prepared != 0,
+                    backend_caught_up: row.backend_caught_up != 0,
+                    append_batch_id: row.append_batch_id,
+                    cache_epoch: row.cache_epoch,
+                },
+            );
+        }
+        return Ok(map);
+    }
+
     let query = checkpoints_query(&clickhouse.config().database, cursor_columns, host);
     let rows: Vec<CheckpointRow> = clickhouse.query_rows(&query, None).await?;
     let mut map = HashMap::<String, model::Checkpoint>::new();
@@ -500,6 +770,7 @@ async fn load_checkpoints(
                 cursor_json: row.cursor_json,
                 source_fingerprint: row.source_fingerprint,
                 schema_fingerprint: row.schema_fingerprint,
+                ..model::Checkpoint::default()
             },
         );
     }
@@ -509,7 +780,7 @@ async fn load_checkpoints(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_ingest_clickhouse_client, checkpoints_query};
+    use super::{build_ingest_clickhouse_client, causal_checkpoints_query, checkpoints_query};
     use axum::{extract::State, http::HeaderMap, routing::post, Router};
     use std::sync::{Arc, Mutex};
     #[tokio::test]
@@ -586,5 +857,19 @@ mod tests {
     fn checkpoints_query_escapes_hostile_host_names() {
         let query = checkpoints_query("moraine_team", false, Some("a'b\\c"));
         assert!(query.contains("WHERE host = 'a\\'b\\\\c'"));
+    }
+
+    #[test]
+    fn causal_checkpoint_restart_prefers_generation_before_late_revision() {
+        let query = causal_checkpoints_query("moraine", Some("dev-box"));
+        assert!(
+            query.contains("tuple(source_generation, checkpoint_revision)"),
+            "a late stale-generation transition must not beat the greatest generation: {query}"
+        );
+        assert_eq!(
+            query.matches("argMax(tuple(").count(),
+            1,
+            "the restart row must come from one indivisible causal tuple"
+        );
     }
 }

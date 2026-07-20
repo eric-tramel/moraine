@@ -28,6 +28,8 @@ pub struct TurnCursor {
     pub last_turn_seq: u32,
     pub session_id: String,
     pub filter_sig: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +39,8 @@ pub struct SessionEventCursor {
     pub session_id: String,
     pub direction: SessionEventsDirection,
     pub filter_sig: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_token: Option<String>,
 }
 
 pub fn encode_cursor<T: Serialize>(cursor: &T) -> RepoResult<String> {

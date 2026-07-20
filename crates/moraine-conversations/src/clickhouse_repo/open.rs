@@ -244,7 +244,10 @@ FORMAT JSONEachRow",
                 .await?
                 .into_iter()
                 .map(|turn| turn.compact)
-                .collect();
+                .collect::<Vec<_>>();
+            if turns.len() != session.row.total_turns as usize {
+                continue;
+            }
             if !self.projected_snapshot_still_current(&session).await? {
                 continue;
             }
@@ -269,9 +272,7 @@ FORMAT JSONEachRow",
                 }),
             }));
         }
-        Err(RepoError::backend(
-            "MCP open session snapshot changed repeatedly",
-        ))
+        Err(RepoError::ReadModelChanged)
     }
 
     pub(super) async fn get_turn_impl(
@@ -343,9 +344,7 @@ FORMAT JSONEachRow",
                 }),
             }));
         }
-        Err(RepoError::backend(
-            "MCP open turn snapshot changed repeatedly",
-        ))
+        Err(RepoError::ReadModelChanged)
     }
 
     pub(super) async fn open_event_impl(&self, req: OpenEventRequest) -> RepoResult<OpenContext> {
@@ -560,7 +559,6 @@ FORMAT JSONEachRow",
 
         for _ in 0..MAX_MCP_OPEN_SNAPSHOT_ATTEMPTS {
             let candidates = self.load_projected_event_candidates(event_uid).await?;
-            let stale_candidates_observed = !candidates.is_empty();
             let mut pinned = None;
             for lookup in candidates {
                 let Some(session) = self.load_projected_session(&lookup.session_id).await? else {
@@ -572,8 +570,8 @@ FORMAT JSONEachRow",
                 }
             }
             let Some((lookup, session)) = pinned else {
-                if stale_candidates_observed {
-                    continue;
+                if self.canonical_event_exists_in_snapshot(event_uid).await? {
+                    return Err(RepoError::ReadModelChanged);
                 }
                 return Ok(None);
             };
@@ -656,8 +654,6 @@ FORMAT JSONEachRow",
                 next_turn: parent_turn.next_turn,
             }));
         }
-        Err(RepoError::backend(
-            "MCP open event snapshot changed repeatedly",
-        ))
+        Err(RepoError::ReadModelChanged)
     }
 }

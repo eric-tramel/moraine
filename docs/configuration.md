@@ -209,6 +209,29 @@ stored in that backend's database, scoped per host (migration 018), so team
 members sharing one backend never disturb each other's mirror progress —
 even when session files on two machines share an absolute path.
 
+Shared-backend ownership uses a random installation UUID persisted at
+`<ingest.state_dir>/publication-host-id` (normally
+`~/.moraine/ingestor/publication-host-id`), not `HOSTNAME` or `USER`. Moraine
+creates the file atomically with owner-only permissions where the platform
+supports them, syncs it durably, and reuses the same ID after restart. A missing
+file creates a new identity; malformed, insecure, or unreadable files stop
+ingest before any publisher or sink starts. Keep this file when moving the
+state directory for the same installation, but do not copy it to another
+machine.
+
+The first #602-capable run intentionally does **not** adopt or merge checkpoint
+or source-host keys written by older releases under an environment-derived
+hostname/username. When a new identity is created while named backends are
+configured, ingest emits a migration warning and mirror catch-up replays
+tracked sources under the new UUID. It never rewrites or claims the old key.
+Previously published rows under a nonempty legacy key remain a separate
+historical publisher and can therefore duplicate the replayed history until an
+administrator retires or rebuilds that legacy backend data. Hostless legacy
+rows remain fail-closed and are surfaced by publication diagnostics. Review
+the startup warning and clean up the old publisher deliberately; copying its
+key into `publication-host-id` is rejected because the file accepts only a
+canonical random UUID.
+
 A slow or unreachable backend never stalls local ingest. Mirror forwarding
 uses a bounded queue; on overflow the backend is marked lagging and live
 mirroring to it pauses. The source session files on disk act as the

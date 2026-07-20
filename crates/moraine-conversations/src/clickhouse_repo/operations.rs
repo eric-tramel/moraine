@@ -345,11 +345,19 @@ impl ClickHouseConversationRepository {
             },
         };
 
+        let publication = match self.ch.publication_diagnostics().await {
+            Ok(diagnostics) => StoreProbe::Available(diagnostics),
+            Err(error) => StoreProbe::Failed {
+                message: error.to_string(),
+            },
+        };
+
         Ok(StoreHealth {
             ping,
             version,
             database_exists,
             connections,
+            publication,
         })
     }
 
@@ -363,6 +371,7 @@ impl ClickHouseConversationRepository {
             applied_schema_versions: report.applied_migrations,
             pending_schema_versions: report.pending_migrations,
             missing_tables: report.missing_tables,
+            publication: report.publication,
             errors: report.errors,
         })
     }

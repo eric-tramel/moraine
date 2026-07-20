@@ -141,6 +141,25 @@ class DurablePublicationTests(unittest.TestCase):
                     with self.assertRaisesRegex(scenarios.EtdSampleFailure, expected):
                         scenarios.publish_event_durably(root, "event.jsonl", b"x")
 
+    def test_same_file_append_is_fsynced_without_inode_replacement(self) -> None:
+        clock = FakeClock()
+        with tempfile.TemporaryDirectory() as root:
+            first = scenarios.append_event_durably(
+                root, "events.jsonl", b'{"n":1}\n', clock_ns=clock
+            )
+            inode = Path(root, "events.jsonl").stat().st_ino
+            second = scenarios.append_event_durably(
+                root, "events.jsonl", b'{"n":2}\n', clock_ns=clock
+            )
+
+            self.assertEqual(Path(root, "events.jsonl").stat().st_ino, inode)
+            self.assertEqual(
+                Path(root, "events.jsonl").read_bytes(),
+                b'{"n":1}\n{"n":2}\n',
+            )
+            self.assertGreaterEqual(first.publication_durable_ns, first.t0_ns)
+            self.assertGreaterEqual(second.publication_durable_ns, second.t0_ns)
+
 
 class EtdScenarioTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -333,6 +352,69 @@ class EtdScenarioTests(unittest.TestCase):
             result = self.run_event(self.miss_then_hit)
         self.assertEqual(result.status, "pass")
         self.assertGreater(result.samples[0]["first_valid_ms"], 0.0)
+
+    def test_serial_append_scenario_correlates_each_same_file_ack(self) -> None:
+        events = fixtures.build_append_probe_events(2, term_count=4)
+        term_events = {
+            term: event for event in events for term in event["probe_terms"]
+        }
+        clock = FakeClock()
+        published = 0
+        emitted = 0
+
+        def publisher(root, filename, payload, *, clock_ns):
+            nonlocal published
+            evidence = scenarios.append_event_durably(
+                root, filename, payload, clock_ns=clock_ns
+            )
+            published += 1
+            return evidence
+
+        def ack_reader():
+            nonlocal emitted
+            if emitted >= published:
+                return []
+            event = events[emitted]
+            emitted += 1
+            observed_ns = clock.peek()
+            return [
+                {
+                    "batch_sequence": emitted,
+                    "event_identity_digests": [event["expected_ack_digest"]],
+                    "ack_monotonic_ns": observed_ns,
+                    "observed_lower_ns": observed_ns,
+                    "observed_upper_ns": observed_ns,
+                }
+            ]
+
+        def probe(query):
+            event = term_events[query["query"]]
+            clock.advance_ms(1)
+            return scenarios.EtdProbeResult(True, visible_result(event), 1.0)
+
+        with tempfile.TemporaryDirectory() as root:
+            result = scenarios.run_serial_append_etd_scenario(
+                events,
+                root,
+                probe,
+                ack_reader,
+                lambda: True,
+                timeout_s=0.1,
+                poll_interval_s=0.001,
+                clock_ns=clock,
+                sleeper=clock.sleep,
+                publisher=publisher,
+            )
+            self.assertEqual(
+                Path(root, events[0]["destination_filename"])
+                .read_bytes()
+                .count(b"\n"),
+                4,
+            )
+
+        self.assertEqual(result.status, "pass")
+        self.assertEqual([sample["batch_sequence"] for sample in result.samples], [1, 2])
+        self.assertTrue(all(sample["valid"] for sample in result.samples))
 
     def test_loaded_arm_is_exactly_seventy_five_percent_and_overlaps_schedule(self) -> None:
         observed_rates: list[float] = []

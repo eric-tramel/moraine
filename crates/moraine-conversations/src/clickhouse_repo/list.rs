@@ -30,7 +30,7 @@ impl ClickHouseConversationRepository {
         };
 
         let session_summary = self.table_ref("v_session_summary");
-        let events_source = canonical_events_source(&self.table_ref("events"));
+        let events_source = self.live_events_source();
         let mode_subquery = self.mode_subquery();
 
         let mut where_clauses = vec!["1 = 1".to_string()];
@@ -177,7 +177,7 @@ FORMAT JSONEachRow",
         };
 
         let session_summary = self.table_ref("v_session_summary");
-        let events_source = canonical_events_source(&self.table_ref("events"));
+        let events_source = self.live_events_source();
 
         let mut where_clauses = vec![
             // A blank session_id is never a real session (e.g. the orphan
@@ -481,6 +481,11 @@ FORMAT JSONEachRow",
                     "cursor does not match current turn filter",
                 ));
             }
+            if cursor.publication_token.is_some()
+                && cursor.publication_token != active_publication_token()
+            {
+                return Err(RepoError::ReadModelChanged);
+            }
             Some(cursor)
         } else {
             None
@@ -545,6 +550,7 @@ FORMAT JSONEachRow",
                     last_turn_seq: last.turn_seq,
                     session_id: session_id.to_string(),
                     filter_sig,
+                    publication_token: active_publication_token(),
                 })?)
             } else {
                 None
@@ -589,6 +595,11 @@ FORMAT JSONEachRow",
                 return Err(RepoError::invalid_cursor(
                     "cursor does not match current session event filter",
                 ));
+            }
+            if cursor.publication_token.is_some()
+                && cursor.publication_token != active_publication_token()
+            {
+                return Err(RepoError::ReadModelChanged);
             }
             Some(cursor)
         } else {
@@ -674,6 +685,7 @@ FORMAT JSONEachRow",
                     session_id: session_id.to_string(),
                     direction,
                     filter_sig,
+                    publication_token: active_publication_token(),
                 })?)
             } else {
                 None
