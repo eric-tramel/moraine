@@ -34,6 +34,7 @@ from performance_fixtures import (
 from performance_protocol import (
     PAIR_ORDER,
     ProtocolError,
+    _validate_resources,
     compare_manifests,
     create_build_identity,
     create_build_recipe,
@@ -1375,6 +1376,15 @@ def validate_source_publication_probe(document: Any) -> None:
         )
     ):
         raise SuiteFailure("source-publication probe run policy is invalid")
+    try:
+        resources_pass = _validate_resources(document["resources"])
+    except ProtocolError as error:
+        raise SuiteFailure(f"source-publication probe resources are invalid: {error}") from error
+    if (
+        document["resources"]["authoritative"] is not run["authoritative"]
+        or (run["authoritative"] and not resources_pass)
+    ):
+        raise SuiteFailure("source-publication probe resource authority differs")
     _validate_publication_capture_scaling(scaling)
     _validate_source_host_column_resources(source_host_columns["before"])
     _validate_source_host_column_resources(source_host_columns["after"])

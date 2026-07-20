@@ -14,6 +14,7 @@ if str(BENCH_DIR) not in sys.path:
     sys.path.insert(0, str(BENCH_DIR))
 
 import performance_fixtures as fixtures
+import performance_protocol as protocol
 import performance_scenarios as scenarios
 
 
@@ -292,6 +293,8 @@ class EtdScenarioTests(unittest.TestCase):
         sample = result.samples[0]
         self.assertEqual(sample["db_ack_interval"]["lower_ms"], 0.0)
         self.assertEqual(sample["db_ack_interval"]["upper_ms"], 5.0)
+        self.assertLess(sample["db_ack_lower_ms"], sample["db_ack_ms"])
+        protocol._validate_etd_sample(sample, "$.samples[0]")
 
     def test_watcher_readiness_prevents_any_publication(self) -> None:
         probe_called = False
@@ -326,6 +329,7 @@ class EtdScenarioTests(unittest.TestCase):
         result = self.run_event(self.immediate_hit, ack_reader=lambda: [], timeout_s=0.005)
         self.assertEqual(result.status, "fail")
         self.assertEqual(result.samples[0]["error_code"], "missing_db_ack")
+        self.assertIsNone(result.samples[0]["db_ack_lower_ms"])
         self.assertIsNone(result.samples[0]["db_ack_ms"])
         self.assertIsNone(result.samples[0]["first_hit_ms"])
         self.assertIsNone(result.samples[0]["first_valid_ms"])

@@ -303,6 +303,7 @@ def etd_sample(lower: float = 100.0, upper: float | None = None, *, left: bool =
             "term_sha256": None,
             "batch_sequence": None,
             "publication_durable_ms": None,
+            "db_ack_lower_ms": None,
             "db_ack_ms": None,
             "last_miss_ms": None,
             "first_hit_ms": None,
@@ -320,6 +321,7 @@ def etd_sample(lower: float = 100.0, upper: float | None = None, *, left: bool =
         "term_sha256": digest(f"term:{suffix}"),
         "batch_sequence": 1,
         "publication_durable_ms": 0.5,
+        "db_ack_lower_ms": 1.0,
         "db_ack_ms": 1.0,
         "last_miss_ms": last_miss,
         "first_hit_ms": upper,
@@ -757,6 +759,7 @@ class DocumentValidationTests(unittest.TestCase):
         })
         protocol.validate_document(multiple_terms)
         early_ack = copy.deepcopy(normal)
+        early_ack["samples"][0]["db_ack_lower_ms"] = 0.25
         early_ack["samples"][0]["db_ack_ms"] = 0.25
         early_ack["samples"][0]["db_ack_interval"] = {
             "lower_ms": 99.75, "upper_ms": 100.75, "censoring": "interval"
@@ -768,6 +771,11 @@ class DocumentValidationTests(unittest.TestCase):
             key: value for key, value in early_ack.items() if key != "artifact_sha256"
         })
         protocol.validate_document(early_ack)
+        self.assert_mutation_rejected(
+            normal,
+            lambda doc: doc["samples"][0].__setitem__("db_ack_lower_ms", 2.0),
+            "must not follow",
+        )
         self.assert_mutation_rejected(normal, lambda doc: doc["samples"][0]["cache_bypass"].__setitem__("posting", False), "valid")
         self.assert_mutation_rejected(normal, lambda doc: doc["samples"].append(copy.deepcopy(doc["samples"][0])), "event_count|duplicate")
         self.assert_mutation_rejected(normal, lambda doc: doc["samples"][0].__setitem__("first_valid_ms", 99), "precede|polling")
