@@ -462,7 +462,12 @@ def _build_event_case(profile: str, split: str, index: int, term_count: int) -> 
     return event
 
 
-def build_append_probe_events(count: int, *, term_count: int = 64) -> list[dict[str, Any]]:
+def build_append_probe_events(
+    count: int,
+    *,
+    term_count: int = 64,
+    first_term_count: int | None = None,
+) -> list[dict[str, Any]]:
     """Build ordered events for one real same-generation JSONL append stream.
 
     Unlike the ordinary ETD fixture, every event targets the same file.  The
@@ -479,6 +484,11 @@ def build_append_probe_events(count: int, *, term_count: int = 64) -> list[dict[
         or isinstance(term_count, bool)
         or not isinstance(term_count, int)
         or term_count < 1
+        or isinstance(first_term_count, bool)
+        or (
+            first_term_count is not None
+            and (not isinstance(first_term_count, int) or first_term_count < 1)
+        )
     ):
         raise FixtureError("append probe requires bounded positive event and term counts")
     destination_filename = "source-publication-append.jsonl"
@@ -490,6 +500,11 @@ def build_append_probe_events(count: int, *, term_count: int = 64) -> list[dict[
         raw_event = f"perf-publication-event-{index:05d}"
         raw_session = f"perf-publication-session-{index:05d}"
         prefix = f"perfpublicationappend{index:05d}x"
+        event_term_count = (
+            first_term_count
+            if index == 0 and first_term_count is not None
+            else term_count
+        )
         event: dict[str, Any] = {
             "case_id": f"publication-append-event-{index:05d}",
             "split": "source-publication",
@@ -500,7 +515,9 @@ def build_append_probe_events(count: int, *, term_count: int = 64) -> list[dict[
             .isoformat(timespec="milliseconds")
             .replace("+00:00", "Z"),
             "marker": f"perfpublicationmarker{index:05d}",
-            "probe_terms": [f"{prefix}{probe:03d}" for probe in range(term_count)],
+            "probe_terms": [
+                f"{prefix}{probe:03d}" for probe in range(event_term_count)
+            ],
         }
         source_bytes = codex_event_lines(event)
         lines = source_bytes.splitlines(keepends=True)
