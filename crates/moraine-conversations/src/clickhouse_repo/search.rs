@@ -27,6 +27,10 @@ impl ClickHouseConversationRepository {
     /// Session headers that are authorized by the operation's captured source
     /// heads and by the current canonical session contents.
     pub(super) fn mcp_search_sessions_source(&self) -> String {
+        self.mcp_search_sessions_source_for(None)
+    }
+
+    fn mcp_search_sessions_source_for(&self, session_ids_source: Option<&str>) -> String {
         let snapshot = require_active_publication_snapshot("MCP search session reads");
 
         let headers = self.table_ref("mcp_open_publication_headers");
@@ -34,7 +38,16 @@ impl ClickHouseConversationRepository {
         let dirty_sessions = self.table_ref("mcp_open_dirty_sessions");
         let captured_heads = snapshot.captured_source_heads_sql(&history);
         let live_events = self.live_events_source();
-
+        let candidate_filter = |alias: &str| {
+            session_ids_source
+                .map(|source| {
+                    format!("\n      AND {alias}.session_id IN (SELECT session_id FROM {source})")
+                })
+                .unwrap_or_default()
+        };
+        let header_candidate_filter = candidate_filter("h");
+        let source_candidate_filter = candidate_filter("e");
+        let dirty_candidate_filter = candidate_filter("dirty");
         format!(
             "(WITH
   {captured_heads} AS captured_heads,
@@ -46,14 +59,14 @@ impl ClickHouseConversationRepository {
       AND arrayAll(
         required_head -> has(captured_heads, required_head),
         h.required_source_heads
-      )
+      ){header_candidate_filter}
   ),
   current_sources AS (
     SELECT
       e.session_id AS session_id,
       toUInt64(cityHash64(arraySort(groupArray(tuple(e.event_uid, e.event_version))))) AS source_revision
     FROM {live_events} AS e
-    WHERE notEmpty(e.session_id)
+    WHERE notEmpty(e.session_id){source_candidate_filter}
       AND e.session_id IN (SELECT session_id FROM head_authorized_headers)
     GROUP BY e.session_id
   ),
@@ -62,7 +75,7 @@ impl ClickHouseConversationRepository {
       dirty.session_id AS session_id,
       toUInt64(max(dirty.dirty_revision)) AS dirty_revision
     FROM {dirty_sessions} AS dirty FINAL
-    WHERE notEmpty(dirty.session_id)
+    WHERE notEmpty(dirty.session_id){dirty_candidate_filter}
       AND dirty.session_id IN (SELECT session_id FROM head_authorized_headers)
     GROUP BY dirty.session_id
   )
@@ -695,22 +708,6 @@ WHERE scope_s.session_id = {session_id}{scope_origin_filter}",
     FROM {postings_table} AS p FINAL
     WHERE p.term IN q_terms
   ),
-  matching_doc_ids AS (
-    SELECT p.source_host AS source_host, p.doc_id AS event_uid
-    FROM {postings_table} AS p FINAL
-    ALL INNER JOIN {sessions_table} AS s ON s.session_id = p.session_id
-    WHERE p.term IN q_terms
-      AND {posting_where_sql}
-      AND projection_ready = 1
-      AND projection_clean = 1
-  ),
-  projected_candidates AS (
-    SELECT source_host, event_uid, session_id, slot, generation, event_time, turn_seq
-    FROM {events_table}
-    WHERE (source_host, event_uid) IN (
-      SELECT source_host, event_uid FROM matching_doc_ids
-    )
-  ),
   ranked AS (
     SELECT
       p.source_host AS source_host,
@@ -728,7 +725,7 @@ WHERE scope_s.session_id = {session_id}{scope_origin_filter}",
       toInt64(toUnixTimestamp64Milli(any(e.event_time))) AS event_unix_ms
     FROM term_postings AS p
     ALL INNER JOIN {sessions_table} AS s ON s.session_id = p.session_id
-    ALL INNER JOIN projected_candidates AS e
+    ALL INNER JOIN {events_table} AS e FINAL
       ON e.source_host = p.source_host
       AND e.event_uid = p.doc_id
       AND e.session_id = s.session_id
@@ -803,7 +800,14 @@ FORMAT JSONEachRow",
         }
 
         let documents_table = self.table_ref("v_live_search_documents");
-        let sessions_source = self.mcp_search_sessions_source();
+        let mut candidate_session_ids = candidates
+            .iter()
+            .map(|candidate| candidate.session_id.clone())
+            .collect::<Vec<_>>();
+        candidate_session_ids.sort_unstable();
+        candidate_session_ids.dedup();
+        let candidate_session_ids_sql = sql_array_strings(&candidate_session_ids);
+        let sessions_source = self.mcp_search_sessions_source_for(Some("candidate_session_ids"));
         let sessions_table = "authorized_sessions";
         let turns_table = self.table_ref("mcp_open_turns");
         let projected_events_table = self.table_ref("mcp_open_events");
@@ -833,6 +837,9 @@ FORMAT JSONEachRow",
 
         Ok(format!(
             "WITH
+  candidate_session_ids AS (
+    SELECT arrayJoin({candidate_session_ids_sql}) AS session_id
+  ),
   authorized_sessions AS {sessions_source},
   {event_uids_sql} AS event_uids,
   candidate_heads AS (

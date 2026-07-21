@@ -851,7 +851,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             );
         }
 
-        if query.contains("toUInt8(0) AS row_kind") && query.contains("projected_candidates AS") {
+        if query.contains("toUInt8(0) AS row_kind") && query.contains("term_postings AS (") {
             let candidate_query_count = state
                 .queries
                 .lock()
@@ -859,7 +859,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                 .iter()
                 .filter(|candidate_query| {
                     candidate_query.contains("toUInt8(0) AS row_kind")
-                        && candidate_query.contains("projected_candidates AS")
+                        && candidate_query.contains("term_postings AS (")
                 })
                 .count();
             if candidate_query_count == 2 && query.contains("search_corpus_stats") {
