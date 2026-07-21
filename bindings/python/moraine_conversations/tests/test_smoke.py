@@ -128,9 +128,9 @@ def _rows_for_query(query: str) -> list[dict]:
 
 def _run_mock_clickhouse(port_queue: mp.Queue) -> None:
     class Handler(BaseHTTPRequestHandler):
-        def _handle(self) -> None:
+        def _handle(self, request_body: str = "") -> None:
             parsed = urlparse(self.path)
-            query = parse_qs(parsed.query).get("query", [""])[0]
+            query = parse_qs(parsed.query).get("query", [""])[0] or request_body
             rows = _rows_for_query(query)
             body = "".join(f"{json.dumps(row)}\n" for row in rows).encode("utf-8")
 
@@ -144,7 +144,9 @@ def _run_mock_clickhouse(port_queue: mp.Queue) -> None:
             self._handle()
 
         def do_POST(self) -> None:  # noqa: N802
-            self._handle()
+            content_length = int(self.headers.get("Content-Length", "0"))
+            request_body = self.rfile.read(content_length).decode("utf-8")
+            self._handle(request_body)
 
         def log_message(self, format: str, *args) -> None:  # noqa: A003
             del format
