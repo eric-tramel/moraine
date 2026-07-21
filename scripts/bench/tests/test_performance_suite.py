@@ -963,6 +963,30 @@ FORMAT JSONEachRow""",
             3,
         )
 
+    def test_publication_replay_state_allows_transient_checkpoint_visibility(
+        self,
+    ) -> None:
+        row = {
+            "source_host": "",
+            "source_name": suite.PUBLICATION_REPLAY_SOURCE_NAME,
+            "source_file": suite.PUBLICATION_REPLAY_SOURCE_FILE,
+            "source_generation": 1,
+            "publication_revision": 2,
+            "last_line": 0,
+            "lifecycle": "",
+            "complete": 1,
+            "compatibility_prepared": 1,
+            "backend_caught_up": 1,
+        }
+        with mock.patch.object(
+            suite, "_clickhouse_query", return_value=json.dumps(row)
+        ):
+            observed = suite._publication_replay_state(
+                "http://127.0.0.1:8123"
+            )
+
+        self.assertEqual(observed, row)
+
     def test_publication_replay_process_resources_never_encode_unavailable_as_zero(
         self,
     ) -> None:
