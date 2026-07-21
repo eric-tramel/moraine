@@ -795,9 +795,13 @@ impl ClickHouseClient {
     }
 
     async fn execute_mcp_open_backfill_insert(&self, statement: String) -> Result<()> {
+        // Generated plan rows contain complete source-head paths and can make
+        // a batch much larger than an HTTP request target. Carry the SQL in
+        // the POST body so backfill size is bounded by the payload limit, not
+        // by URI parsing limits.
         self.request_text_with_params_and_timeout(
-            &statement,
-            None,
+            "",
+            Some(statement.into_bytes()),
             Some(&self.cfg.database),
             false,
             None,

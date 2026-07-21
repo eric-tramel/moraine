@@ -17,6 +17,7 @@ pub use mcp_open_projection::{
 pub mod mcp_tool_names;
 
 const MAX_INSERT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+const MAX_QUERY_URL_BYTES: usize = 2 * 1024;
 use std::collections::{BTreeSet, HashSet};
 use std::time::Duration;
 const DEFAULT_USER_AGENT_ROLE: &str = "moraine-clickhouse";
@@ -184,13 +185,26 @@ impl ClickHouseClient {
     async fn request_builder(
         &self,
         query: &str,
-        body: Vec<u8>,
+        mut body: Vec<u8>,
         options: ClickHouseRequestOptions<'_>,
     ) -> Result<RequestBuilder> {
+        // ClickHouse accepts a complete SQL statement in the POST body. Keep
+        // short queries in the request target for compatibility with insert
+        // payloads, but move generated SQL out of the URL before percent
+        // encoding can exceed the HTTP client's URI limit.
+        let query_in_body = body.is_empty() && query.len() > MAX_QUERY_URL_BYTES;
+        if query_in_body {
+            body.extend_from_slice(query.as_bytes());
+        }
         let mut url = self.base_url()?;
         {
             let mut qp = url.query_pairs_mut();
-            qp.append_pair("query", query);
+            // An empty query means the complete SQL statement is carried in
+            // the POST body. This is required for generated statements that
+            // can exceed practical HTTP request-target limits.
+            if !query.is_empty() && !query_in_body {
+                qp.append_pair("query", query);
+            }
             if let Some(database) = options.database {
                 qp.append_pair("database", database);
             }
@@ -2630,6 +2644,31 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert!(requests[0].headers.get("content-encoding").is_none());
         assert_eq!(requests[0].body, payload);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn oversized_sql_statement_is_automatically_carried_in_request_body() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let base_url = spawn_request_capture_server(RequestCaptureState {
+            requests: requests.clone(),
+        })
+        .await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+        let statement = format!("INSERT INTO plans VALUES ('{}')", "x".repeat(128 * 1024));
+
+        client
+            .request_text(&statement, None, Some("moraine"), false, None)
+            .await
+            .expect("body-carried SQL request");
+
+        let requests = requests.lock().expect("request capture mutex poisoned");
+        assert_eq!(requests.len(), 1);
+        assert!(!requests[0].params.contains_key("query"));
+        assert_eq!(requests[0].body, statement.as_bytes());
+        assert_eq!(
+            requests[0].params.get("database").map(String::as_str),
+            Some("moraine")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
