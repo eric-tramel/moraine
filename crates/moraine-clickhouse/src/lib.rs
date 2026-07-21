@@ -20,6 +20,11 @@ const MAX_INSERT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 use std::collections::{BTreeSet, HashSet};
 use std::time::Duration;
 const DEFAULT_USER_AGENT_ROLE: &str = "moraine-clickhouse";
+const MIN_MIGRATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
+fn migration_request_timeout(configured_seconds: f64) -> Duration {
+    Duration::from_secs_f64(configured_seconds.max(MIN_MIGRATION_REQUEST_TIMEOUT.as_secs_f64()))
+}
 
 #[derive(Clone)]
 pub struct ClickHouseClient {
@@ -282,6 +287,29 @@ impl ClickHouseClient {
         default_format: Option<&str>,
         params: &[(&str, &str)],
     ) -> Result<String> {
+        self.request_text_with_params_and_timeout(
+            query,
+            body,
+            database,
+            async_insert,
+            default_format,
+            params,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn request_text_with_params_and_timeout(
+        &self,
+        query: &str,
+        body: Option<Vec<u8>>,
+        database: Option<&str>,
+        async_insert: bool,
+        default_format: Option<&str>,
+        params: &[(&str, &str)],
+        request_timeout: Option<Duration>,
+    ) -> Result<String> {
         let req = self
             .request_builder(
                 query,
@@ -291,7 +319,7 @@ impl ClickHouseClient {
                     async_insert,
                     default_format,
                     params,
-                    request_timeout: None,
+                    request_timeout,
                 },
             )
             .await?;
@@ -521,6 +549,11 @@ impl ClickHouseClient {
             .filter(|migration| !applied.contains(migration.version))
             .collect::<Vec<_>>();
         let total = pending.len();
+        // Backfills may legitimately outlive the ordinary interactive-query
+        // deadline.  Keep any larger operator-configured timeout, but prevent
+        // a client-side deadline from abandoning a still-running migration
+        // and overlapping it with a retry.
+        let migration_request_timeout = migration_request_timeout(self.cfg.timeout_seconds);
         on_progress(MigrationProgress::Plan {
             applied: bundled_count.saturating_sub(total),
             pending: total,
@@ -538,15 +571,23 @@ impl ClickHouseClient {
 
             let sql = materialize_migration_sql(migration.sql, &self.cfg.database)?;
             for statement in split_sql_statements(&sql) {
-                self.request_text(&statement, None, Some(&self.cfg.database), false, None)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed migration {} statement: {}",
-                            migration.name,
-                            truncate_for_error(&statement)
-                        )
-                    })?;
+                self.request_text_with_params_and_timeout(
+                    &statement,
+                    None,
+                    Some(&self.cfg.database),
+                    false,
+                    None,
+                    &[],
+                    Some(migration_request_timeout),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed migration {} statement: {}",
+                        migration.name,
+                        truncate_for_error(&statement)
+                    )
+                })?;
             }
 
             let log_stmt = format!(
@@ -555,9 +596,17 @@ impl ClickHouseClient {
                 escape_literal(migration.version),
                 escape_literal(migration.name)
             );
-            self.request_text(&log_stmt, None, Some(&self.cfg.database), false, None)
-                .await
-                .with_context(|| format!("failed to record migration {}", migration.name))?;
+            self.request_text_with_params_and_timeout(
+                &log_stmt,
+                None,
+                Some(&self.cfg.database),
+                false,
+                None,
+                &[],
+                Some(migration_request_timeout),
+            )
+            .await
+            .with_context(|| format!("failed to record migration {}", migration.name))?;
 
             executed.push(migration.version.to_string());
             on_progress(MigrationProgress::Applied {
@@ -1970,7 +2019,7 @@ mod tests {
         let document_mv = sql
             .split_once("CREATE MATERIALIZED VIEW moraine.mv_search_documents_from_events")
             .and_then(|(_, tail)| {
-                tail.split_once("INSERT INTO moraine.search_documents")
+                tail.split_once("CREATE MATERIALIZED VIEW moraine.mv_search_postings")
                     .map(|(mv, _)| mv)
             })
             .expect("032 must materialize search documents before backfilling tombstones");
@@ -1979,10 +2028,53 @@ mod tests {
             !document_mv.contains("WHERE"),
             "032 must materialize one document version for every future event revision"
         );
-        let tombstone_backfill = sql
-            .split_once("INSERT INTO moraine.search_documents")
+        let stranded_posting_repair = sql
+            .split_once("-- An interrupted older copy of this migration")
             .and_then(|(_, tail)| {
-                tail.split_once("CREATE MATERIALIZED VIEW moraine.mv_search_postings")
+                tail.split_once("-- Reconcile every current event version")
+                    .map(|(repair, _)| repair)
+            })
+            .expect("032 must repair documents stranded by an interrupted older attempt");
+        assert!(stranded_posting_repair.contains("INSERT INTO moraine.search_postings"));
+        assert!(stranded_posting_repair.contains("FROM moraine.search_documents FINAL"));
+        assert!(stranded_posting_repair.contains("FROM moraine.search_postings"));
+        assert!(stranded_posting_repair.contains("LEFT ANTI JOIN"));
+        assert!(stranded_posting_repair.contains("WHERE missing.doc_len > 0"));
+        let anti_join = stranded_posting_repair
+            .find("LEFT ANTI JOIN")
+            .expect("032 stranded-posting repair must anti-join covered documents");
+        let tokenization = stranded_posting_repair
+            .find("arrayJoin(extractAll")
+            .expect("032 stranded-posting repair must tokenize missing documents");
+        assert!(
+            anti_join < tokenization,
+            "032 must eliminate covered documents before regex tokenization"
+        );
+        assert!(!stranded_posting_repair.contains("FROM moraine.search_postings FINAL"));
+        assert!(stranded_posting_repair.contains("join_algorithm = 'grace_hash'"));
+        assert!(stranded_posting_repair.contains("max_bytes_in_join = 268435456"));
+        for identity in [
+            "missing.source_host = p.source_host",
+            "missing.source_name = p.source_name",
+            "missing.session_id = p.session_id",
+            "missing.source_ref = p.source_ref",
+            "missing.event_uid = p.doc_id",
+            "missing.doc_version = p.post_version",
+        ] {
+            assert!(
+                stranded_posting_repair.contains(identity),
+                "032 stranded-posting repair must match `{identity}`"
+            );
+        }
+        assert!(!stranded_posting_repair.contains("missing.source_file = p.source_file"));
+        assert!(
+            !stranded_posting_repair.contains("missing.source_generation = p.source_generation")
+        );
+
+        let tombstone_backfill = sql
+            .split_once("-- Reconcile every current event version")
+            .and_then(|(_, tail)| {
+                tail.split_once("-- Existing posting rows already carry")
                     .map(|(backfill, _)| backfill)
             })
             .expect("032 must reconcile missing latest-event document versions");
@@ -2047,6 +2139,19 @@ mod tests {
         }
         assert!(live_documents_view.contains("WHERE d.doc_len > 0"));
         assert!(sql.contains("CREATE VIEW moraine.v_live_search_postings"));
+        let postings_mv = sql
+            .find("CREATE MATERIALIZED VIEW moraine.mv_search_postings")
+            .expect("032 must recreate the postings materialized view");
+        let conversation_terms_mv = sql
+            .find("CREATE MATERIALIZED VIEW moraine.mv_search_conversation_terms")
+            .expect("032 must recreate the conversation-terms materialized view");
+        let document_reconciliation = sql
+            .find("INSERT INTO moraine.search_documents")
+            .expect("032 must reconcile missing search documents");
+        assert!(
+            postings_mv < conversation_terms_mv && conversation_terms_mv < document_reconciliation,
+            "032 must install the full search MV chain before repairing or reconciling documents"
+        );
         let live_postings_view = sql
             .split_once("CREATE VIEW moraine.v_live_search_postings AS")
             .and_then(|(_, tail)| {
@@ -2058,8 +2163,8 @@ mod tests {
         for identity in [
             "p.source_host = d.source_host",
             "p.source_name = d.source_name",
-            "p.source_file = d.source_file",
-            "p.source_generation = d.source_generation",
+            "p.session_id = d.session_id",
+            "p.source_ref = d.source_ref",
             "p.doc_id = d.event_uid",
             "p.post_version = d.doc_version",
         ] {
@@ -2068,19 +2173,26 @@ mod tests {
                 "032 live search postings must authorize `{identity}`"
             );
         }
+        assert!(!live_postings_view.contains("p.source_file = d.source_file"));
+        assert!(!live_postings_view.contains("p.source_generation = d.source_generation"));
+        for canonical_projection in [
+            "d.source_host AS source_host",
+            "d.source_name AS source_name",
+            "d.source_file AS source_file",
+            "d.source_generation AS source_generation",
+        ] {
+            assert!(
+                live_postings_view.contains(canonical_projection),
+                "032 must project canonical posting identity `{canonical_projection}`"
+            );
+        }
         assert!(sql.contains("FROM moraine.v_live_search_postings\nGROUP BY term"));
         assert!(sql.contains("FROM moraine.v_live_search_documents;"));
-        assert!(sql.contains("INSERT INTO moraine.search_postings"));
-        let drop_compat = sql
-            .find("DROP VIEW IF EXISTS moraine.mv_search_conversation_terms")
-            .expect("compatibility MV must be paused");
-        let rebuild_postings = sql
-            .find("INSERT INTO moraine.search_postings")
-            .expect("legacy postings must be regenerated");
-        let recreate_compat = sql
-            .find("CREATE MATERIALIZED VIEW moraine.mv_search_conversation_terms")
-            .expect("compatibility MV must resume");
-        assert!(drop_compat < rebuild_postings && rebuild_postings < recreate_compat);
+        assert_eq!(
+            sql.matches("INSERT INTO moraine.search_postings").count(),
+            1,
+            "032 may repair only zero-posting documents, not rebuild the historical corpus"
+        );
     }
 
     #[test]
@@ -2621,6 +2733,12 @@ mod tests {
         assert!(msg.contains("clickhouse returned"));
         assert!(msg.contains("500"));
         assert!(msg.contains("boom"));
+    }
+
+    #[test]
+    fn migration_timeout_outlives_interactive_default_and_preserves_larger_override() {
+        assert_eq!(migration_request_timeout(30.0), Duration::from_secs(300));
+        assert_eq!(migration_request_timeout(900.0), Duration::from_secs(900));
     }
 
     #[tokio::test(flavor = "multi_thread")]

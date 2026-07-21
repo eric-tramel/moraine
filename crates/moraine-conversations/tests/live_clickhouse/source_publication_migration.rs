@@ -9,6 +9,9 @@ const DEFAULT_SOURCE: &str = "legacy-default-local";
 const DEFAULT_FILE: &str = "/legacy/default-local.jsonl";
 const DEFAULT_SESSION: &str = "legacy-default-local-session";
 const DEFAULT_EVENT: &str = "legacy-default-local-event";
+const STRANDED_EVENT: &str = "legacy-default-local-stranded-event";
+const STRANDED_SOURCE_REF: &str = "legacy-default:2:stranded";
+const STRANDED_POSTINGS: u64 = 3;
 const SHARED_HOST: &str = "legacy-shared-host-a";
 const SHARED_SOURCE: &str = "legacy-shared";
 const SHARED_FILE: &str = "/legacy/shared.jsonl";
@@ -340,6 +343,35 @@ fn event_rows() -> Vec<Value> {
     ]
 }
 
+fn stranded_event_row() -> Value {
+    json!({
+        "ingested_at": "2026-01-01 00:00:01.500",
+        "event_uid": STRANDED_EVENT,
+        "session_id": DEFAULT_SESSION,
+        "session_date": "2026-01-01",
+        "source_name": DEFAULT_SOURCE,
+        "harness": "codex",
+        "source_file": DEFAULT_FILE,
+        "source_inode": 102,
+        "source_generation": 2,
+        "source_line_no": 3,
+        "source_offset": 260,
+        "source_ref": STRANDED_SOURCE_REF,
+        "record_ts": "2026-01-01T00:00:01.500Z",
+        "event_ts": "2026-01-01 00:00:01.500",
+        "event_kind": "message",
+        "actor_kind": "user",
+        "payload_type": "message",
+        "endpoint_kind": "generation",
+        "content_types": ["text"],
+        "text_content": "stranded retry repair",
+        "text_preview": "stranded retry repair",
+        "payload_json": "{}",
+        "token_usage_json": "{}",
+        "event_version": 10003,
+    })
+}
+
 async fn seed_pre_031_fixture(
     clickhouse: &ClickHouseClient,
     database: &OwnedDatabaseName,
@@ -364,6 +396,27 @@ async fn seed_pre_031_fixture(
         .insert_json_rows_sync("events", &event_rows())
         .await
         .context("failed to seed pre-032 hostless canonical events")?;
+
+    // Reproduce the durable prefix left by the old migration 032 ordering:
+    // its document reconciliation succeeded while the postings MV was absent,
+    // then the global posting rebuild timed out before producing rows.
+    clickhouse
+        .request_text(
+            &format!(
+                "DROP VIEW IF EXISTS `{}`.mv_search_postings",
+                database.as_str()
+            ),
+            None,
+            Some("system"),
+            false,
+            None,
+        )
+        .await
+        .context("failed to pause legacy postings MV for interrupted-032 fixture")?;
+    clickhouse
+        .insert_json_rows_sync("events", &[stranded_event_row()])
+        .await
+        .context("failed to seed document stranded by interrupted migration 032")?;
 
     let database = database.as_str();
     clickhouse
@@ -685,6 +738,110 @@ async fn assert_post_migration_authorization(clickhouse: &ClickHouseClient) -> R
     Ok(())
 }
 
+async fn assert_interrupted_032_prefix(clickhouse: &ClickHouseClient) -> Result<()> {
+    let documents = scalar(
+        clickhouse,
+        &format!(
+            "SELECT toUInt64(count()) AS value FROM search_documents FINAL \
+             WHERE event_uid = '{STRANDED_EVENT}' FORMAT JSONEachRow"
+        ),
+    )
+    .await?;
+    let postings = scalar(
+        clickhouse,
+        &format!(
+            "SELECT toUInt64(count()) AS value FROM search_postings FINAL \
+             WHERE doc_id = '{STRANDED_EVENT}' FORMAT JSONEachRow"
+        ),
+    )
+    .await?;
+    if documents != 1 || postings != 0 {
+        bail!(
+            "interrupted-032 fixture must contain one stranded document and no postings: \
+             documents={documents} postings={postings}"
+        );
+    }
+    Ok(())
+}
+
+async fn assert_legacy_posting_projection(
+    clickhouse: &ClickHouseClient,
+    expected_raw_rows: u64,
+) -> Result<()> {
+    let raw_rows = scalar(
+        clickhouse,
+        "SELECT toUInt64(count()) AS value FROM search_postings FORMAT JSONEachRow",
+    )
+    .await?;
+    if raw_rows != expected_raw_rows {
+        bail!(
+            "migration 032 rewrote the historical postings corpus: \
+             before={expected_raw_rows} after={raw_rows}"
+        );
+    }
+
+    let physical_legacy = scalar(
+        clickhouse,
+        &format!(
+            "SELECT toUInt64(count()) AS value FROM search_postings FINAL \
+             WHERE doc_id = '{DEFAULT_EVENT}' AND source_host = '' \
+               AND source_file = '' AND source_generation = 0 FORMAT JSONEachRow"
+        ),
+    )
+    .await?;
+    let projected_live = scalar(
+        clickhouse,
+        &format!(
+            "SELECT toUInt64(count()) AS value FROM v_live_search_postings \
+             WHERE doc_id = '{DEFAULT_EVENT}' AND source_host = '' \
+               AND source_name = '{DEFAULT_SOURCE}' AND source_file = '{DEFAULT_FILE}' \
+               AND source_generation = 2 FORMAT JSONEachRow"
+        ),
+    )
+    .await?;
+    let shared_live = scalar(
+        clickhouse,
+        &format!(
+            "SELECT toUInt64(count()) AS value FROM v_live_search_postings \
+             WHERE doc_id = '{SHARED_EVENT}' FORMAT JSONEachRow"
+        ),
+    )
+    .await?;
+    let repaired_physical = scalar(
+        clickhouse,
+        &format!(
+            "SELECT toUInt64(count()) AS value FROM search_postings FINAL \
+             WHERE doc_id = '{STRANDED_EVENT}' AND source_host = '' \
+               AND source_name = '{DEFAULT_SOURCE}' AND source_file = '{DEFAULT_FILE}' \
+               AND source_generation = 2 \
+               AND term IN ('stranded', 'retry', 'repair') FORMAT JSONEachRow"
+        ),
+    )
+    .await?;
+    let repaired_live = scalar(
+        clickhouse,
+        &format!(
+            "SELECT toUInt64(count()) AS value FROM v_live_search_postings \
+             WHERE doc_id = '{STRANDED_EVENT}' AND source_ref = '{STRANDED_SOURCE_REF}' \
+               AND term IN ('stranded', 'retry', 'repair') FORMAT JSONEachRow"
+        ),
+    )
+    .await?;
+    if physical_legacy != 4
+        || projected_live != physical_legacy
+        || shared_live != 0
+        || repaired_physical != STRANDED_POSTINGS
+        || repaired_live != STRANDED_POSTINGS
+    {
+        bail!(
+            "legacy posting projection mismatch: physical_legacy={physical_legacy} \
+             projected_live={projected_live} shared_live={shared_live} \
+             repaired_physical={repaired_physical} repaired_live={repaired_live}"
+        );
+    }
+    Ok(())
+}
+
 pub(super) async fn run(clickhouse: &ClickHouseClient, database: &OwnedDatabaseName) -> Result<()> {
     bootstrap_schema_through_030(clickhouse, database).await?;
     seed_pre_031_fixture(clickhouse, database).await?;
@@ -731,16 +888,49 @@ pub(super) async fn run(clickhouse: &ClickHouseClient, database: &OwnedDatabaseN
     assert_control_backfill(&second)?;
 
     set_checkpoint_merges(clickhouse, database, true).await?;
-    remove_migration_ledger_rows(clickhouse, database.as_str(), &["032", "033"]).await?;
-    let migration_032_033_started = Instant::now();
-    let applied_032_033 = clickhouse
+    assert_interrupted_032_prefix(clickhouse).await?;
+    let pre_032_posting_rows = scalar(
+        clickhouse,
+        "SELECT toUInt64(count()) AS value FROM search_postings FORMAT JSONEachRow",
+    )
+    .await?;
+
+    remove_migration_ledger_rows(clickhouse, database.as_str(), &["032"]).await?;
+    let migration_032_started = Instant::now();
+    let applied_032 = clickhouse
         .run_migrations()
         .await
-        .context("failed to apply migrations 032-033 to legacy fixture")?;
-    let migration_032_033_elapsed = migration_032_033_started.elapsed();
-    if applied_032_033 != ["032", "033"] {
-        bail!("legacy fixture expected migrations 032-033 exactly, got {applied_032_033:?}");
+        .context("failed to apply migration 032 to legacy fixture")?;
+    let migration_032_elapsed = migration_032_started.elapsed();
+    if applied_032 != ["032"] {
+        bail!("legacy fixture expected migration 032 exactly, got {applied_032:?}");
     }
+    let post_032_posting_rows = pre_032_posting_rows + STRANDED_POSTINGS;
+    assert_legacy_posting_projection(clickhouse, post_032_posting_rows).await?;
+
+    remove_migration_ledger_rows(clickhouse, database.as_str(), &["032"]).await?;
+    let replay_032_started = Instant::now();
+    let replayed_032 = clickhouse
+        .run_migrations()
+        .await
+        .context("failed forced idempotency replay of migration 032")?;
+    let replay_032_elapsed = replay_032_started.elapsed();
+    if replayed_032 != ["032"] {
+        bail!("forced idempotency pass expected migration 032, got {replayed_032:?}");
+    }
+    assert_legacy_posting_projection(clickhouse, post_032_posting_rows).await?;
+
+    remove_migration_ledger_rows(clickhouse, database.as_str(), &["033"]).await?;
+    let migration_033_started = Instant::now();
+    let applied_033 = clickhouse
+        .run_migrations()
+        .await
+        .context("failed to apply migration 033 to legacy fixture")?;
+    let migration_033_elapsed = migration_033_started.elapsed();
+    if applied_033 != ["033"] {
+        bail!("legacy fixture expected migration 033 exactly, got {applied_033:?}");
+    }
+    let migration_032_033_elapsed = migration_032_elapsed + migration_033_elapsed;
     let final_state = snapshot(clickhouse).await?;
     if final_state != first {
         bail!(
@@ -766,17 +956,23 @@ pub(super) async fn run(clickhouse: &ClickHouseClient, database: &OwnedDatabaseN
             "kind": "source_publication_legacy_migration_evidence",
             "fixture": {
                 "legacy_checkpoint_rows": 5,
-                "legacy_event_rows": 2,
+                "legacy_event_rows": 3,
                 "default_local_sources": 1,
                 "named_shared_sources": 2,
                 "equal_timestamp_variants": 2,
                 "legacy_mcp_session_heads": 1,
+                "interrupted_032_stranded_documents": 1,
             },
             "migrations": ["031", "032", "033"],
             "migration_031_us": migration_031_elapsed.as_micros(),
             "migration_031_ms": migration_031_elapsed.as_millis(),
             "migration_032_033_us": migration_032_033_elapsed.as_micros(),
             "migration_032_033_ms": migration_032_033_elapsed.as_millis(),
+            "forced_032_idempotency_replay_us": replay_032_elapsed.as_micros(),
+            "forced_032_idempotency_replay_ms": replay_032_elapsed.as_millis(),
+            "interrupted_032_repaired_postings": STRANDED_POSTINGS,
+            "pre_032_physical_postings": pre_032_posting_rows,
+            "post_032_physical_postings": post_032_posting_rows,
             "migration_us": migration_elapsed.as_micros(),
             "migration_ms": migration_elapsed.as_millis(),
             "forced_031_idempotency_replay_us": replay_elapsed.as_micros(),
