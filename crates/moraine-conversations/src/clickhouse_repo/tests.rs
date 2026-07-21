@@ -203,10 +203,21 @@ async fn mcp_search_sql_excludes_internal_tool_calls() {
     assert!(sql.contains("= 'moraine'"));
     assert!(sql.contains("FROM `moraine`.`v_live_search_postings` AS p FINAL"));
     assert!(sql.contains("WHERE p.term IN q_terms"));
-    assert!(sql.contains("SELECT p.source_host AS source_host, p.doc_id AS event_uid"));
+    assert_eq!(
+        sql.matches("FROM `moraine`.`v_live_search_postings` AS p FINAL")
+            .count(),
+        1
+    );
+    assert!(!sql.contains("matching_doc_ids AS ("));
+    assert!(!sql.contains("projected_candidates AS ("));
+    assert!(sql.contains("ALL INNER JOIN `moraine`.`mcp_open_events` AS e FINAL"));
     assert!(sql.contains("ON e.source_host = p.source_host"));
+    assert!(sql.contains("AND e.event_uid = p.doc_id"));
+    assert!(sql.contains("AND e.session_id = s.session_id"));
+    assert!(sql.contains("AND e.slot = s.slot"));
+    assert!(sql.contains("AND e.generation = s.generation"));
     assert!(sql.contains("GROUP BY p.doc_id, p.source_host"));
-    assert!(!sql.contains("PREWHERE"));
+    assert!(!sql.contains("PREWHERE p.term"));
 }
 
 #[test]

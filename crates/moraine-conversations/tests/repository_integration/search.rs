@@ -79,7 +79,7 @@ async fn search_mcp_events_immediate_retry_finishes_within_request_deadline() {
     let candidate_queries = queries
         .iter()
         .filter(|query| {
-            query.contains("toUInt8(0) AS row_kind") && query.contains("projected_candidates AS")
+            query.contains("toUInt8(0) AS row_kind") && query.contains("term_postings AS (")
         })
         .collect::<Vec<_>>();
     assert_eq!(candidate_queries.len(), 2);
@@ -798,13 +798,31 @@ async fn search_mcp_events_uses_one_candidate_and_one_bounded_detail_query() {
     assert!(queries[0].contains("live_session_ids AS ("));
     assert!(queries[0].contains("session_id IN (SELECT session_id FROM live_session_ids)"));
     assert!(queries[0].contains("AS projection_clean"));
-    assert!(queries[0].contains("projected_candidates AS ("));
-    assert!(queries[0].contains("SELECT p.source_host AS source_host, p.doc_id AS event_uid"));
-    assert!(queries[0].contains("WHERE (source_host, event_uid) IN ("));
+    assert!(!queries[0].contains("matching_doc_ids AS ("));
+    assert!(!queries[0].contains("projected_candidates AS ("));
+    assert_eq!(
+        queries[0]
+            .matches("FROM `moraine`.`v_live_search_postings` AS p FINAL")
+            .count(),
+        1,
+        "candidate ranking must expand the live postings view once"
+    );
+    assert!(queries[0].contains("ALL INNER JOIN `moraine`.`mcp_open_events` AS e FINAL"));
     assert!(queries[0].contains("ON e.source_host = p.source_host"));
+    assert!(queries[0].contains("AND e.event_uid = p.doc_id"));
+    assert!(queries[0].contains("AND e.session_id = s.session_id"));
+    assert!(queries[0].contains("AND e.slot = s.slot"));
+    assert!(queries[0].contains("AND e.generation = s.generation"));
     assert!(queries[0].contains("GROUP BY p.doc_id, p.source_host"));
     assert!(queries[0].contains("greatest(toFloat64(corpus_docs), toFloat64(p.df))"));
     assert!(!queries[0].contains("uniqExact"));
+    assert!(queries[1].contains("SELECT arrayJoin(['sess_a','sess_c']) AS session_id"));
+    assert!(!queries[1].contains("FROM `moraine`.`search_postings`"));
+    for alias in ["h", "e", "dirty"] {
+        assert!(queries[1].contains(&format!(
+            "{alias}.session_id IN (SELECT session_id FROM candidate_session_ids)"
+        )));
+    }
     assert!(queries[1].contains("documents AS ("));
     assert!(queries[1].contains("candidate_heads AS ("));
     assert!(queries[1].contains("tupleElement(candidate, 1) AS source_host"));

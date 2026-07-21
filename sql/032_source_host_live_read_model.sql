@@ -514,8 +514,7 @@ ALL INNER JOIN
   ON d.source_host = e.source_host
  AND d.event_uid = e.event_uid
  AND d.doc_version = e.event_version
-WHERE d.doc_len > 0
-  AND lengthUTF8(replaceRegexpAll(d.text_content, '\\s+', '')) > 0;
+WHERE d.doc_len > 0;
 
 CREATE VIEW moraine.v_live_search_postings AS
 SELECT p.*
