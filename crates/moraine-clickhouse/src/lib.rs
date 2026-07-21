@@ -18,6 +18,7 @@ pub mod mcp_tool_names;
 
 const MAX_INSERT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_QUERY_URL_BYTES: usize = 2 * 1024;
+const DEFAULT_MAX_QUERY_SIZE_BYTES: usize = 256 * 1024;
 use std::collections::{BTreeSet, HashSet};
 use std::time::Duration;
 const DEFAULT_USER_AGENT_ROLE: &str = "moraine-clickhouse";
@@ -196,6 +197,14 @@ impl ClickHouseClient {
         if query_in_body {
             body.extend_from_slice(query.as_bytes());
         }
+        let complete_sql_in_body = query_in_body || (query.is_empty() && !body.is_empty());
+        if complete_sql_in_body && body.len() > MAX_INSERT_PAYLOAD_BYTES {
+            bail!(
+                "ClickHouse SQL statement is {} bytes; maximum is {} bytes",
+                body.len(),
+                MAX_INSERT_PAYLOAD_BYTES
+            );
+        }
         let mut url = self.base_url()?;
         {
             let mut qp = url.query_pairs_mut();
@@ -204,6 +213,10 @@ impl ClickHouseClient {
             // can exceed practical HTTP request-target limits.
             if !query.is_empty() && !query_in_body {
                 qp.append_pair("query", query);
+            }
+            if complete_sql_in_body && body.len() > DEFAULT_MAX_QUERY_SIZE_BYTES {
+                let max_query_size = body.len().next_power_of_two();
+                qp.append_pair("max_query_size", &max_query_size.to_string());
             }
             if let Some(database) = options.database {
                 qp.append_pair("database", database);
@@ -2654,7 +2667,7 @@ mod tests {
         })
         .await;
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
-        let statement = format!("INSERT INTO plans VALUES ('{}')", "x".repeat(128 * 1024));
+        let statement = format!("INSERT INTO plans VALUES ('{}')", "x".repeat(512 * 1024));
 
         client
             .request_text(&statement, None, Some("moraine"), false, None)
@@ -2666,9 +2679,28 @@ mod tests {
         assert!(!requests[0].params.contains_key("query"));
         assert_eq!(requests[0].body, statement.as_bytes());
         assert_eq!(
+            requests[0].params.get("max_query_size").map(String::as_str),
+            Some("1048576")
+        );
+        assert_eq!(
             requests[0].params.get("database").map(String::as_str),
             Some("moraine")
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn body_carried_sql_statement_respects_payload_limit() {
+        let client =
+            ClickHouseClient::new(test_clickhouse_config("http://127.0.0.1:1".to_string()))
+                .expect("new client");
+        let statement = "x".repeat(MAX_INSERT_PAYLOAD_BYTES + 1);
+
+        let error = client
+            .request_text(&statement, None, Some("moraine"), false, None)
+            .await
+            .expect_err("oversized body-carried SQL must be rejected before send");
+
+        assert!(error.to_string().contains("maximum is 8388608 bytes"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
