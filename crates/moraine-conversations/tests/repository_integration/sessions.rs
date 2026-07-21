@@ -982,7 +982,7 @@ async fn get_mcp_event_retries_stale_lookup_generation() {
             json!(turn_rows("sess-event", Some(1))),
         ),
         ScriptedResponse::rows(
-            &["FROM `moraine`.`mcp_open_events` FINAL", "event_uid IN"],
+            &["FROM `moraine`.`mcp_open_events` FINAL", "event_order IN"],
             json!(event_ref_rows()),
         ),
         ScriptedResponse::rows(
@@ -1057,6 +1057,23 @@ async fn get_mcp_event_returns_full_content_and_navigation_refs() {
     assert!(queries
         .iter()
         .all(|query| !query.contains("v_conversation_trace")));
+    let lookup_query = queries
+        .iter()
+        .find(|query| query.contains("ORDER BY generation DESC, source_host ASC"))
+        .expect("host-qualified MCP event lookup query");
+    assert!(lookup_query.contains("SELECT\n  source_host,\n  event_uid"));
+    let event_query = queries
+        .iter()
+        .find(|query| query.contains("previous_event_uid"))
+        .expect("host-qualified MCP event content query");
+    assert!(event_query.contains("e.source_host = 'host-a'"));
+    assert!(event_query.contains("e.session_id = 'sess-event'"));
+    let neighbor_query = queries
+        .iter()
+        .find(|query| query.contains("event_order IN"))
+        .expect("order-qualified MCP event neighbor query");
+    assert!(neighbor_query.contains("session_id = 'sess-event'"));
+    assert!(neighbor_query.contains("event_order IN [1, 3]"));
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn list_session_events_supports_forward_cursor_pagination() {

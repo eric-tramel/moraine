@@ -19,8 +19,14 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+#[path = "live_clickhouse/search_host_identity.rs"]
+mod search_host_identity;
 #[path = "live_clickhouse/source_publication.rs"]
 mod source_publication;
+#[path = "live_clickhouse/source_publication_migration.rs"]
+mod source_publication_migration;
+#[path = "live_clickhouse/source_publication_process.rs"]
+mod source_publication_process;
 #[path = "live_clickhouse/support.rs"]
 mod support;
 
@@ -1926,13 +1932,19 @@ async fn live_source_publication_cutover_crash_recovery() -> Result<()> {
     assert_owned_database_census_empty(&clickhouse, "before mutation").await?;
 
     let outcome = async {
+        source_publication_migration::run(&clickhouse, &database).await?;
+        cleanup_database(&clickhouse, &database)
+            .await
+            .context("failed to reset legacy-migration fixture database")?;
+
         let migration_started = Instant::now();
         clickhouse
             .run_migrations()
             .await
             .context("failed to migrate source-publication database")?;
         let migration_ms = migration_started.elapsed().as_millis() as u64;
-        source_publication::run(&clickhouse, &database, migration_ms).await
+        source_publication::run(&clickhouse, &database, migration_ms).await?;
+        source_publication_process::run(&clickhouse, &database).await
     }
     .await;
 

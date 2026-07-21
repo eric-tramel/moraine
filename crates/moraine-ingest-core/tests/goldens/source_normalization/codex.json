@@ -318,6 +318,7 @@
           "linked_external_id": "evt_parent_1",
           "metadata_json": "{}",
           "session_id": "019c5f6a-49bd-7920-ac67-1dd8e33b0e95",
+          "source_event_version": "<event_version>",
           "source_name": "golden-codex"
         }
       ],
@@ -469,6 +470,7 @@
           "project_id": "",
           "repo_rel_path": "",
           "session_id": "019c5f6a-49bd-7920-ac67-1dd8e33b0e95",
+          "source_event_version": "<event_version>",
           "source_name": "golden-codex",
           "source_ref": "/fixtures/codex/session.jsonl:1:4",
           "tool_call_id": "call_read",
@@ -604,6 +606,7 @@
           "project_id": "",
           "repo_rel_path": "",
           "session_id": "019c5f6a-49bd-7920-ac67-1dd8e33b0e95",
+          "source_event_version": "<event_version>",
           "source_name": "golden-codex",
           "source_ref": "/fixtures/codex/session.jsonl:1:5",
           "tool_call_id": "call_read",
@@ -739,6 +742,7 @@
           "project_id": "",
           "repo_rel_path": "",
           "session_id": "019c5f6a-49bd-7920-ac67-1dd8e33b0e95",
+          "source_event_version": "<event_version>",
           "source_name": "golden-codex",
           "source_ref": "/fixtures/codex/session.jsonl:1:6",
           "tool_call_id": "call_patch",
@@ -874,6 +878,7 @@
           "project_id": "",
           "repo_rel_path": "",
           "session_id": "019c5f6a-49bd-7920-ac67-1dd8e33b0e95",
+          "source_event_version": "<event_version>",
           "source_name": "golden-codex",
           "source_ref": "/fixtures/codex/session.jsonl:1:7",
           "tool_call_id": "call_patch",
@@ -1631,6 +1636,7 @@
           "linked_external_id": "",
           "metadata_json": "{}",
           "session_id": "019c5f6a-49bd-7920-ac67-1dd8e33b0e95",
+          "source_event_version": "<event_version>",
           "source_name": "golden-codex"
         },
         {
@@ -1643,6 +1649,7 @@
           "linked_external_id": "",
           "metadata_json": "{}",
           "session_id": "019c5f6a-49bd-7920-ac67-1dd8e33b0e95",
+          "source_event_version": "<event_version>",
           "source_name": "golden-codex"
         },
         {
@@ -1655,6 +1662,7 @@
           "linked_external_id": "",
           "metadata_json": "{}",
           "session_id": "019c5f6a-49bd-7920-ac67-1dd8e33b0e95",
+          "source_event_version": "<event_version>",
           "source_name": "golden-codex"
         },
         {
@@ -1667,6 +1675,7 @@
           "linked_external_id": "",
           "metadata_json": "{}",
           "session_id": "019c5f6a-49bd-7920-ac67-1dd8e33b0e95",
+          "source_event_version": "<event_version>",
           "source_name": "golden-codex"
         }
       ],

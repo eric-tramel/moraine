@@ -140,6 +140,7 @@ resource="$FAKE_DATABASE_DIR/$database"
   printf 'caller_database=%s\n' "${MORAINE_LIVE_TEST_DATABASE:-}"
   printf 'bench_database=%s\n' "${MORAINE_BENCH_CLICKHOUSE_DATABASE:-}"
   printf 'clickhouse_url=%s\n' "${MORAINE_BENCH_CLICKHOUSE_URL:-}"
+  printf 'ingest_bin=%s\n' "${MORAINE_LIVE_TEST_INGEST_BIN:-}"
   printf 'argv'
   printf ' <%s>' "$@"
   printf '\n'
@@ -419,6 +420,9 @@ class RunLiveTestTests(unittest.TestCase):
         self.assertIn("allow=1\n", record)
         self.assertIn(f"sandbox_id={sandbox_id}\n", record)
         self.assertIn("clickhouse_url=http://clickhouse:8123\n", record)
+        self.assertIn(
+            "ingest_bin=/opt/moraine/bin/moraine-ingest\n", record
+        )
         self.assertIn(
             "argv <test> <-p> <moraine-conversations> <--test> <live_clickhouse> "
             f"<--locked> <{function}> <--> <--exact> <--ignored> <--nocapture>\n",

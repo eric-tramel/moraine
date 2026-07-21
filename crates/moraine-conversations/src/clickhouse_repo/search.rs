@@ -25,16 +25,9 @@ pub(super) struct RankedPosting<'a> {
 
 impl ClickHouseConversationRepository {
     /// Session headers that are authorized by the operation's captured source
-    /// heads and by the current canonical session contents. The legacy
-    /// session-only pointer is retained only for direct SQL-builder tests that
-    /// do not install a publication snapshot.
+    /// heads and by the current canonical session contents.
     pub(super) fn mcp_search_sessions_source(&self) -> String {
-        let Some(snapshot) = active_publication_snapshot() else {
-            return format!(
-                "(SELECT * FROM {} FINAL)",
-                self.table_ref("mcp_open_sessions")
-            );
-        };
+        let snapshot = require_active_publication_snapshot("MCP search session reads");
 
         let headers = self.table_ref("mcp_open_publication_headers");
         let history = self.table_ref("v_published_source_generation_history");
@@ -105,6 +98,16 @@ LIMIT 1 BY h.session_id)"
     }
 
     pub async fn search_session_metadata(
+        &self,
+        query: SessionMetadataSearchQuery,
+    ) -> RepoResult<SessionMetadataSearchResults> {
+        self.run_publication_consistent(PublicationReadClass::MovingFeed, || {
+            self.search_session_metadata_impl(query.clone())
+        })
+        .await
+    }
+
+    async fn search_session_metadata_impl(
         &self,
         query: SessionMetadataSearchQuery,
     ) -> RepoResult<SessionMetadataSearchResults> {
@@ -356,6 +359,7 @@ FORMAT JSONEachRow",
         let documents_join_sql = if use_document_codex_flag {
             format!(
                 "(SELECT
+  t.source_host AS source_host,
   t.event_uid AS event_uid,
   any(t.session_id) AS session_id,
   any(t.record_ts) AS event_time,
@@ -373,11 +377,12 @@ FORMAT JSONEachRow",
   any(t.payload_json) AS payload_json,
   toUInt8(any(t.has_codex_mcp)) AS has_codex_mcp
 FROM {documents_table} AS t
-GROUP BY t.event_uid)"
+GROUP BY t.source_host, t.event_uid)"
             )
         } else {
             format!(
                 "(SELECT
+  t.source_host AS source_host,
   t.event_uid AS event_uid,
   any(t.session_id) AS session_id,
   any(t.record_ts) AS event_time,
@@ -395,7 +400,7 @@ GROUP BY t.event_uid)"
   any(t.payload_json) AS payload_json,
   toUInt8(0) AS has_codex_mcp
 FROM {documents_table} AS t
-GROUP BY t.event_uid)"
+GROUP BY t.source_host, t.event_uid)"
             )
         };
 
@@ -458,6 +463,7 @@ GROUP BY t.event_uid)"
   {terms_array_sql} AS q_terms,
   {idf_array_sql} AS q_idf
 SELECT
+  p.source_host AS source_host,
   p.doc_id AS event_uid,
   any(d.session_id) AS session_id,
   any(d.event_time) AS event_time,
@@ -485,11 +491,13 @@ SELECT
   ) AS score,
   uniqExact(p.term) AS matched_terms
 FROM {postings_table} AS p
-INNER JOIN {documents_join_sql} AS d ON d.event_uid = p.doc_id
+ALL INNER JOIN {documents_join_sql} AS d
+  ON d.source_host = p.source_host
+ AND d.event_uid = p.doc_id
 WHERE {where_sql}
-GROUP BY p.doc_id
+GROUP BY p.doc_id, p.source_host
 HAVING matched_terms >= {min_should_match} AND score >= {min_score:.6}
-ORDER BY score DESC, event_uid ASC
+ORDER BY score DESC, event_uid ASC, source_host ASC
 LIMIT {limit}
 FORMAT JSONEachRow",
             preview = self.cfg.preview_chars,
@@ -688,7 +696,7 @@ WHERE scope_s.session_id = {session_id}{scope_origin_filter}",
     WHERE p.term IN q_terms
   ),
   matching_doc_ids AS (
-    SELECT p.doc_id AS event_uid
+    SELECT p.source_host AS source_host, p.doc_id AS event_uid
     FROM {postings_table} AS p FINAL
     ALL INNER JOIN {sessions_table} AS s ON s.session_id = p.session_id
     WHERE p.term IN q_terms
@@ -697,12 +705,15 @@ WHERE scope_s.session_id = {session_id}{scope_origin_filter}",
       AND projection_clean = 1
   ),
   projected_candidates AS (
-    SELECT event_uid, session_id, slot, generation, event_time, turn_seq
+    SELECT source_host, event_uid, session_id, slot, generation, event_time, turn_seq
     FROM {events_table}
-    WHERE event_uid IN (SELECT event_uid FROM matching_doc_ids)
+    WHERE (source_host, event_uid) IN (
+      SELECT source_host, event_uid FROM matching_doc_ids
+    )
   ),
   ranked AS (
     SELECT
+      p.source_host AS source_host,
       p.doc_id AS event_uid,
       any(s.session_id) AS session_id,
       toUInt8(any(s.slot)) AS slot,
@@ -718,15 +729,16 @@ WHERE scope_s.session_id = {session_id}{scope_origin_filter}",
     FROM term_postings AS p
     ALL INNER JOIN {sessions_table} AS s ON s.session_id = p.session_id
     ALL INNER JOIN projected_candidates AS e
-      ON e.event_uid = p.doc_id
+      ON e.source_host = p.source_host
+      AND e.event_uid = p.doc_id
       AND e.session_id = s.session_id
       AND e.slot = s.slot
       AND e.generation = s.generation
     WHERE {posting_where_sql}
       AND {event_where_sql}
-    GROUP BY p.doc_id
+    GROUP BY p.doc_id, p.source_host
     HAVING matched_terms >= {min_should_match} AND raw_score >= {min_score:.6}
-    ORDER BY raw_score DESC, event_unix_ms DESC, event_uid ASC
+    ORDER BY raw_score DESC, event_unix_ms DESC, event_uid ASC, source_host ASC
     LIMIT {limit} OFFSET {offset}
   )
 SELECT *
@@ -734,6 +746,7 @@ FROM (
 SELECT
   toUInt8(0) AS row_kind,
   ranked.event_uid AS event_uid,
+  ranked.source_host AS source_host,
   ranked.session_id AS session_id,
   ranked.slot AS slot,
   ranked.generation AS generation,
@@ -751,6 +764,7 @@ UNION ALL
 SELECT
   toUInt8(1) AS row_kind,
   '' AS event_uid,
+  '' AS source_host,
   '' AS session_id,
   toUInt8(0) AS slot,
   toUInt64(0) AS generation,
@@ -764,7 +778,7 @@ SELECT
   projection_clean AS projection_clean,
   projection_revision AS projection_revision
 )
-ORDER BY row_kind ASC, raw_score DESC, event_unix_ms DESC, event_uid ASC
+ORDER BY row_kind ASC, raw_score DESC, event_unix_ms DESC, event_uid ASC, source_host ASC
 SETTINGS max_bytes_before_external_group_by = 67108864,
   max_bytes_before_external_sort = 67108864
 FORMAT JSONEachRow",
@@ -803,7 +817,8 @@ FORMAT JSONEachRow",
             .iter()
             .map(|candidate| {
                 format!(
-                    "({}, {}, toUInt8({}), toUInt64({}))",
+                    "({}, {}, {}, toUInt8({}), toUInt64({}))",
+                    sql_quote(&candidate.source_host),
                     sql_quote(&candidate.event_uid),
                     sql_quote(&candidate.session_id),
                     candidate.slot,
@@ -822,14 +837,16 @@ FORMAT JSONEachRow",
   {event_uids_sql} AS event_uids,
   candidate_heads AS (
     SELECT
-      tupleElement(candidate, 1) AS event_uid,
-      tupleElement(candidate, 2) AS session_id,
-      toUInt8(tupleElement(candidate, 3)) AS slot,
-      toUInt64(tupleElement(candidate, 4)) AS generation
+      tupleElement(candidate, 1) AS source_host,
+      tupleElement(candidate, 2) AS event_uid,
+      tupleElement(candidate, 3) AS session_id,
+      toUInt8(tupleElement(candidate, 4)) AS slot,
+      toUInt64(tupleElement(candidate, 5)) AS generation
     FROM (SELECT arrayJoin([{candidate_heads_sql}]) AS candidate)
   ),
   documents AS (
     SELECT
+      document.source_host AS source_host,
       document.event_uid AS event_uid,
       argMax(document.session_id, document.doc_version) AS session_id,
       argMax(document.source_name, document.doc_version) AS source_name,
@@ -847,18 +864,24 @@ FORMAT JSONEachRow",
       argMax(leftUTF8(document.text_content, {text_content_limit}), document.doc_version) AS text_content,
       argMax(leftUTF8(document.payload_json, {payload_json_limit}), document.doc_version) AS payload_json
     FROM {documents_table} AS document
-    WHERE document.event_uid IN event_uids
-    GROUP BY document.event_uid
+    WHERE (document.source_host, document.event_uid) IN (
+      SELECT source_host, event_uid FROM candidate_heads
+    )
+    GROUP BY document.source_host, document.event_uid
   ),
   models AS (
-    SELECT source_event.event_uid AS event_uid,
+    SELECT source_event.source_host AS source_host,
+      source_event.event_uid AS event_uid,
       argMax(source_event.model, source_event.event_version) AS model
     FROM {events_table} AS source_event
-    WHERE source_event.event_uid IN event_uids
-    GROUP BY source_event.event_uid
+    WHERE (source_event.source_host, source_event.event_uid) IN (
+      SELECT source_host, event_uid FROM candidate_heads
+    )
+    GROUP BY source_event.source_host, source_event.event_uid
   )
 SELECT
   documents.event_uid AS event_uid,
+  documents.source_host AS source_host,
   documents.session_id AS session_id,
   documents.source_name AS source_name,
   documents.harness AS harness,
@@ -898,13 +921,15 @@ SELECT
   toUInt8(sessions.completed) AS session_completed
 FROM documents
 ALL INNER JOIN candidate_heads AS candidate
-  ON candidate.event_uid = documents.event_uid
+  ON candidate.source_host = documents.source_host
+  AND candidate.event_uid = documents.event_uid
 ALL INNER JOIN {sessions_table} AS sessions
   ON sessions.session_id = candidate.session_id
   AND sessions.slot = candidate.slot
   AND sessions.generation = candidate.generation
 ALL INNER JOIN {projected_events_table} AS projected_events FINAL
-  ON projected_events.event_uid = candidate.event_uid
+  ON projected_events.source_host = candidate.source_host
+  AND projected_events.event_uid = candidate.event_uid
   AND projected_events.session_id = candidate.session_id
   AND projected_events.slot = candidate.slot
   AND projected_events.generation = candidate.generation
@@ -913,7 +938,9 @@ ANY LEFT JOIN {turns_table} AS turns FINAL
   AND turns.slot = sessions.slot
   AND turns.generation = sessions.generation
   AND turns.turn_seq = projected_events.turn_seq
-ANY LEFT JOIN models ON models.event_uid = documents.event_uid
+ANY LEFT JOIN models
+  ON models.source_host = documents.source_host
+  AND models.event_uid = documents.event_uid
 ORDER BY indexOf(event_uids, documents.event_uid) ASC
 FORMAT JSONEachRow",
         ))
@@ -921,16 +948,31 @@ FORMAT JSONEachRow",
 
     pub(super) fn build_search_events_hydrate_sql(
         &self,
-        event_uids: &[String],
+        document_identities: &[SearchDocumentIdentity],
         use_document_codex_flag: bool,
     ) -> RepoResult<String> {
-        if event_uids.is_empty() {
+        if document_identities.is_empty() {
             return Err(RepoError::invalid_argument(
-                "cannot hydrate search rows for empty event_uids",
+                "cannot hydrate search rows for empty document identities",
             ));
         }
         let documents_table = self.table_ref("v_live_search_documents");
-        let event_uids_array = sql_array_strings(event_uids);
+        let event_uids = document_identities
+            .iter()
+            .map(|identity| identity.event_uid.clone())
+            .collect::<Vec<_>>();
+        let event_uids_array = sql_array_strings(&event_uids);
+        let identities_sql = document_identities
+            .iter()
+            .map(|identity| {
+                format!(
+                    "({}, {})",
+                    sql_quote(&identity.source_host),
+                    sql_quote(&identity.event_uid)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         let text_content_limit = usize::from(self.cfg.preview_chars).saturating_mul(4);
         let payload_json_limit = usize::from(self.cfg.preview_chars).saturating_mul(8);
         // Truncate the fat columns inside the aggregation (issue #443): the
@@ -945,6 +987,7 @@ FORMAT JSONEachRow",
         };
         let documents_source_sql = format!(
             "(SELECT
+  t.source_host AS source_host,
   t.event_uid AS event_uid,
   any(t.session_id) AS session_id,
   any(t.record_ts) AS event_time,
@@ -962,12 +1005,22 @@ FORMAT JSONEachRow",
   any(leftUTF8(t.payload_json, {payload_json_limit})) AS payload_json,
   {codex_inner_expr} AS has_codex_mcp
 FROM {documents_table} AS t
+ALL INNER JOIN requested_documents AS requested
+  ON requested.source_host = t.source_host
+ AND requested.event_uid = t.event_uid
 WHERE t.event_uid IN {event_uids_array}
-GROUP BY t.event_uid)"
+GROUP BY t.source_host, t.event_uid)"
         );
 
         Ok(format!(
-            "SELECT
+            "WITH requested_documents AS (
+  SELECT
+    tupleElement(identity, 1) AS source_host,
+    tupleElement(identity, 2) AS event_uid
+  FROM (SELECT arrayJoin([{identities_sql}]) AS identity)
+)
+SELECT
+  d.source_host AS source_host,
   d.event_uid AS event_uid,
   d.session_id AS session_id,
   d.event_time AS event_time,
@@ -1124,7 +1177,7 @@ FORMAT JSONEachRow",
             .unwrap_or(usize::MAX)
             .min(posting_count)
             .min(TERM_POSTINGS_CACHE_MAX_ROWS_TOTAL);
-        let mut index_by_uid = HashMap::<&str, usize>::with_capacity(initial_capacity);
+        let mut index_by_identity = HashMap::<(&str, &str), usize>::with_capacity(initial_capacity);
         let mut candidates = Vec::<RankedPosting<'a>>::with_capacity(initial_capacity);
         let bm25_base = k1 * (1.0 - b);
         let bm25_length_scale = k1 * b / avgdl.max(1.0);
@@ -1137,18 +1190,17 @@ FORMAT JSONEachRow",
 
             if let Some(rows) = postings_by_term.get(term) {
                 for row in rows.iter() {
-                    let entry_index =
-                        *index_by_uid
-                            .entry(row.event_uid.as_str())
-                            .or_insert_with(|| {
-                                let index = candidates.len();
-                                candidates.push(RankedPosting {
-                                    row,
-                                    score: 0.0,
-                                    matched_terms: 0,
-                                });
-                                index
+                    let entry_index = *index_by_identity
+                        .entry((row.source_host.as_str(), row.event_uid.as_str()))
+                        .or_insert_with(|| {
+                            let index = candidates.len();
+                            candidates.push(RankedPosting {
+                                row,
+                                score: 0.0,
+                                matched_terms: 0,
                             });
+                            index
+                        });
                     let entry = &mut candidates[entry_index];
                     let tf = f64::from(row.tf);
                     let norm = tf + bm25_base + bm25_length_scale * f64::from(row.doc_len);
@@ -1178,6 +1230,7 @@ FORMAT JSONEachRow",
         b.score
             .total_cmp(&a.score)
             .then_with(|| a.row.event_uid.cmp(&b.row.event_uid))
+            .then_with(|| a.row.source_host.cmp(&b.row.source_host))
     }
 
     #[cfg(test)]
@@ -1240,6 +1293,7 @@ FORMAT JSONEachRow",
             let query = format!(
                 "SELECT
   term,
+  source_host,
   doc_id AS event_uid,
   doc_len,
   tf
@@ -1253,6 +1307,7 @@ FORMAT JSONEachRow",
             let mut grouped = HashMap::<String, Vec<CachedPostingRow>>::new();
             for row in fetched_rows {
                 grouped.entry(row.term).or_default().push(CachedPostingRow {
+                    source_host: row.source_host,
                     event_uid: row.event_uid,
                     doc_len: row.doc_len,
                     tf: row.tf,
@@ -1306,39 +1361,45 @@ FORMAT JSONEachRow",
 
     pub(super) async fn load_search_doc_extras(
         &self,
-        event_uids: &[String],
+        document_identities: &[SearchDocumentIdentity],
         use_document_codex_flag: bool,
-    ) -> RepoResult<HashMap<String, SearchDocExtraCacheEntry>> {
+    ) -> RepoResult<HashMap<SearchDocumentIdentity, SearchDocExtraCacheEntry>> {
         let now = Instant::now();
-        let mut by_uid = HashMap::<String, SearchDocExtraCacheEntry>::new();
-        let mut missing_uids = Vec::<String>::new();
+        let mut by_identity = HashMap::<SearchDocumentIdentity, SearchDocExtraCacheEntry>::new();
+        let mut missing_identities = Vec::<SearchDocumentIdentity>::new();
 
         {
             let cache = self.search_doc_extra_cache.read().await;
-            for uid in event_uids {
-                let cache_key = publication_cache_key(&format!("document:{uid}"));
+            for identity in document_identities {
+                let cache_key = publication_cache_key(&format!(
+                    "document:{}:{}:{}",
+                    identity.source_host.len(),
+                    identity.source_host,
+                    identity.event_uid
+                ));
                 if let Some(entry) = cache_key
                     .as_deref()
                     .and_then(|cache_key| cache.get(cache_key))
                 {
                     if now.duration_since(entry.fetched_at) <= SEARCH_DOC_EXTRA_CACHE_TTL {
-                        by_uid.insert(uid.clone(), entry.clone());
+                        by_identity.insert(identity.clone(), entry.clone());
                         continue;
                     }
                 }
-                missing_uids.push(uid.clone());
+                missing_identities.push(identity.clone());
             }
         }
 
-        if !missing_uids.is_empty() {
+        if !missing_identities.is_empty() {
             let query =
-                self.build_search_events_hydrate_sql(&missing_uids, use_document_codex_flag)?;
+                self.build_search_events_hydrate_sql(&missing_identities, use_document_codex_flag)?;
             let fetched_rows: Vec<SearchDocExtraRow> =
                 self.map_backend(self.query_rows(&query, None).await)?;
 
             let mut cache = self.search_doc_extra_cache.write().await;
 
             for row in fetched_rows {
+                let identity = SearchDocumentIdentity::new(&row.source_host, &row.event_uid);
                 let entry = SearchDocExtraCacheEntry {
                     session_id: row.session_id,
                     event_time: row.event_time,
@@ -1358,10 +1419,13 @@ FORMAT JSONEachRow",
                     has_codex_mcp: row.has_codex_mcp,
                     fetched_at: now,
                 };
-                by_uid.insert(row.event_uid.clone(), entry.clone());
-                if let Some(cache_key) =
-                    publication_cache_key(&format!("document:{}", row.event_uid))
-                {
+                by_identity.insert(identity.clone(), entry.clone());
+                if let Some(cache_key) = publication_cache_key(&format!(
+                    "document:{}:{}:{}",
+                    identity.source_host.len(),
+                    identity.source_host,
+                    identity.event_uid
+                )) {
                     cache.insert(cache_key, entry);
                 }
             }
@@ -1379,7 +1443,7 @@ FORMAT JSONEachRow",
             }
         }
 
-        Ok(by_uid)
+        Ok(by_identity)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1477,6 +1541,7 @@ FORMAT JSONEachRow",
             b.score
                 .total_cmp(&a.score)
                 .then_with(|| a.event_uid.cmp(&b.event_uid))
+                .then_with(|| a.source_host.cmp(&b.source_host))
         });
         Ok(fallback_rows)
     }
@@ -1623,13 +1688,14 @@ FORMAT JSONEachRow",
             let detail_sql = self.build_search_mcp_event_details_sql(&candidates)?;
             let detail_rows: Vec<SearchMcpEventRow> =
                 self.map_backend(self.query_rows(&detail_sql, None).await)?;
-            let mut details_by_uid = detail_rows
+            let mut details_by_identity = detail_rows
                 .into_iter()
-                .map(|row| (row.event_uid.clone(), row))
+                .map(|row| ((row.source_host.clone(), row.event_uid.clone()), row))
                 .collect::<HashMap<_, _>>();
 
             for candidate in candidates {
-                let Some(mut detail) = details_by_uid.remove(candidate.event_uid.as_str()) else {
+                let identity = (candidate.source_host, candidate.event_uid);
+                let Some(mut detail) = details_by_identity.remove(&identity) else {
                     return Err(RepoError::ReadModelChanged);
                 };
                 detail.raw_score = candidate.raw_score;
@@ -1659,6 +1725,7 @@ FORMAT JSONEachRow",
                 .total_cmp(&a.raw_score)
                 .then_with(|| b.event_unix_ms.cmp(&a.event_unix_ms))
                 .then_with(|| a.event_uid.cmp(&b.event_uid))
+                .then_with(|| a.source_host.cmp(&b.source_host))
         });
     }
 
@@ -1682,7 +1749,8 @@ FORMAT JSONEachRow",
         } else {
             a.text_content_digest == b.text_content_digest
         };
-        let same_logical_coordinates = a.session_id == b.session_id
+        let same_logical_coordinates = a.source_host == b.source_host
+            && a.session_id == b.session_id
             && a.turn_seq == b.turn_seq
             && a_event_type == b_event_type
             && same_content;
@@ -1807,6 +1875,7 @@ FORMAT JSONEachRow",
         }
 
         if a.session_id != b.session_id
+            || a.source_host != b.source_host
             || a.actor_role != b.actor_role
             || a.matched_terms != b.matched_terms
         {
@@ -1901,7 +1970,7 @@ FORMAT JSONEachRow",
             idf_by_term.insert(term.as_str(), Self::bm25_idf(docs, df));
         }
 
-        let mut accum_by_uid = HashMap::<&str, SearchScoreAccum<'_>>::new();
+        let mut accum_by_identity = HashMap::<(&str, &str), SearchScoreAccum<'_>>::new();
         for (idx, term) in terms.iter().enumerate() {
             if idx >= 64 {
                 break;
@@ -1913,8 +1982,8 @@ FORMAT JSONEachRow",
 
             if let Some(rows) = postings_by_term.get(term) {
                 for row in rows.iter() {
-                    let entry = accum_by_uid
-                        .entry(row.event_uid.as_str())
+                    let entry = accum_by_identity
+                        .entry((row.source_host.as_str(), row.event_uid.as_str()))
                         .or_insert_with(|| SearchScoreAccum {
                             row,
                             score: 0.0,
@@ -1928,7 +1997,7 @@ FORMAT JSONEachRow",
         }
 
         let mut fast_candidates = Vec::<CandidateRef<'_>>::new();
-        for acc in accum_by_uid.values() {
+        for acc in accum_by_identity.values() {
             let matched_terms = acc.matched_mask.count_ones() as u64;
             if matched_terms < min_should_match as u64 || acc.score < min_score {
                 continue;
@@ -1950,6 +2019,7 @@ FORMAT JSONEachRow",
                 b.score
                     .total_cmp(&a.score)
                     .then_with(|| a.row.event_uid.cmp(&b.row.event_uid))
+                    .then_with(|| a.row.source_host.cmp(&b.row.source_host))
             });
             fast_candidates.truncate(candidate_limit);
         }
@@ -1957,6 +2027,7 @@ FORMAT JSONEachRow",
             b.score
                 .total_cmp(&a.score)
                 .then_with(|| a.row.event_uid.cmp(&b.row.event_uid))
+                .then_with(|| a.row.source_host.cmp(&b.row.source_host))
         });
 
         let mut fast_rows = Vec::<SearchRow>::new();
@@ -1964,16 +2035,25 @@ FORMAT JSONEachRow",
         let mut offset = 0usize;
         while offset < fast_candidates.len() && fast_rows.len() < limit as usize {
             let end = (offset + hydrate_chunk_size).min(fast_candidates.len());
-            let event_uids: Vec<String> = fast_candidates[offset..end]
+            let document_identities = fast_candidates[offset..end]
                 .iter()
-                .map(|row| row.row.event_uid.clone())
-                .collect();
+                .map(|row| {
+                    SearchDocumentIdentity::new(
+                        row.row.source_host.clone(),
+                        row.row.event_uid.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
             let doc_extras = self
-                .load_search_doc_extras(&event_uids, use_document_codex_flag)
+                .load_search_doc_extras(&document_identities, use_document_codex_flag)
                 .await?;
 
             for row in &fast_candidates[offset..end] {
-                let Some(extra) = doc_extras.get(row.row.event_uid.as_str()) else {
+                let identity = SearchDocumentIdentity::new(
+                    row.row.source_host.clone(),
+                    row.row.event_uid.clone(),
+                );
+                let Some(extra) = doc_extras.get(&identity) else {
                     continue;
                 };
                 if !Self::passes_search_doc_filters(
@@ -1988,6 +2068,7 @@ FORMAT JSONEachRow",
                 }
 
                 fast_rows.push(SearchRow {
+                    source_host: row.row.source_host.clone(),
                     event_uid: row.row.event_uid.clone(),
                     session_id: extra.session_id.clone(),
                     event_time: extra.event_time.clone(),
@@ -2094,7 +2175,9 @@ FORMAT JSONEachRow",
             String::new()
         } else {
             let documents_table = self.table_ref("v_live_search_documents");
-            format!("ANY INNER JOIN {documents_table} AS d ON d.event_uid = p.doc_id")
+            format!(
+                "ANY INNER JOIN {documents_table} AS d\n  ON d.source_host = p.source_host\n AND d.event_uid = p.doc_id"
+            )
         };
         postings_filters.extend(document_filters);
         let filter_sql = format!("WHERE {}", postings_filters.join("\n      AND "));
@@ -2478,7 +2561,8 @@ SELECT
   c.score AS score,
   toUInt16(c.matched_terms) AS matched_terms,
   toUInt32(c.event_count_considered) AS event_count_considered,
-  c.best_event_uid AS best_event_uid
+  tupleElement(c.best_event_identity, 1) AS best_source_host,
+  tupleElement(c.best_event_identity, 2) AS best_event_uid
 FROM (
   SELECT
     e.session_id AS session_id,
@@ -2487,9 +2571,13 @@ FROM (
     count() AS event_count_considered,
     argMax(e.harness, e.event_score) AS harness,
     argMax(e.inference_provider, e.event_score) AS inference_provider,
-    argMax(e.event_uid, e.event_score) AS best_event_uid
+    argMax(
+      tuple(e.source_host, e.event_uid),
+      tuple(e.event_score, e.event_uid, e.source_host)
+    ) AS best_event_identity
   FROM (
     SELECT
+      p.source_host AS source_host,
       p.doc_id AS event_uid,
       any(p.session_id) AS session_id,
       any(p.harness) AS harness,
@@ -2507,7 +2595,7 @@ FROM (
     FROM {postings_table} AS p
     {docs_join_sql}
     {filter_sql}
-    GROUP BY p.doc_id
+    GROUP BY p.doc_id, p.source_host
   ) AS e
   GROUP BY e.session_id
 ) AS c
@@ -2536,20 +2624,42 @@ FORMAT JSONEachRow",
 
     pub(super) async fn fetch_conversation_snippets(
         &self,
-        event_uids: &[String],
-    ) -> RepoResult<HashMap<String, ConversationSnippetContent>> {
-        if event_uids.is_empty() {
+        document_identities: &[SearchDocumentIdentity],
+    ) -> RepoResult<HashMap<SearchDocumentIdentity, ConversationSnippetContent>> {
+        if document_identities.is_empty() {
             return Ok(HashMap::new());
         }
 
         let documents_table = self.table_ref("v_live_search_documents");
-        let event_uids_sql = sql_array_strings(event_uids);
+        let event_uids = document_identities
+            .iter()
+            .map(|identity| identity.event_uid.clone())
+            .collect::<Vec<_>>();
+        let event_uids_sql = sql_array_strings(&event_uids);
+        let identities_sql = document_identities
+            .iter()
+            .map(|identity| {
+                format!(
+                    "({}, {})",
+                    sql_quote(&identity.source_host),
+                    sql_quote(&identity.event_uid)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         let text_content_limit = usize::from(self.cfg.preview_chars).saturating_mul(4);
         let payload_json_limit = usize::from(self.cfg.preview_chars).saturating_mul(8);
         // Truncate inside the aggregation (issue #443) so the GROUP BY state
         // holds bounded strings, not full payload blobs.
         let sql = format!(
-            "SELECT
+            "WITH requested_documents AS (
+  SELECT
+    tupleElement(identity, 1) AS source_host,
+    tupleElement(identity, 2) AS event_uid
+  FROM (SELECT arrayJoin([{identities_sql}]) AS identity)
+)
+SELECT
+  source_host,
   event_uid,
   leftUTF8(text_content_raw, {preview}) AS snippet,
   text_content_raw AS text_content,
@@ -2558,14 +2668,18 @@ FORMAT JSONEachRow",
   actor_role_raw AS actor_role
 FROM (
   SELECT
-    event_uid,
-    any(leftUTF8(text_content, {text_content_limit})) AS text_content_raw,
-    any(leftUTF8(payload_json, {payload_json_limit})) AS payload_json_raw,
-    any(event_class) AS event_class_raw,
-    any(actor_role) AS actor_role_raw
-  FROM {documents_table}
-  WHERE event_uid IN {event_uids_sql}
-  GROUP BY event_uid
+    document.source_host AS source_host,
+    document.event_uid AS event_uid,
+    any(leftUTF8(document.text_content, {text_content_limit})) AS text_content_raw,
+    any(leftUTF8(document.payload_json, {payload_json_limit})) AS payload_json_raw,
+    any(document.event_class) AS event_class_raw,
+    any(document.actor_role) AS actor_role_raw
+  FROM {documents_table} AS document
+  ALL INNER JOIN requested_documents AS requested
+    ON requested.source_host = document.source_host
+   AND requested.event_uid = document.event_uid
+  WHERE document.event_uid IN {event_uids_sql}
+  GROUP BY document.source_host, document.event_uid
 )
 FORMAT JSONEachRow",
             preview = self.cfg.preview_chars,
@@ -2576,11 +2690,11 @@ FORMAT JSONEachRow",
         );
         let rows: Vec<ConversationSnippetRow> =
             self.map_backend(self.query_rows(&sql, None).await)?;
-        let mut by_uid = HashMap::new();
+        let mut by_identity = HashMap::new();
         for row in rows {
             let is_user_facing = is_user_facing_content_event(&row.event_class, &row.actor_role);
-            by_uid.insert(
-                row.event_uid,
+            by_identity.insert(
+                SearchDocumentIdentity::new(row.source_host, row.event_uid),
                 ConversationSnippetContent {
                     snippet: row.snippet,
                     text_content: is_user_facing
@@ -2592,7 +2706,7 @@ FORMAT JSONEachRow",
                 },
             );
         }
-        Ok(by_uid)
+        Ok(by_identity)
     }
 
     pub(super) async fn load_session_time_bounds(
@@ -2896,18 +3010,11 @@ FORMAT JSONEachRow",
             })
             .collect();
 
-        let Some(PublicationEffect::SearchTelemetry {
-            query_row,
-            hit_rows,
-        }) = defer_publication_effect(PublicationEffect::SearchTelemetry {
+        defer_publication_effect(PublicationEffect::SearchTelemetry {
             query_row,
             hit_rows,
         })
-        .await
-        else {
-            return;
-        };
-        self.write_search_log_rows(query_row, hit_rows).await;
+        .await;
     }
 
     pub(super) async fn write_search_log_rows(&self, query_row: Value, hit_rows: Vec<Value>) {
@@ -3399,17 +3506,22 @@ FORMAT JSONEachRow",
 
         let rows: Vec<ConversationSearchRow> =
             self.map_backend(self.query_rows(&sql, None).await)?;
-        let best_event_uids = rows
+        let best_event_identities = rows
             .iter()
             .filter_map(|row| {
                 if row.best_event_uid.is_empty() {
                     None
                 } else {
-                    Some(row.best_event_uid.clone())
+                    Some(SearchDocumentIdentity::new(
+                        row.best_source_host.clone(),
+                        row.best_event_uid.clone(),
+                    ))
                 }
             })
             .collect::<Vec<_>>();
-        let snippet_by_event_uid = self.fetch_conversation_snippets(&best_event_uids).await?;
+        let snippet_by_identity = self
+            .fetch_conversation_snippets(&best_event_identities)
+            .await?;
         let session_ids = rows
             .iter()
             .map(|row| row.session_id.clone())
@@ -3433,6 +3545,7 @@ FORMAT JSONEachRow",
                     score,
                     matched_terms,
                     event_count_considered,
+                    best_source_host,
                     best_event_uid: row_best_event_uid,
                     snippet: row_snippet,
                 } = row;
@@ -3443,9 +3556,11 @@ FORMAT JSONEachRow",
                 } else {
                     Some(row_best_event_uid)
                 };
-                let snippet_content = best_event_uid
-                    .as_ref()
-                    .and_then(|event_uid| snippet_by_event_uid.get(event_uid).cloned());
+                let snippet_content = best_event_uid.as_ref().and_then(|event_uid| {
+                    snippet_by_identity
+                        .get(&SearchDocumentIdentity::new(best_source_host, event_uid))
+                        .cloned()
+                });
                 let snippet = snippet_content
                     .as_ref()
                     .map(|content| content.snippet.clone())

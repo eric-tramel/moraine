@@ -481,10 +481,10 @@ FORMAT JSONEachRow",
                     "cursor does not match current turn filter",
                 ));
             }
-            if cursor.publication_token.is_some()
-                && cursor.publication_token != active_publication_token()
-            {
-                return Err(RepoError::ReadModelChanged);
+            if let Some(cursor_token) = cursor.publication_token.as_deref() {
+                if cursor_token != active_publication_token() {
+                    return Err(RepoError::ReadModelChanged);
+                }
             }
             Some(cursor)
         } else {
@@ -550,7 +550,7 @@ FORMAT JSONEachRow",
                     last_turn_seq: last.turn_seq,
                     session_id: session_id.to_string(),
                     filter_sig,
-                    publication_token: active_publication_token(),
+                    publication_token: Some(active_publication_token()),
                 })?)
             } else {
                 None
@@ -596,10 +596,10 @@ FORMAT JSONEachRow",
                     "cursor does not match current session event filter",
                 ));
             }
-            if cursor.publication_token.is_some()
-                && cursor.publication_token != active_publication_token()
-            {
-                return Err(RepoError::ReadModelChanged);
+            if let Some(cursor_token) = cursor.publication_token.as_deref() {
+                if cursor_token != active_publication_token() {
+                    return Err(RepoError::ReadModelChanged);
+                }
             }
             Some(cursor)
         } else {
@@ -685,7 +685,7 @@ FORMAT JSONEachRow",
                     session_id: session_id.to_string(),
                     direction,
                     filter_sig,
-                    publication_token: active_publication_token(),
+                    publication_token: Some(active_publication_token()),
                 })?)
             } else {
                 None

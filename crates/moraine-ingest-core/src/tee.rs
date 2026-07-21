@@ -905,7 +905,19 @@ fn spawn_backend_supervisor(
             )
             .await;
             if let Some(checkpoint) = coverage_source {
-                let transition = crate::CheckpointTransition::from_checkpoint(checkpoint);
+                let transition = match crate::CheckpointTransition::try_from_checkpoint(checkpoint)
+                {
+                    Ok(transition) => transition,
+                    Err(exc) => {
+                        cell.set_status(BackendSinkStatus::Unreachable);
+                        warn!(
+                            backend = %name,
+                            "backend catch-up checkpoint is invalid; publication remains disabled: {exc}"
+                        );
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
                 match crate::publication::send_mirror_caught_up(&replay_tx, transition).await {
                     Ok(_) => {
                         cell.mark_publication_ready();
@@ -963,6 +975,26 @@ async fn run_replay_pass(
 ) -> Option<Checkpoint> {
     let mut coverage_source = None;
     let mut pass_complete = true;
+    let configured_sources: HashSet<&str> =
+        sources.iter().map(|source| source.name.as_str()).collect();
+    {
+        let map = floor.read().await;
+        for cp in map.values() {
+            if !configured_sources.contains(cp.source_name.as_str()) {
+                pass_complete = false;
+                if reported_lost.insert(cp.source_file.clone()) {
+                    warn!(
+                        backend,
+                        source = %cp.source_name,
+                        file = %cp.source_file,
+                        "checkpointed source is not configured for replay; mirror catch-up \
+                         cannot prove coverage after offset {}",
+                        cp.last_offset
+                    );
+                }
+            }
+        }
+    }
     for source in sources {
         let files = match enumerate_tracked_files(&source.glob, source.format) {
             Ok(files) => files,
@@ -986,17 +1018,17 @@ async fn run_replay_pass(
             let enumerated: HashSet<&str> = files.iter().map(String::as_str).collect();
             let map = floor.read().await;
             for cp in map.values() {
-                if cp.source_name == source.name
-                    && !enumerated.contains(cp.source_file.as_str())
-                    && reported_lost.insert(cp.source_file.clone())
-                {
-                    warn!(
-                        backend,
-                        file = %cp.source_file,
-                        "source file deleted; rows appended after offset {} never reached \
-                         this backend and are lost to it",
-                        cp.last_offset
-                    );
+                if cp.source_name == source.name && !enumerated.contains(cp.source_file.as_str()) {
+                    pass_complete = false;
+                    if reported_lost.insert(cp.source_file.clone()) {
+                        warn!(
+                            backend,
+                            file = %cp.source_file,
+                            "source file deleted; rows appended after offset {} never reached \
+                             this backend and are lost to it",
+                            cp.last_offset
+                        );
+                    }
                 }
             }
         }
@@ -1410,7 +1442,7 @@ mod tests {
             ..Default::default()
         };
         let transition = crate::CheckpointTransition::begin_replay(&checkpoint, 7, 42, "policy");
-        let expected_operation = transition.operation_id.clone();
+        let expected_operation = transition.checkpoint.operation_id.clone();
         let (ack, receive) = tokio::sync::oneshot::channel();
         router_tx
             .send(SinkMessage::BeginReplay { transition, ack })
@@ -1424,10 +1456,10 @@ mod tests {
         let SinkMessage::BeginReplay { transition, ack } = forwarded else {
             panic!("expected forwarded begin-replay barrier");
         };
-        assert_eq!(transition.operation_id, expected_operation);
+        assert_eq!(transition.checkpoint.operation_id, expected_operation);
         ack.send(Ok(crate::publication::ReplayBarrierAck {
             checkpoint_revision: 1,
-            operation_id: transition.operation_id,
+            operation_id: transition.checkpoint.operation_id,
         }))
         .expect("ack forwarded barrier");
         receive
@@ -1897,6 +1929,219 @@ mod tests {
         );
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn missing_checkpointed_file_suppresses_catch_up_on_every_pass() {
+        let directory = unique_replay_file("replay-missing").with_extension("");
+        fs::create_dir_all(&directory).expect("create replay fixture directory");
+        let present_path = directory.join("present.jsonl");
+        let missing_path = directory.join("missing.jsonl");
+        fs::write(
+            &present_path,
+            json!({
+                "type": "user",
+                "timestamp": "2026-04-18T20:43:51.069Z",
+                "uuid": "u1",
+                "sessionId": "team-session",
+                "cwd": "/work/team/project",
+                "message": {"role": "user", "content": "hello"}
+            })
+            .to_string(),
+        )
+        .expect("write present replay fixture");
+
+        let source_name = "claude";
+        let present_file = present_path.to_string_lossy().to_string();
+        let missing_file = missing_path.to_string_lossy().to_string();
+        let config = AppConfig::default();
+        let sources = vec![IngestSource {
+            name: source_name.to_string(),
+            harness: "claude-code".to_string(),
+            enabled: true,
+            glob: directory.join("*.jsonl").to_string_lossy().to_string(),
+            watch_root: directory.to_string_lossy().to_string(),
+            format: SourceFormat::Jsonl,
+        }];
+        let missing_checkpoint = Checkpoint {
+            source_name: source_name.to_string(),
+            source_file: missing_file.clone(),
+            last_offset: 17,
+            status: "active".to_string(),
+            ..Default::default()
+        };
+        let checkpoints = Arc::new(RwLock::new(HashMap::from([(
+            checkpoint_key(source_name, &missing_file),
+            missing_checkpoint,
+        )])));
+        let metrics = Arc::new(Metrics::default());
+        let (tx, mut rx) = mpsc::channel::<SinkMessage>(4);
+        let mut reported_lost = HashSet::new();
+
+        let coverage = run_replay_pass(
+            &config,
+            &sources,
+            &checkpoints,
+            &tx,
+            &metrics,
+            "team-ch",
+            &mut reported_lost,
+        )
+        .await;
+        assert!(
+            coverage.is_none(),
+            "a missing checkpointed file must suppress MirrorCaughtUp even when another file replays"
+        );
+        assert!(reported_lost.contains(&missing_file));
+
+        let SinkMessage::Batch(batch) = timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("present replay batch within timeout")
+            .expect("present replay batch")
+        else {
+            panic!("expected present replay batch");
+        };
+        let present_checkpoint = batch.checkpoint.expect("present replay checkpoint");
+        assert_eq!(present_checkpoint.source_file, present_file);
+        checkpoints.write().await.insert(
+            checkpoint_key(source_name, &present_checkpoint.source_file),
+            present_checkpoint,
+        );
+
+        let reported_count = reported_lost.len();
+        let coverage = run_replay_pass(
+            &config,
+            &sources,
+            &checkpoints,
+            &tx,
+            &metrics,
+            "team-ch",
+            &mut reported_lost,
+        )
+        .await;
+        assert!(
+            coverage.is_none(),
+            "warning de-duplication must not let a later pass authorize MirrorCaughtUp"
+        );
+        assert_eq!(
+            reported_lost.len(),
+            reported_count,
+            "the persistent coverage failure should not duplicate its warning"
+        );
+        assert!(
+            timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "the covered sibling file must not re-emit batches"
+        );
+
+        fs::remove_dir_all(&directory).expect("remove replay fixture directory");
+    }
+
+    #[tokio::test]
+    async fn unconfigured_checkpoint_source_suppresses_catch_up_on_every_pass() {
+        let present_path = unique_replay_file("replay-configured");
+        let removed_path = unique_replay_file("replay-unconfigured");
+        fs::write(
+            &present_path,
+            json!({
+                "type": "user",
+                "timestamp": "2026-04-18T20:43:51.069Z",
+                "uuid": "u1",
+                "sessionId": "team-session",
+                "cwd": "/work/team/project",
+                "message": {"role": "user", "content": "hello"}
+            })
+            .to_string(),
+        )
+        .expect("write configured replay fixture");
+
+        let present_source = "claude";
+        let removed_source = "removed-source";
+        let present_file = present_path.to_string_lossy().to_string();
+        let removed_file = removed_path.to_string_lossy().to_string();
+        let config = AppConfig::default();
+        let sources = vec![IngestSource {
+            name: present_source.to_string(),
+            harness: "claude-code".to_string(),
+            enabled: true,
+            glob: present_file.clone(),
+            watch_root: std::env::temp_dir().to_string_lossy().to_string(),
+            format: SourceFormat::Jsonl,
+        }];
+        let removed_checkpoint = Checkpoint {
+            source_name: removed_source.to_string(),
+            source_file: removed_file.clone(),
+            last_offset: 23,
+            status: "active".to_string(),
+            ..Default::default()
+        };
+        let checkpoints = Arc::new(RwLock::new(HashMap::from([(
+            checkpoint_key(removed_source, &removed_file),
+            removed_checkpoint,
+        )])));
+        let metrics = Arc::new(Metrics::default());
+        let (tx, mut rx) = mpsc::channel::<SinkMessage>(4);
+        let mut reported_lost = HashSet::new();
+
+        let coverage = run_replay_pass(
+            &config,
+            &sources,
+            &checkpoints,
+            &tx,
+            &metrics,
+            "team-ch",
+            &mut reported_lost,
+        )
+        .await;
+        assert!(
+            coverage.is_none(),
+            "an unconfigured checkpoint source must suppress MirrorCaughtUp even when another source replays"
+        );
+        assert!(reported_lost.contains(&removed_file));
+
+        let SinkMessage::Batch(batch) = timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("configured replay batch within timeout")
+            .expect("configured replay batch")
+        else {
+            panic!("expected configured replay batch");
+        };
+        let present_checkpoint = batch.checkpoint.expect("configured replay checkpoint");
+        assert_eq!(present_checkpoint.source_file, present_file);
+        checkpoints.write().await.insert(
+            checkpoint_key(present_source, &present_checkpoint.source_file),
+            present_checkpoint,
+        );
+
+        let reported_count = reported_lost.len();
+        let coverage = run_replay_pass(
+            &config,
+            &sources,
+            &checkpoints,
+            &tx,
+            &metrics,
+            "team-ch",
+            &mut reported_lost,
+        )
+        .await;
+        assert!(
+            coverage.is_none(),
+            "warning de-duplication must not let an unconfigured source authorize MirrorCaughtUp"
+        );
+        assert_eq!(
+            reported_lost.len(),
+            reported_count,
+            "the persistent unconfigured-source failure should not duplicate its warning"
+        );
+        assert!(
+            timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "the covered configured source must not re-emit batches"
+        );
+
+        fs::remove_file(&present_path).expect("remove configured replay fixture");
     }
 
     #[tokio::test]

@@ -541,7 +541,7 @@ async fn drive_opencode_poll(
                 | SinkMessage::MirrorCaughtUp { transition, ack } => {
                     let _ = ack.send(Ok(crate::publication::ReplayBarrierAck {
                         checkpoint_revision: 1,
-                        operation_id: transition.operation_id,
+                        operation_id: transition.checkpoint.operation_id,
                     }));
                 }
                 SinkMessage::FinalizeReplay { transition, ack } => {
@@ -1171,6 +1171,75 @@ async fn opencode_sqlite_replays_rows_when_exclusions_change() {
         !all_event_rows(&replayed).is_empty(),
         "removing exclusions must replay previously skipped rows"
     );
+
+    cleanup(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn opencode_sqlite_can_queue_oversized_replay_row_before_final_checkpoint() {
+    let path = unique_opencode_db_path("sink-limit-envelope");
+    let connection = create_opencode_db(&path);
+    let payload_bytes = crate::sink::CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES + 1024 * 1024;
+    assert!(payload_bytes < SCAN_PAGE_MAX_BYTES);
+    connection
+        .execute(
+            "INSERT INTO event (id, aggregate_id, seq, type, data) \
+             VALUES ('evt_oversized', 'ses_oversized', 0, 'session.created.1', ?1)",
+            rusqlite::params![serde_json::to_string(&json!({
+                "sessionID": "ses_oversized",
+                "info": {
+                    "id": "ses_oversized",
+                    "directory": "/work/opencode-oversized",
+                    "title": "Oversized OpenCode replay",
+                    "time": {
+                        "created": 1780000200000_i64,
+                        "updated": 1780000200000_i64
+                    },
+                    // Metadata is retained by the OpenCode projection. Spaces
+                    // keep this textual payload out of the binary elision
+                    // heuristic while the raw SQLite row remains under 32 MiB.
+                    "metadata": "word ".repeat(payload_bytes / 5 + 1)
+                }
+            }))
+            .unwrap()],
+        )
+        .expect("insert sink-oversized OpenCode event");
+    connection
+        .execute(
+            "INSERT INTO event_sequence (aggregate_id, seq, owner_id) \
+             VALUES ('ses_oversized', 0, NULL)",
+            [],
+        )
+        .expect("insert oversized event sequence");
+    drop(connection);
+
+    let work = opencode_sqlite_work(&path);
+    let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+    let poll_state = VolatilePollMap::new();
+
+    let mut excluded = moraine_config::AppConfig::default();
+    excluded.ingest.exclude_project_dirs = vec!["/work/opencode-oversized/**".to_string()];
+    let excluded_batches = drive_opencode_poll(&excluded, &work, &checkpoints, &poll_state).await;
+    assert!(all_event_rows(&excluded_batches).is_empty());
+
+    let included = moraine_config::AppConfig::default();
+    let replay_batches = drive_opencode_poll(&included, &work, &checkpoints, &poll_state).await;
+    let oversized_index = replay_batches
+        .iter()
+        .position(|batch| {
+            batch.raw_rows.iter().any(|row| {
+                serde_json::to_vec(row).is_ok_and(|encoded| {
+                    encoded.len() > crate::sink::CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES
+                })
+            })
+        })
+        .expect("OpenCode scanner emits a sink-oversized row under its page cap");
+    let checkpoint_index = replay_batches
+        .iter()
+        .position(|batch| batch.checkpoint.is_some())
+        .expect("OpenCode replay queues a final checkpoint");
+    assert!(oversized_index < checkpoint_index);
+    assert!(replay_batches[oversized_index].checkpoint.is_none());
 
     cleanup(&path);
 }

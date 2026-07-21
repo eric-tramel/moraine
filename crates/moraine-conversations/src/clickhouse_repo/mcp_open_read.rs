@@ -49,40 +49,26 @@ impl ClickHouseConversationRepository {
         &self,
         session_id: &str,
     ) -> RepoResult<Option<ProjectedSession>> {
-        let snapshot = active_publication_snapshot();
-        let (sessions, snapshot_cte, authorization, revision_columns, ordering) = if let Some(
-            snapshot,
-        ) =
-            snapshot.as_ref()
-        {
-            let history = self.table_ref("v_published_source_generation_history");
-            let captured_heads = snapshot.captured_source_heads_sql(&history);
-            let live_events = self.live_events_source();
-            (
-                    self.table_ref("mcp_open_publication_headers"),
-                    format!("WITH {captured_heads} AS captured_heads\n"),
-                    format!(
-                        "\n  AND length(s.required_source_heads) > 0\n  AND arrayAll(required_head -> has(captured_heads, required_head), s.required_source_heads)\n  AND s.dirty_revision = (\n    SELECT if(count() = 0, toUInt64(0), toUInt64(max(dirty.dirty_revision)))\n    FROM {} AS dirty FINAL WHERE dirty.session_id = {}\n  )\n  AND s.source_revision = (\n    SELECT if(count() = 0, toUInt64(0), toUInt64(cityHash64(arraySort(groupArray(tuple(e.event_uid, e.event_version))))))\n    FROM {live_events} AS e WHERE e.session_id = {}\n  )",
-                        self.table_ref("mcp_open_dirty_sessions"),
-                        sql_quote(session_id),
-                        sql_quote(session_id),
-                    ),
-                    "candidate_publication_id, toUInt64(source_revision) AS source_revision, toUInt64(dirty_revision) AS dirty_revision, toUInt8(tombstone) AS tombstone, required_heads_fingerprint,",
-                    "ORDER BY header_revision DESC",
-                )
-        } else {
-            (
-                    self.table_ref("mcp_open_sessions"),
-                    String::new(),
-                    String::new(),
-                    "'' AS candidate_publication_id, toUInt64(source_revision) AS source_revision, toUInt64(dirty_revision) AS dirty_revision, toUInt8(0) AS tombstone, '' AS required_heads_fingerprint,",
-                    "",
-                )
-        };
+        let snapshot = require_active_publication_snapshot("projected MCP session reads");
+        let history = self.table_ref("v_published_source_generation_history");
+        let captured_heads = snapshot.captured_source_heads_sql(&history);
+        let live_events = self.live_events_source();
+        let sessions = self.table_ref("mcp_open_publication_headers");
+        let snapshot_cte = format!("WITH {captured_heads} AS captured_heads\n");
+        let authorization = format!(
+            "\n  AND length(s.required_source_heads) > 0\n  AND arrayAll(required_head -> has(captured_heads, required_head), s.required_source_heads)\n  AND s.dirty_revision = (\n    SELECT if(count() = 0, toUInt64(0), toUInt64(max(dirty.dirty_revision)))\n    FROM {} AS dirty FINAL WHERE dirty.session_id = {}\n  )\n  AND s.source_revision = (\n    SELECT if(count() = 0, toUInt64(0), toUInt64(cityHash64(arraySort(groupArray(tuple(e.event_uid, e.event_version))))))\n    FROM {live_events} AS e WHERE e.session_id = {}\n  )",
+            self.table_ref("mcp_open_dirty_sessions"),
+            sql_quote(session_id),
+            sql_quote(session_id),
+        );
         let query = format!(
             "{snapshot_cte}SELECT
   session_id,
-  {revision_columns}
+  candidate_publication_id,
+  toUInt64(source_revision) AS source_revision,
+  toUInt64(dirty_revision) AS dirty_revision,
+  toUInt8(tombstone) AS tombstone,
+  required_heads_fingerprint,
   toUInt8(slot) AS slot,
   toUInt64(generation) AS generation,
   toString(s.first_event_time) AS first_event_time,
@@ -110,20 +96,18 @@ impl ClickHouseConversationRepository {
   origin_cwd
 FROM {sessions} AS s FINAL
 WHERE s.session_id = {}{authorization}
-{ordering}
+ORDER BY header_revision DESC
 LIMIT 1
 FORMAT JSONEachRow",
             sql_quote(session_id),
         );
         let rows: Vec<McpOpenSessionRow> = self.map_backend(self.query_rows(&query, None).await)?;
         let Some(row) = rows.into_iter().next() else {
-            if let Some(snapshot) = snapshot.as_ref() {
-                if self
-                    .canonical_session_exists_in_snapshot(session_id, snapshot)
-                    .await?
-                {
-                    return Err(RepoError::ReadModelChanged);
-                }
+            if self
+                .canonical_session_exists_in_snapshot(session_id, &snapshot)
+                .await?
+            {
+                return Err(RepoError::ReadModelChanged);
             }
             return Ok(None);
         };
@@ -178,9 +162,7 @@ FORMAT JSONEachRow",
         struct ExistsRow {
             exists: u8,
         }
-        let Some(_snapshot) = active_publication_snapshot() else {
-            return Ok(false);
-        };
+        let _snapshot = require_active_publication_snapshot("canonical MCP event existence reads");
         let query = format!(
             "SELECT toUInt8(count() > 0) AS exists\nFROM {} AS e\nWHERE e.event_uid = {}\nFORMAT JSONEachRow",
             self.live_events_source(),
@@ -288,13 +270,14 @@ FORMAT JSONEachRow",
         let events = self.table_ref("mcp_open_events");
         let query = format!(
             "SELECT
+  source_host,
   event_uid,
   session_id,
   toUInt8(slot) AS slot,
   toUInt64(generation) AS generation
 FROM {events} FINAL
 WHERE event_uid = {}
-ORDER BY generation DESC
+ORDER BY generation DESC, source_host ASC, session_id ASC
 LIMIT 64
 FORMAT JSONEachRow",
             sql_quote(event_uid),
@@ -334,10 +317,16 @@ FORMAT JSONEachRow",
   previous_event_uid,
   next_event_uid
 FROM {events} AS e FINAL
-WHERE e.event_uid = {event_uid} AND e.slot = {slot} AND e.generation = {generation}
+WHERE e.event_uid = {event_uid}
+  AND e.source_host = {source_host}
+  AND e.session_id = {session_id}
+  AND e.slot = {slot}
+  AND e.generation = {generation}
 LIMIT 1
 FORMAT JSONEachRow",
             event_uid = sql_quote(&lookup.event_uid),
+            source_host = sql_quote(&lookup.source_host),
+            session_id = sql_quote(&lookup.session_id),
             slot = lookup.slot,
             generation = lookup.generation,
         );
@@ -345,15 +334,21 @@ FORMAT JSONEachRow",
         Ok(rows.into_iter().next())
     }
 
-    pub(super) async fn load_projected_event_refs(
+    pub(super) async fn load_projected_event_refs_by_order(
         &self,
-        event_uids: Vec<String>,
+        session_id: &str,
+        event_orders: Vec<u64>,
         slot: u8,
         generation: u64,
-    ) -> RepoResult<HashMap<String, McpEventRef>> {
-        if event_uids.is_empty() {
+    ) -> RepoResult<HashMap<u64, McpEventRef>> {
+        if event_orders.is_empty() {
             return Ok(HashMap::new());
         }
+        let event_orders = event_orders
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
         #[derive(Deserialize)]
         struct RefRow {
             session_id: String,
@@ -373,9 +368,10 @@ FORMAT JSONEachRow",
   toString(event_time) AS event_time,
   event_type
 FROM {events} FINAL
-WHERE event_uid IN {} AND slot = {} AND generation = {}
+WHERE session_id = {} AND event_order IN [{}] AND slot = {} AND generation = {}
 FORMAT JSONEachRow",
-            sql_array_strings(&event_uids),
+            sql_quote(session_id),
+            event_orders,
             slot,
             generation,
         );
@@ -383,9 +379,9 @@ FORMAT JSONEachRow",
         Ok(rows
             .into_iter()
             .map(|row| {
-                let event_uid = row.event_uid.clone();
+                let event_order = row.event_order;
                 (
-                    event_uid,
+                    event_order,
                     McpEventRef {
                         session_id: row.session_id,
                         event_uid: row.event_uid,

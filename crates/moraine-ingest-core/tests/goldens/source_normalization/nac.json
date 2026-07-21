@@ -458,6 +458,7 @@
           "project_id": "",
           "repo_rel_path": "",
           "session_id": "nac_fixture_session-local",
+          "source_event_version": "<event_version>",
           "source_name": "golden-nac",
           "source_ref": "/fixtures/nac/store.db:1:4",
           "tool_call_id": "call-1",
@@ -595,6 +596,7 @@
           "project_id": "",
           "repo_rel_path": "",
           "session_id": "nac_fixture_session-local",
+          "source_event_version": "<event_version>",
           "source_name": "golden-nac",
           "source_ref": "/fixtures/nac/store.db:1:5",
           "tool_call_id": "call-1",
@@ -701,6 +703,7 @@
           "linked_external_id": "nac_fixture_session-local",
           "metadata_json": "{}",
           "session_id": "nac_fixture_session-local:worker:worker-a",
+          "source_event_version": "<event_version>",
           "source_name": "golden-nac"
         }
       ],

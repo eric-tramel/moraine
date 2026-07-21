@@ -407,6 +407,7 @@ pub(crate) fn event_lookup(event_uid: &str) -> Option<Value> {
     };
     Some(json!({
         "event_uid": event_uid,
+        "source_host": "host-a",
         "session_id": session_id,
         "slot": 0_u8,
         "generation": 100_u64

@@ -1715,7 +1715,7 @@ mod tests {
                         committed = Some(transition.checkpoint.clone());
                         let _ = ack.send(Ok(crate::publication::ReplayBarrierAck {
                             checkpoint_revision: 1,
-                            operation_id: transition.operation_id.clone(),
+                            operation_id: transition.checkpoint.operation_id.clone(),
                         }));
                         transitions.push(transition);
                     }
@@ -2090,12 +2090,15 @@ mod tests {
         );
         assert_eq!(transitions.len(), 2, "begin then durable block");
         let blocked = transitions.last().expect("blocked transition");
-        assert_eq!(blocked.lifecycle.as_str(), "error");
+        assert_eq!(
+            blocked.checkpoint.lifecycle().unwrap(),
+            crate::model::CheckpointLifecycle::Error
+        );
         assert_eq!(
             blocked.checkpoint.source_generation,
             committed_generation + 1
         );
-        assert!(!blocked.block_reason.is_empty());
+        assert!(!blocked.checkpoint.block_reason.is_empty());
 
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(format!("{}-wal", path.display())).ok();

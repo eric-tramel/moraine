@@ -8,7 +8,21 @@ impl ClickHouseConversationRepository {
         &self,
         query: FileAttentionQuery,
     ) -> RepoResult<Vec<FileAttentionTouch>> {
-        self.file_attention_impl(query).await
+        let scope = if query.apply_project_scope {
+            PublicationReadScope::projects(
+                query
+                    .normalized_project_id
+                    .iter()
+                    .chain(&query.normalized_project_roots)
+                    .cloned(),
+            )
+        } else {
+            PublicationReadScope::global()
+        };
+        self.run_publication_consistent_scoped(PublicationReadClass::Strict, scope, || {
+            self.file_attention_impl(query.clone())
+        })
+        .await
     }
 
     /// Tier-0 file-attention query: every captured tool call whose input path
@@ -235,13 +249,8 @@ impl ClickHouseConversationRepository {
 SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
             sql_quote(project_id)
         );
-        let Some(PublicationEffect::FileAttentionProjectRootsWrite { sql }) =
-            defer_publication_effect(PublicationEffect::FileAttentionProjectRootsWrite { sql })
-                .await
-        else {
-            return Ok(());
-        };
-        self.execute_file_attention_project_roots_write(&sql).await
+        defer_publication_effect(PublicationEffect::FileAttentionProjectRootsWrite { sql }).await;
+        Ok(())
     }
 
     pub(super) async fn execute_file_attention_project_roots_write(

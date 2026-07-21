@@ -385,6 +385,60 @@ tokio::task_local! {
     static ACTIVE_PUBLICATION_EFFECTS: Arc<Mutex<Vec<PublicationEffect>>>;
 }
 
+/// Explicit task-local publication context for direct unit-test query builders.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(super) struct TestPublicationSnapshot {
+    publication_revision: u64,
+    cache_epoch: u64,
+}
+
+#[cfg(test)]
+impl TestPublicationSnapshot {
+    pub(super) const fn idle_local(publication_revision: u64, cache_epoch: u64) -> Self {
+        Self {
+            publication_revision,
+            cache_epoch,
+        }
+    }
+
+    fn into_active(self) -> PublicationSnapshot {
+        PublicationSnapshot::new(
+            PublicationConsistencyMode::Local,
+            vec![PublicationHostState {
+                source_host: String::new(),
+                publication_revision: self.publication_revision,
+                head_count: 0,
+                head_fingerprint: String::new(),
+            }],
+            vec![AppendControlRow {
+                host: "test-host".to_string(),
+                control_revision: self.cache_epoch,
+                cache_epoch: self.cache_epoch,
+                state: "idle".to_string(),
+                batch_id: String::new(),
+                publisher_id: "test-publisher".to_string(),
+                manifest_json: String::new(),
+                insert_only: 0,
+                manifest: None,
+            }],
+        )
+    }
+}
+
+#[cfg(test)]
+pub(super) async fn with_test_publication_snapshot<F>(
+    snapshot: TestPublicationSnapshot,
+    future: F,
+) -> F::Output
+where
+    F: Future,
+{
+    ACTIVE_PUBLICATION_SNAPSHOT
+        .scope(snapshot.into_active(), future)
+        .await
+}
+
 pub(super) enum PublicationEffect {
     SearchTelemetry {
         query_row: Value,
@@ -416,31 +470,45 @@ pub(super) fn active_publication_snapshot() -> Option<PublicationSnapshot> {
     ACTIVE_PUBLICATION_SNAPSHOT.try_with(Clone::clone).ok()
 }
 
-pub(super) fn active_publication_token() -> Option<String> {
-    active_publication_snapshot().map(|snapshot| snapshot.token().to_string())
+/// Return the immutable publication authorization captured for this operation.
+///
+/// Live read helpers must only run inside `run_publication_consistent*`. A
+/// missing task-local snapshot means a caller crossed that boundary, so panic
+/// at the point of the bypass instead of silently consulting a moving model.
+pub(super) fn require_active_publication_snapshot(boundary: &'static str) -> PublicationSnapshot {
+    active_publication_snapshot().unwrap_or_else(|| {
+        panic!(
+            "{boundary} requires an active publication snapshot; invoke it through a publication-consistent repository operation"
+        )
+    })
 }
 
-pub(super) async fn defer_publication_effect(
-    effect: PublicationEffect,
-) -> Option<PublicationEffect> {
-    let effects = ACTIVE_PUBLICATION_EFFECTS.try_with(Clone::clone).ok();
-    let Some(effects) = effects else {
-        return Some(effect);
-    };
+pub(super) fn active_publication_token() -> String {
+    require_active_publication_snapshot("publication cursor access")
+        .token()
+        .to_string()
+}
+
+pub(super) async fn defer_publication_effect(effect: PublicationEffect) {
+    let _snapshot = require_active_publication_snapshot("publication effect buffering");
+    let effects = ACTIVE_PUBLICATION_EFFECTS
+        .try_with(Clone::clone)
+        .unwrap_or_else(|_| {
+            panic!(
+                "publication effect buffering requires an active publication effect buffer; invoke it through a publication-consistent repository operation"
+            )
+        });
     effects.lock().await.push(effect);
-    None
 }
 
 /// Return the authorization namespace for mutable live-cache entries.
 /// `None` means an append is preparing, so callers must bypass both lookup and
-/// population. Direct implementation tests that do not install an operation
-/// snapshot retain an isolated legacy namespace.
+/// population. A missing operation snapshot is a boundary violation.
 pub(super) fn publication_cache_token() -> Option<String> {
-    match active_publication_snapshot() {
-        Some(snapshot) if snapshot.cache_allowed() => Some(snapshot.token().to_string()),
-        Some(_) => None,
-        None => Some("legacy".to_string()),
-    }
+    let snapshot = require_active_publication_snapshot("publication cache access");
+    snapshot
+        .cache_allowed()
+        .then(|| snapshot.token().to_string())
 }
 
 /// Qualify a mutable live-cache key with the operation's authorization token.
@@ -457,14 +525,32 @@ pub(super) enum PublicationReadClass {
     MovingFeed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublicationSnapshotPhase {
+    Capture,
+    Revalidate,
+}
+
+impl PublicationSnapshotPhase {
+    const fn publication_marker(self) -> &'static str {
+        match self {
+            Self::Capture => "/* moraine:publication_snapshot:capture */",
+            Self::Revalidate => "/* moraine:publication_snapshot:revalidate */",
+        }
+    }
+
+    const fn append_fence_marker(self) -> &'static str {
+        match self {
+            Self::Capture => "/* moraine:append_fence:capture */",
+            Self::Revalidate => "/* moraine:append_fence:revalidate */",
+        }
+    }
+}
+
 impl ClickHouseConversationRepository {
-    /// Canonical events authorized by the operation's captured heads. Outside
-    /// a repository operation (query-builder/unit-test use), fall back to the
-    /// current live view.
+    /// Canonical events authorized by the operation's captured heads.
     pub(super) fn live_events_source(&self) -> String {
-        let Some(snapshot) = active_publication_snapshot() else {
-            return canonical_events_source(&self.table_ref("v_live_events"));
-        };
+        let snapshot = require_active_publication_snapshot("live event reads");
 
         let history = self.table_ref("v_published_source_generation_history");
         let revision_predicate = snapshot.publication_revision_predicate("history");
@@ -474,12 +560,8 @@ impl ClickHouseConversationRepository {
         )
     }
 
-    fn publication_snapshot_query(&self, phase: &'static str) -> String {
-        let heads_marker = match phase {
-            "capture" => "/* moraine:publication_snapshot:capture */",
-            "revalidate" => "/* moraine:publication_snapshot:revalidate */",
-            _ => unreachable!("publication snapshot phase is internal"),
-        };
+    fn publication_snapshot_query(&self, phase: PublicationSnapshotPhase) -> String {
+        let heads_marker = phase.publication_marker();
         let heads_select = match self.publication_mode {
             PublicationConsistencyMode::Local => {
                 // The local publication actor allocates one globally monotonic
@@ -499,11 +581,7 @@ impl ClickHouseConversationRepository {
                 )
             }
         };
-        let fence_marker = match phase {
-            "capture" => "/* moraine:append_fence:capture */",
-            "revalidate" => "/* moraine:append_fence:revalidate */",
-            _ => unreachable!("publication snapshot phase is internal"),
-        };
+        let fence_marker = phase.append_fence_marker();
         let controls_select = format!(
             "SELECT\n  toUInt8(1) AS row_kind,\n  '' AS source_host,\n  toUInt64(0) AS publication_revision,\n  toUInt64(0) AS head_count,\n  '' AS head_fingerprint,\n  toString(host) AS host,\n  toUInt64(control_revision) AS control_revision,\n  toUInt64(cache_epoch) AS cache_epoch,\n  toString(state) AS state,\n  toString(batch_id) AS batch_id,\n  toString(publisher_id) AS publisher_id,\n  toString(manifest_json) AS manifest_json,\n  toUInt8(insert_only) AS insert_only\nFROM {}",
             self.table_ref("v_current_ingest_append_control")
@@ -516,7 +594,7 @@ impl ClickHouseConversationRepository {
 
     async fn capture_publication_snapshot(
         &self,
-        phase: &'static str,
+        phase: PublicationSnapshotPhase,
     ) -> RepoResult<PublicationSnapshot> {
         let query = self.publication_snapshot_query(phase);
         let rows: Vec<PublicationSnapshotRow> =
@@ -629,7 +707,9 @@ impl ClickHouseConversationRepository {
         }
 
         for _ in 0..MAX_PUBLICATION_READ_ATTEMPTS {
-            let snapshot = self.capture_publication_snapshot("capture").await?;
+            let snapshot = self
+                .capture_publication_snapshot(PublicationSnapshotPhase::Capture)
+                .await?;
             if !snapshot.read_allowed(class, &scope) {
                 return Err(RepoError::ReadModelChanged);
             }
@@ -655,7 +735,9 @@ impl ClickHouseConversationRepository {
             // and this revalidation to the same ClickHouse endpoint; a head or
             // append-control transition on that endpoint changes this complete
             // token, so mixed attempts and their buffered effects are retried.
-            let current = self.capture_publication_snapshot("revalidate").await?;
+            let current = self
+                .capture_publication_snapshot(PublicationSnapshotPhase::Revalidate)
+                .await?;
             if current == snapshot {
                 if !snapshot.read_allowed(class, &release_scope) {
                     return Err(RepoError::ReadModelChanged);
@@ -760,9 +842,55 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "publication cache access requires an active publication snapshot")]
+    fn snapshotless_publication_cache_access_panics() {
+        let _ = publication_cache_token();
+    }
+
+    #[test]
+    #[should_panic(expected = "publication cursor access requires an active publication snapshot")]
+    fn snapshotless_publication_cursor_access_panics() {
+        let _ = active_publication_token();
+    }
+
+    #[test]
+    #[should_panic(expected = "live event reads requires an active publication snapshot")]
+    fn snapshotless_live_event_source_panics() {
+        let repository = repository_with_publication_mode(PublicationConsistencyMode::Local);
+        let _ = repository.live_events_source();
+    }
+
+    #[test]
+    #[should_panic(expected = "MCP search session reads requires an active publication snapshot")]
+    fn snapshotless_mcp_search_session_source_panics() {
+        let repository = repository_with_publication_mode(PublicationConsistencyMode::Local);
+        let _ = repository.mcp_search_sessions_source();
+    }
+
+    #[tokio::test]
+    #[should_panic(
+        expected = "projected MCP session reads requires an active publication snapshot"
+    )]
+    async fn snapshotless_projected_session_read_panics() {
+        let repository = repository_with_publication_mode(PublicationConsistencyMode::Local);
+        let _ = repository.load_projected_session("session-a").await;
+    }
+
+    #[tokio::test]
+    #[should_panic(
+        expected = "canonical MCP event existence reads requires an active publication snapshot"
+    )]
+    async fn snapshotless_canonical_event_existence_read_panics() {
+        let repository = repository_with_publication_mode(PublicationConsistencyMode::Local);
+        let _ = repository
+            .canonical_event_exists_in_snapshot("event-a")
+            .await;
+    }
+
+    #[test]
     fn local_snapshot_query_captures_heads_and_fences_in_one_ordered_statement() {
         let repository = repository_with_publication_mode(PublicationConsistencyMode::Local);
-        let query = repository.publication_snapshot_query("capture");
+        let query = repository.publication_snapshot_query(PublicationSnapshotPhase::Capture);
 
         assert!(query.contains("/* moraine:publication_snapshot:capture */"));
         assert!(query.contains("/* moraine:append_fence:capture */"));
@@ -776,7 +904,7 @@ mod tests {
     #[test]
     fn shared_snapshot_query_retains_host_head_proof_and_revalidation_markers() {
         let repository = repository_with_publication_mode(PublicationConsistencyMode::Shared);
-        let query = repository.publication_snapshot_query("revalidate");
+        let query = repository.publication_snapshot_query(PublicationSnapshotPhase::Revalidate);
 
         assert!(query.contains("/* moraine:publication_snapshot:revalidate */"));
         assert!(query.contains("/* moraine:append_fence:revalidate */"));
@@ -1120,10 +1248,7 @@ mod tests {
         ACTIVE_PUBLICATION_SNAPSHOT
             .scope(snapshot, async move {
                 with_repository_query_id("request-a".to_string(), async move {
-                    assert_eq!(
-                        active_publication_token().as_deref(),
-                        Some(expected.as_str())
-                    );
+                    assert_eq!(active_publication_token(), expected);
                 })
                 .await;
             })
@@ -1185,31 +1310,34 @@ mod tests {
 
     #[tokio::test]
     async fn attempt_effects_are_buffered_until_the_wrapper_commits_them() {
+        let snapshot = PublicationSnapshot::new(
+            PublicationConsistencyMode::Local,
+            vec![host_state("", 4, "heads-a")],
+            vec![control("idle", 7, false)],
+        );
         let effects = Arc::new(Mutex::new(Vec::new()));
-        ACTIVE_PUBLICATION_EFFECTS
-            .scope(effects.clone(), async {
-                let deferred = defer_publication_effect(PublicationEffect::SearchTelemetry {
-                    query_row: json!({"query_id": "query-a"}),
-                    hit_rows: vec![json!({"event_uid": "event-a"})],
-                })
-                .await;
-                assert!(deferred.is_none());
+        ACTIVE_PUBLICATION_SNAPSHOT
+            .scope(
+                snapshot,
+                ACTIVE_PUBLICATION_EFFECTS.scope(effects.clone(), async {
+                    defer_publication_effect(PublicationEffect::SearchTelemetry {
+                        query_row: json!({"query_id": "query-a"}),
+                        hit_rows: vec![json!({"event_uid": "event-a"})],
+                    })
+                    .await;
 
-                let deferred =
                     defer_publication_effect(PublicationEffect::ScopedSessionCacheInsert {
                         session_id: "session-a".to_string(),
                         publication_token: "snapshot-a".to_string(),
                     })
                     .await;
-                assert!(deferred.is_none());
 
-                let deferred =
                     defer_publication_effect(PublicationEffect::FileAttentionProjectRootsWrite {
                         sql: "INSERT INTO roots VALUES ('project-a', '/repo')".to_string(),
                     })
                     .await;
-                assert!(deferred.is_none());
-            })
+                }),
+            )
             .await;
 
         assert_eq!(effects.lock().await.len(), 3);
@@ -1243,29 +1371,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn effects_remain_immediate_without_an_operation_snapshot() {
-        let effect = defer_publication_effect(PublicationEffect::ScopedSessionCacheInsert {
+    #[should_panic(
+        expected = "publication effect buffering requires an active publication snapshot"
+    )]
+    async fn snapshotless_publication_effect_panics() {
+        defer_publication_effect(PublicationEffect::ScopedSessionCacheInsert {
             session_id: "session-a".to_string(),
-            publication_token: "legacy".to_string(),
+            publication_token: "snapshot-a".to_string(),
         })
         .await;
-        assert!(matches!(
-            effect,
-            Some(PublicationEffect::ScopedSessionCacheInsert {
-                session_id,
-                publication_token,
-            }) if session_id == "session-a" && publication_token == "legacy"
-        ));
+    }
 
-        let effect = defer_publication_effect(PublicationEffect::FileAttentionProjectRootsWrite {
-            sql: "INSERT INTO roots VALUES ('project-a', '/repo')".to_string(),
-        })
-        .await;
-        assert!(matches!(
-            effect,
-            Some(PublicationEffect::FileAttentionProjectRootsWrite { sql })
-                if sql.contains("INSERT INTO roots")
-        ));
+    #[tokio::test]
+    #[should_panic(
+        expected = "publication effect buffering requires an active publication effect buffer"
+    )]
+    async fn publication_effect_without_buffer_panics() {
+        let snapshot = PublicationSnapshot::new(
+            PublicationConsistencyMode::Local,
+            vec![host_state("", 4, "heads-a")],
+            vec![control("idle", 7, false)],
+        );
+        ACTIVE_PUBLICATION_SNAPSHOT
+            .scope(snapshot, async {
+                defer_publication_effect(PublicationEffect::FileAttentionProjectRootsWrite {
+                    sql: "INSERT INTO roots VALUES ('project-a', '/repo')".to_string(),
+                })
+                .await;
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -1273,19 +1407,24 @@ mod tests {
         let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
             .expect("build ClickHouse client");
         let repository = ClickHouseConversationRepository::new(client, RepoConfig::default());
+        let snapshot = PublicationSnapshot::new(
+            PublicationConsistencyMode::Local,
+            vec![host_state("", 4, "heads-a")],
+            vec![control("idle", 7, false)],
+        );
         let effects = Arc::new(Mutex::new(Vec::new()));
 
-        ACTIVE_PUBLICATION_EFFECTS
-            .scope(effects.clone(), async {
-                assert!(
+        ACTIVE_PUBLICATION_SNAPSHOT
+            .scope(
+                snapshot,
+                ACTIVE_PUBLICATION_EFFECTS.scope(effects.clone(), async {
                     defer_publication_effect(PublicationEffect::ScopedSessionCacheInsert {
                         session_id: "session-a".to_string(),
                         publication_token: "snapshot-a".to_string(),
                     })
-                    .await
-                    .is_none()
-                );
-            })
+                    .await;
+                }),
+            )
             .await;
 
         // A changed publication token drops this vector rather than flushing

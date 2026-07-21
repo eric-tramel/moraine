@@ -2,8 +2,10 @@ use super::OwnedDatabaseName;
 use anyhow::{bail, Context, Result};
 use moraine_clickhouse::{ClickHouseClient, McpOpenPublicationRequest, McpOpenSourceHead};
 use moraine_conversations::{
-    ClickHouseConversationRepository, ConversationRepository, PageRequest, RepoConfig, RepoError,
-    SearchEventsQuery, SearchStrategyHint, SessionEventsDirection, SessionEventsQuery,
+    AnalyticsRange, ClickHouseConversationRepository, ConversationListFilter, ConversationListSort,
+    ConversationRepository, FileAttentionQuery, McpEventType, McpSessionListFilter, PageRequest,
+    RepoConfig, RepoError, SearchEventsQuery, SearchMcpEventsQuery, SearchStrategyHint,
+    SessionAnalyticsQuery, SessionEventsDirection, SessionEventsQuery, SessionLookback,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -58,7 +60,13 @@ const CROSS_SOURCE_SIDE_G1: &str = "cross-source-side-g1";
 const INACTIVE_ADVERSARY_UID_G3: &str = "inactive-adversary-g3";
 const APPEND_UID_G2: &str = "append-event-g2";
 const ACTIVE_DERIVED_TOOL_CALL: &str = "active-version-skewed-tool";
+const STALE_DERIVED_TOOL_CALL: &str = "stale-owner-version-tool";
+const LEGACY_DERIVED_TOOL_CALL: &str = "legacy-unbound-version-tool";
+const FUTURE_DERIVED_TOOL_CALL: &str = "future-current-version-tool";
+const FUTURE_STALE_DERIVED_TOOL_CALL: &str = "future-stale-version-tool";
 const INACTIVE_DERIVED_TOOL_CALL: &str = "inactive-matching-version-tool";
+const ATTENTION_PROJECT_ID: &str = "git:source-publication-fixture";
+const ATTENTION_REPO_REL_PATH: &str = "src/publication.rs";
 
 #[derive(Debug, Deserialize)]
 struct CountRow {
@@ -103,6 +111,15 @@ struct ControlStorageRow {
 }
 
 #[derive(Debug, Deserialize)]
+struct ColumnStorageRow {
+    table: String,
+    column: String,
+    rows: u64,
+    active_parts: u64,
+    compressed_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
 struct PostingEvidenceRow {
     term: String,
     doc_id: String,
@@ -137,6 +154,28 @@ struct LiveDocumentSummaryRow {
 struct CorpusEvidenceRow {
     docs: u64,
     total_doc_len: u64,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct PublicationDiagnosticsEvidenceRow {
+    ambiguous_hostless_rows: u64,
+    replaying_generations: u64,
+    blocked_generations: u64,
+    mirror_catchup_pending: u64,
+}
+
+#[derive(Clone, Debug)]
+struct SearchRankingEvidence {
+    event_uid: String,
+    rank: usize,
+    score: f64,
+}
+
+#[derive(Debug)]
+struct CutoverCursorFixture {
+    session_events: String,
+    conversations: String,
+    mcp_sessions: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -248,7 +287,62 @@ async fn scalar_u64(
         .context("source-publication scalar query returned no row")
 }
 
-async fn assert_derived_visibility_uses_published_uid(
+async fn backfill_legacy_derived_fixture(
+    clickhouse: &ClickHouseClient,
+    database: &OwnedDatabaseName,
+) -> Result<()> {
+    let database = database.as_str();
+    for query in [
+        format!(
+            "INSERT INTO `{database}`.`event_links` \
+             SELECT l.* REPLACE (\
+               l.event_version + toUInt64(1) AS event_version, \
+               e.event_version AS source_event_version) \
+             FROM (\
+               SELECT * FROM `{database}`.`event_links` FINAL \
+               WHERE source_event_version = 0 \
+                 AND linked_external_id = 'legacy-unbound-version-parent'\
+             ) AS l \
+             ASOF INNER JOIN (\
+               SELECT source_host, event_uid, event_version \
+               FROM `{database}`.`events` FINAL \
+               WHERE event_version > 0 \
+               ORDER BY source_host, event_uid, event_version\
+             ) AS e \
+               ON l.source_host = e.source_host \
+              AND l.event_uid = e.event_uid \
+              AND l.event_version >= e.event_version"
+        ),
+        format!(
+            "INSERT INTO `{database}`.`tool_io` \
+             SELECT t.* REPLACE (\
+               t.event_version + toUInt64(1) AS event_version, \
+               e.event_version AS source_event_version) \
+             FROM (\
+               SELECT * FROM `{database}`.`tool_io` FINAL \
+               WHERE source_event_version = 0 \
+                 AND tool_call_id = '{LEGACY_DERIVED_TOOL_CALL}'\
+             ) AS t \
+             ASOF INNER JOIN (\
+               SELECT source_host, event_uid, event_version \
+               FROM `{database}`.`events` FINAL \
+               WHERE event_version > 0 \
+               ORDER BY source_host, event_uid, event_version\
+             ) AS e \
+               ON t.source_host = e.source_host \
+              AND t.event_uid = e.event_uid \
+              AND t.event_version >= e.event_version"
+        ),
+    ] {
+        clickhouse
+            .request_text(&query, None, Some(database), false, None)
+            .await
+            .context("failed to backfill a legacy derived-version fixture")?;
+    }
+    Ok(())
+}
+
+async fn assert_derived_visibility_uses_exact_event_version(
     clickhouse: &ClickHouseClient,
     database: &OwnedDatabaseName,
 ) -> Result<()> {
@@ -265,10 +359,73 @@ async fn assert_derived_visibility_uses_published_uid(
                     "tool_call_id": ACTIVE_DERIVED_TOOL_CALL,
                     "tool_name": "Read",
                     "tool_phase": "request",
-                    "input_json": "{\"path\":\"Cargo.toml\"}",
+                    "input_json": "{\"path\":\"/fixtures/repo-g1/src/publication.rs\"}",
+                    "project_id": ATTENTION_PROJECT_ID,
+                    "repo_rel_path": ATTENTION_REPO_REL_PATH,
+                    "worktree_root": "/fixtures/repo-g1",
                     "source_ref": STABLE_UIDS.at(1),
-                    // Deliberately differs from the published event's version 1.
+                    // The derived replacement version remains independent.
                     "event_version": 10_001,
+                    "source_event_version": 1,
+                }),
+                json!({
+                    "source_host": HOST_A,
+                    "event_uid": STABLE_UIDS.at(1),
+                    "session_id": "stable-session",
+                    "harness": "codex",
+                    "source_name": SOURCE,
+                    "tool_call_id": STALE_DERIVED_TOOL_CALL,
+                    "tool_name": "Read",
+                    "tool_phase": "request",
+                    "input_json": "{\"path\":\"stale.rs\"}",
+                    "source_ref": STABLE_UIDS.at(1),
+                    "event_version": 10_002,
+                    "source_event_version": 9_999,
+                }),
+                json!({
+                    "source_host": HOST_A,
+                    "event_uid": STABLE_UIDS.at(1),
+                    "session_id": "stable-session",
+                    "harness": "codex",
+                    "source_name": SOURCE,
+                    "tool_call_id": LEGACY_DERIVED_TOOL_CALL,
+                    "tool_name": "Read",
+                    "tool_phase": "request",
+                    "input_json": "{\"path\":\"legacy.rs\"}",
+                    "source_ref": STABLE_UIDS.at(1),
+                    "event_version": 10_003,
+                    // Deliberately omit source_event_version to model upgrade data.
+                }),
+                json!({
+                    "source_host": HOST_A,
+                    "event_uid": EMPTY_UIDS.at(2),
+                    "session_id": "empty-session",
+                    "harness": "codex",
+                    "source_name": SOURCE,
+                    "tool_call_id": FUTURE_DERIVED_TOOL_CALL,
+                    "tool_name": "Read",
+                    "tool_phase": "request",
+                    "input_json": "{\"path\":\"/fixtures/repo-g2/src/publication.rs\"}",
+                    "project_id": ATTENTION_PROJECT_ID,
+                    "repo_rel_path": ATTENTION_REPO_REL_PATH,
+                    "worktree_root": "/fixtures/repo-g2",
+                    "source_ref": EMPTY_UIDS.at(2),
+                    "event_version": 10_004,
+                    "source_event_version": 2,
+                }),
+                json!({
+                    "source_host": HOST_A,
+                    "event_uid": EMPTY_UIDS.at(2),
+                    "session_id": "empty-session",
+                    "harness": "codex",
+                    "source_name": SOURCE,
+                    "tool_call_id": FUTURE_STALE_DERIVED_TOOL_CALL,
+                    "tool_name": "Read",
+                    "tool_phase": "request",
+                    "input_json": "{\"path\":\"stale.rs\"}",
+                    "source_ref": EMPTY_UIDS.at(2),
+                    "event_version": 10_005,
+                    "source_event_version": 1,
                 }),
                 json!({
                     "source_host": HOST_A,
@@ -281,8 +438,8 @@ async fn assert_derived_visibility_uses_published_uid(
                     "tool_phase": "request",
                     "input_json": "{\"path\":\"Cargo.toml\"}",
                     "source_ref": INACTIVE_ADVERSARY_UID_G3,
-                    // Deliberately matches the inactive event's version 1.
                     "event_version": 1,
+                    "source_event_version": 1,
                 }),
             ],
         )
@@ -301,8 +458,58 @@ async fn assert_derived_visibility_uses_published_uid(
                     "linked_external_id": "active-version-skewed-parent",
                     "link_type": "parent_event",
                     "metadata_json": "{}",
-                    // Deliberately differs from the published event's version 1.
                     "event_version": 10_001,
+                    "source_event_version": 1,
+                }),
+                json!({
+                    "source_host": HOST_A,
+                    "event_uid": STABLE_UIDS.at(1),
+                    "linked_event_uid": "stale-version-owner",
+                    "session_id": "stable-session",
+                    "harness": "codex",
+                    "source_name": SOURCE,
+                    "linked_external_id": "stale-owner-version-parent",
+                    "link_type": "parent_event",
+                    "metadata_json": "{}",
+                    "event_version": 10_002,
+                    "source_event_version": 9_999,
+                }),
+                json!({
+                    "source_host": HOST_A,
+                    "event_uid": STABLE_UIDS.at(1),
+                    "linked_event_uid": "legacy-version-owner",
+                    "session_id": "stable-session",
+                    "harness": "codex",
+                    "source_name": SOURCE,
+                    "linked_external_id": "legacy-unbound-version-parent",
+                    "link_type": "parent_event",
+                    "metadata_json": "{}",
+                    "event_version": 10_003,
+                }),
+                json!({
+                    "source_host": HOST_A,
+                    "event_uid": EMPTY_UIDS.at(2),
+                    "session_id": "empty-session",
+                    "harness": "codex",
+                    "source_name": SOURCE,
+                    "linked_external_id": "future-current-version-parent",
+                    "link_type": "parent_event",
+                    "metadata_json": "{}",
+                    "event_version": 10_004,
+                    "source_event_version": 2,
+                }),
+                json!({
+                    "source_host": HOST_A,
+                    "event_uid": EMPTY_UIDS.at(2),
+                    "linked_event_uid": "future-stale-version-owner",
+                    "session_id": "empty-session",
+                    "harness": "codex",
+                    "source_name": SOURCE,
+                    "linked_external_id": "future-stale-version-parent",
+                    "link_type": "parent_event",
+                    "metadata_json": "{}",
+                    "event_version": 10_005,
+                    "source_event_version": 1,
                 }),
                 json!({
                     "source_host": HOST_A,
@@ -313,8 +520,8 @@ async fn assert_derived_visibility_uses_published_uid(
                     "linked_external_id": "inactive-matching-version-parent",
                     "link_type": "parent_event",
                     "metadata_json": "{}",
-                    // Deliberately matches the inactive event's version 1.
                     "event_version": 1,
+                    "source_event_version": 1,
                 }),
             ],
         )
@@ -326,13 +533,49 @@ async fn assert_derived_visibility_uses_published_uid(
             "v_live_tool_io",
             format!("tool_call_id = '{ACTIVE_DERIVED_TOOL_CALL}'"),
             1,
-            "version-skewed published tool row",
+            "exact-owner published tool row",
         ),
         (
             "v_live_event_links",
             "linked_external_id = 'active-version-skewed-parent'".to_string(),
             1,
-            "version-skewed published link row",
+            "exact-owner published link row",
+        ),
+        (
+            "v_live_tool_io",
+            format!("tool_call_id = '{STALE_DERIVED_TOOL_CALL}'"),
+            0,
+            "mismatched-owner published tool row",
+        ),
+        (
+            "v_live_event_links",
+            "linked_external_id = 'stale-owner-version-parent'".to_string(),
+            0,
+            "mismatched-owner published link row",
+        ),
+        (
+            "v_live_tool_io",
+            format!("tool_call_id = '{LEGACY_DERIVED_TOOL_CALL}'"),
+            0,
+            "unbound legacy published tool row",
+        ),
+        (
+            "v_live_event_links",
+            "linked_external_id = 'legacy-unbound-version-parent'".to_string(),
+            0,
+            "unbound legacy published link row",
+        ),
+        (
+            "v_live_tool_io",
+            format!("tool_call_id = '{FUTURE_DERIVED_TOOL_CALL}'"),
+            0,
+            "exact-owner unpublished-generation tool row",
+        ),
+        (
+            "v_live_event_links",
+            "linked_external_id = 'future-current-version-parent'".to_string(),
+            0,
+            "exact-owner unpublished-generation link row",
         ),
         (
             "v_live_tool_io",
@@ -362,6 +605,116 @@ async fn assert_derived_visibility_uses_published_uid(
         }
     }
 
+    backfill_legacy_derived_fixture(clickhouse, database).await?;
+    for (relation, predicate, expected_version, label) in [
+        (
+            "event_links",
+            "linked_external_id = 'legacy-unbound-version-parent'".to_string(),
+            10_004,
+            "legacy link",
+        ),
+        (
+            "tool_io",
+            format!("tool_call_id = '{LEGACY_DERIVED_TOOL_CALL}'"),
+            10_004,
+            "legacy tool",
+        ),
+    ] {
+        let count = scalar_u64(
+            clickhouse,
+            database,
+            &format!(
+                "SELECT toUInt64(count()) AS value FROM `{}`.`{relation}` FINAL \
+                 WHERE {predicate} AND event_version = {expected_version} \
+                   AND source_event_version = 1 FORMAT JSONEachRow",
+                database.as_str(),
+            ),
+        )
+        .await?;
+        if count != 1 {
+            bail!("{label} ASOF backfill did not bind and supersede exactly once: {count}");
+        }
+    }
+    for (relation, predicate, label) in [
+        (
+            "v_live_event_links",
+            "linked_external_id = 'legacy-unbound-version-parent'".to_string(),
+            "backfilled legacy link",
+        ),
+        (
+            "v_live_tool_io",
+            format!("tool_call_id = '{LEGACY_DERIVED_TOOL_CALL}'"),
+            "backfilled legacy tool",
+        ),
+    ] {
+        let count = scalar_u64(
+            clickhouse,
+            database,
+            &format!(
+                "SELECT toUInt64(count()) AS value FROM `{}`.`{relation}` \
+                 WHERE {predicate} FORMAT JSONEachRow",
+                database.as_str(),
+            ),
+        )
+        .await?;
+        if count != 1 {
+            bail!("{label} was not live after causal backfill: {count}");
+        }
+    }
+
+    Ok(())
+}
+
+async fn assert_generation_two_derived_version_cutover(
+    clickhouse: &ClickHouseClient,
+    database: &OwnedDatabaseName,
+) -> Result<()> {
+    for (relation, predicate, expected, label) in [
+        (
+            "v_live_tool_io",
+            format!("tool_call_id = '{FUTURE_DERIVED_TOOL_CALL}'"),
+            1,
+            "current generation-two tool",
+        ),
+        (
+            "v_live_event_links",
+            "linked_external_id = 'future-current-version-parent'".to_string(),
+            1,
+            "current generation-two link",
+        ),
+        (
+            "v_live_tool_io",
+            format!("tool_call_id = '{FUTURE_STALE_DERIVED_TOOL_CALL}'"),
+            0,
+            "stale generation-two tool",
+        ),
+        (
+            "v_live_event_links",
+            "linked_external_id = 'future-stale-version-parent'".to_string(),
+            0,
+            "stale generation-two link",
+        ),
+        (
+            "v_live_tool_io",
+            format!("tool_call_id = '{ACTIVE_DERIVED_TOOL_CALL}'"),
+            0,
+            "retired generation-one tool",
+        ),
+    ] {
+        let count = scalar_u64(
+            clickhouse,
+            database,
+            &format!(
+                "SELECT toUInt64(count()) AS value FROM `{}`.`{relation}` \
+                 WHERE {predicate} FORMAT JSONEachRow",
+                database.as_str(),
+            ),
+        )
+        .await?;
+        if count != expected {
+            bail!("{label} visibility was {count}, expected {expected}");
+        }
+    }
     Ok(())
 }
 
@@ -636,11 +989,11 @@ async fn assert_live_term_count(
     Ok(())
 }
 
-async fn assert_search_uids(
+async fn search_ranking_evidence(
     repository: &ClickHouseConversationRepository,
     query: &str,
     expected: &[&str],
-) -> Result<()> {
+) -> Result<Vec<SearchRankingEvidence>> {
     let result = repository
         .search_events(SearchEventsQuery {
             query: query.to_string(),
@@ -651,16 +1004,83 @@ async fn assert_search_uids(
         })
         .await
         .with_context(|| format!("repository search failed for {query:?}"))?;
-    let mut actual = result
+    if result.stats.result_count != result.hits.len() {
+        bail!(
+            "repository search for {query:?} reported {} results but returned {} hits",
+            result.stats.result_count,
+            result.hits.len()
+        );
+    }
+    let ranking = result
         .hits
+        .iter()
+        .map(|hit| SearchRankingEvidence {
+            event_uid: hit.event_uid.clone(),
+            rank: hit.rank,
+            score: hit.score,
+        })
+        .collect::<Vec<_>>();
+    for (index, hit) in ranking.iter().enumerate() {
+        if hit.rank != index + 1 {
+            bail!(
+                "repository search for {query:?} returned discontinuous rank {} at index {index}",
+                hit.rank
+            );
+        }
+        if !hit.score.is_finite() || hit.score <= 0.0 {
+            bail!(
+                "repository search for {query:?} returned invalid score {} for {:?}",
+                hit.score,
+                hit.event_uid
+            );
+        }
+        if let Some(previous) = index.checked_sub(1).and_then(|index| ranking.get(index)) {
+            if previous.score < hit.score {
+                bail!("repository search for {query:?} was not score ordered: {ranking:?}");
+            }
+        }
+    }
+    let actual = ranking
         .iter()
         .map(|hit| hit.event_uid.as_str())
         .collect::<Vec<_>>();
-    actual.sort_unstable();
-    let mut expected = expected.to_vec();
-    expected.sort_unstable();
     if actual != expected {
         bail!("repository search for {query:?}: expected {expected:?}, got {actual:?}");
+    }
+    Ok(ranking)
+}
+
+async fn assert_search_uids(
+    repository: &ClickHouseConversationRepository,
+    query: &str,
+    expected: &[&str],
+) -> Result<()> {
+    search_ranking_evidence(repository, query, expected)
+        .await
+        .map(|_| ())
+}
+
+fn assert_same_search_ranking(
+    phase: &str,
+    expected: &[SearchRankingEvidence],
+    actual: &[SearchRankingEvidence],
+) -> Result<()> {
+    if expected.len() != actual.len() {
+        bail!(
+            "{phase}: search ranking cardinality changed from {} to {}: expected={expected:?}, actual={actual:?}",
+            expected.len(),
+            actual.len()
+        );
+    }
+    for (expected, actual) in expected.iter().zip(actual) {
+        if expected.event_uid != actual.event_uid
+            || expected.rank != actual.rank
+            || (expected.score - actual.score).abs() > 1e-12
+        {
+            bail!(
+                "{phase}: search ranking or BM25 score changed: expected={expected:?}, actual={actual:?}"
+            );
+        }
     }
     Ok(())
 }
@@ -688,6 +1108,470 @@ async fn session_event_texts(
         .into_iter()
         .map(|event| (event.event_uid, event.text_content))
         .collect())
+}
+
+fn expected_live_session_ids(model: ExpectedPublicationModel) -> Vec<&'static str> {
+    match model {
+        ExpectedPublicationModel::GenerationOne => vec![
+            "changed-session",
+            "cross-host-session",
+            "deleted-session",
+            "empty-session",
+            "stable-session",
+        ],
+        ExpectedPublicationModel::GenerationTwo => vec![
+            "changed-session",
+            "cross-host-session",
+            "empty-session",
+            "new-session",
+            "stable-session",
+        ],
+    }
+}
+
+fn assert_session_id_set(
+    label: &str,
+    actual: impl IntoIterator<Item = String>,
+    expected: &[&str],
+) -> Result<()> {
+    let mut actual = actual.into_iter().collect::<Vec<_>>();
+    actual.sort_unstable();
+    let mut expected = expected.to_vec();
+    expected.sort_unstable();
+    if actual.iter().map(String::as_str).collect::<Vec<_>>() != expected {
+        bail!("{label}: expected sessions {expected:?}, got {actual:?}");
+    }
+    Ok(())
+}
+
+fn publication_attention_query() -> FileAttentionQuery {
+    FileAttentionQuery {
+        cancellation_token: "source-publication-file-attention".to_string(),
+        rel: ATTENTION_REPO_REL_PATH.to_string(),
+        normalized_project_id: None,
+        normalized_project_roots: Vec::new(),
+        derive_legacy_roots: false,
+        apply_project_scope: false,
+        start_unix_ms: None,
+        end_unix_ms: None,
+        harness: Some("codex".to_string()),
+        source_name: Some(SOURCE.to_string()),
+        tool: Some("Read".to_string()),
+        mutations_only: false,
+        max_rows: 10,
+        execution_budget_secs: 10,
+    }
+}
+
+async fn assert_live_repository_surfaces(
+    repository: &ClickHouseConversationRepository,
+    boundary: &str,
+    model: ExpectedPublicationModel,
+) -> Result<()> {
+    let expected_sessions = expected_live_session_ids(model);
+    let conversations = repository
+        .list_conversations(
+            ConversationListFilter {
+                sort: ConversationListSort::Asc,
+                ..ConversationListFilter::default()
+            },
+            PageRequest {
+                limit: 100,
+                cursor: None,
+            },
+        )
+        .await
+        .with_context(|| format!("{boundary}: conversation list failed"))?;
+    if conversations.next_cursor.is_some() {
+        bail!("{boundary}: complete conversation fixture unexpectedly paginated");
+    }
+    assert_session_id_set(
+        &format!("{boundary}: conversation list"),
+        conversations
+            .items
+            .into_iter()
+            .map(|session| session.session_id),
+        &expected_sessions,
+    )?;
+
+    let mcp_sessions = repository
+        .list_mcp_sessions(
+            McpSessionListFilter {
+                start_unix_ms: 0,
+                end_unix_ms: i64::MAX,
+                mode: None,
+                sort: ConversationListSort::Asc,
+                harness: None,
+                source_name: None,
+            },
+            PageRequest {
+                limit: 100,
+                cursor: None,
+            },
+        )
+        .await
+        .with_context(|| format!("{boundary}: MCP session list failed"))?;
+    if mcp_sessions.next_cursor.is_some() {
+        bail!("{boundary}: complete MCP session fixture unexpectedly paginated");
+    }
+    assert_session_id_set(
+        &format!("{boundary}: MCP session list"),
+        mcp_sessions
+            .items
+            .into_iter()
+            .map(|session| session.session_id),
+        &expected_sessions,
+    )?;
+
+    let monitor_sessions = repository
+        .list_session_analytics(SessionAnalyticsQuery {
+            lookback: SessionLookback::All,
+            limit: 100,
+        })
+        .await
+        .with_context(|| format!("{boundary}: monitor session analytics failed"))?;
+    assert_session_id_set(
+        &format!("{boundary}: monitor session analytics"),
+        monitor_sessions
+            .iter()
+            .map(|session| session.summary.session_id.clone()),
+        &expected_sessions,
+    )?;
+    let changed = monitor_sessions
+        .iter()
+        .find(|session| session.summary.session_id == "changed-session")
+        .with_context(|| format!("{boundary}: changed-session analytics row is missing"))?;
+    let analytics_event_uids = changed
+        .turns
+        .iter()
+        .flat_map(|turn| {
+            turn.steps.iter().filter_map(|step| match step {
+                moraine_conversations::SessionStep::Assistant { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+        })
+        .collect::<Vec<_>>();
+    let expected_changed_text = match model {
+        ExpectedPublicationModel::GenerationOne => "beforeterm commonterm",
+        ExpectedPublicationModel::GenerationTwo => "replacementterm commonterm",
+    };
+    if !analytics_event_uids.contains(&expected_changed_text) || changed.summary.total_events != 2 {
+        bail!(
+            "{boundary}: changed-session analytics was not a complete {:?} model: {changed:?}",
+            model
+        );
+    }
+
+    let analytics = repository
+        .analytics_series(AnalyticsRange::ThirtyDays)
+        .await
+        .with_context(|| format!("{boundary}: monitor analytics series failed"))?;
+    if analytics.window.range != AnalyticsRange::ThirtyDays
+        || analytics.window.window_seconds == 0
+        || analytics.window.bucket_seconds == 0
+    {
+        bail!("{boundary}: monitor analytics returned an invalid window: {analytics:?}");
+    }
+
+    let attention =
+        ConversationRepository::file_attention(repository, publication_attention_query())
+            .await
+            .with_context(|| format!("{boundary}: file-attention query failed"))?;
+    let (expected_tool_call, expected_event_uid, expected_root) = match model {
+        ExpectedPublicationModel::GenerationOne => (
+            ACTIVE_DERIVED_TOOL_CALL,
+            STABLE_UIDS.at(1),
+            "/fixtures/repo-g1",
+        ),
+        ExpectedPublicationModel::GenerationTwo => (
+            FUTURE_DERIVED_TOOL_CALL,
+            EMPTY_UIDS.at(2),
+            "/fixtures/repo-g2",
+        ),
+    };
+    if attention.len() != 1
+        || attention[0].tool_call_id != expected_tool_call
+        || attention[0].event_uid != expected_event_uid
+        || attention[0].worktree_root != expected_root
+    {
+        bail!("{boundary}: file-attention crossed the publication boundary: {attention:?}");
+    }
+    Ok(())
+}
+
+async fn capture_generation_one_cursors(
+    repository: &ClickHouseConversationRepository,
+) -> Result<CutoverCursorFixture> {
+    let open_page = repository
+        .list_session_events(
+            SessionEventsQuery {
+                session_id: "changed-session".to_string(),
+                direction: SessionEventsDirection::Forward,
+                event_kinds: None,
+            },
+            PageRequest {
+                limit: 1,
+                cursor: None,
+            },
+        )
+        .await
+        .context("failed to capture generation-one open cursor")?;
+    if open_page.items.len() != 1 || open_page.items[0].event_uid != CHANGED_UIDS.at(1) {
+        bail!("generation-one open cursor did not anchor the changed event: {open_page:?}");
+    }
+    let session_events = open_page
+        .next_cursor
+        .context("generation-one changed session did not produce an open cursor")?;
+
+    let conversation_filter = ConversationListFilter {
+        sort: ConversationListSort::Asc,
+        ..ConversationListFilter::default()
+    };
+    let conversation_page = repository
+        .list_conversations(
+            conversation_filter,
+            PageRequest {
+                limit: 1,
+                cursor: None,
+            },
+        )
+        .await
+        .context("failed to capture generation-one conversation cursor")?;
+    if conversation_page.items.len() != 1
+        || conversation_page.items[0].session_id != "stable-session"
+    {
+        bail!(
+            "generation-one conversation cursor did not anchor stable-session: {conversation_page:?}"
+        );
+    }
+    let conversations = conversation_page
+        .next_cursor
+        .context("generation-one conversation feed did not produce a cursor")?;
+
+    let mcp_page = repository
+        .list_mcp_sessions(
+            McpSessionListFilter {
+                start_unix_ms: 0,
+                end_unix_ms: i64::MAX,
+                mode: None,
+                sort: ConversationListSort::Asc,
+                harness: None,
+                source_name: None,
+            },
+            PageRequest {
+                limit: 1,
+                cursor: None,
+            },
+        )
+        .await
+        .context("failed to capture generation-one MCP-session cursor")?;
+    if mcp_page.items.len() != 1 || mcp_page.items[0].session_id != "stable-session" {
+        bail!("generation-one MCP cursor did not anchor stable-session: {mcp_page:?}");
+    }
+    let mcp_sessions = mcp_page
+        .next_cursor
+        .context("generation-one MCP session feed did not produce a cursor")?;
+
+    Ok(CutoverCursorFixture {
+        session_events,
+        conversations,
+        mcp_sessions,
+    })
+}
+
+async fn assert_cursor_rollover_after_cutover(
+    repository: &ClickHouseConversationRepository,
+    cursors: CutoverCursorFixture,
+) -> Result<()> {
+    let stale_open = repository
+        .list_session_events(
+            SessionEventsQuery {
+                session_id: "changed-session".to_string(),
+                direction: SessionEventsDirection::Forward,
+                event_kinds: None,
+            },
+            PageRequest {
+                limit: 100,
+                cursor: Some(cursors.session_events),
+            },
+        )
+        .await;
+    if !matches!(stale_open, Err(RepoError::ReadModelChanged)) {
+        bail!("generation-one open cursor did not request reopen after cutover: {stale_open:?}");
+    }
+
+    let expected_moving_sessions = [
+        "changed-session",
+        "cross-host-session",
+        "empty-session",
+        "new-session",
+    ];
+    let conversations = repository
+        .list_conversations(
+            ConversationListFilter {
+                sort: ConversationListSort::Asc,
+                ..ConversationListFilter::default()
+            },
+            PageRequest {
+                limit: 100,
+                cursor: Some(cursors.conversations),
+            },
+        )
+        .await
+        .context("generation-one conversation feed cursor did not remain moving")?;
+    assert_session_id_set(
+        "post-cutover moving conversation cursor",
+        conversations
+            .items
+            .into_iter()
+            .map(|session| session.session_id),
+        &expected_moving_sessions,
+    )?;
+
+    let mcp_sessions = repository
+        .list_mcp_sessions(
+            McpSessionListFilter {
+                start_unix_ms: 0,
+                end_unix_ms: i64::MAX,
+                mode: None,
+                sort: ConversationListSort::Asc,
+                harness: None,
+                source_name: None,
+            },
+            PageRequest {
+                limit: 100,
+                cursor: Some(cursors.mcp_sessions),
+            },
+        )
+        .await
+        .context("generation-one MCP session cursor did not remain moving")?;
+    assert_session_id_set(
+        "post-cutover moving MCP session cursor",
+        mcp_sessions
+            .items
+            .into_iter()
+            .map(|session| session.session_id),
+        &expected_moving_sessions,
+    )?;
+
+    let current_first = repository
+        .list_session_events(
+            SessionEventsQuery {
+                session_id: "changed-session".to_string(),
+                direction: SessionEventsDirection::Forward,
+                event_kinds: None,
+            },
+            PageRequest {
+                limit: 1,
+                cursor: None,
+            },
+        )
+        .await
+        .context("failed to open a generation-two session cursor")?;
+    if current_first.items.len() != 1 || current_first.items[0].event_uid != CHANGED_UIDS.at(2) {
+        bail!("generation-two open cursor did not start at the current event: {current_first:?}");
+    }
+    let current_rest = repository
+        .list_session_events(
+            SessionEventsQuery {
+                session_id: "changed-session".to_string(),
+                direction: SessionEventsDirection::Forward,
+                event_kinds: None,
+            },
+            PageRequest {
+                limit: 100,
+                cursor: current_first.next_cursor,
+            },
+        )
+        .await
+        .context("failed to continue a generation-two session cursor")?;
+    if current_rest.items.len() != 1
+        || current_rest.items[0].event_uid != CROSS_SOURCE_SIDE_G1
+        || current_rest.next_cursor.is_some()
+    {
+        bail!("generation-two open cursor did not produce one complete model: {current_rest:?}");
+    }
+    Ok(())
+}
+
+async fn assert_monitor_http_surfaces(
+    clickhouse: &ClickHouseClient,
+    boundary: &str,
+    model: ExpectedPublicationModel,
+) -> Result<()> {
+    let monitor_repository =
+        ClickHouseConversationRepository::new(clickhouse.clone(), RepoConfig::default());
+    let direct_repository =
+        ClickHouseConversationRepository::new(clickhouse.clone(), RepoConfig::default());
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("failed to build source-publication monitor client")?;
+    let (base, shutdown, server, static_dir) =
+        super::start_owned_monitor(monitor_repository).await?;
+
+    let outcome = async {
+        let monitor_analytics = super::monitor_semantics::<super::MonitorAnalyticsResponse>(
+            &client,
+            &base.join("analytics?range=30d")?,
+        )
+        .await?;
+        let direct_analytics = super::direct_analytics_semantics(
+            direct_repository
+                .analytics_series(AnalyticsRange::ThirtyDays)
+                .await?,
+        )?;
+        let analytics_comparison =
+            super::SemanticComparison::compare(&monitor_analytics, &direct_analytics);
+        if !analytics_comparison.passed() {
+            bail!(
+                "{boundary}: monitor/repository analytics diverged during cutover: {analytics_comparison:?}"
+            );
+        }
+
+        let direct_sessions = direct_repository
+            .list_session_analytics(SessionAnalyticsQuery {
+                lookback: SessionLookback::All,
+                limit: 100,
+            })
+            .await?;
+        assert_session_id_set(
+            &format!("{boundary}: direct monitor sessions"),
+            direct_sessions
+                .iter()
+                .map(|session| session.summary.session_id.clone()),
+            &expected_live_session_ids(model),
+        )?;
+        let monitor_sessions = super::monitor_semantics::<super::MonitorSessionsResponse>(
+            &client,
+            &base.join("sessions?since=all&limit=100")?,
+        )
+        .await?;
+        let direct_sessions = super::direct_sessions_semantics(&direct_sessions)?;
+        let sessions_comparison =
+            super::SemanticComparison::compare(&monitor_sessions, &direct_sessions);
+        if !sessions_comparison.passed() {
+            bail!(
+                "{boundary}: monitor/repository sessions diverged during cutover: {sessions_comparison:?}"
+            );
+        }
+        Ok(())
+    }
+    .await;
+
+    let _ = shutdown.send(());
+    let server_result = match server.await {
+        Ok(result) => result,
+        Err(error) => Err(anyhow::anyhow!(
+            "source-publication monitor task failed to join: {error}"
+        )),
+    };
+    let static_cleanup = std::fs::remove_dir_all(&static_dir)
+        .context("failed to remove source-publication monitor static directory");
+    super::finish_with_cleanup(
+        outcome,
+        super::finish_with_cleanup(server_result, static_cleanup),
+    )
 }
 
 fn reconstruct_clickhouse_client(durable_client: &ClickHouseClient) -> Result<ClickHouseClient> {
@@ -1056,6 +1940,7 @@ async fn assert_complete_after_reconstruction(
     if actual_session_uids != expected_session_uids {
         bail!("{boundary}: reconstructed runtime did not expose one complete cross-source session");
     }
+    assert_live_repository_surfaces(&restarted_repository, boundary, state.model).await?;
 
     match state.model {
         ExpectedPublicationModel::GenerationOne => {
@@ -1372,6 +2257,255 @@ async fn assert_equal_timestamp_checkpoint_is_causal(
     Ok(())
 }
 
+fn diagnostic_checkpoint(
+    source_name: &str,
+    source_file: &str,
+    generation: u32,
+    lifecycle: &str,
+    block_reason: &str,
+    final_scan_complete: u8,
+    backend_caught_up: u8,
+) -> Value {
+    json!({
+        "host": HOST_A,
+        "source_name": source_name,
+        "source_file": source_file,
+        "inode": 900 + u64::from(generation),
+        "source_generation": generation,
+        "last_offset": if generation == 1 { 1 } else { 2 },
+        "last_line": if generation == 1 { 1 } else { 2 },
+        "cursor_json": format!("diagnostic-generation-{generation}"),
+        "source_fingerprint": 900,
+        "schema_fingerprint": 901,
+        "sqlite_mtime_ns": 0,
+        "sqlite_size": 0,
+        "checkpoint_revision": 100 + u64::from(generation),
+        "operation_id": format!("diagnostic-{source_name}-g{generation}"),
+        "lifecycle": lifecycle,
+        "protocol_version": 1,
+        "scan_inode": 900 + u64::from(generation),
+        "scan_boundary": 2,
+        "policy_fingerprint": "diagnostic-fixture-policy",
+        "final_scan_complete": final_scan_complete,
+        "block_reason": block_reason,
+        "compatibility_prepared": final_scan_complete,
+        "backend_caught_up": backend_caught_up,
+        "append_batch_id": "",
+        "cache_epoch": 0,
+        "updated_at": format!("2026-07-20 12:02:0{generation}.000"),
+    })
+}
+
+fn diagnostic_readiness(
+    source_name: &str,
+    source_file: &str,
+    generation: u32,
+    complete: u8,
+    block_reason: &str,
+    backend_caught_up: u8,
+) -> Value {
+    json!({
+        "source_host": HOST_A,
+        "source_name": source_name,
+        "source_file": source_file,
+        "source_generation": generation,
+        "readiness_revision": 100 + u64::from(generation),
+        "checkpoint_revision": 100 + u64::from(generation),
+        "operation_id": format!("diagnostic-{source_name}-g{generation}"),
+        "complete": complete,
+        "block_reason": block_reason,
+        "compatibility_prepared": complete,
+        "backend_caught_up": backend_caught_up,
+        "manifest_digest": format!("diagnostic-{source_name}-g{generation}"),
+        "updated_at": format!("2026-07-20 12:02:0{generation}.000"),
+    })
+}
+
+async fn publication_diagnostics_evidence(
+    clickhouse: &ClickHouseClient,
+    database: &OwnedDatabaseName,
+) -> Result<PublicationDiagnosticsEvidenceRow> {
+    clickhouse
+        .query_rows(
+            &format!(
+                "SELECT toUInt64(ambiguous_hostless_rows) AS ambiguous_hostless_rows, \
+                        toUInt64(replaying_generations) AS replaying_generations, \
+                        toUInt64(blocked_generations) AS blocked_generations, \
+                        toUInt64(mirror_catchup_pending) AS mirror_catchup_pending \
+                 FROM `{}`.`v_publication_diagnostics` FORMAT JSONEachRow",
+                database.as_str(),
+            ),
+            Some(database.as_str()),
+        )
+        .await
+        .context("failed to read current-generation publication diagnostics")?
+        .into_iter()
+        .next()
+        .context("publication diagnostics returned no row")
+}
+
+async fn assert_superseded_generation_does_not_degrade_diagnostics(
+    clickhouse: &ClickHouseClient,
+    database: &OwnedDatabaseName,
+) -> Result<()> {
+    let clean = PublicationDiagnosticsEvidenceRow {
+        ambiguous_hostless_rows: 0,
+        replaying_generations: 0,
+        blocked_generations: 0,
+        mirror_catchup_pending: 0,
+    };
+    let before = publication_diagnostics_evidence(clickhouse, database).await?;
+    if before != clean {
+        bail!("completed publication retained stale diagnostic health: {before:?}");
+    }
+
+    let replay_source = "publication-diagnostic-replay";
+    let replay_file = "/fixtures/publication-diagnostic-replay.jsonl";
+    let blocked_source = "publication-diagnostic-blocked";
+    let blocked_file = "/fixtures/publication-diagnostic-blocked.jsonl";
+    let mirror_source = "publication-diagnostic-mirror";
+    let mirror_file = "/fixtures/publication-diagnostic-mirror.jsonl";
+
+    clickhouse
+        .insert_json_rows_sync(
+            "ingest_checkpoint_transitions",
+            &[
+                diagnostic_checkpoint(replay_source, replay_file, 1, "replaying", "", 0, 0),
+                diagnostic_checkpoint(replay_source, replay_file, 2, "active", "", 1, 1),
+                diagnostic_checkpoint(
+                    blocked_source,
+                    blocked_file,
+                    1,
+                    "error",
+                    "legacy_equal_timestamp_ambiguity",
+                    0,
+                    0,
+                ),
+                diagnostic_checkpoint(blocked_source, blocked_file, 2, "active", "", 1, 1),
+                diagnostic_checkpoint(mirror_source, mirror_file, 1, "active", "", 1, 0),
+                diagnostic_checkpoint(mirror_source, mirror_file, 2, "active", "", 1, 1),
+            ],
+        )
+        .await
+        .context("failed to seed superseded checkpoint diagnostics")?;
+    clickhouse
+        .insert_json_rows_sync(
+            "source_generation_publication_readiness",
+            &[
+                diagnostic_readiness(replay_source, replay_file, 1, 0, "", 0),
+                diagnostic_readiness(replay_source, replay_file, 2, 1, "", 1),
+                diagnostic_readiness(
+                    blocked_source,
+                    blocked_file,
+                    1,
+                    0,
+                    "diagnostic_fixture_block",
+                    0,
+                ),
+                diagnostic_readiness(blocked_source, blocked_file, 2, 1, "", 1),
+                diagnostic_readiness(mirror_source, mirror_file, 1, 1, "", 0),
+                diagnostic_readiness(mirror_source, mirror_file, 2, 1, "", 1),
+            ],
+        )
+        .await
+        .context("failed to seed superseded readiness diagnostics")?;
+
+    for (table, predicate, label) in [
+        (
+            "ingest_checkpoint_transitions",
+            "lifecycle = 'replaying'",
+            "historical replaying checkpoint",
+        ),
+        (
+            "ingest_checkpoint_transitions",
+            "block_reason = 'legacy_equal_timestamp_ambiguity'",
+            "historical ambiguous checkpoint",
+        ),
+        (
+            "source_generation_publication_readiness",
+            "block_reason = 'diagnostic_fixture_block'",
+            "historical blocked readiness",
+        ),
+        (
+            "source_generation_publication_readiness",
+            "complete = 1 AND backend_caught_up = 0",
+            "historical mirror-pending readiness",
+        ),
+    ] {
+        let historical = scalar_u64(
+            clickhouse,
+            database,
+            &format!(
+                "SELECT toUInt64(count()) AS value FROM `{}`.`{table}` FINAL \
+                 WHERE source_name LIKE 'publication-diagnostic-%' \
+                   AND source_generation = 1 AND {predicate} FORMAT JSONEachRow",
+                database.as_str(),
+            ),
+        )
+        .await?;
+        if historical != 1 {
+            bail!("{label} was not retained for audit: {historical}");
+        }
+    }
+
+    let current_exact_readiness = scalar_u64(
+        clickhouse,
+        database,
+        &format!(
+            "SELECT toUInt64(count()) AS value \
+             FROM `{0}`.`v_current_ingest_checkpoint_transitions` AS checkpoint \
+             INNER JOIN `{0}`.`v_current_source_generation_publication_readiness` AS readiness \
+               ON readiness.source_host = checkpoint.host \
+              AND readiness.source_name = checkpoint.source_name \
+              AND readiness.source_file = checkpoint.source_file \
+              AND readiness.source_generation = checkpoint.source_generation \
+             WHERE checkpoint.source_name LIKE 'publication-diagnostic-%' \
+               AND checkpoint.source_generation = 2 FORMAT JSONEachRow",
+            database.as_str(),
+        ),
+    )
+    .await?;
+    if current_exact_readiness != 3 {
+        bail!(
+            "current diagnostic fixtures did not resolve exact clean readiness: {current_exact_readiness}"
+        );
+    }
+
+    let after = publication_diagnostics_evidence(clickhouse, database).await?;
+    if after != clean {
+        bail!("superseded source generations degraded current diagnostics: {after:?}");
+    }
+    Ok(())
+}
+
+async fn assert_mcp_search_host_content(
+    repository: &ClickHouseConversationRepository,
+    query: &str,
+    expected_text: &str,
+) -> Result<()> {
+    let result = repository
+        .search_mcp_events(SearchMcpEventsQuery {
+            query: query.to_string(),
+            n_hits: Some(2),
+            event_types: Some(vec![McpEventType::AssistantResponse]),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            ..SearchMcpEventsQuery::default()
+        })
+        .await
+        .with_context(|| format!("MCP search failed for cross-host term {query:?}"))?;
+    if result.hits.len() != 1
+        || result.hits[0].event_uid != CROSS_HOST_UID_G1
+        || result.hits[0].text_content.as_deref() != Some(expected_text)
+    {
+        bail!(
+            "MCP search hydrated the wrong cross-host event for {query:?}: {:?}",
+            result.hits
+        );
+    }
+    Ok(())
+}
+
 fn initial_heads() -> Vec<McpOpenSourceHead> {
     vec![
         McpOpenSourceHead {
@@ -1550,6 +2684,18 @@ pub(super) async fn run(
     .await?;
     assert_search_uids(&repository, "identicalterm", &[STABLE_UIDS.at(1)]).await?;
     assert_search_uids(&repository, "replacementterm", &[]).await?;
+    let generation_one_commonterm_ranking = search_ranking_evidence(
+        &repository,
+        "commonterm",
+        &[
+            CHANGED_UIDS.at(1),
+            DELETED_UIDS.at(1),
+            EMPTY_UIDS.at(1),
+            STABLE_UIDS.at(1),
+        ],
+    )
+    .await?;
+    let cutover_cursors = capture_generation_one_cursors(&repository).await?;
 
     // Both hosts still publish generation one here. Exercise the physical
     // replacement key under FINAL before host A advances to generation two;
@@ -1564,6 +2710,19 @@ pub(super) async fn run(
         )
         .await
         .context("failed to merge cross-host UID fixture")?;
+    clickhouse
+        .request_text(
+            &format!(
+                "OPTIMIZE TABLE `{}`.`mcp_open_events` FINAL",
+                database.as_str()
+            ),
+            None,
+            Some(database.as_str()),
+            false,
+            None,
+        )
+        .await
+        .context("failed to merge cross-host MCP event fixture")?;
     let cross_host_count = scalar_u64(
         clickhouse,
         database,
@@ -1578,6 +2737,53 @@ pub(super) async fn run(
     if cross_host_count != 2 {
         bail!("cross-host identical UIDs collapsed after FINAL: {cross_host_count}");
     }
+    let cross_host_mcp_count = scalar_u64(
+        clickhouse,
+        database,
+        &format!(
+            "SELECT toUInt64(count()) AS value FROM `{}`.`mcp_open_events` FINAL \
+             WHERE event_uid = '{}' AND session_id = 'cross-host-session' \
+             FORMAT JSONEachRow",
+            database.as_str(),
+            CROSS_HOST_UID_G1,
+        ),
+    )
+    .await?;
+    if cross_host_mcp_count != 2 {
+        bail!("cross-host MCP events collapsed after OPTIMIZE FINAL: {cross_host_mcp_count}");
+    }
+    let cross_host_mcp_content = scalar_u64(
+        clickhouse,
+        database,
+        &format!(
+            "SELECT toUInt64(countIf(\
+               (source_host = '{}' AND text_content = 'hostalphaterm') OR \
+               (source_host = '{}' AND text_content = 'hostbetaterm')\
+             )) AS value FROM `{}`.`mcp_open_events` FINAL \
+             WHERE event_uid = '{}' AND session_id = 'cross-host-session' \
+             FORMAT JSONEachRow",
+            HOST_A,
+            HOST_B,
+            database.as_str(),
+            CROSS_HOST_UID_G1,
+        ),
+    )
+    .await?;
+    if cross_host_mcp_content != 2 {
+        bail!("cross-host MCP projection mixed host-qualified content");
+    }
+    let deterministic_open = repository
+        .get_mcp_event(CROSS_HOST_UID_G1)
+        .await?
+        .context("cross-host MCP event UID did not resolve")?;
+    if deterministic_open.event.text_content != "hostalphaterm" {
+        bail!(
+            "cross-host MCP event lookup returned non-deterministic content: {:?}",
+            deterministic_open.event.text_content
+        );
+    }
+    assert_mcp_search_host_content(&repository, "hostalphaterm", "hostalphaterm").await?;
+    assert_mcp_search_host_content(&repository, "hostbetaterm", "hostbetaterm").await?;
 
     // The generation-one repository has served its purpose. All subsequent
     // cutover checks use newly constructed clients and repositories so no
@@ -1664,7 +2870,7 @@ pub(super) async fn run(
         )
         .await
         .context("failed to seed inactive high-TF adversary")?;
-    assert_derived_visibility_uses_published_uid(&replay_writer, database).await?;
+    assert_derived_visibility_uses_exact_event_version(&replay_writer, database).await?;
     drop(replay_writer);
 
     assert_live_term_count(clickhouse, database, "replacementterm", 0).await?;
@@ -1681,6 +2887,29 @@ pub(super) async fn run(
             final_checkpoint_durable: false,
             final_readiness_durable: false,
         },
+    )
+    .await?;
+    let (_staged_client, staged_repository) = reconstruct_reader_runtime(clickhouse)?;
+    let staged_commonterm_ranking = search_ranking_evidence(
+        &staged_repository,
+        "commonterm",
+        &[
+            CHANGED_UIDS.at(1),
+            DELETED_UIDS.at(1),
+            EMPTY_UIDS.at(1),
+            STABLE_UIDS.at(1),
+        ],
+    )
+    .await?;
+    assert_same_search_ranking(
+        "unpublished replacement staging",
+        &generation_one_commonterm_ranking,
+        &staged_commonterm_ranking,
+    )?;
+    assert_monitor_http_surfaces(
+        clickhouse,
+        "physical_rows_durable",
+        ExpectedPublicationModel::GenerationOne,
     )
     .await?;
 
@@ -1816,6 +3045,8 @@ pub(super) async fn run(
     if as_of_generation != 1 {
         bail!("captured revision 3 did not reconstruct generation-one head");
     }
+    let (_cursor_client, cursor_repository) = reconstruct_reader_runtime(clickhouse)?;
+    assert_cursor_rollover_after_cutover(&cursor_repository, cutover_cursors).await?;
 
     assert_complete_after_reconstruction(
         clickhouse,
@@ -1905,8 +3136,15 @@ pub(super) async fn run(
         },
     )
     .await?;
+    assert_monitor_http_surfaces(
+        clickhouse,
+        "compatibility_activation_durable",
+        ExpectedPublicationModel::GenerationTwo,
+    )
+    .await?;
 
     let (_post_activation_client, repository) = reconstruct_reader_runtime(clickhouse)?;
+    assert_generation_two_derived_version_cutover(clickhouse, database).await?;
 
     let stable_count = scalar_u64(
         clickhouse,
@@ -1982,6 +3220,12 @@ pub(super) async fn run(
     )
     .await?;
     assert_search_uids(&repository, "identicalterm", &[STABLE_UIDS.at(2)]).await?;
+    search_ranking_evidence(
+        &repository,
+        "commonterm",
+        &[CHANGED_UIDS.at(2), STABLE_UIDS.at(2)],
+    )
+    .await?;
     if repository
         .get_mcp_event(DELETED_UIDS.at(1))
         .await?
@@ -2159,6 +3403,54 @@ pub(super) async fn run(
     {
         bail!("source-publication control-storage evidence is incomplete: {control_tables:?}");
     }
+    let derived_table_storage: Vec<ControlStorageRow> = clickhouse
+        .query_rows(
+            &format!(
+                "SELECT table, toUInt64(sum(rows)) AS rows, \
+                        toUInt64(count()) AS active_parts, \
+                        toUInt64(sum(data_compressed_bytes)) AS compressed_bytes \
+                 FROM system.parts WHERE active AND database = '{}' \
+                   AND table IN ('event_links', 'tool_io') \
+                 GROUP BY table ORDER BY table FORMAT JSONEachRow",
+                database.as_str(),
+            ),
+            Some("system"),
+        )
+        .await
+        .context("failed to collect derived-table storage evidence")?;
+    let derived_tables = derived_table_storage
+        .iter()
+        .map(|row| row.table.as_str())
+        .collect::<Vec<_>>();
+    if derived_tables != ["event_links", "tool_io"] {
+        bail!("derived-table storage evidence is incomplete: {derived_tables:?}");
+    }
+    let source_event_version_column_storage: Vec<ColumnStorageRow> = clickhouse
+        .query_rows(
+            &format!(
+                "SELECT table, column, toUInt64(sum(rows)) AS rows, \
+                        toUInt64(count()) AS active_parts, \
+                        toUInt64(sum(column_data_compressed_bytes)) AS compressed_bytes \
+                 FROM system.parts_columns WHERE active AND database = '{}' \
+                   AND table IN ('event_links', 'tool_io') \
+                   AND column = 'source_event_version' \
+                 GROUP BY table, column ORDER BY table FORMAT JSONEachRow",
+                database.as_str(),
+            ),
+            Some("system"),
+        )
+        .await
+        .context("failed to collect source_event_version column storage evidence")?;
+    let source_event_version_column_tables = source_event_version_column_storage
+        .iter()
+        .map(|row| row.table.as_str())
+        .collect::<Vec<_>>();
+    if source_event_version_column_tables != ["event_links", "tool_io"] {
+        bail!(
+            "source_event_version column storage evidence is incomplete: \
+             {source_event_version_column_tables:?}"
+        );
+    }
     eprintln!(
         "{}",
         json!({
@@ -2188,8 +3480,26 @@ pub(super) async fn run(
                 "active_parts": row.active_parts,
                 "compressed_bytes": row.compressed_bytes,
             })).collect::<Vec<_>>(),
+            "derived_table_storage_absolute_fixture": derived_table_storage.into_iter().map(|row| json!({
+                "table": row.table,
+                "rows": row.rows,
+                "active_parts": row.active_parts,
+                "compressed_bytes": row.compressed_bytes,
+            })).collect::<Vec<_>>(),
+            "source_event_version_column_storage_absolute_fixture": source_event_version_column_storage.into_iter().map(|row| json!({
+                "table": row.table,
+                "column": row.column,
+                "rows": row.rows,
+                "active_parts": row.active_parts,
+                "compressed_bytes": row.compressed_bytes,
+            })).collect::<Vec<_>>(),
         })
     );
+
+    // Keep the acceptance resource snapshot above limited to the cutover
+    // fixture, then prove that durable superseded failure history cannot make
+    // the current publication-health row look degraded.
+    assert_superseded_generation_does_not_degrade_diagnostics(clickhouse, database).await?;
 
     Ok(())
 }

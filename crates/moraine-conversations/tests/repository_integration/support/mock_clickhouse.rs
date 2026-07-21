@@ -252,19 +252,6 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             return (StatusCode::OK, json_each_row(json!([{ "ready": 1_u8 }])));
         }
 
-        if query.contains("FROM `moraine`.`mcp_open_sessions`")
-            && query.contains("FINAL")
-            && !query.contains("toUInt8(0) AS row_kind")
-        {
-            let session_id = query
-                .split("session_id = '")
-                .nth(1)
-                .and_then(|rest| rest.split('\'').next())
-                .unwrap_or("");
-            let rows = session_row(session_id).into_iter().collect::<Vec<_>>();
-            return (StatusCode::OK, json_each_row(json!(rows)));
-        }
-
         if query.contains("FROM `moraine`.`mcp_open_publication_headers`")
             && query.contains("FINAL")
             && !query.contains("toUInt8(0) AS row_kind")
@@ -303,7 +290,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
         }
 
         if query.contains("FROM `moraine`.`mcp_open_events` FINAL")
-            && query.contains("SELECT\n  event_uid,\n  session_id,")
+            && query.contains("SELECT\n  source_host,\n  event_uid,\n  session_id,")
         {
             let event_uid = query
                 .split("WHERE event_uid = '")
@@ -328,7 +315,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
         }
 
         if query.contains("FROM `moraine`.`mcp_open_events` FINAL")
-            && query.contains("event_uid IN")
+            && query.contains("event_order IN")
             && !query.contains("toUInt8(0) AS row_kind")
         {
             return (StatusCode::OK, json_each_row(json!(event_ref_rows())));
@@ -1410,8 +1397,8 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             );
         }
 
-        if query.contains("WHERE event_uid IN")
-            && query.contains("GROUP BY event_uid")
+        if query.contains("WHERE document.event_uid IN")
+            && query.contains("GROUP BY document.source_host, document.event_uid")
             && query.contains("AS text_content")
             && query.contains("AS payload_json")
             && query.contains("AS event_class")

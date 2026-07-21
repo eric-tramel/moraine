@@ -938,6 +938,246 @@ FORMAT JSONEachRow""",
         self.assertEqual(suite._publication_append_term_count(5.0), 102)
         self.assertEqual(suite._publication_append_term_count(30.0), 602)
 
+    def test_publication_replay_fixture_is_deterministic_and_single_session(self) -> None:
+        left = suite._publication_replay_payload(3, phase="replacement")
+        right = suite._publication_replay_payload(3, phase="replacement")
+        self.assertEqual(left, right)
+        rows = [json.loads(line) for line in left.splitlines()]
+        self.assertEqual(len(rows), 6)
+        self.assertEqual(
+            {
+                row["payload"]["id"]
+                for row in rows
+                if row["type"] == "session_meta"
+            },
+            {suite.PUBLICATION_REPLAY_RAW_SESSION_ID},
+        )
+        self.assertEqual(
+            len(
+                {
+                    row["payload"]["id"]
+                    for row in rows
+                    if row["type"] == "response_item"
+                }
+            ),
+            3,
+        )
+
+    def test_publication_replay_process_resources_never_encode_unavailable_as_zero(
+        self,
+    ) -> None:
+        before = {
+            "pid": 7,
+            "starttime_ticks": 11,
+            "clock_ticks_per_second": 100,
+            "cpu_ticks": 20,
+            "vm_hwm_bytes": 4096,
+            "read_bytes": None,
+            "write_bytes": None,
+        }
+        after = {**before, "cpu_ticks": 35}
+        observed = suite._ingest_process_resource_delta(before, after)
+        self.assertEqual(observed["cpu"]["seconds"], 0.15)
+        self.assertFalse(observed["peak_rss"]["available"])
+        self.assertIsNone(observed["peak_rss"]["bytes"])
+        self.assertEqual(
+            observed["peak_rss"]["reason"],
+            "process_lifetime_hwm_did_not_advance",
+        )
+        self.assertFalse(observed["disk_io"]["available"])
+        self.assertIsNone(observed["disk_io"]["read_bytes"])
+
+    def test_publication_replay_cgroup_io_sums_devices_and_labels_absence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "io.stat").write_text(
+                "8:0 rbytes=10 wbytes=20 rios=1 wios=2 dbytes=0 dios=0\n"
+                "8:16 rbytes=30 wbytes=40 rios=3 wios=4 dbytes=5 dios=1\n",
+                encoding="utf-8",
+            )
+            envelope = mock.Mock(authoritative=True, path=root)
+            before = suite._cgroup_io_snapshot(envelope)
+            self.assertEqual(before["rbytes"], 40)
+            self.assertEqual(before["wbytes"], 60)
+            after = {**before, "rbytes": 140, "wbytes": 260}
+            delta = suite._cgroup_io_delta(before, after)
+            self.assertTrue(delta["available"])
+            self.assertEqual(delta["rbytes"], 100)
+            self.assertEqual(delta["wbytes"], 200)
+
+        unavailable = suite._cgroup_io_delta(None, None)
+        self.assertFalse(unavailable["available"])
+        self.assertIsNone(unavailable["rbytes"])
+        self.assertEqual(unavailable["reason"], "cgroup_io_stat_unavailable")
+
+    def test_publication_replay_refresh_inventory_is_query_log_classified(self) -> None:
+        with mock.patch.object(
+            suite, "_clickhouse_query", side_effect=("", "4\t1\t3")
+        ) as query:
+            observed = suite._compatibility_refresh_snapshot(
+                "http://127.0.0.1:8123"
+            )
+        self.assertEqual(
+            observed,
+            {
+                "total_refresh_count": 4,
+                "activation_refresh_count": 1,
+                "per_chunk_refresh_count": 3,
+            },
+        )
+        self.assertEqual(query.call_args_list[0].args[1], "SYSTEM FLUSH LOGS")
+        self.assertIn("query_kind = 'Insert'", query.call_args_list[1].args[1])
+        self.assertIn("mcp_open_sessions", query.call_args_list[1].args[1])
+
+    def test_source_publication_replay_artifact_validates_availability_and_gates(
+        self,
+    ) -> None:
+        before_storage = {
+            table: {
+                "rows": 0,
+                "active_parts": 0,
+                "compressed_bytes": 0,
+                "bytes_on_disk": 0,
+            }
+            for table in suite.PUBLICATION_REPLAY_STORAGE_TABLES
+        }
+        after_storage = copy.deepcopy(before_storage)
+        after_storage["events"] = {
+            "rows": 2500,
+            "active_parts": 2,
+            "compressed_bytes": 50_000,
+            "bytes_on_disk": 100_000,
+        }
+        delta = suite._publication_replay_storage_delta(
+            before_storage, after_storage
+        )
+        state = {
+            "source_host": "host-a",
+            "source_name": suite.PUBLICATION_REPLAY_SOURCE_NAME,
+            "source_file": suite.PUBLICATION_REPLAY_SOURCE_FILE,
+            "source_generation": 1,
+            "publication_revision": 1,
+            "last_line": 2,
+            "lifecycle": "active",
+            "complete": 1,
+            "compatibility_prepared": 1,
+            "backend_caught_up": 1,
+        }
+        document = {
+            "document_type": "source_publication_replay_probe",
+            "schema_version": "moraine.source-publication-replay-probe.v1",
+            "status": "pass",
+            "git_commit": "a" * 40,
+            "run": {
+                "authoritative": False,
+                "timeout_seconds": 180.0,
+                "poll_interval_seconds": suite.PUBLICATION_REPLAY_POLL_INTERVAL_S,
+            },
+            "fixture": {
+                "source_name": suite.PUBLICATION_REPLAY_SOURCE_NAME,
+                "source_file": suite.PUBLICATION_REPLAY_SOURCE_FILE,
+                "session_id": suite.public_id(
+                    "session", suite.PUBLICATION_REPLAY_RAW_SESSION_ID
+                ),
+                "initial_events": suite.PUBLICATION_REPLAY_INITIAL_EVENTS,
+                "replacement_events": 2500,
+                "replacement_lines": 5000,
+                "replacement_payload_bytes": 1_000_000,
+                "minimum_replay_batches": suite.PUBLICATION_REPLAY_MIN_BATCHES,
+            },
+            "publication": {
+                "before": state,
+                "after": {
+                    **state,
+                    "source_generation": 2,
+                    "publication_revision": 2,
+                    "last_line": 5000,
+                },
+                "history_generations": [1, 2],
+            },
+            "replay": {
+                "wall_time_ms": 1234.5,
+                "batch_count": 2,
+                "event_identity_count": 5000,
+                "batch_sequences": [2, 3],
+            },
+            "compatibility": {
+                "total_refresh_count": 1,
+                "activation_refresh_count": 1,
+                "per_chunk_refresh_count": 0,
+                "readiness_rows": 1,
+                "affected_session_count": 1,
+                "prepared_session_count": 1,
+                "ready_rows": 1,
+                "visible_compatibility_rows": 1,
+            },
+            "process_resources": {
+                "cpu": {
+                    "available": True,
+                    "seconds": 0.5,
+                    "ticks": 50,
+                    "clock_ticks_per_second": 100,
+                    "reason": None,
+                },
+                "peak_rss": {
+                    "available": True,
+                    "bytes": 8192,
+                    "baseline_process_lifetime_hwm_bytes": 4096,
+                    "final_process_lifetime_hwm_bytes": 8192,
+                    "reason": None,
+                },
+                "disk_io": {
+                    "available": False,
+                    "read_bytes": None,
+                    "write_bytes": None,
+                    "reason": "proc_pid_io_unavailable",
+                },
+            },
+            "cgroup_resources": {
+                "evidence": suite.non_authoritative_resource_evidence(),
+                "disk_io": suite._cgroup_io_delta(None, None),
+            },
+            "storage": {
+                "before": before_storage,
+                "after": after_storage,
+                "delta": delta,
+                "retained_inactive_generations": 1,
+                "net_bytes_on_disk_growth": 100_000,
+                "bytes_per_retained_generation": 100_000,
+            },
+            "artifact_sha256": "",
+        }
+        document["artifact_sha256"] = sha256_json(
+            {
+                key: value
+                for key, value in document.items()
+                if key != "artifact_sha256"
+            }
+        )
+        suite.validate_source_publication_replay_probe(document)
+
+        args = suite._parse_args(
+            [
+                "source-publication-replay-probe",
+                "--repo",
+                ".",
+                "--output",
+                "target/publication-replay-probe",
+            ]
+        )
+        self.assertEqual(args.events, suite.PUBLICATION_REPLAY_DEFAULT_EVENTS)
+        self.assertEqual(args.timeout_seconds, 180.0)
+
+        changed = copy.deepcopy(document)
+        changed["compatibility"]["per_chunk_refresh_count"] = 1
+        with self.assertRaisesRegex(suite.SuiteFailure, "compatibility evidence"):
+            suite.validate_source_publication_replay_probe(changed)
+
+        changed = copy.deepcopy(document)
+        changed["cgroup_resources"]["disk_io"]["rbytes"] = 0
+        with self.assertRaisesRegex(suite.SuiteFailure, "unavailable values"):
+            suite.validate_source_publication_replay_probe(changed)
+
     def test_source_publication_probe_validates_samples_head_and_control_deltas(self) -> None:
         before_controls = {
             "published_source_generations": {

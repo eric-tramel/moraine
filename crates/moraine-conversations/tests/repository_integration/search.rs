@@ -124,7 +124,7 @@ async fn search_mcp_events_applies_session_origin_scope() {
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn search_session_metadata_returns_summary_only_matches() {
-    let (repo, _state) = build_repo().await;
+    let (repo, state) = build_repo().await;
 
     let result = repo
         .search_session_metadata(SessionMetadataSearchQuery {
@@ -175,13 +175,22 @@ async fn search_session_metadata_returns_summary_only_matches() {
         hit.snippet.as_deref(),
         Some("Rare summary-only session about metadata discovery.")
     );
+
+    let snapshot_queries = state
+        .publication_snapshot_queries
+        .lock()
+        .expect("publication snapshot query lock");
+    assert_eq!(snapshot_queries.len(), 2);
+    assert!(snapshot_queries[0].contains("moraine:publication_snapshot:capture"));
+    assert!(snapshot_queries[1].contains("moraine:publication_snapshot:revalidate"));
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn search_session_metadata_applies_time_mode_filters_and_caps_limit() {
     let (repo, state) = build_repo_with_max_results(5).await;
 
-    let result = repo
-        .search_session_metadata(SessionMetadataSearchQuery {
+    let result = ConversationRepository::search_session_metadata(
+        &repo,
+        SessionMetadataSearchQuery {
             query: "rare summary".to_string(),
             limit: Some(25),
             min_score: Some(1.5),
@@ -190,9 +199,10 @@ async fn search_session_metadata_applies_time_mode_filters_and_caps_limit() {
             to_unix_ms: Some(1767610000000_i64),
             mode: Some(ConversationMode::Chat),
             session_id: Some("sess_meta_summary".to_string()),
-        })
-        .await
-        .expect("search session metadata");
+        },
+    )
+    .await
+    .expect("search session metadata");
 
     assert_eq!(result.stats.requested_limit, 25);
     assert_eq!(result.stats.effective_limit, 5);
@@ -217,6 +227,14 @@ async fn search_session_metadata_applies_time_mode_filters_and_caps_limit() {
     assert!(metadata_search_query.contains("ifNull(m.mode, 'chat') = 'chat'"));
     assert!(metadata_search_query.contains("meta.session_id = 'sess_meta_summary'"));
     assert!(metadata_search_query.contains("LIMIT 5"));
+
+    let snapshot_queries = state
+        .publication_snapshot_queries
+        .lock()
+        .expect("publication snapshot query lock");
+    assert_eq!(snapshot_queries.len(), 2);
+    assert!(snapshot_queries[0].contains("moraine:publication_snapshot:capture"));
+    assert!(snapshot_queries[1].contains("moraine:publication_snapshot:revalidate"));
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn search_conversations_returns_ranked_session_hits_and_expected_sql_shape() {
@@ -290,7 +308,9 @@ async fn search_conversations_returns_ranked_session_hits_and_expected_sql_shape
         .find(|q| q.contains("GROUP BY e.session_id"))
         .expect("aggregated conversation query should be captured");
 
-    assert!(agg_query.contains("argMax(e.event_uid, e.event_score)"));
+    assert!(agg_query.contains(
+        "argMax(\n      tuple(e.source_host, e.event_uid),\n      tuple(e.event_score, e.event_uid, e.source_host)\n    ) AS best_event_identity"
+    ));
     assert!(agg_query.contains("ANY LEFT JOIN `moraine`.`v_session_summary` AS s"));
     assert!(agg_query.contains("p.session_id IN ['sess_c','sess_a']"));
     assert!(agg_query.contains("ifNull(m.mode, 'chat') = 'chat'"));
@@ -380,8 +400,8 @@ async fn search_conversations_snippet_query_avoids_self_aliased_aggregates() {
     let snippet_query = queries
         .iter()
         .find(|q| {
-            q.contains("WHERE event_uid IN")
-                && q.contains("GROUP BY event_uid")
+            q.contains("WHERE document.event_uid IN")
+                && q.contains("GROUP BY document.source_host, document.event_uid")
                 && q.contains("AS text_content")
         })
         .expect("snippet hydration query should be captured");
@@ -494,6 +514,15 @@ async fn search_events_includes_session_time_bounds() {
     assert_eq!(result.hits[1].first_event_time, "2026-01-01 10:00:00");
     assert_eq!(result.hits[1].last_event_time, "2026-01-01 10:10:00");
     let queries = state.queries.lock().expect("queries lock");
+    let df_query = queries
+        .iter()
+        .find(|query| query.contains("toUInt64(uniqExact") && query.contains(" AS df"))
+        .expect("document-frequency query should be captured");
+    assert!(
+        df_query.contains("uniqExact(tuple(source_host, doc_id))"),
+        "document frequency must use host-qualified document identity: {df_query}"
+    );
+    assert!(!df_query.contains("uniqExact(doc_id)"));
     let bounds_query = queries
         .iter()
         .find(|query| query.contains("FROM `moraine`.`v_session_summary` AS ss"))
@@ -770,13 +799,18 @@ async fn search_mcp_events_uses_one_candidate_and_one_bounded_detail_query() {
     assert!(queries[0].contains("session_id IN (SELECT session_id FROM live_session_ids)"));
     assert!(queries[0].contains("AS projection_clean"));
     assert!(queries[0].contains("projected_candidates AS ("));
-    assert!(queries[0].contains("event_uid IN (SELECT event_uid FROM matching_doc_ids)"));
+    assert!(queries[0].contains("SELECT p.source_host AS source_host, p.doc_id AS event_uid"));
+    assert!(queries[0].contains("WHERE (source_host, event_uid) IN ("));
+    assert!(queries[0].contains("ON e.source_host = p.source_host"));
+    assert!(queries[0].contains("GROUP BY p.doc_id, p.source_host"));
     assert!(queries[0].contains("greatest(toFloat64(corpus_docs), toFloat64(p.df))"));
     assert!(!queries[0].contains("uniqExact"));
     assert!(queries[1].contains("documents AS ("));
     assert!(queries[1].contains("candidate_heads AS ("));
+    assert!(queries[1].contains("tupleElement(candidate, 1) AS source_host"));
     assert!(queries[1].contains("sessions.generation = candidate.generation"));
-    assert!(queries[1].contains("WHERE document.event_uid IN event_uids"));
+    assert!(queries[1].contains("WHERE (document.source_host, document.event_uid) IN ("));
+    assert!(queries[1].contains("ON projected_events.source_host = candidate.source_host"));
     assert!(queries[1].contains("argMax(leftUTF8(document.text_content"));
     assert!(queries[1].contains("argMax(leftUTF8(document.payload_json"));
     assert!(!queries[1].contains("argMax(leftUTF8(text_content"));

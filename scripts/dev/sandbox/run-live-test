@@ -358,6 +358,7 @@ set -m
     -e HOME=/home/moraine \
     -e MORAINE_ALLOW_DESTRUCTIVE_TESTS=1 \
     -e "MORAINE_LIVE_TEST_SANDBOX_ID=${sandbox_id}" \
+    -e MORAINE_LIVE_TEST_INGEST_BIN=/opt/moraine/bin/moraine-ingest \
     -e MORAINE_BENCH_CLICKHOUSE_URL=http://clickhouse:8123 \
     "$container" \
     cargo test -p moraine-conversations \
