@@ -511,7 +511,11 @@ FORMAT JSONEachRow""",
         or state["source_generation"] < 1
         or state["publication_revision"] < 1
         or state["last_line"] < 0
-        or state["lifecycle"] not in {"active", "replaying", "error"}
+        # ClickHouse may expose the newly appended head before the checkpoint
+        # helper view observes its earlier cross-table insert.  An empty
+        # lifecycle is therefore a pollable, incomplete state; the wait below
+        # still requires the exact active checkpoint before it succeeds.
+        or state["lifecycle"] not in {"", "active", "replaying", "error"}
         or any(
             state[name] not in {0, 1}
             for name in ("complete", "compatibility_prepared", "backend_caught_up")
