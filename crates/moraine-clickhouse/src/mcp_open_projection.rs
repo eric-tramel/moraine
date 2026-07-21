@@ -1,7 +1,7 @@
-use super::{escape_identifier, escape_literal, ClickHouseClient};
+use super::{escape_identifier, escape_literal, migration_request_timeout, ClickHouseClient};
 use anyhow::{bail, Context, Result};
 use futures_util::{stream, TryStreamExt};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -132,6 +132,52 @@ struct ProjectionStateRow {
     ready: u8,
     #[serde(default)]
     backfill_cursor: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BackfillFactRow {
+    session_id: String,
+    slot: u8,
+    source_revision: u64,
+    dirty_revision: u64,
+    required_source_heads: Vec<SourceHeadRow>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BackfillPlanRow {
+    session_id: String,
+    candidate_publication_id: String,
+    slot: u8,
+    candidate_generation: u64,
+    source_revision: u64,
+    dirty_revision: u64,
+    required_source_heads: Vec<SourceHeadRow>,
+    required_heads_fingerprint: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BackfillCompleteRow {
+    complete: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BackfillPhaseGuard {
+    LegacyHead,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+enum BackfillPhase {
+    Planned = 0,
+    EventsInserted = 1,
+    TurnsInserted = 2,
+    Complete = 4,
+}
+
+impl BackfillPhase {
+    const fn value(self) -> u8 {
+        self as u8
+    }
 }
 
 fn projection_session_ids<I, S>(session_ids: I) -> BTreeSet<String>
@@ -478,8 +524,10 @@ impl ClickHouseClient {
                 if rows.is_empty() {
                     break;
                 }
-                self.refresh_mcp_open_read_model(rows.iter().map(|row| row.session_id.as_str()))
-                    .await?;
+                self.refresh_mcp_open_read_model_batch(
+                    rows.iter().map(|row| row.session_id.as_str()),
+                )
+                .await?;
                 cursor = rows.last().expect("non-empty page").session_id.clone();
                 self.set_mcp_open_projection_state(false, &cursor).await?;
                 refreshed_sessions += rows.len();
@@ -520,7 +568,7 @@ impl ClickHouseClient {
             if rows.is_empty() {
                 break;
             }
-            self.refresh_mcp_open_read_model(rows.iter().map(|row| row.session_id.as_str()))
+            self.refresh_mcp_open_read_model_batch(rows.iter().map(|row| row.session_id.as_str()))
                 .await?;
             refreshed_sessions += rows.len();
             on_progress(refreshed_sessions);
@@ -528,6 +576,254 @@ impl ClickHouseClient {
 
         self.set_mcp_open_projection_state(true, "").await?;
         Ok(())
+    }
+
+    async fn refresh_mcp_open_read_model_batch<I, S>(&self, session_ids: I) -> Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let session_ids = projection_session_ids(session_ids);
+        if session_ids.is_empty() {
+            return Ok(());
+        }
+
+        for _attempt in 0..MAX_UNSTABLE_REFRESH_ATTEMPTS {
+            self.prepare_mcp_open_backfill_plans(&session_ids).await?;
+
+            self.execute_mcp_open_backfill_insert(batch_projected_events_sql(
+                &self.cfg.database,
+                &session_ids,
+            ))
+            .await?;
+            self.advance_mcp_open_backfill_phase(
+                &session_ids,
+                BackfillPhase::Planned,
+                BackfillPhase::EventsInserted,
+                None,
+            )
+            .await?;
+
+            self.execute_mcp_open_backfill_insert(batch_projected_turns_sql(
+                &self.cfg.database,
+                &session_ids,
+            ))
+            .await?;
+            self.advance_mcp_open_backfill_phase(
+                &session_ids,
+                BackfillPhase::EventsInserted,
+                BackfillPhase::TurnsInserted,
+                None,
+            )
+            .await?;
+
+            // A prior attempt may have published the header and legacy head but
+            // lost the response before recording completion. Recover that exact
+            // durable state before issuing any per-session finalization writes.
+            self.advance_mcp_open_backfill_phase(
+                &session_ids,
+                BackfillPhase::TurnsInserted,
+                BackfillPhase::Complete,
+                Some(BackfillPhaseGuard::LegacyHead),
+            )
+            .await?;
+            self.finalize_mcp_open_backfill_plans(&session_ids).await?;
+            self.advance_mcp_open_backfill_phase(
+                &session_ids,
+                BackfillPhase::TurnsInserted,
+                BackfillPhase::Complete,
+                Some(BackfillPhaseGuard::LegacyHead),
+            )
+            .await?;
+
+            if self.mcp_open_backfill_batch_complete(&session_ids).await? {
+                return Ok(());
+            }
+        }
+
+        bail!(
+            "MCP open projection source kept changing for a {}-session batch after {} attempts",
+            session_ids.len(),
+            MAX_UNSTABLE_REFRESH_ATTEMPTS
+        )
+    }
+
+    async fn prepare_mcp_open_backfill_plans(&self, session_ids: &BTreeSet<String>) -> Result<()> {
+        let facts: Vec<BackfillFactRow> = self
+            .mcp_open_backfill_query(&backfill_facts_sql(&self.cfg.database, session_ids))
+            .await
+            .context("failed to read MCP open batch facts")?;
+        if facts.len() != session_ids.len() {
+            bail!(
+                "MCP open batch facts covered {} of {} requested sessions",
+                facts.len(),
+                session_ids.len()
+            );
+        }
+        let current_plans: Vec<BackfillPlanRow> = self
+            .mcp_open_backfill_query(&backfill_plans_sql(&self.cfg.database, session_ids))
+            .await
+            .context("failed to read MCP open batch plans")?;
+        let current_plans = current_plans
+            .into_iter()
+            .map(|plan| (plan.session_id.clone(), plan))
+            .collect::<BTreeMap<_, _>>();
+
+        let mut replacements = Vec::new();
+        for fact in facts {
+            let required_heads = canonical_source_heads(
+                &fact
+                    .required_source_heads
+                    .iter()
+                    .cloned()
+                    .map(source_head_from_row)
+                    .collect::<Vec<_>>(),
+            )?;
+            let fingerprint = source_heads_fingerprint(&required_heads);
+            let reusable = current_plans.get(&fact.session_id).is_some_and(|plan| {
+                plan.source_revision == fact.source_revision
+                    && plan.dirty_revision == fact.dirty_revision
+                    && plan.required_heads_fingerprint == fingerprint
+            });
+            if !reusable {
+                replacements.push((fact, required_heads, fingerprint));
+            }
+        }
+        if replacements.is_empty() {
+            return Ok(());
+        }
+
+        let generation = self.next_projection_generation().await?;
+        let values = replacements
+            .into_iter()
+            .map(|(fact, required_heads, fingerprint)| {
+                let candidate_publication_id =
+                    format!("backfill:{generation}:{}", fact.session_id);
+                format!(
+                    "({}, {}, {}, toUInt64({generation}), toUInt64({}), toUInt64({}), {}, {}, toUInt8({}), toUInt64({generation}))",
+                    escape_literal(&fact.session_id),
+                    escape_literal(&candidate_publication_id),
+                    fact.slot,
+                    fact.source_revision,
+                    fact.dirty_revision,
+                    source_heads_sql(&required_heads),
+                    escape_literal(&fingerprint),
+                    BackfillPhase::Planned.value(),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",\n");
+        let statement = format!(
+            "INSERT INTO {}.mcp_open_backfill_plans\n\
+             (session_id, candidate_publication_id, slot, candidate_generation, source_revision,\n\
+              dirty_revision, required_source_heads, required_heads_fingerprint, phase, plan_revision)\n\
+             VALUES {values}",
+            escape_identifier(&self.cfg.database),
+        );
+        self.execute_mcp_open_backfill_insert(statement).await
+    }
+
+    async fn finalize_mcp_open_backfill_plans(&self, session_ids: &BTreeSet<String>) -> Result<()> {
+        let plans: Vec<BackfillPlanRow> = self
+            .mcp_open_backfill_query(&backfill_phase_plans_sql(
+                &self.cfg.database,
+                session_ids,
+                Some(BackfillPhase::TurnsInserted),
+            ))
+            .await?;
+        stream::iter(plans.into_iter().map(Ok::<_, anyhow::Error>))
+            .try_for_each_concurrent(REFRESH_CONCURRENCY, |plan| async move {
+                let required_heads = canonical_source_heads(
+                    &plan
+                        .required_source_heads
+                        .into_iter()
+                        .map(source_head_from_row)
+                        .collect::<Vec<_>>(),
+                )?;
+                let candidate = self
+                    .insert_projected_publication_header(CandidateHeaderInsert {
+                        session_id: &plan.session_id,
+                        candidate_publication_id: &plan.candidate_publication_id,
+                        operation_id: &plan.candidate_publication_id,
+                        publisher_id: "historical-backfill",
+                        slot: plan.slot,
+                        generation: plan.candidate_generation,
+                        source_revision: plan.source_revision,
+                        dirty_revision: plan.dirty_revision,
+                        required_heads: &required_heads,
+                    })
+                    .await?;
+                if candidate.is_some() {
+                    self.publish_legacy_session_candidate_head(
+                        &plan.session_id,
+                        &plan.candidate_publication_id,
+                    )
+                    .await?;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    async fn advance_mcp_open_backfill_phase(
+        &self,
+        session_ids: &BTreeSet<String>,
+        from_phase: BackfillPhase,
+        to_phase: BackfillPhase,
+        guard: Option<BackfillPhaseGuard>,
+    ) -> Result<()> {
+        self.execute_mcp_open_backfill_insert(backfill_phase_advance_sql(
+            &self.cfg.database,
+            session_ids,
+            from_phase,
+            to_phase,
+            guard,
+        ))
+        .await
+    }
+
+    async fn mcp_open_backfill_batch_complete(
+        &self,
+        session_ids: &BTreeSet<String>,
+    ) -> Result<bool> {
+        let rows: Vec<BackfillCompleteRow> = self
+            .mcp_open_backfill_query(&backfill_complete_sql(&self.cfg.database, session_ids))
+            .await?;
+        Ok(rows
+            .first()
+            .is_some_and(|row| row.complete == session_ids.len() as u64))
+    }
+
+    async fn execute_mcp_open_backfill_insert(&self, statement: String) -> Result<()> {
+        self.request_text_with_params_and_timeout(
+            &statement,
+            None,
+            Some(&self.cfg.database),
+            false,
+            None,
+            &[],
+            Some(migration_request_timeout(self.cfg.timeout_seconds)),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn mcp_open_backfill_query<T: DeserializeOwned>(&self, query: &str) -> Result<Vec<T>> {
+        let raw = self
+            .request_text_with_params_and_timeout(
+                query,
+                None,
+                Some(&self.cfg.database),
+                false,
+                None,
+                &[],
+                Some(migration_request_timeout(self.cfg.timeout_seconds)),
+            )
+            .await?;
+        serde_json::Deserializer::from_str(&raw)
+            .into_iter::<T>()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("failed to parse MCP open batch JSONEachRow response")
     }
 
     pub async fn mcp_open_read_model_ready(&self) -> Result<bool> {
@@ -1398,56 +1694,342 @@ fn session_source_heads_for_snapshot_sql(
     )
 }
 
-fn projection_ctes(
+fn backfill_session_ids_sql(session_ids: &BTreeSet<String>) -> String {
+    format!(
+        "[{}]",
+        session_ids
+            .iter()
+            .map(|session_id| escape_literal(session_id))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn backfill_facts_sql(database: &str, session_ids: &BTreeSet<String>) -> String {
+    let database = escape_identifier(database);
+    let session_ids = backfill_session_ids_sql(session_ids);
+    format!(
+        "WITH current_heads AS (\n\
+           SELECT source_host, source_name, source_file, source_generation, publication_revision\n\
+           FROM {database}.v_current_published_source_generations\n\
+         ),\n\
+         requested_events AS (\n\
+           SELECT event_uid, event_version, session_id, source_host, source_name, source_file, source_generation\n\
+           FROM {database}.events FINAL\n\
+           PREWHERE session_id IN {session_ids}\n\
+         ),\n\
+         active_sessions AS (\n\
+           SELECT session_id, slot, toUInt8(1) AS present\n\
+           FROM {database}.mcp_open_sessions FINAL\n\
+           WHERE session_id IN {session_ids}\n\
+         ),\n\
+         dirty_sessions AS (\n\
+           SELECT session_id, dirty_revision, toUInt8(1) AS present\n\
+           FROM {database}.mcp_open_dirty_sessions FINAL\n\
+           WHERE session_id IN {session_ids}\n\
+         )\n\
+         SELECT\n\
+           e.session_id AS session_id,\n\
+           if(s.present = 1, toUInt8(1 - s.slot), toUInt8(0)) AS slot,\n\
+           toUInt64(cityHash64(arraySort(groupArray(tuple(e.event_uid, e.event_version))))) AS source_revision,\n\
+           if(d.present = 1, toUInt64(d.dirty_revision), toUInt64(0)) AS dirty_revision,\n\
+           CAST(arraySort(groupUniqArray(tuple(\n\
+             h.source_host, h.source_name, h.source_file, toUInt32(h.source_generation),\n\
+             toUInt64(h.publication_revision)\n\
+           ))), 'Array(Tuple(source_host String, source_name String, source_file String, source_generation UInt32, publication_revision UInt64))') AS required_source_heads\n\
+         FROM requested_events AS e\n\
+         INNER JOIN current_heads AS h\n\
+           ON h.source_host = e.source_host AND h.source_name = e.source_name\n\
+          AND h.source_file = e.source_file AND h.source_generation = e.source_generation\n\
+         LEFT JOIN active_sessions AS s ON s.session_id = e.session_id\n\
+         LEFT JOIN dirty_sessions AS d ON d.session_id = e.session_id\n\
+         GROUP BY e.session_id, s.present, s.slot, d.present, d.dirty_revision\n\
+         ORDER BY e.session_id\n\
+         FORMAT JSONEachRow"
+    )
+}
+
+fn backfill_plans_sql(database: &str, session_ids: &BTreeSet<String>) -> String {
+    backfill_phase_plans_sql(database, session_ids, None)
+}
+
+fn backfill_phase_plans_sql(
     database: &str,
-    session_id: &str,
-    source_revision: u64,
-    required_heads: &[McpOpenSourceHead],
-    revalidate_source_revision: bool,
+    session_ids: &BTreeSet<String>,
+    phase: Option<BackfillPhase>,
 ) -> String {
-    let session_id = escape_literal(session_id);
-    let event_type = event_type_sql();
-    let (canonical_revision, projected_source_revision, source_revision_gate) =
-        if revalidate_source_revision {
-            (
-                "canonical_revision AS (\n\
-                   SELECT if(count() = 0, toUInt64(0), toUInt64(cityHash64(arraySort(groupArray(tuple(event_uid, event_version)))))) AS source_revision\n\
-                   FROM canonical\n\
-                 ),\n\
-                 ",
-                "revision.source_revision".to_string(),
-                format!(
-                    "CROSS JOIN canonical_revision AS revision\n\
-                     WHERE revision.source_revision = {source_revision}\n\
-                     "
-                ),
-            )
-        } else {
-            ("", format!("toUInt64({source_revision})"), String::new())
-        };
+    let phase_filter = phase
+        .map(|phase| format!(" AND phase = {}", phase.value()))
+        .unwrap_or_default();
+    format!(
+        "SELECT session_id, candidate_publication_id, slot, candidate_generation, source_revision,\n\
+          dirty_revision, required_source_heads, required_heads_fingerprint, phase\n\
+         FROM {}.mcp_open_backfill_plans FINAL\n\
+         WHERE session_id IN {}{}\n\
+         ORDER BY session_id\n\
+         FORMAT JSONEachRow",
+        escape_identifier(database),
+        backfill_session_ids_sql(session_ids),
+        phase_filter,
+    )
+}
+
+fn batch_projection_ctes(
+    database: &str,
+    session_ids: &BTreeSet<String>,
+    phase: BackfillPhase,
+) -> String {
+    let database = escape_identifier(database);
+    let session_ids = backfill_session_ids_sql(session_ids);
+    let phase = phase.value();
+    let pipeline = projection_pipeline_ctes("toUInt64(planned_source_revision)", "");
     format!(
         "WITH\n\
+         plans AS (\n\
+           SELECT session_id, candidate_publication_id, slot, candidate_generation, source_revision,\n\
+             dirty_revision, required_source_heads, required_heads_fingerprint\n\
+           FROM {database}.mcp_open_backfill_plans FINAL\n\
+           WHERE session_id IN {session_ids} AND phase = {phase}\n\
+         ),\n\
          canonical AS (\n\
            SELECT\n\
-             ingested_at, event_uid, session_id, source_host, source_name, harness, inference_provider, source_file,\n\
-             source_generation, source_line_no, source_offset, source_ref, record_ts, event_ts,\n\
-             event_kind AS event_class, actor_kind AS actor_role, payload_type, turn_index, toString(turn_index) AS turn_id, item_id,\n\
-             tool_call_id AS call_id, tool_name AS name, if(tool_phase != '', tool_phase, op_status) AS phase,\n\
-             text_content, payload_json, token_usage_json, endpoint_kind, token_usage_buckets,\n\
-             token_usage_native_units, cwd, event_version\n\
+             e.ingested_at, e.event_uid, e.session_id, e.source_host, e.source_name, e.harness,\n\
+             e.inference_provider, e.source_file, e.source_generation, e.source_line_no,\n\
+             e.source_offset, e.source_ref, e.record_ts, e.event_ts,\n\
+             e.event_kind AS event_class, e.actor_kind AS actor_role, e.payload_type,\n\
+             e.turn_index, toString(e.turn_index) AS turn_id, e.item_id,\n\
+             e.tool_call_id AS call_id, e.tool_name AS name,\n\
+             if(e.tool_phase != '', e.tool_phase, e.op_status) AS phase,\n\
+             e.text_content, e.payload_json, e.token_usage_json, e.endpoint_kind,\n\
+             e.token_usage_buckets, e.token_usage_native_units, e.cwd, e.event_version,\n\
+             p.candidate_publication_id, p.slot AS candidate_slot,\n\
+             p.candidate_generation, p.source_revision AS planned_source_revision,\n\
+             p.dirty_revision, p.required_source_heads, p.required_heads_fingerprint\n\
            FROM {database}.events AS e FINAL\n\
-           PREWHERE e.session_id = {session_id}\n\
-           WHERE {source_head_filter}\n\
+           INNER JOIN plans AS p ON p.session_id = e.session_id\n\
+           PREWHERE e.session_id IN {session_ids}\n\
+           WHERE arrayExists(head ->\n\
+             e.source_host = tupleElement(head, 1)\n\
+             AND e.source_name = tupleElement(head, 2)\n\
+             AND e.source_file = tupleElement(head, 3)\n\
+             AND e.source_generation = tupleElement(head, 4),\n\
+             p.required_source_heads)\n\
          ),\n\
-         {canonical_revision}\
-         ordered AS (\n\
+         {pipeline}"
+    )
+}
+
+fn projected_events_insert_sql(database: &str, ctes: &str, slot: &str, generation: &str) -> String {
+    format!(
+        "INSERT INTO {database}.mcp_open_events\n\
+         (event_uid, source_host, slot, candidate_generation, generation, session_id, event_order, turn_seq,\n\
+          event_time, actor_role, event_class, payload_type, event_type, event_ordinal,\n\
+          call_id, name, phase, item_id, source_ref, text_content, payload_json,\n\
+          token_usage_json, endpoint_kind, token_usage_buckets, token_usage_native_units,\n\
+          previous_event_uid, next_event_uid)\n\
+         {ctes}\n\
+         SELECT\n\
+           event_uid, source_host, {slot}, {generation}, {generation}, session_id, event_order, turn_seq,\n\
+           event_time, actor_role, event_class, payload_type, event_type, event_ordinal,\n\
+           call_id, name, phase, item_id, source_ref, text_content, payload_json,\n\
+           token_usage_json, endpoint_kind, token_usage_buckets, token_usage_native_units,\n\
+           previous_event_uid, next_event_uid\n\
+         FROM enriched AS projected
+         LEFT ANTI JOIN (
+           SELECT event_uid, slot, source_host, candidate_generation
+           FROM {database}.mcp_open_events
+           PREWHERE event_uid IN (SELECT event_uid FROM canonical)
+         ) AS existing
+           ON existing.event_uid = projected.event_uid
+          AND existing.slot = projected.candidate_slot
+          AND existing.source_host = projected.source_host
+          AND existing.candidate_generation = projected.candidate_generation"
+    )
+}
+
+fn projected_turns_insert_sql(
+    database: &str,
+    ctes: &str,
+    slot: &str,
+    generation: &str,
+    session_ids: &BTreeSet<String>,
+) -> String {
+    let message = "(event_class = 'message' OR (event_class = 'event_msg' AND payload_type IN ('user_message', 'agent_message', 'message', 'text')))";
+    let user_message = format!("(lowerUTF8(actor_role) = 'user' AND {message})");
+    let assistant_message = format!("(lowerUTF8(actor_role) = 'assistant' AND {message})");
+    let final_response_message =
+        format!("({assistant_message} AND lowerUTF8(phase) != 'commentary')");
+    format!(
+        "INSERT INTO {database}.mcp_open_turns\n\
+         (session_id, slot, candidate_generation, generation, turn_seq, turn_id, started_at, ended_at,\n\
+          total_events, user_messages, assistant_messages, tool_calls, tool_results, reasoning_items,\n\
+          user_input_summary_source, final_response_summary_source, user_input_summary_is_payload, final_response_summary_is_payload,\n\
+          user_input_event_uid, user_input_event_order, user_input_event_time, user_input_event_type,\n\
+          final_response_event_uid, final_response_event_order, final_response_event_time, final_response_event_type,\n\
+          tools_called, normalized_event_types, completed, terminal_event_uid,\n\
+          first_event_uid, first_event_order, first_event_time, first_event_type,\n\
+          last_event_uid, last_event_order, last_event_time, last_event_type,\n\
+          previous_turn_seq, previous_turn_id, previous_turn_started_at, previous_turn_ended_at,\n\
+          next_turn_seq, next_turn_id, next_turn_started_at, next_turn_ended_at, event_summaries_json)\n\
+         {ctes},\n\
+         turn_rows AS (\n\
+           SELECT\n\
+             session_id, any(candidate_slot) AS candidate_slot, any(candidate_generation) AS candidate_generation,\n\
+             turn_seq, anyIf(turn_id, turn_id != '') AS turn_id,\n\
+             min(event_time) AS started_at, max(event_time) AS ended_at, count() AS total_events,\n\
+             countIf(actor_role = 'user' AND event_class = 'message') AS user_messages,\n\
+             countIf(actor_role = 'assistant' AND event_class = 'message') AS assistant_messages,\n\
+             countIf(event_class = 'tool_call') AS tool_calls, countIf(event_class = 'tool_result') AS tool_results,\n\
+             countIf(event_class = 'reasoning') AS reasoning_items,\n\
+             argMinIf(summary_source, tuple(event_order, event_uid), {user_message}) AS user_input_summary_source,\n\
+             argMaxIf(summary_source, tuple(event_order, event_uid), {final_response_message}) AS final_response_summary_source,\n\
+             argMinIf(toUInt8(summary_is_payload), tuple(event_order, event_uid), {user_message}) AS user_input_summary_is_payload,\n\
+             argMaxIf(toUInt8(summary_is_payload), tuple(event_order, event_uid), {final_response_message}) AS final_response_summary_is_payload,\n\
+             argMinIf(event_uid, tuple(event_order, event_uid), {user_message}) AS user_input_event_uid,\n\
+             argMinIf(event_order, tuple(event_order, event_uid), {user_message}) AS user_input_event_order,\n\
+             argMinIf(event_time, tuple(event_order, event_uid), {user_message}) AS user_input_event_time,\n\
+             argMinIf(event_type, tuple(event_order, event_uid), {user_message}) AS user_input_event_type,\n\
+             argMaxIf(event_uid, tuple(event_order, event_uid), {final_response_message}) AS final_response_event_uid,\n\
+             argMaxIf(event_order, tuple(event_order, event_uid), {final_response_message}) AS final_response_event_order,\n\
+             argMaxIf(event_time, tuple(event_order, event_uid), {final_response_message}) AS final_response_event_time,\n\
+             argMaxIf(event_type, tuple(event_order, event_uid), {final_response_message}) AS final_response_event_type,\n\
+             arrayDistinct(arrayMap(x -> x.2, arraySort(groupArrayIf(tuple(event_order, tool_label), event_type = 'tool_call' AND tool_label != '')))) AS tools_called,\n\
+             arrayDistinct(arrayMap(x -> x.2, arraySort(groupArray(tuple(event_order, event_type))))) AS normalized_event_types,\n\
+             argMaxIf(toUInt8(payload_type = 'task_complete'), tuple(event_order, event_uid), payload_type IN ('task_complete', 'turn_aborted')) AS completed,\n\
+             argMaxIf(event_uid, tuple(event_order, event_uid), payload_type IN ('task_complete', 'turn_aborted')) AS terminal_event_uid,\n\
+             argMin(event_uid, tuple(event_order, event_uid)) AS first_event_uid,\n\
+             argMin(event_order, tuple(event_order, event_uid)) AS first_event_order,\n\
+             argMin(event_time, tuple(event_order, event_uid)) AS first_event_time,\n\
+             argMin(event_type, tuple(event_order, event_uid)) AS first_event_type,\n\
+             argMax(event_uid, tuple(event_order, event_uid)) AS last_event_uid,\n\
+             argMax(event_order, tuple(event_order, event_uid)) AS last_event_order,\n\
+             argMax(event_time, tuple(event_order, event_uid)) AS last_event_time,\n\
+             argMax(event_type, tuple(event_order, event_uid)) AS last_event_type,\n\
+             toJSONString(arrayMap(x -> x.2, arraySort(groupArray(tuple(event_order, event_summary))))) AS event_summaries_json\n\
+           FROM summarized\n\
+           GROUP BY session_id, turn_seq\n\
+         ),\n\
+         turn_neighbors AS (\n\
+           SELECT *,\n\
+             lagInFrame(turn_seq, 1, toUInt32(0)) OVER turn_window AS previous_turn_seq,\n\
+             lagInFrame(turn_id, 1, '') OVER turn_window AS previous_turn_id,\n\
+             lagInFrame(started_at, 1, toDateTime64(0, 3)) OVER turn_window AS previous_turn_started_at,\n\
+             lagInFrame(ended_at, 1, toDateTime64(0, 3)) OVER turn_window AS previous_turn_ended_at,\n\
+             leadInFrame(turn_seq, 1, toUInt32(0)) OVER turn_window AS next_turn_seq,\n\
+             leadInFrame(turn_id, 1, '') OVER turn_window AS next_turn_id,\n\
+             leadInFrame(started_at, 1, toDateTime64(0, 3)) OVER turn_window AS next_turn_started_at,\n\
+             leadInFrame(ended_at, 1, toDateTime64(0, 3)) OVER turn_window AS next_turn_ended_at\n\
+           FROM turn_rows\n\
+           WINDOW turn_window AS (PARTITION BY session_id ORDER BY turn_seq ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)\n\
+         )\n\
+         SELECT\n\
+           session_id, {slot}, {generation}, {generation}, turn_seq, turn_id, started_at, ended_at,\n\
+           total_events, user_messages, assistant_messages, tool_calls, tool_results, reasoning_items,\n\
+           user_input_summary_source, final_response_summary_source, user_input_summary_is_payload, final_response_summary_is_payload,\n\
+           user_input_event_uid, user_input_event_order, user_input_event_time, user_input_event_type,\n\
+           final_response_event_uid, final_response_event_order, final_response_event_time, final_response_event_type,\n\
+           tools_called, normalized_event_types, completed, terminal_event_uid,\n\
+           first_event_uid, first_event_order, first_event_time, first_event_type,\n\
+           last_event_uid, last_event_order, last_event_time, last_event_type,\n\
+           previous_turn_seq, previous_turn_id, previous_turn_started_at, previous_turn_ended_at,\n\
+           next_turn_seq, next_turn_id, next_turn_started_at, next_turn_ended_at, event_summaries_json\n\
+         FROM turn_neighbors AS projected
+         LEFT ANTI JOIN (
+           SELECT session_id, slot, candidate_generation, turn_seq
+           FROM {database}.mcp_open_turns
+           PREWHERE session_id IN {}
+         ) AS existing
+           ON existing.session_id = projected.session_id
+          AND existing.slot = projected.candidate_slot
+          AND existing.candidate_generation = projected.candidate_generation
+          AND existing.turn_seq = projected.turn_seq",
+        backfill_session_ids_sql(session_ids),
+    )
+}
+
+fn batch_projected_events_sql(database: &str, session_ids: &BTreeSet<String>) -> String {
+    let ctes = batch_projection_ctes(database, session_ids, BackfillPhase::Planned);
+    projected_events_insert_sql(
+        &escape_identifier(database),
+        &ctes,
+        "candidate_slot",
+        "candidate_generation",
+    )
+}
+
+fn batch_projected_turns_sql(database: &str, session_ids: &BTreeSet<String>) -> String {
+    let ctes = batch_projection_ctes(database, session_ids, BackfillPhase::EventsInserted);
+    projected_turns_insert_sql(
+        &escape_identifier(database),
+        &ctes,
+        "candidate_slot",
+        "candidate_generation",
+        session_ids,
+    )
+}
+
+fn backfill_phase_advance_sql(
+    database: &str,
+    session_ids: &BTreeSet<String>,
+    from_phase: BackfillPhase,
+    to_phase: BackfillPhase,
+    guard: Option<BackfillPhaseGuard>,
+) -> String {
+    let database = escape_identifier(database);
+    let session_ids = backfill_session_ids_sql(session_ids);
+    let from_phase = from_phase.value();
+    let to_phase = to_phase.value();
+    let guard_join = match guard {
+        None => String::new(),
+        Some(BackfillPhaseGuard::LegacyHead) => format!(
+            "INNER JOIN {database}.mcp_open_publication_headers AS h FINAL\n\
+               ON h.session_id = p.session_id\n\
+              AND h.candidate_publication_id = p.candidate_publication_id\n\
+              AND h.slot = p.slot AND h.generation = p.candidate_generation\n\
+              AND h.source_revision = p.source_revision AND h.dirty_revision = p.dirty_revision\n\
+             INNER JOIN {database}.mcp_open_sessions AS s FINAL\n\
+               ON s.session_id = p.session_id AND s.slot = p.slot\n\
+              AND s.generation = p.candidate_generation\n\
+              AND s.source_revision = p.source_revision AND s.dirty_revision = p.dirty_revision\n\
+             "
+        ),
+    };
+    format!(
+        "INSERT INTO {database}.mcp_open_backfill_plans\n\
+         (session_id, candidate_publication_id, slot, candidate_generation, source_revision,\n\
+          dirty_revision, required_source_heads, required_heads_fingerprint, phase, plan_revision)\n\
+         SELECT p.session_id, p.candidate_publication_id, p.slot, p.candidate_generation,\n\
+           p.source_revision, p.dirty_revision, p.required_source_heads,\n\
+           p.required_heads_fingerprint, toUInt8({to_phase}), generateSnowflakeID()\n\
+         FROM {database}.mcp_open_backfill_plans AS p FINAL\n\
+         {guard_join}\
+         WHERE p.session_id IN {session_ids} AND p.phase = {from_phase}"
+    )
+}
+
+fn backfill_complete_sql(database: &str, session_ids: &BTreeSet<String>) -> String {
+    format!(
+        "SELECT toUInt64(countIf(phase >= {})) AS complete\n\
+         FROM {}.mcp_open_backfill_plans FINAL\n\
+         WHERE session_id IN {}\n\
+         FORMAT JSONEachRow",
+        BackfillPhase::Complete.value(),
+        escape_identifier(database),
+        backfill_session_ids_sql(session_ids),
+    )
+}
+
+fn projection_pipeline_ctes(projected_source_revision: &str, source_revision_gate: &str) -> String {
+    let event_type = event_type_sql();
+    format!(
+        "ordered AS (\n\
            SELECT canonical.*,\n\
              ifNull(parseDateTime64BestEffortOrNull(record_ts), ingested_at) AS event_time,\n\
              row_number() OVER canonical_window AS event_order,\n\
              if(toUInt32(turn_index) > 0, toUInt32(turn_index), greatest(toUInt32(1), toUInt32(sum(if(actor_role = 'user' AND event_class = 'message', 1, 0)) OVER canonical_rows))) AS turn_seq,\n\
              {projected_source_revision} AS source_revision\n\
            FROM canonical\n\
-           {source_revision_gate}\
+           {source_revision_gate}\n\
            WINDOW\n\
              canonical_window AS (PARTITION BY session_id ORDER BY ifNull(parseDateTime64BestEffortOrNull(record_ts), ingested_at), source_host, source_file, source_generation, source_offset, source_line_no, event_uid),\n\
              canonical_rows AS (PARTITION BY session_id ORDER BY ifNull(parseDateTime64BestEffortOrNull(record_ts), ingested_at), source_host, source_file, source_generation, source_offset, source_line_no, event_uid ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)\n\
@@ -1479,6 +2061,52 @@ fn projection_ctes(
          )",
         payload_summary_chars = MAX_PROJECTED_PAYLOAD_SUMMARY_CHARS,
         text_summary_chars = MAX_PROJECTED_TEXT_SUMMARY_CHARS,
+    )
+}
+
+fn projection_ctes(
+    database: &str,
+    session_id: &str,
+    source_revision: u64,
+    required_heads: &[McpOpenSourceHead],
+    revalidate_source_revision: bool,
+) -> String {
+    let session_id = escape_literal(session_id);
+    let (canonical_revision, projected_source_revision, source_revision_gate) =
+        if revalidate_source_revision {
+            (
+                "canonical_revision AS (\n\
+                   SELECT if(count() = 0, toUInt64(0), toUInt64(cityHash64(arraySort(groupArray(tuple(event_uid, event_version)))))) AS source_revision\n\
+                   FROM canonical\n\
+                 ),\n\
+                 ",
+                "revision.source_revision".to_string(),
+                format!(
+                    "CROSS JOIN canonical_revision AS revision\n\
+                     WHERE revision.source_revision = {source_revision}\n\
+                     "
+                ),
+            )
+        } else {
+            ("", format!("toUInt64({source_revision})"), String::new())
+        };
+    let pipeline = projection_pipeline_ctes(&projected_source_revision, &source_revision_gate);
+    format!(
+        "WITH\n\
+         canonical AS (\n\
+           SELECT\n\
+             ingested_at, event_uid, session_id, source_host, source_name, harness, inference_provider, source_file,\n\
+             source_generation, source_line_no, source_offset, source_ref, record_ts, event_ts,\n\
+             event_kind AS event_class, actor_kind AS actor_role, payload_type, turn_index, toString(turn_index) AS turn_id, item_id,\n\
+             tool_call_id AS call_id, tool_name AS name, if(tool_phase != '', tool_phase, op_status) AS phase,\n\
+             text_content, payload_json, token_usage_json, endpoint_kind, token_usage_buckets,\n\
+             token_usage_native_units, cwd, event_version\n\
+           FROM {database}.events AS e FINAL\n\
+           PREWHERE e.session_id = {session_id}\n\
+           WHERE {source_head_filter}\n\
+         ),\n\
+         {canonical_revision}\
+         {pipeline}",
         source_head_filter = source_head_filter(required_heads, "e"),
     )
 }
@@ -1499,10 +2127,12 @@ fn event_type_sql() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_source_heads, current_session_source_heads_sql, projection_ctes,
-        projection_session_ids, publish_legacy_candidate_heads_sql,
+        backfill_facts_sql, backfill_phase_advance_sql, batch_projected_events_sql,
+        batch_projected_turns_sql, canonical_source_heads, current_session_source_heads_sql,
+        projection_ctes, projection_session_ids, publish_legacy_candidate_heads_sql,
         session_source_heads_for_snapshot_sql, session_source_revision_sql, source_head_filter,
-        source_heads_fingerprint, McpOpenSourceHead, SourceHeadRow,
+        source_heads_fingerprint, BackfillPhase, BackfillPhaseGuard, McpOpenSourceHead,
+        SourceHeadRow,
     };
     use std::collections::BTreeSet;
 
@@ -1575,6 +2205,44 @@ mod tests {
         assert!(sql.contains("FROM `moraine`.events AS e FINAL"));
         assert!(sql.contains("PREWHERE e.session_id = 'session-a'"));
         assert!(!sql.contains("ORDER BY event_uid"));
+    }
+
+    #[test]
+    fn historical_backfill_batches_children_and_guards_completion() {
+        let sessions = BTreeSet::from(["session-a".to_string(), "session-b".to_string()]);
+        let facts = backfill_facts_sql("moraine", &sessions);
+        assert!(facts.contains("PREWHERE session_id IN ['session-a', 'session-b']"));
+        assert!(facts.contains("Array(Tuple(source_host String"));
+        assert!(facts.contains("mcp_open_sessions FINAL"));
+
+        let events = batch_projected_events_sql("moraine", &sessions);
+        let turns = batch_projected_turns_sql("moraine", &sessions);
+        for (sql, table, phase) in [
+            (&events, "mcp_open_events", "phase = 0"),
+            (&turns, "mcp_open_turns", "phase = 1"),
+        ] {
+            assert!(sql.starts_with(&format!("INSERT INTO `moraine`.{table}")));
+            assert!(sql.contains("FROM `moraine`.mcp_open_backfill_plans FINAL"));
+            assert!(sql.contains(phase));
+            assert!(sql.contains("INNER JOIN plans AS p ON p.session_id = e.session_id"));
+            assert!(sql.contains("PREWHERE e.session_id IN ['session-a', 'session-b']"));
+            assert!(sql.contains("p.candidate_generation"));
+            assert!(sql.contains("LEFT ANTI JOIN"));
+            assert!(sql.contains("existing.candidate_generation = projected.candidate_generation"));
+        }
+        assert!(events.contains("existing.source_host = projected.source_host"));
+
+        let completion = backfill_phase_advance_sql(
+            "moraine",
+            &sessions,
+            BackfillPhase::TurnsInserted,
+            BackfillPhase::Complete,
+            Some(BackfillPhaseGuard::LegacyHead),
+        );
+        assert!(completion.contains("mcp_open_publication_headers AS h FINAL"));
+        assert!(completion.contains("mcp_open_sessions AS s FINAL"));
+        assert!(completion.contains("h.candidate_publication_id = p.candidate_publication_id"));
+        assert!(completion.contains("p.phase = 2"));
     }
 
     #[test]

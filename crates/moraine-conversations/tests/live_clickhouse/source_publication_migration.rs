@@ -140,7 +140,8 @@ async fn bootstrap_schema_through_030(
                 "INSERT INTO `{database}`.schema_migrations (version, name) VALUES \
                  ('031', 'fixture-hold-031'), \
                  ('032', 'fixture-hold-032'), \
-                 ('033', 'fixture-hold-033')"
+                 ('033', 'fixture-hold-033'), \
+                 ('034', 'fixture-hold-034')"
             ),
             None,
             Some("system"),
@@ -930,7 +931,19 @@ pub(super) async fn run(clickhouse: &ClickHouseClient, database: &OwnedDatabaseN
     if applied_033 != ["033"] {
         bail!("legacy fixture expected migration 033 exactly, got {applied_033:?}");
     }
-    let migration_032_033_elapsed = migration_032_elapsed + migration_033_elapsed;
+
+    remove_migration_ledger_rows(clickhouse, database.as_str(), &["034"]).await?;
+    let migration_034_started = Instant::now();
+    let applied_034 = clickhouse
+        .run_migrations()
+        .await
+        .context("failed to apply migration 034 to legacy fixture")?;
+    let migration_034_elapsed = migration_034_started.elapsed();
+    if applied_034 != ["034"] {
+        bail!("legacy fixture expected migration 034 exactly, got {applied_034:?}");
+    }
+    let migration_032_034_elapsed =
+        migration_032_elapsed + migration_033_elapsed + migration_034_elapsed;
     let final_state = snapshot(clickhouse).await?;
     if final_state != first {
         bail!(
@@ -949,7 +962,7 @@ pub(super) async fn run(clickhouse: &ClickHouseClient, database: &OwnedDatabaseN
     }
 
     let projection = current_projection_state(clickhouse).await?;
-    let migration_elapsed = migration_031_elapsed + migration_032_033_elapsed;
+    let migration_elapsed = migration_031_elapsed + migration_032_034_elapsed;
     eprintln!(
         "{}",
         json!({
@@ -963,11 +976,11 @@ pub(super) async fn run(clickhouse: &ClickHouseClient, database: &OwnedDatabaseN
                 "legacy_mcp_session_heads": 1,
                 "interrupted_032_stranded_documents": 1,
             },
-            "migrations": ["031", "032", "033"],
+            "migrations": ["031", "032", "033", "034"],
             "migration_031_us": migration_031_elapsed.as_micros(),
             "migration_031_ms": migration_031_elapsed.as_millis(),
-            "migration_032_033_us": migration_032_033_elapsed.as_micros(),
-            "migration_032_033_ms": migration_032_033_elapsed.as_millis(),
+            "migration_032_034_us": migration_032_034_elapsed.as_micros(),
+            "migration_032_034_ms": migration_032_034_elapsed.as_millis(),
             "forced_032_idempotency_replay_us": replay_032_elapsed.as_micros(),
             "forced_032_idempotency_replay_ms": replay_032_elapsed.as_millis(),
             "interrupted_032_repaired_postings": STRANDED_POSTINGS,
