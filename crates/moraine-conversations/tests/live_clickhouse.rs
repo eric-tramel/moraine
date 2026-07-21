@@ -10,7 +10,7 @@ use moraine_conversations::{
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -1465,6 +1465,295 @@ VALUES
 
     let cleanup = cleanup_database(&clickhouse, &database).await;
     let census = assert_owned_database_census_empty(&clickhouse, "after cleanup").await;
+    finish_with_cleanup(outcome, finish_with_cleanup(cleanup, census))
+}
+
+#[tokio::test]
+#[ignore = "requires wrapper-owned live ClickHouse, destructive opt-in, and ~2 GB free"]
+async fn live_mcp_open_batched_backfill_resources() -> Result<()> {
+    const SESSIONS: u64 = 256;
+    const EVENTS_PER_SESSION: u64 = 32;
+    const EXPECTED_EVENTS: u64 = SESSIONS * EVENTS_PER_SESSION;
+    const EXPECTED_BATCHES: u64 = SESSIONS.div_ceil(64);
+
+    #[derive(Debug, Deserialize)]
+    struct BackfillCountRow {
+        projected_sessions: u64,
+        projected_events: u64,
+        projected_turns: u64,
+        completed_plans: u64,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    struct BackfillPartRow {
+        table: String,
+        parts: u64,
+        rows: u64,
+        bytes_on_disk: u64,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    struct BackfillQueryRow {
+        table: String,
+        queries: u64,
+        read_rows: u64,
+        read_bytes: u64,
+        peak_memory: u64,
+        duration_ms: u64,
+    }
+
+    let prerequisites = LivePrerequisites::load()?;
+    let database = prepare_owned_database_identity(&prerequisites.sandbox_id)?;
+    let clickhouse = live_client(&prerequisites, &database)?;
+    assert_owned_database_census_empty(&clickhouse, "before batched-backfill benchmark").await?;
+
+    let outcome = async {
+        clickhouse
+            .run_migrations()
+            .await
+            .context("failed to migrate batched-backfill benchmark database")?;
+        let database_name = database.as_str();
+        let seed = format!(
+            "INSERT INTO `{database_name}`.`events`\n\
+             (ingested_at, event_uid, session_id, session_date, source_name, harness, source_file,\n\
+              source_line_no, source_offset, source_ref, record_ts, event_ts, event_kind, actor_kind,\n\
+              payload_type, turn_index, text_content, payload_json, event_version)\n\
+             SELECT\n\
+               now64(3),\n\
+               concat('batch-event-', leftPad(toString(number), 8, '0')),\n\
+               concat('batch-session-', leftPad(toString(intDiv(number, {EVENTS_PER_SESSION})), 4, '0')),\n\
+               today(), 'fixture', 'codex', 'batched-backfill.jsonl',\n\
+               number + 1, number * 4096, concat('batch:', toString(number)),\n\
+               '2026-07-21T12:00:00.000Z', now64(3), 'message',\n\
+               if(number % 2 = 0, 'user', 'assistant'), 'text', toUInt32(1),\n\
+               repeat('representative transcript text ', 64),\n\
+               concat('{{\"text\":\"', repeat('representative payload ', 96), '\"}}'),\n\
+               number + 1\n\
+             FROM numbers({EXPECTED_EVENTS})"
+        );
+        clickhouse
+            .request_text(&seed, None, Some(database.as_str()), false, None)
+            .await
+            .context("failed to seed batched MCP backfill corpus")?;
+        publish_missing_schema_fixture_sources(&clickhouse, &database).await?;
+
+        let started = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            clickhouse.backfill_mcp_open_read_model(),
+        )
+        .await
+        .context("batched MCP backfill exceeded 60 seconds")??;
+        let elapsed = started.elapsed();
+        clickhouse
+            .request_text("SYSTEM FLUSH LOGS", None, None, false, None)
+            .await?;
+
+        let counts = clickhouse
+            .query_rows::<BackfillCountRow>(
+                &format!(
+                    "SELECT\n\
+                       (SELECT toUInt64(count()) FROM `{database_name}`.`mcp_open_sessions` FINAL) AS projected_sessions,\n\
+                       (SELECT toUInt64(count()) FROM `{database_name}`.`mcp_open_events`) AS projected_events,\n\
+                       (SELECT toUInt64(count()) FROM `{database_name}`.`mcp_open_turns`) AS projected_turns,\n\
+                       (SELECT toUInt64(countIf(phase >= 4)) FROM `{database_name}`.`mcp_open_backfill_plans` FINAL) AS completed_plans\n\
+                     FORMAT JSONEachRow"
+                ),
+                Some(database.as_str()),
+            )
+            .await?
+            .into_iter()
+            .next()
+            .context("batched MCP backfill counts missing")?;
+        assert_eq!(counts.projected_sessions, SESSIONS);
+        assert_eq!(counts.projected_events, EXPECTED_EVENTS);
+        assert_eq!(counts.projected_turns, SESSIONS);
+        assert_eq!(counts.completed_plans, SESSIONS);
+        assert!(clickhouse.mcp_open_read_model_ready().await?);
+
+        let parts = clickhouse
+            .query_rows::<BackfillPartRow>(
+                &format!(
+                    "SELECT table, toUInt64(count()) AS parts, toUInt64(sum(rows)) AS rows,\n\
+                       toUInt64(sum(bytes_on_disk)) AS bytes_on_disk\n\
+                     FROM system.parts\n\
+                     WHERE database = '{database_name}' AND active\n\
+                       AND table IN ('mcp_open_events', 'mcp_open_turns')\n\
+                     GROUP BY table ORDER BY table FORMAT JSONEachRow"
+                ),
+                Some(database.as_str()),
+            )
+            .await?;
+        assert_eq!(
+            parts
+                .iter()
+                .map(|row| row.table.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["mcp_open_events", "mcp_open_turns"]),
+            "resource evidence must cover both child tables"
+        );
+        for row in &parts {
+            assert!(
+                row.parts <= EXPECTED_BATCHES * 64,
+                "{} created {} active parts for {EXPECTED_BATCHES} batches",
+                row.table,
+                row.parts
+            );
+        }
+
+        let query_cost = clickhouse
+            .query_rows::<BackfillQueryRow>(
+                &format!(
+                    "SELECT\n\
+                       if(startsWith(query, 'INSERT INTO `{database_name}`.mcp_open_events'),\n\
+                         'mcp_open_events', 'mcp_open_turns') AS table,\n\
+                       toUInt64(count()) AS queries, toUInt64(sum(read_rows)) AS read_rows,\n\
+                       toUInt64(sum(read_bytes)) AS read_bytes, toUInt64(max(memory_usage)) AS peak_memory,\n\
+                       toUInt64(sum(query_duration_ms)) AS duration_ms\n\
+                     FROM system.query_log\n\
+                     WHERE type = 'QueryFinish' AND is_initial_query = 1\n\
+                       AND current_database = '{database_name}' AND query_kind = 'Insert'\n\
+                       AND (startsWith(query, 'INSERT INTO `{database_name}`.mcp_open_events')\n\
+                         OR startsWith(query, 'INSERT INTO `{database_name}`.mcp_open_turns'))\n\
+                     GROUP BY table ORDER BY table FORMAT JSONEachRow"
+                ),
+                Some(database.as_str()),
+            )
+            .await?;
+        assert_eq!(
+            query_cost
+                .iter()
+                .map(|row| row.table.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["mcp_open_events", "mcp_open_turns"]),
+            "query-log evidence must cover both child inserts"
+        );
+        for row in &query_cost {
+            assert_eq!(
+                row.queries, EXPECTED_BATCHES,
+                "{} should execute once per 64-session page",
+                row.table
+            );
+        }
+
+        let before_replay = (counts.projected_events, counts.projected_turns);
+        let mut crash_replay_ms = Vec::new();
+        for phase in [0_u8, 1, 2] {
+            clickhouse
+                .request_text(
+                    &format!(
+                        "INSERT INTO `{database_name}`.`mcp_open_backfill_plans`\n\
+                         (session_id, candidate_publication_id, slot, candidate_generation, source_revision,\n\
+                          dirty_revision, required_source_heads, required_heads_fingerprint, phase, plan_revision)\n\
+                         SELECT session_id, candidate_publication_id, slot, candidate_generation, source_revision,\n\
+                           dirty_revision, required_source_heads, required_heads_fingerprint, toUInt8({phase}),\n\
+                           generateSnowflakeID()\n\
+                         FROM `{database_name}`.`mcp_open_backfill_plans` FINAL"
+                    ),
+                    None,
+                    Some(database.as_str()),
+                    false,
+                    None,
+                )
+                .await?;
+            clickhouse
+                .request_text(
+                    &format!(
+                        "INSERT INTO `{database_name}`.`mcp_open_projection_state`\n\
+                         (state_key, ready, generation, backfill_cursor)\n\
+                         VALUES ('global', 0, generateSnowflakeID(), '')"
+                    ),
+                    None,
+                    Some(database.as_str()),
+                    false,
+                    None,
+                )
+                .await?;
+            let crash_replay_started = Instant::now();
+            clickhouse.backfill_mcp_open_read_model().await?;
+            crash_replay_ms.push((phase, crash_replay_started.elapsed().as_millis()));
+            let crash_replay_counts = clickhouse
+                .query_rows::<BackfillCountRow>(
+                    &format!(
+                        "SELECT toUInt64(0) AS projected_sessions,\n\
+                           (SELECT toUInt64(count()) FROM `{database_name}`.`mcp_open_events`) AS projected_events,\n\
+                           (SELECT toUInt64(count()) FROM `{database_name}`.`mcp_open_turns`) AS projected_turns,\n\
+                           toUInt64(0) AS completed_plans FORMAT JSONEachRow"
+                    ),
+                    Some(database.as_str()),
+                )
+                .await?
+                .into_iter()
+                .next()
+                .context("crash-boundary replay counts missing")?;
+            assert_eq!(
+                (
+                    crash_replay_counts.projected_events,
+                    crash_replay_counts.projected_turns
+                ),
+                before_replay,
+                "phase-{phase} recovery must not append child rows"
+            );
+        }
+
+        clickhouse
+            .request_text(
+                &format!(
+                    "INSERT INTO `{database_name}`.`mcp_open_projection_state`\n\
+                     (state_key, ready, generation, backfill_cursor)\n\
+                     VALUES ('global', 0, generateSnowflakeID(), '')"
+                ),
+                None,
+                Some(database.as_str()),
+                false,
+                None,
+            )
+            .await?;
+        let replay_started = Instant::now();
+        clickhouse.backfill_mcp_open_read_model().await?;
+        let replay_elapsed = replay_started.elapsed();
+        let replay_counts = clickhouse
+            .query_rows::<BackfillCountRow>(
+                &format!(
+                    "SELECT\n\
+                       toUInt64(0) AS projected_sessions,\n\
+                       (SELECT toUInt64(count()) FROM `{database_name}`.`mcp_open_events`) AS projected_events,\n\
+                       (SELECT toUInt64(count()) FROM `{database_name}`.`mcp_open_turns`) AS projected_turns,\n\
+                       toUInt64(0) AS completed_plans FORMAT JSONEachRow"
+                ),
+                Some(database.as_str()),
+            )
+            .await?
+            .into_iter()
+            .next()
+            .context("batched MCP replay counts missing")?;
+        assert_eq!(
+            (replay_counts.projected_events, replay_counts.projected_turns),
+            before_replay,
+            "idempotent historical replay must not append child rows"
+        );
+
+        eprintln!(
+            "{}",
+            json!({
+                "kind": "mcp_open_batched_backfill_resources",
+                "sessions": SESSIONS,
+                "events": EXPECTED_EVENTS,
+                "batches": EXPECTED_BATCHES,
+                "elapsed_ms": elapsed.as_millis(),
+                "replay_elapsed_ms": replay_elapsed.as_millis(),
+                "crash_replay_ms": crash_replay_ms,
+                "parts": parts,
+                "query_cost": query_cost,
+            })
+        );
+        Ok(())
+    }
+    .await;
+
+    let cleanup = cleanup_database(&clickhouse, &database).await;
+    let census =
+        assert_owned_database_census_empty(&clickhouse, "after batched-backfill cleanup").await;
     finish_with_cleanup(outcome, finish_with_cleanup(cleanup, census))
 }
 

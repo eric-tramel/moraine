@@ -27,6 +27,7 @@ Modes:
   analytics-parity  Run live_monitor_repository_semantic_parity exactly.
   source-publication
                     Run live_source_publication_cutover_crash_recovery exactly.
+  mcp-backfill      Run live_mcp_open_batched_backfill_resources exactly.
 
 Each invocation creates and owns a fresh sandbox, enables destructive tests
 only for the in-container Cargo process, retains a diagnostic log, and tears
@@ -45,6 +46,9 @@ case "$1" in
         ;;
     source-publication)
         test_function="live_source_publication_cutover_crash_recovery"
+        ;;
+    mcp-backfill)
+        test_function="live_mcp_open_batched_backfill_resources"
         ;;
     -h|--help)
         usage

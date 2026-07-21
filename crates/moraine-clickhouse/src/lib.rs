@@ -1058,6 +1058,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             name: "033_mcp_atomic_publication_bridge.sql",
             sql: include_str!("../../../sql/033_mcp_atomic_publication_bridge.sql"),
         },
+        Migration {
+            version: "034",
+            name: "034_batched_mcp_open_backfill.sql",
+            sql: include_str!("../../../sql/034_batched_mcp_open_backfill.sql"),
+        },
     ]
 }
 
@@ -2247,6 +2252,49 @@ mod tests {
         }
         assert!(!diagnostics.contains("FROM moraine.ingest_checkpoint_transitions FINAL"));
         assert!(!diagnostics.contains("FROM moraine.source_generation_publication_readiness FINAL"));
+    }
+
+    #[test]
+    fn migration_034_resets_only_the_incomplete_derived_mcp_model() {
+        let migration = bundled_migrations()
+            .into_iter()
+            .find(|migration| migration.version == "034")
+            .expect("migration 034 must be registered");
+        let sql = migration.sql;
+
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS moraine.mcp_open_backfill_plans"));
+        assert!(sql.contains("candidate_generation UInt64"));
+        assert!(sql.contains("phase UInt8"));
+        for derived in [
+            "mcp_open_events",
+            "mcp_open_turns",
+            "mcp_open_sessions",
+            "mcp_open_publication_headers",
+            "mcp_open_generation_readiness",
+            "mcp_open_backfill_plans",
+        ] {
+            assert!(
+                sql.contains(&format!("TRUNCATE TABLE moraine.{derived};")),
+                "034 must reset derived relation {derived}"
+            );
+        }
+        for canonical in [
+            "events",
+            "raw_events",
+            "search_documents",
+            "search_postings",
+        ] {
+            assert!(
+                !sql.contains(&format!("TRUNCATE TABLE moraine.{canonical};")),
+                "034 must preserve canonical relation {canonical}"
+            );
+        }
+        assert!(sql.contains("VALUES ('global', 0, generateSnowflakeID(), '')"));
+        assert!(
+            sql.find("VALUES ('global', 0, generateSnowflakeID(), '')")
+                < sql.find("TRUNCATE TABLE moraine.mcp_open_events;"),
+            "034 must fence readers before discarding derived rows"
+        );
     }
 
     #[test]
