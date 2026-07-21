@@ -122,6 +122,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
         State(state): State<Arc<MockState>>,
         Query(params): Query<HashMap<String, String>>,
         headers: HeaderMap,
+        body: String,
     ) -> (StatusCode, String) {
         if headers.get("content-length").is_none() {
             return (
@@ -130,7 +131,11 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             );
         }
 
-        let query = params.get("query").cloned().unwrap_or_default();
+        let query = params
+            .get("query")
+            .filter(|query| !query.is_empty())
+            .cloned()
+            .unwrap_or(body);
         // Publication capture/revalidation is repository infrastructure, not
         // part of the individual query scripts below. Keep the legacy
         // fixtures focused on the operation under test while returning one
@@ -256,6 +261,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             && query.contains("FINAL")
             && !query.contains("toUInt8(0) AS row_kind")
             && !query.contains("candidate_heads AS")
+            && !query.contains("current_headers AS")
         {
             let session_id = query
                 .split("s.session_id = '")
@@ -430,9 +436,9 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             );
         }
 
-        if query.contains("FROM `moraine`.`v_session_summary` AS s")
-            && query.contains("AS completed")
-            && query.contains("latest_terminal_payload_type")
+        if query.contains("FROM `moraine`.`mcp_open_publication_headers` AS h FINAL")
+            && query.contains("current_headers AS")
+            && query.contains("toUInt8(s.completed) AS completed")
         {
             if query.contains("s.session_id < 'sess_b'") {
                 return (
