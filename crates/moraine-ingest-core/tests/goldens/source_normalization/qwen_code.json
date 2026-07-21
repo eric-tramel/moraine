@@ -457,6 +457,7 @@
           "linked_external_id": "qwen-u1",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_event_version": "<event_version>",
           "source_name": "golden-qwen-code"
         },
         {
@@ -469,6 +470,7 @@
           "linked_external_id": "qwen-u1",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_event_version": "<event_version>",
           "source_name": "golden-qwen-code"
         },
         {
@@ -481,6 +483,7 @@
           "linked_external_id": "qwen-u1",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_event_version": "<event_version>",
           "source_name": "golden-qwen-code"
         },
         {
@@ -493,6 +496,7 @@
           "linked_external_id": "qwen-u1",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_event_version": "<event_version>",
           "source_name": "golden-qwen-code"
         }
       ],
@@ -535,6 +539,7 @@
           "project_id": "",
           "repo_rel_path": "",
           "session_id": "qwen-session-001",
+          "source_event_version": "<event_version>",
           "source_name": "golden-qwen-code",
           "source_ref": "/fixtures/qwen-code/session.jsonl:1:2",
           "tool_call_id": "qwen-call-search",
@@ -643,6 +648,7 @@
           "linked_external_id": "qwen-a1",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_event_version": "<event_version>",
           "source_name": "golden-qwen-code"
         }
       ],
@@ -685,6 +691,7 @@
           "project_id": "",
           "repo_rel_path": "",
           "session_id": "qwen-session-001",
+          "source_event_version": "<event_version>",
           "source_name": "golden-qwen-code",
           "source_ref": "/fixtures/qwen-code/session.jsonl:1:3",
           "tool_call_id": "qwen-call-search",
@@ -875,6 +882,7 @@
           "linked_external_id": "qwen-r1",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_event_version": "<event_version>",
           "source_name": "golden-qwen-code"
         },
         {
@@ -887,6 +895,7 @@
           "linked_external_id": "qwen-r1",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_event_version": "<event_version>",
           "source_name": "golden-qwen-code"
         }
       ],
@@ -929,6 +938,7 @@
           "project_id": "",
           "repo_rel_path": "",
           "session_id": "qwen-session-001",
+          "source_event_version": "<event_version>",
           "source_name": "golden-qwen-code",
           "source_ref": "/fixtures/qwen-code/session.jsonl:1:4",
           "tool_call_id": "qwen-call-fail",
@@ -1037,6 +1047,7 @@
           "linked_external_id": "qwen-a2",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_event_version": "<event_version>",
           "source_name": "golden-qwen-code"
         }
       ],
@@ -1079,6 +1090,7 @@
           "project_id": "",
           "repo_rel_path": "",
           "session_id": "qwen-session-001",
+          "source_event_version": "<event_version>",
           "source_name": "golden-qwen-code",
           "source_ref": "/fixtures/qwen-code/session.jsonl:1:5",
           "tool_call_id": "qwen-call-fail",
@@ -1187,6 +1199,7 @@
           "linked_external_id": "qwen-r2",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_event_version": "<event_version>",
           "source_name": "golden-qwen-code"
         }
       ],
@@ -1229,6 +1242,7 @@
           "project_id": "",
           "repo_rel_path": "",
           "session_id": "qwen-session-001",
+          "source_event_version": "<event_version>",
           "source_name": "golden-qwen-code",
           "source_ref": "/fixtures/qwen-code/session.jsonl:1:6",
           "tool_call_id": "qwen-r3",
@@ -1337,6 +1351,7 @@
           "linked_external_id": "qwen-a3",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_event_version": "<event_version>",
           "source_name": "golden-qwen-code"
         }
       ],
@@ -1379,6 +1394,7 @@
           "project_id": "",
           "repo_rel_path": "",
           "session_id": "qwen-session-001",
+          "source_event_version": "<event_version>",
           "source_name": "golden-qwen-code",
           "source_ref": "/fixtures/qwen-code/session.jsonl:1:7",
           "tool_call_id": "qwen-r3",
@@ -1485,6 +1501,7 @@
           "linked_external_id": "qwen-r3",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_event_version": "<event_version>",
           "source_name": "golden-qwen-code"
         }
       ],
@@ -1607,6 +1624,7 @@
           "linked_external_id": "qwen-title",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_event_version": "<event_version>",
           "source_name": "golden-qwen-code"
         }
       ],
@@ -1731,6 +1749,7 @@
           "linked_external_id": "qwen-compression",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_event_version": "<event_version>",
           "source_name": "golden-qwen-code"
         }
       ],
@@ -1855,6 +1874,7 @@
           "linked_external_id": "qwen-notification",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_event_version": "<event_version>",
           "source_name": "golden-qwen-code"
         }
       ],
@@ -1979,6 +1999,7 @@
           "linked_external_id": "qwen-cron",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_event_version": "<event_version>",
           "source_name": "golden-qwen-code"
         }
       ],
@@ -2103,6 +2124,7 @@
           "linked_external_id": "qwen-midturn",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_event_version": "<event_version>",
           "source_name": "golden-qwen-code"
         }
       ],
@@ -2225,6 +2247,7 @@
           "linked_external_id": "qwen-a1",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_event_version": "<event_version>",
           "source_name": "golden-qwen-code"
         }
       ],
@@ -2349,6 +2372,7 @@
           "linked_external_id": "qwen-rewind",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_event_version": "<event_version>",
           "source_name": "golden-qwen-code"
         }
       ],
@@ -2473,6 +2497,7 @@
           "linked_external_id": "qwen-replacement-u",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_event_version": "<event_version>",
           "source_name": "golden-qwen-code"
         }
       ],
@@ -2723,6 +2748,7 @@
           "linked_external_id": "qwen-replacement-a",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_event_version": "<event_version>",
           "source_name": "golden-qwen-code"
         }
       ],

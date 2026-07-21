@@ -23,6 +23,7 @@ moraine-config = { path = "../moraine-config" }
 
 [dev-dependencies]
 axum = "0.7"
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 moraine-monitor-core = { path = "../moraine-monitor-core" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "net", "time", "test-util"] }

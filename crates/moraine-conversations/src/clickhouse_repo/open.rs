@@ -592,13 +592,24 @@ FORMAT JSONEachRow",
             };
             let mut neighbors = match &row {
                 Some(row) => {
-                    let neighbor_uids =
-                        [row.previous_event_uid.clone(), row.next_event_uid.clone()]
-                            .into_iter()
-                            .filter(|event_uid| !event_uid.is_empty())
-                            .collect::<Vec<_>>();
-                    self.load_projected_event_refs(neighbor_uids, lookup.slot, lookup.generation)
-                        .await?
+                    let mut neighbor_orders = Vec::with_capacity(2);
+                    if !row.previous_event_uid.is_empty() {
+                        if let Some(previous_order) = row.event_order.checked_sub(1) {
+                            neighbor_orders.push(previous_order);
+                        }
+                    }
+                    if !row.next_event_uid.is_empty() {
+                        if let Some(next_order) = row.event_order.checked_add(1) {
+                            neighbor_orders.push(next_order);
+                        }
+                    }
+                    self.load_projected_event_refs_by_order(
+                        &row.session_id,
+                        neighbor_orders,
+                        lookup.slot,
+                        lookup.generation,
+                    )
+                    .await?
                 }
                 None => HashMap::new(),
             };
@@ -613,8 +624,14 @@ FORMAT JSONEachRow",
                 "mcp_open_event_load"
             );
 
-            let previous_event = neighbors.remove(&row.previous_event_uid);
-            let next_event = neighbors.remove(&row.next_event_uid);
+            let previous_event = row
+                .event_order
+                .checked_sub(1)
+                .and_then(|event_order| neighbors.remove(&event_order));
+            let next_event = row
+                .event_order
+                .checked_add(1)
+                .and_then(|event_order| neighbors.remove(&event_order));
             let event_type = row.event_type;
             let event_ordinal = row.event_ordinal;
             let event = TraceEvent {

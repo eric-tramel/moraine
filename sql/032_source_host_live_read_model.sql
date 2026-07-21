@@ -36,18 +36,19 @@ ALTER TABLE moraine.events
   );
 
 -- Event UIDs already include the source generation.  Appending the host keeps
--- identical UIDs from different shared-backend writers independent.  Derived
--- rows calculate event_version independently from their event row, so live
--- authorization below must use this generation-scoped identity rather than
--- relying on wall-clock millisecond equality.
+-- identical UIDs from different shared-backend writers independent.  A
+-- derived event_version remains its own replacement-order token;
+-- source_event_version binds it to the exact canonical event revision.
 ALTER TABLE moraine.event_links
   ADD COLUMN IF NOT EXISTS source_host String AFTER ingested_at,
+  ADD COLUMN IF NOT EXISTS source_event_version UInt64 DEFAULT 0 AFTER event_version,
   MODIFY ORDER BY (
     session_id, event_uid, link_type, linked_event_uid, source_host
   );
 
 ALTER TABLE moraine.tool_io
   ADD COLUMN IF NOT EXISTS source_host String AFTER ingested_at,
+  ADD COLUMN IF NOT EXISTS source_event_version UInt64 DEFAULT 0 AFTER event_version,
   MODIFY ORDER BY (
     session_id, tool_call_id, event_uid, source_host
   );
@@ -82,6 +83,102 @@ ALTER TABLE moraine.search_postings
     term, doc_id, source_host
   );
 
+-- Legacy derived rows used independently sampled wall-clock versions.  Bind
+-- each current derived replacement key to the closest event revision that was
+-- already present when the derived row was created.  A copied row increments
+-- only the derived replacement token so it wins FINAL while retaining the
+-- canonical owner revision separately.  Rows without a causal predecessor
+-- (including a reserved zero-version event) remain at source_event_version =
+-- 0 and therefore fail closed.  The zero filters also make a retry after
+-- response loss idempotent.
+INSERT INTO moraine.event_links
+  (ingested_at, source_host, event_uid, linked_event_uid, linked_external_id,
+   link_type, session_id, harness, inference_provider, source_name,
+   metadata_json, event_version, source_event_version)
+SELECT
+  l.ingested_at,
+  l.source_host,
+  l.event_uid,
+  l.linked_event_uid,
+  l.linked_external_id,
+  l.link_type,
+  l.session_id,
+  l.harness,
+  l.inference_provider,
+  l.source_name,
+  l.metadata_json,
+  l.event_version + toUInt64(1) AS event_version,
+  e.event_version AS source_event_version
+FROM
+(
+  SELECT *
+  FROM moraine.event_links FINAL
+  WHERE source_event_version = 0
+    AND event_version < toUInt64(18446744073709551615)
+) AS l
+ASOF INNER JOIN
+(
+  SELECT source_host, event_uid, event_version
+  FROM moraine.events FINAL
+  WHERE event_version > 0
+  ORDER BY source_host, event_uid, event_version
+) AS e
+  ON l.source_host = e.source_host
+ AND l.event_uid = e.event_uid
+ AND l.event_version >= e.event_version;
+
+INSERT INTO moraine.tool_io
+  (ingested_at, source_host, event_uid, session_id, harness,
+   inference_provider, source_name, tool_call_id, parent_tool_call_id,
+   tool_name, tool_phase, tool_error, input_json, output_json, output_text,
+   input_bytes, output_bytes, input_preview, output_preview, io_hash,
+   project_id, repo_rel_path, worktree_root, source_ref, event_version,
+   source_event_version)
+SELECT
+  t.ingested_at,
+  t.source_host,
+  t.event_uid,
+  t.session_id,
+  t.harness,
+  t.inference_provider,
+  t.source_name,
+  t.tool_call_id,
+  t.parent_tool_call_id,
+  t.tool_name,
+  t.tool_phase,
+  t.tool_error,
+  t.input_json,
+  t.output_json,
+  t.output_text,
+  t.input_bytes,
+  t.output_bytes,
+  t.input_preview,
+  t.output_preview,
+  t.io_hash,
+  t.project_id,
+  t.repo_rel_path,
+  t.worktree_root,
+  t.source_ref,
+  t.event_version + toUInt64(1) AS event_version,
+  e.event_version AS source_event_version
+FROM
+(
+  SELECT *
+  FROM moraine.tool_io FINAL
+  WHERE source_event_version = 0
+    AND event_version < toUInt64(18446744073709551615)
+) AS t
+ASOF INNER JOIN
+(
+  SELECT source_host, event_uid, event_version
+  FROM moraine.events FINAL
+  WHERE event_version > 0
+  ORDER BY source_host, event_uid, event_version
+) AS e
+  ON t.source_host = e.source_host
+ AND t.event_uid = e.event_uid
+ AND t.event_version >= e.event_version;
+
 -- The sole current-generation authorization relation.  Readiness and
 -- checkpoint status deliberately do not participate in this view.
 CREATE VIEW moraine.v_live_events AS
@@ -96,10 +193,9 @@ ALL INNER JOIN moraine.v_current_published_source_generations AS h
  AND e.source_file = h.source_file
  AND e.source_generation = h.source_generation;
 
--- `(source_host, event_uid)` is the publication authorization key for derived
--- relations because canonical event UID material includes source_generation.
--- A derived event_version is calculated independently and only orders its own
--- replacement rows; it is not a causal foreign key to events.event_version.
+-- Generation-qualified UID authorization is necessary but not sufficient for
+-- mutable stable UIDs: only a derived row bound to the current canonical event
+-- revision is live.
 CREATE VIEW moraine.v_live_event_links AS
 SELECT l.*
 FROM
@@ -108,11 +204,13 @@ FROM
 ) AS l
 ALL INNER JOIN
 (
-  SELECT source_host, event_uid
+  SELECT source_host, event_uid, event_version
   FROM moraine.v_live_events
 ) AS e
   ON l.source_host = e.source_host
- AND l.event_uid = e.event_uid;
+ AND l.event_uid = e.event_uid
+ AND l.source_event_version != 0
+ AND l.source_event_version = e.event_version;
 
 CREATE VIEW moraine.v_live_tool_io AS
 SELECT t.*
@@ -122,11 +220,13 @@ FROM
 ) AS t
 ALL INNER JOIN
 (
-  SELECT source_host, event_uid
+  SELECT source_host, event_uid, event_version
   FROM moraine.v_live_events
 ) AS e
   ON t.source_host = e.source_host
- AND t.event_uid = e.event_uid;
+ AND t.event_uid = e.event_uid
+ AND t.source_event_version != 0
+ AND t.source_event_version = e.event_version;
 
 CREATE MATERIALIZED VIEW moraine.mv_search_documents_from_events
 TO moraine.search_documents
@@ -363,9 +463,10 @@ SELECT
   toUInt32(1) AS event_freq
 FROM moraine.search_postings;
 
--- FINAL selects the latest document/tombstone version.  Its captured source
--- identity can therefore be authorized directly by the published head;
--- joining the much wider live-events relation is unnecessary.
+-- FINAL selects the latest document/tombstone version, which is live only
+-- when it was derived from the exact canonical event revision.  A document
+-- that merely shares the published generation is stale or orphaned and must
+-- fail closed instead of contributing text or BM25 statistics.
 CREATE VIEW moraine.v_live_search_documents AS
 SELECT d.*
 FROM
@@ -405,11 +506,14 @@ FROM
     has_codex_mcp
   FROM moraine.search_documents FINAL
 ) AS d
-ALL INNER JOIN moraine.v_current_published_source_generations AS h
-  ON d.source_host = h.source_host
- AND d.source_name = h.source_name
- AND d.source_file = h.source_file
- AND d.source_generation = h.source_generation
+ALL INNER JOIN
+(
+  SELECT source_host, event_uid, event_version
+  FROM moraine.v_live_events
+) AS e
+  ON d.source_host = e.source_host
+ AND d.event_uid = e.event_uid
+ AND d.doc_version = e.event_version
 WHERE d.doc_len > 0
   AND lengthUTF8(replaceRegexpAll(d.text_content, '\\s+', '')) > 0;
 

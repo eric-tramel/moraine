@@ -9,8 +9,9 @@ ALTER TABLE moraine.mcp_open_turns
   MODIFY ORDER BY (session_id, slot, turn_seq, candidate_generation);
 
 ALTER TABLE moraine.mcp_open_events
+  ADD COLUMN IF NOT EXISTS source_host String AFTER event_uid,
   ADD COLUMN IF NOT EXISTS candidate_generation UInt64 AFTER generation,
-  MODIFY ORDER BY (event_uid, slot, candidate_generation);
+  MODIFY ORDER BY (event_uid, slot, source_host, candidate_generation);
 
 CREATE TABLE IF NOT EXISTS moraine.mcp_open_publication_headers (
   session_id String,
@@ -192,21 +193,11 @@ FROM
       SELECT count()
       FROM moraine.publication_diagnostic_events FINAL
       WHERE active = 1 AND diagnostic_kind = 'legacy_host_ambiguity'
-    )) + toUInt64((
-      SELECT count()
-      FROM moraine.ingest_checkpoint_transitions FINAL
-      WHERE block_reason = 'legacy_equal_timestamp_ambiguity'
-    )) AS ambiguous_hostless_rows,
-    toUInt64((
-      SELECT count()
-      FROM moraine.ingest_checkpoint_transitions FINAL
-      WHERE lifecycle = 'replaying'
-    )) AS replaying_generations,
-    toUInt64((
-      SELECT count()
-      FROM moraine.source_generation_publication_readiness FINAL
-      WHERE block_reason != ''
-    )) AS blocked_generations,
+    )) + countIf(
+      checkpoint_block_reason = 'legacy_equal_timestamp_ambiguity'
+    ) AS ambiguous_hostless_rows,
+    countIf(checkpoint_lifecycle = 'replaying') AS replaying_generations,
+    countIf(readiness_block_reason != '') AS blocked_generations,
     toUInt64((
       SELECT count()
       FROM moraine.v_current_ingest_append_control
@@ -217,14 +208,31 @@ FROM
       FROM moraine.v_current_ingest_append_control
       WHERE state = 'blocked'
     )) AS blocked_append_preparations,
-    toUInt64((
-      SELECT count()
-      FROM moraine.source_generation_publication_readiness FINAL
-      WHERE complete = 1 AND backend_caught_up = 0
-    )) AS mirror_catchup_pending,
+    countIf(
+      readiness_complete = 1 AND readiness_backend_caught_up = 0
+    ) AS mirror_catchup_pending,
     toUInt64((
       SELECT count()
       FROM moraine.publication_diagnostic_events FINAL
       WHERE active = 1 AND diagnostic_kind = 'writer_conflict'
     )) AS writer_conflicts
+  FROM
+  (
+    -- A historical generation remains durable for audit and as-of recovery,
+    -- but it must stop affecting current health as soon as a newer checkpoint
+    -- generation supersedes it.  Readiness is therefore authorized by the
+    -- exact generation selected by the current checkpoint tuple.
+    SELECT
+      checkpoint.lifecycle AS checkpoint_lifecycle,
+      checkpoint.block_reason AS checkpoint_block_reason,
+      readiness.block_reason AS readiness_block_reason,
+      readiness.complete AS readiness_complete,
+      readiness.backend_caught_up AS readiness_backend_caught_up
+    FROM moraine.v_current_ingest_checkpoint_transitions AS checkpoint
+    LEFT JOIN moraine.v_current_source_generation_publication_readiness AS readiness
+      ON readiness.source_host = checkpoint.host
+     AND readiness.source_name = checkpoint.source_name
+     AND readiness.source_file = checkpoint.source_file
+     AND readiness.source_generation = checkpoint.source_generation
+  ) AS current_source_state
 );

@@ -293,6 +293,7 @@
           "linked_external_id": "/workspace/src/main.rs",
           "metadata_json": "{\"field_path\":\"$.input.path\",\"reference_kind\":\"file\",\"references\":[{\"field_path\":\"$.input.path\",\"reference_kind\":\"file\",\"target\":\"/workspace/src/main.rs\"},{\"field_path\":\"$.input.range\",\"reference_kind\":\"code\",\"target\":\"1:1-20:1\"},{\"field_path\":\"$.input.symbol\",\"reference_kind\":\"code\",\"target\":\"main\"}],\"source\":\"cursor\"}",
           "session_id": "11111111-2222-4333-8444-555555555555",
+          "source_event_version": "<event_version>",
           "source_name": "golden-cursor"
         }
       ],
@@ -335,6 +336,7 @@
           "project_id": "",
           "repo_rel_path": "",
           "session_id": "11111111-2222-4333-8444-555555555555",
+          "source_event_version": "<event_version>",
           "source_name": "golden-cursor",
           "source_ref": "/fixtures/cursor/projects/demo/agent-transcripts/11111111-2222-4333-8444-555555555555/11111111-2222-4333-8444-555555555555.jsonl:1:2",
           "tool_call_id": "cursor-tool-fixture",
@@ -472,6 +474,7 @@
           "project_id": "",
           "repo_rel_path": "",
           "session_id": "11111111-2222-4333-8444-555555555555",
+          "source_event_version": "<event_version>",
           "source_name": "golden-cursor",
           "source_ref": "/fixtures/cursor/projects/demo/agent-transcripts/11111111-2222-4333-8444-555555555555/11111111-2222-4333-8444-555555555555.jsonl:1:3",
           "tool_call_id": "cursor-tool-fixture",

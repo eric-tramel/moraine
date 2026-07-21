@@ -1229,6 +1229,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "futures-util",
  "moraine-clickhouse",
  "moraine-config",
  "moraine-monitor-core",

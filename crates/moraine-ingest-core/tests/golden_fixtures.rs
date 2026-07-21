@@ -500,6 +500,9 @@ fn redact_dynamic(mut value: Value) -> Value {
             if obj.contains_key("event_version") {
                 obj.insert("event_version".to_string(), json!("<event_version>"));
             }
+            if obj.contains_key("source_event_version") {
+                obj.insert("source_event_version".to_string(), json!("<event_version>"));
+            }
             for nested in obj.values_mut() {
                 redact_dynamic_in_place(nested);
             }
@@ -519,6 +522,9 @@ fn redact_dynamic_in_place(value: &mut Value) {
         Value::Object(obj) => {
             if obj.contains_key("event_version") {
                 obj.insert("event_version".to_string(), json!("<event_version>"));
+            }
+            if obj.contains_key("source_event_version") {
+                obj.insert("source_event_version".to_string(), json!("<event_version>"));
             }
             for nested in obj.values_mut() {
                 redact_dynamic_in_place(nested);
@@ -887,7 +893,7 @@ fn assert_link_row_shape(
     row: &Value,
     context: &str,
     link_domain: &HashSet<String>,
-    event_uids: &HashSet<String>,
+    event_versions: &HashMap<String, u64>,
 ) {
     for field in [
         "event_uid",
@@ -903,12 +909,18 @@ fn assert_link_row_shape(
         assert_string(row, field, context);
     }
     assert_u64(row, "event_version", context);
+    assert_u64(row, "source_event_version", context);
     assert_domain(row, "link_type", link_domain, context);
 
     let event_uid = row.get("event_uid").and_then(Value::as_str).unwrap();
     assert!(
-        event_uids.contains(event_uid),
+        event_versions.contains_key(event_uid),
         "{context}.event_uid `{event_uid}` must point at an emitted event"
+    );
+    assert_eq!(
+        row.get("source_event_version").and_then(Value::as_u64),
+        event_versions.get(event_uid).copied(),
+        "{context}.source_event_version must bind the exact owner event revision"
     );
     let linked_event_uid = row.get("linked_event_uid").and_then(Value::as_str).unwrap();
     let linked_external_id = row
@@ -926,13 +938,13 @@ fn assert_link_row_shape(
             "{context} event links must not also carry an external id"
         );
         assert!(
-            event_uids.contains(linked_event_uid),
+            event_versions.contains_key(linked_event_uid),
             "{context}.linked_event_uid `{linked_event_uid}` must point at an emitted event"
         );
     }
 }
 
-fn assert_tool_row_shape(row: &Value, context: &str, event_uids: &HashSet<String>) {
+fn assert_tool_row_shape(row: &Value, context: &str, event_versions: &HashMap<String, u64>) {
     for field in [
         "event_uid",
         "session_id",
@@ -961,13 +973,19 @@ fn assert_tool_row_shape(row: &Value, context: &str, event_uids: &HashSet<String
         "output_bytes",
         "io_hash",
         "event_version",
+        "source_event_version",
     ] {
         assert_u64(row, field, context);
     }
     let event_uid = row.get("event_uid").and_then(Value::as_str).unwrap();
     assert!(
-        event_uids.contains(event_uid),
+        event_versions.contains_key(event_uid),
         "{context}.event_uid `{event_uid}` must point at an emitted event"
+    );
+    assert_eq!(
+        row.get("source_event_version").and_then(Value::as_u64),
+        event_versions.get(event_uid).copied(),
+        "{context}.source_event_version must bind the exact owner event revision"
     );
     let phase = row.get("tool_phase").and_then(Value::as_str).unwrap();
     assert!(
@@ -1048,16 +1066,22 @@ fn assert_source_contract(
 
     for (record_idx, record) in records.iter().enumerate() {
         let context = format!("{} record {record_idx}", case.name);
-        let event_uids = record
+        let event_versions = record
             .event_rows
             .iter()
             .map(|row| {
-                row.get("event_uid")
+                let event_uid = row
+                    .get("event_uid")
                     .and_then(Value::as_str)
                     .unwrap_or_else(|| panic!("{context} event row missing event_uid"))
-                    .to_string()
+                    .to_string();
+                let event_version = row
+                    .get("event_version")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_else(|| panic!("{context} event row missing event_version"));
+                (event_uid, event_version)
             })
-            .collect::<HashSet<_>>();
+            .collect::<HashMap<_, _>>();
 
         if !record.raw_row.is_null() {
             saw_raw = true;
@@ -1098,12 +1122,16 @@ fn assert_source_contract(
                 row,
                 &format!("{context}.link_rows[{row_idx}]"),
                 link_domain,
-                &event_uids,
+                &event_versions,
             );
         }
 
         for (row_idx, row) in record.tool_rows.iter().enumerate() {
-            assert_tool_row_shape(row, &format!("{context}.tool_rows[{row_idx}]"), &event_uids);
+            assert_tool_row_shape(
+                row,
+                &format!("{context}.tool_rows[{row_idx}]"),
+                &event_versions,
+            );
         }
 
         for (row_idx, row) in record.error_rows.iter().enumerate() {
@@ -1134,9 +1162,9 @@ fn nac_sql_fixture_is_pinned_and_inspectable() {
 
 #[test]
 fn source_normalization_golden_fixtures_are_stable() {
-    // Only `event_version` is redacted. UIDs, source refs, timestamps, token
-    // maps, links, tool phases, model/provider fields, hints, and row counts
-    // remain part of the committed snapshot.
+    // Causal and derived row versions are redacted. UIDs, source refs,
+    // timestamps, token maps, links, tool phases, model/provider fields,
+    // hints, and row counts remain part of the committed snapshot.
     let plan = golden_update_plan_from_env().unwrap_or_else(|err| panic!("{err}"));
     let cases = golden_cases();
     assert_known_harness_fixture_coverage(&cases);

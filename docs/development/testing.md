@@ -148,7 +148,7 @@ the wrapper-owned sandbox.
 | --- | --- | --- | --- |
 | `moraine-conversations/live_clickhouse::live_schema_semantics_and_teardown` | `scripts/dev/sandbox/run-live-test analytics-schema`; raw: `cargo test -p moraine-conversations --test live_clickhouse --locked live_schema_semantics_and_teardown -- --exact --ignored --nocapture` | Bash, Docker/Compose, sandbox toolchain. Default wrapper timeout 1,800s (`MORAINE_LIVE_TEST_TIMEOUT_SECONDS` accepts a positive integer). Wrapper owns a fresh `sb-xxxxxx` sandbox and Rust generates an uncaller-controlled `moraine_test_<uuid>` database. Empty, `moraine`, or non-prefix names are refused before SQL. | T3 manual/scheduled. Direct missing/unsafe prerequisites fail. Success and every catchable failure with successful cleanup leave no owned sandbox/database. |
 | `moraine-conversations/live_clickhouse::live_monitor_repository_semantic_parity` | `scripts/dev/sandbox/run-live-test analytics-parity`; raw: `cargo test -p moraine-conversations --test live_clickhouse --locked live_monitor_repository_semantic_parity -- --exact --ignored --nocapture` | Same owned sandbox; both arms use the same generated database/dataset. Cardinality, digest, or oracle mismatch fails independently of timing. | T3 unless the same semantics are already proven in T1. Timing is not the pass condition. |
-| `moraine-conversations/live_clickhouse::live_source_publication_cutover_crash_recovery` | `scripts/dev/sandbox/run-live-test source-publication`; raw: `cargo test -p moraine-conversations --test live_clickhouse --locked live_source_publication_cutover_crash_recovery -- --exact --ignored --nocapture` | Same owned sandbox and generated database. The fixture exercises g1/g2 cutover, causal checkpoint selection, stale-reader revalidation, and head/append response-loss idempotency. It uses newly constructed writer clients for each protocol stage and reconstructs a fresh ClickHouse HTTP client plus repository with empty in-memory caches after durable replaying-checkpoint/physical-row staging, compatibility preparation, final checkpoint persistence, final readiness persistence, source-head insertion before compatibility activation, the identical-head retry, and post-activation. It pins the physical and candidate cardinalities, rejects pre-head activation, verifies the legacy pointer separately, and requires every reconstructed reader to observe an old-complete or new-complete model while emitting content-free control evidence. This is deterministic durable-state/client/repository restart injection; it neither instantiates the production `PublicationActor` nor sends a process `SIGKILL`. Runner `SIGKILL` cleanup behavior is covered separately below. | T3 manual/scheduled and required for source-publication, checkpoint, liveness-view, or publication-consistency changes. Direct failure is fail; wrapper cleanup rules are identical to the other live modes. |
+| `moraine-conversations/live_clickhouse::live_source_publication_cutover_crash_recovery` | `scripts/dev/sandbox/run-live-test source-publication`; raw inside the wrapper-owned sandbox: `MORAINE_LIVE_TEST_INGEST_BIN=/opt/moraine/bin/moraine-ingest cargo test -p moraine-conversations --test live_clickhouse --locked live_source_publication_cutover_crash_recovery -- --exact --ignored --nocapture` | Same owned sandbox and generated database. A pre-cutover layer builds the actual schema through migration 030, seeds default-local, named shared, equal-timestamp checkpoint, hostless event, and legacy MCP-control rows, then applies 031–033 with the production runner. It measures the upgrade, forces an idempotent 031 replay, compares raw control-table counts and causal tuples, and proves default-local visibility while shared hostless rows fail closed. The database is then reset. The deterministic layer reconstructs fresh ClickHouse clients and repositories with empty caches across every durable publication stage, pins physical/candidate cardinality, and rejects mixed old/new models. The process layer launches the wrapper-built production `moraine-ingest` binary with one persistent state directory behind a loopback commit-then-drop ClickHouse proxy. It atomically replaces an owned JSONL source, drops acknowledged responses only after the upstream synchronous insert commits, sends real process `SIGKILL`, and restarts the same binary/state. It covers replaying checkpoint boundaries `last_line=0..4`, every pre-head physical/compatibility/final-control stage, and a committed source-head response loss, requiring the causal checkpoint/readiness tuple, source-head history, live model, and exact legacy candidate pointer to recover without an extra publication revision. No production fault hook is compiled or configured. | T3 manual/scheduled and required for source-publication, checkpoint, liveness-view, or publication-consistency changes. Direct failure is fail; wrapper cleanup rules are identical to the other live modes. |
 | `moraine-conversations/live_clickhouse::live_mcp_open_boundedness_benchmark` | Raw: `cargo test -p moraine-conversations --test live_clickhouse --locked live_mcp_open_boundedness_benchmark -- --exact --ignored --nocapture` inside a caller-owned sandbox | Same owned database guard and cleanup. Opens separate realistic targets spanning 100 turns, 500 full-payload events, and a 1,000-event compact turn; then seeds 100,000 unrelated sessions and 1,000,000 substantial unrelated events into both canonical `events` and the bounded MCP read model. Compares exact session/turn/event semantics before and after growth, exercises sequential/concurrent/recovery opens, and records labeled `system.query_log` latency, throughput, errors, rows, bytes, and memory. Fails on SLA misses, errors, semantic drift, or corpus-linear row/byte/memory growth. Requires about 2 GB free. | T3 manual regression benchmark. Timing and bounded-cost assertions are pass conditions. |
 
 Each wrapper run records its sandbox ID, exact Cargo command, generated database and a
@@ -379,6 +379,14 @@ python3 scripts/bench/performance_suite.py source-publication-append-probe \
   --mode local --repo <clean-candidate-worktree> --samples 100 \
   --p95-limit-ms 2000 \
   --output target/bench/performance/source-publication-append
+
+# Candidate-only replacement replay/resource capture for issue #602. The
+# default fixture replaces one one-event generation with 2,500 events in one
+# session so production ingest must flush at least two replay batches.
+python3 scripts/bench/performance_suite.py source-publication-replay-probe \
+  --mode local --repo <clean-candidate-worktree> --events 2500 \
+  --timeout-seconds 180 \
+  --output target/bench/performance/source-publication-replay
 ```
 
 The native central burst is a T3 manual native regression probe, not a substitute
@@ -423,6 +431,33 @@ history receives zero append writes. Local mode is explicitly non-authoritative;
 The run-level CPU and memory counters cover both bounded capture-scaling and
 append phases; they are not presented as append-only process costs.
 
+The replay probe is the dedicated replacement/resource capture for issue #602.
+It builds the pinned candidate, owns a fresh performance sandbox, publishes a
+one-event generation, then atomically renames a file-fsynced 2,500-event
+single-session replacement over the same path. Its wall-time boundary starts
+immediately before the durable rename and ends only after generation 2 and its
+legacy MCP compatibility row are visible. Content-free ingest ACK observations
+count actual replay flush batches. ClickHouse query-log `QueryFinish` rows for
+`mcp_open_sessions` classify the one candidate activation reconciliation and
+reject any additional per-chunk refresh. The artifact is
+`source-publication-replay-probe.json` and records raw batch sequences, affected
+and prepared session counts, exact generation/checkpoint/readiness states, and
+before/after/delta rows, active parts, compressed bytes, and bytes on disk for
+the physical data, publication-control, and MCP compatibility tables. Net
+`bytes_on_disk` growth is reported per retained inactive generation; those rows
+are persistent and reclamation remains #603.
+
+Process CPU is the `moraine-ingest` `/proc/<pid>/stat` delta. Process disk I/O is
+the `/proc/<pid>/io` delta when readable. Replay-window peak RSS is reported only
+when the process lifetime `VmHWM` advances during the bounded replacement; if it
+does not, the measured equal before/after high-water bound is retained and the
+peak is explicitly unavailable. In authoritative mode the probe additionally
+resets and captures the owned cgroup-v2 CPU, peak-memory, throttling, and
+`io.stat` window. Local mode preserves the same topology but labels cgroup
+throttling and block-I/O unavailable rather than treating sentinel zeroes as
+measurements. The generation wait uses a fixed 50 ms publication-state poll, so
+the artifact records that observer interval alongside the timeout.
+
 ### Atomic source-publication PR report
 
 An issue #602 PR records the following in its description; omitted or unavailable
@@ -436,7 +471,7 @@ measurements are labeled as such rather than inferred:
   `source-publication-append-probe.json`;
 - replacement replay wall time, process CPU, peak RSS, throttling/disk bytes,
   replay-batch count, and compatibility refresh count (one activation refresh,
-  none per chunk) from a dedicated replay/resource capture; the acceptance
+  none per chunk) from `source-publication-replay-probe.json`; the acceptance
   fixture supplies migration/control-storage evidence, not process metrics;
 - migration/backfill duration and control-table rows, active parts, and
   compressed bytes for source-head history, causal checkpoints, append control,

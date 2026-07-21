@@ -1854,6 +1854,62 @@ mod tests {
         }
         assert!(sql.contains("CREATE VIEW moraine.v_live_events"));
         assert!(sql.contains("CREATE VIEW moraine.v_live_search_documents"));
+        for table in ["event_links", "tool_io"] {
+            let column = format!(
+                "ALTER TABLE moraine.{table}\n  ADD COLUMN IF NOT EXISTS source_host String AFTER ingested_at,\n  ADD COLUMN IF NOT EXISTS source_event_version UInt64 DEFAULT 0 AFTER event_version"
+            );
+            assert!(
+                sql.contains(&column),
+                "032 must add a fail-closed causal event version to {table}"
+            );
+        }
+        let link_backfill = sql
+            .split_once("INSERT INTO moraine.event_links")
+            .and_then(|(_, tail)| {
+                tail.split_once("INSERT INTO moraine.tool_io")
+                    .map(|(backfill, _)| backfill)
+            })
+            .expect("032 must backfill causal link versions before tool versions");
+        let tool_backfill = sql
+            .split_once("INSERT INTO moraine.tool_io")
+            .and_then(|(_, tail)| {
+                tail.split_once("-- The sole current-generation authorization relation")
+                    .map(|(backfill, _)| backfill)
+            })
+            .expect("032 must backfill causal tool versions before live views");
+        for (relation, backfill) in [("event_links", link_backfill), ("tool_io", tool_backfill)] {
+            assert!(backfill.contains("source_event_version = 0"));
+            assert!(backfill.contains("event_version + toUInt64(1) AS event_version"));
+            assert!(backfill.contains("e.event_version AS source_event_version"));
+            assert!(backfill.contains("ASOF INNER JOIN"));
+            assert!(backfill.contains("event_version >= e.event_version"));
+            assert!(
+                backfill.contains("WHERE event_version > 0"),
+                "032 must not bind reserved zero-version owners for {relation}"
+            );
+            assert!(
+                backfill.contains("FROM moraine.events FINAL"),
+                "032 must bind legacy {relation} rows to canonical FINAL events"
+            );
+        }
+        let live_links_view = sql
+            .split_once("CREATE VIEW moraine.v_live_event_links AS")
+            .and_then(|(_, tail)| {
+                tail.split_once("CREATE VIEW moraine.v_live_tool_io AS")
+                    .map(|(view, _)| view)
+            })
+            .expect("032 must define live event links");
+        let live_tools_view = sql
+            .split_once("CREATE VIEW moraine.v_live_tool_io AS")
+            .and_then(|(_, tail)| {
+                tail.split_once("CREATE MATERIALIZED VIEW moraine.mv_search_documents_from_events")
+                    .map(|(view, _)| view)
+            })
+            .expect("032 must define live tool IO");
+        assert!(live_links_view.contains("l.source_event_version = e.event_version"));
+        assert!(live_tools_view.contains("t.source_event_version = e.event_version"));
+        assert!(live_links_view.contains("l.source_event_version != 0"));
+        assert!(live_tools_view.contains("t.source_event_version != 0"));
         assert!(
             !sql.contains("ANY INNER JOIN"),
             "032 authorization joins must preserve every matching left-side row"
@@ -1952,6 +2008,25 @@ mod tests {
         );
         assert!(!sql.contains("ANY INNER JOIN"));
         assert!(!sql.contains("\nINNER JOIN"));
+        let dirty_sessions_mv = sql
+            .split_once("CREATE MATERIALIZED VIEW moraine.mv_mcp_open_dirty_sessions_from_events")
+            .map(|(_, tail)| tail)
+            .expect("032 must replace the MCP dirty-session materialized view");
+        assert!(dirty_sessions_mv.contains("FROM moraine.events AS e"));
+        assert!(dirty_sessions_mv
+            .contains("ALL INNER JOIN moraine.v_current_published_source_generations AS h"));
+        for identity in [
+            "e.source_host = h.source_host",
+            "e.source_name = h.source_name",
+            "e.source_file = h.source_file",
+            "e.source_generation = h.source_generation",
+        ] {
+            assert!(
+                dirty_sessions_mv.contains(identity),
+                "032 must not dirty MCP sessions for an unpublished replay: missing `{identity}`"
+            );
+        }
+        assert!(dirty_sessions_mv.contains("GROUP BY e.session_id"));
         let live_documents_view = sql
             .split_once("CREATE VIEW moraine.v_live_search_documents AS")
             .and_then(|(_, tail)| {
@@ -1959,18 +2034,15 @@ mod tests {
                     .map(|(view, _)| view)
             })
             .expect("032 must define a bounded live search-document view");
-        assert!(live_documents_view
-            .contains("ALL INNER JOIN moraine.v_current_published_source_generations AS h"));
-        assert!(!live_documents_view.contains("moraine.v_live_events"));
+        assert!(live_documents_view.contains("FROM moraine.v_live_events"));
         for identity in [
-            "d.source_host = h.source_host",
-            "d.source_name = h.source_name",
-            "d.source_file = h.source_file",
-            "d.source_generation = h.source_generation",
+            "d.source_host = e.source_host",
+            "d.event_uid = e.event_uid",
+            "d.doc_version = e.event_version",
         ] {
             assert!(
                 live_documents_view.contains(identity),
-                "032 live search documents must authorize `{identity}`"
+                "032 live search documents must authorize exact event identity `{identity}`"
             );
         }
         assert!(live_documents_view.contains("WHERE d.doc_len > 0"));
@@ -2019,8 +2091,11 @@ mod tests {
             .expect("migration 033 must be registered");
         let sql = migration.sql;
 
+        assert!(sql.contains("ADD COLUMN IF NOT EXISTS source_host String AFTER event_uid"));
         assert!(sql.contains("ADD COLUMN IF NOT EXISTS candidate_generation UInt64"));
-        assert!(sql.contains("MODIFY ORDER BY (event_uid, slot, candidate_generation)"));
+        assert!(
+            sql.contains("MODIFY ORDER BY (event_uid, slot, source_host, candidate_generation)")
+        );
         assert!(sql.contains("MODIFY ORDER BY (session_id, slot, turn_seq, candidate_generation)"));
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS moraine.mcp_open_publication_headers"));
         assert!(sql.contains("ORDER BY (session_id, candidate_publication_id)"));
@@ -2028,6 +2103,38 @@ mod tests {
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS moraine.mcp_open_generation_readiness"));
         assert!(sql.contains("VALUES ('global', 0, generateSnowflakeID(), '')"));
         assert!(sql.contains("blocked_append_preparations"));
+    }
+
+    #[test]
+    fn migration_033_diagnostics_only_count_current_checkpoint_generations() {
+        let migration = bundled_migrations()
+            .into_iter()
+            .find(|migration| migration.version == "033")
+            .expect("migration 033 must be registered");
+        let diagnostics = migration
+            .sql
+            .split_once("CREATE VIEW moraine.v_publication_diagnostics AS")
+            .map(|(_, diagnostics)| diagnostics)
+            .expect("033 must install publication diagnostics");
+
+        assert!(diagnostics
+            .contains("FROM moraine.v_current_ingest_checkpoint_transitions AS checkpoint"));
+        assert!(diagnostics.contains(
+            "LEFT JOIN moraine.v_current_source_generation_publication_readiness AS readiness"
+        ));
+        for identity in [
+            "readiness.source_host = checkpoint.host",
+            "readiness.source_name = checkpoint.source_name",
+            "readiness.source_file = checkpoint.source_file",
+            "readiness.source_generation = checkpoint.source_generation",
+        ] {
+            assert!(
+                diagnostics.contains(identity),
+                "033 diagnostics must authorize readiness with `{identity}`"
+            );
+        }
+        assert!(!diagnostics.contains("FROM moraine.ingest_checkpoint_transitions FINAL"));
+        assert!(!diagnostics.contains("FROM moraine.source_generation_publication_readiness FINAL"));
     }
 
     #[test]

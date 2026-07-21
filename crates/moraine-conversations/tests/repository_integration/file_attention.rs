@@ -7,22 +7,25 @@ async fn file_attention_clamps_its_query_budget_to_the_request_deadline() {
     with_repository_query_deadline(
         "test-file-attention-deadline".to_string(),
         tokio::time::Instant::now() + Duration::from_secs(2),
-        repo.file_attention(FileAttentionQuery {
-            cancellation_token: "test-file-attention-deadline".to_string(),
-            rel: "crates/foo.rs".to_string(),
-            normalized_project_id: Some("project-a".to_string()),
-            normalized_project_roots: vec!["/worktree-a".to_string()],
-            derive_legacy_roots: true,
-            apply_project_scope: true,
-            start_unix_ms: None,
-            end_unix_ms: None,
-            harness: None,
-            source_name: None,
-            tool: None,
-            mutations_only: false,
-            max_rows: 10,
-            execution_budget_secs: 4,
-        }),
+        ConversationRepository::file_attention(
+            &repo,
+            FileAttentionQuery {
+                cancellation_token: "test-file-attention-deadline".to_string(),
+                rel: "crates/foo.rs".to_string(),
+                normalized_project_id: Some("project-a".to_string()),
+                normalized_project_roots: vec!["/worktree-a".to_string()],
+                derive_legacy_roots: true,
+                apply_project_scope: true,
+                start_unix_ms: None,
+                end_unix_ms: None,
+                harness: None,
+                source_name: None,
+                tool: None,
+                mutations_only: false,
+                max_rows: 10,
+                execution_budget_secs: 4,
+            },
+        ),
     )
     .await
     .expect("deadline-scoped file attention succeeds");
@@ -40,6 +43,15 @@ async fn file_attention_clamps_its_query_budget_to_the_request_deadline() {
         assert!(remaining > 0.0 && remaining <= 2.0);
         assert_eq!(params["timeout_overflow_mode"], "throw");
     }
+    drop(request_params);
+
+    let snapshot_queries = state
+        .publication_snapshot_queries
+        .lock()
+        .expect("publication snapshot query lock");
+    assert_eq!(snapshot_queries.len(), 2);
+    assert!(snapshot_queries[0].contains("moraine:publication_snapshot:capture"));
+    assert!(snapshot_queries[1].contains("moraine:publication_snapshot:revalidate"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -149,19 +161,20 @@ async fn file_attention_merges_normalized_exact_lookup_with_suffix_fallback() {
             "legacy root guard must reject {fragment}: {fallback_query}"
         );
     }
+
+    let snapshot_queries = state
+        .publication_snapshot_queries
+        .lock()
+        .expect("publication snapshot query lock");
+    assert_eq!(snapshot_queries.len(), 2);
+    assert!(snapshot_queries[0].contains("moraine:publication_snapshot:capture"));
+    assert!(snapshot_queries[1].contains("moraine:publication_snapshot:revalidate"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn file_attention_project_scope_recovers_durable_only_deleted_root() {
     let responses = vec![
         ScriptedResponse::rows(&["repo_rel_path = 'crates/foo.rs'"], json!([])),
-        ScriptedResponse::raw(
-            &[
-                "INSERT INTO `moraine`.`file_attention_project_roots`",
-                "arrayJoin(['/worktree-a'])",
-            ],
-            "",
-        ),
         ScriptedResponse::rows(
             &[
                 "NOT startsWith(ti.project_id, 'git:')",
@@ -190,11 +203,19 @@ async fn file_attention_project_scope_recovers_durable_only_deleted_root() {
                 "output_preview": ""
             }]),
         ),
+        ScriptedResponse::raw(
+            &[
+                "INSERT INTO `moraine`.`file_attention_project_roots`",
+                "arrayJoin(['/worktree-a'])",
+            ],
+            "",
+        ),
     ];
     let (repo, _state) = build_scripted_repo(responses).await;
 
-    let touches = repo
-        .file_attention(FileAttentionQuery {
+    let touches = ConversationRepository::file_attention(
+        &repo,
+        FileAttentionQuery {
             cancellation_token: "test-file-attention-pre-digest".to_string(),
             rel: "crates/foo.rs".to_string(),
             normalized_project_id: Some("git:new-project-id".to_string()),
@@ -209,9 +230,10 @@ async fn file_attention_project_scope_recovers_durable_only_deleted_root() {
             mutations_only: false,
             max_rows: 10,
             execution_budget_secs: 3,
-        })
-        .await
-        .expect("durably mapped deleted root remains visible during migration");
+        },
+    )
+    .await
+    .expect("durably mapped deleted root remains visible during migration");
 
     assert_eq!(touches.len(), 1);
     assert_eq!(touches[0].session_id, "sess-pre-digest");
@@ -222,13 +244,6 @@ async fn file_attention_project_scope_recovers_durable_only_deleted_root() {
 async fn file_attention_project_scope_excludes_unmapped_pruned_legacy_root() {
     let responses = vec![
         ScriptedResponse::rows(&["repo_rel_path = 'crates/foo.rs'"], json!([])),
-        ScriptedResponse::raw(
-            &[
-                "INSERT INTO `moraine`.`file_attention_project_roots`",
-                "arrayJoin(['/worktree-a'])",
-            ],
-            "",
-        ),
         ScriptedResponse::rows(
             &[
                 "has(project_roots, ti.worktree_root)",
@@ -238,11 +253,19 @@ async fn file_attention_project_scope_excludes_unmapped_pruned_legacy_root() {
             json!([]),
         )
         .forbidding(&["'/worktree-b'"]),
+        ScriptedResponse::raw(
+            &[
+                "INSERT INTO `moraine`.`file_attention_project_roots`",
+                "arrayJoin(['/worktree-a'])",
+            ],
+            "",
+        ),
     ];
     let (repo, _state) = build_scripted_repo(responses).await;
 
-    let touches = repo
-        .file_attention(FileAttentionQuery {
+    let touches = ConversationRepository::file_attention(
+        &repo,
+        FileAttentionQuery {
             cancellation_token: "test-file-attention-unmapped-pruned".to_string(),
             rel: "crates/foo.rs".to_string(),
             normalized_project_id: Some("git:new-project-id".to_string()),
@@ -257,9 +280,10 @@ async fn file_attention_project_scope_excludes_unmapped_pruned_legacy_root() {
             mutations_only: false,
             max_rows: 10,
             execution_budget_secs: 3,
-        })
-        .await
-        .expect("unmappable pruned history must fail closed");
+        },
+    )
+    .await
+    .expect("unmappable pruned history must fail closed");
 
     assert!(touches.is_empty());
 }
@@ -268,22 +292,25 @@ async fn file_attention_project_scope_excludes_unmapped_pruned_legacy_root() {
 async fn file_attention_all_scope_is_the_only_unscoped_widening_path() {
     let (repo, state) = build_repo().await;
 
-    repo.file_attention(FileAttentionQuery {
-        cancellation_token: "test-file-attention-all".to_string(),
-        rel: "crates/foo.rs".to_string(),
-        normalized_project_id: Some("project-a".to_string()),
-        normalized_project_roots: vec!["/worktree-a".to_string()],
-        derive_legacy_roots: true,
-        apply_project_scope: false,
-        start_unix_ms: None,
-        end_unix_ms: None,
-        harness: None,
-        source_name: None,
-        tool: None,
-        mutations_only: false,
-        max_rows: 10,
-        execution_budget_secs: 3,
-    })
+    ConversationRepository::file_attention(
+        &repo,
+        FileAttentionQuery {
+            cancellation_token: "test-file-attention-all".to_string(),
+            rel: "crates/foo.rs".to_string(),
+            normalized_project_id: Some("project-a".to_string()),
+            normalized_project_roots: vec!["/worktree-a".to_string()],
+            derive_legacy_roots: true,
+            apply_project_scope: false,
+            start_unix_ms: None,
+            end_unix_ms: None,
+            harness: None,
+            source_name: None,
+            tool: None,
+            mutations_only: false,
+            max_rows: 10,
+            execution_budget_secs: 3,
+        },
+    )
     .await
     .expect("all-scope file_attention query succeeds");
 
@@ -309,22 +336,25 @@ async fn file_attention_all_scope_is_the_only_unscoped_widening_path() {
 async fn file_attention_all_scope_keeps_the_configured_server_floor_only() {
     let (repo, state) = build_scoped_repo(&["/work/project"]).await;
 
-    repo.file_attention(FileAttentionQuery {
-        cancellation_token: "test-file-attention-scoped-all".to_string(),
-        rel: "crates/foo.rs".to_string(),
-        normalized_project_id: Some("project-a".to_string()),
-        normalized_project_roots: vec!["/worktree-a".to_string()],
-        derive_legacy_roots: true,
-        apply_project_scope: false,
-        start_unix_ms: None,
-        end_unix_ms: None,
-        harness: None,
-        source_name: None,
-        tool: None,
-        mutations_only: false,
-        max_rows: 10,
-        execution_budget_secs: 3,
-    })
+    ConversationRepository::file_attention(
+        &repo,
+        FileAttentionQuery {
+            cancellation_token: "test-file-attention-scoped-all".to_string(),
+            rel: "crates/foo.rs".to_string(),
+            normalized_project_id: Some("project-a".to_string()),
+            normalized_project_roots: vec!["/worktree-a".to_string()],
+            derive_legacy_roots: true,
+            apply_project_scope: false,
+            start_unix_ms: None,
+            end_unix_ms: None,
+            harness: None,
+            source_name: None,
+            tool: None,
+            mutations_only: false,
+            max_rows: 10,
+            execution_budget_secs: 3,
+        },
+    )
     .await
     .expect("all-scope query on scoped repository succeeds");
 
@@ -357,8 +387,9 @@ async fn file_attention_all_scope_preserves_legacy_suffix_fallback_on_schema_ske
     ];
     let (repo, state) = build_scripted_repo(responses).await;
 
-    let touches = repo
-        .file_attention(FileAttentionQuery {
+    let touches = ConversationRepository::file_attention(
+        &repo,
+        FileAttentionQuery {
             cancellation_token: "test-file-attention-schema-skew-all".to_string(),
             rel: "crates/foo.rs".to_string(),
             normalized_project_id: Some("project-a".to_string()),
@@ -373,9 +404,10 @@ async fn file_attention_all_scope_preserves_legacy_suffix_fallback_on_schema_ske
             mutations_only: false,
             max_rows: 10,
             execution_budget_secs: 3,
-        })
-        .await
-        .expect("legacy all-scope fallback succeeds");
+        },
+    )
+    .await
+    .expect("legacy all-scope fallback succeeds");
 
     assert!(touches.is_empty());
     assert_eq!(state.queries.lock().expect("queries lock").len(), 2);
@@ -389,8 +421,9 @@ async fn file_attention_project_scope_stays_closed_on_schema_skew() {
     )];
     let (repo, state) = build_scripted_repo(responses).await;
 
-    let touches = repo
-        .file_attention(FileAttentionQuery {
+    let touches = ConversationRepository::file_attention(
+        &repo,
+        FileAttentionQuery {
             cancellation_token: "test-file-attention-schema-skew-project".to_string(),
             rel: "crates/foo.rs".to_string(),
             normalized_project_id: Some("project-a".to_string()),
@@ -405,9 +438,10 @@ async fn file_attention_project_scope_stays_closed_on_schema_skew() {
             mutations_only: false,
             max_rows: 10,
             execution_budget_secs: 3,
-        })
-        .await
-        .expect("project-scoped schema-skew query stays closed");
+        },
+    )
+    .await
+    .expect("project-scoped schema-skew query stays closed");
 
     assert!(touches.is_empty());
     assert_eq!(state.queries.lock().expect("queries lock").len(), 1);
@@ -417,22 +451,25 @@ async fn file_attention_project_scope_stays_closed_on_schema_skew() {
 async fn file_attention_project_scope_without_identity_stays_closed() {
     let (repo, state) = build_repo().await;
 
-    repo.file_attention(FileAttentionQuery {
-        cancellation_token: "test-file-attention-unknown-project".to_string(),
-        rel: "crates/foo.rs".to_string(),
-        normalized_project_id: None,
-        normalized_project_roots: Vec::new(),
-        derive_legacy_roots: false,
-        apply_project_scope: true,
-        start_unix_ms: None,
-        end_unix_ms: None,
-        harness: None,
-        source_name: None,
-        tool: None,
-        mutations_only: false,
-        max_rows: 10,
-        execution_budget_secs: 3,
-    })
+    ConversationRepository::file_attention(
+        &repo,
+        FileAttentionQuery {
+            cancellation_token: "test-file-attention-unknown-project".to_string(),
+            rel: "crates/foo.rs".to_string(),
+            normalized_project_id: None,
+            normalized_project_roots: Vec::new(),
+            derive_legacy_roots: false,
+            apply_project_scope: true,
+            start_unix_ms: None,
+            end_unix_ms: None,
+            harness: None,
+            source_name: None,
+            tool: None,
+            mutations_only: false,
+            max_rows: 10,
+            execution_budget_secs: 3,
+        },
+    )
     .await
     .expect("closed project-scope file_attention query succeeds");
 

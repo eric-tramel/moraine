@@ -85,22 +85,13 @@ impl ClickHouseConversationRepository {
         let rows: Vec<SessionIdRow> = self.map_backend(self.query_rows(&query, None).await)?;
         let in_scope = !rows.is_empty();
         if in_scope {
-            let Some(publication_token) = publication_token else {
-                return Ok(true);
-            };
-            let Some(PublicationEffect::ScopedSessionCacheInsert {
-                session_id,
-                publication_token,
-            }) = defer_publication_effect(PublicationEffect::ScopedSessionCacheInsert {
-                session_id: session_id.to_string(),
-                publication_token,
-            })
-            .await
-            else {
-                return Ok(true);
-            };
-            self.insert_scoped_session_cache(session_id, publication_token)
+            if let Some(publication_token) = publication_token {
+                defer_publication_effect(PublicationEffect::ScopedSessionCacheInsert {
+                    session_id: session_id.to_string(),
+                    publication_token,
+                })
                 .await;
+            }
         }
         Ok(in_scope)
     }

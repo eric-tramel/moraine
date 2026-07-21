@@ -1,4 +1,4 @@
-use crate::model::Checkpoint;
+use crate::model::{Checkpoint, CheckpointLifecycle};
 use anyhow::{anyhow, bail, Context, Result};
 use moraine_clickhouse::{ClickHouseClient, McpOpenPublicationRequest, McpOpenSourceHead};
 use serde::{Deserialize, Serialize};
@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 use tokio::sync::{mpsc, oneshot};
@@ -45,79 +45,35 @@ impl SourceKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum CheckpointLifecycle {
-    Active,
-    Replaying,
-    Error,
-}
-
-impl CheckpointLifecycle {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Replaying => "replaying",
-            Self::Error => "error",
-        }
-    }
-
-    pub(crate) fn parse(value: &str) -> Self {
-        match value {
-            "active" => Self::Active,
-            "replaying" => Self::Replaying,
-            _ => Self::Error,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct CheckpointTransition {
     pub(crate) source: SourceKey,
     pub(crate) checkpoint: Checkpoint,
-    pub(crate) checkpoint_revision: u64,
-    pub(crate) operation_id: String,
-    pub(crate) lifecycle: CheckpointLifecycle,
     pub(crate) protocol_version: u16,
-    pub(crate) scan_inode: u64,
-    pub(crate) scan_boundary: u64,
-    pub(crate) policy_fingerprint: String,
-    pub(crate) final_scan_complete: bool,
-    pub(crate) block_reason: String,
-    pub(crate) compatibility_prepared: bool,
-    pub(crate) backend_caught_up: bool,
-    pub(crate) append_batch_id: String,
-    pub(crate) cache_epoch: u64,
 }
 
 impl CheckpointTransition {
-    pub(crate) fn from_checkpoint(mut checkpoint: Checkpoint) -> Self {
+    pub(crate) fn try_from_checkpoint(checkpoint: Checkpoint) -> Result<Self> {
+        let lifecycle = checkpoint
+            .lifecycle()
+            .context("checkpoint has invalid lifecycle")?;
+        Ok(Self::from_valid_checkpoint(checkpoint, lifecycle))
+    }
+
+    fn from_valid_checkpoint(mut checkpoint: Checkpoint, lifecycle: CheckpointLifecycle) -> Self {
         // Callers commonly build a new cursor with `..committed.clone()`.
         // Never inherit the previous transition's causal identity: derive it
         // deterministically from the complete new state so retries converge
         // while real cursor/lifecycle changes get a fresh revision.
         checkpoint.checkpoint_revision = 0;
         checkpoint.operation_id.clear();
-        let lifecycle = CheckpointLifecycle::parse(&checkpoint.status);
         let source = SourceKey::from_checkpoint(&checkpoint);
         let mut transition = Self {
             source,
-            checkpoint_revision: 0,
-            operation_id: String::new(),
-            lifecycle,
             protocol_version: PUBLICATION_PROTOCOL_VERSION,
-            scan_inode: checkpoint.scan_inode,
-            scan_boundary: checkpoint.scan_boundary,
-            policy_fingerprint: checkpoint.policy_fingerprint.clone(),
-            final_scan_complete: checkpoint.final_scan_complete,
-            block_reason: checkpoint.block_reason.clone(),
-            compatibility_prepared: checkpoint.compatibility_prepared,
-            backend_caught_up: checkpoint.backend_caught_up,
-            append_batch_id: checkpoint.append_batch_id.clone(),
-            cache_epoch: checkpoint.cache_epoch,
             checkpoint,
         };
-        transition.ensure_operation_id();
+        transition.ensure_operation_id(lifecycle);
         transition
     }
 
@@ -128,7 +84,7 @@ impl CheckpointTransition {
         policy_fingerprint: impl Into<String>,
     ) -> Self {
         let mut checkpoint = checkpoint.clone();
-        checkpoint.status = CheckpointLifecycle::Replaying.as_str().to_string();
+        checkpoint.set_lifecycle(CheckpointLifecycle::Replaying);
         checkpoint.scan_inode = scan_inode;
         checkpoint.scan_boundary = scan_boundary;
         checkpoint.policy_fingerprint = policy_fingerprint.into();
@@ -137,10 +93,7 @@ impl CheckpointTransition {
         checkpoint.compatibility_prepared = false;
         checkpoint.checkpoint_revision = 0;
         checkpoint.operation_id.clear();
-        let mut transition = Self::from_checkpoint(checkpoint);
-        transition.lifecycle = CheckpointLifecycle::Replaying;
-        transition.ensure_operation_id();
-        transition
+        Self::from_valid_checkpoint(checkpoint, CheckpointLifecycle::Replaying)
     }
 
     pub(crate) fn finalize_replay(
@@ -150,7 +103,7 @@ impl CheckpointTransition {
         policy_fingerprint: impl Into<String>,
     ) -> Self {
         let mut checkpoint = checkpoint.clone();
-        checkpoint.status = CheckpointLifecycle::Active.as_str().to_string();
+        checkpoint.set_lifecycle(CheckpointLifecycle::Active);
         checkpoint.scan_inode = scan_inode;
         checkpoint.scan_boundary = scan_boundary;
         checkpoint.policy_fingerprint = policy_fingerprint.into();
@@ -160,23 +113,17 @@ impl CheckpointTransition {
         checkpoint.backend_caught_up = false;
         checkpoint.checkpoint_revision = 0;
         checkpoint.operation_id.clear();
-        let mut transition = Self::from_checkpoint(checkpoint);
-        transition.lifecycle = CheckpointLifecycle::Active;
-        transition.ensure_operation_id();
-        transition
+        Self::from_valid_checkpoint(checkpoint, CheckpointLifecycle::Active)
     }
 
     pub(crate) fn blocked(checkpoint: &Checkpoint, reason: impl Into<String>) -> Self {
         let mut checkpoint = checkpoint.clone();
-        checkpoint.status = CheckpointLifecycle::Error.as_str().to_string();
+        checkpoint.set_lifecycle(CheckpointLifecycle::Error);
         checkpoint.block_reason = reason.into();
         checkpoint.final_scan_complete = false;
         checkpoint.checkpoint_revision = 0;
         checkpoint.operation_id.clear();
-        let mut transition = Self::from_checkpoint(checkpoint);
-        transition.lifecycle = CheckpointLifecycle::Error;
-        transition.ensure_operation_id();
-        transition
+        Self::from_valid_checkpoint(checkpoint, CheckpointLifecycle::Error)
     }
 
     #[cfg(test)]
@@ -186,23 +133,25 @@ impl CheckpointTransition {
     }
 
     pub(crate) fn set_backend_caught_up(&mut self, caught_up: bool) {
-        self.backend_caught_up = caught_up;
         self.checkpoint.backend_caught_up = caught_up;
-        self.checkpoint_revision = 0;
         self.checkpoint.checkpoint_revision = 0;
-        self.operation_id.clear();
         self.checkpoint.operation_id.clear();
-        self.ensure_operation_id();
+        let lifecycle = self
+            .checkpoint
+            .lifecycle()
+            .expect("checkpoint transition lifecycle is validated at construction");
+        self.ensure_operation_id(lifecycle);
     }
 
     fn set_compatibility_prepared(&mut self, prepared: bool) {
-        self.compatibility_prepared = prepared;
         self.checkpoint.compatibility_prepared = prepared;
-        self.checkpoint_revision = 0;
         self.checkpoint.checkpoint_revision = 0;
-        self.operation_id.clear();
         self.checkpoint.operation_id.clear();
-        self.ensure_operation_id();
+        let lifecycle = self
+            .checkpoint
+            .lifecycle()
+            .expect("checkpoint transition lifecycle is validated at construction");
+        self.ensure_operation_id(lifecycle);
     }
 
     pub(crate) fn canonicalize_source(&mut self, sink_host: &str) {
@@ -210,13 +159,13 @@ impl CheckpointTransition {
     }
 
     pub(crate) fn validate_begin_replay(&self) -> Result<()> {
-        if self.lifecycle != CheckpointLifecycle::Replaying {
+        if self.checkpoint.lifecycle()? != CheckpointLifecycle::Replaying {
             bail!("begin-replay transition must have replaying lifecycle");
         }
         if self.checkpoint.source_generation < 2 {
             bail!("replacement replay requires generation >= 2");
         }
-        if self.final_scan_complete {
+        if self.checkpoint.final_scan_complete {
             bail!("begin-replay transition cannot be final");
         }
         Ok(())
@@ -224,7 +173,7 @@ impl CheckpointTransition {
 
     pub(crate) fn validate_final(&self) -> Result<()> {
         self.validate_final_source()?;
-        if !self.compatibility_prepared {
+        if !self.checkpoint.compatibility_prepared {
             bail!("compatibility projection is not prepared");
         }
         Ok(())
@@ -232,33 +181,38 @@ impl CheckpointTransition {
 
     fn validate_final_source(&self) -> Result<()> {
         self.validate_staged_final()?;
-        if !self.backend_caught_up {
+        if !self.checkpoint.backend_caught_up {
             bail!("backend catch-up barrier is not durable");
         }
         Ok(())
     }
 
     pub(crate) fn validate_staged_final(&self) -> Result<()> {
-        if self.lifecycle != CheckpointLifecycle::Active {
+        if self.checkpoint.lifecycle()? != CheckpointLifecycle::Active {
             bail!("final replay transition must have active lifecycle");
         }
-        if !self.final_scan_complete {
+        if !self.checkpoint.final_scan_complete {
             bail!("final replay transition is missing source-boundary validation");
         }
-        if !self.block_reason.is_empty() {
-            bail!("blocked replay cannot publish: {}", self.block_reason);
+        if !self.checkpoint.block_reason.is_empty() {
+            bail!(
+                "blocked replay cannot publish: {}",
+                self.checkpoint.block_reason
+            );
         }
-        if self.scan_inode == 0 || self.scan_inode != self.checkpoint.source_inode {
+        if self.checkpoint.scan_inode == 0
+            || self.checkpoint.scan_inode != self.checkpoint.source_inode
+        {
             bail!("source inode changed during replay validation");
         }
-        if self.checkpoint.last_offset < self.scan_boundary {
+        if self.checkpoint.last_offset < self.checkpoint.scan_boundary {
             bail!("replay stopped before the captured source boundary");
         }
         Ok(())
     }
 
-    fn ensure_operation_id(&mut self) {
-        if !self.operation_id.is_empty() {
+    fn ensure_operation_id(&mut self, lifecycle: CheckpointLifecycle) {
+        if !self.checkpoint.operation_id.is_empty() {
             return;
         }
         let mut hasher = Sha256::new();
@@ -266,8 +220,8 @@ impl CheckpointTransition {
             self.source.source_host.as_str(),
             self.source.source_name.as_str(),
             self.source.source_file.as_str(),
-            self.lifecycle.as_str(),
-            self.policy_fingerprint.as_str(),
+            lifecycle.as_str(),
+            self.checkpoint.policy_fingerprint.as_str(),
         ] {
             hasher.update((value.len() as u64).to_le_bytes());
             hasher.update(value.as_bytes());
@@ -279,17 +233,21 @@ impl CheckpointTransition {
         hasher.update(self.checkpoint.cursor_json.as_bytes());
         hasher.update(self.checkpoint.source_fingerprint.to_le_bytes());
         hasher.update(self.checkpoint.schema_fingerprint.to_le_bytes());
-        hasher.update(self.scan_inode.to_le_bytes());
-        hasher.update(self.scan_boundary.to_le_bytes());
-        hasher.update([self.final_scan_complete as u8]);
-        hasher.update(self.block_reason.as_bytes());
-        hasher.update([self.compatibility_prepared as u8]);
-        hasher.update([self.backend_caught_up as u8]);
-        self.operation_id = format!("cp-{:x}", hasher.finalize());
-        self.checkpoint.operation_id = self.operation_id.clone();
+        hasher.update(self.checkpoint.scan_inode.to_le_bytes());
+        hasher.update(self.checkpoint.scan_boundary.to_le_bytes());
+        hasher.update([self.checkpoint.final_scan_complete as u8]);
+        hasher.update(self.checkpoint.block_reason.as_bytes());
+        hasher.update([self.checkpoint.compatibility_prepared as u8]);
+        hasher.update([self.checkpoint.backend_caught_up as u8]);
+        self.checkpoint.operation_id = format!("cp-{:x}", hasher.finalize());
     }
 
-    fn to_row(&self, host: &str, checkpoint_revision: u64) -> Value {
+    fn to_row(
+        &self,
+        host: &str,
+        checkpoint_revision: u64,
+        lifecycle: CheckpointLifecycle,
+    ) -> Value {
         json!({
             "host": host,
             "source_name": self.source.source_name,
@@ -302,18 +260,18 @@ impl CheckpointTransition {
             "source_fingerprint": self.checkpoint.source_fingerprint,
             "schema_fingerprint": self.checkpoint.schema_fingerprint,
             "checkpoint_revision": checkpoint_revision,
-            "operation_id": self.operation_id,
-            "lifecycle": self.lifecycle.as_str(),
+            "operation_id": self.checkpoint.operation_id,
+            "lifecycle": lifecycle.as_str(),
             "protocol_version": self.protocol_version,
-            "scan_inode": self.scan_inode,
-            "scan_boundary": self.scan_boundary,
-            "policy_fingerprint": self.policy_fingerprint,
-            "final_scan_complete": u8::from(self.final_scan_complete),
-            "block_reason": self.block_reason,
-            "compatibility_prepared": u8::from(self.compatibility_prepared),
-            "backend_caught_up": u8::from(self.backend_caught_up),
-            "append_batch_id": self.append_batch_id,
-            "cache_epoch": self.cache_epoch,
+            "scan_inode": self.checkpoint.scan_inode,
+            "scan_boundary": self.checkpoint.scan_boundary,
+            "policy_fingerprint": self.checkpoint.policy_fingerprint,
+            "final_scan_complete": u8::from(self.checkpoint.final_scan_complete),
+            "block_reason": self.checkpoint.block_reason,
+            "compatibility_prepared": u8::from(self.checkpoint.compatibility_prepared),
+            "backend_caught_up": u8::from(self.checkpoint.backend_caught_up),
+            "append_batch_id": self.checkpoint.append_batch_id,
+            "cache_epoch": self.checkpoint.cache_epoch,
             "updated_at": clickhouse_datetime64_now(),
         })
     }
@@ -618,7 +576,6 @@ fn append_manifest_is_complete(
 /// the file descriptor keeps the advisory lock alive until shutdown.
 pub(crate) struct PublicationOwnerLock {
     file: File,
-    path: PathBuf,
 }
 
 impl PublicationOwnerLock {
@@ -631,13 +588,19 @@ impl PublicationOwnerLock {
             )
         })?;
         let path = state_dir.join("publication-owner.lock");
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(false).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        }
+        let mut file = options
             .open(&path)
             .with_context(|| format!("failed to open publication lock {}", path.display()))?;
+        validate_publication_owner_lock(&file, &path)?;
         #[cfg(unix)]
         {
             // SAFETY: `file` owns a valid descriptor and `flock` has no
@@ -655,14 +618,59 @@ impl PublicationOwnerLock {
                 );
             }
         }
+        // Revalidate the descriptor after acquiring the lock so an unsafe
+        // metadata race cannot reach the truncate/write path.
+        validate_publication_owner_lock(&file, &path)?;
         file.set_len(0)
             .context("failed to reset publication owner lock metadata")?;
         file.write_all(publisher_id.as_bytes())
             .context("failed to write publication owner identity")?;
         file.sync_all()
             .context("failed to durably record publication owner identity")?;
-        Ok(Self { file, path })
+        Ok(Self { file })
     }
+}
+
+fn validate_publication_owner_lock(file: &File, path: &Path) -> Result<()> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect publication lock {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("publication lock {} is not a regular file", path.display());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let mode = metadata.mode() & 0o7777;
+        if mode != 0o600 {
+            bail!(
+                "publication lock {} has insecure permissions {:o}; expected 600",
+                path.display(),
+                mode
+            );
+        }
+        // SAFETY: geteuid has no arguments and no failure mode.
+        let effective_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != effective_uid {
+            bail!(
+                "publication lock {} is owned by uid {}, not current uid {}",
+                path.display(),
+                metadata.uid(),
+                effective_uid
+            );
+        }
+        if metadata.nlink() != 1 {
+            bail!(
+                "publication lock {} has {} hard links; expected exactly 1",
+                path.display(),
+                metadata.nlink()
+            );
+        }
+    }
+
+    Ok(())
 }
 
 impl Drop for PublicationOwnerLock {
@@ -672,7 +680,6 @@ impl Drop for PublicationOwnerLock {
         unsafe {
             libc::flock(std::os::fd::AsRawFd::as_raw_fd(&self.file), libc::LOCK_UN);
         }
-        let _ = &self.path;
     }
 }
 
@@ -684,6 +691,85 @@ pub(crate) struct PublicationActor {
     publisher_id: String,
     gate: Mutex<()>,
     diagnostic_revision: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourcePublicationKind {
+    Initial,
+    Replacement,
+}
+
+impl SourcePublicationKind {
+    fn validate_prepared(self, transition: &CheckpointTransition) -> Result<()> {
+        match self {
+            Self::Initial => Ok(()),
+            Self::Replacement => transition.validate_final(),
+        }
+    }
+
+    fn persists_readiness_after_direct_repair_activation(self) -> bool {
+        matches!(self, Self::Replacement)
+    }
+
+    fn messages(self) -> HeadPublicationMessages {
+        match self {
+            Self::Initial => HeadPublicationMessages {
+                repair_not_authorized:
+                    "initial MCP compatibility repair did not authorize the published generation",
+                insert_context: "failed to publish initial source generation",
+                missing_after_insert:
+                    "initial source head is not observable after acknowledged insert",
+                conflict_detail: "another publisher won initial source-head verification",
+                conflict_error:
+                    "conflicting publisher changed the initial source head during activation",
+                activate_context: "failed to activate initial MCP compatibility publication",
+                reprepare_context:
+                    "failed to reprepare initial MCP compatibility after concurrent head change",
+                reactivate_context: "failed to reactivate initial MCP compatibility publication",
+                activation_not_current:
+                    "initial MCP compatibility activation did not become current",
+            },
+            Self::Replacement => HeadPublicationMessages {
+                repair_not_authorized:
+                    "MCP compatibility repair did not authorize the published generation",
+                insert_context: "failed to publish source generation",
+                missing_after_insert:
+                    "published source head is not observable after acknowledged insert",
+                conflict_detail: "another publisher won source-head verification",
+                conflict_error: "conflicting publisher changed the source head during activation",
+                activate_context: "failed to activate MCP compatibility publication",
+                reprepare_context:
+                    "failed to reprepare MCP compatibility after concurrent head change",
+                reactivate_context: "failed to reactivate MCP compatibility publication",
+                activation_not_current:
+                    "MCP compatibility activation did not become current after source publication",
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeadPublicationAction {
+    Repair {
+        publication_revision: u64,
+        previous_source_generation: Option<u32>,
+    },
+    Commit {
+        publication_revision: u64,
+        previous_source_generation: Option<u32>,
+    },
+}
+
+struct HeadPublicationMessages {
+    repair_not_authorized: &'static str,
+    insert_context: &'static str,
+    missing_after_insert: &'static str,
+    conflict_detail: &'static str,
+    conflict_error: &'static str,
+    activate_context: &'static str,
+    reprepare_context: &'static str,
+    reactivate_context: &'static str,
+    activation_not_current: &'static str,
 }
 
 impl PublicationActor {
@@ -718,7 +804,7 @@ impl PublicationActor {
         transition: &mut CheckpointTransition,
     ) -> Result<ReplayBarrierAck> {
         transition.validate_staged_final()?;
-        if transition.backend_caught_up {
+        if transition.checkpoint.backend_caught_up {
             bail!("staged mirror final is already marked backend-caught-up");
         }
         let _guard = self.gate.lock().await;
@@ -735,7 +821,7 @@ impl PublicationActor {
         &self,
         transition: &mut CheckpointTransition,
     ) -> Result<ReplayBarrierAck> {
-        if !transition.backend_caught_up {
+        if !transition.checkpoint.backend_caught_up {
             bail!("mirror catch-up transition is not marked backend-caught-up");
         }
         let validated_final = transition.validate_staged_final().is_ok();
@@ -757,8 +843,7 @@ impl PublicationActor {
     ) -> Result<()> {
         let mut diagnostic = transition.clone();
         diagnostic.canonicalize_source(&self.source_host);
-        diagnostic.block_reason = "publication_repair_failed".to_string();
-        diagnostic.checkpoint.block_reason = diagnostic.block_reason.clone();
+        diagnostic.checkpoint.block_reason = "publication_repair_failed".to_string();
         let _guard = self.gate.lock().await;
         self.record_readiness_locked(&diagnostic, true).await
     }
@@ -875,16 +960,19 @@ impl PublicationActor {
         transition: &mut CheckpointTransition,
     ) -> Result<ReplayBarrierAck> {
         transition.canonicalize_source(&self.source_host);
+        let lifecycle = transition
+            .checkpoint
+            .lifecycle()
+            .context("checkpoint transition has invalid lifecycle")?;
         let revision_state = self
-            .checkpoint_revision_state(&transition.operation_id)
+            .checkpoint_revision_state(&transition.checkpoint.operation_id)
             .await?;
         if revision_state.operation_revision > 0 {
             let revision = revision_state.operation_revision;
-            transition.checkpoint_revision = revision;
             transition.checkpoint.checkpoint_revision = revision;
             return Ok(ReplayBarrierAck {
                 checkpoint_revision: revision,
-                operation_id: transition.operation_id.clone(),
+                operation_id: transition.checkpoint.operation_id.clone(),
             });
         }
         let revision = revision_state
@@ -894,36 +982,45 @@ impl PublicationActor {
         self.clickhouse
             .insert_json_rows_sync(
                 "ingest_checkpoint_transitions",
-                &[transition.to_row(&self.source_host, revision)],
+                &[transition.to_row(&self.source_host, revision, lifecycle)],
             )
             .await
             .context("failed to persist causal ingest checkpoint")?;
-        transition.checkpoint_revision = revision;
         transition.checkpoint.checkpoint_revision = revision;
-        if transition.lifecycle == CheckpointLifecycle::Error || !transition.block_reason.is_empty()
+        if lifecycle == CheckpointLifecycle::Error || !transition.checkpoint.block_reason.is_empty()
         {
             self.record_readiness_locked(transition, false).await?;
         }
         Ok(ReplayBarrierAck {
             checkpoint_revision: revision,
-            operation_id: transition.operation_id.clone(),
+            operation_id: transition.checkpoint.operation_id.clone(),
         })
     }
 
-    pub(crate) async fn publish_final(
+    /// Commit a new source head or repair the compatibility activation for a
+    /// head that was already durable when its acknowledgement was lost.
+    ///
+    /// Callers retain generation-specific eligibility and stale-head policy.
+    /// This primitive owns the shared causal sequence while the actor gate is
+    /// held: candidate preparation, checkpoint/readiness persistence, head
+    /// insert and verification, activation, and one reprepare/reactivate.
+    async fn commit_or_repair_head_locked(
         &self,
         transition: &mut CheckpointTransition,
+        action: HeadPublicationAction,
+        kind: SourcePublicationKind,
     ) -> Result<PublicationAck> {
-        transition.validate_final_source()?;
-        let _guard = self.gate.lock().await;
-        transition.canonicalize_source(&self.source_host);
-        if let Some(head) = self.current_head(&transition.source).await? {
-            if head.source_generation == transition.checkpoint.source_generation {
-                if transition.checkpoint_revision == 0 {
-                    if let Some(revision) =
-                        self.transition_revision(&transition.operation_id).await?
+        let messages = kind.messages();
+        match action {
+            HeadPublicationAction::Repair {
+                publication_revision,
+                previous_source_generation,
+            } => {
+                if transition.checkpoint.checkpoint_revision == 0 {
+                    if let Some(revision) = self
+                        .transition_revision(&transition.checkpoint.operation_id)
+                        .await?
                     {
-                        transition.checkpoint_revision = revision;
                         transition.checkpoint.checkpoint_revision = revision;
                     }
                 }
@@ -935,12 +1032,12 @@ impl PublicationActor {
                 if !activated {
                     self.prepare_compatibility_locked(
                         transition,
-                        transition.checkpoint.source_generation.checked_sub(1),
-                        head.publication_revision,
+                        previous_source_generation,
+                        publication_revision,
                     )
                     .await?;
                     transition.set_compatibility_prepared(true);
-                    transition.validate_final()?;
+                    kind.validate_prepared(transition)?;
                     self.persist_transition_locked(transition).await?;
                     self.record_readiness_locked(transition, true).await?;
                     activated = self
@@ -949,23 +1046,125 @@ impl PublicationActor {
                         .await?;
                 }
                 if !activated {
-                    bail!("MCP compatibility repair did not authorize the published generation");
+                    bail!(messages.repair_not_authorized);
                 }
-                if !transition.compatibility_prepared {
-                    // Activation may repair a head committed by the prior
-                    // process without entering the reprepare branch above.
-                    // Persist the final 1/1/1 gate so a prior repair-failure
+                if kind.persists_readiness_after_direct_repair_activation()
+                    && !transition.checkpoint.compatibility_prepared
+                {
+                    // A replacement activation may repair a head committed by
+                    // the prior process without entering the reprepare branch.
+                    // Persist the final 1/1/1 gate so an older repair-failure
                     // diagnostic cannot remain current after success.
                     transition.set_compatibility_prepared(true);
-                    transition.validate_final()?;
+                    kind.validate_prepared(transition)?;
                     self.persist_transition_locked(transition).await?;
                     self.record_readiness_locked(transition, true).await?;
                 }
-                return Ok(PublicationAck {
-                    checkpoint_revision: transition.checkpoint_revision,
-                    publication_revision: head.publication_revision,
+                Ok(PublicationAck {
+                    checkpoint_revision: transition.checkpoint.checkpoint_revision,
+                    publication_revision,
                     already_published: true,
-                });
+                })
+            }
+            HeadPublicationAction::Commit {
+                publication_revision,
+                previous_source_generation,
+            } => {
+                let candidate_id = self
+                    .prepare_compatibility_locked(
+                        transition,
+                        previous_source_generation,
+                        publication_revision,
+                    )
+                    .await?;
+                transition.set_compatibility_prepared(true);
+                kind.validate_prepared(transition)?;
+                let checkpoint = self.persist_transition_locked(transition).await?;
+                self.record_readiness_locked(transition, true).await?;
+                self.clickhouse
+                    .insert_json_rows_sync(
+                        "published_source_generations",
+                        &[json!({
+                            "source_host": transition.source.source_host,
+                            "source_name": transition.source.source_name,
+                            "source_file": transition.source.source_file,
+                            "source_generation": transition.checkpoint.source_generation,
+                            "publication_revision": publication_revision,
+                            "publisher_id": self.publisher_id,
+                            "operation_id": transition.checkpoint.operation_id,
+                            "published_at": clickhouse_datetime64_now(),
+                        })],
+                    )
+                    .await
+                    .context(messages.insert_context)?;
+                let written = self
+                    .current_head(&transition.source)
+                    .await?
+                    .context(messages.missing_after_insert)?;
+                if written.source_generation != transition.checkpoint.source_generation
+                    || written.publication_revision != publication_revision
+                    || written.operation_id != transition.checkpoint.operation_id
+                    || written.publisher_id != self.publisher_id
+                {
+                    self.record_writer_conflict(&transition.source, true, messages.conflict_detail)
+                        .await?;
+                    bail!(messages.conflict_error);
+                }
+                self.record_writer_conflict(&transition.source, false, "")
+                    .await?;
+                let mut activated = self
+                    .clickhouse
+                    .activate_mcp_open_publication(&candidate_id)
+                    .await
+                    .context(messages.activate_context)?;
+                if !activated {
+                    self.prepare_compatibility_locked(
+                        transition,
+                        previous_source_generation,
+                        publication_revision,
+                    )
+                    .await
+                    .context(messages.reprepare_context)?;
+                    activated = self
+                        .clickhouse
+                        .activate_mcp_open_publication(&candidate_id)
+                        .await
+                        .context(messages.reactivate_context)?;
+                }
+                if !activated {
+                    bail!(messages.activation_not_current);
+                }
+                Ok(PublicationAck {
+                    checkpoint_revision: checkpoint.checkpoint_revision,
+                    publication_revision,
+                    already_published: false,
+                })
+            }
+        }
+    }
+
+    pub(crate) async fn publish_final(
+        &self,
+        transition: &mut CheckpointTransition,
+    ) -> Result<PublicationAck> {
+        transition.validate_final_source()?;
+        let _guard = self.gate.lock().await;
+        transition.canonicalize_source(&self.source_host);
+        if let Some(head) = self.current_head(&transition.source).await? {
+            if head.source_generation == transition.checkpoint.source_generation {
+                return self
+                    .commit_or_repair_head_locked(
+                        transition,
+                        HeadPublicationAction::Repair {
+                            publication_revision: head.publication_revision,
+                            previous_source_generation: transition
+                                .checkpoint
+                                .source_generation
+                                .checked_sub(1),
+                        },
+                        SourcePublicationKind::Replacement,
+                    )
+                    .await;
             }
             if head.source_generation > transition.checkpoint.source_generation {
                 bail!(
@@ -980,84 +1179,24 @@ impl PublicationActor {
             .current_head(&transition.source)
             .await?
             .map(|head| head.source_generation);
-        let candidate_id = self
-            .prepare_compatibility_locked(transition, previous_generation, publication_revision)
-            .await?;
-        transition.set_compatibility_prepared(true);
-        transition.validate_final()?;
-        let checkpoint = self.persist_transition_locked(transition).await?;
-        self.record_readiness_locked(transition, true).await?;
-        self.clickhouse
-            .insert_json_rows_sync(
-                "published_source_generations",
-                &[json!({
-                    "source_host": transition.source.source_host,
-                    "source_name": transition.source.source_name,
-                    "source_file": transition.source.source_file,
-                    "source_generation": transition.checkpoint.source_generation,
-                    "publication_revision": publication_revision,
-                    "publisher_id": self.publisher_id,
-                    "operation_id": transition.operation_id,
-                    "published_at": clickhouse_datetime64_now(),
-                })],
-            )
-            .await
-            .context("failed to publish source generation")?;
-        let written = self
-            .current_head(&transition.source)
-            .await?
-            .context("published source head is not observable after acknowledged insert")?;
-        if written.source_generation != transition.checkpoint.source_generation
-            || written.publication_revision != publication_revision
-            || written.operation_id != transition.operation_id
-            || written.publisher_id != self.publisher_id
-        {
-            self.record_writer_conflict(
-                &transition.source,
-                true,
-                "another publisher won source-head verification",
-            )
-            .await?;
-            bail!("conflicting publisher changed the source head during activation");
-        }
-        self.record_writer_conflict(&transition.source, false, "")
-            .await?;
-        let mut activated = self
-            .clickhouse
-            .activate_mcp_open_publication(&candidate_id)
-            .await
-            .context("failed to activate MCP compatibility publication")?;
-        if !activated {
-            self.prepare_compatibility_locked(
-                transition,
-                previous_generation,
+        self.commit_or_repair_head_locked(
+            transition,
+            HeadPublicationAction::Commit {
                 publication_revision,
-            )
-            .await
-            .context("failed to reprepare MCP compatibility after concurrent head change")?;
-            activated = self
-                .clickhouse
-                .activate_mcp_open_publication(&candidate_id)
-                .await
-                .context("failed to reactivate MCP compatibility publication")?;
-        }
-        if !activated {
-            bail!("MCP compatibility activation did not become current after source publication");
-        }
-        Ok(PublicationAck {
-            checkpoint_revision: checkpoint.checkpoint_revision,
-            publication_revision,
-            already_published: false,
-        })
+                previous_source_generation: previous_generation,
+            },
+            SourcePublicationKind::Replacement,
+        )
+        .await
     }
 
     pub(crate) async fn publish_initial_if_absent(
         &self,
         transition: &mut CheckpointTransition,
     ) -> Result<Option<PublicationAck>> {
-        if transition.lifecycle != CheckpointLifecycle::Active
+        if transition.checkpoint.lifecycle()? != CheckpointLifecycle::Active
             || transition.checkpoint.source_generation != 1
-            || !transition.block_reason.is_empty()
+            || !transition.checkpoint.block_reason.is_empty()
         {
             return Ok(None);
         }
@@ -1076,7 +1215,7 @@ impl PublicationActor {
             // the source-wide candidate prepared by the initial publication.
             // Only the original operation can represent a crash after the
             // source head became durable but before compatibility activation.
-            if !is_original_initial_publication(&head, &transition.operation_id) {
+            if !is_original_initial_publication(&head, &transition.checkpoint.operation_id) {
                 let checkpoint = self.persist_transition_locked(transition).await?;
                 return Ok(Some(PublicationAck {
                     checkpoint_revision: checkpoint.checkpoint_revision,
@@ -1084,106 +1223,29 @@ impl PublicationActor {
                     already_published: true,
                 }));
             }
-            if transition.checkpoint_revision == 0 {
-                if let Some(revision) = self.transition_revision(&transition.operation_id).await? {
-                    transition.checkpoint_revision = revision;
-                    transition.checkpoint.checkpoint_revision = revision;
-                }
-            }
-            let candidate_id = candidate_publication_id(transition);
-            let mut activated = self
-                .clickhouse
-                .activate_mcp_open_publication(&candidate_id)
-                .await?;
-            if !activated {
-                self.prepare_compatibility_locked(transition, None, head.publication_revision)
-                    .await?;
-                transition.set_compatibility_prepared(true);
-                self.persist_transition_locked(transition).await?;
-                self.record_readiness_locked(transition, true).await?;
-                activated = self
-                    .clickhouse
-                    .activate_mcp_open_publication(&candidate_id)
-                    .await?;
-            }
-            if !activated {
-                bail!(
-                    "initial MCP compatibility repair did not authorize the published generation"
-                );
-            }
-            return Ok(Some(PublicationAck {
-                checkpoint_revision: transition.checkpoint_revision,
-                publication_revision: head.publication_revision,
-                already_published: true,
-            }));
+            return self
+                .commit_or_repair_head_locked(
+                    transition,
+                    HeadPublicationAction::Repair {
+                        publication_revision: head.publication_revision,
+                        previous_source_generation: None,
+                    },
+                    SourcePublicationKind::Initial,
+                )
+                .await
+                .map(Some);
         }
         let publication_revision = self.next_publication_revision().await?;
-        let candidate_id = self
-            .prepare_compatibility_locked(transition, None, publication_revision)
-            .await?;
-        transition.set_compatibility_prepared(true);
-        let checkpoint = self.persist_transition_locked(transition).await?;
-        self.record_readiness_locked(transition, true).await?;
-        self.clickhouse
-            .insert_json_rows_sync(
-                "published_source_generations",
-                &[json!({
-                    "source_host": transition.source.source_host,
-                    "source_name": transition.source.source_name,
-                    "source_file": transition.source.source_file,
-                    "source_generation": 1,
-                    "publication_revision": publication_revision,
-                    "publisher_id": self.publisher_id,
-                    "operation_id": transition.operation_id,
-                    "published_at": clickhouse_datetime64_now(),
-                })],
-            )
-            .await
-            .context("failed to publish initial source generation")?;
-        let written = self
-            .current_head(&transition.source)
-            .await?
-            .context("initial source head is not observable after acknowledged insert")?;
-        if written.source_generation != 1
-            || written.publication_revision != publication_revision
-            || written.operation_id != transition.operation_id
-            || written.publisher_id != self.publisher_id
-        {
-            self.record_writer_conflict(
-                &transition.source,
-                true,
-                "another publisher won initial source-head verification",
-            )
-            .await?;
-            bail!("conflicting publisher changed the initial source head during activation");
-        }
-        self.record_writer_conflict(&transition.source, false, "")
-            .await?;
-        let mut activated = self
-            .clickhouse
-            .activate_mcp_open_publication(&candidate_id)
-            .await
-            .context("failed to activate initial MCP compatibility publication")?;
-        if !activated {
-            self.prepare_compatibility_locked(transition, None, publication_revision)
-                .await
-                .context(
-                    "failed to reprepare initial MCP compatibility after concurrent head change",
-                )?;
-            activated = self
-                .clickhouse
-                .activate_mcp_open_publication(&candidate_id)
-                .await
-                .context("failed to reactivate initial MCP compatibility publication")?;
-        }
-        if !activated {
-            bail!("initial MCP compatibility activation did not become current");
-        }
-        Ok(Some(PublicationAck {
-            checkpoint_revision: checkpoint.checkpoint_revision,
-            publication_revision,
-            already_published: false,
-        }))
+        self.commit_or_repair_head_locked(
+            transition,
+            HeadPublicationAction::Commit {
+                publication_revision,
+                previous_source_generation: None,
+            },
+            SourcePublicationKind::Initial,
+        )
+        .await
+        .map(Some)
     }
 
     pub(crate) async fn has_published_generation(
@@ -1208,7 +1270,7 @@ impl PublicationActor {
     ) -> Result<Vec<PublicationAck>> {
         let mut repaired = Vec::new();
         for mut checkpoint in checkpoints {
-            if checkpoint.status != CheckpointLifecycle::Active.as_str()
+            if checkpoint.lifecycle()? != CheckpointLifecycle::Active
                 || !checkpoint.block_reason.is_empty()
             {
                 continue;
@@ -1216,14 +1278,13 @@ impl PublicationActor {
             checkpoint.backend_caught_up = true;
             checkpoint.checkpoint_revision = 0;
             checkpoint.operation_id.clear();
-            let mut transition = CheckpointTransition::from_checkpoint(checkpoint);
-            transition.backend_caught_up = true;
+            let mut transition = CheckpointTransition::try_from_checkpoint(checkpoint)?;
             transition.checkpoint.backend_caught_up = true;
             if transition.checkpoint.source_generation == 1 {
                 if let Some(publication) = self.publish_initial_if_absent(&mut transition).await? {
                     repaired.push(publication);
                 }
-            } else if transition.final_scan_complete {
+            } else if transition.checkpoint.final_scan_complete {
                 repaired.push(self.publish_final(&mut transition).await?);
             }
         }
@@ -1486,12 +1547,12 @@ impl PublicationActor {
                     "source_file": transition.source.source_file,
                     "source_generation": transition.checkpoint.source_generation,
                     "readiness_revision": readiness_revision,
-                    "checkpoint_revision": transition.checkpoint_revision,
-                    "operation_id": transition.operation_id,
+                    "checkpoint_revision": transition.checkpoint.checkpoint_revision,
+                    "operation_id": transition.checkpoint.operation_id,
                     "complete": u8::from(complete),
-                    "block_reason": transition.block_reason,
-                    "compatibility_prepared": u8::from(transition.compatibility_prepared),
-                    "backend_caught_up": u8::from(transition.backend_caught_up),
+                    "block_reason": transition.checkpoint.block_reason,
+                    "compatibility_prepared": u8::from(transition.checkpoint.compatibility_prepared),
+                    "backend_caught_up": u8::from(transition.checkpoint.backend_caught_up),
                     "manifest_digest": manifest_digest,
                     "updated_at": clickhouse_datetime64_now(),
                 })],
@@ -1526,7 +1587,7 @@ impl PublicationActor {
             .clickhouse
             .prepare_mcp_open_publication(&McpOpenPublicationRequest {
                 candidate_publication_id: candidate_publication_id.clone(),
-                operation_id: transition.operation_id.clone(),
+                operation_id: transition.checkpoint.operation_id.clone(),
                 publisher_id: self.publisher_id.clone(),
                 source_host: transition.source.source_host.clone(),
                 source_name: transition.source.source_name.clone(),
@@ -1670,13 +1731,13 @@ fn sql_string_list(values: &BTreeSet<String>) -> String {
 
 fn transition_manifest_digest(transition: &CheckpointTransition) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(transition.operation_id.as_bytes());
-    hasher.update(transition.checkpoint_revision.to_le_bytes());
+    hasher.update(transition.checkpoint.operation_id.as_bytes());
+    hasher.update(transition.checkpoint.checkpoint_revision.to_le_bytes());
     hasher.update(transition.checkpoint.source_generation.to_le_bytes());
     hasher.update(transition.checkpoint.last_offset.to_le_bytes());
     hasher.update(transition.checkpoint.last_line_no.to_le_bytes());
-    hasher.update([transition.compatibility_prepared as u8]);
-    hasher.update([transition.backend_caught_up as u8]);
+    hasher.update([transition.checkpoint.compatibility_prepared as u8]);
+    hasher.update([transition.checkpoint.backend_caught_up as u8]);
     format!("{:x}", hasher.finalize())
 }
 
@@ -1697,6 +1758,43 @@ fn candidate_publication_id(transition: &CheckpointTransition) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        extract::{Query, State},
+        http::StatusCode,
+        routing::post,
+        Router,
+    };
+    #[cfg(unix)]
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    #[cfg(unix)]
+    struct TestPublicationStateDir(PathBuf);
+
+    #[cfg(unix)]
+    impl TestPublicationStateDir {
+        fn new(label: &str) -> Self {
+            Self(std::env::temp_dir().join(format!(
+                "moraine-publication-lock-{label}-{}",
+                uuid::Uuid::new_v4()
+            )))
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn lock_path(&self) -> PathBuf {
+            self.path().join("publication-owner.lock")
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TestPublicationStateDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn checkpoint(generation: u32) -> Checkpoint {
         Checkpoint {
@@ -1706,9 +1804,568 @@ mod tests {
             source_generation: generation,
             last_offset: 100,
             last_line_no: 4,
-            status: "active".to_string(),
+            status: CheckpointLifecycle::Active.to_string(),
             ..Checkpoint::default()
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct HeadPublicationMock {
+        queries: Arc<StdMutex<Vec<String>>>,
+        inserts: Arc<StdMutex<BTreeMap<String, usize>>>,
+        current_head: Arc<StdMutex<Option<Value>>>,
+        transition_revisions: Arc<StdMutex<BTreeMap<String, u64>>>,
+        mcp_generation_ready: Arc<StdMutex<bool>>,
+    }
+
+    impl HeadPublicationMock {
+        fn insert_count(&self, table: &str) -> usize {
+            self.inserts
+                .lock()
+                .expect("head mock inserts mutex poisoned")
+                .get(table)
+                .copied()
+                .unwrap_or(0)
+        }
+
+        fn query_count(&self, needle: &str) -> usize {
+            self.queries
+                .lock()
+                .expect("head mock queries mutex poisoned")
+                .iter()
+                .filter(|query| query.contains(needle))
+                .count()
+        }
+
+        fn set_current_head(&self, transition: &CheckpointTransition, revision: u64) {
+            *self
+                .current_head
+                .lock()
+                .expect("head mock current_head mutex poisoned") = Some(json!({
+                "source_host": "test-host",
+                "source_name": transition.source.source_name,
+                "source_file": transition.source.source_file,
+                "source_generation": transition.checkpoint.source_generation,
+                "publication_revision": revision,
+                "publisher_id": "test-publisher",
+                "operation_id": transition.checkpoint.operation_id,
+            }));
+        }
+
+        fn seed_transition_revision(&self, operation_id: &str, revision: u64) {
+            self.transition_revisions
+                .lock()
+                .expect("head mock transition revisions mutex poisoned")
+                .insert(operation_id.to_string(), revision);
+        }
+
+        fn set_mcp_generation_ready(&self, ready: bool) {
+            *self
+                .mcp_generation_ready
+                .lock()
+                .expect("head mock MCP readiness mutex poisoned") = ready;
+        }
+    }
+
+    fn head_mock_response(params: &BTreeMap<String, String>, rows: &[Value]) -> String {
+        if params
+            .get("default_format")
+            .is_some_and(|format| format == "JSON")
+        {
+            json!({ "data": rows }).to_string()
+        } else {
+            rows.iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    }
+
+    fn head_mock_insert_table(query: &str) -> Option<&'static str> {
+        [
+            "ingest_checkpoint_transitions",
+            "source_generation_publication_readiness",
+            "published_source_generations",
+            "publication_diagnostic_events",
+            "mcp_open_generation_readiness",
+        ]
+        .into_iter()
+        .find(|table| query.contains(table))
+    }
+
+    async fn head_publication_mock_handler(
+        State(state): State<HeadPublicationMock>,
+        Query(params): Query<BTreeMap<String, String>>,
+        body: String,
+    ) -> (StatusCode, String) {
+        let query = params
+            .get("query")
+            .map(String::as_str)
+            .unwrap_or(body.as_str());
+        state
+            .queries
+            .lock()
+            .expect("head mock queries mutex poisoned")
+            .push(query.to_string());
+
+        if query.contains("generateSnowflakeID()") {
+            return (
+                StatusCode::OK,
+                head_mock_response(&params, &[json!({ "source_revision": 41u64 })]),
+            );
+        }
+        if query.contains("maxIf(transitions.checkpoint_revision") {
+            let revisions = state
+                .transition_revisions
+                .lock()
+                .expect("head mock transition revisions mutex poisoned");
+            let max_revision = revisions.values().copied().max().unwrap_or(0);
+            let operation_revision = revisions
+                .iter()
+                .find_map(|(operation_id, revision)| {
+                    query
+                        .contains(&format!("transitions.operation_id = '{operation_id}'"))
+                        .then_some(*revision)
+                })
+                .unwrap_or(0);
+            return (
+                StatusCode::OK,
+                head_mock_response(
+                    &params,
+                    &[json!({
+                        "operation_revision": operation_revision,
+                        "max_revision": max_revision,
+                    })],
+                ),
+            );
+        }
+        if query.contains("max(transitions.checkpoint_revision)) AS checkpoint_revision") {
+            let revisions = state
+                .transition_revisions
+                .lock()
+                .expect("head mock transition revisions mutex poisoned");
+            let checkpoint_revision = revisions
+                .iter()
+                .find_map(|(operation_id, revision)| {
+                    query
+                        .contains(&format!("transitions.operation_id = '{operation_id}'"))
+                        .then_some(*revision)
+                })
+                .unwrap_or(0);
+            return (
+                StatusCode::OK,
+                head_mock_response(
+                    &params,
+                    &[json!({ "checkpoint_revision": checkpoint_revision })],
+                ),
+            );
+        }
+        if query.contains("v_current_published_source_generations")
+            && query.contains("WHERE source_host =")
+        {
+            let rows = state
+                .current_head
+                .lock()
+                .expect("head mock current_head mutex poisoned")
+                .clone()
+                .into_iter()
+                .collect::<Vec<_>>();
+            return (StatusCode::OK, head_mock_response(&params, &rows));
+        }
+        if query.contains("v_current_published_source_generations")
+            && query.contains("ORDER BY source_host")
+        {
+            let rows = state
+                .current_head
+                .lock()
+                .expect("head mock current_head mutex poisoned")
+                .clone()
+                .into_iter()
+                .collect::<Vec<_>>();
+            return (StatusCode::OK, head_mock_response(&params, &rows));
+        }
+        if query.contains("v_current_mcp_open_generation_readiness") {
+            let ready = *state
+                .mcp_generation_ready
+                .lock()
+                .expect("head mock MCP readiness mutex poisoned");
+            return (
+                StatusCode::OK,
+                head_mock_response(&params, &[json!({ "ready": u8::from(ready) })]),
+            );
+        }
+        if query.contains("SELECT") && !query.contains("INSERT INTO") {
+            return (StatusCode::OK, head_mock_response(&params, &[]));
+        }
+
+        let Some(table) = head_mock_insert_table(query) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("unexpected head publication query: {query}"),
+            );
+        };
+        *state
+            .inserts
+            .lock()
+            .expect("head mock inserts mutex poisoned")
+            .entry(table.to_string())
+            .or_insert(0) += 1;
+
+        if table == "mcp_open_generation_readiness" {
+            state.set_mcp_generation_ready(true);
+        }
+        for row in body
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        {
+            if table == "ingest_checkpoint_transitions" {
+                if let (Some(operation_id), Some(revision)) = (
+                    row.get("operation_id").and_then(Value::as_str),
+                    row.get("checkpoint_revision").and_then(Value::as_u64),
+                ) {
+                    state.seed_transition_revision(operation_id, revision);
+                }
+            } else if table == "published_source_generations" {
+                *state
+                    .current_head
+                    .lock()
+                    .expect("head mock current_head mutex poisoned") = Some(row);
+            }
+        }
+        (StatusCode::OK, String::new())
+    }
+
+    async fn spawn_head_publication_actor() -> (PublicationActor, HeadPublicationMock) {
+        let state = HeadPublicationMock::default();
+        let app = Router::new()
+            .route("/", post(head_publication_mock_handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind head publication mock");
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut config = moraine_config::AppConfig::default();
+        config.clickhouse.url = format!("http://{address}");
+        config.clickhouse.timeout_seconds = 1.0;
+        let clickhouse = ClickHouseClient::new(config.clickhouse).unwrap();
+        (
+            PublicationActor::new(
+                clickhouse,
+                "test-host".to_string(),
+                "test-publisher".to_string(),
+            ),
+            state,
+        )
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct HeadPublicationTrace {
+        checkpoint_transitions: usize,
+        publication_readiness: usize,
+        source_heads: usize,
+        writer_diagnostics: usize,
+        mcp_readiness: usize,
+        mcp_candidate_reads: usize,
+        mcp_activation_reads: usize,
+        mcp_preparations: usize,
+    }
+
+    fn head_publication_trace(state: &HeadPublicationMock) -> HeadPublicationTrace {
+        HeadPublicationTrace {
+            checkpoint_transitions: state.insert_count("ingest_checkpoint_transitions"),
+            publication_readiness: state.insert_count("source_generation_publication_readiness"),
+            source_heads: state.insert_count("published_source_generations"),
+            writer_diagnostics: state.insert_count("publication_diagnostic_events"),
+            mcp_readiness: state.insert_count("mcp_open_generation_readiness"),
+            mcp_candidate_reads: state.query_count("mcp_open_publication_headers FINAL"),
+            mcp_activation_reads: state.query_count("v_current_mcp_open_generation_readiness"),
+            mcp_preparations: state.query_count("SELECT DISTINCT session_id"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn initial_and_replacement_new_heads_share_the_commit_sequence() {
+        let (initial_actor, initial_state) = spawn_head_publication_actor().await;
+        let mut initial_checkpoint = checkpoint(1);
+        initial_checkpoint.backend_caught_up = true;
+        let mut initial = CheckpointTransition::try_from_checkpoint(initial_checkpoint).unwrap();
+        let initial_ack = initial_actor
+            .publish_initial_if_absent(&mut initial)
+            .await
+            .expect("publish initial source head")
+            .expect("eligible initial generation");
+
+        let (replacement_actor, replacement_state) = spawn_head_publication_actor().await;
+        let mut replacement =
+            CheckpointTransition::finalize_replay(&checkpoint(2), 42, 100, "policy");
+        replacement.set_backend_caught_up(true);
+        let replacement_ack = replacement_actor
+            .publish_final(&mut replacement)
+            .await
+            .expect("publish replacement source head");
+
+        assert_eq!(initial_ack.checkpoint_revision, 1);
+        assert_eq!(replacement_ack.checkpoint_revision, 1);
+        assert_eq!(initial_ack.publication_revision, 1);
+        assert_eq!(replacement_ack.publication_revision, 1);
+        assert!(!initial_ack.already_published);
+        assert!(!replacement_ack.already_published);
+        assert_eq!(
+            head_publication_trace(&initial_state),
+            head_publication_trace(&replacement_state),
+            "both entry points must execute the same durable commit stages"
+        );
+        assert_eq!(
+            replacement_state.query_count("WHERE source_host ="),
+            initial_state.query_count("WHERE source_host =") + 1,
+            "replacement policy preserves its second current-head read for previous-generation capture"
+        );
+    }
+
+    async fn repair_after_lost_head_ack(
+        generation: u32,
+        kind: SourcePublicationKind,
+        initially_ready: bool,
+    ) -> (PublicationAck, HeadPublicationMock, CheckpointTransition) {
+        let (actor, state) = spawn_head_publication_actor().await;
+        let mut transition = if kind == SourcePublicationKind::Initial {
+            let mut checkpoint = checkpoint(1);
+            checkpoint.backend_caught_up = true;
+            CheckpointTransition::try_from_checkpoint(checkpoint).unwrap()
+        } else {
+            let mut transition =
+                CheckpointTransition::finalize_replay(&checkpoint(generation), 42, 100, "policy");
+            transition.set_backend_caught_up(true);
+            transition
+        };
+        state.set_current_head(&transition, 7);
+        state.seed_transition_revision(&transition.checkpoint.operation_id, 5);
+        state.set_mcp_generation_ready(initially_ready);
+
+        let ack = if kind == SourcePublicationKind::Initial {
+            actor
+                .publish_initial_if_absent(&mut transition)
+                .await
+                .expect("repair initial publication")
+                .expect("initial generation remains eligible")
+        } else {
+            actor
+                .publish_final(&mut transition)
+                .await
+                .expect("repair replacement publication")
+        };
+        (ack, state, transition)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn initial_and_replacement_response_loss_share_reprepare_repair() {
+        let (initial_ack, initial_state, initial) =
+            repair_after_lost_head_ack(1, SourcePublicationKind::Initial, false).await;
+        let (replacement_ack, replacement_state, replacement) =
+            repair_after_lost_head_ack(2, SourcePublicationKind::Replacement, false).await;
+
+        assert!(initial_ack.already_published);
+        assert!(replacement_ack.already_published);
+        assert_eq!(initial_ack.publication_revision, 7);
+        assert_eq!(replacement_ack.publication_revision, 7);
+        assert_eq!(initial_ack.checkpoint_revision, 6);
+        assert_eq!(replacement_ack.checkpoint_revision, 6);
+        assert!(initial.checkpoint.compatibility_prepared);
+        assert!(replacement.checkpoint.compatibility_prepared);
+        assert_eq!(
+            head_publication_trace(&initial_state),
+            head_publication_trace(&replacement_state),
+            "both response-loss paths must prepare, persist readiness, and reactivate identically"
+        );
+        assert_eq!(
+            initial_state.insert_count("published_source_generations"),
+            0
+        );
+        assert_eq!(
+            replacement_state.insert_count("published_source_generations"),
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn direct_response_loss_activation_keeps_replacement_readiness_repair() {
+        let (initial_ack, initial_state, initial) =
+            repair_after_lost_head_ack(1, SourcePublicationKind::Initial, true).await;
+        let (replacement_ack, replacement_state, replacement) =
+            repair_after_lost_head_ack(2, SourcePublicationKind::Replacement, true).await;
+
+        assert_eq!(initial_ack.checkpoint_revision, 5);
+        assert_eq!(replacement_ack.checkpoint_revision, 6);
+        assert!(!initial.checkpoint.compatibility_prepared);
+        assert!(replacement.checkpoint.compatibility_prepared);
+        assert_eq!(
+            initial_state.insert_count("ingest_checkpoint_transitions"),
+            0
+        );
+        assert_eq!(
+            initial_state.insert_count("source_generation_publication_readiness"),
+            0
+        );
+        assert_eq!(
+            replacement_state.insert_count("ingest_checkpoint_transitions"),
+            1
+        );
+        assert_eq!(
+            replacement_state.insert_count("source_generation_publication_readiness"),
+            1
+        );
+    }
+
+    #[test]
+    fn transition_construction_rejects_an_unknown_checkpoint_lifecycle() {
+        let mut checkpoint = checkpoint(2);
+        checkpoint.status = "paused".to_string();
+
+        let error = CheckpointTransition::try_from_checkpoint(checkpoint)
+            .expect_err("unknown lifecycle must not become an error transition");
+
+        assert!(error.to_string().contains("invalid lifecycle"));
+        assert!(format!("{error:#}").contains("paused"));
+    }
+
+    #[test]
+    fn transition_serialization_has_one_canonical_checkpoint_state() {
+        let transition = CheckpointTransition::finalize_replay(&checkpoint(2), 42, 100, "policy");
+        let encoded = serde_json::to_value(&transition).unwrap();
+        let object = encoded.as_object().unwrap();
+
+        assert_eq!(
+            object.keys().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "checkpoint".to_string(),
+                "protocol_version".to_string(),
+                "source".to_string(),
+            ])
+        );
+        assert_eq!(encoded["checkpoint"]["status"], json!("active"));
+        assert!(encoded.get("lifecycle").is_none());
+        assert!(encoded.get("operation_id").is_none());
+
+        let decoded: CheckpointTransition = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, transition);
+        assert_eq!(
+            decoded.checkpoint.lifecycle().unwrap(),
+            CheckpointLifecycle::Active
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_owner_lock_creates_and_reopens_only_secure_files() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
+        let state = TestPublicationStateDir::new("secure");
+        let owner = PublicationOwnerLock::acquire(state.path(), "publisher-one")
+            .expect("create secure publication lock");
+        let metadata = owner.file.metadata().expect("publication lock metadata");
+        assert!(metadata.is_file());
+        assert_eq!(metadata.mode() & 0o7777, 0o600);
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(metadata.nlink(), 1);
+        // SAFETY: F_GETFD only reads descriptor flags from the valid lock fd.
+        let descriptor_flags = unsafe { libc::fcntl(owner.file.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(descriptor_flags, -1);
+        assert_ne!(descriptor_flags & libc::FD_CLOEXEC, 0);
+        assert_eq!(
+            std::fs::read_to_string(state.lock_path()).unwrap(),
+            "publisher-one"
+        );
+        drop(owner);
+
+        let reopened = PublicationOwnerLock::acquire(state.path(), "publisher-two")
+            .expect("reopen pre-existing secure publication lock");
+        assert_eq!(
+            std::fs::read_to_string(state.lock_path()).unwrap(),
+            "publisher-two"
+        );
+        drop(reopened);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_owner_lock_refuses_symlinks_without_touching_the_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let state = TestPublicationStateDir::new("symlink");
+        std::fs::create_dir_all(state.path()).unwrap();
+        let target = state.path().join("target");
+        std::fs::write(&target, "unchanged").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, state.lock_path()).unwrap();
+
+        let error = PublicationOwnerLock::acquire(state.path(), "attacker")
+            .err()
+            .expect("symlink lock must fail closed");
+        assert!(format!("{error:#}").contains("failed to open publication lock"));
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "unchanged");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_owner_lock_refuses_insecure_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state = TestPublicationStateDir::new("permissions");
+        std::fs::create_dir_all(state.path()).unwrap();
+        let lock_path = state.lock_path();
+        std::fs::write(&lock_path, "unchanged").unwrap();
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        let error = PublicationOwnerLock::acquire(state.path(), "attacker")
+            .err()
+            .expect("insecure lock permissions must fail closed");
+        assert!(error.to_string().contains("insecure permissions"));
+        assert_eq!(std::fs::read_to_string(lock_path).unwrap(), "unchanged");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_owner_lock_refuses_multiple_hard_links() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state = TestPublicationStateDir::new("hard-link");
+        std::fs::create_dir_all(state.path()).unwrap();
+        let target = state.path().join("target");
+        std::fs::write(&target, "unchanged").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::hard_link(&target, state.lock_path()).unwrap();
+
+        let error = PublicationOwnerLock::acquire(state.path(), "attacker")
+            .err()
+            .expect("multiply linked lock must fail closed");
+        assert!(error.to_string().contains("hard links"));
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "unchanged");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_owner_lock_refuses_non_regular_files() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let state = TestPublicationStateDir::new("fifo");
+        std::fs::create_dir_all(state.path()).unwrap();
+        let lock_path = state.lock_path();
+        let encoded = CString::new(lock_path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: encoded is a valid, NUL-terminated path and mode is valid.
+        assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = PublicationOwnerLock::acquire(state.path(), "attacker")
+            .err()
+            .expect("non-regular lock must fail closed");
+        assert!(error.to_string().contains("not a regular file"));
     }
 
     #[tokio::test]
@@ -1777,10 +2434,12 @@ mod tests {
     fn replay_operation_id_is_retry_stable() {
         let left = CheckpointTransition::begin_replay(&checkpoint(2), 42, 100, "policy");
         let right = CheckpointTransition::begin_replay(&checkpoint(2), 42, 100, "policy");
-        assert_eq!(left.operation_id, right.operation_id);
+        assert_eq!(left.checkpoint.operation_id, right.checkpoint.operation_id);
         assert_ne!(
-            left.operation_id,
-            CheckpointTransition::begin_replay(&checkpoint(3), 42, 100, "policy").operation_id
+            left.checkpoint.operation_id,
+            CheckpointTransition::begin_replay(&checkpoint(3), 42, 100, "policy")
+                .checkpoint
+                .operation_id
         );
     }
 
@@ -1789,29 +2448,44 @@ mod tests {
         let mut value = checkpoint(1);
         value.compatibility_prepared = true;
         value.backend_caught_up = true;
-        let original = CheckpointTransition::from_checkpoint(value.clone()).operation_id;
+        let original = CheckpointTransition::try_from_checkpoint(value.clone())
+            .unwrap()
+            .checkpoint
+            .operation_id;
 
         value.append_batch_id = "retry-fence".to_string();
         value.cache_epoch = 99;
         assert_eq!(
-            CheckpointTransition::from_checkpoint(value.clone()).operation_id,
+            CheckpointTransition::try_from_checkpoint(value.clone())
+                .unwrap()
+                .checkpoint
+                .operation_id,
             original,
             "a response-loss retry may establish a new append fence"
         );
 
         value.source_fingerprint = 7;
-        let source_changed = CheckpointTransition::from_checkpoint(value.clone()).operation_id;
+        let source_changed = CheckpointTransition::try_from_checkpoint(value.clone())
+            .unwrap()
+            .checkpoint
+            .operation_id;
         assert_ne!(source_changed, original);
 
         value.schema_fingerprint = 11;
         assert_ne!(
-            CheckpointTransition::from_checkpoint(value.clone()).operation_id,
+            CheckpointTransition::try_from_checkpoint(value.clone())
+                .unwrap()
+                .checkpoint
+                .operation_id,
             source_changed
         );
 
         value.last_offset += 1;
         assert_ne!(
-            CheckpointTransition::from_checkpoint(value).operation_id,
+            CheckpointTransition::try_from_checkpoint(value)
+                .unwrap()
+                .checkpoint
+                .operation_id,
             original
         );
     }
@@ -1820,23 +2494,27 @@ mod tests {
     fn readiness_transition_identity_round_trips_after_each_mutation() {
         let mut transition =
             CheckpointTransition::finalize_replay(&checkpoint(2), 42, 100, "policy");
-        let staged_operation_id = transition.operation_id.clone();
+        let staged_operation_id = transition.checkpoint.operation_id.clone();
 
         transition.set_backend_caught_up(true);
-        let caught_up_operation_id = transition.operation_id.clone();
+        let caught_up_operation_id = transition.checkpoint.operation_id.clone();
         assert_ne!(caught_up_operation_id, staged_operation_id);
         assert_eq!(
-            CheckpointTransition::from_checkpoint(transition.checkpoint.clone()).operation_id,
+            CheckpointTransition::try_from_checkpoint(transition.checkpoint.clone())
+                .unwrap()
+                .checkpoint
+                .operation_id,
             caught_up_operation_id
         );
 
         transition.set_compatibility_prepared(true);
-        let prepared_operation_id = transition.operation_id.clone();
+        let prepared_operation_id = transition.checkpoint.operation_id.clone();
         assert_ne!(prepared_operation_id, caught_up_operation_id);
-        let reconstructed = CheckpointTransition::from_checkpoint(transition.checkpoint.clone());
-        assert_eq!(reconstructed.operation_id, prepared_operation_id);
-        assert!(reconstructed.backend_caught_up);
-        assert!(reconstructed.compatibility_prepared);
+        let reconstructed =
+            CheckpointTransition::try_from_checkpoint(transition.checkpoint.clone()).unwrap();
+        assert_eq!(reconstructed.checkpoint.operation_id, prepared_operation_id);
+        assert!(reconstructed.checkpoint.backend_caught_up);
+        assert!(reconstructed.checkpoint.compatibility_prepared);
     }
 
     #[test]

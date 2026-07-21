@@ -72,7 +72,7 @@ const SCAN_PAGE_SIZE: usize = 512;
 /// bubbles (~2.4 MB each with the `toolCallBinary` duplicate) would otherwise
 /// buffer over a gigabyte at `SCAN_PAGE_SIZE` rows; the cap ends the page
 /// early so the scan's working set stays bounded regardless of value sizes.
-const SCAN_PAGE_MAX_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const SCAN_PAGE_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 const CURSOR_STATE_VERSION: u32 = 1;
 
@@ -1701,7 +1701,7 @@ mod tests {
                     | SinkMessage::MirrorCaughtUp { transition, ack } => {
                         let _ = ack.send(Ok(crate::publication::ReplayBarrierAck {
                             checkpoint_revision: 1,
-                            operation_id: transition.operation_id,
+                            operation_id: transition.checkpoint.operation_id,
                         }));
                     }
                     SinkMessage::FinalizeReplay { transition, ack } => {
@@ -1893,7 +1893,7 @@ mod tests {
                         assert_eq!(transition.checkpoint.source_generation, 2);
                         let _ = ack.send(Ok(crate::publication::ReplayBarrierAck {
                             checkpoint_revision: 1,
-                            operation_id: transition.operation_id,
+                            operation_id: transition.checkpoint.operation_id,
                         }));
                     }
                     SinkMessage::FinalizeReplay { transition, ack } => {
@@ -1927,6 +1927,269 @@ mod tests {
             !all_event_rows(&replayed).is_empty(),
             "removing exclusions must replay previously skipped rows"
         );
+
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cursor_sqlite_can_queue_oversized_replay_row_before_final_checkpoint() {
+        let path = unique_db_path("sink-limit-envelope");
+        let db = create_kv_db(&path);
+        put(
+            &db,
+            &format!("composerData:{COMPOSER_ID}"),
+            &composer_value("Oversized replay", 1),
+        );
+        let payload_bytes = crate::sink::CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES + 1024 * 1024;
+        assert!(payload_bytes < SCAN_PAGE_MAX_BYTES);
+        put(
+            &db,
+            &format!("bubbleId:{COMPOSER_ID}:{USER_BUBBLE_ID}"),
+            &json!({
+                "_v": 3,
+                "type": 1,
+                "bubbleId": USER_BUBBLE_ID,
+                "createdAt": "2026-05-08T02:04:37.835Z",
+                "text": "x".repeat(payload_bytes),
+            }),
+        );
+
+        let work = sqlite_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+        let poll_state = VolatilePollMap::new();
+
+        let mut excluded = moraine_config::AppConfig::default();
+        excluded.ingest.exclude_project_dirs = vec!["/Users/demo/project/**".to_string()];
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(64);
+        process_cursor_sqlite_db(
+            &excluded,
+            &work,
+            checkpoints.clone(),
+            &poll_state,
+            sink_tx,
+            &metrics,
+        )
+        .await
+        .expect("excluded initial Cursor poll");
+        let excluded_batches = drain_batches(&mut sink_rx).await;
+        let initial = excluded_batches
+            .last()
+            .and_then(|batch| batch.checkpoint.clone())
+            .expect("excluded poll checkpoint");
+        checkpoints.write().await.insert(
+            checkpoint_key(&initial.source_name, &initial.source_file),
+            initial,
+        );
+
+        let included = moraine_config::AppConfig::default();
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(64);
+        let process = process_cursor_sqlite_db(
+            &included,
+            &work,
+            checkpoints,
+            &poll_state,
+            sink_tx,
+            &metrics,
+        );
+        tokio::pin!(process);
+        let mut replay_batches = Vec::new();
+        loop {
+            tokio::select! {
+                result = &mut process => {
+                    result.expect("Cursor oversized replacement replay");
+                    break;
+                }
+                message = sink_rx.recv() => match message.expect("Cursor replay sink remains open") {
+                    SinkMessage::Batch(batch) => replay_batches.push(batch),
+                    SinkMessage::BeginReplay { transition, ack } => {
+                        let _ = ack.send(Ok(crate::publication::ReplayBarrierAck {
+                            checkpoint_revision: 1,
+                            operation_id: transition.checkpoint.operation_id,
+                        }));
+                    }
+                    SinkMessage::FinalizeReplay { transition: _, ack } => {
+                        let _ = ack.send(Ok(
+                            crate::publication::FinalizeReplayOutcome::Published(
+                                crate::publication::PublicationAck {
+                                    checkpoint_revision: 2,
+                                    publication_revision: 2,
+                                    already_published: false,
+                                },
+                            ),
+                        ));
+                    }
+                    SinkMessage::BlockReplay { .. } | SinkMessage::MirrorCaughtUp { .. } => {
+                        panic!("valid Cursor replay should reach finalization")
+                    }
+                }
+            }
+        }
+        while let Ok(SinkMessage::Batch(batch)) = sink_rx.try_recv() {
+            replay_batches.push(batch);
+        }
+
+        let oversized_index = replay_batches
+            .iter()
+            .position(|batch| {
+                batch.raw_rows.iter().any(|row| {
+                    serde_json::to_vec(row).is_ok_and(|encoded| {
+                        encoded.len() > crate::sink::CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES
+                    })
+                })
+            })
+            .expect("Cursor scanner emits a sink-oversized row under its page cap");
+        let checkpoint_index = replay_batches
+            .iter()
+            .position(|batch| batch.checkpoint.is_some())
+            .expect("Cursor replay queues a final checkpoint");
+        assert!(oversized_index < checkpoint_index);
+        assert!(replay_batches[oversized_index].checkpoint.is_none());
+
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cursor_reference_metadata_can_exceed_sink_limit_while_raw_row_stays_bounded() {
+        let path = unique_db_path("reference-expansion-envelope");
+        let db = create_kv_db(&path);
+        put(
+            &db,
+            &format!("composerData:{COMPOSER_ID}"),
+            &composer_value("Reference expansion replay", 1),
+        );
+
+        // Cursor stores one compact nested path once, while event_links
+        // expands that prefix into every reference's field_path. This keeps
+        // the source row comfortably below 10 MiB while making the derived
+        // link cross ClickHouse's per-object limit.
+        let nested_key = format!("nested_{}", "x".repeat(249));
+        let references = (0..33_000)
+            .map(|_| json!({"path": "p"}))
+            .collect::<Vec<_>>();
+        let mut params = Map::new();
+        params.insert(nested_key, Value::Array(references));
+        let mut bubble = tool_bubble_value("pending", false);
+        *bubble
+            .pointer_mut("/toolFormerData/params")
+            .expect("tool params") = Value::Object(params);
+        let source_bytes = serde_json::to_vec(&bubble).unwrap().len();
+        assert!(source_bytes < crate::sink::CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES);
+        assert!(source_bytes < SCAN_PAGE_MAX_BYTES);
+        put(
+            &db,
+            &format!("bubbleId:{COMPOSER_ID}:{TOOL_BUBBLE_ID}"),
+            &bubble,
+        );
+
+        let work = sqlite_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+        let poll_state = VolatilePollMap::new();
+
+        let mut excluded = moraine_config::AppConfig::default();
+        excluded.ingest.exclude_project_dirs = vec!["/Users/demo/project/**".to_string()];
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(64);
+        process_cursor_sqlite_db(
+            &excluded,
+            &work,
+            checkpoints.clone(),
+            &poll_state,
+            sink_tx,
+            &metrics,
+        )
+        .await
+        .expect("excluded initial Cursor reference poll");
+        let excluded_batches = drain_batches(&mut sink_rx).await;
+        let initial = excluded_batches
+            .last()
+            .and_then(|batch| batch.checkpoint.clone())
+            .expect("excluded reference checkpoint");
+        checkpoints.write().await.insert(
+            checkpoint_key(&initial.source_name, &initial.source_file),
+            initial,
+        );
+
+        let included = moraine_config::AppConfig::default();
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(64);
+        let process = process_cursor_sqlite_db(
+            &included,
+            &work,
+            checkpoints,
+            &poll_state,
+            sink_tx,
+            &metrics,
+        );
+        tokio::pin!(process);
+        let mut replay_batches = Vec::new();
+        loop {
+            tokio::select! {
+                result = &mut process => {
+                    result.expect("Cursor reference replacement replay");
+                    break;
+                }
+                message = sink_rx.recv() => match message.expect("Cursor reference sink remains open") {
+                    SinkMessage::Batch(batch) => replay_batches.push(batch),
+                    SinkMessage::BeginReplay { transition, ack } => {
+                        let _ = ack.send(Ok(crate::publication::ReplayBarrierAck {
+                            checkpoint_revision: 1,
+                            operation_id: transition.checkpoint.operation_id,
+                        }));
+                    }
+                    SinkMessage::FinalizeReplay { transition: _, ack } => {
+                        let _ = ack.send(Ok(
+                            crate::publication::FinalizeReplayOutcome::Published(
+                                crate::publication::PublicationAck {
+                                    checkpoint_revision: 2,
+                                    publication_revision: 2,
+                                    already_published: false,
+                                },
+                            ),
+                        ));
+                    }
+                    SinkMessage::BlockReplay { .. } | SinkMessage::MirrorCaughtUp { .. } => {
+                        panic!("valid Cursor reference replay should reach finalization")
+                    }
+                }
+            }
+        }
+        while let Ok(SinkMessage::Batch(batch)) = sink_rx.try_recv() {
+            replay_batches.push(batch);
+        }
+
+        let (link_batch_index, oversized_link) = replay_batches
+            .iter()
+            .enumerate()
+            .find_map(|(index, batch)| {
+                batch
+                    .link_rows
+                    .iter()
+                    .find(|row| {
+                        serde_json::to_vec(row).is_ok_and(|encoded| {
+                            encoded.len() > crate::sink::CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES
+                        })
+                    })
+                    .map(|row| (index, row))
+            })
+            .expect("Cursor reference metadata expands beyond the sink limit");
+        let owner_uid = oversized_link
+            .get("event_uid")
+            .and_then(Value::as_str)
+            .expect("link owner UID");
+        let link_batch = &replay_batches[link_batch_index];
+        assert!(link_batch.checkpoint.is_none());
+        assert!(link_batch
+            .event_rows
+            .iter()
+            .any(|row| { row.get("event_uid").and_then(Value::as_str) == Some(owner_uid) }));
+        assert!(replay_batches
+            .iter()
+            .flat_map(|batch| &batch.raw_rows)
+            .all(|row| {
+                serde_json::to_vec(row).is_ok_and(|encoded| {
+                    encoded.len() < crate::sink::CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES
+                })
+            }));
 
         cleanup(&path);
     }

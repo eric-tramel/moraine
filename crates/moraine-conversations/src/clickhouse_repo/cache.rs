@@ -601,7 +601,7 @@ FORMAT JSONEachRow",
 
         let missing_terms_array = sql_array_strings(&missing_terms);
         let df_query = format!(
-            "SELECT term, toUInt64(uniqExact(doc_id)) AS df FROM {postings_table} WHERE term IN {missing_terms_array} GROUP BY term FORMAT JSONEachRow",
+            "SELECT term, toUInt64(uniqExact(tuple(source_host, doc_id))) AS df FROM {postings_table} WHERE term IN {missing_terms_array} GROUP BY term FORMAT JSONEachRow",
         );
         let rows: Vec<DfRow> = self.map_backend(self.query_rows(&df_query, None).await)?;
         for row in rows {

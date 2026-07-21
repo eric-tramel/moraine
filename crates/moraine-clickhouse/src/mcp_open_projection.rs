@@ -83,6 +83,16 @@ struct CandidateHeaderInsert<'a> {
     required_heads: &'a [McpOpenSourceHead],
 }
 
+struct McpOpenSessionRefreshRequest<'a> {
+    session_id: &'a str,
+    candidate_publication_id: &'a str,
+    operation_id: &'a str,
+    publisher_id: &'a str,
+    required_heads: &'a [McpOpenSourceHead],
+    publish_legacy_head: bool,
+    first_generation: Option<u64>,
+}
+
 #[derive(Debug, Deserialize)]
 struct SourceRevisionRow {
     source_revision: u64,
@@ -268,15 +278,15 @@ impl ClickHouseClient {
                 let first_generation = self.next_projection_generation().await?;
                 let candidate_publication_id =
                     format!("append:{}:{}", session_id, first_generation);
-                self.refresh_mcp_open_session(
-                    &session_id,
-                    &candidate_publication_id,
-                    &candidate_publication_id,
-                    "ordinary-append",
-                    &required_heads,
-                    true,
-                    Some(first_generation),
-                )
+                self.refresh_mcp_open_session(McpOpenSessionRefreshRequest {
+                    session_id: &session_id,
+                    candidate_publication_id: &candidate_publication_id,
+                    operation_id: &candidate_publication_id,
+                    publisher_id: "ordinary-append",
+                    required_heads: &required_heads,
+                    publish_legacy_head: true,
+                    first_generation: Some(first_generation),
+                })
                 .await
                 .map(|_| ())
             })
@@ -345,15 +355,15 @@ impl ClickHouseClient {
                 != 0;
             let candidate = if has_live_events {
                 let candidate = self
-                    .refresh_mcp_open_session(
-                        &session_id,
-                        &request.candidate_publication_id,
-                        &request.operation_id,
-                        &request.publisher_id,
-                        &session_heads,
-                        false,
-                        None,
-                    )
+                    .refresh_mcp_open_session(McpOpenSessionRefreshRequest {
+                        session_id: &session_id,
+                        candidate_publication_id: &request.candidate_publication_id,
+                        operation_id: &request.operation_id,
+                        publisher_id: &request.publisher_id,
+                        required_heads: &session_heads,
+                        publish_legacy_head: false,
+                        first_generation: None,
+                    })
                     .await?;
                 prepared_session_count += 1;
                 candidate
@@ -562,14 +572,17 @@ impl ClickHouseClient {
 
     async fn refresh_mcp_open_session(
         &self,
-        session_id: &str,
-        candidate_publication_id: &str,
-        operation_id: &str,
-        publisher_id: &str,
-        required_heads: &[McpOpenSourceHead],
-        publish_legacy_head: bool,
-        first_generation: Option<u64>,
+        request: McpOpenSessionRefreshRequest<'_>,
     ) -> Result<CandidateHeaderRow> {
+        let McpOpenSessionRefreshRequest {
+            session_id,
+            candidate_publication_id,
+            operation_id,
+            publisher_id,
+            required_heads,
+            publish_legacy_head,
+            first_generation,
+        } = request;
         for attempt in 0..MAX_UNSTABLE_REFRESH_ATTEMPTS {
             let source_revision = self
                 .session_source_revision_for_heads(session_id, required_heads)
@@ -1041,14 +1054,14 @@ impl ClickHouseClient {
         );
         let statement = format!(
             "INSERT INTO {database}.mcp_open_events\n\
-             (event_uid, slot, candidate_generation, generation, session_id, event_order, turn_seq,\n\
+             (event_uid, source_host, slot, candidate_generation, generation, session_id, event_order, turn_seq,\n\
               event_time, actor_role, event_class, payload_type, event_type, event_ordinal,\n\
               call_id, name, phase, item_id, source_ref, text_content, payload_json,\n\
               token_usage_json, endpoint_kind, token_usage_buckets, token_usage_native_units,\n\
               previous_event_uid, next_event_uid)\n\
              {ctes}\n\
              SELECT\n\
-               event_uid, {slot}, {generation}, {generation}, session_id, event_order, turn_seq,\n\
+               event_uid, source_host, {slot}, {generation}, {generation}, session_id, event_order, turn_seq,\n\
                event_time, actor_role, event_class, payload_type, event_type, event_ordinal,\n\
                call_id, name, phase, item_id, source_ref, text_content, payload_json,\n\
                token_usage_json, endpoint_kind, token_usage_buckets, token_usage_native_units,\n\
@@ -1545,6 +1558,13 @@ mod tests {
         assert!(!child_ctes.contains("canonical_revision AS"));
         assert!(!child_ctes.contains("CROSS JOIN canonical_revision"));
         assert!(child_ctes.contains("toUInt64(42) AS source_revision"));
+
+        let projection_source = include_str!("mcp_open_projection.rs");
+        assert!(projection_source.contains(
+            "(event_uid, source_host, slot, candidate_generation, generation, session_id"
+        ));
+        assert!(projection_source
+            .contains("event_uid, source_host, {slot}, {generation}, {generation}, session_id"));
     }
 
     #[test]

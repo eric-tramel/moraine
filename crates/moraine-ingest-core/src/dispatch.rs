@@ -1,5 +1,5 @@
 use crate::checkpoint::checkpoint_key;
-use crate::model::{Checkpoint, NormalizedRecord, RowBatch};
+use crate::model::{Checkpoint, CheckpointLifecycle, NormalizedRecord, RowBatch};
 use crate::normalize::{normalize_record, normalize_record_with_ts_hint};
 use crate::sources::claude_code::cowork_session_path;
 use crate::sources::kiro_cli::{load_kiro_session_metadata, KiroSessionMetadata};
@@ -485,7 +485,7 @@ async fn send_chunk_if_batch_exceeds_limits(
     source_generation: u32,
     offset: u64,
     line_no: u64,
-    lifecycle: &str,
+    lifecycle: CheckpointLifecycle,
     scan_boundary: u64,
     policy_fingerprint: &str,
     context: &'static str,
@@ -1041,7 +1041,7 @@ pub(crate) async fn process_file(
         source_generation: 1,
         last_offset: 0,
         last_line_no: 0,
-        status: "active".to_string(),
+        status: CheckpointLifecycle::Active.to_string(),
         policy_fingerprint: policy_fingerprint.clone(),
         ..Default::default()
     });
@@ -1083,8 +1083,10 @@ pub(crate) async fn process_file(
         || source_truncated
         || policy_changed
         || sidecar_requires_transcript_replay;
-    let resume_replay = checkpoint.status == "replaying";
-    let retry_blocked_replay = checkpoint.status == "error" && !checkpoint.block_reason.is_empty();
+    let checkpoint_lifecycle = checkpoint.lifecycle()?;
+    let resume_replay = checkpoint_lifecycle == CheckpointLifecycle::Replaying;
+    let retry_blocked_replay =
+        checkpoint_lifecycle == CheckpointLifecycle::Error && !checkpoint.block_reason.is_empty();
     if starts_replacement {
         checkpoint.source_generation =
             crate::publication::checked_next_generation(checkpoint.source_generation)
@@ -1112,7 +1114,7 @@ pub(crate) async fn process_file(
         file_size
     };
     if replacement_replay {
-        checkpoint.status = "replaying".to_string();
+        checkpoint.set_lifecycle(CheckpointLifecycle::Replaying);
         checkpoint.scan_inode = inode;
         checkpoint.scan_boundary = scan_boundary;
         checkpoint.final_scan_complete = false;
@@ -1173,7 +1175,7 @@ pub(crate) async fn process_file(
                 let mut final_checkpoint = checkpoint.clone();
                 final_checkpoint.last_offset = scan_boundary;
                 final_checkpoint.last_line_no = 0;
-                final_checkpoint.status = "active".to_string();
+                final_checkpoint.set_lifecycle(CheckpointLifecycle::Active);
                 final_checkpoint.final_scan_complete = true;
                 final_checkpoint.compatibility_prepared = true;
                 final_checkpoint.backend_caught_up = true;
@@ -1192,9 +1194,9 @@ pub(crate) async fn process_file(
     }
     let cowork_companion = load_cowork_companion_record(work);
     let batch_lifecycle = if replacement_replay {
-        "replaying"
+        CheckpointLifecycle::Replaying
     } else {
-        "active"
+        CheckpointLifecycle::Active
     };
 
     let mut file = std::fs::File::open(source_file)
@@ -1604,7 +1606,7 @@ pub(crate) async fn process_file(
             let mut blocked = checkpoint.clone();
             blocked.last_offset = offset;
             blocked.last_line_no = line_no;
-            blocked.status = "error".to_string();
+            blocked.set_lifecycle(CheckpointLifecycle::Error);
             blocked.policy_fingerprint = policy_fingerprint.clone();
             blocked.scan_inode = inode;
             blocked.scan_boundary = scan_boundary;
@@ -1621,7 +1623,7 @@ pub(crate) async fn process_file(
         source_generation: checkpoint.source_generation,
         last_offset: offset,
         last_line_no: line_no,
-        status: "active".to_string(),
+        status: CheckpointLifecycle::Active.to_string(),
         cursor_json: kiro_cursor_json.unwrap_or_else(|| checkpoint.cursor_json.clone()),
         source_fingerprint: sidecar_fingerprint,
         policy_fingerprint: policy_fingerprint.clone(),
@@ -1640,7 +1642,7 @@ pub(crate) async fn process_file(
     {
         let batch_checkpoint = if replacement_replay {
             Checkpoint {
-                status: "replaying".to_string(),
+                status: CheckpointLifecycle::Replaying.to_string(),
                 final_scan_complete: false,
                 compatibility_prepared: false,
                 backend_caught_up: false,
@@ -1657,7 +1659,7 @@ pub(crate) async fn process_file(
         if replacement_replay {
             if let Some(reason) = replay_block_reason {
                 let blocked_checkpoint = Checkpoint {
-                    status: "error".to_string(),
+                    status: CheckpointLifecycle::Error.to_string(),
                     final_scan_complete: false,
                     compatibility_prepared: false,
                     backend_caught_up: false,
@@ -1763,7 +1765,7 @@ async fn process_session_json_file(
         source_generation: SESSION_JSON_GENERATION,
         last_offset: 0,
         last_line_no: 0,
-        status: "active".to_string(),
+        status: CheckpointLifecycle::Active.to_string(),
         ..Default::default()
     });
 
@@ -1873,7 +1875,7 @@ async fn process_session_json_file(
         source_generation: SESSION_JSON_GENERATION,
         last_offset: file_size,
         last_line_no: message_count,
-        status: "active".to_string(),
+        status: CheckpointLifecycle::Active.to_string(),
         ..Default::default()
     };
 
@@ -2078,7 +2080,7 @@ mod tests {
         CLICKHOUSE_JSON_OBJECT_BYTE_LIMIT, ERROR_KIND_NORMALIZED_ROW_TOO_LARGE,
         ERROR_KIND_SOURCE_LINE_TOO_LARGE, SESSION_JSON_GENERATION, SESSION_JSON_INODE,
     };
-    use crate::model::Checkpoint;
+    use crate::model::{Checkpoint, CheckpointLifecycle};
     use crate::sqlite_poll::VolatilePollMap;
     use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
     use moraine_config::SourceFormat;
@@ -2310,23 +2312,35 @@ mod tests {
             panic!("replacement rows must be preceded by BeginReplay");
         };
         assert_eq!(begin.checkpoint.source_generation, 2);
-        assert_eq!(begin.lifecycle.as_str(), "replaying");
-        assert!(!begin.final_scan_complete);
+        assert_eq!(
+            begin.checkpoint.lifecycle().unwrap(),
+            CheckpointLifecycle::Replaying
+        );
+        assert!(!begin.checkpoint.final_scan_complete);
 
         let ObservedSinkMessage::Batch(batch) = &messages[1] else {
             panic!("replacement payload must follow BeginReplay");
         };
         let replay_checkpoint = batch.checkpoint.as_ref().expect("replay checkpoint");
         assert_eq!(replay_checkpoint.source_generation, 2);
-        assert_eq!(replay_checkpoint.status, "replaying");
+        assert_eq!(
+            replay_checkpoint.lifecycle().unwrap(),
+            CheckpointLifecycle::Replaying
+        );
 
         let ObservedSinkMessage::Finalize(finalize) = &messages[2] else {
             panic!("replacement payload must end with FinalizeReplay");
         };
         assert_eq!(finalize.checkpoint.source_generation, 2);
-        assert_eq!(finalize.lifecycle.as_str(), "active");
-        assert!(finalize.final_scan_complete);
-        assert_eq!(finalize.scan_boundary, finalize.checkpoint.last_offset);
+        assert_eq!(
+            finalize.checkpoint.lifecycle().unwrap(),
+            CheckpointLifecycle::Active
+        );
+        assert!(finalize.checkpoint.final_scan_complete);
+        assert_eq!(
+            finalize.checkpoint.scan_boundary,
+            finalize.checkpoint.last_offset
+        );
 
         // Simulate a crash after the replay payload checkpoint became durable
         // but before the publication acknowledgement. Restart must finalize
@@ -2446,8 +2460,11 @@ mod tests {
             .next()
             .expect("candidate replay batch");
         assert_eq!(
-            batch.checkpoint.as_ref().map(|cp| cp.status.as_str()),
-            Some("replaying")
+            batch
+                .checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.lifecycle().unwrap()),
+            Some(CheckpointLifecycle::Replaying)
         );
         assert_eq!(batch.error_rows.len(), 1);
 
@@ -2458,7 +2475,10 @@ mod tests {
                 _ => None,
             })
             .expect("durable blocked replacement checkpoint");
-        assert_eq!(blocked_checkpoint.status, "error");
+        assert_eq!(
+            blocked_checkpoint.lifecycle().unwrap(),
+            CheckpointLifecycle::Error
+        );
         assert_eq!(
             blocked_checkpoint.last_offset,
             fs::metadata(&path).expect("replacement metadata").len(),
@@ -2831,7 +2851,7 @@ mod tests {
             SinkMessage::BeginReplay { transition, ack } => {
                 let _ = ack.send(Ok(crate::publication::ReplayBarrierAck {
                     checkpoint_revision: 1,
-                    operation_id: transition.operation_id.clone(),
+                    operation_id: transition.checkpoint.operation_id.clone(),
                 }));
                 ObservedSinkMessage::Begin(transition)
             }
@@ -2848,14 +2868,14 @@ mod tests {
             SinkMessage::BlockReplay { transition, ack } => {
                 let _ = ack.send(Ok(crate::publication::ReplayBarrierAck {
                     checkpoint_revision: 2,
-                    operation_id: transition.operation_id.clone(),
+                    operation_id: transition.checkpoint.operation_id.clone(),
                 }));
                 ObservedSinkMessage::Block(transition)
             }
             SinkMessage::MirrorCaughtUp { transition, ack } => {
                 let _ = ack.send(Ok(crate::publication::ReplayBarrierAck {
                     checkpoint_revision: 2,
-                    operation_id: transition.operation_id.clone(),
+                    operation_id: transition.checkpoint.operation_id.clone(),
                 }));
                 ObservedSinkMessage::MirrorCaughtUp
             }
@@ -3814,7 +3834,7 @@ mod tests {
             source_generation: 1,
             last_offset: (header.len() + 1) as u64,
             last_line_no: 1,
-            status: "active".to_string(),
+            status: CheckpointLifecycle::Active.to_string(),
             ..Default::default()
         };
         let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));

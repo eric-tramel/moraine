@@ -721,45 +721,7 @@ async fn load_checkpoints(
         let mut map = HashMap::<String, model::Checkpoint>::new();
         for row in rows {
             let key = checkpoint_key(&row.source_name, &row.source_file);
-            map.insert(
-                key,
-                model::Checkpoint {
-                    source_name: row.source_name,
-                    source_file: row.source_file,
-                    source_inode: row.source_inode,
-                    source_generation: row.source_generation.max(1),
-                    last_offset: row.last_offset,
-                    last_line_no: row.last_line_no,
-                    status: row.status,
-                    cursor_json: row.cursor_json,
-                    source_fingerprint: row.source_fingerprint,
-                    schema_fingerprint: row.schema_fingerprint,
-                    policy_fingerprint: row.policy_fingerprint,
-                    checkpoint_revision: row.checkpoint_revision,
-                    operation_id: row.operation_id,
-                    scan_inode: row.scan_inode,
-                    scan_boundary: row.scan_boundary,
-                    final_scan_complete: row.final_scan_complete != 0,
-                    block_reason: row.block_reason,
-                    compatibility_prepared: row.compatibility_prepared != 0,
-                    backend_caught_up: row.backend_caught_up != 0,
-                    append_batch_id: row.append_batch_id,
-                    cache_epoch: row.cache_epoch,
-                },
-            );
-        }
-        return Ok(map);
-    }
-
-    let query = checkpoints_query(&clickhouse.config().database, cursor_columns, host);
-    let rows: Vec<CheckpointRow> = clickhouse.query_rows(&query, None).await?;
-    let mut map = HashMap::<String, model::Checkpoint>::new();
-
-    for row in rows {
-        let key = checkpoint_key(&row.source_name, &row.source_file);
-        map.insert(
-            key,
-            model::Checkpoint {
+            let checkpoint = model::Checkpoint {
                 source_name: row.source_name,
                 source_file: row.source_file,
                 source_inode: row.source_inode,
@@ -770,9 +732,55 @@ async fn load_checkpoints(
                 cursor_json: row.cursor_json,
                 source_fingerprint: row.source_fingerprint,
                 schema_fingerprint: row.schema_fingerprint,
-                ..model::Checkpoint::default()
-            },
-        );
+                policy_fingerprint: row.policy_fingerprint,
+                checkpoint_revision: row.checkpoint_revision,
+                operation_id: row.operation_id,
+                scan_inode: row.scan_inode,
+                scan_boundary: row.scan_boundary,
+                final_scan_complete: row.final_scan_complete != 0,
+                block_reason: row.block_reason,
+                compatibility_prepared: row.compatibility_prepared != 0,
+                backend_caught_up: row.backend_caught_up != 0,
+                append_batch_id: row.append_batch_id,
+                cache_epoch: row.cache_epoch,
+            };
+            checkpoint.lifecycle().with_context(|| {
+                format!(
+                    "invalid lifecycle for checkpoint {}:{}",
+                    checkpoint.source_name, checkpoint.source_file
+                )
+            })?;
+            map.insert(key, checkpoint);
+        }
+        return Ok(map);
+    }
+
+    let query = checkpoints_query(&clickhouse.config().database, cursor_columns, host);
+    let rows: Vec<CheckpointRow> = clickhouse.query_rows(&query, None).await?;
+    let mut map = HashMap::<String, model::Checkpoint>::new();
+
+    for row in rows {
+        let key = checkpoint_key(&row.source_name, &row.source_file);
+        let checkpoint = model::Checkpoint {
+            source_name: row.source_name,
+            source_file: row.source_file,
+            source_inode: row.source_inode,
+            source_generation: row.source_generation.max(1),
+            last_offset: row.last_offset,
+            last_line_no: row.last_line_no,
+            status: row.status,
+            cursor_json: row.cursor_json,
+            source_fingerprint: row.source_fingerprint,
+            schema_fingerprint: row.schema_fingerprint,
+            ..model::Checkpoint::default()
+        };
+        checkpoint.lifecycle().with_context(|| {
+            format!(
+                "invalid lifecycle for checkpoint {}:{}",
+                checkpoint.source_name, checkpoint.source_file
+            )
+        })?;
+        map.insert(key, checkpoint);
     }
 
     Ok(map)
