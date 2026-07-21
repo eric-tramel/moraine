@@ -264,60 +264,6 @@ SELECT
   token_usage_native_units
 FROM moraine.events;
 
--- Reconcile every current event version that is missing from the document
--- index.  This both creates zero-length tombstones for revisions skipped by
--- older MVs and closes the migration window while the MV above was absent:
--- an event inserted by a concurrent writer during that window must not leave
--- an older document version live.  Concurrent duplicate insertion is safe
--- under the versioned ReplacingMergeTree key.
-INSERT INTO moraine.search_documents
-  (doc_version, ingested_at, event_uid, compacted_parent_uid, session_id,
-   session_date, source_host, source_name, harness, inference_provider,
-   endpoint_kind, source_file, source_generation, source_line_no,
-   source_offset, source_ref, record_ts, event_class, payload_type, actor_role,
-   name, phase, text_content, payload_json, token_usage_json,
-   token_usage_buckets, token_usage_native_units)
-SELECT
-  e.event_version AS doc_version,
-  e.ingested_at,
-  e.event_uid,
-  e.origin_event_id AS compacted_parent_uid,
-  e.session_id,
-  e.session_date,
-  e.source_host,
-  e.source_name,
-  e.harness,
-  e.inference_provider,
-  e.endpoint_kind,
-  e.source_file,
-  e.source_generation,
-  e.source_line_no,
-  e.source_offset,
-  e.source_ref,
-  e.record_ts,
-  e.event_kind AS event_class,
-  e.payload_type,
-  e.actor_kind AS actor_role,
-  e.tool_name AS name,
-  if(e.tool_phase != '', e.tool_phase, e.op_status) AS phase,
-  e.text_content,
-  e.payload_json,
-  e.token_usage_json,
-  e.token_usage_buckets,
-  e.token_usage_native_units
-FROM
-(
-  SELECT * FROM moraine.events FINAL
-) AS e
-LEFT ANTI JOIN
-(
-  SELECT source_host, event_uid, doc_version
-  FROM moraine.search_documents
-) AS d
-  ON e.source_host = d.source_host
- AND e.event_uid = d.event_uid
- AND e.event_version = d.doc_version;
-
 CREATE MATERIALIZED VIEW moraine.mv_search_postings
 TO moraine.search_postings
 AS
@@ -383,14 +329,64 @@ GROUP BY
   d.source_ref,
   d.doc_len;
 
--- ALTER fills the new fixed-identity posting columns with type defaults for
--- pre-upgrade rows.  Regenerate postings from documents under the new key so
--- all previously indexed live text remains searchable.  The versioned key
--- makes this INSERT idempotent if migration recording is interrupted.
+CREATE MATERIALIZED VIEW moraine.mv_search_conversation_terms
+TO moraine.search_conversation_terms
+AS
+SELECT
+  term,
+  session_id,
+  toUInt64(tf) AS tf_sum,
+  toUInt32(1) AS event_freq
+FROM moraine.search_postings;
+
+-- An interrupted older copy of this migration may have reconciled documents
+-- while mv_search_postings was absent, then failed in the former corpus-wide
+-- posting rebuild.  Replay only current document versions that still have no
+-- posting under their complete pre-existing identity.  The IN subquery reads
+-- identity columns only; the outer primary-key lookup tokenizes the small
+-- stranded set and inserts through the conversation-terms MV.  Existing
+-- legacy postings deliberately match without source_file/source_generation
+-- because ALTER filled those new columns with type defaults.  Grace hash
+-- bounds the identity membership table and spills partitions instead of
+-- allowing a large legacy posting corpus to consume server memory.
 INSERT INTO moraine.search_postings
   (post_version, term, doc_id, session_id, source_host, source_name, harness,
    inference_provider, source_file, source_generation, event_class,
    payload_type, actor_role, name, phase, source_ref, doc_len, tf)
+WITH missing_document_ids AS
+(
+  SELECT missing.event_uid, missing.source_host
+  FROM
+  (
+    SELECT
+      event_uid,
+      source_host,
+      source_name,
+      session_id,
+      source_ref,
+      doc_version,
+      doc_len
+    FROM moraine.search_documents FINAL
+  ) AS missing
+  LEFT ANTI JOIN
+  (
+    SELECT
+      doc_id,
+      source_host,
+      source_name,
+      session_id,
+      source_ref,
+      post_version
+    FROM moraine.search_postings
+  ) AS p
+    ON missing.source_host = p.source_host
+   AND missing.source_name = p.source_name
+   AND missing.session_id = p.session_id
+   AND missing.source_ref = p.source_ref
+   AND missing.event_uid = p.doc_id
+   AND missing.doc_version = p.post_version
+  WHERE missing.doc_len > 0
+)
 SELECT
   d.doc_version AS post_version,
   d.term,
@@ -432,6 +428,8 @@ FROM
     arrayJoin(extractAll(lowerUTF8(text_content), '[a-z0-9_]+')) AS term
   FROM moraine.search_documents FINAL
   WHERE doc_len > 0
+    AND (event_uid, source_host) IN
+    (SELECT event_uid, source_host FROM missing_document_ids)
 ) AS d
 WHERE lengthUTF8(d.term) BETWEEN 2 AND 64
 GROUP BY
@@ -451,17 +449,76 @@ GROUP BY
   d.name,
   d.phase,
   d.source_ref,
-  d.doc_len;
+  d.doc_len
+SETTINGS
+  join_algorithm = 'grace_hash',
+  grace_hash_join_initial_buckets = 32,
+  max_bytes_in_join = 268435456;
 
-CREATE MATERIALIZED VIEW moraine.mv_search_conversation_terms
-TO moraine.search_conversation_terms
-AS
+-- Reconcile every current event version that is missing from the document
+-- index.  Both search MVs are live before this INSERT, so only genuinely
+-- missing documents are tokenized into postings.  This also creates
+-- zero-length tombstones for revisions skipped by older MVs and closes the
+-- migration window while the MVs above were absent.  Concurrent duplicate
+-- insertion is safe under the versioned ReplacingMergeTree keys.
+INSERT INTO moraine.search_documents
+  (doc_version, ingested_at, event_uid, compacted_parent_uid, session_id,
+   session_date, source_host, source_name, harness, inference_provider,
+   endpoint_kind, source_file, source_generation, source_line_no,
+   source_offset, source_ref, record_ts, event_class, payload_type, actor_role,
+   name, phase, text_content, payload_json, token_usage_json,
+   token_usage_buckets, token_usage_native_units)
 SELECT
-  term,
-  session_id,
-  toUInt64(tf) AS tf_sum,
-  toUInt32(1) AS event_freq
-FROM moraine.search_postings;
+  e.event_version AS doc_version,
+  e.ingested_at,
+  e.event_uid,
+  e.origin_event_id AS compacted_parent_uid,
+  e.session_id,
+  e.session_date,
+  e.source_host,
+  e.source_name,
+  e.harness,
+  e.inference_provider,
+  e.endpoint_kind,
+  e.source_file,
+  e.source_generation,
+  e.source_line_no,
+  e.source_offset,
+  e.source_ref,
+  e.record_ts,
+  e.event_kind AS event_class,
+  e.payload_type,
+  e.actor_kind AS actor_role,
+  e.tool_name AS name,
+  if(e.tool_phase != '', e.tool_phase, e.op_status) AS phase,
+  e.text_content,
+  e.payload_json,
+  e.token_usage_json,
+  e.token_usage_buckets,
+  e.token_usage_native_units
+FROM
+(
+  SELECT * FROM moraine.events FINAL
+) AS e
+LEFT ANTI JOIN
+(
+  SELECT source_host, event_uid, doc_version
+  FROM moraine.search_documents
+) AS d
+  ON e.source_host = d.source_host
+ AND e.event_uid = d.event_uid
+ AND e.event_version = d.doc_version;
+
+-- Existing posting rows already carry the document's session, source name,
+-- source ref, generation-qualified event UID, and exact version.  Adding
+-- source_host to their physical key supplies the missing cross-writer
+-- discriminator; source_file and source_generation are descriptive payload
+-- copied by the new MV, not authorization keys.  The live view below matches
+-- every pre-existing identity field and projects the two new fields from the
+-- authorized document so legacy default-filled rows keep their complete
+-- public schema.  Do not regenerate the historical index here: that would
+-- re-tokenize and rewrite every posting during startup, proportional to the
+-- full corpus.
 
 -- FINAL selects the latest document/tombstone version, which is live only
 -- when it was derived from the exact canonical event revision.  A document
@@ -517,7 +574,25 @@ ALL INNER JOIN
 WHERE d.doc_len > 0;
 
 CREATE VIEW moraine.v_live_search_postings AS
-SELECT p.*
+SELECT
+  p.post_version,
+  p.term,
+  p.doc_id,
+  p.session_id,
+  d.source_host AS source_host,
+  d.source_name AS source_name,
+  p.harness,
+  p.inference_provider,
+  d.source_file AS source_file,
+  d.source_generation AS source_generation,
+  p.event_class,
+  p.payload_type,
+  p.actor_role,
+  p.name,
+  p.phase,
+  p.source_ref,
+  p.doc_len,
+  p.tf
 FROM
 (
   SELECT * FROM moraine.search_postings FINAL
@@ -529,14 +604,16 @@ ALL INNER JOIN
     source_name,
     source_file,
     source_generation,
+    session_id,
+    source_ref,
     event_uid,
     doc_version
   FROM moraine.v_live_search_documents
 ) AS d
   ON p.source_host = d.source_host
  AND p.source_name = d.source_name
- AND p.source_file = d.source_file
- AND p.source_generation = d.source_generation
+ AND p.session_id = d.session_id
+ AND p.source_ref = d.source_ref
  AND p.doc_id = d.event_uid
  AND p.post_version = d.doc_version;
 
