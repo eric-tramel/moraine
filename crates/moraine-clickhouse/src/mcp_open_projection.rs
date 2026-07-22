@@ -114,6 +114,26 @@ struct SessionIdRow {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct SupersededSnapshotCountRow {
+    rows: u64,
+}
+
+/// Snapshot rows reclaimed because their generation fell behind the published
+/// per-session pointer and can never be served by a live read again.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct McpOpenReclaimStats {
+    pub superseded_event_rows: u64,
+    pub superseded_turn_rows: u64,
+}
+
+impl McpOpenReclaimStats {
+    pub fn total(&self) -> u64 {
+        self.superseded_event_rows
+            .saturating_add(self.superseded_turn_rows)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct SourceHeadRow {
     source_host: String,
     source_name: String,
@@ -306,37 +326,16 @@ fn source_head_from_row(row: SourceHeadRow) -> McpOpenSourceHead {
 impl ClickHouseClient {
     /// Rebuild complete canonical snapshots for the affected sessions and
     /// publish each session head only after its inactive children are durable.
+    ///
+    /// Routed through the durable plan machinery so a retry after a failed or
+    /// response-lost attempt reuses the same candidate generation and its
+    /// anti-joined inserts add zero duplicate snapshot rows.
     pub async fn refresh_mcp_open_read_model<I, S>(&self, session_ids: I) -> Result<()>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let session_ids = projection_session_ids(session_ids);
-
-        stream::iter(session_ids.into_iter().map(Ok::<_, anyhow::Error>))
-            .try_for_each_concurrent(REFRESH_CONCURRENCY, |session_id| async move {
-                let required_heads = self.current_session_source_heads(&session_id).await?;
-                if required_heads.is_empty() {
-                    return Ok(());
-                }
-                // One Snowflake can identify both this one-session candidate
-                // and its first immutable child snapshot.
-                let first_generation = self.next_projection_generation().await?;
-                let candidate_publication_id =
-                    format!("append:{}:{}", session_id, first_generation);
-                self.refresh_mcp_open_session(McpOpenSessionRefreshRequest {
-                    session_id: &session_id,
-                    candidate_publication_id: &candidate_publication_id,
-                    operation_id: &candidate_publication_id,
-                    publisher_id: "ordinary-append",
-                    required_heads: &required_heads,
-                    publish_legacy_head: true,
-                    first_generation: Some(first_generation),
-                })
-                .await
-                .map(|_| ())
-            })
-            .await
+        self.refresh_mcp_open_read_model_batch(session_ids).await
     }
 
     /// Prepare one replacement generation's complete old/new affected-session
@@ -556,6 +555,10 @@ impl ClickHouseClient {
         }
 
         self.set_mcp_open_projection_state(true, "").await?;
+        // Drained sessions supersede their earlier published snapshots.
+        // Reclamation is best-effort here: the ingest janitor retries it on a
+        // fixed cadence, so a failure must not fail the completed rebuild.
+        let _ = self.reclaim_superseded_mcp_open_snapshots().await;
         Ok(())
     }
 
@@ -570,15 +573,22 @@ impl ClickHouseClient {
         }
 
         for _attempt in 0..MAX_UNSTABLE_REFRESH_ATTEMPTS {
-            self.prepare_mcp_open_backfill_plans(&session_ids).await?;
+            // Sessions whose events are not currently authorized by a
+            // published source head produce no batch facts. They are skipped
+            // rather than failing the batch: their dirty rows persist, so a
+            // later publication or drain pass reconciles them.
+            let covered = self.prepare_mcp_open_backfill_plans(&session_ids).await?;
+            if covered.is_empty() {
+                return Ok(());
+            }
 
             self.execute_mcp_open_backfill_insert(batch_projected_events_sql(
                 &self.cfg.database,
-                &session_ids,
+                &covered,
             ))
             .await?;
             self.advance_mcp_open_backfill_phase(
-                &session_ids,
+                &covered,
                 BackfillPhase::Planned,
                 BackfillPhase::EventsInserted,
                 None,
@@ -587,11 +597,11 @@ impl ClickHouseClient {
 
             self.execute_mcp_open_backfill_insert(batch_projected_turns_sql(
                 &self.cfg.database,
-                &session_ids,
+                &covered,
             ))
             .await?;
             self.advance_mcp_open_backfill_phase(
-                &session_ids,
+                &covered,
                 BackfillPhase::EventsInserted,
                 BackfillPhase::TurnsInserted,
                 None,
@@ -602,22 +612,22 @@ impl ClickHouseClient {
             // lost the response before recording completion. Recover that exact
             // durable state before issuing any per-session finalization writes.
             self.advance_mcp_open_backfill_phase(
-                &session_ids,
+                &covered,
                 BackfillPhase::TurnsInserted,
                 BackfillPhase::Complete,
                 Some(BackfillPhaseGuard::LegacyHead),
             )
             .await?;
-            self.finalize_mcp_open_backfill_plans(&session_ids).await?;
+            self.finalize_mcp_open_backfill_plans(&covered).await?;
             self.advance_mcp_open_backfill_phase(
-                &session_ids,
+                &covered,
                 BackfillPhase::TurnsInserted,
                 BackfillPhase::Complete,
                 Some(BackfillPhaseGuard::LegacyHead),
             )
             .await?;
 
-            if self.mcp_open_backfill_batch_complete(&session_ids).await? {
+            if self.mcp_open_backfill_batch_complete(&covered).await? {
                 return Ok(());
             }
         }
@@ -629,18 +639,20 @@ impl ClickHouseClient {
         )
     }
 
-    async fn prepare_mcp_open_backfill_plans(&self, session_ids: &BTreeSet<String>) -> Result<()> {
+    /// Returns the subset of requested sessions that currently have
+    /// authorized live events and therefore received (or retained) a plan.
+    async fn prepare_mcp_open_backfill_plans(
+        &self,
+        session_ids: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>> {
         let facts: Vec<BackfillFactRow> = self
             .mcp_open_backfill_query(&backfill_facts_sql(&self.cfg.database, session_ids))
             .await
             .context("failed to read MCP open batch facts")?;
-        if facts.len() != session_ids.len() {
-            bail!(
-                "MCP open batch facts covered {} of {} requested sessions",
-                facts.len(),
-                session_ids.len()
-            );
-        }
+        let covered = facts
+            .iter()
+            .map(|fact| fact.session_id.clone())
+            .collect::<BTreeSet<_>>();
         let current_plans: Vec<BackfillPlanRow> = self
             .mcp_open_backfill_query(&backfill_plans_sql(&self.cfg.database, session_ids))
             .await
@@ -671,7 +683,7 @@ impl ClickHouseClient {
             }
         }
         if replacements.is_empty() {
-            return Ok(());
+            return Ok(covered);
         }
 
         let generation = self.next_projection_generation().await?;
@@ -701,7 +713,8 @@ impl ClickHouseClient {
              VALUES {values}",
             escape_identifier(&self.cfg.database),
         );
-        self.execute_mcp_open_backfill_insert(statement).await
+        self.execute_mcp_open_backfill_insert(statement).await?;
+        Ok(covered)
     }
 
     async fn finalize_mcp_open_backfill_plans(&self, session_ids: &BTreeSet<String>) -> Result<()> {
@@ -809,6 +822,44 @@ impl ClickHouseClient {
             .into_iter::<T>()
             .collect::<std::result::Result<Vec<_>, _>>()
             .context("failed to parse MCP open batch JSONEachRow response")
+    }
+
+    /// Reclaim snapshot rows whose candidate generation fell behind the
+    /// published `mcp_open_sessions` pointer for their session. Live reads pin
+    /// the pointed (slot, generation), and generations are time-ordered, so
+    /// anything below the pointer is unreachable through live APIs. In-flight
+    /// candidates always carry a newer generation and are never touched;
+    /// sessions without a published pointer keep every row.
+    pub async fn reclaim_superseded_mcp_open_snapshots(&self) -> Result<McpOpenReclaimStats> {
+        let mut stats = McpOpenReclaimStats::default();
+        for table in ["mcp_open_events", "mcp_open_turns"] {
+            let probe = superseded_snapshot_probe_sql(&self.cfg.database, table);
+            let rows: Vec<SupersededSnapshotCountRow> = self
+                .query_json_each_row(&probe, Some(&self.cfg.database))
+                .await
+                .with_context(|| format!("failed to probe superseded {table} snapshot rows"))?;
+            let superseded = rows.first().map_or(0, |row| row.rows);
+            if superseded == 0 {
+                continue;
+            }
+            let delete = superseded_snapshot_delete_sql(&self.cfg.database, table);
+            self.request_text_with_params_and_timeout(
+                "",
+                Some(delete.into_bytes()),
+                Some(&self.cfg.database),
+                false,
+                None,
+                &[],
+                Some(migration_request_timeout(self.cfg.timeout_seconds)),
+            )
+            .await
+            .with_context(|| format!("failed to reclaim superseded {table} snapshot rows"))?;
+            match table {
+                "mcp_open_events" => stats.superseded_event_rows = superseded,
+                _ => stats.superseded_turn_rows = superseded,
+            }
+        }
+        Ok(stats)
     }
 
     pub async fn mcp_open_read_model_ready(&self) -> Result<bool> {
@@ -986,22 +1037,6 @@ impl ClickHouseClient {
         rows.first()
             .map(|row| row.source_revision)
             .context("ClickHouse did not allocate an MCP open projection generation")
-    }
-
-    async fn current_session_source_heads(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<McpOpenSourceHead>> {
-        let query = current_session_source_heads_sql(&self.cfg.database, session_id);
-        let rows: Vec<SourceHeadRow> = self
-            .query_json_each_row(&query, Some(&self.cfg.database))
-            .await?;
-        canonical_source_heads(
-            &rows
-                .into_iter()
-                .map(source_head_from_row)
-                .collect::<Vec<_>>(),
-        )
     }
 
     async fn session_source_heads_for_snapshot(
@@ -1626,36 +1661,6 @@ fn session_source_revision_sql(
     )
 }
 
-fn current_session_source_heads_sql(database: &str, session_id: &str) -> String {
-    let database = escape_identifier(database);
-    format!(
-        "WITH current_heads AS (\n\
-           SELECT\n\
-             heads.source_host AS source_host,\n\
-             heads.source_name AS source_name,\n\
-             heads.source_file AS source_file,\n\
-             tupleElement(argMax(tuple(heads.source_generation, heads.publication_revision), heads.publication_revision), 1) AS source_generation,\n\
-             max(heads.publication_revision) AS publication_revision\n\
-           FROM {database}.published_source_generations AS heads\n\
-           GROUP BY heads.source_host, heads.source_name, heads.source_file\n\
-         )\n\
-         SELECT DISTINCT\n\
-           h.source_host AS source_host,\n\
-           h.source_name AS source_name,\n\
-           h.source_file AS source_file,\n\
-           toUInt32(h.source_generation) AS source_generation,\n\
-           toUInt64(h.publication_revision) AS publication_revision\n\
-         FROM {database}.events AS e FINAL\n\
-         INNER JOIN current_heads AS h\n\
-           ON h.source_host = e.source_host AND h.source_name = e.source_name\n\
-          AND h.source_file = e.source_file AND h.source_generation = e.source_generation\n\
-         PREWHERE e.session_id = {}\n\
-         ORDER BY source_host, source_name, source_file\n\
-         FORMAT JSONEachRow",
-        escape_literal(session_id),
-    )
-}
-
 fn session_source_heads_for_snapshot_sql(
     database: &str,
     session_id: &str,
@@ -1764,6 +1769,39 @@ fn backfill_facts_sql(database: &str, session_ids: &BTreeSet<String>) -> String 
 
 fn backfill_plans_sql(database: &str, session_ids: &BTreeSet<String>) -> String {
     backfill_phase_plans_sql(database, session_ids, None)
+}
+
+fn superseded_snapshot_probe_sql(database: &str, table: &str) -> String {
+    let database = escape_identifier(database);
+    format!(
+        "SELECT count() AS rows\n\
+         FROM {database}.{table} AS snapshot\n\
+         INNER JOIN (\n\
+           SELECT session_id, generation AS live_generation\n\
+           FROM {database}.mcp_open_sessions FINAL\n\
+         ) AS live ON live.session_id = snapshot.session_id\n\
+         WHERE snapshot.candidate_generation < live.live_generation\n\
+         FORMAT JSONEachRow"
+    )
+}
+
+fn superseded_snapshot_delete_sql(database: &str, table: &str) -> String {
+    let database = escape_identifier(database);
+    format!(
+        "DELETE FROM {database}.{table}\n\
+         WHERE (session_id, candidate_generation) IN (\n\
+           SELECT snapshot.session_id, snapshot.candidate_generation\n\
+           FROM (\n\
+             SELECT DISTINCT session_id, candidate_generation\n\
+             FROM {database}.{table}\n\
+           ) AS snapshot\n\
+           INNER JOIN (\n\
+             SELECT session_id, generation AS live_generation\n\
+             FROM {database}.mcp_open_sessions FINAL\n\
+           ) AS live ON live.session_id = snapshot.session_id\n\
+           WHERE snapshot.candidate_generation < live.live_generation\n\
+         )"
+    )
 }
 
 fn backfill_phase_plans_sql(
@@ -2141,11 +2179,11 @@ fn event_type_sql() -> &'static str {
 mod tests {
     use super::{
         backfill_facts_sql, backfill_phase_advance_sql, batch_projected_events_sql,
-        batch_projected_turns_sql, canonical_source_heads, current_session_source_heads_sql,
-        projection_ctes, projection_session_ids, publish_legacy_candidate_heads_sql,
-        session_source_heads_for_snapshot_sql, session_source_revision_sql, source_head_filter,
-        source_heads_fingerprint, BackfillPhase, BackfillPhaseGuard, McpOpenHostRevision,
-        McpOpenSourceHead, SourceHeadRow,
+        batch_projected_turns_sql, canonical_source_heads, projection_ctes, projection_session_ids,
+        publish_legacy_candidate_heads_sql, session_source_heads_for_snapshot_sql,
+        session_source_revision_sql, source_head_filter, source_heads_fingerprint,
+        superseded_snapshot_delete_sql, superseded_snapshot_probe_sql, BackfillPhase,
+        BackfillPhaseGuard, McpOpenHostRevision, McpOpenSourceHead, SourceHeadRow,
     };
     use std::collections::BTreeSet;
 
@@ -2221,6 +2259,29 @@ mod tests {
     }
 
     #[test]
+    fn superseded_snapshot_reclaim_only_targets_generations_below_the_live_pointer() {
+        for table in ["mcp_open_events", "mcp_open_turns"] {
+            let probe = superseded_snapshot_probe_sql("moraine", table);
+            assert!(probe.contains(&format!("FROM `moraine`.{table} AS snapshot")));
+            assert!(probe.contains("FROM `moraine`.mcp_open_sessions FINAL"));
+            assert!(probe.contains("snapshot.candidate_generation < live.live_generation"));
+            assert!(probe.contains("INNER JOIN"));
+
+            let delete = superseded_snapshot_delete_sql("moraine", table);
+            assert!(delete.starts_with(&format!("DELETE FROM `moraine`.{table}\n")));
+            assert!(delete.contains("(session_id, candidate_generation) IN ("));
+            assert!(delete.contains("SELECT DISTINCT session_id, candidate_generation"));
+            assert!(delete.contains("FROM `moraine`.mcp_open_sessions FINAL"));
+            assert!(delete.contains("snapshot.candidate_generation < live.live_generation"));
+            // Sessions without a published pointer must keep every row, and
+            // in-flight candidates (newer generations) must never match.
+            assert!(delete.contains("INNER JOIN"));
+            assert!(!delete.contains("LEFT JOIN"));
+            assert!(!delete.contains("<="));
+        }
+    }
+
+    #[test]
     fn historical_backfill_batches_children_and_guards_completion() {
         let sessions = BTreeSet::from(["session-a".to_string(), "session-b".to_string()]);
         let facts = backfill_facts_sql("moraine", &sessions);
@@ -2264,24 +2325,6 @@ mod tests {
         let unsupported_final_alias = ["FINAL", "AS"].join(" ");
 
         assert!(!source.contains(&unsupported_final_alias));
-    }
-
-    #[test]
-    fn current_head_aggregation_qualifies_raw_revision_inputs() {
-        let sql = current_session_source_heads_sql("moraine", "session-a");
-
-        assert!(sql.contains(
-            "argMax(tuple(heads.source_generation, heads.publication_revision), heads.publication_revision)"
-        ));
-        assert!(sql.contains("max(heads.publication_revision) AS publication_revision"));
-        assert!(sql.contains("FROM `moraine`.published_source_generations AS heads"));
-        assert!(sql.contains("GROUP BY heads.source_host, heads.source_name, heads.source_file"));
-        assert!(sql.contains("h.source_host AS source_host"));
-        assert!(sql.contains("h.source_name AS source_name"));
-        assert!(sql.contains("h.source_file AS source_file"));
-        assert!(sql.contains("PREWHERE e.session_id = 'session-a'"));
-        assert!(!sql.contains("tuple(source_generation, publication_revision)"));
-        assert!(!sql.contains("max(publication_revision)"));
     }
 
     #[test]
