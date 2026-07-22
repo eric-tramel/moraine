@@ -424,11 +424,26 @@ pub(crate) struct AppendManifest {
     /// Classification defaults to false. The writer may set it only after a
     /// preflight proves every replacement key is new.
     pub(crate) insert_only: bool,
+    /// A prior process durably fenced this batch but exited before every
+    /// source checkpoint reached the fence. New flushes may advance the
+    /// missing checkpoints under the retained batch identity.
+    #[serde(default)]
+    pub(crate) recovery_pending: bool,
+    /// Checkpoint revision observed for each source when crash continuation
+    /// began. A later proof must advance past this durable causal boundary.
+    #[serde(default)]
+    pub(crate) recovery_checkpoint_revisions: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 struct AppendCheckpointProof {
+    source_host: String,
+    source_name: String,
+    source_file: String,
+    checkpoint_revision: u64,
     source_generation: u32,
+    #[serde(default)]
+    published_source_generation: u32,
     last_offset: u64,
     last_line: u64,
     lifecycle: String,
@@ -574,6 +589,27 @@ fn source_key_manifest_id(source: &SourceKey) -> String {
     )
 }
 
+fn source_keys_sql_tuple_list(source_keys: &BTreeSet<SourceKey>) -> String {
+    source_keys
+        .iter()
+        .map(|source| {
+            format!(
+                "('{}', '{}', '{}')",
+                escape_string(&source.source_host),
+                escape_string(&source.source_name),
+                escape_string(&source.source_file),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn append_proof_is_nonterminal(proof: &AppendCheckpointProof) -> bool {
+    (proof.lifecycle == CheckpointLifecycle::Active.as_str()
+        || proof.lifecycle == CheckpointLifecycle::Replaying.as_str())
+        && proof.block_reason.is_empty()
+}
+
 fn append_manifest_is_complete(
     manifest: &AppendManifest,
     proofs: &BTreeMap<String, AppendCheckpointProof>,
@@ -592,11 +628,129 @@ fn append_manifest_is_complete(
                 proof.source_generation == *target_generation
                     && proof.last_offset >= *target_offset
                     && proof.last_line >= *target_line
-                    && proof.lifecycle == CheckpointLifecycle::Active.as_str()
-                    && proof.block_reason.is_empty()
+                    && append_proof_is_nonterminal(proof)
                     && proof.append_batch_id == batch_id
                     && proof.cache_epoch == target_epoch
             })
+        })
+}
+
+fn publisher_host_id(publisher_id: &str) -> Option<&str> {
+    let (process_prefix, instance_id) = publisher_id.rsplit_once(':')?;
+    let (host_id, process_id) = process_prefix.rsplit_once(':')?;
+    if host_id.is_empty() || instance_id.is_empty() || process_id.parse::<u32>().is_err() {
+        return None;
+    }
+    Some(host_id)
+}
+
+fn same_publication_host(left: &str, right: &str) -> bool {
+    publisher_host_id(left)
+        .zip(publisher_host_id(right))
+        .is_some_and(|(left, right)| left == right)
+}
+
+fn append_recovery_proof_authorized(
+    manifest: &AppendManifest,
+    key: &str,
+    proof: &AppendCheckpointProof,
+    batch_id: &str,
+    target_epoch: u64,
+) -> bool {
+    (proof.append_batch_id == batch_id && proof.cache_epoch == target_epoch)
+        || manifest
+            .recovery_checkpoint_revisions
+            .get(key)
+            .is_some_and(|revision| proof.checkpoint_revision > *revision)
+}
+
+fn prepare_append_recovery(
+    manifest: &mut AppendManifest,
+    proofs: &BTreeMap<String, AppendCheckpointProof>,
+) {
+    if !manifest.recovery_pending {
+        manifest.recovery_checkpoint_revisions = manifest
+            .source_keys
+            .iter()
+            .map(|source| {
+                let key = source_key_manifest_id(source);
+                let revision = proofs
+                    .get(&key)
+                    .map_or(0, |proof| proof.checkpoint_revision);
+                (key, revision)
+            })
+            .collect();
+    }
+    manifest.recovery_pending = true;
+}
+
+fn append_manifest_recovery_is_complete(
+    manifest: &AppendManifest,
+    proofs: &BTreeMap<String, AppendCheckpointProof>,
+    batch_id: &str,
+    target_epoch: u64,
+) -> bool {
+    !manifest.source_keys.is_empty()
+        && manifest.source_keys.iter().all(|source| {
+            let key = source_key_manifest_id(source);
+            let Some((target_generation, target_offset, target_line)) =
+                manifest.target_cursors.get(&key)
+            else {
+                return false;
+            };
+            proofs.get(&key).is_some_and(|proof| {
+                let superseded = proof.source_generation > *target_generation
+                    && proof.published_source_generation == proof.source_generation
+                    && proof.lifecycle == CheckpointLifecycle::Active.as_str()
+                    && proof.block_reason.is_empty();
+                superseded
+                    || (proof.source_generation == *target_generation
+                        && proof.last_offset >= *target_offset
+                        && proof.last_line >= *target_line
+                        && append_proof_is_nonterminal(proof)
+                        && append_recovery_proof_authorized(
+                            manifest,
+                            &key,
+                            proof,
+                            batch_id,
+                            target_epoch,
+                        ))
+            })
+        })
+}
+
+fn append_manifest_can_resume(
+    manifest: &AppendManifest,
+    proofs: &BTreeMap<String, AppendCheckpointProof>,
+    batch_id: &str,
+    target_epoch: u64,
+) -> bool {
+    !manifest.source_keys.is_empty()
+        && manifest.source_keys.iter().all(|source| {
+            let key = source_key_manifest_id(source);
+            let Some((target_generation, target_offset, target_line)) =
+                manifest.target_cursors.get(&key)
+            else {
+                return false;
+            };
+            let Some(proof) = proofs.get(&key) else {
+                return true;
+            };
+            let superseded = proof.source_generation > *target_generation
+                && proof.published_source_generation == proof.source_generation
+                && proof.lifecycle == CheckpointLifecycle::Active.as_str()
+                && proof.block_reason.is_empty();
+            if superseded {
+                return true;
+            }
+            if proof.source_generation != *target_generation || !append_proof_is_nonterminal(proof)
+            {
+                return false;
+            }
+            let reached_target =
+                proof.last_offset >= *target_offset && proof.last_line >= *target_line;
+            !reached_target
+                || append_recovery_proof_authorized(manifest, &key, proof, batch_id, target_epoch)
         })
 }
 
@@ -839,6 +993,8 @@ impl PublicationActor {
         transition.canonicalize_source(&self.source_host);
         let checkpoint = self.persist_transition_locked(transition).await?;
         self.record_readiness_locked(transition, true).await?;
+        self.commit_recovered_append_for_source_locked(&transition.source)
+            .await?;
         Ok(checkpoint)
     }
 
@@ -859,6 +1015,8 @@ impl PublicationActor {
         if validated_final {
             self.record_readiness_locked(transition, true).await?;
         }
+        self.commit_recovered_append_for_source_locked(&transition.source)
+            .await?;
         Ok(checkpoint)
     }
 
@@ -903,18 +1061,126 @@ impl PublicationActor {
         Ok(ambiguous)
     }
 
-    /// Crash recovery never infers completion from row arrival. Until an
-    /// exact stage verifier proves the persisted manifest, convert an orphaned
-    /// preparation to a durable blocked fence while preserving its scope.
+    async fn append_checkpoint_proofs(
+        &self,
+        manifest: &AppendManifest,
+    ) -> Result<BTreeMap<String, AppendCheckpointProof>> {
+        if manifest.source_keys.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let query = format!(
+            "SELECT checkpoint.host AS source_host, \
+                    checkpoint.source_name AS source_name, \
+                    checkpoint.source_file AS source_file, \
+                    toUInt64(checkpoint.checkpoint_revision) AS checkpoint_revision, \
+                    toUInt32(checkpoint.source_generation) AS source_generation, \
+                    toUInt32(ifNull(head.source_generation, 0)) AS published_source_generation, \
+                    toUInt64(checkpoint.last_offset) AS last_offset, \
+                    toUInt64(checkpoint.last_line) AS last_line, \
+                    checkpoint.lifecycle AS lifecycle, \
+                    checkpoint.block_reason AS block_reason, \
+                    checkpoint.append_batch_id AS append_batch_id, \
+                    toUInt64(checkpoint.cache_epoch) AS cache_epoch \
+             FROM {database}.v_current_ingest_checkpoint_transitions AS checkpoint \
+             LEFT JOIN {database}.v_current_published_source_generations AS head \
+               ON head.source_host = checkpoint.host \
+              AND head.source_name = checkpoint.source_name \
+              AND head.source_file = checkpoint.source_file \
+             WHERE tuple(checkpoint.host, checkpoint.source_name, checkpoint.source_file) \
+                   IN ({source_keys})",
+            database = quote_ident(&self.clickhouse.config().database),
+            source_keys = source_keys_sql_tuple_list(&manifest.source_keys),
+        );
+        let rows: Vec<AppendCheckpointProof> = self.clickhouse.query_rows(&query, None).await?;
+        Ok(rows
+            .into_iter()
+            .map(|proof| {
+                let key = source_key_manifest_id(&SourceKey {
+                    source_host: proof.source_host.clone(),
+                    source_name: proof.source_name.clone(),
+                    source_file: proof.source_file.clone(),
+                });
+                (key, proof)
+            })
+            .collect())
+    }
+
+    async fn commit_recovered_append_for_source_locked(&self, source: &SourceKey) -> Result<()> {
+        let current = self.current_append_control().await?;
+        if current.state != "preparing" || current.publisher_id != self.publisher_id {
+            return Ok(());
+        }
+        let manifest = serde_json::from_str::<AppendManifest>(&current.manifest_json)
+            .context("failed to decode append manifest at checkpoint publication boundary")?;
+        if !manifest.recovery_pending || !manifest.source_keys.contains(source) {
+            return Ok(());
+        }
+        let advanced_sources = BTreeSet::from([source.clone()]);
+        self.commit_append_locked(&current.batch_id, Some(&advanced_sources))
+            .await?;
+        Ok(())
+    }
+
+    async fn reopen_append_for_recovery(
+        &self,
+        expected: &AppendControlRow,
+        manifest: &AppendManifest,
+    ) -> Result<()> {
+        let _guard = self.gate.lock().await;
+        let current = self.current_append_control().await?;
+        if current.batch_id != expected.batch_id
+            || (current.state != "preparing" && current.state != "blocked")
+        {
+            bail!(
+                "append control changed while recovering batch {}",
+                expected.batch_id
+            );
+        }
+        if !same_publication_host(&current.publisher_id, &self.publisher_id) {
+            bail!(
+                "another publication host owns append batch {}",
+                current.batch_id
+            );
+        }
+        let revision = current
+            .control_revision
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("append control revision exhausted during recovery"))?;
+        self.clickhouse
+            .insert_json_rows_sync(
+                "ingest_append_control",
+                &[json!({
+                    "host": self.source_host,
+                    "control_revision": revision,
+                    "cache_epoch": current.cache_epoch,
+                    "state": "preparing",
+                    "batch_id": current.batch_id,
+                    "publisher_id": self.publisher_id,
+                    "manifest_json": serde_json::to_string(manifest)?,
+                    "insert_only": 0,
+                    "updated_at": clickhouse_datetime64_now(),
+                })],
+            )
+            .await
+            .context("failed to reopen interrupted append fence")?;
+        for source in &manifest.source_keys {
+            self.record_writer_conflict(source, false, "").await?;
+        }
+        Ok(())
+    }
+
+    /// Crash recovery advances an interrupted batch only through its durable
+    /// source checkpoints. Recoverable work keeps the original batch and cache
+    /// epoch; malformed, foreign-owned, or terminal manifests stay blocked.
     pub(crate) async fn block_orphaned_append_on_startup(&self) -> Result<bool> {
         let current = {
             let _guard = self.gate.lock().await;
             self.current_append_control().await?
         };
-        if current.state != "preparing" {
-            return Ok(current.state == "blocked");
+        if current.state != "preparing" && current.state != "blocked" {
+            return Ok(false);
         }
-        let manifest = match serde_json::from_str::<AppendManifest>(&current.manifest_json) {
+        let mut manifest = match serde_json::from_str::<AppendManifest>(&current.manifest_json) {
             Ok(manifest) => manifest,
             Err(error) => {
                 self.block_orphaned_append_raw(&current).await?;
@@ -926,32 +1192,49 @@ impl PublicationActor {
             self.block_orphaned_append_raw(&current).await?;
             return Ok(true);
         };
-        let mut proofs = BTreeMap::new();
-        for source in &manifest.source_keys {
-            let query = format!(
-                "SELECT toUInt32(source_generation) AS source_generation, \
-                        toUInt64(last_offset) AS last_offset, \
-                        toUInt64(last_line) AS last_line, lifecycle, block_reason, \
-                        append_batch_id, toUInt64(cache_epoch) AS cache_epoch \
-                 FROM {}.v_current_ingest_checkpoint_transitions \
-                 WHERE host = '{}' AND source_name = '{}' AND source_file = '{}' LIMIT 1",
-                quote_ident(&self.clickhouse.config().database),
-                escape_string(&source.source_host),
-                escape_string(&source.source_name),
-                escape_string(&source.source_file),
-            );
-            let mut rows: Vec<AppendCheckpointProof> =
-                self.clickhouse.query_rows(&query, None).await?;
-            if let Some(proof) = rows.pop() {
-                proofs.insert(source_key_manifest_id(source), proof);
+        let proofs = self.append_checkpoint_proofs(&manifest).await?;
+        if !same_publication_host(&current.publisher_id, &self.publisher_id) {
+            for source in &manifest.source_keys {
+                self.record_writer_conflict(
+                    source,
+                    true,
+                    "another publication host owns the unresolved append fence",
+                )
+                .await?;
             }
+            return Ok(true);
         }
-        if append_manifest_is_complete(&manifest, &proofs, &current.batch_id, target_epoch) {
-            self.commit_append(&current.batch_id).await?;
+        let complete = if manifest.recovery_pending {
+            append_manifest_recovery_is_complete(
+                &manifest,
+                &proofs,
+                &current.batch_id,
+                target_epoch,
+            )
+        } else {
+            append_manifest_is_complete(&manifest, &proofs, &current.batch_id, target_epoch)
+        };
+        if complete {
+            if current.state == "blocked" || current.publisher_id != self.publisher_id {
+                prepare_append_recovery(&mut manifest, &proofs);
+                self.reopen_append_for_recovery(&current, &manifest).await?;
+            }
+            self.commit_append(&current.batch_id, None).await?;
             return Ok(false);
         }
-        self.block_append(&current.batch_id, &manifest).await?;
-        Ok(true)
+        if !append_manifest_can_resume(&manifest, &proofs, &current.batch_id, target_epoch) {
+            if current.state == "preparing" {
+                self.block_append(&current.batch_id, &manifest).await?;
+            }
+            return Ok(true);
+        }
+        prepare_append_recovery(&mut manifest, &proofs);
+        self.reopen_append_for_recovery(&current, &manifest).await?;
+        tracing::info!(
+            batch_id = current.batch_id,
+            "reopened interrupted append fence for checkpoint continuation"
+        );
+        Ok(false)
     }
 
     async fn block_orphaned_append_raw(&self, current: &AppendControlRow) -> Result<()> {
@@ -1178,44 +1461,54 @@ impl PublicationActor {
         transition.validate_final_source()?;
         let _guard = self.gate.lock().await;
         transition.canonicalize_source(&self.source_host);
-        if let Some(head) = self.current_head(&transition.source).await? {
-            if head.source_generation == transition.checkpoint.source_generation {
-                return self
-                    .commit_or_repair_head_locked(
-                        transition,
-                        HeadPublicationAction::Repair {
-                            publication_revision: head.publication_revision,
-                            previous_source_generation: transition
-                                .checkpoint
-                                .source_generation
-                                .checked_sub(1),
-                        },
-                        SourcePublicationKind::Replacement,
-                    )
-                    .await;
-            }
-            if head.source_generation > transition.checkpoint.source_generation {
-                bail!(
-                    "refusing to publish stale generation {} behind current {}",
-                    transition.checkpoint.source_generation,
-                    head.source_generation
-                );
-            }
+        let current_head = self.current_head(&transition.source).await?;
+        if current_head
+            .as_ref()
+            .is_some_and(|head| head.source_generation > transition.checkpoint.source_generation)
+        {
+            bail!(
+                "refusing to publish stale generation {} behind current {}",
+                transition.checkpoint.source_generation,
+                current_head
+                    .as_ref()
+                    .expect("stale current head exists")
+                    .source_generation
+            );
         }
-        let publication_revision = self.next_publication_revision().await?;
-        let previous_generation = self
-            .current_head(&transition.source)
+        let publication = if let Some(head) = current_head
+            .as_ref()
+            .filter(|head| head.source_generation == transition.checkpoint.source_generation)
+        {
+            self.commit_or_repair_head_locked(
+                transition,
+                HeadPublicationAction::Repair {
+                    publication_revision: head.publication_revision,
+                    previous_source_generation: transition
+                        .checkpoint
+                        .source_generation
+                        .checked_sub(1),
+                },
+                SourcePublicationKind::Replacement,
+            )
             .await?
-            .map(|head| head.source_generation);
-        self.commit_or_repair_head_locked(
-            transition,
-            HeadPublicationAction::Commit {
-                publication_revision,
-                previous_source_generation: previous_generation,
-            },
-            SourcePublicationKind::Replacement,
-        )
-        .await
+        } else {
+            let publication_revision = self.next_publication_revision().await?;
+            self.commit_or_repair_head_locked(
+                transition,
+                HeadPublicationAction::Commit {
+                    publication_revision,
+                    previous_source_generation: self
+                        .current_head(&transition.source)
+                        .await?
+                        .map(|head| head.source_generation),
+                },
+                SourcePublicationKind::Replacement,
+            )
+            .await?
+        };
+        self.commit_recovered_append_for_source_locked(&transition.source)
+            .await?;
+        Ok(publication)
     }
 
     pub(crate) async fn publish_initial_if_absent(
@@ -1319,6 +1612,19 @@ impl PublicationActor {
         Ok(repaired)
     }
 
+    pub(crate) async fn has_recovering_append(&self) -> Result<bool> {
+        let _guard = self.gate.lock().await;
+        let current = self.current_append_control().await?;
+        if current.state != "preparing" || current.publisher_id != self.publisher_id {
+            return Ok(false);
+        }
+        Ok(
+            serde_json::from_str::<AppendManifest>(&current.manifest_json)
+                .context("failed to decode current append manifest")?
+                .recovery_pending,
+        )
+    }
+
     pub(crate) async fn begin_append(
         &self,
         manifest: &AppendManifest,
@@ -1329,9 +1635,13 @@ impl PublicationActor {
         let _guard = self.gate.lock().await;
         let batch_id = manifest.batch_id();
         let current = self.current_append_control().await?;
-        let clear_writer_conflict =
-            !current.publisher_id.is_empty() && current.publisher_id != self.publisher_id;
-        if current.batch_id == batch_id && current.state == "blocked" {
+        let current_owner = current.publisher_id == self.publisher_id;
+        let same_host_restart = same_publication_host(&current.publisher_id, &self.publisher_id);
+        let clear_writer_conflict = !current.publisher_id.is_empty() && !current_owner;
+        if current.batch_id == batch_id
+            && current.state == "blocked"
+            && (current_owner || same_host_restart)
+        {
             let revision = current
                 .control_revision
                 .checked_add(1)
@@ -1353,9 +1663,12 @@ impl PublicationActor {
                 )
                 .await
                 .context("failed to reacquire blocked append fence")?;
+            for source in &manifest.source_keys {
+                self.record_writer_conflict(source, false, "").await?;
+            }
             return Ok(Some((batch_id, current.cache_epoch)));
         }
-        if (current.state == "preparing" || current.state == "blocked") && clear_writer_conflict {
+        if (current.state == "preparing" || current.state == "blocked") && !current_owner {
             for source in &manifest.source_keys {
                 self.record_writer_conflict(
                     source,
@@ -1369,6 +1682,16 @@ impl PublicationActor {
                 current.state,
                 current.batch_id
             );
+        }
+        if current.state == "preparing" && current_owner {
+            let persisted = serde_json::from_str::<AppendManifest>(&current.manifest_json)
+                .context("failed to decode current append manifest")?;
+            if persisted.recovery_pending {
+                for source in manifest.source_keys.union(&persisted.source_keys) {
+                    self.record_writer_conflict(source, false, "").await?;
+                }
+                return Ok(Some((current.batch_id, current.cache_epoch)));
+            }
         }
         if current.batch_id == batch_id {
             if current.state == "idle" {
@@ -1452,8 +1775,20 @@ impl PublicationActor {
         Ok(insert_only)
     }
 
-    pub(crate) async fn commit_append(&self, batch_id: &str) -> Result<u64> {
+    pub(crate) async fn commit_append(
+        &self,
+        batch_id: &str,
+        advanced_sources: Option<&BTreeSet<SourceKey>>,
+    ) -> Result<u64> {
         let _guard = self.gate.lock().await;
+        self.commit_append_locked(batch_id, advanced_sources).await
+    }
+
+    async fn commit_append_locked(
+        &self,
+        batch_id: &str,
+        advanced_sources: Option<&BTreeSet<SourceKey>>,
+    ) -> Result<u64> {
         let current = self.current_append_control().await?;
         if current.batch_id == batch_id && current.state == "idle" {
             return Ok(current.cache_epoch);
@@ -1464,6 +1799,23 @@ impl PublicationActor {
                 current.batch_id,
                 current.state
             );
+        }
+        if current.publisher_id != self.publisher_id {
+            bail!("cannot commit append batch {batch_id} owned by another publisher");
+        }
+        let manifest = serde_json::from_str::<AppendManifest>(&current.manifest_json)
+            .context("failed to decode append manifest before commit")?;
+        if manifest.recovery_pending {
+            if advanced_sources.is_some_and(|sources| sources.is_disjoint(&manifest.source_keys)) {
+                return Ok(current.cache_epoch);
+            }
+            let target_epoch = current.cache_epoch.checked_add(1).ok_or_else(|| {
+                anyhow!("append cache epoch exhausted at {}", current.cache_epoch)
+            })?;
+            let proofs = self.append_checkpoint_proofs(&manifest).await?;
+            if !append_manifest_recovery_is_complete(&manifest, &proofs, batch_id, target_epoch) {
+                return Ok(current.cache_epoch);
+            }
         }
         let revision = current.control_revision.checked_add(1).ok_or_else(|| {
             anyhow!(
@@ -2677,7 +3029,12 @@ mod tests {
         );
         let batch_id = manifest.batch_id();
         let proof = |checkpoint: &Checkpoint| AppendCheckpointProof {
+            source_host: String::new(),
+            source_name: checkpoint.source_name.clone(),
+            source_file: checkpoint.source_file.clone(),
+            checkpoint_revision: 10,
             source_generation: checkpoint.source_generation,
+            published_source_generation: checkpoint.source_generation,
             last_offset: checkpoint.last_offset,
             last_line: checkpoint.last_line_no,
             lifecycle: "active".to_string(),
@@ -2713,7 +3070,12 @@ mod tests {
         let batch_id = manifest.batch_id();
         let key = source_key_manifest_id(&SourceKey::from_checkpoint(&checkpoint));
         let mut proof = AppendCheckpointProof {
+            source_host: String::new(),
+            source_name: checkpoint.source_name.clone(),
+            source_file: checkpoint.source_file.clone(),
+            checkpoint_revision: 10,
             source_generation: 1,
+            published_source_generation: 1,
             last_offset: checkpoint.last_offset,
             last_line: checkpoint.last_line_no,
             lifecycle: "error".to_string(),
@@ -2732,9 +3094,71 @@ mod tests {
         proof.cache_epoch = 2;
         assert!(!append_manifest_is_complete(
             &manifest,
+            &BTreeMap::from([(key.clone(), proof.clone())]),
+            &batch_id,
+            3
+        ));
+
+        let mut recovering = manifest.clone();
+        prepare_append_recovery(
+            &mut recovering,
+            &BTreeMap::from([(key.clone(), proof.clone())]),
+        );
+        proof.checkpoint_revision = 11;
+        assert!(append_manifest_recovery_is_complete(
+            &recovering,
+            &BTreeMap::from([(key.clone(), proof.clone())]),
+            &batch_id,
+            3
+        ));
+        proof.checkpoint_revision = 10;
+        assert!(!append_manifest_recovery_is_complete(
+            &recovering,
+            &BTreeMap::from([(key.clone(), proof.clone())]),
+            &batch_id,
+            3
+        ));
+
+        proof.checkpoint_revision = 11;
+        proof.source_generation = 2;
+        proof.published_source_generation = 2;
+        assert!(append_manifest_recovery_is_complete(
+            &recovering,
+            &BTreeMap::from([(key.clone(), proof.clone())]),
+            &batch_id,
+            3
+        ));
+
+        proof.source_generation = 1;
+        proof.published_source_generation = 1;
+        proof.lifecycle = CheckpointLifecycle::Replaying.as_str().to_string();
+        proof.append_batch_id = batch_id.clone();
+        proof.cache_epoch = 3;
+        assert!(append_manifest_is_complete(
+            &manifest,
+            &BTreeMap::from([(key.clone(), proof.clone())]),
+            &batch_id,
+            3
+        ));
+
+        proof.append_batch_id = "different-batch".to_string();
+        proof.cache_epoch = 2;
+        proof.last_offset = checkpoint.last_offset.saturating_sub(1);
+        assert!(append_manifest_can_resume(
+            &manifest,
             &BTreeMap::from([(key, proof)]),
             &batch_id,
             3
         ));
+    }
+
+    #[test]
+    fn append_restart_ownership_uses_the_durable_host_identity() {
+        let first = "453ceec9-18c2-477b-8b7b-6545a784ac6f:10816:instance-a";
+        let restarted = "453ceec9-18c2-477b-8b7b-6545a784ac6f:60138:instance-b";
+        let foreign = "d57ab5c0-11b9-4e17-b642-bc2884af85bc:42:instance-c";
+        assert!(same_publication_host(first, restarted));
+        assert!(!same_publication_host(first, foreign));
+        assert!(!same_publication_host(first, "migration-031"));
     }
 }
