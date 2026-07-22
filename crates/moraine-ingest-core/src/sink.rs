@@ -1960,6 +1960,22 @@ async fn flush_pending_inner(
                 }
             }
         }
+        let recovering_append = if has_live_append {
+            false
+        } else {
+            match publication.has_recovering_append().await {
+                Ok(recovering) => recovering,
+                Err(error) => {
+                    metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
+                    *metrics
+                        .last_error
+                        .lock()
+                        .expect("metrics last_error mutex poisoned") = error.to_string();
+                    warn!("failed to inspect recovering append fence: {error}");
+                    return false;
+                }
+            }
+        };
         if has_live_append {
             if let Err(error) = publication.prove_insert_only(append_manifest).await {
                 // Classification is an optimization only. Query failure is
@@ -1967,6 +1983,8 @@ async fn flush_pending_inner(
                 append_manifest.insert_only = false;
                 warn!("append insert-only preflight failed; using hard fence: {error}");
             }
+        }
+        if has_live_append || recovering_append {
             if pending_append_fence.is_none() {
                 *pending_append_fence = match publication.begin_append(append_manifest).await {
                     Ok(fence) => fence,
@@ -2196,7 +2214,7 @@ async fn flush_pending_inner(
                     .map_err(|error| SinkFlushFailure::new(SinkStage::AppendControl, error))?;
             } else {
                 publication
-                    .commit_append(batch_id)
+                    .commit_append(batch_id, Some(&append_manifest.source_keys))
                     .await
                     .map_err(|error| SinkFlushFailure::new(SinkStage::AppendControl, error))?;
             }
