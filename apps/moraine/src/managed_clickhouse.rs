@@ -859,10 +859,15 @@ async fn stop_after_output_forwarder(
     };
     let stopped = terminate_and_reap(child, grace, None).await;
     let drained = finish_output_forwarders(forwarders, log).await;
-    let mut reason = format!("{failure:#}");
+    // A replacement generation is only safe when the old child is provably
+    // gone; spawning beside a possibly-live server would fight over the same
+    // port and data directory, so an unkillable child stays supervision-fatal.
     if let Err(err) = stopped {
-        reason = format!("{reason}; also failed to stop child: {err:#}");
+        return Err(failure.context(format!(
+            "also failed to stop child after output forwarding failure: {err:#}"
+        )));
     }
+    let mut reason = format!("{failure:#}");
     if let Err(err) = drained {
         reason = format!("{reason}; also failed to drain remaining child output: {err:#}");
     }

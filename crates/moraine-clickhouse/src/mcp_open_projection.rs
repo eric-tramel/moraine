@@ -525,33 +525,11 @@ impl ClickHouseClient {
         }
 
         loop {
-            let query = format!(
-                "SELECT d.session_id AS session_id\n\
-                 FROM (\n\
-                   SELECT session_id, dirty_revision\n\
-                   FROM {}.mcp_open_dirty_sessions FINAL\n\
-                 ) AS d\n\
-                 INNER JOIN (\n\
-                   SELECT DISTINCT session_id\n\
-                   FROM {}.v_live_events\n\
-                   WHERE notEmpty(session_id)\n\
-                 ) AS live ON live.session_id = d.session_id\n\
-                 LEFT JOIN (\n\
-                   SELECT session_id, dirty_revision\n\
-                   FROM {}.mcp_open_sessions FINAL\n\
-                 ) AS s ON s.session_id = d.session_id\n\
-                 WHERE notEmpty(d.session_id)\n\
-                   AND d.dirty_revision > ifNull(s.dirty_revision, 0)\n\
-                 ORDER BY d.session_id ASC\n\
-                 LIMIT {}\n\
-                 FORMAT JSONEachRow",
-                escape_identifier(&self.cfg.database),
-                escape_identifier(&self.cfg.database),
-                escape_identifier(&self.cfg.database),
-                BACKFILL_PAGE_SIZE,
-            );
             let rows: Vec<SessionIdRow> = self
-                .query_json_each_row(&query, Some(&self.cfg.database))
+                .query_json_each_row(
+                    &dirty_reconciliation_sql(&self.cfg.database, BACKFILL_PAGE_SIZE),
+                    Some(&self.cfg.database),
+                )
                 .await
                 .context("failed to read dirty MCP open sessions")?;
             if rows.is_empty() {
@@ -894,6 +872,20 @@ impl ClickHouseClient {
         }
         stats.superseded_generations = superseded.len() as u64;
         Ok(stats)
+    }
+
+    /// Sessions with durable projection debt: dirtied past their published
+    /// pointer and currently live. Ingest reseeds its in-memory pending set
+    /// from this after restarts and on a fixed cadence.
+    pub async fn pending_dirty_mcp_open_sessions(&self, limit: usize) -> Result<Vec<String>> {
+        let rows: Vec<SessionIdRow> = self
+            .query_json_each_row(
+                &dirty_reconciliation_sql(&self.cfg.database, limit),
+                Some(&self.cfg.database),
+            )
+            .await
+            .context("failed to read pending dirty MCP open sessions")?;
+        Ok(rows.into_iter().map(|row| row.session_id).collect())
     }
 
     pub async fn mcp_open_read_model_ready(&self) -> Result<bool> {
@@ -1831,6 +1823,33 @@ fn superseded_snapshot_set_sql(database: &str) -> String {
          WHERE h.tombstone = 0\n\
            AND h.generation < lineage.newest_generation\n\
            AND h.generation < live.pointer_generation"
+    )
+}
+
+/// Sessions whose dirty revision moved past their published pointer —
+/// projection debt that is durable across process restarts.
+fn dirty_reconciliation_sql(database: &str, limit: usize) -> String {
+    let database = escape_identifier(database);
+    format!(
+        "SELECT d.session_id AS session_id\n\
+         FROM (\n\
+           SELECT session_id, dirty_revision\n\
+           FROM {database}.mcp_open_dirty_sessions FINAL\n\
+         ) AS d\n\
+         INNER JOIN (\n\
+           SELECT DISTINCT session_id\n\
+           FROM {database}.v_live_events\n\
+           WHERE notEmpty(session_id)\n\
+         ) AS live ON live.session_id = d.session_id\n\
+         LEFT JOIN (\n\
+           SELECT session_id, dirty_revision\n\
+           FROM {database}.mcp_open_sessions FINAL\n\
+         ) AS s ON s.session_id = d.session_id\n\
+         WHERE notEmpty(d.session_id)\n\
+           AND d.dirty_revision > ifNull(s.dirty_revision, 0)\n\
+         ORDER BY d.session_id ASC\n\
+         LIMIT {limit}\n\
+         FORMAT JSONEachRow"
     )
 }
 

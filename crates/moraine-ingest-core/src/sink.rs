@@ -214,6 +214,9 @@ struct ProjectionOutcome {
 struct ProjectionWorker {
     requests: tokio::sync::mpsc::Sender<Vec<String>>,
     outcomes: Arc<Mutex<Vec<ProjectionOutcome>>>,
+    /// Durable projection debt found by the maintenance task, merged into the
+    /// pending set on the next drain.
+    discovered: Arc<Mutex<BTreeSet<String>>>,
 }
 
 fn spawn_projection_worker(clickhouse: ClickHouseClient) -> ProjectionWorker {
@@ -240,7 +243,11 @@ fn spawn_projection_worker(clickhouse: ClickHouseClient) -> ProjectionWorker {
             }
         }
     });
-    ProjectionWorker { requests, outcomes }
+    ProjectionWorker {
+        requests,
+        outcomes,
+        discovered: Arc::new(Mutex::new(BTreeSet::new())),
+    }
 }
 
 const PROJECTION_REFRESH_MIN_GAP: Duration = Duration::from_secs(2);
@@ -251,6 +258,7 @@ const PROJECTION_FAILURE_BACKOFF_CEILING: Duration = Duration::from_secs(60);
 const PROJECTION_HISTORY_LIMIT: usize = 4096;
 const THROTTLED_RETRY_DELAY_CEILING: Duration = Duration::from_secs(60);
 const SNAPSHOT_RECLAIM_INTERVAL: Duration = Duration::from_secs(60);
+const PROJECTION_DEBT_PAGE: usize = 256;
 
 /// Escalate the fixed flush retry delay exponentially while ClickHouse stays
 /// unreachable, so an outage produces a warn every minute instead of every
@@ -261,16 +269,48 @@ fn throttled_retry_delay(base: Duration, consecutive_failures: u32) -> Duration 
         .clamp(base, THROTTLED_RETRY_DELAY_CEILING.max(base))
 }
 
-/// Reclaim superseded snapshot rows in the background, at most one run at a
-/// time; the mutation is server-side durable so a lost response only delays
-/// accounting until the next tick.
-fn spawn_snapshot_reclaim(clickhouse: &ClickHouseClient, in_flight: &Arc<AtomicBool>) {
+/// Releases the single-flight maintenance slot even if the task panics.
+struct MaintenanceSlot(Arc<AtomicBool>);
+
+impl Drop for MaintenanceSlot {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Background projection maintenance, at most one run at a time per sink:
+/// reseed durable projection debt (dirty sessions that outlived a restart or
+/// were dropped from the in-memory pending set) into `discovered`, then
+/// reclaim superseded snapshots. Mutations are server-side durable, so a lost
+/// response only delays accounting until the next tick.
+fn spawn_projection_maintenance(
+    clickhouse: &ClickHouseClient,
+    in_flight: &Arc<AtomicBool>,
+    discovered: &Arc<Mutex<BTreeSet<String>>>,
+) {
     if in_flight.swap(true, Ordering::SeqCst) {
         return;
     }
     let clickhouse = clickhouse.clone();
-    let guard = Arc::clone(in_flight);
+    let slot = MaintenanceSlot(Arc::clone(in_flight));
+    let discovered = Arc::clone(discovered);
     tokio::spawn(async move {
+        let _slot = slot;
+        match clickhouse
+            .pending_dirty_mcp_open_sessions(PROJECTION_DEBT_PAGE)
+            .await
+        {
+            Ok(sessions) if !sessions.is_empty() => {
+                discovered
+                    .lock()
+                    .expect("discovered projection debt mutex poisoned")
+                    .extend(sessions);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!("failed to reconcile durable mcp open projection debt: {error:#}");
+            }
+        }
         match clickhouse.reclaim_superseded_mcp_open_snapshots().await {
             Ok(stats) if stats.total() > 0 => info!(
                 superseded_generations = stats.superseded_generations,
@@ -281,7 +321,6 @@ fn spawn_snapshot_reclaim(clickhouse: &ClickHouseClient, in_flight: &Arc<AtomicB
                 warn!("superseded mcp open snapshot reclaim failed: {error:#}");
             }
         }
-        guard.store(false, Ordering::SeqCst);
     });
 }
 
@@ -377,6 +416,13 @@ fn drain_pending_projection(
     governor: &mut ProjectionGovernor,
     pending_ack: &mut PendingAckBatch,
 ) {
+    let discovered = std::mem::take(
+        &mut *worker
+            .discovered
+            .lock()
+            .expect("discovered projection debt mutex poisoned"),
+    );
+    pending_ack.projection_session_ids.extend(discovered);
     let outcomes = std::mem::take(
         &mut *worker
             .outcomes
@@ -1198,8 +1244,12 @@ pub(crate) fn spawn_sink_task(
                 _ = heartbeat_tick.tick() => {
                     emit_heartbeat(&clickhouse, &metrics, &role).await;
                 }
-                _ = reclaim_tick.tick(), if matches!(role, SinkRole::Default { .. }) => {
-                    spawn_snapshot_reclaim(&clickhouse, &reclaim_in_flight);
+                _ = reclaim_tick.tick() => {
+                    spawn_projection_maintenance(
+                        &clickhouse,
+                        &reclaim_in_flight,
+                        &projection_worker.discovered,
+                    );
                 }
             }
         }
@@ -3216,6 +3266,75 @@ mod tests {
          Expected not greater than 10485760 bytes, but current is 104890103 bytes per row. \
          While executing ParallelParsingBlockInputFormat.";
 
+    #[test]
+    fn projection_governor_debounces_by_cost_and_isolates_failures() {
+        let mut governor = ProjectionGovernor::default();
+        let mut pending: BTreeSet<String> = ["cheap", "huge", "failing"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let now = Instant::now();
+
+        // Unknown sessions are immediately due; in-flight sessions are not.
+        assert_eq!(governor.due_sessions(&pending, now).len(), 3);
+        governor.mark_in_flight(&["huge".to_string()]);
+        assert!(!governor.due_sessions(&pending, now).contains("huge"));
+
+        // Success removes the session from pending and schedules the next
+        // refresh proportionally to its cost, clamped to the ceiling.
+        governor.apply_outcome(
+            ProjectionOutcome {
+                session_id: "huge".to_string(),
+                cost: Duration::from_secs(60),
+                error: None,
+            },
+            &mut pending,
+            now,
+        );
+        assert!(!pending.contains("huge"));
+        pending.insert("huge".to_string());
+        assert!(!governor.due_sessions(&pending, now).contains("huge"));
+        assert!(governor
+            .due_sessions(&pending, now + Duration::from_secs(601))
+            .contains("huge"));
+
+        // Cheap sessions come due again at the floor.
+        governor.apply_outcome(
+            ProjectionOutcome {
+                session_id: "cheap".to_string(),
+                cost: Duration::from_millis(10),
+                error: None,
+            },
+            &mut pending,
+            now,
+        );
+        pending.insert("cheap".to_string());
+        assert!(!governor.due_sessions(&pending, now).contains("cheap"));
+        assert!(governor
+            .due_sessions(&pending, now + Duration::from_secs(2))
+            .contains("cheap"));
+
+        // A failure backs off only the failing session and keeps it pending.
+        governor.mark_in_flight(&["failing".to_string()]);
+        governor.apply_outcome(
+            ProjectionOutcome {
+                session_id: "failing".to_string(),
+                cost: Duration::ZERO,
+                error: Some("refresh failed".to_string()),
+            },
+            &mut pending,
+            now,
+        );
+        assert!(pending.contains("failing"));
+        assert!(!governor.due_sessions(&pending, now).contains("failing"));
+        assert!(governor
+            .due_sessions(&pending, now + Duration::from_secs(2))
+            .contains("failing"));
+        assert!(governor
+            .due_sessions(&pending, now + Duration::from_secs(2))
+            .contains("cheap"));
+    }
+
     #[tokio::test]
     async fn failed_flush_throttles_sink_consumption() {
         let mut config = moraine_config::AppConfig::default();
@@ -4587,11 +4706,14 @@ mod tests {
 
         assert_eq!(mock_state.rows("events").len(), 1);
         assert_eq!(
-            mock_state.query_count("WITH current_heads AS"),
+            mock_state.query_count("mcp_open_backfill_plans"),
             0,
             "an unpublished replacement chunk must not invoke the MCP projector"
         );
-        assert!(pending.acknowledgements.projection_session_ids.is_empty());
+        assert!(
+            pending.acknowledgements.projection_session_ids.is_empty(),
+            "unpublished sources must not enqueue projection debt"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
