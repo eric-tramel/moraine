@@ -12,8 +12,8 @@ use crate::render::{
 };
 use crate::service::Service;
 use anyhow::{bail, Context, Result};
-use moraine_clickhouse::{DoctorReport, PublicationDiagnostics};
-use moraine_config::AppConfig;
+use moraine_clickhouse::{DoctorReport, PublicationDiagnostics, QueryClass, QueryEnvelope};
+use moraine_config::{AppConfig, ValidatedQueryBudgets};
 use moraine_conversations::{ConversationRepository, IngestHeartbeatRead, StoreDiagnostics};
 use std::time::Duration;
 
@@ -408,19 +408,33 @@ fn heartbeat_snapshot(read: IngestHeartbeatRead) -> HeartbeatSnapshot {
 
 async fn read_repository_status(
     repository: &dyn ConversationRepository,
+    budgets: &ValidatedQueryBudgets,
 ) -> Result<(DoctorReport, HeartbeatSnapshot)> {
-    let report = doctor_report(repository.read_store_diagnostics().await?);
-    let heartbeat = match repository.latest_ingest_heartbeat().await {
-        Ok(read) => heartbeat_snapshot(read),
-        Err(err) => HeartbeatSnapshot::Error {
-            message: err.to_string(),
-        },
-    };
-    Ok((report, heartbeat))
+    // Status direct-DB reads are an Interactive-class operation (issue #600,
+    // amendment A6): one envelope covers both diagnostics reads so they share
+    // an absolute deadline and read allowance.
+    QueryEnvelope::new_with_admin_budget(
+        "status",
+        QueryClass::Interactive,
+        &budgets.interactive,
+        &budgets.administrative,
+    )
+    .scope(async {
+        let report = doctor_report(repository.read_store_diagnostics().await?);
+        let heartbeat = match repository.latest_ingest_heartbeat().await {
+            Ok(read) => heartbeat_snapshot(read),
+            Err(err) => HeartbeatSnapshot::Error {
+                message: err.to_string(),
+            },
+        };
+        Ok((report, heartbeat))
+    })
+    .await
 }
 async fn read_preferred_status(
     cfg: &AppConfig,
     repository: &dyn ConversationRepository,
+    budgets: &ValidatedQueryBudgets,
     api_available: bool,
     timeout: Duration,
 ) -> Result<StatusData> {
@@ -428,7 +442,7 @@ async fn read_preferred_status(
         match read_daemon_status(cfg, timeout).await {
             Ok(status) => return Ok(status),
             Err(error) => {
-                let (report, heartbeat) = read_repository_status(repository).await?;
+                let (report, heartbeat) = read_repository_status(repository, budgets).await?;
                 return Ok(StatusData {
                     report,
                     heartbeat,
@@ -442,7 +456,7 @@ async fn read_preferred_status(
         }
     }
 
-    let (report, heartbeat) = read_repository_status(repository).await?;
+    let (report, heartbeat) = read_repository_status(repository, budgets).await?;
     Ok(StatusData {
         report,
         heartbeat,
@@ -483,6 +497,7 @@ pub(super) async fn cmd_status(
     } = read_preferred_status(
         cfg,
         repository,
+        &super::query_budgets(cfg),
         backend_endpoints.http_listening,
         STATUS_API_TIMEOUT,
     )
@@ -540,6 +555,10 @@ mod tests {
         cfg.monitor.host = "127.0.0.1".to_string();
         cfg.monitor.port = monitor_port;
         cfg
+    }
+
+    fn test_budgets() -> ValidatedQueryBudgets {
+        crate::commands::query_budgets(&AppConfig::default())
     }
 
     fn test_repository() -> InMemoryConversationRepository {
@@ -723,6 +742,7 @@ mod tests {
         let status = read_preferred_status(
             &test_config(port),
             &repository,
+            &test_budgets(),
             true,
             Duration::from_secs(1),
         )
@@ -767,6 +787,7 @@ mod tests {
             let status = read_preferred_status(
                 &test_config(port),
                 &repository,
+                &test_budgets(),
                 true,
                 Duration::from_secs(1),
             )
@@ -808,6 +829,7 @@ mod tests {
             let status = read_preferred_status(
                 &test_config(port),
                 &repository,
+                &test_budgets(),
                 true,
                 Duration::from_secs(1),
             )
@@ -838,6 +860,7 @@ mod tests {
             let status = read_preferred_status(
                 &test_config(port),
                 &repository,
+                &test_budgets(),
                 true,
                 Duration::from_secs(1),
             )
@@ -858,6 +881,7 @@ mod tests {
         let status = read_preferred_status(
             &test_config(port),
             &repository,
+            &test_budgets(),
             true,
             Duration::from_secs(1),
         )
@@ -888,6 +912,7 @@ mod tests {
         let status = read_preferred_status(
             &test_config(port),
             &repository,
+            &test_budgets(),
             true,
             Duration::from_millis(20),
         )
@@ -912,6 +937,7 @@ mod tests {
         let status = read_preferred_status(
             &test_config(9),
             &repository,
+            &test_budgets(),
             false,
             Duration::from_millis(20),
         )

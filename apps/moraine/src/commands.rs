@@ -8,9 +8,10 @@ mod up;
 
 use anyhow::{bail, Context, Result};
 use moraine_clickhouse::{
-    ClickHouseClient, DoctorReport, MigrationProgress, PublicationDiagnostics,
+    ClickHouseClient, DoctorReport, MigrationProgress, PublicationDiagnostics, QueryClass,
+    QueryEnvelope,
 };
-use moraine_config::AppConfig;
+use moraine_config::{AppConfig, QueryBudgetsConfig, ValidatedQueryBudgets};
 use moraine_conversations::{ClickHouseConversationRepository, RepoConfig};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -201,6 +202,19 @@ fn conversation_repository(cfg: &AppConfig) -> Result<ClickHouseConversationRepo
     ))
 }
 
+/// The validated `[query_budgets]` every CLI query envelope is built from
+/// (issue #600 W8). `load_cfg` already rejects invalid budgets, so the
+/// fallback only fires for programmatically-built configs (tests); it keeps
+/// the command usable on the bundled defaults instead of failing on a budget
+/// shape the loader would have rejected anyway.
+pub(crate) fn query_budgets(cfg: &AppConfig) -> ValidatedQueryBudgets {
+    ValidatedQueryBudgets::from_config(&cfg.query_budgets).unwrap_or_else(|error| {
+        eprintln!("warning: invalid [query_budgets]; CLI envelopes use bundled defaults: {error}");
+        ValidatedQueryBudgets::from_config(&QueryBudgetsConfig::default())
+            .expect("bundled default query budgets are valid")
+    })
+}
+
 // Deliberate shared-read-layer exception: `db *`/`doctor` are storage administration,
 // while `export` owns a versioned row contract and schema-skew gate. Those paths keep
 // direct ClickHouse access; operational status reads go through ConversationRepository.
@@ -222,26 +236,39 @@ where
     F: FnMut(DatabaseProgress),
 {
     let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
+    let budgets = query_budgets(cfg);
     let applied = ch
-        .run_migrations_with_progress(|event| {
+        .run_migrations_with_progress_and_budget(&budgets.migration, |event| {
             on_progress(DatabaseProgress::Migration(event));
         })
         .await?;
     on_progress(DatabaseProgress::ReconciliationInspecting);
-    let historical = !ch.mcp_open_read_model_ready().await?;
-    on_progress(DatabaseProgress::ReconciliationStarted { historical });
 
-    let mut processed = 0;
-    ch.backfill_mcp_open_read_model_with_progress(|refreshed_sessions| {
-        processed = refreshed_sessions;
-        on_progress(DatabaseProgress::ReconciliationAdvanced {
-            processed: refreshed_sessions,
-        });
-    })
-    .await
-    .context("failed to backfill MCP open read model")?;
-    on_progress(DatabaseProgress::ReconciliationFinished { processed });
-    Ok(MigrationOutcome { applied })
+    // The ready probe and read-model backfill previously ran unenveloped
+    // here; migrate/up wraps them in one Migration-class envelope whose
+    // absolute deadline honors the operator client timeout (amendments
+    // A5/A6). The migration runner above scopes its own per-statement
+    // envelopes and is unaffected. A backfill that exceeds this budget fails
+    // with a typed error and stays retryable: its cursor is persisted after
+    // every page.
+    ch.migration_envelope(&budgets.migration)
+        .scope(async {
+            let historical = !ch.mcp_open_read_model_ready().await?;
+            on_progress(DatabaseProgress::ReconciliationStarted { historical });
+
+            let mut processed = 0;
+            ch.backfill_mcp_open_read_model_with_progress(|refreshed_sessions| {
+                processed = refreshed_sessions;
+                on_progress(DatabaseProgress::ReconciliationAdvanced {
+                    processed: refreshed_sessions,
+                });
+            })
+            .await
+            .context("failed to backfill MCP open read model")?;
+            on_progress(DatabaseProgress::ReconciliationFinished { processed });
+            Ok(MigrationOutcome { applied })
+        })
+        .await
 }
 
 pub(super) async fn migrate_database_for_up<F>(
@@ -285,7 +312,18 @@ async fn cmd_db_migrate(cfg: &AppConfig) -> Result<MigrationOutcome> {
 
 async fn cmd_db_doctor(cfg: &AppConfig) -> Result<DoctorReport> {
     let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
-    ch.doctor_report().await
+    let budgets = query_budgets(cfg);
+    // Doctor is an Interactive-class read (amendment A6 — deliberately not
+    // Administrative, whose tiny caps only fit KILL/telemetry one-shots):
+    // the report spans ping, version, ledger, table, and publication reads.
+    QueryEnvelope::new_with_admin_budget(
+        "doctor",
+        QueryClass::Interactive,
+        &budgets.interactive,
+        &budgets.administrative,
+    )
+    .scope(ch.doctor_report())
+    .await
 }
 
 fn parse_config_flag(args: &[String]) -> Result<(Option<PathBuf>, Vec<String>)> {

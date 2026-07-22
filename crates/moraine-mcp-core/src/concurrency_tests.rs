@@ -302,8 +302,10 @@ fn test_state_with_admission(
     max_parallel_requests: usize,
     max_queued_requests: usize,
 ) -> Arc<AppState> {
+    let cfg = Arc::new(AppConfig::default());
+    let query_budgets = validated_query_budgets(&cfg).expect("default budgets validate");
     AppState::with_repository(
-        Arc::new(AppConfig::default()),
+        cfg,
         repository,
         Arc::new(AtomicBool::new(false)),
         std::env::current_dir().ok(),
@@ -311,6 +313,7 @@ fn test_state_with_admission(
             max_parallel_requests,
             max_queued_requests,
         )),
+        query_budgets,
     )
 }
 
@@ -451,9 +454,11 @@ async fn full_queue_returns_structured_overload_within_one_hundred_milliseconds(
 
     assert_eq!(overloaded["id"], json!(4));
     assert_eq!(overloaded["result"]["isError"], json!(true));
+    // Queue-full admission recoded to resource_exhausted by issue #600
+    // (amendment A11); the details payload is unchanged.
     assert_eq!(
         overloaded["result"]["structuredContent"]["error"]["code"],
-        json!("deadline_exceeded")
+        json!("resource_exhausted")
     );
     assert_eq!(
         overloaded["result"]["structuredContent"]["error"]["details"]["reason"],
@@ -853,10 +858,12 @@ async fn cancellation_is_registered_before_each_tool_first_repository_read() {
         repository.wait_for_cancelled(index + 1).await;
     }
 
+    // Every tool now shares its request envelope's id (issue #600 W7), so
+    // all cancellations target 'moraine-request-…' base ids whose prefix
+    // KILL covers the per-statement children.
     let cancelled = repository.cancelled_queries.lock().await.clone();
     assert_eq!(cancelled.len(), 3);
-    assert!(cancelled[0].starts_with("moraine-search-sessions-"));
-    assert!(cancelled[1..]
+    assert!(cancelled
         .iter()
         .all(|query_id| query_id.starts_with("moraine-request-")));
 
@@ -905,7 +912,7 @@ async fn request_cancellation_propagates_unique_clickhouse_query_ids() {
     assert_ne!(cancelled[0], cancelled[1]);
     assert!(cancelled
         .iter()
-        .all(|query_id| query_id.starts_with("moraine-file-attention-")));
+        .all(|query_id| query_id.starts_with("moraine-request-")));
 
     writer
         .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"ping\",\"method\":\"ping\"}\n")
@@ -969,7 +976,7 @@ async fn full_socket_disconnect_cancels_blocked_repository_work() {
     repository.wait_for_cancelled(1).await;
     assert_eq!(repository.started.load(Ordering::Acquire), 1);
     assert_eq!(repository.cancelled_queries.lock().await.len(), 1);
-    assert!(repository.cancelled_queries.lock().await[0].starts_with("moraine-search-sessions-"));
+    assert!(repository.cancelled_queries.lock().await[0].starts_with("moraine-request-"));
 }
 
 #[tokio::test]
@@ -1105,7 +1112,7 @@ async fn service_shutdown_cancels_in_flight_backend_query() {
         .lock()
         .await
         .iter()
-        .all(|query_id| query_id.starts_with("moraine-file-attention-")));
+        .all(|query_id| query_id.starts_with("moraine-request-")));
 }
 
 #[cfg(unix)]
@@ -1189,6 +1196,209 @@ async fn central_service_shutdown_cancels_process_wide_queued_requests() {
     assert_eq!(repository.started.load(Ordering::Acquire), 1);
     assert_eq!(repository.cancelled_queries.lock().await.len(), 1);
     assert!(!socket_path.exists(), "central socket was cleaned up");
+}
+
+#[tokio::test]
+async fn tool_requests_record_envelope_telemetry() {
+    let before = query_envelope_telemetry();
+    let repository = Arc::new(BlockingRepository::new(0));
+    let (mut reader, mut writer, server) = start_connection(repository);
+
+    writer
+        .write_all(search_request(1).as_bytes())
+        .await
+        .expect("send telemetry request");
+    let response = read_response(&mut reader).await;
+    assert_eq!(response["id"], json!(1));
+
+    // Counters are process-global and tests run in parallel, so assert
+    // monotonic growth rather than exact deltas.
+    let after = query_envelope_telemetry();
+    assert!(
+        after.requests > before.requests,
+        "envelope telemetry must aggregate completed requests: before={before:?}, after={after:?}"
+    );
+
+    writer.shutdown().await.expect("half-close request stream");
+    drop(writer);
+    tokio::time::timeout(std::time::Duration::from_secs(1), server)
+        .await
+        .expect("connection drained")
+        .expect("connection task joined")
+        .expect("connection succeeded");
+}
+
+/// Issue #600 W7 exit criterion: when a tool's internal tokio timeout fires,
+/// dropping the repository future must cancel the in-flight ClickHouse
+/// statement (the #576 orphan pattern). Verified against a mock transport:
+/// a hanging HTTP "server" records the abandoned statement's query id and
+/// the `KILL QUERY` the transport's per-statement drop guard issues.
+#[tokio::test]
+async fn internal_list_timeout_kills_abandoned_transport_statement() {
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn read_http_request(stream: &mut TcpStream) -> Option<(String, String)> {
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        let header_end = loop {
+            let read = stream.read(&mut chunk).await.ok()?;
+            if read == 0 {
+                return None;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+        let content_length = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        while buffer.len() < header_end + content_length {
+            let read = stream.read(&mut chunk).await.ok()?;
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+        }
+        let body = String::from_utf8_lossy(&buffer[header_end..]).to_string();
+        Some((head, body))
+    }
+
+    fn query_id_param(head: &str) -> Option<String> {
+        let tail = head.split("query_id=").nth(1)?;
+        Some(
+            tail.chars()
+                .take_while(|ch| *ch != '&' && *ch != ' ')
+                .collect(),
+        )
+    }
+
+    // Mock ClickHouse: data queries hang with their connections held open (a
+    // stuck server query); KILL statements are recorded and acknowledged.
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock clickhouse");
+    let url = format!("http://{}", listener.local_addr().expect("mock address"));
+    let kills: Arc<StdMutex<Vec<String>>> = Arc::default();
+    let hung_query_ids: Arc<StdMutex<Vec<String>>> = Arc::default();
+    let accept_kills = kills.clone();
+    let accept_hung = hung_query_ids.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let kills = accept_kills.clone();
+            let hung = accept_hung.clone();
+            tokio::spawn(async move {
+                let Some((head, body)) = read_http_request(&mut stream).await else {
+                    return;
+                };
+                // The SQL rides the URL `query` param form-encoded ('+' for
+                // spaces); normalize before matching.
+                let statement = format!("{} {body}", head.replace('+', " "));
+                if statement.contains("KILL QUERY") {
+                    kills.lock().expect("kills lock").push(statement);
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await;
+                } else {
+                    if let Some(query_id) = query_id_param(&head) {
+                        hung.lock().expect("hung lock").push(query_id);
+                    }
+                    // Never respond: the statement stays "running" until the
+                    // dropped client future's guard kills it.
+                    std::future::pending::<()>().await;
+                }
+            });
+        }
+    });
+
+    let repository = moraine_conversations::build_clickhouse_repository(
+        moraine_config::ClickHouseConfig {
+            url,
+            database: "moraine".to_string(),
+            timeout_seconds: 30.0,
+            ..Default::default()
+        },
+        RepoConfig::default(),
+    )
+    .expect("clickhouse repository");
+    let state = AppState::embedded(AppConfig::default(), repository);
+    let (mut reader, mut writer, server) = start_connection_with_state(state);
+
+    writer
+        .write_all(
+            tool_request(
+                "kill-on-timeout",
+                "list_sessions",
+                json!({
+                    "start_datetime": "2026-01-01T00:00:00Z",
+                    "end_datetime": "2026-01-02T00:00:00Z",
+                }),
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("send list request against hanging backend");
+
+    // The tool's internal 3s timeout fires and answers deadline_exceeded.
+    let mut line = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        reader.read_line(&mut line),
+    )
+    .await
+    .expect("list response within deadline")
+    .expect("read list response");
+    let response: Value = serde_json::from_str(line.trim()).expect("list response frame");
+    assert_eq!(response["id"], json!("kill-on-timeout"));
+    assert_eq!(
+        response["result"]["structuredContent"]["error"]["code"],
+        json!("deadline_exceeded")
+    );
+
+    // Dropping the timed-out repository future must KILL the in-flight
+    // server statement.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let kill = loop {
+        if let Some(kill) = kills.lock().expect("kills lock").first().cloned() {
+            break kill;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no KILL statement was issued for the abandoned query"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
+    let hung = hung_query_ids.lock().expect("hung lock").clone();
+    assert!(!hung.is_empty(), "mock never saw a data query");
+    assert!(
+        hung.iter().any(|query_id| kill.contains(query_id.as_str())),
+        "KILL must target the abandoned statement: kill={kill}, hung={hung:?}"
+    );
+    assert!(
+        kill.contains("moraine-request-"),
+        "abandoned statement ids derive from the request envelope: {kill}"
+    );
+
+    writer.shutdown().await.expect("half-close request stream");
+    drop(writer);
+    tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .expect("connection drained")
+        .expect("connection task joined")
+        .expect("connection succeeded");
 }
 
 #[tokio::test]

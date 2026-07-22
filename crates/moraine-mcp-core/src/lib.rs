@@ -8,8 +8,10 @@ mod private_proxy;
 mod search_sessions_v1;
 
 use anyhow::{anyhow, Context, Result};
-use moraine_config::{AppConfig, KNOWN_INGEST_HARNESSES};
-use moraine_conversations::{BackendRepositoryRouter, RepoError};
+use moraine_config::{AppConfig, ValidatedQueryBudgets, KNOWN_INGEST_HARNESSES};
+use moraine_conversations::{
+    BackendRepositoryRouter, EnvelopeStatsSnapshot, QueryClass, QueryEnvelope, RepoError,
+};
 pub use moraine_conversations::{ConversationRepository, SessionOriginScope};
 pub use private_proxy::private_route_deadline;
 #[cfg(unix)]
@@ -231,8 +233,89 @@ const SERVICE_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_milli
 type QueryCancellationSlot = Arc<StdMutex<Option<String>>>;
 
 tokio::task_local! {
-    static REQUEST_QUERY_CANCELLATION: QueryCancellationSlot;
     static REQUEST_ACCEPTED_AT: std::time::Instant;
+}
+
+/// Point-in-time aggregation of query-envelope accounting across every MCP
+/// tool request this process has served. Surfaced for the monitor/status
+/// telemetry wiring (issue #600 W11) via [`query_envelope_telemetry`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QueryEnvelopeTelemetrySnapshot {
+    /// tools/call requests that ran inside an Interactive envelope.
+    pub requests: u64,
+    /// ClickHouse statements admitted across those requests.
+    pub statements: u64,
+    /// Rows consumed from cumulative read allowances (trustworthy summaries
+    /// only).
+    pub rows_consumed: u64,
+    pub bytes_consumed: u64,
+    /// Statements refused or killed for an expired deadline budget.
+    pub deadline_exceeded: u64,
+    /// Statements refused or killed for cap/allowance/memory exhaustion.
+    pub resource_exhausted: u64,
+    /// tools/call requests rejected up front because the admission queue was
+    /// full (reported on the wire as `resource_exhausted`).
+    pub queue_full_rejections: u64,
+}
+
+struct QueryEnvelopeTelemetry {
+    requests: AtomicU64,
+    statements: AtomicU64,
+    rows_consumed: AtomicU64,
+    bytes_consumed: AtomicU64,
+    deadline_exceeded: AtomicU64,
+    resource_exhausted: AtomicU64,
+    queue_full_rejections: AtomicU64,
+}
+
+static QUERY_ENVELOPE_TELEMETRY: QueryEnvelopeTelemetry = QueryEnvelopeTelemetry {
+    requests: AtomicU64::new(0),
+    statements: AtomicU64::new(0),
+    rows_consumed: AtomicU64::new(0),
+    bytes_consumed: AtomicU64::new(0),
+    deadline_exceeded: AtomicU64::new(0),
+    resource_exhausted: AtomicU64::new(0),
+    queue_full_rejections: AtomicU64::new(0),
+};
+
+impl QueryEnvelopeTelemetry {
+    fn record_request(&self, stats: &EnvelopeStatsSnapshot) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        self.statements
+            .fetch_add(stats.statements, Ordering::Relaxed);
+        self.rows_consumed
+            .fetch_add(stats.rows_consumed, Ordering::Relaxed);
+        self.bytes_consumed
+            .fetch_add(stats.bytes_consumed, Ordering::Relaxed);
+        self.deadline_exceeded
+            .fetch_add(stats.deadline_exceeded, Ordering::Relaxed);
+        self.resource_exhausted
+            .fetch_add(stats.resource_exhausted, Ordering::Relaxed);
+    }
+
+    fn record_queue_full(&self) {
+        self.queue_full_rejections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> QueryEnvelopeTelemetrySnapshot {
+        QueryEnvelopeTelemetrySnapshot {
+            requests: self.requests.load(Ordering::Relaxed),
+            statements: self.statements.load(Ordering::Relaxed),
+            rows_consumed: self.rows_consumed.load(Ordering::Relaxed),
+            bytes_consumed: self.bytes_consumed.load(Ordering::Relaxed),
+            deadline_exceeded: self.deadline_exceeded.load(Ordering::Relaxed),
+            resource_exhausted: self.resource_exhausted.load(Ordering::Relaxed),
+            queue_full_rejections: self.queue_full_rejections.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Process-wide MCP query-envelope telemetry: per-request statement counts,
+/// consumed read allowances, and budget verdicts, aggregated at the end of
+/// every tools/call request. The monitor/status boundary (issue #600 W11)
+/// reads this to surface repeated budget exhaustion.
+pub fn query_envelope_telemetry() -> QueryEnvelopeTelemetrySnapshot {
+    QUERY_ENVELOPE_TELEMETRY.snapshot()
 }
 
 pub(crate) fn request_performance() -> contract::PerformanceBuilder {
@@ -288,6 +371,10 @@ struct AppState {
     launch_dir: Option<PathBuf>,
     prewarm_started: Arc<AtomicBool>,
     request_admission: Arc<RequestAdmission>,
+    /// The operator's validated `[query_budgets]` classes: every tools/call
+    /// request runs inside an Interactive envelope built from these, and
+    /// prewarm runs under the Background class (issue #600 W7).
+    query_budgets: ValidatedQueryBudgets,
 }
 
 fn tool_output_schema(tool: &str, data_schema: Value) -> Value {
@@ -310,6 +397,7 @@ fn tool_output_schema(tool: &str, data_schema: Value) -> Value {
                             "not_found",
                             "unsupported_event_type",
                             "deadline_exceeded",
+                            "resource_exhausted",
                             "internal_error"
                         ]
                     },
@@ -367,8 +455,18 @@ impl AppState {
                         .is_ok()
                 {
                     let repo = self.repo.clone();
+                    let budgets = self.query_budgets;
                     tokio::spawn(async move {
-                        if let Err(err) = repo.prewarm_mcp_search_state().await {
+                        // Task-locals do not cross tokio::spawn: the spawned
+                        // prewarm establishes its own Background envelope so
+                        // its statements never run unenveloped (#600 W7).
+                        let envelope = QueryEnvelope::new_with_admin_budget(
+                            "prewarm",
+                            QueryClass::Background,
+                            &budgets.background,
+                            &budgets.administrative,
+                        );
+                        if let Err(err) = envelope.scope(repo.prewarm_mcp_search_state()).await {
                             warn!("mcp prewarm failed: {}", err);
                         } else {
                             debug!("mcp prewarm completed");
@@ -780,16 +878,25 @@ pub(crate) fn repo_error_to_contract_error(error: RepoError) -> contract::Contra
             "retryable": true,
             "retry_after_ms": SEARCH_PROJECTION_RETRY_AFTER_MS,
         })),
-        // Interim mapping until the boundary wave lands the dedicated
-        // deadline_exceeded / resource_exhausted wire codes (#600 W7).
+        // Query-budget verdicts surface as their dedicated wire codes
+        // (issue #600, amendment A11) with the applicable budget attached.
         RepoError::DeadlineExceeded { budget_note } => contract::ContractError::new(
-            contract::ToolErrorCode::InternalError,
+            contract::ToolErrorCode::DeadlineExceeded,
             format!("query deadline exceeded: {budget_note}"),
-        ),
+        )
+        .with_details(json!({
+            "reason": "query_budget",
+            "retryable": true,
+            "budget": budget_note,
+        })),
         RepoError::ResourceExhausted { budget_note } => contract::ContractError::new(
-            contract::ToolErrorCode::InternalError,
+            contract::ToolErrorCode::ResourceExhausted,
             format!("query resource budget exhausted: {budget_note}"),
-        ),
+        )
+        .with_details(json!({
+            "reason": "query_budget",
+            "budget": budget_note,
+        })),
         RepoError::Backend(message) | RepoError::Internal(message) => {
             contract::ContractError::new(contract::ToolErrorCode::InternalError, message)
         }
@@ -805,6 +912,14 @@ pub(crate) fn internal_id_error(error: contract::ContractError) -> contract::Con
     )
 }
 
+/// Validate the operator's `[query_budgets]` tables into the only form query
+/// envelopes accept. `load_config` already performs this validation, so a
+/// failure here means a hand-built `AppConfig` carried an unbounded budget.
+fn validated_query_budgets(cfg: &AppConfig) -> Result<ValidatedQueryBudgets> {
+    ValidatedQueryBudgets::from_config(&cfg.query_budgets)
+        .map_err(|error| anyhow!("invalid [query_budgets] configuration: {error}"))
+}
+
 impl AppState {
     fn with_repository(
         cfg: Arc<AppConfig>,
@@ -812,6 +927,7 @@ impl AppState {
         prewarm_started: Arc<AtomicBool>,
         launch_dir: Option<PathBuf>,
         request_admission: Arc<RequestAdmission>,
+        query_budgets: ValidatedQueryBudgets,
     ) -> Arc<AppState> {
         Arc::new(AppState {
             cfg,
@@ -819,45 +935,22 @@ impl AppState {
             launch_dir,
             prewarm_started,
             request_admission,
+            query_budgets,
         })
     }
 
     fn embedded(cfg: AppConfig, repo: Arc<dyn ConversationRepository>) -> Arc<AppState> {
         let request_admission = build_request_admission(&cfg);
+        let query_budgets = validated_query_budgets(&cfg)
+            .expect("query budgets are validated at configuration load");
         Self::with_repository(
             cfg.into(),
             repo,
             Arc::new(AtomicBool::new(false)),
             std::env::current_dir().ok(),
             request_admission,
+            query_budgets,
         )
-    }
-}
-
-pub(crate) struct QueryCancellationGuard {
-    query_id: String,
-    slot: Option<QueryCancellationSlot>,
-}
-
-impl QueryCancellationGuard {
-    pub(crate) fn new(query_id: String) -> Self {
-        let slot = REQUEST_QUERY_CANCELLATION
-            .try_with(|slot| slot.clone())
-            .ok();
-        if let Some(slot) = &slot {
-            *slot.lock().expect("query cancellation slot poisoned") = Some(query_id.clone());
-        }
-        Self { query_id, slot }
-    }
-
-    pub(crate) fn disarm(&mut self) {
-        let Some(slot) = &self.slot else {
-            return;
-        };
-        let mut registered = slot.lock().expect("query cancellation slot poisoned");
-        if registered.as_ref() == Some(&self.query_id) {
-            *registered = None;
-        }
     }
 }
 
@@ -1126,6 +1219,7 @@ async fn dispatch_rpc_line(
     let admission_ticket = match state.request_admission.try_register() {
         Ok(ticket) => ticket,
         Err(TryAdmissionError::Full) => {
+            QUERY_ENVELOPE_TELEMETRY.record_queue_full();
             return Ok(Some(admission_error_response(
                 id,
                 &admitted_tool,
@@ -1138,7 +1232,6 @@ async fn dispatch_rpc_line(
     };
 
     let (cancel_tx, mut cancel_rx) = oneshot::channel();
-    let request_query_id = backend_query_id("request");
     let query_cancellation = Arc::new(StdMutex::new(None));
     let task_query_cancellation = query_cancellation.clone();
     let request_state = state.clone();
@@ -1162,10 +1255,26 @@ async fn dispatch_rpc_line(
             AdmissionOutcome::Admitted(permit) => permit,
             AdmissionOutcome::Cancelled => return (task_key, None),
         };
+
+        // Mandatory Interactive envelope (issue #600 W7): the whole tool
+        // future runs inside scope(), so every ClickHouse statement carries
+        // a finite deadline, statement cap, and read allowance from the
+        // operator's [query_budgets].interactive. Created after admission so
+        // queue wait never consumes the execution budget. The MCP-visible
+        // query id for cancellation is the envelope's request id: the
+        // repository's cancel_query targets the id and its '{id}-' statement
+        // children through one bounded prefix KILL.
+        let envelope = QueryEnvelope::new_with_admin_budget(
+            "request",
+            QueryClass::Interactive,
+            &request_state.query_budgets.interactive,
+            &request_state.query_budgets.administrative,
+        );
         let query_cancellation = task_query_cancellation;
         *query_cancellation
             .lock()
-            .expect("query cancellation slot poisoned") = Some(request_query_id.clone());
+            .expect("query cancellation slot poisoned") =
+            Some(envelope.request_id().to_string());
 
         enum Outcome {
             Completed(Option<Value>),
@@ -1174,13 +1283,7 @@ async fn dispatch_rpc_line(
         let outcome = {
             let request = REQUEST_ACCEPTED_AT.scope(
                 accepted_at.into_std(),
-                REQUEST_QUERY_CANCELLATION.scope(
-                    query_cancellation.clone(),
-                    moraine_conversations::with_repository_query_id(
-                        request_query_id,
-                        request_state.handle_request(req),
-                    ),
-                ),
+                Arc::clone(&envelope).scope(request_state.handle_request(req)),
             );
             tokio::pin!(request);
             tokio::select! {
@@ -1190,6 +1293,7 @@ async fn dispatch_rpc_line(
                 response = &mut request => Outcome::Completed(response),
             }
         };
+        QUERY_ENVELOPE_TELEMETRY.record_request(&envelope.stats());
         let response = match outcome {
             Outcome::Completed(response) => response,
             Outcome::Cancelled => {
@@ -1224,8 +1328,11 @@ fn admission_error_response(
     max_executing: usize,
     max_queued: usize,
 ) -> Value {
+    // Queue-full admission is a capacity verdict, not a time verdict: it is
+    // reported as resource_exhausted (issue #600, amendment A11 — this
+    // recodes the pre-envelope deadline_exceeded shape).
     let error = contract::ContractError::new(
-        contract::ToolErrorCode::DeadlineExceeded,
+        contract::ToolErrorCode::ResourceExhausted,
         "MCP retrieval queue is full; retry later",
     )
     .with_details(json!({
@@ -1371,6 +1478,8 @@ pub async fn run_stdio_with_repository(
     cfg: AppConfig,
     repository: Arc<dyn ConversationRepository>,
 ) -> Result<()> {
+    // Fail closed on an unbounded [query_budgets] before serving anything.
+    validated_query_budgets(&cfg)?;
     let state = AppState::embedded(cfg, repository);
     serve_connection(
         state,
@@ -1414,6 +1523,7 @@ struct SocketState {
     router: Arc<BackendRepositoryRouter>,
     prewarm_gates: BackendPrewarmGates,
     request_admission: Arc<RequestAdmission>,
+    query_budgets: ValidatedQueryBudgets,
     shutdown: watch::Receiver<bool>,
 }
 
@@ -1441,9 +1551,11 @@ where
 
     let (connection_shutdown_tx, connection_shutdown_rx) = watch::channel(false);
     let request_admission = build_request_admission(&cfg);
+    let query_budgets = validated_query_budgets(&cfg)?;
     let state = SocketState {
         prewarm_gates: BackendPrewarmGates::new(&cfg),
         request_admission,
+        query_budgets,
         shutdown: connection_shutdown_rx,
         cfg,
         router,
@@ -1807,6 +1919,7 @@ async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStr
         prewarm_started,
         launch_dir,
         state.request_admission,
+        state.query_budgets,
     );
     if negotiated {
         private_proxy::write_ack(&mut write_half).await?;
@@ -2557,6 +2670,79 @@ mod tests {
             assert!(response["result"]["structuredContent"]["error"]
                 .get("details")
                 .is_none());
+        }
+    }
+
+    fn budget_error_test_state(error: RepoError) -> Arc<AppState> {
+        let repository = Arc::new(InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            InMemoryConversationResponses {
+                get_mcp_session: Some(Err(error.clone())),
+                list_mcp_sessions: Some(Err(error.clone())),
+                search_mcp_events: Some(Err(error.clone())),
+                file_attention: Some(Err(error)),
+                ..InMemoryConversationResponses::default()
+            },
+        ));
+        AppState::embedded(AppConfig::default(), repository)
+    }
+
+    /// Issue #600 (amendment A11): query-budget verdicts surface as the
+    /// dedicated deadline_exceeded / resource_exhausted wire codes with the
+    /// applicable budget attached, through BOTH mapping sites (the shared
+    /// mapper and open's catch-all).
+    #[tokio::test]
+    async fn budget_verdicts_surface_dedicated_wire_codes_on_every_tool() {
+        let cases = [
+            (
+                RepoError::deadline_exceeded("interactive deadline budget 15.000s"),
+                "deadline_exceeded",
+            ),
+            (
+                RepoError::resource_exhausted("interactive read_rows budget 500000000"),
+                "resource_exhausted",
+            ),
+        ];
+
+        for (repo_error, code) in cases {
+            let state = budget_error_test_state(repo_error);
+            let open_id = contract::McpSessionId::from_raw_session_id("session-budget")
+                .expect("valid session id")
+                .to_string();
+            let tool_calls = [
+                (
+                    contract::SEARCH_SESSIONS_TOOL,
+                    json!({ "query": "nothing" }),
+                ),
+                (
+                    contract::LIST_SESSIONS_TOOL,
+                    json!({
+                        "start_datetime": "2026-07-11T00:00:00Z",
+                        "end_datetime": "2026-07-12T00:00:00Z"
+                    }),
+                ),
+                (contract::OPEN_TOOL, json!({ "id": open_id })),
+                (
+                    contract::FILE_ATTENTION_TOOL,
+                    json!({ "path": "crates/moraine-mcp-core/src/lib.rs" }),
+                ),
+            ];
+
+            for (index, (tool, arguments)) in tool_calls.into_iter().enumerate() {
+                let response = call_tool_rpc(&state, index as u64 + 1, tool, arguments).await;
+                assert_handled_tool_error_exchange(&response, tool, code);
+                let details = &response["result"]["structuredContent"]["error"]["details"];
+                assert_eq!(details["reason"], json!("query_budget"), "{tool}");
+                assert!(
+                    details["budget"]
+                        .as_str()
+                        .is_some_and(|budget| budget.contains("interactive")),
+                    "{tool} must carry the applicable budget: {details}"
+                );
+                if code == "deadline_exceeded" {
+                    assert_eq!(details["retryable"], json!(true), "{tool}");
+                }
+            }
         }
     }
 

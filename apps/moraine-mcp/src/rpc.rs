@@ -1,6 +1,6 @@
 use crate::cli::ServeMode;
 use anyhow::{anyhow, bail, Context, Result};
-use moraine_config::AppConfig;
+use moraine_config::{AppConfig, QueryBudgetsConfig, ValidatedQueryBudgets};
 use moraine_conversations::{BackendRepositoryRouter, RepoConfig};
 #[cfg(unix)]
 use moraine_mcp_core::PrivateRouteNegotiation;
@@ -118,6 +118,19 @@ fn repository_config(cfg: &AppConfig, session_scope: Option<SessionOriginScope>)
         bm25_max_query_terms: cfg.bm25.max_query_terms,
         session_scope,
     }
+}
+
+/// The validated `[query_budgets]` the backend's monitor envelopes are built
+/// from (issue #600 W8). `load_config` already fails on invalid budgets, so
+/// the fallback only fires for programmatically-built configs (tests); it
+/// keeps the daemon serving on the bundled defaults instead of refusing to
+/// boot for a budget shape the loader would have rejected anyway.
+fn backend_query_budgets(cfg: &AppConfig) -> ValidatedQueryBudgets {
+    ValidatedQueryBudgets::from_config(&cfg.query_budgets).unwrap_or_else(|error| {
+        warn!("invalid [query_budgets]; backend envelopes use bundled defaults: {error}");
+        ValidatedQueryBudgets::from_config(&QueryBudgetsConfig::default())
+            .expect("bundled default query budgets are valid")
+    })
 }
 
 fn backend_router(
@@ -247,12 +260,20 @@ async fn run_backend(
         ("MCP socket service", result)
     });
 
+    // Monitor requests each get an Interactive query envelope built from the
+    // operator's validated budgets (issue #600 W8). rpc.rs itself performs no
+    // repository reads: the `default_repository()` warm-up above only
+    // constructs the default slot (its schema handshake for named backends is
+    // enveloped at backend_router's spawn site), and all health/publication
+    // diagnostics reads live in the monitor handlers wrapped below.
+    let query_budgets = backend_query_budgets(&cfg);
     services.spawn(async move {
         let result = moraine_monitor_core::run_server_with_router(
             router,
             host,
             port,
             static_dir,
+            query_budgets,
             wait_for_shutdown(shutdown_rx),
         )
         .await;
