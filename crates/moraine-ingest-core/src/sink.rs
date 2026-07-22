@@ -22,7 +22,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify, RwLock};
@@ -167,14 +167,181 @@ impl PendingAckBatch {
             .extend(event_rows.iter().filter_map(event_identity_digest));
     }
 
+    /// Projection session ids survive the acknowledgement clear: a session
+    /// deferred by the refresh governor stays pending until its refresh
+    /// actually succeeds, at which point it is removed individually.
     fn clear(&mut self) {
         self.event_identity_digests.clear();
-        self.projection_session_ids.clear();
     }
 
     fn extend_projection(&mut self, session_ids: &BTreeSet<String>) {
         self.projection_session_ids
             .extend(session_ids.iter().cloned());
+    }
+}
+
+/// Debounce and failure-backoff state for the live MCP open projection.
+///
+/// Refresh cost is dominated by session history size, so each session's next
+/// refresh is spaced proportionally to its last observed refresh cost: cheap
+/// sessions stay near-realtime while one enormous streaming session cannot
+/// re-snapshot itself at every flush tick.
+#[derive(Default)]
+struct ProjectionGovernor {
+    consecutive_failures: u32,
+    retry_not_before: Option<Instant>,
+    history: HashMap<String, ProjectionRefreshRecord>,
+}
+
+#[derive(Clone, Copy)]
+struct ProjectionRefreshRecord {
+    finished_at: Instant,
+    cost: Duration,
+}
+
+const PROJECTION_REFRESH_MIN_GAP: Duration = Duration::from_secs(2);
+const PROJECTION_REFRESH_MAX_GAP: Duration = Duration::from_secs(600);
+const PROJECTION_REFRESH_COST_FACTOR: u32 = 20;
+const PROJECTION_FAILURE_BACKOFF_FLOOR: Duration = Duration::from_secs(1);
+const PROJECTION_FAILURE_BACKOFF_CEILING: Duration = Duration::from_secs(60);
+const PROJECTION_HISTORY_LIMIT: usize = 4096;
+const THROTTLED_RETRY_DELAY_CEILING: Duration = Duration::from_secs(60);
+const SNAPSHOT_RECLAIM_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Escalate the fixed flush retry delay exponentially while ClickHouse stays
+/// unreachable, so an outage produces a warn every minute instead of every
+/// second, then recover to the base cadence on the first success.
+fn throttled_retry_delay(base: Duration, consecutive_failures: u32) -> Duration {
+    let shift = consecutive_failures.saturating_sub(1).min(6);
+    base.saturating_mul(1_u32 << shift)
+        .clamp(base, THROTTLED_RETRY_DELAY_CEILING.max(base))
+}
+
+/// Reclaim superseded snapshot rows in the background, at most one run at a
+/// time; the mutation is server-side durable so a lost response only delays
+/// accounting until the next tick.
+fn spawn_snapshot_reclaim(clickhouse: &ClickHouseClient, in_flight: &Arc<AtomicBool>) {
+    if in_flight.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let clickhouse = clickhouse.clone();
+    let guard = Arc::clone(in_flight);
+    tokio::spawn(async move {
+        match clickhouse.reclaim_superseded_mcp_open_snapshots().await {
+            Ok(stats) if stats.total() > 0 => info!(
+                superseded_event_rows = stats.superseded_event_rows,
+                superseded_turn_rows = stats.superseded_turn_rows,
+                "reclaimed superseded mcp open snapshot rows"
+            ),
+            Ok(_) => {}
+            Err(error) => {
+                warn!("superseded mcp open snapshot reclaim failed: {error:#}");
+            }
+        }
+        guard.store(false, Ordering::SeqCst);
+    });
+}
+
+fn projection_refresh_gap(cost: Duration) -> Duration {
+    (cost * PROJECTION_REFRESH_COST_FACTOR)
+        .clamp(PROJECTION_REFRESH_MIN_GAP, PROJECTION_REFRESH_MAX_GAP)
+}
+
+fn projection_failure_backoff(consecutive_failures: u32) -> Duration {
+    let shift = consecutive_failures.saturating_sub(1).min(6);
+    (PROJECTION_FAILURE_BACKOFF_FLOOR * (1_u32 << shift)).min(PROJECTION_FAILURE_BACKOFF_CEILING)
+}
+
+impl ProjectionGovernor {
+    fn ready(&self, now: Instant) -> bool {
+        self.retry_not_before.is_none_or(|instant| now >= instant)
+    }
+
+    fn due_sessions(&self, pending: &BTreeSet<String>, now: Instant) -> BTreeSet<String> {
+        pending
+            .iter()
+            .filter(|session_id| {
+                self.history.get(session_id.as_str()).is_none_or(|record| {
+                    now.saturating_duration_since(record.finished_at)
+                        >= projection_refresh_gap(record.cost)
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn record_success(&mut self, refreshed: &BTreeSet<String>, total_cost: Duration, now: Instant) {
+        self.consecutive_failures = 0;
+        self.retry_not_before = None;
+        let per_session_cost = total_cost / u32::try_from(refreshed.len().max(1)).unwrap_or(1);
+        for session_id in refreshed {
+            self.history.insert(
+                session_id.clone(),
+                ProjectionRefreshRecord {
+                    finished_at: now,
+                    cost: per_session_cost,
+                },
+            );
+        }
+        if self.history.len() > PROJECTION_HISTORY_LIMIT {
+            let mut ages = self
+                .history
+                .values()
+                .map(|record| record.finished_at)
+                .collect::<Vec<_>>();
+            ages.sort_unstable();
+            let cutoff = ages[ages.len() / 2];
+            self.history.retain(|_, record| record.finished_at > cutoff);
+        }
+    }
+
+    fn record_failure(&mut self, now: Instant) -> Duration {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let delay = projection_failure_backoff(self.consecutive_failures);
+        self.retry_not_before = Some(now + delay);
+        delay
+    }
+}
+
+/// Refresh the MCP open read model for pending sessions that are currently
+/// due, without ever failing the surrounding flush: canonical rows are already
+/// durable and `mcp_open_dirty_sessions` persists the projection debt, so a
+/// failed or deferred refresh is simply retried on a later tick.
+async fn drain_pending_projection(
+    clickhouse: &ClickHouseClient,
+    governor: &mut ProjectionGovernor,
+    pending_ack: &mut PendingAckBatch,
+) {
+    if pending_ack.projection_session_ids.is_empty() {
+        return;
+    }
+    let now = Instant::now();
+    if !governor.ready(now) {
+        return;
+    }
+    let due = governor.due_sessions(&pending_ack.projection_session_ids, now);
+    if due.is_empty() {
+        return;
+    }
+    let refresh_started = Instant::now();
+    match clickhouse
+        .refresh_mcp_open_read_model(due.iter().map(String::as_str))
+        .await
+    {
+        Ok(()) => {
+            for session_id in &due {
+                pending_ack.projection_session_ids.remove(session_id);
+            }
+            governor.record_success(&due, refresh_started.elapsed(), Instant::now());
+        }
+        Err(error) => {
+            let delay = governor.record_failure(Instant::now());
+            warn!(
+                sessions = due.len(),
+                retry_in_ms = delay.as_millis() as u64,
+                "mcp open projection refresh failed; sessions stay pending for retry: {error:#}"
+            );
+        }
     }
 }
 
@@ -187,6 +354,7 @@ struct PendingFlush {
     error_rows: Vec<Value>,
     checkpoint_updates: HashMap<String, Checkpoint>,
     acknowledgements: PendingAckBatch,
+    projection: ProjectionGovernor,
     quarantined_generations: QuarantinedGenerations,
     append_manifest: Option<AppendManifest>,
     append_fence: Option<(String, u64)>,
@@ -593,7 +761,11 @@ pub(crate) fn spawn_sink_task(
 
         let mut flush_tick = tokio::time::interval(flush_interval);
         let mut heartbeat_tick = tokio::time::interval(heartbeat_interval);
+        let mut reclaim_tick = tokio::time::interval(SNAPSHOT_RECLAIM_INTERVAL);
+        reclaim_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let reclaim_in_flight = Arc::new(AtomicBool::new(false));
         let mut throttling_flush_retries = false;
+        let mut throttled_flush_failures: u32 = 0;
 
         loop {
             if throttling_flush_retries && pending.has_data() {
@@ -612,14 +784,19 @@ pub(crate) fn spawn_sink_task(
                 if flush_ok {
                     pending_batch_bytes = 0;
                     throttling_flush_retries = false;
+                    throttled_flush_failures = 0;
                     info!("flush retry succeeded; resuming sink intake");
                 } else {
-                    tokio::select! {
-                        _ = tokio::time::sleep(retry_backoff) => {}
-                        _ = heartbeat_tick.tick() => {
-                            emit_heartbeat(&clickhouse, &metrics, &role).await;
-                        }
-                    }
+                    // Heartbeat inserts against an unreachable server are
+                    // pure churn; they resume with the first successful
+                    // retry. The delay escalates so a long outage warns
+                    // about once a minute instead of once a second.
+                    throttled_flush_failures = throttled_flush_failures.saturating_add(1);
+                    tokio::time::sleep(throttled_retry_delay(
+                        retry_backoff,
+                        throttled_flush_failures,
+                    ))
+                    .await;
                 }
                 continue;
             }
@@ -671,7 +848,7 @@ pub(crate) fn spawn_sink_task(
                                 if !flush_ok {
                                     if !throttling_flush_retries {
                                         warn!(
-                                            "flush failed; pausing sink intake and retrying pending rows every {} ms",
+                                            "flush failed; pausing sink intake and retrying pending rows with escalating backoff (base {} ms)",
                                             retry_backoff.as_millis()
                                         );
                                     }
@@ -928,7 +1105,7 @@ pub(crate) fn spawn_sink_task(
                         if !flush_ok {
                             if !throttling_flush_retries {
                                 warn!(
-                                    "flush failed; pausing sink intake and retrying pending rows every {} ms",
+                                    "flush failed; pausing sink intake and retrying pending rows with escalating backoff (base {} ms)",
                                     retry_backoff.as_millis()
                                 );
                             }
@@ -936,10 +1113,22 @@ pub(crate) fn spawn_sink_task(
                         } else {
                             pending_batch_bytes = 0;
                         }
+                    } else {
+                        // Sessions deferred by the refresh governor still owe
+                        // a projection pass even when no new rows arrive.
+                        drain_pending_projection(
+                            &clickhouse,
+                            &mut pending.projection,
+                            &mut pending.acknowledgements,
+                        )
+                        .await;
                     }
                 }
                 _ = heartbeat_tick.tick() => {
                     emit_heartbeat(&clickhouse, &metrics, &role).await;
+                }
+                _ = reclaim_tick.tick(), if matches!(role, SinkRole::Default { .. }) => {
+                    spawn_snapshot_reclaim(&clickhouse, &reclaim_in_flight);
                 }
             }
         }
@@ -1357,7 +1546,6 @@ fn oversized_row_fragment(row: &Value) -> String {
 enum SinkStage {
     RawEvents,
     Events,
-    McpOpenProjection,
     EventLinks,
     ToolIo,
     IngestErrors,
@@ -1370,7 +1558,6 @@ impl SinkStage {
         match self {
             Self::RawEvents => "raw_events",
             Self::Events => "events",
-            Self::McpOpenProjection => "mcp_open_projection",
             Self::EventLinks => "event_links",
             Self::ToolIo => "tool_io",
             Self::IngestErrors => "ingest_errors",
@@ -1417,7 +1604,6 @@ impl PendingSinkData<'_> {
         let stage_rows = match stage {
             SinkStage::RawEvents => self.raw_rows,
             SinkStage::Events => self.event_rows,
-            SinkStage::McpOpenProjection => self.event_rows,
             SinkStage::EventLinks => self.link_rows,
             SinkStage::ToolIo => self.tool_rows,
             SinkStage::IngestErrors => self.error_rows,
@@ -1445,7 +1631,6 @@ impl PendingSinkData<'_> {
         match stage {
             SinkStage::RawEvents => self.raw_rows.len(),
             SinkStage::Events => self.event_rows.len(),
-            SinkStage::McpOpenProjection => self.event_rows.len(),
             SinkStage::EventLinks => self.link_rows.len(),
             SinkStage::ToolIo => self.tool_rows.len(),
             SinkStage::IngestErrors => self.error_rows.len(),
@@ -1799,6 +1984,7 @@ async fn flush_pending_inner(
         error_rows,
         checkpoint_updates,
         acknowledgements: pending_ack,
+        projection,
         quarantined_generations,
         append_manifest: pending_append_manifest,
         append_fence: pending_append_fence,
@@ -2177,19 +2363,11 @@ async fn flush_pending_inner(
 
         // Compatibility preparation is dependency-ordered: canonical events,
         // links, tools, and errors are durable before the candidate is built;
-        // the causal checkpoint and source head remain later stages.
-        if !pending_ack.projection_session_ids.is_empty() {
-            clickhouse
-                .refresh_mcp_open_read_model(
-                    pending_ack
-                        .projection_session_ids
-                        .iter()
-                        .map(String::as_str),
-                )
-                .await
-                .map_err(|error| SinkFlushFailure::new(SinkStage::McpOpenProjection, error))?;
-            pending_ack.projection_session_ids.clear();
-        }
+        // the causal checkpoint and source head remain later stages. The
+        // refresh never fails the flush: dirty-session rows persist the debt
+        // and the governor retries with backoff, so one hot or failing
+        // session cannot head-of-line block checkpoints for every source.
+        drain_pending_projection(clickhouse, projection, pending_ack).await;
 
         if !checkpoint_rows.is_empty() {
             commit_checkpoint_updates(
@@ -2239,9 +2417,7 @@ async fn flush_pending_inner(
         Err(failure) => {
             metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
             let error_text = failure.error.to_string();
-            if failure.stage != SinkStage::McpOpenProjection
-                && is_oversized_json_each_row_insert_error(&failure.error)
-            {
+            if is_oversized_json_each_row_insert_error(&failure.error) {
                 let block_reason = format!(
                     "non-retryable sink failure at {}: {error_text}",
                     failure.stage.table()

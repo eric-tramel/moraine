@@ -772,13 +772,27 @@ async fn finish_output_forwarders(
     log: &SupervisorLog,
 ) -> Result<()> {
     if !forwarders.finish().await? {
-        log.line(format!(
-            "clickhouse supervisor: output-drain=aborted timeout_seconds={}",
-            OUTPUT_DRAIN_GRACE.as_secs_f64()
-        ))
-        .await?;
+        log_status_best_effort(
+            log,
+            format!(
+                "clickhouse supervisor: output-drain=aborted timeout_seconds={}",
+                OUTPUT_DRAIN_GRACE.as_secs_f64()
+            ),
+        )
+        .await;
     }
     Ok(())
+}
+
+/// Write a supervisor status line, degrading to stderr when the log cannot be
+/// written. Supervisor logging is diagnostics, not a liveness dependency: it
+/// must never terminate or fail supervision of a healthy ClickHouse (a full
+/// disk previously killed the database purely because this log was
+/// unwritable).
+async fn log_status_best_effort(log: &SupervisorLog, message: String) {
+    if let Err(error) = log.line(&message).await {
+        eprintln!("{message} (supervisor log unavailable: {error:#})");
+    }
 }
 
 async fn join_output_forwarder(task: Option<JoinHandle<Result<()>>>, stream: &str) -> Result<()> {
@@ -824,6 +838,9 @@ fn mark_output_closed(forwarders: &mut OutputForwarders, stream: OutputStream) {
     }
 }
 
+/// A forwarder ending abnormally means the child's output pipe can no longer
+/// be drained, so the child must be replaced — but through the ordinary
+/// restart budget as a failed generation, never as a supervision-fatal error.
 async fn stop_after_output_forwarder(
     child: &mut Child,
     forwarders: &mut OutputForwarders,
@@ -831,6 +848,7 @@ async fn stop_after_output_forwarder(
     outcome: std::result::Result<Result<()>, tokio::task::JoinError>,
     grace: Duration,
     log: &SupervisorLog,
+    ready_uptime: Option<Duration>,
 ) -> Result<GenerationOutcome> {
     mark_output_closed(forwarders, stream);
     let stream_name = stream.name();
@@ -841,42 +859,62 @@ async fn stop_after_output_forwarder(
     };
     let stopped = terminate_and_reap(child, grace, None).await;
     let drained = finish_output_forwarders(forwarders, log).await;
+    let mut reason = format!("{failure:#}");
     if let Err(err) = stopped {
-        return Err(failure.context(format!(
-            "also failed to stop child after output forwarding failure: {err:#}"
-        )));
+        reason = format!("{reason}; also failed to stop child: {err:#}");
     }
     if let Err(err) = drained {
-        return Err(failure.context(format!(
-            "also failed to drain remaining child output: {err:#}"
-        )));
+        reason = format!("{reason}; also failed to drain remaining child output: {err:#}");
     }
-    Err(failure)
+    Ok(GenerationOutcome::Failed {
+        reason,
+        ready_uptime,
+    })
 }
 
-async fn log_while_child_live(
-    child: &mut Child,
-    forwarders: &mut OutputForwarders,
-    grace: Duration,
+const OUTPUT_LOG_DEGRADED_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Forward one record to the supervisor log, degrading to drop-and-count when
+/// the log itself cannot be written (e.g. a full disk). The child's pipe must
+/// keep draining regardless: ClickHouse must never stall or be terminated
+/// because its supervisor cannot persist diagnostics.
+async fn forward_record(
     log: &SupervisorLog,
-    message: String,
-) -> Result<()> {
-    let Err(log_err) = log.line(message).await else {
-        return Ok(());
-    };
-    let stopped = terminate_and_reap(child, grace, None).await;
-    let drained = forwarders.finish().await;
-    if let Err(err) = stopped {
-        return Err(log_err.context(format!(
-            "also failed to stop child after supervisor log failure: {err:#}"
-        )));
+    record: Vec<u8>,
+    dropped_bytes: &mut u64,
+    degraded_last_attempt: &mut Option<Instant>,
+) -> Vec<u8> {
+    if let Some(last_attempt) = *degraded_last_attempt {
+        if last_attempt.elapsed() < OUTPUT_LOG_DEGRADED_RETRY_INTERVAL {
+            *dropped_bytes = dropped_bytes.saturating_add(record.len() as u64);
+            return record;
+        }
+        *degraded_last_attempt = Some(Instant::now());
+        let recovered = log
+            .line(format!(
+                "clickhouse supervisor: log=recovered dropped_bytes={dropped_bytes}"
+            ))
+            .await
+            .is_ok();
+        if !recovered {
+            *dropped_bytes = dropped_bytes.saturating_add(record.len() as u64);
+            return record;
+        }
+        *degraded_last_attempt = None;
+        *dropped_bytes = 0;
     }
-    if let Err(err) = drained {
-        return Err(log_err.context(format!(
-            "also failed to drain child after supervisor log failure: {err:#}"
-        )));
+    let record_len = record.len() as u64;
+    match log.write_record(record).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!(
+                "clickhouse supervisor: log=degraded dropping child output records: {error:#}"
+            );
+            *degraded_last_attempt = Some(Instant::now());
+            *dropped_bytes = dropped_bytes.saturating_add(record_len);
+            Vec::with_capacity(OUTPUT_RECORD_BYTES)
+        }
     }
-    Err(log_err)
 }
 
 async fn forward_clickhouse_output<R>(mut reader: R, log: SupervisorLog) -> Result<()>
@@ -885,6 +923,8 @@ where
 {
     let mut input = [0_u8; 8 * 1024];
     let mut record = Vec::with_capacity(OUTPUT_RECORD_BYTES);
+    let mut dropped_bytes = 0_u64;
+    let mut degraded_last_attempt = None;
     loop {
         let read = reader
             .read(&mut input)
@@ -893,7 +933,7 @@ where
         if read == 0 {
             if !record.is_empty() {
                 record.extend_from_slice(OUTPUT_UNTERMINATED_MARKER);
-                log.write_record(record).await?;
+                forward_record(&log, record, &mut dropped_bytes, &mut degraded_last_attempt).await;
             }
             return Ok(());
         }
@@ -909,11 +949,15 @@ where
             record.extend_from_slice(&input[offset..offset + take]);
             offset += take;
             if newline.is_some() {
-                record = log.write_record(record).await?;
+                record =
+                    forward_record(&log, record, &mut dropped_bytes, &mut degraded_last_attempt)
+                        .await;
                 record.clear();
             } else if record.len() == OUTPUT_FRAGMENT_BYTES {
                 record.extend_from_slice(OUTPUT_CONTINUATION_MARKER);
-                record = log.write_record(record).await?;
+                record =
+                    forward_record(&log, record, &mut dropped_bytes, &mut degraded_last_attempt)
+                        .await;
                 record.clear();
             }
         }
@@ -1116,17 +1160,14 @@ async fn run_generation(
             }
         };
     let pid = child.id();
-    log_while_child_live(
-        &mut child,
-        &mut forwarders,
-        policy.child_shutdown_grace,
+    log_status_best_effort(
         log,
         format!(
             "clickhouse supervisor: generation={generation} pid={} state=starting",
             pid.map_or_else(|| "unknown".to_string(), |pid| pid.to_string())
         ),
     )
-    .await?;
+    .await;
 
     let readiness = wait_for_clickhouse(cfg);
     tokio::pin!(readiness);
@@ -1180,6 +1221,7 @@ async fn run_generation(
                     stdout,
                     policy.child_shutdown_grace,
                     log,
+                    None,
                 )
                 .await;
             }
@@ -1195,6 +1237,7 @@ async fn run_generation(
                     stderr,
                     policy.child_shutdown_grace,
                     log,
+                    None,
                 )
                 .await;
             }
@@ -1202,7 +1245,9 @@ async fn run_generation(
         break outcome;
     };
     if let Some(outcome) = startup_outcome {
-        finish_output_forwarders(&mut forwarders, log).await?;
+        if let Err(error) = finish_output_forwarders(&mut forwarders, log).await {
+            eprintln!("clickhouse supervisor: output drain failed: {error:#}");
+        }
         return Ok(outcome);
     }
 
@@ -1210,7 +1255,9 @@ async fn run_generation(
         .try_wait()
         .context("failed to inspect ClickHouse after readiness")?
     {
-        finish_output_forwarders(&mut forwarders, log).await?;
+        if let Err(error) = finish_output_forwarders(&mut forwarders, log).await {
+            eprintln!("clickhouse supervisor: output drain failed: {error:#}");
+        }
         return Ok(GenerationOutcome::Failed {
             reason: format!("exited at readiness boundary ({})", describe_exit(status)),
             ready_uptime: None,
@@ -1218,17 +1265,14 @@ async fn run_generation(
     }
 
     let ready_since = Instant::now();
-    log_while_child_live(
-        &mut child,
-        &mut forwarders,
-        policy.child_shutdown_grace,
+    log_status_best_effort(
         log,
         format!(
             "clickhouse supervisor: generation={generation} pid={} state=ready",
             pid.map_or_else(|| "unknown".to_string(), |pid| pid.to_string())
         ),
     )
-    .await?;
+    .await;
     let outcome = loop {
         let outcome = tokio::select! {
             biased;
@@ -1262,6 +1306,7 @@ async fn run_generation(
                     stdout,
                     policy.child_shutdown_grace,
                     log,
+                    Some(ready_since.elapsed()),
                 )
                 .await;
             }
@@ -1277,13 +1322,16 @@ async fn run_generation(
                     stderr,
                     policy.child_shutdown_grace,
                     log,
+                    Some(ready_since.elapsed()),
                 )
                 .await;
             }
         };
         break outcome;
     };
-    finish_output_forwarders(&mut forwarders, log).await?;
+    if let Err(error) = finish_output_forwarders(&mut forwarders, log).await {
+        eprintln!("clickhouse supervisor: output drain failed: {error:#}");
+    }
     Ok(outcome)
 }
 
@@ -1312,19 +1360,24 @@ async fn supervise_clickhouse(
             let Some(delay) = policy.restart_delays.get(consecutive_failures - 1).copied() else {
                 unreachable!("restart budget checked after every failed generation");
             };
-            log.line(format!(
-                "clickhouse supervisor: replacement={} delay_seconds={} state=backoff",
-                consecutive_failures,
-                delay.as_secs_f64()
-            ))
-            .await?;
+            log_status_best_effort(
+                log,
+                format!(
+                    "clickhouse supervisor: replacement={} delay_seconds={} state=backoff",
+                    consecutive_failures,
+                    delay.as_secs_f64()
+                ),
+            )
+            .await;
             tokio::select! {
                 biased;
                 _ = signals.recv() => {
-                    log.line(
+                    log_status_best_effort(
+                        log,
                         "clickhouse supervisor: state=stopped reason=intentional shutdown during backoff"
+                            .to_string(),
                     )
-                    .await?;
+                    .await;
                     return Ok(ExitCode::SUCCESS);
                 }
                 _ = sleep(delay) => {}
@@ -1350,22 +1403,31 @@ async fn supervise_clickhouse(
                 let (next_count, reset) =
                     next_failure_count(consecutive_failures, ready_uptime, policy.stability_window);
                 if reset {
-                    log.line(format!(
-                        "clickhouse supervisor: generation={generation} state=stable-budget-reset"
-                    ))
-                    .await?;
+                    log_status_best_effort(
+                        log,
+                        format!(
+                            "clickhouse supervisor: generation={generation} state=stable-budget-reset"
+                        ),
+                    )
+                    .await;
                 }
                 consecutive_failures = next_count;
-                log.line(format!(
-                    "clickhouse supervisor: generation={generation} state=failed reason={reason}"
-                ))
-                .await?;
+                log_status_best_effort(
+                    log,
+                    format!(
+                        "clickhouse supervisor: generation={generation} state=failed reason={reason}"
+                    ),
+                )
+                .await;
                 if consecutive_failures > policy.restart_delays.len() {
-                    log.line(format!(
-                        "clickhouse supervisor: state=exhausted replacements={} final_reason={reason}",
-                        policy.restart_delays.len()
-                    ))
-                    .await?;
+                    log_status_best_effort(
+                        log,
+                        format!(
+                            "clickhouse supervisor: state=exhausted replacements={} final_reason={reason}",
+                            policy.restart_delays.len()
+                        ),
+                    )
+                    .await;
                     return Ok(ExitCode::from(1));
                 }
                 generation += 1;
