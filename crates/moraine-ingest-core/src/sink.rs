@@ -185,18 +185,62 @@ impl PendingAckBatch {
 /// Refresh cost is dominated by session history size, so each session's next
 /// refresh is spaced proportionally to its last observed refresh cost: cheap
 /// sessions stay near-realtime while one enormous streaming session cannot
-/// re-snapshot itself at every flush tick.
+/// re-snapshot itself at every flush tick. Failures back off per session, so
+/// one persistently unstable session never delays anyone else's refresh.
 #[derive(Default)]
 struct ProjectionGovernor {
-    consecutive_failures: u32,
-    retry_not_before: Option<Instant>,
-    history: HashMap<String, ProjectionRefreshRecord>,
+    history: HashMap<String, ProjectionSessionState>,
+    in_flight: BTreeSet<String>,
 }
 
-#[derive(Clone, Copy)]
-struct ProjectionRefreshRecord {
-    finished_at: Instant,
+#[derive(Default, Clone, Copy)]
+struct ProjectionSessionState {
+    last_success: Option<Instant>,
+    last_cost: Duration,
+    consecutive_failures: u32,
+    retry_not_before: Option<Instant>,
+}
+
+struct ProjectionOutcome {
+    session_id: String,
     cost: Duration,
+    error: Option<String>,
+}
+
+/// Single-flight off-loop refresh worker. The sink loop must never block
+/// behind a multi-minute snapshot of one enormous session, so refreshes run
+/// in their own task and report back through a shared outcome list that the
+/// loop applies on later ticks.
+struct ProjectionWorker {
+    requests: tokio::sync::mpsc::Sender<Vec<String>>,
+    outcomes: Arc<Mutex<Vec<ProjectionOutcome>>>,
+}
+
+fn spawn_projection_worker(clickhouse: ClickHouseClient) -> ProjectionWorker {
+    let (requests, mut rx) = tokio::sync::mpsc::channel::<Vec<String>>(1);
+    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let completed = Arc::clone(&outcomes);
+    tokio::spawn(async move {
+        while let Some(sessions) = rx.recv().await {
+            for session_id in sessions {
+                let started = Instant::now();
+                let error = clickhouse
+                    .refresh_mcp_open_read_model(std::iter::once(session_id.as_str()))
+                    .await
+                    .err()
+                    .map(|error| format!("{error:#}"));
+                completed
+                    .lock()
+                    .expect("projection outcome mutex poisoned")
+                    .push(ProjectionOutcome {
+                        session_id,
+                        cost: started.elapsed(),
+                        error,
+                    });
+            }
+        }
+    });
+    ProjectionWorker { requests, outcomes }
 }
 
 const PROJECTION_REFRESH_MIN_GAP: Duration = Duration::from_secs(2);
@@ -229,9 +273,8 @@ fn spawn_snapshot_reclaim(clickhouse: &ClickHouseClient, in_flight: &Arc<AtomicB
     tokio::spawn(async move {
         match clickhouse.reclaim_superseded_mcp_open_snapshots().await {
             Ok(stats) if stats.total() > 0 => info!(
-                superseded_event_rows = stats.superseded_event_rows,
-                superseded_turn_rows = stats.superseded_turn_rows,
-                "reclaimed superseded mcp open snapshot rows"
+                superseded_generations = stats.superseded_generations,
+                "reclaimed superseded mcp open snapshot generations"
             ),
             Ok(_) => {}
             Err(error) => {
@@ -253,94 +296,119 @@ fn projection_failure_backoff(consecutive_failures: u32) -> Duration {
 }
 
 impl ProjectionGovernor {
-    fn ready(&self, now: Instant) -> bool {
-        self.retry_not_before.is_none_or(|instant| now >= instant)
-    }
-
     fn due_sessions(&self, pending: &BTreeSet<String>, now: Instant) -> BTreeSet<String> {
         pending
             .iter()
+            .filter(|session_id| !self.in_flight.contains(session_id.as_str()))
             .filter(|session_id| {
-                self.history.get(session_id.as_str()).is_none_or(|record| {
-                    now.saturating_duration_since(record.finished_at)
-                        >= projection_refresh_gap(record.cost)
+                self.history.get(session_id.as_str()).is_none_or(|state| {
+                    state.retry_not_before.is_none_or(|instant| now >= instant)
+                        && state.last_success.is_none_or(|finished_at| {
+                            now.saturating_duration_since(finished_at)
+                                >= projection_refresh_gap(state.last_cost)
+                        })
                 })
             })
             .cloned()
             .collect()
     }
 
-    fn record_success(&mut self, refreshed: &BTreeSet<String>, total_cost: Duration, now: Instant) {
-        self.consecutive_failures = 0;
-        self.retry_not_before = None;
-        let per_session_cost = total_cost / u32::try_from(refreshed.len().max(1)).unwrap_or(1);
-        for session_id in refreshed {
-            self.history.insert(
-                session_id.clone(),
-                ProjectionRefreshRecord {
-                    finished_at: now,
-                    cost: per_session_cost,
-                },
-            );
+    fn mark_in_flight(&mut self, sessions: &[String]) {
+        self.in_flight.extend(sessions.iter().cloned());
+    }
+
+    fn apply_outcome(
+        &mut self,
+        outcome: ProjectionOutcome,
+        pending: &mut BTreeSet<String>,
+        now: Instant,
+    ) {
+        self.in_flight.remove(&outcome.session_id);
+        match outcome.error {
+            None => {
+                pending.remove(&outcome.session_id);
+                self.history.insert(
+                    outcome.session_id,
+                    ProjectionSessionState {
+                        last_success: Some(now),
+                        last_cost: outcome.cost,
+                        consecutive_failures: 0,
+                        retry_not_before: None,
+                    },
+                );
+            }
+            Some(error) => {
+                let state = self.history.entry(outcome.session_id.clone()).or_default();
+                state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+                let delay = projection_failure_backoff(state.consecutive_failures);
+                state.retry_not_before = Some(now + delay);
+                warn!(
+                    session_id = outcome.session_id.as_str(),
+                    consecutive_failures = state.consecutive_failures,
+                    retry_in_ms = delay.as_millis() as u64,
+                    "mcp open projection refresh failed; session stays pending: {error}"
+                );
+            }
         }
         if self.history.len() > PROJECTION_HISTORY_LIMIT {
             let mut ages = self
                 .history
                 .values()
-                .map(|record| record.finished_at)
+                .filter_map(|state| state.last_success)
                 .collect::<Vec<_>>();
             ages.sort_unstable();
-            let cutoff = ages[ages.len() / 2];
-            self.history.retain(|_, record| record.finished_at > cutoff);
+            if let Some(cutoff) = ages.get(ages.len() / 2).copied() {
+                self.history.retain(|_, state| {
+                    state
+                        .last_success
+                        .is_none_or(|finished_at| finished_at > cutoff)
+                });
+            }
         }
-    }
-
-    fn record_failure(&mut self, now: Instant) -> Duration {
-        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        let delay = projection_failure_backoff(self.consecutive_failures);
-        self.retry_not_before = Some(now + delay);
-        delay
     }
 }
 
-/// Refresh the MCP open read model for pending sessions that are currently
-/// due, without ever failing the surrounding flush: canonical rows are already
-/// durable and `mcp_open_dirty_sessions` persists the projection debt, so a
-/// failed or deferred refresh is simply retried on a later tick.
-async fn drain_pending_projection(
-    clickhouse: &ClickHouseClient,
+/// Apply finished refreshes and hand the currently due sessions to the
+/// worker. Never blocks and never fails the surrounding loop: canonical rows
+/// are already durable and `mcp_open_dirty_sessions` persists the projection
+/// debt, so a failed or deferred refresh is simply retried on a later tick.
+fn drain_pending_projection(
+    worker: &ProjectionWorker,
     governor: &mut ProjectionGovernor,
     pending_ack: &mut PendingAckBatch,
 ) {
-    if pending_ack.projection_session_ids.is_empty() {
-        return;
-    }
+    let outcomes = std::mem::take(
+        &mut *worker
+            .outcomes
+            .lock()
+            .expect("projection outcome mutex poisoned"),
+    );
     let now = Instant::now();
-    if !governor.ready(now) {
+    for outcome in outcomes {
+        governor.apply_outcome(outcome, &mut pending_ack.projection_session_ids, now);
+    }
+    if pending_ack.projection_session_ids.is_empty() {
         return;
     }
     let due = governor.due_sessions(&pending_ack.projection_session_ids, now);
     if due.is_empty() {
         return;
     }
-    let refresh_started = Instant::now();
-    match clickhouse
-        .refresh_mcp_open_read_model(due.iter().map(String::as_str))
-        .await
-    {
-        Ok(()) => {
-            for session_id in &due {
-                pending_ack.projection_session_ids.remove(session_id);
-            }
-            governor.record_success(&due, refresh_started.elapsed(), Instant::now());
-        }
-        Err(error) => {
-            let delay = governor.record_failure(Instant::now());
-            warn!(
-                sessions = due.len(),
-                retry_in_ms = delay.as_millis() as u64,
-                "mcp open projection refresh failed; sessions stay pending for retry: {error:#}"
-            );
+    // Cheapest sessions first: while one enormous session occupies the
+    // worker for minutes, everyone queued behind it waits, so inexpensive
+    // near-realtime sessions must never queue behind it within one batch.
+    let mut ordered: Vec<String> = due.into_iter().collect();
+    ordered.sort_by_key(|session_id| {
+        governor
+            .history
+            .get(session_id)
+            .map_or(Duration::ZERO, |state| state.last_cost)
+    });
+    match worker.requests.try_send(ordered.clone()) {
+        Ok(()) => governor.mark_in_flight(&ordered),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            warn!("mcp open projection worker stopped; sessions stay pending");
         }
     }
 }
@@ -760,10 +828,13 @@ pub(crate) fn spawn_sink_task(
         };
 
         let mut flush_tick = tokio::time::interval(flush_interval);
+        flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut heartbeat_tick = tokio::time::interval(heartbeat_interval);
+        heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut reclaim_tick = tokio::time::interval(SNAPSHOT_RECLAIM_INTERVAL);
         reclaim_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let reclaim_in_flight = Arc::new(AtomicBool::new(false));
+        let projection_worker = spawn_projection_worker(clickhouse.clone());
         let mut throttling_flush_retries = false;
         let mut throttled_flush_failures: u32 = 0;
 
@@ -1113,16 +1184,16 @@ pub(crate) fn spawn_sink_task(
                         } else {
                             pending_batch_bytes = 0;
                         }
-                    } else {
-                        // Sessions deferred by the refresh governor still owe
-                        // a projection pass even when no new rows arrive.
-                        drain_pending_projection(
-                            &clickhouse,
-                            &mut pending.projection,
-                            &mut pending.acknowledgements,
-                        )
-                        .await;
                     }
+                    // Sessions whose canonical rows flushed owe a projection
+                    // pass; the off-loop worker runs it so a huge session can
+                    // never stall intake, and deferred sessions are retried
+                    // here even when no new rows arrive.
+                    drain_pending_projection(
+                        &projection_worker,
+                        &mut pending.projection,
+                        &mut pending.acknowledgements,
+                    );
                 }
                 _ = heartbeat_tick.tick() => {
                     emit_heartbeat(&clickhouse, &metrics, &role).await;
@@ -1984,7 +2055,7 @@ async fn flush_pending_inner(
         error_rows,
         checkpoint_updates,
         acknowledgements: pending_ack,
-        projection,
+        projection: _,
         quarantined_generations,
         append_manifest: pending_append_manifest,
         append_fence: pending_append_fence,
@@ -2361,13 +2432,11 @@ async fn flush_pending_inner(
             error_rows.clear();
         }
 
-        // Compatibility preparation is dependency-ordered: canonical events,
-        // links, tools, and errors are durable before the candidate is built;
-        // the causal checkpoint and source head remain later stages. The
-        // refresh never fails the flush: dirty-session rows persist the debt
-        // and the governor retries with backoff, so one hot or failing
-        // session cannot head-of-line block checkpoints for every source.
-        drain_pending_projection(clickhouse, projection, pending_ack).await;
+        // MCP open compatibility snapshots are refreshed off-loop by the
+        // projection worker: session ids enter the pending set only after
+        // their canonical rows are durable (Events stage above), and the
+        // dirty-session relation persists the debt across restarts, so
+        // checkpoints never wait on projection.
 
         if !checkpoint_rows.is_empty() {
             commit_checkpoint_updates(
