@@ -104,6 +104,21 @@ pub(crate) struct MockState {
     pub(crate) scripted_responses: Mutex<Option<VecDeque<ScriptedResponse>>>,
 }
 
+/// Run one repository interaction under a generous Interactive-class
+/// envelope (30s deadline, bundled-default caps). Post-flip (issue #600
+/// W12) the transport refuses unenveloped statements, so every integration
+/// test scopes its repository calls through this helper; tests that prove
+/// specific budget behavior build their own tighter envelopes instead.
+pub(crate) async fn scoped<F: std::future::Future>(f: F) -> F::Output {
+    moraine_conversations::QueryEnvelope::new(
+        "test",
+        moraine_conversations::QueryClass::Interactive,
+        &interactive_test_budget(30.0),
+    )
+    .scope(f)
+    .await
+}
+
 /// Interactive-class query budget with the given deadline for
 /// envelope-scoped integration tests; every other field keeps the bundled
 /// defaults (budgets are constructible only from validated config).
@@ -155,6 +170,24 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             .filter(|query| !query.is_empty())
             .cloned()
             .unwrap_or(body);
+        // Cancellation KILLs are recorded (the cancel_query tests assert the
+        // prefix contract) but answered out-of-band: drop-guard KILLs are
+        // spawned, best-effort, and racy by design (issue #600), so they
+        // must never consume a scripted response or trip a query barrier.
+        if query.trim_start().starts_with("KILL QUERY") {
+            state.queries.lock().expect("query lock").push(query);
+            state
+                .query_ids
+                .lock()
+                .expect("query id lock")
+                .push(params.get("query_id").cloned());
+            state
+                .request_params
+                .lock()
+                .expect("request params lock")
+                .push(params.clone());
+            return (StatusCode::OK, String::new());
+        }
         // Publication capture/revalidation is repository infrastructure, not
         // part of the individual query scripts below. Keep the legacy
         // fixtures focused on the operation under test while returning one

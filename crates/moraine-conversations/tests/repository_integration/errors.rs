@@ -28,134 +28,151 @@ fn interactive_budget_with_cap(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn server_timeout_maps_to_deadline_exceeded() {
-    let (repo, state) = build_scripted_repo(vec![ScriptedResponse::failure(
-        &[],
-        "Code: 159. DB::Exception: Timeout exceeded: elapsed 2.0 seconds",
-    )])
-    .await;
+    scoped(async {
+        let (repo, state) = build_scripted_repo(vec![ScriptedResponse::failure(
+            &[],
+            "Code: 159. DB::Exception: Timeout exceeded: elapsed 2.0 seconds",
+        )])
+        .await;
 
-    let error = repo
-        .latest_ingest_heartbeat()
-        .await
-        .expect_err("timed-out read must fail");
-    match error {
-        RepoError::DeadlineExceeded { budget_note } => {
-            assert!(
-                budget_note.contains("159"),
-                "note should carry the server code: {budget_note}"
-            );
+        let error = repo
+            .latest_ingest_heartbeat()
+            .await
+            .expect_err("timed-out read must fail");
+        match error {
+            RepoError::DeadlineExceeded { budget_note } => {
+                assert!(
+                    budget_note.contains("159"),
+                    "note should carry the server code: {budget_note}"
+                );
+            }
+            other => panic!("expected DeadlineExceeded, got {other:?}"),
         }
-        other => panic!("expected DeadlineExceeded, got {other:?}"),
-    }
-    assert_script_consumed(&state, 1);
+        assert_script_consumed(&state, 1);
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn killed_query_maps_to_deadline_exceeded() {
-    let (repo, state) = build_scripted_repo(vec![ScriptedResponse::failure(
-        &[],
-        "Code: 394. DB::Exception: Query was cancelled",
-    )])
-    .await;
+    scoped(async {
+        let (repo, state) = build_scripted_repo(vec![ScriptedResponse::failure(
+            &[],
+            "Code: 394. DB::Exception: Query was cancelled",
+        )])
+        .await;
 
-    let error = repo
-        .latest_ingest_heartbeat()
-        .await
-        .expect_err("killed read must fail");
-    assert!(
-        matches!(error, RepoError::DeadlineExceeded { .. }),
-        "expected DeadlineExceeded for a killed query, got {error:?}"
-    );
-    assert_script_consumed(&state, 1);
+        let error = repo
+            .latest_ingest_heartbeat()
+            .await
+            .expect_err("killed read must fail");
+        assert!(
+            matches!(error, RepoError::DeadlineExceeded { .. }),
+            "expected DeadlineExceeded for a killed query, got {error:?}"
+        );
+        assert_script_consumed(&state, 1);
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn server_resource_limits_map_to_resource_exhausted() {
-    for body in [
-        "Code: 241. DB::Exception: Memory limit (for query) exceeded",
-        "Code: 396. DB::Exception: Limit for rows or bytes to read exceeded",
-    ] {
-        let (repo, state) = build_scripted_repo(vec![ScriptedResponse::failure(&[], body)]).await;
-        let error = repo
-            .latest_ingest_heartbeat()
-            .await
-            .expect_err("resource-limited read must fail");
-        assert!(
-            matches!(error, RepoError::ResourceExhausted { .. }),
-            "expected ResourceExhausted for {body:?}, got {error:?}"
-        );
-        assert_script_consumed(&state, 1);
-    }
+    scoped(async {
+        for body in [
+            "Code: 241. DB::Exception: Memory limit (for query) exceeded",
+            "Code: 396. DB::Exception: Limit for rows or bytes to read exceeded",
+        ] {
+            let (repo, state) =
+                build_scripted_repo(vec![ScriptedResponse::failure(&[], body)]).await;
+            let error = repo
+                .latest_ingest_heartbeat()
+                .await
+                .expect_err("resource-limited read must fail");
+            assert!(
+                matches!(error, RepoError::ResourceExhausted { .. }),
+                "expected ResourceExhausted for {body:?}, got {error:?}"
+            );
+            assert_script_consumed(&state, 1);
+        }
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn unclassified_server_errors_stay_backend_errors() {
-    for body in [
-        "Code: 60. DB::Exception: Table moraine.missing does not exist",
-        "no exception code in this body at all",
-    ] {
-        let (repo, state) = build_scripted_repo(vec![ScriptedResponse::failure(&[], body)]).await;
-        let error = repo
-            .latest_ingest_heartbeat()
-            .await
-            .expect_err("failed read must fail");
-        match error {
-            RepoError::Backend(message) => {
-                assert!(
-                    message.contains(body),
-                    "message should keep the body: {message}"
-                );
+    scoped(async {
+        for body in [
+            "Code: 60. DB::Exception: Table moraine.missing does not exist",
+            "no exception code in this body at all",
+        ] {
+            let (repo, state) =
+                build_scripted_repo(vec![ScriptedResponse::failure(&[], body)]).await;
+            let error = repo
+                .latest_ingest_heartbeat()
+                .await
+                .expect_err("failed read must fail");
+            match error {
+                RepoError::Backend(message) => {
+                    assert!(
+                        message.contains(body),
+                        "message should keep the body: {message}"
+                    );
+                }
+                other => panic!("expected Backend for {body:?}, got {other:?}"),
             }
-            other => panic!("expected Backend for {body:?}, got {other:?}"),
+            assert_script_consumed(&state, 1);
         }
-        assert_script_consumed(&state, 1);
-    }
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn typed_budget_errors_take_the_consistency_non_retry_arm() {
-    // Only ReadModelChanged re-runs the publication-consistent operation.
-    // A typed deadline error must propagate after exactly one attempt: one
-    // snapshot capture, one operation read, no revalidation, no retry.
-    let (repo, state) = build_scripted_repo(vec![ScriptedResponse::failure(
-        &[],
-        "Code: 159. DB::Exception: Timeout exceeded: elapsed 2.0 seconds",
-    )])
+    scoped(async {
+        // Only ReadModelChanged re-runs the publication-consistent operation.
+        // A typed deadline error must propagate after exactly one attempt: one
+        // snapshot capture, one operation read, no revalidation, no retry.
+        let (repo, state) = build_scripted_repo(vec![ScriptedResponse::failure(
+            &[],
+            "Code: 159. DB::Exception: Timeout exceeded: elapsed 2.0 seconds",
+        )])
+        .await;
+
+        let error = repo
+            .list_mcp_sessions(
+                McpSessionListFilter {
+                    start_unix_ms: 1767261600000_i64,
+                    end_unix_ms: 1767500000000_i64,
+                    mode: None,
+                    harness: None,
+                    source_name: None,
+                    sort: ConversationListSort::Desc,
+                },
+                PageRequest {
+                    limit: 2,
+                    cursor: None,
+                },
+            )
+            .await
+            .expect_err("timed-out consistent read must fail");
+        assert!(
+            matches!(error, RepoError::DeadlineExceeded { .. }),
+            "expected DeadlineExceeded, got {error:?}"
+        );
+
+        assert_script_consumed(&state, 1);
+        let snapshot_queries = state
+            .publication_snapshot_queries
+            .lock()
+            .expect("publication snapshot query lock");
+        assert_eq!(
+            snapshot_queries.len(),
+            1,
+            "no revalidation and no retry after a typed budget error"
+        );
+        assert!(snapshot_queries[0].contains("moraine:publication_snapshot:capture"));
+    })
     .await;
-
-    let error = repo
-        .list_mcp_sessions(
-            McpSessionListFilter {
-                start_unix_ms: 1767261600000_i64,
-                end_unix_ms: 1767500000000_i64,
-                mode: None,
-                harness: None,
-                source_name: None,
-                sort: ConversationListSort::Desc,
-            },
-            PageRequest {
-                limit: 2,
-                cursor: None,
-            },
-        )
-        .await
-        .expect_err("timed-out consistent read must fail");
-    assert!(
-        matches!(error, RepoError::DeadlineExceeded { .. }),
-        "expected DeadlineExceeded, got {error:?}"
-    );
-
-    assert_script_consumed(&state, 1);
-    let snapshot_queries = state
-        .publication_snapshot_queries
-        .lock()
-        .expect("publication snapshot query lock");
-    assert_eq!(
-        snapshot_queries.len(),
-        1,
-        "no revalidation and no retry after a typed budget error"
-    );
-    assert!(snapshot_queries[0].contains("moraine:publication_snapshot:capture"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

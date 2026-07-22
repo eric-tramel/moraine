@@ -1,11 +1,13 @@
 use anyhow::{anyhow, bail, Context, Result};
 use moraine_clickhouse::ClickHouseClient;
-use moraine_config::{AppConfig, ClickHouseConfig, DEFAULT_BACKEND_NAME};
+use moraine_config::{
+    AppConfig, ClickHouseConfig, QueryBudgetClassConfig, QueryBudgetsConfig, ValidatedQueryBudget,
+    ValidatedQueryBudgets, DEFAULT_BACKEND_NAME, QUERY_MEMORY_BACKSTOP_BYTES,
+};
 use moraine_conversations::{
-    with_repository_query_id, AnalyticsRange, BackendRepositoryRouter,
-    ClickHouseConversationRepository, ConversationListSort, ConversationRepository,
-    McpSessionListFilter, PageRequest, RepoConfig, RepoError, SessionAnalyticsQuery,
-    SessionLookback, TurnListFilter,
+    AnalyticsRange, BackendRepositoryRouter, ClickHouseConversationRepository,
+    ConversationListSort, ConversationRepository, McpSessionListFilter, PageRequest, QueryClass,
+    QueryEnvelope, RepoConfig, RepoError, SessionAnalyticsQuery, SessionLookback, TurnListFilter,
 };
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
@@ -19,6 +21,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+#[path = "live_clickhouse/envelope_gates.rs"]
+mod envelope_gates;
 #[path = "live_clickhouse/search_host_identity.rs"]
 mod search_host_identity;
 #[path = "live_clickhouse/source_publication.rs"]
@@ -284,6 +288,51 @@ fn live_client(
 ) -> Result<ClickHouseClient> {
     ClickHouseClient::new(prerequisites.clickhouse_config(database))
         .context("failed to construct owned live ClickHouse client")
+}
+
+/// Generous Migration-class budget for live-test fixture setup, verification
+/// reads, and teardown. The transport fails closed on unenveloped statements
+/// (issue #600 W12), so every raw statement a live test issues must ride an
+/// explicit envelope. Migration class arms no drop-guard KILLs, keeping
+/// fixture DDL and teardown immune to spurious cancellation while every
+/// statement still carries a finite server budget.
+fn live_fixture_budget() -> ValidatedQueryBudget {
+    let config = QueryBudgetsConfig {
+        migration: QueryBudgetClassConfig {
+            deadline_seconds: 7_200.0,
+            memory_bytes: QUERY_MEMORY_BACKSTOP_BYTES,
+            spill_bytes: QUERY_MEMORY_BACKSTOP_BYTES / 4,
+            read_rows: 1_000_000_000_000,
+            read_bytes: 1_000_000_000_000_000,
+            statement_cap: 1_000_000,
+        },
+        ..QueryBudgetsConfig::default()
+    };
+    ValidatedQueryBudgets::from_config(&config)
+        .expect("live fixture budget must validate")
+        .migration
+}
+
+/// Run one live test body under the shared fixture envelope. Operations
+/// under test build their own class envelopes inside this scope, exactly the
+/// way production boundaries nest inside a process that already has ambient
+/// work running.
+async fn with_live_fixture_envelope<F: std::future::Future>(f: F) -> F::Output {
+    QueryEnvelope::new(
+        "live-fixture",
+        QueryClass::Migration,
+        &live_fixture_budget(),
+    )
+    .scope(f)
+    .await
+}
+
+/// The bundled-default Interactive budget, for scoping request-shaped live
+/// operations exactly the way the MCP and monitor boundaries do.
+fn default_interactive_budget() -> ValidatedQueryBudget {
+    ValidatedQueryBudgets::from_config(&QueryBudgetsConfig::default())
+        .expect("bundled default query budgets are valid")
+        .interactive
 }
 
 async fn install_schema_fixture(
@@ -786,90 +835,90 @@ async fn run_open_suite(
     phase: &str,
     concurrent: bool,
 ) -> Result<OpenSuite> {
-    let wall_started = Instant::now();
-    let (session, session_ms, turn, turn_ms, event, event_ms) = if concurrent {
-        let session = async {
+    // One Interactive envelope per measured phase: the transport owns query
+    // ids now (issue #600), so the phase label rides the envelope kind and
+    // lands in the `moraine-issue532-{phase}-...` query-log ids that
+    // `read_open_cost_metrics` aggregates.
+    QueryEnvelope::new(
+        &format!("issue532-{phase}"),
+        QueryClass::Interactive,
+        &default_interactive_budget(),
+    )
+    .scope(async move {
+        let wall_started = Instant::now();
+        let (session, session_ms, turn, turn_ms, event, event_ms) = if concurrent {
+            let session = async {
+                let started = Instant::now();
+                let value = repository
+                    .get_mcp_session("issue532-target-session")
+                    .await
+                    .context("bounded session open failed")?
+                    .context("bounded session target missing")?;
+                Ok::<_, anyhow::Error>((value, started.elapsed().as_millis() as u64))
+            };
+            let turn = async {
+                let started = Instant::now();
+                let value = repository
+                    .get_mcp_turn("issue532-target-turn", 1)
+                    .await
+                    .context("bounded turn open failed")?
+                    .context("bounded turn target missing")?;
+                Ok::<_, anyhow::Error>((value, started.elapsed().as_millis() as u64))
+            };
+            let event = async {
+                let started = Instant::now();
+                let value = repository
+                    .get_mcp_event("issue532-target-event-0250")
+                    .await
+                    .context("bounded event open failed")?
+                    .context("bounded event target missing")?;
+                Ok::<_, anyhow::Error>((value, started.elapsed().as_millis() as u64))
+            };
+            let (session, turn, event) = tokio::join!(session, turn, event);
+            let (session, session_ms) = session?;
+            let (turn, turn_ms) = turn?;
+            let (event, event_ms) = event?;
+            (session, session_ms, turn, turn_ms, event, event_ms)
+        } else {
             let started = Instant::now();
-            let value = with_repository_query_id(
-                format!("issue532-{phase}-session"),
-                repository.get_mcp_session("issue532-target-session"),
-            )
-            .await
-            .context("bounded session open failed")?
-            .context("bounded session target missing")?;
-            Ok::<_, anyhow::Error>((value, started.elapsed().as_millis() as u64))
-        };
-        let turn = async {
+            let session = repository
+                .get_mcp_session("issue532-target-session")
+                .await
+                .context("bounded session open failed")?
+                .context("bounded session target missing")?;
+            let session_ms = started.elapsed().as_millis() as u64;
+
             let started = Instant::now();
-            let value = with_repository_query_id(
-                format!("issue532-{phase}-turn"),
-                repository.get_mcp_turn("issue532-target-turn", 1),
-            )
-            .await
-            .context("bounded turn open failed")?
-            .context("bounded turn target missing")?;
-            Ok::<_, anyhow::Error>((value, started.elapsed().as_millis() as u64))
-        };
-        let event = async {
+            let turn = repository
+                .get_mcp_turn("issue532-target-turn", 1)
+                .await
+                .context("bounded turn open failed")?
+                .context("bounded turn target missing")?;
+            let turn_ms = started.elapsed().as_millis() as u64;
+
             let started = Instant::now();
-            let value = with_repository_query_id(
-                format!("issue532-{phase}-event"),
-                repository.get_mcp_event("issue532-target-event-0250"),
-            )
-            .await
-            .context("bounded event open failed")?
-            .context("bounded event target missing")?;
-            Ok::<_, anyhow::Error>((value, started.elapsed().as_millis() as u64))
+            let event = repository
+                .get_mcp_event("issue532-target-event-0250")
+                .await
+                .context("bounded event open failed")?
+                .context("bounded event target missing")?;
+            let event_ms = started.elapsed().as_millis() as u64;
+            (session, session_ms, turn, turn_ms, event, event_ms)
         };
-        let (session, turn, event) = tokio::join!(session, turn, event);
-        let (session, session_ms) = session?;
-        let (turn, turn_ms) = turn?;
-        let (event, event_ms) = event?;
-        (session, session_ms, turn, turn_ms, event, event_ms)
-    } else {
-        let started = Instant::now();
-        let session = with_repository_query_id(
-            format!("issue532-{phase}-session"),
-            repository.get_mcp_session("issue532-target-session"),
-        )
-        .await
-        .context("bounded session open failed")?
-        .context("bounded session target missing")?;
-        let session_ms = started.elapsed().as_millis() as u64;
 
-        let started = Instant::now();
-        let turn = with_repository_query_id(
-            format!("issue532-{phase}-turn"),
-            repository.get_mcp_turn("issue532-target-turn", 1),
-        )
-        .await
-        .context("bounded turn open failed")?
-        .context("bounded turn target missing")?;
-        let turn_ms = started.elapsed().as_millis() as u64;
-
-        let started = Instant::now();
-        let event = with_repository_query_id(
-            format!("issue532-{phase}-event"),
-            repository.get_mcp_event("issue532-target-event-0250"),
-        )
-        .await
-        .context("bounded event open failed")?
-        .context("bounded event target missing")?;
-        let event_ms = started.elapsed().as_millis() as u64;
-        (session, session_ms, turn, turn_ms, event, event_ms)
-    };
-
-    Ok(OpenSuite {
-        semantic: json!({
-            "session": session,
-            "turn": turn,
-            "event": event,
-        }),
-        event_ms,
-        turn_ms,
-        session_ms,
-        wall_ms: wall_started.elapsed().as_millis() as u64,
+        Ok(OpenSuite {
+            semantic: json!({
+                "session": session,
+                "turn": turn,
+                "event": event,
+            }),
+            event_ms,
+            turn_ms,
+            session_ms,
+            wall_ms: wall_started.elapsed().as_millis() as u64,
+        })
     })
+    .await
 }
 
 async fn read_open_cost_metrics(
@@ -883,7 +932,7 @@ async fn read_open_cost_metrics(
     let rows: Vec<OpenCostMetrics> = clickhouse
         .query_rows(
             "SELECT
-  extract(query_id, '^issue532-([^-]+)-') AS phase,
+  extract(query_id, '^moraine-issue532-([a-z]+)-') AS phase,
   toUInt64(count()) AS query_count,
   toUInt64(sum(read_rows)) AS read_rows,
   toUInt64(sum(read_bytes)) AS read_bytes,
@@ -891,7 +940,7 @@ async fn read_open_cost_metrics(
   toUInt64(sum(query_duration_ms)) AS duration_ms
 FROM system.query_log
 WHERE type = 'QueryFinish'
-  AND startsWith(query_id, 'issue532-')
+  AND startsWith(query_id, 'moraine-issue532-')
   AND current_database = currentDatabase()
 GROUP BY phase
 FORMAT JSONEachRow",
@@ -908,6 +957,10 @@ FORMAT JSONEachRow",
 #[tokio::test]
 #[ignore = "requires wrapper-owned live ClickHouse and destructive opt-in"]
 async fn live_schema_semantics_and_teardown() -> Result<()> {
+    with_live_fixture_envelope(live_schema_semantics_and_teardown_body()).await
+}
+
+async fn live_schema_semantics_and_teardown_body() -> Result<()> {
     let prerequisites = LivePrerequisites::load()?;
     let database = prepare_owned_database_identity(&prerequisites.sandbox_id)?;
     let clickhouse = live_client(&prerequisites, &database)?;
@@ -1471,6 +1524,10 @@ VALUES
 #[tokio::test]
 #[ignore = "requires wrapper-owned live ClickHouse, destructive opt-in, and ~2 GB free"]
 async fn live_mcp_open_batched_backfill_resources() -> Result<()> {
+    with_live_fixture_envelope(live_mcp_open_batched_backfill_resources_body()).await
+}
+
+async fn live_mcp_open_batched_backfill_resources_body() -> Result<()> {
     const SESSIONS: u64 = 256;
     const EVENTS_PER_SESSION: u64 = 32;
     const EXPECTED_EVENTS: u64 = SESSIONS * EVENTS_PER_SESSION;
@@ -1760,6 +1817,10 @@ async fn live_mcp_open_batched_backfill_resources() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires wrapper-owned live ClickHouse, destructive opt-in, and ~2 GB free"]
 async fn live_mcp_open_boundedness_benchmark() -> Result<()> {
+    with_live_fixture_envelope(live_mcp_open_boundedness_benchmark_body()).await
+}
+
+async fn live_mcp_open_boundedness_benchmark_body() -> Result<()> {
     const UNRELATED_EVENTS: u64 = 1_000_000;
     const UNRELATED_SESSIONS: u64 = 100_000;
     const CANONICAL_BATCH_SIZE: u64 = 10_000;
@@ -2137,6 +2198,10 @@ async fn start_owned_monitor(
 #[tokio::test]
 #[ignore = "requires wrapper-owned live ClickHouse and destructive opt-in"]
 async fn live_monitor_repository_semantic_parity() -> Result<()> {
+    with_live_fixture_envelope(live_monitor_repository_semantic_parity_body()).await
+}
+
+async fn live_monitor_repository_semantic_parity_body() -> Result<()> {
     let prerequisites = LivePrerequisites::load()?;
     let database = prepare_owned_database_identity(&prerequisites.sandbox_id)?;
     let clickhouse = live_client(&prerequisites, &database)?;
@@ -2215,6 +2280,10 @@ async fn live_monitor_repository_semantic_parity() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires wrapper-owned live ClickHouse and destructive opt-in"]
 async fn live_source_publication_cutover_crash_recovery() -> Result<()> {
+    with_live_fixture_envelope(live_source_publication_cutover_crash_recovery_body()).await
+}
+
+async fn live_source_publication_cutover_crash_recovery_body() -> Result<()> {
     let prerequisites = LivePrerequisites::load()?;
     let database = prepare_owned_database_identity(&prerequisites.sandbox_id)?;
     let clickhouse = live_client(&prerequisites, &database)?;
@@ -2240,6 +2309,35 @@ async fn live_source_publication_cutover_crash_recovery() -> Result<()> {
     let cleanup = cleanup_database(&clickhouse, &database).await;
     let census = assert_owned_database_census_empty(&clickhouse, "after cleanup").await;
     finish_with_cleanup(outcome, finish_with_cleanup(cleanup, census))
+}
+
+// Issue #600 exit-gate live tests (design-600.md LIVE TEST PLAN). The bodies
+// live in live_clickhouse/envelope_gates.rs; these root-level wrappers keep
+// the exact `--exact` libtest paths that scripts/dev/sandbox/run-live-test
+// dispatches on.
+
+#[tokio::test]
+#[ignore = "requires wrapper-owned live ClickHouse and destructive opt-in"]
+async fn live_envelope_query_log_coverage() -> Result<()> {
+    with_live_fixture_envelope(envelope_gates::query_log_coverage()).await
+}
+
+#[tokio::test]
+#[ignore = "requires wrapper-owned live ClickHouse and destructive opt-in"]
+async fn live_envelope_abandoned_query_cancelled() -> Result<()> {
+    with_live_fixture_envelope(envelope_gates::abandoned_query_cancelled()).await
+}
+
+#[tokio::test]
+#[ignore = "requires wrapper-owned live ClickHouse and destructive opt-in"]
+async fn live_envelope_shared_budget_and_statement_cap() -> Result<()> {
+    with_live_fixture_envelope(envelope_gates::shared_budget_and_statement_cap()).await
+}
+
+#[tokio::test]
+#[ignore = "requires wrapper-owned live ClickHouse and destructive opt-in"]
+async fn live_envelope_spill_and_memory_ceiling() -> Result<()> {
+    with_live_fixture_envelope(envelope_gates::spill_and_memory_ceiling()).await
 }
 
 #[cfg(test)]

@@ -851,7 +851,10 @@ envelope enforces an absolute execution deadline, per-statement memory and
 spill ceilings, cumulative read allowances, and a fixed statement cap for the
 whole logical operation. There is no unlimited setting: zero values are
 rejected at config load (ClickHouse treats zero limits as "unlimited"), so a
-config that would produce an unbounded query never loads.
+config that would produce an unbounded query never loads. The envelope is
+also mandatory at the transport: a statement issued without one is refused
+client-side with a typed error before it reaches ClickHouse, so an
+unenveloped query is unrepresentable.
 
 ```toml
 [query_budgets.interactive]
@@ -904,9 +907,11 @@ larger operator-configured client timeout when one is set; the migration
 budget never tightens below it.
 
 The defaults are deliberately generous for healthy local corpora. Tighten
-them after observing budget-exhaustion telemetry in monitor health/status;
-repeated `deadline_exceeded` or `resource_exhausted` results indicate either
-an under-provisioned budget or a query-shape problem worth investigating.
+them after observing budget-exhaustion telemetry in monitor health/status
+(the `query_budgets` block in `/api/v1/health` and `/api/v1/status`, also
+summarized as a `moraine status` note when nonzero); repeated
+`deadline_exceeded` or `resource_exhausted` results indicate either an
+under-provisioned budget or a query-shape problem worth investigating.
 
 ## Backend Daemon
 
@@ -1011,7 +1016,7 @@ The managed server also ships a query-safety profile sized for a local host:
 | --- | --- | --- |
 | `max_concurrent_queries` | `64` | Server-wide query slots. Moraine's own interactive load is admission-bounded well below this (8 MCP + 4 monitor + 2 background reads), so ingest inserts, merges, and administrative statements always have free slots. |
 | `max_server_memory_usage_to_ram_ratio` | `0.9` | Aggregate server memory ceiling, pinned explicitly. Kept at 0.9 because background merges can legitimately demand most of it; per-query limits keep reads from occupying merge headroom. |
-| `max_memory_usage` (default profile) | `4 GiB` | Per-query memory backstop, replacing the previous unlimited (`0`) profile. Moraine's query envelope sends tighter per-statement budgets; this only catches statements issued without one. |
+| `max_memory_usage` (default profile) | `4 GiB` | Per-query memory backstop, replacing the previous unlimited (`0`) profile. Moraine's query envelope sends tighter per-statement budgets and the transport refuses unenveloped statements; this catches non-Moraine clients and defends in depth. |
 | `max_bytes_before_external_group_by` / `max_bytes_before_external_sort` (default profile) | `2 GiB` | Spill-to-disk thresholds at half the per-query backstop, so a query approaching the cap spills instead of failing on memory. |
 
 The per-statement query envelope (query IDs, deadlines, memory and read

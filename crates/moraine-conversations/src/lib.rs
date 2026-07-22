@@ -39,7 +39,8 @@ pub use in_memory_repo::{
 // re-export the transport envelope surface so they can establish class
 // envelopes without a new dependency edge (issue #600, amendment A1).
 pub use moraine_clickhouse::{
-    envelope_error_kind, unenveloped_statement_count, AllowanceResource, EnvelopeError,
+    budget_telemetry, envelope_error_kind, record_budget_rejection, record_budget_request,
+    unenveloped_statement_count, AllowanceResource, BudgetTelemetrySnapshot, EnvelopeError,
     EnvelopeStatsSnapshot, QueryClass, QueryEnvelope,
 };
 pub use repo::ConversationRepository;

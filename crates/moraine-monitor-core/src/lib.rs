@@ -12,10 +12,11 @@ use axum::{
 use moraine_config::AppConfig;
 use moraine_config::{QueryBudgetsConfig, ValidatedQueryBudgets};
 use moraine_conversations::{
-    AnalyticsRange, BackendRepository, BackendRepositoryRouter, IngestHeartbeat,
-    IngestHeartbeatRead, PublicationDiagnostics, QueryClass, QueryEnvelope, RepoError,
-    SessionAnalytics, SessionAnalyticsQuery, SessionLookback, SessionStep, SessionTurn,
-    StoreConnectionMetrics, StoreHealth, StoreProbe, TablePreviewQuery, TableSummaries,
+    budget_telemetry, record_budget_rejection, record_budget_request, AnalyticsRange,
+    BackendRepository, BackendRepositoryRouter, IngestHeartbeat, IngestHeartbeatRead,
+    PublicationDiagnostics, QueryClass, QueryEnvelope, RepoError, SessionAnalytics,
+    SessionAnalyticsQuery, SessionLookback, SessionStep, SessionTurn, StoreConnectionMetrics,
+    StoreHealth, StoreProbe, TablePreviewQuery, TableSummaries,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -240,14 +241,19 @@ async fn monitor_query_envelope(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    QueryEnvelope::new_with_admin_budget(
+    let envelope = QueryEnvelope::new_with_admin_budget(
         "monitor",
         QueryClass::Interactive,
         &limits.budgets.interactive,
         &limits.budgets.administrative,
-    )
-    .scope(next.run(request))
-    .await
+    );
+    let response = Arc::clone(&envelope).scope(next.run(request)).await;
+    // Fold this request's envelope accounting into the process-wide budget
+    // sink (issue #600 W11) — these are the monitor's own counters in the
+    // `query_budgets` health block. Handlers finish their repository reads
+    // before building the response, so the stats are final here.
+    record_budget_request(&envelope.stats());
+    response
 }
 
 /// Bounded admission for repository-heavy dashboard reads: overflow is
@@ -262,6 +268,7 @@ async fn monitor_read_admission(
     let _permit = match limits.read_permits.try_acquire() {
         Ok(permit) => permit,
         Err(_) => {
+            record_budget_rejection();
             return json_response(
                 json!({
                     "ok": false,
@@ -506,6 +513,24 @@ async fn api_capabilities(State(state): State<Arc<AppState>>) -> Response {
     )
 }
 
+/// Process-wide query-budget telemetry block (issue #600 W11), a sibling of
+/// `publication` in health/status payloads. Counters cover both request
+/// boundaries the daemon hosts in this process (MCP tools/call and monitor
+/// HTTP requests) plus `unenveloped_statements`, which stays 0 now that the
+/// transport fails closed (W12) — a nonzero value would mean a permissive
+/// branch regressed into the transport.
+/// Additive: existing fields and failure shapes are untouched.
+fn query_budgets_payload() -> Value {
+    let totals = budget_telemetry();
+    json!({
+        "requests": totals.requests,
+        "statements": totals.statements,
+        "deadline_exceeded": totals.deadline_exceeded,
+        "resource_exhausted": totals.resource_exhausted,
+        "unenveloped_statements": totals.unenveloped_statements,
+    })
+}
+
 async fn api_health(Extension(backend): Extension<Arc<BackendRepository>>) -> Response {
     let (health, heartbeat) = tokio::join!(
         backend.repository().read_store_health(),
@@ -527,6 +552,7 @@ async fn api_health(Extension(backend): Extension<Arc<BackendRepository>>) -> Re
                     "healthy": false,
                     "error": "publication readiness unavailable while store health is unavailable",
                 },
+                "query_budgets": query_budgets_payload(),
             });
             if let Some(code) = code {
                 payload["code"] = json!(code);
@@ -560,6 +586,7 @@ async fn api_health(Extension(backend): Extension<Arc<BackendRepository>>) -> Re
             "ping_ms": ping_ms,
             "connections": connections,
             "publication": publication,
+            "query_budgets": query_budgets_payload(),
             "ingestor": health_heartbeat_payload(&heartbeat),
         }),
         StatusCode::OK,
@@ -580,6 +607,7 @@ fn health_failure_response(
             "error": message,
             "connections": connections,
             "publication": publication,
+            "query_budgets": query_budgets_payload(),
         }),
         StatusCode::SERVICE_UNAVAILABLE,
     )
@@ -619,6 +647,7 @@ async fn api_status(Extension(backend): Extension<Arc<BackendRepository>>) -> Re
             "ok": true,
             "clickhouse": clickhouse,
             "publication": publication,
+            "query_budgets": query_budgets_payload(),
             "database": {
                 "exists": database_exists,
                 "table_count": tables.len(),
@@ -2136,13 +2165,31 @@ mod tests {
             ),
         ];
         for (canonical_path, legacy_path) in route_matrix {
-            let canonical = router_json(&app, canonical_path).await;
-            let legacy = router_json(&app, legacy_path).await;
+            let (canonical_status, mut canonical) = router_json(&app, canonical_path).await;
+            let (legacy_status, mut legacy) = router_json(&app, legacy_path).await;
+            assert_eq!(canonical_status, legacy_status);
+            // `query_budgets` is live process telemetry: the two sequential
+            // requests observe different `requests` totals through the same
+            // handler. Assert the block travels on both shapes, then compare
+            // the rest of the payloads byte-for-byte.
+            let canonical_budgets = canonical
+                .as_object_mut()
+                .expect("canonical payload object")
+                .remove("query_budgets");
+            let legacy_budgets = legacy
+                .as_object_mut()
+                .expect("legacy payload object")
+                .remove("query_budgets");
+            assert_eq!(
+                canonical_budgets.is_some(),
+                legacy_budgets.is_some(),
+                "{legacy_path} must carry query_budgets iff {canonical_path} does"
+            );
             assert_eq!(
                 canonical, legacy,
                 "{legacy_path} must directly alias {canonical_path}"
             );
-            assert_eq!(canonical.0, StatusCode::OK);
+            assert_eq!(canonical_status, StatusCode::OK);
         }
 
         let (status, capabilities) = router_json(&app, "/api/v1/capabilities").await;
@@ -2643,6 +2690,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_and_status_expose_query_budget_totals() {
+        let (state, _) = fake_state(successful_responses());
+        let app = monitor_router(state);
+
+        let before = budget_telemetry();
+        let (code, health) = router_json(&app, "/api/v1/health").await;
+        assert_eq!(code, StatusCode::OK);
+        for field in [
+            "requests",
+            "statements",
+            "deadline_exceeded",
+            "resource_exhausted",
+            "unenveloped_statements",
+        ] {
+            assert!(
+                health["query_budgets"][field].is_u64(),
+                "query_budgets.{field} must be a counter: {health}"
+            );
+        }
+
+        let (code, status) = router_json(&app, "/api/v1/status").await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(
+            status["query_budgets"]["requests"].is_u64(),
+            "status must carry the same query_budgets block: {status}"
+        );
+
+        // Both requests ran inside the monitor envelope middleware, so the
+        // process totals grew by at least two (lower bound only: the sink is
+        // shared with concurrently running tests in this binary).
+        assert!(
+            budget_telemetry().requests >= before.requests + 2,
+            "monitor requests must fold into the process budget telemetry"
+        );
+    }
+
+    #[tokio::test]
     async fn read_admission_overflow_returns_429_and_health_stays_exempt() {
         let (state, _) = fake_state(successful_responses());
         let app = monitor_router(state.clone());
@@ -2654,6 +2738,7 @@ mod tests {
             .await
             .expect("hold every read permit");
 
+        let before = budget_telemetry();
         let (status, payload) = router_json(&app, "/api/v1/tables").await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(payload["ok"], json!(false));
@@ -2661,6 +2746,13 @@ mod tests {
         assert!(payload["error"]
             .as_str()
             .is_some_and(|message| message.contains("concurrent reads")));
+        // The rejection is budget exhaustion and must reach the process-wide
+        // telemetry the health endpoint reports (lower bound: the sink is
+        // shared with concurrently running tests).
+        assert!(
+            budget_telemetry().resource_exhausted > before.resource_exhausted,
+            "admission overflow must count as resource_exhausted"
+        );
 
         // Health is deliberately outside the semaphore so supervisors can
         // still probe liveness while the dashboard has the permits busy.
@@ -2707,6 +2799,12 @@ mod tests {
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(payload["code"], json!("deadline_exceeded"));
         assert_eq!(payload["publication"]["available"], json!(false));
+        // Budget telemetry stays visible on the failure shape too: exhaustion
+        // is exactly when the operator needs the counters.
+        assert!(
+            payload["query_budgets"]["deadline_exceeded"].is_u64(),
+            "failure payload must keep the query_budgets block: {payload}"
+        );
 
         // Non-budget failures keep the pre-envelope contract: 503, no code.
         let (status, payload) = router_json(&app, "/api/v1/web-searches").await;
