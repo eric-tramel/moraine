@@ -63,7 +63,6 @@ struct ReadinessRow {
     block_reason: String,
     compatibility_prepared: u8,
     backend_caught_up: u8,
-    manifest_digest: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -141,7 +140,8 @@ async fn bootstrap_schema_through_030(
                  ('031', 'fixture-hold-031'), \
                  ('032', 'fixture-hold-032'), \
                  ('033', 'fixture-hold-033'), \
-                 ('034', 'fixture-hold-034')"
+                 ('034', 'fixture-hold-034'), \
+                 ('035', 'fixture-hold-035')"
             ),
             None,
             Some("system"),
@@ -520,7 +520,7 @@ async fn snapshot(clickhouse: &ClickHouseClient) -> Result<BackfillSnapshot> {
                     toUInt64(checkpoint_revision) AS checkpoint_revision, operation_id, \
                     toUInt8(complete) AS complete, block_reason, \
                     toUInt8(compatibility_prepared) AS compatibility_prepared, \
-                    toUInt8(backend_caught_up) AS backend_caught_up, manifest_digest \
+                    toUInt8(backend_caught_up) AS backend_caught_up \
              FROM source_generation_publication_readiness FINAL \
              ORDER BY source_host, source_name, source_file, source_generation \
              FORMAT JSONEachRow",
@@ -623,7 +623,6 @@ fn assert_control_backfill(state: &BackfillSnapshot) -> Result<()> {
             || !row.block_reason.is_empty()
             || row.compatibility_prepared != 1
             || row.backend_caught_up != 1
-            || row.manifest_digest != "legacy-migration-031"
     }) {
         bail!("unambiguous legacy readiness is incomplete: {state:?}");
     }
@@ -942,8 +941,21 @@ pub(super) async fn run(clickhouse: &ClickHouseClient, database: &OwnedDatabaseN
     if applied_034 != ["034"] {
         bail!("legacy fixture expected migration 034 exactly, got {applied_034:?}");
     }
-    let migration_032_034_elapsed =
-        migration_032_elapsed + migration_033_elapsed + migration_034_elapsed;
+
+    remove_migration_ledger_rows(clickhouse, database.as_str(), &["035"]).await?;
+    let migration_035_started = Instant::now();
+    let applied_035 = clickhouse
+        .run_migrations()
+        .await
+        .context("failed to apply migration 035 to legacy fixture")?;
+    let migration_035_elapsed = migration_035_started.elapsed();
+    if applied_035 != ["035"] {
+        bail!("legacy fixture expected migration 035 exactly, got {applied_035:?}");
+    }
+    let migration_032_035_elapsed = migration_032_elapsed
+        + migration_033_elapsed
+        + migration_034_elapsed
+        + migration_035_elapsed;
     let final_state = snapshot(clickhouse).await?;
     if final_state != first {
         bail!(
@@ -962,7 +974,7 @@ pub(super) async fn run(clickhouse: &ClickHouseClient, database: &OwnedDatabaseN
     }
 
     let projection = current_projection_state(clickhouse).await?;
-    let migration_elapsed = migration_031_elapsed + migration_032_034_elapsed;
+    let migration_elapsed = migration_031_elapsed + migration_032_035_elapsed;
     eprintln!(
         "{}",
         json!({
@@ -976,11 +988,11 @@ pub(super) async fn run(clickhouse: &ClickHouseClient, database: &OwnedDatabaseN
                 "legacy_mcp_session_heads": 1,
                 "interrupted_032_stranded_documents": 1,
             },
-            "migrations": ["031", "032", "033", "034"],
+            "migrations": ["031", "032", "033", "034", "035"],
             "migration_031_us": migration_031_elapsed.as_micros(),
             "migration_031_ms": migration_031_elapsed.as_millis(),
-            "migration_032_034_us": migration_032_034_elapsed.as_micros(),
-            "migration_032_034_ms": migration_032_034_elapsed.as_millis(),
+            "migration_032_035_us": migration_032_035_elapsed.as_micros(),
+            "migration_032_035_ms": migration_032_035_elapsed.as_millis(),
             "forced_032_idempotency_replay_us": replay_032_elapsed.as_micros(),
             "forced_032_idempotency_replay_ms": replay_032_elapsed.as_millis(),
             "interrupted_032_repaired_postings": STRANDED_POSTINGS,

@@ -997,7 +997,7 @@ def seed_publication_control_sql(
 INSERT INTO {database}.ingest_checkpoint_transitions
 (
   host, source_name, source_file, inode, source_generation, last_offset,
-  last_line, checkpoint_revision, operation_id, lifecycle, protocol_version,
+  last_line, checkpoint_revision, operation_id, lifecycle,
   scan_inode, scan_boundary, policy_fingerprint, final_scan_complete,
   block_reason, compatibility_prepared, backend_caught_up, append_batch_id,
   cache_epoch
@@ -1005,7 +1005,7 @@ INSERT INTO {database}.ingest_checkpoint_transitions
 VALUES
 (
   '', '{source_name}', '{source_file}', 0, 1, {documents}, {documents}, 1,
-  '{operation_id}:checkpoint', 'active', 1, 0, {documents},
+  '{operation_id}:checkpoint', 'active', 0, {documents},
   'performance-fixture-v1', 1, '', 1, 1, '', 0
 )
 """.strip()
@@ -1014,12 +1014,12 @@ INSERT INTO {database}.source_generation_publication_readiness
 (
   source_host, source_name, source_file, source_generation,
   readiness_revision, checkpoint_revision, operation_id, complete,
-  block_reason, compatibility_prepared, backend_caught_up, manifest_digest
+  block_reason, compatibility_prepared, backend_caught_up
 )
 VALUES
 (
   '', '{source_name}', '{source_file}', 1, 1, 1,
-  '{operation_id}:readiness', 1, '', 1, 1, '{recipe['fixture_sha256']}'
+  '{operation_id}:readiness', 1, '', 1, 1
 )
 """.strip()
     head = f"""

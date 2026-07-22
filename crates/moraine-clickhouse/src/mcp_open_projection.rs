@@ -27,10 +27,16 @@ pub struct McpOpenSourceHead {
 
 /// A bounded replacement-generation compatibility preparation request.
 ///
-/// `required_source_heads` is the complete desired backend head set. The
-/// projector stores only the subset required by each affected session, plus
-/// the target source head so a disappearance tombstone cannot authorize
-/// before the source cutover.
+/// `captured_host_revisions` is a compact causal token for the complete
+/// published backend head set. Per-session preparation expands only the heads
+/// that can contribute to that session, plus the target source head so a
+/// disappearance tombstone cannot authorize before the source cutover.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct McpOpenHostRevision {
+    pub source_host: String,
+    pub publication_revision: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpOpenPublicationRequest {
     pub candidate_publication_id: String,
@@ -41,18 +47,17 @@ pub struct McpOpenPublicationRequest {
     pub source_file: String,
     pub previous_source_generation: Option<u32>,
     pub source_generation: u32,
-    pub required_source_heads: Vec<McpOpenSourceHead>,
+    pub publication_revision: u64,
+    pub captured_host_revisions: Vec<McpOpenHostRevision>,
 }
 
-/// Durable preparation facts consumed by the source-publication actor.
+/// Durable preparation counts consumed by the source-publication actor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpOpenGenerationReadiness {
     pub candidate_publication_id: String,
     pub affected_session_count: u64,
     pub prepared_session_count: u64,
     pub tombstone_count: u64,
-    pub required_heads_fingerprint: String,
-    pub candidate_digest: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,6 +253,20 @@ fn source_heads_sql(heads: &[McpOpenSourceHead]) -> String {
         .join(", ");
     format!("[{rows}]")
 }
+fn host_revisions_sql(revisions: &[McpOpenHostRevision]) -> String {
+    let rows = revisions
+        .iter()
+        .map(|revision| {
+            format!(
+                "tuple({}, toUInt64({}))",
+                escape_literal(&revision.source_host),
+                revision.publication_revision,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("CAST([{rows}], 'Array(Tuple(String, UInt64))')")
+}
 
 fn source_head_filter(heads: &[McpOpenSourceHead], alias: &str) -> String {
     if heads.is_empty() {
@@ -282,25 +301,6 @@ fn source_head_from_row(row: SourceHeadRow) -> McpOpenSourceHead {
         source_generation: row.source_generation,
         publication_revision: row.publication_revision,
     }
-}
-
-fn candidate_headers_digest(rows: &[CandidateHeaderRow]) -> String {
-    let mut hasher = Sha256::new();
-    for row in rows {
-        for value in [
-            row.session_id.as_bytes(),
-            row.required_heads_fingerprint.as_bytes(),
-        ] {
-            hasher.update((value.len() as u64).to_be_bytes());
-            hasher.update(value);
-        }
-        hasher.update([row.slot]);
-        hasher.update(row.generation.to_be_bytes());
-        hasher.update(row.source_revision.to_be_bytes());
-        hasher.update(row.dirty_revision.to_be_bytes());
-        hasher.update([row.tombstone]);
-    }
-    format!("{:x}", hasher.finalize())
 }
 
 impl ClickHouseClient {
@@ -358,22 +358,12 @@ impl ClickHouseClient {
             bail!("MCP publication operation id cannot be empty");
         }
 
-        let required_heads = canonical_source_heads(&request.required_source_heads)?;
         let target_head = McpOpenSourceHead {
             source_host: request.source_host.clone(),
             source_name: request.source_name.clone(),
             source_file: request.source_file.clone(),
             source_generation: request.source_generation,
-            publication_revision: required_heads
-                .iter()
-                .find(|head| {
-                    head.source_host == request.source_host
-                        && head.source_name == request.source_name
-                        && head.source_file == request.source_file
-                        && head.source_generation == request.source_generation
-                })
-                .map(|head| head.publication_revision)
-                .context("desired MCP source head is absent from required_source_heads")?,
+            publication_revision: request.publication_revision,
         };
         let affected_sessions = self
             .mcp_open_affected_sessions(request.previous_source_generation, &target_head)
@@ -381,11 +371,10 @@ impl ClickHouseClient {
         let affected_session_count = affected_sessions.len() as u64;
         let mut prepared_session_count = 0_u64;
         let mut tombstone_count = 0_u64;
-        let mut candidate_rows = Vec::with_capacity(affected_sessions.len());
 
         for session_id in affected_sessions {
             let mut session_heads = self
-                .session_source_heads_for_snapshot(&session_id, &required_heads)
+                .session_source_heads_for_snapshot(&session_id, request, &target_head)
                 .await?;
             if !session_heads
                 .iter()
@@ -399,20 +388,18 @@ impl ClickHouseClient {
                 .session_source_revision_for_heads(&session_id, &session_heads)
                 .await?
                 != 0;
-            let candidate = if has_live_events {
-                let candidate = self
-                    .refresh_mcp_open_session(McpOpenSessionRefreshRequest {
-                        session_id: &session_id,
-                        candidate_publication_id: &request.candidate_publication_id,
-                        operation_id: &request.operation_id,
-                        publisher_id: &request.publisher_id,
-                        required_heads: &session_heads,
-                        publish_legacy_head: false,
-                        first_generation: None,
-                    })
-                    .await?;
+            if has_live_events {
+                self.refresh_mcp_open_session(McpOpenSessionRefreshRequest {
+                    session_id: &session_id,
+                    candidate_publication_id: &request.candidate_publication_id,
+                    operation_id: &request.operation_id,
+                    publisher_id: &request.publisher_id,
+                    required_heads: &session_heads,
+                    publish_legacy_head: false,
+                    first_generation: None,
+                })
+                .await?;
                 prepared_session_count += 1;
-                candidate
             } else {
                 tombstone_count += 1;
                 prepared_session_count += 1;
@@ -423,23 +410,17 @@ impl ClickHouseClient {
                     &request.publisher_id,
                     &session_heads,
                 )
-                .await?
-            };
-            candidate_rows.push(candidate);
+                .await?;
+            }
         }
 
-        candidate_rows.sort_by(|left, right| left.session_id.cmp(&right.session_id));
-        let candidate_digest = candidate_headers_digest(&candidate_rows);
-        let required_heads_fingerprint = source_heads_fingerprint(&required_heads);
         let readiness = McpOpenGenerationReadiness {
             candidate_publication_id: request.candidate_publication_id.clone(),
             affected_session_count,
             prepared_session_count,
             tombstone_count,
-            required_heads_fingerprint,
-            candidate_digest,
         };
-        self.insert_mcp_open_generation_readiness(request, &required_heads, &readiness, true, "")
+        self.insert_mcp_open_generation_readiness(request, &readiness, true, "")
             .await?;
         Ok(readiness)
     }
@@ -1026,13 +1007,15 @@ impl ClickHouseClient {
     async fn session_source_heads_for_snapshot(
         &self,
         session_id: &str,
-        desired_heads: &[McpOpenSourceHead],
+        request: &McpOpenPublicationRequest,
+        target: &McpOpenSourceHead,
     ) -> Result<Vec<McpOpenSourceHead>> {
-        if desired_heads.is_empty() {
-            return Ok(Vec::new());
-        }
-        let query =
-            session_source_heads_for_snapshot_sql(&self.cfg.database, session_id, desired_heads);
+        let query = session_source_heads_for_snapshot_sql(
+            &self.cfg.database,
+            session_id,
+            &request.captured_host_revisions,
+            target,
+        );
         let rows: Vec<SourceHeadRow> = self
             .query_json_each_row(&query, Some(&self.cfg.database))
             .await?;
@@ -1251,12 +1234,13 @@ impl ClickHouseClient {
              (session_id, candidate_publication_id, slot, generation, source_revision, dirty_revision,\n\
               first_event_time, last_event_time, total_turns, total_events, user_messages, assistant_messages,\n\
               tool_calls, tool_results, mode, first_event_uid, last_event_uid, last_actor_role, title, source,\n\
-              harness, inference_provider, session_slug, session_summary, completed, terminal_event_uid, origin_cwd,\n\
-              tombstone, required_source_heads, required_heads_fingerprint, header_revision, publisher_id, operation_id)\n\
+              harness, inference_provider, session_slug, session_summary, list_title, list_session_summary,\n\
+              completed, terminal_event_uid, origin_cwd, tombstone, required_source_heads,\n\
+              required_heads_fingerprint, header_revision, publisher_id, operation_id)\n\
              SELECT {session_id}, {candidate_publication_id}, {slot}, {generation}, toUInt64(0),\n\
                toUInt64({dirty_revision}), toDateTime64(0, 3), toDateTime64(0, 3), toUInt32(0),\n\
                toUInt64(0), toUInt64(0), toUInt64(0), toUInt64(0), toUInt64(0), '', '', '', '', '', '',\n\
-               '', '', '', '', toUInt8(0), '', '', toUInt8(1), {required_heads},\n\
+               '', '', '', '', '', '', toUInt8(0), '', '', toUInt8(1), {required_heads},\n\
                {required_heads_fingerprint}, {generation}, {publisher_id}, {operation_id}",
             database = escape_identifier(&self.cfg.database),
             session_id = escape_literal(session_id),
@@ -1277,7 +1261,6 @@ impl ClickHouseClient {
     async fn insert_mcp_open_generation_readiness(
         &self,
         request: &McpOpenPublicationRequest,
-        required_heads: &[McpOpenSourceHead],
         readiness: &McpOpenGenerationReadiness,
         ready: bool,
         block_reason: &str,
@@ -1287,11 +1270,10 @@ impl ClickHouseClient {
             "INSERT INTO {database}.mcp_open_generation_readiness\n\
              (candidate_publication_id, source_host, source_name, source_file, source_generation,\n\
               readiness_revision, operation_id, affected_session_count, prepared_session_count,\n\
-              tombstone_count, required_source_heads, required_heads_fingerprint, candidate_digest,\n\
-              ready, block_reason)\n\
+              tombstone_count, ready, block_reason)\n\
              VALUES ({candidate_id}, {source_host}, {source_name}, {source_file}, {source_generation},\n\
               {readiness_revision}, {operation_id}, {affected}, {prepared}, {tombstones},\n\
-              {required_heads}, {fingerprint}, {digest}, {ready}, {block_reason})",
+              {ready}, {block_reason})",
             database = escape_identifier(&self.cfg.database),
             candidate_id = escape_literal(&request.candidate_publication_id),
             source_host = escape_literal(&request.source_host),
@@ -1302,9 +1284,6 @@ impl ClickHouseClient {
             affected = readiness.affected_session_count,
             prepared = readiness.prepared_session_count,
             tombstones = readiness.tombstone_count,
-            required_heads = source_heads_sql(required_heads),
-            fingerprint = escape_literal(&readiness.required_heads_fingerprint),
-            digest = escape_literal(&readiness.candidate_digest),
             ready = u8::from(ready),
             block_reason = escape_literal(block_reason),
         );
@@ -1506,8 +1485,9 @@ impl ClickHouseClient {
               last_event_time, total_turns, total_events, user_messages, assistant_messages,\n\
               tool_calls, tool_results, mode, first_event_uid, last_event_uid, last_actor_role,\n\
               title, source, harness, inference_provider, session_slug, session_summary,\n\
-              completed, terminal_event_uid, origin_cwd, tombstone, required_source_heads,\n\
-              required_heads_fingerprint, header_revision, publisher_id, operation_id)\n\
+              list_title, list_session_summary, completed, terminal_event_uid, origin_cwd,\n\
+              tombstone, required_source_heads, required_heads_fingerprint, header_revision,\n\
+              publisher_id, operation_id)\n\
              {ctes},\n\
              header AS (\n\
                SELECT\n\
@@ -1530,6 +1510,10 @@ impl ClickHouseClient {
                    tuple(event_ts, event_uid), event_class = 'session_meta'), '') AS latest_metadata_name,\n\
                  ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'summary'), ''),\n\
                    tuple(event_ts, event_uid), event_class = 'session_meta'), '') AS latest_metadata_summary,\n\
+                 ifNull(argMaxIf(coalesce(nullIf(JSONExtractString(payload_json, 'title'), ''), nullIf(JSONExtractString(payload_json, 'name'), ''), nullIf(JSONExtractString(payload_json, 'summary'), '')),\n\
+                   tuple(event_ts, event_uid), event_class = 'session_meta'), '') AS latest_session_meta_title,\n\
+                 ifNull(argMaxIf(coalesce(nullIf(JSONExtractString(payload_json, 'summary'), ''), nullIf(JSONExtractString(payload_json, 'title'), ''), nullIf(JSONExtractString(payload_json, 'name'), '')),\n\
+                   tuple(event_ts, event_uid), event_class = 'session_meta'), '') AS latest_session_meta_summary,\n\
                  ifNull(argMinIf(nullIf(trimBoth(replaceRegexpOne(arrayElement(splitByChar('/', replaceAll(source_file, '\\\\', '/')), -1), '[.]jsonl$', '')), ''),\n\
                    tuple(event_ts, event_uid), source_name = 'omp' AND notEmpty(session_id)\n\
                      AND endsWith(source_file, '.jsonl')\n\
@@ -1563,6 +1547,8 @@ impl ClickHouseClient {
                if(h.source = 'omp', coalesce(nullIf(h.latest_metadata_title, ''), nullIf(h.latest_metadata_name, ''), nullIf(h.latest_metadata_summary, ''), nullIf(h.omp_dispatch_title, ''), ''), coalesce(nullIf(h.latest_metadata_title, ''), nullIf(h.latest_metadata_name, ''), '')), h.source,\n\
                h.harness, h.inference_provider, h.session_slug,\n\
                if(h.source = 'omp', coalesce(nullIf(h.latest_metadata_summary, ''), nullIf(h.latest_metadata_title, ''), nullIf(h.latest_metadata_name, ''), nullIf(h.omp_dispatch_title, ''), ''), coalesce(nullIf(h.latest_metadata_summary, ''), nullIf(h.latest_metadata_title, ''), nullIf(h.latest_metadata_name, ''), '')),\n\
+               if(h.source = 'omp', coalesce(nullIf(h.latest_metadata_title, ''), nullIf(h.latest_metadata_name, ''), nullIf(h.latest_metadata_summary, ''), nullIf(h.omp_dispatch_title, ''), ''), h.latest_session_meta_title),\n\
+               if(h.source = 'omp', coalesce(nullIf(h.latest_metadata_summary, ''), nullIf(h.latest_metadata_title, ''), nullIf(h.latest_metadata_name, ''), nullIf(h.omp_dispatch_title, ''), ''), h.latest_session_meta_summary),\n\
                ifNull(t.completed, 0), ifNull(t.terminal_event_uid, ''), h.origin_cwd,\n\
                toUInt8(0), {required_heads_sql}, {required_heads_fingerprint}, {generation},\n\
                {publisher_id}, {operation_id}\n\
@@ -1673,28 +1659,51 @@ fn current_session_source_heads_sql(database: &str, session_id: &str) -> String 
 fn session_source_heads_for_snapshot_sql(
     database: &str,
     session_id: &str,
-    desired_heads: &[McpOpenSourceHead],
+    captured_host_revisions: &[McpOpenHostRevision],
+    target: &McpOpenSourceHead,
 ) -> String {
     let database = escape_identifier(database);
-    let heads_sql = source_heads_sql(desired_heads);
+    let host_revisions = host_revisions_sql(captured_host_revisions);
     format!(
-        "WITH {heads_sql} AS desired_heads\n\
+        "WITH {host_revisions} AS captured_host_revisions,\n\
+         captured_heads AS (\n\
+           SELECT\n\
+             history.source_host AS source_host,\n\
+             history.source_name AS source_name,\n\
+             history.source_file AS source_file,\n\
+             tupleElement(argMax(tuple(history.source_generation, history.publication_revision), history.publication_revision), 1) AS source_generation,\n\
+             max(history.publication_revision) AS publication_revision\n\
+           FROM {database}.v_published_source_generation_history AS history\n\
+           ARRAY JOIN captured_host_revisions AS captured\n\
+           WHERE history.source_host = tupleElement(captured, 1)\n\
+             AND history.publication_revision <= tupleElement(captured, 2)\n\
+           GROUP BY history.source_host, history.source_name, history.source_file\n\
+         ),\n\
+         desired_heads AS (\n\
+           SELECT * FROM captured_heads\n\
+           WHERE source_host != {target_host} OR source_name != {target_name} OR source_file != {target_file}\n\
+           UNION ALL\n\
+           SELECT {target_host}, {target_name}, {target_file}, toUInt32({target_generation}), toUInt64({target_revision})\n\
+         )\n\
          SELECT DISTINCT\n\
            e.source_host AS source_host,\n\
            e.source_name AS source_name,\n\
            e.source_file AS source_file,\n\
            toUInt32(e.source_generation) AS source_generation,\n\
-           toUInt64(tupleElement(head, 5)) AS publication_revision\n\
+           toUInt64(head.publication_revision) AS publication_revision\n\
          FROM {database}.events AS e FINAL\n\
-         ARRAY JOIN desired_heads AS head\n\
+         INNER JOIN desired_heads AS head\n\
+           ON e.source_host = head.source_host AND e.source_name = head.source_name\n\
+          AND e.source_file = head.source_file AND e.source_generation = head.source_generation\n\
          PREWHERE e.session_id = {session_id}\n\
-         WHERE e.source_host = tupleElement(head, 1)\n\
-           AND e.source_name = tupleElement(head, 2)\n\
-           AND e.source_file = tupleElement(head, 3)\n\
-           AND e.source_generation = tupleElement(head, 4)\n\
          ORDER BY source_host, source_name, source_file\n\
          FORMAT JSONEachRow",
         session_id = escape_literal(session_id),
+        target_host = escape_literal(&target.source_host),
+        target_name = escape_literal(&target.source_name),
+        target_file = escape_literal(&target.source_file),
+        target_generation = target.source_generation,
+        target_revision = target.publication_revision,
     )
 }
 
@@ -2135,8 +2144,8 @@ mod tests {
         batch_projected_turns_sql, canonical_source_heads, current_session_source_heads_sql,
         projection_ctes, projection_session_ids, publish_legacy_candidate_heads_sql,
         session_source_heads_for_snapshot_sql, session_source_revision_sql, source_head_filter,
-        source_heads_fingerprint, BackfillPhase, BackfillPhaseGuard, McpOpenSourceHead,
-        SourceHeadRow,
+        source_heads_fingerprint, BackfillPhase, BackfillPhaseGuard, McpOpenHostRevision,
+        McpOpenSourceHead, SourceHeadRow,
     };
     use std::collections::BTreeSet;
 
@@ -2277,13 +2286,21 @@ mod tests {
 
     #[test]
     fn source_head_queries_emit_deserializable_json_field_names() {
-        let desired = [head("host-a", "/sessions/a.jsonl", 3, 10)];
-        let sql = session_source_heads_for_snapshot_sql("moraine", "session-a", &desired);
+        let desired = head("host-a", "/sessions/a.jsonl", 3, 10);
+        let captured = [McpOpenHostRevision {
+            source_host: "host-a".to_string(),
+            publication_revision: 9,
+        }];
+        let sql =
+            session_source_heads_for_snapshot_sql("moraine", "session-a", &captured, &desired);
 
         assert!(sql.contains("e.source_host AS source_host"));
         assert!(sql.contains("e.source_name AS source_name"));
         assert!(sql.contains("e.source_file AS source_file"));
         assert!(sql.contains("PREWHERE e.session_id = 'session-a'"));
+        assert!(sql.contains("history.publication_revision <= tupleElement(captured, 2)"));
+        assert!(sql.contains("FROM `moraine`.v_published_source_generation_history AS history"));
+        assert!(sql.contains("toUInt32(3), toUInt64(10)"));
 
         let row: SourceHeadRow = serde_json::from_str(
             r#"{"source_host":"host-a","source_name":"codex","source_file":"/sessions/a.jsonl","source_generation":3,"publication_revision":10}"#,

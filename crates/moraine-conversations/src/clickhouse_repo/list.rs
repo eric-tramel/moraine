@@ -289,11 +289,11 @@ SELECT
   toUInt64(s.total_events) AS total_events,
   s.mode AS mode,
   toUInt8(s.completed) AS completed,
-  s.title AS title,
+  s.list_title AS title,
   s.source AS source,
   s.harness AS harness,
   s.session_slug AS session_slug,
-  s.session_summary AS session_summary
+  s.list_session_summary AS session_summary
 FROM current_headers AS s
 WHERE {where_sql}
 ORDER BY s.last_event_time {order_dir}, s.session_id {order_dir}

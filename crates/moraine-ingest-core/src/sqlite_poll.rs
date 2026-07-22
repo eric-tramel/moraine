@@ -80,6 +80,7 @@ const ERROR_KIND_OPEN: &str = "sqlite_open_error";
 const ERROR_KIND_SCHEMA: &str = "sqlite_schema_mismatch";
 const ERROR_KIND_TOO_LARGE: &str = "sqlite_cursor_too_large";
 const ERROR_KIND_SCAN: &str = "sqlite_scan_error";
+const ERROR_KIND_MIXED_SNAPSHOT: &str = "sqlite_mixed_snapshot";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 struct StatFingerprint {
@@ -304,6 +305,12 @@ fn project_exclusions_hash(config: &AppConfig) -> u64 {
 
 fn sqlite_policy_fingerprint(format: &str, exclusions_hash: u64) -> String {
     format!("sqlite-publication-v1:{format}:{exclusions_hash:016x}")
+}
+
+fn sqlite_data_version(connection: &Connection) -> Result<i64> {
+    connection
+        .query_row("PRAGMA data_version", [], |row| row.get(0))
+        .context("failed to query PRAGMA data_version")
 }
 
 fn database_scan_still_valid(source_file: &str, scan_inode: u64) -> Result<()> {
@@ -792,6 +799,18 @@ fn scan_database(db_path: &str, prior: &CursorState) -> ScanOutcome {
             }
         }
     };
+    // Opening a WAL database can create or touch its reader-owned `-shm`
+    // sidecar. Use the post-open state as the stable scan baseline.
+    let opened_stat = stat_fingerprint(db_path).unwrap_or_default();
+    let data_version_before = match sqlite_data_version(&connection) {
+        Ok(value) => value,
+        Err(exc) => {
+            return ScanOutcome::Failed {
+                error_kind: ERROR_KIND_SCAN,
+                error_text: format!("failed to read pre-scan data_version: {exc:#}"),
+            }
+        }
+    };
 
     let schema_fingerprint = match validate_schema(&connection) {
         Ok(fingerprint) => fingerprint,
@@ -865,6 +884,24 @@ fn scan_database(db_path: &str, prior: &CursorState) -> ScanOutcome {
                 ),
             };
         }
+    }
+
+    let data_version_after = match sqlite_data_version(&connection) {
+        Ok(value) => value,
+        Err(exc) => {
+            return ScanOutcome::Failed {
+                error_kind: ERROR_KIND_SCAN,
+                error_text: format!("failed to read post-scan data_version: {exc:#}"),
+            }
+        }
+    };
+    if data_version_before != data_version_after || stat_fingerprint(db_path) != Some(opened_stat) {
+        return ScanOutcome::Failed {
+            error_kind: ERROR_KIND_MIXED_SNAPSHOT,
+            error_text:
+                "Cursor database changed during the paged scan; retrying without advancing the cursor"
+                    .to_string(),
+        };
     }
 
     // Composer (session_meta) records first, then bubbles in timestamp order:

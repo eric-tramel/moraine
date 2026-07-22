@@ -14,9 +14,10 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, warn};
 
 use super::{
-    hash_str, open_read_only, stat_fingerprint, truncate_chars_local, StatFingerprint,
-    SyntheticRecord, VolatilePollMap, CURSOR_STATE_VERSION, ERROR_KIND_OPEN, ERROR_KIND_SCAN,
-    ERROR_KIND_SCHEMA, ERROR_KIND_TOO_LARGE, SCAN_PAGE_MAX_BYTES, SCAN_PAGE_SIZE,
+    hash_str, open_read_only, sqlite_data_version, stat_fingerprint, truncate_chars_local,
+    StatFingerprint, SyntheticRecord, VolatilePollMap, CURSOR_STATE_VERSION,
+    ERROR_KIND_MIXED_SNAPSHOT, ERROR_KIND_OPEN, ERROR_KIND_SCAN, ERROR_KIND_SCHEMA,
+    ERROR_KIND_TOO_LARGE, SCAN_PAGE_MAX_BYTES, SCAN_PAGE_SIZE,
 };
 
 const MAX_OPENCODE_RELEVANT_ROWS: u64 = 10_000;
@@ -191,6 +192,17 @@ pub(crate) async fn process_opencode_sqlite_db(
     let policy_fingerprint =
         super::sqlite_policy_fingerprint(SOURCE_FORMAT_OPENCODE_SQLITE, current_exclusions_hash);
 
+    let sequence_rewound = if had_committed && current_stat != state.stat {
+        let scan_db_path = source_file.clone();
+        let prior = state.clone();
+        tokio::task::spawn_blocking(move || opencode_sequences_rewound(&scan_db_path, &prior))
+            .await
+            .context("opencode_sqlite sequence preflight panicked")?
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
     // Replaced databases restart logical identities. Changed exclusions replay
     // the event history so rows skipped under the prior policy can return.
     let generation_changed = had_committed && checkpoint.source_inode != inode;
@@ -198,7 +210,7 @@ pub(crate) async fn process_opencode_sqlite_db(
         had_committed && state.project_exclusions_hash != current_exclusions_hash;
     let retry_blocked_replay = checkpoint.status == "replaying"
         || (checkpoint.status == "error" && !checkpoint.block_reason.is_empty());
-    let starts_replacement = generation_changed || exclusions_changed;
+    let starts_replacement = generation_changed || exclusions_changed || sequence_rewound;
     if starts_replacement {
         checkpoint.source_inode = inode;
         checkpoint.source_generation =
@@ -212,6 +224,12 @@ pub(crate) async fn process_opencode_sqlite_db(
         state = OpenCodeState::fresh();
     }
     state.project_exclusions_hash = current_exclusions_hash;
+    if replacement_replay {
+        // BeginReplay is itself durable. Persist the reset cursor with that
+        // boundary so a crash before the scan cannot rediscover the same
+        // rewind from the previous generation and bump again.
+        checkpoint.cursor_json = state.serialize();
+    }
     checkpoint.policy_fingerprint = policy_fingerprint.clone();
     checkpoint.status = if replacement_replay {
         "replaying".to_string()
@@ -507,6 +525,18 @@ fn scan_opencode_database(db_path: &str, prior: &OpenCodeState) -> OpenCodeScanO
             }
         }
     };
+    // Opening a WAL database can create or touch its reader-owned `-shm`
+    // sidecar. Use the post-open state as the stable scan baseline.
+    let opened_stat = stat_fingerprint(db_path).unwrap_or_default();
+    let data_version_before = match sqlite_data_version(&connection) {
+        Ok(value) => value,
+        Err(exc) => {
+            return OpenCodeScanOutcome::Failed {
+                error_kind: ERROR_KIND_SCAN,
+                error_text: format!("failed to read OpenCode pre-scan data_version: {exc:#}"),
+            }
+        }
+    };
 
     let schema_fingerprint = match validate_opencode_schema(&connection) {
         Ok(fingerprint) => fingerprint,
@@ -555,7 +585,26 @@ fn scan_opencode_database(db_path: &str, prior: &OpenCodeState) -> OpenCodeScanO
         }
     }
 
-    match scan_opencode_rows(&connection, prior) {
+    let result = scan_opencode_rows(&connection, prior);
+    let data_version_after = match sqlite_data_version(&connection) {
+        Ok(value) => value,
+        Err(exc) => {
+            return OpenCodeScanOutcome::Failed {
+                error_kind: ERROR_KIND_SCAN,
+                error_text: format!("failed to read OpenCode post-scan data_version: {exc:#}"),
+            }
+        }
+    };
+    if data_version_before != data_version_after || stat_fingerprint(db_path) != Some(opened_stat) {
+        return OpenCodeScanOutcome::Failed {
+            error_kind: ERROR_KIND_MIXED_SNAPSHOT,
+            error_text:
+                "OpenCode database changed during the paged scan; retrying without advancing the cursor"
+                    .to_string(),
+        };
+    }
+
+    match result {
         Ok((records, new_state, relevant_rows)) => OpenCodeScanOutcome::Scanned {
             records,
             new_state,
@@ -763,6 +812,25 @@ fn scan_opencode_rows(
     new_state.event_scan_complete = true;
     new_state.aggregate_sequences = aggregate_sequences;
     Ok((records, new_state, relevant_events))
+}
+
+fn opencode_sequences_rewound(db_path: &str, prior: &OpenCodeState) -> Result<bool> {
+    if prior.aggregate_sequences.is_empty() {
+        return Ok(false);
+    }
+    let connection = open_read_only(db_path)?;
+    let current = opencode_aggregate_sequences(&connection)?
+        .into_iter()
+        .map(|aggregate| (aggregate.aggregate_id, aggregate.seq))
+        .collect::<BTreeMap<_, _>>();
+    Ok(prior
+        .aggregate_sequences
+        .iter()
+        .any(|(aggregate_id, prior_seq)| {
+            current
+                .get(aggregate_id)
+                .is_none_or(|current_seq| current_seq < prior_seq)
+        }))
 }
 
 fn opencode_scan_from_seq(prior: &OpenCodeState, aggregate: &OpenCodeAggregateSequence) -> i64 {

@@ -1,6 +1,6 @@
 use crate::model::{Checkpoint, CheckpointLifecycle};
 use anyhow::{anyhow, bail, Context, Result};
-use moraine_clickhouse::{ClickHouseClient, McpOpenPublicationRequest, McpOpenSourceHead};
+use moraine_clickhouse::{ClickHouseClient, McpOpenHostRevision, McpOpenPublicationRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -11,8 +11,6 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 use tokio::sync::{mpsc, oneshot};
-
-pub(crate) const PUBLICATION_PROTOCOL_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub(crate) struct SourceKey {
@@ -49,7 +47,6 @@ impl SourceKey {
 pub(crate) struct CheckpointTransition {
     pub(crate) source: SourceKey,
     pub(crate) checkpoint: Checkpoint,
-    pub(crate) protocol_version: u16,
 }
 
 impl CheckpointTransition {
@@ -68,11 +65,7 @@ impl CheckpointTransition {
         checkpoint.checkpoint_revision = 0;
         checkpoint.operation_id.clear();
         let source = SourceKey::from_checkpoint(&checkpoint);
-        let mut transition = Self {
-            source,
-            protocol_version: PUBLICATION_PROTOCOL_VERSION,
-            checkpoint,
-        };
+        let mut transition = Self { source, checkpoint };
         transition.ensure_operation_id(lifecycle);
         transition
     }
@@ -262,7 +255,6 @@ impl CheckpointTransition {
             "checkpoint_revision": checkpoint_revision,
             "operation_id": self.checkpoint.operation_id,
             "lifecycle": lifecycle.as_str(),
-            "protocol_version": self.protocol_version,
             "scan_inode": self.checkpoint.scan_inode,
             "scan_boundary": self.checkpoint.scan_boundary,
             "policy_fingerprint": self.checkpoint.policy_fingerprint,
@@ -476,6 +468,17 @@ impl AppendManifest {
             .chain(tool_rows)
             .chain(error_rows)
         {
+            if let Some(source) = source_key_from_row(row, host) {
+                manifest.source_keys.insert(source);
+            }
+        }
+        for row in raw_rows
+            .iter()
+            .chain(event_rows)
+            .chain(link_rows)
+            .chain(tool_rows)
+            .chain(error_rows)
+        {
             collect_string(row, "session_id", &mut manifest.session_ids);
             collect_string(row, "project_id", &mut manifest.project_ids);
             collect_string(row, "event_uid", &mut manifest.event_uids);
@@ -495,12 +498,19 @@ impl AppendManifest {
     }
 
     pub(crate) fn batch_id(&self) -> String {
-        // The physical sink drains successful stages between retries. Derive
-        // the retry identity from the immutable causal target, while `digest`
-        // continues to cover the full first-attempt manifest persisted in the
-        // control row.
-        let encoded = serde_json::to_vec(&(&self.source_keys, &self.target_cursors))
-            .expect("append target contains only serializable values");
+        // Retried flush stages reuse the manifest retained by `PendingFlush`.
+        // Include row identities so consecutive checkpoint-less chunks from
+        // the same source cannot reuse an already committed fence.
+        let encoded = serde_json::to_vec(&(
+            &self.source_keys,
+            &self.target_cursors,
+            &self.session_ids,
+            &self.project_ids,
+            &self.event_uids,
+            &self.dependency_uids,
+            &self.expected_counts,
+        ))
+        .expect("append target contains only serializable values");
         let mut hasher = Sha256::new();
         hasher.update(encoded);
         format!("append-{:x}", hasher.finalize())
@@ -522,6 +532,24 @@ impl AppendManifest {
         hasher.update(encoded);
         format!("{:x}", hasher.finalize())
     }
+}
+
+fn source_key_from_row(row: &Value, default_host: &str) -> Option<SourceKey> {
+    let source_name = row.get("source_name")?.as_str()?.trim();
+    let source_file = row.get("source_file")?.as_str()?.trim();
+    if source_name.is_empty() || source_file.is_empty() {
+        return None;
+    }
+    let source_host = row
+        .get("source_host")
+        .and_then(Value::as_str)
+        .filter(|host| !host.is_empty())
+        .unwrap_or(default_host);
+    Some(SourceKey {
+        source_host: source_host.to_string(),
+        source_name: source_name.to_string(),
+        source_file: source_file.to_string(),
+    })
 }
 
 fn collect_string(row: &Value, key: &str, values: &mut BTreeSet<String>) {
@@ -1303,6 +1331,30 @@ impl PublicationActor {
         let current = self.current_append_control().await?;
         let clear_writer_conflict =
             !current.publisher_id.is_empty() && current.publisher_id != self.publisher_id;
+        if current.batch_id == batch_id && current.state == "blocked" {
+            let revision = current
+                .control_revision
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("append control revision exhausted during recovery"))?;
+            self.clickhouse
+                .insert_json_rows_sync(
+                    "ingest_append_control",
+                    &[json!({
+                        "host": self.source_host,
+                        "control_revision": revision,
+                        "cache_epoch": current.cache_epoch,
+                        "state": "preparing",
+                        "batch_id": batch_id,
+                        "publisher_id": self.publisher_id,
+                        "manifest_json": current.manifest_json,
+                        "insert_only": current.insert_only,
+                        "updated_at": clickhouse_datetime64_now(),
+                    })],
+                )
+                .await
+                .context("failed to reacquire blocked append fence")?;
+            return Ok(Some((batch_id, current.cache_epoch)));
+        }
         if (current.state == "preparing" || current.state == "blocked") && clear_writer_conflict {
             for source in &manifest.source_keys {
                 self.record_writer_conflict(
@@ -1537,7 +1589,6 @@ impl PublicationActor {
             escape_string(&self.source_host),
         );
         let readiness_revision = self.next_revision(&query, "readiness").await?;
-        let manifest_digest = transition_manifest_digest(transition);
         self.clickhouse
             .insert_json_rows_sync(
                 "source_generation_publication_readiness",
@@ -1553,7 +1604,6 @@ impl PublicationActor {
                     "block_reason": transition.checkpoint.block_reason,
                     "compatibility_prepared": u8::from(transition.checkpoint.compatibility_prepared),
                     "backend_caught_up": u8::from(transition.checkpoint.backend_caught_up),
-                    "manifest_digest": manifest_digest,
                     "updated_at": clickhouse_datetime64_now(),
                 })],
             )
@@ -1567,21 +1617,7 @@ impl PublicationActor {
         previous_source_generation: Option<u32>,
         publication_revision: u64,
     ) -> Result<String> {
-        let mut required_source_heads = self.current_source_heads().await?;
-        required_source_heads.retain(|head| {
-            head.source_host != transition.source.source_host
-                || head.source_name != transition.source.source_name
-                || head.source_file != transition.source.source_file
-        });
-        required_source_heads.push(McpOpenSourceHead {
-            source_host: transition.source.source_host.clone(),
-            source_name: transition.source.source_name.clone(),
-            source_file: transition.source.source_file.clone(),
-            source_generation: transition.checkpoint.source_generation,
-            publication_revision,
-        });
-        required_source_heads.sort();
-        required_source_heads.dedup();
+        let captured_host_revisions = self.current_host_revisions().await?;
         let candidate_publication_id = candidate_publication_id(transition);
         let readiness = self
             .clickhouse
@@ -1594,7 +1630,8 @@ impl PublicationActor {
                 source_file: transition.source.source_file.clone(),
                 previous_source_generation,
                 source_generation: transition.checkpoint.source_generation,
-                required_source_heads,
+                publication_revision,
+                captured_host_revisions,
             })
             .await
             .context("failed to prepare MCP compatibility publication")?;
@@ -1608,13 +1645,11 @@ impl PublicationActor {
         Ok(candidate_publication_id)
     }
 
-    async fn current_source_heads(&self) -> Result<Vec<McpOpenSourceHead>> {
+    async fn current_host_revisions(&self) -> Result<Vec<McpOpenHostRevision>> {
         let query = format!(
-            "SELECT source_host, source_name, source_file, \
-                    toUInt32(source_generation) AS source_generation, \
-                    toUInt64(publication_revision) AS publication_revision \
+            "SELECT source_host, toUInt64(max(publication_revision)) AS publication_revision \
              FROM {}.v_current_published_source_generations \
-             ORDER BY source_host, source_name, source_file",
+             GROUP BY source_host ORDER BY source_host",
             quote_ident(&self.clickhouse.config().database),
         );
         self.clickhouse.query_rows(&query, None).await
@@ -1727,18 +1762,6 @@ fn sql_string_list(values: &BTreeSet<String>) -> String {
         .map(|value| format!("'{}'", escape_string(value)))
         .collect::<Vec<_>>()
         .join(",")
-}
-
-fn transition_manifest_digest(transition: &CheckpointTransition) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(transition.checkpoint.operation_id.as_bytes());
-    hasher.update(transition.checkpoint.checkpoint_revision.to_le_bytes());
-    hasher.update(transition.checkpoint.source_generation.to_le_bytes());
-    hasher.update(transition.checkpoint.last_offset.to_le_bytes());
-    hasher.update(transition.checkpoint.last_line_no.to_le_bytes());
-    hasher.update([transition.checkpoint.compatibility_prepared as u8]);
-    hasher.update([transition.checkpoint.backend_caught_up as u8]);
-    format!("{:x}", hasher.finalize())
 }
 
 fn candidate_publication_id(transition: &CheckpointTransition) -> String {
@@ -2240,11 +2263,7 @@ mod tests {
 
         assert_eq!(
             object.keys().cloned().collect::<BTreeSet<_>>(),
-            BTreeSet::from([
-                "checkpoint".to_string(),
-                "protocol_version".to_string(),
-                "source".to_string(),
-            ])
+            BTreeSet::from(["checkpoint".to_string(), "source".to_string(),])
         );
         assert_eq!(encoded["checkpoint"]["status"], json!("active"));
         assert!(encoded.get("lifecycle").is_none());
@@ -2587,6 +2606,57 @@ mod tests {
         assert_eq!(left.batch_id(), right.batch_id());
         assert!(!left.insert_only);
         assert_eq!(left.session_ids, BTreeSet::from(["s1".to_string()]));
+    }
+
+    #[test]
+    fn checkpointless_append_chunks_own_distinct_source_fences() {
+        let row = |event_uid: &str| {
+            json!({
+                "source_host": "",
+                "source_name": "opencode",
+                "source_file": "/tmp/opencode.db",
+                "source_generation": 3,
+                "session_id": "session-a",
+                "event_uid": event_uid,
+            })
+        };
+        let first = AppendManifest::from_pending(
+            "host-a",
+            &[],
+            &[row("event-a")],
+            &[],
+            &[],
+            &[],
+            std::iter::empty(),
+        );
+        let retry = AppendManifest::from_pending(
+            "host-a",
+            &[],
+            &[row("event-a")],
+            &[],
+            &[],
+            &[],
+            std::iter::empty(),
+        );
+        let next = AppendManifest::from_pending(
+            "host-a",
+            &[],
+            &[row("event-b")],
+            &[],
+            &[],
+            &[],
+            std::iter::empty(),
+        );
+        assert_eq!(
+            first.source_keys,
+            BTreeSet::from([SourceKey {
+                source_host: "host-a".to_string(),
+                source_name: "opencode".to_string(),
+                source_file: "/tmp/opencode.db".to_string(),
+            }])
+        );
+        assert_eq!(first.batch_id(), retry.batch_id());
+        assert_ne!(first.batch_id(), next.batch_id());
     }
 
     #[test]

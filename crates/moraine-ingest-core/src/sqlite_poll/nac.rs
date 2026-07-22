@@ -18,9 +18,9 @@ use tracing::{debug, warn};
 use url::Origin;
 
 use super::{
-    hash_str, open_read_only, stat_fingerprint, truncate_chars_local, StatFingerprint,
-    SyntheticRecord, VolatilePollMap, ERROR_KIND_OPEN, ERROR_KIND_SCAN, ERROR_KIND_SCHEMA,
-    ERROR_KIND_TOO_LARGE, SCAN_PAGE_MAX_BYTES, SCAN_PAGE_SIZE,
+    hash_str, open_read_only, sqlite_data_version, stat_fingerprint, truncate_chars_local,
+    StatFingerprint, SyntheticRecord, VolatilePollMap, ERROR_KIND_MIXED_SNAPSHOT, ERROR_KIND_OPEN,
+    ERROR_KIND_SCAN, ERROR_KIND_SCHEMA, ERROR_KIND_TOO_LARGE, SCAN_PAGE_MAX_BYTES, SCAN_PAGE_SIZE,
 };
 
 const NAC_CURSOR_VERSION: u32 = 1;
@@ -31,7 +31,6 @@ const MAX_NAC_SYNTHETIC_RECORDS: usize = 200_000;
 const ERROR_KIND_NORMALIZED_ROW_TOO_LARGE: &str = "nac_normalized_row_too_large";
 const MAX_NAC_CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_NAC_TEXT_CHARS: usize = 200_000;
-const ERROR_KIND_MIXED_SNAPSHOT: &str = "sqlite_mixed_snapshot";
 
 const REQUIRED_SESSION_COLUMNS: &[&str] = &[
     "session_id",
@@ -603,7 +602,7 @@ fn scan_nac_database(
             }
         }
     };
-    let data_version_before = match data_version(&connection) {
+    let data_version_before = match sqlite_data_version(&connection) {
         Ok(value) => value,
         Err(exc) => {
             return NacScanOutcome::Failed {
@@ -635,7 +634,7 @@ fn scan_nac_database(
             }
         }
     };
-    let data_version_after = match data_version(&connection) {
+    let data_version_after = match sqlite_data_version(&connection) {
         Ok(value) => value,
         Err(exc) => {
             return NacScanOutcome::Failed {
@@ -720,12 +719,6 @@ fn table_columns(connection: &Connection, table: &str) -> Result<BTreeSet<String
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<std::result::Result<BTreeSet<_>, _>>()?;
     Ok(columns)
-}
-
-fn data_version(connection: &Connection) -> Result<i64> {
-    connection
-        .query_row("PRAGMA data_version", [], |row| row.get(0))
-        .context("failed to query PRAGMA data_version")
 }
 
 #[derive(Debug)]

@@ -208,6 +208,7 @@ async fn diagnostics_maps_doctor_partial_report_and_ping_short_circuit() {
             "mcp_open_projection_state",
             "mcp_open_publication_headers",
             "mcp_open_generation_readiness",
+            "mcp_open_backfill_plans",
             "published_source_generations",
             "ingest_checkpoint_transitions",
             "source_generation_publication_readiness",

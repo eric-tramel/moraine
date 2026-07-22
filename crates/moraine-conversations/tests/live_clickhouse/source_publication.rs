@@ -1,6 +1,6 @@
 use super::OwnedDatabaseName;
 use anyhow::{bail, Context, Result};
-use moraine_clickhouse::{ClickHouseClient, McpOpenPublicationRequest, McpOpenSourceHead};
+use moraine_clickhouse::{ClickHouseClient, McpOpenHostRevision, McpOpenPublicationRequest};
 use moraine_conversations::{
     AnalyticsRange, ClickHouseConversationRepository, ConversationListFilter, ConversationListSort,
     ConversationRepository, FileAttentionQuery, McpEventType, McpSessionListFilter, PageRequest,
@@ -154,6 +154,11 @@ struct LiveDocumentSummaryRow {
 struct CorpusEvidenceRow {
     docs: u64,
     total_doc_len: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExplainRow {
+    explain: String,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -916,6 +921,88 @@ async fn assert_live_search_precondition(
         || term_df != 1
     {
         bail!("live search precondition failed before repository search: {evidence}");
+    }
+    Ok(())
+}
+
+fn publication_join_position(plan: &[String]) -> Option<usize> {
+    plan.iter().position(|line| {
+        line.contains("Clauses:")
+            && line.contains("source_host")
+            && line.contains("source_name")
+            && line.contains("source_file")
+            && line.contains("source_generation")
+    })
+}
+
+async fn assert_search_statistics_authorized_before_aggregation(
+    clickhouse: &ClickHouseClient,
+    database: &OwnedDatabaseName,
+) -> Result<()> {
+    let corpus_query = format!(
+        "EXPLAIN PLAN actions=1 \
+         SELECT docs, total_doc_len FROM `{}`.`search_corpus_stats` \
+         FORMAT JSONEachRow",
+        database.as_str(),
+    );
+    let corpus_plan = clickhouse
+        .query_rows::<ExplainRow>(&corpus_query, Some(database.as_str()))
+        .await
+        .context("failed to explain live search corpus statistics")?
+        .into_iter()
+        .map(|row| row.explain)
+        .collect::<Vec<_>>();
+    let corpus_aggregate = corpus_plan
+        .iter()
+        .position(|line| line.trim() == "count()")
+        .context("search corpus plan did not contain the final document count")?;
+    let corpus_publication_join = publication_join_position(&corpus_plan)
+        .context("search corpus plan did not contain the publication-head join")?;
+    if corpus_aggregate >= corpus_publication_join {
+        bail!(
+            "search corpus plan aggregates before publication authorization: {}",
+            corpus_plan.join("\n")
+        );
+    }
+
+    // This is the production BM25 `term_postings` prelude: document
+    // frequencies are windowed over only the publication-authorized postings
+    // that survived exact document-version and non-empty-document filtering.
+    let ranking_query = format!(
+        "EXPLAIN PLAN actions=1 \
+         WITH term_postings AS (\
+           SELECT p.*, toUInt64(count() OVER (PARTITION BY p.term)) AS df \
+           FROM `{}`.`v_live_search_postings` AS p FINAL \
+           WHERE p.term IN ['identicalterm']\
+         ) \
+         SELECT doc_id, df FROM term_postings ORDER BY df DESC \
+         FORMAT JSONEachRow",
+        database.as_str(),
+    );
+    let ranking_plan = clickhouse
+        .query_rows::<ExplainRow>(&ranking_query, Some(database.as_str()))
+        .await
+        .context("failed to explain live BM25 term ranking")?
+        .into_iter()
+        .map(|row| row.explain)
+        .collect::<Vec<_>>();
+    let term_df_window = ranking_plan
+        .iter()
+        .position(|line| line.contains("Window step for window"))
+        .context("BM25 plan did not contain the term document-frequency window")?;
+    let ranking_publication_join = publication_join_position(&ranking_plan)
+        .context("BM25 plan did not contain the publication-head join")?;
+    let nonempty_document_filter = ranking_plan
+        .iter()
+        .position(|line| line.contains("greater(") && line.contains("doc_len"))
+        .context("BM25 plan did not exclude empty search documents")?;
+    if term_df_window >= ranking_publication_join
+        || ranking_publication_join >= nonempty_document_filter
+    {
+        bail!(
+            "BM25 plan ranks before publication and empty-document authorization: {}",
+            ranking_plan.join("\n")
+        );
     }
     Ok(())
 }
@@ -1762,7 +1849,6 @@ async fn assert_durable_boundary_state(
                AND checkpoint_revision = 10 AND operation_id = 'publish-primary-g2' \
                AND complete = 1 AND block_reason = '' \
                AND compatibility_prepared = 1 AND backend_caught_up = 1 \
-               AND manifest_digest = 'fixture-manifest-g2' \
              FORMAT JSONEachRow",
             database.as_str(),
             HOST_A,
@@ -2013,7 +2099,6 @@ async fn persist_replaying_checkpoint(
                 "checkpoint_revision": 9,
                 "operation_id": "begin-primary-g2",
                 "lifecycle": "replaying",
-                "protocol_version": 1,
                 "scan_inode": 72,
                 "scan_boundary": 8,
                 "policy_fingerprint": "fixture-policy",
@@ -2069,7 +2154,6 @@ async fn persist_final_checkpoint(
                 "checkpoint_revision": 10,
                 "operation_id": "publish-primary-g2",
                 "lifecycle": "active",
-                "protocol_version": 1,
                 "scan_inode": 72,
                 "scan_boundary": 8,
                 "policy_fingerprint": "fixture-policy",
@@ -2121,7 +2205,6 @@ async fn persist_final_readiness(
                 "block_reason": "",
                 "compatibility_prepared": 1,
                 "backend_caught_up": 1,
-                "manifest_digest": "fixture-manifest-g2",
                 "updated_at": "2026-07-20 12:00:31.000",
             })],
         )
@@ -2159,7 +2242,6 @@ async fn assert_equal_timestamp_checkpoint_is_causal(
         "schema_fingerprint": 601,
         "sqlite_mtime_ns": 0,
         "sqlite_size": 0,
-        "protocol_version": 1,
         "scan_inode": 72,
         "scan_boundary": 900,
         "policy_fingerprint": "fixture-policy",
@@ -2282,7 +2364,6 @@ fn diagnostic_checkpoint(
         "checkpoint_revision": 100 + u64::from(generation),
         "operation_id": format!("diagnostic-{source_name}-g{generation}"),
         "lifecycle": lifecycle,
-        "protocol_version": 1,
         "scan_inode": 900 + u64::from(generation),
         "scan_boundary": 2,
         "policy_fingerprint": "diagnostic-fixture-policy",
@@ -2316,7 +2397,6 @@ fn diagnostic_readiness(
         "block_reason": block_reason,
         "compatibility_prepared": complete,
         "backend_caught_up": backend_caught_up,
-        "manifest_digest": format!("diagnostic-{source_name}-g{generation}"),
         "updated_at": format!("2026-07-20 12:02:0{generation}.000"),
     })
 }
@@ -2506,52 +2586,6 @@ async fn assert_mcp_search_host_content(
     Ok(())
 }
 
-fn initial_heads() -> Vec<McpOpenSourceHead> {
-    vec![
-        McpOpenSourceHead {
-            source_host: HOST_A.to_string(),
-            source_name: SOURCE.to_string(),
-            source_file: SOURCE_FILE.to_string(),
-            source_generation: 1,
-            publication_revision: 1,
-        },
-        McpOpenSourceHead {
-            source_host: HOST_A.to_string(),
-            source_name: SIDE_SOURCE.to_string(),
-            source_file: SIDE_FILE.to_string(),
-            source_generation: 1,
-            publication_revision: 3,
-        },
-        McpOpenSourceHead {
-            source_host: HOST_B.to_string(),
-            source_name: SOURCE.to_string(),
-            source_file: SOURCE_FILE.to_string(),
-            source_generation: 1,
-            publication_revision: 2,
-        },
-    ]
-}
-
-fn replacement_heads() -> Vec<McpOpenSourceHead> {
-    initial_heads()
-        .into_iter()
-        .map(|head| {
-            if head.source_host == HOST_A
-                && head.source_name == SOURCE
-                && head.source_file == SOURCE_FILE
-            {
-                McpOpenSourceHead {
-                    source_generation: 2,
-                    publication_revision: 4,
-                    ..head
-                }
-            } else {
-                head
-            }
-        })
-        .collect()
-}
-
 pub(super) async fn run(
     clickhouse: &ClickHouseClient,
     database: &OwnedDatabaseName,
@@ -2674,6 +2708,7 @@ pub(super) async fn run(
         bail!("stable session handle did not resolve generation-one content");
     }
     assert_search_uids(&repository, "beforeterm", &[CHANGED_UIDS.at(1)]).await?;
+    assert_search_statistics_authorized_before_aggregation(clickhouse, database).await?;
     assert_live_search_precondition(
         clickhouse,
         database,
@@ -2924,7 +2959,17 @@ pub(super) async fn run(
             source_file: SOURCE_FILE.to_string(),
             previous_source_generation: Some(1),
             source_generation: 2,
-            required_source_heads: replacement_heads(),
+            publication_revision: 4,
+            captured_host_revisions: vec![
+                McpOpenHostRevision {
+                    source_host: HOST_A.to_string(),
+                    publication_revision: 3,
+                },
+                McpOpenHostRevision {
+                    source_host: HOST_B.to_string(),
+                    publication_revision: 2,
+                },
+            ],
         })
         .await
         .context("failed to prepare replacement MCP compatibility candidates")?;

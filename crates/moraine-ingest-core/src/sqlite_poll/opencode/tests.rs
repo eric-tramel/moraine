@@ -574,6 +574,35 @@ async fn drive_opencode_poll(
     batches
 }
 
+async fn capture_begin_replay_checkpoint(
+    work: &WorkItem,
+    checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
+) -> Checkpoint {
+    let config = moraine_config::AppConfig::default();
+    let metrics = Arc::new(Metrics::default());
+    let poll_state = VolatilePollMap::new();
+    let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(4);
+    let process = process_opencode_sqlite_db(
+        &config,
+        work,
+        checkpoints.clone(),
+        &poll_state,
+        sink_tx,
+        &metrics,
+    );
+    tokio::pin!(process);
+    let message = tokio::select! {
+        result = &mut process => {
+            panic!("opencode poll completed before BeginReplay: {result:?}");
+        }
+        message = sink_rx.recv() => message.expect("opencode replay channel remains open"),
+    };
+    match message {
+        SinkMessage::BeginReplay { transition, .. } => transition.checkpoint,
+        other => panic!("expected BeginReplay, observed {other:?}"),
+    }
+}
+
 fn all_event_rows(batches: &[RowBatch]) -> Vec<Value> {
     batches
         .iter()
@@ -1369,6 +1398,18 @@ async fn opencode_sqlite_sequence_regression_resets_aggregate_cursor() {
     )
     .expect("regress event sequence");
 
+    let replaying_checkpoint = capture_begin_replay_checkpoint(&work, &checkpoints).await;
+    assert_eq!(
+        replaying_checkpoint.source_generation,
+        first_checkpoint.source_generation + 1,
+        "rewind BeginReplay advances exactly once"
+    );
+    assert_eq!(replaying_checkpoint.status, "replaying");
+    checkpoints.write().await.insert(
+        checkpoint_key(&work.source_name, &work.path),
+        replaying_checkpoint,
+    );
+
     let second = run_opencode_poll(&work, &checkpoints).await;
     let second_rows = all_event_rows(&second);
     assert!(
@@ -1382,6 +1423,19 @@ async fn opencode_sqlite_sequence_regression_resets_aggregate_cursor() {
         .last()
         .and_then(|batch| batch.checkpoint.clone())
         .expect("second checkpoint");
+    assert_eq!(
+        second_checkpoint.source_generation,
+        first_checkpoint.source_generation + 1,
+        "sequence regression must replay through a replacement generation"
+    );
+    let durable_checkpoint = checkpoints
+        .read()
+        .await
+        .get(&checkpoint_key(&work.source_name, &work.path))
+        .cloned()
+        .expect("finalized replay checkpoint");
+    assert_eq!(durable_checkpoint.status, "active");
+    assert!(durable_checkpoint.final_scan_complete);
     let second_cursor: Value =
         serde_json::from_str(&second_checkpoint.cursor_json).expect("second cursor parses");
     assert_eq!(
