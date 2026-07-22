@@ -118,18 +118,27 @@ struct SupersededSnapshotCountRow {
     rows: u64,
 }
 
-/// Snapshot rows reclaimed because their generation fell behind the published
-/// per-session pointer and can never be served by a live read again.
+#[derive(Debug, Clone, Deserialize)]
+struct SupersededGenerationRow {
+    session_id: String,
+    generation: u64,
+}
+
+/// Bounds a reclaim DELETE's literal (session, generation) list far below the
+/// 8 MiB request payload cap.
+const RECLAIM_DELETE_CHUNK: usize = 1000;
+
+/// Superseded (session, generation) snapshot heads reclaimed because a newer
+/// generation exists in the same source-head lineage and the published
+/// per-session pointer has moved past them.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct McpOpenReclaimStats {
-    pub superseded_event_rows: u64,
-    pub superseded_turn_rows: u64,
+    pub superseded_generations: u64,
 }
 
 impl McpOpenReclaimStats {
     pub fn total(&self) -> u64 {
-        self.superseded_event_rows
-            .saturating_add(self.superseded_turn_rows)
+        self.superseded_generations
     }
 }
 
@@ -824,41 +833,66 @@ impl ClickHouseClient {
             .context("failed to parse MCP open batch JSONEachRow response")
     }
 
-    /// Reclaim snapshot rows whose candidate generation fell behind the
-    /// published `mcp_open_sessions` pointer for their session. Live reads pin
-    /// the pointed (slot, generation), and generations are time-ordered, so
-    /// anything below the pointer is unreachable through live APIs. In-flight
-    /// candidates always carry a newer generation and are never touched;
-    /// sessions without a published pointer keep every row.
+    /// Reclaim snapshots superseded by ordinary appends: a (session,
+    /// generation) is reclaimable only when a NEWER generation exists for the
+    /// same session with the same `required_heads_fingerprint` (same source
+    /// files and source generations, i.e. the same lineage) AND the published
+    /// `mcp_open_sessions` pointer has moved past it. Cross-lineage
+    /// generations — replacement candidates, rollback survivors that a
+    /// publication-snapshot read could still authorize — are never touched
+    /// here; their lifecycle belongs to the dedicated cleanup work (#603).
+    /// Superseded header rows are deleted first so a reclaimed generation can
+    /// never again be selected by a reader, then its child rows follow.
     pub async fn reclaim_superseded_mcp_open_snapshots(&self) -> Result<McpOpenReclaimStats> {
         let mut stats = McpOpenReclaimStats::default();
-        for table in ["mcp_open_events", "mcp_open_turns"] {
-            let probe = superseded_snapshot_probe_sql(&self.cfg.database, table);
-            let rows: Vec<SupersededSnapshotCountRow> = self
-                .query_json_each_row(&probe, Some(&self.cfg.database))
-                .await
-                .with_context(|| format!("failed to probe superseded {table} snapshot rows"))?;
-            let superseded = rows.first().map_or(0, |row| row.rows);
-            if superseded == 0 {
-                continue;
-            }
-            let delete = superseded_snapshot_delete_sql(&self.cfg.database, table);
-            self.request_text_with_params_and_timeout(
-                "",
-                Some(delete.into_bytes()),
+
+        // An earlier reclaim (possibly one whose response timed out while the
+        // server kept executing) may still be running; stacking further
+        // mutations over the same rows only multiplies the work.
+        let pending: Vec<SupersededSnapshotCountRow> = self
+            .query_json_each_row(
+                &pending_reclaim_mutations_sql(&self.cfg.database),
                 Some(&self.cfg.database),
-                false,
-                None,
-                &[],
-                Some(migration_request_timeout(self.cfg.timeout_seconds)),
             )
             .await
-            .with_context(|| format!("failed to reclaim superseded {table} snapshot rows"))?;
-            match table {
-                "mcp_open_events" => stats.superseded_event_rows = superseded,
-                _ => stats.superseded_turn_rows = superseded,
+            .context("failed to inspect pending mcp open reclaim mutations")?;
+        if pending.first().is_some_and(|row| row.rows > 0) {
+            return Ok(stats);
+        }
+
+        // Capture the superseded set once: the set is derived from headers,
+        // and the header rows themselves are deleted first, so re-evaluating
+        // it per statement would leave the child rows behind.
+        let superseded: Vec<SupersededGenerationRow> = self
+            .query_json_each_row(
+                &format!(
+                    "{}\nFORMAT JSONEachRow",
+                    superseded_snapshot_set_sql(&self.cfg.database)
+                ),
+                Some(&self.cfg.database),
+            )
+            .await
+            .context("failed to probe superseded mcp open snapshot generations")?;
+        if superseded.is_empty() {
+            return Ok(stats);
+        }
+
+        for chunk in superseded.chunks(RECLAIM_DELETE_CHUNK) {
+            for statement in superseded_snapshot_delete_statements(&self.cfg.database, chunk) {
+                self.request_text_with_params_and_timeout(
+                    "",
+                    Some(statement.into_bytes()),
+                    Some(&self.cfg.database),
+                    false,
+                    None,
+                    &[],
+                    Some(migration_request_timeout(self.cfg.timeout_seconds)),
+                )
+                .await
+                .context("failed to reclaim superseded mcp open snapshot rows")?;
             }
         }
+        stats.superseded_generations = superseded.len() as u64;
         Ok(stats)
     }
 
@@ -1771,37 +1805,81 @@ fn backfill_plans_sql(database: &str, session_ids: &BTreeSet<String>) -> String 
     backfill_phase_plans_sql(database, session_ids, None)
 }
 
-fn superseded_snapshot_probe_sql(database: &str, table: &str) -> String {
+/// Superseded (session_id, generation) pairs: non-tombstone headers strictly
+/// below BOTH the newest generation of their own source-head lineage (same
+/// `required_heads_fingerprint` — ordinary appends share it; replacements
+/// change it) AND the published per-session pointer. Cross-lineage rows are
+/// deliberately excluded: a rolled-back publication may legally re-authorize
+/// an older lineage's newest header, so only within-lineage supersession is
+/// provably dead. Headers-only, so the probe never scans the child tables.
+fn superseded_snapshot_set_sql(database: &str) -> String {
     let database = escape_identifier(database);
     format!(
-        "SELECT count() AS rows\n\
-         FROM {database}.{table} AS snapshot\n\
+        "SELECT h.session_id AS session_id, h.generation AS generation\n\
+         FROM {database}.mcp_open_publication_headers AS h FINAL\n\
          INNER JOIN (\n\
-           SELECT session_id, generation AS live_generation\n\
+           SELECT session_id, required_heads_fingerprint, max(generation) AS newest_generation\n\
+           FROM {database}.mcp_open_publication_headers FINAL\n\
+           WHERE tombstone = 0\n\
+           GROUP BY session_id, required_heads_fingerprint\n\
+         ) AS lineage ON lineage.session_id = h.session_id\n\
+          AND lineage.required_heads_fingerprint = h.required_heads_fingerprint\n\
+         INNER JOIN (\n\
+           SELECT session_id, generation AS pointer_generation\n\
            FROM {database}.mcp_open_sessions FINAL\n\
-         ) AS live ON live.session_id = snapshot.session_id\n\
-         WHERE snapshot.candidate_generation < live.live_generation\n\
-         FORMAT JSONEachRow"
+         ) AS live ON live.session_id = h.session_id\n\
+         WHERE h.tombstone = 0\n\
+           AND h.generation < lineage.newest_generation\n\
+           AND h.generation < live.pointer_generation"
     )
 }
 
-fn superseded_snapshot_delete_sql(database: &str, table: &str) -> String {
-    let database = escape_identifier(database);
+fn pending_reclaim_mutations_sql(database: &str) -> String {
     format!(
-        "DELETE FROM {database}.{table}\n\
-         WHERE (session_id, candidate_generation) IN (\n\
-           SELECT snapshot.session_id, snapshot.candidate_generation\n\
-           FROM (\n\
-             SELECT DISTINCT session_id, candidate_generation\n\
-             FROM {database}.{table}\n\
-           ) AS snapshot\n\
-           INNER JOIN (\n\
-             SELECT session_id, generation AS live_generation\n\
-             FROM {database}.mcp_open_sessions FINAL\n\
-           ) AS live ON live.session_id = snapshot.session_id\n\
-           WHERE snapshot.candidate_generation < live.live_generation\n\
-         )"
+        "SELECT count() AS rows\n\
+         FROM system.mutations\n\
+         WHERE database = {}\n\
+           AND table IN ('mcp_open_publication_headers', 'mcp_open_events', 'mcp_open_turns')\n\
+           AND is_done = 0\n\
+         FORMAT JSONEachRow",
+        escape_literal(database),
     )
+}
+
+/// Header rows are removed first so a reclaimed generation can never again be
+/// selected by a reader that would then find its child rows missing. The
+/// captured pairs are inlined as literals: the set was computed from headers,
+/// which the first statement deletes.
+fn superseded_snapshot_delete_statements(
+    database: &str,
+    pairs: &[SupersededGenerationRow],
+) -> [String; 3] {
+    let set = pairs
+        .iter()
+        .map(|pair| {
+            format!(
+                "({}, toUInt64({}))",
+                escape_literal(&pair.session_id),
+                pair.generation
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let escaped = escape_identifier(database);
+    [
+        format!(
+            "DELETE FROM {escaped}.mcp_open_publication_headers\n\
+             WHERE (session_id, generation) IN ({set})"
+        ),
+        format!(
+            "DELETE FROM {escaped}.mcp_open_events\n\
+             WHERE (session_id, candidate_generation) IN ({set})"
+        ),
+        format!(
+            "DELETE FROM {escaped}.mcp_open_turns\n\
+             WHERE (session_id, candidate_generation) IN ({set})"
+        ),
+    ]
 }
 
 fn backfill_phase_plans_sql(
@@ -2179,11 +2257,12 @@ fn event_type_sql() -> &'static str {
 mod tests {
     use super::{
         backfill_facts_sql, backfill_phase_advance_sql, batch_projected_events_sql,
-        batch_projected_turns_sql, canonical_source_heads, projection_ctes, projection_session_ids,
-        publish_legacy_candidate_heads_sql, session_source_heads_for_snapshot_sql,
-        session_source_revision_sql, source_head_filter, source_heads_fingerprint,
-        superseded_snapshot_delete_sql, superseded_snapshot_probe_sql, BackfillPhase,
-        BackfillPhaseGuard, McpOpenHostRevision, McpOpenSourceHead, SourceHeadRow,
+        batch_projected_turns_sql, canonical_source_heads, pending_reclaim_mutations_sql,
+        projection_ctes, projection_session_ids, publish_legacy_candidate_heads_sql,
+        session_source_heads_for_snapshot_sql, session_source_revision_sql, source_head_filter,
+        source_heads_fingerprint, superseded_snapshot_delete_statements,
+        superseded_snapshot_set_sql, BackfillPhase, BackfillPhaseGuard, McpOpenHostRevision,
+        McpOpenSourceHead, SourceHeadRow, SupersededGenerationRow,
     };
     use std::collections::BTreeSet;
 
@@ -2259,25 +2338,63 @@ mod tests {
     }
 
     #[test]
-    fn superseded_snapshot_reclaim_only_targets_generations_below_the_live_pointer() {
-        for table in ["mcp_open_events", "mcp_open_turns"] {
-            let probe = superseded_snapshot_probe_sql("moraine", table);
-            assert!(probe.contains(&format!("FROM `moraine`.{table} AS snapshot")));
-            assert!(probe.contains("FROM `moraine`.mcp_open_sessions FINAL"));
-            assert!(probe.contains("snapshot.candidate_generation < live.live_generation"));
-            assert!(probe.contains("INNER JOIN"));
+    fn superseded_snapshot_set_requires_same_lineage_and_pointer_supersession() {
+        let set = superseded_snapshot_set_sql("moraine");
+        assert!(set.contains("FROM `moraine`.mcp_open_publication_headers AS h FINAL"));
+        assert!(set.contains("GROUP BY session_id, required_heads_fingerprint"));
+        assert!(set.contains("lineage.required_heads_fingerprint = h.required_heads_fingerprint"));
+        assert!(set.contains("FROM `moraine`.mcp_open_sessions FINAL"));
+        assert!(set.contains("h.generation < lineage.newest_generation"));
+        assert!(set.contains("h.generation < live.pointer_generation"));
+        // Tombstones stay untouched; sessions without a published pointer and
+        // cross-lineage (replacement/rollback) generations keep every row;
+        // in-flight candidates carry newer generations and never match.
+        assert!(set.contains("WHERE h.tombstone = 0"));
+        assert!(!set.contains("LEFT JOIN"));
+        assert!(!set.contains("<="));
 
-            let delete = superseded_snapshot_delete_sql("moraine", table);
-            assert!(delete.starts_with(&format!("DELETE FROM `moraine`.{table}\n")));
-            assert!(delete.contains("(session_id, candidate_generation) IN ("));
-            assert!(delete.contains("SELECT DISTINCT session_id, candidate_generation"));
-            assert!(delete.contains("FROM `moraine`.mcp_open_sessions FINAL"));
-            assert!(delete.contains("snapshot.candidate_generation < live.live_generation"));
-            // Sessions without a published pointer must keep every row, and
-            // in-flight candidates (newer generations) must never match.
-            assert!(delete.contains("INNER JOIN"));
-            assert!(!delete.contains("LEFT JOIN"));
-            assert!(!delete.contains("<="));
+        let mutations = pending_reclaim_mutations_sql("moraine");
+        assert!(mutations.contains("FROM system.mutations"));
+        assert!(mutations.contains("database = 'moraine'"));
+        assert!(mutations.contains("is_done = 0"));
+        for table in [
+            "mcp_open_publication_headers",
+            "mcp_open_events",
+            "mcp_open_turns",
+        ] {
+            assert!(mutations.contains(table));
+        }
+    }
+
+    #[test]
+    fn superseded_snapshot_deletes_remove_headers_first_with_literal_pairs() {
+        let pairs = vec![
+            SupersededGenerationRow {
+                session_id: "session-a".to_string(),
+                generation: 41,
+            },
+            SupersededGenerationRow {
+                session_id: "session-b".to_string(),
+                generation: 42,
+            },
+        ];
+        let [headers, events, turns] = superseded_snapshot_delete_statements("moraine", &pairs);
+        assert!(headers.starts_with("DELETE FROM `moraine`.mcp_open_publication_headers\n"));
+        assert!(headers.contains(
+            "(session_id, generation) IN (('session-a', toUInt64(41)), ('session-b', toUInt64(42)))"
+        ));
+        assert!(events.starts_with("DELETE FROM `moraine`.mcp_open_events\n"));
+        assert!(
+            events.contains("(session_id, candidate_generation) IN (('session-a', toUInt64(41))")
+        );
+        assert!(turns.starts_with("DELETE FROM `moraine`.mcp_open_turns\n"));
+        assert!(
+            turns.contains("(session_id, candidate_generation) IN (('session-a', toUInt64(41))")
+        );
+        // The literal pair carriage is what makes deleting headers first safe:
+        // no statement re-derives the set from the already-deleted headers.
+        for statement in [&headers, &events, &turns] {
+            assert!(!statement.contains("SELECT"));
         }
     }
 
