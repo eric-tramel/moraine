@@ -3,7 +3,7 @@ use flate2::{write::GzEncoder, Compression};
 use moraine_config::{ClickHouseConfig, ClickHouseRequestCompression};
 use reqwest::{
     header::{HeaderValue, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, USER_AGENT},
-    Client, RequestBuilder, Url,
+    Client, RequestBuilder, StatusCode, Url,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -61,6 +61,133 @@ struct ClickHouseRequestOptions<'a> {
 #[derive(Deserialize)]
 struct ClickHouseEnvelope<T> {
     data: Vec<T>,
+    /// Set when the server hit an exception after response headers were
+    /// already flushed (e.g. the query was killed or timed out mid-stream);
+    /// `data` is truncated and must not be treated as a result.
+    exception: Option<String>,
+}
+
+/// Budget-relevant classification of a ClickHouse server error, derived from
+/// the server exception code so callers can map failures to their own
+/// contracts without string matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ClickHouseErrorKind {
+    /// 159 TIMEOUT_EXCEEDED, 160 TOO_SLOW, 209 SOCKET_TIMEOUT.
+    DeadlineExceeded,
+    /// 158 TOO_MANY_ROWS, 202 TOO_MANY_SIMULTANEOUS_QUERIES,
+    /// 241 MEMORY_LIMIT_EXCEEDED, 307 TOO_MANY_BYTES,
+    /// 396 TOO_MANY_ROWS_OR_BYTES.
+    ResourceExhausted,
+    /// 394 QUERY_WAS_CANCELLED.
+    QueryKilled,
+    /// Any other server error, including responses without a parsable code.
+    Other,
+}
+
+impl ClickHouseErrorKind {
+    pub fn from_code(code: i32) -> Self {
+        match code {
+            159 | 160 | 209 => Self::DeadlineExceeded,
+            158 | 202 | 241 | 307 | 396 => Self::ResourceExhausted,
+            394 => Self::QueryKilled,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// Typed ClickHouse failure: a non-success HTTP response, or a server
+/// exception embedded in a 200-OK body after headers were already flushed
+/// (a killed or expired mid-stream query).
+///
+/// Always attached as the root of the returned `anyhow::Error`, so existing
+/// `.context()` callers keep composing; recover it with
+/// [`clickhouse_error_kind`] or `error.downcast_ref::<ClickHouseHttpError>()`.
+#[derive(Debug)]
+pub struct ClickHouseHttpError {
+    status: StatusCode,
+    code: Option<i32>,
+    body: String,
+}
+
+impl ClickHouseHttpError {
+    fn from_error_response(status: StatusCode, header_code: Option<i32>, body: String) -> Self {
+        let code = header_code.or_else(|| extract_clickhouse_exception_code(&body));
+        Self { status, code, body }
+    }
+
+    fn from_in_body_exception(body: String) -> Self {
+        let code = extract_clickhouse_exception_code(&body);
+        Self {
+            status: StatusCode::OK,
+            code,
+            body,
+        }
+    }
+
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    /// Server exception code (`Code: NNN`) parsed from the response headers
+    /// or body, when present.
+    pub fn code(&self) -> Option<i32> {
+        self.code
+    }
+
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+
+    pub fn kind(&self) -> ClickHouseErrorKind {
+        self.code
+            .map_or(ClickHouseErrorKind::Other, ClickHouseErrorKind::from_code)
+    }
+}
+
+impl std::fmt::Display for ClickHouseHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.status.is_success() {
+            write!(
+                f,
+                "clickhouse reported an exception after the response started: {}",
+                self.body
+            )
+        } else {
+            // Keep the historical message; callers classify failures from it.
+            write!(f, "clickhouse returned {}: {}", self.status, self.body)
+        }
+    }
+}
+
+impl std::error::Error for ClickHouseHttpError {}
+
+/// Budget-relevant kind of the ClickHouse error in `error`'s chain, if any.
+pub fn clickhouse_error_kind(error: &anyhow::Error) -> Option<ClickHouseErrorKind> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ClickHouseHttpError>())
+        .map(ClickHouseHttpError::kind)
+}
+
+/// FORMAT JSON envelope drift: a completed 200-OK body that is not a JSON
+/// envelope and carries no ClickHouse exception marker. The only failure
+/// class `query_rows_with_params` may transparently retry as JSONEachRow.
+#[derive(Debug)]
+struct JsonEnvelopeParseError {
+    body: String,
+    source: serde_json::Error,
+}
+
+impl std::fmt::Display for JsonEnvelopeParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid clickhouse JSON response: {}", self.body)
+    }
+}
+
+impl std::error::Error for JsonEnvelopeParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -281,13 +408,20 @@ impl ClickHouseClient {
         let response = req.send().await.context("clickhouse request failed")?;
         let status = response.status();
         if !status.is_success() {
+            let header_code = response
+                .headers()
+                .get("x-clickhouse-exception-code")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<i32>().ok());
             let text = response.text().await.with_context(|| {
                 format!(
                     "failed to read clickhouse response body (status {})",
                     status
                 )
             })?;
-            return Err(anyhow!("clickhouse returned {}: {}", status, text));
+            return Err(anyhow::Error::new(
+                ClickHouseHttpError::from_error_response(status, header_code, text),
+            ));
         }
 
         Ok(response)
@@ -431,10 +565,20 @@ impl ClickHouseClient {
         let raw = self
             .request_text_with_params(query, None, database, false, None, params)
             .await?;
-        serde_json::Deserializer::from_str(&raw)
+        match serde_json::Deserializer::from_str(&raw)
             .into_iter::<T>()
             .collect::<std::result::Result<Vec<_>, _>>()
-            .context("failed to parse JSONEachRow response")
+        {
+            Ok(rows) => Ok(rows),
+            // A killed/expired streaming query appends exception text after
+            // 200-OK headers; surface the server error, not a parse failure.
+            Err(_) if body_contains_clickhouse_exception(&raw) => Err(anyhow::Error::new(
+                ClickHouseHttpError::from_in_body_exception(raw),
+            )),
+            Err(source) => {
+                Err(anyhow::Error::new(source).context("failed to parse JSONEachRow response"))
+            }
+        }
     }
 
     pub async fn query_json_data<T: DeserializeOwned>(
@@ -455,8 +599,25 @@ impl ClickHouseClient {
         let raw = self
             .request_text_with_params(query, None, database, false, Some("JSON"), params)
             .await?;
-        let envelope: ClickHouseEnvelope<T> = serde_json::from_str(&raw)
-            .with_context(|| format!("invalid clickhouse JSON response: {}", raw))?;
+        let envelope: ClickHouseEnvelope<T> = match serde_json::from_str(&raw) {
+            Ok(envelope) => envelope,
+            Err(source) => {
+                // A kill/timeout can truncate the envelope after 200-OK
+                // headers were flushed; report those as server errors so the
+                // JSONEachRow fallback never re-runs already-rejected work.
+                let error = if body_contains_clickhouse_exception(&raw) {
+                    anyhow::Error::new(ClickHouseHttpError::from_in_body_exception(raw))
+                } else {
+                    anyhow::Error::new(JsonEnvelopeParseError { body: raw, source })
+                };
+                return Err(error);
+            }
+        };
+        if let Some(exception) = envelope.exception {
+            return Err(anyhow::Error::new(
+                ClickHouseHttpError::from_in_body_exception(exception),
+            ));
+        }
         Ok(envelope.data)
     }
 
@@ -485,10 +646,15 @@ impl ClickHouseClient {
             .await
         {
             Ok(rows) => Ok(rows),
-            Err(_) => {
+            // FORMAT JSON envelope drift is the only failure where silently
+            // re-running the query is safe. Typed deadline/resource/kill
+            // errors and HTTP failures propagate: the server already refused
+            // or killed the work once.
+            Err(err) if json_envelope_drift_retry_allowed(&err) => {
                 self.query_json_each_row_with_params(query, database, params)
                     .await
             }
+            Err(err) => Err(err),
         }
     }
 
@@ -1280,6 +1446,44 @@ fn has_explicit_json_each_row_format(query: &str) -> bool {
     compact.contains(" format jsoneachrow")
 }
 
+/// Extract the `Code: NNN` server exception code ClickHouse embeds in error
+/// text, including bodies that failed after 200-OK headers were flushed.
+fn extract_clickhouse_exception_code(text: &str) -> Option<i32> {
+    const MARKER: &str = "Code: ";
+    let mut remaining = text;
+    while let Some(idx) = remaining.find(MARKER) {
+        let rest = &remaining[idx + MARKER.len()..];
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 {
+            if let Ok(code) = rest[..digits].parse::<i32>() {
+                return Some(code);
+            }
+        }
+        remaining = rest;
+    }
+    None
+}
+
+/// Whether a 200-OK body carries a ClickHouse exception marker (the server
+/// hit an error after flushing response headers). Requires both the `DB::`
+/// exception prefix and a parsable code so ordinary row data mentioning
+/// "Code:" does not classify as an exception.
+fn body_contains_clickhouse_exception(body: &str) -> bool {
+    body.contains("DB::") && extract_clickhouse_exception_code(body).is_some()
+}
+
+/// Amendment A8 (issue #600): `query_rows_with_params` may re-issue a query
+/// as JSONEachRow only for genuine envelope drift — a completed 200-OK body
+/// that failed JSON-envelope parsing and carries no ClickHouse exception
+/// marker. Kill-truncated bodies and typed server errors are never silently
+/// re-executed.
+fn json_envelope_drift_retry_allowed(error: &anyhow::Error) -> bool {
+    clickhouse_error_kind(error).is_none()
+        && error
+            .chain()
+            .any(|cause| cause.downcast_ref::<JsonEnvelopeParseError>().is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1546,6 +1750,87 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind stream capture listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        format!("http://{}", addr)
+    }
+
+    /// Serves the ClickHouse failure shapes the typed error layer must
+    /// classify: non-200 exceptions (body and header coded), 200-OK bodies
+    /// truncated by a mid-stream kill, envelope `exception` fields, and
+    /// genuine FORMAT JSON envelope drift. Records every received query.
+    async fn spawn_typed_error_server(queries: Arc<Mutex<Vec<String>>>) -> String {
+        use axum::response::IntoResponse;
+
+        async fn handler(
+            State(queries): State<Arc<Mutex<Vec<String>>>>,
+            Query(params): Query<HashMap<String, String>>,
+        ) -> axum::response::Response {
+            let query = params.get("query").cloned().unwrap_or_default();
+            queries
+                .lock()
+                .expect("typed error queries mutex poisoned")
+                .push(query.clone());
+
+            if query.contains("MEMORY") {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Code: 241. DB::Exception: Memory limit (for query) exceeded: \
+                     would use 1.10 GiB, maximum: 1.00 GiB. (MEMORY_LIMIT_EXCEEDED)"
+                        .to_string(),
+                )
+                    .into_response();
+            }
+            if query.contains("HEADER_CODE") {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [("x-clickhouse-exception-code", "159")],
+                    "timeout without inline code text".to_string(),
+                )
+                    .into_response();
+            }
+            if query.contains("KILLED_ENVELOPE") {
+                // Headers already flushed when the KILL landed: truncated
+                // JSON envelope with the exception text appended.
+                return (
+                    StatusCode::OK,
+                    "{\"meta\":[{\"name\":\"value\"}],\"data\":[{\"value\":1}\
+                     Code: 394. DB::Exception: Query was cancelled. (QUERY_WAS_CANCELLED)"
+                        .to_string(),
+                )
+                    .into_response();
+            }
+            if query.contains("EXCEPTION_FIELD") {
+                return (
+                    StatusCode::OK,
+                    "{\"data\":[],\"exception\":\"Code: 159. DB::Exception: \
+                     Timeout exceeded: elapsed 15.1 seconds. (TIMEOUT_EXCEEDED)\"}"
+                        .to_string(),
+                )
+                    .into_response();
+            }
+            if query.contains("KILLED_ROWS") {
+                return (
+                    StatusCode::OK,
+                    "{\"value\":1}\nCode: 394. DB::Exception: Query was cancelled. \
+                     (QUERY_WAS_CANCELLED)\n"
+                        .to_string(),
+                )
+                    .into_response();
+            }
+            // Default: envelope drift — rows come back as JSONEachRow even
+            // when the request asked for the FORMAT JSON envelope.
+            (StatusCode::OK, "{\"value\":7}\n".to_string()).into_response()
+        }
+
+        let app = Router::new().route("/", post(handler)).with_state(queries);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind typed error listener");
         let addr = listener.local_addr().expect("listener addr");
 
         tokio::spawn(async move {
@@ -2798,6 +3083,225 @@ mod tests {
             .expect("fallback query_rows");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].value, 7);
+    }
+
+    #[test]
+    fn error_kind_classifies_budget_relevant_codes() {
+        for code in [159, 160, 209] {
+            assert_eq!(
+                ClickHouseErrorKind::from_code(code),
+                ClickHouseErrorKind::DeadlineExceeded,
+                "code {code}"
+            );
+        }
+        for code in [158, 202, 241, 307, 396] {
+            assert_eq!(
+                ClickHouseErrorKind::from_code(code),
+                ClickHouseErrorKind::ResourceExhausted,
+                "code {code}"
+            );
+        }
+        assert_eq!(
+            ClickHouseErrorKind::from_code(394),
+            ClickHouseErrorKind::QueryKilled
+        );
+        assert_eq!(
+            ClickHouseErrorKind::from_code(117),
+            ClickHouseErrorKind::Other
+        );
+    }
+
+    #[test]
+    fn exception_code_extraction_handles_representative_bodies() {
+        assert_eq!(
+            extract_clickhouse_exception_code(
+                "Code: 241. DB::Exception: Memory limit (for query) exceeded: would use \
+                 1.10 GiB, maximum: 1.00 GiB. (MEMORY_LIMIT_EXCEEDED) (version 24.8.4.13)"
+            ),
+            Some(241)
+        );
+        // The first parsable code wins even after a non-numeric near-marker.
+        assert_eq!(
+            extract_clickhouse_exception_code(
+                "prefix Code: notanumber then Code: 394. DB::Exception: Query was cancelled"
+            ),
+            Some(394)
+        );
+        assert_eq!(extract_clickhouse_exception_code("no code marker"), None);
+
+        assert!(body_contains_clickhouse_exception(
+            "{\"data\":[{\"value\":1}\nCode: 159. DB::Exception: Timeout exceeded"
+        ));
+        // Row data mentioning "Code:" without a DB:: exception is not a marker.
+        assert!(!body_contains_clickhouse_exception(
+            "{\"note\":\"see Code: 500 in the transcript\"}"
+        ));
+        assert!(!body_contains_clickhouse_exception("not-json"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn non_success_response_carries_typed_code_and_is_not_retried() {
+        #[derive(Debug, Deserialize)]
+        struct Row {
+            #[allow(dead_code)]
+            value: u8,
+        }
+
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let base_url = spawn_typed_error_server(queries.clone()).await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+
+        let err = client
+            .query_rows::<Row>("SELECT MEMORY", None)
+            .await
+            .expect_err("memory-limit failure propagates");
+
+        let typed = err
+            .downcast_ref::<ClickHouseHttpError>()
+            .expect("typed clickhouse error");
+        assert_eq!(typed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(typed.code(), Some(241));
+        assert_eq!(typed.kind(), ClickHouseErrorKind::ResourceExhausted);
+        assert_eq!(
+            clickhouse_error_kind(&err),
+            Some(ClickHouseErrorKind::ResourceExhausted)
+        );
+        let message = format!("{err:#}");
+        assert!(message.contains("clickhouse returned 500"));
+        assert!(message.contains("Code: 241"));
+
+        let queries = queries.lock().expect("typed error queries mutex poisoned");
+        assert_eq!(queries.len(), 1, "typed errors must not trigger the retry");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exception_code_header_classifies_body_without_inline_code() {
+        #[derive(Debug, Deserialize)]
+        struct Row {
+            #[allow(dead_code)]
+            value: u8,
+        }
+
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let base_url = spawn_typed_error_server(queries.clone()).await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+
+        let err = client
+            .query_rows::<Row>("SELECT HEADER_CODE", None)
+            .await
+            .expect_err("header-coded failure propagates");
+
+        assert_eq!(
+            clickhouse_error_kind(&err),
+            Some(ClickHouseErrorKind::DeadlineExceeded)
+        );
+        let queries = queries.lock().expect("typed error queries mutex poisoned");
+        assert_eq!(queries.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kill_truncated_envelope_body_is_typed_and_not_retried() {
+        #[derive(Debug, Deserialize)]
+        struct Row {
+            #[allow(dead_code)]
+            value: u8,
+        }
+
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let base_url = spawn_typed_error_server(queries.clone()).await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+
+        let err = client
+            .query_rows::<Row>("SELECT KILLED_ENVELOPE", None)
+            .await
+            .expect_err("kill-truncated body propagates");
+
+        assert_eq!(
+            clickhouse_error_kind(&err),
+            Some(ClickHouseErrorKind::QueryKilled)
+        );
+        let queries = queries.lock().expect("typed error queries mutex poisoned");
+        assert_eq!(
+            queries.len(),
+            1,
+            "a kill-truncated 200-OK body must never re-execute the query"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn envelope_exception_field_is_typed_and_not_retried() {
+        #[derive(Debug, Deserialize)]
+        struct Row {
+            #[allow(dead_code)]
+            value: u8,
+        }
+
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let base_url = spawn_typed_error_server(queries.clone()).await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+
+        let err = client
+            .query_rows::<Row>("SELECT EXCEPTION_FIELD", None)
+            .await
+            .expect_err("envelope exception field propagates");
+
+        assert_eq!(
+            clickhouse_error_kind(&err),
+            Some(ClickHouseErrorKind::DeadlineExceeded)
+        );
+        let queries = queries.lock().expect("typed error queries mutex poisoned");
+        assert_eq!(queries.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn killed_json_each_row_body_is_typed_query_killed() {
+        #[derive(Debug, Deserialize)]
+        struct Row {
+            #[allow(dead_code)]
+            value: u8,
+        }
+
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let base_url = spawn_typed_error_server(queries.clone()).await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+
+        let err = client
+            .query_rows::<Row>("SELECT KILLED_ROWS FORMAT JSONEachRow", None)
+            .await
+            .expect_err("killed streaming body propagates");
+
+        assert_eq!(
+            clickhouse_error_kind(&err),
+            Some(ClickHouseErrorKind::QueryKilled)
+        );
+        let queries = queries.lock().expect("typed error queries mutex poisoned");
+        assert_eq!(queries.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn format_drift_without_exception_marker_still_falls_back() {
+        #[derive(Deserialize)]
+        struct Row {
+            value: u8,
+        }
+
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let base_url = spawn_typed_error_server(queries.clone()).await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+
+        let rows: Vec<Row> = client
+            .query_rows("SELECT 7 AS value", None)
+            .await
+            .expect("drift fallback succeeds");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].value, 7);
+
+        let queries = queries.lock().expect("typed error queries mutex poisoned");
+        assert_eq!(
+            queries.len(),
+            2,
+            "genuine envelope drift re-issues the query as JSONEachRow"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
