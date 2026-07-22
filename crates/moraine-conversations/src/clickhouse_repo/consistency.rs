@@ -596,6 +596,9 @@ impl ClickHouseConversationRepository {
         &self,
         phase: PublicationSnapshotPhase,
     ) -> RepoResult<PublicationSnapshot> {
+        // Snapshot capture/revalidation runs on the request task, so it rides
+        // the boundary's active QueryEnvelope through the transport task-local
+        // (amendment A10 coverage) and counts against the request budget.
         let query = self.publication_snapshot_query(phase);
         let rows: Vec<PublicationSnapshotRow> =
             self.map_backend(self.query_rows(&query, None).await)?;
@@ -1237,7 +1240,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_survives_nested_query_id_scope() {
+    async fn snapshot_survives_nested_envelope_scope() {
         let snapshot = PublicationSnapshot::new(
             PublicationConsistencyMode::Local,
             vec![host_state("", 4, "heads-a")],
@@ -1245,12 +1248,19 @@ mod tests {
         );
         let expected = snapshot.token().to_string();
 
+        let budget = moraine_config::ValidatedQueryBudgets::from_config(
+            &moraine_config::QueryBudgetsConfig::default(),
+        )
+        .expect("default budgets validate")
+        .interactive;
+
         ACTIVE_PUBLICATION_SNAPSHOT
             .scope(snapshot, async move {
-                with_repository_query_id("request-a".to_string(), async move {
-                    assert_eq!(active_publication_token(), expected);
-                })
-                .await;
+                QueryEnvelope::new("request", QueryClass::Interactive, &budget)
+                    .scope(async move {
+                        assert_eq!(active_publication_token(), expected);
+                    })
+                    .await;
             })
             .await;
     }

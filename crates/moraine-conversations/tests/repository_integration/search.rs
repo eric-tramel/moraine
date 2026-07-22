@@ -61,14 +61,11 @@ async fn search_mcp_events_immediate_retry_finishes_within_request_deadline() {
         ..SearchMcpEventsQuery::default()
     };
 
-    let retry_deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    let budget = interactive_test_budget(4.0);
     let retry = tokio::time::timeout(
         Duration::from_secs(4),
-        with_repository_query_deadline(
-            "active-ingest-retry".to_string(),
-            retry_deadline,
-            repo.search_mcp_events(query()),
-        ),
+        QueryEnvelope::new("request", QueryClass::Interactive, &budget)
+            .scope(repo.search_mcp_events(query())),
     )
     .await
     .expect("bounded internal retry must finish inside the request deadline")
@@ -648,12 +645,16 @@ async fn search_mcp_events_supports_global_search_with_enriched_hits() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn search_mcp_events_attaches_cancellation_token_to_clickhouse_reads() {
+async fn search_mcp_events_runs_reads_under_the_envelope_request_id() {
     let (repo, state) = build_repo().await;
     let cancellation_token = "mcp-search-cancel-test";
 
-    let result = repo
-        .search_mcp_events(SearchMcpEventsQuery {
+    let budget = interactive_test_budget(15.0);
+    let envelope = QueryEnvelope::new("request", QueryClass::Interactive, &budget);
+    let request_id = envelope.request_id().to_string();
+
+    let result = envelope
+        .scope(repo.search_mcp_events(SearchMcpEventsQuery {
             query: "hello world".to_string(),
             cancellation_token: Some(cancellation_token.to_string()),
             n_hits: Some(2),
@@ -664,63 +665,33 @@ async fn search_mcp_events_attaches_cancellation_token_to_clickhouse_reads() {
             min_score: Some(0.0),
             min_should_match: Some(1),
             ..SearchMcpEventsQuery::default()
-        })
+        }))
         .await
-        .expect("cancellable mcp event search");
+        .expect("envelope-scoped mcp event search");
 
+    // The caller token is still reported in the result, but the transport
+    // owns statement ids: every read runs as `{request_id}-{seq}`, never as
+    // the caller token (the envelope wins over caller query_id params).
+    // Spawned telemetry inserts carry their own `moraine-telemetry-` ids
+    // (task-locals do not cross spawn), so restrict to the search reads.
     assert_eq!(result.query_id, cancellation_token);
+    let queries = state.queries.lock().expect("queries lock").clone();
     let query_ids = state.query_ids.lock().expect("query id lock").clone();
     assert!(!query_ids.is_empty());
-    let child_prefix = format!("{cancellation_token}-");
-    let observed = query_ids
+    let child_prefix = format!("{request_id}-");
+    let observed = queries
         .iter()
-        .map(|query_id| query_id.as_deref().expect("query id"))
+        .zip(query_ids.iter())
+        .filter(|(query, _)| !query.trim_start().starts_with("INSERT INTO"))
+        .map(|(_, query_id)| query_id.as_deref().expect("query id"))
         .collect::<Vec<_>>();
+    assert!(!observed.is_empty());
     assert!(observed
         .iter()
         .all(|query_id| query_id.starts_with(&child_prefix)));
-    assert_eq!(
-        observed
-            .iter()
-            .copied()
-            .collect::<std::collections::HashSet<_>>()
-            .len(),
-        observed.len()
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn repository_query_context_attaches_id_without_query_model_token() {
-    let (repo, state) = build_repo().await;
-    let query_id = "mcp-request-context-test";
-
-    with_repository_query_id(
-        query_id.to_string(),
-        repo.search_mcp_events(SearchMcpEventsQuery {
-            query: "hello world".to_string(),
-            n_hits: Some(2),
-            event_types: Some(vec![
-                McpEventType::UserInput,
-                McpEventType::AssistantResponse,
-            ]),
-            min_score: Some(0.0),
-            min_should_match: Some(1),
-            ..SearchMcpEventsQuery::default()
-        }),
-    )
-    .await
-    .expect("query scoped by request context");
-
-    let query_ids = state.query_ids.lock().expect("query id lock").clone();
-    assert!(!query_ids.is_empty());
-    let child_prefix = format!("{query_id}-");
-    let observed = query_ids
-        .iter()
-        .map(|observed| observed.as_deref().expect("query id"))
-        .collect::<Vec<_>>();
     assert!(observed
         .iter()
-        .all(|observed| observed.starts_with(&child_prefix)));
+        .all(|query_id| !query_id.contains(cancellation_token)));
     assert_eq!(
         observed
             .iter()
@@ -732,14 +703,51 @@ async fn repository_query_context_attaches_id_without_query_model_token() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn repository_query_context_passes_remaining_deadline_to_every_read() {
+async fn unenveloped_search_reads_run_without_budget_params_pre_flip() {
     let (repo, state) = build_repo().await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
 
-    with_repository_query_deadline(
-        "mcp-deadline-context-test".to_string(),
-        deadline,
-        repo.search_mcp_events(SearchMcpEventsQuery {
+    // Pre-flip permissive posture (amendment A2): without an active envelope
+    // the statements execute exactly as before the envelope existed — no
+    // query ids, no injected deadline.
+    repo.search_mcp_events(SearchMcpEventsQuery {
+        query: "hello world".to_string(),
+        n_hits: Some(2),
+        event_types: Some(vec![
+            McpEventType::UserInput,
+            McpEventType::AssistantResponse,
+        ]),
+        min_score: Some(0.0),
+        min_should_match: Some(1),
+        ..SearchMcpEventsQuery::default()
+    })
+    .await
+    .expect("unenveloped search still succeeds pre-flip");
+
+    // Spawned telemetry inserts get their own Administrative envelope even
+    // when the request ran unenveloped, so restrict to the search reads.
+    let queries = state.queries.lock().expect("queries lock").clone();
+    let query_ids = state.query_ids.lock().expect("query id lock").clone();
+    let request_params = state.request_params.lock().expect("request params lock");
+    let reads = queries
+        .iter()
+        .enumerate()
+        .filter(|(_, query)| !query.trim_start().starts_with("INSERT INTO"))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert!(!reads.is_empty());
+    for index in reads {
+        assert!(query_ids[index].is_none());
+        assert!(!request_params[index].contains_key("max_execution_time"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn envelope_scope_passes_remaining_deadline_to_every_read() {
+    let (repo, state) = build_repo().await;
+
+    let budget = interactive_test_budget(2.0);
+    QueryEnvelope::new("request", QueryClass::Interactive, &budget)
+        .scope(repo.search_mcp_events(SearchMcpEventsQuery {
             query: "hello world".to_string(),
             cancellation_token: Some("nested-search-query".to_string()),
             n_hits: Some(2),
@@ -747,14 +755,22 @@ async fn repository_query_context_passes_remaining_deadline_to_every_read() {
             min_score: Some(0.0),
             min_should_match: Some(1),
             ..SearchMcpEventsQuery::default()
-        }),
-    )
-    .await
-    .expect("deadline-scoped search");
+        }))
+        .await
+        .expect("deadline-scoped search");
 
+    // Restrict to the two search reads: spawned telemetry inserts may or may
+    // not have landed yet and carry their own administrative deadline.
+    let queries = state.queries.lock().expect("queries lock").clone();
     let request_params = state.request_params.lock().expect("request params lock");
-    assert_eq!(request_params.len(), 2);
-    for params in request_params.iter() {
+    let read_params = queries
+        .iter()
+        .zip(request_params.iter())
+        .filter(|(query, _)| !query.trim_start().starts_with("INSERT INTO"))
+        .map(|(_, params)| params)
+        .collect::<Vec<_>>();
+    assert_eq!(read_params.len(), 2);
+    for params in read_params {
         let remaining = params["max_execution_time"]
             .parse::<f64>()
             .expect("numeric remaining ClickHouse deadline");

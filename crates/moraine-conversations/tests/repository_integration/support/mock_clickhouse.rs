@@ -104,6 +104,25 @@ pub(crate) struct MockState {
     pub(crate) scripted_responses: Mutex<Option<VecDeque<ScriptedResponse>>>,
 }
 
+/// Interactive-class query budget with the given deadline for
+/// envelope-scoped integration tests; every other field keeps the bundled
+/// defaults (budgets are constructible only from validated config).
+pub(crate) fn interactive_test_budget(
+    deadline_seconds: f64,
+) -> moraine_config::ValidatedQueryBudget {
+    let defaults = moraine_config::QueryBudgetsConfig::default();
+    let cfg = moraine_config::QueryBudgetsConfig {
+        interactive: moraine_config::QueryBudgetClassConfig {
+            deadline_seconds,
+            ..defaults.interactive
+        },
+        ..defaults
+    };
+    moraine_config::ValidatedQueryBudgets::from_config(&cfg)
+        .expect("test budget validates")
+        .interactive
+}
+
 pub(crate) fn test_clickhouse_config(url: String) -> ClickHouseConfig {
     ClickHouseConfig {
         url,

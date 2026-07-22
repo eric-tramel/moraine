@@ -3025,31 +3025,37 @@ FORMAT JSONEachRow",
     }
 
     pub(super) async fn write_search_log_rows(&self, query_row: Value, hit_rows: Vec<Value>) {
-        let ch = self.ch.clone();
-        if self.cfg.async_log_writes {
-            tokio::spawn(async move {
-                if let Err(err) = ch.insert_json_rows("search_query_log", &[query_row]).await {
-                    warn!("failed to write search_query_log: {}", err);
-                }
-                if !hit_rows.is_empty() {
-                    if let Err(err) = ch.insert_json_rows("search_hit_log", &hit_rows).await {
-                        warn!("failed to write search_hit_log: {}", err);
-                    }
-                }
-            });
-        } else {
-            if let Err(err) = self
-                .ch
-                .insert_json_rows("search_query_log", &[query_row])
-                .await
-            {
+        async fn insert_rows(ch: &ClickHouseClient, query_row: Value, hit_rows: Vec<Value>) {
+            if let Err(err) = ch.insert_json_rows("search_query_log", &[query_row]).await {
                 warn!("failed to write search_query_log: {}", err);
             }
             if !hit_rows.is_empty() {
-                if let Err(err) = self.ch.insert_json_rows("search_hit_log", &hit_rows).await {
+                if let Err(err) = ch.insert_json_rows("search_hit_log", &hit_rows).await {
                     warn!("failed to write search_hit_log: {}", err);
                 }
             }
+        }
+
+        if self.cfg.async_log_writes {
+            let ch = self.ch.clone();
+            let admin_budget = administrative_query_budget();
+            tokio::spawn(async move {
+                // Task-locals do not cross tokio::spawn: the request envelope
+                // (if any) is not active in here, so the telemetry inserts get
+                // their own Administrative-class envelope (amendments A6/A10).
+                QueryEnvelope::new("telemetry", QueryClass::Administrative, &admin_budget)
+                    .scope(async move { insert_rows(&ch, query_row, hit_rows).await })
+                    .await;
+            });
+        } else if QueryEnvelope::current().is_ok() {
+            // Ride the active request envelope: the inserts count against the
+            // request's statement cap like any other statement it issues.
+            insert_rows(&self.ch, query_row, hit_rows).await;
+        } else {
+            let admin_budget = administrative_query_budget();
+            QueryEnvelope::new("telemetry", QueryClass::Administrative, &admin_budget)
+                .scope(insert_rows(&self.ch, query_row, hit_rows))
+                .await;
         }
     }
 

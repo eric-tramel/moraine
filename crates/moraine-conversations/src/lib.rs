@@ -34,6 +34,14 @@ pub use error::{RepoError, RepoResult};
 pub use in_memory_repo::{
     InMemoryConversationCalls, InMemoryConversationRepository, InMemoryConversationResponses,
 };
+// Boundary crates (MCP dispatch, monitor handlers, CLI commands) hold only
+// `Arc<dyn ConversationRepository>` and do not depend on moraine-clickhouse;
+// re-export the transport envelope surface so they can establish class
+// envelopes without a new dependency edge (issue #600, amendment A1).
+pub use moraine_clickhouse::{
+    envelope_error_kind, unenveloped_statement_count, AllowanceResource, EnvelopeError,
+    EnvelopeStatsSnapshot, QueryClass, QueryEnvelope,
+};
 pub use repo::ConversationRepository;
 
 /// Build the production ClickHouse repository behind its backend-neutral read

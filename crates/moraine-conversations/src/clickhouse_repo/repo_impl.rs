@@ -217,14 +217,16 @@ impl ConversationRepository for ClickHouseConversationRepository {
         &self,
         query: SearchMcpEventsQuery,
     ) -> RepoResult<SearchMcpEventsResult> {
-        let operation = self.run_publication_consistent(PublicationReadClass::MovingFeed, || {
+        // Query ids and deadlines are owned by the transport envelope; the
+        // legacy per-tool id rescope is gone. The caller's cancellation token
+        // survives only as the reported `query_id` in the result — explicit
+        // cancellation now targets the envelope's request id via
+        // `cancel_query`, and abandoned statements are killed by the
+        // transport's drop guards.
+        self.run_publication_consistent(PublicationReadClass::MovingFeed, || {
             self.search_mcp_events_impl(query.clone())
-        });
-        if let Some(query_id) = query.cancellation_token.clone() {
-            with_repository_query_id(query_id, operation).await
-        } else {
-            operation.await
-        }
+        })
+        .await
     }
 
     async fn search_conversations(
@@ -251,21 +253,10 @@ impl ConversationRepository for ClickHouseConversationRepository {
         &self,
         query: FileAttentionQuery,
     ) -> RepoResult<Vec<FileAttentionTouch>> {
-        let scope = if query.apply_project_scope {
-            PublicationReadScope::projects(
-                query
-                    .normalized_project_id
-                    .iter()
-                    .chain(&query.normalized_project_roots)
-                    .cloned(),
-            )
-        } else {
-            PublicationReadScope::global()
-        };
-        self.run_publication_consistent_scoped(PublicationReadClass::Strict, scope, || {
-            self.file_attention_impl(query.clone())
-        })
-        .await
+        // Delegate to the inherent method so both entry points share the
+        // publication scope AND the envelope deadline narrowing to the
+        // tool's execution budget.
+        ClickHouseConversationRepository::file_attention(self, query).await
     }
 
     async fn cancel_query(&self, query_id: &str) -> RepoResult<()> {

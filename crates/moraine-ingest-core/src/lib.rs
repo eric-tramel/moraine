@@ -29,9 +29,10 @@ use crate::tee::{
 };
 use crate::watch::{enumerate_tracked_files, spawn_watcher_threads};
 use anyhow::{Context, Result};
-use moraine_clickhouse::ClickHouseClient;
+use moraine_clickhouse::{ClickHouseClient, QueryClass, QueryEnvelope};
 use moraine_config::{
-    AppConfig, ClickHouseConfig, IngestSource, SourceFormat, DEFAULT_BACKEND_NAME,
+    AppConfig, ClickHouseConfig, IngestSource, QueryBudgetsConfig, SourceFormat,
+    ValidatedQueryBudgets, DEFAULT_BACKEND_NAME,
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -113,6 +114,61 @@ pub(crate) enum SinkMessage {
     },
 }
 
+/// The validated `[query_budgets]` every ingest envelope is built from
+/// (issue #600 work item W9). `load_config` already fails on invalid
+/// budgets, so the fallback only fires for programmatically-built configs
+/// (tests); it keeps ingest running on the bundled defaults instead of
+/// panicking inside a sink task.
+pub(crate) fn ingest_query_budgets(config: &AppConfig) -> ValidatedQueryBudgets {
+    ValidatedQueryBudgets::from_config(&config.query_budgets).unwrap_or_else(|error| {
+        warn!("invalid [query_budgets]; ingest envelopes use bundled defaults: {error}");
+        ValidatedQueryBudgets::from_config(&QueryBudgetsConfig::default())
+            .expect("bundled default query budgets are valid")
+    })
+}
+
+/// Background-class envelope for one ingest logical operation, with the
+/// operator-configured administrative budget for its cancellation statements.
+pub(crate) fn background_envelope(
+    budgets: &ValidatedQueryBudgets,
+    kind: &str,
+) -> Arc<QueryEnvelope> {
+    QueryEnvelope::new_with_admin_budget(
+        kind,
+        QueryClass::Background,
+        &budgets.background,
+        &budgets.administrative,
+    )
+}
+
+/// Background-class envelope whose statement cap is batch-derived
+/// (amendment A7): `fixed + per_item * items`, floored at the configured
+/// class cap inside the transport constructor.
+pub(crate) fn background_batch_envelope(
+    budgets: &ValidatedQueryBudgets,
+    kind: &str,
+    fixed: u32,
+    per_item: u32,
+    items: usize,
+) -> Arc<QueryEnvelope> {
+    QueryEnvelope::new_batch(
+        kind,
+        QueryClass::Background,
+        &budgets.background,
+        &budgets.administrative,
+        moraine_clickhouse::batch_statement_cap(fixed, per_item, items),
+    )
+}
+
+/// Run `f` under `envelope` without consuming it, so one long-lived phase
+/// (e.g. ingest startup) can cover several sequential awaits.
+pub(crate) async fn scoped<F: std::future::Future>(
+    envelope: &Arc<QueryEnvelope>,
+    f: F,
+) -> F::Output {
+    Arc::clone(envelope).scope(f).await
+}
+
 fn build_ingest_clickhouse_client(config: ClickHouseConfig) -> Result<ClickHouseClient> {
     let user_agent = format!(
         "moraine-ingest/{} (pid={})",
@@ -164,7 +220,14 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
     }
 
     let clickhouse = build_ingest_clickhouse_client(config.clickhouse.clone())?;
-    clickhouse.ping().await.context("clickhouse ping failed")?;
+    let budgets = ingest_query_budgets(&config);
+    // Startup reads (ping, schema probes, checkpoint load) run under one
+    // Background envelope; publication repairs establish their own inside
+    // the actor.
+    let startup_envelope = background_envelope(&budgets, "ingest-startup");
+    scoped(&startup_envelope, clickhouse.ping())
+        .await
+        .context("clickhouse ping failed")?;
 
     // The advisory lock is acquired before any sink can write. It rejects a
     // duplicate local publisher instead of allowing two processes to race
@@ -175,14 +238,23 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         publication_identity.publisher_id(),
     ) {
         Ok(owner) => {
-            if let Err(error) = record_publication_writer_conflict(&clickhouse, false, "").await {
+            if let Err(error) = scoped(
+                &startup_envelope,
+                record_publication_writer_conflict(&clickhouse, false, ""),
+            )
+            .await
+            {
                 warn!("failed to clear publication writer-conflict diagnostic: {error}");
             }
             owner
         }
         Err(lock_error) => {
             let detail = "another local ingest process owns this publication identity";
-            if let Err(error) = record_publication_writer_conflict(&clickhouse, true, detail).await
+            if let Err(error) = scoped(
+                &startup_envelope,
+                record_publication_writer_conflict(&clickhouse, true, detail),
+            )
+            .await
             {
                 warn!("failed to record publication writer-conflict diagnostic: {error}");
             }
@@ -207,12 +279,14 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         ("tool_io", "source_host"),
         ("ingest_errors", "source_host"),
     ] {
-        if !table_column_available(&clickhouse, table, column)
-            .await
-            .with_context(|| {
-                format!("failed to inspect required publication column {table}.{column}")
-            })?
-        {
+        if !scoped(
+            &startup_envelope,
+            table_column_available(&clickhouse, table, column),
+        )
+        .await
+        .with_context(|| {
+            format!("failed to inspect required publication column {table}.{column}")
+        })? {
             return Err(anyhow::anyhow!(
                 "publication-aware ingest requires {table}.{column}; run `moraine db migrate` before restarting ingest"
             ));
@@ -223,6 +297,7 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         clickhouse.clone(),
         String::new(),
         publication_identity.publisher_id().to_string(),
+        budgets,
     );
     if startup_publication
         .block_orphaned_append_on_startup()
@@ -234,9 +309,12 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         );
     }
 
-    let checkpoint_cursor_columns = checkpoint_cursor_columns_available(&clickhouse)
-        .await
-        .context("failed to inspect ingest_checkpoints columns")?;
+    let checkpoint_cursor_columns = scoped(
+        &startup_envelope,
+        checkpoint_cursor_columns_available(&clickhouse),
+    )
+    .await
+    .context("failed to inspect ingest_checkpoints columns")?;
     if !checkpoint_cursor_columns {
         warn!(
             "ingest_checkpoints is missing the SQLite cursor columns (migration 015); \
@@ -247,9 +325,12 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         );
     }
 
-    let checkpoint_map = load_checkpoints(&clickhouse, checkpoint_cursor_columns, None)
-        .await
-        .context("failed to load checkpoints from clickhouse")?;
+    let checkpoint_map = scoped(
+        &startup_envelope,
+        load_checkpoints(&clickhouse, checkpoint_cursor_columns, None),
+    )
+    .await
+    .context("failed to load checkpoints from clickhouse")?;
 
     info!(
         "loaded {} checkpoints across {} sources",
@@ -257,12 +338,18 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         enabled_sources.len()
     );
 
-    let raw_events_author_column = table_column_available(&clickhouse, "raw_events", "author")
-        .await
-        .context("failed to inspect raw_events author column")?;
-    let events_author_column = table_column_available(&clickhouse, "events", "author")
-        .await
-        .context("failed to inspect events author column")?;
+    let raw_events_author_column = scoped(
+        &startup_envelope,
+        table_column_available(&clickhouse, "raw_events", "author"),
+    )
+    .await
+    .context("failed to inspect raw_events author column")?;
+    let events_author_column = scoped(
+        &startup_envelope,
+        table_column_available(&clickhouse, "events", "author"),
+    )
+    .await
+    .context("failed to inspect events author column")?;
     if !raw_events_author_column || !events_author_column {
         warn!(
             raw_events_author_column,
@@ -273,9 +360,12 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         );
     }
     let heartbeat_backend_column = if has_named_backends {
-        let available = heartbeat_column_available(&clickhouse, "backend_sinks")
-            .await
-            .context("failed to inspect ingest_heartbeats columns")?;
+        let available = scoped(
+            &startup_envelope,
+            heartbeat_column_available(&clickhouse, "backend_sinks"),
+        )
+        .await
+        .context("failed to inspect ingest_heartbeats columns")?;
         if !available {
             warn!(
                 "ingest_heartbeats is missing the backend_sinks column (migration 017); \
@@ -287,9 +377,13 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
     } else {
         false
     };
-    let heartbeat_redactions_column = heartbeat_column_available(&clickhouse, "redactions_total")
-        .await
-        .context("failed to inspect ingest_heartbeats redaction columns")?;
+    let heartbeat_redactions_column = scoped(
+        &startup_envelope,
+        heartbeat_column_available(&clickhouse, "redactions_total"),
+    )
+    .await
+    .context("failed to inspect ingest_heartbeats redaction columns")?;
+    drop(startup_envelope);
     if !heartbeat_redactions_column {
         warn!(
             "ingest_heartbeats is missing the redactions_total column (migration 022); \

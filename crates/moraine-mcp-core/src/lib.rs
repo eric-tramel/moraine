@@ -780,6 +780,16 @@ pub(crate) fn repo_error_to_contract_error(error: RepoError) -> contract::Contra
             "retryable": true,
             "retry_after_ms": SEARCH_PROJECTION_RETRY_AFTER_MS,
         })),
+        // Interim mapping until the boundary wave lands the dedicated
+        // deadline_exceeded / resource_exhausted wire codes (#600 W7).
+        RepoError::DeadlineExceeded { budget_note } => contract::ContractError::new(
+            contract::ToolErrorCode::InternalError,
+            format!("query deadline exceeded: {budget_note}"),
+        ),
+        RepoError::ResourceExhausted { budget_note } => contract::ContractError::new(
+            contract::ToolErrorCode::InternalError,
+            format!("query resource budget exhausted: {budget_note}"),
+        ),
         RepoError::Backend(message) | RepoError::Internal(message) => {
             contract::ContractError::new(contract::ToolErrorCode::InternalError, message)
         }

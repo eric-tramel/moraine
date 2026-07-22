@@ -12,12 +12,13 @@ use crate::tee::{
     SharedRouteResolver, StatusRegistry,
 };
 use crate::{
-    DispatchState, Metrics, SinkMessage, WATCHER_BACKEND_MIXED, WATCHER_BACKEND_NATIVE,
-    WATCHER_BACKEND_POLL,
+    background_batch_envelope, background_envelope, ingest_query_budgets, DispatchState, Metrics,
+    SinkMessage, WATCHER_BACKEND_MIXED, WATCHER_BACKEND_NATIVE, WATCHER_BACKEND_POLL,
 };
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use moraine_clickhouse::{is_oversized_json_each_row_insert_error, ClickHouseClient};
+use moraine_config::ValidatedQueryBudgets;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -219,7 +220,10 @@ struct ProjectionWorker {
     discovered: Arc<Mutex<BTreeSet<String>>>,
 }
 
-fn spawn_projection_worker(clickhouse: ClickHouseClient) -> ProjectionWorker {
+fn spawn_projection_worker(
+    clickhouse: ClickHouseClient,
+    budgets: ValidatedQueryBudgets,
+) -> ProjectionWorker {
     let (requests, mut rx) = tokio::sync::mpsc::channel::<Vec<String>>(1);
     let outcomes = Arc::new(Mutex::new(Vec::new()));
     let completed = Arc::clone(&outcomes);
@@ -227,8 +231,16 @@ fn spawn_projection_worker(clickhouse: ClickHouseClient) -> ProjectionWorker {
         while let Some(sessions) = rx.recv().await {
             for session_id in sessions {
                 let started = Instant::now();
-                let error = clickhouse
-                    .refresh_mcp_open_read_model(std::iter::once(session_id.as_str()))
+                // Task-locals do not cross `tokio::spawn`: the worker builds
+                // its own Background envelope, one per session refresh, so a
+                // single enormous session spends its own budget and a
+                // deadline failure is retried by the per-session backoff.
+                let envelope = background_envelope(&budgets, "ingest-projection");
+                let error = envelope
+                    .scope(
+                        clickhouse
+                            .refresh_mcp_open_read_model(std::iter::once(session_id.as_str())),
+                    )
                     .await
                     .err()
                     .map(|error| format!("{error:#}"));
@@ -260,6 +272,38 @@ const THROTTLED_RETRY_DELAY_CEILING: Duration = Duration::from_secs(60);
 const SNAPSHOT_RECLAIM_INTERVAL: Duration = Duration::from_secs(60);
 const PROJECTION_DEBT_PAGE: usize = 256;
 
+/// Fixed statement overhead of one flush cycle: append-fence begin/commit/
+/// block, recovering-append probe, insert-only preflight, checkpoint commit
+/// machinery, and the non-retryable error-recording path.
+const FLUSH_STATEMENT_OVERHEAD: u32 = 64;
+
+/// Per-item statement allowance for one flush cycle (amendment A7), where
+/// items = pending rows + checkpoint updates. Each row contributes at most
+/// one 8 MiB `insert_json_rows` chunk, and checkpoints add per-source head
+/// probes, transition persists, and (for generation-1 sources) initial
+/// compatibility preparation whose snapshot statements scale with the rows
+/// being flushed. The configured `[query_budgets.background].statement_cap`
+/// stays as the floor for small flushes.
+const FLUSH_STATEMENTS_PER_ITEM: u32 = 4;
+
+/// Fixed statement overhead of one projection-maintenance cycle: the durable
+/// dirty-session page read plus the reclaim bookkeeping statements.
+const MAINTENANCE_STATEMENT_OVERHEAD: u32 = 16;
+
+/// Per-session statement allowance for one maintenance cycle: superseded
+/// snapshot reclaim issues a handful of statements per reclaimed generation,
+/// bounded by the debt page size known at envelope creation.
+const MAINTENANCE_STATEMENTS_PER_SESSION: u32 = 4;
+
+/// The batch size one flush cycle's statement cap is derived from
+/// (amendment A7): `FLUSH_STATEMENT_OVERHEAD + FLUSH_STATEMENTS_PER_ITEM *
+/// items`, never a global constant a legitimate batch can exceed.
+fn flush_statement_items(pending: &PendingFlush) -> usize {
+    pending
+        .row_count()
+        .saturating_add(pending.checkpoint_updates.len())
+}
+
 /// Escalate the fixed flush retry delay exponentially while ClickHouse stays
 /// unreachable, so an outage produces a warn every minute instead of every
 /// second, then recover to the base cadence on the first success.
@@ -285,6 +329,7 @@ impl Drop for MaintenanceSlot {
 /// response only delays accounting until the next tick.
 fn spawn_projection_maintenance(
     clickhouse: &ClickHouseClient,
+    budgets: ValidatedQueryBudgets,
     in_flight: &Arc<AtomicBool>,
     discovered: &Arc<Mutex<BTreeSet<String>>>,
 ) {
@@ -296,31 +341,45 @@ fn spawn_projection_maintenance(
     let discovered = Arc::clone(discovered);
     tokio::spawn(async move {
         let _slot = slot;
-        match clickhouse
-            .pending_dirty_mcp_open_sessions(PROJECTION_DEBT_PAGE)
-            .await
-        {
-            Ok(sessions) if !sessions.is_empty() => {
-                discovered
-                    .lock()
-                    .expect("discovered projection debt mutex poisoned")
-                    .extend(sessions);
-            }
-            Ok(_) => {}
-            Err(error) => {
-                warn!("failed to reconcile durable mcp open projection debt: {error:#}");
-            }
-        }
-        match clickhouse.reclaim_superseded_mcp_open_snapshots().await {
-            Ok(stats) if stats.total() > 0 => info!(
-                superseded_generations = stats.superseded_generations,
-                "reclaimed superseded mcp open snapshot generations"
-            ),
-            Ok(_) => {}
-            Err(error) => {
-                warn!("superseded mcp open snapshot reclaim failed: {error:#}");
-            }
-        }
+        // Task-locals do not cross `tokio::spawn`: the janitor builds its own
+        // Background envelope per cycle, cap derived from the debt page size
+        // it can touch (amendment A7).
+        let envelope = background_batch_envelope(
+            &budgets,
+            "ingest-maintenance",
+            MAINTENANCE_STATEMENT_OVERHEAD,
+            MAINTENANCE_STATEMENTS_PER_SESSION,
+            PROJECTION_DEBT_PAGE,
+        );
+        envelope
+            .scope(async {
+                match clickhouse
+                    .pending_dirty_mcp_open_sessions(PROJECTION_DEBT_PAGE)
+                    .await
+                {
+                    Ok(sessions) if !sessions.is_empty() => {
+                        discovered
+                            .lock()
+                            .expect("discovered projection debt mutex poisoned")
+                            .extend(sessions);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        warn!("failed to reconcile durable mcp open projection debt: {error:#}");
+                    }
+                }
+                match clickhouse.reclaim_superseded_mcp_open_snapshots().await {
+                    Ok(stats) if stats.total() > 0 => info!(
+                        superseded_generations = stats.superseded_generations,
+                        "reclaimed superseded mcp open snapshot generations"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => {
+                        warn!("superseded mcp open snapshot reclaim failed: {error:#}");
+                    }
+                }
+            })
+            .await;
     });
 }
 
@@ -510,6 +569,9 @@ struct FlushContext<'a> {
     checkpoint_host: &'a str,
     ack_observer: &'a IngestAckObserver,
     publication: Option<&'a PublicationActor>,
+    /// Class budgets for the one Background envelope each flush cycle runs
+    /// under (issue #600 work item W9).
+    budgets: ValidatedQueryBudgets,
 }
 
 #[derive(Clone, Copy)]
@@ -765,6 +827,9 @@ pub(crate) fn spawn_sink_task(
     tokio::spawn(async move {
         let mut pending = PendingFlush::default();
         let mut pending_batch_bytes = 0usize;
+        // Task-locals do not cross `tokio::spawn`: every envelope the sink
+        // task needs is built here from the operator-validated budgets.
+        let budgets = ingest_query_budgets(&config);
         let ack_observer = IngestAckObserver::new(
             config.ingest.ack_observation && matches!(&role, SinkRole::Default { .. }),
         );
@@ -779,6 +844,7 @@ pub(crate) fn spawn_sink_task(
             clickhouse.clone(),
             checkpoint_host.clone(),
             publication_identity.publisher_id().to_string(),
+            budgets,
         );
         let default_publication_ready = matches!(&role, SinkRole::Default { .. });
         if !default_publication_ready {
@@ -871,6 +937,7 @@ pub(crate) fn spawn_sink_task(
             checkpoint_host: &checkpoint_host,
             ack_observer: &ack_observer,
             publication: Some(&publication_actor),
+            budgets,
         };
 
         let mut flush_tick = tokio::time::interval(flush_interval);
@@ -880,7 +947,7 @@ pub(crate) fn spawn_sink_task(
         let mut reclaim_tick = tokio::time::interval(SNAPSHOT_RECLAIM_INTERVAL);
         reclaim_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let reclaim_in_flight = Arc::new(AtomicBool::new(false));
-        let projection_worker = spawn_projection_worker(clickhouse.clone());
+        let projection_worker = spawn_projection_worker(clickhouse.clone(), budgets);
         let mut throttling_flush_retries = false;
         let mut throttled_flush_failures: u32 = 0;
 
@@ -1242,11 +1309,12 @@ pub(crate) fn spawn_sink_task(
                     );
                 }
                 _ = heartbeat_tick.tick() => {
-                    emit_heartbeat(&clickhouse, &metrics, &role).await;
+                    emit_heartbeat(&clickhouse, &budgets, &metrics, &role).await;
                 }
                 _ = reclaim_tick.tick() => {
                     spawn_projection_maintenance(
                         &clickhouse,
+                        budgets,
                         &reclaim_in_flight,
                         &projection_worker.discovered,
                     );
@@ -1936,7 +2004,12 @@ async fn commit_checkpoint_updates(
 /// Default-role only: mirror sinks write rows into databases this host does
 /// not own, so the ingest heartbeat (including per-backend mirror status)
 /// always lands in the default backend.
-async fn emit_heartbeat(clickhouse: &ClickHouseClient, metrics: &Arc<Metrics>, role: &SinkRole) {
+async fn emit_heartbeat(
+    clickhouse: &ClickHouseClient,
+    budgets: &ValidatedQueryBudgets,
+    metrics: &Arc<Metrics>,
+    role: &SinkRole,
+) {
     let SinkRole::Default {
         dispatch,
         backends,
@@ -2002,8 +2075,9 @@ async fn emit_heartbeat(clickhouse: &ClickHouseClient, metrics: &Arc<Metrics>, r
         }
     }
 
-    if let Err(exc) = clickhouse
-        .insert_json_rows("ingest_heartbeats", &[heartbeat])
+    // One Background envelope per heartbeat emit (issue #600 work item W9).
+    if let Err(exc) = background_envelope(budgets, "ingest-heartbeat")
+        .scope(clickhouse.insert_json_rows("ingest_heartbeats", &[heartbeat]))
         .await
     {
         warn!("heartbeat insert failed: {exc}");
@@ -2026,6 +2100,7 @@ async fn flush_pending(
         checkpoint_host: "",
         ack_observer: &observer,
         publication: None,
+        budgets: ingest_query_budgets(&moraine_config::AppConfig::default()),
     };
     flush_pending_inner(
         &context,
@@ -2053,6 +2128,7 @@ async fn flush_pending_with_ack(
         checkpoint_host: "",
         ack_observer,
         publication: None,
+        budgets: ingest_query_budgets(&moraine_config::AppConfig::default()),
     };
     flush_pending_inner(
         &context,
@@ -2084,7 +2160,31 @@ async fn flush_for_barrier(
     flush_pending_with_publication(context, pending, options).await
 }
 
+/// Run one flush cycle under ONE Background envelope covering every
+/// statement the flush issues — table inserts (including their 8 MiB
+/// `insert_json_rows` chunks), publication head inspections, append fences,
+/// and checkpoint commits. The statement cap is derived from the batch being
+/// flushed (amendment A7); the publication actor inherits this envelope for
+/// calls made during the flush.
 async fn flush_pending_inner(
+    context: &FlushContext<'_>,
+    pending: &mut PendingFlush,
+    options: FlushOptions,
+) -> bool {
+    let items = flush_statement_items(pending);
+    let envelope = background_batch_envelope(
+        &context.budgets,
+        "ingest-flush",
+        FLUSH_STATEMENT_OVERHEAD,
+        FLUSH_STATEMENTS_PER_ITEM,
+        items,
+    );
+    envelope
+        .scope(flush_pending_statements(context, pending, options))
+        .await
+}
+
+async fn flush_pending_statements(
     context: &FlushContext<'_>,
     pending: &mut PendingFlush,
     options: FlushOptions,
@@ -2678,6 +2778,9 @@ mod tests {
         calls_by_table: Arc<Mutex<HashMap<String, usize>>>,
         rows_by_table: Arc<Mutex<HashMap<String, Vec<Value>>>>,
         queries: Arc<Mutex<Vec<String>>>,
+        /// Envelope child query id of every request, `None` when the
+        /// statement arrived unenveloped.
+        envelope_query_ids: Arc<Mutex<Vec<Option<String>>>>,
         fail_once_by_table: Arc<Mutex<HashMap<String, usize>>>,
         fail_always_by_table: Arc<Mutex<HashMap<String, String>>>,
         append_control_response: Arc<Mutex<Option<String>>>,
@@ -2751,6 +2854,13 @@ mod tests {
                 .count()
         }
 
+        fn envelope_query_ids(&self) -> Vec<Option<String>> {
+            self.envelope_query_ids
+                .lock()
+                .expect("mock envelope ids mutex poisoned")
+                .clone()
+        }
+
         fn set_live_event_exists(&self, exists: bool) {
             *self
                 .live_event_exists
@@ -2817,6 +2927,11 @@ mod tests {
             .lock()
             .expect("mock queries mutex poisoned")
             .push(query.to_string());
+        state
+            .envelope_query_ids
+            .lock()
+            .expect("mock envelope ids mutex poisoned")
+            .push(params.get("query_id").cloned());
         if query.contains("v_current_ingest_append_control") {
             return (
                 StatusCode::OK,
@@ -3004,6 +3119,157 @@ mod tests {
             status: CheckpointLifecycle::Active.to_string(),
             ..Default::default()
         }
+    }
+
+    fn test_budgets() -> ValidatedQueryBudgets {
+        ingest_query_budgets(&moraine_config::AppConfig::default())
+    }
+
+    /// Everything issued so far ran enveloped, with ids of `kind`, and every
+    /// statement belongs to exactly `expected_envelopes` distinct envelopes.
+    fn assert_enveloped(
+        state: &MockClickHouseState,
+        kind: &str,
+        expected_envelopes: Option<usize>,
+    ) {
+        let ids = state.envelope_query_ids();
+        assert!(!ids.is_empty(), "mock captured no statements");
+        let prefix = format!("moraine-{kind}-");
+        let mut requests = std::collections::BTreeSet::new();
+        for id in &ids {
+            let id = id
+                .as_deref()
+                .expect("every ingest statement must carry an envelope query id");
+            assert!(
+                id.starts_with(&prefix),
+                "expected {prefix}* query id, got {id}"
+            );
+            let (request_id, sequence) = id
+                .rsplit_once('-')
+                .expect("child query ids end with a sequence");
+            sequence
+                .parse::<u32>()
+                .expect("child query ids end with a numeric sequence");
+            requests.insert(request_id.to_string());
+        }
+        if let Some(expected) = expected_envelopes {
+            assert_eq!(
+                requests.len(),
+                expected,
+                "expected {expected} distinct envelopes, saw {requests:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn flush_statement_cap_derives_from_the_batch_being_flushed() {
+        let mut pending = PendingFlush::default();
+        for index in 0..1_000 {
+            pending.event_rows.push(json!({ "id": index }));
+        }
+        for suffix in ["a", "b", "c"] {
+            let mut checkpoint = sample_checkpoint();
+            checkpoint.source_file = format!("/tmp/source-{suffix}.jsonl");
+            pending
+                .checkpoint_updates
+                .insert(format!("source-{suffix}"), checkpoint);
+        }
+
+        let items = flush_statement_items(&pending);
+        assert_eq!(items, 1_003);
+        assert_eq!(
+            moraine_clickhouse::batch_statement_cap(
+                FLUSH_STATEMENT_OVERHEAD,
+                FLUSH_STATEMENTS_PER_ITEM,
+                items,
+            ),
+            FLUSH_STATEMENT_OVERHEAD + FLUSH_STATEMENTS_PER_ITEM * 1_003,
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flush_cycle_runs_under_one_background_envelope() {
+        let (clickhouse, state) =
+            spawn_mock_clickhouse_with_state(MockClickHouseState::default()).await;
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+        let mut pending = PendingFlush::default();
+        pending.raw_rows.push(json!({ "id": 1 }));
+        pending.event_rows.push(json!({ "id": 1 }));
+        pending.tool_rows.push(json!({ "id": 1 }));
+
+        assert!(flush_pending(&clickhouse, &checkpoints, &metrics, &mut pending).await);
+
+        // Three table inserts, one shared envelope: the whole flush cycle's
+        // statements carry child ids of a single ingest-flush request.
+        assert_enveloped(&state, "ingest-flush", Some(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn projection_worker_creates_its_own_envelope_inside_the_spawn() {
+        let (clickhouse, state) =
+            spawn_mock_clickhouse_with_state(MockClickHouseState::default()).await;
+        let worker = spawn_projection_worker(clickhouse, test_budgets());
+        worker
+            .requests
+            .send(vec!["session-1".to_string()])
+            .await
+            .expect("projection worker accepts requests");
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if !worker
+                    .outcomes
+                    .lock()
+                    .expect("projection outcome mutex poisoned")
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("projection refresh completes");
+
+        // The refresh ran inside tokio::spawn, where no caller envelope can
+        // reach: every statement must still be enveloped by the worker's own
+        // per-session Background envelope.
+        assert_enveloped(&state, "ingest-projection", None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn projection_maintenance_creates_its_own_envelope_inside_the_spawn() {
+        let (clickhouse, state) =
+            spawn_mock_clickhouse_with_state(MockClickHouseState::default()).await;
+        let in_flight = Arc::new(AtomicBool::new(false));
+        let discovered = Arc::new(Mutex::new(BTreeSet::new()));
+        spawn_projection_maintenance(&clickhouse, test_budgets(), &in_flight, &discovered);
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if !in_flight.load(Ordering::SeqCst) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("maintenance cycle completes");
+
+        assert_enveloped(&state, "ingest-maintenance", Some(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn heartbeat_emit_runs_under_background_envelope() {
+        let (clickhouse, state) =
+            spawn_mock_clickhouse_with_state(MockClickHouseState::default()).await;
+        let metrics = Arc::new(Metrics::default());
+
+        emit_heartbeat(&clickhouse, &test_budgets(), &metrics, &default_role()).await;
+
+        assert_eq!(state.call_count("ingest_heartbeats"), 1);
+        assert_enveloped(&state, "ingest-heartbeat", Some(1));
     }
 
     #[test]
@@ -3940,6 +4206,7 @@ mod tests {
             clickhouse.clone(),
             String::new(),
             "test-publisher".to_string(),
+            test_budgets(),
         );
         let context = FlushContext {
             clickhouse: &clickhouse,
@@ -3949,6 +4216,7 @@ mod tests {
             checkpoint_host: "",
             ack_observer: &observer,
             publication: Some(&actor),
+            budgets: test_budgets(),
         };
         assert!(
             !flush_pending_with_publication(
@@ -4517,6 +4785,7 @@ mod tests {
             clickhouse,
             "test-host".to_string(),
             "test-publisher".to_string(),
+            test_budgets(),
         );
         let mut transition =
             CheckpointTransition::try_from_checkpoint(sample_checkpoint()).unwrap();
@@ -4554,6 +4823,7 @@ mod tests {
             clickhouse,
             "test-host".to_string(),
             "test-publisher".to_string(),
+            test_budgets(),
         );
 
         let ack = actor
@@ -4589,6 +4859,7 @@ mod tests {
             clickhouse,
             "test-host".to_string(),
             "test-publisher".to_string(),
+            test_budgets(),
         );
         let mut transition =
             CheckpointTransition::try_from_checkpoint(sample_checkpoint()).unwrap();
@@ -4614,6 +4885,7 @@ mod tests {
             clickhouse,
             "test-host".to_string(),
             "test-publisher".to_string(),
+            test_budgets(),
         );
         let mut manifest = AppendManifest::default();
         manifest.event_uids.insert("event-1".to_string());
@@ -4649,6 +4921,7 @@ mod tests {
             clickhouse.clone(),
             String::new(),
             "test-publisher".to_string(),
+            test_budgets(),
         );
         assert!(
             actor
@@ -4690,6 +4963,7 @@ mod tests {
             checkpoint_host: "",
             ack_observer: &observer,
             publication: Some(&actor),
+            budgets: test_budgets(),
         };
 
         assert!(
@@ -4956,6 +5230,7 @@ mod tests {
             clickhouse,
             expected_host.clone(),
             identity.publisher_id().to_string(),
+            test_budgets(),
         );
         let mut checkpoint = sample_checkpoint();
         checkpoint.source_generation = 2;

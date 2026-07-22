@@ -806,9 +806,17 @@ fn spawn_backend_supervisor(
                 return;
             }
         };
+        // Task-locals do not cross `tokio::spawn`: the supervisor's own
+        // handshake/checkpoint reads get a fresh Background envelope per
+        // attempt (the retry loops sleep, so one absolute deadline cannot
+        // span them).
+        let budgets = crate::ingest_query_budgets(context.config.as_ref());
 
         loop {
-            match client.schema_skew().await {
+            let skew = crate::background_envelope(&budgets, "ingest-backend-handshake")
+                .scope(client.schema_skew())
+                .await;
+            match skew {
                 Ok(skew) => {
                     match enforce_remote_schema_policy(&name, &skew, allow_newer_server) {
                         Ok(()) => break,
@@ -840,7 +848,10 @@ fn spawn_backend_supervisor(
         // another host's rows must never decide what THIS host replays.
         let host = context.publication_identity.host_id();
         let durable = loop {
-            match crate::load_checkpoints(&client, true, Some(host)).await {
+            let loaded = crate::background_envelope(&budgets, "ingest-backend-checkpoints")
+                .scope(crate::load_checkpoints(&client, true, Some(host)))
+                .await;
+            match loaded {
                 Ok(map) => break map,
                 Err(exc) => {
                     cell.set_status(BackendSinkStatus::Unreachable);

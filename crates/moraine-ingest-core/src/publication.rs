@@ -1,6 +1,9 @@
 use crate::model::{Checkpoint, CheckpointLifecycle};
 use anyhow::{anyhow, bail, Context, Result};
-use moraine_clickhouse::{ClickHouseClient, McpOpenHostRevision, McpOpenPublicationRequest};
+use moraine_clickhouse::{
+    ClickHouseClient, McpOpenHostRevision, McpOpenPublicationRequest, QueryEnvelope,
+};
+use moraine_config::ValidatedQueryBudgets;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -873,7 +876,19 @@ pub(crate) struct PublicationActor {
     publisher_id: String,
     gate: Mutex<()>,
     diagnostic_revision: AtomicU64,
+    budgets: ValidatedQueryBudgets,
 }
+
+/// Fixed statement overhead of one publication logical operation (append
+/// fences, head verification, readiness/diagnostic persists, retries).
+const PUBLICATION_STATEMENT_OVERHEAD: u32 = 64;
+
+/// Per-candidate statement allowance for batch-shaped publication operations
+/// (amendment A7): a head commit/repair runs ~4 activate/persist statements
+/// per candidate plus compatibility preparation for the sessions of that
+/// source, so the term is deliberately generous. The configured
+/// `[query_budgets.background].statement_cap` stays as the floor.
+const PUBLICATION_STATEMENTS_PER_CANDIDATE: u32 = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SourcePublicationKind {
@@ -959,6 +974,7 @@ impl PublicationActor {
         clickhouse: ClickHouseClient,
         source_host: String,
         publisher_id: String,
+        budgets: ValidatedQueryBudgets,
     ) -> Self {
         Self {
             clickhouse,
@@ -966,15 +982,44 @@ impl PublicationActor {
             publisher_id,
             gate: Mutex::new(()),
             diagnostic_revision: AtomicU64::new(system_time_revision()),
+            budgets,
         }
+    }
+
+    /// Run one publication logical operation under the caller's envelope
+    /// when one is active — a flush cycle is ONE Background envelope
+    /// covering all of its statements, including the publication calls made
+    /// during the flush — and otherwise under a fresh Background envelope
+    /// whose statement cap is batch-derived from `items` (amendment A7).
+    /// Entry points wrap themselves so barrier arms, startup repair, and
+    /// mirror supervisors are covered without per-call-site scoping.
+    async fn enveloped<T, F>(&self, items: usize, operation: F) -> Result<T>
+    where
+        F: std::future::Future<Output = Result<T>>,
+    {
+        if QueryEnvelope::current().is_ok() {
+            return operation.await;
+        }
+        crate::background_batch_envelope(
+            &self.budgets,
+            "ingest-publication",
+            PUBLICATION_STATEMENT_OVERHEAD,
+            PUBLICATION_STATEMENTS_PER_CANDIDATE,
+            items,
+        )
+        .scope(operation)
+        .await
     }
 
     pub(crate) async fn persist_transition(
         &self,
         transition: &mut CheckpointTransition,
     ) -> Result<ReplayBarrierAck> {
-        let _guard = self.gate.lock().await;
-        self.persist_transition_locked(transition).await
+        self.enveloped(1, async {
+            let _guard = self.gate.lock().await;
+            self.persist_transition_locked(transition).await
+        })
+        .await
     }
 
     /// Persist a validated final scan on a mirror before its ordered catch-up
@@ -985,17 +1030,20 @@ impl PublicationActor {
         &self,
         transition: &mut CheckpointTransition,
     ) -> Result<ReplayBarrierAck> {
-        transition.validate_staged_final()?;
-        if transition.checkpoint.backend_caught_up {
-            bail!("staged mirror final is already marked backend-caught-up");
-        }
-        let _guard = self.gate.lock().await;
-        transition.canonicalize_source(&self.source_host);
-        let checkpoint = self.persist_transition_locked(transition).await?;
-        self.record_readiness_locked(transition, true).await?;
-        self.commit_recovered_append_for_source_locked(&transition.source)
-            .await?;
-        Ok(checkpoint)
+        self.enveloped(1, async {
+            transition.validate_staged_final()?;
+            if transition.checkpoint.backend_caught_up {
+                bail!("staged mirror final is already marked backend-caught-up");
+            }
+            let _guard = self.gate.lock().await;
+            transition.canonicalize_source(&self.source_host);
+            let checkpoint = self.persist_transition_locked(transition).await?;
+            self.record_readiness_locked(transition, true).await?;
+            self.commit_recovered_append_for_source_locked(&transition.source)
+                .await?;
+            Ok(checkpoint)
+        })
+        .await
     }
 
     /// Persist the ordered mirror catch-up gate. Final scans supersede their
@@ -1005,19 +1053,22 @@ impl PublicationActor {
         &self,
         transition: &mut CheckpointTransition,
     ) -> Result<ReplayBarrierAck> {
-        if !transition.checkpoint.backend_caught_up {
-            bail!("mirror catch-up transition is not marked backend-caught-up");
-        }
-        let validated_final = transition.validate_staged_final().is_ok();
-        let _guard = self.gate.lock().await;
-        transition.canonicalize_source(&self.source_host);
-        let checkpoint = self.persist_transition_locked(transition).await?;
-        if validated_final {
-            self.record_readiness_locked(transition, true).await?;
-        }
-        self.commit_recovered_append_for_source_locked(&transition.source)
-            .await?;
-        Ok(checkpoint)
+        self.enveloped(1, async {
+            if !transition.checkpoint.backend_caught_up {
+                bail!("mirror catch-up transition is not marked backend-caught-up");
+            }
+            let validated_final = transition.validate_staged_final().is_ok();
+            let _guard = self.gate.lock().await;
+            transition.canonicalize_source(&self.source_host);
+            let checkpoint = self.persist_transition_locked(transition).await?;
+            if validated_final {
+                self.record_readiness_locked(transition, true).await?;
+            }
+            self.commit_recovered_append_for_source_locked(&transition.source)
+                .await?;
+            Ok(checkpoint)
+        })
+        .await
     }
 
     /// Keep a post-catch-up publication failure visible without rolling back
@@ -1027,17 +1078,25 @@ impl PublicationActor {
         &self,
         transition: &CheckpointTransition,
     ) -> Result<()> {
-        let mut diagnostic = transition.clone();
-        diagnostic.canonicalize_source(&self.source_host);
-        diagnostic.checkpoint.block_reason = "publication_repair_failed".to_string();
-        let _guard = self.gate.lock().await;
-        self.record_readiness_locked(&diagnostic, true).await
+        self.enveloped(1, async {
+            let mut diagnostic = transition.clone();
+            diagnostic.canonicalize_source(&self.source_host);
+            diagnostic.checkpoint.block_reason = "publication_repair_failed".to_string();
+            let _guard = self.gate.lock().await;
+            self.record_readiness_locked(&diagnostic, true).await
+        })
+        .await
     }
 
     pub(crate) async fn diagnose_shared_legacy_ambiguity(&self) -> Result<bool> {
         if self.source_host.is_empty() {
             return Ok(false);
         }
+        self.enveloped(1, self.diagnose_shared_legacy_ambiguity_inner())
+            .await
+    }
+
+    async fn diagnose_shared_legacy_ambiguity_inner(&self) -> Result<bool> {
         let query = format!(
             "SELECT toUInt64(count()) AS existing_count FROM {}.events FINAL WHERE source_host = ''",
             quote_ident(&self.clickhouse.config().database),
@@ -1173,6 +1232,11 @@ impl PublicationActor {
     /// source checkpoints. Recoverable work keeps the original batch and cache
     /// epoch; malformed, foreign-owned, or terminal manifests stay blocked.
     pub(crate) async fn block_orphaned_append_on_startup(&self) -> Result<bool> {
+        self.enveloped(1, self.block_orphaned_append_on_startup_inner())
+            .await
+    }
+
+    async fn block_orphaned_append_on_startup_inner(&self) -> Result<bool> {
         let current = {
             let _guard = self.gate.lock().await;
             self.current_append_control().await?
@@ -1458,6 +1522,14 @@ impl PublicationActor {
         &self,
         transition: &mut CheckpointTransition,
     ) -> Result<PublicationAck> {
+        self.enveloped(1, self.publish_final_inner(transition))
+            .await
+    }
+
+    async fn publish_final_inner(
+        &self,
+        transition: &mut CheckpointTransition,
+    ) -> Result<PublicationAck> {
         transition.validate_final_source()?;
         let _guard = self.gate.lock().await;
         transition.canonicalize_source(&self.source_host);
@@ -1521,6 +1593,14 @@ impl PublicationActor {
         {
             return Ok(None);
         }
+        self.enveloped(1, self.publish_initial_if_absent_inner(transition))
+            .await
+    }
+
+    async fn publish_initial_if_absent_inner(
+        &self,
+        transition: &mut CheckpointTransition,
+    ) -> Result<Option<PublicationAck>> {
         let _guard = self.gate.lock().await;
         transition.canonicalize_source(&self.source_host);
         if let Some(head) = self.current_head(&transition.source).await? {
@@ -1574,11 +1654,14 @@ impl PublicationActor {
         source: &SourceKey,
         generation: u32,
     ) -> Result<bool> {
-        let _guard = self.gate.lock().await;
-        Ok(self
-            .current_head(source)
-            .await?
-            .is_some_and(|head| head.source_generation == generation))
+        self.enveloped(1, async {
+            let _guard = self.gate.lock().await;
+            Ok(self
+                .current_head(source)
+                .await?
+                .is_some_and(|head| head.source_generation == generation))
+        })
+        .await
     }
 
     /// Idempotent startup/catch-up repair. Only checkpoints carrying every
@@ -1588,6 +1671,21 @@ impl PublicationActor {
     pub(crate) async fn repair_ready_publications(
         &self,
         checkpoints: impl IntoIterator<Item = Checkpoint>,
+    ) -> Result<Vec<PublicationAck>> {
+        // The batch size drives the derived statement cap (amendment A7):
+        // repair issues head commit/repair work per candidate checkpoint.
+        let candidates: Vec<Checkpoint> = checkpoints.into_iter().collect();
+        let candidate_count = candidates.len();
+        self.enveloped(
+            candidate_count,
+            self.repair_ready_publications_inner(candidates),
+        )
+        .await
+    }
+
+    async fn repair_ready_publications_inner(
+        &self,
+        checkpoints: Vec<Checkpoint>,
     ) -> Result<Vec<PublicationAck>> {
         let mut repaired = Vec::new();
         for mut checkpoint in checkpoints {
@@ -1613,16 +1711,19 @@ impl PublicationActor {
     }
 
     pub(crate) async fn has_recovering_append(&self) -> Result<bool> {
-        let _guard = self.gate.lock().await;
-        let current = self.current_append_control().await?;
-        if current.state != "preparing" || current.publisher_id != self.publisher_id {
-            return Ok(false);
-        }
-        Ok(
-            serde_json::from_str::<AppendManifest>(&current.manifest_json)
-                .context("failed to decode current append manifest")?
-                .recovery_pending,
-        )
+        self.enveloped(1, async {
+            let _guard = self.gate.lock().await;
+            let current = self.current_append_control().await?;
+            if current.state != "preparing" || current.publisher_id != self.publisher_id {
+                return Ok(false);
+            }
+            Ok(
+                serde_json::from_str::<AppendManifest>(&current.manifest_json)
+                    .context("failed to decode current append manifest")?
+                    .recovery_pending,
+            )
+        })
+        .await
     }
 
     pub(crate) async fn begin_append(
@@ -1632,6 +1733,14 @@ impl PublicationActor {
         if manifest.source_keys.is_empty() {
             return Ok(None);
         }
+        self.enveloped(
+            manifest.source_keys.len(),
+            self.begin_append_inner(manifest),
+        )
+        .await
+    }
+
+    async fn begin_append_inner(&self, manifest: &AppendManifest) -> Result<Option<(String, u64)>> {
         let _guard = self.gate.lock().await;
         let batch_id = manifest.batch_id();
         let current = self.current_append_control().await?;
@@ -1758,21 +1867,24 @@ impl PublicationActor {
             manifest.insert_only = false;
             return Ok(false);
         }
-        let event_uids = sql_string_list(&manifest.event_uids);
-        let session_ids = sql_string_list(&manifest.session_ids);
-        let query = format!(
-            "SELECT toUInt8(1) AS existing FROM {}.v_live_events \
-             WHERE event_uid IN ({}) OR session_id IN ({}) LIMIT 1",
-            quote_ident(&self.clickhouse.config().database),
-            event_uids,
-            session_ids,
-        );
-        let rows: Vec<ExistenceRow> = self.clickhouse.query_rows(&query, None).await?;
-        let insert_only = rows.first().is_none_or(|row| row.existing == 0);
-        manifest.insert_only = insert_only;
-        // The digest covers the classification as well as the affected rows.
-        manifest.digest = manifest.compute_digest();
-        Ok(insert_only)
+        self.enveloped(1, async {
+            let event_uids = sql_string_list(&manifest.event_uids);
+            let session_ids = sql_string_list(&manifest.session_ids);
+            let query = format!(
+                "SELECT toUInt8(1) AS existing FROM {}.v_live_events \
+                 WHERE event_uid IN ({}) OR session_id IN ({}) LIMIT 1",
+                quote_ident(&self.clickhouse.config().database),
+                event_uids,
+                session_ids,
+            );
+            let rows: Vec<ExistenceRow> = self.clickhouse.query_rows(&query, None).await?;
+            let insert_only = rows.first().is_none_or(|row| row.existing == 0);
+            manifest.insert_only = insert_only;
+            // The digest covers the classification as well as the affected rows.
+            manifest.digest = manifest.compute_digest();
+            Ok(insert_only)
+        })
+        .await
     }
 
     pub(crate) async fn commit_append(
@@ -1780,8 +1892,11 @@ impl PublicationActor {
         batch_id: &str,
         advanced_sources: Option<&BTreeSet<SourceKey>>,
     ) -> Result<u64> {
-        let _guard = self.gate.lock().await;
-        self.commit_append_locked(batch_id, advanced_sources).await
+        self.enveloped(1, async {
+            let _guard = self.gate.lock().await;
+            self.commit_append_locked(batch_id, advanced_sources).await
+        })
+        .await
     }
 
     async fn commit_append_locked(
@@ -1852,6 +1967,11 @@ impl PublicationActor {
         batch_id: &str,
         manifest: &AppendManifest,
     ) -> Result<()> {
+        self.enveloped(1, self.block_append_inner(batch_id, manifest))
+            .await
+    }
+
+    async fn block_append_inner(&self, batch_id: &str, manifest: &AppendManifest) -> Result<()> {
         let _guard = self.gate.lock().await;
         let current = self.current_append_control().await?;
         if current.batch_id != batch_id || current.state != "preparing" {
@@ -2432,6 +2552,7 @@ mod tests {
                 clickhouse,
                 "test-host".to_string(),
                 "test-publisher".to_string(),
+                crate::ingest_query_budgets(&moraine_config::AppConfig::default()),
             ),
             state,
         )
