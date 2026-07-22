@@ -2218,6 +2218,57 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn materialized_config_applies_query_safety_profile() {
+        let root = temp_dir("query-safety-config");
+        let cfg = test_config(&root, "http://127.0.0.1:18123".to_string());
+        let paths = crate::paths::runtime_paths(&cfg);
+        ensure_runtime_dirs(&paths).expect("runtime dirs");
+        materialize_clickhouse_config(&cfg, &paths).expect("materialize config");
+        let rendered_config = fs::read_to_string(&paths.clickhouse_config).expect("read config");
+        let rendered_users = fs::read_to_string(&paths.clickhouse_users).expect("read users");
+
+        assert_eq!(
+            rendered_config
+                .matches("<max_concurrent_queries>64</max_concurrent_queries>")
+                .count(),
+            1
+        );
+        assert_eq!(
+            rendered_config
+                .matches(
+                    "<max_server_memory_usage_to_ram_ratio>0.9</max_server_memory_usage_to_ram_ratio>",
+                )
+                .count(),
+            1
+        );
+        assert_eq!(
+            rendered_users
+                .matches("<max_memory_usage>4294967296</max_memory_usage>")
+                .count(),
+            1
+        );
+        assert_eq!(
+            rendered_users
+                .matches(
+                    "<max_bytes_before_external_group_by>2147483648</max_bytes_before_external_group_by>",
+                )
+                .count(),
+            1
+        );
+        assert_eq!(
+            rendered_users
+                .matches(
+                    "<max_bytes_before_external_sort>2147483648</max_bytes_before_external_sort>",
+                )
+                .count(),
+            1
+        );
+        // The unlimited per-query profile must stay gone.
+        assert!(!rendered_users.contains("<max_memory_usage>0</max_memory_usage>"));
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn managed_generation_disables_clickhouse_watchdog() {

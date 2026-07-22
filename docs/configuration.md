@@ -45,6 +45,7 @@ future keys.
 | `[[ingest.sources]]` | Watched agent trace sources. |
 | `[mcp]` | MCP retrieval defaults and shared backend socket settings. |
 | `[bm25]` | Search ranking defaults. |
+| `[query_budgets]` | Per-class ClickHouse query budgets (deadline, memory, spill, read allowances, statement cap) for the mandatory query envelope. |
 | `[monitor]` | Monitor HTTP port. |
 | `[backend]` | Unified MCP socket and monitor HTTP daemon startup, HTTP bind, and experimental non-loopback guard. |
 | `[runtime]` | Runtime directories and managed ClickHouse settings. |
@@ -842,6 +843,71 @@ Most installations should keep these defaults.
 | `default_min_should_match` | `1` | Default minimum number of query terms that should match. |
 | `max_query_terms` | `32` | Maximum query terms kept after tokenization. |
 
+## Query Budgets
+
+`[query_budgets]` bounds every ClickHouse query Moraine issues. Each query
+runs inside a mandatory envelope drawn from one of five classes, and the
+envelope enforces an absolute execution deadline, per-statement memory and
+spill ceilings, cumulative read allowances, and a fixed statement cap for the
+whole logical operation. There is no unlimited setting: zero values are
+rejected at config load (ClickHouse treats zero limits as "unlimited"), so a
+config that would produce an unbounded query never loads.
+
+```toml
+[query_budgets.interactive]
+deadline_seconds = 15.0
+memory_bytes = 1073741824   # 1 GiB
+spill_bytes = 268435456     # 256 MiB
+read_rows = 500000000
+read_bytes = 10737418240    # 10 GiB
+statement_cap = 256
+```
+
+Each class is a table with the same six required fields. Absent classes and
+fields fall back to the defaults below, so a partial table overrides only the
+fields it names.
+
+| Field | Purpose |
+| --- | --- |
+| `deadline_seconds` | Absolute server execution deadline for the whole logical operation. Statements are issued with `max_execution_time` set to the remaining portion, so multi-statement operations share one deadline. |
+| `memory_bytes` | Per-statement `max_memory_usage` ceiling. |
+| `spill_bytes` | Sort/group-by spill threshold (`max_bytes_before_external_group_by` / `_sort`). |
+| `read_rows` | Cumulative request-level row-read allowance (`max_rows_to_read`). |
+| `read_bytes` | Cumulative request-level byte-read allowance (`max_bytes_to_read`). |
+| `statement_cap` | Maximum number of statements one logical operation may issue. |
+
+Per-class defaults:
+
+| Class | Used by | `deadline_seconds` | `memory_bytes` | `spill_bytes` | `read_rows` | `read_bytes` | `statement_cap` |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `interactive` | MCP tools, monitor reads, CLI status/doctor reads | `15.0` | 1 GiB | 256 MiB | 500M | 10 GiB | `256` |
+| `background` | Ingest publication inspections, projection refreshes, janitor work | `600.0` | 2 GiB | 512 MiB | 5B | 100 GiB | `512` |
+| `migration` | Schema migrations, read-model backfills | `600.0` | 4 GiB | 1 GiB | 10B | 200 GiB | `1024` |
+| `administrative` | KILL statements and telemetry one-shots only | `5.0` | 256 MiB | 64 MiB | 1M | 256 MiB | `4` |
+| `export` | `moraine export` streaming reads | `600.0` | 2 GiB | 512 MiB | 10B | 200 GiB | `64` |
+
+Validation is fail-closed and applies to every class:
+
+- every field must be at least 1 (zero would mean "unlimited" in ClickHouse);
+- `deadline_seconds` must be a finite number greater than zero and at most
+  `86400` (24 hours);
+- `memory_bytes` may not exceed the 4 GiB per-query server backstop that
+  managed installs ship in their ClickHouse user profile (see
+  [Runtime Paths](#runtime-paths)). The envelope's per-statement settings are
+  the primary enforcement mechanism and apply to external ClickHouse backends
+  too; the server profile is only the last-resort bound for managed installs.
+
+The `background` deadline intentionally matches the projection debounce
+ceiling so the worst-case legitimate projection refresh completes within one
+budget instead of retrying forever. Migrations additionally keep honoring a
+larger operator-configured client timeout when one is set; the migration
+budget never tightens below it.
+
+The defaults are deliberately generous for healthy local corpora. Tighten
+them after observing budget-exhaustion telemetry in monitor health/status;
+repeated `deadline_exceeded` or `resource_exhausted` results indicate either
+an under-provisioned budget or a query-shape problem worth investigating.
+
 ## Backend Daemon
 
 `[backend]` controls the unified daemon's HTTP listener:
@@ -938,3 +1004,21 @@ core count. Individual repository reads do not override `max_threads`, so an
 idle query can scale up while concurrent queries share the aggregate budget.
 These defaults apply only to Moraine-managed ClickHouse; external ClickHouse
 deployments retain their administrator-defined scheduling policy.
+
+The managed server also ships a query-safety profile sized for a local host:
+
+| Setting | Value | Purpose |
+| --- | --- | --- |
+| `max_concurrent_queries` | `64` | Server-wide query slots. Moraine's own interactive load is admission-bounded well below this (8 MCP + 4 monitor + 2 background reads), so ingest inserts, merges, and administrative statements always have free slots. |
+| `max_server_memory_usage_to_ram_ratio` | `0.9` | Aggregate server memory ceiling, pinned explicitly. Kept at 0.9 because background merges can legitimately demand most of it; per-query limits keep reads from occupying merge headroom. |
+| `max_memory_usage` (default profile) | `4 GiB` | Per-query memory backstop, replacing the previous unlimited (`0`) profile. Moraine's query envelope sends tighter per-statement budgets; this only catches statements issued without one. |
+| `max_bytes_before_external_group_by` / `max_bytes_before_external_sort` (default profile) | `2 GiB` | Spill-to-disk thresholds at half the per-query backstop, so a query approaching the cap spills instead of failing on memory. |
+
+The per-statement query envelope (query IDs, deadlines, memory and read
+ceilings) is the primary safety mechanism and applies to every deployment
+shape; this server profile is a defense-in-depth backstop that only reaches
+Moraine-managed ClickHouse. The profile files are re-rendered from the
+built-in templates every time the managed server starts, so existing
+installations pick up profile changes at the next `moraine up` or managed
+restart — local edits to the rendered `~/.moraine/clickhouse/config.xml` and
+`users.xml` files do not persist.

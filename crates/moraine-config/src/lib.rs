@@ -321,6 +321,416 @@ pub struct Bm25Config {
     pub max_query_terms: usize,
 }
 
+/// Ceiling on any configured query deadline. A deadline above one day is
+/// indistinguishable from "unlimited" for an interactive local service.
+pub const QUERY_DEADLINE_MAX_SECONDS: f64 = 86_400.0;
+
+/// Server-side per-query memory backstop, matching the `max_memory_usage`
+/// profile shipped to managed ClickHouse installs (`config/users.xml`). No
+/// class budget may exceed it: the envelope's per-statement ceiling must stay
+/// enforceable even when the server profile is the only remaining bound.
+pub const QUERY_MEMORY_BACKSTOP_BYTES: u64 = 4 * BYTES_PER_GIB;
+
+const BYTES_PER_MIB: u64 = 1024 * 1024;
+const BYTES_PER_GIB: u64 = 1024 * BYTES_PER_MIB;
+
+/// One `[query_budgets.<class>]` table: the finite execution budget every
+/// ClickHouse statement in that class runs under. Zero is rejected at load
+/// time for every field (ClickHouse treats zero limits as "unlimited"), so
+/// an unbounded budget is unrepresentable in configuration.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QueryBudgetClassConfig {
+    /// Absolute server execution deadline, in seconds, for the whole logical
+    /// operation (`max_execution_time` derives from its remaining portion).
+    pub deadline_seconds: f64,
+    /// Per-statement `max_memory_usage` ceiling in bytes.
+    pub memory_bytes: u64,
+    /// Sort/group-by spill threshold in bytes
+    /// (`max_bytes_before_external_group_by` / `_sort`).
+    pub spill_bytes: u64,
+    /// Cumulative request-level row-read allowance (`max_rows_to_read`).
+    pub read_rows: u64,
+    /// Cumulative request-level byte-read allowance (`max_bytes_to_read`).
+    pub read_bytes: u64,
+    /// Fixed maximum number of statements per logical operation.
+    pub statement_cap: u32,
+}
+
+/// Per-class query budgets for the mandatory query envelope (issue #600).
+/// Absent classes and fields fall back to the documented defaults; partial
+/// tables override only the fields they name.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QueryBudgetsConfig {
+    /// MCP tools, monitor reads, CLI status/doctor and other user-facing reads.
+    pub interactive: QueryBudgetClassConfig,
+    /// Ingest publication inspections, projection refreshes, janitor work.
+    pub background: QueryBudgetClassConfig,
+    /// Schema migrations and read-model backfill machinery.
+    pub migration: QueryBudgetClassConfig,
+    /// KILL statements and telemetry one-shots only.
+    pub administrative: QueryBudgetClassConfig,
+    /// `moraine export` streaming reads (explicit generous budget; amendment
+    /// A9 forbids code-side unlimited escapes, so export is its own entry).
+    pub export: QueryBudgetClassConfig,
+}
+
+const DEFAULT_INTERACTIVE_QUERY_BUDGET: QueryBudgetClassConfig = QueryBudgetClassConfig {
+    deadline_seconds: 15.0,
+    memory_bytes: BYTES_PER_GIB,
+    spill_bytes: 256 * BYTES_PER_MIB,
+    read_rows: 500_000_000,
+    read_bytes: 10 * BYTES_PER_GIB,
+    statement_cap: 256,
+};
+
+const DEFAULT_BACKGROUND_QUERY_BUDGET: QueryBudgetClassConfig = QueryBudgetClassConfig {
+    // 600s matches the projection debounce ceiling so the worst-case
+    // legitimate projection refresh fits inside one budget (amendment A7);
+    // allowances are sized for publication-actor full-table inspections.
+    deadline_seconds: 600.0,
+    memory_bytes: 2 * BYTES_PER_GIB,
+    spill_bytes: 512 * BYTES_PER_MIB,
+    read_rows: 5_000_000_000,
+    read_bytes: 100 * BYTES_PER_GIB,
+    statement_cap: 512,
+};
+
+const DEFAULT_MIGRATION_QUERY_BUDGET: QueryBudgetClassConfig = QueryBudgetClassConfig {
+    deadline_seconds: 600.0,
+    memory_bytes: 4 * BYTES_PER_GIB,
+    spill_bytes: BYTES_PER_GIB,
+    read_rows: 10_000_000_000,
+    read_bytes: 200 * BYTES_PER_GIB,
+    statement_cap: 1024,
+};
+
+const DEFAULT_ADMINISTRATIVE_QUERY_BUDGET: QueryBudgetClassConfig = QueryBudgetClassConfig {
+    deadline_seconds: 5.0,
+    memory_bytes: 256 * BYTES_PER_MIB,
+    spill_bytes: 64 * BYTES_PER_MIB,
+    read_rows: 1_000_000,
+    read_bytes: 256 * BYTES_PER_MIB,
+    statement_cap: 4,
+};
+
+const DEFAULT_EXPORT_QUERY_BUDGET: QueryBudgetClassConfig = QueryBudgetClassConfig {
+    // Matches the pre-envelope export ceiling (600s max_execution_time).
+    deadline_seconds: 600.0,
+    memory_bytes: 2 * BYTES_PER_GIB,
+    spill_bytes: 512 * BYTES_PER_MIB,
+    read_rows: 10_000_000_000,
+    read_bytes: 200 * BYTES_PER_GIB,
+    statement_cap: 64,
+};
+
+impl Default for QueryBudgetsConfig {
+    fn default() -> Self {
+        Self {
+            interactive: DEFAULT_INTERACTIVE_QUERY_BUDGET,
+            background: DEFAULT_BACKGROUND_QUERY_BUDGET,
+            migration: DEFAULT_MIGRATION_QUERY_BUDGET,
+            administrative: DEFAULT_ADMINISTRATIVE_QUERY_BUDGET,
+            export: DEFAULT_EXPORT_QUERY_BUDGET,
+        }
+    }
+}
+
+/// Serde defaults are per-struct, but each class has its own default budget,
+/// so deserialization goes through per-field optionals merged over the class
+/// defaults. This keeps partial tables ergonomic (override one field, keep
+/// the rest) without ever representing an absent budget.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartialQueryBudgetClass {
+    deadline_seconds: Option<f64>,
+    memory_bytes: Option<u64>,
+    spill_bytes: Option<u64>,
+    read_rows: Option<u64>,
+    read_bytes: Option<u64>,
+    statement_cap: Option<u32>,
+}
+
+impl PartialQueryBudgetClass {
+    fn merged(self, defaults: QueryBudgetClassConfig) -> QueryBudgetClassConfig {
+        QueryBudgetClassConfig {
+            deadline_seconds: self.deadline_seconds.unwrap_or(defaults.deadline_seconds),
+            memory_bytes: self.memory_bytes.unwrap_or(defaults.memory_bytes),
+            spill_bytes: self.spill_bytes.unwrap_or(defaults.spill_bytes),
+            read_rows: self.read_rows.unwrap_or(defaults.read_rows),
+            read_bytes: self.read_bytes.unwrap_or(defaults.read_bytes),
+            statement_cap: self.statement_cap.unwrap_or(defaults.statement_cap),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for QueryBudgetsConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Default, Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        struct PartialQueryBudgets {
+            interactive: PartialQueryBudgetClass,
+            background: PartialQueryBudgetClass,
+            migration: PartialQueryBudgetClass,
+            administrative: PartialQueryBudgetClass,
+            export: PartialQueryBudgetClass,
+        }
+
+        let partial = PartialQueryBudgets::deserialize(deserializer)?;
+        Ok(Self {
+            interactive: partial.interactive.merged(DEFAULT_INTERACTIVE_QUERY_BUDGET),
+            background: partial.background.merged(DEFAULT_BACKGROUND_QUERY_BUDGET),
+            migration: partial.migration.merged(DEFAULT_MIGRATION_QUERY_BUDGET),
+            administrative: partial
+                .administrative
+                .merged(DEFAULT_ADMINISTRATIVE_QUERY_BUDGET),
+            export: partial.export.merged(DEFAULT_EXPORT_QUERY_BUDGET),
+        })
+    }
+}
+
+/// Typed rejection from [`ValidatedQueryBudgets`] construction. Every
+/// variant names the offending `query_budgets.<class>.<field>`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum QueryBudgetsValidationError {
+    DeadlineNotFinite {
+        class: &'static str,
+    },
+    DeadlineNotPositive {
+        class: &'static str,
+        value: f64,
+    },
+    DeadlineAboveMax {
+        class: &'static str,
+        value: f64,
+    },
+    MemoryZero {
+        class: &'static str,
+    },
+    MemoryAboveBackstop {
+        class: &'static str,
+        value: u64,
+        backstop: u64,
+    },
+    SpillZero {
+        class: &'static str,
+    },
+    ReadRowsZero {
+        class: &'static str,
+    },
+    ReadBytesZero {
+        class: &'static str,
+    },
+    StatementCapZero {
+        class: &'static str,
+    },
+}
+
+impl fmt::Display for QueryBudgetsValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeadlineNotFinite { class } => write!(
+                formatter,
+                "query_budgets.{class}.deadline_seconds must be a finite number of seconds"
+            ),
+            Self::DeadlineNotPositive { class, value } => write!(
+                formatter,
+                "query_budgets.{class}.deadline_seconds must be greater than zero (got {value})"
+            ),
+            Self::DeadlineAboveMax { class, value } => write!(
+                formatter,
+                "query_budgets.{class}.deadline_seconds must be at most {QUERY_DEADLINE_MAX_SECONDS} (24h); got {value}"
+            ),
+            Self::MemoryZero { class } => write!(
+                formatter,
+                "query_budgets.{class}.memory_bytes must be at least 1; zero would disable the per-query memory ceiling"
+            ),
+            Self::MemoryAboveBackstop {
+                class,
+                value,
+                backstop,
+            } => write!(
+                formatter,
+                "query_budgets.{class}.memory_bytes ({value}) exceeds the per-query server memory backstop ({backstop} bytes)"
+            ),
+            Self::SpillZero { class } => write!(
+                formatter,
+                "query_budgets.{class}.spill_bytes must be at least 1; zero would disable sort/group-by spill"
+            ),
+            Self::ReadRowsZero { class } => write!(
+                formatter,
+                "query_budgets.{class}.read_rows must be at least 1"
+            ),
+            Self::ReadBytesZero { class } => write!(
+                formatter,
+                "query_budgets.{class}.read_bytes must be at least 1"
+            ),
+            Self::StatementCapZero { class } => write!(
+                formatter,
+                "query_budgets.{class}.statement_cap must be at least 1"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for QueryBudgetsValidationError {}
+
+/// A query budget that passed fail-closed validation. Fields are private so
+/// an invalid budget (zero, non-finite, above the backstop) is
+/// unrepresentable once constructed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ValidatedQueryBudget {
+    deadline_seconds: f64,
+    memory_bytes: u64,
+    spill_bytes: u64,
+    read_rows: u64,
+    read_bytes: u64,
+    statement_cap: u32,
+}
+
+impl ValidatedQueryBudget {
+    fn from_class_config(
+        class: &'static str,
+        cfg: &QueryBudgetClassConfig,
+        memory_backstop_bytes: u64,
+    ) -> std::result::Result<Self, QueryBudgetsValidationError> {
+        if !cfg.deadline_seconds.is_finite() {
+            return Err(QueryBudgetsValidationError::DeadlineNotFinite { class });
+        }
+        if cfg.deadline_seconds <= 0.0 {
+            return Err(QueryBudgetsValidationError::DeadlineNotPositive {
+                class,
+                value: cfg.deadline_seconds,
+            });
+        }
+        if cfg.deadline_seconds > QUERY_DEADLINE_MAX_SECONDS {
+            return Err(QueryBudgetsValidationError::DeadlineAboveMax {
+                class,
+                value: cfg.deadline_seconds,
+            });
+        }
+        if cfg.memory_bytes == 0 {
+            return Err(QueryBudgetsValidationError::MemoryZero { class });
+        }
+        if cfg.memory_bytes > memory_backstop_bytes {
+            return Err(QueryBudgetsValidationError::MemoryAboveBackstop {
+                class,
+                value: cfg.memory_bytes,
+                backstop: memory_backstop_bytes,
+            });
+        }
+        if cfg.spill_bytes == 0 {
+            return Err(QueryBudgetsValidationError::SpillZero { class });
+        }
+        if cfg.read_rows == 0 {
+            return Err(QueryBudgetsValidationError::ReadRowsZero { class });
+        }
+        if cfg.read_bytes == 0 {
+            return Err(QueryBudgetsValidationError::ReadBytesZero { class });
+        }
+        if cfg.statement_cap == 0 {
+            return Err(QueryBudgetsValidationError::StatementCapZero { class });
+        }
+        Ok(Self {
+            deadline_seconds: cfg.deadline_seconds,
+            memory_bytes: cfg.memory_bytes,
+            spill_bytes: cfg.spill_bytes,
+            read_rows: cfg.read_rows,
+            read_bytes: cfg.read_bytes,
+            statement_cap: cfg.statement_cap,
+        })
+    }
+
+    pub fn deadline_seconds(&self) -> f64 {
+        self.deadline_seconds
+    }
+
+    /// Validated finite and positive, so the conversion cannot panic.
+    pub fn deadline(&self) -> std::time::Duration {
+        std::time::Duration::from_secs_f64(self.deadline_seconds)
+    }
+
+    pub fn memory_bytes(&self) -> u64 {
+        self.memory_bytes
+    }
+
+    pub fn spill_bytes(&self) -> u64 {
+        self.spill_bytes
+    }
+
+    pub fn read_rows(&self) -> u64 {
+        self.read_rows
+    }
+
+    pub fn read_bytes(&self) -> u64 {
+        self.read_bytes
+    }
+
+    pub fn statement_cap(&self) -> u32 {
+        self.statement_cap
+    }
+}
+
+/// The validated product of `[query_budgets]`: the only type query envelopes
+/// accept (amendment A9), so ad-hoc unlimited budgets cannot be constructed
+/// in code either. `load_config` performs this validation, making a config
+/// with any unbounded budget a load error.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ValidatedQueryBudgets {
+    pub interactive: ValidatedQueryBudget,
+    pub background: ValidatedQueryBudget,
+    pub migration: ValidatedQueryBudget,
+    pub administrative: ValidatedQueryBudget,
+    pub export: ValidatedQueryBudget,
+}
+
+impl ValidatedQueryBudgets {
+    /// Validates against the shipped managed-install backstop
+    /// [`QUERY_MEMORY_BACKSTOP_BYTES`].
+    pub fn from_config(
+        cfg: &QueryBudgetsConfig,
+    ) -> std::result::Result<Self, QueryBudgetsValidationError> {
+        Self::with_memory_backstop(cfg, QUERY_MEMORY_BACKSTOP_BYTES)
+    }
+
+    /// Validates against an explicit per-query server memory backstop, for
+    /// deployments whose ClickHouse profile differs from the managed one.
+    pub fn with_memory_backstop(
+        cfg: &QueryBudgetsConfig,
+        memory_backstop_bytes: u64,
+    ) -> std::result::Result<Self, QueryBudgetsValidationError> {
+        Ok(Self {
+            interactive: ValidatedQueryBudget::from_class_config(
+                "interactive",
+                &cfg.interactive,
+                memory_backstop_bytes,
+            )?,
+            background: ValidatedQueryBudget::from_class_config(
+                "background",
+                &cfg.background,
+                memory_backstop_bytes,
+            )?,
+            migration: ValidatedQueryBudget::from_class_config(
+                "migration",
+                &cfg.migration,
+                memory_backstop_bytes,
+            )?,
+            administrative: ValidatedQueryBudget::from_class_config(
+                "administrative",
+                &cfg.administrative,
+                memory_backstop_bytes,
+            )?,
+            export: ValidatedQueryBudget::from_class_config(
+                "export",
+                &cfg.export,
+                memory_backstop_bytes,
+            )?,
+        })
+    }
+}
+
 const REDACTED_AUTH_TOKEN: &str = "[REDACTED]";
 
 #[derive(Clone, Deserialize)]
@@ -407,6 +817,8 @@ pub struct AppConfig {
     pub backend: BackendConfig,
     #[serde(default)]
     pub bm25: Bm25Config,
+    #[serde(default)]
+    pub query_budgets: QueryBudgetsConfig,
     #[serde(default)]
     pub monitor: MonitorConfig,
     #[serde(default)]
@@ -514,6 +926,7 @@ impl Default for AppConfig {
             mcp: McpConfig::default(),
             backend: BackendConfig::default(),
             bm25: Bm25Config::default(),
+            query_budgets: QueryBudgetsConfig::default(),
             monitor: MonitorConfig::default(),
             runtime: RuntimeConfig::default(),
         }
@@ -1460,6 +1873,11 @@ fn normalize_config(mut cfg: AppConfig) -> Result<AppConfig> {
             "mcp.max_parallel_requests must be greater than zero when configured"
         ));
     }
+
+    // Fail closed at load time: a config carrying any unbounded query budget
+    // never produces a usable AppConfig (issue #600 exit gate 7).
+    ValidatedQueryBudgets::from_config(&cfg.query_budgets)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
 
     for (exclude_idx, pattern) in cfg.ingest.exclude_project_dirs.iter_mut().enumerate() {
         *pattern = expand_path(pattern.trim());
@@ -4226,5 +4644,211 @@ watch_root = "~/.pi/agent/sessions"
             .expect("pi source");
         assert_eq!(source.format, SourceFormat::Jsonl);
         assert_eq!(source.tracked_extension(), "jsonl");
+    }
+
+    #[test]
+    fn query_budgets_absent_section_yields_documented_defaults() {
+        let path = write_temp_config("[identity]\nauthor = \"\"\n", "query-budgets-absent");
+        let cfg = load_config(&path).expect("config without [query_budgets] should load");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(cfg.query_budgets, QueryBudgetsConfig::default());
+
+        let validated = ValidatedQueryBudgets::from_config(&cfg.query_budgets)
+            .expect("default budgets must validate");
+        assert_eq!(validated.interactive.deadline_seconds(), 15.0);
+        assert_eq!(
+            validated.interactive.deadline(),
+            std::time::Duration::from_secs(15)
+        );
+        assert_eq!(validated.interactive.statement_cap(), 256);
+        assert_eq!(validated.background.deadline_seconds(), 600.0);
+        assert_eq!(validated.migration.memory_bytes(), 4 * BYTES_PER_GIB);
+        assert_eq!(validated.administrative.deadline_seconds(), 5.0);
+        assert_eq!(validated.administrative.statement_cap(), 4);
+        assert_eq!(validated.export.deadline_seconds(), 600.0);
+    }
+
+    #[test]
+    fn query_budgets_partial_table_overrides_only_named_fields() {
+        let path = write_temp_config(
+            r#"
+[query_budgets.interactive]
+deadline_seconds = 30.0
+
+[query_budgets.background]
+statement_cap = 64
+"#,
+            "query-budgets-partial",
+        );
+        let cfg = load_config(&path).expect("partial [query_budgets] should load");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(cfg.query_budgets.interactive.deadline_seconds, 30.0);
+        assert_eq!(cfg.query_budgets.interactive.statement_cap, 256);
+        assert_eq!(cfg.query_budgets.interactive.memory_bytes, BYTES_PER_GIB);
+        assert_eq!(cfg.query_budgets.background.statement_cap, 64);
+        assert_eq!(cfg.query_budgets.background.deadline_seconds, 600.0);
+        assert_eq!(
+            cfg.query_budgets.migration,
+            QueryBudgetsConfig::default().migration
+        );
+        assert_eq!(
+            cfg.query_budgets.export,
+            QueryBudgetsConfig::default().export
+        );
+    }
+
+    #[test]
+    fn query_budgets_zero_values_fail_config_load() {
+        for (label, contents, expected) in [
+            (
+                "cap",
+                "[query_budgets.interactive]\nstatement_cap = 0\n",
+                "query_budgets.interactive.statement_cap",
+            ),
+            (
+                "memory",
+                "[query_budgets.background]\nmemory_bytes = 0\n",
+                "query_budgets.background.memory_bytes",
+            ),
+            (
+                "spill",
+                "[query_budgets.migration]\nspill_bytes = 0\n",
+                "query_budgets.migration.spill_bytes",
+            ),
+            (
+                "rows",
+                "[query_budgets.export]\nread_rows = 0\n",
+                "query_budgets.export.read_rows",
+            ),
+            (
+                "bytes",
+                "[query_budgets.administrative]\nread_bytes = 0\n",
+                "query_budgets.administrative.read_bytes",
+            ),
+            (
+                "deadline",
+                "[query_budgets.interactive]\ndeadline_seconds = 0.0\n",
+                "query_budgets.interactive.deadline_seconds",
+            ),
+        ] {
+            let path = write_temp_config(contents, &format!("query-budgets-zero-{label}"));
+            let error = load_config(&path).expect_err("zero budget must fail closed");
+            std::fs::remove_file(&path).ok();
+            assert!(
+                error.to_string().contains(expected),
+                "case `{label}`: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_budgets_negative_and_unknown_inputs_fail_config_load() {
+        for (label, contents) in [
+            (
+                "negative-rows",
+                "[query_budgets.interactive]\nread_rows = -1\n",
+            ),
+            (
+                "unknown-field",
+                "[query_budgets.interactive]\ndeadline = 5.0\n",
+            ),
+            ("unknown-class", "[query_budgets.turbo]\nread_rows = 1\n"),
+        ] {
+            let path = write_temp_config(contents, &format!("query-budgets-reject-{label}"));
+            let error = load_config(&path).expect_err("malformed budget must fail closed");
+            std::fs::remove_file(&path).ok();
+            assert!(!error.to_string().is_empty(), "case `{label}`");
+        }
+    }
+
+    #[test]
+    fn query_budget_validation_deadline_edges() {
+        let mut cfg = QueryBudgetsConfig::default();
+
+        cfg.interactive.deadline_seconds = -1.0;
+        assert_eq!(
+            ValidatedQueryBudgets::from_config(&cfg),
+            Err(QueryBudgetsValidationError::DeadlineNotPositive {
+                class: "interactive",
+                value: -1.0,
+            })
+        );
+
+        cfg.interactive.deadline_seconds = f64::NAN;
+        assert!(matches!(
+            ValidatedQueryBudgets::from_config(&cfg),
+            Err(QueryBudgetsValidationError::DeadlineNotFinite {
+                class: "interactive"
+            })
+        ));
+
+        cfg.interactive.deadline_seconds = f64::INFINITY;
+        assert_eq!(
+            ValidatedQueryBudgets::from_config(&cfg),
+            Err(QueryBudgetsValidationError::DeadlineNotFinite {
+                class: "interactive"
+            })
+        );
+
+        cfg.interactive.deadline_seconds = QUERY_DEADLINE_MAX_SECONDS + 0.1;
+        assert_eq!(
+            ValidatedQueryBudgets::from_config(&cfg),
+            Err(QueryBudgetsValidationError::DeadlineAboveMax {
+                class: "interactive",
+                value: QUERY_DEADLINE_MAX_SECONDS + 0.1,
+            })
+        );
+
+        // Boundary acceptance: exactly 24h and exactly one statement.
+        cfg.interactive.deadline_seconds = QUERY_DEADLINE_MAX_SECONDS;
+        cfg.interactive.statement_cap = 1;
+        ValidatedQueryBudgets::from_config(&cfg).expect("24h deadline and cap 1 are valid");
+    }
+
+    #[test]
+    fn query_budget_validation_enforces_memory_backstop() {
+        let mut cfg = QueryBudgetsConfig::default();
+
+        // The migration default sits exactly at the shipped backstop.
+        cfg.migration.memory_bytes = QUERY_MEMORY_BACKSTOP_BYTES;
+        ValidatedQueryBudgets::from_config(&cfg).expect("backstop-equal memory is valid");
+
+        cfg.migration.memory_bytes = QUERY_MEMORY_BACKSTOP_BYTES + 1;
+        assert_eq!(
+            ValidatedQueryBudgets::from_config(&cfg),
+            Err(QueryBudgetsValidationError::MemoryAboveBackstop {
+                class: "migration",
+                value: QUERY_MEMORY_BACKSTOP_BYTES + 1,
+                backstop: QUERY_MEMORY_BACKSTOP_BYTES,
+            })
+        );
+
+        // A stricter deployment backstop rejects the shipped defaults too.
+        assert_eq!(
+            ValidatedQueryBudgets::with_memory_backstop(
+                &QueryBudgetsConfig::default(),
+                512 * BYTES_PER_MIB,
+            ),
+            Err(QueryBudgetsValidationError::MemoryAboveBackstop {
+                class: "interactive",
+                value: BYTES_PER_GIB,
+                backstop: 512 * BYTES_PER_MIB,
+            })
+        );
+    }
+
+    #[test]
+    fn shipped_template_query_budgets_match_code_defaults() {
+        let path = write_temp_config(
+            include_str!("../../../config/moraine.toml"),
+            "shipped-template-query-budgets",
+        );
+        let cfg = load_config(&path).expect("shipped template must parse");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            cfg.query_budgets,
+            QueryBudgetsConfig::default(),
+            "template [query_budgets] values must not drift from code defaults"
+        );
     }
 }

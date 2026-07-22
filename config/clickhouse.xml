@@ -24,7 +24,12 @@
   <concurrent_threads_soft_limit_num>0</concurrent_threads_soft_limit_num>
   <concurrent_threads_soft_limit_ratio_to_cores>1</concurrent_threads_soft_limit_ratio_to_cores>
   <concurrent_threads_scheduler>fair_round_robin</concurrent_threads_scheduler>
-  <max_concurrent_queries>500</max_concurrent_queries>
+  <max_concurrent_queries>64</max_concurrent_queries>
+  <!-- Aggregate server ceiling pinned explicitly. Keep at 0.9: background
+       merges can legitimately demand most of it (a single merge has needed
+       13.69 GiB against a 14.4 GiB cap); per-query limits in users.xml and
+       Moraine's query envelope keep reads from occupying merge headroom. -->
+  <max_server_memory_usage_to_ram_ratio>0.9</max_server_memory_usage_to_ram_ratio>
   <max_thread_pool_free_size>64</max_thread_pool_free_size>
   <uncompressed_cache_size>536870912</uncompressed_cache_size>
   <mark_cache_size>536870912</mark_cache_size>
