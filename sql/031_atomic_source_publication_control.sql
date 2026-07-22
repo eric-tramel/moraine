@@ -33,7 +33,6 @@ CREATE TABLE IF NOT EXISTS moraine.ingest_checkpoint_transitions (
   checkpoint_revision UInt64,
   operation_id String,
   lifecycle LowCardinality(String),
-  protocol_version UInt16,
   scan_inode UInt64,
   scan_boundary UInt64,
   policy_fingerprint String,
@@ -60,7 +59,6 @@ CREATE TABLE IF NOT EXISTS moraine.source_generation_publication_readiness (
   block_reason String,
   compatibility_prepared UInt8,
   backend_caught_up UInt8,
-  manifest_digest String,
   updated_at DateTime64(3) DEFAULT now64(3)
 )
 ENGINE = ReplacingMergeTree(readiness_revision)
@@ -171,17 +169,16 @@ SELECT
   tupleElement(checkpoint, 10) AS checkpoint_revision,
   tupleElement(checkpoint, 11) AS operation_id,
   tupleElement(checkpoint, 12) AS lifecycle,
-  tupleElement(checkpoint, 13) AS protocol_version,
-  tupleElement(checkpoint, 14) AS scan_inode,
-  tupleElement(checkpoint, 15) AS scan_boundary,
-  tupleElement(checkpoint, 16) AS policy_fingerprint,
-  tupleElement(checkpoint, 17) AS final_scan_complete,
-  tupleElement(checkpoint, 18) AS block_reason,
-  tupleElement(checkpoint, 19) AS compatibility_prepared,
-  tupleElement(checkpoint, 20) AS backend_caught_up,
-  tupleElement(checkpoint, 21) AS append_batch_id,
-  tupleElement(checkpoint, 22) AS cache_epoch,
-  tupleElement(checkpoint, 23) AS updated_at
+  tupleElement(checkpoint, 13) AS scan_inode,
+  tupleElement(checkpoint, 14) AS scan_boundary,
+  tupleElement(checkpoint, 15) AS policy_fingerprint,
+  tupleElement(checkpoint, 16) AS final_scan_complete,
+  tupleElement(checkpoint, 17) AS block_reason,
+  tupleElement(checkpoint, 18) AS compatibility_prepared,
+  tupleElement(checkpoint, 19) AS backend_caught_up,
+  tupleElement(checkpoint, 20) AS append_batch_id,
+  tupleElement(checkpoint, 21) AS cache_epoch,
+  tupleElement(checkpoint, 22) AS updated_at
 FROM
 (
   SELECT
@@ -202,7 +199,6 @@ FROM
         checkpoint_revision,
         operation_id,
         lifecycle,
-        protocol_version,
         scan_inode,
         scan_boundary,
         policy_fingerprint,
@@ -233,8 +229,7 @@ SELECT
   tupleElement(readiness, 5) AS block_reason,
   tupleElement(readiness, 6) AS compatibility_prepared,
   tupleElement(readiness, 7) AS backend_caught_up,
-  tupleElement(readiness, 8) AS manifest_digest,
-  tupleElement(readiness, 9) AS updated_at
+  tupleElement(readiness, 8) AS updated_at
 FROM
 (
   SELECT
@@ -251,7 +246,6 @@ FROM
         block_reason,
         compatibility_prepared,
         backend_caught_up,
-        manifest_digest,
         updated_at
       ),
       tuple(readiness_revision, operation_id)
@@ -323,7 +317,6 @@ SELECT
     legacy.host, legacy.source_name, legacy.source_file, legacy.source_generation
   ))) AS operation_id,
   if(legacy.latest_variants > 1, 'error', tupleElement(legacy.chosen, 4)) AS lifecycle,
-  toUInt16(0) AS protocol_version,
   tupleElement(legacy.chosen, 1) AS scan_inode,
   tupleElement(legacy.chosen, 2) AS scan_boundary,
   '' AS policy_fingerprint,
@@ -466,7 +459,7 @@ WHERE tuple(
 INSERT INTO moraine.source_generation_publication_readiness
   (source_host, source_name, source_file, source_generation, readiness_revision,
    checkpoint_revision, operation_id, complete, block_reason,
-   compatibility_prepared, backend_caught_up, manifest_digest, updated_at)
+   compatibility_prepared, backend_caught_up, updated_at)
 SELECT
   head.source_host,
   head.source_name,
@@ -481,7 +474,6 @@ SELECT
   '' AS block_reason,
   toUInt8(1) AS compatibility_prepared,
   toUInt8(1) AS backend_caught_up,
-  'legacy-migration-031' AS manifest_digest,
   checkpoint.updated_at
 FROM moraine.v_current_published_source_generations AS head
 INNER JOIN

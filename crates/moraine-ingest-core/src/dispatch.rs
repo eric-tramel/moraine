@@ -202,7 +202,6 @@ fn work_item_is_ingestable(work: &WorkItem) -> bool {
 struct CoworkCompanionRecord {
     record: Value,
     source_file: String,
-    source_inode: u64,
 }
 
 fn load_cowork_companion_record(work: &WorkItem) -> Option<CoworkCompanionRecord> {
@@ -284,7 +283,6 @@ fn load_cowork_companion_record(work: &WorkItem) -> Option<CoworkCompanionRecord
     let source_file = metadata_path.to_string_lossy().to_string();
     Some(CoworkCompanionRecord {
         record: Value::Object(record),
-        source_inode: source_inode_for_file(&source_file, &metadata),
         source_file,
     })
 }
@@ -1266,9 +1264,9 @@ pub(crate) async fn process_file(
             &companion.record,
             &work.source_name,
             &work.harness,
-            &companion.source_file,
-            companion.source_inode,
-            1,
+            source_file,
+            inode,
+            checkpoint.source_generation,
             1,
             0,
             "",
@@ -3538,8 +3536,23 @@ mod tests {
                 .map(|row| row["event_uid"].as_str().expect("metadata event uid"))
                 .collect::<std::collections::HashSet<_>>()
                 .len(),
-            1,
-            "both nested transcripts reuse one companion metadata identity"
+            2,
+            "companion metadata is qualified by each published transcript source"
+        );
+        assert_eq!(
+            session_meta
+                .iter()
+                .map(|row| {
+                    row["source_file"]
+                        .as_str()
+                        .expect("metadata source file")
+                        .to_string()
+                })
+                .collect::<std::collections::BTreeSet<_>>(),
+            cowork_fixture_transcripts()
+                .iter()
+                .map(|path| path.to_string_lossy().to_string())
+                .collect(),
         );
         let payload: Value = serde_json::from_str(
             session_meta[0]["payload_json"]

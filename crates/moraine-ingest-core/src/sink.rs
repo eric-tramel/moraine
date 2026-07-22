@@ -2,7 +2,7 @@ use crate::checkpoint::merge_checkpoint;
 use crate::heartbeat::host_name;
 use crate::model::{Checkpoint, CheckpointLifecycle, RowBatch};
 use crate::publication::{
-    AppendManifest, CheckpointTransition, FinalizeReplayOutcome, PublicationActor,
+    AppendManifest, CheckpointTransition, FinalizeReplayOutcome, PublicationActor, SourceKey,
 };
 use crate::publication_identity::PublicationIdentity;
 use crate::redaction::{RedactionAudit, SecretRedactor};
@@ -188,6 +188,8 @@ struct PendingFlush {
     checkpoint_updates: HashMap<String, Checkpoint>,
     acknowledgements: PendingAckBatch,
     quarantined_generations: QuarantinedGenerations,
+    append_manifest: Option<AppendManifest>,
+    append_fence: Option<(String, u64)>,
 }
 
 impl PendingFlush {
@@ -211,7 +213,10 @@ impl PendingFlush {
     }
 
     fn has_data(&self) -> bool {
-        self.row_count() != 0 || !self.checkpoint_updates.is_empty()
+        self.row_count() != 0
+            || !self.checkpoint_updates.is_empty()
+            || self.append_manifest.is_some()
+            || self.append_fence.is_some()
     }
 }
 
@@ -537,21 +542,27 @@ pub(crate) fn spawn_sink_task(
             }
         };
         if default_publication_ready {
-            let repair_candidates = checkpoints
-                .read()
-                .await
-                .values()
-                .cloned()
-                .collect::<Vec<_>>();
-            if let Err(error) = publication_actor
-                .repair_ready_publications(repair_candidates)
-                .await
-            {
-                warn!("startup publication repair failed closed: {error}");
-                *metrics
-                    .last_error
-                    .lock()
-                    .expect("metrics last_error mutex poisoned") = error.to_string();
+            loop {
+                let repair_candidates = checkpoints
+                    .read()
+                    .await
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                match publication_actor
+                    .repair_ready_publications(repair_candidates)
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(error) => {
+                        warn!("startup publication repair failed closed; retrying: {error}");
+                        *metrics
+                            .last_error
+                            .lock()
+                            .expect("metrics last_error mutex poisoned") = error.to_string();
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
             }
         }
 
@@ -1789,6 +1800,8 @@ async fn flush_pending_inner(
         checkpoint_updates,
         acknowledgements: pending_ack,
         quarantined_generations,
+        append_manifest: pending_append_manifest,
+        append_fence: pending_append_fence,
     } = pending;
     let started = Instant::now();
 
@@ -1827,17 +1840,21 @@ async fn flush_pending_inner(
         );
     }
 
-    let mut append_manifest = AppendManifest::from_pending(
-        checkpoint_host,
-        raw_rows,
-        event_rows,
-        link_rows,
-        tool_rows,
-        error_rows,
-        checkpoint_updates.values().cloned(),
-    );
-    let mut append_fence = None;
-    let projection_all_sources = publication.is_none() || checkpoint_updates.is_empty();
+    if pending_append_manifest.is_none() {
+        *pending_append_manifest = Some(AppendManifest::from_pending(
+            checkpoint_host,
+            raw_rows,
+            event_rows,
+            link_rows,
+            tool_rows,
+            error_rows,
+            checkpoint_updates.values().cloned(),
+        ));
+    }
+    let append_manifest = pending_append_manifest
+        .as_mut()
+        .expect("pending append manifest was initialized");
+    let projection_all_sources = publication.is_none();
     let mut live_projection_sources = BTreeSet::<(String, String, String, u32)>::new();
     if let Some(publication) = publication {
         let mut has_live_append = false;
@@ -1897,26 +1914,74 @@ async fn flush_pending_inner(
             }
             has_live_append |= active && published;
         }
-        if has_live_append {
-            if let Err(error) = publication.prove_insert_only(&mut append_manifest).await {
-                // Classification is an optimization only. Query failure is
-                // fail-closed to the backend-wide hard fence, not data loss.
-                append_manifest.insert_only = false;
-                warn!("append insert-only preflight failed; using hard fence: {error}");
+        let event_sources = event_rows
+            .iter()
+            .filter_map(|row| {
+                Some((
+                    row.get("source_host")?.as_str()?.to_string(),
+                    row.get("source_name")?.as_str()?.to_string(),
+                    row.get("source_file")?.as_str()?.to_string(),
+                    u32::try_from(row.get("source_generation")?.as_u64()?).ok()?,
+                ))
+            })
+            .collect::<BTreeSet<_>>();
+        for (source_host, source_name, source_file, source_generation) in event_sources {
+            let source_tuple = (
+                source_host.clone(),
+                source_name.clone(),
+                source_file.clone(),
+                source_generation,
+            );
+            if live_projection_sources.contains(&source_tuple) {
+                continue;
             }
-            append_fence = match publication.begin_append(&append_manifest).await {
-                Ok(fence) => fence,
+            let source = SourceKey {
+                source_host,
+                source_name,
+                source_file,
+            };
+            match publication
+                .has_published_generation(&source, source_generation)
+                .await
+            {
+                Ok(true) => {
+                    live_projection_sources.insert(source_tuple);
+                    has_live_append = true;
+                }
+                Ok(false) => {}
                 Err(error) => {
                     metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
                     *metrics
                         .last_error
                         .lock()
                         .expect("metrics last_error mutex poisoned") = error.to_string();
-                    warn!("failed to establish append cache fence: {error}");
+                    warn!("failed to inspect event source head before flush: {error}");
                     return false;
                 }
-            };
-            if let Some((batch_id, cache_epoch)) = append_fence.as_ref() {
+            }
+        }
+        if has_live_append {
+            if let Err(error) = publication.prove_insert_only(append_manifest).await {
+                // Classification is an optimization only. Query failure is
+                // fail-closed to the backend-wide hard fence, not data loss.
+                append_manifest.insert_only = false;
+                warn!("append insert-only preflight failed; using hard fence: {error}");
+            }
+            if pending_append_fence.is_none() {
+                *pending_append_fence = match publication.begin_append(append_manifest).await {
+                    Ok(fence) => fence,
+                    Err(error) => {
+                        metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
+                        *metrics
+                            .last_error
+                            .lock()
+                            .expect("metrics last_error mutex poisoned") = error.to_string();
+                        warn!("failed to establish append cache fence: {error}");
+                        return false;
+                    }
+                };
+            }
+            if let Some((batch_id, cache_epoch)) = pending_append_fence.as_ref() {
                 let Some(target_epoch) = cache_epoch.checked_add(1) else {
                     metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
                     *metrics
@@ -2121,10 +2186,12 @@ async fn flush_pending_inner(
             .map_err(|error| SinkFlushFailure::new(SinkStage::IngestCheckpoints, error))?;
         }
 
-        if let (Some(publication), Some((batch_id, _))) = (publication, append_fence.as_ref()) {
+        if let (Some(publication), Some((batch_id, _))) =
+            (publication, pending_append_fence.as_ref())
+        {
             if quarantined.rows > 0 || blocks_pending_generation {
                 publication
-                    .block_append(batch_id, &append_manifest)
+                    .block_append(batch_id, append_manifest)
                     .await
                     .map_err(|error| SinkFlushFailure::new(SinkStage::AppendControl, error))?;
             } else {
@@ -2147,6 +2214,8 @@ async fn flush_pending_inner(
         Ok(()) => {
             ack_observer.observe(&pending_ack.event_identity_digests);
             pending_ack.clear();
+            *pending_append_manifest = None;
+            *pending_append_fence = None;
             true
         }
         Err(failure) => {
@@ -2239,9 +2308,9 @@ async fn flush_pending_inner(
                     return false;
                 }
                 if let (Some(publication), Some((batch_id, _))) =
-                    (publication, append_fence.as_ref())
+                    (publication, pending_append_fence.as_ref())
                 {
-                    if let Err(error) = publication.block_append(batch_id, &append_manifest).await {
+                    if let Err(error) = publication.block_append(batch_id, append_manifest).await {
                         warn!("failed to block append fence after non-retryable sink failure: {error}");
                         return false;
                     }
@@ -2258,6 +2327,8 @@ async fn flush_pending_inner(
                     checkpoint_updates,
                 );
                 pending_ack.clear();
+                *pending_append_manifest = None;
+                *pending_append_fence = None;
                 return true;
             }
 

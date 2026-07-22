@@ -70,15 +70,6 @@ CREATE TABLE IF NOT EXISTS moraine.mcp_open_generation_readiness (
   affected_session_count UInt64,
   prepared_session_count UInt64,
   tombstone_count UInt64,
-  required_source_heads Array(Tuple(
-    source_host String,
-    source_name String,
-    source_file String,
-    source_generation UInt32,
-    publication_revision UInt64
-  )),
-  required_heads_fingerprint String,
-  candidate_digest String,
   ready UInt8,
   block_reason String,
   prepared_at DateTime64(3) DEFAULT now64(3)
@@ -108,12 +99,9 @@ SELECT
   tupleElement(readiness, 3) AS affected_session_count,
   tupleElement(readiness, 4) AS prepared_session_count,
   tupleElement(readiness, 5) AS tombstone_count,
-  tupleElement(readiness, 6) AS required_source_heads,
-  tupleElement(readiness, 7) AS required_heads_fingerprint,
-  tupleElement(readiness, 8) AS candidate_digest,
-  tupleElement(readiness, 9) AS ready,
-  tupleElement(readiness, 10) AS block_reason,
-  tupleElement(readiness, 11) AS prepared_at
+  tupleElement(readiness, 6) AS ready,
+  tupleElement(readiness, 7) AS block_reason,
+  tupleElement(readiness, 8) AS prepared_at
 FROM
 (
   SELECT
@@ -129,9 +117,6 @@ FROM
         affected_session_count,
         prepared_session_count,
         tombstone_count,
-        required_source_heads,
-        required_heads_fingerprint,
-        candidate_digest,
         ready,
         block_reason,
         prepared_at

@@ -444,7 +444,7 @@ fn build_events_query(
                  source_line_no DESC,
                  event_uid DESC
       ) AS event_uid_rank
-    FROM {database}.events AS e FINAL
+    FROM {database}.v_live_events AS e
   )
   WHERE event_uid_rank = 1
 ),
@@ -891,7 +891,7 @@ mod tests {
         let sql = build_events_query("moraine", &columns, &filters, Some(100)).expect("sql");
 
         assert!(sql.contains("row_number() OVER (\n        PARTITION BY event_uid"));
-        assert!(sql.contains("FROM `moraine`.events AS e FINAL"));
+        assert!(sql.contains("FROM `moraine`.v_live_events AS e"));
         assert!(sql.contains("FROM trace_events AS e\nWHERE"));
         assert!(sql.contains("(e.`harness` = 'codex' OR e.`harness` = 'hermes')"));
         assert!(sql.contains("(e.`cwd` = '/repo' OR startsWith(e.`cwd`, concat('/repo', '/')))"));

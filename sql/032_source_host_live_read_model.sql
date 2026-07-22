@@ -511,19 +511,15 @@ LEFT ANTI JOIN
 
 -- Existing posting rows already carry the document's session, source name,
 -- source ref, generation-qualified event UID, and exact version.  Adding
--- source_host to their physical key supplies the missing cross-writer
--- discriminator; source_file and source_generation are descriptive payload
--- copied by the new MV, not authorization keys.  The live view below matches
--- every pre-existing identity field and projects the two new fields from the
--- authorized document so legacy default-filled rows keep their complete
--- public schema.  Do not regenerate the historical index here: that would
--- re-tokenize and rewrite every posting during startup, proportional to the
--- full corpus.
-
--- FINAL selects the latest document/tombstone version, which is live only
--- when it was derived from the exact canonical event revision.  A document
--- that merely shares the published generation is stale or orphaned and must
--- fail closed instead of contributing text or BM25 statistics.
+-- `FINAL` selects the latest document or empty-text tombstone for each
+-- generation-qualified event identity. The document's own source tuple is
+-- sufficient to authorize that identity against the central published head;
+-- no canonical-event rescan belongs on the ranking hot path.
+--
+-- Keep the explicit projection below because ClickHouse omits MATERIALIZED
+-- columns from `SELECT *` by default. Do not regenerate the historical index
+-- here: that would re-tokenize and rewrite every posting during startup,
+-- proportional to the full corpus.
 CREATE VIEW moraine.v_live_search_documents AS
 SELECT d.*
 FROM
@@ -563,14 +559,11 @@ FROM
     has_codex_mcp
   FROM moraine.search_documents FINAL
 ) AS d
-ALL INNER JOIN
-(
-  SELECT source_host, event_uid, event_version
-  FROM moraine.v_live_events
-) AS e
-  ON d.source_host = e.source_host
- AND d.event_uid = e.event_uid
- AND d.doc_version = e.event_version
+ALL INNER JOIN moraine.v_current_published_source_generations AS h
+  ON d.source_host = h.source_host
+ AND d.source_name = h.source_name
+ AND d.source_file = h.source_file
+ AND d.source_generation = h.source_generation
 WHERE d.doc_len > 0;
 
 CREATE VIEW moraine.v_live_search_postings AS

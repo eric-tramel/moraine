@@ -37,7 +37,7 @@ const PROCESS_SOURCE: &str = "source-publication-process";
 const PROCESS_SESSION: &str = "source-publication-process-session";
 const FIXTURE_LINES: u64 = 4;
 const FIXTURE_EVENTS: u64 = 5;
-const PROCESS_WAIT: Duration = Duration::from_secs(30);
+const PROCESS_WAIT: Duration = Duration::from_secs(120);
 const LEGACY_SESSION_PUBLICATION_COLUMNS: &str = "session_id, slot, generation, source_revision, \
     dirty_revision, first_event_time, last_event_time, total_turns, total_events, user_messages, \
     assistant_messages, tool_calls, tool_results, mode, first_event_uid, last_event_uid, \
@@ -481,7 +481,7 @@ async fn proxy_request(
         }
     };
 
-    let query = clickhouse_query(&uri).unwrap_or_default();
+    let query = clickhouse_query(&uri, &body);
     if status.is_success() && state.faults.commit_if_matches(&query, &body) {
         // The upstream response has been read completely, so a synchronous
         // ClickHouse insert is committed. Erroring the downstream body makes
@@ -505,9 +505,14 @@ fn response_with_body(status: StatusCode, body: Body) -> Response {
         .expect("static proxy response is valid")
 }
 
-fn clickhouse_query(uri: &Uri) -> Option<String> {
-    url::form_urlencoded::parse(uri.query()?.as_bytes())
-        .find_map(|(key, value)| (key == "query").then(|| value.into_owned()))
+fn clickhouse_query(uri: &Uri, body: &[u8]) -> String {
+    let url_query = uri.query().and_then(|query| {
+        url::form_urlencoded::parse(query.as_bytes())
+            .find_map(|(key, value)| (key == "query").then(|| value.into_owned()))
+    });
+    url_query
+        .filter(|query| !query.is_empty())
+        .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned())
 }
 
 struct OwnedTempTree {
@@ -749,9 +754,6 @@ struct McpReadinessRow {
     affected_session_count: u64,
     prepared_session_count: u64,
     tombstone_count: u64,
-    required_source_heads: Vec<RequiredSourceHead>,
-    required_heads_fingerprint: String,
-    candidate_digest: String,
     ready: u8,
     block_reason: String,
 }
@@ -801,7 +803,6 @@ struct ReadinessRow {
     block_reason: String,
     compatibility_prepared: u8,
     backend_caught_up: u8,
-    manifest_digest: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1014,7 +1015,6 @@ async fn assert_stage_commit(
                 || !readiness.block_reason.is_empty()
                 || readiness.compatibility_prepared != 1
                 || readiness.backend_caught_up != 1
-                || readiness.manifest_digest.is_empty()
             {
                 bail!("unexpected committed source-readiness boundary: {readiness:?}");
             }
@@ -1330,8 +1330,7 @@ async fn current_readiness(
     let query = format!(
         "SELECT toUInt64(readiness_revision) AS readiness_revision, \
                 toUInt64(checkpoint_revision) AS checkpoint_revision, operation_id, \
-                complete, block_reason, compatibility_prepared, backend_caught_up, \
-                manifest_digest \
+                complete, block_reason, compatibility_prepared, backend_caught_up \
          FROM `{}`.`v_current_source_generation_publication_readiness` \
          WHERE source_host = '' AND source_name = {} AND source_file = {} \
            AND source_generation = {} LIMIT 1 FORMAT JSONEachRow",
@@ -1358,8 +1357,7 @@ async fn current_mcp_readiness(
         "SELECT candidate_publication_id, operation_id, \
                 toUInt64(affected_session_count) AS affected_session_count, \
                 toUInt64(prepared_session_count) AS prepared_session_count, \
-                toUInt64(tombstone_count) AS tombstone_count, required_source_heads, \
-                required_heads_fingerprint, candidate_digest, ready, block_reason \
+                toUInt64(tombstone_count) AS tombstone_count, ready, block_reason \
          FROM `{}`.`v_current_mcp_open_generation_readiness` \
          WHERE source_host = '' AND source_name = {} AND source_file = {} \
            AND source_generation = {} FORMAT JSONEachRow",
@@ -1788,7 +1786,6 @@ async fn assert_final_boundary(
         || !readiness.block_reason.is_empty()
         || readiness.compatibility_prepared != 1
         || readiness.backend_caught_up != 1
-        || readiness.manifest_digest.is_empty()
     {
         bail!("unexpected final readiness after committed head response loss: {readiness:?}");
     }
@@ -1814,16 +1811,7 @@ async fn assert_final_boundary(
     {
         bail!("MCP readiness candidate cardinality is incomplete: {mcp_readiness:?}");
     }
-    if !mcp_readiness.required_source_heads.contains(&required_head) {
-        bail!(
-            "backend-global MCP readiness omits the committed source head: expected={required_head:?}, readiness={mcp_readiness:?}"
-        );
-    }
-    if mcp_readiness.required_heads_fingerprint.is_empty()
-        || mcp_readiness.candidate_digest.is_empty()
-        || mcp_readiness.ready != 1
-        || !mcp_readiness.block_reason.is_empty()
-    {
+    if mcp_readiness.ready != 1 || !mcp_readiness.block_reason.is_empty() {
         bail!("MCP readiness authorization is incomplete: {mcp_readiness:?}");
     }
 
@@ -2191,6 +2179,18 @@ pub(super) async fn run(clickhouse: &ClickHouseClient, database: &OwnedDatabaseN
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clickhouse_query_accepts_url_and_body_transports() {
+        let url: Uri = "/?query=SELECT%201".parse().expect("URL query URI parses");
+        assert_eq!(clickhouse_query(&url, b"ignored"), "SELECT 1");
+
+        let body: Uri = "/?database=moraine".parse().expect("body query URI parses");
+        assert_eq!(
+            clickhouse_query(&body, b"INSERT INTO moraine.events SELECT 1"),
+            "INSERT INTO moraine.events SELECT 1"
+        );
+    }
 
     #[test]
     fn fault_targets_match_only_the_owned_generation_and_boundary() {

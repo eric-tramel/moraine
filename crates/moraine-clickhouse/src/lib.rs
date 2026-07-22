@@ -12,7 +12,7 @@ use std::io::Write;
 
 mod mcp_open_projection;
 pub use mcp_open_projection::{
-    McpOpenGenerationReadiness, McpOpenPublicationRequest, McpOpenSourceHead,
+    McpOpenGenerationReadiness, McpOpenHostRevision, McpOpenPublicationRequest, McpOpenSourceHead,
 };
 pub mod mcp_tool_names;
 
@@ -786,6 +786,7 @@ impl ClickHouseClient {
             "mcp_open_projection_state",
             "mcp_open_publication_headers",
             "mcp_open_generation_readiness",
+            "mcp_open_backfill_plans",
             "published_source_generations",
             "ingest_checkpoint_transitions",
             "source_generation_publication_readiness",
@@ -1089,6 +1090,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             version: "034",
             name: "034_batched_mcp_open_backfill.sql",
             sql: include_str!("../../../sql/034_batched_mcp_open_backfill.sql"),
+        },
+        Migration {
+            version: "035",
+            name: "035_mcp_list_metadata_projection.sql",
+            sql: include_str!("../../../sql/035_mcp_list_metadata_projection.sql"),
         },
     ]
 }
@@ -2158,11 +2164,14 @@ mod tests {
                     .map(|(view, _)| view)
             })
             .expect("032 must define a bounded live search-document view");
-        assert!(live_documents_view.contains("FROM moraine.v_live_events"));
+        assert!(live_documents_view.contains("FROM moraine.search_documents FINAL"));
+        assert!(live_documents_view
+            .contains("ALL INNER JOIN moraine.v_current_published_source_generations AS h"));
         for identity in [
-            "d.source_host = e.source_host",
-            "d.event_uid = e.event_uid",
-            "d.doc_version = e.event_version",
+            "d.source_host = h.source_host",
+            "d.source_name = h.source_name",
+            "d.source_file = h.source_file",
+            "d.source_generation = h.source_generation",
         ] {
             assert!(
                 live_documents_view.contains(identity),
@@ -2321,6 +2330,47 @@ mod tests {
             sql.find("VALUES ('global', 0, generateSnowflakeID(), '')")
                 < sql.find("TRUNCATE TABLE moraine.mcp_open_events;"),
             "034 must fence readers before discarding derived rows"
+        );
+    }
+
+    #[test]
+    fn migration_035_adds_list_metadata_and_rebuilds_only_the_derived_mcp_model() {
+        let migration = bundled_migrations()
+            .into_iter()
+            .find(|migration| migration.version == "035")
+            .expect("migration 035 must be registered");
+        let sql = migration.sql;
+
+        assert!(sql.contains("ADD COLUMN IF NOT EXISTS list_title String"));
+        assert!(sql.contains("ADD COLUMN IF NOT EXISTS list_session_summary String"));
+        for derived in [
+            "mcp_open_events",
+            "mcp_open_turns",
+            "mcp_open_sessions",
+            "mcp_open_publication_headers",
+            "mcp_open_generation_readiness",
+            "mcp_open_backfill_plans",
+        ] {
+            assert!(
+                sql.contains(&format!("TRUNCATE TABLE moraine.{derived};")),
+                "035 must reset derived relation {derived}"
+            );
+        }
+        for canonical in [
+            "events",
+            "raw_events",
+            "search_documents",
+            "search_postings",
+        ] {
+            assert!(
+                !sql.contains(&format!("TRUNCATE TABLE moraine.{canonical};")),
+                "035 must preserve canonical relation {canonical}"
+            );
+        }
+        assert!(
+            sql.find("VALUES ('global', 0, generateSnowflakeID(), '')")
+                < sql.find("TRUNCATE TABLE moraine.mcp_open_events;"),
+            "035 must fence readers before discarding derived rows"
         );
     }
 
