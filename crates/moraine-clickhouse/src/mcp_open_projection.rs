@@ -780,12 +780,10 @@ impl ClickHouseClient {
         // a batch much larger than an HTTP request target. Carry the SQL in
         // the POST body so backfill size is bounded by the payload limit, not
         // by URI parsing limits.
-        self.request_text_with_params_and_timeout(
+        self.mutation_request_text_with_params_and_timeout(
             "",
             Some(statement.into_bytes()),
             Some(&self.cfg.database),
-            false,
-            None,
             &[],
             Some(migration_request_timeout(self.cfg.timeout_seconds)),
         )
@@ -857,12 +855,10 @@ impl ClickHouseClient {
 
         for chunk in superseded.chunks(RECLAIM_DELETE_CHUNK) {
             for statement in superseded_snapshot_delete_statements(&self.cfg.database, chunk) {
-                self.request_text_with_params_and_timeout(
+                self.mutation_request_text_with_params_and_timeout(
                     "",
                     Some(statement.into_bytes()),
                     Some(&self.cfg.database),
-                    false,
-                    None,
                     &[],
                     Some(migration_request_timeout(self.cfg.timeout_seconds)),
                 )
@@ -923,8 +919,14 @@ impl ClickHouseClient {
             u8::from(ready),
             escape_literal(cursor),
         );
-        self.request_text(&statement, None, Some(&self.cfg.database), false, None)
-            .await?;
+        self.mutation_request_text_with_params_and_timeout(
+            &statement,
+            None,
+            Some(&self.cfg.database),
+            &[],
+            None,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1312,8 +1314,14 @@ impl ClickHouseClient {
             publisher_id = escape_literal(publisher_id),
             operation_id = escape_literal(operation_id),
         );
-        self.request_text(&statement, None, Some(&self.cfg.database), false, None)
-            .await?;
+        self.mutation_request_text_with_params_and_timeout(
+            &statement,
+            None,
+            Some(&self.cfg.database),
+            &[],
+            None,
+        )
+        .await?;
         self.mcp_open_candidate_header(session_id, candidate_publication_id)
             .await?
             .context("MCP tombstone header was not durable after insert")
@@ -1348,16 +1356,28 @@ impl ClickHouseClient {
             ready = u8::from(ready),
             block_reason = escape_literal(block_reason),
         );
-        self.request_text(&statement, None, Some(&self.cfg.database), false, None)
-            .await?;
+        self.mutation_request_text_with_params_and_timeout(
+            &statement,
+            None,
+            Some(&self.cfg.database),
+            &[],
+            None,
+        )
+        .await?;
         Ok(())
     }
 
     async fn publish_legacy_candidate_heads(&self, candidate_publication_id: &str) -> Result<()> {
         let statement =
             publish_legacy_candidate_heads_sql(&self.cfg.database, candidate_publication_id, None);
-        self.request_text(&statement, None, Some(&self.cfg.database), false, None)
-            .await?;
+        self.mutation_request_text_with_params_and_timeout(
+            &statement,
+            None,
+            Some(&self.cfg.database),
+            &[],
+            None,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1371,8 +1391,14 @@ impl ClickHouseClient {
             candidate_publication_id,
             Some(session_id),
         );
-        self.request_text(&statement, None, Some(&self.cfg.database), false, None)
-            .await?;
+        self.mutation_request_text_with_params_and_timeout(
+            &statement,
+            None,
+            Some(&self.cfg.database),
+            &[],
+            None,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1408,8 +1434,14 @@ impl ClickHouseClient {
                previous_event_uid, next_event_uid\n\
              FROM enriched",
         );
-        self.request_text(&statement, None, Some(&self.cfg.database), false, None)
-            .await?;
+        self.mutation_request_text_with_params_and_timeout(
+            &statement,
+            None,
+            Some(&self.cfg.database),
+            &[],
+            None,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1509,8 +1541,14 @@ impl ClickHouseClient {
                next_turn_seq, next_turn_id, next_turn_started_at, next_turn_ended_at, event_summaries_json\n\
              FROM turn_neighbors",
         );
-        self.request_text(&statement, None, Some(&self.cfg.database), false, None)
-            .await?;
+        self.mutation_request_text_with_params_and_timeout(
+            &statement,
+            None,
+            Some(&self.cfg.database),
+            &[],
+            None,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1623,8 +1661,14 @@ impl ClickHouseClient {
             publisher_id = escape_literal(publisher_id),
             operation_id = escape_literal(operation_id),
         );
-        self.request_text(&statement, None, Some(&self.cfg.database), false, None)
-            .await?;
+        self.mutation_request_text_with_params_and_timeout(
+            &statement,
+            None,
+            Some(&self.cfg.database),
+            &[],
+            None,
+        )
+        .await?;
         let candidate = self
             .mcp_open_candidate_header(session_id, candidate_publication_id)
             .await?;

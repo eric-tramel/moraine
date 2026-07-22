@@ -10,11 +10,19 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::io::Write;
 
+pub mod envelope;
 mod mcp_open_projection;
+pub use envelope::{
+    batch_statement_cap, envelope_error_kind, kill_query_prefix, unenveloped_statement_count,
+    AllowanceResource, EnvelopeError, EnvelopeStatsSnapshot, QueryClass, QueryEnvelope,
+};
 pub use mcp_open_projection::{
     McpOpenGenerationReadiness, McpOpenHostRevision, McpOpenPublicationRequest, McpOpenSourceHead,
 };
 pub mod mcp_tool_names;
+
+use envelope::{StatementDropGuard, MIN_SERVER_EXECUTION_SECONDS};
+use std::sync::Arc;
 
 const MAX_INSERT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_QUERY_URL_BYTES: usize = 2 * 1024;
@@ -34,20 +42,54 @@ pub struct ClickHouseClient {
     http: Client,
 }
 
-#[derive(Debug)]
 pub struct ClickHouseByteStream {
     response: reqwest::Response,
+    /// Envelope accounting/cancellation for the streaming statement; the
+    /// drop guard stays armed until the stream is read to completion, so an
+    /// abandoned stream KILLs its server query.
+    ticket: Option<StatementTicket>,
+}
+
+impl std::fmt::Debug for ClickHouseByteStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClickHouseByteStream")
+            .field("response", &self.response)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ClickHouseByteStream {
     pub async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
-        let chunk = self
-            .response
-            .chunk()
-            .await
-            .context("failed to read clickhouse response chunk")?;
-        Ok(chunk.map(|bytes| bytes.to_vec()))
+        match self.response.chunk().await {
+            Ok(Some(bytes)) => Ok(Some(bytes.to_vec())),
+            Ok(None) => {
+                // Stream fully consumed: the server statement is complete.
+                if let Some(ticket) = self.ticket.as_mut() {
+                    ticket.disarm();
+                }
+                Ok(None)
+            }
+            // Transport failure mid-stream: the server query may still be
+            // running, so the ticket stays armed and dropping this stream
+            // issues the bounded KILL.
+            Err(error) => {
+                Err(anyhow::Error::new(error).context("failed to read clickhouse response chunk"))
+            }
+        }
     }
+}
+
+/// How the transport envelopes one statement (amendment A3): buffered reads
+/// set `wait_end_of_query=1` and decrement the cumulative allowance from the
+/// trustworthy end-of-query summary; inserts skip the read-ceiling settings
+/// (writes) but still count against the statement cap; streams enforce the
+/// per-statement read ceiling but skip the cumulative decrement (their
+/// headers flush before execution finishes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatementProfile {
+    BufferedRead,
+    Insert,
+    Stream,
 }
 
 struct ClickHouseRequestOptions<'a> {
@@ -56,6 +98,87 @@ struct ClickHouseRequestOptions<'a> {
     default_format: Option<&'a str>,
     params: &'a [(&'a str, &'a str)],
     request_timeout: Option<Duration>,
+    statement: StatementProfile,
+}
+
+/// Settings the active envelope owns per statement. Caller-supplied values
+/// for these keys are dropped (the envelope wins for budget parameters);
+/// every other caller parameter — readonly, format toggles, merge settings —
+/// passes through untouched. `max_execution_time` is the one negotiated key:
+/// the envelope keeps a caller value that is tighter than the remaining
+/// request deadline (min-merge), preserving per-statement caps like
+/// file-attention's.
+const ENVELOPE_OWNED_PARAMS: [&str; 9] = [
+    "query_id",
+    "max_execution_time",
+    "timeout_overflow_mode",
+    "max_memory_usage",
+    "max_bytes_before_external_group_by",
+    "max_bytes_before_external_sort",
+    "max_rows_to_read",
+    "max_bytes_to_read",
+    "wait_end_of_query",
+];
+
+/// Per-statement envelope bookkeeping returned by `request_builder`
+/// alongside the HTTP request: allowance accounting on success, telemetry
+/// classification on failure, and the cancel-on-drop guard (amendment A4).
+struct StatementTicket {
+    envelope: Arc<QueryEnvelope>,
+    guard: Option<StatementDropGuard>,
+    decrement_from_summary: bool,
+}
+
+impl StatementTicket {
+    fn on_success(&mut self, response: &reqwest::Response) {
+        if self.decrement_from_summary {
+            if let Some((rows, bytes)) = parse_clickhouse_summary(response.headers()) {
+                self.envelope.consume(rows, bytes);
+            }
+        }
+        self.disarm();
+    }
+
+    /// A `ClickHouseHttpError` in the chain means the server answered — the
+    /// statement finished server-side (rejected, killed, or failed), so the
+    /// guard disarms. A pure transport failure (client timeout, connection
+    /// reset) leaves it armed: the server query may still be running, and
+    /// dropping the ticket issues the bounded KILL.
+    fn on_error(&mut self, error: &anyhow::Error) {
+        self.envelope
+            .note_server_error_kind(clickhouse_error_kind(error));
+        if error
+            .chain()
+            .any(|cause| cause.downcast_ref::<ClickHouseHttpError>().is_some())
+        {
+            self.disarm();
+        }
+    }
+
+    fn disarm(&mut self) {
+        if let Some(guard) = self.guard.as_mut() {
+            guard.disarm();
+        }
+    }
+}
+
+/// Parse `read_rows`/`read_bytes` from an `X-ClickHouse-Summary` header
+/// (JSON with string-encoded numbers).
+fn parse_clickhouse_summary(headers: &reqwest::header::HeaderMap) -> Option<(u64, u64)> {
+    let raw = headers.get("x-clickhouse-summary")?.to_str().ok()?;
+    let value: Value = serde_json::from_str(raw).ok()?;
+    let field = |name: &str| -> u64 {
+        value
+            .get(name)
+            .and_then(|entry| {
+                entry
+                    .as_str()
+                    .and_then(|text| text.parse::<u64>().ok())
+                    .or_else(|| entry.as_u64())
+            })
+            .unwrap_or(0)
+    };
+    Some((field("read_rows"), field("read_bytes")))
 }
 
 #[derive(Deserialize)]
@@ -315,7 +438,7 @@ impl ClickHouseClient {
         query: &str,
         mut body: Vec<u8>,
         options: ClickHouseRequestOptions<'_>,
-    ) -> Result<RequestBuilder> {
+    ) -> Result<(RequestBuilder, Option<StatementTicket>)> {
         // ClickHouse accepts a complete SQL statement in the POST body. Keep
         // short queries in the request target for compatibility with insert
         // payloads, but move generated SQL out of the URL before percent
@@ -332,6 +455,91 @@ impl ClickHouseClient {
                 MAX_INSERT_PAYLOAD_BYTES
             );
         }
+
+        // Envelope enforcement (issue #600): with an active envelope every
+        // statement is admitted against the shared deadline / statement cap /
+        // read allowance, carries a child query id preserving the KILL prefix
+        // contract, and gets budget-derived server settings. Without one the
+        // statement executes exactly as before the envelope existed, plus a
+        // process counter — the fail-closed flip is a later work item
+        // (amendment A2).
+        let mut envelope_params: Vec<(&'static str, String)> = Vec::new();
+        let mut envelope_request_timeout = None;
+        let ticket = match QueryEnvelope::current() {
+            Err(_) => {
+                envelope::record_unenveloped_statement();
+                None
+            }
+            Ok(active) => {
+                let admission = active.admit_statement().map_err(anyhow::Error::new)?;
+                active.stamp_cancel_target(self);
+
+                // Min-merge a caller-supplied max_execution_time: the tighter
+                // of the caller's per-statement cap and the remaining request
+                // deadline wins, floored so integer-flooring servers cannot
+                // read a fractional value as unlimited.
+                let caller_execution_limit = options
+                    .params
+                    .iter()
+                    .find_map(|(name, value)| (*name == "max_execution_time").then_some(*value))
+                    .and_then(|value| value.parse::<f64>().ok())
+                    .filter(|value| value.is_finite() && *value > 0.0);
+                let remaining_seconds = admission.remaining.as_secs_f64();
+                let effective_execution_seconds = caller_execution_limit
+                    .map_or(remaining_seconds, |limit| limit.min(remaining_seconds))
+                    .max(MIN_SERVER_EXECUTION_SECONDS);
+
+                envelope_params.push(("query_id", admission.query_id.clone()));
+                envelope_params.push((
+                    "max_execution_time",
+                    format!("{effective_execution_seconds:.3}"),
+                ));
+                envelope_params.push(("timeout_overflow_mode", "throw".to_string()));
+                envelope_params.push(("max_memory_usage", active.memory_bytes().to_string()));
+                envelope_params.push((
+                    "max_bytes_before_external_group_by",
+                    active.spill_bytes().to_string(),
+                ));
+                envelope_params.push((
+                    "max_bytes_before_external_sort",
+                    active.spill_bytes().to_string(),
+                ));
+                if options.statement != StatementProfile::Insert {
+                    // Read ceilings come from the REMAINING request allowance
+                    // (amendment A3); inserts are writes and skip them.
+                    envelope_params
+                        .push(("max_rows_to_read", admission.rows_remaining.to_string()));
+                    envelope_params
+                        .push(("max_bytes_to_read", admission.bytes_remaining.to_string()));
+                }
+                if options.statement == StatementProfile::BufferedRead {
+                    // Makes X-ClickHouse-Summary reflect completed execution,
+                    // so the cumulative decrement is sound (amendment A3).
+                    envelope_params.push(("wait_end_of_query", "1".to_string()));
+                }
+
+                // Give the server's structured TIMEOUT_EXCEEDED time to win
+                // over a client abort. Migration statements keep their
+                // caller-supplied (operator-honoring) client bound.
+                if options.request_timeout.is_none() && active.class() != QueryClass::Migration {
+                    envelope_request_timeout = Some(admission.remaining + Duration::from_secs(2));
+                }
+
+                let guard = active.arms_cancel_guards().then(|| {
+                    StatementDropGuard::new(
+                        admission.query_id.clone(),
+                        self.clone(),
+                        *active.admin_budget(),
+                    )
+                });
+                Some(StatementTicket {
+                    decrement_from_summary: options.statement == StatementProfile::BufferedRead,
+                    guard,
+                    envelope: active,
+                })
+            }
+        };
+
         let mut url = self.base_url()?;
         {
             let mut qp = url.query_pairs_mut();
@@ -358,6 +566,12 @@ impl ClickHouseClient {
                 }
             }
             for (key, value) in options.params {
+                if ticket.is_some() && ENVELOPE_OWNED_PARAMS.contains(key) {
+                    continue;
+                }
+                qp.append_pair(key, value);
+            }
+            for (key, value) in &envelope_params {
                 qp.append_pair(key, value);
             }
         }
@@ -393,7 +607,7 @@ impl ClickHouseClient {
             req = req.header(CONTENT_ENCODING, content_encoding);
         }
 
-        if let Some(timeout) = options.request_timeout {
+        if let Some(timeout) = options.request_timeout.or(envelope_request_timeout) {
             req = req.timeout(timeout);
         }
 
@@ -401,7 +615,7 @@ impl ClickHouseClient {
             req = req.basic_auth(self.cfg.username.clone(), Some(self.cfg.password.clone()));
         }
 
-        Ok(req)
+        Ok((req, ticket))
     }
 
     async fn send_checked_response(&self, req: RequestBuilder) -> Result<reqwest::Response> {
@@ -471,7 +685,32 @@ impl ClickHouseClient {
         params: &[(&str, &str)],
         request_timeout: Option<Duration>,
     ) -> Result<String> {
-        let req = self
+        self.request_text_inner(
+            query,
+            body,
+            database,
+            async_insert,
+            default_format,
+            params,
+            request_timeout,
+            StatementProfile::BufferedRead,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn request_text_inner(
+        &self,
+        query: &str,
+        body: Option<Vec<u8>>,
+        database: Option<&str>,
+        async_insert: bool,
+        default_format: Option<&str>,
+        params: &[(&str, &str)],
+        request_timeout: Option<Duration>,
+        statement: StatementProfile,
+    ) -> Result<String> {
+        let (req, mut ticket) = self
             .request_builder(
                 query,
                 body.unwrap_or_default(),
@@ -481,10 +720,24 @@ impl ClickHouseClient {
                     default_format,
                     params,
                     request_timeout,
+                    statement,
                 },
             )
             .await?;
-        let response = self.send_checked_response(req).await?;
+        let response = match self.send_checked_response(req).await {
+            Ok(response) => {
+                if let Some(ticket) = ticket.as_mut() {
+                    ticket.on_success(&response);
+                }
+                response
+            }
+            Err(error) => {
+                if let Some(ticket) = ticket.as_mut() {
+                    ticket.on_error(&error);
+                }
+                return Err(error);
+            }
+        };
         let status = response.status();
         let text = response.text().await.with_context(|| {
             format!(
@@ -504,7 +757,7 @@ impl ClickHouseClient {
         params: &[(&str, &str)],
         request_timeout: Option<Duration>,
     ) -> Result<ClickHouseByteStream> {
-        let req = self
+        let (req, mut ticket) = self
             .request_builder(
                 query,
                 Vec::new(),
@@ -514,12 +767,21 @@ impl ClickHouseClient {
                     default_format,
                     params,
                     request_timeout,
+                    statement: StatementProfile::Stream,
                 },
             )
             .await?;
-        let response = self.send_checked_response(req).await?;
+        let response = match self.send_checked_response(req).await {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(ticket) = ticket.as_mut() {
+                    ticket.on_error(&error);
+                }
+                return Err(error);
+            }
+        };
 
-        Ok(ClickHouseByteStream { response })
+        Ok(ClickHouseByteStream { response, ticket })
     }
 
     pub async fn ping(&self) -> Result<()> {
@@ -691,24 +953,67 @@ impl ClickHouseClient {
                 && payload.len().saturating_add(line.len()).saturating_add(1)
                     > MAX_INSERT_PAYLOAD_BYTES
             {
-                self.request_text(
-                    &query,
-                    Some(std::mem::take(&mut payload)),
-                    None,
-                    async_insert,
-                    None,
-                )
-                .await?;
+                self.insert_request_text(&query, std::mem::take(&mut payload), async_insert)
+                    .await?;
             }
             payload.extend_from_slice(&line);
             payload.push(b'\n');
         }
 
         if !payload.is_empty() {
-            self.request_text(&query, Some(payload), None, async_insert, None)
+            self.insert_request_text(&query, payload, async_insert)
                 .await?;
         }
         Ok(())
+    }
+
+    /// Insert-profile transport call for write statements issued as text
+    /// (INSERT ... SELECT, INSERT ... VALUES, lightweight DELETE): an active
+    /// envelope still allocates a child query id, deadline, and memory
+    /// settings and counts the statement against the cap, but skips the
+    /// read-ceiling settings — these are writes (amendment A3).
+    pub(crate) async fn mutation_request_text_with_params_and_timeout(
+        &self,
+        query: &str,
+        body: Option<Vec<u8>>,
+        database: Option<&str>,
+        params: &[(&str, &str)],
+        request_timeout: Option<Duration>,
+    ) -> Result<String> {
+        self.request_text_inner(
+            query,
+            body,
+            database,
+            false,
+            None,
+            params,
+            request_timeout,
+            StatementProfile::Insert,
+        )
+        .await
+    }
+
+    /// Insert-profile transport call: an active envelope still allocates a
+    /// child query id, deadline, and memory settings and counts the
+    /// statement against the cap, but skips the read-ceiling settings —
+    /// inserts are writes (amendment A3).
+    async fn insert_request_text(
+        &self,
+        query: &str,
+        payload: Vec<u8>,
+        async_insert: bool,
+    ) -> Result<String> {
+        self.request_text_inner(
+            query,
+            Some(payload),
+            None,
+            async_insert,
+            None,
+            &[],
+            None,
+            StatementProfile::Insert,
+        )
+        .await
     }
 
     pub async fn run_migrations(&self) -> Result<Vec<String>> {
@@ -3615,5 +3920,535 @@ mod tests {
 
         let msg = err.to_string();
         assert!(msg.contains("failed to read clickhouse response body"));
+    }
+
+    // ------------------------------------------------------------------
+    // Query envelope transport enforcement (issue #600, W4/W5)
+    // ------------------------------------------------------------------
+
+    #[derive(Clone, Default)]
+    struct EnvelopeCaptureState {
+        requests: Arc<Mutex<Vec<EnvelopeCapturedRequest>>>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct EnvelopeCapturedRequest {
+        query: String,
+        pairs: Vec<(String, String)>,
+    }
+
+    impl EnvelopeCapturedRequest {
+        fn pair(&self, key: &str) -> Option<&str> {
+            self.pairs
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.as_str())
+        }
+
+        fn pair_count(&self, key: &str) -> usize {
+            self.pairs.iter().filter(|(name, _)| name == key).count()
+        }
+    }
+
+    impl EnvelopeCaptureState {
+        fn snapshot(&self) -> Vec<EnvelopeCapturedRequest> {
+            self.requests
+                .lock()
+                .expect("envelope capture mutex poisoned")
+                .clone()
+        }
+
+        async fn wait_for<F>(&self, deadline: Duration, predicate: F) -> bool
+        where
+            F: Fn(&[EnvelopeCapturedRequest]) -> bool,
+        {
+            let started = std::time::Instant::now();
+            loop {
+                if predicate(&self.snapshot()) {
+                    return true;
+                }
+                if started.elapsed() > deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    /// Mock ClickHouse that records the exact query-string pairs of every
+    /// request, answers with a trustworthy-looking summary header
+    /// (read_rows=100, read_bytes=2048), and hangs on queries containing
+    /// SLOW so their futures can be dropped mid-flight.
+    async fn spawn_envelope_capture_server(state: EnvelopeCaptureState) -> String {
+        use axum::extract::RawQuery;
+        use axum::response::IntoResponse;
+
+        async fn handler(
+            State(state): State<EnvelopeCaptureState>,
+            RawQuery(raw_query): RawQuery,
+            body: Bytes,
+        ) -> axum::response::Response {
+            let pairs: Vec<(String, String)> =
+                url::form_urlencoded::parse(raw_query.unwrap_or_default().as_bytes())
+                    .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                    .collect();
+            let query = pairs
+                .iter()
+                .find(|(key, _)| key == "query")
+                .map(|(_, value)| value.clone())
+                .unwrap_or_else(|| String::from_utf8_lossy(&body).into_owned());
+            state
+                .requests
+                .lock()
+                .expect("envelope capture mutex poisoned")
+                .push(EnvelopeCapturedRequest {
+                    query: query.clone(),
+                    pairs,
+                });
+
+            if query.contains("SLOW") {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+
+            (
+                StatusCode::OK,
+                [(
+                    "x-clickhouse-summary",
+                    "{\"read_rows\":\"100\",\"read_bytes\":\"2048\",\"written_rows\":\"0\"}",
+                )],
+                "ok\n",
+            )
+                .into_response()
+        }
+
+        let app = Router::new().route("/", post(handler)).with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind envelope capture listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        format!("http://{}", addr)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn enveloped_statement_carries_budget_settings_and_child_query_id() {
+        let state = EnvelopeCaptureState::default();
+        let base_url = spawn_envelope_capture_server(state.clone()).await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+
+        let budget = envelope::test_budget(30.0, 8, 1_000, 1_000_000);
+        let query_envelope = QueryEnvelope::new("request", QueryClass::Interactive, &budget);
+        let request_id = query_envelope.request_id().to_string();
+
+        Arc::clone(&query_envelope)
+            .scope(async {
+                client
+                    .request_text("SELECT 1", None, None, false, None)
+                    .await
+            })
+            .await
+            .expect("enveloped statement");
+
+        let requests = state.snapshot();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(
+            request.pair("query_id"),
+            Some(format!("{request_id}-0").as_str())
+        );
+        let max_execution_time: f64 = request
+            .pair("max_execution_time")
+            .expect("max_execution_time present")
+            .parse()
+            .expect("parsable max_execution_time");
+        assert!(
+            max_execution_time > 0.0 && max_execution_time <= 30.0,
+            "max_execution_time out of range: {max_execution_time}"
+        );
+        assert_eq!(request.pair("timeout_overflow_mode"), Some("throw"));
+        assert_eq!(
+            request.pair("max_memory_usage"),
+            Some((64 * 1024 * 1024).to_string().as_str())
+        );
+        assert_eq!(
+            request.pair("max_bytes_before_external_group_by"),
+            Some((8 * 1024 * 1024).to_string().as_str())
+        );
+        assert_eq!(
+            request.pair("max_bytes_before_external_sort"),
+            Some((8 * 1024 * 1024).to_string().as_str())
+        );
+        assert_eq!(request.pair("max_rows_to_read"), Some("1000"));
+        assert_eq!(request.pair("max_bytes_to_read"), Some("1000000"));
+        assert_eq!(request.pair("wait_end_of_query"), Some("1"));
+
+        // The trustworthy end-of-query summary decremented the allowance.
+        let stats = query_envelope.stats();
+        assert_eq!(stats.statements, 1);
+        assert_eq!(stats.rows_consumed, 100);
+        assert_eq!(stats.bytes_consumed, 2_048);
+        assert_eq!(stats.rows_remaining, 900);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn envelope_wins_budget_params_and_min_merges_caller_execution_time() {
+        let state = EnvelopeCaptureState::default();
+        let base_url = spawn_envelope_capture_server(state.clone()).await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+
+        let budget = envelope::test_budget(30.0, 8, 1_000, 1_000_000);
+        let query_envelope = QueryEnvelope::new("request", QueryClass::Interactive, &budget);
+        let request_id = query_envelope.request_id().to_string();
+
+        query_envelope
+            .scope(async {
+                client
+                    .request_text_with_params(
+                        "SELECT 1",
+                        None,
+                        None,
+                        false,
+                        None,
+                        &[
+                            ("query_id", "caller-id"),
+                            ("max_execution_time", "2.0"),
+                            ("max_rows_to_read", "999999999"),
+                            ("readonly", "1"),
+                        ],
+                    )
+                    .await
+            })
+            .await
+            .expect("enveloped statement");
+
+        let requests = state.snapshot();
+        let request = &requests[0];
+        // Envelope wins budget params: exactly one instance of each, and the
+        // caller's query id / rows ceiling are gone.
+        assert_eq!(request.pair_count("query_id"), 1);
+        assert_eq!(
+            request.pair("query_id"),
+            Some(format!("{request_id}-0").as_str())
+        );
+        assert_eq!(request.pair_count("max_rows_to_read"), 1);
+        assert_eq!(request.pair("max_rows_to_read"), Some("1000"));
+        // A caller execution cap tighter than the remaining deadline is kept.
+        assert_eq!(request.pair_count("max_execution_time"), 1);
+        assert_eq!(request.pair("max_execution_time"), Some("2.000"));
+        // Non-budget caller params pass through untouched.
+        assert_eq!(request.pair("readonly"), Some("1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn enveloped_insert_skips_read_ceilings_but_counts_against_cap() {
+        let state = EnvelopeCaptureState::default();
+        let base_url = spawn_envelope_capture_server(state.clone()).await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+
+        let budget = envelope::test_budget(30.0, 8, 1_000, 1_000_000);
+        let query_envelope = QueryEnvelope::new("request", QueryClass::Background, &budget);
+
+        Arc::clone(&query_envelope)
+            .scope(async {
+                client
+                    .insert_json_rows("events", &[json!({"value": 1})])
+                    .await
+            })
+            .await
+            .expect("enveloped insert");
+
+        let requests = state.snapshot();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert!(request.query.starts_with("INSERT INTO"));
+        assert!(request.pair("query_id").is_some());
+        assert!(request.pair("max_execution_time").is_some());
+        assert!(request.pair("max_memory_usage").is_some());
+        // Writes skip the read-ceiling settings and the summary wait.
+        assert_eq!(request.pair("max_rows_to_read"), None);
+        assert_eq!(request.pair("max_bytes_to_read"), None);
+        assert_eq!(request.pair("wait_end_of_query"), None);
+        // But the statement still consumed a cap slot.
+        assert_eq!(query_envelope.stats().statements, 1);
+        // And the write summary did not drain the read allowance.
+        assert_eq!(query_envelope.stats().rows_consumed, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn summary_decrements_shrink_later_statement_read_ceilings() {
+        let state = EnvelopeCaptureState::default();
+        let base_url = spawn_envelope_capture_server(state.clone()).await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+
+        let budget = envelope::test_budget(30.0, 8, 1_000, 1_000_000);
+        let query_envelope = QueryEnvelope::new("request", QueryClass::Interactive, &budget);
+
+        Arc::clone(&query_envelope)
+            .scope(async {
+                for _ in 0..3 {
+                    client
+                        .request_text("SELECT 1", None, None, false, None)
+                        .await
+                        .expect("enveloped statement");
+                }
+            })
+            .await;
+
+        let requests = state.snapshot();
+        let ceilings: Vec<&str> = requests
+            .iter()
+            .map(|request| request.pair("max_rows_to_read").expect("rows ceiling"))
+            .collect();
+        // Each statement's ceiling is the REMAINING allowance after the
+        // previous statement's 100-row summary decrement.
+        assert_eq!(ceilings, vec!["1000", "900", "800"]);
+        assert_eq!(query_envelope.stats().rows_remaining, 700);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admission_failures_are_typed_and_fail_fast_without_reaching_server() {
+        let state = EnvelopeCaptureState::default();
+        let base_url = spawn_envelope_capture_server(state.clone()).await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+
+        // Statement cap.
+        let budget = envelope::test_budget(30.0, 1, 1_000, 1_000_000);
+        let query_envelope = QueryEnvelope::new("request", QueryClass::Interactive, &budget);
+        let error = Arc::clone(&query_envelope)
+            .scope(async {
+                client
+                    .request_text("SELECT 1", None, None, false, None)
+                    .await
+                    .expect("first statement fits the cap");
+                client
+                    .request_text("SELECT 1", None, None, false, None)
+                    .await
+                    .expect_err("second statement exceeds the cap")
+            })
+            .await;
+        assert_eq!(
+            envelope_error_kind(&error),
+            Some(ClickHouseErrorKind::ResourceExhausted)
+        );
+        assert_eq!(state.snapshot().len(), 1, "capped statement reached server");
+
+        // Expired deadline: refused client-side, nothing new reaches the server.
+        let expired_budget = envelope::test_budget(0.005, 8, 1_000, 1_000_000);
+        let expired_envelope =
+            QueryEnvelope::new("request", QueryClass::Interactive, &expired_budget);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let error = expired_envelope
+            .scope(async {
+                client
+                    .request_text("SELECT 1", None, None, false, None)
+                    .await
+                    .expect_err("expired envelope must refuse admission")
+            })
+            .await;
+        assert_eq!(
+            envelope_error_kind(&error),
+            Some(ClickHouseErrorKind::DeadlineExceeded)
+        );
+        assert_eq!(
+            state.snapshot().len(),
+            1,
+            "expired statement reached server"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unenveloped_statement_executes_as_today_and_increments_counter() {
+        let state = EnvelopeCaptureState::default();
+        let base_url = spawn_envelope_capture_server(state.clone()).await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+
+        let before = unenveloped_statement_count();
+        client
+            .request_text("SELECT 1", None, None, false, None)
+            .await
+            .expect("unenveloped statement still executes pre-flip");
+        assert!(unenveloped_statement_count() > before);
+
+        let requests = state.snapshot();
+        let request = &requests[0];
+        assert_eq!(request.pair("query_id"), None);
+        assert_eq!(request.pair("max_execution_time"), None);
+        assert_eq!(request.pair("wait_end_of_query"), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropped_statement_future_kills_its_child_query() {
+        let state = EnvelopeCaptureState::default();
+        let base_url = spawn_envelope_capture_server(state.clone()).await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+
+        let budget = envelope::test_budget(30.0, 8, 1_000, 1_000_000);
+        let query_envelope = QueryEnvelope::new("request", QueryClass::Interactive, &budget);
+        let child_id = format!("{}-0", query_envelope.request_id());
+
+        query_envelope
+            .scope(async {
+                // The tokio timeout drops the in-flight statement future —
+                // the #576 orphan pattern. The scope itself completes
+                // normally afterwards.
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(200),
+                    client.request_text("SELECT SLOW", None, None, false, None),
+                )
+                .await;
+            })
+            .await;
+
+        let expected = format!("KILL QUERY WHERE query_id = '{child_id}' SYNC");
+        assert!(
+            state
+                .wait_for(Duration::from_secs(3), |requests| {
+                    requests.iter().any(|request| request.query == expected)
+                })
+                .await,
+            "no child KILL observed; captured: {:?}",
+            state.snapshot()
+        );
+
+        // The KILL itself runs enveloped: administrative kind, own child
+        // query id, and a finite deadline.
+        let requests = state.snapshot();
+        let kill = requests
+            .iter()
+            .find(|request| request.query == expected)
+            .expect("kill captured");
+        let kill_query_id = kill.pair("query_id").expect("kill query_id");
+        assert!(
+            kill_query_id.starts_with("moraine-kill-"),
+            "kill query id: {kill_query_id}"
+        );
+        let kill_deadline: f64 = kill
+            .pair("max_execution_time")
+            .expect("kill max_execution_time")
+            .parse()
+            .expect("parsable kill deadline");
+        assert!(kill_deadline > 0.0 && kill_deadline <= 5.0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropped_scope_issues_prefix_kill_for_the_whole_request() {
+        let state = EnvelopeCaptureState::default();
+        let base_url = spawn_envelope_capture_server(state.clone()).await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+
+        let budget = envelope::test_budget(30.0, 8, 1_000, 1_000_000);
+        let query_envelope = QueryEnvelope::new("request", QueryClass::Interactive, &budget);
+        let request_id = query_envelope.request_id().to_string();
+
+        let task = tokio::spawn({
+            let client = client.clone();
+            query_envelope.scope(async move {
+                let _ = client
+                    .request_text("SELECT SLOW", None, None, false, None)
+                    .await;
+            })
+        });
+
+        assert!(
+            state
+                .wait_for(Duration::from_secs(3), |requests| {
+                    requests
+                        .iter()
+                        .any(|request| request.query.contains("SLOW"))
+                })
+                .await,
+            "slow statement never reached the server"
+        );
+        task.abort();
+
+        // Aborting the scope drops both guards: the statement guard KILLs
+        // the child, and the request guard KILLs the whole id prefix.
+        let prefix_clause = format!("startsWith(query_id, '{request_id}-')");
+        assert!(
+            state
+                .wait_for(Duration::from_secs(3), |requests| {
+                    requests.iter().any(|request| {
+                        request.query.starts_with("KILL QUERY WHERE query_id = ")
+                            && request.query.contains(&prefix_clause)
+                    })
+                })
+                .await,
+            "no prefix KILL observed; captured: {:?}",
+            state.snapshot()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn migration_class_statements_get_no_drop_guard_kill() {
+        let state = EnvelopeCaptureState::default();
+        let base_url = spawn_envelope_capture_server(state.clone()).await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+
+        let budget = envelope::test_budget(30.0, 8, 1_000, 1_000_000);
+        let query_envelope = QueryEnvelope::new("migrate", QueryClass::Migration, &budget);
+
+        query_envelope
+            .scope(async {
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(200),
+                    client.request_text("SELECT SLOW", None, None, false, None),
+                )
+                .await;
+            })
+            .await;
+
+        // Give any (incorrect) kill task ample time to land.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            state
+                .snapshot()
+                .iter()
+                .all(|request| !request.query.starts_with("KILL QUERY")),
+            "migration statement must rely on server max_execution_time only; \
+             captured: {:?}",
+            state.snapshot()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn enveloped_stream_enforces_ceilings_without_summary_wait() {
+        let state = EnvelopeCaptureState::default();
+        let base_url = spawn_envelope_capture_server(state.clone()).await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+
+        let budget = envelope::test_budget(30.0, 8, 1_000, 1_000_000);
+        let query_envelope = QueryEnvelope::new("export", QueryClass::Background, &budget);
+
+        Arc::clone(&query_envelope)
+            .scope(async {
+                let mut stream = client
+                    .request_stream_with_params("SELECT 1", None, None, &[], None)
+                    .await
+                    .expect("enveloped stream");
+                while stream.next_chunk().await.expect("stream chunk").is_some() {}
+            })
+            .await;
+
+        let requests = state.snapshot();
+        let request = &requests[0];
+        // The per-statement ceiling is enforced server-side...
+        assert_eq!(request.pair("max_rows_to_read"), Some("1000"));
+        // ...but streams skip the end-of-query wait and cumulative decrement.
+        assert_eq!(request.pair("wait_end_of_query"), None);
+        assert_eq!(query_envelope.stats().rows_consumed, 0);
+
+        // A fully consumed stream disarms its guard: no KILL follows.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            state
+                .snapshot()
+                .iter()
+                .all(|request| !request.query.starts_with("KILL QUERY")),
+            "completed stream must not be killed"
+        );
     }
 }
