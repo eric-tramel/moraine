@@ -291,10 +291,15 @@ impl QueryEnvelopeTelemetry {
             .fetch_add(stats.deadline_exceeded, Ordering::Relaxed);
         self.resource_exhausted
             .fetch_add(stats.resource_exhausted, Ordering::Relaxed);
+        // Same-site forward into the process-wide budget sink (issue #600
+        // W11): the daemon hosts MCP and monitor in one process, so the
+        // monitor's `query_budgets` health block totals both boundaries.
+        moraine_conversations::record_budget_request(stats);
     }
 
     fn record_queue_full(&self) {
         self.queue_full_rejections.fetch_add(1, Ordering::Relaxed);
+        moraine_conversations::record_budget_rejection();
     }
 
     fn snapshot(&self) -> QueryEnvelopeTelemetrySnapshot {

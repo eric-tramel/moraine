@@ -7,7 +7,7 @@
 //! any executor handoff. A spawned worker (projection worker, publication
 //! actor, janitor, backfill task) must establish its own class envelope via
 //! [`QueryEnvelope::new`] + [`QueryEnvelope::scope`]; statements issued from
-//! an unscoped spawn run unenveloped pre-flip and fail closed post-flip.
+//! an unscoped spawn fail closed at the transport.
 //! logical Moraine operation issues shares one absolute deadline, one fixed
 //! statement cap, and one cumulative read allowance, and every abandonment
 //! path converges on a bounded best-effort `KILL QUERY`.
@@ -43,17 +43,119 @@ const KILL_WALL: Duration = Duration::from_secs(5);
 pub(crate) const MIN_SERVER_EXECUTION_SECONDS: f64 = 1.0;
 
 /// Process-wide count of statements issued without an active envelope.
-/// Pre-flip (before the fail-closed work item) these execute exactly as
-/// today; the counter is the telemetry that gates the flip (amendment A2).
+/// Post-flip (issue #600 W12) the transport fails closed instead of
+/// executing unenveloped statements, so nothing increments this counter any
+/// more: it exists so the telemetry surface (monitor `query_budgets`,
+/// `moraine status`) keeps reporting an explicit zero, and so a future
+/// regression that reintroduces a permissive branch has an obvious place to
+/// count — tests assert it stays 0.
 static UNENVELOPED_STATEMENTS: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) fn record_unenveloped_statement() {
-    UNENVELOPED_STATEMENTS.fetch_add(1, Ordering::Relaxed);
-}
-
 /// Total statements this process has issued outside any query envelope.
+/// Always 0 post-flip: an absent envelope is a typed refusal, not an
+/// unenveloped execution.
 pub fn unenveloped_statement_count() -> u64 {
     UNENVELOPED_STATEMENTS.load(Ordering::Relaxed)
+}
+
+/// Run `f` under the caller's active envelope when one exists, otherwise
+/// under a fresh Administrative micro-budget envelope.
+///
+/// This is the documented internal exemption path for the transport's
+/// liveness probes (`ping`/`version`): they must work before any request
+/// envelope exists (supervisor readiness gates, `up` startup waits) yet must
+/// never become an unenveloped escape hatch, so an unscoped probe rides the
+/// bundled `[query_budgets.administrative]` caps (single-digit statements,
+/// seconds-scale deadline). When the caller already scoped an envelope —
+/// doctor's Interactive report, ingest's Background startup — the probe runs
+/// inside it so the statements stay on the caller's budget and KILL prefix.
+pub(crate) async fn scope_administrative_if_unenveloped<F: Future>(kind: &str, f: F) -> F::Output {
+    if QueryEnvelope::current().is_ok() {
+        return f.await;
+    }
+    let admin_budget = default_administrative_budget();
+    QueryEnvelope::new_with_admin_budget(
+        kind,
+        QueryClass::Administrative,
+        &admin_budget,
+        &admin_budget,
+    )
+    .scope(f)
+    .await
+}
+
+/// Process-wide budget telemetry shared by every request boundary in one
+/// process (issue #600 W11). The MCP dispatch and monitor middleware record
+/// one entry per finished request via [`record_budget_request`]; up-front
+/// admission rejections (MCP queue-full, monitor read-semaphore overflow)
+/// count as resource exhaustion via [`record_budget_rejection`]. The monitor
+/// `/api/v1/health` and `/api/v1/status` handlers read [`budget_telemetry`]
+/// so repeated budget exhaustion is operator-visible without log spelunking.
+struct BudgetTelemetry {
+    requests: AtomicU64,
+    statements: AtomicU64,
+    deadline_exceeded: AtomicU64,
+    resource_exhausted: AtomicU64,
+}
+
+static BUDGET_TELEMETRY: BudgetTelemetry = BudgetTelemetry {
+    requests: AtomicU64::new(0),
+    statements: AtomicU64::new(0),
+    deadline_exceeded: AtomicU64::new(0),
+    resource_exhausted: AtomicU64::new(0),
+};
+
+/// Point-in-time process totals of request-boundary envelope accounting.
+/// `unenveloped_statements` folds in [`unenveloped_statement_count`] so one
+/// snapshot carries everything the monitor's `query_budgets` block reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BudgetTelemetrySnapshot {
+    /// Requests that finished inside a request-boundary envelope.
+    pub requests: u64,
+    /// ClickHouse statements admitted across those requests.
+    pub statements: u64,
+    /// Statements refused or killed for an expired deadline budget.
+    pub deadline_exceeded: u64,
+    /// Statements refused or killed for cap/allowance/memory exhaustion,
+    /// plus whole requests rejected up front by bounded admission.
+    pub resource_exhausted: u64,
+    /// Statements issued without any active envelope. Always 0 since the
+    /// fail-closed flip: a nonzero value means a permissive branch regressed
+    /// into the transport.
+    pub unenveloped_statements: u64,
+}
+
+/// Fold one finished request's envelope accounting into the process totals.
+pub fn record_budget_request(stats: &EnvelopeStatsSnapshot) {
+    BUDGET_TELEMETRY.requests.fetch_add(1, Ordering::Relaxed);
+    BUDGET_TELEMETRY
+        .statements
+        .fetch_add(stats.statements, Ordering::Relaxed);
+    BUDGET_TELEMETRY
+        .deadline_exceeded
+        .fetch_add(stats.deadline_exceeded, Ordering::Relaxed);
+    BUDGET_TELEMETRY
+        .resource_exhausted
+        .fetch_add(stats.resource_exhausted, Ordering::Relaxed);
+}
+
+/// Count one request rejected up front by bounded admission (queue full /
+/// semaphore overflow) — reported on the wire as `resource_exhausted`.
+pub fn record_budget_rejection() {
+    BUDGET_TELEMETRY
+        .resource_exhausted
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+/// Process-wide budget telemetry totals.
+pub fn budget_telemetry() -> BudgetTelemetrySnapshot {
+    BudgetTelemetrySnapshot {
+        requests: BUDGET_TELEMETRY.requests.load(Ordering::Relaxed),
+        statements: BUDGET_TELEMETRY.statements.load(Ordering::Relaxed),
+        deadline_exceeded: BUDGET_TELEMETRY.deadline_exceeded.load(Ordering::Relaxed),
+        resource_exhausted: BUDGET_TELEMETRY.resource_exhausted.load(Ordering::Relaxed),
+        unenveloped_statements: unenveloped_statement_count(),
+    }
 }
 
 /// Administrative budget used for cancellation when the caller did not wire
@@ -441,8 +543,9 @@ impl QueryEnvelope {
     /// tightened to at most `deadline_cap` from now. Request id, statement
     /// sequence, statement cap, and read allowances are the parent's —
     /// narrowing can only tighten, never reset (so a tool cannot widen its
-    /// budget by re-scoping). Without an active envelope `f` runs unchanged,
-    /// matching the pre-flip permissive posture (amendment A2).
+    /// budget by re-scoping). Without an active envelope `f` runs unchanged
+    /// and any statement it issues fails closed at the transport — narrowing
+    /// never mints a budget out of thin air (amendment A2).
     pub async fn scope_narrowed<F: Future>(deadline_cap: Duration, f: F) -> F::Output {
         let Ok(parent) = Self::current() else {
             return f.await;
@@ -792,6 +895,18 @@ fn sanitize_kind(kind: &str) -> String {
     }
 }
 
+/// Test-only scope: run `f` under a generous Interactive-class envelope so
+/// transport unit tests satisfy the fail-closed flip without each repeating
+/// envelope boilerplate. Tests that exercise budget refusal keep building
+/// their own tight envelopes from [`test_budget`].
+#[cfg(test)]
+pub(crate) async fn with_test_envelope<F: Future>(f: F) -> F::Output {
+    let budget = test_budget(30.0, 256, 1_000_000, 1_000_000_000);
+    QueryEnvelope::new("test", QueryClass::Interactive, &budget)
+        .scope(f)
+        .await
+}
+
 /// Test-only budget factory shared with the transport tests in `lib.rs`.
 #[cfg(test)]
 pub(crate) fn test_budget(
@@ -883,6 +998,35 @@ mod tests {
             "expected DeadlineExpired, got {error:?}"
         );
         assert_eq!(envelope.stats().deadline_exceeded, 1);
+    }
+
+    #[test]
+    fn budget_telemetry_accumulates_requests_and_rejections() {
+        // The sink is process-wide and other tests may record concurrently,
+        // so assert monotone lower-bound deltas rather than exact values.
+        let before = budget_telemetry();
+
+        let budget = test_budget(30.0, 2, 1_000, 1_000_000);
+        let envelope = QueryEnvelope::new("request", QueryClass::Interactive, &budget);
+        envelope.admit_statement().expect("statement 1");
+        envelope.admit_statement().expect("statement 2");
+        envelope
+            .admit_statement()
+            .expect_err("cap exhausted on statement 3");
+        record_budget_request(&envelope.stats());
+        record_budget_rejection();
+
+        let after = budget_telemetry();
+        assert!(after.requests > before.requests, "{after:?}");
+        assert!(after.statements >= before.statements + 2, "{after:?}");
+        assert!(
+            after.resource_exhausted >= before.resource_exhausted + 2,
+            "cap refusal plus admission rejection: {after:?}"
+        );
+        assert!(
+            after.unenveloped_statements >= before.unenveloped_statements,
+            "{after:?}"
+        );
     }
 
     #[test]

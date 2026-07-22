@@ -2,9 +2,15 @@ use super::mock_clickhouse::MockState;
 
 pub(crate) fn assert_script_consumed(state: &MockState, expected_requests: usize) {
     let queries = state.queries.lock().expect("queries lock");
+    // Drop-guard cancellation KILLs are spawned and racy by design (issue
+    // #600) and never consume a scripted response, so they don't count
+    // against the deterministic request budget.
+    let scripted_requests = queries
+        .iter()
+        .filter(|query| !query.trim_start().starts_with("KILL QUERY"))
+        .count();
     assert_eq!(
-        queries.len(),
-        expected_requests,
+        scripted_requests, expected_requests,
         "captured queries: {queries:#?}"
     );
     drop(queries);

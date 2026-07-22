@@ -313,6 +313,10 @@ async fn assert_fixture_semantics(
 #[tokio::test]
 #[ignore = "requires wrapper-owned live ClickHouse and destructive opt-in"]
 async fn live_search_host_identity_and_exact_document_revision() -> Result<()> {
+    with_live_fixture_envelope(live_search_host_identity_and_exact_document_revision_body()).await
+}
+
+async fn live_search_host_identity_and_exact_document_revision_body() -> Result<()> {
     let prerequisites = LivePrerequisites::load()?;
     let database = prepare_owned_database_identity(&prerequisites.sandbox_id)?;
     let clickhouse = live_client(&prerequisites, &database)?;

@@ -28,8 +28,7 @@ const REPOSITORY_READ_SETTINGS: [(&str, &str); 1] =
 /// as `{request_id}-{seq}` and the caller-supplied id here is ignored. The
 /// function survives only so boundaries that have not yet migrated to
 /// [`QueryEnvelope::scope`] keep compiling; without an active envelope the
-/// statements run exactly as before the envelope existed (pre-flip posture,
-/// amendment A2).
+/// statements fail closed at the transport (amendment A2, post-flip).
 pub async fn with_repository_query_id<F>(_query_id: String, future: F) -> F::Output
 where
     F: Future,
@@ -197,11 +196,11 @@ impl ClickHouseConversationRepository {
         database: Option<&str>,
         params: &[(&str, &str)],
     ) -> AnyResult<Vec<T>> {
-        // The transport owns the budget parameters: with an active envelope
-        // it strips caller-supplied envelope keys and min-merges any caller
+        // The transport owns the budget parameters: it strips
+        // caller-supplied envelope keys and min-merges any caller
         // max_execution_time (preserving file_attention's tighter
-        // per-statement cap); without one — pre-flip — the caller params run
-        // exactly as before.
+        // per-statement cap); without an active envelope the statement is
+        // refused before it reaches the server.
         let mut request_params = Vec::with_capacity(params.len() + REPOSITORY_READ_SETTINGS.len());
         request_params.extend_from_slice(params);
         request_params.extend_from_slice(&REPOSITORY_READ_SETTINGS);

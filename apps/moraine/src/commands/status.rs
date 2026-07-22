@@ -30,8 +30,19 @@ struct DaemonStatusResponse {
     clickhouse: DaemonClickhouseStatus,
     #[serde(default)]
     publication: Option<DaemonPublicationStatus>,
+    #[serde(default)]
+    query_budgets: Option<DaemonQueryBudgets>,
     database: DaemonDatabaseStatus,
     ingestor: DaemonIngestorStatus,
+}
+
+/// Additive `query_budgets` telemetry block from the daemon status/health
+/// API (issue #600 W11). Optional end-to-end: pre-envelope daemons omit it
+/// and the CLI stays silent rather than falling back to direct DB reads.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+struct DaemonQueryBudgets {
+    deadline_exceeded: u64,
+    resource_exhausted: u64,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -83,6 +94,10 @@ struct StatusData {
     source: StatusDataSource,
     fallback_note: Option<String>,
     clickhouse_health_url: String,
+    /// Daemon-reported budget-exhaustion telemetry; `None` on direct-DB
+    /// fallback (the CLI process has no meaningful counters of its own) and
+    /// for daemons that predate the block.
+    query_budgets: Option<DaemonQueryBudgets>,
 }
 
 fn service_runtime_running(services: &[ServiceRuntimeStatus], service: Service) -> bool {
@@ -252,7 +267,23 @@ fn daemon_status_data(payload: DaemonStatusResponse) -> Result<StatusData> {
         source: StatusDataSource::DaemonApi,
         fallback_note: None,
         clickhouse_health_url: payload.clickhouse.url,
+        query_budgets: payload.query_budgets,
     })
+}
+
+/// One-line budget summary for `moraine status` (issue #600 W11). `None`
+/// (omit silently) when the daemon telemetry is unavailable or when nothing
+/// has been rejected — the line exists to flag repeated exhaustion, not to
+/// narrate healthy traffic.
+fn budget_status_note(query_budgets: Option<DaemonQueryBudgets>) -> Option<String> {
+    let budgets = query_budgets?;
+    if budgets.deadline_exceeded == 0 && budgets.resource_exhausted == 0 {
+        return None;
+    }
+    Some(format!(
+        "query budgets: {} deadline / {} resource rejections since start",
+        budgets.deadline_exceeded, budgets.resource_exhausted
+    ))
 }
 
 async fn read_daemon_status(cfg: &AppConfig, timeout: Duration) -> Result<StatusData> {
@@ -451,6 +482,7 @@ async fn read_preferred_status(
                         "daemon status API failed ({error:#}); using direct DB fallback"
                     )),
                     clickhouse_health_url: cfg.clickhouse.url.clone(),
+                    query_budgets: None,
                 });
             }
         }
@@ -463,6 +495,7 @@ async fn read_preferred_status(
         source: StatusDataSource::DirectDb,
         fallback_note: None,
         clickhouse_health_url: cfg.clickhouse.url.clone(),
+        query_budgets: None,
     })
 }
 
@@ -494,6 +527,7 @@ pub(super) async fn cmd_status(
         source: data_source,
         fallback_note,
         clickhouse_health_url,
+        query_budgets,
     } = read_preferred_status(
         cfg,
         repository,
@@ -503,6 +537,9 @@ pub(super) async fn cmd_status(
     )
     .await?;
     let mut status_notes = build_status_notes(&services, &report, &clickhouse_health_url);
+    if let Some(note) = budget_status_note(query_budgets) {
+        status_notes.push(note);
+    }
     if let Some(note) = fallback_note {
         status_notes.push(note);
     }
@@ -608,6 +645,13 @@ mod tests {
                 "writer_conflicts": 0,
                 "issues": []
             },
+            "query_budgets": {
+                "requests": 12,
+                "statements": 48,
+                "deadline_exceeded": 0,
+                "resource_exhausted": 0,
+                "unenveloped_statements": 0
+            },
             "database": {"exists": true},
             "ingestor": {
                 "present": true,
@@ -645,6 +689,64 @@ mod tests {
         assert_eq!(legacy.source, StatusDataSource::DaemonApi);
         assert!(legacy.report.publication.is_none());
         assert!(!crate::commands::doctor_is_healthy(&legacy.report));
+    }
+
+    #[test]
+    fn budget_note_prints_only_for_nonzero_daemon_rejections() {
+        assert_eq!(budget_status_note(None), None);
+        assert_eq!(
+            budget_status_note(Some(DaemonQueryBudgets {
+                deadline_exceeded: 0,
+                resource_exhausted: 0,
+            })),
+            None
+        );
+        assert_eq!(
+            budget_status_note(Some(DaemonQueryBudgets {
+                deadline_exceeded: 3,
+                resource_exhausted: 1,
+            }))
+            .as_deref(),
+            Some("query budgets: 3 deadline / 1 resource rejections since start")
+        );
+    }
+
+    #[test]
+    fn daemon_status_data_carries_optional_query_budget_telemetry() {
+        // Block present with zero rejections (the shared fixture): captured,
+        // but the note stays silent.
+        let zeros: DaemonStatusResponse =
+            serde_json::from_str(&daemon_status_body(true)).expect("daemon fixture");
+        let zeros = daemon_status_data(zeros).expect("daemon status with zero budgets");
+        assert!(zeros.query_budgets.is_some());
+        assert_eq!(budget_status_note(zeros.query_budgets), None);
+
+        // Nonzero counts surface the one-line summary.
+        let mut nonzero: Value =
+            serde_json::from_str(&daemon_status_body(true)).expect("daemon fixture");
+        nonzero["query_budgets"]["deadline_exceeded"] = json!(2);
+        nonzero["query_budgets"]["resource_exhausted"] = json!(5);
+        let nonzero: DaemonStatusResponse =
+            serde_json::from_value(nonzero).expect("nonzero budget fixture");
+        let nonzero = daemon_status_data(nonzero).expect("daemon status with rejections");
+        assert_eq!(
+            budget_status_note(nonzero.query_budgets).as_deref(),
+            Some("query budgets: 2 deadline / 5 resource rejections since start")
+        );
+
+        // Pre-envelope daemons omit the whole block: silently absent, and the
+        // response still parses (additive contract).
+        let mut legacy: Value =
+            serde_json::from_str(&daemon_status_body(true)).expect("daemon fixture");
+        legacy
+            .as_object_mut()
+            .expect("daemon response object")
+            .remove("query_budgets");
+        let legacy: DaemonStatusResponse =
+            serde_json::from_value(legacy).expect("legacy daemon response schema");
+        let legacy = daemon_status_data(legacy).expect("legacy daemon status");
+        assert!(legacy.query_budgets.is_none());
+        assert_eq!(budget_status_note(legacy.query_budgets), None);
     }
 
     fn spawn_api_response(body: &str, delay: Duration) -> (u16, thread::JoinHandle<String>) {

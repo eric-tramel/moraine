@@ -460,6 +460,26 @@ class RunLiveTestTests(unittest.TestCase):
             "mcp-backfill", "live_mcp_open_batched_backfill_resources"
         )
 
+    def test_envelope_query_log_mode_runs_only_exact_ignored_function(self) -> None:
+        self.assert_exact_invocation(
+            "envelope-query-log", "live_envelope_query_log_coverage"
+        )
+
+    def test_envelope_cancellation_mode_runs_only_exact_ignored_function(self) -> None:
+        self.assert_exact_invocation(
+            "envelope-cancellation", "live_envelope_abandoned_query_cancelled"
+        )
+
+    def test_envelope_shared_budget_mode_runs_only_exact_ignored_function(self) -> None:
+        self.assert_exact_invocation(
+            "envelope-shared-budget", "live_envelope_shared_budget_and_statement_cap"
+        )
+
+    def test_envelope_spill_mode_runs_only_exact_ignored_function(self) -> None:
+        self.assert_exact_invocation(
+            "envelope-spill", "live_envelope_spill_and_memory_ceiling"
+        )
+
     def test_missing_and_unknown_modes_fail_before_boot(self) -> None:
         missing = self.run_wrapper()
         unknown = self.run_wrapper("all-ignored")

@@ -28,6 +28,13 @@ Modes:
   source-publication
                     Run live_source_publication_cutover_crash_recovery exactly.
   mcp-backfill      Run live_mcp_open_batched_backfill_resources exactly.
+  envelope-query-log
+                    Run live_envelope_query_log_coverage exactly.
+  envelope-cancellation
+                    Run live_envelope_abandoned_query_cancelled exactly.
+  envelope-shared-budget
+                    Run live_envelope_shared_budget_and_statement_cap exactly.
+  envelope-spill    Run live_envelope_spill_and_memory_ceiling exactly.
 
 Each invocation creates and owns a fresh sandbox, enables destructive tests
 only for the in-container Cargo process, retains a diagnostic log, and tears
@@ -49,6 +56,18 @@ case "$1" in
         ;;
     mcp-backfill)
         test_function="live_mcp_open_batched_backfill_resources"
+        ;;
+    envelope-query-log)
+        test_function="live_envelope_query_log_coverage"
+        ;;
+    envelope-cancellation)
+        test_function="live_envelope_abandoned_query_cancelled"
+        ;;
+    envelope-shared-budget)
+        test_function="live_envelope_shared_budget_and_statement_cap"
+        ;;
+    envelope-spill)
+        test_function="live_envelope_spill_and_memory_ceiling"
         ;;
     -h|--help)
         usage

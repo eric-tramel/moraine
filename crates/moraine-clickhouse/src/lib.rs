@@ -13,8 +13,9 @@ use std::io::Write;
 pub mod envelope;
 mod mcp_open_projection;
 pub use envelope::{
-    batch_statement_cap, envelope_error_kind, kill_query_prefix, unenveloped_statement_count,
-    AllowanceResource, EnvelopeError, EnvelopeStatsSnapshot, QueryClass, QueryEnvelope,
+    batch_statement_cap, budget_telemetry, envelope_error_kind, kill_query_prefix,
+    record_budget_rejection, record_budget_request, unenveloped_statement_count, AllowanceResource,
+    BudgetTelemetrySnapshot, EnvelopeError, EnvelopeStatsSnapshot, QueryClass, QueryEnvelope,
 };
 pub use mcp_open_projection::{
     McpOpenGenerationReadiness, McpOpenHostRevision, McpOpenPublicationRequest, McpOpenSourceHead,
@@ -470,19 +471,29 @@ impl ClickHouseClient {
             );
         }
 
-        // Envelope enforcement (issue #600): with an active envelope every
-        // statement is admitted against the shared deadline / statement cap /
-        // read allowance, carries a child query id preserving the KILL prefix
-        // contract, and gets budget-derived server settings. Without one the
-        // statement executes exactly as before the envelope existed, plus a
-        // process counter — the fail-closed flip is a later work item
-        // (amendment A2).
+        // Envelope enforcement (issue #600, fail closed): every statement is
+        // admitted against an active envelope's shared deadline / statement
+        // cap / read allowance, carries a child query id preserving the KILL
+        // prefix contract, and gets budget-derived server settings. An absent
+        // envelope is a typed refusal — `EnvelopeError::Missing` at the root
+        // of the chain — before any bytes reach the server (amendment A2,
+        // post-flip). There is no bypass parameter: the only statements that
+        // run without a caller-scoped envelope are the documented internal
+        // exemptions, each of which scopes its own class envelope before
+        // reaching this point (`ping`/`version` via
+        // `envelope::scope_administrative_if_unenveloped`, KILL statements
+        // via the Administrative envelope in `run_bounded_kill`, migration
+        // preflight via `migration_envelope` in
+        // `run_migrations_with_progress_and_budget`).
         let mut envelope_params: Vec<(&'static str, String)> = Vec::new();
         let mut envelope_request_timeout = None;
         let ticket = match QueryEnvelope::current() {
-            Err(_) => {
-                envelope::record_unenveloped_statement();
-                None
+            Err(error) => {
+                debug_assert!(matches!(error, EnvelopeError::Missing));
+                return Err(anyhow::Error::new(error).context(
+                    "refusing ClickHouse statement issued outside a query envelope; \
+                     scope the operation with QueryEnvelope::scope (issue #600)",
+                ));
             }
             Ok(active) => {
                 let admission = active.admit_statement().map_err(anyhow::Error::new)?;
@@ -798,21 +809,34 @@ impl ClickHouseClient {
         Ok(ClickHouseByteStream { response, ticket })
     }
 
+    /// Liveness probe. Documented fail-closed exemption (issue #600 W12):
+    /// readiness gates legitimately probe before any request envelope exists
+    /// (ClickHouse supervisor startup, `up` waits), so an unscoped ping
+    /// self-scopes an Administrative micro-budget envelope instead of
+    /// executing unenveloped; under a caller's envelope it consumes the
+    /// caller's budget as usual.
     pub async fn ping(&self) -> Result<()> {
-        let response = self
-            .request_text("SELECT 1", None, Some("system"), false, None)
-            .await?;
-        if response.trim() == "1" {
-            Ok(())
-        } else {
-            Err(anyhow!("unexpected ping response: {}", response.trim()))
-        }
+        envelope::scope_administrative_if_unenveloped("ping", async {
+            let response = self
+                .request_text("SELECT 1", None, Some("system"), false, None)
+                .await?;
+            if response.trim() == "1" {
+                Ok(())
+            } else {
+                Err(anyhow!("unexpected ping response: {}", response.trim()))
+            }
+        })
+        .await
     }
 
+    /// Server version probe. Same documented Administrative micro-budget
+    /// exemption as [`Self::ping`] (issue #600 W12).
     pub async fn version(&self) -> Result<String> {
-        let rows: Vec<Value> = self
-            .query_json_data("SELECT version() AS version", Some("system"))
-            .await?;
+        let rows: Vec<Value> = envelope::scope_administrative_if_unenveloped("version", async {
+            self.query_json_data("SELECT version() AS version", Some("system"))
+                .await
+        })
+        .await?;
         let version = rows
             .first()
             .and_then(|row| row.get("version"))
@@ -3216,12 +3240,10 @@ mod tests {
             ClickHouseClient::new_with_user_agent(test_clickhouse_config(base_url), identity)
                 .expect("new attributed client");
 
-        client
-            .request_text("SELECT 1", None, None, false, None)
+        envelope::with_test_envelope(client.request_text("SELECT 1", None, None, false, None))
             .await
             .expect("first attributed request");
-        client
-            .request_text("SELECT 1", None, None, false, None)
+        envelope::with_test_envelope(client.request_text("SELECT 1", None, None, false, None))
             .await
             .expect("second attributed request");
 
@@ -3241,8 +3263,7 @@ mod tests {
         let client = ClickHouseClient::new(test_clickhouse_config(base_url))
             .expect("compatibility constructor");
 
-        client
-            .request_text("SELECT 1", None, None, false, None)
+        envelope::with_test_envelope(client.request_text("SELECT 1", None, None, false, None))
             .await
             .expect("request from compatibility client");
 
@@ -3290,17 +3311,16 @@ mod tests {
 "#
         .to_vec();
 
-        client
-            .request_text_with_params(
-                "INSERT INTO tool_io FORMAT JSONEachRow",
-                Some(payload.clone()),
-                Some("moraine_team"),
-                true,
-                Some("JSONEachRow"),
-                &[("query_id", "gzip-test")],
-            )
-            .await
-            .expect("gzip request");
+        envelope::with_test_envelope(client.request_text_with_params(
+            "INSERT INTO tool_io FORMAT JSONEachRow",
+            Some(payload.clone()),
+            Some("moraine_team"),
+            true,
+            Some("JSONEachRow"),
+            &[("query_id", "gzip-test")],
+        ))
+        .await
+        .expect("gzip request");
 
         let requests = requests.lock().expect("request capture mutex poisoned");
         assert_eq!(requests.len(), 1);
@@ -3350,9 +3370,15 @@ mod tests {
                 .map(String::as_str),
             Some("1")
         );
-        assert_eq!(
-            request.params.get("query_id").map(String::as_str),
-            Some("gzip-test")
+        // The envelope owns `query_id` (issue #600): the caller-supplied
+        // value is dropped in favor of the envelope's child id.
+        assert!(
+            request
+                .params
+                .get("query_id")
+                .is_some_and(|query_id| query_id.starts_with("moraine-test-")),
+            "envelope-owned query_id, got {:?}",
+            request.params.get("query_id")
         );
 
         let mut decoded = Vec::new();
@@ -3372,10 +3398,15 @@ mod tests {
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
         let payload = b"plain request body".to_vec();
 
-        client
-            .request_text("SELECT 1", Some(payload.clone()), None, false, None)
-            .await
-            .expect("plain request");
+        envelope::with_test_envelope(client.request_text(
+            "SELECT 1",
+            Some(payload.clone()),
+            None,
+            false,
+            None,
+        ))
+        .await
+        .expect("plain request");
 
         let requests = requests.lock().expect("request capture mutex poisoned");
         assert_eq!(requests.len(), 1);
@@ -3393,10 +3424,15 @@ mod tests {
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
         let statement = format!("INSERT INTO plans VALUES ('{}')", "x".repeat(512 * 1024));
 
-        client
-            .request_text(&statement, None, Some("moraine"), false, None)
-            .await
-            .expect("body-carried SQL request");
+        envelope::with_test_envelope(client.request_text(
+            &statement,
+            None,
+            Some("moraine"),
+            false,
+            None,
+        ))
+        .await
+        .expect("body-carried SQL request");
 
         let requests = requests.lock().expect("request capture mutex poisoned");
         assert_eq!(requests.len(), 1);
@@ -3438,8 +3474,7 @@ mod tests {
         config.request_compression = ClickHouseRequestCompression::Gzip;
         let client = ClickHouseClient::new(config).expect("new client");
 
-        client
-            .request_text("SELECT 1", None, None, false, None)
+        envelope::with_test_envelope(client.request_text("SELECT 1", None, None, false, None))
             .await
             .expect("empty request");
 
@@ -3466,10 +3501,10 @@ mod tests {
         let base_url = spawn_mock_server().await;
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
 
-        let rows: Vec<Row> = client
-            .query_rows("SELECT 7 AS value", None)
-            .await
-            .expect("fallback query_rows");
+        let rows: Vec<Row> =
+            envelope::with_test_envelope(client.query_rows("SELECT 7 AS value", None))
+                .await
+                .expect("fallback query_rows");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].value, 7);
     }
@@ -3540,8 +3575,7 @@ mod tests {
         let base_url = spawn_typed_error_server(queries.clone()).await;
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
 
-        let err = client
-            .query_rows::<Row>("SELECT MEMORY", None)
+        let err = envelope::with_test_envelope(client.query_rows::<Row>("SELECT MEMORY", None))
             .await
             .expect_err("memory-limit failure propagates");
 
@@ -3575,10 +3609,10 @@ mod tests {
         let base_url = spawn_typed_error_server(queries.clone()).await;
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
 
-        let err = client
-            .query_rows::<Row>("SELECT HEADER_CODE", None)
-            .await
-            .expect_err("header-coded failure propagates");
+        let err =
+            envelope::with_test_envelope(client.query_rows::<Row>("SELECT HEADER_CODE", None))
+                .await
+                .expect_err("header-coded failure propagates");
 
         assert_eq!(
             clickhouse_error_kind(&err),
@@ -3600,10 +3634,10 @@ mod tests {
         let base_url = spawn_typed_error_server(queries.clone()).await;
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
 
-        let err = client
-            .query_rows::<Row>("SELECT KILLED_ENVELOPE", None)
-            .await
-            .expect_err("kill-truncated body propagates");
+        let err =
+            envelope::with_test_envelope(client.query_rows::<Row>("SELECT KILLED_ENVELOPE", None))
+                .await
+                .expect_err("kill-truncated body propagates");
 
         assert_eq!(
             clickhouse_error_kind(&err),
@@ -3629,10 +3663,10 @@ mod tests {
         let base_url = spawn_typed_error_server(queries.clone()).await;
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
 
-        let err = client
-            .query_rows::<Row>("SELECT EXCEPTION_FIELD", None)
-            .await
-            .expect_err("envelope exception field propagates");
+        let err =
+            envelope::with_test_envelope(client.query_rows::<Row>("SELECT EXCEPTION_FIELD", None))
+                .await
+                .expect_err("envelope exception field propagates");
 
         assert_eq!(
             clickhouse_error_kind(&err),
@@ -3654,10 +3688,11 @@ mod tests {
         let base_url = spawn_typed_error_server(queries.clone()).await;
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
 
-        let err = client
-            .query_rows::<Row>("SELECT KILLED_ROWS FORMAT JSONEachRow", None)
-            .await
-            .expect_err("killed streaming body propagates");
+        let err = envelope::with_test_envelope(
+            client.query_rows::<Row>("SELECT KILLED_ROWS FORMAT JSONEachRow", None),
+        )
+        .await
+        .expect_err("killed streaming body propagates");
 
         assert_eq!(
             clickhouse_error_kind(&err),
@@ -3678,10 +3713,10 @@ mod tests {
         let base_url = spawn_typed_error_server(queries.clone()).await;
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
 
-        let rows: Vec<Row> = client
-            .query_rows("SELECT 7 AS value", None)
-            .await
-            .expect("drift fallback succeeds");
+        let rows: Vec<Row> =
+            envelope::with_test_envelope(client.query_rows("SELECT 7 AS value", None))
+                .await
+                .expect("drift fallback succeeds");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].value, 7);
 
@@ -3700,16 +3735,15 @@ mod tests {
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
         let large_value = "x".repeat((MAX_INSERT_PAYLOAD_BYTES / 2).saturating_add(1024));
 
-        client
-            .insert_json_rows(
-                "raw_events",
-                &[
-                    json!({ "payload": large_value }),
-                    json!({ "payload": large_value }),
-                ],
-            )
-            .await
-            .expect("chunked insert should succeed");
+        envelope::with_test_envelope(client.insert_json_rows(
+            "raw_events",
+            &[
+                json!({ "payload": large_value }),
+                json!({ "payload": large_value }),
+            ],
+        ))
+        .await
+        .expect("chunked insert should succeed");
 
         let lengths = lengths.lock().expect("length capture mutex poisoned");
         assert_eq!(lengths.len(), 2, "rows should be split into two inserts");
@@ -3730,20 +3764,19 @@ mod tests {
         .await;
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
 
-        let mut stream = client
-            .request_stream_with_params(
-                "SELECT value FROM events FORMAT JSONEachRow",
-                Some("moraine"),
-                None,
-                &[
-                    ("query_id", "qid-test"),
-                    ("readonly", "1"),
-                    ("max_execution_time", "600"),
-                ],
-                Some(Duration::from_secs(630)),
-            )
-            .await
-            .expect("stream request");
+        let mut stream = envelope::with_test_envelope(client.request_stream_with_params(
+            "SELECT value FROM events FORMAT JSONEachRow",
+            Some("moraine"),
+            None,
+            &[
+                ("query_id", "qid-test"),
+                ("readonly", "1"),
+                ("max_execution_time", "600"),
+            ],
+            Some(Duration::from_secs(630)),
+        ))
+        .await
+        .expect("stream request");
 
         let mut body = Vec::new();
         while let Some(chunk) = stream.next_chunk().await.expect("chunk") {
@@ -3765,14 +3798,31 @@ mod tests {
             params[0].get("database").map(String::as_str),
             Some("moraine")
         );
-        assert_eq!(
-            params[0].get("query_id").map(String::as_str),
-            Some("qid-test")
+        // Budget params are envelope-owned (issue #600): the caller's
+        // query_id is replaced by the envelope's child id and the caller's
+        // max_execution_time is min-merged with the remaining deadline;
+        // non-budget params like readonly pass through untouched.
+        assert!(
+            params[0]
+                .get("query_id")
+                .is_some_and(|query_id| query_id.starts_with("moraine-test-")),
+            "envelope-owned query_id, got {:?}",
+            params[0].get("query_id")
         );
         assert_eq!(params[0].get("readonly").map(String::as_str), Some("1"));
+        let effective_execution: f64 = params[0]
+            .get("max_execution_time")
+            .expect("max_execution_time set")
+            .parse()
+            .expect("parsable max_execution_time");
+        assert!(
+            effective_execution > 0.0 && effective_execution <= 600.0,
+            "min-merged execution limit, got {effective_execution}"
+        );
         assert_eq!(
-            params[0].get("max_execution_time").map(String::as_str),
-            Some("600")
+            params[0].get("max_rows_to_read").map(String::as_str),
+            Some("1000000"),
+            "stream statements carry the remaining read allowance ceilings"
         );
 
         let content_lengths = content_lengths
@@ -3786,10 +3836,15 @@ mod tests {
         let base_url = spawn_mock_server().await;
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
 
-        let err = client
-            .request_stream_with_params("SELECT FAIL", None, None, &[], None)
-            .await
-            .expect_err("expected HTTP failure");
+        let err = envelope::with_test_envelope(client.request_stream_with_params(
+            "SELECT FAIL",
+            None,
+            None,
+            &[],
+            None,
+        ))
+        .await
+        .expect_err("expected HTTP failure");
 
         let msg = err.to_string();
         assert!(msg.contains("clickhouse returned"));
@@ -3993,7 +4048,9 @@ mod tests {
         .await;
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
 
-        let skew = client.schema_skew().await.expect("skew probe");
+        let skew = envelope::with_test_envelope(client.schema_skew())
+            .await
+            .expect("skew probe");
         let newest = bundled_migrations()
             .last()
             .expect("bundled migrations non-empty")
@@ -4021,7 +4078,9 @@ mod tests {
         .await;
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
 
-        let skew = client.schema_skew().await.expect("skew probe");
+        let skew = envelope::with_test_envelope(client.schema_skew())
+            .await
+            .expect("skew probe");
         assert_eq!(skew.missing_on_server.len(), bundled_migrations().len());
         assert!(skew.unknown_on_server.is_empty());
     }
@@ -4031,10 +4090,15 @@ mod tests {
         let base_url = spawn_mock_server().await;
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
 
-        let err = client
-            .request_text("SELECT FAIL", None, None, false, None)
-            .await
-            .expect_err("expected HTTP failure");
+        let err = envelope::with_test_envelope(client.request_text(
+            "SELECT FAIL",
+            None,
+            None,
+            false,
+            None,
+        ))
+        .await
+        .expect_err("expected HTTP failure");
 
         let msg = err.to_string();
         assert!(msg.contains("clickhouse returned"));
@@ -4047,10 +4111,10 @@ mod tests {
         let base_url = spawn_truncated_body_server();
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
 
-        let err = client
-            .request_text("SELECT 1", None, None, false, None)
-            .await
-            .expect_err("expected response body read failure");
+        let err =
+            envelope::with_test_envelope(client.request_text("SELECT 1", None, None, false, None))
+                .await
+                .expect_err("expected response body read failure");
 
         let msg = err.to_string();
         assert!(msg.contains("failed to read clickhouse response body"));
@@ -4144,13 +4208,22 @@ mod tests {
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }
 
+            // Answer the liveness probes with well-formed payloads so the
+            // exemption tests can drive the real `ping`/`version` surfaces.
+            let body = if query.trim() == "SELECT 1" {
+                "1\n"
+            } else if query.contains("version()") {
+                "{\"data\":[{\"version\":\"25.0.0-test\"}],\"rows\":1}\n"
+            } else {
+                "ok\n"
+            };
             (
                 StatusCode::OK,
                 [(
                     "x-clickhouse-summary",
                     "{\"read_rows\":\"100\",\"read_bytes\":\"2048\",\"written_rows\":\"0\"}",
                 )],
-                "ok\n",
+                body,
             )
                 .into_response()
         }
@@ -4395,23 +4468,176 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn unenveloped_statement_executes_as_today_and_increments_counter() {
+    async fn unenveloped_statement_fails_closed_with_typed_missing_error() {
         let state = EnvelopeCaptureState::default();
         let base_url = spawn_envelope_capture_server(state.clone()).await;
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
 
         let before = unenveloped_statement_count();
-        client
+        // Every public transport entry point funnels through
+        // `request_builder`; each surface must refuse a bare call with
+        // `EnvelopeError::Missing` at the root of the chain, before any bytes
+        // reach the server.
+        let text_error = client
             .request_text("SELECT 1", None, None, false, None)
             .await
-            .expect("unenveloped statement still executes pre-flip");
-        assert!(unenveloped_statement_count() > before);
+            .expect_err("bare request_text must fail closed");
+        assert_eq!(
+            text_error.downcast_ref::<EnvelopeError>(),
+            Some(&EnvelopeError::Missing),
+            "chain: {text_error:#}"
+        );
 
+        let rows_error = client
+            .query_rows_with_params::<Value>("SELECT 1", None, &[])
+            .await
+            .expect_err("bare query must fail closed");
+        assert_eq!(
+            rows_error.downcast_ref::<EnvelopeError>(),
+            Some(&EnvelopeError::Missing)
+        );
+
+        let stream_error = client
+            .request_stream_with_params("SELECT 1", None, None, &[], None)
+            .await
+            .expect_err("bare stream must fail closed");
+        assert_eq!(
+            stream_error.downcast_ref::<EnvelopeError>(),
+            Some(&EnvelopeError::Missing)
+        );
+
+        let insert_error = client
+            .insert_json_rows("events", &[serde_json::json!({"a": 1})])
+            .await
+            .expect_err("bare insert must fail closed");
+        assert_eq!(
+            insert_error.downcast_ref::<EnvelopeError>(),
+            Some(&EnvelopeError::Missing)
+        );
+
+        // Nothing reached the server, and the refusals are not "unenveloped
+        // statements": post-flip that counter is dead in production and must
+        // stay at its pre-flip value (0 for the whole process, but this test
+        // shares the process with others, so assert no growth).
+        assert!(state.snapshot().is_empty(), "refusal must not reach server");
+        assert_eq!(unenveloped_statement_count(), before);
+        assert_eq!(
+            unenveloped_statement_count(),
+            0,
+            "no production or test path may execute an unenveloped statement"
+        );
+
+        // `envelope_error_kind` classifies Missing as Other: it is a caller
+        // bug, not a budget outcome, so it must not masquerade as
+        // deadline/resource exhaustion on the wire.
+        assert_eq!(
+            envelope_error_kind(&text_error),
+            Some(ClickHouseErrorKind::Other)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ping_and_version_self_scope_an_administrative_envelope() {
+        let state = EnvelopeCaptureState::default();
+        let base_url = spawn_envelope_capture_server(state.clone()).await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+
+        // Bare probes are the documented exemption: they succeed by scoping
+        // their own Administrative micro-budget envelope.
+        client.ping().await.expect("bare ping self-scopes");
         let requests = state.snapshot();
-        let request = &requests[0];
-        assert_eq!(request.pair("query_id"), None);
-        assert_eq!(request.pair("max_execution_time"), None);
-        assert_eq!(request.pair("wait_end_of_query"), None);
+        let ping_request = requests.last().expect("ping captured");
+        let ping_query_id = ping_request.pair("query_id").expect("ping query_id");
+        assert!(
+            ping_query_id.starts_with("moraine-ping-"),
+            "ping query id: {ping_query_id}"
+        );
+        let ping_deadline: f64 = ping_request
+            .pair("max_execution_time")
+            .expect("ping max_execution_time")
+            .parse()
+            .expect("parsable ping deadline");
+        assert!(ping_deadline > 0.0 && ping_deadline <= 10.0);
+
+        let version = client.version().await.expect("bare version self-scopes");
+        assert_eq!(version, "25.0.0-test");
+        let requests = state.snapshot();
+        let version_request = requests.last().expect("version captured");
+        let version_query_id = version_request.pair("query_id").expect("version query_id");
+        assert!(
+            version_query_id.starts_with("moraine-version-"),
+            "version query id: {version_query_id}"
+        );
+
+        // Under a caller envelope the probe consumes the caller's budget and
+        // KILL prefix instead of minting its own.
+        let budget = envelope::test_budget(30.0, 8, 1_000, 1_000_000);
+        let query_envelope = QueryEnvelope::new("request", QueryClass::Interactive, &budget);
+        let request_id = query_envelope.request_id().to_string();
+        query_envelope
+            .scope(async { client.ping().await })
+            .await
+            .expect("enveloped ping");
+        let requests = state.snapshot();
+        let scoped_ping = requests.last().expect("scoped ping captured");
+        assert_eq!(
+            scoped_ping.pair("query_id"),
+            Some(format!("{request_id}-0").as_str()),
+            "scoped ping must ride the caller's envelope"
+        );
+
+        assert_eq!(unenveloped_statement_count(), 0);
+    }
+
+    /// Structural unrepresentability guard (issue #600 W12): every HTTP
+    /// egress path in this transport funnels through `request_builder`, and
+    /// `request_builder` contains exactly one envelope decision that fails
+    /// closed. If someone adds a second `self.http.post(...)` (a transport
+    /// bypass) or a permissive count-and-execute branch for absent envelopes,
+    /// this test fails before review does.
+    #[test]
+    fn transport_source_has_single_guarded_http_egress() {
+        // The needles are assembled with `concat!` so this test's own source
+        // (also part of the included file) never matches them.
+        let transport_source = include_str!("lib.rs");
+        let envelope_source = include_str!("envelope.rs");
+
+        let post_needle = concat!("self.http", ".post(");
+        assert_eq!(
+            transport_source.matches(post_needle).count(),
+            1,
+            "all ClickHouse HTTP egress must funnel through request_builder's single POST"
+        );
+        // No other reqwest client construction or ad-hoc send outside the
+        // guarded path: one client constructor, no one-shot reqwest calls.
+        let builder_needle = concat!("Client::", "builder()");
+        assert_eq!(transport_source.matches(builder_needle).count(), 1);
+        let get_needle = concat!("reqwest::", "get");
+        let http_field_needle = concat!("self.", "http");
+        for source in [transport_source, envelope_source] {
+            assert!(!source.contains(get_needle));
+        }
+        assert_eq!(envelope_source.matches(http_field_needle).count(), 0);
+
+        // The single decision point fails closed on a missing envelope...
+        let guard_needle = concat!(
+            "let ticket = match QueryEnvelope::current() {\n",
+            "            Err(error) => {"
+        );
+        assert!(
+            transport_source.contains(guard_needle),
+            "request_builder must refuse statements without an active envelope"
+        );
+        // ...and the pre-flip permissive branch cannot come back silently.
+        let permissive_needle = concat!("record_unenveloped", "_statement");
+        assert!(
+            !transport_source.contains(permissive_needle),
+            "permissive unenveloped execution was removed by the fail-closed flip"
+        );
+        assert!(
+            !envelope_source.contains(permissive_needle),
+            "the unenveloped counter must stay dead post-flip"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
