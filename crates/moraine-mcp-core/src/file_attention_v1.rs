@@ -12,7 +12,6 @@
 use super::{
     backend_query_id, cancel_query_with_deadline, handled_tool_error_result, internal_id_error,
     repo_error_to_contract_error, request_performance, tool_success_result, AppState,
-    QueryCancellationGuard,
 };
 use crate::contract::{
     format_rfc3339_utc_millis, CanonicalFileAttentionArgs, ContractError, FileAttentionArgs,
@@ -21,7 +20,7 @@ use crate::contract::{
     FILE_ATTENTION_MIN_TAIL_SEGMENTS, FILE_ATTENTION_TOOL,
 };
 use anyhow::{Context, Result};
-use moraine_conversations::{FileAttentionQuery, FileAttentionTouch};
+use moraine_conversations::{FileAttentionQuery, FileAttentionTouch, QueryEnvelope};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -98,7 +97,13 @@ impl AppState {
             );
         }
 
-        let query_id = backend_query_id("file-attention");
+        // The MCP-visible query id is the request envelope's id; the repo's
+        // cancel_query reaches every '{id}-{seq}' statement child through one
+        // prefix KILL. Outside an envelope (direct unit-test calls) keep the
+        // legacy bespoke id so unenveloped statements stay attributable.
+        let query_id = QueryEnvelope::current()
+            .map(|envelope| envelope.request_id().to_string())
+            .unwrap_or_else(|_| backend_query_id("file-attention"));
         let repo_query = FileAttentionQuery {
             cancellation_token: query_id.clone(),
             rel: tail.rel.clone(),
@@ -120,20 +125,22 @@ impl AppState {
             execution_budget_secs: FILE_ATTENTION_DEADLINE_MS.div_ceil(1_000),
         };
 
-        let mut cancellation = QueryCancellationGuard::new(query_id.clone());
-        let repo_result = timeout(
+        // The tool-level cap narrows the request envelope (never widens it),
+        // so every statement's server max_execution_time tracks the 4s
+        // bound; a fired tokio timeout drops the repository future and the
+        // transport's per-statement drop guards KILL whatever is in flight.
+        let repo_result = QueryEnvelope::scope_narrowed(
             Duration::from_millis(FILE_ATTENTION_DEADLINE_MS),
-            self.repo.file_attention(repo_query),
+            timeout(
+                Duration::from_millis(FILE_ATTENTION_DEADLINE_MS),
+                self.repo.file_attention(repo_query),
+            ),
         )
         .await;
 
         let touches = match repo_result {
-            Ok(Ok(touches)) => {
-                cancellation.disarm();
-                touches
-            }
+            Ok(Ok(touches)) => touches,
             Ok(Err(error)) => {
-                cancellation.disarm();
                 return encode_error(
                     canonical_request,
                     repo_error_to_contract_error(error),
@@ -141,8 +148,9 @@ impl AppState {
                 );
             }
             Err(_) => {
+                // Belt-and-suspenders alongside the transport drop guards:
+                // an explicit bounded prefix KILL on the request id.
                 cancel_query_with_deadline(self, &query_id).await;
-                cancellation.disarm();
                 return encode_error(
                     canonical_request,
                     ContractError::new(

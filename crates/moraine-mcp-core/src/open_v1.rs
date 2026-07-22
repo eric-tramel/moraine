@@ -439,10 +439,13 @@ fn repo_error_tool_response(
     started_at: Instant,
 ) -> Result<Value> {
     match error {
-        moraine_conversations::RepoError::ReadModelChanged => {
-            let error = crate::repo_error_to_contract_error(
-                moraine_conversations::RepoError::ReadModelChanged,
-            );
+        // Structured retryable/budget verdicts keep their dedicated wire
+        // codes and details through the shared mapper (issue #600 W7 maps
+        // deadline/resource errors at BOTH mapping sites).
+        error @ (moraine_conversations::RepoError::ReadModelChanged
+        | moraine_conversations::RepoError::DeadlineExceeded { .. }
+        | moraine_conversations::RepoError::ResourceExhausted { .. }) => {
+            let error = crate::repo_error_to_contract_error(error);
             error_tool_response(
                 request,
                 ToolError {
