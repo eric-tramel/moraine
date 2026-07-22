@@ -1292,3 +1292,98 @@ fn autoresearch_retrieval_benchmark() {
     );
     println!("METRIC retrieval_candidate_count={expected_len}");
 }
+
+// --- issue #600: typed budget-error classification at the repo boundary ---
+
+fn interactive_test_budget() -> moraine_config::ValidatedQueryBudget {
+    moraine_config::ValidatedQueryBudgets::from_config(
+        &moraine_config::QueryBudgetsConfig::default(),
+    )
+    .expect("default budgets validate")
+    .interactive
+}
+
+#[test]
+fn classify_backend_error_maps_envelope_deadline_to_deadline_exceeded() {
+    let error = anyhow::Error::new(EnvelopeError::DeadlineExpired {
+        budget: Duration::from_secs(15),
+    })
+    .context("outer repository context");
+    match classify_backend_error(error) {
+        RepoError::DeadlineExceeded { budget_note } => {
+            assert!(
+                budget_note.contains("15.000"),
+                "note should carry the budget: {budget_note}"
+            );
+        }
+        other => panic!("expected DeadlineExceeded, got {other:?}"),
+    }
+}
+
+#[test]
+fn classify_backend_error_maps_cap_and_allowance_to_resource_exhausted() {
+    let cap = anyhow::Error::new(EnvelopeError::StatementCapExceeded { cap: 4 });
+    assert!(matches!(
+        classify_backend_error(cap),
+        RepoError::ResourceExhausted { .. }
+    ));
+
+    let allowance = anyhow::Error::new(EnvelopeError::AllowanceExhausted {
+        resource: moraine_clickhouse::AllowanceResource::Rows,
+        budget: 100,
+    });
+    match classify_backend_error(allowance) {
+        RepoError::ResourceExhausted { budget_note } => {
+            assert!(
+                budget_note.contains("read_rows"),
+                "note should name the exhausted resource: {budget_note}"
+            );
+        }
+        other => panic!("expected ResourceExhausted, got {other:?}"),
+    }
+}
+
+#[test]
+fn classify_backend_error_keeps_unclassified_failures_as_backend() {
+    // A missing envelope is not a budget outcome: pre-flip it cannot happen
+    // at classification time (the statement ran unenveloped), and post-flip
+    // it is a wiring bug — either way it stays an opaque backend error.
+    let missing = anyhow::Error::new(EnvelopeError::Missing);
+    assert!(matches!(
+        classify_backend_error(missing),
+        RepoError::Backend(_)
+    ));
+
+    let plain = anyhow::anyhow!("clickhouse returned 500 Internal Server Error: Code: 60");
+    match classify_backend_error(plain) {
+        RepoError::Backend(message) => assert!(message.contains("Code: 60")),
+        other => panic!("expected Backend, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn classify_backend_error_is_stable_inside_an_active_envelope_scope() {
+    let budget = interactive_test_budget();
+    let envelope = QueryEnvelope::new("request", QueryClass::Interactive, &budget);
+    envelope
+        .scope(async move {
+            // Local admission errors keep their own budget text under scope().
+            let error = anyhow::Error::new(EnvelopeError::DeadlineExpired {
+                budget: Duration::from_secs(15),
+            });
+            match classify_backend_error(error) {
+                RepoError::DeadlineExceeded { budget_note } => {
+                    assert!(budget_note.contains("deadline expired"));
+                }
+                other => panic!("expected DeadlineExceeded, got {other:?}"),
+            }
+            // Errors without a typed budget root stay opaque Backend errors
+            // even while an envelope is active (no false positives).
+            let unrelated = anyhow::anyhow!("some transport failure");
+            assert!(matches!(
+                classify_backend_error(unrelated),
+                RepoError::Backend(_)
+            ));
+        })
+        .await;
+}

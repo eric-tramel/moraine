@@ -36,6 +36,20 @@ fn migration_request_timeout(configured_seconds: f64) -> Duration {
     Duration::from_secs_f64(configured_seconds.max(MIN_MIGRATION_REQUEST_TIMEOUT.as_secs_f64()))
 }
 
+/// The bundled-default `[query_budgets.migration]` budget, for migration
+/// callers that do not thread an operator-loaded `ValidatedQueryBudgets`.
+fn default_migration_budget() -> moraine_config::ValidatedQueryBudget {
+    static MIGRATION: std::sync::OnceLock<moraine_config::ValidatedQueryBudget> =
+        std::sync::OnceLock::new();
+    *MIGRATION.get_or_init(|| {
+        moraine_config::ValidatedQueryBudgets::from_config(
+            &moraine_config::QueryBudgetsConfig::default(),
+        )
+        .expect("bundled default query budgets are valid")
+        .migration
+    })
+}
+
 #[derive(Clone)]
 pub struct ClickHouseClient {
     cfg: ClickHouseConfig,
@@ -1020,38 +1034,89 @@ impl ClickHouseClient {
         self.run_migrations_with_progress(|_| {}).await
     }
 
-    pub async fn run_migrations_with_progress<F>(&self, mut on_progress: F) -> Result<Vec<String>>
+    /// Migration-class envelope for schema/read-model work driven by this
+    /// client (the migration runner itself, and the `migrate`/`up` command
+    /// path around `backfill_mcp_open_read_model*` / projection reclaim).
+    /// The absolute deadline honors `max(configured migration budget,
+    /// operator client timeout, 300s)` per amendment A5, so an envelope can
+    /// never be tighter than the client bound migrations honored before
+    /// envelopes existed.
+    pub fn migration_envelope(
+        &self,
+        budget: &moraine_config::ValidatedQueryBudget,
+    ) -> Arc<QueryEnvelope> {
+        QueryEnvelope::new_migration(
+            "migration",
+            budget,
+            migration_request_timeout(self.cfg.timeout_seconds),
+        )
+    }
+
+    pub async fn run_migrations_with_progress<F>(&self, on_progress: F) -> Result<Vec<String>>
+    where
+        F: FnMut(MigrationProgress),
+    {
+        self.run_migrations_with_progress_and_budget(&default_migration_budget(), on_progress)
+            .await
+    }
+
+    /// Run pending migrations with every statement scoped inside its own
+    /// Migration-class envelope built from `migration_budget`.
+    ///
+    /// Envelope granularity is deliberately per statement, not per run: the
+    /// pre-envelope behavior gave every statement the full
+    /// `migration_request_timeout` client bound, and one envelope spanning
+    /// the run (or even one multi-statement migration) would cap the SUM of
+    /// statement times on upgrade — a regression amendment A5 forbids. The
+    /// per-statement envelopes deliberately shadow any envelope the caller
+    /// scoped for the same reason. Migration statements get no drop-guard
+    /// KILLs by class; the operator-honoring client timeout stays as the
+    /// reqwest bound.
+    pub async fn run_migrations_with_progress_and_budget<F>(
+        &self,
+        migration_budget: &moraine_config::ValidatedQueryBudget,
+        mut on_progress: F,
+    ) -> Result<Vec<String>>
     where
         F: FnMut(MigrationProgress),
     {
         validate_identifier(&self.cfg.database)?;
 
-        self.request_text(
-            &format!(
-                "CREATE DATABASE IF NOT EXISTS {}",
-                escape_identifier(&self.cfg.database)
-            ),
-            None,
-            None,
-            false,
-            None,
-        )
-        .await?;
-
-        self.ensure_migration_ledger().await?;
-        let applied = self.applied_migration_versions().await?;
-        let bundled = bundled_migrations();
-        let bundled_count = bundled.len();
-        let pending = bundled
-            .into_iter()
-            .filter(|migration| !applied.contains(migration.version))
-            .collect::<Vec<_>>();
-        let total = pending.len();
         // Backfills may legitimately outlive the ordinary interactive-query
         // deadline.  Keep any larger operator-configured timeout, but prevent
         // a client-side deadline from abandoning a still-running migration
         // and overlapping it with a retry.
         let migration_request_timeout = migration_request_timeout(self.cfg.timeout_seconds);
+
+        // Plan preflight (database/ledger DDL + applied-version read) under
+        // one Migration envelope; each pending statement below gets its own.
+        let (bundled_count, pending) = self
+            .migration_envelope(migration_budget)
+            .scope(async {
+                self.request_text(
+                    &format!(
+                        "CREATE DATABASE IF NOT EXISTS {}",
+                        escape_identifier(&self.cfg.database)
+                    ),
+                    None,
+                    None,
+                    false,
+                    None,
+                )
+                .await?;
+
+                self.ensure_migration_ledger().await?;
+                let applied = self.applied_migration_versions().await?;
+                let bundled = bundled_migrations();
+                let bundled_count = bundled.len();
+                let pending = bundled
+                    .into_iter()
+                    .filter(|migration| !applied.contains(migration.version))
+                    .collect::<Vec<_>>();
+                Ok::<_, anyhow::Error>((bundled_count, pending))
+            })
+            .await?;
+        let total = pending.len();
         on_progress(MigrationProgress::Plan {
             applied: bundled_count.saturating_sub(total),
             pending: total,
@@ -1069,23 +1134,24 @@ impl ClickHouseClient {
 
             let sql = materialize_migration_sql(migration.sql, &self.cfg.database)?;
             for statement in split_sql_statements(&sql) {
-                self.request_text_with_params_and_timeout(
-                    &statement,
-                    None,
-                    Some(&self.cfg.database),
-                    false,
-                    None,
-                    &[],
-                    Some(migration_request_timeout),
-                )
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed migration {} statement: {}",
-                        migration.name,
-                        truncate_for_error(&statement)
-                    )
-                })?;
+                self.migration_envelope(migration_budget)
+                    .scope(self.request_text_with_params_and_timeout(
+                        &statement,
+                        None,
+                        Some(&self.cfg.database),
+                        false,
+                        None,
+                        &[],
+                        Some(migration_request_timeout),
+                    ))
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed migration {} statement: {}",
+                            migration.name,
+                            truncate_for_error(&statement)
+                        )
+                    })?;
             }
 
             let log_stmt = format!(
@@ -1094,17 +1160,18 @@ impl ClickHouseClient {
                 escape_literal(migration.version),
                 escape_literal(migration.name)
             );
-            self.request_text_with_params_and_timeout(
-                &log_stmt,
-                None,
-                Some(&self.cfg.database),
-                false,
-                None,
-                &[],
-                Some(migration_request_timeout),
-            )
-            .await
-            .with_context(|| format!("failed to record migration {}", migration.name))?;
+            self.migration_envelope(migration_budget)
+                .scope(self.request_text_with_params_and_timeout(
+                    &log_stmt,
+                    None,
+                    Some(&self.cfg.database),
+                    false,
+                    None,
+                    &[],
+                    Some(migration_request_timeout),
+                ))
+                .await
+                .with_context(|| format!("failed to record migration {}", migration.name))?;
 
             executed.push(migration.version.to_string());
             on_progress(MigrationProgress::Applied {
@@ -1865,7 +1932,19 @@ mod tests {
     struct MigrationMockState {
         applied: Arc<Vec<String>>,
         queries: Arc<Mutex<Vec<String>>>,
+        params: Arc<Mutex<Vec<HashMap<String, String>>>>,
         fail_ledger_insert: bool,
+    }
+
+    impl MigrationMockState {
+        fn new(applied: Vec<String>, queries: Arc<Mutex<Vec<String>>>) -> Self {
+            Self {
+                applied: Arc::new(applied),
+                queries,
+                params: Arc::new(Mutex::new(Vec::new())),
+                fail_ledger_insert: false,
+            }
+        }
     }
 
     async fn spawn_migration_mock_server(state: MigrationMockState) -> String {
@@ -1874,6 +1953,11 @@ mod tests {
             Query(params): Query<HashMap<String, String>>,
         ) -> (StatusCode, String) {
             let query = params.get("query").cloned().unwrap_or_default();
+            state
+                .params
+                .lock()
+                .expect("migration params mutex poisoned")
+                .push(params.clone());
             state
                 .queries
                 .lock()
@@ -3725,11 +3809,10 @@ mod tests {
             .into_iter()
             .map(|migration| migration.version.to_string())
             .collect::<Vec<_>>();
-        let base_url = spawn_migration_mock_server(MigrationMockState {
-            applied: Arc::new(applied),
-            queries: Arc::new(Mutex::new(Vec::new())),
-            fail_ledger_insert: false,
-        })
+        let base_url = spawn_migration_mock_server(MigrationMockState::new(
+            applied,
+            Arc::new(Mutex::new(Vec::new())),
+        ))
         .await;
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
         let mut events = Vec::new();
@@ -3758,12 +3841,8 @@ mod tests {
             .map(|migration| migration.version.to_string())
             .collect::<Vec<_>>();
         let queries = Arc::new(Mutex::new(Vec::new()));
-        let base_url = spawn_migration_mock_server(MigrationMockState {
-            applied: Arc::new(applied),
-            queries: queries.clone(),
-            fail_ledger_insert: false,
-        })
-        .await;
+        let base_url =
+            spawn_migration_mock_server(MigrationMockState::new(applied, queries.clone())).await;
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
         let mut events = Vec::new();
 
@@ -3813,9 +3892,8 @@ mod tests {
             .map(|migration| migration.version.to_string())
             .collect::<Vec<_>>();
         let base_url = spawn_migration_mock_server(MigrationMockState {
-            applied: Arc::new(applied),
-            queries: Arc::new(Mutex::new(Vec::new())),
             fail_ledger_insert: true,
+            ..MigrationMockState::new(applied, Arc::new(Mutex::new(Vec::new())))
         })
         .await;
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
@@ -3839,6 +3917,62 @@ mod tests {
         assert!(events
             .iter()
             .all(|event| !matches!(event, MigrationProgress::Applied { .. })));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn migration_statements_carry_envelope_deadline_honoring_operator_timeout() {
+        let bundled = bundled_migrations();
+        let applied = bundled[..bundled.len() - 1]
+            .iter()
+            .map(|migration| migration.version.to_string())
+            .collect::<Vec<_>>();
+        let state = MigrationMockState::new(applied, Arc::new(Mutex::new(Vec::new())));
+        let params = state.params.clone();
+        let base_url = spawn_migration_mock_server(state).await;
+
+        // Operator client timeout (900s) exceeds the default migration budget
+        // deadline (600s): the per-statement Migration envelope must honor the
+        // larger operator bound (amendment A5) — never lower than pre-envelope
+        // behavior.
+        let mut cfg = test_clickhouse_config(base_url);
+        cfg.timeout_seconds = 900.0;
+        let client = ClickHouseClient::new(cfg).expect("new client");
+
+        client
+            .run_migrations_with_progress(|_| {})
+            .await
+            .expect("apply latest migration");
+
+        let params = params.lock().expect("migration params mutex poisoned");
+        assert!(!params.is_empty(), "mock captured no requests");
+        for request in params.iter() {
+            let query_id = request
+                .get("query_id")
+                .expect("every migration statement carries an envelope query id");
+            assert!(
+                query_id.starts_with("moraine-migration-"),
+                "unexpected query id {query_id}"
+            );
+            let max_execution_time = request
+                .get("max_execution_time")
+                .expect("every migration statement carries a server deadline")
+                .parse::<f64>()
+                .expect("parseable max_execution_time");
+            assert!(
+                max_execution_time > 600.0 && max_execution_time <= 900.0,
+                "server deadline must honor the 900s operator bound, got {max_execution_time}"
+            );
+        }
+        // Per-statement envelopes: no two statements share a request id, so
+        // one upgrade's total is never capped by a single absolute deadline.
+        let mut ids = params
+            .iter()
+            .filter_map(|request| request.get("query_id").cloned())
+            .collect::<Vec<_>>();
+        let total = ids.len();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), total, "migration statement ids must be unique");
     }
 
     #[tokio::test(flavor = "multi_thread")]

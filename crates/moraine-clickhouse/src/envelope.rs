@@ -287,13 +287,79 @@ impl QueryEnvelope {
         budget: &ValidatedQueryBudget,
         admin_budget: &ValidatedQueryBudget,
     ) -> Arc<Self> {
-        let deadline_budget = budget.deadline();
+        Self::build(
+            kind,
+            class,
+            budget,
+            admin_budget,
+            budget.statement_cap(),
+            budget.deadline(),
+        )
+    }
+
+    /// Envelope for a batch-shaped logical operation (amendment A7): identical
+    /// to [`Self::new_with_admin_budget`] except the statement cap is derived
+    /// from the actual batch at envelope creation (see
+    /// [`batch_statement_cap`]), so no legitimate batch can exceed its own
+    /// cap. The class budget's configured cap stays as a floor — a
+    /// batch-derived cap can only widen the operator's headroom for a large
+    /// batch, never shrink it for a small one. Everything else (deadline,
+    /// memory, spill, read allowances) still comes from the validated class
+    /// budget (amendment A9).
+    pub fn new_batch(
+        kind: &str,
+        class: QueryClass,
+        budget: &ValidatedQueryBudget,
+        admin_budget: &ValidatedQueryBudget,
+        batch_cap: u32,
+    ) -> Arc<Self> {
+        Self::build(
+            kind,
+            class,
+            budget,
+            admin_budget,
+            batch_cap.max(budget.statement_cap()),
+            budget.deadline(),
+        )
+    }
+
+    /// Migration-class envelope whose absolute deadline honors
+    /// `max(configured migration budget, deadline_floor)` (amendment A5): the
+    /// migration runner passes its operator-derived client timeout (itself
+    /// floored at 300s) as `deadline_floor`, so the server-side envelope
+    /// deadline can never be tighter than the client bound migrations honored
+    /// before envelopes existed. Migration statements get no drop-guard KILLs
+    /// by class (killing DDL mid-flight risks partial state); they rely on
+    /// server `max_execution_time` only.
+    pub fn new_migration(
+        kind: &str,
+        budget: &ValidatedQueryBudget,
+        deadline_floor: Duration,
+    ) -> Arc<Self> {
+        Self::build(
+            kind,
+            QueryClass::Migration,
+            budget,
+            &default_administrative_budget(),
+            budget.statement_cap(),
+            budget.deadline().max(deadline_floor),
+        )
+    }
+
+    fn build(
+        kind: &str,
+        class: QueryClass,
+        budget: &ValidatedQueryBudget,
+        admin_budget: &ValidatedQueryBudget,
+        statement_cap: u32,
+        deadline_budget: Duration,
+    ) -> Arc<Self> {
         Arc::new(Self {
             shared: Arc::new(EnvelopeShared {
                 request_id: generate_request_id(kind).into(),
                 class,
                 sequence: AtomicU32::new(0),
-                statement_cap: budget.statement_cap(),
+                statement_cap,
                 rows_remaining: AtomicU64::new(budget.read_rows()),
                 bytes_remaining: AtomicU64::new(budget.read_bytes()),
                 rows_budget: budget.read_rows(),
@@ -943,6 +1009,67 @@ mod tests {
         })
         .await;
         assert_eq!(value, 7);
+    }
+
+    #[test]
+    fn new_batch_uses_derived_cap_with_class_cap_floor() {
+        // Class cap 4; a large batch widens the cap to its derived value.
+        let budget = test_budget(30.0, 4, 1_000, 1_000_000);
+        let wide = QueryEnvelope::new_batch(
+            "ingest-flush",
+            QueryClass::Background,
+            &budget,
+            &budget,
+            batch_statement_cap(2, 1, 6),
+        );
+        for index in 0..8 {
+            wide.admit_statement()
+                .unwrap_or_else(|error| panic!("statement {index} admitted: {error}"));
+        }
+        assert_eq!(
+            wide.admit_statement().unwrap_err(),
+            EnvelopeError::StatementCapExceeded { cap: 8 }
+        );
+
+        // A tiny batch keeps the configured class cap as the floor.
+        let narrow = QueryEnvelope::new_batch(
+            "ingest-flush",
+            QueryClass::Background,
+            &budget,
+            &budget,
+            batch_statement_cap(1, 1, 1),
+        );
+        for _ in 0..4 {
+            narrow.admit_statement().expect("class-cap floor admits");
+        }
+        assert_eq!(
+            narrow.admit_statement().unwrap_err(),
+            EnvelopeError::StatementCapExceeded { cap: 4 }
+        );
+    }
+
+    #[test]
+    fn new_migration_deadline_honors_operator_floor() {
+        // Budget deadline 2s, operator floor 3600s: the floor wins.
+        let budget = test_budget(2.0, 4, 1_000, 1_000_000);
+        let floored = QueryEnvelope::new_migration("migration", &budget, Duration::from_secs(3600));
+        assert_eq!(floored.class(), QueryClass::Migration);
+        let remaining = floored.remaining().expect("deadline in the future");
+        assert!(
+            remaining > Duration::from_secs(3000),
+            "operator floor must widen the deadline, remaining {remaining:?}"
+        );
+
+        // Budget deadline 3600s, floor 1s: the configured budget wins.
+        let budget = test_budget(3600.0, 4, 1_000, 1_000_000);
+        let unfloored = QueryEnvelope::new_migration("migration", &budget, Duration::from_secs(1));
+        let remaining = unfloored.remaining().expect("deadline in the future");
+        assert!(
+            remaining > Duration::from_secs(3000),
+            "a floor below the budget must not tighten it, remaining {remaining:?}"
+        );
+        // Migration statements never arm drop-guard KILLs.
+        assert!(!unfloored.arms_cancel_guards());
     }
 
     #[test]

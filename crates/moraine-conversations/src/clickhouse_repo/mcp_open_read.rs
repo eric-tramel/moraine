@@ -25,6 +25,9 @@ pub(super) struct ProjectedTurn {
 
 impl ClickHouseConversationRepository {
     pub(super) async fn ensure_mcp_open_read_model_ready(&self) -> RepoResult<()> {
+        // Direct transport call, but on the request task: the boundary's
+        // active QueryEnvelope covers it through the transport task-local
+        // (amendment A10 coverage for the mcp_open ready check).
         let ready = self.map_backend(self.ch.mcp_open_read_model_ready().await)?;
         if ready {
             Ok(())

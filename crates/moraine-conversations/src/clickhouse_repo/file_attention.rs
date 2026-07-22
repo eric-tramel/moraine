@@ -19,9 +19,21 @@ impl ClickHouseConversationRepository {
         } else {
             PublicationReadScope::global()
         };
-        self.run_publication_consistent_scoped(PublicationReadClass::Strict, scope, || {
-            self.file_attention_impl(query.clone())
-        })
+        // Tighten the active envelope's deadline to this tool's execution
+        // budget: every statement of the operation — snapshot capture and
+        // revalidation, exact and suffix lookups, and the durable
+        // project-roots write — shares the tighter wall. Narrowing never
+        // resets the request id, statement cap, or read allowances
+        // (QueryEnvelope::scope_narrowed only tightens); the per-statement
+        // max_execution_time param below is additionally min-merged by the
+        // transport.
+        let deadline_cap = Duration::from_secs(query.execution_budget_secs.max(1));
+        QueryEnvelope::scope_narrowed(
+            deadline_cap,
+            self.run_publication_consistent_scoped(PublicationReadClass::Strict, scope, || {
+                self.file_attention_impl(query.clone())
+            }),
+        )
         .await
     }
 
@@ -548,19 +560,16 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
         self.map_backend(self.query_rows_with_params(&sql, None, &params).await)
     }
 
+    /// Cancel every statement issued under `query_id` (the id itself plus its
+    /// `{query_id}-{seq}` children). Delegates to the transport's bounded
+    /// prefix KILL, which runs under its own Administrative-class envelope —
+    /// finite deadline, own query id — instead of the historical unbounded
+    /// hand-rolled KILL.
     pub async fn cancel_query(&self, query_id: &str) -> RepoResult<()> {
-        let query_id = query_id.trim();
-        if query_id.is_empty() {
-            return Ok(());
-        }
-        let child_prefix = format!("{query_id}-");
-        let sql = format!(
-            "KILL QUERY WHERE query_id = {} OR startsWith(query_id, {}) SYNC",
-            sql_quote(query_id),
-            sql_quote(&child_prefix)
-        );
-        self.map_backend(self.ch.request_text(&sql, None, None, false, None).await)
-            .map(|_| ())
+        let admin_budget = administrative_query_budget();
+        self.map_backend(
+            moraine_clickhouse::kill_query_prefix(&self.ch, query_id, &admin_budget).await,
+        )
     }
 }
 
