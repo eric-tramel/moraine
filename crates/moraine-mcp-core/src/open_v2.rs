@@ -14,12 +14,11 @@
 //! function inside the repository reader (`plan_continuation`); this module only
 //! translates its outcomes to the wire.
 //!
-//! This module is NOT yet on the `open` dispatch path — WI-08 performs the
-//! one-way flip that routes `call_tool` here when the repository reports the v2
-//! reader is active. Until then it is exercised directly by unit and live tests,
-//! so the reader-facing surface is `dead_code`-allowed for this wave only; WI-08
-//! removes the need by giving `open_v2` a live dispatch root.
-#![allow(dead_code)]
+//! This module is on the `open` dispatch path via [`AppState::open`] (WI-08):
+//! `call_tool` routes here whenever the resolved reader mode is v2 (the
+//! configured `[mcp] open_reader` selector resolved against this backend's
+//! cached `open_v2` readiness and Local status). The v1 module stays byte-
+//! identical and handles every other resolution.
 
 use crate::contract::{
     classify_open_cursor, encode_open_cursor_v2, CanonicalOpenV1Args, ContractError, McpEntityKind,

@@ -500,9 +500,9 @@ mod tests {
 
     use crate::domain::{
         AnalyticsRange, AnalyticsSnapshot, AnalyticsWindow, ConversationMode, ConversationSummary,
-        IngestHeartbeatRead, PublicationDiagnostics, SessionAnalytics, SessionAnalyticsQuery,
-        SessionLookback, StoreConnectionMetrics, StoreDiagnostics, StoreHealth, StoreProbe,
-        TablePreview, TablePreviewQuery, TableSummaries, WebSearchEvent,
+        CoreIndexHealth, IngestHeartbeatRead, PublicationDiagnostics, SessionAnalytics,
+        SessionAnalyticsQuery, SessionLookback, StoreConnectionMetrics, StoreDiagnostics,
+        StoreHealth, StoreProbe, TablePreview, TablePreviewQuery, TableSummaries, WebSearchEvent,
     };
     use crate::error::RepoError;
 
@@ -566,6 +566,9 @@ mod tests {
             .await
             .expect("default store health");
         assert!(matches!(health.ping, StoreProbe::Failed { .. }));
+        // The additive core-index probe (issue #598) defaults to the
+        // not-configured `Failed` variant on the in-memory stub.
+        assert!(matches!(health.core_index, StoreProbe::Failed { .. }));
         assert_eq!(
             repo.read_store_diagnostics()
                 .await
@@ -653,6 +656,13 @@ mod tests {
             database_exists: StoreProbe::Available(true),
             connections: StoreProbe::Available(StoreConnectionMetrics::default()),
             publication: StoreProbe::Available(PublicationDiagnostics::default()),
+            core_index: StoreProbe::Available(CoreIndexHealth {
+                core_indexes_ready: true,
+                open_v2_ready: false,
+                open_v2_provenance: None,
+                backfill_cursor_age_ms: Some(1_500),
+                audit_outcome: None,
+            }),
         };
         let diagnostics = StoreDiagnostics {
             healthy: true,

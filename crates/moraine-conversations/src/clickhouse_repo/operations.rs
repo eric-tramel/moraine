@@ -358,6 +358,12 @@ impl ClickHouseConversationRepository {
             database_exists,
             connections,
             publication,
+            // Placeholder: the canonical read-index probe (issue #598) is
+            // gathered and overwritten by `read_store_health` in `repo_impl`,
+            // which owns the WI-03 accessor reads.
+            core_index: StoreProbe::Failed {
+                message: "core-index probe not gathered".to_string(),
+            },
         })
     }
 

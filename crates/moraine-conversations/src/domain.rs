@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-pub use moraine_clickhouse::PublicationDiagnostics;
+pub use moraine_clickhouse::{CoreIndexAuditOutcome, PublicationDiagnostics};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1385,6 +1385,30 @@ pub struct StoreConnectionMetrics {
     pub interserver: u64,
 }
 
+/// Canonical read-index / open-reader readiness (issue #598), surfaced by the
+/// monitor `/api/v1/health` and `/api/v1/status` payloads. Fields mirror the CLI
+/// `CoreIndexReport` (issue #598 WI-05) where practical so operators see the same
+/// readiness across HTTP and CLI; the reader-resolution fields
+/// (`configured_open_reader`/`effective_open_reader`) are config-derived and live
+/// only in the CLI surface, not this store-sourced probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreIndexHealth {
+    /// `core_indexes.ready == 1`: the coverage sweep completed and the overlap
+    /// audit passed.
+    pub core_indexes_ready: bool,
+    /// `open_v2.ready == 1`: the one-way `open` cutover flag consumers read.
+    pub open_v2_ready: bool,
+    /// How `open_v2` was published (`auto-local` | `operator-promote`), present
+    /// only when `open_v2_ready` and provenance was recorded.
+    pub open_v2_provenance: Option<String>,
+    /// Milliseconds since the backfill cursor / readiness row was last written
+    /// (decoded from the snowflake generation). `None` when the sweep has not
+    /// written a real generation yet (seed rows carry `generation = 0`).
+    pub backfill_cursor_age_ms: Option<i64>,
+    /// The persisted overlap-audit outcome, if any.
+    pub audit_outcome: Option<CoreIndexAuditOutcome>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoreHealth {
     /// Successful ping latency in milliseconds.
@@ -1393,6 +1417,11 @@ pub struct StoreHealth {
     pub database_exists: StoreProbe<bool>,
     pub connections: StoreProbe<StoreConnectionMetrics>,
     pub publication: StoreProbe<PublicationDiagnostics>,
+    /// Additive canonical read-index readiness probe (issue #598). Older
+    /// consumers ignore the extra field; a store that cannot report it (backend
+    /// unavailable, or a repository that does not source it) yields the
+    /// not-configured `Failed` variant.
+    pub core_index: StoreProbe<CoreIndexHealth>,
 }
 
 impl Default for StoreHealth {
@@ -1412,6 +1441,9 @@ impl Default for StoreHealth {
             },
             publication: StoreProbe::Failed {
                 message: "publication-readiness probe not configured".to_string(),
+            },
+            core_index: StoreProbe::Failed {
+                message: "core-index probe not configured".to_string(),
             },
         }
     }
@@ -1485,9 +1517,63 @@ fn default_page_limit() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnalyticsRange, SearchEventKind, SearchEventsQuery, SearchStrategyHint,
-        SessionAnalyticsQuery, SessionLookback, SessionOriginScope, SessionStep, TablePreviewQuery,
+        AnalyticsRange, CoreIndexHealth, PublicationDiagnostics, SearchEventKind,
+        SearchEventsQuery, SearchStrategyHint, SessionAnalyticsQuery, SessionLookback,
+        SessionOriginScope, SessionStep, StoreConnectionMetrics, StoreHealth, StoreProbe,
+        TablePreviewQuery,
     };
+
+    #[test]
+    fn store_health_core_index_probe_is_additive() {
+        // Every pre-#598 field must serialize byte-for-byte as before; the new
+        // `core_index` probe is strictly appended.
+        let health = StoreHealth {
+            ping: StoreProbe::Available(3.5),
+            version: StoreProbe::Available("25.1".to_string()),
+            database_exists: StoreProbe::Available(true),
+            connections: StoreProbe::Available(StoreConnectionMetrics::default()),
+            publication: StoreProbe::Available(PublicationDiagnostics::default()),
+            core_index: StoreProbe::Available(CoreIndexHealth {
+                core_indexes_ready: true,
+                open_v2_ready: false,
+                open_v2_provenance: None,
+                backfill_cursor_age_ms: Some(1_200),
+                audit_outcome: None,
+            }),
+        };
+
+        let value = serde_json::to_value(&health).expect("serialize store health");
+        let object = value.as_object().expect("store health is a JSON object");
+
+        // Existing probe fields keep their exact externally-tagged shape.
+        assert_eq!(object["ping"], serde_json::json!({"available": 3.5}));
+        assert_eq!(object["version"], serde_json::json!({"available": "25.1"}));
+        assert_eq!(
+            object["database_exists"],
+            serde_json::json!({"available": true})
+        );
+        assert!(object.contains_key("connections"));
+        assert!(object.contains_key("publication"));
+
+        // The additive probe is present and carries the readiness fields.
+        let core_index = &object["core_index"]["available"];
+        assert_eq!(core_index["core_indexes_ready"], serde_json::json!(true));
+        assert_eq!(core_index["open_v2_ready"], serde_json::json!(false));
+        assert_eq!(
+            core_index["backfill_cursor_age_ms"],
+            serde_json::json!(1_200)
+        );
+
+        // A round-trip preserves the whole (extended) struct.
+        let restored: StoreHealth = serde_json::from_value(value).expect("round-trip store health");
+        assert_eq!(restored, health);
+    }
+
+    #[test]
+    fn store_health_default_core_index_probe_is_not_configured() {
+        let health = StoreHealth::default();
+        assert!(matches!(health.core_index, StoreProbe::Failed { .. }));
+    }
 
     #[test]
     fn search_events_query_preserves_wire_contract() {

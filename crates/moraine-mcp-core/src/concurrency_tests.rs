@@ -314,6 +314,8 @@ fn test_state_with_admission(
             max_queued_requests,
         )),
         query_budgets,
+        false,
+        true,
     )
 }
 
@@ -1152,7 +1154,7 @@ async fn central_service_shutdown_cancels_process_wide_queued_requests() {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server_socket_path = socket_path.clone();
     let server = tokio::spawn(async move {
-        run_socket_with_router(cfg, router, server_socket_path, async move {
+        run_socket_with_router(cfg, router, server_socket_path, false, async move {
             let _ = shutdown_rx.await;
         })
         .await
