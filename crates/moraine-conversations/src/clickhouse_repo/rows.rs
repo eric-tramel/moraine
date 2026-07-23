@@ -170,8 +170,14 @@ pub(super) struct OpenTargetRow {
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct McpOpenSessionRow {
     pub(super) session_id: String,
+    #[serde(default)]
+    pub(super) candidate_publication_id: String,
     pub(super) slot: u8,
     pub(super) generation: u64,
+    #[serde(default)]
+    pub(super) source_revision: u64,
+    #[serde(default)]
+    pub(super) dirty_revision: u64,
     pub(super) first_event_time: String,
     pub(super) first_event_unix_ms: i64,
     pub(super) last_event_time: String,
@@ -195,6 +201,10 @@ pub(super) struct McpOpenSessionRow {
     pub(super) completed: u8,
     pub(super) terminal_event_uid: String,
     pub(super) origin_cwd: String,
+    #[serde(default)]
+    pub(super) tombstone: u8,
+    #[serde(default)]
+    pub(super) required_heads_fingerprint: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -250,6 +260,8 @@ pub(super) struct McpOpenTurnRow {
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct McpOpenEventLookupRow {
     pub(super) event_uid: String,
+    #[serde(default)]
+    pub(super) source_host: String,
     pub(super) session_id: String,
     pub(super) slot: u8,
     pub(super) generation: u64,
@@ -302,6 +314,8 @@ pub(super) struct ProjectedEventSummaryRow {
 
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct SearchRow {
+    #[serde(default)]
+    pub(super) source_host: String,
     pub(super) event_uid: String,
     pub(super) session_id: String,
     #[serde(default)]
@@ -332,6 +346,8 @@ pub(super) struct SearchMcpCandidateRow {
     #[serde(default)]
     pub(super) event_uid: String,
     #[serde(default)]
+    pub(super) source_host: String,
+    #[serde(default)]
     pub(super) session_id: String,
     #[serde(default)]
     pub(super) slot: u8,
@@ -355,6 +371,8 @@ pub(super) struct SearchMcpCandidateRow {
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct SearchMcpEventRow {
     pub(super) event_uid: String,
+    #[serde(default)]
+    pub(super) source_host: String,
     pub(super) session_id: String,
     pub(super) source_name: String,
     pub(super) harness: String,
@@ -414,8 +432,25 @@ pub(super) struct SearchMcpEventRow {
     pub(super) session_completed: u8,
 }
 
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+pub(super) struct SearchDocumentIdentity {
+    pub(super) source_host: String,
+    pub(super) event_uid: String,
+}
+
+impl SearchDocumentIdentity {
+    pub(super) fn new(source_host: impl Into<String>, event_uid: impl Into<String>) -> Self {
+        Self {
+            source_host: source_host.into(),
+            event_uid: event_uid.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct CachedPostingRow {
+    #[serde(default)]
+    pub(super) source_host: String,
     pub(super) event_uid: String,
     pub(super) doc_len: u32,
     pub(super) tf: u16,
@@ -424,6 +459,8 @@ pub(super) struct CachedPostingRow {
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct FetchedPostingRow {
     pub(super) term: String,
+    #[serde(default)]
+    pub(super) source_host: String,
     pub(super) event_uid: String,
     pub(super) doc_len: u32,
     pub(super) tf: u16,
@@ -431,6 +468,8 @@ pub(super) struct FetchedPostingRow {
 
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct SearchDocExtraRow {
+    #[serde(default)]
+    pub(super) source_host: String,
     pub(super) event_uid: String,
     pub(super) session_id: String,
     #[serde(default)]
@@ -489,6 +528,8 @@ pub(super) struct ConversationSearchRow {
     pub(super) score: f64,
     pub(super) matched_terms: u16,
     pub(super) event_count_considered: u32,
+    #[serde(default)]
+    pub(super) best_source_host: String,
     pub(super) best_event_uid: String,
     #[serde(default)]
     pub(super) snippet: String,
@@ -509,6 +550,8 @@ pub(super) struct ConversationSessionMetadataRow {
 
 #[derive(Debug, Deserialize)]
 pub(super) struct ConversationSnippetRow {
+    #[serde(default)]
+    pub(super) source_host: String,
     pub(super) event_uid: String,
     pub(super) snippet: String,
     #[serde(default)]

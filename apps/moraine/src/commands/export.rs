@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
-use moraine_clickhouse::ClickHouseClient;
+use moraine_clickhouse::{ClickHouseClient, QueryClass, QueryEnvelope};
 use moraine_config::AppConfig;
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -8,7 +8,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{ErrorKind, Write};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
-use uuid::Uuid;
 
 use super::schema::{
     all_non_sensitive_event_columns, default_event_columns, event_column, EventColumn,
@@ -25,7 +24,21 @@ pub(crate) async fn events(cfg: &AppConfig, args: ExportEventsArgs) -> Result<Ex
     let prepared = prepare_export(cfg, args)?;
 
     let client = ClickHouseClient::new(cfg.clickhouse.clone())?;
-    ensure_schema_ready(&client).await?;
+
+    // Export rides a Migration-class envelope with its own generous config
+    // budget (`[query_budgets.export]`, issue #600 amendment A6). The
+    // streaming statement enforces the per-statement read ceiling but skips
+    // cumulative summary accounting, and Migration-class statements arm no
+    // drop-guard KILL: the server bounds the query via max_execution_time
+    // even if stdout goes away mid-stream. The envelope owns query ids, so
+    // every statement of this export lands in system.query_log as
+    // `{query_id}-{seq}` under the request id reported in the metadata line.
+    let envelope = QueryEnvelope::new(
+        "export",
+        QueryClass::Migration,
+        &super::query_budgets(cfg).export,
+    );
+    let export_query_id = envelope.request_id().to_string();
 
     let started = Instant::now();
     let params = prepared
@@ -33,14 +46,19 @@ pub(crate) async fn events(cfg: &AppConfig, args: ExportEventsArgs) -> Result<Ex
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect::<Vec<_>>();
-    let mut stream = client
-        .request_stream_with_params(
-            &prepared.query,
-            Some(&cfg.clickhouse.database),
-            None,
-            &params,
-            Some(request_timeout(cfg.clickhouse.timeout_seconds)),
-        )
+    let mut stream = envelope
+        .scope(async {
+            ensure_schema_ready(&client).await?;
+            client
+                .request_stream_with_params(
+                    &prepared.query,
+                    Some(&cfg.clickhouse.database),
+                    None,
+                    &params,
+                    Some(request_timeout(cfg.clickhouse.timeout_seconds)),
+                )
+                .await
+        })
         .await?;
 
     let mut stdout = std::io::stdout().lock();
@@ -56,7 +74,7 @@ pub(crate) async fn events(cfg: &AppConfig, args: ExportEventsArgs) -> Result<Ex
         data_schema_version: EVENTS_SCHEMA_VERSION,
         export_kind: EXPORT_KIND_EVENTS,
         backend: DEFAULT_BACKEND,
-        query_id: &prepared.query_id,
+        query_id: &export_query_id,
         columns: prepared
             .columns
             .iter()
@@ -79,7 +97,6 @@ struct PreparedExport {
     columns: Vec<&'static EventColumn>,
     sensitive_columns_requested: Vec<String>,
     limit: Option<usize>,
-    query_id: String,
     query_params: Vec<(String, String)>,
     query: String,
     filters_metadata: BTreeMap<String, Value>,
@@ -122,15 +139,13 @@ fn prepare_export(cfg: &AppConfig, args: ExportEventsArgs) -> Result<PreparedExp
         bail!("moraine export events requires at least one filter unless --all is supplied");
     }
 
-    let query_id = Uuid::new_v4().to_string();
     let query = build_events_query(&cfg.clickhouse.database, &columns, &filters, args.limit)?;
-    let query_params = build_query_params(&query_id);
+    let query_params = build_query_params();
 
     Ok(PreparedExport {
         columns,
         sensitive_columns_requested,
         limit: args.limit,
-        query_id,
         query_params,
         query,
         filters_metadata: filters.metadata,
@@ -192,9 +207,12 @@ fn select_columns(raw: Option<&str>, include_sensitive: bool) -> Result<Vec<&'st
     Ok(columns)
 }
 
-fn build_query_params(query_id: &str) -> Vec<(String, String)> {
+/// Caller-side query params. The envelope owns query ids and min-merges this
+/// `max_execution_time` with the remaining export deadline; keeping the
+/// explicit value preserves the pre-envelope ceiling even on an unenveloped
+/// code path. `readonly` is not an envelope-owned key and passes through.
+fn build_query_params() -> Vec<(String, String)> {
     vec![
-        ("query_id".to_string(), query_id.to_string()),
         ("readonly".to_string(), "1".to_string()),
         (
             "max_execution_time".to_string(),
@@ -444,7 +462,7 @@ fn build_events_query(
                  source_line_no DESC,
                  event_uid DESC
       ) AS event_uid_rank
-    FROM {database}.events AS e FINAL
+    FROM {database}.v_live_events AS e
   )
   WHERE event_uid_rank = 1
 ),
@@ -891,7 +909,7 @@ mod tests {
         let sql = build_events_query("moraine", &columns, &filters, Some(100)).expect("sql");
 
         assert!(sql.contains("row_number() OVER (\n        PARTITION BY event_uid"));
-        assert!(sql.contains("FROM `moraine`.events AS e FINAL"));
+        assert!(sql.contains("FROM `moraine`.v_live_events AS e"));
         assert!(sql.contains("FROM trace_events AS e\nWHERE"));
         assert!(sql.contains("(e.`harness` = 'codex' OR e.`harness` = 'hermes')"));
         assert!(sql.contains("(e.`cwd` = '/repo' OR startsWith(e.`cwd`, concat('/repo', '/')))"));
@@ -937,11 +955,13 @@ mod tests {
 
     #[test]
     fn query_params_use_readonly_and_internal_execution_limit() {
-        let params = build_query_params("qid");
+        // The query id is envelope-owned (issue #600): the export envelope
+        // assigns `{request_id}-{seq}` child ids, so the caller params carry
+        // only readonly and the legacy execution ceiling.
+        let params = build_query_params();
         assert_eq!(
             params,
             vec![
-                ("query_id".to_string(), "qid".to_string()),
                 ("readonly".to_string(), "1".to_string()),
                 (
                     "max_execution_time".to_string(),

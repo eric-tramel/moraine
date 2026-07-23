@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import copy
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import math
@@ -86,6 +87,20 @@ FINGERPRINT_FIELDS = (
     "schedule_templates_sha256",
 )
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+APPEND_INDEXED_PAYLOAD_TERMS = (
+    "source",
+    "publication",
+    "append",
+    "ingest",
+    "session",
+    "assistant",
+    "response",
+    "visibility",
+    "generation",
+    "checkpoint",
+    "search",
+    "index",
+)
 
 
 class FixtureError(ValueError):
@@ -118,7 +133,7 @@ class FreshSeedTarget:
 class OneUseTermBank:
     """Hands each ETD probe term out once and fails closed on exhaustion."""
 
-    __slots__ = ("case_id", "_terms", "_index", "_used")
+    __slots__ = ("case_id", "_indexed_target", "_terms", "_index", "_used")
 
     def __init__(self, event: Mapping[str, Any]) -> None:
         case_id = event.get("case_id")
@@ -129,7 +144,15 @@ class OneUseTermBank:
             raise FixtureError("ETD probe bank contains an invalid term")
         if len(terms) != len(set(terms)):
             raise FixtureError("ETD probe bank contains reused terms")
+        indexed_target = event.get("indexed_target_term")
+        if indexed_target is not None and (
+            not isinstance(indexed_target, str)
+            or not indexed_target
+            or indexed_target in terms
+        ):
+            raise FixtureError("ETD indexed target term is invalid")
         self.case_id = case_id
+        self._indexed_target = indexed_target
         self._terms = tuple(terms)
         self._index = 0
         self._used: set[str] = set()
@@ -149,7 +172,13 @@ class OneUseTermBank:
         return term
 
     def claim_query(self) -> dict[str, Any]:
-        return {"query": self.claim(), "n_hits": 10}
+        cache_buster = self.claim()
+        query = (
+            f"{self._indexed_target} {cache_buster}"
+            if self._indexed_target is not None
+            else cache_buster
+        )
+        return {"query": query, "n_hits": 10}
 
 
 def public_id(prefix: str, raw: str) -> str:
@@ -411,7 +440,10 @@ def _build_event_case(profile: str, split: str, index: int, term_count: int) -> 
     raw_event, raw_session = _event_identity(split, index)
     prefix = f"perfprobe{profile}{split}{index:04d}x"
     probe_terms = [f"{prefix}{probe:03d}" for probe in range(term_count)]
-    recorded_at = f"2026-07-13T12:{SPLITS.index(split) * 10 + index:02d}:00.000Z"
+    recorded_at = (
+        datetime(2026, 7, 13, 12, tzinfo=timezone.utc)
+        + timedelta(minutes=SPLITS.index(split) * 10 + index)
+    ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
     event = {
         "case_id": f"{split}-event-{index:04d}",
         "split": split,
@@ -456,6 +488,104 @@ def _build_event_case(profile: str, split: str, index: int, term_count: int) -> 
         }
     )
     return event
+
+
+def build_append_probe_events(
+    count: int,
+    *,
+    term_count: int = 64,
+    first_term_count: int | None = None,
+) -> list[dict[str, Any]]:
+    """Build ordered events for one real same-generation JSONL append stream.
+
+    Unlike the ordinary ETD fixture, every event targets the same file.  The
+    expected normalized identity therefore includes the cumulative byte offset
+    and monotonically increasing source line number.  This makes the probe
+    sensitive to accidentally treating an append as a replacement generation.
+    """
+
+    if (
+        isinstance(count, bool)
+        or not isinstance(count, int)
+        or count < 1
+        or count > 10_000
+        or isinstance(term_count, bool)
+        or not isinstance(term_count, int)
+        or term_count < 1
+        or isinstance(first_term_count, bool)
+        or (
+            first_term_count is not None
+            and (not isinstance(first_term_count, int) or first_term_count < 1)
+        )
+    ):
+        raise FixtureError("append probe requires bounded positive event and term counts")
+    destination_filename = "source-publication-append.jsonl"
+    source_file = f"/sandbox/fixtures/codex/sessions/{destination_filename}"
+    cumulative_offset = 0
+    events: list[dict[str, Any]] = []
+    base = datetime(2026, 7, 14, 12, tzinfo=timezone.utc)
+    for index in range(count):
+        raw_event = f"perf-publication-event-{index:05d}"
+        raw_session = f"perf-publication-session-{index:05d}"
+        prefix = f"perfpublicationappend{index:05d}x"
+        event_term_count = (
+            first_term_count
+            if index == 0 and first_term_count is not None
+            else term_count
+        )
+        event: dict[str, Any] = {
+            "case_id": f"publication-append-event-{index:05d}",
+            "split": "source-publication",
+            "raw_event_uid": raw_event,
+            "raw_session_id": raw_session,
+            "destination_filename": destination_filename,
+            "recorded_at": (base + timedelta(seconds=index))
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z"),
+            "marker": f"perfpublicationmarker{index:05d}",
+            "indexed_target_term": f"perfpublicationtarget{index:05d}",
+            "indexed_payload_terms": list(APPEND_INDEXED_PAYLOAD_TERMS),
+            "probe_terms": [
+                f"{prefix}nonce{probe:03d}" for probe in range(event_term_count)
+            ],
+        }
+        source_bytes = codex_event_lines(event)
+        lines = source_bytes.splitlines(keepends=True)
+        if len(lines) != 2:
+            raise FixtureError("generated append probe must contain exactly two records")
+        source_line_no = 2 * (index + 1)
+        source_offset = cumulative_offset + len(lines[0])
+        record_fingerprint = lines[1].rstrip(b"\n").decode("utf-8")
+        material = (
+            f"{source_file}|1|{source_line_no}|{source_offset}|"
+            f"{record_fingerprint}|raw"
+        )
+        normalized_event_uid = hashlib.sha256(material.encode("utf-8")).hexdigest()
+        identity = {
+            "event_id": public_id("event", normalized_event_uid),
+            "session_id": public_id("session", raw_session),
+        }
+        event.update(
+            {
+                "normalized_event_uid": normalized_event_uid,
+                "expected_event_id": identity["event_id"],
+                "expected_session_id": identity["session_id"],
+                "expected_ack_digest": _ack_digest(normalized_event_uid),
+                "expected_source_generation": 1,
+                "expected_source_line_no": source_line_no,
+                "expected_source_offset": source_offset,
+                "oracle": {
+                    "count": 1,
+                    "truncated": False,
+                    "ordered_identities": [identity],
+                    "ordered_sha256": _ordered_digest([identity]),
+                    "set_sha256": sha256_json([identity]),
+                },
+            }
+        )
+        events.append(event)
+        cumulative_offset += len(source_bytes)
+    return events
 
 
 def _event_operations(events: Sequence[Mapping[str, Any]], duration_ns: int) -> list[dict[str, Any]]:
@@ -848,6 +978,76 @@ FROM numbers({documents})
 """.strip()
 
 
+def seed_publication_control_sql(
+    target: FreshSeedTarget, recipe: Mapping[str, Any]
+) -> tuple[str, ...]:
+    """Seed causal readiness, publish one head, then enqueue its live sessions."""
+
+    if not isinstance(target, FreshSeedTarget):
+        raise FixtureError("seed_publication_control_sql requires FreshSeedTarget evidence")
+    target.validate()
+    validate_recipe(recipe)
+    corpus = recipe["corpus"]
+    database = target.database
+    source_name = str(corpus["source_name"]).replace("'", "''")
+    source_file = str(corpus["source_file"]).replace("'", "''")
+    documents = int(corpus["document_count"])
+    operation_id = f"performance-fixture:{recipe['fixture_sha256']}".replace("'", "''")
+    checkpoint = f"""
+INSERT INTO {database}.ingest_checkpoint_transitions
+(
+  host, source_name, source_file, inode, source_generation, last_offset,
+  last_line, checkpoint_revision, operation_id, lifecycle,
+  scan_inode, scan_boundary, policy_fingerprint, final_scan_complete,
+  block_reason, compatibility_prepared, backend_caught_up, append_batch_id,
+  cache_epoch
+)
+VALUES
+(
+  '', '{source_name}', '{source_file}', 0, 1, {documents}, {documents}, 1,
+  '{operation_id}:checkpoint', 'active', 0, {documents},
+  'performance-fixture-v1', 1, '', 1, 1, '', 0
+)
+""".strip()
+    readiness = f"""
+INSERT INTO {database}.source_generation_publication_readiness
+(
+  source_host, source_name, source_file, source_generation,
+  readiness_revision, checkpoint_revision, operation_id, complete,
+  block_reason, compatibility_prepared, backend_caught_up
+)
+VALUES
+(
+  '', '{source_name}', '{source_file}', 1, 1, 1,
+  '{operation_id}:readiness', 1, '', 1, 1
+)
+""".strip()
+    head = f"""
+INSERT INTO {database}.published_source_generations
+(
+  source_host, source_name, source_file, source_generation,
+  publication_revision, publisher_id, operation_id
+)
+VALUES
+(
+  '', '{source_name}', '{source_file}', 1, 1,
+  'performance-fixture', '{operation_id}:head'
+)
+""".strip()
+    dirty = f"""
+INSERT INTO {database}.mcp_open_dirty_sessions
+  (session_id, dirty_revision, observed_at)
+SELECT session_id, generateSnowflakeID(), now64(3)
+FROM
+(
+  SELECT DISTINCT session_id
+  FROM {database}.v_live_events
+  WHERE notEmpty(session_id)
+)
+""".strip()
+    return checkpoint, readiness, head, dirty
+
+
 def codex_event_lines(event: Mapping[str, Any]) -> bytes:
     """Encode one ETD source fixture without exposing its expected public answer."""
 
@@ -863,6 +1063,23 @@ def codex_event_lines(event: Mapping[str, Any]) -> bytes:
             "cli_version": "benchmark",
         },
     }
+    indexed_target = event.get("indexed_target_term")
+    if indexed_target is None:
+        content_terms = list(event["probe_terms"])
+    else:
+        indexed_payload_terms = event.get("indexed_payload_terms")
+        if (
+            not isinstance(indexed_target, str)
+            or not indexed_target
+            or not isinstance(indexed_payload_terms, list)
+            or not indexed_payload_terms
+            or any(
+                not isinstance(term, str) or not term
+                for term in indexed_payload_terms
+            )
+        ):
+            raise FixtureError("ETD indexed probe payload is invalid")
+        content_terms = [indexed_target, *indexed_payload_terms]
     message = {
         "timestamp": event["recorded_at"],
         "type": "response_item",
@@ -874,7 +1091,7 @@ def codex_event_lines(event: Mapping[str, Any]) -> bytes:
             "content": [
                 {
                     "type": "output_text",
-                    "text": " ".join([event["marker"], *event["probe_terms"]]),
+                    "text": " ".join([event["marker"], *content_terms]),
                 }
             ],
         },

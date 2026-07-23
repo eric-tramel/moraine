@@ -1029,6 +1029,10 @@ pub enum ToolErrorCode {
     NotFound,
     UnsupportedEventType,
     DeadlineExceeded,
+    /// A non-time query budget ran out: admission queue full, statement cap,
+    /// cumulative read allowance, or a server memory/rows/bytes ceiling
+    /// (issue #600, amendment A11).
+    ResourceExhausted,
     InternalError,
 }
 
@@ -1040,6 +1044,7 @@ impl ToolErrorCode {
             Self::NotFound => "not_found",
             Self::UnsupportedEventType => "unsupported_event_type",
             Self::DeadlineExceeded => "deadline_exceeded",
+            Self::ResourceExhausted => "resource_exhausted",
             Self::InternalError => "internal_error",
         }
     }

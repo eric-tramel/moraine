@@ -223,6 +223,62 @@ default_min_score = 0.0
 default_min_should_match = 1
 max_query_terms = 32
 
+# Per-class ClickHouse query budgets. Every query moraine issues runs inside
+# a mandatory envelope drawn from one of these classes, so nothing here can
+# be disabled: zero is a config error (ClickHouse treats zero limits as
+# unlimited), absent fields use the defaults shown, deadline_seconds is
+# capped at 86400 (24h), and memory_bytes may not exceed the 4 GiB per-query
+# server backstop shipped to managed installs.
+#
+# interactive: MCP tools, monitor reads, CLI status/doctor reads.
+[query_budgets.interactive]
+deadline_seconds = 15.0
+memory_bytes = 1073741824   # 1 GiB
+spill_bytes = 268435456     # 256 MiB
+read_rows = 500000000
+read_bytes = 10737418240    # 10 GiB
+statement_cap = 256
+
+# background: ingest publication inspections, projection refreshes, janitor
+# work. The 600s deadline matches the projection debounce ceiling so the
+# worst-case legitimate projection refresh fits in one budget.
+[query_budgets.background]
+deadline_seconds = 600.0
+memory_bytes = 2147483648   # 2 GiB
+spill_bytes = 536870912     # 512 MiB
+read_rows = 5000000000
+read_bytes = 107374182400   # 100 GiB
+statement_cap = 512
+
+# migration: schema migrations and read-model backfills. Operator-configured
+# client timeouts larger than this deadline are still honored by migrations.
+[query_budgets.migration]
+deadline_seconds = 600.0
+memory_bytes = 4294967296   # 4 GiB
+spill_bytes = 1073741824    # 1 GiB
+read_rows = 10000000000
+read_bytes = 214748364800   # 200 GiB
+statement_cap = 1024
+
+# administrative: KILL statements and telemetry one-shots only.
+[query_budgets.administrative]
+deadline_seconds = 5.0
+memory_bytes = 268435456    # 256 MiB
+spill_bytes = 67108864      # 64 MiB
+read_rows = 1000000
+read_bytes = 268435456      # 256 MiB
+statement_cap = 4
+
+# export: `moraine export` streaming reads (matches the pre-envelope 600s
+# export ceiling).
+[query_budgets.export]
+deadline_seconds = 600.0
+memory_bytes = 2147483648   # 2 GiB
+spill_bytes = 536870912     # 512 MiB
+read_rows = 10000000000
+read_bytes = 214748364800   # 200 GiB
+statement_cap = 64
+
 [monitor]
 port = 8080
 

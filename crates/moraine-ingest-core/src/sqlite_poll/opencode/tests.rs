@@ -3,8 +3,7 @@ use crate::checkpoint::checkpoint_key;
 use crate::model::{Checkpoint, RowBatch};
 use moraine_config::SourceFormat;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::time::timeout;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn unique_opencode_db_path(name: &str) -> PathBuf {
     let suffix = SystemTime::now()
@@ -494,16 +493,6 @@ fn opencode_sqlite_work(path: &Path) -> WorkItem {
     }
 }
 
-async fn drain_batches(rx: &mut mpsc::Receiver<SinkMessage>) -> Vec<RowBatch> {
-    let mut out = Vec::new();
-    while let Ok(Some(SinkMessage::Batch(batch))) =
-        timeout(Duration::from_millis(50), rx.recv()).await
-    {
-        out.push(batch);
-    }
-    out
-}
-
 async fn run_opencode_poll(
     work: &WorkItem,
     checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
@@ -517,26 +506,101 @@ async fn run_opencode_poll_with_state(
     poll_state: &VolatilePollMap,
 ) -> Vec<RowBatch> {
     let config = moraine_config::AppConfig::default();
+    drive_opencode_poll(&config, work, checkpoints, poll_state).await
+}
+
+async fn drive_opencode_poll(
+    config: &moraine_config::AppConfig,
+    work: &WorkItem,
+    checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
+    poll_state: &VolatilePollMap,
+) -> Vec<RowBatch> {
     let metrics = Arc::new(Metrics::default());
     let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(64);
-
-    process_opencode_sqlite_db(
-        &config,
+    let process = process_opencode_sqlite_db(
+        config,
         work,
         checkpoints.clone(),
         poll_state,
         sink_tx,
         &metrics,
-    )
-    .await
-    .expect("opencode_sqlite poll should succeed");
-    let batches = drain_batches(&mut sink_rx).await;
+    );
+    tokio::pin!(process);
+    let mut batches = Vec::new();
+    let mut finalized = None;
+    loop {
+        tokio::select! {
+            result = &mut process => {
+                result.expect("opencode_sqlite poll should succeed");
+                break;
+            }
+            message = sink_rx.recv() => match message.expect("opencode test sink remains open") {
+                SinkMessage::Batch(batch) => batches.push(batch),
+                SinkMessage::BeginReplay { transition, ack }
+                | SinkMessage::BlockReplay { transition, ack }
+                | SinkMessage::MirrorCaughtUp { transition, ack } => {
+                    let _ = ack.send(Ok(crate::publication::ReplayBarrierAck {
+                        checkpoint_revision: 1,
+                        operation_id: transition.checkpoint.operation_id,
+                    }));
+                }
+                SinkMessage::FinalizeReplay { transition, ack } => {
+                    finalized = Some(transition.checkpoint);
+                    let _ = ack.send(Ok(
+                        crate::publication::FinalizeReplayOutcome::Published(
+                            crate::publication::PublicationAck {
+                                checkpoint_revision: 2,
+                                publication_revision: 1,
+                                already_published: false,
+                            },
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    while let Ok(message) = sink_rx.try_recv() {
+        if let SinkMessage::Batch(batch) = message {
+            batches.push(batch);
+        }
+    }
 
-    if let Some(cp) = batches.last().and_then(|batch| batch.checkpoint.clone()) {
+    if let Some(cp) =
+        finalized.or_else(|| batches.last().and_then(|batch| batch.checkpoint.clone()))
+    {
         let key = checkpoint_key(&cp.source_name, &cp.source_file);
         checkpoints.write().await.insert(key, cp);
     }
     batches
+}
+
+async fn capture_begin_replay_checkpoint(
+    work: &WorkItem,
+    checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
+) -> Checkpoint {
+    let config = moraine_config::AppConfig::default();
+    let metrics = Arc::new(Metrics::default());
+    let poll_state = VolatilePollMap::new();
+    let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(4);
+    let process = process_opencode_sqlite_db(
+        &config,
+        work,
+        checkpoints.clone(),
+        &poll_state,
+        sink_tx,
+        &metrics,
+    );
+    tokio::pin!(process);
+    let message = tokio::select! {
+        result = &mut process => {
+            panic!("opencode poll completed before BeginReplay: {result:?}");
+        }
+        message = sink_rx.recv() => message.expect("opencode replay channel remains open"),
+    };
+    match message {
+        SinkMessage::BeginReplay { transition, .. } => transition.checkpoint,
+        other => panic!("expected BeginReplay, observed {other:?}"),
+    }
 }
 
 fn all_event_rows(batches: &[RowBatch]) -> Vec<Value> {
@@ -1111,23 +1175,12 @@ async fn opencode_sqlite_replays_rows_when_exclusions_change() {
     drop(seed_opencode_db(&path));
     let work = opencode_sqlite_work(&path);
     let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
-    let metrics = Arc::new(Metrics::default());
     let poll_state = VolatilePollMap::new();
 
     let mut excluded_config = moraine_config::AppConfig::default();
     excluded_config.ingest.exclude_project_dirs = vec!["/work/opencode-demo/**".to_string()];
-    let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(64);
-    process_opencode_sqlite_db(
-        &excluded_config,
-        &work,
-        checkpoints.clone(),
-        &poll_state,
-        sink_tx,
-        &metrics,
-    )
-    .await
-    .expect("excluded OpenCode poll");
-    let excluded_batches = drain_batches(&mut sink_rx).await;
+    let excluded_batches =
+        drive_opencode_poll(&excluded_config, &work, &checkpoints, &poll_state).await;
     assert!(
         all_event_rows(&excluded_batches).is_empty(),
         "excluded session rows must not reach the sink"
@@ -1142,22 +1195,80 @@ async fn opencode_sqlite_replays_rows_when_exclusions_change() {
     );
 
     let included_config = moraine_config::AppConfig::default();
-    let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(64);
-    process_opencode_sqlite_db(
-        &included_config,
-        &work,
-        checkpoints,
-        &poll_state,
-        sink_tx,
-        &metrics,
-    )
-    .await
-    .expect("OpenCode replay after exclusion removal");
-    let replayed = drain_batches(&mut sink_rx).await;
+    let replayed = drive_opencode_poll(&included_config, &work, &checkpoints, &poll_state).await;
     assert!(
         !all_event_rows(&replayed).is_empty(),
         "removing exclusions must replay previously skipped rows"
     );
+
+    cleanup(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn opencode_sqlite_can_queue_oversized_replay_row_before_final_checkpoint() {
+    let path = unique_opencode_db_path("sink-limit-envelope");
+    let connection = create_opencode_db(&path);
+    let payload_bytes = crate::sink::CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES + 1024 * 1024;
+    assert!(payload_bytes < SCAN_PAGE_MAX_BYTES);
+    connection
+        .execute(
+            "INSERT INTO event (id, aggregate_id, seq, type, data) \
+             VALUES ('evt_oversized', 'ses_oversized', 0, 'session.created.1', ?1)",
+            rusqlite::params![serde_json::to_string(&json!({
+                "sessionID": "ses_oversized",
+                "info": {
+                    "id": "ses_oversized",
+                    "directory": "/work/opencode-oversized",
+                    "title": "Oversized OpenCode replay",
+                    "time": {
+                        "created": 1780000200000_i64,
+                        "updated": 1780000200000_i64
+                    },
+                    // Metadata is retained by the OpenCode projection. Spaces
+                    // keep this textual payload out of the binary elision
+                    // heuristic while the raw SQLite row remains under 32 MiB.
+                    "metadata": "word ".repeat(payload_bytes / 5 + 1)
+                }
+            }))
+            .unwrap()],
+        )
+        .expect("insert sink-oversized OpenCode event");
+    connection
+        .execute(
+            "INSERT INTO event_sequence (aggregate_id, seq, owner_id) \
+             VALUES ('ses_oversized', 0, NULL)",
+            [],
+        )
+        .expect("insert oversized event sequence");
+    drop(connection);
+
+    let work = opencode_sqlite_work(&path);
+    let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+    let poll_state = VolatilePollMap::new();
+
+    let mut excluded = moraine_config::AppConfig::default();
+    excluded.ingest.exclude_project_dirs = vec!["/work/opencode-oversized/**".to_string()];
+    let excluded_batches = drive_opencode_poll(&excluded, &work, &checkpoints, &poll_state).await;
+    assert!(all_event_rows(&excluded_batches).is_empty());
+
+    let included = moraine_config::AppConfig::default();
+    let replay_batches = drive_opencode_poll(&included, &work, &checkpoints, &poll_state).await;
+    let oversized_index = replay_batches
+        .iter()
+        .position(|batch| {
+            batch.raw_rows.iter().any(|row| {
+                serde_json::to_vec(row).is_ok_and(|encoded| {
+                    encoded.len() > crate::sink::CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES
+                })
+            })
+        })
+        .expect("OpenCode scanner emits a sink-oversized row under its page cap");
+    let checkpoint_index = replay_batches
+        .iter()
+        .position(|batch| batch.checkpoint.is_some())
+        .expect("OpenCode replay queues a final checkpoint");
+    assert!(oversized_index < checkpoint_index);
+    assert!(replay_batches[oversized_index].checkpoint.is_none());
 
     cleanup(&path);
 }
@@ -1287,6 +1398,18 @@ async fn opencode_sqlite_sequence_regression_resets_aggregate_cursor() {
     )
     .expect("regress event sequence");
 
+    let replaying_checkpoint = capture_begin_replay_checkpoint(&work, &checkpoints).await;
+    assert_eq!(
+        replaying_checkpoint.source_generation,
+        first_checkpoint.source_generation + 1,
+        "rewind BeginReplay advances exactly once"
+    );
+    assert_eq!(replaying_checkpoint.status, "replaying");
+    checkpoints.write().await.insert(
+        checkpoint_key(&work.source_name, &work.path),
+        replaying_checkpoint,
+    );
+
     let second = run_opencode_poll(&work, &checkpoints).await;
     let second_rows = all_event_rows(&second);
     assert!(
@@ -1300,6 +1423,19 @@ async fn opencode_sqlite_sequence_regression_resets_aggregate_cursor() {
         .last()
         .and_then(|batch| batch.checkpoint.clone())
         .expect("second checkpoint");
+    assert_eq!(
+        second_checkpoint.source_generation,
+        first_checkpoint.source_generation + 1,
+        "sequence regression must replay through a replacement generation"
+    );
+    let durable_checkpoint = checkpoints
+        .read()
+        .await
+        .get(&checkpoint_key(&work.source_name, &work.path))
+        .cloned()
+        .expect("finalized replay checkpoint");
+    assert_eq!(durable_checkpoint.status, "active");
+    assert!(durable_checkpoint.final_scan_complete);
     let second_cursor: Value =
         serde_json::from_str(&second_checkpoint.cursor_json).expect("second cursor parses");
     assert_eq!(

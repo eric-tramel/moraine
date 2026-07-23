@@ -140,6 +140,7 @@ resource="$FAKE_DATABASE_DIR/$database"
   printf 'caller_database=%s\n' "${MORAINE_LIVE_TEST_DATABASE:-}"
   printf 'bench_database=%s\n' "${MORAINE_BENCH_CLICKHOUSE_DATABASE:-}"
   printf 'clickhouse_url=%s\n' "${MORAINE_BENCH_CLICKHOUSE_URL:-}"
+  printf 'ingest_bin=%s\n' "${MORAINE_LIVE_TEST_INGEST_BIN:-}"
   printf 'argv'
   printf ' <%s>' "$@"
   printf '\n'
@@ -420,6 +421,9 @@ class RunLiveTestTests(unittest.TestCase):
         self.assertIn(f"sandbox_id={sandbox_id}\n", record)
         self.assertIn("clickhouse_url=http://clickhouse:8123\n", record)
         self.assertIn(
+            "ingest_bin=/opt/moraine/bin/moraine-ingest\n", record
+        )
+        self.assertIn(
             "argv <test> <-p> <moraine-conversations> <--test> <live_clickhouse> "
             f"<--locked> <{function}> <--> <--exact> <--ignored> <--nocapture>\n",
             record,
@@ -443,6 +447,37 @@ class RunLiveTestTests(unittest.TestCase):
     def test_parity_mode_runs_only_exact_ignored_function(self) -> None:
         self.assert_exact_invocation(
             "analytics-parity", "live_monitor_repository_semantic_parity"
+        )
+
+    def test_source_publication_mode_runs_only_exact_ignored_function(self) -> None:
+        self.assert_exact_invocation(
+            "source-publication",
+            "live_source_publication_cutover_crash_recovery",
+        )
+
+    def test_mcp_backfill_mode_runs_only_exact_ignored_function(self) -> None:
+        self.assert_exact_invocation(
+            "mcp-backfill", "live_mcp_open_batched_backfill_resources"
+        )
+
+    def test_envelope_query_log_mode_runs_only_exact_ignored_function(self) -> None:
+        self.assert_exact_invocation(
+            "envelope-query-log", "live_envelope_query_log_coverage"
+        )
+
+    def test_envelope_cancellation_mode_runs_only_exact_ignored_function(self) -> None:
+        self.assert_exact_invocation(
+            "envelope-cancellation", "live_envelope_abandoned_query_cancelled"
+        )
+
+    def test_envelope_shared_budget_mode_runs_only_exact_ignored_function(self) -> None:
+        self.assert_exact_invocation(
+            "envelope-shared-budget", "live_envelope_shared_budget_and_statement_cap"
+        )
+
+    def test_envelope_spill_mode_runs_only_exact_ignored_function(self) -> None:
+        self.assert_exact_invocation(
+            "envelope-spill", "live_envelope_spill_and_memory_ceiling"
         )
 
     def test_missing_and_unknown_modes_fail_before_boot(self) -> None:

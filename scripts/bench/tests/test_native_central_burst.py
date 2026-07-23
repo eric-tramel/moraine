@@ -70,6 +70,10 @@ def fixture_database_evidence(recipe: Mapping[str, Any]) -> dict[str, Any]:
         "projected_events": documents,
         "dirty_session_count": 0,
         "projection_ready_rows": 1,
+        "publication_head_count": 1,
+        "active_checkpoint_count": 1,
+        "publication_readiness_count": 1,
+        "idle_append_control_count": 1,
         "pass": True,
     }
 
@@ -510,20 +514,42 @@ class NativeBurstTests(unittest.TestCase):
                 "measurement_started_at_us": 200,
             },
         ]
+        def log_row(prefix: str, suffix: str, stage: str, event_time: int) -> str:
+            read_rows = 10 if stage == "candidate" else 6 if stage == "detail" else 1
+            return json.dumps(
+                {
+                    "query_id": f"{prefix}-{suffix}",
+                    "stage": stage,
+                    "type": "QueryFinish",
+                    "event_time_us": str(event_time),
+                    "query_duration_ms": 1,
+                    "read_rows": str(read_rows),
+                    "read_bytes": str(read_rows * 10),
+                    "result_rows": "1",
+                    "memory_usage": "100",
+                },
+                separators=(",", ":"),
+            )
+
+        business = ("candidate", "detail")
         rows = "\n".join(
             [
-                '{"query_id":"moraine-search-sessions-42-c","stage":"candidate",'
-                '"type":"QueryFinish","event_time_us":"150","query_duration_ms":20,'
-                '"read_rows":"10","read_bytes":"100","result_rows":"1","memory_usage":"400"}',
-                '{"query_id":"moraine-search-sessions-42-d","stage":"detail",'
-                '"type":"QueryFinish","event_time_us":"151","query_duration_ms":8,'
-                '"read_rows":"6","read_bytes":"60","result_rows":"10","memory_usage":"200"}',
-                '{"query_id":"moraine-search-sessions-43-c","stage":"candidate",'
-                '"type":"QueryFinish","event_time_us":"152","query_duration_ms":10,'
-                '"read_rows":"10","read_bytes":"100","result_rows":"1","memory_usage":"300"}',
-                '{"query_id":"moraine-search-sessions-43-d","stage":"detail",'
-                '"type":"QueryFinish","event_time_us":"153","query_duration_ms":5,'
-                '"read_rows":"6","read_bytes":"60","result_rows":"10","memory_usage":"100"}',
+                *[
+                    log_row("moraine-search-sessions-42", f"cold-{index}", stage, 150 + index)
+                    for index, stage in enumerate(
+                        (*burst.CONTROL_QUERY_STAGES, *business)
+                    )
+                ],
+                *[
+                    log_row("moraine-search-sessions-43", f"warm-{index}", stage, 170 + index)
+                    for index, stage in enumerate(
+                        (*burst.CONTROL_QUERY_STAGES, *business)
+                    )
+                ],
+                *[
+                    log_row("moraine-search-sessions-43", f"measured-{index}", stage, 210 + index)
+                    for index, stage in enumerate(burst.CONTROL_QUERY_STAGES)
+                ],
             ]
         )
         with mock.patch.object(
@@ -532,7 +558,11 @@ class NativeBurstTests(unittest.TestCase):
             side_effect=["100", "300", "", rows],
         ) as query:
             collector = burst.QueryLogCollector(endpoint)
-            evidence = collector.collect(ownership, steady_warmup_case_count=1)
+            evidence = collector.collect(
+                ownership,
+                steady_warmup_case_count=1,
+                steady_measured_requests_per_client=1,
+            )
 
         self.assertTrue(evidence["pass"])
         lifecycles = [
@@ -549,6 +579,7 @@ class NativeBurstTests(unittest.TestCase):
                 requested=True,
                 lifecycles=lifecycles,
                 steady_warmup_case_count=1,
+                steady_measured_requests_per_client=1,
             )
         )
         self.assertEqual(evidence["by_stage"]["candidate"]["read_rows"], 20)
@@ -557,10 +588,14 @@ class NativeBurstTests(unittest.TestCase):
         )
         self.assertEqual(steady["total"]["candidate_queries"], 1)
         self.assertEqual(steady["measured"]["candidate_queries"], 0)
+        self.assertEqual(steady["total"]["publication_capture_queries"], 2)
+        self.assertEqual(steady["measured"]["publication_capture_queries"], 1)
         aggregate_sql = query.call_args_list[-1].args[1]
         self.assertIn("startsWith(query_id, 'moraine-search-sessions-42-')", aggregate_sql)
         self.assertIn("projected_candidates AS", aggregate_sql)
         self.assertIn("candidate_heads AS", aggregate_sql)
+        self.assertIn("moraine:publication_snapshot:capture", aggregate_sql)
+        self.assertIn("moraine:append_fence:revalidate", aggregate_sql)
         self.assertNotIn("OR position(query, 'candidate_heads AS')", aggregate_sql)
 
         with mock.patch.object(
@@ -571,6 +606,7 @@ class NativeBurstTests(unittest.TestCase):
             incomplete = burst.QueryLogCollector(endpoint).collect(
                 ownership,
                 steady_warmup_case_count=1,
+                steady_measured_requests_per_client=1,
             )
         self.assertFalse(incomplete["pass"])
         self.assertEqual(incomplete["coverage"]["passed_lifecycle_count"], 1)
@@ -588,6 +624,7 @@ class NativeBurstTests(unittest.TestCase):
             unexpected = burst.QueryLogCollector(endpoint).collect(
                 ownership,
                 steady_warmup_case_count=1,
+                steady_measured_requests_per_client=1,
             )
         self.assertFalse(unexpected["pass"])
         self.assertEqual(unexpected["by_stage"]["unknown"]["query_count"], 1)
@@ -702,6 +739,10 @@ class NativeBurstTests(unittest.TestCase):
                     "projected_events",
                     "dirty_session_count",
                     "projection_ready_rows",
+                    "publication_head_count",
+                    "active_checkpoint_count",
+                    "publication_readiness_count",
+                    "idle_append_control_count",
                 }
             }
             with mock.patch.object(
@@ -714,6 +755,12 @@ class NativeBurstTests(unittest.TestCase):
             fixture_sql = query.call_args_list[-1].args[1]
             self.assertIn("mcp_open_projection_state", fixture_sql)
             self.assertIn("mcp_open_dirty_sessions", fixture_sql)
+            self.assertIn("v_current_published_source_generations", fixture_sql)
+            self.assertIn("v_current_ingest_checkpoint_transitions", fixture_sql)
+            self.assertIn(
+                "v_current_source_generation_publication_readiness", fixture_sql
+            )
+            self.assertIn("v_current_ingest_append_control", fixture_sql)
             self.assertIn("INNER JOIN `moraine_native_test`.mcp_open_sessions", fixture_sql)
             self.assertNotIn(
                 "ANY INNER JOIN `moraine_native_test`.mcp_open_sessions",

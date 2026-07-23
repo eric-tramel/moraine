@@ -1,7 +1,73 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fmt;
+use std::str::FromStr;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Durable lifecycle of one source generation.
+///
+/// The serde representation intentionally remains the existing lowercase
+/// string used by checkpoint payloads and ClickHouse rows. Keeping the wire
+/// format stable while making the in-memory value typed ensures an unknown
+/// lifecycle fails deserialization instead of being treated as an error
+/// transition with different semantics.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointLifecycle {
+    #[default]
+    Active,
+    Replaying,
+    Error,
+}
+
+impl CheckpointLifecycle {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Replaying => "replaying",
+            Self::Error => "error",
+        }
+    }
+}
+
+impl fmt::Display for CheckpointLifecycle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvalidCheckpointLifecycle(String);
+
+impl fmt::Display for InvalidCheckpointLifecycle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "unknown checkpoint lifecycle {:?}", self.0)
+    }
+}
+
+impl std::error::Error for InvalidCheckpointLifecycle {}
+
+impl FromStr for CheckpointLifecycle {
+    type Err = InvalidCheckpointLifecycle;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "active" => Ok(Self::Active),
+            "replaying" => Ok(Self::Replaying),
+            "error" => Ok(Self::Error),
+            _ => Err(InvalidCheckpointLifecycle(value.to_string())),
+        }
+    }
+}
+
+impl TryFrom<&str> for CheckpointLifecycle {
+    type Error = InvalidCheckpointLifecycle;
+
+    fn try_from(value: &str) -> Result<Self, InvalidCheckpointLifecycle> {
+        value.parse()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct Checkpoint {
     pub source_name: String,
     pub source_file: String,
@@ -9,6 +75,7 @@ pub struct Checkpoint {
     pub source_generation: u32,
     pub last_offset: u64,
     pub last_line_no: u64,
+    #[serde(deserialize_with = "deserialize_checkpoint_lifecycle")]
     pub status: String,
     /// Structured poll cursor for database-backed sources (issue #361).
     /// Authoritative for `cursor_sqlite`; always empty for file-backed
@@ -22,6 +89,60 @@ pub struct Checkpoint {
     /// Hash of the relevant database schema for DB-backed sources.
     #[serde(default)]
     pub schema_fingerprint: u64,
+    /// Fingerprint of the normalization and exclusion policy that produced
+    /// this cursor. A policy change is a whole-source replacement even when
+    /// the underlying file identity is unchanged.
+    #[serde(default)]
+    pub policy_fingerprint: String,
+    /// Causal revision assigned by the serialized checkpoint writer. Zero is
+    /// an unassigned in-memory transition and is never persisted to the
+    /// causal transition relation.
+    #[serde(default)]
+    pub checkpoint_revision: u64,
+    /// Retry-stable identity for one causal transition.
+    #[serde(default)]
+    pub operation_id: String,
+    /// File identity and boundary captured for a replacement scan.
+    #[serde(default)]
+    pub scan_inode: u64,
+    #[serde(default)]
+    pub scan_boundary: u64,
+    /// True only after the captured scan boundary has been consumed and the
+    /// source identity has been revalidated.
+    #[serde(default)]
+    pub final_scan_complete: bool,
+    /// Durable fail-closed reason. Lifecycle remains in `status`; error detail
+    /// is intentionally separate so an error string cannot accidentally make
+    /// a generation active.
+    #[serde(default)]
+    pub block_reason: String,
+    #[serde(default)]
+    pub compatibility_prepared: bool,
+    #[serde(default)]
+    pub backend_caught_up: bool,
+    /// Same-generation append fence state associated with this cursor.
+    #[serde(default)]
+    pub append_batch_id: String,
+    #[serde(default)]
+    pub cache_epoch: u64,
+}
+
+impl Checkpoint {
+    pub fn lifecycle(&self) -> Result<CheckpointLifecycle, InvalidCheckpointLifecycle> {
+        self.status.parse()
+    }
+
+    pub fn set_lifecycle(&mut self, lifecycle: CheckpointLifecycle) {
+        self.status = lifecycle.as_str().to_string();
+    }
+}
+
+fn deserialize_checkpoint_lifecycle<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let lifecycle = CheckpointLifecycle::deserialize(deserializer)?;
+    Ok(lifecycle.as_str().to_string())
 }
 
 #[derive(Debug, Clone, Default)]

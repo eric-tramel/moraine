@@ -1,6 +1,6 @@
 use super::{
     backend_query_id, handled_tool_error_result, internal_id_error, repo_error_to_contract_error,
-    request_performance, tool_success_result, AppState, QueryCancellationGuard,
+    request_performance, tool_success_result, AppState,
 };
 use crate::contract::{
     format_rfc3339_utc_millis, CanonicalSearchSessionsArgs, ContractError, McpEventId, McpId,
@@ -9,7 +9,7 @@ use crate::contract::{
 };
 use anyhow::{Context, Result};
 use moraine_conversations::{
-    McpEventType as RepoMcpEventType, SearchMcpEventHit, SearchMcpEventsQuery,
+    McpEventType as RepoMcpEventType, QueryEnvelope, SearchMcpEventHit, SearchMcpEventsQuery,
     SearchMcpEventsResult,
 };
 use serde_json::{json, Value};
@@ -29,10 +29,17 @@ impl AppState {
         };
 
         let canonical_request = canonical_request_json(&args)?;
-        let query_id = backend_query_id("search-sessions");
+        // The MCP-visible query id is the request envelope's id: the
+        // transport runs every statement as '{request_id}-{seq}', so
+        // cancel_query on this token reaches all of them via one prefix
+        // KILL. Outside an envelope (direct unit-test calls) keep the legacy
+        // bespoke id so unenveloped statements stay attributable.
+        let query_id = QueryEnvelope::current()
+            .map(|envelope| envelope.request_id().to_string())
+            .unwrap_or_else(|_| backend_query_id("search-sessions"));
         let repo_query = SearchMcpEventsQuery {
             query: args.query.clone(),
-            cancellation_token: Some(query_id.clone()),
+            cancellation_token: Some(query_id),
             n_hits: Some(args.n_hits),
             session_id: scoped_session_id(&args).map(ToOwned::to_owned),
             turn_seq: scoped_turn_seq(&args),
@@ -49,14 +56,12 @@ impl AppState {
             min_should_match: None,
         };
 
-        let mut cancellation = QueryCancellationGuard::new(query_id);
+        // Abandonment safety comes from the envelope: per-statement drop
+        // guards in the transport KILL whatever is in flight if this future
+        // is dropped, so no tool-level cancellation guard is needed.
         let search_result = match self.repo.search_mcp_events(repo_query).await {
-            Ok(result) => {
-                cancellation.disarm();
-                result
-            }
+            Ok(result) => result,
             Err(error) => {
-                cancellation.disarm();
                 return encode_search_sessions_error(
                     canonical_request,
                     repo_error_to_contract_error(error),

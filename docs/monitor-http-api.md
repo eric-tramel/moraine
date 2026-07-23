@@ -14,8 +14,8 @@ All canonical routes are `GET` routes and successful responses use JSON.
 | Route | Query | Purpose |
 | --- | --- | --- |
 | `/api/v1/capabilities` | none | Describe this server build, its observed schema migration level, and available HTTP feature groups. |
-| `/api/v1/health` | none | Probe ClickHouse health and report a compact ingest heartbeat summary. |
-| `/api/v1/status` | none | Return the diagnostic ClickHouse, database, table, connection, and ingestor snapshot used by the status dashboard. |
+| `/api/v1/health` | none | Probe ClickHouse health and report compact publication-readiness, query-budget, and ingest-heartbeat summaries. |
+| `/api/v1/status` | none | Return the diagnostic ClickHouse, publication, database, table, connection, and ingestor snapshot used by the status dashboard. |
 | `/api/v1/analytics` | `range` | Return token, turn, and concurrent-session time series for a supported window. |
 | `/api/v1/tables` | none | List tables with engine, temporary-table marker, and estimated row count. |
 | `/api/v1/tables/:table` | `limit` | Return the named table's schema and a bounded row preview. `:table` is a path parameter. |
@@ -26,6 +26,13 @@ There is no session-detail backend route. In particular,
 `/api/v1/sessions/:id` is not part of the API. A client that needs a session
 must use the records returned by `/api/v1/sessions`; it must not infer a detail
 route from the collection URL.
+
+Successful analytics, web-search, and session responses carry
+`"read_model":"live"`: their rows are authorized against published source
+generations. Table listing and bounded table preview carry
+`"read_model":"audit"` because they intentionally inspect physical relations,
+including retained inactive generations. Table preview is not a current-data
+API.
 
 ## Capabilities Contract
 
@@ -116,6 +123,37 @@ rows. They do not use `null` to mean an empty collection.
   a sibling `connections.error` when connection metrics are unavailable. A
   connection-metrics error alone does not make an otherwise successful health
   probe fail.
+- Health and status include a `publication` object. `available` distinguishes a
+  successful readiness query from a missing/incompatible control schema;
+  `healthy` is false when ownership is ambiguous, a generation or append
+  preparation is blocked, or writers conflict. Counts for replaying
+  generations, transient append preparations, and mirror catch-up are progress
+  facts and do not by themselves make publication unhealthy. `issues` contains
+  operator-facing detail. Publication degradation
+  does not silently expose candidate generations: live reads remain authorized
+  by the prior published heads. A publication-probe failure is reported inside
+  an otherwise live HTTP `200` health response; `moraine db doctor` treats a
+  missing or unhealthy publication diagnosis as needing attention.
+- Health and status include an additive `query_budgets` object with
+  process-lifetime counters from the daemon's mandatory query envelopes:
+  `requests`, `statements`, `deadline_exceeded`, `resource_exhausted`, and
+  `unenveloped_statements`. The counts cover both request boundaries the
+  backend daemon hosts in one process — MCP tool calls and monitor HTTP
+  requests — and reset when the backend restarts. Nonzero `deadline_exceeded`
+  or `resource_exhausted` totals mean requests were refused or killed against
+  the configured `[query_budgets]`; `moraine status` prints the same counters
+  as a one-line status note when they are nonzero. `unenveloped_statements`
+  is always `0`: the transport refuses statements issued outside a query
+  envelope, so a nonzero value indicates a regression in the fail-closed
+  transport. Health failure responses
+  keep the block, since budget exhaustion is exactly when it matters.
+- Ingest establishes its durable publication host identity before connecting
+  writers. Creation with named backends emits a migration warning explaining
+  that legacy `HOSTNAME`/`USER` keys are not adopted. An unreadable, corrupt,
+  or insecure `publication-host-id` file prevents ingest startup rather than
+  falling back to an environment-derived identity. Nonempty legacy publisher
+  keys remain separate and may require deliberate backend cleanup; hostless
+  ambiguous shared rows appear in the `publication` diagnosis above.
 - When no ingest heartbeat is available, `ingestor.present` and
   `ingestor.alive` are `false`, while `ingestor.latest` and
   `ingestor.age_seconds` are `null`.

@@ -70,8 +70,11 @@ pub(crate) fn session_row(session_id: &str) -> Option<Value> {
     };
     Some(json!({
         "session_id": session_id,
+        "candidate_publication_id": "fixture-publication",
         "slot": 0_u8,
         "generation": 100_u64,
+        "source_revision": 1_u64,
+        "dirty_revision": 1_u64,
         "first_event_time": first_time,
         "first_event_unix_ms": 1769940060000_i64,
         "last_event_time": last_time,
@@ -94,7 +97,9 @@ pub(crate) fn session_row(session_id: &str) -> Option<Value> {
         "session_summary": title,
         "completed": completed,
         "terminal_event_uid": terminal,
-        "origin_cwd": origin
+        "origin_cwd": origin,
+        "tombstone": 0_u8,
+        "required_heads_fingerprint": "fixture-heads-v1"
     }))
 }
 
@@ -402,6 +407,7 @@ pub(crate) fn event_lookup(event_uid: &str) -> Option<Value> {
     };
     Some(json!({
         "event_uid": event_uid,
+        "source_host": "host-a",
         "session_id": session_id,
         "slot": 0_u8,
         "generation": 100_u64

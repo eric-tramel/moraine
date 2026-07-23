@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+pub use moraine_clickhouse::PublicationDiagnostics;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConversationMode {
@@ -1293,6 +1295,7 @@ pub struct StoreHealth {
     pub version: StoreProbe<String>,
     pub database_exists: StoreProbe<bool>,
     pub connections: StoreProbe<StoreConnectionMetrics>,
+    pub publication: StoreProbe<PublicationDiagnostics>,
 }
 
 impl Default for StoreHealth {
@@ -1310,6 +1313,9 @@ impl Default for StoreHealth {
             connections: StoreProbe::Failed {
                 message: "connection-metrics probe not configured".to_string(),
             },
+            publication: StoreProbe::Failed {
+                message: "publication-readiness probe not configured".to_string(),
+            },
         }
     }
 }
@@ -1323,6 +1329,7 @@ pub struct StoreDiagnostics {
     pub applied_schema_versions: Vec<String>,
     pub pending_schema_versions: Vec<String>,
     pub missing_tables: Vec<String>,
+    pub publication: Option<PublicationDiagnostics>,
     pub errors: Vec<String>,
 }
 

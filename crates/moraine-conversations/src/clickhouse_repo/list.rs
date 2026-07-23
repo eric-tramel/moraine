@@ -30,7 +30,7 @@ impl ClickHouseConversationRepository {
         };
 
         let session_summary = self.table_ref("v_session_summary");
-        let events_source = canonical_events_source(&self.table_ref("events"));
+        let events_source = self.live_events_source();
         let mode_subquery = self.mode_subquery();
 
         let mut where_clauses = vec!["1 = 1".to_string()];
@@ -176,8 +176,11 @@ FORMAT JSONEachRow",
             None
         };
 
-        let session_summary = self.table_ref("v_session_summary");
-        let events_source = canonical_events_source(&self.table_ref("events"));
+        let snapshot = require_active_publication_snapshot("projected MCP session list reads");
+        let headers = self.table_ref("mcp_open_publication_headers");
+        let history = self.table_ref("v_published_source_generation_history");
+        let dirty_sessions = self.table_ref("mcp_open_dirty_sessions");
+        let captured_heads = snapshot.captured_source_heads_sql(&history);
 
         let mut where_clauses = vec![
             // A blank session_id is never a real session (e.g. the orphan
@@ -186,6 +189,7 @@ FORMAT JSONEachRow",
             // cursor. `notEmpty(trimBoth(...))` mirrors the MCP contract's
             // `trim().is_empty()` rejection so the repo filter and the mcp-core
             // skip agree on what counts as blank.
+            "s.tombstone = 0".to_string(),
             "notEmpty(trimBoth(s.session_id))".to_string(),
             format!(
                 "toUnixTimestamp64Milli(s.last_event_time) >= {}",
@@ -196,8 +200,29 @@ FORMAT JSONEachRow",
                 filter.end_unix_ms
             ),
         ];
-        if let Some(scope_clause) = self.session_scope_clause("s.session_id") {
-            where_clauses.push(scope_clause);
+        if let Some(scope) = self.cfg.session_scope.as_ref() {
+            let roots = scope
+                .roots
+                .iter()
+                .map(|root| {
+                    format!(
+                        "s.origin_cwd = {root} OR startsWith(s.origin_cwd, {prefix})",
+                        root = sql_quote(root),
+                        prefix = sql_quote(&format!("{root}/")),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            where_clauses.push(format!("({roots})"));
+        }
+        if let Some(mode) = filter.mode {
+            where_clauses.push(format!("s.mode = {}", sql_quote(mode.as_str())));
+        }
+        if let Some(harness) = filter.harness.as_deref() {
+            where_clauses.push(format!("s.harness = {}", sql_quote(harness)));
+        }
+        if let Some(source_name) = filter.source_name.as_deref() {
+            where_clauses.push(format!("s.source = {}", sql_quote(source_name)));
         }
 
         if let Some(cursor) = &cursor {
@@ -219,216 +244,65 @@ FORMAT JSONEachRow",
             ConversationListSort::Asc => "ASC",
         };
         let limit_plus = (limit as usize) + 1;
-        let window_limit_sql = if filter.mode.is_none()
-            && filter.harness.is_none()
-            && filter.source_name.is_none()
-        {
-            format!(
-                    "  ORDER BY s.last_event_time {order_dir}, s.session_id {order_dir}\n  LIMIT {limit_plus}\n"
-                )
-        } else {
-            String::new()
-        };
-        let mut event_filter_clauses = Vec::new();
-        if let Some(mode) = filter.mode {
-            event_filter_clauses.push(format!(
-                "ifNull(r.mode, 'chat') = {}",
-                sql_quote(mode.as_str())
-            ));
-        }
-        if let Some(harness) = filter.harness.as_deref() {
-            event_filter_clauses.push(format!("r.latest_harness = {}", sql_quote(harness)));
-        }
-        if let Some(source_name) = filter.source_name.as_deref() {
-            event_filter_clauses.push(format!("r.latest_source_name = {}", sql_quote(source_name)));
-        }
-        let event_filter_sql = if event_filter_clauses.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}\n", event_filter_clauses.join("\n    AND "))
-        };
-        let mode_aggregate = Self::mode_aggregate_sql();
 
-        // Resolve the time/scope window first, applying the keyset LIMIT before
-        // event aggregation whenever no mode predicate depends on that
-        // aggregation. Then compute every event-backed field in one grouped pass
-        // over only the candidate sessions. The previous query independently
-        // aggregated mode, completion state, and metadata across the entire
-        // events table before applying the window and LIMIT.
+        // Listing is a moving-feed read over the already materialized session
+        // headers. Source-head authorization pins each candidate to this
+        // operation's publication snapshot, while the dirty revision prevents a
+        // header from being served after its canonical session changes. This
+        // avoids rebuilding all list metadata from the canonical event corpus on
+        // every page.
         let query = format!(
             "WITH
-window_sessions AS (
-  SELECT
-    s.session_id AS session_id,
-    toString(s.first_event_time) AS first_event_time,
-    toInt64(toUnixTimestamp64Milli(s.first_event_time)) AS first_event_unix_ms,
-    toString(s.last_event_time) AS last_event_time,
-    toInt64(toUnixTimestamp64Milli(s.last_event_time)) AS last_event_unix_ms,
-    toUInt32(s.total_turns) AS total_turns,
-    toUInt64(s.total_events) AS total_events
-  FROM {session_summary} AS s
-  WHERE {where_sql}
-{window_limit_sql}),
-event_rollups AS (
+  {captured_heads} AS captured_heads,
+current_dirty AS (
   SELECT
     session_id,
-    {mode_aggregate} AS mode,
-    maxIf(toUInt32(turn_index), payload_type IN ('task_complete', 'turn_aborted')) AS latest_terminal_turn_seq,
-    ifNull(
-      argMaxIf(payload_type, tuple(event_ts, event_uid), payload_type IN ('task_complete', 'turn_aborted')),
-      ''
-    ) AS latest_terminal_payload_type,
-    ifNull(
-      argMaxIf(
-        coalesce(
-          nullIf(JSONExtractString(payload_json, 'title'), ''),
-          nullIf(JSONExtractString(payload_json, 'name'), ''),
-          nullIf(JSONExtractString(payload_json, 'summary'), '')
-        ),
-        tuple(event_ts, event_uid),
-        event_kind = 'session_meta'
-      ),
-      ''
-    ) AS latest_session_meta_title,
-    ifNull(
-      argMaxIf(
-        coalesce(
-          nullIf(JSONExtractString(payload_json, 'summary'), ''),
-          nullIf(JSONExtractString(payload_json, 'title'), ''),
-          nullIf(JSONExtractString(payload_json, 'name'), '')
-        ),
-        tuple(event_ts, event_uid),
-        event_kind = 'session_meta'
-      ),
-      ''
-    ) AS latest_session_meta_summary,
-    ifNull(
-      argMaxIf(
-        nullIf(JSONExtractString(payload_json, 'title'), ''),
-        tuple(event_ts, event_uid),
-        event_kind = 'session_meta'
-          OR (e.source_name = 'omp' AND JSONExtractString(e.payload_json, 'type') IN ('title', 'title_change'))
-      ),
-      ''
-    ) AS latest_metadata_title,
-    ifNull(
-      argMaxIf(
-        nullIf(JSONExtractString(payload_json, 'name'), ''),
-        tuple(event_ts, event_uid),
-        event_kind = 'session_meta'
-      ),
-      ''
-    ) AS latest_metadata_name,
-    ifNull(
-      argMaxIf(
-        nullIf(JSONExtractString(payload_json, 'summary'), ''),
-        tuple(event_ts, event_uid),
-        event_kind = 'session_meta'
-      ),
-      ''
-    ) AS latest_metadata_summary,
-    ifNull(
-      argMinIf(
-        nullIf(
-          trimBoth(
-            replaceRegexpOne(
-              arrayElement(splitByChar('/', replaceAll(e.source_file, '\\\\', '/')), -1),
-              '[.]jsonl$',
-              ''
-            )
-          ),
-          ''
-        ),
-        tuple(event_ts, event_uid),
-        e.source_name = 'omp'
-          AND notEmpty(e.session_id)
-          AND endsWith(e.source_file, '.jsonl')
-          AND NOT endsWith(e.source_file, concat(e.session_id, '.jsonl'))
-      ),
-      ''
-    ) AS omp_dispatch_title,
-    ifNull(argMax(nullIf(e.harness, ''), tuple(event_ts, event_uid)), '') AS latest_harness,
-    ifNull(argMax(nullIf(e.source_name, ''), tuple(event_ts, event_uid)), '') AS latest_source_name,
-    ifNull(
-      argMaxIf(
-        nullIf(JSONExtractString(payload_json, 'slug'), ''),
-        tuple(event_ts, event_uid),
-        event_kind = 'session_meta'
-      ),
-      ''
-    ) AS session_slug
-  FROM {events_source} AS e
-  WHERE session_id IN (SELECT session_id FROM window_sessions)
-  GROUP BY session_id
+    toUInt64(dirty_revision) AS dirty_revision
+  FROM {dirty_sessions} FINAL
+  WHERE notEmpty(session_id)
 ),
-candidate_sessions AS (
+authorized_headers AS (
   SELECT
-    w.session_id AS session_id,
-    w.first_event_time AS first_event_time,
-    w.last_event_time AS last_event_time,
-    w.first_event_unix_ms AS first_event_unix_ms,
-    w.last_event_unix_ms AS last_event_unix_ms,
-    w.total_turns AS total_turns,
-    w.total_events AS total_events,
-    ifNull(r.mode, 'chat') AS mode,
-    toUInt8(
-      ifNull(r.latest_terminal_turn_seq, toUInt32(0)) = w.total_turns
-      AND ifNull(r.latest_terminal_payload_type, '') = 'task_complete'
-    ) AS completed,
-    if(
-      ifNull(r.latest_source_name, '') = 'omp',
-      coalesce(
-        nullIf(r.latest_metadata_title, ''),
-        nullIf(r.latest_metadata_name, ''),
-        nullIf(r.latest_metadata_summary, ''),
-        nullIf(r.omp_dispatch_title, ''),
-        ''
-      ),
-      ifNull(r.latest_session_meta_title, '')
-    ) AS title,
-    ifNull(r.latest_source_name, '') AS source,
-    ifNull(r.latest_harness, '') AS harness,
-    ifNull(r.session_slug, '') AS session_slug,
-    if(
-      ifNull(r.latest_source_name, '') = 'omp',
-      coalesce(
-        nullIf(r.latest_metadata_summary, ''),
-        nullIf(r.latest_metadata_title, ''),
-        nullIf(r.latest_metadata_name, ''),
-        nullIf(r.omp_dispatch_title, ''),
-        ''
-      ),
-      ifNull(r.latest_session_meta_summary, '')
-    ) AS session_summary
-  FROM window_sessions AS w
-  LEFT JOIN event_rollups AS r ON r.session_id = w.session_id
-  {event_filter_sql}ORDER BY w.last_event_unix_ms {order_dir}, w.session_id {order_dir}
-  LIMIT {limit_plus}
+    h.*
+  FROM {headers} AS h FINAL
+  ANY LEFT JOIN current_dirty AS d ON d.session_id = h.session_id
+  WHERE length(h.required_source_heads) > 0
+    AND arrayAll(
+      required_head -> has(captured_heads, required_head),
+      h.required_source_heads
+    )
+    AND h.dirty_revision = ifNull(d.dirty_revision, toUInt64(0))
+),
+current_headers AS (
+  SELECT *
+  FROM authorized_headers
+  ORDER BY session_id ASC, header_revision DESC
+  LIMIT 1 BY session_id
 )
 SELECT
-  session_id,
-  first_event_time,
-  first_event_unix_ms,
-  last_event_time,
-  last_event_unix_ms,
-  total_turns,
-  total_events,
-  mode,
-  completed,
-  title,
-  source,
-  harness,
-  session_slug,
-  session_summary
-FROM candidate_sessions
-ORDER BY last_event_unix_ms {order_dir}, session_id {order_dir}
+  s.session_id AS session_id,
+  toString(s.first_event_time) AS first_event_time,
+  toInt64(toUnixTimestamp64Milli(s.first_event_time)) AS first_event_unix_ms,
+  toString(s.last_event_time) AS last_event_time,
+  toInt64(toUnixTimestamp64Milli(s.last_event_time)) AS last_event_unix_ms,
+  toUInt32(s.total_turns) AS total_turns,
+  toUInt64(s.total_events) AS total_events,
+  s.mode AS mode,
+  toUInt8(s.completed) AS completed,
+  s.list_title AS title,
+  s.source AS source,
+  s.harness AS harness,
+  s.session_slug AS session_slug,
+  s.list_session_summary AS session_summary
+FROM current_headers AS s
+WHERE {where_sql}
+ORDER BY s.last_event_time {order_dir}, s.session_id {order_dir}
+LIMIT {limit_plus}
 FORMAT JSONEachRow",
-            session_summary = session_summary,
-            events_source = events_source,
+            headers = headers,
+            dirty_sessions = dirty_sessions,
+            captured_heads = captured_heads,
             where_sql = where_sql,
-            mode_aggregate = mode_aggregate,
-            window_limit_sql = window_limit_sql,
-            event_filter_sql = event_filter_sql,
             order_dir = order_dir,
             limit_plus = limit_plus,
         );
@@ -480,6 +354,11 @@ FORMAT JSONEachRow",
                 return Err(RepoError::invalid_cursor(
                     "cursor does not match current turn filter",
                 ));
+            }
+            if let Some(cursor_token) = cursor.publication_token.as_deref() {
+                if cursor_token != active_publication_token() {
+                    return Err(RepoError::ReadModelChanged);
+                }
             }
             Some(cursor)
         } else {
@@ -545,6 +424,7 @@ FORMAT JSONEachRow",
                     last_turn_seq: last.turn_seq,
                     session_id: session_id.to_string(),
                     filter_sig,
+                    publication_token: Some(active_publication_token()),
                 })?)
             } else {
                 None
@@ -589,6 +469,11 @@ FORMAT JSONEachRow",
                 return Err(RepoError::invalid_cursor(
                     "cursor does not match current session event filter",
                 ));
+            }
+            if let Some(cursor_token) = cursor.publication_token.as_deref() {
+                if cursor_token != active_publication_token() {
+                    return Err(RepoError::ReadModelChanged);
+                }
             }
             Some(cursor)
         } else {
@@ -674,6 +559,7 @@ FORMAT JSONEachRow",
                     session_id: session_id.to_string(),
                     direction,
                     filter_sig,
+                    publication_token: Some(active_publication_token()),
                 })?)
             } else {
                 None

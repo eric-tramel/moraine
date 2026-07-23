@@ -706,7 +706,7 @@ def _validate_ttr(metrics_value: Any, samples_value: Any) -> bool:
 
 def _validate_etd_sample(value: Any, path: str) -> tuple[bool, tuple[float, float | None, str], tuple[float, float | None, str]]:
     sample = _mapping(value, path)
-    _fields(sample, {"event_identity_sha256", "term_sha256", "batch_sequence", "publication_durable_ms", "db_ack_ms", "last_miss_ms", "first_hit_ms", "first_valid_ms", "source_interval", "db_ack_interval", "term_use_count", "cache_bypass", "valid", "error_code"}, path)
+    _fields(sample, {"event_identity_sha256", "term_sha256", "batch_sequence", "publication_durable_ms", "db_ack_lower_ms", "db_ack_ms", "last_miss_ms", "first_hit_ms", "first_valid_ms", "source_interval", "db_ack_interval", "term_use_count", "cache_bypass", "valid", "error_code"}, path)
     _sha(sample["event_identity_sha256"], f"{path}.event_identity_sha256")
     term_sha256 = sample["term_sha256"]
     if term_sha256 is not None:
@@ -715,7 +715,12 @@ def _validate_etd_sample(value: Any, path: str) -> tuple[bool, tuple[float, floa
     if batch_sequence is not None:
         _integer(batch_sequence, f"{path}.batch_sequence")
     publication = _optional_number(sample["publication_durable_ms"], f"{path}.publication_durable_ms")
+    ack_lower = _optional_number(sample["db_ack_lower_ms"], f"{path}.db_ack_lower_ms")
     ack = _optional_number(sample["db_ack_ms"], f"{path}.db_ack_ms")
+    if (ack_lower is None) != (ack is None):
+        _fail(path, "DB-ack observation bounds must both be present or absent")
+    if ack_lower is not None and ack is not None and ack_lower > ack:
+        _fail(f"{path}.db_ack_lower_ms", "must not follow db_ack_ms")
     last_miss = _optional_number(sample["last_miss_ms"], f"{path}.last_miss_ms")
     first_hit = _optional_number(sample["first_hit_ms"], f"{path}.first_hit_ms")
     first_valid = _optional_number(sample["first_valid_ms"], f"{path}.first_valid_ms")
@@ -729,15 +734,15 @@ def _validate_etd_sample(value: Any, path: str) -> tuple[bool, tuple[float, floa
         if source[2] != "right" or db_ack[2] != "right":
             _fail(path, "missing first-valid response must be right-censored")
     else:
-        if publication is None or ack is None:
+        if publication is None or ack_lower is None or ack is None:
             _fail(path, "visible event requires durable-publication and DB-ack timestamps")
         expected_source_lower = last_miss if last_miss is not None else 0.0
         expected_source_censor = "interval" if last_miss is not None else "left"
         if not (_close(source[0], expected_source_lower) and source[1] is not None and _close(source[1], first_valid) and source[2] == expected_source_censor):
             _fail(f"{path}.source_interval", "does not match polling timestamps")
         expected_db_lower = max(0.0, (last_miss if last_miss is not None else ack) - ack)
-        expected_db_upper = max(0.0, first_valid - ack)
-        expected_db_censor = "interval" if last_miss is not None and last_miss > ack else "left"
+        expected_db_upper = max(0.0, first_valid - ack_lower)
+        expected_db_censor = "interval" if last_miss is not None and last_miss >= ack else "left"
         if not (_close(db_ack[0], expected_db_lower) and db_ack[1] is not None and _close(db_ack[1], expected_db_upper) and db_ack[2] == expected_db_censor):
             _fail(f"{path}.db_ack_interval", "does not match ack/poll timestamps")
     term_use_count = _integer(sample["term_use_count"], f"{path}.term_use_count")
@@ -749,7 +754,7 @@ def _validate_etd_sample(value: Any, path: str) -> tuple[bool, tuple[float, floa
         _string(error_code, f"{path}.error_code")
     computed_valid = (
         batch_sequence is not None and term_sha256 is not None and term_use_count >= 1
-        and publication is not None and ack is not None
+        and publication is not None and ack_lower is not None and ack is not None
         and first_valid is not None and first_hit is not None
         and all_bypassed and error_code is None
     )

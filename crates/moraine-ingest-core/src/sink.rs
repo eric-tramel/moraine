@@ -1,36 +1,88 @@
 use crate::checkpoint::merge_checkpoint;
 use crate::heartbeat::host_name;
-use crate::model::{Checkpoint, RowBatch};
+use crate::model::{Checkpoint, CheckpointLifecycle, RowBatch};
+use crate::publication::{
+    AppendManifest, CheckpointTransition, FinalizeReplayOutcome, PublicationActor, SourceKey,
+};
+use crate::publication_identity::PublicationIdentity;
 use crate::redaction::{RedactionAudit, SecretRedactor};
 use crate::sources::shared::truncate_chars;
 use crate::tee::{
-    backend_sinks_json, filter_batch_for_backend, BackendSinkCell, ReplayFloor,
+    backend_sinks_json, filter_batch_for_backend, BackendSinkCell, BackendSinkStatus, ReplayFloor,
     SharedRouteResolver, StatusRegistry,
 };
 use crate::{
-    DispatchState, Metrics, SinkMessage, WATCHER_BACKEND_MIXED, WATCHER_BACKEND_NATIVE,
-    WATCHER_BACKEND_POLL,
+    background_batch_envelope, background_envelope, ingest_query_budgets, DispatchState, Metrics,
+    SinkMessage, WATCHER_BACKEND_MIXED, WATCHER_BACKEND_NATIVE, WATCHER_BACKEND_POLL,
 };
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use moraine_clickhouse::{is_oversized_json_each_row_insert_error, ClickHouseClient};
+use moraine_config::ValidatedQueryBudgets;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-const CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES: usize = 10 * 1024 * 1024;
+pub(crate) const CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES: usize = 10 * 1024 * 1024;
 const OVERSIZED_ROW_FRAGMENT_CHARS: usize = 20_000;
 const SINK_JSON_OBJECT_TOO_LARGE: &str = "sink_json_object_too_large";
 const MAX_SINK_ERROR_TEXT_CHARS: usize = 1_000;
 
 const INGEST_ACK_TRACE_TARGET: &str = "moraine_ingest_ack";
+
+/// A sink can flush a source row before the adapter's final checkpoint batch
+/// arrives. Keep row-level quarantine state across those flushes so the later
+/// checkpoint and publication barrier cannot make an incomplete generation
+/// active.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct SourceGenerationKey {
+    source_name: String,
+    source_file: String,
+    source_generation: u64,
+}
+
+impl SourceGenerationKey {
+    fn from_source(source: &IngestErrorSource) -> Option<Self> {
+        if source.source_name.is_empty()
+            || source.source_file.is_empty()
+            || source.source_generation == 0
+        {
+            return None;
+        }
+        Some(Self {
+            source_name: source.source_name.clone(),
+            source_file: source.source_file.clone(),
+            source_generation: source.source_generation,
+        })
+    }
+
+    fn from_checkpoint(checkpoint: &Checkpoint) -> Self {
+        Self {
+            source_name: checkpoint.source_name.clone(),
+            source_file: checkpoint.source_file.clone(),
+            source_generation: u64::from(checkpoint.source_generation),
+        }
+    }
+
+    fn same_source(&self, checkpoint: &Checkpoint) -> bool {
+        self.source_name == checkpoint.source_name && self.source_file == checkpoint.source_file
+    }
+}
+
+type QuarantinedGenerations = HashMap<SourceGenerationKey, usize>;
+type EventOwnershipIndex = HashMap<(String, u64), Vec<IngestErrorSource>>;
+
+#[derive(Default)]
+struct QuarantineOwnership {
+    by_event_uid: EventOwnershipIndex,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct IngestAckObservation {
@@ -107,6 +159,7 @@ impl IngestAckObserver {
 #[derive(Default)]
 struct PendingAckBatch {
     event_identity_digests: Vec<String>,
+    projection_session_ids: BTreeSet<String>,
 }
 
 impl PendingAckBatch {
@@ -115,9 +168,415 @@ impl PendingAckBatch {
             .extend(event_rows.iter().filter_map(event_identity_digest));
     }
 
+    /// Projection session ids survive the acknowledgement clear: a session
+    /// deferred by the refresh governor stays pending until its refresh
+    /// actually succeeds, at which point it is removed individually.
     fn clear(&mut self) {
         self.event_identity_digests.clear();
     }
+
+    fn extend_projection(&mut self, session_ids: &BTreeSet<String>) {
+        self.projection_session_ids
+            .extend(session_ids.iter().cloned());
+    }
+}
+
+/// Debounce and failure-backoff state for the live MCP open projection.
+///
+/// Refresh cost is dominated by session history size, so each session's next
+/// refresh is spaced proportionally to its last observed refresh cost: cheap
+/// sessions stay near-realtime while one enormous streaming session cannot
+/// re-snapshot itself at every flush tick. Failures back off per session, so
+/// one persistently unstable session never delays anyone else's refresh.
+#[derive(Default)]
+struct ProjectionGovernor {
+    history: HashMap<String, ProjectionSessionState>,
+    in_flight: BTreeSet<String>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct ProjectionSessionState {
+    last_success: Option<Instant>,
+    last_cost: Duration,
+    consecutive_failures: u32,
+    retry_not_before: Option<Instant>,
+}
+
+struct ProjectionOutcome {
+    session_id: String,
+    cost: Duration,
+    error: Option<String>,
+}
+
+/// Single-flight off-loop refresh worker. The sink loop must never block
+/// behind a multi-minute snapshot of one enormous session, so refreshes run
+/// in their own task and report back through a shared outcome list that the
+/// loop applies on later ticks.
+struct ProjectionWorker {
+    requests: tokio::sync::mpsc::Sender<Vec<String>>,
+    outcomes: Arc<Mutex<Vec<ProjectionOutcome>>>,
+    /// Durable projection debt found by the maintenance task, merged into the
+    /// pending set on the next drain.
+    discovered: Arc<Mutex<BTreeSet<String>>>,
+}
+
+fn spawn_projection_worker(
+    clickhouse: ClickHouseClient,
+    budgets: ValidatedQueryBudgets,
+) -> ProjectionWorker {
+    let (requests, mut rx) = tokio::sync::mpsc::channel::<Vec<String>>(1);
+    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let completed = Arc::clone(&outcomes);
+    tokio::spawn(async move {
+        while let Some(sessions) = rx.recv().await {
+            for session_id in sessions {
+                let started = Instant::now();
+                // Task-locals do not cross `tokio::spawn`: the worker builds
+                // its own Background envelope, one per session refresh, so a
+                // single enormous session spends its own budget and a
+                // deadline failure is retried by the per-session backoff.
+                let envelope = background_envelope(&budgets, "ingest-projection");
+                let error = envelope
+                    .scope(
+                        clickhouse
+                            .refresh_mcp_open_read_model(std::iter::once(session_id.as_str())),
+                    )
+                    .await
+                    .err()
+                    .map(|error| format!("{error:#}"));
+                completed
+                    .lock()
+                    .expect("projection outcome mutex poisoned")
+                    .push(ProjectionOutcome {
+                        session_id,
+                        cost: started.elapsed(),
+                        error,
+                    });
+            }
+        }
+    });
+    ProjectionWorker {
+        requests,
+        outcomes,
+        discovered: Arc::new(Mutex::new(BTreeSet::new())),
+    }
+}
+
+const PROJECTION_REFRESH_MIN_GAP: Duration = Duration::from_secs(2);
+const PROJECTION_REFRESH_MAX_GAP: Duration = Duration::from_secs(600);
+const PROJECTION_REFRESH_COST_FACTOR: u32 = 20;
+const PROJECTION_FAILURE_BACKOFF_FLOOR: Duration = Duration::from_secs(1);
+const PROJECTION_FAILURE_BACKOFF_CEILING: Duration = Duration::from_secs(60);
+const PROJECTION_HISTORY_LIMIT: usize = 4096;
+const THROTTLED_RETRY_DELAY_CEILING: Duration = Duration::from_secs(60);
+const SNAPSHOT_RECLAIM_INTERVAL: Duration = Duration::from_secs(60);
+const PROJECTION_DEBT_PAGE: usize = 256;
+
+/// Fixed statement overhead of one flush cycle: append-fence begin/commit/
+/// block, recovering-append probe, insert-only preflight, checkpoint commit
+/// machinery, and the non-retryable error-recording path.
+const FLUSH_STATEMENT_OVERHEAD: u32 = 64;
+
+/// Per-item statement allowance for one flush cycle (amendment A7), where
+/// items = pending rows + checkpoint updates. Each row contributes at most
+/// one 8 MiB `insert_json_rows` chunk, and checkpoints add per-source head
+/// probes, transition persists, and (for generation-1 sources) initial
+/// compatibility preparation whose snapshot statements scale with the rows
+/// being flushed. The configured `[query_budgets.background].statement_cap`
+/// stays as the floor for small flushes.
+const FLUSH_STATEMENTS_PER_ITEM: u32 = 4;
+
+/// Fixed statement overhead of one projection-maintenance cycle: the durable
+/// dirty-session page read plus the reclaim bookkeeping statements.
+const MAINTENANCE_STATEMENT_OVERHEAD: u32 = 16;
+
+/// Per-session statement allowance for one maintenance cycle: superseded
+/// snapshot reclaim issues a handful of statements per reclaimed generation,
+/// bounded by the debt page size known at envelope creation.
+const MAINTENANCE_STATEMENTS_PER_SESSION: u32 = 4;
+
+/// The batch size one flush cycle's statement cap is derived from
+/// (amendment A7): `FLUSH_STATEMENT_OVERHEAD + FLUSH_STATEMENTS_PER_ITEM *
+/// items`, never a global constant a legitimate batch can exceed.
+fn flush_statement_items(pending: &PendingFlush) -> usize {
+    pending
+        .row_count()
+        .saturating_add(pending.checkpoint_updates.len())
+}
+
+/// Escalate the fixed flush retry delay exponentially while ClickHouse stays
+/// unreachable, so an outage produces a warn every minute instead of every
+/// second, then recover to the base cadence on the first success.
+fn throttled_retry_delay(base: Duration, consecutive_failures: u32) -> Duration {
+    let shift = consecutive_failures.saturating_sub(1).min(6);
+    base.saturating_mul(1_u32 << shift)
+        .clamp(base, THROTTLED_RETRY_DELAY_CEILING.max(base))
+}
+
+/// Releases the single-flight maintenance slot even if the task panics.
+struct MaintenanceSlot(Arc<AtomicBool>);
+
+impl Drop for MaintenanceSlot {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Background projection maintenance, at most one run at a time per sink:
+/// reseed durable projection debt (dirty sessions that outlived a restart or
+/// were dropped from the in-memory pending set) into `discovered`, then
+/// reclaim superseded snapshots. Mutations are server-side durable, so a lost
+/// response only delays accounting until the next tick.
+fn spawn_projection_maintenance(
+    clickhouse: &ClickHouseClient,
+    budgets: ValidatedQueryBudgets,
+    in_flight: &Arc<AtomicBool>,
+    discovered: &Arc<Mutex<BTreeSet<String>>>,
+) {
+    if in_flight.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let clickhouse = clickhouse.clone();
+    let slot = MaintenanceSlot(Arc::clone(in_flight));
+    let discovered = Arc::clone(discovered);
+    tokio::spawn(async move {
+        let _slot = slot;
+        // Task-locals do not cross `tokio::spawn`: the janitor builds its own
+        // Background envelope per cycle, cap derived from the debt page size
+        // it can touch (amendment A7).
+        let envelope = background_batch_envelope(
+            &budgets,
+            "ingest-maintenance",
+            MAINTENANCE_STATEMENT_OVERHEAD,
+            MAINTENANCE_STATEMENTS_PER_SESSION,
+            PROJECTION_DEBT_PAGE,
+        );
+        envelope
+            .scope(async {
+                match clickhouse
+                    .pending_dirty_mcp_open_sessions(PROJECTION_DEBT_PAGE)
+                    .await
+                {
+                    Ok(sessions) if !sessions.is_empty() => {
+                        discovered
+                            .lock()
+                            .expect("discovered projection debt mutex poisoned")
+                            .extend(sessions);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        warn!("failed to reconcile durable mcp open projection debt: {error:#}");
+                    }
+                }
+                match clickhouse.reclaim_superseded_mcp_open_snapshots().await {
+                    Ok(stats) if stats.total() > 0 => info!(
+                        superseded_generations = stats.superseded_generations,
+                        "reclaimed superseded mcp open snapshot generations"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => {
+                        warn!("superseded mcp open snapshot reclaim failed: {error:#}");
+                    }
+                }
+            })
+            .await;
+    });
+}
+
+fn projection_refresh_gap(cost: Duration) -> Duration {
+    (cost * PROJECTION_REFRESH_COST_FACTOR)
+        .clamp(PROJECTION_REFRESH_MIN_GAP, PROJECTION_REFRESH_MAX_GAP)
+}
+
+fn projection_failure_backoff(consecutive_failures: u32) -> Duration {
+    let shift = consecutive_failures.saturating_sub(1).min(6);
+    (PROJECTION_FAILURE_BACKOFF_FLOOR * (1_u32 << shift)).min(PROJECTION_FAILURE_BACKOFF_CEILING)
+}
+
+impl ProjectionGovernor {
+    fn due_sessions(&self, pending: &BTreeSet<String>, now: Instant) -> BTreeSet<String> {
+        pending
+            .iter()
+            .filter(|session_id| !self.in_flight.contains(session_id.as_str()))
+            .filter(|session_id| {
+                self.history.get(session_id.as_str()).is_none_or(|state| {
+                    state.retry_not_before.is_none_or(|instant| now >= instant)
+                        && state.last_success.is_none_or(|finished_at| {
+                            now.saturating_duration_since(finished_at)
+                                >= projection_refresh_gap(state.last_cost)
+                        })
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn mark_in_flight(&mut self, sessions: &[String]) {
+        self.in_flight.extend(sessions.iter().cloned());
+    }
+
+    fn apply_outcome(
+        &mut self,
+        outcome: ProjectionOutcome,
+        pending: &mut BTreeSet<String>,
+        now: Instant,
+    ) {
+        self.in_flight.remove(&outcome.session_id);
+        match outcome.error {
+            None => {
+                pending.remove(&outcome.session_id);
+                self.history.insert(
+                    outcome.session_id,
+                    ProjectionSessionState {
+                        last_success: Some(now),
+                        last_cost: outcome.cost,
+                        consecutive_failures: 0,
+                        retry_not_before: None,
+                    },
+                );
+            }
+            Some(error) => {
+                let state = self.history.entry(outcome.session_id.clone()).or_default();
+                state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+                let delay = projection_failure_backoff(state.consecutive_failures);
+                state.retry_not_before = Some(now + delay);
+                warn!(
+                    session_id = outcome.session_id.as_str(),
+                    consecutive_failures = state.consecutive_failures,
+                    retry_in_ms = delay.as_millis() as u64,
+                    "mcp open projection refresh failed; session stays pending: {error}"
+                );
+            }
+        }
+        if self.history.len() > PROJECTION_HISTORY_LIMIT {
+            let mut ages = self
+                .history
+                .values()
+                .filter_map(|state| state.last_success)
+                .collect::<Vec<_>>();
+            ages.sort_unstable();
+            if let Some(cutoff) = ages.get(ages.len() / 2).copied() {
+                self.history.retain(|_, state| {
+                    state
+                        .last_success
+                        .is_none_or(|finished_at| finished_at > cutoff)
+                });
+            }
+        }
+    }
+}
+
+/// Apply finished refreshes and hand the currently due sessions to the
+/// worker. Never blocks and never fails the surrounding loop: canonical rows
+/// are already durable and `mcp_open_dirty_sessions` persists the projection
+/// debt, so a failed or deferred refresh is simply retried on a later tick.
+fn drain_pending_projection(
+    worker: &ProjectionWorker,
+    governor: &mut ProjectionGovernor,
+    pending_ack: &mut PendingAckBatch,
+) {
+    let discovered = std::mem::take(
+        &mut *worker
+            .discovered
+            .lock()
+            .expect("discovered projection debt mutex poisoned"),
+    );
+    pending_ack.projection_session_ids.extend(discovered);
+    let outcomes = std::mem::take(
+        &mut *worker
+            .outcomes
+            .lock()
+            .expect("projection outcome mutex poisoned"),
+    );
+    let now = Instant::now();
+    for outcome in outcomes {
+        governor.apply_outcome(outcome, &mut pending_ack.projection_session_ids, now);
+    }
+    if pending_ack.projection_session_ids.is_empty() {
+        return;
+    }
+    let due = governor.due_sessions(&pending_ack.projection_session_ids, now);
+    if due.is_empty() {
+        return;
+    }
+    // Cheapest sessions first: while one enormous session occupies the
+    // worker for minutes, everyone queued behind it waits, so inexpensive
+    // near-realtime sessions must never queue behind it within one batch.
+    let mut ordered: Vec<String> = due.into_iter().collect();
+    ordered.sort_by_key(|session_id| {
+        governor
+            .history
+            .get(session_id)
+            .map_or(Duration::ZERO, |state| state.last_cost)
+    });
+    match worker.requests.try_send(ordered.clone()) {
+        Ok(()) => governor.mark_in_flight(&ordered),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            warn!("mcp open projection worker stopped; sessions stay pending");
+        }
+    }
+}
+
+#[derive(Default)]
+struct PendingFlush {
+    raw_rows: Vec<Value>,
+    event_rows: Vec<Value>,
+    link_rows: Vec<Value>,
+    tool_rows: Vec<Value>,
+    error_rows: Vec<Value>,
+    checkpoint_updates: HashMap<String, Checkpoint>,
+    acknowledgements: PendingAckBatch,
+    projection: ProjectionGovernor,
+    quarantined_generations: QuarantinedGenerations,
+    append_manifest: Option<AppendManifest>,
+    append_fence: Option<(String, u64)>,
+}
+
+impl PendingFlush {
+    fn extend(&mut self, batch: RowBatch) {
+        self.raw_rows.extend(batch.raw_rows);
+        self.event_rows.extend(batch.event_rows);
+        self.link_rows.extend(batch.link_rows);
+        self.tool_rows.extend(batch.tool_rows);
+        self.error_rows.extend(batch.error_rows);
+        if let Some(checkpoint) = batch.checkpoint {
+            merge_checkpoint(&mut self.checkpoint_updates, checkpoint);
+        }
+    }
+
+    fn row_count(&self) -> usize {
+        self.raw_rows.len()
+            + self.event_rows.len()
+            + self.link_rows.len()
+            + self.tool_rows.len()
+            + self.error_rows.len()
+    }
+
+    fn has_data(&self) -> bool {
+        self.row_count() != 0
+            || !self.checkpoint_updates.is_empty()
+            || self.append_manifest.is_some()
+            || self.append_fence.is_some()
+    }
+}
+
+struct FlushContext<'a> {
+    clickhouse: &'a ClickHouseClient,
+    checkpoints: &'a Arc<RwLock<HashMap<String, Checkpoint>>>,
+    metrics: &'a Arc<Metrics>,
+    checkpoint_cursor_columns: bool,
+    checkpoint_host: &'a str,
+    ack_observer: &'a IngestAckObserver,
+    publication: Option<&'a PublicationActor>,
+    /// Class budgets for the one Background envelope each flush cycle runs
+    /// under (issue #600 work item W9).
+    budgets: ValidatedQueryBudgets,
+}
+
+#[derive(Clone, Copy)]
+struct FlushOptions {
+    publication_ready: bool,
 }
 
 fn event_identity_digest(row: &Value) -> Option<String> {
@@ -179,6 +638,31 @@ pub(crate) enum SinkRole {
     },
 }
 
+fn publication_ready_for_role(role: &SinkRole) -> bool {
+    match role {
+        SinkRole::Default { .. } => true,
+        SinkRole::Backend { cell, .. } => cell.publication_ready(),
+    }
+}
+
+fn publication_ready_for_sink(role: &SinkRole, shared_legacy_ambiguous: bool) -> bool {
+    !shared_legacy_ambiguous && publication_ready_for_role(role)
+}
+
+fn publication_host_for_role<'a>(role: &SinkRole, identity: &'a PublicationIdentity) -> &'a str {
+    match role {
+        SinkRole::Backend { .. } => identity.host_id(),
+        SinkRole::Default { .. } => "",
+    }
+}
+
+fn account_barrier_flush(flushed: bool, pending_batch_bytes: &mut usize) -> bool {
+    if flushed {
+        *pending_batch_bytes = 0;
+    }
+    flushed
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SinkAuthorConfig {
     author: String,
@@ -202,6 +686,22 @@ impl SinkAuthorConfig {
     fn apply_to_batch(&self, batch: &mut RowBatch) {
         batch.stamp_author(&self.author, self.raw_events_column, self.events_column);
     }
+}
+
+fn stamp_source_host(batch: &mut RowBatch, source_host: &str) {
+    for row in batch
+        .raw_rows
+        .iter_mut()
+        .chain(&mut batch.event_rows)
+        .chain(&mut batch.link_rows)
+        .chain(&mut batch.tool_rows)
+        .chain(&mut batch.error_rows)
+    {
+        if let Some(object) = row.as_object_mut() {
+            object.insert("source_host".to_string(), json!(source_host));
+        }
+    }
+    batch.recompute_approx_bytes();
 }
 
 /// Backend-role health bookkeeping after a flush attempt; no-op for the
@@ -320,31 +820,99 @@ pub(crate) fn spawn_sink_task(
     metrics: Arc<Metrics>,
     mut rx: mpsc::Receiver<SinkMessage>,
     checkpoint_cursor_columns: bool,
+    publication_identity: PublicationIdentity,
     author: SinkAuthorConfig,
     role: SinkRole,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut raw_rows = Vec::<Value>::new();
-        let mut event_rows = Vec::<Value>::new();
-        let mut link_rows = Vec::<Value>::new();
-        let mut tool_rows = Vec::<Value>::new();
-        let mut error_rows = Vec::<Value>::new();
-        let mut checkpoint_updates = HashMap::<String, Checkpoint>::new();
+        let mut pending = PendingFlush::default();
         let mut pending_batch_bytes = 0usize;
+        // Task-locals do not cross `tokio::spawn`: every envelope the sink
+        // task needs is built here from the operator-validated budgets.
+        let budgets = ingest_query_budgets(&config);
         let ack_observer = IngestAckObserver::new(
             config.ingest.ack_observation && matches!(&role, SinkRole::Default { .. }),
         );
-        let mut pending_ack = PendingAckBatch::default();
 
         // Mirror sinks share one ingest_checkpoints table per team backend,
         // so their rows are scoped per host (migration 018; guaranteed
         // present by the schema handshake). The default backend stays
         // single-writer and keeps writing host-less rows, which also keeps
         // it working before `moraine db migrate` adds the column locally.
-        let checkpoint_host = match &role {
-            SinkRole::Backend { .. } => host_name(),
-            SinkRole::Default { .. } => String::new(),
+        let checkpoint_host = publication_host_for_role(&role, &publication_identity).to_string();
+        let publication_actor = PublicationActor::new(
+            clickhouse.clone(),
+            checkpoint_host.clone(),
+            publication_identity.publisher_id().to_string(),
+            budgets,
+        );
+        let default_publication_ready = matches!(&role, SinkRole::Default { .. });
+        if !default_publication_ready {
+            match publication_actor.block_orphaned_append_on_startup().await {
+                Ok(true) => {
+                    warn!(
+                        "an unresolved shared-backend append manifest remains blocked after restart"
+                    );
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    let detail = format!(
+                        "failed to repair shared-backend append publication control: {error}"
+                    );
+                    warn!("{detail}");
+                    *metrics
+                        .last_error
+                        .lock()
+                        .expect("metrics last_error mutex poisoned") = detail;
+                    if let SinkRole::Backend { cell, .. } = &role {
+                        cell.set_status(BackendSinkStatus::Unreachable);
+                    }
+                    return;
+                }
+            }
+        }
+        let shared_legacy_ambiguous = if default_publication_ready {
+            false
+        } else {
+            match publication_actor.diagnose_shared_legacy_ambiguity().await {
+                Ok(ambiguous) => {
+                    if ambiguous {
+                        warn!(
+                            "shared backend contains hostless legacy events; publication remains fail-closed"
+                        );
+                    }
+                    ambiguous
+                }
+                Err(error) => {
+                    warn!("failed to prove shared legacy ownership; publication remains fail-closed: {error}");
+                    true
+                }
+            }
         };
+        if default_publication_ready {
+            loop {
+                let repair_candidates = checkpoints
+                    .read()
+                    .await
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                match publication_actor
+                    .repair_ready_publications(repair_candidates)
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(error) => {
+                        warn!("startup publication repair failed closed; retrying: {error}");
+                        *metrics
+                            .last_error
+                            .lock()
+                            .expect("metrics last_error mutex poisoned") = error.to_string();
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        }
 
         let flush_interval = duration_from_config_seconds(
             config.ingest.flush_interval_seconds,
@@ -361,50 +929,58 @@ pub(crate) fn spawn_sink_task(
             0.25,
             "ingest.flush_interval_seconds * 2.0",
         );
+        let flush_context = FlushContext {
+            clickhouse: &clickhouse,
+            checkpoints: &checkpoints,
+            metrics: &metrics,
+            checkpoint_cursor_columns,
+            checkpoint_host: &checkpoint_host,
+            ack_observer: &ack_observer,
+            publication: Some(&publication_actor),
+            budgets,
+        };
 
         let mut flush_tick = tokio::time::interval(flush_interval);
+        flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut heartbeat_tick = tokio::time::interval(heartbeat_interval);
+        heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut reclaim_tick = tokio::time::interval(SNAPSHOT_RECLAIM_INTERVAL);
+        reclaim_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let reclaim_in_flight = Arc::new(AtomicBool::new(false));
+        let projection_worker = spawn_projection_worker(clickhouse.clone(), budgets);
         let mut throttling_flush_retries = false;
+        let mut throttled_flush_failures: u32 = 0;
 
         loop {
-            if throttling_flush_retries
-                && has_pending_data(
-                    &raw_rows,
-                    &event_rows,
-                    &link_rows,
-                    &tool_rows,
-                    &error_rows,
-                    &checkpoint_updates,
-                )
-            {
-                let flush_ok = flush_pending_with_ack(
-                    &clickhouse,
-                    &checkpoints,
-                    &metrics,
-                    &mut raw_rows,
-                    &mut event_rows,
-                    &mut link_rows,
-                    &mut tool_rows,
-                    &mut error_rows,
-                    &mut checkpoint_updates,
-                    checkpoint_cursor_columns,
-                    &checkpoint_host,
-                    &ack_observer,
-                    &mut pending_ack,
+            if throttling_flush_retries && pending.has_data() {
+                let flush_ok = flush_pending_with_publication(
+                    &flush_context,
+                    &mut pending,
+                    FlushOptions {
+                        publication_ready: publication_ready_for_sink(
+                            &role,
+                            shared_legacy_ambiguous,
+                        ),
+                    },
                 )
                 .await;
                 note_flush_outcome(&role, &checkpoints, flush_ok, rx.is_empty()).await;
                 if flush_ok {
                     pending_batch_bytes = 0;
                     throttling_flush_retries = false;
+                    throttled_flush_failures = 0;
                     info!("flush retry succeeded; resuming sink intake");
                 } else {
-                    tokio::select! {
-                        _ = tokio::time::sleep(retry_backoff) => {}
-                        _ = heartbeat_tick.tick() => {
-                            emit_heartbeat(&clickhouse, &metrics, &role).await;
-                        }
-                    }
+                    // Heartbeat inserts against an unreachable server are
+                    // pure churn; they resume with the first successful
+                    // retry. The delay escalates so a long outage warns
+                    // about once a minute instead of once a second.
+                    throttled_flush_failures = throttled_flush_failures.saturating_add(1);
+                    tokio::time::sleep(throttled_retry_delay(
+                        retry_backoff,
+                        throttled_flush_failures,
+                    ))
+                    .await;
                 }
                 continue;
             }
@@ -433,42 +1009,30 @@ pub(crate) fn spawn_sink_task(
                                 }
                                 SinkRole::Default { .. } => batch,
                             };
+                            stamp_source_host(&mut batch, &checkpoint_host);
                             author.apply_to_batch(&mut batch);
                             pending_batch_bytes =
                                 pending_batch_bytes.saturating_add(batch.approx_bytes());
-                            raw_rows.extend(batch.raw_rows);
-                            event_rows.extend(batch.event_rows);
-                            link_rows.extend(batch.link_rows);
-                            tool_rows.extend(batch.tool_rows);
-                            error_rows.extend(batch.error_rows);
-                            if let Some(cp) = batch.checkpoint {
-                                merge_checkpoint(&mut checkpoint_updates, cp);
-                            }
+                            pending.extend(batch);
 
-                            let total_rows = raw_rows.len() + event_rows.len() + link_rows.len() + tool_rows.len() + error_rows.len();
-                            if total_rows >= config.ingest.batch_size
+                            if pending.row_count() >= config.ingest.batch_size
                                 || pending_batch_bytes >= config.ingest.max_batch_bytes.max(1)
                             {
-                                let flush_ok = flush_pending_with_ack(
-                                    &clickhouse,
-                                    &checkpoints,
-                                    &metrics,
-                                    &mut raw_rows,
-                                    &mut event_rows,
-                                    &mut link_rows,
-                                    &mut tool_rows,
-                                    &mut error_rows,
-                                    &mut checkpoint_updates,
-                                    checkpoint_cursor_columns,
-                                    &checkpoint_host,
-                    &ack_observer,
-                    &mut pending_ack,
+                                let flush_ok = flush_pending_with_publication(
+                                    &flush_context,
+                                    &mut pending,
+                                    FlushOptions {
+                                        publication_ready: publication_ready_for_sink(
+                                            &role,
+                                            shared_legacy_ambiguous,
+                                        ),
+                                    },
                                 ).await;
                                 note_flush_outcome(&role, &checkpoints, flush_ok, rx.is_empty()).await;
                                 if !flush_ok {
                                     if !throttling_flush_retries {
                                         warn!(
-                                            "flush failed; pausing sink intake and retrying pending rows every {} ms",
+                                            "flush failed; pausing sink intake and retrying pending rows with escalating backoff (base {} ms)",
                                             retry_backoff.as_millis()
                                         );
                                     }
@@ -478,31 +1042,254 @@ pub(crate) fn spawn_sink_task(
                                 }
                             }
                         }
+                        Some(SinkMessage::BeginReplay { mut transition, ack }) => {
+                            let flushed = account_barrier_flush(
+                                flush_for_barrier(
+                                    &flush_context,
+                                    &mut pending,
+                                    FlushOptions {
+                                        publication_ready: publication_ready_for_sink(
+                                            &role,
+                                            shared_legacy_ambiguous,
+                                        ),
+                                    },
+                                )
+                                .await,
+                                &mut pending_batch_bytes,
+                            );
+                            let result = if !flushed {
+                                throttling_flush_retries = true;
+                                Err("failed to flush batches preceding begin-replay barrier".to_string())
+                            } else {
+                                match transition.validate_begin_replay() {
+                                    Err(error) => Err(error.to_string()),
+                                    Ok(()) => match publication_actor.persist_transition(&mut transition).await {
+                                        Ok(barrier) => {
+                                            merge_checkpoint(
+                                                &mut *checkpoints.write().await,
+                                                transition.checkpoint.clone(),
+                                            );
+                                            clear_quarantines_before_replay(
+                                                &mut pending.quarantined_generations,
+                                                &transition.checkpoint,
+                                            );
+                                            Ok(barrier)
+                                        }
+                                        Err(error) => Err(error.to_string()),
+                                    },
+                                }
+                            };
+                            let _ = ack.send(result);
+                        }
+                        Some(SinkMessage::FinalizeReplay { mut transition, ack }) => {
+                            let flushed = account_barrier_flush(
+                                flush_for_barrier(
+                                    &flush_context,
+                                    &mut pending,
+                                    FlushOptions {
+                                        publication_ready: publication_ready_for_sink(
+                                            &role,
+                                            shared_legacy_ambiguous,
+                                        ),
+                                    },
+                                )
+                                .await,
+                                &mut pending_batch_bytes,
+                            );
+                            let result = if !flushed {
+                                throttling_flush_retries = true;
+                                Err("failed to flush replay batches before final publication".to_string())
+                            } else if let Err(error) = validate_latest_replay_checkpoint(
+                                &checkpoints,
+                                &pending.quarantined_generations,
+                                &transition,
+                            )
+                            .await
+                            {
+                                Err(error)
+                            } else {
+                                let publication_ready = publication_ready_for_sink(
+                                    &role,
+                                    shared_legacy_ambiguous,
+                                );
+                                transition.set_backend_caught_up(publication_ready);
+                                if !publication_ready {
+                                    let staged = match publication_actor
+                                        .persist_staged_mirror_final(&mut transition)
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            merge_checkpoint(
+                                                &mut *checkpoints.write().await,
+                                                transition.checkpoint.clone(),
+                                            );
+                                            clear_quarantine_for_generation(
+                                                &mut pending.quarantined_generations,
+                                                &transition.checkpoint,
+                                            );
+                                            Ok(FinalizeReplayOutcome::StagedForMirror)
+                                        }
+                                        Err(error) => Err(error.to_string()),
+                                    };
+                                    let _ = ack.send(staged);
+                                    continue;
+                                }
+                                match publication_actor.publish_final(&mut transition).await {
+                                    Ok(publication) => {
+                                        merge_checkpoint(
+                                            &mut *checkpoints.write().await,
+                                            transition.checkpoint.clone(),
+                                        );
+                                        clear_quarantine_for_generation(
+                                            &mut pending.quarantined_generations,
+                                            &transition.checkpoint,
+                                        );
+                                        Ok(FinalizeReplayOutcome::Published(publication))
+                                    }
+                                    Err(error) => Err(error.to_string()),
+                                }
+                            };
+                            let _ = ack.send(result);
+                        }
+                        Some(SinkMessage::BlockReplay { mut transition, ack }) => {
+                            let flushed = account_barrier_flush(
+                                flush_for_barrier(
+                                    &flush_context,
+                                    &mut pending,
+                                    FlushOptions {
+                                        publication_ready: publication_ready_for_sink(
+                                            &role,
+                                            shared_legacy_ambiguous,
+                                        ),
+                                    },
+                                )
+                                .await,
+                                &mut pending_batch_bytes,
+                            );
+                            let result = if !flushed {
+                                throttling_flush_retries = true;
+                                Err("failed to flush batches preceding replay-block barrier".to_string())
+                            } else if transition.checkpoint.block_reason.is_empty() {
+                                Err("blocked replay transition requires a block reason".to_string())
+                            } else {
+                                transition
+                                    .checkpoint
+                                    .set_lifecycle(CheckpointLifecycle::Error);
+                                match publication_actor.persist_transition(&mut transition).await {
+                                    Ok(barrier) => {
+                                        merge_checkpoint(
+                                            &mut *checkpoints.write().await,
+                                            transition.checkpoint.clone(),
+                                        );
+                                        Ok(barrier)
+                                    }
+                                    Err(error) => Err(error.to_string()),
+                                }
+                            };
+                            let _ = ack.send(result);
+                        }
+                        Some(SinkMessage::MirrorCaughtUp { mut transition, ack }) => {
+                            let flushed = account_barrier_flush(
+                                flush_for_barrier(
+                                    &flush_context,
+                                    &mut pending,
+                                    FlushOptions {
+                                        publication_ready: publication_ready_for_sink(
+                                            &role,
+                                            shared_legacy_ambiguous,
+                                        ),
+                                    },
+                                )
+                                .await,
+                                &mut pending_batch_bytes,
+                            );
+                            let mut result = if flushed && shared_legacy_ambiguous {
+                                Err(
+                                    "shared legacy source ownership is ambiguous; publication remains disabled"
+                                        .to_string(),
+                                )
+                            } else if flushed {
+                                let key = crate::checkpoint::checkpoint_key(
+                                    &transition.source.source_name,
+                                    &transition.source.source_file,
+                                );
+                                let latest = checkpoints.read().await.get(&key).cloned();
+                                let latest_transition = latest
+                                    .map(|mut latest| {
+                                    // The barrier may have waited behind replay
+                                    // batches. Persist readiness against the
+                                    // cursor that actually flushed, never the
+                                    // placeholder captured by the supervisor.
+                                    latest.checkpoint_revision = 0;
+                                    latest.operation_id.clear();
+                                        CheckpointTransition::try_from_checkpoint(latest)
+                                    })
+                                    .transpose()
+                                    .map_err(|error| error.to_string());
+                                match latest_transition {
+                                    Err(error) => Err(error),
+                                    Ok(latest) => {
+                                        if let Some(latest) = latest {
+                                            transition = latest;
+                                        }
+                                        transition.set_backend_caught_up(true);
+                                        publication_actor
+                                            .persist_mirror_caught_up(&mut transition)
+                                            .await
+                                            .map_err(|error| error.to_string())
+                                    }
+                                }
+                            } else {
+                                throttling_flush_retries = true;
+                                Err("failed to flush batches preceding mirror catch-up barrier".to_string())
+                            };
+                            if result.is_ok() {
+                                merge_checkpoint(
+                                    &mut *checkpoints.write().await,
+                                    transition.checkpoint.clone(),
+                                );
+                                let repair_candidates =
+                                    checkpoints.read().await.values().cloned().collect::<Vec<_>>();
+                                if let Err(error) = publication_actor
+                                    .repair_ready_publications(repair_candidates)
+                                    .await
+                                {
+                                    let failure = format!(
+                                        "mirror catch-up is durable but publication repair failed: {error}"
+                                    );
+                                    result = match publication_actor
+                                        .record_publication_repair_failure(&transition)
+                                        .await
+                                    {
+                                        Ok(()) => Err(failure),
+                                        Err(diagnostic_error) => Err(format!(
+                                            "{failure}; failed to persist publication-repair diagnostic: {diagnostic_error}"
+                                        )),
+                                    };
+                                }
+                            }
+                            let _ = ack.send(result);
+                        }
                         None => break,
                     }
                 }
                 _ = flush_tick.tick() => {
-                    if has_pending_data(&raw_rows, &event_rows, &link_rows, &tool_rows, &error_rows, &checkpoint_updates) {
-                        let flush_ok = flush_pending_with_ack(
-                            &clickhouse,
-                            &checkpoints,
-                            &metrics,
-                            &mut raw_rows,
-                            &mut event_rows,
-                            &mut link_rows,
-                            &mut tool_rows,
-                            &mut error_rows,
-                            &mut checkpoint_updates,
-                            checkpoint_cursor_columns,
-                            &checkpoint_host,
-                    &ack_observer,
-                    &mut pending_ack,
+                    if pending.has_data() {
+                        let flush_ok = flush_pending_with_publication(
+                            &flush_context,
+                            &mut pending,
+                            FlushOptions {
+                                publication_ready: publication_ready_for_sink(
+                                    &role,
+                                    shared_legacy_ambiguous,
+                                ),
+                            },
                         ).await;
                         note_flush_outcome(&role, &checkpoints, flush_ok, rx.is_empty()).await;
                         if !flush_ok {
                             if !throttling_flush_retries {
                                 warn!(
-                                    "flush failed; pausing sink intake and retrying pending rows every {} ms",
+                                    "flush failed; pausing sink intake and retrying pending rows with escalating backoff (base {} ms)",
                                     retry_backoff.as_millis()
                                 );
                             }
@@ -511,35 +1298,37 @@ pub(crate) fn spawn_sink_task(
                             pending_batch_bytes = 0;
                         }
                     }
+                    // Sessions whose canonical rows flushed owe a projection
+                    // pass; the off-loop worker runs it so a huge session can
+                    // never stall intake, and deferred sessions are retried
+                    // here even when no new rows arrive.
+                    drain_pending_projection(
+                        &projection_worker,
+                        &mut pending.projection,
+                        &mut pending.acknowledgements,
+                    );
                 }
                 _ = heartbeat_tick.tick() => {
-                    emit_heartbeat(&clickhouse, &metrics, &role).await;
+                    emit_heartbeat(&clickhouse, &budgets, &metrics, &role).await;
+                }
+                _ = reclaim_tick.tick() => {
+                    spawn_projection_maintenance(
+                        &clickhouse,
+                        budgets,
+                        &reclaim_in_flight,
+                        &projection_worker.discovered,
+                    );
                 }
             }
         }
 
-        if has_pending_data(
-            &raw_rows,
-            &event_rows,
-            &link_rows,
-            &tool_rows,
-            &error_rows,
-            &checkpoint_updates,
-        ) {
-            let flush_ok = flush_pending_with_ack(
-                &clickhouse,
-                &checkpoints,
-                &metrics,
-                &mut raw_rows,
-                &mut event_rows,
-                &mut link_rows,
-                &mut tool_rows,
-                &mut error_rows,
-                &mut checkpoint_updates,
-                checkpoint_cursor_columns,
-                &checkpoint_host,
-                &ack_observer,
-                &mut pending_ack,
+        if pending.has_data() {
+            let flush_ok = flush_pending_with_publication(
+                &flush_context,
+                &mut pending,
+                FlushOptions {
+                    publication_ready: publication_ready_for_sink(&role, shared_legacy_ambiguous),
+                },
             )
             .await;
             note_flush_outcome(&role, &checkpoints, flush_ok, true).await;
@@ -547,49 +1336,345 @@ pub(crate) fn spawn_sink_task(
     })
 }
 
-fn has_pending_data(
-    raw_rows: &[Value],
-    event_rows: &[Value],
-    link_rows: &[Value],
-    tool_rows: &[Value],
-    error_rows: &[Value],
-    checkpoint_updates: &HashMap<String, Checkpoint>,
-) -> bool {
-    !(raw_rows.is_empty()
-        && event_rows.is_empty()
-        && link_rows.is_empty()
-        && tool_rows.is_empty()
-        && error_rows.is_empty()
-        && checkpoint_updates.is_empty())
+fn direct_row_source(row: &Value) -> Option<IngestErrorSource> {
+    let source = ingest_error_source_from_row(row);
+    SourceGenerationKey::from_source(&source).map(|_| source)
 }
 
-fn quarantine_oversized_rows(
-    table: &str,
-    rows: &mut Vec<Value>,
-    error_rows: &mut Vec<Value>,
-) -> anyhow::Result<usize> {
-    let mut kept = Vec::with_capacity(rows.len());
-    let mut quarantined = 0usize;
+fn push_event_ownership_candidate(
+    index: &mut EventOwnershipIndex,
+    event_uid: &str,
+    event_version: u64,
+    source: IngestErrorSource,
+) {
+    if event_uid.is_empty() || event_version == 0 {
+        return;
+    }
+    let source_key = SourceGenerationKey::from_source(&source)
+        .expect("ownership candidates always have a generation key");
+    let candidates = index
+        .entry((event_uid.to_string(), event_version))
+        .or_default();
+    if !candidates
+        .iter()
+        .any(|candidate| SourceGenerationKey::from_source(candidate).as_ref() == Some(&source_key))
+    {
+        candidates.push(source);
+    }
+}
 
-    for row in std::mem::take(rows) {
+fn quarantine_ownership(event_rows: &[Value]) -> QuarantineOwnership {
+    let mut ownership = QuarantineOwnership::default();
+    // A derived row is causally owned by the exact event version selected by
+    // the live views, not merely by a reusable event UID.
+    for row in event_rows {
+        let Some(source) = direct_row_source(row) else {
+            continue;
+        };
+        let Some(event_uid) = row.get("event_uid").and_then(Value::as_str) else {
+            continue;
+        };
+        let event_version = row_u64(row, "event_version").unwrap_or_default();
+        push_event_ownership_candidate(
+            &mut ownership.by_event_uid,
+            event_uid,
+            event_version,
+            source,
+        );
+    }
+    ownership
+}
+
+fn quarantine_sources_for_row(
+    row: &Value,
+    ownership: &QuarantineOwnership,
+) -> Vec<IngestErrorSource> {
+    if let Some(source) = direct_row_source(row) {
+        return vec![source];
+    }
+    if let (Some(event_uid), Some(source_event_version)) = (
+        row.get("event_uid").and_then(Value::as_str),
+        row_u64(row, "source_event_version").filter(|version| *version != 0),
+    ) {
+        if let Some(sources) = ownership
+            .by_event_uid
+            .get(&(event_uid.to_string(), source_event_version))
+        {
+            return sources.clone();
+        }
+    }
+    Vec::new()
+}
+
+#[derive(Default)]
+struct QuarantineSummary {
+    rows: usize,
+    generations: QuarantinedGenerations,
+}
+
+impl QuarantineSummary {
+    fn merge(&mut self, other: Self) {
+        self.rows = self.rows.saturating_add(other.rows);
+        for (source, rows) in other.generations {
+            self.generations
+                .entry(source)
+                .and_modify(|total| *total = total.saturating_add(rows))
+                .or_insert(rows);
+        }
+    }
+}
+
+struct OversizedRowPlan {
+    index: usize,
+    row_bytes: usize,
+    sources: Vec<IngestErrorSource>,
+}
+
+fn plan_oversized_rows(
+    table: &str,
+    rows: &[Value],
+    ownership: &QuarantineOwnership,
+) -> anyhow::Result<Vec<OversizedRowPlan>> {
+    let mut plan = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
         let row_bytes = serde_json::to_vec(&row)
             .with_context(|| format!("failed to encode {table} row for oversized-row guard"))?
             .len();
         if row_bytes > CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES {
-            error_rows.push(oversized_row_error(table, &row, row_bytes));
-            quarantined = quarantined.saturating_add(1);
-        } else {
-            kept.push(row);
+            let sources = quarantine_sources_for_row(row, ownership);
+            if sources.is_empty() {
+                let event_uid = row
+                    .get("event_uid")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                anyhow::bail!(
+                    "cannot quarantine oversized {table} row without an exact source generation owner (event_uid={event_uid:?})"
+                );
+            }
+            plan.push(OversizedRowPlan {
+                index,
+                row_bytes,
+                sources,
+            });
         }
+    }
+    Ok(plan)
+}
+
+fn apply_oversized_row_plan(
+    table: &str,
+    rows: &mut Vec<Value>,
+    error_rows: &mut Vec<Value>,
+    plan: Vec<OversizedRowPlan>,
+) -> QuarantineSummary {
+    let mut kept = Vec::with_capacity(rows.len().saturating_sub(plan.len()));
+    let mut quarantined = QuarantineSummary::default();
+    let mut plan = plan.into_iter().peekable();
+
+    for (index, row) in std::mem::take(rows).into_iter().enumerate() {
+        let Some(oversized) = plan.next_if(|entry| entry.index == index) else {
+            kept.push(row);
+            continue;
+        };
+
+        for source in &oversized.sources {
+            error_rows.push(oversized_row_error(
+                table,
+                &row,
+                oversized.row_bytes,
+                Some(source),
+            ));
+            let source = SourceGenerationKey::from_source(source)
+                .expect("planned quarantine sources always have a generation key");
+            quarantined
+                .generations
+                .entry(source)
+                .and_modify(|total| *total = total.saturating_add(1))
+                .or_insert(1);
+        }
+        quarantined.rows = quarantined.rows.saturating_add(1);
     }
 
     *rows = kept;
-    Ok(quarantined)
+    quarantined
 }
 
-fn oversized_row_error(table: &str, row: &Value, row_bytes: usize) -> Value {
-    let source = ingest_error_source_from_row(row);
+#[allow(clippy::too_many_arguments)]
+fn quarantine_oversized_pending_rows(
+    raw_rows: &mut Vec<Value>,
+    event_rows: &mut Vec<Value>,
+    link_rows: &mut Vec<Value>,
+    tool_rows: &mut Vec<Value>,
+    error_rows: &mut Vec<Value>,
+) -> anyhow::Result<QuarantineSummary> {
+    let ownership = quarantine_ownership(event_rows);
+
+    // Resolve every oversized row before mutating any table. An unscoped row
+    // stays pending and blocks the flush without contaminating other sources.
+    let raw_plan = plan_oversized_rows("raw_events", raw_rows, &ownership)?;
+    let event_plan = plan_oversized_rows("events", event_rows, &ownership)?;
+    let link_plan = plan_oversized_rows("event_links", link_rows, &ownership)?;
+    let tool_plan = plan_oversized_rows("tool_io", tool_rows, &ownership)?;
+    let error_plan = plan_oversized_rows("ingest_errors", error_rows, &ownership)?;
+
+    let mut summary = QuarantineSummary::default();
+    let mut compacted_error_rows = Vec::new();
+    summary.merge(apply_oversized_row_plan(
+        "ingest_errors",
+        error_rows,
+        &mut compacted_error_rows,
+        error_plan,
+    ));
+    error_rows.extend(compacted_error_rows);
+    summary.merge(apply_oversized_row_plan(
+        "raw_events",
+        raw_rows,
+        error_rows,
+        raw_plan,
+    ));
+    summary.merge(apply_oversized_row_plan(
+        "events", event_rows, error_rows, event_plan,
+    ));
+    summary.merge(apply_oversized_row_plan(
+        "event_links",
+        link_rows,
+        error_rows,
+        link_plan,
+    ));
+    summary.merge(apply_oversized_row_plan(
+        "tool_io", tool_rows, error_rows, tool_plan,
+    ));
+    Ok(summary)
+}
+
+fn quarantine_reason(rows: usize) -> String {
+    format!("{rows} oversized row(s) quarantined during generation flush")
+}
+
+fn remember_quarantined_generations(
+    state: &mut QuarantinedGenerations,
+    quarantined: QuarantinedGenerations,
+) {
+    for (source, rows) in quarantined {
+        state
+            .entry(source)
+            .and_modify(|total| *total = total.saturating_add(rows))
+            .or_insert(rows);
+    }
+}
+
+fn apply_quarantine_to_checkpoints(
+    state: &QuarantinedGenerations,
+    checkpoint_updates: &mut HashMap<String, Checkpoint>,
+) {
+    for checkpoint in checkpoint_updates.values_mut() {
+        let source = SourceGenerationKey::from_checkpoint(checkpoint);
+        let Some(rows) = state.get(&source).copied() else {
+            continue;
+        };
+        checkpoint.set_lifecycle(CheckpointLifecycle::Error);
+        checkpoint.final_scan_complete = false;
+        checkpoint.compatibility_prepared = false;
+        checkpoint.backend_caught_up = false;
+        checkpoint.block_reason = quarantine_reason(rows);
+    }
+}
+
+fn clear_quarantines_before_replay(state: &mut QuarantinedGenerations, checkpoint: &Checkpoint) {
+    let generation = u64::from(checkpoint.source_generation);
+    state.retain(|source, _| {
+        !(source.same_source(checkpoint) && source.source_generation <= generation)
+    });
+}
+
+fn clear_quarantine_for_generation(state: &mut QuarantinedGenerations, checkpoint: &Checkpoint) {
+    state.remove(&SourceGenerationKey::from_checkpoint(checkpoint));
+}
+
+async fn validate_latest_replay_checkpoint(
+    checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
+    quarantined_generations: &QuarantinedGenerations,
+    transition: &CheckpointTransition,
+) -> std::result::Result<(), String> {
+    let source = SourceGenerationKey::from_checkpoint(&transition.checkpoint);
+    if let Some(rows) = quarantined_generations.get(&source) {
+        return Err(format!(
+            "final publication rejected: {}",
+            quarantine_reason(*rows)
+        ));
+    }
+
+    let key = crate::checkpoint::checkpoint_key(
+        &transition.source.source_name,
+        &transition.source.source_file,
+    );
+    let state = checkpoints.read().await;
+    let Some(latest) = state.get(&key) else {
+        return Err("final publication rejected: no durable replay checkpoint".to_string());
+    };
+
+    let latest_lifecycle = latest.lifecycle().map_err(|error| {
+        format!("final publication rejected: invalid durable checkpoint: {error}")
+    })?;
+    if latest_lifecycle == CheckpointLifecycle::Error || !latest.block_reason.is_empty() {
+        let reason = if latest.block_reason.is_empty() {
+            "latest replay checkpoint is in error state"
+        } else {
+            latest.block_reason.as_str()
+        };
+        return Err(format!("final publication rejected: {reason}"));
+    }
+    if !matches!(
+        latest_lifecycle,
+        CheckpointLifecycle::Replaying | CheckpointLifecycle::Active
+    ) {
+        return Err(format!(
+            "final publication rejected: latest replay checkpoint has {} lifecycle",
+            latest_lifecycle
+        ));
+    }
+
+    let candidate = &transition.checkpoint;
+    if latest.source_generation != candidate.source_generation
+        || latest.source_inode != candidate.source_inode
+        || latest.last_offset != candidate.last_offset
+        || latest.last_line_no != candidate.last_line_no
+        || latest.cursor_json != candidate.cursor_json
+        || latest.source_fingerprint != candidate.source_fingerprint
+        || latest.schema_fingerprint != candidate.schema_fingerprint
+        || latest.scan_inode != candidate.scan_inode
+        || latest.scan_boundary != candidate.scan_boundary
+        || latest.policy_fingerprint != candidate.policy_fingerprint
+    {
+        return Err(
+            "final publication rejected: latest durable replay checkpoint does not match candidate"
+                .to_string(),
+        );
+    }
+    if latest_lifecycle == CheckpointLifecycle::Active && !latest.final_scan_complete {
+        return Err(
+            "final publication rejected: latest active checkpoint is not scan-complete".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn oversized_row_error(
+    table: &str,
+    row: &Value,
+    row_bytes: usize,
+    source: Option<&IngestErrorSource>,
+) -> Value {
+    let fallback_source;
+    let source = match source {
+        Some(source) => source,
+        None => {
+            fallback_source = ingest_error_source_from_row(row);
+            &fallback_source
+        }
+    };
     json!({
+        "source_host": row.get("source_host").and_then(Value::as_str).unwrap_or_default(),
         "source_name": source.source_name,
         "harness": source.harness,
         "source_file": source.source_file,
@@ -650,11 +1735,11 @@ fn oversized_row_fragment(row: &Value) -> String {
 enum SinkStage {
     RawEvents,
     Events,
-    McpOpenProjection,
     EventLinks,
     ToolIo,
     IngestErrors,
     IngestCheckpoints,
+    AppendControl,
 }
 
 impl SinkStage {
@@ -662,11 +1747,11 @@ impl SinkStage {
         match self {
             Self::RawEvents => "raw_events",
             Self::Events => "events",
-            Self::McpOpenProjection => "mcp_open_projection",
             Self::EventLinks => "event_links",
             Self::ToolIo => "tool_io",
             Self::IngestErrors => "ingest_errors",
             Self::IngestCheckpoints => "ingest_checkpoints",
+            Self::AppendControl => "ingest_append_control",
         }
     }
 }
@@ -682,7 +1767,7 @@ impl SinkFlushFailure {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default, Eq, PartialEq)]
 struct IngestErrorSource {
     source_name: String,
     harness: String,
@@ -708,11 +1793,11 @@ impl PendingSinkData<'_> {
         let stage_rows = match stage {
             SinkStage::RawEvents => self.raw_rows,
             SinkStage::Events => self.event_rows,
-            SinkStage::McpOpenProjection => self.event_rows,
             SinkStage::EventLinks => self.link_rows,
             SinkStage::ToolIo => self.tool_rows,
             SinkStage::IngestErrors => self.error_rows,
             SinkStage::IngestCheckpoints => &[],
+            SinkStage::AppendControl => &[],
         };
 
         if let [row] = stage_rows {
@@ -735,11 +1820,11 @@ impl PendingSinkData<'_> {
         match stage {
             SinkStage::RawEvents => self.raw_rows.len(),
             SinkStage::Events => self.event_rows.len(),
-            SinkStage::McpOpenProjection => self.event_rows.len(),
             SinkStage::EventLinks => self.link_rows.len(),
             SinkStage::ToolIo => self.tool_rows.len(),
             SinkStage::IngestErrors => self.error_rows.len(),
             SinkStage::IngestCheckpoints => self.checkpoint_updates.len(),
+            SinkStage::AppendControl => self.checkpoint_updates.len(),
         }
     }
 
@@ -854,22 +1939,64 @@ async fn commit_checkpoint_updates(
     checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
     checkpoint_rows: &[Value],
     checkpoint_updates: &HashMap<String, Checkpoint>,
+    publication: Option<&PublicationActor>,
+    publication_ready: bool,
 ) -> anyhow::Result<()> {
     if checkpoint_rows.is_empty() {
         return Ok(());
     }
 
+    let mut committed = Vec::with_capacity(checkpoint_updates.len());
+    for checkpoint in checkpoint_updates.values() {
+        let mut transition = CheckpointTransition::try_from_checkpoint(checkpoint.clone())?;
+        let initial_local = transition.checkpoint.lifecycle()? == CheckpointLifecycle::Active
+            && transition.checkpoint.source_generation == 1
+            && checkpoint_rows.iter().all(|row| {
+                row.get("host")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .is_empty()
+            });
+        if initial_local {
+            // Empty host is the local backend and is already caught up with
+            // itself. A mirror must receive the ordered catch-up barrier.
+            transition.set_backend_caught_up(true);
+        } else if !publication_ready {
+            // Adapter checkpoints describe source-scan completeness, not
+            // mirror coverage. Until the ordered catch-up barrier is durable,
+            // a backend transition must stay staged even if the adapter set
+            // its ordinary generation-1 readiness defaults to true.
+            transition.set_backend_caught_up(false);
+        }
+        if let Some(publication) = publication {
+            if !initial_local {
+                publication.persist_transition(&mut transition).await?;
+            }
+        }
+        committed.push(transition);
+    }
+
     clickhouse
-        .insert_json_rows("ingest_checkpoints", checkpoint_rows)
+        .insert_json_rows_sync("ingest_checkpoints", checkpoint_rows)
         .await
         .context("failed to insert ingest checkpoint rows")?;
+
+    if let Some(publication) = publication {
+        for transition in &mut committed {
+            if transition.checkpoint.backend_caught_up
+                && transition.checkpoint.source_generation == 1
+            {
+                publication.publish_initial_if_absent(transition).await?;
+            }
+        }
+    }
 
     // Offset-monotone merge, not a blind insert: a backend map has two
     // producers (live router batches and catch-up replay), so an out-of-order
     // flush must never regress what the map already committed.
     let mut state = checkpoints.write().await;
-    for cp in checkpoint_updates.values() {
-        merge_checkpoint(&mut state, cp.clone());
+    for transition in committed {
+        merge_checkpoint(&mut state, transition.checkpoint);
     }
     Ok(())
 }
@@ -877,7 +2004,12 @@ async fn commit_checkpoint_updates(
 /// Default-role only: mirror sinks write rows into databases this host does
 /// not own, so the ingest heartbeat (including per-backend mirror status)
 /// always lands in the default backend.
-async fn emit_heartbeat(clickhouse: &ClickHouseClient, metrics: &Arc<Metrics>, role: &SinkRole) {
+async fn emit_heartbeat(
+    clickhouse: &ClickHouseClient,
+    budgets: &ValidatedQueryBudgets,
+    metrics: &Arc<Metrics>,
+    role: &SinkRole,
+) {
     let SinkRole::Default {
         dispatch,
         backends,
@@ -943,8 +2075,9 @@ async fn emit_heartbeat(clickhouse: &ClickHouseClient, metrics: &Arc<Metrics>, r
         }
     }
 
-    if let Err(exc) = clickhouse
-        .insert_json_rows("ingest_heartbeats", &[heartbeat])
+    // One Background envelope per heartbeat emit (issue #600 work item W9).
+    if let Err(exc) = background_envelope(budgets, "ingest-heartbeat")
+        .scope(clickhouse.insert_json_rows("ingest_heartbeats", &[heartbeat]))
         .await
     {
         warn!("heartbeat insert failed: {exc}");
@@ -952,61 +2085,363 @@ async fn emit_heartbeat(clickhouse: &ClickHouseClient, metrics: &Arc<Metrics>, r
 }
 
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)]
 async fn flush_pending(
     clickhouse: &ClickHouseClient,
     checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
     metrics: &Arc<Metrics>,
-    raw_rows: &mut Vec<Value>,
-    event_rows: &mut Vec<Value>,
-    link_rows: &mut Vec<Value>,
-    tool_rows: &mut Vec<Value>,
-    error_rows: &mut Vec<Value>,
-    checkpoint_updates: &mut HashMap<String, Checkpoint>,
-    checkpoint_cursor_columns: bool,
-    checkpoint_host: &str,
+    pending: &mut PendingFlush,
 ) -> bool {
     let observer = IngestAckObserver::new(false);
-    let mut pending_ack = PendingAckBatch::default();
-    flush_pending_with_ack(
+    let context = FlushContext {
         clickhouse,
         checkpoints,
         metrics,
+        checkpoint_cursor_columns: true,
+        checkpoint_host: "",
+        ack_observer: &observer,
+        publication: None,
+        budgets: ingest_query_budgets(&moraine_config::AppConfig::default()),
+    };
+    flush_pending_inner(
+        &context,
+        pending,
+        FlushOptions {
+            publication_ready: true,
+        },
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn flush_pending_with_ack(
+    clickhouse: &ClickHouseClient,
+    checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
+    metrics: &Arc<Metrics>,
+    pending: &mut PendingFlush,
+    ack_observer: &IngestAckObserver,
+) -> bool {
+    let context = FlushContext {
+        clickhouse,
+        checkpoints,
+        metrics,
+        checkpoint_cursor_columns: true,
+        checkpoint_host: "",
+        ack_observer,
+        publication: None,
+        budgets: ingest_query_budgets(&moraine_config::AppConfig::default()),
+    };
+    flush_pending_inner(
+        &context,
+        pending,
+        FlushOptions {
+            publication_ready: true,
+        },
+    )
+    .await
+}
+
+async fn flush_pending_with_publication(
+    context: &FlushContext<'_>,
+    pending: &mut PendingFlush,
+    options: FlushOptions,
+) -> bool {
+    debug_assert!(context.publication.is_some());
+    flush_pending_inner(context, pending, options).await
+}
+
+async fn flush_for_barrier(
+    context: &FlushContext<'_>,
+    pending: &mut PendingFlush,
+    options: FlushOptions,
+) -> bool {
+    if !pending.has_data() {
+        return true;
+    }
+    flush_pending_with_publication(context, pending, options).await
+}
+
+/// Run one flush cycle under ONE Background envelope covering every
+/// statement the flush issues — table inserts (including their 8 MiB
+/// `insert_json_rows` chunks), publication head inspections, append fences,
+/// and checkpoint commits. The statement cap is derived from the batch being
+/// flushed (amendment A7); the publication actor inherits this envelope for
+/// calls made during the flush.
+async fn flush_pending_inner(
+    context: &FlushContext<'_>,
+    pending: &mut PendingFlush,
+    options: FlushOptions,
+) -> bool {
+    let items = flush_statement_items(pending);
+    let envelope = background_batch_envelope(
+        &context.budgets,
+        "ingest-flush",
+        FLUSH_STATEMENT_OVERHEAD,
+        FLUSH_STATEMENTS_PER_ITEM,
+        items,
+    );
+    envelope
+        .scope(flush_pending_statements(context, pending, options))
+        .await
+}
+
+async fn flush_pending_statements(
+    context: &FlushContext<'_>,
+    pending: &mut PendingFlush,
+    options: FlushOptions,
+) -> bool {
+    let clickhouse = context.clickhouse;
+    let checkpoints = context.checkpoints;
+    let metrics = context.metrics;
+    let checkpoint_cursor_columns = context.checkpoint_cursor_columns;
+    let checkpoint_host = context.checkpoint_host;
+    let ack_observer = context.ack_observer;
+    let publication = context.publication;
+    let publication_ready = options.publication_ready;
+    let PendingFlush {
         raw_rows,
         event_rows,
         link_rows,
         tool_rows,
         error_rows,
         checkpoint_updates,
-        checkpoint_cursor_columns,
-        checkpoint_host,
-        &observer,
-        &mut pending_ack,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn flush_pending_with_ack(
-    clickhouse: &ClickHouseClient,
-    checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
-    metrics: &Arc<Metrics>,
-    raw_rows: &mut Vec<Value>,
-    event_rows: &mut Vec<Value>,
-    link_rows: &mut Vec<Value>,
-    tool_rows: &mut Vec<Value>,
-    error_rows: &mut Vec<Value>,
-    checkpoint_updates: &mut HashMap<String, Checkpoint>,
-    checkpoint_cursor_columns: bool,
-    checkpoint_host: &str,
-    ack_observer: &IngestAckObserver,
-    pending_ack: &mut PendingAckBatch,
-) -> bool {
+        acknowledgements: pending_ack,
+        projection: _,
+        quarantined_generations,
+        append_manifest: pending_append_manifest,
+        append_fence: pending_append_fence,
+    } = pending;
     let started = Instant::now();
 
-    let checkpoint_rows: Vec<Value> = checkpoint_updates
+    // An oversized row may have been drained into an earlier checkpoint-less
+    // chunk. Apply its fail-closed state before append/publication
+    // classification sees the adapter's later checkpoint.
+    apply_quarantine_to_checkpoints(quarantined_generations, checkpoint_updates);
+
+    // Size/ownership validation must precede append classification. Otherwise
+    // an unowned row could fail after `begin_append` and leave unrelated
+    // readers behind a preparing fence.
+    let quarantined = match quarantine_oversized_pending_rows(
+        raw_rows, event_rows, link_rows, tool_rows, error_rows,
+    ) {
+        Ok(quarantined) => quarantined,
+        Err(exc) => {
+            metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
+            *metrics
+                .last_error
+                .lock()
+                .expect("metrics last_error mutex poisoned") = exc.to_string();
+            warn!("flush failed during oversized-row guard: {exc}");
+            return false;
+        }
+    };
+    remember_quarantined_generations(quarantined_generations, quarantined.generations);
+    apply_quarantine_to_checkpoints(quarantined_generations, checkpoint_updates);
+    let blocks_pending_generation = checkpoint_updates.values().any(|checkpoint| {
+        quarantined_generations.contains_key(&SourceGenerationKey::from_checkpoint(checkpoint))
+    });
+    if quarantined.rows > 0 {
+        warn!(
+            rows = quarantined.rows,
+            max_bytes = CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES,
+            "quarantined oversized rows before ClickHouse insert"
+        );
+    }
+
+    if pending_append_manifest.is_none() {
+        *pending_append_manifest = Some(AppendManifest::from_pending(
+            checkpoint_host,
+            raw_rows,
+            event_rows,
+            link_rows,
+            tool_rows,
+            error_rows,
+            checkpoint_updates.values().cloned(),
+        ));
+    }
+    let append_manifest = pending_append_manifest
+        .as_mut()
+        .expect("pending append manifest was initialized");
+    let projection_all_sources = publication.is_none();
+    let mut live_projection_sources = BTreeSet::<(String, String, String, u32)>::new();
+    if let Some(publication) = publication {
+        let mut has_live_append = false;
+        for checkpoint in checkpoint_updates.values() {
+            let transition = match CheckpointTransition::try_from_checkpoint(checkpoint.clone()) {
+                Ok(transition) => transition,
+                Err(error) => {
+                    metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
+                    *metrics
+                        .last_error
+                        .lock()
+                        .expect("metrics last_error mutex poisoned") = error.to_string();
+                    warn!("refusing to flush checkpoint with invalid lifecycle: {error}");
+                    return false;
+                }
+            };
+            let published = match publication
+                .has_published_generation(
+                    &transition.source,
+                    transition.checkpoint.source_generation,
+                )
+                .await
+            {
+                Ok(published) => published,
+                Err(error) => {
+                    metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
+                    *metrics
+                        .last_error
+                        .lock()
+                        .expect("metrics last_error mutex poisoned") = error.to_string();
+                    warn!("failed to inspect current source head before flush: {error}");
+                    return false;
+                }
+            };
+            let active = match transition.checkpoint.lifecycle() {
+                Ok(lifecycle) => {
+                    lifecycle == CheckpointLifecycle::Active
+                        && transition.checkpoint.block_reason.is_empty()
+                }
+                Err(error) => {
+                    metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
+                    *metrics
+                        .last_error
+                        .lock()
+                        .expect("metrics last_error mutex poisoned") = error.to_string();
+                    warn!("refusing to flush checkpoint with invalid lifecycle: {error}");
+                    return false;
+                }
+            };
+            if active && published {
+                live_projection_sources.insert((
+                    checkpoint_host.to_string(),
+                    transition.source.source_name.clone(),
+                    transition.source.source_file.clone(),
+                    transition.checkpoint.source_generation,
+                ));
+            }
+            has_live_append |= active && published;
+        }
+        let event_sources = event_rows
+            .iter()
+            .filter_map(|row| {
+                Some((
+                    row.get("source_host")?.as_str()?.to_string(),
+                    row.get("source_name")?.as_str()?.to_string(),
+                    row.get("source_file")?.as_str()?.to_string(),
+                    u32::try_from(row.get("source_generation")?.as_u64()?).ok()?,
+                ))
+            })
+            .collect::<BTreeSet<_>>();
+        for (source_host, source_name, source_file, source_generation) in event_sources {
+            let source_tuple = (
+                source_host.clone(),
+                source_name.clone(),
+                source_file.clone(),
+                source_generation,
+            );
+            if live_projection_sources.contains(&source_tuple) {
+                continue;
+            }
+            let source = SourceKey {
+                source_host,
+                source_name,
+                source_file,
+            };
+            match publication
+                .has_published_generation(&source, source_generation)
+                .await
+            {
+                Ok(true) => {
+                    live_projection_sources.insert(source_tuple);
+                    has_live_append = true;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
+                    *metrics
+                        .last_error
+                        .lock()
+                        .expect("metrics last_error mutex poisoned") = error.to_string();
+                    warn!("failed to inspect event source head before flush: {error}");
+                    return false;
+                }
+            }
+        }
+        let recovering_append = if has_live_append {
+            false
+        } else {
+            match publication.has_recovering_append().await {
+                Ok(recovering) => recovering,
+                Err(error) => {
+                    metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
+                    *metrics
+                        .last_error
+                        .lock()
+                        .expect("metrics last_error mutex poisoned") = error.to_string();
+                    warn!("failed to inspect recovering append fence: {error}");
+                    return false;
+                }
+            }
+        };
+        if has_live_append {
+            if let Err(error) = publication.prove_insert_only(append_manifest).await {
+                // Classification is an optimization only. Query failure is
+                // fail-closed to the backend-wide hard fence, not data loss.
+                append_manifest.insert_only = false;
+                warn!("append insert-only preflight failed; using hard fence: {error}");
+            }
+        }
+        if has_live_append || recovering_append {
+            if pending_append_fence.is_none() {
+                *pending_append_fence = match publication.begin_append(append_manifest).await {
+                    Ok(fence) => fence,
+                    Err(error) => {
+                        metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
+                        *metrics
+                            .last_error
+                            .lock()
+                            .expect("metrics last_error mutex poisoned") = error.to_string();
+                        warn!("failed to establish append cache fence: {error}");
+                        return false;
+                    }
+                };
+            }
+            if let Some((batch_id, cache_epoch)) = pending_append_fence.as_ref() {
+                let Some(target_epoch) = cache_epoch.checked_add(1) else {
+                    metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
+                    *metrics
+                        .last_error
+                        .lock()
+                        .expect("metrics last_error mutex poisoned") =
+                        "append cache epoch exhausted".to_string();
+                    return false;
+                };
+                for checkpoint in checkpoint_updates.values_mut() {
+                    checkpoint.append_batch_id = batch_id.clone();
+                    checkpoint.cache_epoch = target_epoch;
+                }
+            }
+        }
+    }
+
+    for checkpoint in checkpoint_updates.values() {
+        if let Err(error) = checkpoint.lifecycle() {
+            metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
+            *metrics
+                .last_error
+                .lock()
+                .expect("metrics last_error mutex poisoned") = error.to_string();
+            warn!("refusing to flush checkpoint with invalid lifecycle: {error}");
+            return false;
+        }
+    }
+
+    let mut checkpoint_rows: Vec<Value> = checkpoint_updates
         .values()
         .map(|cp| {
+            let lifecycle = cp
+                .lifecycle()
+                .expect("checkpoint lifecycles were validated before serialization");
             let mut row = json!({
                 "source_name": cp.source_name,
                 "source_file": cp.source_file,
@@ -1014,10 +2449,8 @@ async fn flush_pending_with_ack(
                 "source_generation": cp.source_generation,
                 "last_offset": cp.last_offset,
                 "last_line_no": cp.last_line_no,
-                "status": cp.status,
+                "status": lifecycle.as_str(),
             });
-            // Older schemas (pre-015) reject unknown columns at insert time,
-            // so the SQLite cursor fields are attached only when present.
             if checkpoint_cursor_columns {
                 if let Some(obj) = row.as_object_mut() {
                     obj.insert("cursor_json".to_string(), json!(cp.cursor_json));
@@ -1031,8 +2464,6 @@ async fn flush_pending_with_ack(
                     );
                 }
             }
-            // Backend-role only (migration 018): scopes rows in a shared
-            // team table to this host. Empty for the default sink.
             if !checkpoint_host.is_empty() {
                 if let Some(obj) = row.as_object_mut() {
                     obj.insert("host".to_string(), json!(checkpoint_host));
@@ -1042,35 +2473,29 @@ async fn flush_pending_with_ack(
         })
         .collect();
 
-    let quarantined = match (|| -> anyhow::Result<usize> {
-        Ok(
-            quarantine_oversized_rows("raw_events", raw_rows, error_rows)?
-                + quarantine_oversized_rows("events", event_rows, error_rows)?
-                + quarantine_oversized_rows("event_links", link_rows, error_rows)?
-                + quarantine_oversized_rows("tool_io", tool_rows, error_rows)?,
-        )
-    })() {
-        Ok(quarantined) => quarantined,
-        Err(exc) => {
-            metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
-            *metrics
-                .last_error
-                .lock()
-                .expect("metrics last_error mutex poisoned") = exc.to_string();
-            warn!("flush failed during oversized-row guard: {exc}");
-            return false;
-        }
-    };
-    if quarantined > 0 {
-        warn!(
-            rows = quarantined,
-            max_bytes = CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES,
-            "quarantined oversized rows before ClickHouse insert"
-        );
-    }
-
     let projected_session_ids = event_rows
         .iter()
+        .filter(|row| {
+            projection_all_sources
+                || live_projection_sources.contains(&(
+                    row.get("source_host")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    row.get("source_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    row.get("source_file")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    row.get("source_generation")
+                        .and_then(Value::as_u64)
+                        .and_then(|value| u32::try_from(value).ok())
+                        .unwrap_or_default(),
+                ))
+        })
         .filter_map(|row| {
             row.get("session_id")
                 .and_then(Value::as_str)
@@ -1081,10 +2506,14 @@ async fn flush_pending_with_ack(
 
     let flush_result = async {
         if !raw_rows.is_empty() {
-            clickhouse
-                .insert_json_rows("raw_events", raw_rows)
-                .await
-                .map_err(|error| SinkFlushFailure::new(SinkStage::RawEvents, error))?;
+            let insert = if publication.is_some() {
+                clickhouse
+                    .insert_json_rows_sync("raw_events", raw_rows)
+                    .await
+            } else {
+                clickhouse.insert_json_rows("raw_events", raw_rows).await
+            };
+            insert.map_err(|error| SinkFlushFailure::new(SinkStage::RawEvents, error))?;
             metrics
                 .raw_rows_written
                 .fetch_add(raw_rows.len() as u64, Ordering::Relaxed);
@@ -1104,45 +2533,60 @@ async fn flush_pending_with_ack(
                 .insert_json_rows_sync("events", event_rows)
                 .await
                 .map_err(|error| SinkFlushFailure::new(SinkStage::Events, error))?;
-            clickhouse
-                .refresh_mcp_open_read_model(projected_session_ids.iter().map(String::as_str))
-                .await
-                .map_err(|error| SinkFlushFailure::new(SinkStage::McpOpenProjection, error))?;
             metrics
                 .event_rows_written
                 .fetch_add(event_rows.len() as u64, Ordering::Relaxed);
             if ack_observer.enabled {
                 pending_ack.extend(event_rows);
             }
+            pending_ack.extend_projection(&projected_session_ids);
             event_rows.clear();
         }
 
         if !link_rows.is_empty() {
-            clickhouse
-                .insert_json_rows("event_links", link_rows)
-                .await
-                .map_err(|error| SinkFlushFailure::new(SinkStage::EventLinks, error))?;
+            let insert = if publication.is_some() {
+                clickhouse
+                    .insert_json_rows_sync("event_links", link_rows)
+                    .await
+            } else {
+                clickhouse.insert_json_rows("event_links", link_rows).await
+            };
+            insert.map_err(|error| SinkFlushFailure::new(SinkStage::EventLinks, error))?;
             link_rows.clear();
         }
 
         if !tool_rows.is_empty() {
-            clickhouse
-                .insert_json_rows("tool_io", tool_rows)
-                .await
-                .map_err(|error| SinkFlushFailure::new(SinkStage::ToolIo, error))?;
+            let insert = if publication.is_some() {
+                clickhouse.insert_json_rows_sync("tool_io", tool_rows).await
+            } else {
+                clickhouse.insert_json_rows("tool_io", tool_rows).await
+            };
+            insert.map_err(|error| SinkFlushFailure::new(SinkStage::ToolIo, error))?;
             tool_rows.clear();
         }
 
         if !error_rows.is_empty() {
-            clickhouse
-                .insert_json_rows("ingest_errors", error_rows)
-                .await
-                .map_err(|error| SinkFlushFailure::new(SinkStage::IngestErrors, error))?;
+            let insert = if publication.is_some() {
+                clickhouse
+                    .insert_json_rows_sync("ingest_errors", error_rows)
+                    .await
+            } else {
+                clickhouse
+                    .insert_json_rows("ingest_errors", error_rows)
+                    .await
+            };
+            insert.map_err(|error| SinkFlushFailure::new(SinkStage::IngestErrors, error))?;
             metrics
                 .err_rows_written
                 .fetch_add(error_rows.len() as u64, Ordering::Relaxed);
             error_rows.clear();
         }
+
+        // MCP open compatibility snapshots are refreshed off-loop by the
+        // projection worker: session ids enter the pending set only after
+        // their canonical rows are durable (Events stage above), and the
+        // dirty-session relation persists the debt across restarts, so
+        // checkpoints never wait on projection.
 
         if !checkpoint_rows.is_empty() {
             commit_checkpoint_updates(
@@ -1150,11 +2594,29 @@ async fn flush_pending_with_ack(
                 checkpoints,
                 &checkpoint_rows,
                 checkpoint_updates,
+                publication,
+                publication_ready,
             )
             .await
             .map_err(|error| SinkFlushFailure::new(SinkStage::IngestCheckpoints, error))?;
-            checkpoint_updates.clear();
         }
+
+        if let (Some(publication), Some((batch_id, _))) =
+            (publication, pending_append_fence.as_ref())
+        {
+            if quarantined.rows > 0 || blocks_pending_generation {
+                publication
+                    .block_append(batch_id, append_manifest)
+                    .await
+                    .map_err(|error| SinkFlushFailure::new(SinkStage::AppendControl, error))?;
+            } else {
+                publication
+                    .commit_append(batch_id, Some(&append_manifest.source_keys))
+                    .await
+                    .map_err(|error| SinkFlushFailure::new(SinkStage::AppendControl, error))?;
+            }
+        }
+        checkpoint_updates.clear();
 
         metrics
             .last_flush_ms
@@ -1167,14 +2629,28 @@ async fn flush_pending_with_ack(
         Ok(()) => {
             ack_observer.observe(&pending_ack.event_identity_digests);
             pending_ack.clear();
+            *pending_append_manifest = None;
+            *pending_append_fence = None;
             true
         }
         Err(failure) => {
             metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
             let error_text = failure.error.to_string();
-            if failure.stage != SinkStage::McpOpenProjection
-                && is_oversized_json_each_row_insert_error(&failure.error)
-            {
+            if is_oversized_json_each_row_insert_error(&failure.error) {
+                let block_reason = format!(
+                    "non-retryable sink failure at {}: {error_text}",
+                    failure.stage.table()
+                );
+                for checkpoint in checkpoint_updates.values_mut() {
+                    checkpoint.set_lifecycle(CheckpointLifecycle::Error);
+                    checkpoint.final_scan_complete = false;
+                    checkpoint.block_reason = block_reason.clone();
+                }
+                for row in &mut checkpoint_rows {
+                    if let Some(object) = row.as_object_mut() {
+                        object.insert("status".to_string(), json!("error"));
+                    }
+                }
                 let last_error = format!(
                     "non-retryable sink flush failure at {}: {error_text}",
                     failure.stage.table()
@@ -1224,6 +2700,8 @@ async fn flush_pending_with_ack(
                     checkpoints,
                     &checkpoint_rows,
                     checkpoint_updates,
+                    publication,
+                    publication_ready,
                 )
                 .await
                 {
@@ -1242,6 +2720,14 @@ async fn flush_pending_with_ack(
                     );
                     return false;
                 }
+                if let (Some(publication), Some((batch_id, _))) =
+                    (publication, pending_append_fence.as_ref())
+                {
+                    if let Err(error) = publication.block_append(batch_id, append_manifest).await {
+                        warn!("failed to block append fence after non-retryable sink failure: {error}");
+                        return false;
+                    }
+                }
                 metrics
                     .last_flush_ms
                     .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -1254,6 +2740,8 @@ async fn flush_pending_with_ack(
                     checkpoint_updates,
                 );
                 pending_ack.clear();
+                *pending_append_manifest = None;
+                *pending_append_fence = None;
                 return true;
             }
 
@@ -1289,8 +2777,15 @@ mod tests {
     struct MockClickHouseState {
         calls_by_table: Arc<Mutex<HashMap<String, usize>>>,
         rows_by_table: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+        queries: Arc<Mutex<Vec<String>>>,
+        /// Envelope child query id of every request, `None` when the
+        /// statement arrived unenveloped.
+        envelope_query_ids: Arc<Mutex<Vec<Option<String>>>>,
         fail_once_by_table: Arc<Mutex<HashMap<String, usize>>>,
         fail_always_by_table: Arc<Mutex<HashMap<String, String>>>,
+        append_control_response: Arc<Mutex<Option<String>>>,
+        current_source_head_response: Arc<Mutex<Option<String>>>,
+        live_event_exists: Arc<Mutex<bool>>,
     }
 
     impl MockClickHouseState {
@@ -1334,6 +2829,60 @@ mod tests {
                 .cloned()
                 .unwrap_or_default()
         }
+
+        fn max_u64(&self, table: &str, field: &str) -> u64 {
+            self.rows(table)
+                .into_iter()
+                .filter_map(|row| row.get(field).and_then(Value::as_u64))
+                .max()
+                .unwrap_or(0)
+        }
+
+        fn seed_rows(&self, table: &str, rows: Vec<Value>) {
+            self.rows_by_table
+                .lock()
+                .expect("mock rows mutex poisoned")
+                .insert(table.to_string(), rows);
+        }
+
+        fn query_count(&self, needle: &str) -> usize {
+            self.queries
+                .lock()
+                .expect("mock queries mutex poisoned")
+                .iter()
+                .filter(|query| query.contains(needle))
+                .count()
+        }
+
+        fn envelope_query_ids(&self) -> Vec<Option<String>> {
+            self.envelope_query_ids
+                .lock()
+                .expect("mock envelope ids mutex poisoned")
+                .clone()
+        }
+
+        fn set_live_event_exists(&self, exists: bool) {
+            *self
+                .live_event_exists
+                .lock()
+                .expect("mock live_event_exists mutex poisoned") = exists;
+        }
+
+        fn set_append_control_response(&self, response: Value) {
+            *self
+                .append_control_response
+                .lock()
+                .expect("mock append_control_response mutex poisoned") =
+                Some(format!("{response}\n"));
+        }
+
+        fn set_current_source_head_response(&self, response: Value) {
+            *self
+                .current_source_head_response
+                .lock()
+                .expect("mock current_source_head_response mutex poisoned") =
+                Some(format!("{response}\n"));
+        }
     }
 
     fn inserted_table_name(query: &str) -> Option<&'static str> {
@@ -1351,6 +2900,14 @@ mod tests {
             Some("ingest_heartbeats")
         } else if query.contains("`events`") {
             Some("events")
+        } else if query.contains("`ingest_checkpoint_transitions`") {
+            Some("ingest_checkpoint_transitions")
+        } else if query.contains("`source_generation_publication_readiness`") {
+            Some("source_generation_publication_readiness")
+        } else if query.contains("`publication_diagnostic_events`") {
+            Some("publication_diagnostic_events")
+        } else if query.contains("`ingest_append_control`") {
+            Some("ingest_append_control")
         } else {
             None
         }
@@ -1361,8 +2918,110 @@ mod tests {
         Query(params): Query<HashMap<String, String>>,
         body: String,
     ) -> (StatusCode, String) {
-        let query = params.get("query").cloned().unwrap_or_default();
-        let Some(table) = inserted_table_name(&query) else {
+        let query = params
+            .get("query")
+            .map(String::as_str)
+            .unwrap_or(body.as_str());
+        state
+            .queries
+            .lock()
+            .expect("mock queries mutex poisoned")
+            .push(query.to_string());
+        state
+            .envelope_query_ids
+            .lock()
+            .expect("mock envelope ids mutex poisoned")
+            .push(params.get("query_id").cloned());
+        if query.contains("v_current_ingest_append_control") {
+            return (
+                StatusCode::OK,
+                state
+                    .append_control_response
+                    .lock()
+                    .expect("mock append_control_response mutex poisoned")
+                    .clone()
+                    .unwrap_or_default(),
+            );
+        }
+        if query.contains("FROM `moraine`.v_current_published_source_generations")
+            && query.contains("WHERE source_host =")
+        {
+            return (
+                StatusCode::OK,
+                state
+                    .current_source_head_response
+                    .lock()
+                    .expect("mock current_source_head_response mutex poisoned")
+                    .clone()
+                    .unwrap_or_default(),
+            );
+        }
+        if query.contains("maxIf(transitions.checkpoint_revision") {
+            let rows = state.rows("ingest_checkpoint_transitions");
+            let max_revision = rows
+                .iter()
+                .filter_map(|row| row.get("checkpoint_revision").and_then(Value::as_u64))
+                .max()
+                .unwrap_or(0);
+            let operation_revision = rows
+                .iter()
+                .filter(|row| {
+                    row.get("operation_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|operation_id| {
+                            query.contains(&format!("transitions.operation_id = '{operation_id}'"))
+                        })
+                })
+                .filter_map(|row| row.get("checkpoint_revision").and_then(Value::as_u64))
+                .max()
+                .unwrap_or(0);
+            let row = format!(
+                "{{\"operation_revision\":{operation_revision},\"max_revision\":{max_revision}}}"
+            );
+            return (
+                StatusCode::OK,
+                if params
+                    .get("default_format")
+                    .is_some_and(|format| format == "JSON")
+                {
+                    format!("{{\"data\":[{row}]}}\n")
+                } else {
+                    format!("{row}\n")
+                },
+            );
+        }
+        if query.contains("max(readiness.readiness_revision)) AS revision") {
+            let revision = state.max_u64(
+                "source_generation_publication_readiness",
+                "readiness_revision",
+            );
+            return (StatusCode::OK, format!("{{\"revision\":{revision}}}\n"));
+        }
+        if query.contains("toUInt8(1) AS existing") && query.contains("v_live_events") {
+            let existing = *state
+                .live_event_exists
+                .lock()
+                .expect("mock live_event_exists mutex poisoned");
+            let json_envelope = params
+                .get("default_format")
+                .is_some_and(|format| format == "JSON");
+            return (
+                StatusCode::OK,
+                match (existing, json_envelope) {
+                    (true, true) => "{\"data\":[{\"existing\":1}]}\n".to_string(),
+                    (true, false) => "{\"existing\":1}\n".to_string(),
+                    (false, true) => "{\"data\":[]}\n".to_string(),
+                    (false, false) => String::new(),
+                },
+            );
+        }
+        if query.contains("existing_count") {
+            return (StatusCode::OK, "{\"existing_count\":0}\n".to_string());
+        }
+        if query.contains("SELECT") && !query.contains("INSERT INTO") {
+            return (StatusCode::OK, String::new());
+        }
+        let Some(table) = inserted_table_name(query) else {
             return (
                 StatusCode::BAD_REQUEST,
                 format!("unexpected query payload: {query}"),
@@ -1457,9 +3116,203 @@ mod tests {
             source_generation: 1,
             last_offset: 100,
             last_line_no: 3,
-            status: "active".to_string(),
+            status: CheckpointLifecycle::Active.to_string(),
             ..Default::default()
         }
+    }
+
+    fn test_budgets() -> ValidatedQueryBudgets {
+        ingest_query_budgets(&moraine_config::AppConfig::default())
+    }
+
+    /// Everything issued so far ran enveloped, with ids of `kind`, and every
+    /// statement belongs to exactly `expected_envelopes` distinct envelopes.
+    fn assert_enveloped(
+        state: &MockClickHouseState,
+        kind: &str,
+        expected_envelopes: Option<usize>,
+    ) {
+        let ids = state.envelope_query_ids();
+        assert!(!ids.is_empty(), "mock captured no statements");
+        let prefix = format!("moraine-{kind}-");
+        let mut requests = std::collections::BTreeSet::new();
+        for id in &ids {
+            let id = id
+                .as_deref()
+                .expect("every ingest statement must carry an envelope query id");
+            assert!(
+                id.starts_with(&prefix),
+                "expected {prefix}* query id, got {id}"
+            );
+            let (request_id, sequence) = id
+                .rsplit_once('-')
+                .expect("child query ids end with a sequence");
+            sequence
+                .parse::<u32>()
+                .expect("child query ids end with a numeric sequence");
+            requests.insert(request_id.to_string());
+        }
+        if let Some(expected) = expected_envelopes {
+            assert_eq!(
+                requests.len(),
+                expected,
+                "expected {expected} distinct envelopes, saw {requests:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn flush_statement_cap_derives_from_the_batch_being_flushed() {
+        let mut pending = PendingFlush::default();
+        for index in 0..1_000 {
+            pending.event_rows.push(json!({ "id": index }));
+        }
+        for suffix in ["a", "b", "c"] {
+            let mut checkpoint = sample_checkpoint();
+            checkpoint.source_file = format!("/tmp/source-{suffix}.jsonl");
+            pending
+                .checkpoint_updates
+                .insert(format!("source-{suffix}"), checkpoint);
+        }
+
+        let items = flush_statement_items(&pending);
+        assert_eq!(items, 1_003);
+        assert_eq!(
+            moraine_clickhouse::batch_statement_cap(
+                FLUSH_STATEMENT_OVERHEAD,
+                FLUSH_STATEMENTS_PER_ITEM,
+                items,
+            ),
+            FLUSH_STATEMENT_OVERHEAD + FLUSH_STATEMENTS_PER_ITEM * 1_003,
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flush_cycle_runs_under_one_background_envelope() {
+        let (clickhouse, state) =
+            spawn_mock_clickhouse_with_state(MockClickHouseState::default()).await;
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+        let mut pending = PendingFlush::default();
+        pending.raw_rows.push(json!({ "id": 1 }));
+        pending.event_rows.push(json!({ "id": 1 }));
+        pending.tool_rows.push(json!({ "id": 1 }));
+
+        assert!(flush_pending(&clickhouse, &checkpoints, &metrics, &mut pending).await);
+
+        // Three table inserts, one shared envelope: the whole flush cycle's
+        // statements carry child ids of a single ingest-flush request.
+        assert_enveloped(&state, "ingest-flush", Some(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn projection_worker_creates_its_own_envelope_inside_the_spawn() {
+        let (clickhouse, state) =
+            spawn_mock_clickhouse_with_state(MockClickHouseState::default()).await;
+        let worker = spawn_projection_worker(clickhouse, test_budgets());
+        worker
+            .requests
+            .send(vec!["session-1".to_string()])
+            .await
+            .expect("projection worker accepts requests");
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if !worker
+                    .outcomes
+                    .lock()
+                    .expect("projection outcome mutex poisoned")
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("projection refresh completes");
+
+        // The refresh ran inside tokio::spawn, where no caller envelope can
+        // reach: every statement must still be enveloped by the worker's own
+        // per-session Background envelope.
+        assert_enveloped(&state, "ingest-projection", None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn projection_maintenance_creates_its_own_envelope_inside_the_spawn() {
+        let (clickhouse, state) =
+            spawn_mock_clickhouse_with_state(MockClickHouseState::default()).await;
+        let in_flight = Arc::new(AtomicBool::new(false));
+        let discovered = Arc::new(Mutex::new(BTreeSet::new()));
+        spawn_projection_maintenance(&clickhouse, test_budgets(), &in_flight, &discovered);
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if !in_flight.load(Ordering::SeqCst) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("maintenance cycle completes");
+
+        assert_enveloped(&state, "ingest-maintenance", Some(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn heartbeat_emit_runs_under_background_envelope() {
+        let (clickhouse, state) =
+            spawn_mock_clickhouse_with_state(MockClickHouseState::default()).await;
+        let metrics = Arc::new(Metrics::default());
+
+        emit_heartbeat(&clickhouse, &test_budgets(), &metrics, &default_role()).await;
+
+        assert_eq!(state.call_count("ingest_heartbeats"), 1);
+        assert_enveloped(&state, "ingest-heartbeat", Some(1));
+    }
+
+    #[test]
+    fn successful_drain_clears_bytes_before_empty_block_reason_rejection() {
+        let mut pending_batch_bytes = 4_096;
+        let flushed = account_barrier_flush(true, &mut pending_batch_bytes);
+        let transition = CheckpointTransition::blocked(&sample_checkpoint(), "");
+
+        let result: std::result::Result<(), String> = if !flushed {
+            Err("failed to flush batches preceding replay-block barrier".to_string())
+        } else if transition.checkpoint.block_reason.is_empty() {
+            Err("blocked replay transition requires a block reason".to_string())
+        } else {
+            Ok(())
+        };
+
+        assert_eq!(pending_batch_bytes, 0);
+        assert_eq!(
+            result.unwrap_err(),
+            "blocked replay transition requires a block reason"
+        );
+    }
+
+    #[test]
+    fn successful_drain_clears_bytes_before_shared_legacy_ambiguity_rejection() {
+        let mut pending_batch_bytes = 4_096;
+        let flushed = account_barrier_flush(true, &mut pending_batch_bytes);
+        let shared_legacy_ambiguous = true;
+
+        let result: std::result::Result<(), String> = if flushed && shared_legacy_ambiguous {
+            Err(
+                "shared legacy source ownership is ambiguous; publication remains disabled"
+                    .to_string(),
+            )
+        } else {
+            Ok(())
+        };
+
+        assert_eq!(pending_batch_bytes, 0);
+        assert_eq!(
+            result.unwrap_err(),
+            "shared legacy source ownership is ambiguous; publication remains disabled"
+        );
     }
 
     fn single_row_batch(id: u64) -> SinkMessage {
@@ -1477,6 +3330,23 @@ mod tests {
 
     fn test_redaction_audit() -> Arc<RedactionAudit> {
         Arc::new(RedactionAudit::default())
+    }
+
+    fn test_publication_identity() -> PublicationIdentity {
+        PublicationIdentity::for_test("11111111-1111-4111-8111-111111111111")
+    }
+
+    fn test_backend_role(cell: Arc<BackendSinkCell>) -> SinkRole {
+        SinkRole::Backend {
+            cell,
+            resolver: Arc::new(Mutex::new(crate::tee::RouteResolver::new(Arc::new(
+                moraine_config::AppConfig::default(),
+            )))),
+            replay_notify: Arc::new(Notify::new()),
+            replay_floor: Arc::new(Mutex::new(None)),
+            redactor: test_redactor(),
+            redactions: test_redaction_audit(),
+        }
     }
 
     fn default_role() -> SinkRole {
@@ -1582,57 +3452,28 @@ mod tests {
         let checkpoints = Arc::new(RwLock::new(HashMap::new()));
         let metrics = Arc::new(Metrics::default());
         let observer = IngestAckObserver::with_clock(true, fixed_monotonic_timestamp);
-        let mut pending_ack = PendingAckBatch::default();
-        let mut raw_rows = vec![json!({"event_uid": "event-1"})];
-        let mut event_rows = vec![json!({"event_uid": "event-1"})];
-        let mut link_rows = vec![json!({"event_uid": "event-1"})];
-        let mut tool_rows = Vec::new();
-        let mut error_rows = Vec::new();
-        let mut checkpoint_updates = HashMap::new();
+        let mut pending = PendingFlush {
+            raw_rows: vec![json!({"event_uid": "event-1"})],
+            event_rows: vec![json!({"event_uid": "event-1"})],
+            link_rows: vec![json!({"event_uid": "event-1"})],
+            ..PendingFlush::default()
+        };
 
         assert!(
-            !flush_pending_with_ack(
-                &clickhouse,
-                &checkpoints,
-                &metrics,
-                &mut raw_rows,
-                &mut event_rows,
-                &mut link_rows,
-                &mut tool_rows,
-                &mut error_rows,
-                &mut checkpoint_updates,
-                true,
-                "",
-                &observer,
-                &mut pending_ack,
-            )
-            .await
+            !flush_pending_with_ack(&clickhouse, &checkpoints, &metrics, &mut pending, &observer,)
+                .await
         );
         assert!(observer.captured().is_empty());
-        assert_eq!(pending_ack.event_identity_digests.len(), 1);
+        assert_eq!(pending.acknowledgements.event_identity_digests.len(), 1);
 
         assert!(
-            flush_pending_with_ack(
-                &clickhouse,
-                &checkpoints,
-                &metrics,
-                &mut raw_rows,
-                &mut event_rows,
-                &mut link_rows,
-                &mut tool_rows,
-                &mut error_rows,
-                &mut checkpoint_updates,
-                true,
-                "",
-                &observer,
-                &mut pending_ack,
-            )
-            .await
+            flush_pending_with_ack(&clickhouse, &checkpoints, &metrics, &mut pending, &observer,)
+                .await
         );
         let captured = observer.captured();
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].batch_sequence, 1);
-        assert!(pending_ack.event_identity_digests.is_empty());
+        assert!(pending.acknowledgements.event_identity_digests.is_empty());
     }
 
     #[test]
@@ -1691,6 +3532,75 @@ mod tests {
          Expected not greater than 10485760 bytes, but current is 104890103 bytes per row. \
          While executing ParallelParsingBlockInputFormat.";
 
+    #[test]
+    fn projection_governor_debounces_by_cost_and_isolates_failures() {
+        let mut governor = ProjectionGovernor::default();
+        let mut pending: BTreeSet<String> = ["cheap", "huge", "failing"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let now = Instant::now();
+
+        // Unknown sessions are immediately due; in-flight sessions are not.
+        assert_eq!(governor.due_sessions(&pending, now).len(), 3);
+        governor.mark_in_flight(&["huge".to_string()]);
+        assert!(!governor.due_sessions(&pending, now).contains("huge"));
+
+        // Success removes the session from pending and schedules the next
+        // refresh proportionally to its cost, clamped to the ceiling.
+        governor.apply_outcome(
+            ProjectionOutcome {
+                session_id: "huge".to_string(),
+                cost: Duration::from_secs(60),
+                error: None,
+            },
+            &mut pending,
+            now,
+        );
+        assert!(!pending.contains("huge"));
+        pending.insert("huge".to_string());
+        assert!(!governor.due_sessions(&pending, now).contains("huge"));
+        assert!(governor
+            .due_sessions(&pending, now + Duration::from_secs(601))
+            .contains("huge"));
+
+        // Cheap sessions come due again at the floor.
+        governor.apply_outcome(
+            ProjectionOutcome {
+                session_id: "cheap".to_string(),
+                cost: Duration::from_millis(10),
+                error: None,
+            },
+            &mut pending,
+            now,
+        );
+        pending.insert("cheap".to_string());
+        assert!(!governor.due_sessions(&pending, now).contains("cheap"));
+        assert!(governor
+            .due_sessions(&pending, now + Duration::from_secs(2))
+            .contains("cheap"));
+
+        // A failure backs off only the failing session and keeps it pending.
+        governor.mark_in_flight(&["failing".to_string()]);
+        governor.apply_outcome(
+            ProjectionOutcome {
+                session_id: "failing".to_string(),
+                cost: Duration::ZERO,
+                error: Some("refresh failed".to_string()),
+            },
+            &mut pending,
+            now,
+        );
+        assert!(pending.contains("failing"));
+        assert!(!governor.due_sessions(&pending, now).contains("failing"));
+        assert!(governor
+            .due_sessions(&pending, now + Duration::from_secs(2))
+            .contains("failing"));
+        assert!(governor
+            .due_sessions(&pending, now + Duration::from_secs(2))
+            .contains("cheap"));
+    }
+
     #[tokio::test]
     async fn failed_flush_throttles_sink_consumption() {
         let mut config = moraine_config::AppConfig::default();
@@ -1713,6 +3623,7 @@ mod tests {
             metrics,
             rx,
             true,
+            test_publication_identity(),
             SinkAuthorConfig::fully_supported(String::new()),
             default_role(),
         );
@@ -1739,45 +3650,34 @@ mod tests {
         let checkpoints = Arc::new(RwLock::new(HashMap::new()));
         let metrics = Arc::new(Metrics::default());
 
-        let mut raw_rows = vec![json!({
-            "record_ts": "2026-02-17T00:00:01.000Z",
-            "event_uid": "evt-1"
-        })];
-        let mut event_rows = vec![json!({"event_uid": "evt-1"})];
-        let mut link_rows = Vec::<Value>::new();
-        let mut tool_rows = Vec::<Value>::new();
-        let mut error_rows = Vec::<Value>::new();
-        let mut checkpoint_updates = HashMap::new();
         let checkpoint = sample_checkpoint();
-        checkpoint_updates.insert(
-            checkpoint_key(&checkpoint.source_name, &checkpoint.source_file),
-            checkpoint.clone(),
-        );
+        let mut pending = PendingFlush {
+            raw_rows: vec![json!({
+                "record_ts": "2026-02-17T00:00:01.000Z",
+                "event_uid": "evt-1"
+            })],
+            event_rows: vec![json!({"event_uid": "evt-1"})],
+            checkpoint_updates: HashMap::from([(
+                checkpoint_key(&checkpoint.source_name, &checkpoint.source_file),
+                checkpoint.clone(),
+            )]),
+            ..PendingFlush::default()
+        };
 
-        let first_attempt = flush_pending(
-            &clickhouse,
-            &checkpoints,
-            &metrics,
-            &mut raw_rows,
-            &mut event_rows,
-            &mut link_rows,
-            &mut tool_rows,
-            &mut error_rows,
-            &mut checkpoint_updates,
-            true,
-            "",
-        )
-        .await;
+        let first_attempt = flush_pending(&clickhouse, &checkpoints, &metrics, &mut pending).await;
         assert!(!first_attempt, "first flush should fail at events stage");
 
-        assert!(raw_rows.is_empty(), "raw rows should not be retried");
+        assert!(
+            pending.raw_rows.is_empty(),
+            "raw rows should not be retried"
+        );
         assert_eq!(
-            event_rows.len(),
+            pending.event_rows.len(),
             1,
             "event rows remain pending after failure"
         );
         assert_eq!(
-            checkpoint_updates.len(),
+            pending.checkpoint_updates.len(),
             1,
             "checkpoint update must remain pending until checkpoint flush succeeds"
         );
@@ -1785,27 +3685,14 @@ mod tests {
         assert_eq!(metrics.event_rows_written.load(Ordering::Relaxed), 0);
         assert_eq!(metrics.flush_failures.load(Ordering::Relaxed), 1);
 
-        let second_attempt = flush_pending(
-            &clickhouse,
-            &checkpoints,
-            &metrics,
-            &mut raw_rows,
-            &mut event_rows,
-            &mut link_rows,
-            &mut tool_rows,
-            &mut error_rows,
-            &mut checkpoint_updates,
-            true,
-            "",
-        )
-        .await;
+        let second_attempt = flush_pending(&clickhouse, &checkpoints, &metrics, &mut pending).await;
         assert!(
             second_attempt,
             "second flush should complete remaining stages"
         );
 
-        assert!(event_rows.is_empty());
-        assert!(checkpoint_updates.is_empty());
+        assert!(pending.event_rows.is_empty());
+        assert!(pending.checkpoint_updates.is_empty());
         assert_eq!(metrics.raw_rows_written.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.event_rows_written.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.flush_failures.load(Ordering::Relaxed), 1);
@@ -1835,48 +3722,35 @@ mod tests {
 
         let checkpoint = sample_checkpoint();
         let checkpoint_key_value = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
-        let mut checkpoint_updates = HashMap::from([(checkpoint_key_value.clone(), checkpoint)]);
-        let mut raw_rows = vec![json!({
-            "source_name": "source-a",
-            "harness": "codex",
-            "source_file": "/tmp/source-a.jsonl",
-            "source_inode": 42u64,
-            "source_generation": 1u32,
-            "source_line_no": 7u64,
-            "source_offset": 2048u64,
-            "record_ts": "2026-02-17T00:00:01.000Z",
-            "top_type": "response_item",
-            "session_id": "session-a",
-            "raw_json": "payload-marker-that-must-not-be-copied",
-            "raw_json_hash": 1u64,
-            "event_uid": "evt-fallback",
-        })];
-        let mut event_rows = vec![json!({"event_uid": "evt-fallback"})];
-        let mut link_rows = Vec::<Value>::new();
-        let mut tool_rows = Vec::<Value>::new();
-        let mut error_rows = Vec::<Value>::new();
+        let mut pending = PendingFlush {
+            raw_rows: vec![json!({
+                "source_name": "source-a",
+                "harness": "codex",
+                "source_file": "/tmp/source-a.jsonl",
+                "source_inode": 42u64,
+                "source_generation": 1u32,
+                "source_line_no": 7u64,
+                "source_offset": 2048u64,
+                "record_ts": "2026-02-17T00:00:01.000Z",
+                "top_type": "response_item",
+                "session_id": "session-a",
+                "raw_json": "payload-marker-that-must-not-be-copied",
+                "raw_json_hash": 1u64,
+                "event_uid": "evt-fallback",
+            })],
+            event_rows: vec![json!({"event_uid": "evt-fallback"})],
+            checkpoint_updates: HashMap::from([(checkpoint_key_value.clone(), checkpoint)]),
+            ..PendingFlush::default()
+        };
 
         assert!(
-            flush_pending(
-                &clickhouse,
-                &checkpoints,
-                &metrics,
-                &mut raw_rows,
-                &mut event_rows,
-                &mut link_rows,
-                &mut tool_rows,
-                &mut error_rows,
-                &mut checkpoint_updates,
-                true,
-                "",
-            )
-            .await,
+            flush_pending(&clickhouse, &checkpoints, &metrics, &mut pending).await,
             "non-retryable oversized JSONEachRow failures should clear the stuck batch"
         );
 
-        assert!(raw_rows.is_empty());
-        assert!(event_rows.is_empty());
-        assert!(checkpoint_updates.is_empty());
+        assert!(pending.raw_rows.is_empty());
+        assert!(pending.event_rows.is_empty());
+        assert!(pending.checkpoint_updates.is_empty());
         assert_eq!(mock_state.call_count("raw_events"), 1);
         assert_eq!(
             mock_state.call_count("events"),
@@ -1950,45 +3824,32 @@ mod tests {
 
         let checkpoint = sample_checkpoint();
         let checkpoint_key_value = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
-        let mut checkpoint_updates = HashMap::from([(checkpoint_key_value, checkpoint)]);
-        let mut raw_rows = vec![json!({
-            "source_name": "source-a",
-            "source_file": "/tmp/source-a.jsonl",
-            "source_line_no": 7u64,
-            "source_offset": 2048u64,
-            "record_ts": "2026-02-17T00:00:01.000Z",
-            "top_type": "response_item",
-            "session_id": "session-a",
-            "raw_json": "{}",
-            "raw_json_hash": 1u64,
-            "event_uid": "evt-error-record-fails",
-        })];
-        let mut event_rows = vec![json!({"event_uid": "evt-error-record-fails"})];
-        let mut link_rows = Vec::<Value>::new();
-        let mut tool_rows = Vec::<Value>::new();
-        let mut error_rows = Vec::<Value>::new();
+        let mut pending = PendingFlush {
+            raw_rows: vec![json!({
+                "source_name": "source-a",
+                "source_file": "/tmp/source-a.jsonl",
+                "source_line_no": 7u64,
+                "source_offset": 2048u64,
+                "record_ts": "2026-02-17T00:00:01.000Z",
+                "top_type": "response_item",
+                "session_id": "session-a",
+                "raw_json": "{}",
+                "raw_json_hash": 1u64,
+                "event_uid": "evt-error-record-fails",
+            })],
+            event_rows: vec![json!({"event_uid": "evt-error-record-fails"})],
+            checkpoint_updates: HashMap::from([(checkpoint_key_value, checkpoint)]),
+            ..PendingFlush::default()
+        };
 
         assert!(
-            !flush_pending(
-                &clickhouse,
-                &checkpoints,
-                &metrics,
-                &mut raw_rows,
-                &mut event_rows,
-                &mut link_rows,
-                &mut tool_rows,
-                &mut error_rows,
-                &mut checkpoint_updates,
-                true,
-                "",
-            )
-            .await,
+            !flush_pending(&clickhouse, &checkpoints, &metrics, &mut pending).await,
             "fallback should remain retryable when the compact error row cannot be written"
         );
 
-        assert_eq!(raw_rows.len(), 1);
-        assert_eq!(event_rows.len(), 1);
-        assert_eq!(checkpoint_updates.len(), 1);
+        assert_eq!(pending.raw_rows.len(), 1);
+        assert_eq!(pending.event_rows.len(), 1);
+        assert_eq!(pending.checkpoint_updates.len(), 1);
         assert_eq!(mock_state.call_count("ingest_errors"), 1);
         assert_eq!(mock_state.call_count("ingest_checkpoints"), 0);
         assert!(mock_state.rows("ingest_errors").is_empty());
@@ -2016,44 +3877,31 @@ mod tests {
 
         let checkpoint = sample_checkpoint();
         let checkpoint_key_value = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
-        let mut checkpoint_updates = HashMap::from([(checkpoint_key_value.clone(), checkpoint)]);
-        let mut raw_rows = vec![json!({
-            "record_ts": "2026-02-17T00:00:01.000Z",
-            "event_uid": "evt-later-stage",
-            "raw_json": "{}",
-        })];
-        let mut event_rows = vec![json!({
-            "event_uid": "evt-later-stage",
-            "source_name": "source-a",
-            "source_file": "/tmp/source-a.jsonl",
-            "source_line_no": 17u64,
-            "source_offset": 4096u64,
-        })];
-        let mut link_rows = Vec::<Value>::new();
-        let mut tool_rows = Vec::<Value>::new();
-        let mut error_rows = Vec::<Value>::new();
+        let mut pending = PendingFlush {
+            raw_rows: vec![json!({
+                "record_ts": "2026-02-17T00:00:01.000Z",
+                "event_uid": "evt-later-stage",
+                "raw_json": "{}",
+            })],
+            event_rows: vec![json!({
+                "event_uid": "evt-later-stage",
+                "source_name": "source-a",
+                "source_file": "/tmp/source-a.jsonl",
+                "source_line_no": 17u64,
+                "source_offset": 4096u64,
+            })],
+            checkpoint_updates: HashMap::from([(checkpoint_key_value.clone(), checkpoint)]),
+            ..PendingFlush::default()
+        };
 
         assert!(
-            flush_pending(
-                &clickhouse,
-                &checkpoints,
-                &metrics,
-                &mut raw_rows,
-                &mut event_rows,
-                &mut link_rows,
-                &mut tool_rows,
-                &mut error_rows,
-                &mut checkpoint_updates,
-                true,
-                "",
-            )
-            .await,
+            flush_pending(&clickhouse, &checkpoints, &metrics, &mut pending).await,
             "non-retryable fallback after a partial commit should finish by checkpointing"
         );
 
-        assert!(raw_rows.is_empty());
-        assert!(event_rows.is_empty());
-        assert!(checkpoint_updates.is_empty());
+        assert!(pending.raw_rows.is_empty());
+        assert!(pending.event_rows.is_empty());
+        assert!(pending.checkpoint_updates.is_empty());
         assert_eq!(mock_state.rows("raw_events").len(), 1);
         assert!(mock_state.rows("events").is_empty());
         assert_eq!(mock_state.rows("ingest_errors").len(), 1);
@@ -2096,47 +3944,33 @@ mod tests {
         checkpoint.last_line_no = 99;
         checkpoint.last_offset = 8192;
         let checkpoint_key_value = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
-        let mut checkpoint_updates = HashMap::from([(checkpoint_key_value, checkpoint)]);
-        let mut raw_rows = vec![
-            json!({
-                "source_name": "source-a",
-                "source_file": "/tmp/source-a.jsonl",
-                "source_line_no": 7u64,
-                "source_offset": 2048u64,
-                "record_ts": "2026-02-17T00:00:01.000Z",
-                "event_uid": "evt-first",
-                "raw_json": "{}",
-            }),
-            json!({
-                "source_name": "source-a",
-                "source_file": "/tmp/source-a.jsonl",
-                "source_line_no": 8u64,
-                "source_offset": 4096u64,
-                "record_ts": "2026-02-17T00:00:02.000Z",
-                "event_uid": "evt-second",
-                "raw_json": "{}",
-            }),
-        ];
-        let mut event_rows = Vec::<Value>::new();
-        let mut link_rows = Vec::<Value>::new();
-        let mut tool_rows = Vec::<Value>::new();
-        let mut error_rows = Vec::<Value>::new();
+        let mut pending = PendingFlush {
+            raw_rows: vec![
+                json!({
+                    "source_name": "source-a",
+                    "source_file": "/tmp/source-a.jsonl",
+                    "source_line_no": 7u64,
+                    "source_offset": 2048u64,
+                    "record_ts": "2026-02-17T00:00:01.000Z",
+                    "event_uid": "evt-first",
+                    "raw_json": "{}",
+                }),
+                json!({
+                    "source_name": "source-a",
+                    "source_file": "/tmp/source-a.jsonl",
+                    "source_line_no": 8u64,
+                    "source_offset": 4096u64,
+                    "record_ts": "2026-02-17T00:00:02.000Z",
+                    "event_uid": "evt-second",
+                    "raw_json": "{}",
+                }),
+            ],
+            checkpoint_updates: HashMap::from([(checkpoint_key_value, checkpoint)]),
+            ..PendingFlush::default()
+        };
 
         assert!(
-            flush_pending(
-                &clickhouse,
-                &checkpoints,
-                &metrics,
-                &mut raw_rows,
-                &mut event_rows,
-                &mut link_rows,
-                &mut tool_rows,
-                &mut error_rows,
-                &mut checkpoint_updates,
-                true,
-                "",
-            )
-            .await,
+            flush_pending(&clickhouse, &checkpoints, &metrics, &mut pending).await,
             "multi-row non-retryable fallback should be batch-handled"
         );
 
@@ -2172,48 +4006,35 @@ mod tests {
 
         let checkpoint = sample_checkpoint();
         let checkpoint_key_value = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
-        let mut checkpoint_updates = HashMap::from([(checkpoint_key_value, checkpoint)]);
-        let mut raw_rows = vec![json!({
-            "source_name": "source-a",
-            "harness": "codex",
-            "source_file": "/tmp/source-a.jsonl",
-            "source_inode": 42u64,
-            "source_generation": 1u32,
-            "source_line_no": 7u64,
-            "source_offset": 2048u64,
-            "record_ts": "2026-02-17T00:00:01.000Z",
-            "top_type": "response_item",
-            "session_id": "session-a",
-            "raw_json": "{}",
-            "raw_json_hash": 1u64,
-            "event_uid": "evt-retry",
-        })];
-        let mut event_rows = vec![json!({"event_uid": "evt-retry"})];
-        let mut link_rows = Vec::<Value>::new();
-        let mut tool_rows = Vec::<Value>::new();
-        let mut error_rows = Vec::<Value>::new();
+        let mut pending = PendingFlush {
+            raw_rows: vec![json!({
+                "source_name": "source-a",
+                "harness": "codex",
+                "source_file": "/tmp/source-a.jsonl",
+                "source_inode": 42u64,
+                "source_generation": 1u32,
+                "source_line_no": 7u64,
+                "source_offset": 2048u64,
+                "record_ts": "2026-02-17T00:00:01.000Z",
+                "top_type": "response_item",
+                "session_id": "session-a",
+                "raw_json": "{}",
+                "raw_json_hash": 1u64,
+                "event_uid": "evt-retry",
+            })],
+            event_rows: vec![json!({"event_uid": "evt-retry"})],
+            checkpoint_updates: HashMap::from([(checkpoint_key_value, checkpoint)]),
+            ..PendingFlush::default()
+        };
 
         assert!(
-            !flush_pending(
-                &clickhouse,
-                &checkpoints,
-                &metrics,
-                &mut raw_rows,
-                &mut event_rows,
-                &mut link_rows,
-                &mut tool_rows,
-                &mut error_rows,
-                &mut checkpoint_updates,
-                true,
-                "",
-            )
-            .await,
+            !flush_pending(&clickhouse, &checkpoints, &metrics, &mut pending).await,
             "other ClickHouse Code 117 failures should remain retryable"
         );
 
-        assert_eq!(raw_rows.len(), 1);
-        assert_eq!(event_rows.len(), 1);
-        assert_eq!(checkpoint_updates.len(), 1);
+        assert_eq!(pending.raw_rows.len(), 1);
+        assert_eq!(pending.event_rows.len(), 1);
+        assert_eq!(pending.checkpoint_updates.len(), 1);
         assert!(mock_state.rows("ingest_errors").is_empty());
         assert_eq!(mock_state.call_count("ingest_errors"), 0);
         assert_eq!(metrics.err_rows_written.load(Ordering::Relaxed), 0);
@@ -2235,42 +4056,28 @@ mod tests {
 
         let checkpoint = sample_checkpoint();
         let checkpoint_key_value = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
-        let mut checkpoint_updates = HashMap::from([(checkpoint_key_value.clone(), checkpoint)]);
-        let mut raw_rows = vec![json!({
-            "source_name": "source-a",
-            "harness": "codex",
-            "source_file": "/tmp/source-a.jsonl",
-            "source_inode": 42u64,
-            "source_generation": 1u32,
-            "source_line_no": 7u64,
-            "source_offset": 2048u64,
-            "record_ts": "2026-02-17T00:00:01.000Z",
-            "top_type": "response_item",
-            "session_id": "session-a",
-            "raw_json": "x".repeat(CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES),
-            "raw_json_hash": 1u64,
-            "event_uid": "evt-oversized",
-        })];
-        let mut event_rows = Vec::<Value>::new();
-        let mut link_rows = Vec::<Value>::new();
-        let mut tool_rows = Vec::<Value>::new();
-        let mut error_rows = Vec::<Value>::new();
+        let mut pending = PendingFlush {
+            raw_rows: vec![json!({
+                "source_name": "source-a",
+                "harness": "codex",
+                "source_file": "/tmp/source-a.jsonl",
+                "source_inode": 42u64,
+                "source_generation": 1u32,
+                "source_line_no": 7u64,
+                "source_offset": 2048u64,
+                "record_ts": "2026-02-17T00:00:01.000Z",
+                "top_type": "response_item",
+                "session_id": "session-a",
+                "raw_json": "x".repeat(CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES),
+                "raw_json_hash": 1u64,
+                "event_uid": "evt-oversized",
+            })],
+            checkpoint_updates: HashMap::from([(checkpoint_key_value.clone(), checkpoint)]),
+            ..PendingFlush::default()
+        };
 
         assert!(
-            flush_pending(
-                &clickhouse,
-                &checkpoints,
-                &metrics,
-                &mut raw_rows,
-                &mut event_rows,
-                &mut link_rows,
-                &mut tool_rows,
-                &mut error_rows,
-                &mut checkpoint_updates,
-                true,
-                "",
-            )
-            .await,
+            flush_pending(&clickhouse, &checkpoints, &metrics, &mut pending).await,
             "oversized rows should be quarantined without failing the flush"
         );
 
@@ -2302,7 +4109,7 @@ mod tests {
             Some(OVERSIZED_ROW_FRAGMENT_CHARS)
         );
         assert_eq!(mock_state.rows("ingest_checkpoints").len(), 1);
-        assert!(checkpoint_updates.is_empty());
+        assert!(pending.checkpoint_updates.is_empty());
         assert_eq!(metrics.raw_rows_written.load(Ordering::Relaxed), 0);
         assert_eq!(metrics.err_rows_written.load(Ordering::Relaxed), 1);
 
@@ -2319,39 +4126,24 @@ mod tests {
         let checkpoints = Arc::new(RwLock::new(HashMap::new()));
         let metrics = Arc::new(Metrics::default());
 
-        let mut raw_rows = Vec::<Value>::new();
-        let mut event_rows = Vec::<Value>::new();
-        let mut link_rows = Vec::<Value>::new();
-        let mut tool_rows = vec![json!({
-            "event_uid": "evt-tool",
-            "session_id": "session-a",
-            "harness": "codex",
-            "source_name": "source-a",
-            "tool_call_id": "call-1",
-            "tool_name": "shell",
-            "tool_phase": "response",
-            "output_json": "x".repeat(CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES),
-            "source_ref": "/tmp/source-a.jsonl:3:17",
-            "event_version": 1u64,
-        })];
-        let mut error_rows = Vec::<Value>::new();
-        let mut checkpoint_updates = HashMap::new();
+        let mut pending = PendingFlush {
+            tool_rows: vec![json!({
+                "event_uid": "evt-tool",
+                "session_id": "session-a",
+                "harness": "codex",
+                "source_name": "source-a",
+                "tool_call_id": "call-1",
+                "tool_name": "shell",
+                "tool_phase": "response",
+                "output_json": "x".repeat(CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES),
+                "source_ref": "/tmp/source-a.jsonl:3:17",
+                "event_version": 1u64,
+            })],
+            ..PendingFlush::default()
+        };
 
         assert!(
-            flush_pending(
-                &clickhouse,
-                &checkpoints,
-                &metrics,
-                &mut raw_rows,
-                &mut event_rows,
-                &mut link_rows,
-                &mut tool_rows,
-                &mut error_rows,
-                &mut checkpoint_updates,
-                true,
-                "",
-            )
-            .await,
+            flush_pending(&clickhouse, &checkpoints, &metrics, &mut pending).await,
             "oversized tool rows should be quarantined without failing the flush"
         );
 
@@ -2379,6 +4171,1228 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn oversized_unowned_derived_row_blocks_without_poisoning_an_unrelated_source() {
+        let (clickhouse, mock_state) = spawn_mock_clickhouse("unused-table").await;
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+
+        let mut candidate_a = sample_checkpoint();
+        candidate_a.source_name = "cursor-state".to_string();
+        candidate_a.source_file = "/tmp/cursor-a.vscdb".to_string();
+        candidate_a.source_generation = 2;
+        let mut unrelated_b = candidate_a.clone();
+        unrelated_b.source_file = "/tmp/cursor-b.vscdb".to_string();
+        unrelated_b.source_generation = 5;
+        let candidate_a_key = checkpoint_key(&candidate_a.source_name, &candidate_a.source_file);
+        let unrelated_b_key = checkpoint_key(&unrelated_b.source_name, &unrelated_b.source_file);
+        checkpoints.write().await.extend([
+            (candidate_a_key, candidate_a.clone()),
+            (unrelated_b_key.clone(), unrelated_b.clone()),
+        ]);
+
+        let mut pending = PendingFlush {
+            link_rows: vec![json!({
+                "event_uid": "missing-owner",
+                "source_event_version": 7u64,
+                "source_name": "cursor-state",
+                "metadata_json": "x".repeat(CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES),
+            })],
+            checkpoint_updates: HashMap::from([(unrelated_b_key, unrelated_b.clone())]),
+            ..PendingFlush::default()
+        };
+
+        let observer = IngestAckObserver::new(false);
+        let actor = PublicationActor::new(
+            clickhouse.clone(),
+            String::new(),
+            "test-publisher".to_string(),
+            test_budgets(),
+        );
+        let context = FlushContext {
+            clickhouse: &clickhouse,
+            checkpoints: &checkpoints,
+            metrics: &metrics,
+            checkpoint_cursor_columns: true,
+            checkpoint_host: "",
+            ack_observer: &observer,
+            publication: Some(&actor),
+            budgets: test_budgets(),
+        };
+        assert!(
+            !flush_pending_with_publication(
+                &context,
+                &mut pending,
+                FlushOptions {
+                    publication_ready: true,
+                },
+            )
+            .await,
+            "missing exact ownership must fail before any row or fence mutation"
+        );
+        assert_eq!(pending.link_rows.len(), 1, "the required row is retained");
+        assert_eq!(pending.checkpoint_updates.len(), 1);
+        assert!(pending.quarantined_generations.is_empty());
+        assert!(mock_state.rows("event_links").is_empty());
+        assert!(mock_state.rows("ingest_errors").is_empty());
+        assert!(mock_state.rows("ingest_checkpoints").is_empty());
+        assert!(mock_state.rows("ingest_append_control").is_empty());
+        let state = checkpoints.read().await;
+        assert_eq!(state.len(), 2);
+        assert_eq!(
+            state
+                .get(&checkpoint_key(
+                    &candidate_a.source_name,
+                    &candidate_a.source_file,
+                ))
+                .expect("candidate A remains cached")
+                .lifecycle()
+                .unwrap(),
+            candidate_a.lifecycle().unwrap()
+        );
+        assert_eq!(
+            state
+                .get(&checkpoint_key(
+                    &unrelated_b.source_name,
+                    &unrelated_b.source_file,
+                ))
+                .expect("unrelated B remains cached")
+                .lifecycle()
+                .unwrap(),
+            unrelated_b.lifecycle().unwrap()
+        );
+        drop(state);
+        assert!(metrics
+            .last_error
+            .lock()
+            .expect("metrics last_error mutex poisoned")
+            .contains("without an exact source generation owner"));
+    }
+
+    #[test]
+    fn quarantine_source_attribution_covers_links_tools_and_errors() {
+        let event = json!({
+            "event_uid": "owner-event",
+            "event_version": 7u64,
+            "source_name": "cursor-state",
+            "source_file": "/tmp/cursor-state.vscdb",
+            "source_inode": 42u64,
+            "source_generation": 3u64,
+            "source_line_no": 17u64,
+            "source_offset": 2048u64,
+        });
+        let other_version = json!({
+            "event_uid": "owner-event",
+            "event_version": 8u64,
+            "source_name": "cursor-state",
+            "source_file": "/tmp/other-cursor-state.vscdb",
+            "source_inode": 84u64,
+            "source_generation": 5u64,
+            "source_line_no": 23u64,
+            "source_offset": 4096u64,
+        });
+        let link = json!({
+            "event_uid": "owner-event",
+            "source_event_version": 7u64,
+            "source_name": "cursor-state",
+            "metadata_json": "{}",
+        });
+        let tool = json!({
+            "event_uid": "tool-event",
+            "source_name": "cursor-state",
+            "source_ref": "/tmp/cursor-state.vscdb:3:18",
+        });
+        let error = json!({
+            "source_name": "cursor-state",
+            "source_file": "/tmp/cursor-state.vscdb",
+            "source_generation": 3u64,
+            "source_line_no": 19u64,
+        });
+        let owners = quarantine_ownership(&[event, other_version]);
+
+        let link_sources = quarantine_sources_for_row(&link, &owners);
+        let [link_source] = link_sources.as_slice() else {
+            panic!("link must resolve to exactly one owner source");
+        };
+        assert_eq!(link_source.source_file, "/tmp/cursor-state.vscdb");
+        assert_eq!(link_source.source_generation, 3);
+        assert_eq!(link_source.source_line_no, 17);
+
+        let tool_sources = quarantine_sources_for_row(&tool, &owners);
+        let [tool_source] = tool_sources.as_slice() else {
+            panic!("tool must resolve to exactly one source_ref");
+        };
+        assert_eq!(tool_source.source_file, "/tmp/cursor-state.vscdb");
+        assert_eq!(tool_source.source_generation, 3);
+        assert_eq!(tool_source.source_line_no, 18);
+
+        let error_sources = quarantine_sources_for_row(&error, &owners);
+        let [error_source] = error_sources.as_slice() else {
+            panic!("error must resolve to exactly one direct source");
+        };
+        assert_eq!(error_source.source_file, "/tmp/cursor-state.vscdb");
+        assert_eq!(error_source.source_generation, 3);
+        assert_eq!(error_source.source_line_no, 19);
+    }
+
+    async fn assert_sqlite_sized_quarantine_blocks_queued_finalization(
+        source_name: &str,
+        harness: &str,
+        source_file: &str,
+    ) {
+        let (clickhouse, mock_state) = spawn_mock_clickhouse("unused-table").await;
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.batch_size = 1;
+        config.ingest.flush_interval_seconds = 60.0;
+        config.ingest.heartbeat_interval_seconds = 60.0;
+
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel::<SinkMessage>(8);
+        let handle = spawn_sink_task(
+            config,
+            clickhouse,
+            checkpoints.clone(),
+            Arc::new(Metrics::default()),
+            rx,
+            true,
+            test_publication_identity(),
+            SinkAuthorConfig::fully_supported(String::new()),
+            default_role(),
+        );
+
+        let payload_bytes = 11 * 1024 * 1024;
+        assert!(payload_bytes > CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES);
+        assert!(payload_bytes < crate::sqlite_poll::SCAN_PAGE_MAX_BYTES);
+
+        let mut checkpoint = sample_checkpoint();
+        checkpoint.source_name = source_name.to_string();
+        checkpoint.source_file = source_file.to_string();
+        checkpoint.source_generation = 2;
+        checkpoint.last_offset = 2;
+        checkpoint.last_line_no = 1;
+        checkpoint.scan_inode = checkpoint.source_inode;
+        checkpoint.scan_boundary = checkpoint.last_offset;
+        checkpoint.policy_fingerprint = format!("{source_name}-sqlite-policy");
+
+        let begin = CheckpointTransition::begin_replay(
+            &checkpoint,
+            checkpoint.source_inode,
+            checkpoint.scan_boundary,
+            checkpoint.policy_fingerprint.clone(),
+        );
+        crate::publication::send_begin_replay(&tx, begin)
+            .await
+            .expect("begin replacement replay");
+
+        // SQLite adapters drain a batch as soon as it crosses max_batch_bytes,
+        // then send the causal checkpoint in a later batch. This row is below
+        // their 32 MiB scan-page cap but above ClickHouse's 10 MiB object cap.
+        let mut oversized = RowBatch::default();
+        oversized.push_raw_row(json!({
+            "source_name": source_name,
+            "harness": harness,
+            "source_file": source_file,
+            "source_inode": checkpoint.source_inode,
+            "source_generation": checkpoint.source_generation,
+            "source_line_no": 1u64,
+            "source_offset": 1u64,
+            "record_ts": "2026-07-20T00:00:00.000Z",
+            "raw_json": "x".repeat(payload_bytes),
+            "event_uid": format!("{source_name}-oversized"),
+        }));
+        tx.send(SinkMessage::Batch(oversized))
+            .await
+            .expect("queue checkpoint-less oversized SQLite chunk");
+
+        let mut replay_checkpoint = checkpoint.clone();
+        replay_checkpoint.set_lifecycle(CheckpointLifecycle::Replaying);
+        replay_checkpoint.final_scan_complete = false;
+        replay_checkpoint.compatibility_prepared = false;
+        replay_checkpoint.backend_caught_up = false;
+        let mut final_batch = RowBatch::default();
+        final_batch.checkpoint = Some(replay_checkpoint.clone());
+        tx.send(SinkMessage::Batch(final_batch))
+            .await
+            .expect("queue final SQLite replay checkpoint");
+
+        let final_transition = CheckpointTransition::finalize_replay(
+            &replay_checkpoint,
+            replay_checkpoint.source_inode,
+            replay_checkpoint.scan_boundary,
+            replay_checkpoint.policy_fingerprint.clone(),
+        );
+        let error = crate::publication::send_finalize_replay(&tx, final_transition)
+            .await
+            .expect_err("sink-side quarantine must reject queued publication");
+        assert!(
+            error.to_string().contains("oversized row(s) quarantined"),
+            "unexpected finalization error: {error:#}"
+        );
+
+        assert!(
+            mock_state.rows("published_source_generations").is_empty(),
+            "an incomplete replacement generation must never publish"
+        );
+        assert_eq!(mock_state.rows("ingest_errors").len(), 1);
+        let key = checkpoint_key(source_name, source_file);
+        let committed = checkpoints
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .expect("quarantined replay checkpoint is durable");
+        assert_eq!(committed.lifecycle().unwrap(), CheckpointLifecycle::Error);
+        assert!(!committed.final_scan_complete);
+        assert!(!committed.compatibility_prepared);
+        assert!(!committed.backend_caught_up);
+        assert!(committed
+            .block_reason
+            .contains("oversized row(s) quarantined"));
+
+        drop(tx);
+        timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("sink should stop")
+            .expect("sink task should not panic");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cursor_sqlite_sized_quarantine_cannot_be_overwritten_by_finalize() {
+        assert_sqlite_sized_quarantine_blocks_queued_finalization(
+            "cursor-state",
+            "cursor",
+            "/tmp/cursor-state.vscdb",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opencode_sqlite_sized_quarantine_cannot_be_overwritten_by_finalize() {
+        assert_sqlite_sized_quarantine_blocks_queued_finalization(
+            "opencode-state",
+            "opencode",
+            "/tmp/opencode.db",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cursor_link_only_quarantine_inherits_owner_and_blocks_finalize() {
+        let (clickhouse, mock_state) = spawn_mock_clickhouse("unused-table").await;
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.batch_size = 1;
+        config.ingest.flush_interval_seconds = 60.0;
+        config.ingest.heartbeat_interval_seconds = 60.0;
+
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel::<SinkMessage>(8);
+        let handle = spawn_sink_task(
+            config,
+            clickhouse,
+            checkpoints.clone(),
+            Arc::new(Metrics::default()),
+            rx,
+            true,
+            test_publication_identity(),
+            SinkAuthorConfig::fully_supported(String::new()),
+            default_role(),
+        );
+
+        let mut checkpoint = sample_checkpoint();
+        checkpoint.source_name = "cursor-reference-state".to_string();
+        checkpoint.source_file = "/tmp/cursor-reference-state.vscdb".to_string();
+        checkpoint.source_generation = 2;
+        checkpoint.last_offset = 2;
+        checkpoint.last_line_no = 1;
+        checkpoint.scan_inode = checkpoint.source_inode;
+        checkpoint.scan_boundary = checkpoint.last_offset;
+        checkpoint.policy_fingerprint = "cursor-reference-policy".to_string();
+        let begin = CheckpointTransition::begin_replay(
+            &checkpoint,
+            checkpoint.source_inode,
+            checkpoint.scan_boundary,
+            checkpoint.policy_fingerprint.clone(),
+        );
+        crate::publication::send_begin_replay(&tx, begin)
+            .await
+            .expect("begin Cursor reference replay");
+
+        let owner_uid = "cursor-reference-owner";
+        let raw_row = json!({
+            "source_name": checkpoint.source_name,
+            "harness": "cursor",
+            "source_file": checkpoint.source_file,
+            "source_inode": checkpoint.source_inode,
+            "source_generation": checkpoint.source_generation,
+            "source_line_no": 1u64,
+            "source_offset": 1u64,
+            "record_ts": "2026-07-20T00:00:00.000Z",
+            "raw_json": "{\"small\":true}",
+            "event_uid": "cursor-reference-raw",
+        });
+        assert!(
+            serde_json::to_vec(&raw_row).unwrap().len() < CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES
+        );
+        let event_row = json!({
+            "event_uid": owner_uid,
+            "event_version": 7u64,
+            "session_id": "cursor-reference-session",
+            "source_name": checkpoint.source_name,
+            "source_file": checkpoint.source_file,
+            "source_inode": checkpoint.source_inode,
+            "source_generation": checkpoint.source_generation,
+            "source_line_no": 1u64,
+            "source_offset": 1u64,
+        });
+        // event_links intentionally has no source_file/source_generation or
+        // source_ref columns. The sink must resolve it through its owner UID.
+        let link_row = json!({
+            "event_uid": owner_uid,
+            "linked_event_uid": "",
+            "linked_external_id": "/tmp/primary.rs",
+            "link_type": "unknown",
+            "session_id": "cursor-reference-session",
+            "harness": "cursor",
+            "source_name": checkpoint.source_name,
+            "metadata_json": "x".repeat(CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES),
+            "event_version": 9u64,
+            "source_event_version": 7u64,
+        });
+        assert!(
+            serde_json::to_vec(&link_row).unwrap().len()
+                > CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES
+        );
+        let mut candidate = RowBatch::default();
+        candidate.push_raw_row(raw_row);
+        candidate.extend_event_rows([event_row]);
+        candidate.extend_link_rows([link_row]);
+        tx.send(SinkMessage::Batch(candidate))
+            .await
+            .expect("queue Cursor link-expansion batch");
+
+        let mut replay_checkpoint = checkpoint.clone();
+        replay_checkpoint.set_lifecycle(CheckpointLifecycle::Replaying);
+        replay_checkpoint.final_scan_complete = false;
+        replay_checkpoint.compatibility_prepared = false;
+        replay_checkpoint.backend_caught_up = false;
+        let mut final_batch = RowBatch::default();
+        final_batch.checkpoint = Some(replay_checkpoint.clone());
+        tx.send(SinkMessage::Batch(final_batch))
+            .await
+            .expect("queue final Cursor replay checkpoint");
+
+        let final_transition = CheckpointTransition::finalize_replay(
+            &replay_checkpoint,
+            replay_checkpoint.source_inode,
+            replay_checkpoint.scan_boundary,
+            replay_checkpoint.policy_fingerprint.clone(),
+        );
+        let error = crate::publication::send_finalize_replay(&tx, final_transition)
+            .await
+            .expect_err("link-only quarantine must reject queued publication");
+        assert!(error.to_string().contains("oversized row(s) quarantined"));
+        assert!(mock_state.rows("event_links").is_empty());
+        assert!(mock_state.rows("published_source_generations").is_empty());
+        let errors = mock_state.rows("ingest_errors");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0].get("source_file").and_then(Value::as_str),
+            Some("/tmp/cursor-reference-state.vscdb")
+        );
+        assert_eq!(
+            errors[0].get("source_generation").and_then(Value::as_u64),
+            Some(2)
+        );
+
+        let key = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
+        let committed = checkpoints
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .expect("link quarantine checkpoint is durable");
+        assert_eq!(committed.lifecycle().unwrap(), CheckpointLifecycle::Error);
+        assert!(committed
+            .block_reason
+            .contains("oversized row(s) quarantined"));
+
+        drop(tx);
+        timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("sink should stop")
+            .expect("sink task should not panic");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ambiguous_link_owner_quarantines_every_candidate_generation() {
+        let (clickhouse, mock_state) = spawn_mock_clickhouse("unused-table").await;
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.batch_size = 1;
+        config.ingest.flush_interval_seconds = 60.0;
+        config.ingest.heartbeat_interval_seconds = 60.0;
+
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel::<SinkMessage>(8);
+        let handle = spawn_sink_task(
+            config,
+            clickhouse,
+            checkpoints.clone(),
+            Arc::new(Metrics::default()),
+            rx,
+            true,
+            test_publication_identity(),
+            SinkAuthorConfig::fully_supported(String::new()),
+            default_role(),
+        );
+
+        let make_checkpoint = |source_file: &str, source_inode: u64| {
+            let mut checkpoint = sample_checkpoint();
+            checkpoint.source_name = "cursor-reference-state".to_string();
+            checkpoint.source_file = source_file.to_string();
+            checkpoint.source_inode = source_inode;
+            checkpoint.source_generation = 2;
+            checkpoint.last_offset = 2;
+            checkpoint.last_line_no = 1;
+            checkpoint.scan_inode = source_inode;
+            checkpoint.scan_boundary = checkpoint.last_offset;
+            checkpoint.policy_fingerprint = "cursor-reference-policy".to_string();
+            checkpoint
+        };
+        let candidates = [
+            make_checkpoint("/tmp/cursor-reference-a.vscdb", 101),
+            make_checkpoint("/tmp/cursor-reference-b.vscdb", 202),
+        ];
+
+        for checkpoint in &candidates {
+            let begin = CheckpointTransition::begin_replay(
+                checkpoint,
+                checkpoint.source_inode,
+                checkpoint.scan_boundary,
+                checkpoint.policy_fingerprint.clone(),
+            );
+            crate::publication::send_begin_replay(&tx, begin)
+                .await
+                .expect("begin candidate replay");
+        }
+
+        let owner_uid = "shared-cursor-reference-owner";
+        let mut batch = RowBatch::default();
+        batch.extend_event_rows(candidates.iter().map(|checkpoint| {
+            json!({
+                "event_uid": owner_uid,
+                "event_version": 7u64,
+                "session_id": "cursor-reference-session",
+                "source_name": checkpoint.source_name,
+                "source_file": checkpoint.source_file,
+                "source_inode": checkpoint.source_inode,
+                "source_generation": checkpoint.source_generation,
+                "source_line_no": 1u64,
+                "source_offset": 1u64,
+            })
+        }));
+        batch.extend_link_rows([json!({
+            "event_uid": owner_uid,
+            "linked_event_uid": "",
+            "linked_external_id": "/tmp/primary.rs",
+            "link_type": "unknown",
+            "session_id": "cursor-reference-session",
+            "harness": "cursor",
+            "source_name": "cursor-reference-state",
+            "metadata_json": "x".repeat(CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES),
+            "event_version": 9u64,
+            "source_event_version": 7u64,
+        })]);
+        assert!(batch.checkpoint.is_none());
+        assert!(
+            serde_json::to_vec(&batch.link_rows[0]).unwrap().len()
+                > CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES
+        );
+        tx.send(SinkMessage::Batch(batch))
+            .await
+            .expect("queue checkpoint-less ambiguous link batch");
+
+        for checkpoint in &candidates {
+            let mut replay_checkpoint = checkpoint.clone();
+            replay_checkpoint.set_lifecycle(CheckpointLifecycle::Replaying);
+            replay_checkpoint.final_scan_complete = false;
+            replay_checkpoint.compatibility_prepared = false;
+            replay_checkpoint.backend_caught_up = false;
+            let mut final_batch = RowBatch::default();
+            final_batch.checkpoint = Some(replay_checkpoint.clone());
+            tx.send(SinkMessage::Batch(final_batch))
+                .await
+                .expect("queue candidate final replay checkpoint");
+
+            let final_transition = CheckpointTransition::finalize_replay(
+                &replay_checkpoint,
+                replay_checkpoint.source_inode,
+                replay_checkpoint.scan_boundary,
+                replay_checkpoint.policy_fingerprint.clone(),
+            );
+            let error = crate::publication::send_finalize_replay(&tx, final_transition)
+                .await
+                .expect_err("every possible link owner must be blocked from publication");
+            assert!(error.to_string().contains("oversized row(s) quarantined"));
+        }
+
+        assert!(mock_state.rows("event_links").is_empty());
+        assert!(mock_state.rows("published_source_generations").is_empty());
+        let errors = mock_state.rows("ingest_errors");
+        assert_eq!(errors.len(), 2, "one compact error per candidate owner");
+        let error_files = errors
+            .iter()
+            .filter_map(|row| row.get("source_file").and_then(Value::as_str))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            error_files,
+            BTreeSet::from([
+                "/tmp/cursor-reference-a.vscdb",
+                "/tmp/cursor-reference-b.vscdb",
+            ])
+        );
+        for checkpoint in &candidates {
+            let key = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
+            let committed = checkpoints
+                .read()
+                .await
+                .get(&key)
+                .cloned()
+                .expect("candidate quarantine checkpoint is durable");
+            assert_eq!(committed.lifecycle().unwrap(), CheckpointLifecycle::Error);
+            assert!(committed
+                .block_reason
+                .contains("oversized row(s) quarantined"));
+        }
+
+        drop(tx);
+        timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("sink should stop")
+            .expect("sink task should not panic");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn checkpoint_transition_allocates_from_one_aggregate_lookup() {
+        let state = MockClickHouseState::default();
+        state.seed_rows(
+            "ingest_checkpoint_transitions",
+            vec![
+                json!({"checkpoint_revision": 4, "operation_id": "earlier-a"}),
+                json!({"checkpoint_revision": 7, "operation_id": "earlier-b"}),
+            ],
+        );
+        let (clickhouse, mock_state) = spawn_mock_clickhouse_with_state(state).await;
+        let actor = PublicationActor::new(
+            clickhouse,
+            "test-host".to_string(),
+            "test-publisher".to_string(),
+            test_budgets(),
+        );
+        let mut transition =
+            CheckpointTransition::try_from_checkpoint(sample_checkpoint()).unwrap();
+
+        let ack = actor
+            .persist_transition(&mut transition)
+            .await
+            .expect("persist checkpoint transition");
+
+        assert_eq!(ack.checkpoint_revision, 8);
+        assert_eq!(transition.checkpoint.checkpoint_revision, 8);
+        assert_eq!(mock_state.rows("ingest_checkpoint_transitions").len(), 3);
+        assert_eq!(
+            mock_state.query_count("maxIf(transitions.checkpoint_revision"),
+            1,
+            "operation idempotence and max revision should share one query"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn checkpoint_transition_response_loss_retry_reuses_original_revision() {
+        let mut transition =
+            CheckpointTransition::try_from_checkpoint(sample_checkpoint()).unwrap();
+        let operation_id = transition.checkpoint.operation_id.clone();
+        let state = MockClickHouseState::default();
+        state.seed_rows(
+            "ingest_checkpoint_transitions",
+            vec![
+                json!({"checkpoint_revision": 3, "operation_id": operation_id}),
+                json!({"checkpoint_revision": 8, "operation_id": "later-operation"}),
+            ],
+        );
+        let (clickhouse, mock_state) = spawn_mock_clickhouse_with_state(state).await;
+        let actor = PublicationActor::new(
+            clickhouse,
+            "test-host".to_string(),
+            "test-publisher".to_string(),
+            test_budgets(),
+        );
+
+        let ack = actor
+            .persist_transition(&mut transition)
+            .await
+            .expect("retry persisted transition after response loss");
+
+        assert_eq!(ack.checkpoint_revision, 3);
+        assert_eq!(transition.checkpoint.checkpoint_revision, 3);
+        assert_eq!(
+            mock_state.rows("ingest_checkpoint_transitions").len(),
+            2,
+            "retry must not append a duplicate transition"
+        );
+        assert_eq!(
+            mock_state.query_count("maxIf(transitions.checkpoint_revision"),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn checkpoint_transition_revision_overflow_remains_an_error() {
+        let state = MockClickHouseState::default();
+        state.seed_rows(
+            "ingest_checkpoint_transitions",
+            vec![json!({
+                "checkpoint_revision": u64::MAX,
+                "operation_id": "different-operation",
+            })],
+        );
+        let (clickhouse, mock_state) = spawn_mock_clickhouse_with_state(state).await;
+        let actor = PublicationActor::new(
+            clickhouse,
+            "test-host".to_string(),
+            "test-publisher".to_string(),
+            test_budgets(),
+        );
+        let mut transition =
+            CheckpointTransition::try_from_checkpoint(sample_checkpoint()).unwrap();
+
+        let error = actor
+            .persist_transition(&mut transition)
+            .await
+            .expect_err("checkpoint revision overflow must fail closed");
+
+        assert!(error.to_string().contains("checkpoint revision exhausted"));
+        assert_eq!(mock_state.rows("ingest_checkpoint_transitions").len(), 1);
+        assert_eq!(
+            mock_state.query_count("maxIf(transitions.checkpoint_revision"),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn insert_only_proof_stops_after_the_first_matching_live_event() {
+        let state = MockClickHouseState::default();
+        let (clickhouse, mock_state) = spawn_mock_clickhouse_with_state(state).await;
+        let actor = PublicationActor::new(
+            clickhouse,
+            "test-host".to_string(),
+            "test-publisher".to_string(),
+            test_budgets(),
+        );
+        let mut manifest = AppendManifest::default();
+        manifest.event_uids.insert("event-1".to_string());
+        manifest.session_ids.insert("session-1".to_string());
+
+        assert!(actor
+            .prove_insert_only(&mut manifest)
+            .await
+            .expect("prove absent replacement keys"));
+
+        mock_state.set_live_event_exists(true);
+        assert!(!actor
+            .prove_insert_only(&mut manifest)
+            .await
+            .expect("detect an existing replacement key"));
+        assert_eq!(mock_state.query_count("toUInt8(1) AS existing"), 2);
+        assert_eq!(mock_state.query_count("v_live_events"), 2);
+        assert_eq!(mock_state.query_count("LIMIT 1"), 2);
+        assert_eq!(mock_state.query_count("count()) AS existing_count"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unpublished_replay_batch_does_not_schedule_mcp_projection_refresh() {
+        let state = MockClickHouseState::default();
+        state.set_current_source_head_response(json!({
+            "source_generation": 1,
+            "publication_revision": 7,
+            "publisher_id": "test-publisher",
+            "operation_id": "generation-one",
+        }));
+        let (clickhouse, mock_state) = spawn_mock_clickhouse_with_state(state).await;
+        let actor = PublicationActor::new(
+            clickhouse.clone(),
+            String::new(),
+            "test-publisher".to_string(),
+            test_budgets(),
+        );
+        assert!(
+            actor
+                .has_published_generation(
+                    &crate::publication::SourceKey::local("source-a", "/tmp/source-a.jsonl",),
+                    1,
+                )
+                .await
+                .expect("read mocked generation-one source head"),
+            "the mock must prove that generation one is published"
+        );
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+        let mut replay = sample_checkpoint();
+        replay.source_generation = 2;
+        replay.set_lifecycle(CheckpointLifecycle::Replaying);
+        replay.final_scan_complete = false;
+        replay.compatibility_prepared = false;
+        let key = checkpoint_key(&replay.source_name, &replay.source_file);
+        let observer = IngestAckObserver::new(false);
+        let mut pending = PendingFlush {
+            event_rows: vec![json!({
+                "event_uid": "replacement-event",
+                "event_version": 2,
+                "session_id": "replacement-session",
+                "source_host": "",
+                "source_name": "source-a",
+                "source_file": "/tmp/source-a.jsonl",
+                "source_generation": 2,
+            })],
+            checkpoint_updates: HashMap::from([(key, replay)]),
+            ..PendingFlush::default()
+        };
+        let context = FlushContext {
+            clickhouse: &clickhouse,
+            checkpoints: &checkpoints,
+            metrics: &metrics,
+            checkpoint_cursor_columns: true,
+            checkpoint_host: "",
+            ack_observer: &observer,
+            publication: Some(&actor),
+            budgets: test_budgets(),
+        };
+
+        assert!(
+            flush_pending_with_publication(
+                &context,
+                &mut pending,
+                FlushOptions {
+                    publication_ready: true,
+                },
+            )
+            .await,
+            "the replay batch itself should still flush durably"
+        );
+
+        assert_eq!(mock_state.rows("events").len(), 1);
+        assert_eq!(
+            mock_state.query_count("mcp_open_backfill_plans"),
+            0,
+            "an unpublished replacement chunk must not invoke the MCP projector"
+        );
+        assert!(
+            pending.acknowledgements.projection_session_ids.is_empty(),
+            "unpublished sources must not enqueue projection debt"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backend_initial_checkpoint_stays_staged_before_catch_up_barrier() {
+        let (clickhouse, mock_state) =
+            spawn_mock_clickhouse_with_state(MockClickHouseState::default()).await;
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.heartbeat_interval_seconds = 60.0;
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (tx, rx) = mpsc::channel::<SinkMessage>(8);
+        let cell = Arc::new(BackendSinkCell::new("team-ch"));
+        let publication_identity = test_publication_identity();
+        let expected_host = publication_identity.host_id().to_string();
+        let handle = spawn_sink_task(
+            config,
+            clickhouse,
+            checkpoints.clone(),
+            metrics,
+            rx,
+            true,
+            publication_identity,
+            SinkAuthorConfig::fully_supported(String::new()),
+            test_backend_role(cell),
+        );
+
+        let mut checkpoint = sample_checkpoint();
+        checkpoint.final_scan_complete = true;
+        checkpoint.compatibility_prepared = true;
+        checkpoint.backend_caught_up = true;
+        let key = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
+        let mut batch = RowBatch::default();
+        batch.checkpoint = Some(checkpoint);
+        tx.send(SinkMessage::Batch(batch))
+            .await
+            .expect("send initial backend checkpoint");
+        drop(tx);
+
+        timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("backend sink should finish")
+            .expect("backend sink task should not panic");
+
+        let committed = checkpoints
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .expect("backend checkpoint committed");
+        assert!(
+            !committed.backend_caught_up,
+            "adapter readiness must be revoked until MirrorCaughtUp is ordered and durable"
+        );
+        let transitions = mock_state.rows("ingest_checkpoint_transitions");
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(
+            transitions[0]
+                .get("backend_caught_up")
+                .and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            transitions[0].get("host").and_then(Value::as_str),
+            Some(expected_host.as_str())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backend_replay_finalization_returns_typed_staged_success() {
+        let (clickhouse, mock_state) =
+            spawn_mock_clickhouse_with_state(MockClickHouseState::default()).await;
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.heartbeat_interval_seconds = 60.0;
+        let mut checkpoint = sample_checkpoint();
+        checkpoint.source_generation = 2;
+        checkpoint.set_lifecycle(CheckpointLifecycle::Replaying);
+        checkpoint.scan_inode = checkpoint.source_inode;
+        checkpoint.scan_boundary = checkpoint.last_offset;
+        checkpoint.policy_fingerprint = "policy-fingerprint".to_string();
+        let key = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
+        let checkpoints = Arc::new(RwLock::new(HashMap::from([(key, checkpoint.clone())])));
+        let metrics = Arc::new(Metrics::default());
+        let (tx, rx) = mpsc::channel::<SinkMessage>(8);
+        let cell = Arc::new(BackendSinkCell::new("team-ch"));
+        let handle = spawn_sink_task(
+            config,
+            clickhouse,
+            checkpoints,
+            metrics,
+            rx,
+            true,
+            test_publication_identity(),
+            SinkAuthorConfig::fully_supported(String::new()),
+            test_backend_role(cell),
+        );
+
+        let transition = CheckpointTransition::finalize_replay(
+            &checkpoint,
+            checkpoint.source_inode,
+            checkpoint.last_offset,
+            "policy-fingerprint",
+        );
+        assert_eq!(
+            crate::publication::send_finalize_replay(&tx, transition)
+                .await
+                .expect("staged mirror finalization is successful"),
+            FinalizeReplayOutcome::StagedForMirror
+        );
+        assert!(
+            mock_state.rows("published_source_generations").is_empty(),
+            "a staged mirror finalization must not publish its source head"
+        );
+        let readiness = mock_state.rows("source_generation_publication_readiness");
+        assert_eq!(readiness.len(), 1);
+        let transitions = mock_state.rows("ingest_checkpoint_transitions");
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(
+            readiness[0].get("complete").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            readiness[0]
+                .get("source_generation")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            readiness[0]
+                .get("backend_caught_up")
+                .and_then(Value::as_u64),
+            Some(0),
+            "staged completion must remain visible as mirror catch-up pending"
+        );
+        assert_eq!(
+            readiness[0]
+                .get("compatibility_prepared")
+                .and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            readiness[0].get("block_reason").and_then(Value::as_str),
+            Some("")
+        );
+        assert_eq!(
+            readiness[0].get("checkpoint_revision"),
+            transitions[0].get("checkpoint_revision")
+        );
+        assert_eq!(
+            readiness[0].get("operation_id"),
+            transitions[0].get("operation_id")
+        );
+
+        drop(tx);
+        timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("backend sink should finish")
+            .expect("backend sink task should not panic");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backend_staged_final_waits_for_durable_readiness_before_ack() {
+        let (clickhouse, mock_state) =
+            spawn_mock_clickhouse_with_state(MockClickHouseState::with_permanent_failure(
+                "source_generation_publication_readiness",
+                "intentional staged-readiness failure",
+            ))
+            .await;
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.heartbeat_interval_seconds = 60.0;
+        let mut checkpoint = sample_checkpoint();
+        checkpoint.source_generation = 2;
+        checkpoint.set_lifecycle(CheckpointLifecycle::Replaying);
+        checkpoint.scan_inode = checkpoint.source_inode;
+        checkpoint.scan_boundary = checkpoint.last_offset;
+        checkpoint.policy_fingerprint = "policy-fingerprint".to_string();
+        let key = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
+        let checkpoints = Arc::new(RwLock::new(HashMap::from([(key, checkpoint.clone())])));
+        let (tx, rx) = mpsc::channel::<SinkMessage>(8);
+        let handle = spawn_sink_task(
+            config,
+            clickhouse,
+            checkpoints.clone(),
+            Arc::new(Metrics::default()),
+            rx,
+            true,
+            test_publication_identity(),
+            SinkAuthorConfig::fully_supported(String::new()),
+            test_backend_role(Arc::new(BackendSinkCell::new("team-ch"))),
+        );
+
+        let transition = CheckpointTransition::finalize_replay(
+            &checkpoint,
+            checkpoint.source_inode,
+            checkpoint.last_offset,
+            "policy-fingerprint",
+        );
+        let error = crate::publication::send_finalize_replay(&tx, transition)
+            .await
+            .expect_err("readiness failure must reject staged success");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to persist source-generation publication readiness"),
+            "unexpected staged-readiness error: {error:#}"
+        );
+        assert_eq!(
+            mock_state.rows("ingest_checkpoint_transitions").len(),
+            1,
+            "the checkpoint may commit before the readiness failure"
+        );
+        assert!(mock_state
+            .rows("source_generation_publication_readiness")
+            .is_empty());
+        assert_eq!(
+            checkpoints
+                .read()
+                .await
+                .values()
+                .next()
+                .map(|checkpoint| checkpoint.lifecycle().unwrap()),
+            Some(CheckpointLifecycle::Replaying),
+            "failed readiness must not merge or acknowledge the staged checkpoint"
+        );
+        assert!(mock_state.rows("published_source_generations").is_empty());
+
+        drop(tx);
+        timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("backend sink should finish")
+            .expect("backend sink task should not panic");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn staged_mirror_readiness_reports_pending_until_catch_up_supersedes_it() {
+        let (clickhouse, mock_state) =
+            spawn_mock_clickhouse_with_state(MockClickHouseState::default()).await;
+        let identity = test_publication_identity();
+        let expected_host = identity.host_id().to_string();
+        let actor = PublicationActor::new(
+            clickhouse,
+            expected_host.clone(),
+            identity.publisher_id().to_string(),
+            test_budgets(),
+        );
+        let mut checkpoint = sample_checkpoint();
+        checkpoint.source_generation = 2;
+        let mut transition = CheckpointTransition::finalize_replay(
+            &checkpoint,
+            checkpoint.source_inode,
+            checkpoint.last_offset,
+            "policy-fingerprint",
+        );
+
+        let staged = actor
+            .persist_staged_mirror_final(&mut transition)
+            .await
+            .expect("persist staged mirror final");
+        let staged_operation_id = transition.checkpoint.operation_id.clone();
+        let staged_readiness = mock_state.rows("source_generation_publication_readiness");
+        assert_eq!(staged_readiness.len(), 1);
+        let staged_row = &staged_readiness[0];
+        assert_eq!(staged_row.get("complete").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            staged_row.get("backend_caught_up").and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            staged_row
+                .get("checkpoint_revision")
+                .and_then(Value::as_u64),
+            Some(staged.checkpoint_revision)
+        );
+        assert_eq!(
+            staged_row.get("source_host").and_then(Value::as_str),
+            Some(expected_host.as_str())
+        );
+        let staged_revision = staged_row
+            .get("readiness_revision")
+            .and_then(Value::as_u64)
+            .expect("staged readiness revision");
+        assert!(
+            staged_row.get("complete").and_then(Value::as_u64) == Some(1)
+                && staged_row.get("backend_caught_up").and_then(Value::as_u64) == Some(0),
+            "the diagnostics predicate must report a pending mirror"
+        );
+
+        transition.set_backend_caught_up(true);
+        let caught_up = actor
+            .persist_mirror_caught_up(&mut transition)
+            .await
+            .expect("persist mirror catch-up");
+        assert_ne!(transition.checkpoint.operation_id, staged_operation_id);
+        assert!(caught_up.checkpoint_revision > staged.checkpoint_revision);
+
+        let mut readiness = mock_state.rows("source_generation_publication_readiness");
+        readiness.sort_by_key(|row| {
+            row.get("readiness_revision")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+        });
+        assert_eq!(readiness.len(), 2);
+        let current = readiness.last().expect("current readiness row");
+        assert!(current
+            .get("readiness_revision")
+            .and_then(Value::as_u64)
+            .is_some_and(|revision| revision > staged_revision));
+        assert_eq!(current.get("complete").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            current.get("backend_caught_up").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            current
+                .get("compatibility_prepared")
+                .and_then(Value::as_u64),
+            Some(0),
+            "catch-up readiness precedes compatibility publication"
+        );
+        assert!(
+            !(current.get("complete").and_then(Value::as_u64) == Some(1)
+                && current.get("backend_caught_up").and_then(Value::as_u64) == Some(0)),
+            "the current diagnostics predicate must clear mirror catch-up pending"
+        );
+
+        actor
+            .record_publication_repair_failure(&transition)
+            .await
+            .expect("persist publication-repair diagnostic");
+        let mut readiness = mock_state.rows("source_generation_publication_readiness");
+        readiness.sort_by_key(|row| {
+            row.get("readiness_revision")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+        });
+        let diagnostic = readiness.last().expect("diagnostic readiness row");
+        assert_eq!(
+            diagnostic.get("block_reason").and_then(Value::as_str),
+            Some("publication_repair_failed")
+        );
+        assert_eq!(
+            diagnostic.get("backend_caught_up").and_then(Value::as_u64),
+            Some(1),
+            "publication failure must not roll back durable mirror catch-up"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backend_sink_repairs_its_orphaned_append_before_intake() {
+        let state = MockClickHouseState::default();
+        state.set_append_control_response(json!({
+            "control_revision": 7,
+            "cache_epoch": 3,
+            "state": "preparing",
+            "batch_id": "append-from-prior-process",
+            "publisher_id": "host:prior-pid",
+            "manifest_json": "{invalid",
+            "insert_only": 1,
+        }));
+        let (clickhouse, mock_state) = spawn_mock_clickhouse_with_state(state).await;
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.heartbeat_interval_seconds = 60.0;
+        let (tx, rx) = mpsc::channel::<SinkMessage>(8);
+        let cell = Arc::new(BackendSinkCell::new("team-ch"));
+        let publication_identity = test_publication_identity();
+        let expected_host = publication_identity.host_id().to_string();
+        let handle = spawn_sink_task(
+            config,
+            clickhouse,
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(Metrics::default()),
+            rx,
+            true,
+            publication_identity,
+            SinkAuthorConfig::fully_supported(String::new()),
+            test_backend_role(cell),
+        );
+        drop(tx);
+
+        timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("backend sink should finish")
+            .expect("backend sink task should not panic");
+
+        let controls = mock_state.rows("ingest_append_control");
+        assert_eq!(
+            controls.len(),
+            1,
+            "orphan repair writes one terminal control"
+        );
+        assert_eq!(
+            controls[0].get("state").and_then(Value::as_str),
+            Some("blocked")
+        );
+        assert_eq!(
+            controls[0].get("batch_id").and_then(Value::as_str),
+            Some("append-from-prior-process")
+        );
+        assert_eq!(
+            controls[0].get("host").and_then(Value::as_str),
+            Some(expected_host.as_str()),
+            "each shared backend repairs this host's own append fence"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn backend_sink_filters_intake_to_routed_sessions() {
         let (clickhouse, mock_state) = spawn_mock_clickhouse("unused-table").await;
 
@@ -2402,6 +5416,9 @@ mod tests {
         let metrics = Arc::new(Metrics::default());
         let redactions = test_redaction_audit();
         let (tx, rx) = mpsc::channel::<SinkMessage>(8);
+        let cell = Arc::new(BackendSinkCell::new("team-ch"));
+        let publication_identity = test_publication_identity();
+        let expected_host = publication_identity.host_id().to_string();
 
         let handle = spawn_sink_task(
             config,
@@ -2410,16 +5427,32 @@ mod tests {
             metrics,
             rx,
             true,
+            publication_identity,
             SinkAuthorConfig::fully_supported(String::new()),
             SinkRole::Backend {
-                cell: Arc::new(BackendSinkCell::new("team-ch")),
-                resolver,
+                cell: cell.clone(),
+                resolver: resolver.clone(),
                 replay_notify: Arc::new(Notify::new()),
                 replay_floor: Arc::new(Mutex::new(None)),
                 redactor: test_redactor(),
                 redactions: redactions.clone(),
             },
         );
+
+        // The supervisor normally performs this sequence after its replay
+        // pass. A backend sink starts fail-closed; routing becomes converged
+        // only after the durable catch-up barrier is acknowledged.
+        let mut catch_up_checkpoint = sample_checkpoint();
+        catch_up_checkpoint.source_name = "catch-up-placeholder".to_string();
+        catch_up_checkpoint.source_file = "/tmp/catch-up-placeholder.jsonl".to_string();
+        catch_up_checkpoint.set_lifecycle(CheckpointLifecycle::Replaying);
+        catch_up_checkpoint.final_scan_complete = false;
+        let catch_up = CheckpointTransition::try_from_checkpoint(catch_up_checkpoint).unwrap();
+        crate::publication::send_mirror_caught_up(&tx, catch_up)
+            .await
+            .expect("initial mirror catch-up barrier");
+        cell.mark_publication_ready();
+        assert!(cell.publication_ready());
 
         let raw_secret = "ghp_abcdefghijklmnopqrstuvwxyzABCDE12345";
         let mut batch = RowBatch::default();
@@ -2455,6 +5488,11 @@ mod tests {
             Some("team-session")
         );
         assert_eq!(
+            raw_rows[0].get("source_host").and_then(Value::as_str),
+            Some(expected_host.as_str()),
+            "shared physical rows use the durable publication identity"
+        );
+        assert_eq!(
             raw_rows[0].get("raw_json").and_then(Value::as_str),
             Some("{\"token\":\"[REDACTED:github-token]\"}"),
             "backend sink backstop redacts the remote copy after route filtering"
@@ -2473,7 +5511,7 @@ mod tests {
         );
         assert_eq!(
             checkpoint_rows[0].get("host").and_then(Value::as_str),
-            Some(host_name().as_str()),
+            Some(expected_host.as_str()),
             "backend checkpoint rows are host-scoped: team backends share one \
              ingest_checkpoints table across members"
         );
@@ -2484,11 +5522,6 @@ mod tests {
         let (clickhouse, mock_state) = spawn_mock_clickhouse("unused-table").await;
         let checkpoints = Arc::new(RwLock::new(HashMap::new()));
         let metrics = Arc::new(Metrics::default());
-        let mut raw_rows = Vec::<Value>::new();
-        let mut event_rows = Vec::<Value>::new();
-        let mut link_rows = Vec::<Value>::new();
-        let mut tool_rows = Vec::<Value>::new();
-        let mut error_rows = Vec::<Value>::new();
 
         let ahead = sample_checkpoint(); // offset 100
         let key = checkpoint_key(&ahead.source_name, &ahead.source_file);
@@ -2496,24 +5529,11 @@ mod tests {
         behind.last_offset = 50;
 
         for cp in [ahead, behind] {
-            let mut checkpoint_updates = HashMap::new();
-            checkpoint_updates.insert(key.clone(), cp);
-            assert!(
-                flush_pending(
-                    &clickhouse,
-                    &checkpoints,
-                    &metrics,
-                    &mut raw_rows,
-                    &mut event_rows,
-                    &mut link_rows,
-                    &mut tool_rows,
-                    &mut error_rows,
-                    &mut checkpoint_updates,
-                    true,
-                    "",
-                )
-                .await
-            );
+            let mut pending = PendingFlush {
+                checkpoint_updates: HashMap::from([(key.clone(), cp)]),
+                ..PendingFlush::default()
+            };
+            assert!(flush_pending(&clickhouse, &checkpoints, &metrics, &mut pending).await);
         }
 
         // A backend map has two producers (live router batches and replay),
@@ -2587,6 +5607,52 @@ mod tests {
                 .await
                 .is_ok(),
             "recovery must schedule a replay pass"
+        );
+    }
+
+    #[test]
+    fn durable_identity_scopes_only_shared_backend_rows() {
+        let identity = test_publication_identity();
+        let backend = test_backend_role(Arc::new(BackendSinkCell::new("team-ch")));
+
+        assert_eq!(
+            publication_host_for_role(&backend, &identity),
+            identity.host_id()
+        );
+        assert_eq!(
+            publication_host_for_role(&default_role(), &identity),
+            "",
+            "default-local physical rows retain the hostless source_host contract"
+        );
+    }
+
+    #[test]
+    fn backend_publication_readiness_tracks_each_catch_up_revocation() {
+        let cell = Arc::new(BackendSinkCell::new("team-ch"));
+        let role = SinkRole::Backend {
+            cell: cell.clone(),
+            resolver: Arc::new(Mutex::new(crate::tee::RouteResolver::new(Arc::new(
+                moraine_config::AppConfig::default(),
+            )))),
+            replay_notify: Arc::new(Notify::new()),
+            replay_floor: Arc::new(Mutex::new(None)),
+            redactor: test_redactor(),
+            redactions: test_redaction_audit(),
+        };
+
+        assert!(!publication_ready_for_role(&role));
+        assert!(!publication_ready_for_sink(&role, false));
+        cell.mark_publication_ready();
+        assert!(publication_ready_for_role(&role));
+        assert!(publication_ready_for_sink(&role, false));
+        assert!(
+            !publication_ready_for_sink(&role, true),
+            "legacy ownership ambiguity must override a stale ready latch"
+        );
+        cell.request_catch_up();
+        assert!(
+            !publication_ready_for_role(&role),
+            "the sink must observe a later mirror gap instead of retaining its first ready latch"
         );
     }
 

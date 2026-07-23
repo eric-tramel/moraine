@@ -108,6 +108,7 @@
           "linked_external_id": "kimi-cli:11111111-2222-4333-8444-555555555555",
           "metadata_json": "{}",
           "session_id": "kimi-cli:agent-abcdef01",
+          "source_event_version": "<event_version>",
           "source_name": "golden-kimi-cli-subagent"
         }
       ],

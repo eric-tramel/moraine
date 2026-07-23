@@ -12,8 +12,8 @@ use crate::render::{
 };
 use crate::service::Service;
 use anyhow::{bail, Context, Result};
-use moraine_clickhouse::DoctorReport;
-use moraine_config::AppConfig;
+use moraine_clickhouse::{DoctorReport, PublicationDiagnostics, QueryClass, QueryEnvelope};
+use moraine_config::{AppConfig, ValidatedQueryBudgets};
 use moraine_conversations::{ConversationRepository, IngestHeartbeatRead, StoreDiagnostics};
 use std::time::Duration;
 
@@ -28,8 +28,21 @@ struct RequiredNullable<T>(Option<T>);
 struct DaemonStatusResponse {
     ok: bool,
     clickhouse: DaemonClickhouseStatus,
+    #[serde(default)]
+    publication: Option<DaemonPublicationStatus>,
+    #[serde(default)]
+    query_budgets: Option<DaemonQueryBudgets>,
     database: DaemonDatabaseStatus,
     ingestor: DaemonIngestorStatus,
+}
+
+/// Additive `query_budgets` telemetry block from the daemon status/health
+/// API (issue #600 W11). Optional end-to-end: pre-envelope daemons omit it
+/// and the CLI stays silent rather than falling back to direct DB reads.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+struct DaemonQueryBudgets {
+    deadline_exceeded: u64,
+    resource_exhausted: u64,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -53,6 +66,22 @@ struct DaemonIngestorStatus {
 }
 
 #[derive(Debug, serde::Deserialize)]
+struct DaemonPublicationStatus {
+    available: bool,
+    healthy: bool,
+    ambiguous_hostless_rows: Option<u64>,
+    replaying_generations: Option<u64>,
+    blocked_generations: Option<u64>,
+    append_preparations: Option<u64>,
+    blocked_append_preparations: Option<u64>,
+    mirror_catchup_pending: Option<u64>,
+    writer_conflicts: Option<u64>,
+    #[serde(default)]
+    issues: Vec<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct DaemonHeartbeat {
     ts: String,
     queue_depth: u64,
@@ -65,6 +94,10 @@ struct StatusData {
     source: StatusDataSource,
     fallback_note: Option<String>,
     clickhouse_health_url: String,
+    /// Daemon-reported budget-exhaustion telemetry; `None` on direct-DB
+    /// fallback (the CLI process has no meaningful counters of its own) and
+    /// for daemons that predate the block.
+    query_budgets: Option<DaemonQueryBudgets>,
 }
 
 fn service_runtime_running(services: &[ServiceRuntimeStatus], service: Service) -> bool {
@@ -151,6 +184,51 @@ fn daemon_status_data(payload: DaemonStatusResponse) -> Result<StatusData> {
         bail!("daemon API returned an unhealthy ClickHouse without an error");
     }
 
+    let mut publication_error = None;
+    let publication = match payload.publication {
+        Some(publication) if publication.available => {
+            if publication.error.is_some() {
+                bail!("daemon API returned available publication diagnostics with an error");
+            }
+            let diagnostics = PublicationDiagnostics {
+                ambiguous_hostless_rows: publication
+                    .ambiguous_hostless_rows
+                    .context("daemon API omitted ambiguous_hostless_rows")?,
+                replaying_generations: publication
+                    .replaying_generations
+                    .context("daemon API omitted replaying_generations")?,
+                blocked_generations: publication
+                    .blocked_generations
+                    .context("daemon API omitted blocked_generations")?,
+                append_preparations: publication
+                    .append_preparations
+                    .context("daemon API omitted append_preparations")?,
+                blocked_append_preparations: publication
+                    .blocked_append_preparations
+                    .context("daemon API omitted blocked_append_preparations")?,
+                mirror_catchup_pending: publication
+                    .mirror_catchup_pending
+                    .context("daemon API omitted mirror_catchup_pending")?,
+                writer_conflicts: publication
+                    .writer_conflicts
+                    .context("daemon API omitted writer_conflicts")?,
+                issues: publication.issues,
+            };
+            if publication.healthy != diagnostics.is_healthy() {
+                bail!("daemon API returned contradictory publication health fields");
+            }
+            Some(diagnostics)
+        }
+        Some(publication) => {
+            if publication.healthy || publication.error.is_none() {
+                bail!("daemon API returned contradictory unavailable publication diagnostics");
+            }
+            publication_error = publication.error;
+            None
+        }
+        None => None,
+    };
+
     let latest = payload.ingestor.latest.0;
     if payload.ingestor.present != latest.is_some() {
         bail!("daemon API returned inconsistent ingestor presence");
@@ -167,6 +245,10 @@ fn daemon_status_data(payload: DaemonStatusResponse) -> Result<StatusData> {
         },
         None => HeartbeatSnapshot::Unavailable,
     };
+    let mut errors = payload.clickhouse.error.0.into_iter().collect::<Vec<_>>();
+    if let Some(error) = publication_error {
+        errors.push(format!("publication diagnostics unavailable: {error}"));
+    }
     let report = DoctorReport {
         clickhouse_healthy: payload.clickhouse.healthy,
         clickhouse_version: payload.clickhouse.version.0,
@@ -175,7 +257,8 @@ fn daemon_status_data(payload: DaemonStatusResponse) -> Result<StatusData> {
         applied_migrations: Vec::new(),
         pending_migrations: Vec::new(),
         missing_tables: Vec::new(),
-        errors: payload.clickhouse.error.0.into_iter().collect(),
+        publication,
+        errors,
     };
 
     Ok(StatusData {
@@ -184,7 +267,23 @@ fn daemon_status_data(payload: DaemonStatusResponse) -> Result<StatusData> {
         source: StatusDataSource::DaemonApi,
         fallback_note: None,
         clickhouse_health_url: payload.clickhouse.url,
+        query_budgets: payload.query_budgets,
     })
+}
+
+/// One-line budget summary for `moraine status` (issue #600 W11). `None`
+/// (omit silently) when the daemon telemetry is unavailable or when nothing
+/// has been rejected — the line exists to flag repeated exhaustion, not to
+/// narrate healthy traffic.
+fn budget_status_note(query_budgets: Option<DaemonQueryBudgets>) -> Option<String> {
+    let budgets = query_budgets?;
+    if budgets.deadline_exceeded == 0 && budgets.resource_exhausted == 0 {
+        return None;
+    }
+    Some(format!(
+        "query budgets: {} deadline / {} resource rejections since start",
+        budgets.deadline_exceeded, budgets.resource_exhausted
+    ))
 }
 
 async fn read_daemon_status(cfg: &AppConfig, timeout: Duration) -> Result<StatusData> {
@@ -269,6 +368,41 @@ fn build_status_notes(
             ServiceRuntimeState::Running | ServiceRuntimeState::Stopped => {}
         }
     }
+    if let Some(publication) = &report.publication {
+        if publication.replaying_generations > 0 {
+            notes.push(format!(
+                "{} source generation(s) are replaying behind published heads",
+                publication.replaying_generations
+            ));
+        }
+        if publication.append_preparations > 0 {
+            notes.push(format!(
+                "{} append preparation(s) are fenced from strict live reads",
+                publication.append_preparations
+            ));
+        }
+        if publication.blocked_append_preparations > 0 {
+            notes.push(format!(
+                "{} append preparation(s) are blocked and remain fail-closed",
+                publication.blocked_append_preparations
+            ));
+        }
+        if publication.mirror_catchup_pending > 0 {
+            notes.push(format!(
+                "{} mirror publication(s) are waiting for catch-up",
+                publication.mirror_catchup_pending
+            ));
+        }
+        if !publication.is_healthy() {
+            notes.push(format!(
+                "publication is degraded (ambiguous hostless rows: {}, blocked generations: {}, blocked append preparations: {}, writer conflicts: {})",
+                publication.ambiguous_hostless_rows,
+                publication.blocked_generations,
+                publication.blocked_append_preparations,
+                publication.writer_conflicts
+            ));
+        }
+    }
     notes
 }
 
@@ -281,6 +415,7 @@ fn doctor_report(diagnostics: StoreDiagnostics) -> DoctorReport {
         applied_migrations: diagnostics.applied_schema_versions,
         pending_migrations: diagnostics.pending_schema_versions,
         missing_tables: diagnostics.missing_tables,
+        publication: diagnostics.publication,
         errors: diagnostics.errors,
     }
 }
@@ -304,19 +439,33 @@ fn heartbeat_snapshot(read: IngestHeartbeatRead) -> HeartbeatSnapshot {
 
 async fn read_repository_status(
     repository: &dyn ConversationRepository,
+    budgets: &ValidatedQueryBudgets,
 ) -> Result<(DoctorReport, HeartbeatSnapshot)> {
-    let report = doctor_report(repository.read_store_diagnostics().await?);
-    let heartbeat = match repository.latest_ingest_heartbeat().await {
-        Ok(read) => heartbeat_snapshot(read),
-        Err(err) => HeartbeatSnapshot::Error {
-            message: err.to_string(),
-        },
-    };
-    Ok((report, heartbeat))
+    // Status direct-DB reads are an Interactive-class operation (issue #600,
+    // amendment A6): one envelope covers both diagnostics reads so they share
+    // an absolute deadline and read allowance.
+    QueryEnvelope::new_with_admin_budget(
+        "status",
+        QueryClass::Interactive,
+        &budgets.interactive,
+        &budgets.administrative,
+    )
+    .scope(async {
+        let report = doctor_report(repository.read_store_diagnostics().await?);
+        let heartbeat = match repository.latest_ingest_heartbeat().await {
+            Ok(read) => heartbeat_snapshot(read),
+            Err(err) => HeartbeatSnapshot::Error {
+                message: err.to_string(),
+            },
+        };
+        Ok((report, heartbeat))
+    })
+    .await
 }
 async fn read_preferred_status(
     cfg: &AppConfig,
     repository: &dyn ConversationRepository,
+    budgets: &ValidatedQueryBudgets,
     api_available: bool,
     timeout: Duration,
 ) -> Result<StatusData> {
@@ -324,7 +473,7 @@ async fn read_preferred_status(
         match read_daemon_status(cfg, timeout).await {
             Ok(status) => return Ok(status),
             Err(error) => {
-                let (report, heartbeat) = read_repository_status(repository).await?;
+                let (report, heartbeat) = read_repository_status(repository, budgets).await?;
                 return Ok(StatusData {
                     report,
                     heartbeat,
@@ -333,18 +482,20 @@ async fn read_preferred_status(
                         "daemon status API failed ({error:#}); using direct DB fallback"
                     )),
                     clickhouse_health_url: cfg.clickhouse.url.clone(),
+                    query_budgets: None,
                 });
             }
         }
     }
 
-    let (report, heartbeat) = read_repository_status(repository).await?;
+    let (report, heartbeat) = read_repository_status(repository, budgets).await?;
     Ok(StatusData {
         report,
         heartbeat,
         source: StatusDataSource::DirectDb,
         fallback_note: None,
         clickhouse_health_url: cfg.clickhouse.url.clone(),
+        query_budgets: None,
     })
 }
 
@@ -376,14 +527,19 @@ pub(super) async fn cmd_status(
         source: data_source,
         fallback_note,
         clickhouse_health_url,
+        query_budgets,
     } = read_preferred_status(
         cfg,
         repository,
+        &super::query_budgets(cfg),
         backend_endpoints.http_listening,
         STATUS_API_TIMEOUT,
     )
     .await?;
     let mut status_notes = build_status_notes(&services, &report, &clickhouse_health_url);
+    if let Some(note) = budget_status_note(query_budgets) {
+        status_notes.push(note);
+    }
     if let Some(note) = fallback_note {
         status_notes.push(note);
     }
@@ -438,6 +594,10 @@ mod tests {
         cfg
     }
 
+    fn test_budgets() -> ValidatedQueryBudgets {
+        crate::commands::query_budgets(&AppConfig::default())
+    }
+
     fn test_repository() -> InMemoryConversationRepository {
         InMemoryConversationRepository::with_responses(
             RepoConfig::default(),
@@ -451,6 +611,7 @@ mod tests {
                     applied_schema_versions: vec!["001".to_string()],
                     pending_schema_versions: Vec::new(),
                     missing_tables: Vec::new(),
+                    publication: Some(PublicationDiagnostics::default()),
                     errors: Vec::new(),
                 })),
                 ..InMemoryConversationResponses::default()
@@ -472,6 +633,25 @@ mod tests {
                     Value::String("API-reported database failure".to_string())
                 }
             },
+            "publication": {
+                "available": true,
+                "healthy": true,
+                "ambiguous_hostless_rows": 0,
+                "replaying_generations": 0,
+                "blocked_generations": 0,
+                "append_preparations": 0,
+                "blocked_append_preparations": 0,
+                "mirror_catchup_pending": 0,
+                "writer_conflicts": 0,
+                "issues": []
+            },
+            "query_budgets": {
+                "requests": 12,
+                "statements": 48,
+                "deadline_exceeded": 0,
+                "resource_exhausted": 0,
+                "unenveloped_statements": 0
+            },
             "database": {"exists": true},
             "ingestor": {
                 "present": true,
@@ -483,6 +663,90 @@ mod tests {
             }
         })
         .to_string()
+    }
+
+    #[test]
+    fn daemon_publication_compatibility_accepts_legacy_and_zero_counts() {
+        let complete: DaemonStatusResponse =
+            serde_json::from_str(&daemon_status_body(true)).expect("complete daemon fixture");
+        let complete = daemon_status_data(complete).expect("accept zero publication counts");
+        assert_eq!(complete.source, StatusDataSource::DaemonApi);
+        assert_eq!(
+            complete.report.publication,
+            Some(PublicationDiagnostics::default())
+        );
+        assert!(crate::commands::doctor_is_healthy(&complete.report));
+
+        let mut legacy: Value =
+            serde_json::from_str(&daemon_status_body(true)).expect("legacy daemon fixture");
+        legacy
+            .as_object_mut()
+            .expect("daemon response object")
+            .remove("publication");
+        let legacy: DaemonStatusResponse =
+            serde_json::from_value(legacy).expect("legacy daemon response schema");
+        let legacy = daemon_status_data(legacy).expect("accept legacy daemon response");
+        assert_eq!(legacy.source, StatusDataSource::DaemonApi);
+        assert!(legacy.report.publication.is_none());
+        assert!(!crate::commands::doctor_is_healthy(&legacy.report));
+    }
+
+    #[test]
+    fn budget_note_prints_only_for_nonzero_daemon_rejections() {
+        assert_eq!(budget_status_note(None), None);
+        assert_eq!(
+            budget_status_note(Some(DaemonQueryBudgets {
+                deadline_exceeded: 0,
+                resource_exhausted: 0,
+            })),
+            None
+        );
+        assert_eq!(
+            budget_status_note(Some(DaemonQueryBudgets {
+                deadline_exceeded: 3,
+                resource_exhausted: 1,
+            }))
+            .as_deref(),
+            Some("query budgets: 3 deadline / 1 resource rejections since start")
+        );
+    }
+
+    #[test]
+    fn daemon_status_data_carries_optional_query_budget_telemetry() {
+        // Block present with zero rejections (the shared fixture): captured,
+        // but the note stays silent.
+        let zeros: DaemonStatusResponse =
+            serde_json::from_str(&daemon_status_body(true)).expect("daemon fixture");
+        let zeros = daemon_status_data(zeros).expect("daemon status with zero budgets");
+        assert!(zeros.query_budgets.is_some());
+        assert_eq!(budget_status_note(zeros.query_budgets), None);
+
+        // Nonzero counts surface the one-line summary.
+        let mut nonzero: Value =
+            serde_json::from_str(&daemon_status_body(true)).expect("daemon fixture");
+        nonzero["query_budgets"]["deadline_exceeded"] = json!(2);
+        nonzero["query_budgets"]["resource_exhausted"] = json!(5);
+        let nonzero: DaemonStatusResponse =
+            serde_json::from_value(nonzero).expect("nonzero budget fixture");
+        let nonzero = daemon_status_data(nonzero).expect("daemon status with rejections");
+        assert_eq!(
+            budget_status_note(nonzero.query_budgets).as_deref(),
+            Some("query budgets: 2 deadline / 5 resource rejections since start")
+        );
+
+        // Pre-envelope daemons omit the whole block: silently absent, and the
+        // response still parses (additive contract).
+        let mut legacy: Value =
+            serde_json::from_str(&daemon_status_body(true)).expect("daemon fixture");
+        legacy
+            .as_object_mut()
+            .expect("daemon response object")
+            .remove("query_budgets");
+        let legacy: DaemonStatusResponse =
+            serde_json::from_value(legacy).expect("legacy daemon response schema");
+        let legacy = daemon_status_data(legacy).expect("legacy daemon status");
+        assert!(legacy.query_budgets.is_none());
+        assert_eq!(budget_status_note(legacy.query_budgets), None);
     }
 
     fn spawn_api_response(body: &str, delay: Duration) -> (u16, thread::JoinHandle<String>) {
@@ -536,6 +800,7 @@ mod tests {
                     applied_schema_versions: vec!["001".to_string()],
                     pending_schema_versions: Vec::new(),
                     missing_tables: Vec::new(),
+                    publication: Some(PublicationDiagnostics::default()),
                     errors: Vec::new(),
                 })),
                 ..InMemoryConversationResponses::default()
@@ -579,6 +844,7 @@ mod tests {
         let status = read_preferred_status(
             &test_config(port),
             &repository,
+            &test_budgets(),
             true,
             Duration::from_secs(1),
         )
@@ -590,6 +856,11 @@ mod tests {
         assert!(!status.report.clickhouse_healthy);
         assert_eq!(status.report.database, "api_db");
         assert_eq!(status.report.errors, vec!["API-reported database failure"]);
+        assert!(status
+            .report
+            .publication
+            .as_ref()
+            .is_some_and(PublicationDiagnostics::is_healthy));
         assert!(matches!(
             status.heartbeat,
             HeartbeatSnapshot::Available {
@@ -618,6 +889,7 @@ mod tests {
             let status = read_preferred_status(
                 &test_config(port),
                 &repository,
+                &test_budgets(),
                 true,
                 Duration::from_secs(1),
             )
@@ -659,6 +931,7 @@ mod tests {
             let status = read_preferred_status(
                 &test_config(port),
                 &repository,
+                &test_budgets(),
                 true,
                 Duration::from_secs(1),
             )
@@ -674,6 +947,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn contradictory_publication_fields_fall_back_to_direct_db() {
+        let mut healthy_with_block =
+            serde_json::from_str::<Value>(&daemon_status_body(true)).expect("valid fixture");
+        healthy_with_block["publication"]["blocked_generations"] = json!(1);
+        let mut unavailable_without_error =
+            serde_json::from_str::<Value>(&daemon_status_body(true)).expect("valid fixture");
+        unavailable_without_error["publication"]["available"] = json!(false);
+        unavailable_without_error["publication"]["healthy"] = json!(false);
+
+        for payload in [healthy_with_block, unavailable_without_error] {
+            let repository = test_repository();
+            let (port, worker) = spawn_api_response(&payload.to_string(), Duration::ZERO);
+            let status = read_preferred_status(
+                &test_config(port),
+                &repository,
+                &test_budgets(),
+                true,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("fall back after contradictory publication response");
+
+            assert_eq!(status.source, StatusDataSource::DirectDb);
+            assert_eq!(repository.calls().read_store_diagnostics, 1);
+            worker.join().expect("daemon API worker");
+        }
+    }
+
+    #[tokio::test]
     async fn oversized_api_response_falls_back_before_buffering_the_body() {
         let repository = test_repository();
         let body = "x".repeat(STATUS_API_MAX_RESPONSE_BYTES + 1);
@@ -681,6 +983,7 @@ mod tests {
         let status = read_preferred_status(
             &test_config(port),
             &repository,
+            &test_budgets(),
             true,
             Duration::from_secs(1),
         )
@@ -711,6 +1014,7 @@ mod tests {
         let status = read_preferred_status(
             &test_config(port),
             &repository,
+            &test_budgets(),
             true,
             Duration::from_millis(20),
         )
@@ -735,6 +1039,7 @@ mod tests {
         let status = read_preferred_status(
             &test_config(9),
             &repository,
+            &test_budgets(),
             false,
             Duration::from_millis(20),
         )
@@ -767,6 +1072,16 @@ mod tests {
                 "applied_migrations": ["001"],
                 "pending_migrations": [],
                 "missing_tables": [],
+                "publication": {
+                    "ambiguous_hostless_rows": 0,
+                    "replaying_generations": 0,
+                    "blocked_generations": 0,
+                    "append_preparations": 0,
+                    "blocked_append_preparations": 0,
+                    "mirror_catchup_pending": 0,
+                    "writer_conflicts": 0,
+                    "issues": []
+                },
                 "errors": []
             })
         );
@@ -810,6 +1125,7 @@ mod tests {
             applied_migrations: Vec::new(),
             pending_migrations: Vec::new(),
             missing_tables: Vec::new(),
+            publication: Some(PublicationDiagnostics::default()),
             errors: Vec::new(),
         }
     }
@@ -835,6 +1151,42 @@ mod tests {
         assert!(notes[0].contains("managed clickhouse runtime is running"));
         assert!(notes[0].contains("are failing"));
         assert!(notes[0].contains("http://127.0.0.1:8123"));
+    }
+
+    #[test]
+    fn build_status_notes_reports_publication_progress_and_degradation() {
+        let mut report = test_doctor_report(true);
+        report.publication = Some(PublicationDiagnostics {
+            ambiguous_hostless_rows: 2,
+            replaying_generations: 3,
+            blocked_generations: 1,
+            append_preparations: 4,
+            blocked_append_preparations: 2,
+            mirror_catchup_pending: 5,
+            writer_conflicts: 1,
+            issues: Vec::new(),
+        });
+
+        let notes = build_status_notes(
+            &[managed_runtime_status(Service::ClickHouse, Some(4242))],
+            &report,
+            "http://127.0.0.1:8123",
+        );
+        assert!(notes
+            .iter()
+            .any(|note| note.contains("3 source generation")));
+        assert!(notes
+            .iter()
+            .any(|note| note.contains("4 append preparation")));
+        assert!(notes
+            .iter()
+            .any(|note| note.contains("2 append preparation")));
+        assert!(notes
+            .iter()
+            .any(|note| note.contains("5 mirror publication")));
+        assert!(notes
+            .iter()
+            .any(|note| note.contains("publication is degraded")));
     }
 
     #[test]

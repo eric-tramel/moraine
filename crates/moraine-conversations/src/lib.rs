@@ -25,14 +25,23 @@ pub use domain::{
 };
 pub use domain::{
     AnalyticsConcurrencyPoint, AnalyticsRange, AnalyticsSnapshot, AnalyticsTokenPoint,
-    AnalyticsTurnPoint, AnalyticsWindow, IngestHeartbeat, IngestHeartbeatRead, SessionAnalytics,
-    SessionAnalyticsQuery, SessionLookback, SessionStep, SessionTurn, StoreConnectionMetrics,
-    StoreDiagnostics, StoreHealth, StoreProbe, TableColumn, TablePreview, TablePreviewQuery,
-    TableSummaries, TableSummary, ToolResult, WebSearchEvent,
+    AnalyticsTurnPoint, AnalyticsWindow, IngestHeartbeat, IngestHeartbeatRead,
+    PublicationDiagnostics, SessionAnalytics, SessionAnalyticsQuery, SessionLookback, SessionStep,
+    SessionTurn, StoreConnectionMetrics, StoreDiagnostics, StoreHealth, StoreProbe, TableColumn,
+    TablePreview, TablePreviewQuery, TableSummaries, TableSummary, ToolResult, WebSearchEvent,
 };
 pub use error::{RepoError, RepoResult};
 pub use in_memory_repo::{
     InMemoryConversationCalls, InMemoryConversationRepository, InMemoryConversationResponses,
+};
+// Boundary crates (MCP dispatch, monitor handlers, CLI commands) hold only
+// `Arc<dyn ConversationRepository>` and do not depend on moraine-clickhouse;
+// re-export the transport envelope surface so they can establish class
+// envelopes without a new dependency edge (issue #600, amendment A1).
+pub use moraine_clickhouse::{
+    budget_telemetry, envelope_error_kind, record_budget_rejection, record_budget_request,
+    unenveloped_statement_count, AllowanceResource, BudgetTelemetrySnapshot, EnvelopeError,
+    EnvelopeStatsSnapshot, QueryClass, QueryEnvelope,
 };
 pub use repo::ConversationRepository;
 

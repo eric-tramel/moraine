@@ -8,7 +8,33 @@ impl ClickHouseConversationRepository {
         &self,
         query: FileAttentionQuery,
     ) -> RepoResult<Vec<FileAttentionTouch>> {
-        self.file_attention_impl(query).await
+        let scope = if query.apply_project_scope {
+            PublicationReadScope::projects(
+                query
+                    .normalized_project_id
+                    .iter()
+                    .chain(&query.normalized_project_roots)
+                    .cloned(),
+            )
+        } else {
+            PublicationReadScope::global()
+        };
+        // Tighten the active envelope's deadline to this tool's execution
+        // budget: every statement of the operation — snapshot capture and
+        // revalidation, exact and suffix lookups, and the durable
+        // project-roots write — shares the tighter wall. Narrowing never
+        // resets the request id, statement cap, or read allowances
+        // (QueryEnvelope::scope_narrowed only tightens); the per-statement
+        // max_execution_time param below is additionally min-merged by the
+        // transport.
+        let deadline_cap = Duration::from_secs(query.execution_budget_secs.max(1));
+        QueryEnvelope::scope_narrowed(
+            deadline_cap,
+            self.run_publication_consistent_scoped(PublicationReadClass::Strict, scope, || {
+                self.file_attention_impl(query.clone())
+            }),
+        )
+        .await
     }
 
     /// Tier-0 file-attention query: every captured tool call whose input path
@@ -94,8 +120,8 @@ impl ClickHouseConversationRepository {
     ) -> RepoResult<Vec<FileAttentionTouch>> {
         let rel = query.rel.as_str();
 
-        let tool_io = self.table_ref("tool_io");
-        let events_source = canonical_events_source(&self.table_ref("events"));
+        let tool_io = self.table_ref("v_live_tool_io");
+        let events_source = self.live_events_source();
         let trace = self.table_ref("v_conversation_trace");
         let rel_sql = sql_quote(rel);
         let project_predicate = if query.apply_project_scope {
@@ -162,7 +188,7 @@ impl ClickHouseConversationRepository {
         let sql = format!(
             "WITH matched AS (
     SELECT session_id, event_uid, tool_call_id, harness, tool_name, tool_phase, input_preview, output_preview, repo_rel_path, worktree_root
-    FROM {tool_io} FINAL
+    FROM {tool_io}
     WHERE {match_predicate}
   )
   SELECT
@@ -235,7 +261,15 @@ impl ClickHouseConversationRepository {
 SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
             sql_quote(project_id)
         );
-        self.map_backend(self.ch.request_text(&sql, None, None, false, None).await)
+        defer_publication_effect(PublicationEffect::FileAttentionProjectRootsWrite { sql }).await;
+        Ok(())
+    }
+
+    pub(super) async fn execute_file_attention_project_roots_write(
+        &self,
+        sql: &str,
+    ) -> RepoResult<()> {
+        self.map_backend(self.ch.request_text(sql, None, None, false, None).await)
             .map(|_| ())
     }
 
@@ -247,8 +281,8 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
     ) -> RepoResult<Vec<FileAttentionTouch>> {
         let rel = query.rel.as_str();
 
-        let tool_io = self.table_ref("tool_io");
-        let events_source = canonical_events_source(&self.table_ref("events"));
+        let tool_io = self.table_ref("v_live_tool_io");
+        let events_source = self.live_events_source();
         let trace = self.table_ref("v_conversation_trace");
         let rel_sql = sql_quote(rel);
         let slash_rel_sql = sql_quote(&format!("/{rel}"));
@@ -482,7 +516,7 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
         let sql = format!(
             "WITH {project_roots_with}matched AS (
     SELECT session_id, event_uid, tool_call_id, harness, tool_name, tool_phase, input_json, input_preview, output_preview{normalized_tool_columns}
-    FROM {tool_io} FINAL
+    FROM {tool_io}
     WHERE {match_predicate}
   )
   SELECT
@@ -526,19 +560,16 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
         self.map_backend(self.query_rows_with_params(&sql, None, &params).await)
     }
 
+    /// Cancel every statement issued under `query_id` (the id itself plus its
+    /// `{query_id}-{seq}` children). Delegates to the transport's bounded
+    /// prefix KILL, which runs under its own Administrative-class envelope —
+    /// finite deadline, own query id — instead of the historical unbounded
+    /// hand-rolled KILL.
     pub async fn cancel_query(&self, query_id: &str) -> RepoResult<()> {
-        let query_id = query_id.trim();
-        if query_id.is_empty() {
-            return Ok(());
-        }
-        let child_prefix = format!("{query_id}-");
-        let sql = format!(
-            "KILL QUERY WHERE query_id = {} OR startsWith(query_id, {}) SYNC",
-            sql_quote(query_id),
-            sql_quote(&child_prefix)
-        );
-        self.map_backend(self.ch.request_text(&sql, None, None, false, None).await)
-            .map(|_| ())
+        let admin_budget = administrative_query_budget();
+        self.map_backend(
+            moraine_clickhouse::kill_query_prefix(&self.ch, query_id, &admin_budget).await,
+        )
     }
 }
 

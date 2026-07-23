@@ -38,6 +38,7 @@ fn sample_search_row(
     matched_terms: u64,
 ) -> SearchRow {
     SearchRow {
+        source_host: "host-a".to_string(),
         event_uid: event_uid.to_string(),
         session_id: session_id.to_string(),
         event_time: "2026-04-27T12:00:00.000Z".to_string(),
@@ -62,6 +63,7 @@ fn sample_search_row(
 fn sample_mcp_search_row(event_uid: &str, raw_score: f64, event_unix_ms: i64) -> SearchMcpEventRow {
     SearchMcpEventRow {
         event_uid: event_uid.to_string(),
+        source_host: "host-a".to_string(),
         session_id: "session-1".to_string(),
         source_name: "source".to_string(),
         harness: "harness".to_string(),
@@ -172,13 +174,13 @@ fn repository_reads_leave_thread_scheduling_to_clickhouse() {
     );
 }
 
-#[test]
-fn mcp_search_sql_excludes_internal_tool_calls() {
+#[tokio::test]
+async fn mcp_search_sql_excludes_internal_tool_calls() {
     let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
         .expect("build ClickHouse client");
     let repo = ClickHouseConversationRepository::new(client, RepoConfig::default());
-    let sql = repo
-        .build_search_mcp_events_sql(
+    let sql = with_test_publication_snapshot(TestPublicationSnapshot::idle_local(1, 1), async {
+        repo.build_search_mcp_events_sql(
             &["needle".to_string()],
             &[McpEventType::ToolCall],
             None,
@@ -191,12 +193,142 @@ fn mcp_search_sql_excludes_internal_tool_calls() {
             20,
             0,
         )
-        .expect("build MCP event search SQL");
+        .expect("build MCP event search SQL")
+    })
+    .await;
 
     assert!(sql.contains("p.source_name != 'codex-mcp'"));
     assert!(sql.contains("splitByString('__', lowerUTF8(trimBoth(p.name)))"));
     assert!(sql.contains("arrayElement"));
     assert!(sql.contains("= 'moraine'"));
+    assert!(sql.contains("FROM `moraine`.`v_live_search_postings` AS p FINAL"));
+    assert!(sql.contains("WHERE p.term IN q_terms"));
+    assert_eq!(
+        sql.matches("FROM `moraine`.`v_live_search_postings` AS p FINAL")
+            .count(),
+        1
+    );
+    assert!(!sql.contains("matching_doc_ids AS ("));
+    assert!(!sql.contains("projected_candidates AS ("));
+    assert!(sql.contains("ALL INNER JOIN `moraine`.`mcp_open_events` AS e FINAL"));
+    assert!(sql.contains("ON e.source_host = p.source_host"));
+    assert!(sql.contains("AND e.event_uid = p.doc_id"));
+    assert!(sql.contains("AND e.session_id = s.session_id"));
+    assert!(sql.contains("AND e.slot = s.slot"));
+    assert!(sql.contains("AND e.generation = s.generation"));
+    assert!(sql.contains("GROUP BY p.doc_id, p.source_host"));
+    assert!(!sql.contains("PREWHERE p.term"));
+}
+
+#[test]
+fn live_search_queries_use_the_full_document_view_contract() {
+    let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
+        .expect("build ClickHouse client");
+    let repo = ClickHouseConversationRepository::new(client, RepoConfig::default());
+    let terms = vec!["needle".to_string()];
+    let idf = HashMap::from([("needle".to_string(), 1.0)]);
+
+    let ranking_sql = repo
+        .build_search_events_sql(
+            &terms, &idf, 10.0, true, None, true, true, None, None, 1, 0.0, 20,
+        )
+        .expect("build live search ranking SQL");
+    let hydration_sql = repo
+        .build_search_events_hydrate_sql(&[SearchDocumentIdentity::new("host-a", "event-a")], true)
+        .expect("build live search hydration SQL");
+
+    for sql in [&ranking_sql, &hydration_sql] {
+        assert!(sql.contains("FROM `moraine`.`v_live_search_documents` AS t"));
+        for required in [
+            "t.source_host",
+            "t.event_uid",
+            "t.session_id",
+            "t.record_ts",
+            "t.source_name",
+            "t.harness",
+            "t.inference_provider",
+            "t.event_class",
+            "t.payload_type",
+            "t.actor_role",
+            "t.name",
+            "t.phase",
+            "t.source_ref",
+            "t.doc_len",
+            "t.text_content",
+            "t.payload_json",
+            "t.has_codex_mcp",
+        ] {
+            assert!(
+                sql.contains(required),
+                "live search SQL omitted {required}: {sql}"
+            );
+        }
+    }
+    assert!(ranking_sql.contains("GROUP BY t.source_host, t.event_uid"));
+    assert!(ranking_sql.contains("ON d.source_host = p.source_host"));
+    assert!(ranking_sql.contains("GROUP BY p.doc_id, p.source_host"));
+    assert!(hydration_sql.contains("requested.source_host = t.source_host"));
+    assert!(hydration_sql.contains("GROUP BY t.source_host, t.event_uid"));
+}
+
+#[test]
+fn conversation_candidates_aggregate_live_term_frequency_before_scoring() {
+    let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
+        .expect("build ClickHouse client");
+    let repo = ClickHouseConversationRepository::new(client, RepoConfig::default());
+    let terms = vec!["needle".to_string()];
+    let idf = HashMap::from([("needle".to_string(), 1.0)]);
+
+    let sql = repo
+        .build_search_conversation_candidates_sql(
+            &terms, &idf, true, false, 1, 20, None, None, None,
+        )
+        .expect("build conversation candidate SQL");
+
+    assert!(sql.contains("sum(p.tf) AS tf_sum"));
+    assert!(sql.contains("GROUP BY p.session_id, p.term"));
+    assert!(sql.contains("log1p(toFloat64(terms.tf_sum))"));
+    assert!(!sql.contains("log1p(toFloat64(p.tf))"));
+}
+
+#[test]
+fn conversation_candidate_document_filters_only_select_eligible_sessions() {
+    let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
+        .expect("build ClickHouse client");
+    let repo = ClickHouseConversationRepository::new(client, RepoConfig::default());
+    let terms = vec!["needle".to_string()];
+    let idf = HashMap::from([("needle".to_string(), 1.0)]);
+
+    let sql = repo
+        .build_search_conversation_candidates_sql(
+            &terms,
+            &idf,
+            false,
+            true,
+            1,
+            20,
+            Some(1_000),
+            Some(2_000),
+            None,
+        )
+        .expect("build filtered conversation candidate SQL");
+    let (_, after_eligible) = sql
+        .split_once("eligible_sessions AS (\n")
+        .expect("eligible-session CTE");
+    let (eligible, after_eligible) = after_eligible
+        .split_once("  ),\n  session_terms AS (\n")
+        .expect("session-term CTE boundary");
+    let (session_terms, _) = after_eligible
+        .split_once("  )\nSELECT")
+        .expect("session-term CTE end");
+
+    assert!(eligible.contains("v_live_search_documents"));
+    assert!(eligible.contains("toUnixTimestamp64Milli(d.ingested_at) >= 1000"));
+    assert!(eligible.contains("toUnixTimestamp64Milli(d.ingested_at) < 2000"));
+    assert!(session_terms.contains("ALL INNER JOIN eligible_sessions AS eligible"));
+    assert!(session_terms.contains("WHERE p.term IN q_terms"));
+    assert!(!session_terms.contains("v_live_search_documents"));
+    assert!(!session_terms.contains("d.ingested_at"));
 }
 
 #[test]
@@ -473,6 +605,36 @@ fn dedupe_search_rows_prefers_message_over_event_msg_mirror() {
 }
 
 #[test]
+fn dedupe_search_rows_never_collapses_mirrors_from_different_hosts() {
+    let first = sample_search_row(
+        "shared-uid",
+        "sess-a",
+        "event_msg",
+        "agent_message",
+        "assistant",
+        "same answer",
+        18.26,
+        3,
+    );
+    let mut second = sample_search_row(
+        "shared-uid",
+        "sess-a",
+        "message",
+        "message",
+        "assistant",
+        "same answer",
+        18.26,
+        3,
+    );
+    second.source_host = "host-b".to_string();
+
+    let deduped = ClickHouseConversationRepository::dedupe_search_rows(vec![first, second], 5);
+    assert_eq!(deduped.len(), 2);
+    assert_eq!(deduped[0].source_host, "host-a");
+    assert_eq!(deduped[1].source_host, "host-b");
+}
+
+#[test]
 fn dedupe_search_rows_fills_limit_after_collapsing_mirrors() {
     let rows = vec![
         sample_search_row(
@@ -679,6 +841,10 @@ fn dedupe_mcp_search_rows_preserves_non_mirror_codex_final_answers() {
     different_session.session_id = "session-2".to_string();
     assert_distinct(different_session);
 
+    let mut different_host = event_msg.clone();
+    different_host.source_host = "host-b".to_string();
+    assert_distinct(different_host);
+
     let mut different_turn = event_msg.clone();
     different_turn.turn_seq += 1;
     assert_distinct(different_turn);
@@ -822,6 +988,7 @@ fn open_context_filter_clause_respects_include_system_events_flag() {
 #[test]
 fn cached_posting_ranker_matches_full_sort_reference() {
     let posting = |event_uid: &str, doc_len: u32, tf: u16| CachedPostingRow {
+        source_host: "host-a".to_string(),
         event_uid: event_uid.to_string(),
         doc_len,
         tf,
@@ -886,18 +1053,17 @@ fn cached_posting_ranker_matches_full_sort_reference() {
         0.0,
     );
 
-    let mut reference_by_uid = HashMap::<&str, SearchScoreAccum<'_>>::new();
+    let mut reference_by_identity = HashMap::<(&str, &str), SearchScoreAccum<'_>>::new();
     for (idx, term) in terms.iter().enumerate() {
         let idf = ClickHouseConversationRepository::bm25_idf(docs, df_by_term[term]);
         for row in postings_by_term[term].iter() {
-            let entry =
-                reference_by_uid
-                    .entry(row.event_uid.as_str())
-                    .or_insert(SearchScoreAccum {
-                        row,
-                        score: 0.0,
-                        matched_mask: 0,
-                    });
+            let entry = reference_by_identity
+                .entry((row.source_host.as_str(), row.event_uid.as_str()))
+                .or_insert(SearchScoreAccum {
+                    row,
+                    score: 0.0,
+                    matched_mask: 0,
+                });
             entry.score += idf
                 * ClickHouseConversationRepository::bm25_term_score(
                     row.tf,
@@ -909,7 +1075,7 @@ fn cached_posting_ranker_matches_full_sort_reference() {
             entry.matched_mask |= 1_u64 << idx;
         }
     }
-    let mut expected = reference_by_uid
+    let mut expected = reference_by_identity
         .into_values()
         .filter_map(|acc| {
             let matched_terms = u64::from(acc.matched_mask.count_ones());
@@ -924,6 +1090,7 @@ fn cached_posting_ranker_matches_full_sort_reference() {
         b.score
             .total_cmp(&a.score)
             .then_with(|| a.row.event_uid.cmp(&b.row.event_uid))
+            .then_with(|| a.row.source_host.cmp(&b.row.source_host))
     });
 
     assert_eq!(actual.len(), expected.len());
@@ -943,6 +1110,68 @@ fn cached_posting_ranker_matches_full_sort_reference() {
             expected.score
         );
     }
+}
+
+#[test]
+fn cached_posting_ranker_keeps_identical_uids_from_different_hosts_distinct() {
+    let terms = vec!["alpha".to_string(), "beta".to_string()];
+    let postings_by_term = HashMap::<String, Arc<[CachedPostingRow]>>::from([
+        (
+            "alpha".to_string(),
+            Arc::from(
+                vec![CachedPostingRow {
+                    source_host: "host-a".to_string(),
+                    event_uid: "shared-uid".to_string(),
+                    doc_len: 2,
+                    tf: 1,
+                }]
+                .into_boxed_slice(),
+            ),
+        ),
+        (
+            "beta".to_string(),
+            Arc::from(
+                vec![CachedPostingRow {
+                    source_host: "host-b".to_string(),
+                    event_uid: "shared-uid".to_string(),
+                    doc_len: 2,
+                    tf: 1,
+                }]
+                .into_boxed_slice(),
+            ),
+        ),
+    ]);
+    let df_by_term = HashMap::from([("alpha".to_string(), 1), ("beta".to_string(), 1)]);
+
+    let ranked = ClickHouseConversationRepository::rank_cached_postings(
+        &terms,
+        &postings_by_term,
+        &df_by_term,
+        2,
+        2.0,
+        1.2,
+        0.75,
+        1,
+        0.0,
+    );
+
+    assert_eq!(ranked.len(), 2);
+    assert_eq!(ranked[0].row.event_uid, "shared-uid");
+    assert_eq!(ranked[1].row.event_uid, "shared-uid");
+    assert_eq!(ranked[0].row.source_host, "host-a");
+    assert_eq!(ranked[1].row.source_host, "host-b");
+    assert_eq!(ranked[0].matched_terms, 1);
+    assert_eq!(ranked[1].matched_terms, 1);
+}
+
+#[test]
+fn bm25_idf_treats_identical_uids_on_two_hosts_as_two_documents() {
+    let host_qualified = ClickHouseConversationRepository::bm25_idf(2, 2);
+    let uid_only_bug = ClickHouseConversationRepository::bm25_idf(2, 1);
+
+    assert!((host_qualified - 1.2_f64.ln()).abs() < 1e-12);
+    assert!((uid_only_bug - 2.0_f64.ln()).abs() < 1e-12);
+    assert!(host_qualified < uid_only_bug);
 }
 
 #[test]
@@ -970,6 +1199,7 @@ fn autoresearch_retrieval_benchmark() {
                         .rotate_left((term_index * 7) as u32)
                         ^ (term_index as u64).wrapping_mul(0xd6e8_feb8_6659_fd93);
                     mixed.is_multiple_of(5).then(|| CachedPostingRow {
+                        source_host: "host-a".to_string(),
                         event_uid: format!("event-{doc:05}"),
                         doc_len: 64 + (mixed % 448) as u32,
                         tf: 1 + ((mixed >> 11) % 7) as u16,
@@ -1061,4 +1291,99 @@ fn autoresearch_retrieval_benchmark() {
         1_000_000_000.0 / serial_ns as f64
     );
     println!("METRIC retrieval_candidate_count={expected_len}");
+}
+
+// --- issue #600: typed budget-error classification at the repo boundary ---
+
+fn interactive_test_budget() -> moraine_config::ValidatedQueryBudget {
+    moraine_config::ValidatedQueryBudgets::from_config(
+        &moraine_config::QueryBudgetsConfig::default(),
+    )
+    .expect("default budgets validate")
+    .interactive
+}
+
+#[test]
+fn classify_backend_error_maps_envelope_deadline_to_deadline_exceeded() {
+    let error = anyhow::Error::new(EnvelopeError::DeadlineExpired {
+        budget: Duration::from_secs(15),
+    })
+    .context("outer repository context");
+    match classify_backend_error(error) {
+        RepoError::DeadlineExceeded { budget_note } => {
+            assert!(
+                budget_note.contains("15.000"),
+                "note should carry the budget: {budget_note}"
+            );
+        }
+        other => panic!("expected DeadlineExceeded, got {other:?}"),
+    }
+}
+
+#[test]
+fn classify_backend_error_maps_cap_and_allowance_to_resource_exhausted() {
+    let cap = anyhow::Error::new(EnvelopeError::StatementCapExceeded { cap: 4 });
+    assert!(matches!(
+        classify_backend_error(cap),
+        RepoError::ResourceExhausted { .. }
+    ));
+
+    let allowance = anyhow::Error::new(EnvelopeError::AllowanceExhausted {
+        resource: moraine_clickhouse::AllowanceResource::Rows,
+        budget: 100,
+    });
+    match classify_backend_error(allowance) {
+        RepoError::ResourceExhausted { budget_note } => {
+            assert!(
+                budget_note.contains("read_rows"),
+                "note should name the exhausted resource: {budget_note}"
+            );
+        }
+        other => panic!("expected ResourceExhausted, got {other:?}"),
+    }
+}
+
+#[test]
+fn classify_backend_error_keeps_unclassified_failures_as_backend() {
+    // A missing envelope is not a budget outcome: pre-flip it cannot happen
+    // at classification time (the statement ran unenveloped), and post-flip
+    // it is a wiring bug — either way it stays an opaque backend error.
+    let missing = anyhow::Error::new(EnvelopeError::Missing);
+    assert!(matches!(
+        classify_backend_error(missing),
+        RepoError::Backend(_)
+    ));
+
+    let plain = anyhow::anyhow!("clickhouse returned 500 Internal Server Error: Code: 60");
+    match classify_backend_error(plain) {
+        RepoError::Backend(message) => assert!(message.contains("Code: 60")),
+        other => panic!("expected Backend, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn classify_backend_error_is_stable_inside_an_active_envelope_scope() {
+    let budget = interactive_test_budget();
+    let envelope = QueryEnvelope::new("request", QueryClass::Interactive, &budget);
+    envelope
+        .scope(async move {
+            // Local admission errors keep their own budget text under scope().
+            let error = anyhow::Error::new(EnvelopeError::DeadlineExpired {
+                budget: Duration::from_secs(15),
+            });
+            match classify_backend_error(error) {
+                RepoError::DeadlineExceeded { budget_note } => {
+                    assert!(budget_note.contains("deadline expired"));
+                }
+                other => panic!("expected DeadlineExceeded, got {other:?}"),
+            }
+            // Errors without a typed budget root stay opaque Backend errors
+            // even while an envelope is active (no false positives).
+            let unrelated = anyhow::anyhow!("some transport failure");
+            assert!(matches!(
+                classify_backend_error(unrelated),
+                RepoError::Backend(_)
+            ));
+        })
+        .await;
 }

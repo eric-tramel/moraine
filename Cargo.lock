@@ -1204,6 +1204,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "url",
 ]
@@ -1228,6 +1229,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "futures-util",
  "moraine-clickhouse",
  "moraine-config",
  "moraine-monitor-core",
@@ -1235,6 +1237,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -1276,6 +1279,7 @@ dependencies = [
  "tracing",
  "url",
  "urlencoding",
+ "uuid",
  "walkdir",
 ]
 

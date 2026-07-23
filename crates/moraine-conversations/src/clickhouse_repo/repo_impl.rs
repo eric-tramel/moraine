@@ -12,21 +12,33 @@ impl ConversationRepository for ClickHouseConversationRepository {
     }
 
     async fn prewarm_mcp_search_state(&self) -> RepoResult<()> {
-        ClickHouseConversationRepository::prewarm_mcp_search_state(self).await
+        self.run_publication_consistent(PublicationReadClass::MovingFeed, || {
+            ClickHouseConversationRepository::prewarm_mcp_search_state(self)
+        })
+        .await
     }
     async fn list_session_analytics(
         &self,
         query: SessionAnalyticsQuery,
     ) -> RepoResult<Vec<SessionAnalytics>> {
-        self.list_session_analytics_impl(query).await
+        self.run_publication_consistent(PublicationReadClass::MovingFeed, || {
+            self.list_session_analytics_impl(query.clone())
+        })
+        .await
     }
 
     async fn analytics_series(&self, range: AnalyticsRange) -> RepoResult<AnalyticsSnapshot> {
-        self.analytics_series_impl(range).await
+        self.run_publication_consistent(PublicationReadClass::MovingFeed, || {
+            self.analytics_series_impl(range)
+        })
+        .await
     }
 
     async fn list_web_searches(&self, limit: u16) -> RepoResult<Vec<WebSearchEvent>> {
-        self.list_web_searches_impl(limit).await
+        self.run_publication_consistent(PublicationReadClass::MovingFeed, || {
+            self.list_web_searches_impl(limit)
+        })
+        .await
     }
 
     async fn latest_ingest_heartbeat(&self) -> RepoResult<IngestHeartbeatRead> {
@@ -54,7 +66,10 @@ impl ConversationRepository for ClickHouseConversationRepository {
         filter: ConversationListFilter,
         page: PageRequest,
     ) -> RepoResult<Page<ConversationSummary>> {
-        self.list_conversations_impl(filter, page).await
+        self.run_publication_consistent(PublicationReadClass::MovingFeed, || {
+            self.list_conversations_impl(filter.clone(), page.clone())
+        })
+        .await
     }
 
     async fn get_conversation(
@@ -62,15 +77,30 @@ impl ConversationRepository for ClickHouseConversationRepository {
         session_id: &str,
         opts: ConversationDetailOptions,
     ) -> RepoResult<Option<Conversation>> {
-        self.get_conversation_impl(session_id, opts).await
+        self.run_publication_consistent_scoped(
+            PublicationReadClass::Strict,
+            PublicationReadScope::session(session_id),
+            || self.get_conversation_impl(session_id, opts.clone()),
+        )
+        .await
     }
 
     async fn get_session_metadata(&self, session_id: &str) -> RepoResult<Option<SessionMetadata>> {
-        self.get_session_metadata_impl(session_id).await
+        self.run_publication_consistent_scoped(
+            PublicationReadClass::Strict,
+            PublicationReadScope::session(session_id),
+            || self.get_session_metadata_impl(session_id),
+        )
+        .await
     }
 
     async fn get_mcp_session(&self, session_id: &str) -> RepoResult<Option<McpSessionOpen>> {
-        self.get_mcp_session_impl(session_id).await
+        self.run_publication_consistent_scoped(
+            PublicationReadClass::Strict,
+            PublicationReadScope::session(session_id),
+            || self.get_mcp_session_impl(session_id),
+        )
+        .await
     }
 
     async fn list_mcp_sessions(
@@ -78,7 +108,10 @@ impl ConversationRepository for ClickHouseConversationRepository {
         filter: McpSessionListFilter,
         page: PageRequest,
     ) -> RepoResult<Page<McpSessionListItem>> {
-        self.list_mcp_sessions_impl(filter, page).await
+        self.run_publication_consistent(PublicationReadClass::MovingFeed, || {
+            self.list_mcp_sessions_impl(filter.clone(), page.clone())
+        })
+        .await
     }
 
     async fn list_turns(
@@ -87,11 +120,21 @@ impl ConversationRepository for ClickHouseConversationRepository {
         filter: TurnListFilter,
         page: PageRequest,
     ) -> RepoResult<Page<TurnSummary>> {
-        self.list_turns_impl(session_id, filter, page).await
+        self.run_publication_consistent_scoped(
+            PublicationReadClass::Strict,
+            PublicationReadScope::session(session_id),
+            || self.list_turns_impl(session_id, filter.clone(), page.clone()),
+        )
+        .await
     }
 
     async fn get_turn(&self, session_id: &str, turn_seq: u32) -> RepoResult<Option<Turn>> {
-        self.get_turn_impl(session_id, turn_seq).await
+        self.run_publication_consistent_scoped(
+            PublicationReadClass::Strict,
+            PublicationReadScope::session(session_id),
+            || self.get_turn_impl(session_id, turn_seq),
+        )
+        .await
     }
 
     async fn get_mcp_turn(
@@ -99,7 +142,12 @@ impl ConversationRepository for ClickHouseConversationRepository {
         session_id: &str,
         turn_seq: u32,
     ) -> RepoResult<Option<McpTurnOpen>> {
-        self.get_mcp_turn_impl(session_id, turn_seq, true).await
+        self.run_publication_consistent_scoped(
+            PublicationReadClass::Strict,
+            PublicationReadScope::session(session_id),
+            || self.get_mcp_turn_impl(session_id, turn_seq, true),
+        )
+        .await
     }
 
     async fn get_mcp_turn_summary(
@@ -107,15 +155,43 @@ impl ConversationRepository for ClickHouseConversationRepository {
         session_id: &str,
         turn_seq: u32,
     ) -> RepoResult<Option<McpTurnOpen>> {
-        self.get_mcp_turn_impl(session_id, turn_seq, false).await
+        self.run_publication_consistent_scoped(
+            PublicationReadClass::Strict,
+            PublicationReadScope::session(session_id),
+            || self.get_mcp_turn_impl(session_id, turn_seq, false),
+        )
+        .await
     }
 
     async fn open_event(&self, req: OpenEventRequest) -> RepoResult<OpenContext> {
-        self.open_event_impl(req).await
+        let scope = PublicationReadScope::event(&req.event_uid);
+        self.run_publication_consistent_scoped_with_result_scope(
+            PublicationReadClass::Strict,
+            scope,
+            |result: &OpenContext| {
+                if result.found {
+                    Some(PublicationReadScope::session(&result.session_id))
+                } else {
+                    None
+                }
+            },
+            || self.open_event_impl(req.clone()),
+        )
+        .await
     }
 
     async fn get_mcp_event(&self, event_uid: &str) -> RepoResult<Option<McpEventOpen>> {
-        self.get_mcp_event_impl(event_uid).await
+        self.run_publication_consistent_scoped_with_result_scope(
+            PublicationReadClass::Strict,
+            PublicationReadScope::event(event_uid),
+            |result: &Option<McpEventOpen>| {
+                result
+                    .as_ref()
+                    .map(|event| PublicationReadScope::session(&event.event.session_id))
+            },
+            || self.get_mcp_event_impl(event_uid),
+        )
+        .await
     }
 
     async fn list_session_events(
@@ -123,43 +199,64 @@ impl ConversationRepository for ClickHouseConversationRepository {
         query: SessionEventsQuery,
         page: PageRequest,
     ) -> RepoResult<Page<TraceEvent>> {
-        self.list_session_events_impl(query, page).await
+        let scope = PublicationReadScope::session(&query.session_id);
+        self.run_publication_consistent_scoped(PublicationReadClass::Strict, scope, || {
+            self.list_session_events_impl(query.clone(), page.clone())
+        })
+        .await
     }
 
     async fn search_events(&self, query: SearchEventsQuery) -> RepoResult<SearchEventsResult> {
-        self.search_events_impl(query).await
+        self.run_publication_consistent(PublicationReadClass::MovingFeed, || {
+            self.search_events_impl(query.clone())
+        })
+        .await
     }
 
     async fn search_mcp_events(
         &self,
         query: SearchMcpEventsQuery,
     ) -> RepoResult<SearchMcpEventsResult> {
-        if let Some(query_id) = query.cancellation_token.clone() {
-            with_repository_query_id(query_id, self.search_mcp_events_impl(query)).await
-        } else {
-            self.search_mcp_events_impl(query).await
-        }
+        // Query ids and deadlines are owned by the transport envelope; the
+        // legacy per-tool id rescope is gone. The caller's cancellation token
+        // survives only as the reported `query_id` in the result — explicit
+        // cancellation now targets the envelope's request id via
+        // `cancel_query`, and abandoned statements are killed by the
+        // transport's drop guards.
+        self.run_publication_consistent(PublicationReadClass::MovingFeed, || {
+            self.search_mcp_events_impl(query.clone())
+        })
+        .await
     }
 
     async fn search_conversations(
         &self,
         query: ConversationSearchQuery,
     ) -> RepoResult<ConversationSearchResults> {
-        self.search_conversations_impl(query).await
+        self.run_publication_consistent(PublicationReadClass::MovingFeed, || {
+            self.search_conversations_impl(query.clone())
+        })
+        .await
     }
 
     async fn search_session_metadata(
         &self,
         query: SessionMetadataSearchQuery,
     ) -> RepoResult<SessionMetadataSearchResults> {
-        ClickHouseConversationRepository::search_session_metadata(self, query).await
+        self.run_publication_consistent(PublicationReadClass::MovingFeed, || {
+            ClickHouseConversationRepository::search_session_metadata(self, query.clone())
+        })
+        .await
     }
 
     async fn file_attention(
         &self,
         query: FileAttentionQuery,
     ) -> RepoResult<Vec<FileAttentionTouch>> {
-        self.file_attention_impl(query).await
+        // Delegate to the inherent method so both entry points share the
+        // publication scope AND the envelope deadline narrowing to the
+        // tool's execution budget.
+        ClickHouseConversationRepository::file_attention(self, query).await
     }
 
     async fn cancel_query(&self, query_id: &str) -> RepoResult<()> {

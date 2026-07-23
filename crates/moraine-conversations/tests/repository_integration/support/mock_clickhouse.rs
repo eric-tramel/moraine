@@ -97,10 +97,45 @@ pub(crate) struct MockOptions {
 #[derive(Default)]
 pub(crate) struct MockState {
     pub(crate) queries: Mutex<Vec<String>>,
+    pub(crate) publication_snapshot_queries: Mutex<Vec<String>>,
     pub(crate) query_ids: Mutex<Vec<Option<String>>>,
     pub(crate) request_params: Mutex<Vec<HashMap<String, String>>>,
     pub(crate) options: MockOptions,
     pub(crate) scripted_responses: Mutex<Option<VecDeque<ScriptedResponse>>>,
+}
+
+/// Run one repository interaction under a generous Interactive-class
+/// envelope (30s deadline, bundled-default caps). Post-flip (issue #600
+/// W12) the transport refuses unenveloped statements, so every integration
+/// test scopes its repository calls through this helper; tests that prove
+/// specific budget behavior build their own tighter envelopes instead.
+pub(crate) async fn scoped<F: std::future::Future>(f: F) -> F::Output {
+    moraine_conversations::QueryEnvelope::new(
+        "test",
+        moraine_conversations::QueryClass::Interactive,
+        &interactive_test_budget(30.0),
+    )
+    .scope(f)
+    .await
+}
+
+/// Interactive-class query budget with the given deadline for
+/// envelope-scoped integration tests; every other field keeps the bundled
+/// defaults (budgets are constructible only from validated config).
+pub(crate) fn interactive_test_budget(
+    deadline_seconds: f64,
+) -> moraine_config::ValidatedQueryBudget {
+    let defaults = moraine_config::QueryBudgetsConfig::default();
+    let cfg = moraine_config::QueryBudgetsConfig {
+        interactive: moraine_config::QueryBudgetClassConfig {
+            deadline_seconds,
+            ..defaults.interactive
+        },
+        ..defaults
+    };
+    moraine_config::ValidatedQueryBudgets::from_config(&cfg)
+        .expect("test budget validates")
+        .interactive
 }
 
 pub(crate) fn test_clickhouse_config(url: String) -> ClickHouseConfig {
@@ -121,6 +156,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
         State(state): State<Arc<MockState>>,
         Query(params): Query<HashMap<String, String>>,
         headers: HeaderMap,
+        body: String,
     ) -> (StatusCode, String) {
         if headers.get("content-length").is_none() {
             return (
@@ -129,7 +165,75 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             );
         }
 
-        let query = params.get("query").cloned().unwrap_or_default();
+        let query = params
+            .get("query")
+            .filter(|query| !query.is_empty())
+            .cloned()
+            .unwrap_or(body);
+        // Cancellation KILLs are recorded (the cancel_query tests assert the
+        // prefix contract) but answered out-of-band: drop-guard KILLs are
+        // spawned, best-effort, and racy by design (issue #600), so they
+        // must never consume a scripted response or trip a query barrier.
+        if query.trim_start().starts_with("KILL QUERY") {
+            state.queries.lock().expect("query lock").push(query);
+            state
+                .query_ids
+                .lock()
+                .expect("query id lock")
+                .push(params.get("query_id").cloned());
+            state
+                .request_params
+                .lock()
+                .expect("request params lock")
+                .push(params.clone());
+            return (StatusCode::OK, String::new());
+        }
+        // Publication capture/revalidation is repository infrastructure, not
+        // part of the individual query scripts below. Keep the legacy
+        // fixtures focused on the operation under test while returning one
+        // combined, stable publication-head and append-fence snapshot.
+        if query.contains("moraine:publication_snapshot:") {
+            state
+                .publication_snapshot_queries
+                .lock()
+                .expect("publication snapshot query lock")
+                .push(query);
+            return (
+                StatusCode::OK,
+                json_each_row(json!([
+                    {
+                        "row_kind": 0_u8,
+                        "source_host": "",
+                        "publication_revision": 1_u64,
+                        "head_count": 0_u64,
+                        "head_fingerprint": "",
+                        "host": "",
+                        "control_revision": 0_u64,
+                        "cache_epoch": 0_u64,
+                        "state": "",
+                        "batch_id": "",
+                        "publisher_id": "",
+                        "manifest_json": "",
+                        "insert_only": 0_u8
+                    },
+                    {
+                        "row_kind": 1_u8,
+                        "source_host": "",
+                        "publication_revision": 0_u64,
+                        "head_count": 0_u64,
+                        "head_fingerprint": "",
+                        "host": "host-a",
+                        "control_revision": 1_u64,
+                        "cache_epoch": 1_u64,
+                        "state": "idle",
+                        "batch_id": "",
+                        "publisher_id": "publisher-a",
+                        "manifest_json": "",
+                        "insert_only": 0_u8
+                    }
+                ])),
+            );
+        }
         state
             .queries
             .lock()
@@ -205,12 +309,14 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             return (StatusCode::OK, json_each_row(json!([{ "ready": 1_u8 }])));
         }
 
-        if query.contains("FROM `moraine`.`mcp_open_sessions`")
+        if query.contains("FROM `moraine`.`mcp_open_publication_headers`")
             && query.contains("FINAL")
             && !query.contains("toUInt8(0) AS row_kind")
+            && !query.contains("candidate_heads AS")
+            && !query.contains("current_headers AS")
         {
             let session_id = query
-                .split("session_id = '")
+                .split("s.session_id = '")
                 .nth(1)
                 .and_then(|rest| rest.split('\'').next())
                 .unwrap_or("");
@@ -242,7 +348,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
         }
 
         if query.contains("FROM `moraine`.`mcp_open_events` FINAL")
-            && query.contains("SELECT\n  event_uid,\n  session_id,")
+            && query.contains("SELECT\n  source_host,\n  event_uid,\n  session_id,")
         {
             let event_uid = query
                 .split("WHERE event_uid = '")
@@ -267,7 +373,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
         }
 
         if query.contains("FROM `moraine`.`mcp_open_events` FINAL")
-            && query.contains("event_uid IN")
+            && query.contains("event_order IN")
             && !query.contains("toUInt8(0) AS row_kind")
         {
             return (StatusCode::OK, json_each_row(json!(event_ref_rows())));
@@ -308,7 +414,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             );
         }
 
-        if query.contains("FROM `moraine`.`tool_io` FINAL")
+        if query.contains("FROM `moraine`.`v_live_tool_io`")
             && query.contains("repo_rel_path = 'crates/foo.rs'")
             && query.contains("project_id = 'project-a'")
             && !query.contains("JSONExtractString(input_json")
@@ -337,7 +443,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             );
         }
 
-        if query.contains("FROM `moraine`.`tool_io` FINAL")
+        if query.contains("FROM `moraine`.`v_live_tool_io`")
             && query.contains("JSONExtractString(input_json, 'path')")
             && query.contains("crates/foo.rs")
         {
@@ -382,9 +488,9 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             );
         }
 
-        if query.contains("FROM `moraine`.`v_session_summary` AS s")
-            && query.contains("AS completed")
-            && query.contains("latest_terminal_payload_type")
+        if query.contains("FROM `moraine`.`mcp_open_publication_headers` AS h FINAL")
+            && query.contains("current_headers AS")
+            && query.contains("toUInt8(s.completed) AS completed")
         {
             if query.contains("s.session_id < 'sess_b'") {
                 return (
@@ -803,7 +909,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             );
         }
 
-        if query.contains("toUInt8(0) AS row_kind") && query.contains("projected_candidates AS") {
+        if query.contains("toUInt8(0) AS row_kind") && query.contains("term_postings AS (") {
             let candidate_query_count = state
                 .queries
                 .lock()
@@ -811,7 +917,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                 .iter()
                 .filter(|candidate_query| {
                     candidate_query.contains("toUInt8(0) AS row_kind")
-                        && candidate_query.contains("projected_candidates AS")
+                        && candidate_query.contains("term_postings AS (")
                 })
                 .count();
             if candidate_query_count == 2 && query.contains("search_corpus_stats") {
@@ -1083,7 +1189,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
 
         if query.contains("AS mcp_event_type")
             && query.contains("AS raw_score")
-            && query.contains("FROM `moraine`.`search_postings` AS p")
+            && query.contains("FROM `moraine`.`v_live_search_postings` AS p")
         {
             let assistant_row = json!({
                 "event_uid": "evt-c-42",
@@ -1246,7 +1352,10 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             );
         }
 
-        if query.contains("FROM `moraine`.`search_conversation_terms` AS ct") {
+        if query.contains("FROM `moraine`.`v_live_search_postings` AS p")
+            && query.contains("GROUP BY p.session_id")
+            && query.contains("SELECT\n  c.session_id AS session_id")
+        {
             return (
                 StatusCode::OK,
                 json_each_row(json!([
@@ -1265,7 +1374,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
         }
 
         if query.contains("GROUP BY e.session_id")
-            && query.contains("FROM `moraine`.`search_postings` AS p")
+            && query.contains("FROM `moraine`.`v_live_search_postings` AS p")
         {
             return (
                 StatusCode::OK,
@@ -1346,8 +1455,8 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             );
         }
 
-        if query.contains("WHERE event_uid IN")
-            && query.contains("GROUP BY event_uid")
+        if query.contains("WHERE document.event_uid IN")
+            && query.contains("GROUP BY document.source_host, document.event_uid")
             && query.contains("AS text_content")
             && query.contains("AS payload_json")
             && query.contains("AS event_class")
@@ -1396,9 +1505,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             );
         }
 
-        if query.contains("WITH\n  ['rare','summary'] AS q_terms")
-            && query.contains("FROM (SELECT * FROM `moraine`.`events` FINAL) AS e")
-            && query.contains("WHERE e.event_kind = 'session_meta'")
+        if query.contains("WHERE e.event_kind = 'session_meta'")
             && query.contains("AS meta_event_uid")
             && query.contains("AS matched_terms")
         {
@@ -1923,7 +2030,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             );
         }
 
-        if query.contains("FROM `moraine`.`search_documents`")
+        if query.contains("FROM `moraine`.`v_live_search_documents`")
             && query.contains("WHERE event_uid = 'evt-open-full'")
         {
             return (
@@ -2163,6 +2270,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
         .then(|| options.scripted_responses.iter().cloned().collect());
     let state = Arc::new(MockState {
         queries: Mutex::default(),
+        publication_snapshot_queries: Mutex::default(),
         query_ids: Mutex::default(),
         request_params: Mutex::default(),
         options,

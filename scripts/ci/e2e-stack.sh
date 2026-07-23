@@ -1512,6 +1512,15 @@ EOF
   assert_clickhouse_count "$clickhouse_url" "codex unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-codex'" "8"
   assert_clickhouse_count "$clickhouse_url" "codex event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex'" "8"
   assert_clickhouse_count "$clickhouse_url" "codex link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-codex' AND link_type = 'parent_event' AND linked_external_id = 'msg-user-${run_stamp}'" "1"
+  # Physical rows can precede the initial source head while its MCP candidate
+  # is prepared. Wait for the exact owner-authorized link before mutating its
+  # independent replacement token below.
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.v_live_event_links WHERE source_name = 'ci-codex' AND link_type = 'parent_event' AND linked_external_id = 'msg-user-${run_stamp}'" 120
+  # Derived rows receive their own wall-clock event_version and therefore do
+  # not necessarily share the event row's millisecond.  A later derived
+  # version for the same generation-scoped event UID must remain live.
+  clickhouse_scalar "$clickhouse_url" "INSERT INTO ${clickhouse_database}.event_links SELECT * REPLACE (event_version + 100 AS event_version) FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-codex' AND link_type = 'parent_event' AND linked_external_id = 'msg-user-${run_stamp}'" >/dev/null
+  assert_clickhouse_count "$clickhouse_url" "codex version-skewed live link" "SELECT count() FROM ${clickhouse_database}.v_live_event_links WHERE source_name = 'ci-codex' AND link_type = 'parent_event' AND linked_external_id = 'msg-user-${run_stamp}'" "1"
   assert_clickhouse_count "$clickhouse_url" "codex tool rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-codex' AND tool_call_id = 'codex-tool-${run_stamp}'" "2"
   assert_clickhouse_count "$clickhouse_url" "codex tool request fields" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-codex' AND tool_call_id = 'codex-tool-${run_stamp}' AND tool_name = 'Read' AND tool_phase = 'request'" "1"
   assert_clickhouse_count "$clickhouse_url" "codex plain-git event identity" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex' AND event_kind = 'tool_call' AND project_id != '' AND worktree_root = '${codex_project_dir}'" "1"
@@ -1523,15 +1532,16 @@ EOF
   # Simulate rows ingested before normalized project fields existed. The MCP
   # smoke below must recover only this retained, structured path + cwd evidence
   # and map it back to the launch repository without resetting checkpoints.
-  clickhouse_scalar "$clickhouse_url" "INSERT INTO ${clickhouse_database}.tool_io SELECT * REPLACE ('' AS project_id, '' AS repo_rel_path, '' AS worktree_root, event_version + 100 AS event_version) FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-codex' AND tool_call_id = 'codex-tool-${run_stamp}' AND tool_phase = 'request'" >/dev/null
+  clickhouse_scalar "$clickhouse_url" "INSERT INTO ${clickhouse_database}.tool_io SELECT * REPLACE ('' AS project_id, '' AS repo_rel_path, '' AS worktree_root, event_version + 100 AS event_version, source_event_version + 100 AS source_event_version) FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-codex' AND tool_call_id = 'codex-tool-${run_stamp}' AND tool_phase = 'request'" >/dev/null
   clickhouse_scalar "$clickhouse_url" "INSERT INTO ${clickhouse_database}.events SELECT * REPLACE ('' AS project_id, '' AS repo_rel_path, '' AS worktree_root, event_version + 100 AS event_version) FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex' AND event_kind = 'tool_call' AND tool_call_id = 'codex-tool-${run_stamp}'" >/dev/null
   assert_clickhouse_count "$clickhouse_url" "codex legacy tool identity fixture" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-codex' AND tool_call_id = 'codex-tool-${run_stamp}' AND tool_phase = 'request' AND project_id = '' AND repo_rel_path = '' AND worktree_root = ''" "1"
+  assert_clickhouse_count "$clickhouse_url" "codex version-skewed live tool request" "SELECT count() FROM ${clickhouse_database}.v_live_tool_io WHERE source_name = 'ci-codex' AND tool_call_id = 'codex-tool-${run_stamp}' AND tool_phase = 'request' AND project_id = '' AND repo_rel_path = '' AND worktree_root = ''" "1"
 
   # Negative legacy fixtures: a top-level path plus nested path evidence, and
   # a nested-only path, may match the file tail but must never invent a root.
-  clickhouse_scalar "$clickhouse_url" "INSERT INTO ${clickhouse_database}.tool_io SELECT * REPLACE ('${codex_multi_path_session_id}' AS session_id, concat(event_uid, '-multi-path') AS event_uid, 'codex-multi-path-${run_stamp}' AS tool_call_id, '{\"path\":\"Cargo.toml\",\"options\":{\"file_path\":\"other.rs\"}}' AS input_json, '' AS project_id, '' AS repo_rel_path, '' AS worktree_root, event_version + 200 AS event_version) FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-codex' AND tool_call_id = 'codex-tool-${run_stamp}' AND tool_phase = 'request'" >/dev/null
+  clickhouse_scalar "$clickhouse_url" "INSERT INTO ${clickhouse_database}.tool_io SELECT * REPLACE ('${codex_multi_path_session_id}' AS session_id, concat(event_uid, '-multi-path') AS event_uid, 'codex-multi-path-${run_stamp}' AS tool_call_id, '{\"path\":\"Cargo.toml\",\"options\":{\"file_path\":\"other.rs\"}}' AS input_json, '' AS project_id, '' AS repo_rel_path, '' AS worktree_root, event_version + 200 AS event_version, source_event_version + 200 AS source_event_version) FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-codex' AND tool_call_id = 'codex-tool-${run_stamp}' AND tool_phase = 'request'" >/dev/null
   clickhouse_scalar "$clickhouse_url" "INSERT INTO ${clickhouse_database}.events SELECT * REPLACE ('${codex_multi_path_session_id}' AS session_id, concat(event_uid, '-multi-path') AS event_uid, 'codex-multi-path-${run_stamp}' AS tool_call_id, '' AS project_id, '' AS repo_rel_path, '' AS worktree_root, event_version + 200 AS event_version) FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex' AND event_kind = 'tool_call' AND tool_call_id = 'codex-tool-${run_stamp}'" >/dev/null
-  clickhouse_scalar "$clickhouse_url" "INSERT INTO ${clickhouse_database}.tool_io SELECT * REPLACE ('${codex_nested_path_session_id}' AS session_id, concat(event_uid, '-nested-path') AS event_uid, 'codex-nested-path-${run_stamp}' AS tool_call_id, '{\"options\":{\"path\":\"Cargo.toml\"}}' AS input_json, '' AS project_id, '' AS repo_rel_path, '' AS worktree_root, event_version + 300 AS event_version) FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-codex' AND tool_call_id = 'codex-tool-${run_stamp}' AND tool_phase = 'request'" >/dev/null
+  clickhouse_scalar "$clickhouse_url" "INSERT INTO ${clickhouse_database}.tool_io SELECT * REPLACE ('${codex_nested_path_session_id}' AS session_id, concat(event_uid, '-nested-path') AS event_uid, 'codex-nested-path-${run_stamp}' AS tool_call_id, '{\"options\":{\"path\":\"Cargo.toml\"}}' AS input_json, '' AS project_id, '' AS repo_rel_path, '' AS worktree_root, event_version + 300 AS event_version, source_event_version + 300 AS source_event_version) FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'ci-codex' AND tool_call_id = 'codex-tool-${run_stamp}' AND tool_phase = 'request'" >/dev/null
   clickhouse_scalar "$clickhouse_url" "INSERT INTO ${clickhouse_database}.events SELECT * REPLACE ('${codex_nested_path_session_id}' AS session_id, concat(event_uid, '-nested-path') AS event_uid, 'codex-nested-path-${run_stamp}' AS tool_call_id, '' AS project_id, '' AS repo_rel_path, '' AS worktree_root, event_version + 300 AS event_version) FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-codex' AND event_kind = 'tool_call' AND tool_call_id = 'codex-tool-${run_stamp}'" >/dev/null
 
   assert_clickhouse_count "$clickhouse_url" "claude unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-claude'" "3"
@@ -1563,6 +1573,10 @@ EOF
   assert_clickhouse_count "$clickhouse_url" "Qwen domain fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND harness = 'qwen-code' AND session_id = '${qwen_session_id}' AND cwd = '${tmp_root}/qwen-project'" "14"
   assert_clickhouse_count "$clickhouse_url" "Qwen model without provider" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND model = 'qwen3-coder-plus' AND inference_provider = ''" "13"
   assert_clickhouse_count "$clickhouse_url" "Qwen token accounting" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND item_id = 'qwen-assistant-${run_stamp}' AND event_kind = 'reasoning' AND input_tokens = 120 AND output_tokens = 80 AND cache_read_tokens = 20 AND cache_write_tokens = 0 AND token_usage_buckets['input_text'] = 91 AND token_usage_buckets['output_text'] = 62 AND token_usage_buckets['input_image'] = 4 AND token_usage_buckets['output_audio'] = 11 AND token_usage_buckets['reasoning'] = 7 AND token_usage_buckets['server_tool_use'] = 5" "1"
+  # Initial source publication now prepares each source's complete MCP
+  # compatibility candidate before making that source live. Physical event
+  # rows can therefore precede this pointer while the initial backfill drains.
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.mcp_open_sessions FINAL WHERE session_id = '${qwen_session_id}' AND title = 'Qwen e2e ${run_stamp}'" 120
   assert_clickhouse_count "$clickhouse_url" "Qwen title projection" "SELECT count() FROM ${clickhouse_database}.mcp_open_sessions FINAL WHERE session_id = '${qwen_session_id}' AND title = 'Qwen e2e ${run_stamp}'" "1"
   assert_clickhouse_count "$clickhouse_url" "Qwen reasoning row" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND item_id = 'qwen-assistant-${run_stamp}' AND event_kind = 'reasoning' AND has_reasoning = 1" "1"
   assert_clickhouse_count "$clickhouse_url" "Qwen projected assistant part order" "SELECT uniqExact(tuple(event_ordinal, event_class)) FROM ${clickhouse_database}.mcp_open_events FINAL WHERE session_id = '${qwen_session_id}' AND item_id = 'qwen-assistant-${run_stamp}' AND ((event_ordinal = 2 AND event_class = 'reasoning') OR (event_ordinal = 3 AND event_class = 'message') OR (event_ordinal = 4 AND event_class = 'tool_call'))" "3"
@@ -1844,6 +1858,8 @@ PY
   # deletion is archival: previously indexed remote metadata and durable bodies
   # remain retrievable.
   echo "[e2e] nac sqlite source deletion follows archival policy"
+  local nac_append_control_before_delete
+  nac_append_control_before_delete="$(clickhouse_scalar "$clickhouse_url" "SELECT toUInt64(control_revision) FROM ${clickhouse_database}.v_current_ingest_append_control WHERE host = ''")"
   "$python_bin" - "$nac_fixture_file" "$nac_remote_worker_id" <<'PY'
 import sqlite3
 import sys
@@ -1859,6 +1875,16 @@ PY
   sleep 3
   assert_clickhouse_count "$clickhouse_url" "nac deleted remote metadata remains archived" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND event_kind = 'session_meta' AND JSONExtractString(payload_json, 'cwd_scope') = 'remote'" "2"
   assert_clickhouse_count "$clickhouse_url" "nac deleted remote body remains archived" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND (position(text_content, '${nac_remote_keyword}') > 0 OR position(payload_json, '${nac_remote_keyword}') > 0)" "4"
+  # The archival rows can become visible before the ingest pass has committed
+  # its checkpoint/publication tail and before the MCP projector has consumed
+  # the resulting dirty revisions. Later cache assertions require a stable
+  # publication token, so wait for the mutation's own idle heartbeat, append
+  # fence, and projection catch-up rather than relying on a fixed sleep.
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.v_current_ingest_append_control WHERE host = '' AND state = 'idle' AND control_revision > ${nac_append_control_before_delete}" 120
+  local nac_heartbeat_after_delete_commit
+  nac_heartbeat_after_delete_commit="$(clickhouse_scalar "$clickhouse_url" "SELECT toString(max(ts)) FROM ${clickhouse_database}.ingest_heartbeats")"
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.ingest_heartbeats WHERE ts > parseDateTime64BestEffort('${nac_heartbeat_after_delete_commit}') AND queue_depth = 0 AND files_active = 0" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT toUInt64(count() = 0) FROM (SELECT dirty.session_id FROM ${clickhouse_database}.mcp_open_dirty_sessions AS dirty FINAL ANY INNER JOIN (SELECT DISTINCT session_id FROM ${clickhouse_database}.v_live_events WHERE source_name = 'ci-nac') AS live USING (session_id) ANY LEFT JOIN (SELECT session_id, dirty_revision FROM ${clickhouse_database}.mcp_open_sessions FINAL) AS projected USING (session_id) WHERE dirty.dirty_revision > ifNull(projected.dirty_revision, toUInt64(0)))" 120
 
 
   assert_clickhouse_count "$clickhouse_url" "hermes session unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-hermes-session'" "5"
@@ -2289,7 +2315,12 @@ PY
 )"
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND source_generation = 2 AND session_id = '${nac_replacement_session_id}' AND position(text_content, '${nac_replacement_keyword}') > 0" 120
   assert_clickhouse_count "$clickhouse_url" "nac replacement advances source generation" "SELECT count() FROM ${clickhouse_database}.ingest_checkpoints FINAL WHERE source_name = 'ci-nac' AND source_generation = 2" "1"
-  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM (SELECT session_id, generation, dirty_revision, total_events FROM ${clickhouse_database}.mcp_open_sessions FINAL WHERE session_id = '${nac_replacement_session_id}') AS projected INNER JOIN (SELECT session_id, dirty_revision FROM ${clickhouse_database}.mcp_open_dirty_sessions FINAL WHERE session_id = '${nac_replacement_session_id}') AS dirty USING (session_id) WHERE projected.total_events = 8 AND projected.dirty_revision = dirty.dirty_revision" 120
+  # Replacement replay rows are deliberately excluded from the ordinary
+  # append dirty-session MV until their source head is published. A session
+  # introduced by the replacement can therefore have a clean revision of zero
+  # without ever acquiring a physical dirty row.
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM (SELECT session_id, generation, dirty_revision, total_events FROM ${clickhouse_database}.mcp_open_sessions FINAL WHERE session_id = '${nac_replacement_session_id}') AS projected ANY LEFT JOIN (SELECT session_id, dirty_revision FROM ${clickhouse_database}.mcp_open_dirty_sessions FINAL WHERE session_id = '${nac_replacement_session_id}') AS dirty USING (session_id) WHERE projected.total_events = 8 AND projected.dirty_revision = ifNull(dirty.dirty_revision, toUInt64(0))" 120
+  assert_clickhouse_count "$clickhouse_url" "nac replacement bypasses append dirtiness" "SELECT count() FROM ${clickhouse_database}.mcp_open_dirty_sessions FINAL WHERE session_id = '${nac_replacement_session_id}'" "0"
   wait_for_clickhouse_scalar_stable "$clickhouse_url" "SELECT concat(toString(slot), ':', toString(generation), ':', toString(source_revision), ':', toString(dirty_revision), ':', toString(total_events)) FROM ${clickhouse_database}.mcp_open_sessions FINAL WHERE session_id = '${nac_replacement_session_id}' LIMIT 1" 60 5 >/dev/null
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
     --moraine "$moraine_bin" \

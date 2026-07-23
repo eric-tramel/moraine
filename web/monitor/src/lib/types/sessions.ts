@@ -84,6 +84,7 @@ export interface Session {
 
 export interface SessionsResponse {
   ok: boolean;
+  read_model?: 'live';
   sessions: Session[];
   models?: string[];
   harnesses?: Harness[];

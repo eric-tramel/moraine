@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import copy
+import json
+import os
+import re
 import tempfile
 import unittest
 from unittest import mock
@@ -13,7 +16,7 @@ if str(BENCH) not in sys.path:
 
 
 import performance_suite as suite
-from performance_fixtures import build_recipe
+from performance_fixtures import build_append_probe_events, build_recipe
 from performance_protocol import create_build_identity, create_build_recipe, sha256_json
 from performance_scenarios import ScenarioResult
 from performance_suite import (
@@ -28,7 +31,7 @@ from performance_suite import (
     freeze,
     validate_path,
 )
-from performance_runtime import LocalEnvelope
+from performance_runtime import LocalEnvelope, OwnedSandbox
 
 
 def digest(label: str) -> str:
@@ -193,6 +196,56 @@ class EvidenceTests(unittest.TestCase):
         result = ScenarioResult("fail", {}, (), 0)
         self.assertTrue(suite._scenario_pass(result, "qps"))
 
+    def test_loaded_etd_scenario_gate_includes_background_query_outcomes(self) -> None:
+        metrics = {
+            "event_count": 1,
+            "operational": {
+                "planned": 1,
+                "started": 1,
+                "completed": 1,
+                "scheduler_p99_slip_ms": 0.0,
+                "first_started_ns": 1,
+                "last_completed_ns": 2,
+            },
+            "loaded_query": {
+                "planned": 1,
+                "started": 1,
+                "completed": 1,
+                "schedule_delivered": True,
+                "drained": True,
+                "backlog": 0,
+                "scheduler_p99_slip_ms": 0.0,
+                "first_start_slip_ms": 0.0,
+                "coverage_ns": 1,
+                "failure_count": 0,
+                "semantic_failures": 0,
+            },
+        }
+        result = ScenarioResult("pass", metrics, ({"valid": True},), 0)
+        self.assertTrue(suite._scenario_pass(result, "etd_loaded"))
+
+        metrics["loaded_query"]["failure_count"] = 1
+        self.assertFalse(suite._scenario_pass(result, "etd_loaded"))
+
+    def test_etd_scenario_gate_includes_operational_evidence(self) -> None:
+        metrics = {
+            "event_count": 1,
+            "operational": {
+                "planned": 1,
+                "started": 1,
+                "completed": 1,
+                "scheduler_p99_slip_ms": 0.0,
+                "first_started_ns": 1,
+                "last_completed_ns": 2,
+            },
+            "loaded_query": None,
+        }
+        result = ScenarioResult("pass", metrics, ({"valid": True},), 0)
+        self.assertTrue(suite._scenario_pass(result, "etd_idle"))
+
+        metrics["operational"]["completed"] = 0
+        self.assertFalse(suite._scenario_pass(result, "etd_idle"))
+
     def test_local_qps_goodput_calibrates_follow_on_load_without_passing_gate(self) -> None:
         result = ScenarioResult(
             "fail",
@@ -298,6 +351,41 @@ class EvidenceTests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.TestCase):
+    def test_prepare_builds_canonicalizes_relative_output_for_sandbox_mount(self) -> None:
+        class StopAfterBuildPath(Exception):
+            pass
+
+        observed: dict[str, Path] = {}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "candidate"
+            repository.mkdir()
+            absolute_output = root / "output"
+            relative_output = Path(os.path.relpath(absolute_output, Path.cwd()))
+
+            def stop_after_path(_repo, build_output, **_kwargs):
+                observed["output"] = build_output
+                raise StopAfterBuildPath
+
+            with (
+                mock.patch.object(suite, "_require_clean"),
+                mock.patch.object(suite, "ensure_runtime_build_image"),
+                mock.patch.object(
+                    suite,
+                    "build_release_binaries_in_docker",
+                    side_effect=stop_after_path,
+                ),
+            ):
+                with self.assertRaises(StopAfterBuildPath):
+                    suite._prepare_builds(
+                        {"candidate": repository},
+                        relative_output,
+                        authoritative=False,
+                    )
+
+        self.assertTrue(observed["output"].is_absolute())
+        self.assertEqual(observed["output"], absolute_output.resolve() / "candidate")
+
     def test_setup_failure_reports_each_owned_cleanup_failure(self) -> None:
         envelope = mock.Mock()
         envelope.owned_id = "perf-0123456789abcdef"
@@ -332,6 +420,69 @@ class LifecycleTests(unittest.TestCase):
                 )
         sandbox.down.assert_called_once()
         envelope.remove.assert_called_once()
+
+    def test_seed_reconciles_projection_before_measurement(self) -> None:
+        recipe = build_recipe("smoke")
+        expected = str(recipe["corpus"]["document_count"])
+        search_counts = iter(("0", expected))
+        queries: list[str] = []
+
+        def query(_url, sql, **_kwargs):
+            queries.append(sql)
+            if sql == "SELECT count() FROM moraine.search_documents":
+                return next(search_counts)
+            if "FROM system.tables" in sql:
+                return "1"
+            if "mcp_open_projection_state" in sql:
+                return "1"
+            if "countIf(dirty.dirty_revision" in sql:
+                return "0"
+            return ""
+
+        sandbox = mock.Mock(
+            clickhouse_port=8123,
+            sandbox_id="sb-123abc",
+        )
+        with mock.patch.object(suite, "_clickhouse_query", side_effect=query):
+            suite._seed_owned_sandbox(sandbox, recipe)
+
+        sandbox.reconcile_seeded_read_model.assert_called_once_with()
+        sandbox.checkpoint.assert_called_once_with("seeded")
+        self.assertTrue(any("mcp_open_projection_state" in sql for sql in queries))
+        self.assertTrue(any("countIf(dirty.dirty_revision" in sql for sql in queries))
+
+    def test_owned_sandbox_reconciles_with_frozen_binary(self) -> None:
+        sandbox = OwnedSandbox(
+            Path("/repo"),
+            Path("/sandbox-tool"),
+            "sb-123abc",
+            "project",
+            8873,
+            8123,
+            Path("/tmp/sandbox-config"),
+            "sha256:" + "a" * 64,
+            mock.Mock(),
+        )
+        process = mock.Mock(returncode=0, stderr="")
+        with mock.patch("performance_runtime._run", return_value=process) as run:
+            sandbox.reconcile_seeded_read_model()
+
+        run.assert_called_once_with(
+            [
+                "/sandbox-tool",
+                "exec-loadgen",
+                "sb-123abc",
+                "--cwd",
+                "/home/moraine",
+                "--",
+                "/opt/moraine/bin/moraine",
+                "db",
+                "migrate",
+                "--config",
+                "/sandbox/moraine.toml",
+            ],
+            timeout=600,
+        )
 
 
     def test_local_envelope_checks_docker_without_claiming_cgroup_control(self) -> None:
@@ -443,6 +594,97 @@ class CliArtifactTests(unittest.TestCase):
         self.assertIsNone(args.profile)
         self.assertIsNone(args.pairs)
 
+    def test_local_comparison_aggregates_baseline_and_candidate_arms(self) -> None:
+        definition = {"suite": "local-comparison-test"}
+        suite_identity = sha256_json(definition)
+        identities = {
+            arm: digest(f"{arm}-build") for arm in ("baseline", "candidate")
+        }
+        prepared = {
+            arm: PreparedBuild(
+                mock.Mock(),
+                {"identity_sha256": identities[arm]},
+            )
+            for arm in ("baseline", "candidate")
+        }
+        metrics = {
+            "baseline": {
+                "qps": {"sustainable_qps": 100.0},
+                "ttr": {"p95_ms": 50.0},
+                "etd_loaded": {
+                    "source_etd_p95": {"lower_ms": 90.0, "upper_ms": 110.0}
+                },
+                "mixed": {"ratios": {"query_goodput": 1.0}},
+            },
+            "candidate": {
+                "qps": {"sustainable_qps": 125.0},
+                "ttr": {"p95_ms": 40.0},
+                "etd_loaded": {
+                    "source_etd_p95": {"lower_ms": 70.0, "upper_ms": 90.0}
+                },
+                "mixed": {"ratios": {"query_goodput": 1.1}},
+            },
+        }
+        documents = {}
+
+        def run_arm(_repo, _prepared, _recipe, _definition, **kwargs):
+            arm = kwargs["arm"]
+            paths = []
+            for scenario, scenario_metrics in metrics[arm].items():
+                path = kwargs["output"] / f"{scenario}-research.json"
+                documents[path] = {
+                    "scenario": scenario,
+                    "metrics": scenario_metrics,
+                    "suite_definition_sha256": suite_identity,
+                    "binary": {"build_identity_sha256": identities[arm]},
+                    "semantic": {"oracle_sha256": digest(f"{arm}:{scenario}")},
+                }
+                paths.append(path)
+            return paths, float(metrics[arm]["qps"]["sustainable_qps"])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repositories = {
+                "baseline": root / "baseline",
+                "candidate": root / "candidate",
+            }
+            with (
+                mock.patch.object(
+                    suite,
+                    "_prepare_builds",
+                    return_value=(prepared, {}),
+                ),
+                mock.patch.object(suite, "_definition", return_value=definition),
+                mock.patch.object(suite, "_run_logical_arm", side_effect=run_arm),
+                mock.patch.object(
+                    suite,
+                    "load_document",
+                    side_effect=documents.__getitem__,
+                ),
+                mock.patch.object(
+                    suite,
+                    "_local_docker_platform",
+                    return_value="test-platform",
+                ),
+            ):
+                result = suite.run_local_comparison(
+                    repositories,
+                    profile="smoke",
+                    pairs=1,
+                    output=root / "output",
+                )
+            summary = json.loads(result.read_text(encoding="utf-8"))
+
+        pair = summary["pair_results"][0]
+        self.assertEqual(pair["baseline"]["qps"], 100.0)
+        self.assertEqual(pair["candidate"]["qps"], 125.0)
+        self.assertEqual(pair["baseline"]["source_etd_p95_midpoint_ms"], 100.0)
+        self.assertEqual(pair["candidate"]["source_etd_p95_midpoint_ms"], 80.0)
+        self.assertEqual(
+            pair["ratios"],
+            {"qps": 1.25, "ttr": 1.25, "source_etd": 1.25},
+        )
+
     def test_local_comparison_validator_requires_non_authoritative_relative_evidence(
         self,
     ) -> None:
@@ -470,6 +712,32 @@ class CliArtifactTests(unittest.TestCase):
         document["authoritative"] = True
         with self.assertRaisesRegex(suite.SuiteFailure, "non-authoritative"):
             suite._validate_local_comparison(document)
+
+    def test_validate_path_accepts_local_comparison(self) -> None:
+        artifact_path = "candidate/pair-1/artifacts/qps-research.json"
+        suite_identity = digest("local-suite")
+        candidate_identity = digest("candidate-build")
+        document = {
+            "schema_version": "moraine-local-comparison-v1",
+            "mode": "local_comparative",
+            "authoritative": False,
+            "pairs": 1,
+            "pair_results": [{}],
+            "suite_definition_sha256": suite_identity,
+            "builds": {"candidate": candidate_identity},
+            "artifacts": [artifact_path],
+            "artifact_bindings": {
+                artifact_path: {
+                    "suite_definition_sha256": suite_identity,
+                    "build_identity_sha256": candidate_identity,
+                    "semantic_oracle_sha256": digest("oracle"),
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "local-comparison.json"
+            path.write_text(json.dumps(document), encoding="utf-8")
+            validate_path(path)
 
     def test_autoresearch_metrics_use_candidate_end_to_end_evidence(self) -> None:
         pair_results = [
@@ -572,6 +840,588 @@ class CliArtifactTests(unittest.TestCase):
                 "neither a protocol document nor a fixture recipe",
             ):
                 validate_path(path)
+
+    def test_publication_capture_scale_seed_is_insert_only_and_exact(self) -> None:
+        statements = []
+        snapshots = iter(("1\t1", "10000\t10000"))
+
+        def query(_url, sql, **_kwargs):
+            statements.append(sql)
+            if "v_current_published_source_generations" in sql:
+                return next(snapshots)
+            return ""
+
+        with mock.patch.object(suite, "_clickhouse_query", side_effect=query):
+            observed = suite._seed_publication_heads_to(
+                "http://127.0.0.1:8123",
+                current_count=1,
+                target_count=10_000,
+            )
+
+        self.assertEqual(
+            observed, {"head_count": 10_000, "max_publication_revision": 10_000}
+        )
+        insert = next(sql for sql in statements if sql.startswith("INSERT INTO"))
+        self.assertIn("FROM numbers(9999)", insert)
+        self.assertNotRegex(insert, r"(?i)\b(?:DELETE|TRUNCATE|DROP)\b")
+        capture = suite._publication_capture_sql()
+        self.assertEqual(
+            capture,
+            """/* moraine:publication_snapshot:capture */
+SELECT
+  toUInt64(ifNull(max(publication_revision), 0)) AS publication_revision
+FROM `moraine`.`published_source_generations`
+FORMAT JSONEachRow""",
+        )
+        self.assertNotIn("v_current_published_source_generations", capture)
+        self.assertNotIn("head_fingerprint", capture)
+        self.assertNotIn("head_count", capture)
+
+    def test_local_publication_capture_result_has_only_the_revision_token(self) -> None:
+        suite._validate_publication_capture_result(
+            '{"publication_revision":"42"}', publication_revision=42
+        )
+        with self.assertRaisesRegex(suite.SuiteFailure, "capture result is malformed"):
+            suite._validate_publication_capture_result(
+                '{"publication_revision":"42","head_count":"1"}',
+                publication_revision=42,
+            )
+
+    def test_publication_capture_query_log_requires_exact_finished_rows(self) -> None:
+        rows = "\n".join(
+            json.dumps(
+                {
+                    "query_id": query_id,
+                    "type": "QueryFinish",
+                    "query_duration_ms": index + 0.5,
+                    "read_rows": "10000",
+                    "read_bytes": "640000",
+                    "result_rows": "1",
+                    "memory_usage_bytes": "8192",
+                }
+            )
+            for index, query_id in enumerate(("capture-a", "capture-b"))
+        )
+        with mock.patch.object(suite, "_clickhouse_query", side_effect=("", rows)):
+            samples = suite._publication_capture_query_log_samples(
+                "http://127.0.0.1:8123", ("capture-a", "capture-b")
+            )
+
+        self.assertEqual(len(samples), 2)
+        self.assertEqual(samples[0]["read_rows"], 10_000)
+        summary = suite._publication_capture_query_log_summary(samples)
+        self.assertEqual(summary["read_rows_total"], 20_000)
+        self.assertEqual(summary["max_memory_bytes"], 8192)
+
+    def test_publication_capture_storage_allows_physical_history_rows(self) -> None:
+        self.assertIsNotNone(
+            re.search(
+                suite.PUBLICATION_CONTROL_TABLE_PATTERN,
+                "published_source_generations",
+            )
+        )
+        suite._validate_publication_capture_storage(
+            {"published_source_generations": {"rows": 3}},
+            logical_head_count=2,
+        )
+        with self.assertRaisesRegex(
+            suite.SuiteFailure, "fewer than logical head count"
+        ):
+            suite._validate_publication_capture_storage(
+                {"published_source_generations": {"rows": 1}},
+                logical_head_count=2,
+            )
+
+    def test_publication_append_warmup_has_an_unmeasured_readiness_budget(self) -> None:
+        self.assertEqual(suite._publication_append_warmup_timeout(5.0), 30.0)
+        self.assertEqual(suite._publication_append_warmup_timeout(45.0), 45.0)
+        self.assertEqual(suite._publication_append_term_count(5.0), 102)
+        self.assertEqual(suite._publication_append_term_count(30.0), 602)
+
+    def test_publication_replay_fixture_is_deterministic_and_single_session(self) -> None:
+        left = suite._publication_replay_payload(3, phase="replacement")
+        right = suite._publication_replay_payload(3, phase="replacement")
+        self.assertEqual(left, right)
+        rows = [json.loads(line) for line in left.splitlines()]
+        self.assertEqual(len(rows), 6)
+        self.assertEqual(
+            {
+                row["payload"]["id"]
+                for row in rows
+                if row["type"] == "session_meta"
+            },
+            {suite.PUBLICATION_REPLAY_RAW_SESSION_ID},
+        )
+        self.assertEqual(
+            len(
+                {
+                    row["payload"]["id"]
+                    for row in rows
+                    if row["type"] == "response_item"
+                }
+            ),
+            3,
+        )
+
+    def test_publication_replay_state_allows_transient_checkpoint_visibility(
+        self,
+    ) -> None:
+        row = {
+            "source_host": "",
+            "source_name": suite.PUBLICATION_REPLAY_SOURCE_NAME,
+            "source_file": suite.PUBLICATION_REPLAY_SOURCE_FILE,
+            "source_generation": 1,
+            "publication_revision": 2,
+            "last_line": 0,
+            "lifecycle": "",
+            "complete": 1,
+            "compatibility_prepared": 1,
+            "backend_caught_up": 1,
+        }
+        with mock.patch.object(
+            suite, "_clickhouse_query", return_value=json.dumps(row)
+        ):
+            observed = suite._publication_replay_state(
+                "http://127.0.0.1:8123"
+            )
+
+        self.assertEqual(observed, row)
+
+    def test_publication_replay_process_resources_never_encode_unavailable_as_zero(
+        self,
+    ) -> None:
+        before = {
+            "pid": 7,
+            "starttime_ticks": 11,
+            "clock_ticks_per_second": 100,
+            "cpu_ticks": 20,
+            "vm_hwm_bytes": 4096,
+            "read_bytes": None,
+            "write_bytes": None,
+        }
+        after = {**before, "cpu_ticks": 35}
+        observed = suite._ingest_process_resource_delta(before, after)
+        self.assertEqual(observed["cpu"]["seconds"], 0.15)
+        self.assertFalse(observed["peak_rss"]["available"])
+        self.assertIsNone(observed["peak_rss"]["bytes"])
+        self.assertEqual(
+            observed["peak_rss"]["reason"],
+            "process_lifetime_hwm_did_not_advance",
+        )
+        self.assertFalse(observed["disk_io"]["available"])
+        self.assertIsNone(observed["disk_io"]["read_bytes"])
+
+    def test_publication_replay_cgroup_io_sums_devices_and_labels_absence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "io.stat").write_text(
+                "8:0 rbytes=10 wbytes=20 rios=1 wios=2 dbytes=0 dios=0\n"
+                "8:16 rbytes=30 wbytes=40 rios=3 wios=4 dbytes=5 dios=1\n",
+                encoding="utf-8",
+            )
+            envelope = mock.Mock(authoritative=True, path=root)
+            before = suite._cgroup_io_snapshot(envelope)
+            self.assertEqual(before["rbytes"], 40)
+            self.assertEqual(before["wbytes"], 60)
+            after = {**before, "rbytes": 140, "wbytes": 260}
+            delta = suite._cgroup_io_delta(before, after)
+            self.assertTrue(delta["available"])
+            self.assertEqual(delta["rbytes"], 100)
+            self.assertEqual(delta["wbytes"], 200)
+
+        unavailable = suite._cgroup_io_delta(None, None)
+        self.assertFalse(unavailable["available"])
+        self.assertIsNone(unavailable["rbytes"])
+        self.assertEqual(unavailable["reason"], "cgroup_io_stat_unavailable")
+
+    def test_publication_replay_refresh_inventory_is_query_log_classified(self) -> None:
+        with mock.patch.object(
+            suite, "_clickhouse_query", side_effect=("", "4\t1\t3")
+        ) as query:
+            observed = suite._compatibility_refresh_snapshot(
+                "http://127.0.0.1:8123"
+            )
+        self.assertEqual(
+            observed,
+            {
+                "total_refresh_count": 4,
+                "activation_refresh_count": 1,
+                "per_chunk_refresh_count": 3,
+            },
+        )
+        self.assertEqual(query.call_args_list[0].args[1], "SYSTEM FLUSH LOGS")
+        self.assertIn("query_kind = 'Insert'", query.call_args_list[1].args[1])
+        self.assertIn("mcp_open_sessions", query.call_args_list[1].args[1])
+
+    def test_source_publication_replay_artifact_validates_availability_and_gates(
+        self,
+    ) -> None:
+        before_storage = {
+            table: {
+                "rows": 0,
+                "active_parts": 0,
+                "compressed_bytes": 0,
+                "bytes_on_disk": 0,
+            }
+            for table in suite.PUBLICATION_REPLAY_STORAGE_TABLES
+        }
+        after_storage = copy.deepcopy(before_storage)
+        after_storage["events"] = {
+            "rows": 2500,
+            "active_parts": 2,
+            "compressed_bytes": 50_000,
+            "bytes_on_disk": 100_000,
+        }
+        delta = suite._publication_replay_storage_delta(
+            before_storage, after_storage
+        )
+        state = {
+            "source_host": "host-a",
+            "source_name": suite.PUBLICATION_REPLAY_SOURCE_NAME,
+            "source_file": suite.PUBLICATION_REPLAY_SOURCE_FILE,
+            "source_generation": 1,
+            "publication_revision": 1,
+            "last_line": 2,
+            "lifecycle": "active",
+            "complete": 1,
+            "compatibility_prepared": 1,
+            "backend_caught_up": 1,
+        }
+        document = {
+            "document_type": "source_publication_replay_probe",
+            "schema_version": "moraine.source-publication-replay-probe.v1",
+            "status": "pass",
+            "git_commit": "a" * 40,
+            "run": {
+                "authoritative": False,
+                "timeout_seconds": 180.0,
+                "poll_interval_seconds": suite.PUBLICATION_REPLAY_POLL_INTERVAL_S,
+            },
+            "fixture": {
+                "source_name": suite.PUBLICATION_REPLAY_SOURCE_NAME,
+                "source_file": suite.PUBLICATION_REPLAY_SOURCE_FILE,
+                "session_id": suite.public_id(
+                    "session", suite.PUBLICATION_REPLAY_RAW_SESSION_ID
+                ),
+                "initial_events": suite.PUBLICATION_REPLAY_INITIAL_EVENTS,
+                "replacement_events": 2500,
+                "replacement_lines": 5000,
+                "replacement_payload_bytes": 1_000_000,
+                "minimum_replay_batches": suite.PUBLICATION_REPLAY_MIN_BATCHES,
+            },
+            "publication": {
+                "before": state,
+                "after": {
+                    **state,
+                    "source_generation": 2,
+                    "publication_revision": 2,
+                    "last_line": 5000,
+                },
+                "history_generations": [1, 2],
+            },
+            "replay": {
+                "wall_time_ms": 1234.5,
+                "batch_count": 2,
+                "event_identity_count": 5000,
+                "batch_sequences": [2, 3],
+            },
+            "compatibility": {
+                "total_refresh_count": 1,
+                "activation_refresh_count": 1,
+                "per_chunk_refresh_count": 0,
+                "readiness_rows": 1,
+                "affected_session_count": 1,
+                "prepared_session_count": 1,
+                "ready_rows": 1,
+                "visible_compatibility_rows": 1,
+            },
+            "process_resources": {
+                "cpu": {
+                    "available": True,
+                    "seconds": 0.5,
+                    "ticks": 50,
+                    "clock_ticks_per_second": 100,
+                    "reason": None,
+                },
+                "peak_rss": {
+                    "available": True,
+                    "bytes": 8192,
+                    "baseline_process_lifetime_hwm_bytes": 4096,
+                    "final_process_lifetime_hwm_bytes": 8192,
+                    "reason": None,
+                },
+                "disk_io": {
+                    "available": False,
+                    "read_bytes": None,
+                    "write_bytes": None,
+                    "reason": "proc_pid_io_unavailable",
+                },
+            },
+            "cgroup_resources": {
+                "evidence": suite.non_authoritative_resource_evidence(),
+                "disk_io": suite._cgroup_io_delta(None, None),
+            },
+            "storage": {
+                "before": before_storage,
+                "after": after_storage,
+                "delta": delta,
+                "retained_inactive_generations": 1,
+                "net_bytes_on_disk_growth": 100_000,
+                "bytes_per_retained_generation": 100_000,
+            },
+            "artifact_sha256": "",
+        }
+        document["artifact_sha256"] = sha256_json(
+            {
+                key: value
+                for key, value in document.items()
+                if key != "artifact_sha256"
+            }
+        )
+        suite.validate_source_publication_replay_probe(document)
+
+        args = suite._parse_args(
+            [
+                "source-publication-replay-probe",
+                "--repo",
+                ".",
+                "--output",
+                "target/publication-replay-probe",
+            ]
+        )
+        self.assertEqual(args.events, suite.PUBLICATION_REPLAY_DEFAULT_EVENTS)
+        self.assertEqual(args.timeout_seconds, 180.0)
+
+        changed = copy.deepcopy(document)
+        changed["compatibility"]["per_chunk_refresh_count"] = 1
+        with self.assertRaisesRegex(suite.SuiteFailure, "compatibility evidence"):
+            suite.validate_source_publication_replay_probe(changed)
+
+        changed = copy.deepcopy(document)
+        changed["cgroup_resources"]["disk_io"]["rbytes"] = 0
+        with self.assertRaisesRegex(suite.SuiteFailure, "unavailable values"):
+            suite.validate_source_publication_replay_probe(changed)
+
+    def test_source_publication_probe_validates_samples_head_and_control_deltas(self) -> None:
+        before_controls = {
+            "published_source_generations": {
+                "rows": 2,
+                "active_parts": 1,
+                "compressed_bytes": 128,
+            }
+        }
+        after_controls = {
+            "published_source_generations": {
+                "rows": 2,
+                "active_parts": 1,
+                "compressed_bytes": 128,
+            },
+            "ingest_checkpoints": {
+                "rows": 100,
+                "active_parts": 4,
+                "compressed_bytes": 4096,
+            },
+        }
+        raw = [float(value) for value in range(100)]
+        append_events = build_append_probe_events(100, term_count=4)
+        etd_samples = []
+        for index, (event, latency) in enumerate(
+            zip(append_events, raw, strict=True), 1
+        ):
+            term_use_count = 1 + (index - 1) % len(event["probe_terms"])
+            last_query = (
+                f"{event['indexed_target_term']} "
+                f"{event['probe_terms'][term_use_count - 1]}"
+            )
+            first_valid_ms = 1.0 + latency
+            etd_samples.append(
+                {
+                    "event_identity_sha256": "sha256:"
+                    + event["expected_ack_digest"],
+                    "term_sha256": suite._term_digest(last_query),
+                    "batch_sequence": index,
+                    "publication_durable_ms": 1.0,
+                    "db_ack_lower_ms": 0.5,
+                    "db_ack_ms": 0.5,
+                    "last_miss_ms": None,
+                    "first_hit_ms": first_valid_ms,
+                    "first_valid_ms": first_valid_ms,
+                    "source_interval": {
+                        "lower_ms": 0.0,
+                        "upper_ms": first_valid_ms,
+                        "censoring": "left",
+                    },
+                    "db_ack_interval": {
+                        "lower_ms": 0.0,
+                        "upper_ms": first_valid_ms - 0.5,
+                        "censoring": "left",
+                    },
+                    "term_use_count": term_use_count,
+                    "cache_bypass": {
+                        "result": True,
+                        "document_frequency": True,
+                        "posting": True,
+                        "corpus": True,
+                        "hydration": True,
+                    },
+                    "valid": True,
+                    "error_code": None,
+                }
+            )
+        query_evidence = suite._append_probe_query_evidence(
+            append_events, etd_samples
+        )
+        source_host_before = {
+            table: {
+                "rows": 0,
+                "active_parts": 0,
+                "compressed_bytes": 0,
+                "uncompressed_bytes": 0,
+                "bytes_on_disk": 0,
+            }
+            for table in suite.SOURCE_HOST_PHYSICAL_TABLES
+        }
+        source_host_after = copy.deepcopy(source_host_before)
+        source_host_after["events"] = {
+            "rows": 101,
+            "active_parts": 2,
+            "compressed_bytes": 256,
+            "uncompressed_bytes": 808,
+            "bytes_on_disk": 512,
+        }
+        scaling_points = []
+        for head_count in suite.PUBLICATION_CAPTURE_HEAD_COUNTS:
+            query_samples = [
+                {
+                    "query_duration_ms": float(value),
+                    "read_rows": head_count,
+                    "read_bytes": head_count * 64,
+                    "result_rows": 1,
+                    "memory_usage_bytes": head_count * 8,
+                }
+                for value in range(suite.PUBLICATION_CAPTURE_REPETITIONS)
+            ]
+            scaling_points.append(
+                {
+                    "head_count": head_count,
+                    "max_publication_revision": head_count,
+                    "client_latency": suite._latency_summary(
+                        [
+                            float(value)
+                            for value in range(
+                                suite.PUBLICATION_CAPTURE_REPETITIONS
+                            )
+                        ]
+                    ),
+                    "query_log": suite._publication_capture_query_log_summary(
+                        query_samples
+                    ),
+                    "control_tables": {
+                        "published_source_generations": {
+                            "rows": head_count + 1,
+                            "active_parts": 1,
+                            "compressed_bytes": head_count * 32,
+                        }
+                    },
+                }
+            )
+        document = {
+            "document_type": "source_publication_append_probe",
+            "schema_version": "moraine.source-publication-probe.v2",
+            "status": "pass",
+            "git_commit": "a" * 40,
+            "run": {
+                "authoritative": False,
+                "minimum_samples": 100,
+                "p95_limit_ms": 2_000.0,
+                "timeout_seconds": 5.0,
+            },
+            "append": {
+                "sample_count": 100,
+                "fsync_to_live_p50_ms": 49.0,
+                "fsync_to_live_p95_ms": 94.0,
+                "fsync_to_live_max_ms": 99.0,
+                "raw_fsync_to_live_ms": raw,
+            },
+            "query_evidence": query_evidence,
+            "etd_samples": etd_samples,
+            "publication_head": {
+                "before": {"row_count": 2, "max_publication_revision": 2},
+                "after": {"row_count": 2, "max_publication_revision": 2},
+                "head_write_count": 0,
+                "publication_revision_unchanged": True,
+            },
+            "control_tables": {
+                "before": before_controls,
+                "after": after_controls,
+                "delta": suite._control_resource_delta(
+                    before_controls, after_controls
+                ),
+            },
+            "control_capture_scaling": {
+                "publication_mode": "local",
+                "capture_query": "raw_history_max_publication_revision",
+                "head_counts": list(suite.PUBLICATION_CAPTURE_HEAD_COUNTS),
+                "warmup_repetitions": suite.PUBLICATION_CAPTURE_WARMUP_REPETITIONS,
+                "measured_repetitions": suite.PUBLICATION_CAPTURE_REPETITIONS,
+                "points": scaling_points,
+            },
+            "source_host_columns": {
+                "before": source_host_before,
+                "after": source_host_after,
+                "delta": suite._source_host_column_resource_delta(
+                    source_host_before, source_host_after
+                ),
+            },
+            "resources": suite.non_authoritative_resource_evidence(),
+            "artifact_sha256": "",
+        }
+        document["artifact_sha256"] = sha256_json(
+            {
+                key: value
+                for key, value in document.items()
+                if key != "artifact_sha256"
+            }
+        )
+
+        suite.validate_source_publication_probe(document)
+        legacy_version = copy.deepcopy(document)
+        legacy_version["schema_version"] = "moraine.source-publication-probe.v1"
+        with self.assertRaisesRegex(suite.SuiteFailure, "identity"):
+            suite.validate_source_publication_probe(legacy_version)
+        args = suite._parse_args(
+            [
+                "source-publication-append-probe",
+                "--repo",
+                ".",
+                "--output",
+                "target/publication-probe",
+            ]
+        )
+        self.assertEqual(args.samples, 100)
+        self.assertEqual(args.p95_limit_ms, 2_000.0)
+
+        changed = copy.deepcopy(document)
+        changed["publication_head"]["head_write_count"] = 1
+        with self.assertRaisesRegex(suite.SuiteFailure, "control evidence"):
+            suite.validate_source_publication_probe(changed)
+
+        changed = copy.deepcopy(document)
+        changed["resources"]["memory_peak_bytes"] = -1
+        with self.assertRaisesRegex(suite.SuiteFailure, "memory_peak_bytes"):
+            suite.validate_source_publication_probe(changed)
+
+        changed = copy.deepcopy(document)
+        changed["query_evidence"]["cache_buster_terms"][
+            "fixture_text_occurrences"
+        ] = 1
+        with self.assertRaisesRegex(suite.SuiteFailure, "term counts"):
+            suite.validate_source_publication_probe(changed)
+
+        changed = copy.deepcopy(document)
+        changed["etd_samples"][0]["term_use_count"] = 2
+        with self.assertRaisesRegex(suite.SuiteFailure, "sample and query evidence"):
+            suite.validate_source_publication_probe(changed)
 
 
 if __name__ == "__main__":

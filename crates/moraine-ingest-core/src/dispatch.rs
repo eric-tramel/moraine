@@ -1,5 +1,5 @@
 use crate::checkpoint::checkpoint_key;
-use crate::model::{Checkpoint, NormalizedRecord, RowBatch};
+use crate::model::{Checkpoint, CheckpointLifecycle, NormalizedRecord, RowBatch};
 use crate::normalize::{normalize_record, normalize_record_with_ts_hint};
 use crate::sources::claude_code::cowork_session_path;
 use crate::sources::kiro_cli::{load_kiro_session_metadata, KiroSessionMetadata};
@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use moraine_config::{is_workflow_journal_path, map_tracked_path, AppConfig, SourceFormat};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 #[cfg(not(unix))]
 use std::hash::{Hash, Hasher};
@@ -41,6 +42,95 @@ pub(crate) const CLICKHOUSE_JSON_OBJECT_BYTE_LIMIT: usize = 10 * 1024 * 1024;
 const DEFAULT_JSONL_SOURCE_LINE_BYTE_LIMIT: usize = 8 * 1024 * 1024;
 const ERROR_KIND_SOURCE_LINE_TOO_LARGE: &str = "jsonl_source_line_too_large";
 const ERROR_KIND_NORMALIZED_ROW_TOO_LARGE: &str = "jsonl_normalized_row_too_large";
+const JSONL_PUBLICATION_PROTOCOL_VERSION: &str = "jsonl-publication-v1";
+
+/// Fingerprint the policy inputs that can change which logical rows a file
+/// produces. A changed value is a whole-source replacement, even when the
+/// inode and byte offset are unchanged: rows hidden by an old exclusion or
+/// normalized with old adapter rules must not remain live alongside the new
+/// interpretation.
+fn jsonl_policy_fingerprint(config: &AppConfig, work: &WorkItem) -> String {
+    let mut exclusions = config.ingest.exclude_project_dirs.clone();
+    exclusions.sort();
+    let payload = serde_json::to_vec(&json!({
+        "protocol": JSONL_PUBLICATION_PROTOCOL_VERSION,
+        "source_format": work.format.to_string(),
+        "harness": work.harness,
+        "project_exclusions": exclusions,
+    }))
+    .expect("JSONL publication policy is serializable");
+    let digest = Sha256::digest(payload);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn source_scan_still_valid(source_file: &str, scan_inode: u64, scan_boundary: u64) -> Result<()> {
+    let metadata = std::fs::metadata(source_file)
+        .with_context(|| format!("source disappeared while scanning {source_file}"))?;
+    let final_inode = source_inode_for_file(source_file, &metadata);
+    anyhow::ensure!(
+        final_inode == scan_inode,
+        "source inode changed while scanning {source_file}: {scan_inode} -> {final_inode}"
+    );
+    anyhow::ensure!(
+        metadata.len() >= scan_boundary,
+        "source shrank while scanning {source_file}: {} < captured boundary {scan_boundary}",
+        metadata.len()
+    );
+    Ok(())
+}
+
+async fn begin_replay_barrier(
+    sink_tx: &mpsc::Sender<SinkMessage>,
+    checkpoint: &Checkpoint,
+    scan_inode: u64,
+    scan_boundary: u64,
+    policy_fingerprint: &str,
+) -> Result<()> {
+    let transition = crate::CheckpointTransition::begin_replay(
+        checkpoint,
+        scan_inode,
+        scan_boundary,
+        policy_fingerprint,
+    );
+    crate::publication::send_begin_replay(sink_tx, transition).await?;
+    Ok(())
+}
+
+async fn finalize_replay_barrier(
+    sink_tx: &mpsc::Sender<SinkMessage>,
+    checkpoint: &Checkpoint,
+    scan_inode: u64,
+    scan_boundary: u64,
+    policy_fingerprint: &str,
+) -> Result<()> {
+    let transition = crate::CheckpointTransition::finalize_replay(
+        checkpoint,
+        scan_inode,
+        scan_boundary,
+        policy_fingerprint,
+    );
+    match crate::publication::send_finalize_replay(sink_tx, transition).await? {
+        crate::FinalizeReplayOutcome::Published(_) => {}
+        crate::FinalizeReplayOutcome::StagedForMirror => {
+            debug!(
+                source = %checkpoint.source_name,
+                path = %checkpoint.source_file,
+                "replacement finalization staged until mirror catch-up barrier"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn block_replay_barrier(
+    sink_tx: &mpsc::Sender<SinkMessage>,
+    checkpoint: &Checkpoint,
+    reason: impl Into<String>,
+) -> Result<()> {
+    let transition = crate::CheckpointTransition::blocked(checkpoint, reason.into());
+    crate::publication::send_block_replay(sink_tx, transition).await?;
+    Ok(())
+}
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct KiroCheckpointCursor {
@@ -112,7 +202,6 @@ fn work_item_is_ingestable(work: &WorkItem) -> bool {
 struct CoworkCompanionRecord {
     record: Value,
     source_file: String,
-    source_inode: u64,
 }
 
 fn load_cowork_companion_record(work: &WorkItem) -> Option<CoworkCompanionRecord> {
@@ -194,7 +283,6 @@ fn load_cowork_companion_record(work: &WorkItem) -> Option<CoworkCompanionRecord
     let source_file = metadata_path.to_string_lossy().to_string();
     Some(CoworkCompanionRecord {
         record: Value::Object(record),
-        source_inode: source_inode_for_file(&source_file, &metadata),
         source_file,
     })
 }
@@ -395,6 +483,9 @@ async fn send_chunk_if_batch_exceeds_limits(
     source_generation: u32,
     offset: u64,
     line_no: u64,
+    lifecycle: CheckpointLifecycle,
+    scan_boundary: u64,
+    policy_fingerprint: &str,
     context: &'static str,
 ) -> Result<()> {
     if !batch.exceeds_limits(config.ingest.batch_size, config.ingest.max_batch_bytes) {
@@ -409,7 +500,10 @@ async fn send_chunk_if_batch_exceeds_limits(
         source_generation,
         last_offset: offset,
         last_line_no: line_no,
-        status: "active".to_string(),
+        status: lifecycle.to_string(),
+        policy_fingerprint: policy_fingerprint.to_string(),
+        scan_inode: source_inode,
+        scan_boundary,
         ..Default::default()
     });
 
@@ -929,10 +1023,14 @@ pub(crate) async fn process_file(
 
     let inode = source_inode_for_file(source_file, &meta);
 
+    // Pin the scan to this boundary. Growth after it is deliberately left for
+    // the next ordinary append; reading an unbounded growing file can starve a
+    // replacement's publication forever.
     let file_size = meta.len();
     let cp_key = checkpoint_key(&work.source_name, source_file);
     let committed = { checkpoints.read().await.get(&cp_key).cloned() };
     let first_ingest = committed.is_none();
+    let policy_fingerprint = jsonl_policy_fingerprint(config, work);
 
     let mut checkpoint = committed.unwrap_or(Checkpoint {
         source_name: work.source_name.clone(),
@@ -941,19 +1039,10 @@ pub(crate) async fn process_file(
         source_generation: 1,
         last_offset: 0,
         last_line_no: 0,
-        status: "active".to_string(),
+        status: CheckpointLifecycle::Active.to_string(),
+        policy_fingerprint: policy_fingerprint.clone(),
         ..Default::default()
     });
-
-    let mut generation_changed = false;
-    if checkpoint.source_inode != inode || file_size < checkpoint.last_offset {
-        checkpoint.source_inode = inode;
-        checkpoint.source_generation = checkpoint.source_generation.saturating_add(1).max(1);
-        checkpoint.last_offset = 0;
-        checkpoint.last_line_no = 0;
-        checkpoint.status = "active".to_string();
-        generation_changed = true;
-    }
 
     let kiro_metadata = if work.format == SourceFormat::KiroSession {
         Some(load_kiro_session_metadata(source_file))
@@ -980,14 +1069,67 @@ pub(crate) async fn process_file(
         && checkpoint.last_offset > 0
         && (!kiro_cursor.kiro_sidecar_valid
             || kiro_cursor.transcript_fingerprint != transcript_fingerprint);
-    if sidecar_requires_transcript_replay {
+    let source_identity_changed = checkpoint.source_inode != inode;
+    let source_truncated = file_size < checkpoint.last_offset;
+    // A legacy checkpoint has no persisted policy fingerprint. Adopt the
+    // current fingerprint on its next successful checkpoint; subsequent
+    // changes are explicit replacement replays.
+    let policy_changed = !first_ingest
+        && !checkpoint.policy_fingerprint.is_empty()
+        && checkpoint.policy_fingerprint != policy_fingerprint;
+    let starts_replacement = source_identity_changed
+        || source_truncated
+        || policy_changed
+        || sidecar_requires_transcript_replay;
+    let checkpoint_lifecycle = checkpoint.lifecycle()?;
+    let resume_replay = checkpoint_lifecycle == CheckpointLifecycle::Replaying;
+    let retry_blocked_replay =
+        checkpoint_lifecycle == CheckpointLifecycle::Error && !checkpoint.block_reason.is_empty();
+    if starts_replacement {
+        checkpoint.source_generation =
+            crate::publication::checked_next_generation(checkpoint.source_generation)
+                .context("source generation exhausted while beginning JSONL replacement")?;
+        checkpoint.source_inode = inode;
         checkpoint.last_offset = 0;
         checkpoint.last_line_no = 0;
+        checkpoint.cursor_json.clear();
+        checkpoint.policy_fingerprint = policy_fingerprint.clone();
+    }
+    // A blocked replay checkpoint can carry the terminal cursor of a scan
+    // that quarantined one or more rows. Resuming from that cursor would see
+    // EOF, forget the quarantine, and publish the incomplete generation. A
+    // retry of the same candidate generation must therefore validate the
+    // whole captured source again.
+    if retry_blocked_replay && !starts_replacement {
+        checkpoint.last_offset = 0;
+        checkpoint.last_line_no = 0;
+        checkpoint.cursor_json.clear();
+    }
+    let replacement_replay = starts_replacement || resume_replay || retry_blocked_replay;
+    let scan_boundary = if resume_replay && checkpoint.scan_boundary > 0 {
+        checkpoint.scan_boundary.max(checkpoint.last_offset)
+    } else {
+        file_size
+    };
+    if replacement_replay {
+        checkpoint.set_lifecycle(CheckpointLifecycle::Replaying);
+        checkpoint.scan_inode = inode;
+        checkpoint.scan_boundary = scan_boundary;
+        checkpoint.final_scan_complete = false;
+        checkpoint.block_reason.clear();
+        begin_replay_barrier(
+            &sink_tx,
+            &checkpoint,
+            inode,
+            scan_boundary,
+            &policy_fingerprint,
+        )
+        .await?;
     }
     let sidecar_needs_processing =
-        kiro_metadata.is_some() && (first_ingest || generation_changed || sidecar_changed);
+        kiro_metadata.is_some() && (first_ingest || replacement_replay || sidecar_changed);
 
-    if file_size == checkpoint.last_offset && !generation_changed && !sidecar_needs_processing {
+    if file_size == checkpoint.last_offset && !replacement_replay && !sidecar_needs_processing {
         return Ok(());
     }
     if !config.ingest.exclude_project_dirs.is_empty() {
@@ -1005,12 +1147,18 @@ pub(crate) async fn process_file(
             sidecar_cwd.to_string()
         };
         if work.format == SourceFormat::KiroSession && !std::path::Path::new(&cwd).is_absolute() {
-            debug!(
+            let reason = format!(
+                "Kiro project exclusions require a trusted absolute cwd, but none was available for {source_file}"
+            );
+            warn!(
                 source_name = %work.source_name,
                 harness = %work.harness,
                 source_file,
-                "skipping Kiro session because project exclusions are configured and the session cwd is unavailable"
+                "{reason}"
             );
+            if replacement_replay {
+                block_replay_barrier(&sink_tx, &checkpoint, reason).await?;
+            }
             return Ok(());
         }
         if config.is_project_dir_excluded(&cwd) {
@@ -1021,17 +1169,41 @@ pub(crate) async fn process_file(
                 project_dir = %cwd,
                 "skipping session from excluded project directory"
             );
+            if replacement_replay {
+                let mut final_checkpoint = checkpoint.clone();
+                final_checkpoint.last_offset = scan_boundary;
+                final_checkpoint.last_line_no = 0;
+                final_checkpoint.set_lifecycle(CheckpointLifecycle::Active);
+                final_checkpoint.final_scan_complete = true;
+                final_checkpoint.compatibility_prepared = true;
+                final_checkpoint.backend_caught_up = true;
+                source_scan_still_valid(source_file, inode, scan_boundary)?;
+                finalize_replay_barrier(
+                    &sink_tx,
+                    &final_checkpoint,
+                    inode,
+                    scan_boundary,
+                    &policy_fingerprint,
+                )
+                .await?;
+            }
             return Ok(());
         }
     }
     let cowork_companion = load_cowork_companion_record(work);
+    let batch_lifecycle = if replacement_replay {
+        CheckpointLifecycle::Replaying
+    } else {
+        CheckpointLifecycle::Active
+    };
 
     let mut file = std::fs::File::open(source_file)
         .with_context(|| format!("failed to open {}", source_file))?;
     file.seek(SeekFrom::Start(checkpoint.last_offset))
         .with_context(|| format!("failed to seek {}", source_file))?;
 
-    let mut reader = BufReader::new(file);
+    let remaining = scan_boundary.saturating_sub(checkpoint.last_offset);
+    let mut reader = BufReader::new(file.take(remaining));
     let mut offset = checkpoint.last_offset;
     let mut line_no = checkpoint.last_line_no;
     let initial_hints = if checkpoint.last_offset > 0 || work.harness == "pi-coding-agent" {
@@ -1086,14 +1258,15 @@ pub(crate) async fn process_file(
     let mut session_cursors: HashMap<String, SessionCursor> = HashMap::new();
 
     let mut batch = RowBatch::default();
+    let mut replay_block_reason = None::<String>;
     if let Some(companion) = cowork_companion {
         match normalize_record(
             &companion.record,
             &work.source_name,
             &work.harness,
-            &companion.source_file,
-            companion.source_inode,
-            1,
+            source_file,
+            inode,
+            checkpoint.source_generation,
             1,
             0,
             "",
@@ -1101,11 +1274,18 @@ pub(crate) async fn process_file(
             "",
         ) {
             Ok(normalized) => batch.extend_normalized(normalized),
-            Err(exc) => warn!(
-                source_file,
-                metadata_file = %companion.source_file,
-                "Claude Cowork metadata normalization failed: {exc}"
-            ),
+            Err(exc) => {
+                warn!(
+                    source_file,
+                    metadata_file = %companion.source_file,
+                    "Claude Cowork metadata normalization failed: {exc}"
+                );
+                if replacement_replay {
+                    replay_block_reason = Some(format!(
+                        "Claude Cowork companion metadata normalization failed: {exc}"
+                    ));
+                }
+            }
         }
     }
     let source_line_byte_limit = jsonl_source_line_byte_limit(config);
@@ -1115,6 +1295,9 @@ pub(crate) async fn process_file(
             .as_ref()
             .expect("sidecar processing requires Kiro metadata state");
         if let Some(error_text) = metadata.error() {
+            if replacement_replay {
+                replay_block_reason = Some(format!("Kiro sidecar is invalid: {error_text}"));
+            }
             batch.push_error_row(json!({
                 "source_name": work.source_name,
                 "harness": work.harness,
@@ -1151,6 +1334,10 @@ pub(crate) async fn process_file(
                     batch.extend_normalized(normalized);
                 }
                 Err(exc) => {
+                    if replacement_replay {
+                        replay_block_reason =
+                            Some(format!("Kiro sidecar normalization failed: {exc}"));
+                    }
                     batch.push_error_row(json!({
                         "source_name": work.source_name,
                         "harness": work.harness,
@@ -1182,6 +1369,11 @@ pub(crate) async fn process_file(
         line_no = line_no.saturating_add(1);
 
         let Some(buf) = buf else {
+            if replacement_replay && replay_block_reason.is_none() {
+                replay_block_reason = Some(format!(
+                    "source line {line_no} exceeded the JSONL ingest limit"
+                ));
+            }
             warn!(
                 source_file,
                 source_line_no = line_no,
@@ -1212,6 +1404,9 @@ pub(crate) async fn process_file(
                 checkpoint.source_generation,
                 offset,
                 line_no,
+                batch_lifecycle,
+                scan_boundary,
+                &policy_fingerprint,
                 "oversized-line chunk",
             )
             .await?;
@@ -1231,6 +1426,10 @@ pub(crate) async fn process_file(
         let parsed: Value = match serde_json::from_str::<Value>(&text) {
             Ok(value) if value.is_object() => value,
             Ok(_) => {
+                if replacement_replay && replay_block_reason.is_none() {
+                    replay_block_reason =
+                        Some(format!("source line {line_no} was not a JSON object"));
+                }
                 batch.push_error_row(json!({
                     "source_name": work.source_name,
                     "harness": work.harness,
@@ -1246,6 +1445,10 @@ pub(crate) async fn process_file(
                 continue;
             }
             Err(exc) => {
+                if replacement_replay && replay_block_reason.is_none() {
+                    replay_block_reason =
+                        Some(format!("source line {line_no} failed JSON parsing: {exc}"));
+                }
                 batch.push_error_row(json!({
                     "source_name": work.source_name,
                     "harness": work.harness,
@@ -1278,6 +1481,10 @@ pub(crate) async fn process_file(
         ) {
             Ok(normalized) => normalized,
             Err(exc) => {
+                if replacement_replay && replay_block_reason.is_none() {
+                    replay_block_reason =
+                        Some(format!("source line {line_no} failed normalization: {exc}"));
+                }
                 batch.push_error_row(json!({
                     "source_name": work.source_name,
                     "harness": work.harness,
@@ -1296,6 +1503,11 @@ pub(crate) async fn process_file(
 
         if let Some(row_size) = largest_serialized_normalized_row(&normalized) {
             if row_size.bytes > CLICKHOUSE_JSON_OBJECT_BYTE_LIMIT {
+                if replacement_replay && replay_block_reason.is_none() {
+                    replay_block_reason = Some(format!(
+                        "source line {line_no} normalized past the ClickHouse object limit"
+                    ));
+                }
                 warn!(
                     source_file,
                     source_line_no = line_no,
@@ -1328,6 +1540,9 @@ pub(crate) async fn process_file(
                     checkpoint.source_generation,
                     offset,
                     line_no,
+                    batch_lifecycle,
+                    scan_boundary,
+                    &policy_fingerprint,
                     "oversized-normalized-row chunk",
                 )
                 .await?;
@@ -1369,6 +1584,9 @@ pub(crate) async fn process_file(
             checkpoint.source_generation,
             offset,
             line_no,
+            batch_lifecycle,
+            scan_boundary,
+            &policy_fingerprint,
             "chunk",
         )
         .await?;
@@ -1381,6 +1599,21 @@ pub(crate) async fn process_file(
             transcript_fingerprint: metadata.transcript_fingerprint(),
         })
     });
+    if let Err(exc) = source_scan_still_valid(source_file, inode, scan_boundary) {
+        if replacement_replay {
+            let mut blocked = checkpoint.clone();
+            blocked.last_offset = offset;
+            blocked.last_line_no = line_no;
+            blocked.set_lifecycle(CheckpointLifecycle::Error);
+            blocked.policy_fingerprint = policy_fingerprint.clone();
+            blocked.scan_inode = inode;
+            blocked.scan_boundary = scan_boundary;
+            blocked.block_reason = exc.to_string();
+            block_replay_barrier(&sink_tx, &blocked, exc.to_string()).await?;
+        }
+        return Err(exc);
+    }
+
     let final_checkpoint = Checkpoint {
         source_name: work.source_name.clone(),
         source_file: source_file.to_string(),
@@ -1388,22 +1621,61 @@ pub(crate) async fn process_file(
         source_generation: checkpoint.source_generation,
         last_offset: offset,
         last_line_no: line_no,
-        status: "active".to_string(),
+        status: CheckpointLifecycle::Active.to_string(),
         cursor_json: kiro_cursor_json.unwrap_or_else(|| checkpoint.cursor_json.clone()),
         source_fingerprint: sidecar_fingerprint,
-        ..Default::default()
+        policy_fingerprint: policy_fingerprint.clone(),
+        scan_inode: inode,
+        scan_boundary,
+        final_scan_complete: true,
+        compatibility_prepared: true,
+        backend_caught_up: true,
+        ..checkpoint.clone()
     };
 
     if batch.row_count() > 0
-        || generation_changed
+        || replacement_replay
         || sidecar_needs_processing
         || offset != checkpoint.last_offset
     {
-        batch.checkpoint = Some(final_checkpoint);
+        let batch_checkpoint = if replacement_replay {
+            Checkpoint {
+                status: CheckpointLifecycle::Replaying.to_string(),
+                final_scan_complete: false,
+                compatibility_prepared: false,
+                backend_caught_up: false,
+                ..final_checkpoint.clone()
+            }
+        } else {
+            final_checkpoint.clone()
+        };
+        batch.checkpoint = Some(batch_checkpoint);
         sink_tx
             .send(SinkMessage::Batch(batch))
             .await
             .context("sink channel closed while sending final batch")?;
+        if replacement_replay {
+            if let Some(reason) = replay_block_reason {
+                let blocked_checkpoint = Checkpoint {
+                    status: CheckpointLifecycle::Error.to_string(),
+                    final_scan_complete: false,
+                    compatibility_prepared: false,
+                    backend_caught_up: false,
+                    block_reason: reason.clone(),
+                    ..final_checkpoint
+                };
+                block_replay_barrier(&sink_tx, &blocked_checkpoint, reason).await?;
+                return Ok(());
+            }
+            finalize_replay_barrier(
+                &sink_tx,
+                &final_checkpoint,
+                inode,
+                scan_boundary,
+                &policy_fingerprint,
+            )
+            .await?;
+        }
     }
 
     if metrics.queue_depth.load(Ordering::Relaxed) == 0 {
@@ -1491,7 +1763,7 @@ async fn process_session_json_file(
         source_generation: SESSION_JSON_GENERATION,
         last_offset: 0,
         last_line_no: 0,
-        status: "active".to_string(),
+        status: CheckpointLifecycle::Active.to_string(),
         ..Default::default()
     });
 
@@ -1601,7 +1873,7 @@ async fn process_session_json_file(
         source_generation: SESSION_JSON_GENERATION,
         last_offset: file_size,
         last_line_no: message_count,
-        status: "active".to_string(),
+        status: CheckpointLifecycle::Active.to_string(),
         ..Default::default()
     };
 
@@ -1806,13 +2078,14 @@ mod tests {
         CLICKHOUSE_JSON_OBJECT_BYTE_LIMIT, ERROR_KIND_NORMALIZED_ROW_TOO_LARGE,
         ERROR_KIND_SOURCE_LINE_TOO_LARGE, SESSION_JSON_GENERATION, SESSION_JSON_INODE,
     };
-    use crate::model::Checkpoint;
+    use crate::model::{Checkpoint, CheckpointLifecycle};
     use crate::sqlite_poll::VolatilePollMap;
     use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
     use moraine_config::SourceFormat;
     use serde_json::{json, Value};
     use std::collections::HashMap;
     use std::fs;
+    use std::future::Future;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
@@ -1943,6 +2216,311 @@ mod tests {
 
         let _ = fs::remove_file(&path);
         assert_ne!(original_id, replaced_id);
+    }
+
+    #[test]
+    fn captured_source_boundary_accepts_growth_but_rejects_shrink() {
+        let path = unique_test_file("scan-boundary");
+        fs::write(&path, "one\n").expect("write captured source");
+        let source_file = path.to_string_lossy().to_string();
+        let metadata = fs::metadata(&path).expect("captured metadata");
+        let inode = source_inode_for_file(&source_file, &metadata);
+        let boundary = metadata.len();
+
+        fs::write(&path, "one\ntwo\n").expect("grow source");
+        super::source_scan_still_valid(&source_file, inode, boundary)
+            .expect("growth beyond a captured boundary is later append work");
+
+        fs::write(&path, "x").expect("shrink source");
+        let error = super::source_scan_still_valid(&source_file, inode, boundary)
+            .expect_err("shrink invalidates the replay scan");
+        assert!(error.to_string().contains("shrank"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn jsonl_rotation_is_bracketed_by_durable_replay_barriers() {
+        let path = unique_test_file("rotation-publication");
+        let replacement = unique_test_file("rotation-publication-next");
+        let record = |uuid: &str, content: &str| {
+            json!({
+                "type": "user",
+                "timestamp": "2026-04-18T20:43:51.069Z",
+                "uuid": uuid,
+                "sessionId": "rotation-session",
+                "cwd": "/repo",
+                "message": {"role": "user", "content": content}
+            })
+            .to_string()
+                + "\n"
+        };
+        fs::write(&path, record("old", "old generation")).expect("write initial source");
+
+        let config = moraine_config::AppConfig::default();
+        let work = WorkItem {
+            source_name: "claude".to_string(),
+            harness: "claude-code".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: String::new(),
+            path: path.to_string_lossy().to_string(),
+        };
+        let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(16);
+
+        process_file(
+            &config,
+            &work,
+            checkpoints.clone(),
+            &VolatilePollMap::new(),
+            sink_tx.clone(),
+            &metrics,
+        )
+        .await
+        .expect("initial generation ingests");
+        let initial = drain_batches(&mut sink_rx).await;
+        let initial_checkpoint = initial[0].checkpoint.clone().expect("initial checkpoint");
+        assert_eq!(initial_checkpoint.source_generation, 1);
+        assert!(!initial_checkpoint.policy_fingerprint.is_empty());
+        checkpoints.write().await.insert(
+            crate::checkpoint::checkpoint_key(&work.source_name, &work.path),
+            initial_checkpoint,
+        );
+
+        fs::write(&replacement, record("new", "new generation")).expect("write replacement source");
+        fs::rename(&replacement, &path).expect("rotate source atomically");
+
+        let (result, messages) = drive_with_barrier_acks(
+            process_file(
+                &config,
+                &work,
+                checkpoints,
+                &VolatilePollMap::new(),
+                sink_tx,
+                &metrics,
+            ),
+            &mut sink_rx,
+        )
+        .await;
+        result.expect("replacement generation ingests");
+
+        assert_eq!(messages.len(), 3, "begin, replay batch, final publication");
+        let ObservedSinkMessage::Begin(begin) = &messages[0] else {
+            panic!("replacement rows must be preceded by BeginReplay");
+        };
+        assert_eq!(begin.checkpoint.source_generation, 2);
+        assert_eq!(
+            begin.checkpoint.lifecycle().unwrap(),
+            CheckpointLifecycle::Replaying
+        );
+        assert!(!begin.checkpoint.final_scan_complete);
+
+        let ObservedSinkMessage::Batch(batch) = &messages[1] else {
+            panic!("replacement payload must follow BeginReplay");
+        };
+        let replay_checkpoint = batch.checkpoint.as_ref().expect("replay checkpoint");
+        assert_eq!(replay_checkpoint.source_generation, 2);
+        assert_eq!(
+            replay_checkpoint.lifecycle().unwrap(),
+            CheckpointLifecycle::Replaying
+        );
+
+        let ObservedSinkMessage::Finalize(finalize) = &messages[2] else {
+            panic!("replacement payload must end with FinalizeReplay");
+        };
+        assert_eq!(finalize.checkpoint.source_generation, 2);
+        assert_eq!(
+            finalize.checkpoint.lifecycle().unwrap(),
+            CheckpointLifecycle::Active
+        );
+        assert!(finalize.checkpoint.final_scan_complete);
+        assert_eq!(
+            finalize.checkpoint.scan_boundary,
+            finalize.checkpoint.last_offset
+        );
+
+        // Simulate a crash after the replay payload checkpoint became durable
+        // but before the publication acknowledgement. Restart must finalize
+        // the same generation, not allocate generation 3 or silently return at
+        // EOF.
+        let resumed = Arc::new(RwLock::new(HashMap::from([(
+            crate::checkpoint::checkpoint_key(&work.source_name, &work.path),
+            replay_checkpoint.clone(),
+        )])));
+        let (resume_tx, mut resume_rx) = mpsc::channel::<SinkMessage>(8);
+        let (result, resumed_messages) = drive_with_barrier_acks(
+            process_file(
+                &config,
+                &work,
+                resumed,
+                &VolatilePollMap::new(),
+                resume_tx,
+                &metrics,
+            ),
+            &mut resume_rx,
+        )
+        .await;
+        result.expect("restart finalizes the durable replay generation");
+        assert!(matches!(
+            resumed_messages.first(),
+            Some(ObservedSinkMessage::Begin(_))
+        ));
+        let resumed_final = resumed_messages
+            .iter()
+            .find_map(|message| match message {
+                ObservedSinkMessage::Finalize(transition) => Some(transition),
+                _ => None,
+            })
+            .expect("resumed replay finalization");
+        assert_eq!(resumed_final.checkpoint.source_generation, 2);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn jsonl_replacement_quarantine_blocks_instead_of_publishing() {
+        let path = unique_test_file("rotation-quarantine");
+        let replacement = unique_test_file("rotation-quarantine-next");
+        let record = |uuid: &str| {
+            json!({
+                "type": "user",
+                "timestamp": "2026-04-18T20:43:51.069Z",
+                "uuid": uuid,
+                "sessionId": "rotation-session",
+                "cwd": "/repo",
+                "message": {"role": "user", "content": uuid}
+            })
+            .to_string()
+                + "\n"
+        };
+        fs::write(&path, record("old")).expect("write initial source");
+
+        let config = moraine_config::AppConfig::default();
+        let work = WorkItem {
+            source_name: "claude".to_string(),
+            harness: "claude-code".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: String::new(),
+            path: path.to_string_lossy().to_string(),
+        };
+        let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(16);
+
+        process_file(
+            &config,
+            &work,
+            checkpoints.clone(),
+            &VolatilePollMap::new(),
+            sink_tx.clone(),
+            &metrics,
+        )
+        .await
+        .expect("initial generation ingests");
+        let initial = drain_batches(&mut sink_rx).await;
+        let initial_checkpoint = initial[0].checkpoint.clone().expect("initial checkpoint");
+        checkpoints.write().await.insert(
+            crate::checkpoint::checkpoint_key(&work.source_name, &work.path),
+            initial_checkpoint,
+        );
+
+        fs::write(&replacement, record("new") + "{malformed\n")
+            .expect("write quarantined replacement");
+        fs::rename(&replacement, &path).expect("rotate source atomically");
+
+        let (result, messages) = drive_with_barrier_acks(
+            process_file(
+                &config,
+                &work,
+                checkpoints,
+                &VolatilePollMap::new(),
+                sink_tx,
+                &metrics,
+            ),
+            &mut sink_rx,
+        )
+        .await;
+        result.expect("quarantined replacement is durably blocked");
+
+        assert!(matches!(
+            messages.first(),
+            Some(ObservedSinkMessage::Begin(_))
+        ));
+        assert!(messages
+            .iter()
+            .any(|message| matches!(message, ObservedSinkMessage::Block(_))));
+        assert!(!messages
+            .iter()
+            .any(|message| matches!(message, ObservedSinkMessage::Finalize(_))));
+        let batch = observed_batches(&messages)
+            .into_iter()
+            .next()
+            .expect("candidate replay batch");
+        assert_eq!(
+            batch
+                .checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.lifecycle().unwrap()),
+            Some(CheckpointLifecycle::Replaying)
+        );
+        assert_eq!(batch.error_rows.len(), 1);
+
+        let blocked_checkpoint = messages
+            .iter()
+            .find_map(|message| match message {
+                ObservedSinkMessage::Block(transition) => Some(transition.checkpoint.clone()),
+                _ => None,
+            })
+            .expect("durable blocked replacement checkpoint");
+        assert_eq!(
+            blocked_checkpoint.lifecycle().unwrap(),
+            CheckpointLifecycle::Error
+        );
+        assert_eq!(
+            blocked_checkpoint.last_offset,
+            fs::metadata(&path).expect("replacement metadata").len(),
+            "the durable error reproduces the terminal-cursor restart hazard"
+        );
+
+        // A later poll or process restart sees the durable error checkpoint.
+        // It must rescan the whole candidate, rediscover the malformed row,
+        // and remain blocked rather than treating terminal EOF as success.
+        let resumed = Arc::new(RwLock::new(HashMap::from([(
+            crate::checkpoint::checkpoint_key(&work.source_name, &work.path),
+            blocked_checkpoint,
+        )])));
+        let (retry_tx, mut retry_rx) = mpsc::channel::<SinkMessage>(16);
+        let (result, retry_messages) = drive_with_barrier_acks(
+            process_file(
+                &config,
+                &work,
+                resumed,
+                &VolatilePollMap::new(),
+                retry_tx,
+                &metrics,
+            ),
+            &mut retry_rx,
+        )
+        .await;
+        result.expect("unchanged malformed replacement remains durably blocked");
+        assert!(matches!(
+            retry_messages.first(),
+            Some(ObservedSinkMessage::Begin(_))
+        ));
+        assert!(retry_messages
+            .iter()
+            .any(|message| matches!(message, ObservedSinkMessage::Block(_))));
+        assert!(!retry_messages
+            .iter()
+            .any(|message| matches!(message, ObservedSinkMessage::Finalize(_))));
+        let retried_batch = observed_batches(&retry_messages)
+            .into_iter()
+            .next()
+            .expect("retried candidate replay batch");
+        assert_eq!(retried_batch.error_rows.len(), 1);
+
+        let _ = fs::remove_file(&path);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2256,6 +2834,88 @@ mod tests {
         out
     }
 
+    #[derive(Debug)]
+    enum ObservedSinkMessage {
+        Batch(crate::model::RowBatch),
+        Begin(crate::CheckpointTransition),
+        Finalize(crate::CheckpointTransition),
+        Block(crate::CheckpointTransition),
+        MirrorCaughtUp,
+    }
+
+    fn observe_and_ack(message: SinkMessage) -> ObservedSinkMessage {
+        match message {
+            SinkMessage::Batch(batch) => ObservedSinkMessage::Batch(batch),
+            SinkMessage::BeginReplay { transition, ack } => {
+                let _ = ack.send(Ok(crate::publication::ReplayBarrierAck {
+                    checkpoint_revision: 1,
+                    operation_id: transition.checkpoint.operation_id.clone(),
+                }));
+                ObservedSinkMessage::Begin(transition)
+            }
+            SinkMessage::FinalizeReplay { transition, ack } => {
+                let _ = ack.send(Ok(crate::publication::FinalizeReplayOutcome::Published(
+                    crate::publication::PublicationAck {
+                        checkpoint_revision: 2,
+                        publication_revision: 1,
+                        already_published: false,
+                    },
+                )));
+                ObservedSinkMessage::Finalize(transition)
+            }
+            SinkMessage::BlockReplay { transition, ack } => {
+                let _ = ack.send(Ok(crate::publication::ReplayBarrierAck {
+                    checkpoint_revision: 2,
+                    operation_id: transition.checkpoint.operation_id.clone(),
+                }));
+                ObservedSinkMessage::Block(transition)
+            }
+            SinkMessage::MirrorCaughtUp { transition, ack } => {
+                let _ = ack.send(Ok(crate::publication::ReplayBarrierAck {
+                    checkpoint_revision: 2,
+                    operation_id: transition.checkpoint.operation_id.clone(),
+                }));
+                ObservedSinkMessage::MirrorCaughtUp
+            }
+        }
+    }
+
+    async fn drive_with_barrier_acks<F>(
+        process: F,
+        rx: &mut mpsc::Receiver<SinkMessage>,
+    ) -> (anyhow::Result<()>, Vec<ObservedSinkMessage>)
+    where
+        F: Future<Output = anyhow::Result<()>>,
+    {
+        tokio::pin!(process);
+        let mut observed = Vec::new();
+        let result = loop {
+            tokio::select! {
+                result = &mut process => break result,
+                maybe_message = rx.recv() => {
+                    let Some(message) = maybe_message else {
+                        break Err(anyhow::anyhow!("sink channel closed while process was active"));
+                    };
+                    observed.push(observe_and_ack(message));
+                }
+            }
+        };
+        while let Ok(message) = rx.try_recv() {
+            observed.push(observe_and_ack(message));
+        }
+        (result, observed)
+    }
+
+    fn observed_batches(messages: &[ObservedSinkMessage]) -> Vec<&crate::model::RowBatch> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                ObservedSinkMessage::Batch(batch) => Some(batch),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn kiro_sidecar(session_id: &str, title: &str, input_tokens: u64, credits: f64) -> Value {
         json!({
             "session_id": session_id,
@@ -2362,17 +3022,28 @@ mod tests {
                 .expect("serialize Kiro sidecar"),
         )
         .expect("write Kiro sidecar");
-        process_file(
-            &config,
-            &work,
-            checkpoints.clone(),
-            &VolatilePollMap::new(),
-            sink_tx.clone(),
-            &metrics,
+        let (result, second_messages) = drive_with_barrier_acks(
+            process_file(
+                &config,
+                &work,
+                checkpoints.clone(),
+                &VolatilePollMap::new(),
+                sink_tx.clone(),
+                &metrics,
+            ),
+            &mut sink_rx,
         )
-        .await
-        .expect("refresh Kiro session after sidecar appears");
-        let second = drain_batches(&mut sink_rx).await;
+        .await;
+        result.expect("refresh Kiro session after sidecar appears");
+        assert!(matches!(
+            second_messages.first(),
+            Some(ObservedSinkMessage::Begin(_))
+        ));
+        assert!(matches!(
+            second_messages.last(),
+            Some(ObservedSinkMessage::Finalize(_))
+        ));
+        let second = observed_batches(&second_messages);
         assert_eq!(second.len(), 1);
         assert_eq!(
             second[0].raw_rows.len(),
@@ -2391,8 +3062,17 @@ mod tests {
             .filter_map(|row| row.get("event_uid").and_then(Value::as_str))
             .map(str::to_string)
             .collect::<Vec<_>>();
-        assert_eq!(replayed_event_uids, first_event_uids);
-        let second_checkpoint = second[0].checkpoint.as_ref().expect("checkpoint").clone();
+        assert_ne!(
+            replayed_event_uids, first_event_uids,
+            "a sidecar-driven whole-source replay uses a checked replacement generation"
+        );
+        let second_checkpoint = second_messages
+            .iter()
+            .find_map(|message| match message {
+                ObservedSinkMessage::Finalize(transition) => Some(transition.checkpoint.clone()),
+                _ => None,
+            })
+            .expect("final replacement checkpoint");
         let second_cursor = super::parse_kiro_checkpoint_cursor(&second_checkpoint.cursor_json);
         assert!(second_cursor.kiro_sidecar_valid);
         assert_ne!(second_cursor.transcript_fingerprint, 0);
@@ -2442,17 +3122,28 @@ mod tests {
             serde_json::to_vec_pretty(&changed_hints).expect("serialize changed Kiro hints"),
         )
         .expect("update Kiro transcript hints");
-        process_file(
-            &config,
-            &work,
-            checkpoints,
-            &VolatilePollMap::new(),
-            sink_tx,
-            &metrics,
+        let (result, fourth_messages) = drive_with_barrier_acks(
+            process_file(
+                &config,
+                &work,
+                checkpoints,
+                &VolatilePollMap::new(),
+                sink_tx,
+                &metrics,
+            ),
+            &mut sink_rx,
         )
-        .await
-        .expect("replay Kiro transcript after metadata hints change");
-        let fourth = drain_batches(&mut sink_rx).await;
+        .await;
+        result.expect("replay Kiro transcript after metadata hints change");
+        assert!(matches!(
+            fourth_messages.first(),
+            Some(ObservedSinkMessage::Begin(_))
+        ));
+        assert!(matches!(
+            fourth_messages.last(),
+            Some(ObservedSinkMessage::Finalize(_))
+        ));
+        let fourth = observed_batches(&fourth_messages);
         assert_eq!(fourth.len(), 1);
         assert_eq!(fourth[0].raw_rows.len(), 3, "metadata plus replay");
         assert_eq!(fourth[0].event_rows.len(), 3);
@@ -2845,8 +3536,23 @@ mod tests {
                 .map(|row| row["event_uid"].as_str().expect("metadata event uid"))
                 .collect::<std::collections::HashSet<_>>()
                 .len(),
-            1,
-            "both nested transcripts reuse one companion metadata identity"
+            2,
+            "companion metadata is qualified by each published transcript source"
+        );
+        assert_eq!(
+            session_meta
+                .iter()
+                .map(|row| {
+                    row["source_file"]
+                        .as_str()
+                        .expect("metadata source file")
+                        .to_string()
+                })
+                .collect::<std::collections::BTreeSet<_>>(),
+            cowork_fixture_transcripts()
+                .iter()
+                .map(|path| path.to_string_lossy().to_string())
+                .collect(),
         );
         let payload: Value = serde_json::from_str(
             session_meta[0]["payload_json"]
@@ -3141,7 +3847,7 @@ mod tests {
             source_generation: 1,
             last_offset: (header.len() + 1) as u64,
             last_line_no: 1,
-            status: "active".to_string(),
+            status: CheckpointLifecycle::Active.to_string(),
             ..Default::default()
         };
         let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));

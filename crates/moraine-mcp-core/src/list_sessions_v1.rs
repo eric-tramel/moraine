@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use chrono::{Datelike, TimeZone, Timelike, Utc};
 use moraine_conversations::{
     ConversationListSort as RepoListSort, ConversationMode as RepoConversationMode,
-    McpSessionListFilter, McpSessionListItem, Page, PageRequest,
+    McpSessionListFilter, McpSessionListItem, Page, PageRequest, QueryEnvelope,
 };
 use serde_json::{json, Value};
 use tokio::time::{timeout, Duration};
@@ -42,9 +42,17 @@ impl AppState {
             cursor: args.cursor.clone(),
         };
 
-        let page_result = timeout(
+        // The tool-level cap narrows the request envelope (never widens it),
+        // so the server-side max_execution_time of every statement below
+        // tracks this 3s bound. When the tokio timeout fires the dropped
+        // repository future's per-statement drop guard KILLs the in-flight
+        // server query — the #576 orphan pattern (issue #600 W7).
+        let page_result = QueryEnvelope::scope_narrowed(
             Duration::from_millis(LIST_SESSIONS_DEADLINE_MS),
-            self.repo.list_mcp_sessions(repo_filter, repo_page),
+            timeout(
+                Duration::from_millis(LIST_SESSIONS_DEADLINE_MS),
+                self.repo.list_mcp_sessions(repo_filter, repo_page),
+            ),
         )
         .await;
 

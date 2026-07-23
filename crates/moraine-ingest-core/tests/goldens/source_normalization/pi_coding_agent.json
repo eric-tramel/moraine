@@ -316,6 +316,7 @@
           "linked_external_id": "pi-model-1",
           "metadata_json": "{}",
           "session_id": "11111111-2222-4333-8444-555555555555",
+          "source_event_version": "<event_version>",
           "source_name": "golden-pi"
         }
       ],
@@ -440,6 +441,7 @@
           "linked_external_id": "pi-thinking-1",
           "metadata_json": "{}",
           "session_id": "11111111-2222-4333-8444-555555555555",
+          "source_event_version": "<event_version>",
           "source_name": "golden-pi"
         }
       ],
@@ -728,6 +730,7 @@
           "linked_external_id": "pi-user-1",
           "metadata_json": "{}",
           "session_id": "11111111-2222-4333-8444-555555555555",
+          "source_event_version": "<event_version>",
           "source_name": "golden-pi"
         },
         {
@@ -740,6 +743,7 @@
           "linked_external_id": "pi-user-1",
           "metadata_json": "{}",
           "session_id": "11111111-2222-4333-8444-555555555555",
+          "source_event_version": "<event_version>",
           "source_name": "golden-pi"
         },
         {
@@ -752,6 +756,7 @@
           "linked_external_id": "pi-user-1",
           "metadata_json": "{}",
           "session_id": "11111111-2222-4333-8444-555555555555",
+          "source_event_version": "<event_version>",
           "source_name": "golden-pi"
         }
       ],
@@ -794,6 +799,7 @@
           "project_id": "",
           "repo_rel_path": "",
           "session_id": "11111111-2222-4333-8444-555555555555",
+          "source_event_version": "<event_version>",
           "source_name": "golden-pi",
           "source_ref": "/fixtures/pi/session.jsonl:1:5",
           "tool_call_id": "pi-tool-1",
@@ -902,6 +908,7 @@
           "linked_external_id": "pi-assistant-1",
           "metadata_json": "{}",
           "session_id": "11111111-2222-4333-8444-555555555555",
+          "source_event_version": "<event_version>",
           "source_name": "golden-pi"
         }
       ],
@@ -944,6 +951,7 @@
           "project_id": "",
           "repo_rel_path": "",
           "session_id": "11111111-2222-4333-8444-555555555555",
+          "source_event_version": "<event_version>",
           "source_name": "golden-pi",
           "source_ref": "/fixtures/pi/session.jsonl:1:6",
           "tool_call_id": "pi-tool-1",
@@ -1052,6 +1060,7 @@
           "linked_external_id": "pi-tool-result-1",
           "metadata_json": "{}",
           "session_id": "11111111-2222-4333-8444-555555555555",
+          "source_event_version": "<event_version>",
           "source_name": "golden-pi"
         }
       ],
@@ -1094,6 +1103,7 @@
           "project_id": "",
           "repo_rel_path": "",
           "session_id": "11111111-2222-4333-8444-555555555555",
+          "source_event_version": "<event_version>",
           "source_name": "golden-pi",
           "source_ref": "/fixtures/pi/session.jsonl:1:7",
           "tool_call_id": "pi-bash-1",
@@ -1119,6 +1129,7 @@
           "project_id": "",
           "repo_rel_path": "",
           "session_id": "11111111-2222-4333-8444-555555555555",
+          "source_event_version": "<event_version>",
           "source_name": "golden-pi",
           "source_ref": "/fixtures/pi/session.jsonl:1:7",
           "tool_call_id": "pi-bash-1",
@@ -1225,6 +1236,7 @@
           "linked_external_id": "pi-bash-1",
           "metadata_json": "{}",
           "session_id": "11111111-2222-4333-8444-555555555555",
+          "source_event_version": "<event_version>",
           "source_name": "golden-pi"
         }
       ],
@@ -1347,6 +1359,7 @@
           "linked_external_id": "pi-compact-1",
           "metadata_json": "{}",
           "session_id": "11111111-2222-4333-8444-555555555555",
+          "source_event_version": "<event_version>",
           "source_name": "golden-pi"
         }
       ],
@@ -1469,6 +1482,7 @@
           "linked_external_id": "pi-branch-1",
           "metadata_json": "{}",
           "session_id": "11111111-2222-4333-8444-555555555555",
+          "source_event_version": "<event_version>",
           "source_name": "golden-pi"
         }
       ],
@@ -1593,6 +1607,7 @@
           "linked_external_id": "pi-custom-1",
           "metadata_json": "{}",
           "session_id": "11111111-2222-4333-8444-555555555555",
+          "source_event_version": "<event_version>",
           "source_name": "golden-pi"
         }
       ],
@@ -1715,6 +1730,7 @@
           "linked_external_id": "pi-custom-message-1",
           "metadata_json": "{}",
           "session_id": "11111111-2222-4333-8444-555555555555",
+          "source_event_version": "<event_version>",
           "source_name": "golden-pi"
         }
       ],
@@ -1837,6 +1853,7 @@
           "linked_external_id": "pi-label-1",
           "metadata_json": "{}",
           "session_id": "11111111-2222-4333-8444-555555555555",
+          "source_event_version": "<event_version>",
           "source_name": "golden-pi"
         }
       ],

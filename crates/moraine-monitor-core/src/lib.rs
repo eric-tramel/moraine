@@ -10,11 +10,13 @@ use axum::{
 };
 #[cfg(test)]
 use moraine_config::AppConfig;
+use moraine_config::{QueryBudgetsConfig, ValidatedQueryBudgets};
 use moraine_conversations::{
-    AnalyticsRange, BackendRepository, BackendRepositoryRouter, IngestHeartbeat,
-    IngestHeartbeatRead, RepoError, SessionAnalytics, SessionAnalyticsQuery, SessionLookback,
-    SessionStep, SessionTurn, StoreConnectionMetrics, StoreHealth, StoreProbe, TablePreviewQuery,
-    TableSummaries,
+    budget_telemetry, record_budget_rejection, record_budget_request, AnalyticsRange,
+    BackendRepository, BackendRepositoryRouter, IngestHeartbeat, IngestHeartbeatRead,
+    PublicationDiagnostics, QueryClass, QueryEnvelope, RepoError, SessionAnalytics,
+    SessionAnalyticsQuery, SessionLookback, SessionStep, SessionTurn, StoreConnectionMetrics,
+    StoreHealth, StoreProbe, TablePreviewQuery, TableSummaries,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -25,11 +27,44 @@ use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
+use tokio::sync::Semaphore;
 use tracing::warn;
+
+/// Concurrent repository-backed dashboard reads admitted at once. Overflow is
+/// rejected with 429 `resource_exhausted` instead of queueing unboundedly.
+/// `/health` is exempt: supervisors and `moraine status` poll it during
+/// incidents, which is exactly when heavy dashboard reads hold the permits.
+const MONITOR_READ_PERMITS: usize = 4;
+
+/// Per-request protections for repository-backed monitor endpoints (issue
+/// #600 W8): every data request runs inside an Interactive query envelope
+/// built from the operator's validated `[query_budgets]`, and heavy reads
+/// pass through a small non-queueing admission semaphore.
+struct MonitorReadLimits {
+    budgets: ValidatedQueryBudgets,
+    read_permits: Semaphore,
+}
+
+impl MonitorReadLimits {
+    fn new(budgets: ValidatedQueryBudgets) -> Self {
+        Self {
+            budgets,
+            read_permits: Semaphore::new(MONITOR_READ_PERMITS),
+        }
+    }
+}
+
+/// Bundled-default budgets for entry points that run without an
+/// operator-loaded config (the live-test listener path).
+fn default_query_budgets() -> ValidatedQueryBudgets {
+    ValidatedQueryBudgets::from_config(&QueryBudgetsConfig::default())
+        .expect("bundled default query budgets are valid")
+}
 
 struct AppState {
     backend_router: Arc<BackendRepositoryRouter>,
     static_dir: PathBuf,
+    read_limits: Arc<MonitorReadLimits>,
 }
 
 #[derive(Deserialize)]
@@ -64,13 +99,14 @@ pub async fn run_server_with_router<S>(
     host: String,
     port: u16,
     static_dir: PathBuf,
+    query_budgets: ValidatedQueryBudgets,
     shutdown: S,
 ) -> Result<()>
 where
     S: Future<Output = ()> + Send + 'static,
 {
     let static_dir_display = static_dir.display().to_string();
-    let app = router_with_backend_router(backend_router, static_dir)?;
+    let app = router_with_backend_router(backend_router, static_dir, query_budgets)?;
     let bind = format!("{host}:{port}")
         .parse::<SocketAddr>()
         .map_err(|err| anyhow!("invalid bind address: {err}"))?;
@@ -91,7 +127,10 @@ where
 /// Run the monitor HTTP server on an already-bound listener.
 ///
 /// Ownership of the listener transfers to the server and is released after
-/// shutdown completes or startup fails.
+/// shutdown completes or startup fails. This entry point serves callers that
+/// attach without an operator-loaded config (live tests), so its query
+/// envelopes use the bundled default `[query_budgets]`; the daemon path
+/// threads the operator's budgets through [`run_server_with_router`].
 pub async fn run_server_with_listener<S>(
     backend_router: Arc<BackendRepositoryRouter>,
     listener: tokio::net::TcpListener,
@@ -102,7 +141,7 @@ where
     S: Future<Output = ()> + Send + 'static,
 {
     let static_dir_display = static_dir.display().to_string();
-    let app = router_with_backend_router(backend_router, static_dir)?;
+    let app = router_with_backend_router(backend_router, static_dir, default_query_budgets())?;
     let bind = listener
         .local_addr()
         .map_err(|error| anyhow!("failed to read monitor listener address: {error}"))?;
@@ -133,20 +172,31 @@ where
 fn router_with_backend_router(
     backend_router: Arc<BackendRepositoryRouter>,
     static_dir: PathBuf,
+    query_budgets: ValidatedQueryBudgets,
 ) -> Result<Router> {
     validate_static_dir(&static_dir)?;
     let state = Arc::new(AppState {
         backend_router,
         static_dir,
+        read_limits: Arc::new(MonitorReadLimits::new(query_budgets)),
     });
     Ok(monitor_router(state))
 }
 
 fn monitor_router(state: Arc<AppState>) -> Router {
-    let data_routes = dashboard_routes().route_layer(middleware::from_fn_with_state(
-        state.backend_router.clone(),
-        select_backend_repository,
-    ));
+    // Layer order (outermost first): backend selection -> query envelope ->
+    // per-route admission -> handler. The envelope wraps the entire handler
+    // future, so an abandoned request (client disconnect) drops the handler
+    // inside the scope and the transport's drop guards cancel its statements.
+    let data_routes = dashboard_routes(state.read_limits.clone())
+        .route_layer(middleware::from_fn_with_state(
+            state.read_limits.clone(),
+            monitor_query_envelope,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.backend_router.clone(),
+            select_backend_repository,
+        ));
     // Capabilities is daemon/default-global metadata, not a project-routed data
     // endpoint. It intentionally remains outside project selection middleware.
     let versioned_routes = data_routes
@@ -163,15 +213,105 @@ fn monitor_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-fn dashboard_routes() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/health", get(api_health))
+fn dashboard_routes(read_limits: Arc<MonitorReadLimits>) -> Router<Arc<AppState>> {
+    // `/health` bypasses the read semaphore (see MONITOR_READ_PERMITS) but
+    // still runs inside the per-request query envelope added above.
+    let admitted = Router::new()
         .route("/status", get(api_status))
         .route("/analytics", get(api_analytics))
         .route("/tables", get(api_tables))
         .route("/web-searches", get(api_web_searches))
         .route("/tables/:table", get(api_table_rows))
         .route("/sessions", get(api_sessions))
+        .route_layer(middleware::from_fn_with_state(
+            read_limits,
+            monitor_read_admission,
+        ));
+    Router::new()
+        .route("/health", get(api_health))
+        .merge(admitted)
+}
+
+/// Establish the mandatory Interactive query envelope (issue #600, amendment
+/// A6) for one repository-backed monitor request. Per request, never per
+/// client or per service: MCP and monitor share one router/repository, so
+/// budgets and cancellation must be scoped to this HTTP request alone.
+async fn monitor_query_envelope(
+    State(limits): State<Arc<MonitorReadLimits>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let envelope = QueryEnvelope::new_with_admin_budget(
+        "monitor",
+        QueryClass::Interactive,
+        &limits.budgets.interactive,
+        &limits.budgets.administrative,
+    );
+    let response = Arc::clone(&envelope).scope(next.run(request)).await;
+    // Fold this request's envelope accounting into the process-wide budget
+    // sink (issue #600 W11) — these are the monitor's own counters in the
+    // `query_budgets` health block. Handlers finish their repository reads
+    // before building the response, so the stats are final here.
+    record_budget_request(&envelope.stats());
+    response
+}
+
+/// Bounded admission for repository-heavy dashboard reads: overflow is
+/// rejected immediately with 429 `resource_exhausted` rather than queued,
+/// so a burst of dashboard traffic cannot pile unbounded work behind the
+/// interactive deadline.
+async fn monitor_read_admission(
+    State(limits): State<Arc<MonitorReadLimits>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let _permit = match limits.read_permits.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            record_budget_rejection();
+            return json_response(
+                json!({
+                    "ok": false,
+                    "error": format!(
+                        "monitor is serving its maximum of {MONITOR_READ_PERMITS} concurrent reads; retry shortly"
+                    ),
+                    "code": "resource_exhausted",
+                }),
+                StatusCode::TOO_MANY_REQUESTS,
+            );
+        }
+    };
+    next.run(request).await
+}
+
+/// HTTP status plus the additive machine-readable `code` for a repository
+/// failure (amendment A11): envelope deadline -> 504 `deadline_exceeded`,
+/// budget/cap/allowance exhaustion -> 429 `resource_exhausted`, everything
+/// else keeps the pre-envelope 503 with no code. Scope/auth and not-found
+/// outcomes never reach this mapping: they travel as `Ok(None)`/empty
+/// results, not as `RepoError`.
+fn repo_error_status(error: &RepoError) -> (StatusCode, Option<&'static str>) {
+    match error {
+        RepoError::DeadlineExceeded { .. } => {
+            (StatusCode::GATEWAY_TIMEOUT, Some("deadline_exceeded"))
+        }
+        RepoError::ResourceExhausted { .. } => {
+            (StatusCode::TOO_MANY_REQUESTS, Some("resource_exhausted"))
+        }
+        _ => (StatusCode::SERVICE_UNAVAILABLE, None),
+    }
+}
+
+/// `{ok:false,error}` failure response with the additive `code` field when
+/// the failure has a budget classification. Existing dashboard fields are
+/// untouched (the contract change is additive).
+fn repo_error_response(message: String, error: &RepoError) -> Response {
+    let (status, code) = repo_error_status(error);
+    let mut payload = json!({"ok": false, "error": message});
+    if let Some(code) = code {
+        payload["code"] = json!(code);
+    }
+    json_response(payload, status)
 }
 
 /// Optional project context for repository-backed data endpoints. The value is
@@ -334,12 +474,26 @@ fn json_response<T: Serialize>(payload: T, status: StatusCode) -> Response {
 /// `X-Moraine-Project-Dir` and remains outside routing middleware.
 async fn api_capabilities(State(state): State<Arc<AppState>>) -> Response {
     let schema_migration_level = match state.backend_router.default_repository().await {
-        Ok(default_backend) => default_backend
-            .repository()
-            .read_store_diagnostics()
+        // Capabilities sits outside the data-route middleware, so this
+        // diagnostics read establishes its own Interactive envelope.
+        Ok(default_backend) => {
+            let limits = &state.read_limits;
+            QueryEnvelope::new_with_admin_budget(
+                "monitor",
+                QueryClass::Interactive,
+                &limits.budgets.interactive,
+                &limits.budgets.administrative,
+            )
+            .scope(async move {
+                default_backend
+                    .repository()
+                    .read_store_diagnostics()
+                    .await
+                    .ok()
+                    .and_then(|diagnostics| diagnostics.applied_schema_versions.into_iter().max())
+            })
             .await
-            .ok()
-            .and_then(|diagnostics| diagnostics.applied_schema_versions.into_iter().max()),
+        }
         Err(_) => None,
     };
 
@@ -359,6 +513,24 @@ async fn api_capabilities(State(state): State<Arc<AppState>>) -> Response {
     )
 }
 
+/// Process-wide query-budget telemetry block (issue #600 W11), a sibling of
+/// `publication` in health/status payloads. Counters cover both request
+/// boundaries the daemon hosts in this process (MCP tools/call and monitor
+/// HTTP requests) plus `unenveloped_statements`, which stays 0 now that the
+/// transport fails closed (W12) — a nonzero value would mean a permissive
+/// branch regressed into the transport.
+/// Additive: existing fields and failure shapes are untouched.
+fn query_budgets_payload() -> Value {
+    let totals = budget_telemetry();
+    json!({
+        "requests": totals.requests,
+        "statements": totals.statements,
+        "deadline_exceeded": totals.deadline_exceeded,
+        "resource_exhausted": totals.resource_exhausted,
+        "unenveloped_statements": totals.unenveloped_statements,
+    })
+}
+
 async fn api_health(Extension(backend): Extension<Arc<BackendRepository>>) -> Response {
     let (health, heartbeat) = tokio::join!(
         backend.repository().read_store_health(),
@@ -367,31 +539,40 @@ async fn api_health(Extension(backend): Extension<Arc<BackendRepository>>) -> Re
     let health = match health {
         Ok(health) => health,
         Err(error) => {
+            let (status, code) = repo_error_status(&error);
             let message = error.to_string();
-            return json_response(
-                json!({
-                    "ok": false,
-                    "url": backend.clickhouse_url(),
-                    "database": backend.clickhouse_database(),
-                    "error": message,
-                    "connections": {"total": Value::Null, "error": message},
-                }),
-                StatusCode::SERVICE_UNAVAILABLE,
-            );
+            let mut payload = json!({
+                "ok": false,
+                "url": backend.clickhouse_url(),
+                "database": backend.clickhouse_database(),
+                "error": message,
+                "connections": {"total": Value::Null, "error": message},
+                "publication": {
+                    "available": false,
+                    "healthy": false,
+                    "error": "publication readiness unavailable while store health is unavailable",
+                },
+                "query_budgets": query_budgets_payload(),
+            });
+            if let Some(code) = code {
+                payload["code"] = json!(code);
+            }
+            return json_response(payload, status);
         }
     };
     let connections = connection_payload(&health.connections);
+    let publication = publication_payload(&health.publication);
 
     let ping_ms = match &health.ping {
         StoreProbe::Available(value) => *value,
         StoreProbe::Failed { message } => {
-            return health_failure_response(&backend, message, connections);
+            return health_failure_response(&backend, message, connections, publication);
         }
     };
     let version = match &health.version {
         StoreProbe::Available(value) => value,
         StoreProbe::Failed { message } => {
-            return health_failure_response(&backend, message, connections);
+            return health_failure_response(&backend, message, connections, publication);
         }
     };
     let heartbeat = heartbeat.map(monitor_heartbeat_status).unwrap_or_default();
@@ -404,6 +585,8 @@ async fn api_health(Extension(backend): Extension<Arc<BackendRepository>>) -> Re
             "version": version,
             "ping_ms": ping_ms,
             "connections": connections,
+            "publication": publication,
+            "query_budgets": query_budgets_payload(),
             "ingestor": health_heartbeat_payload(&heartbeat),
         }),
         StatusCode::OK,
@@ -414,6 +597,7 @@ fn health_failure_response(
     backend: &BackendRepository,
     message: &str,
     connections: Value,
+    publication: Value,
 ) -> Response {
     json_response(
         json!({
@@ -422,6 +606,8 @@ fn health_failure_response(
             "database": backend.clickhouse_database(),
             "error": message,
             "connections": connections,
+            "publication": publication,
+            "query_budgets": query_budgets_payload(),
         }),
         StatusCode::SERVICE_UNAVAILABLE,
     )
@@ -443,10 +629,7 @@ async fn api_status(Extension(backend): Extension<Arc<BackendRepository>>) -> Re
         let tables = match tables {
             Ok(tables) => monitor_table_summaries(tables),
             Err(error) => {
-                return json_response(
-                    json!({"ok": false, "error": error.to_string()}),
-                    StatusCode::SERVICE_UNAVAILABLE,
-                );
+                return repo_error_response(error.to_string(), &error);
             }
         };
         let heartbeat = heartbeat.map(monitor_heartbeat_status).unwrap_or_default();
@@ -457,11 +640,14 @@ async fn api_status(Extension(backend): Extension<Arc<BackendRepository>>) -> Re
 
     let estimated_total_rows = tables.iter().map(|table| table.rows).sum::<u64>();
     let clickhouse = status_clickhouse_payload(&backend, &health, database_exists);
+    let publication = publication_payload(&health.publication);
 
     json_response(
         json!({
             "ok": true,
             "clickhouse": clickhouse,
+            "publication": publication,
+            "query_budgets": query_budgets_payload(),
             "database": {
                 "exists": database_exists,
                 "table_count": tables.len(),
@@ -486,6 +672,10 @@ fn unavailable_store_health(message: String) -> StoreHealth {
             message: message.clone(),
         },
         connections: StoreProbe::Failed { message },
+        publication: StoreProbe::Failed {
+            message: "publication readiness unavailable while store health is unavailable"
+                .to_string(),
+        },
     }
 }
 
@@ -541,16 +731,39 @@ fn connection_payload(probe: &StoreProbe<StoreConnectionMetrics>) -> Value {
     }
 }
 
+fn publication_payload(probe: &StoreProbe<PublicationDiagnostics>) -> Value {
+    match probe {
+        StoreProbe::Available(diagnostics) => json!({
+            "available": true,
+            "healthy": diagnostics.is_healthy(),
+            "ambiguous_hostless_rows": diagnostics.ambiguous_hostless_rows,
+            "replaying_generations": diagnostics.replaying_generations,
+            "blocked_generations": diagnostics.blocked_generations,
+            "append_preparations": diagnostics.append_preparations,
+            "blocked_append_preparations": diagnostics.blocked_append_preparations,
+            "mirror_catchup_pending": diagnostics.mirror_catchup_pending,
+            "writer_conflicts": diagnostics.writer_conflicts,
+            "issues": diagnostics.issues,
+        }),
+        StoreProbe::Failed { message } => json!({
+            "available": false,
+            "healthy": false,
+            "error": message,
+        }),
+    }
+}
+
 async fn api_tables(Extension(backend): Extension<Arc<BackendRepository>>) -> Response {
     match backend.repository().list_table_summaries().await {
         Ok(tables) => json_response(
-            json!({"ok": true, "tables": monitor_table_summaries(tables)}),
+            json!({
+                "ok": true,
+                "read_model": "audit",
+                "tables": monitor_table_summaries(tables),
+            }),
             StatusCode::OK,
         ),
-        Err(error) => json_response(
-            json!({"ok": false, "error": error.to_string()}),
-            StatusCode::SERVICE_UNAVAILABLE,
-        ),
+        Err(error) => repo_error_response(error.to_string(), &error),
     }
 }
 
@@ -575,16 +788,14 @@ async fn api_web_searches(
     let rows = match backend.repository().list_web_searches(limit).await {
         Ok(rows) => rows,
         Err(error) => {
-            return json_response(
-                json!({"ok": false, "error": format!("web search query failed: {error}")}),
-                StatusCode::SERVICE_UNAVAILABLE,
-            );
+            return repo_error_response(format!("web search query failed: {error}"), &error);
         }
     };
 
     json_response(
         json!({
             "ok": true,
+            "read_model": "live",
             "table": "web_searches",
             "limit": limit,
             "schema": [
@@ -612,16 +823,14 @@ async fn api_analytics(
     let snapshot = match backend.repository().analytics_series(range).await {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            return json_response(
-                json!({"ok": false, "error": format!("analytics query failed: {error}")}),
-                StatusCode::SERVICE_UNAVAILABLE,
-            );
+            return repo_error_response(format!("analytics query failed: {error}"), &error);
         }
     };
 
     json_response(
         json!({
             "ok": true,
+            "read_model": "live",
             "range": {
                 "key": snapshot.window.range.as_str(),
                 "label": format!("Last {}", snapshot.window.range.as_str()),
@@ -663,10 +872,7 @@ async fn api_sessions(
     let sessions = match backend.repository().list_session_analytics(query).await {
         Ok(sessions) => sessions,
         Err(error) => {
-            return json_response(
-                json!({"ok": false, "error": format!("sessions query failed: {error}")}),
-                StatusCode::SERVICE_UNAVAILABLE,
-            );
+            return repo_error_response(format!("sessions query failed: {error}"), &error);
         }
     };
     let now_ms = unix_now_ms();
@@ -675,7 +881,10 @@ async fn api_sessions(
         .map(|session| monitor_session_json(session, now_ms))
         .collect::<Vec<_>>();
 
-    json_response(json!({"ok": true, "sessions": sessions}), StatusCode::OK)
+    json_response(
+        json!({"ok": true, "read_model": "live", "sessions": sessions}),
+        StatusCode::OK,
+    )
 }
 
 fn resolve_session_lookback(value: Option<&str>) -> SessionLookback {
@@ -1040,6 +1249,7 @@ async fn api_table_rows(
             json_response(
                 json!({
                     "ok": true,
+                    "read_model": "audit",
                     "table": preview.table,
                     "limit": preview.limit,
                     "schema": schema,
@@ -1052,13 +1262,7 @@ async fn api_table_rows(
             json!({"ok": false, "error": "invalid table name"}),
             StatusCode::BAD_REQUEST,
         ),
-        Err(error) => json_response(
-            json!({
-                "ok": false,
-                "error": format!("unable to read table {table}: {error}"),
-            }),
-            StatusCode::SERVICE_UNAVAILABLE,
-        ),
+        Err(error) => repo_error_response(format!("unable to read table {table}: {error}"), &error),
     }
 }
 
@@ -1195,6 +1399,7 @@ mod tests {
             Arc::new(AppState {
                 backend_router,
                 static_dir: PathBuf::new(),
+                read_limits: Arc::new(MonitorReadLimits::new(default_query_budgets())),
             }),
             repository,
         )
@@ -1306,6 +1511,7 @@ mod tests {
                 postgres: 5,
                 interserver: 1,
             }),
+            publication: StoreProbe::Available(PublicationDiagnostics::default()),
         }
     }
 
@@ -1572,6 +1778,8 @@ mod tests {
         assert_eq!(health["ok"], json!(true));
         assert_eq!(health["version"], json!("25.1.1"));
         assert_eq!(health["connections"]["total"], json!(15));
+        assert_eq!(health["publication"]["available"], json!(true));
+        assert_eq!(health["publication"]["healthy"], json!(true));
         assert_eq!(
             health["ingestor"]["latest"],
             json!({"backend_sinks": {"team-ch": "healthy"}})
@@ -1583,6 +1791,7 @@ mod tests {
         assert_eq!(status["database"]["exists"], json!(true));
         assert_eq!(status["database"]["table_count"], json!(1));
         assert_eq!(status["database"]["estimated_total_rows"], json!(7));
+        assert_eq!(status["publication"]["healthy"], json!(true));
         assert_eq!(status["ingestor"]["latest"]["host"], json!("host-a"));
         let status_latest = status["ingestor"]["latest"]
             .as_object()
@@ -1595,6 +1804,7 @@ mod tests {
         let response = api_tables(Extension(backend.clone())).await;
         assert_eq!(response.status(), StatusCode::OK);
         let tables = response_json(response).await;
+        assert_eq!(tables["read_model"], json!("audit"));
         assert_eq!(tables["tables"][0]["is_temporary"], json!(0));
 
         let response = api_web_searches(
@@ -1604,6 +1814,7 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let web_searches = response_json(response).await;
+        assert_eq!(web_searches["read_model"], json!("live"));
         assert_eq!(web_searches["limit"], json!(1_000));
         assert_eq!(web_searches["schema"].as_array().unwrap().len(), 9);
         assert_eq!(web_searches["rows"][0]["search_query"], json!("moraine"));
@@ -1617,6 +1828,7 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let analytics = response_json(response).await;
+        assert_eq!(analytics["read_model"], json!("live"));
         assert_eq!(analytics["range"]["key"], json!("7d"));
         assert_eq!(analytics["range"]["label"], json!("Last 7d"));
         assert_eq!(analytics["series"]["tokens"][0]["tokens"], json!(4));
@@ -1631,6 +1843,7 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let sessions = response_json(response).await;
+        assert_eq!(sessions["read_model"], json!("live"));
         let session = &sessions["sessions"][0];
         assert_eq!(session["id"], json!("session-1"));
         assert_eq!(session["endedAt"], json!(1_771_243_203_900_i64));
@@ -1652,6 +1865,7 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let preview = response_json(response).await;
+        assert_eq!(preview["read_model"], json!("audit"));
         assert_eq!(preview["limit"], json!(500));
         assert_eq!(preview["schema"][0]["type"], json!("String"));
 
@@ -1798,6 +2012,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_and_status_expose_publication_progress_and_fail_closed_diagnostics() {
+        let diagnostics = PublicationDiagnostics {
+            ambiguous_hostless_rows: 7,
+            replaying_generations: 2,
+            blocked_generations: 1,
+            append_preparations: 3,
+            blocked_append_preparations: 2,
+            mirror_catchup_pending: 4,
+            writer_conflicts: 1,
+            issues: vec!["host identity cannot be proven".to_string()],
+        };
+        let (backend, _) = fake_backend(InMemoryConversationResponses {
+            read_store_health: Some(Ok(StoreHealth {
+                publication: StoreProbe::Available(diagnostics),
+                ..sample_health()
+            })),
+            latest_ingest_heartbeat: Some(Ok(sample_heartbeat())),
+            list_table_summaries: Some(Ok(TableSummaries::default())),
+            ..Default::default()
+        })
+        .await;
+
+        let health = response_json(api_health(Extension(backend.clone())).await).await;
+        assert_eq!(health["ok"], json!(true));
+        assert_eq!(health["publication"]["healthy"], json!(false));
+        assert_eq!(health["publication"]["ambiguous_hostless_rows"], json!(7));
+        assert_eq!(health["publication"]["blocked_generations"], json!(1));
+        assert_eq!(health["publication"]["writer_conflicts"], json!(1));
+        assert_eq!(health["publication"]["replaying_generations"], json!(2));
+        assert_eq!(health["publication"]["append_preparations"], json!(3));
+        assert_eq!(
+            health["publication"]["blocked_append_preparations"],
+            json!(2)
+        );
+        assert_eq!(health["publication"]["mirror_catchup_pending"], json!(4));
+
+        let status = response_json(api_status(Extension(backend)).await).await;
+        assert_eq!(status["publication"], health["publication"]);
+    }
+
+    #[tokio::test]
+    async fn publication_probe_failure_is_diagnostic_without_hiding_store_liveness() {
+        let (backend, _) = fake_backend(InMemoryConversationResponses {
+            read_store_health: Some(Ok(StoreHealth {
+                publication: StoreProbe::Failed {
+                    message: "publication control schema unavailable".to_string(),
+                },
+                ..sample_health()
+            })),
+            latest_ingest_heartbeat: Some(Ok(sample_heartbeat())),
+            ..Default::default()
+        })
+        .await;
+
+        let response = api_health(Extension(backend)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let health = response_json(response).await;
+        assert_eq!(health["ok"], json!(true));
+        assert_eq!(health["publication"]["available"], json!(false));
+        assert_eq!(health["publication"]["healthy"], json!(false));
+        assert_eq!(
+            health["publication"]["error"],
+            json!("publication control schema unavailable")
+        );
+    }
+
+    #[tokio::test]
     async fn pre017_heartbeat_keeps_legacy_health_and_status_shapes() {
         let mut heartbeat = sample_heartbeat();
         let latest = heartbeat.latest.as_mut().expect("latest heartbeat");
@@ -1846,7 +2127,7 @@ mod tests {
             )
             .expect("preloaded default router"),
         );
-        let app = router_with_backend_router(backend_router, root.clone())
+        let app = router_with_backend_router(backend_router, root.clone(), default_query_budgets())
             .expect("build injected router");
 
         let static_response = get_with_project_dir(
@@ -1884,13 +2165,31 @@ mod tests {
             ),
         ];
         for (canonical_path, legacy_path) in route_matrix {
-            let canonical = router_json(&app, canonical_path).await;
-            let legacy = router_json(&app, legacy_path).await;
+            let (canonical_status, mut canonical) = router_json(&app, canonical_path).await;
+            let (legacy_status, mut legacy) = router_json(&app, legacy_path).await;
+            assert_eq!(canonical_status, legacy_status);
+            // `query_budgets` is live process telemetry: the two sequential
+            // requests observe different `requests` totals through the same
+            // handler. Assert the block travels on both shapes, then compare
+            // the rest of the payloads byte-for-byte.
+            let canonical_budgets = canonical
+                .as_object_mut()
+                .expect("canonical payload object")
+                .remove("query_budgets");
+            let legacy_budgets = legacy
+                .as_object_mut()
+                .expect("legacy payload object")
+                .remove("query_budgets");
+            assert_eq!(
+                canonical_budgets.is_some(),
+                legacy_budgets.is_some(),
+                "{legacy_path} must carry query_budgets iff {canonical_path} does"
+            );
             assert_eq!(
                 canonical, legacy,
                 "{legacy_path} must directly alias {canonical_path}"
             );
-            assert_eq!(canonical.0, StatusCode::OK);
+            assert_eq!(canonical_status, StatusCode::OK);
         }
 
         let (status, capabilities) = router_json(&app, "/api/v1/capabilities").await;
@@ -1966,8 +2265,8 @@ mod tests {
             default_repository.clone(),
             named_repository.clone(),
         );
-        let app =
-            router_with_backend_router(backend_router, root.clone()).expect("routing test app");
+        let app = router_with_backend_router(backend_router, root.clone(), default_query_budgets())
+            .expect("routing test app");
 
         let default = response_json(get_with_project_dir(&app, "/api/v1/tables", None).await).await;
         assert_eq!(default_repository.calls().list_table_summaries, 1);
@@ -2036,7 +2335,7 @@ mod tests {
             default_repository.clone(),
             named_repository.clone(),
         );
-        let app = router_with_backend_router(backend_router, root.clone())
+        let app = router_with_backend_router(backend_router, root.clone(), default_query_budgets())
             .expect("capabilities routing test app");
 
         for header in [
@@ -2073,8 +2372,8 @@ mod tests {
             .expect("named backend")
             .url = "http://user:secret@team.example:8123/path?token=secret#fragment".to_string();
         let backend_router = preloaded_backend_router(config, default_repository, named_repository);
-        let app =
-            router_with_backend_router(backend_router, root.clone()).expect("metadata test app");
+        let app = router_with_backend_router(backend_router, root.clone(), default_query_budgets())
+            .expect("metadata test app");
 
         let default_health =
             response_json(get_with_project_dir(&app, "/api/health", None).await).await;
@@ -2115,8 +2414,8 @@ mod tests {
             default_repository.clone(),
             named_repository.clone(),
         );
-        let app =
-            router_with_backend_router(backend_router, root.clone()).expect("validation test app");
+        let app = router_with_backend_router(backend_router, root.clone(), default_query_budgets())
+            .expect("validation test app");
 
         let mut repeated = Request::builder()
             .uri("/api/health")
@@ -2187,7 +2486,7 @@ mod tests {
             )
             .expect("lazy backend router"),
         );
-        let app = router_with_backend_router(backend_router, root.clone())
+        let app = router_with_backend_router(backend_router, root.clone(), default_query_budgets())
             .expect("construction error test app");
 
         let response = get_with_project_dir(
@@ -2221,6 +2520,7 @@ mod tests {
             address.ip().to_string(),
             address.port(),
             missing_static_dir,
+            default_query_budgets(),
             std::future::pending(),
         )
         .await
@@ -2354,5 +2654,264 @@ mod tests {
         assert!(error.to_string().contains("does not contain `index.html`"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn data_requests_run_inside_an_interactive_monitor_envelope() {
+        let limits = Arc::new(MonitorReadLimits::new(default_query_budgets()));
+        let app: Router = Router::new()
+            .route(
+                "/probe",
+                get(|| async {
+                    let envelope = QueryEnvelope::current().expect("handler must see an envelope");
+                    Json(json!({
+                        "request_id": envelope.request_id(),
+                        "interactive": envelope.class() == QueryClass::Interactive,
+                    }))
+                }),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                limits,
+                monitor_query_envelope,
+            ));
+
+        let (status, first) = router_json(&app, "/probe").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(first["interactive"], json!(true));
+        let first_id = first["request_id"].as_str().expect("request id");
+        assert!(
+            first_id.starts_with("moraine-monitor-"),
+            "monitor request ids must carry the monitor kind: {first_id}"
+        );
+
+        // Per request, never per client: a second request gets a new envelope.
+        let (_, second) = router_json(&app, "/probe").await;
+        assert_ne!(second["request_id"], first["request_id"]);
+    }
+
+    #[tokio::test]
+    async fn health_and_status_expose_query_budget_totals() {
+        let (state, _) = fake_state(successful_responses());
+        let app = monitor_router(state);
+
+        let before = budget_telemetry();
+        let (code, health) = router_json(&app, "/api/v1/health").await;
+        assert_eq!(code, StatusCode::OK);
+        for field in [
+            "requests",
+            "statements",
+            "deadline_exceeded",
+            "resource_exhausted",
+            "unenveloped_statements",
+        ] {
+            assert!(
+                health["query_budgets"][field].is_u64(),
+                "query_budgets.{field} must be a counter: {health}"
+            );
+        }
+
+        let (code, status) = router_json(&app, "/api/v1/status").await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(
+            status["query_budgets"]["requests"].is_u64(),
+            "status must carry the same query_budgets block: {status}"
+        );
+
+        // Both requests ran inside the monitor envelope middleware, so the
+        // process totals grew by at least two (lower bound only: the sink is
+        // shared with concurrently running tests in this binary).
+        assert!(
+            budget_telemetry().requests >= before.requests + 2,
+            "monitor requests must fold into the process budget telemetry"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_admission_overflow_returns_429_and_health_stays_exempt() {
+        let (state, _) = fake_state(successful_responses());
+        let app = monitor_router(state.clone());
+
+        let held = state
+            .read_limits
+            .read_permits
+            .acquire_many(MONITOR_READ_PERMITS as u32)
+            .await
+            .expect("hold every read permit");
+
+        let before = budget_telemetry();
+        let (status, payload) = router_json(&app, "/api/v1/tables").await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(payload["ok"], json!(false));
+        assert_eq!(payload["code"], json!("resource_exhausted"));
+        assert!(payload["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("concurrent reads")));
+        // The rejection is budget exhaustion and must reach the process-wide
+        // telemetry the health endpoint reports (lower bound: the sink is
+        // shared with concurrently running tests).
+        assert!(
+            budget_telemetry().resource_exhausted > before.resource_exhausted,
+            "admission overflow must count as resource_exhausted"
+        );
+
+        // Health is deliberately outside the semaphore so supervisors can
+        // still probe liveness while the dashboard has the permits busy.
+        let (status, payload) = router_json(&app, "/api/v1/health").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["ok"], json!(true));
+
+        drop(held);
+        let (status, _) = router_json(&app, "/api/v1/tables").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn budget_errors_map_to_504_and_429_with_additive_codes() {
+        let (state, _) = fake_state(InMemoryConversationResponses {
+            list_table_summaries: Some(Err(RepoError::deadline_exceeded(
+                "query budget deadline expired (budget 15.000s)",
+            ))),
+            analytics_series: Some(Err(RepoError::resource_exhausted(
+                "read_rows allowance exhausted (budget 500000000)",
+            ))),
+            list_web_searches: Some(Err(RepoError::backend("web unavailable"))),
+            read_store_health: Some(Err(RepoError::deadline_exceeded(
+                "query budget deadline expired (budget 15.000s)",
+            ))),
+            ..Default::default()
+        });
+        let app = monitor_router(state);
+
+        let (status, payload) = router_json(&app, "/api/v1/tables").await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(payload["ok"], json!(false));
+        assert_eq!(payload["code"], json!("deadline_exceeded"));
+        assert!(payload["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("deadline exceeded")));
+
+        let (status, payload) = router_json(&app, "/api/v1/analytics").await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(payload["code"], json!("resource_exhausted"));
+
+        // Health keeps its existing failure payload fields and adds the code.
+        let (status, payload) = router_json(&app, "/api/v1/health").await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(payload["code"], json!("deadline_exceeded"));
+        assert_eq!(payload["publication"]["available"], json!(false));
+        // Budget telemetry stays visible on the failure shape too: exhaustion
+        // is exactly when the operator needs the counters.
+        assert!(
+            payload["query_budgets"]["deadline_exceeded"].is_u64(),
+            "failure payload must keep the query_budgets block: {payload}"
+        );
+
+        // Non-budget failures keep the pre-envelope contract: 503, no code.
+        let (status, payload) = router_json(&app, "/api/v1/web-searches").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(payload.get("code").is_none());
+    }
+
+    /// Mock ClickHouse endpoint: KILL statements are recorded and succeed,
+    /// every other statement signals arrival and then hangs forever.
+    #[derive(Clone)]
+    struct MockClickHouse {
+        kills: Arc<std::sync::Mutex<Vec<String>>>,
+        started_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    }
+
+    async fn mock_clickhouse_statement(
+        State(mock): State<MockClickHouse>,
+        Query(params): Query<std::collections::HashMap<String, String>>,
+    ) -> Response {
+        let sql = params.get("query").cloned().unwrap_or_default();
+        if sql.trim_start().to_uppercase().starts_with("KILL QUERY") {
+            mock.kills.lock().expect("kill log").push(sql);
+            return Response::new(Body::from(""));
+        }
+        let _ = mock.started_tx.send(());
+        std::future::pending::<Response>().await
+    }
+
+    #[tokio::test]
+    async fn dropped_monitor_request_kills_the_inflight_statement() {
+        use moraine_conversations::build_clickhouse_repository;
+
+        let kills = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mock = MockClickHouse {
+            kills: kills.clone(),
+            started_tx,
+        };
+        let mock_app: Router = Router::new()
+            .fallback(axum::routing::any(mock_clickhouse_statement))
+            .with_state(mock);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock clickhouse");
+        let mock_addr = listener.local_addr().expect("mock clickhouse address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, mock_app).await;
+        });
+
+        let clickhouse = ClickHouseConfig {
+            url: format!("http://{mock_addr}"),
+            database: "moraine".to_string(),
+            ..ClickHouseConfig::default()
+        };
+        let repository = build_clickhouse_repository(clickhouse, RepoConfig::default())
+            .expect("build repository against mock clickhouse");
+        let backend_router = Arc::new(
+            BackendRepositoryRouter::from_preloaded_for_testing(
+                Arc::new(AppConfig::default()),
+                [(DEFAULT_BACKEND_NAME.to_string(), repository)],
+            )
+            .expect("preloaded mock-backed router"),
+        );
+        let state = Arc::new(AppState {
+            backend_router,
+            static_dir: PathBuf::new(),
+            read_limits: Arc::new(MonitorReadLimits::new(default_query_budgets())),
+        });
+        let app = monitor_router(state);
+
+        // Drive a repository-backed endpoint until its first ClickHouse
+        // statement is in flight on the mock, then drop the request future —
+        // exactly what axum does when the HTTP client disconnects.
+        let mut request = Box::pin(
+            app.clone().oneshot(
+                Request::builder()
+                    .uri("/api/v1/tables")
+                    .body(Body::empty())
+                    .expect("tables request"),
+            ),
+        );
+        tokio::select! {
+            response = &mut request => {
+                panic!("mock ClickHouse must hold the statement open, got {response:?}");
+            }
+            started = started_rx.recv() => {
+                started.expect("statement start signal");
+            }
+        }
+        drop(request);
+
+        // The transport's drop guards must issue a bounded KILL for the
+        // abandoned statement, carrying the monitor envelope's id prefix.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let recorded = kills.lock().expect("kill log").clone();
+            if recorded
+                .iter()
+                .any(|sql| sql.contains("KILL QUERY") && sql.contains("moraine-monitor-"))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no KILL for the dropped monitor request; observed: {recorded:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 }

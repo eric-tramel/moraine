@@ -1,9 +1,11 @@
 use moraine_clickhouse::ClickHouseClient;
-use moraine_config::ClickHouseConfig;
+use moraine_config::{
+    ClickHouseConfig, QueryBudgetsConfig, ValidatedQueryBudget, ValidatedQueryBudgets,
+};
 use moraine_conversations::{
     ClickHouseConversationRepository, ConversationDetailOptions, ConversationListFilter,
     ConversationListSort, ConversationMode, ConversationRepository, ConversationSearchQuery,
-    PageRequest, RepoConfig, SearchEventsQuery, SearchStrategyHint,
+    PageRequest, QueryClass, QueryEnvelope, RepoConfig, SearchEventsQuery, SearchStrategyHint,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -12,6 +14,20 @@ use pyo3::prelude::*;
 struct ConversationClient {
     repo: ClickHouseConversationRepository,
     rt: tokio::runtime::Runtime,
+    interactive_budget: ValidatedQueryBudget,
+}
+
+impl ConversationClient {
+    /// The binding is a request boundary like MCP or the monitor: every
+    /// repository call runs inside its own Interactive envelope built from
+    /// the bundled default budgets (the binding loads no moraine.toml).
+    fn interactive_envelope(&self) -> std::sync::Arc<QueryEnvelope> {
+        QueryEnvelope::new(
+            "python-binding",
+            QueryClass::Interactive,
+            &self.interactive_budget,
+        )
+    }
 }
 
 #[pymethods]
@@ -59,7 +75,15 @@ impl ConversationClient {
             .build()
             .map_err(py_runtime_err)?;
 
-        Ok(Self { repo, rt })
+        let interactive_budget = ValidatedQueryBudgets::from_config(&QueryBudgetsConfig::default())
+            .map_err(py_runtime_err)?
+            .interactive;
+
+        Ok(Self {
+            repo,
+            rt,
+            interactive_budget,
+        })
     }
 
     #[pyo3(signature = (from_unix_ms=None, to_unix_ms=None, mode=None, limit=50, cursor=None))]
@@ -74,15 +98,18 @@ impl ConversationClient {
         let parsed_mode = parse_mode(mode)?;
         let page = self
             .rt
-            .block_on(self.repo.list_conversations(
-                ConversationListFilter {
-                    from_unix_ms,
-                    to_unix_ms,
-                    mode: parsed_mode,
-                    sort: ConversationListSort::Desc,
-                },
-                PageRequest { limit, cursor },
-            ))
+            .block_on(
+                self.interactive_envelope()
+                    .scope(self.repo.list_conversations(
+                        ConversationListFilter {
+                            from_unix_ms,
+                            to_unix_ms,
+                            mode: parsed_mode,
+                            sort: ConversationListSort::Desc,
+                        },
+                        PageRequest { limit, cursor },
+                    )),
+            )
             .map_err(py_runtime_err)?;
 
         serde_json::to_string(&page).map_err(py_runtime_err)
@@ -93,8 +120,10 @@ impl ConversationClient {
         let conversation = self
             .rt
             .block_on(
-                self.repo
-                    .get_conversation(&session_id, ConversationDetailOptions { include_turns }),
+                self.interactive_envelope().scope(
+                    self.repo
+                        .get_conversation(&session_id, ConversationDetailOptions { include_turns }),
+                ),
             )
             .map_err(py_runtime_err)?;
 
@@ -127,17 +156,20 @@ impl ConversationClient {
         let parsed_mode = parse_mode(mode)?;
         let results = self
             .rt
-            .block_on(self.repo.search_conversations(ConversationSearchQuery {
-                query,
-                limit,
-                min_score,
-                min_should_match,
-                from_unix_ms,
-                to_unix_ms,
-                mode: parsed_mode,
-                include_tool_events,
-                exclude_codex_mcp,
-            }))
+            .block_on(
+                self.interactive_envelope()
+                    .scope(self.repo.search_conversations(ConversationSearchQuery {
+                        query,
+                        limit,
+                        min_score,
+                        min_should_match,
+                        from_unix_ms,
+                        to_unix_ms,
+                        mode: parsed_mode,
+                        include_tool_events,
+                        exclude_codex_mcp,
+                    })),
+            )
             .map_err(py_runtime_err)?;
 
         serde_json::to_string(&results).map_err(py_runtime_err)
@@ -171,20 +203,22 @@ impl ConversationClient {
         let parsed_strategy_hint = parse_strategy_hint(search_strategy)?;
         let results = self
             .rt
-            .block_on(self.repo.search_events(SearchEventsQuery {
-                query,
-                source,
-                limit,
-                session_id,
-                session_ids: None,
-                min_score,
-                min_should_match,
-                include_tool_events,
-                event_kinds: None,
-                exclude_codex_mcp,
-                bypass_cache: disable_cache,
-                strategy_hint: parsed_strategy_hint,
-            }))
+            .block_on(self.interactive_envelope().scope(self.repo.search_events(
+                SearchEventsQuery {
+                    query,
+                    source,
+                    limit,
+                    session_id,
+                    session_ids: None,
+                    min_score,
+                    min_should_match,
+                    include_tool_events,
+                    event_kinds: None,
+                    exclude_codex_mcp,
+                    bypass_cache: disable_cache,
+                    strategy_hint: parsed_strategy_hint,
+                },
+            )))
             .map_err(py_runtime_err)?;
 
         serde_json::to_string(&results).map_err(py_runtime_err)

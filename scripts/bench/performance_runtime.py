@@ -38,6 +38,7 @@ CENTRAL_STATUS_SCHEMA = "moraine-performance-central-v1"
 OWNED_ID_RE = re.compile(r"^perf-[0-9a-f]{12}$")
 SANDBOX_ID_RE = re.compile(r"^sb-[0-9a-f]{6}$")
 SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 RELEASE_BINARIES = ("moraine", "moraine-ingest", "moraine-monitor", "moraine-mcp")
 RUNNING_SERVER_BINARIES = ("moraine-ingest", "moraine-mcp")
 BUILD_ENV_ALLOWLIST = (
@@ -1725,7 +1726,8 @@ class OwnedSandbox:
             raise RuntimeFailure(f"cannot read owned benchmark logs: {proc.stderr[-2048:].strip()}")
         observations: list[AckObservation] = []
         marker_fields = ("batch_sequence=", "event_identity_digests=", "ack_monotonic_ns=")
-        for line in (*proc.stdout.splitlines(), *proc.stderr.splitlines()):
+        for raw_line in (*proc.stdout.splitlines(), *proc.stderr.splitlines()):
+            line = ANSI_CSI_RE.sub("", raw_line)
             present = tuple(field in line for field in marker_fields)
             if not any(present):
                 continue
@@ -1773,6 +1775,31 @@ class OwnedSandbox:
             raise RuntimeFailure(f"cannot record benchmark checkpoint: {proc.stderr[-2048:].strip()}")
         if os.environ.get("MORAINE_PERFORMANCE_FAILPOINT") == phase:
             raise RuntimeFailure(f"performance failpoint reached: {phase}")
+
+    def reconcile_seeded_read_model(self) -> None:
+        """Project a directly seeded fixture before any measured MCP request."""
+
+        proc = _run(
+            [
+                str(self.script),
+                "exec-loadgen",
+                self.sandbox_id,
+                "--cwd",
+                "/home/moraine",
+                "--",
+                "/opt/moraine/bin/moraine",
+                "db",
+                "migrate",
+                "--config",
+                "/sandbox/moraine.toml",
+            ],
+            timeout=600,
+        )
+        if proc.returncode:
+            raise RuntimeFailure(
+                "cannot reconcile seeded MCP read model: "
+                f"{proc.stderr[-2048:].strip()}"
+            )
 
     def spawn_stdio_route(
         self,

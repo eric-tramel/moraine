@@ -255,11 +255,11 @@
     },
     "etd_sample": {
       "type": "object", "additionalProperties": false,
-      "required": ["event_identity_sha256", "term_sha256", "batch_sequence", "publication_durable_ms", "db_ack_ms", "last_miss_ms", "first_hit_ms", "first_valid_ms", "source_interval", "db_ack_interval", "term_use_count", "cache_bypass", "valid", "error_code"],
+      "required": ["event_identity_sha256", "term_sha256", "batch_sequence", "publication_durable_ms", "db_ack_lower_ms", "db_ack_ms", "last_miss_ms", "first_hit_ms", "first_valid_ms", "source_interval", "db_ack_interval", "term_use_count", "cache_bypass", "valid", "error_code"],
       "properties": {
         "event_identity_sha256": {"$ref": "#/$defs/sha256"}, "term_sha256": {"oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
         "batch_sequence": {"oneOf": [{"$ref": "#/$defs/nonnegative_integer"}, {"type": "null"}]},
-        "publication_durable_ms": {"oneOf": [{"$ref": "#/$defs/nonnegative"}, {"type": "null"}]}, "db_ack_ms": {"oneOf": [{"$ref": "#/$defs/nonnegative"}, {"type": "null"}]},
+        "publication_durable_ms": {"oneOf": [{"$ref": "#/$defs/nonnegative"}, {"type": "null"}]}, "db_ack_lower_ms": {"oneOf": [{"$ref": "#/$defs/nonnegative"}, {"type": "null"}]}, "db_ack_ms": {"oneOf": [{"$ref": "#/$defs/nonnegative"}, {"type": "null"}]},
         "last_miss_ms": {"oneOf": [{"$ref": "#/$defs/nonnegative"}, {"type": "null"}]},
         "first_hit_ms": {"oneOf": [{"$ref": "#/$defs/nonnegative"}, {"type": "null"}]},
         "first_valid_ms": {"oneOf": [{"$ref": "#/$defs/nonnegative"}, {"type": "null"}]},

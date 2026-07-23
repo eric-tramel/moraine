@@ -53,6 +53,7 @@ def valid_etd_sample(index: int) -> dict:
         "term_sha256": f"sha256:{index + 100:064x}",
         "batch_sequence": index + 1,
         "publication_durable_ms": 1.0,
+        "db_ack_lower_ms": 2.0,
         "db_ack_ms": 2.0,
         "last_miss_ms": 3.0,
         "first_hit_ms": 4.0,

@@ -244,7 +244,10 @@ FORMAT JSONEachRow",
                 .await?
                 .into_iter()
                 .map(|turn| turn.compact)
-                .collect();
+                .collect::<Vec<_>>();
+            if turns.len() != session.row.total_turns as usize {
+                continue;
+            }
             if !self.projected_snapshot_still_current(&session).await? {
                 continue;
             }
@@ -269,9 +272,7 @@ FORMAT JSONEachRow",
                 }),
             }));
         }
-        Err(RepoError::backend(
-            "MCP open session snapshot changed repeatedly",
-        ))
+        Err(RepoError::ReadModelChanged)
     }
 
     pub(super) async fn get_turn_impl(
@@ -343,9 +344,7 @@ FORMAT JSONEachRow",
                 }),
             }));
         }
-        Err(RepoError::backend(
-            "MCP open turn snapshot changed repeatedly",
-        ))
+        Err(RepoError::ReadModelChanged)
     }
 
     pub(super) async fn open_event_impl(&self, req: OpenEventRequest) -> RepoResult<OpenContext> {
@@ -560,7 +559,6 @@ FORMAT JSONEachRow",
 
         for _ in 0..MAX_MCP_OPEN_SNAPSHOT_ATTEMPTS {
             let candidates = self.load_projected_event_candidates(event_uid).await?;
-            let stale_candidates_observed = !candidates.is_empty();
             let mut pinned = None;
             for lookup in candidates {
                 let Some(session) = self.load_projected_session(&lookup.session_id).await? else {
@@ -572,8 +570,8 @@ FORMAT JSONEachRow",
                 }
             }
             let Some((lookup, session)) = pinned else {
-                if stale_candidates_observed {
-                    continue;
+                if self.canonical_event_exists_in_snapshot(event_uid).await? {
+                    return Err(RepoError::ReadModelChanged);
                 }
                 return Ok(None);
             };
@@ -594,13 +592,24 @@ FORMAT JSONEachRow",
             };
             let mut neighbors = match &row {
                 Some(row) => {
-                    let neighbor_uids =
-                        [row.previous_event_uid.clone(), row.next_event_uid.clone()]
-                            .into_iter()
-                            .filter(|event_uid| !event_uid.is_empty())
-                            .collect::<Vec<_>>();
-                    self.load_projected_event_refs(neighbor_uids, lookup.slot, lookup.generation)
-                        .await?
+                    let mut neighbor_orders = Vec::with_capacity(2);
+                    if !row.previous_event_uid.is_empty() {
+                        if let Some(previous_order) = row.event_order.checked_sub(1) {
+                            neighbor_orders.push(previous_order);
+                        }
+                    }
+                    if !row.next_event_uid.is_empty() {
+                        if let Some(next_order) = row.event_order.checked_add(1) {
+                            neighbor_orders.push(next_order);
+                        }
+                    }
+                    self.load_projected_event_refs_by_order(
+                        &row.session_id,
+                        neighbor_orders,
+                        lookup.slot,
+                        lookup.generation,
+                    )
+                    .await?
                 }
                 None => HashMap::new(),
             };
@@ -615,8 +624,14 @@ FORMAT JSONEachRow",
                 "mcp_open_event_load"
             );
 
-            let previous_event = neighbors.remove(&row.previous_event_uid);
-            let next_event = neighbors.remove(&row.next_event_uid);
+            let previous_event = row
+                .event_order
+                .checked_sub(1)
+                .and_then(|event_order| neighbors.remove(&event_order));
+            let next_event = row
+                .event_order
+                .checked_add(1)
+                .and_then(|event_order| neighbors.remove(&event_order));
             let event_type = row.event_type;
             let event_ordinal = row.event_ordinal;
             let event = TraceEvent {
@@ -656,8 +671,6 @@ FORMAT JSONEachRow",
                 next_turn: parent_turn.next_turn,
             }));
         }
-        Err(RepoError::backend(
-            "MCP open event snapshot changed repeatedly",
-        ))
+        Err(RepoError::ReadModelChanged)
     }
 }

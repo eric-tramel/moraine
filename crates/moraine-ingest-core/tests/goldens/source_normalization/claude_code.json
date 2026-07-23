@@ -373,6 +373,7 @@
           "linked_external_id": "user-1",
           "metadata_json": "{}",
           "session_id": "7c666c01-d38e-4658-8650-854ffb5b626e",
+          "source_event_version": "<event_version>",
           "source_name": "golden-claude-code"
         },
         {
@@ -385,6 +386,7 @@
           "linked_external_id": "user-1",
           "metadata_json": "{}",
           "session_id": "7c666c01-d38e-4658-8650-854ffb5b626e",
+          "source_event_version": "<event_version>",
           "source_name": "golden-claude-code"
         },
         {
@@ -397,6 +399,7 @@
           "linked_external_id": "user-1",
           "metadata_json": "{}",
           "session_id": "7c666c01-d38e-4658-8650-854ffb5b626e",
+          "source_event_version": "<event_version>",
           "source_name": "golden-claude-code"
         }
       ],
@@ -439,6 +442,7 @@
           "project_id": "",
           "repo_rel_path": "",
           "session_id": "7c666c01-d38e-4658-8650-854ffb5b626e",
+          "source_event_version": "<event_version>",
           "source_name": "golden-claude-code",
           "source_ref": "/fixtures/claude-code/session.jsonl:1:2",
           "tool_call_id": "toolu_1",
@@ -547,6 +551,7 @@
           "linked_external_id": "assistant-1",
           "metadata_json": "{}",
           "session_id": "7c666c01-d38e-4658-8650-854ffb5b626e",
+          "source_event_version": "<event_version>",
           "source_name": "golden-claude-code"
         },
         {
@@ -559,6 +564,7 @@
           "linked_external_id": "toolu_1",
           "metadata_json": "{}",
           "session_id": "7c666c01-d38e-4658-8650-854ffb5b626e",
+          "source_event_version": "<event_version>",
           "source_name": "golden-claude-code"
         },
         {
@@ -571,6 +577,7 @@
           "linked_external_id": "assistant-1",
           "metadata_json": "{}",
           "session_id": "7c666c01-d38e-4658-8650-854ffb5b626e",
+          "source_event_version": "<event_version>",
           "source_name": "golden-claude-code"
         }
       ],
@@ -613,6 +620,7 @@
           "project_id": "",
           "repo_rel_path": "",
           "session_id": "7c666c01-d38e-4658-8650-854ffb5b626e",
+          "source_event_version": "<event_version>",
           "source_name": "golden-claude-code",
           "source_ref": "/fixtures/claude-code/session.jsonl:1:3",
           "tool_call_id": "toolu_1",
@@ -719,6 +727,7 @@
           "linked_external_id": "user-2",
           "metadata_json": "{}",
           "session_id": "7c666c01-d38e-4658-8650-854ffb5b626e",
+          "source_event_version": "<event_version>",
           "source_name": "golden-claude-code"
         }
       ],

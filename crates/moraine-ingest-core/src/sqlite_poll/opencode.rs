@@ -14,9 +14,10 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, warn};
 
 use super::{
-    hash_str, open_read_only, stat_fingerprint, truncate_chars_local, StatFingerprint,
-    SyntheticRecord, VolatilePollMap, CURSOR_STATE_VERSION, ERROR_KIND_OPEN, ERROR_KIND_SCAN,
-    ERROR_KIND_SCHEMA, ERROR_KIND_TOO_LARGE, SCAN_PAGE_MAX_BYTES, SCAN_PAGE_SIZE,
+    hash_str, open_read_only, sqlite_data_version, stat_fingerprint, truncate_chars_local,
+    StatFingerprint, SyntheticRecord, VolatilePollMap, CURSOR_STATE_VERSION,
+    ERROR_KIND_MIXED_SNAPSHOT, ERROR_KIND_OPEN, ERROR_KIND_SCAN, ERROR_KIND_SCHEMA,
+    ERROR_KIND_TOO_LARGE, SCAN_PAGE_MAX_BYTES, SCAN_PAGE_SIZE,
 };
 
 const MAX_OPENCODE_RELEVANT_ROWS: u64 = 10_000;
@@ -188,19 +189,62 @@ pub(crate) async fn process_opencode_sqlite_db(
 
     let mut state = OpenCodeState::parse(&checkpoint.cursor_json);
     let current_exclusions_hash = super::project_exclusions_hash(config);
+    let policy_fingerprint =
+        super::sqlite_policy_fingerprint(SOURCE_FORMAT_OPENCODE_SQLITE, current_exclusions_hash);
+
+    let sequence_rewound = if had_committed && current_stat != state.stat {
+        let scan_db_path = source_file.clone();
+        let prior = state.clone();
+        tokio::task::spawn_blocking(move || opencode_sequences_rewound(&scan_db_path, &prior))
+            .await
+            .context("opencode_sqlite sequence preflight panicked")?
+            .unwrap_or(false)
+    } else {
+        false
+    };
 
     // Replaced databases restart logical identities. Changed exclusions replay
     // the event history so rows skipped under the prior policy can return.
-    let generation_changed = checkpoint.source_inode != inode;
-    let exclusions_changed = state.project_exclusions_hash != current_exclusions_hash;
-    if generation_changed {
+    let generation_changed = had_committed && checkpoint.source_inode != inode;
+    let exclusions_changed =
+        had_committed && state.project_exclusions_hash != current_exclusions_hash;
+    let retry_blocked_replay = checkpoint.status == "replaying"
+        || (checkpoint.status == "error" && !checkpoint.block_reason.is_empty());
+    let starts_replacement = generation_changed || exclusions_changed || sequence_rewound;
+    if starts_replacement {
         checkpoint.source_inode = inode;
-        checkpoint.source_generation = checkpoint.source_generation.saturating_add(1).max(1);
+        checkpoint.source_generation =
+            crate::publication::checked_next_generation(checkpoint.source_generation)
+                .context("source generation exhausted while replacing opencode_sqlite database")?;
+        checkpoint.last_offset = 0;
+        checkpoint.last_line_no = 0;
     }
-    if generation_changed || exclusions_changed {
+    let replacement_replay = starts_replacement || retry_blocked_replay;
+    if replacement_replay {
         state = OpenCodeState::fresh();
     }
     state.project_exclusions_hash = current_exclusions_hash;
+    if replacement_replay {
+        // BeginReplay is itself durable. Persist the reset cursor with that
+        // boundary so a crash before the scan cannot rediscover the same
+        // rewind from the previous generation and bump again.
+        checkpoint.cursor_json = state.serialize();
+    }
+    checkpoint.policy_fingerprint = policy_fingerprint.clone();
+    checkpoint.status = if replacement_replay {
+        "replaying".to_string()
+    } else {
+        "active".to_string()
+    };
+    checkpoint.block_reason.clear();
+    let scan_boundary = checkpoint
+        .last_offset
+        .checked_add(1)
+        .context("opencode_sqlite poll sequence exhausted")?;
+    if replacement_replay {
+        super::begin_database_replay(&sink_tx, &checkpoint, scan_boundary, &policy_fingerprint)
+            .await?;
+    }
 
     // Cheap no-change short-circuit: nothing touched the database or its WAL
     // sidecars since the last poll. `event_scan_complete` also forces one real
@@ -245,8 +289,8 @@ pub(crate) async fn process_opencode_sqlite_db(
                 prior
             };
             let scan_is_noop = had_committed
-                && !generation_changed
-                && !exclusions_changed
+                && !starts_replacement
+                && !retry_blocked_replay
                 && records.is_empty()
                 && checkpoint.status == "active"
                 && new_state == prior_state_covered
@@ -256,7 +300,18 @@ pub(crate) async fn process_opencode_sqlite_db(
                 return Ok(());
             }
 
+            if let Err(exc) = super::database_scan_still_valid(&source_file, inode) {
+                if replacement_replay {
+                    let mut blocked = checkpoint.clone();
+                    blocked.status = "error".to_string();
+                    blocked.block_reason = exc.to_string();
+                    super::block_database_replay(&sink_tx, &blocked, exc.to_string()).await?;
+                }
+                return Err(exc);
+            }
+
             let mut batch = RowBatch::default();
+            let mut replay_block_reason = None::<String>;
             for synthetic in &records {
                 if crate::dispatch::record_project_dir_is_excluded(
                     config,
@@ -286,6 +341,12 @@ pub(crate) async fn process_opencode_sqlite_db(
                         batch.lines_processed = batch.lines_processed.saturating_add(1);
                     }
                     Err(exc) => {
+                        if replacement_replay && replay_block_reason.is_none() {
+                            replay_block_reason = Some(format!(
+                                "opencode_sqlite row {} failed normalization: {exc}",
+                                synthetic.source_line_no
+                            ));
+                        }
                         batch.push_error_row(json!({
                             "source_name": work.source_name,
                             "harness": work.harness,
@@ -311,23 +372,64 @@ pub(crate) async fn process_opencode_sqlite_db(
             }
 
             let emitted = records.len();
-            batch.checkpoint = Some(Checkpoint {
+            let final_checkpoint = Checkpoint {
                 source_name: work.source_name.clone(),
                 source_file: source_file.clone(),
                 source_inode: inode,
                 source_generation: checkpoint.source_generation,
-                last_offset: checkpoint.last_offset.saturating_add(1),
+                last_offset: scan_boundary,
                 last_line_no: relevant_rows,
-                status: "active".to_string(),
+                status: if replacement_replay {
+                    "replaying".to_string()
+                } else {
+                    "active".to_string()
+                },
                 cursor_json: new_state.serialize(),
                 source_fingerprint: inode,
                 schema_fingerprint,
-            });
+                policy_fingerprint: policy_fingerprint.clone(),
+                scan_inode: inode,
+                scan_boundary,
+                final_scan_complete: !replacement_replay,
+                compatibility_prepared: !replacement_replay,
+                backend_caught_up: !replacement_replay,
+                ..checkpoint.clone()
+            };
+            batch.checkpoint = Some(final_checkpoint.clone());
 
             sink_tx
                 .send(SinkMessage::Batch(batch))
                 .await
                 .context("sink channel closed while sending final opencode_sqlite batch")?;
+            if replacement_replay {
+                if let Some(reason) = replay_block_reason {
+                    let blocked_checkpoint = Checkpoint {
+                        status: "error".to_string(),
+                        final_scan_complete: false,
+                        compatibility_prepared: false,
+                        backend_caught_up: false,
+                        block_reason: reason.clone(),
+                        ..final_checkpoint
+                    };
+                    super::block_database_replay(&sink_tx, &blocked_checkpoint, reason).await?;
+                    poll_state.clear(&cp_key);
+                    return Ok(());
+                }
+                let active_checkpoint = Checkpoint {
+                    status: "active".to_string(),
+                    final_scan_complete: true,
+                    compatibility_prepared: true,
+                    backend_caught_up: true,
+                    ..final_checkpoint
+                };
+                super::finalize_database_replay(
+                    &sink_tx,
+                    &active_checkpoint,
+                    scan_boundary,
+                    &policy_fingerprint,
+                )
+                .await?;
+            }
             poll_state.clear(&cp_key);
 
             if emitted > 0 {
@@ -366,29 +468,48 @@ pub(crate) async fn process_opencode_sqlite_db(
                 "source_line_no": 0u64,
                 "source_offset": 0u64,
                 "error_kind": error_kind,
-                "error_text": error_text,
+                "error_text": error_text.clone(),
                 "raw_fragment": "",
             }));
 
             let mut error_state = state.clone();
             error_state.last_error = error_kind.to_string();
-            batch.checkpoint = Some(Checkpoint {
+            let error_checkpoint = Checkpoint {
                 source_name: work.source_name.clone(),
                 source_file: source_file.clone(),
                 source_inode: inode,
                 source_generation: checkpoint.source_generation,
                 last_offset: checkpoint.last_offset,
                 last_line_no: checkpoint.last_line_no,
-                status: "active".to_string(),
+                status: if replacement_replay {
+                    "error".to_string()
+                } else {
+                    "active".to_string()
+                },
                 cursor_json: error_state.serialize(),
                 source_fingerprint: inode,
                 schema_fingerprint: checkpoint.schema_fingerprint,
-            });
+                policy_fingerprint: policy_fingerprint.clone(),
+                scan_inode: inode,
+                scan_boundary,
+                block_reason: if replacement_replay {
+                    error_text.clone()
+                } else {
+                    String::new()
+                },
+                ..checkpoint.clone()
+            };
+            if !replacement_replay {
+                batch.checkpoint = Some(error_checkpoint.clone());
+            }
 
             sink_tx
                 .send(SinkMessage::Batch(batch))
                 .await
                 .context("sink channel closed while sending opencode_sqlite error batch")?;
+            if replacement_replay {
+                super::block_database_replay(&sink_tx, &error_checkpoint, error_text).await?;
+            }
             Ok(())
         }
     }
@@ -401,6 +522,18 @@ fn scan_opencode_database(db_path: &str, prior: &OpenCodeState) -> OpenCodeScanO
             return OpenCodeScanOutcome::Failed {
                 error_kind: ERROR_KIND_OPEN,
                 error_text: format!("{exc:#}"),
+            }
+        }
+    };
+    // Opening a WAL database can create or touch its reader-owned `-shm`
+    // sidecar. Use the post-open state as the stable scan baseline.
+    let opened_stat = stat_fingerprint(db_path).unwrap_or_default();
+    let data_version_before = match sqlite_data_version(&connection) {
+        Ok(value) => value,
+        Err(exc) => {
+            return OpenCodeScanOutcome::Failed {
+                error_kind: ERROR_KIND_SCAN,
+                error_text: format!("failed to read OpenCode pre-scan data_version: {exc:#}"),
             }
         }
     };
@@ -452,7 +585,26 @@ fn scan_opencode_database(db_path: &str, prior: &OpenCodeState) -> OpenCodeScanO
         }
     }
 
-    match scan_opencode_rows(&connection, prior) {
+    let result = scan_opencode_rows(&connection, prior);
+    let data_version_after = match sqlite_data_version(&connection) {
+        Ok(value) => value,
+        Err(exc) => {
+            return OpenCodeScanOutcome::Failed {
+                error_kind: ERROR_KIND_SCAN,
+                error_text: format!("failed to read OpenCode post-scan data_version: {exc:#}"),
+            }
+        }
+    };
+    if data_version_before != data_version_after || stat_fingerprint(db_path) != Some(opened_stat) {
+        return OpenCodeScanOutcome::Failed {
+            error_kind: ERROR_KIND_MIXED_SNAPSHOT,
+            error_text:
+                "OpenCode database changed during the paged scan; retrying without advancing the cursor"
+                    .to_string(),
+        };
+    }
+
+    match result {
         Ok((records, new_state, relevant_rows)) => OpenCodeScanOutcome::Scanned {
             records,
             new_state,
@@ -660,6 +812,25 @@ fn scan_opencode_rows(
     new_state.event_scan_complete = true;
     new_state.aggregate_sequences = aggregate_sequences;
     Ok((records, new_state, relevant_events))
+}
+
+fn opencode_sequences_rewound(db_path: &str, prior: &OpenCodeState) -> Result<bool> {
+    if prior.aggregate_sequences.is_empty() {
+        return Ok(false);
+    }
+    let connection = open_read_only(db_path)?;
+    let current = opencode_aggregate_sequences(&connection)?
+        .into_iter()
+        .map(|aggregate| (aggregate.aggregate_id, aggregate.seq))
+        .collect::<BTreeMap<_, _>>();
+    Ok(prior
+        .aggregate_sequences
+        .iter()
+        .any(|(aggregate_id, prior_seq)| {
+            current
+                .get(aggregate_id)
+                .is_none_or(|current_seq| current_seq < prior_seq)
+        }))
 }
 
 fn opencode_scan_from_seq(prior: &OpenCodeState, aggregate: &OpenCodeAggregateSequence) -> i64 {

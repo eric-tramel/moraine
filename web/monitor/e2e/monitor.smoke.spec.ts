@@ -126,6 +126,18 @@ async function setupMockMonitorApi(page: Page): Promise<void> {
         version: '25.1.2',
         ping_ms: 8.75,
         connections: { total: 16 },
+        publication: {
+          available: true,
+          healthy: true,
+          ambiguous_hostless_rows: 0,
+          replaying_generations: 1,
+          blocked_generations: 0,
+          append_preparations: 0,
+          blocked_append_preparations: 0,
+          mirror_catchup_pending: 0,
+          writer_conflicts: 0,
+          issues: ['generation_replaying'],
+        },
       },
     });
   });
@@ -237,6 +249,9 @@ test('loads dashboard and handles core interactions', async ({ page }) => {
   await expect(page.locator('#healthGroup')).toContainText('ClickHouse');
   await expect(page.locator('#healthGroup')).toContainText('127.0.0.1:8123');
   await expect(page.locator('#healthGroup')).toContainText('moraine');
+  const publicationChips = page.locator('#healthGroup .ss-chip').filter({ hasText: 'publication' });
+  await expect(publicationChips.first()).toContainText('healthy');
+  await expect(publicationChips.last()).toContainText('1 active');
   await expect(page.locator('#ingestorGroup')).toContainText('healthy');
 
   await page.locator('#analyticsRanges').getByRole('button', { name: '7d' }).click();

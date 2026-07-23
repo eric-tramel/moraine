@@ -2,8 +2,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context as _, Result};
-use moraine_clickhouse::{enforce_remote_schema_policy, ClickHouseClient};
-use moraine_config::{AppConfig, ClickHouseConfig, DEFAULT_BACKEND_NAME};
+use moraine_clickhouse::{
+    enforce_remote_schema_policy, ClickHouseClient, QueryClass, QueryEnvelope,
+};
+use moraine_config::{
+    AppConfig, ClickHouseConfig, ValidatedQueryBudget, ValidatedQueryBudgets, DEFAULT_BACKEND_NAME,
+};
 use tokio::sync::{watch, Mutex};
 use tracing::warn;
 use url::Url;
@@ -102,6 +106,11 @@ struct BackendSlot {
     backend_name: Arc<str>,
     clickhouse: ClickHouseConfig,
     checked: bool,
+    /// Budget for the schema-handshake statements a checked slot issues while
+    /// building. The build runs inside `tokio::spawn`, where no request
+    /// envelope is active (task-locals do not cross spawn), so the handshake
+    /// carries its own Administrative-class envelope (amendment A10).
+    admin_budget: ValidatedQueryBudget,
     state: Mutex<SlotState>,
 }
 
@@ -110,6 +119,7 @@ impl BackendSlot {
         backend_name: String,
         clickhouse: ClickHouseConfig,
         checked: bool,
+        admin_budget: ValidatedQueryBudget,
         preloaded: Option<Arc<dyn ConversationRepository>>,
     ) -> Self {
         let backend_name: Arc<str> = Arc::from(backend_name);
@@ -125,6 +135,7 @@ impl BackendSlot {
             backend_name,
             clickhouse,
             checked,
+            admin_budget,
             state: Mutex::new(state),
         }
     }
@@ -195,6 +206,7 @@ impl BackendSlot {
                 self.clickhouse.clone(),
                 repo_config,
                 user_agent,
+                &self.admin_budget,
             )
             .await?
         } else {
@@ -264,6 +276,10 @@ impl BackendRepositoryRouter {
             ));
         }
 
+        let admin_budget = ValidatedQueryBudgets::from_config(&config.query_budgets)
+            .map_err(|error| anyhow!("invalid [query_budgets] configuration: {error}"))?
+            .administrative;
+
         let mut slots = BTreeMap::new();
         for (backend_name, clickhouse) in &config.backends {
             let repository = preloaded.remove(backend_name);
@@ -273,6 +289,7 @@ impl BackendRepositoryRouter {
                     backend_name.clone(),
                     clickhouse.clone(),
                     backend_name != DEFAULT_BACKEND_NAME,
+                    admin_budget,
                     repository,
                 )),
             );
@@ -379,18 +396,30 @@ async fn build_checked_clickhouse_repository_with_user_agent(
     clickhouse: ClickHouseConfig,
     config: RepoConfig,
     user_agent: impl AsRef<str>,
+    admin_budget: &ValidatedQueryBudget,
 ) -> Result<Arc<dyn ConversationRepository>> {
     let allow_newer_server = clickhouse.allow_newer_server;
     let client =
         ClickHouseClient::new_with_user_agent(clickhouse, user_agent).with_context(|| {
             format!("backend '{backend_name}': failed to construct ClickHouse client")
         })?;
-    let skew = client.schema_skew().await.with_context(|| {
+    // The handshake runs inside a spawned build task where no request
+    // envelope is active; give its (at most two) statements an explicit
+    // Administrative-class envelope so they carry a query id and a finite
+    // deadline (amendment A10).
+    let skew = QueryEnvelope::new(
+        "backend-handshake",
+        QueryClass::Administrative,
+        admin_budget,
+    )
+    .scope(async { client.schema_skew().await })
+    .await
+    .with_context(|| {
         format!("backend '{backend_name}': schema handshake failed (is the server reachable?)")
     })?;
     enforce_remote_schema_policy(backend_name, &skew, allow_newer_server)?;
 
-    Ok(Arc::new(ClickHouseConversationRepository::new(
+    Ok(Arc::new(ClickHouseConversationRepository::new_shared(
         client, config,
     )))
 }
@@ -573,6 +602,7 @@ mod tests {
             clickhouse_config(url, false),
             RepoConfig::default(),
             "moraine-backend/test",
+            &crate::clickhouse_repo::default_administrative_query_budget(),
         )
         .await
         .expect("clean named backend");
@@ -604,6 +634,7 @@ mod tests {
             clickhouse_config(url, true),
             RepoConfig::default(),
             "moraine-backend/test",
+            &crate::clickhouse_repo::default_administrative_query_budget(),
         )
         .await
         .err()
@@ -625,6 +656,7 @@ mod tests {
             clickhouse_config(url, false),
             RepoConfig::default(),
             "moraine-backend/test",
+            &crate::clickhouse_repo::default_administrative_query_budget(),
         )
         .await
         .err()
@@ -645,6 +677,7 @@ mod tests {
             clickhouse_config(url, true),
             RepoConfig::default(),
             "moraine-backend/test",
+            &crate::clickhouse_repo::default_administrative_query_budget(),
         )
         .await
         .expect("allow_newer_server accepts a server-ahead ledger");
@@ -658,6 +691,7 @@ mod tests {
             clickhouse_config(url, false),
             RepoConfig::default(),
             "moraine-backend/test",
+            &crate::clickhouse_repo::default_administrative_query_budget(),
         )
         .await
         .err()

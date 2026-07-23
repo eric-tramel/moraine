@@ -25,6 +25,16 @@ Usage: scripts/dev/sandbox/run-live-test <mode>
 Modes:
   analytics-schema  Run live_schema_semantics_and_teardown exactly.
   analytics-parity  Run live_monitor_repository_semantic_parity exactly.
+  source-publication
+                    Run live_source_publication_cutover_crash_recovery exactly.
+  mcp-backfill      Run live_mcp_open_batched_backfill_resources exactly.
+  envelope-query-log
+                    Run live_envelope_query_log_coverage exactly.
+  envelope-cancellation
+                    Run live_envelope_abandoned_query_cancelled exactly.
+  envelope-shared-budget
+                    Run live_envelope_shared_budget_and_statement_cap exactly.
+  envelope-spill    Run live_envelope_spill_and_memory_ceiling exactly.
 
 Each invocation creates and owns a fresh sandbox, enables destructive tests
 only for the in-container Cargo process, retains a diagnostic log, and tears
@@ -40,6 +50,24 @@ case "$1" in
         ;;
     analytics-parity)
         test_function="live_monitor_repository_semantic_parity"
+        ;;
+    source-publication)
+        test_function="live_source_publication_cutover_crash_recovery"
+        ;;
+    mcp-backfill)
+        test_function="live_mcp_open_batched_backfill_resources"
+        ;;
+    envelope-query-log)
+        test_function="live_envelope_query_log_coverage"
+        ;;
+    envelope-cancellation)
+        test_function="live_envelope_abandoned_query_cancelled"
+        ;;
+    envelope-shared-budget)
+        test_function="live_envelope_shared_budget_and_statement_cap"
+        ;;
+    envelope-spill)
+        test_function="live_envelope_spill_and_memory_ceiling"
         ;;
     -h|--help)
         usage
@@ -353,6 +381,7 @@ set -m
     -e HOME=/home/moraine \
     -e MORAINE_ALLOW_DESTRUCTIVE_TESTS=1 \
     -e "MORAINE_LIVE_TEST_SANDBOX_ID=${sandbox_id}" \
+    -e MORAINE_LIVE_TEST_INGEST_BIN=/opt/moraine/bin/moraine-ingest \
     -e MORAINE_BENCH_CLICKHOUSE_URL=http://clickhouse:8123 \
     "$container" \
     cargo test -p moraine-conversations \

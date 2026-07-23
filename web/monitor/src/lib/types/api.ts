@@ -9,6 +9,20 @@ export interface ConnectionStats {
   error?: string | null;
 }
 
+export interface PublicationStatus {
+  available: boolean;
+  healthy: boolean;
+  ambiguous_hostless_rows?: number;
+  replaying_generations?: number;
+  blocked_generations?: number;
+  append_preparations?: number;
+  blocked_append_preparations?: number;
+  mirror_catchup_pending?: number;
+  writer_conflicts?: number;
+  issues?: string[];
+  error?: string;
+}
+
 export interface HealthResponse {
   ok: boolean;
   url?: string;
@@ -16,6 +30,7 @@ export interface HealthResponse {
   version?: string | null;
   ping_ms?: number | null;
   connections?: ConnectionStats;
+  publication?: PublicationStatus;
   ingestor?: IngestorStatus;
   error?: string;
 }
@@ -36,6 +51,7 @@ export interface IngestorStatus {
 
 export interface StatusResponse {
   ok: boolean;
+  publication?: PublicationStatus;
   ingestor?: IngestorStatus;
   error?: string;
 }
@@ -76,6 +92,7 @@ export interface AnalyticsSeries {
 
 export interface AnalyticsResponse {
   ok: boolean;
+  read_model?: 'live';
   range: AnalyticsRange;
   series: AnalyticsSeries;
   error?: string;

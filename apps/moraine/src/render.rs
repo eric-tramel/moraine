@@ -447,6 +447,19 @@ pub(crate) fn render_status(output: &CliOutput, snapshot: &StatusSnapshot) -> Re
         doctor_lines[0].push_str(&format!("  (v{version})"));
     }
     doctor_lines.push(format!("source: {}", snapshot.data_source.label()));
+    match &snapshot.doctor.publication {
+        Some(publication) => doctor_lines.push(format!(
+            "publication: {}  (replaying: {}, blocked: {}, append preparing: {}, append blocked: {}, mirror catch-up: {}, writer conflicts: {})",
+            health_label(publication.is_healthy()),
+            publication.replaying_generations,
+            publication.blocked_generations,
+            publication.append_preparations,
+            publication.blocked_append_preparations,
+            publication.mirror_catchup_pending,
+            publication.writer_conflicts,
+        )),
+        None => doctor_lines.push("publication: unavailable".to_string()),
+    }
     if !snapshot.doctor.pending_migrations.is_empty() {
         doctor_lines.push(format!(
             "  pending migrations: {}",
@@ -593,6 +606,30 @@ pub(crate) fn render_db_doctor(output: &CliOutput, report: &DoctorReport) -> Res
             "applied migrations: {}",
             report.applied_migrations.join(", ")
         ));
+    }
+    if let Some(publication) = &report.publication {
+        lines.push(format!(
+            "publication: {}",
+            health_label(publication.is_healthy())
+        ));
+        lines.push(format!(
+            "publication states: replaying={}, blocked={}, append_preparing={}, append_blocked={}, mirror_catchup={}, writer_conflicts={}, ambiguous_hostless_rows={}",
+            publication.replaying_generations,
+            publication.blocked_generations,
+            publication.append_preparations,
+            publication.blocked_append_preparations,
+            publication.mirror_catchup_pending,
+            publication.writer_conflicts,
+            publication.ambiguous_hostless_rows,
+        ));
+        if !publication.issues.is_empty() {
+            lines.push(format!(
+                "publication issues: {}",
+                publication.issues.join(" | ")
+            ));
+        }
+    } else {
+        lines.push("publication: unavailable".to_string());
     }
     if !report.errors.is_empty() {
         lines.push(format!("errors: {}", report.errors.join(" | ")));
