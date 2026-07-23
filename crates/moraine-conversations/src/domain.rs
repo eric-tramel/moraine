@@ -466,6 +466,103 @@ pub struct McpEventOpen {
     pub next_turn: Option<McpTurnRef>,
 }
 
+// --- issue-598 v2 canonical reader page-in / page-out API (WI-06) ----------
+//
+// The shared page-aware canonical reader consumes and produces these
+// repository-facing types. The tool-facing `OpenCursorV2` (WI-07, in
+// `moraine-mcp-core`) is a serialized projection of a [`CanonicalContinuation`]
+// plus the target; the repository never encodes or decodes the wire cursor.
+
+/// The full ordering-tuple anchor plus the derived state a continuation needs
+/// to resume expansion forward from the last served event without rescanning
+/// the session prefix (design §5.3 / §6, D1). `sort_time_ms` is the
+/// deterministic navigation order key (never `ingested_at`), so an anchor is
+/// stable across re-inserts of the same event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalReadAnchor {
+    pub sort_time_ms: i64,
+    pub source_host: String,
+    pub source_file: String,
+    pub source_generation: u32,
+    pub source_offset: u64,
+    pub source_line_no: u64,
+    pub event_uid: String,
+    /// The anchor row's public `event_order` (count of rows at-or-before it).
+    pub event_order: u64,
+    /// The anchor row's public `turn_seq`.
+    pub turn_seq: u32,
+    /// `U_A`: the count of user-message rows at-or-before the anchor. Feeds the
+    /// forward `turn_seq` derivation and the exact prefix boundary guard.
+    pub prefix_user_message_count: u64,
+    /// The anchor row's 1-based ordinal within its turn (design R2).
+    pub event_ordinal: u32,
+}
+
+/// The cheap per-session change signals a cursor pins so a quiescent
+/// continuation can proceed with zero session-scoped work, and a mutated
+/// session can be detected without a full rescan (design §5.2.1 / §5.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalSessionSignals {
+    /// The publication revision pinned when the cursor was minted.
+    pub pinned_revision: u64,
+    /// `hex(SHA256(sorted live (host,name,file,generation) tuples))` — the
+    /// session's live head set fingerprint. A change means this session's
+    /// generation flipped (replay/truncation) and the cursor must reopen.
+    pub heads_fingerprint: String,
+    /// Directory `sum(observed_events)` — a monotone physical-insert counter
+    /// (hint-only; over-counts under retry). A bump triggers the exact
+    /// boundary guard.
+    pub observed_sum: u64,
+    pub min_bound_ms: i64,
+    pub max_bound_ms: i64,
+}
+
+/// The page-out continuation the repository returns for a non-terminal page:
+/// where to resume, and the signals/fingerprint to validate against on the
+/// next page. `None` from a reader method means the traversal is complete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalContinuation {
+    pub signals: CanonicalSessionSignals,
+    pub after: CanonicalReadAnchor,
+    /// The `turn_seq` of the last fully served turn (session pages) or the turn
+    /// being paged (turn pages); `0` for event reads.
+    pub after_turn_seq: u32,
+}
+
+/// The page-in continuation a caller passes to resume a traversal (the decoded
+/// tool cursor). Carries the previously minted [`CanonicalContinuation`] state.
+pub type CanonicalPageAfter = CanonicalContinuation;
+
+/// One page of a session open plus its continuation. `session.turns` holds only
+/// this page's `K` turns and `session.snapshot` is always `None` (v2 uses the
+/// continuation, not generation-pinned snapshots).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanonicalSessionPage {
+    pub session: McpSessionOpen,
+    pub continuation: Option<CanonicalContinuation>,
+}
+
+/// One page of a turn open plus its continuation. `turn.events` holds only this
+/// page's events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanonicalTurnPage {
+    pub turn: McpTurnOpen,
+    pub continuation: Option<CanonicalContinuation>,
+}
+
+/// The outcome of a page read. `Reopen` means the pinned cursor no longer
+/// describes a consistent view of the session (a replacement/replay flipped the
+/// heads, or a prefix mutation was detected) and the caller must reopen the
+/// target to restart expansion — the tool layer maps this to the structured
+/// reopen response (design §5.4, §6). Distinct from
+/// [`crate::error::RepoError::ReadModelChanged`], which is snapshot-revalidation
+/// exhaustion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CanonicalReadOutcome<T> {
+    Page(T),
+    Reopen,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceEvent {
     pub session_id: String,

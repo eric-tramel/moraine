@@ -2528,6 +2528,17 @@ async fn flush_pending_statements(
             raw_rows.clear();
         }
 
+        // The `events` insert is the canonical-content authority: it is the sole
+        // durability point every v2 read reconstructs from. Migration 036's read-
+        // index materialized views (directory / locator / navigation) fire
+        // synchronously inside THIS insert. `materialized_views_ignore_errors` is
+        // deliberately left unset, so a transiently bad index insert fails the
+        // whole statement loudly rather than silently skipping an index. A failed
+        // insert leaves `event_rows` un-cleared and is retried whole; because
+        // `events` is ReplacingMergeTree(event_version) with a PK that is a
+        // deterministic function of the record bytes, the whole-block retry
+        // collapses to the same logical rows and cannot duplicate canonical
+        // content. Projection debt is enqueued only AFTER this insert commits.
         if !event_rows.is_empty() {
             clickhouse
                 .insert_json_rows_sync("events", event_rows)
@@ -2786,6 +2797,11 @@ mod tests {
         append_control_response: Arc<Mutex<Option<String>>>,
         current_source_head_response: Arc<Mutex<Option<String>>>,
         live_event_exists: Arc<Mutex<bool>>,
+        /// WI-04: any query whose text contains one of these needles fails with
+        /// a 500, regardless of statement kind. Used to simulate a genuinely
+        /// failing/slow MCP-open projection refresh (whose statements read/write
+        /// only `mcp_open_*` and never `INSERT INTO events`).
+        fail_query_needles: Arc<Mutex<Vec<String>>>,
     }
 
     impl MockClickHouseState {
@@ -2810,6 +2826,23 @@ mod tests {
                 .lock()
                 .expect("mock fail_always mutex poisoned")
                 .insert(table.to_string(), body.to_string());
+        }
+
+        /// Clear a permanent per-table failure, modelling an operator recreating
+        /// a dropped materialized-view target so the next insert retry drains.
+        fn recover_table(&self, table: &str) {
+            self.fail_always_by_table
+                .lock()
+                .expect("mock fail_always mutex poisoned")
+                .remove(table);
+        }
+
+        /// Fail every statement whose text contains `needle` (WI-04).
+        fn fail_query_containing(&self, needle: &str) {
+            self.fail_query_needles
+                .lock()
+                .expect("mock fail_query_needles mutex poisoned")
+                .push(needle.to_string());
         }
 
         fn call_count(&self, table: &str) -> usize {
@@ -2932,6 +2965,21 @@ mod tests {
             .lock()
             .expect("mock envelope ids mutex poisoned")
             .push(params.get("query_id").cloned());
+        {
+            let needles = state
+                .fail_query_needles
+                .lock()
+                .expect("mock fail_query_needles mutex poisoned");
+            if let Some(needle) = needles
+                .iter()
+                .find(|needle| query.contains(needle.as_str()))
+            {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("intentional query failure matching {needle}"),
+                );
+            }
+        }
         if query.contains("v_current_ingest_append_control") {
             return (
                 StatusCode::OK,
@@ -5720,5 +5768,260 @@ mod tests {
         assert_eq!(nan, Duration::from_millis(50));
         assert_eq!(pos_inf, Duration::from_millis(50));
         assert_eq!(neg_inf, Duration::from_millis(50));
+    }
+
+    // ---- WI-04 (issue #598): retry-boundary + MV failure-mode verification ----
+    //
+    // Spec §2 guarantee (issue-598.md:38-45, 155): a slow or failed projection —
+    // and, after migration 036, a firing read-index materialized view — must
+    // never cause an already-committed canonical `events` batch to be inserted a
+    // second time. The retry boundary that enforces this lives in
+    // `flush_pending_statements`: each stage clears its own buffer immediately
+    // after ClickHouse confirms its insert (e.g. `event_rows.clear()` right after
+    // the Events stage), so a failure in any *later* stage retries only the
+    // unfinished tables. The MCP-open projection is strictly downstream and
+    // off-loop (`spawn_projection_worker` -> `refresh_mcp_open_read_model`, which
+    // only ever writes `mcp_open_*` relations), so it can never re-enter the flush
+    // path nor re-insert `events`. These four tests pin that boundary end-to-end.
+    // The ClickHouse-level idempotency of the whole-block retry (ReplacingMergeTree
+    // collapse of `events` and the RMT/AggregatingMergeTree 036 index targets under
+    // the deterministic `sort_time` key) is a live property exercised by the
+    // `canonical-index-backfill` sandbox mode (WI-03/WI-10); these unit tests pin
+    // the sink-observable contract that feeds it.
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn downstream_stage_failure_never_reinserts_canonical_events() {
+        // A stage strictly AFTER the durable `events` insert (here `event_links`,
+        // standing in for any downstream consumer, the projection included) fails
+        // on the first attempt. The canonical events insert must remain a single
+        // insert across the failure and the retry.
+        let (clickhouse, mock_state) = spawn_mock_clickhouse("event_links").await;
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+
+        let checkpoint = sample_checkpoint();
+        let mut pending = PendingFlush {
+            raw_rows: vec![json!({"record_ts": "2026-02-17T00:00:01.000Z", "event_uid": "evt-1"})],
+            event_rows: vec![json!({
+                "event_uid": "evt-1",
+                "event_version": 1,
+                "session_id": "session-a",
+            })],
+            link_rows: vec![json!({"event_uid": "evt-1", "linked_event_uid": "evt-0"})],
+            checkpoint_updates: HashMap::from([(
+                checkpoint_key(&checkpoint.source_name, &checkpoint.source_file),
+                checkpoint.clone(),
+            )]),
+            ..PendingFlush::default()
+        };
+
+        let first = flush_pending(&clickhouse, &checkpoints, &metrics, &mut pending).await;
+        assert!(!first, "first flush fails at the event_links stage");
+        assert_eq!(
+            mock_state.call_count("events"),
+            1,
+            "the canonical events insert committed exactly once"
+        );
+        assert_eq!(mock_state.rows("events").len(), 1);
+        assert!(
+            pending.event_rows.is_empty(),
+            "durable events are cleared and never retried"
+        );
+        assert_eq!(pending.link_rows.len(), 1, "only the failed stage retries");
+
+        let second = flush_pending(&clickhouse, &checkpoints, &metrics, &mut pending).await;
+        assert!(second, "retry completes the remaining downstream stages");
+        assert_eq!(
+            mock_state.call_count("events"),
+            1,
+            "a downstream failure must NOT trigger a second canonical events insert",
+        );
+        assert_eq!(mock_state.rows("events").len(), 1);
+        assert_eq!(mock_state.call_count("event_links"), 2);
+        assert_eq!(metrics.event_rows_written.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failing_projection_refresh_does_not_reinsert_canonical_events() {
+        // Commit a canonical events batch, then drive the off-loop projection
+        // worker against a backend that fails the projection's very first read. A
+        // genuinely failing/slow projection refresh must not re-insert `events`.
+        let state = MockClickHouseState::default();
+        // The projection's first statement is the backfill-facts CTE; fail it so
+        // the refresh returns an error. That statement is a SELECT over
+        // `mcp_open_*` / `events FINAL` and never issues `INSERT INTO events`.
+        state.fail_query_containing("requested_events");
+        let (clickhouse, mock_state) = spawn_mock_clickhouse_with_state(state).await;
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+
+        let mut pending = PendingFlush {
+            event_rows: vec![json!({
+                "event_uid": "evt-1",
+                "event_version": 1,
+                "session_id": "session-a",
+            })],
+            ..PendingFlush::default()
+        };
+        assert!(flush_pending(&clickhouse, &checkpoints, &metrics, &mut pending).await);
+        assert_eq!(mock_state.call_count("events"), 1);
+        assert!(
+            pending
+                .acknowledgements
+                .projection_session_ids
+                .contains("session-a"),
+            "the durable events batch enqueues its session for off-loop projection",
+        );
+
+        let worker = spawn_projection_worker(clickhouse, test_budgets());
+        worker
+            .requests
+            .send(vec!["session-a".to_string()])
+            .await
+            .expect("projection worker accepts requests");
+
+        let outcome_error = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(error) = worker
+                    .outcomes
+                    .lock()
+                    .expect("projection outcome mutex poisoned")
+                    .first()
+                    .map(|outcome| outcome.error.clone())
+                {
+                    return error;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("projection refresh reports an outcome");
+
+        assert!(
+            outcome_error.is_some(),
+            "the projection refresh must genuinely fail in this scenario",
+        );
+        assert_eq!(
+            mock_state.call_count("events"),
+            1,
+            "a failing projection refresh must NOT re-insert canonical events",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mv_failure_surfaces_as_events_insert_failure_and_whole_block_retries() {
+        // Migration 036 adds three read-index materialized views that fire inside
+        // the `INSERT INTO events` statement. With `materialized_views_ignore_errors`
+        // left unset (design §2e), an MV failure fails the whole insert loudly. At
+        // the sink this is indistinguishable from an `events` insert failure: the
+        // block stays pending and is retried WHOLE. Because `events` is
+        // ReplacingMergeTree(event_version) with a PK that is a deterministic
+        // function of the record bytes, the retry re-sends byte-identical rows and
+        // collapses to one logical row -- no duplication.
+        let (clickhouse, mock_state) = spawn_mock_clickhouse("events").await;
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+
+        let checkpoint = sample_checkpoint();
+        let event_row = json!({
+            "event_uid": "evt-1",
+            "event_version": 1,
+            "session_id": "session-a",
+            "source_host": "",
+            "source_name": "source-a",
+            "source_file": "/tmp/source-a.jsonl",
+            "source_generation": 1,
+            "record_ts": "2026-02-17T00:00:01.000Z",
+        });
+        let mut pending = PendingFlush {
+            event_rows: vec![event_row.clone()],
+            checkpoint_updates: HashMap::from([(
+                checkpoint_key(&checkpoint.source_name, &checkpoint.source_file),
+                checkpoint.clone(),
+            )]),
+            ..PendingFlush::default()
+        };
+
+        let first = flush_pending(&clickhouse, &checkpoints, &metrics, &mut pending).await;
+        assert!(!first, "an MV failure fails the events insert loudly");
+        assert_eq!(mock_state.call_count("events"), 1);
+        assert_eq!(pending.event_rows.len(), 1, "the whole block stays pending");
+        assert!(
+            pending.acknowledgements.projection_session_ids.is_empty(),
+            "projection debt is enqueued only after the events insert is durable",
+        );
+
+        let second = flush_pending(&clickhouse, &checkpoints, &metrics, &mut pending).await;
+        assert!(second, "the retry re-inserts the whole block");
+        assert_eq!(mock_state.call_count("events"), 2);
+        let durable = mock_state.rows("events");
+        assert_eq!(durable.len(), 1, "one logical events row lands");
+        assert_eq!(
+            durable[0], event_row,
+            "the retry re-sends byte-identical rows: deterministic PK => RMT collapse",
+        );
+        assert!(
+            pending
+                .acknowledgements
+                .projection_session_ids
+                .contains("session-a"),
+            "projection debt is enqueued once the events insert commits",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn missing_mv_target_fails_insert_loudly_then_recovers_after_recreate() {
+        // A deliberately-broken 036 MV (its target table dropped) makes the
+        // `events` insert fail with a non-oversized, retryable error. The batch
+        // must NOT be silently dropped (that path is reserved for oversized
+        // JSONEachRow rows); it stays pending until the operator recreates the
+        // target, after which the retry drains. This is the design's
+        // "materialized_views_ignore_errors stays unset; recovery = recreate +
+        // retry" contract (WI-04 item 3).
+        let mv_missing = "Code: 60. DB::Exception: Table moraine.mcp_event_navigation \
+                          does not exist. While pushing to view \
+                          moraine.mv_mcp_event_navigation_from_events.";
+        let (clickhouse, mock_state) = spawn_mock_clickhouse_with_state(
+            MockClickHouseState::with_permanent_failure("events", mv_missing),
+        )
+        .await;
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+
+        let checkpoint = sample_checkpoint();
+        let mut pending = PendingFlush {
+            event_rows: vec![json!({
+                "event_uid": "evt-1",
+                "event_version": 1,
+                "session_id": "session-a",
+            })],
+            checkpoint_updates: HashMap::from([(
+                checkpoint_key(&checkpoint.source_name, &checkpoint.source_file),
+                checkpoint.clone(),
+            )]),
+            ..PendingFlush::default()
+        };
+
+        let broken = flush_pending(&clickhouse, &checkpoints, &metrics, &mut pending).await;
+        assert!(!broken, "a broken MV fails the insert loudly");
+        assert_eq!(
+            pending.event_rows.len(),
+            1,
+            "the batch is retained for retry, not dropped as non-retryable",
+        );
+        assert_eq!(pending.checkpoint_updates.len(), 1);
+        assert_eq!(
+            mock_state.call_count("ingest_checkpoints"),
+            0,
+            "no checkpoint advances past a failed canonical insert",
+        );
+
+        // Operator recreates the MV target; the very next retry succeeds.
+        mock_state.recover_table("events");
+        let recovered = flush_pending(&clickhouse, &checkpoints, &metrics, &mut pending).await;
+        assert!(recovered, "recreating the MV target lets the retry drain");
+        assert!(pending.event_rows.is_empty());
+        assert!(pending.checkpoint_updates.is_empty());
+        assert_eq!(mock_state.rows("events").len(), 1);
     }
 }

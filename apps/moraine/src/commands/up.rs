@@ -1,6 +1,6 @@
 use anyhow::Result;
 use dialoguer::console::Style;
-use moraine_clickhouse::MigrationProgress;
+use moraine_clickhouse::{CoreIndexBackfillProgress, MigrationProgress};
 use moraine_config::AppConfig;
 use std::future::Future;
 use std::io::Write;
@@ -274,6 +274,54 @@ impl<W: Write> StartupProgress<W> {
                     )),
                 );
             }
+            DatabaseProgress::CoreIndex(event) => match event {
+                CoreIndexBackfillProgress::Starting { resuming } => {
+                    self.tree.phase(
+                        "Canonical read indexes",
+                        Some(if resuming {
+                            "resuming sweep"
+                        } else {
+                            "sweeping corpus"
+                        }),
+                    );
+                    self.database_tick();
+                }
+                CoreIndexBackfillProgress::PageIndexed {
+                    pages,
+                    events_indexed,
+                } => {
+                    self.phase(
+                        "Canonical read indexes",
+                        &format!("{pages} pages · {events_indexed} events"),
+                    );
+                    self.database_tick();
+                }
+                CoreIndexBackfillProgress::Auditing => {
+                    self.phase("Canonical read indexes", "auditing coverage");
+                    self.database_tick();
+                }
+                CoreIndexBackfillProgress::Published {
+                    core_indexes,
+                    open_v2,
+                } => {
+                    if core_indexes {
+                        self.success_step(
+                            "Canonical read indexes ready",
+                            Some(if open_v2 {
+                                "open v2 reader published"
+                            } else {
+                                "open v2 reader unpublished"
+                            }),
+                        );
+                    } else {
+                        self.success_step(
+                            "Canonical read indexes installed",
+                            Some("overlap audit did not pass; readiness withheld"),
+                        );
+                    }
+                }
+                CoreIndexBackfillProgress::AlreadyComplete => {}
+            },
         }
     }
 

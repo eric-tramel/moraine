@@ -273,6 +273,19 @@ impl PublicationSnapshot {
         &self.token
     }
 
+    /// The pinned publication revision as a scalar, for the v2 canonical
+    /// reader's continuation signals (design §5.4). In `Local` mode this is the
+    /// single global monotonic revision; in `Shared` mode it is the maximum
+    /// host revision (a conservative monotone token — the per-session heads
+    /// fingerprint carries the exact head identity).
+    pub(super) fn pinned_revision_u64(&self) -> u64 {
+        self.hosts
+            .iter()
+            .map(|host| host.publication_revision)
+            .max()
+            .unwrap_or(0)
+    }
+
     pub(super) fn cache_allowed(&self) -> bool {
         self.controls.iter().all(|control| control.state == "idle")
     }
@@ -321,7 +334,12 @@ impl PublicationSnapshot {
             .all(|control| match control.state.as_str() {
                 "idle" => true,
                 "preparing" | "blocked" if control.has_verified_insert_only_manifest() => {
+                    // A verified insert-only append never rewrites a served
+                    // prefix, so a moving feed and the anchored-session reader
+                    // both proceed even when the manifest overlaps the target;
+                    // a strict read still bounces on any overlap.
                     class == PublicationReadClass::MovingFeed
+                        || class == PublicationReadClass::AnchoredSession
                         || !scope.overlaps(control.manifest.as_ref().expect("verified manifest"))
                 }
                 _ => false,
@@ -523,6 +541,15 @@ pub(super) enum PublicationReadClass {
     /// Global list/search/analytics operation. Only a proven insert-only
     /// append is allowed to expose a moving prefix while it is preparing.
     MovingFeed,
+    /// The issue-598 v2 `open` canonical reader (design §5.1, D9). A
+    /// session-scoped read that tolerates a *verified insert-only* append
+    /// fence even when the fence's manifest overlaps its target session — the
+    /// reader pins the as-of heads (appends write no head rows), keys every
+    /// hydration by an explicit `event_uid` set, and absorbs any rows landing
+    /// mid-request through its layered staleness guard. A replacement
+    /// (non-insert-only) fence still fences it exactly like [`Strict`], so it
+    /// surfaces the structured reopen rather than mixing generations.
+    AnchoredSession,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -550,13 +577,27 @@ impl PublicationSnapshotPhase {
 impl ClickHouseConversationRepository {
     /// Canonical events authorized by the operation's captured heads.
     pub(super) fn live_events_source(&self) -> String {
+        self.live_events_source_scoped(None)
+    }
+
+    /// Canonical events authorized by the operation's captured heads, with an
+    /// optional single-session filter emitted **inside** the derived table
+    /// (issue-598 C2-R0): `events` leads its primary key with `session_id`
+    /// (`sql/001_schema.sql`), so the inner `WHERE e.session_id = …` prunes the
+    /// `FINAL` scan by key rather than after the join. `None` reproduces the v1
+    /// `live_events_source` SQL byte-for-byte (the filter fragment is empty), so
+    /// every existing caller is untouched.
+    pub(super) fn live_events_source_scoped(&self, session_id: Option<&str>) -> String {
         let snapshot = require_active_publication_snapshot("live event reads");
 
         let history = self.table_ref("v_published_source_generation_history");
         let revision_predicate = snapshot.publication_revision_predicate("history");
         let events = self.table_ref("events");
+        let session_filter = session_id
+            .map(|session_id| format!("\nWHERE e.session_id = {}", sql_quote(session_id)))
+            .unwrap_or_default();
         format!(
-            "(SELECT e.*\nFROM {events} AS e FINAL\nALL INNER JOIN (\n  SELECT\n    history.source_host AS source_host,\n    history.source_name AS source_name,\n    history.source_file AS source_file,\n    tupleElement(argMax(tuple(history.source_generation, history.publication_revision), history.publication_revision), 1) AS source_generation\n  FROM {history} AS history\n  WHERE {revision_predicate}\n  GROUP BY history.source_host, history.source_name, history.source_file\n) AS published\n  ON published.source_host = e.source_host\n AND published.source_name = e.source_name\n AND published.source_file = e.source_file\n AND published.source_generation = e.source_generation)"
+            "(SELECT e.*\nFROM {events} AS e FINAL\nALL INNER JOIN (\n  SELECT\n    history.source_host AS source_host,\n    history.source_name AS source_name,\n    history.source_file AS source_file,\n    tupleElement(argMax(tuple(history.source_generation, history.publication_revision), history.publication_revision), 1) AS source_generation\n  FROM {history} AS history\n  WHERE {revision_predicate}\n  GROUP BY history.source_host, history.source_name, history.source_file\n) AS published\n  ON published.source_host = e.source_host\n AND published.source_name = e.source_name\n AND published.source_file = e.source_file\n AND published.source_generation = e.source_generation{session_filter})"
         )
     }
 
@@ -1113,6 +1154,53 @@ mod tests {
     }
 
     #[test]
+    fn anchored_session_reads_proceed_through_an_overlapping_insert_only_fence() {
+        // Design §5.1 / D9: a verified insert-only fence over the target
+        // session must NOT bounce the v2 open reader (unlike a strict read),
+        // because appends never rewrite the served prefix.
+        let snapshot = PublicationSnapshot::new(
+            PublicationConsistencyMode::Local,
+            vec![host_state("", 4, "heads-a")],
+            vec![control("preparing", 7, true)],
+        );
+
+        // The strict read over the overlapping session is fenced …
+        assert!(!snapshot.read_allowed(
+            PublicationReadClass::Strict,
+            &PublicationReadScope::session("session-a")
+        ));
+        // … while the anchored-session reader proceeds over the very same
+        // overlapping session.
+        assert!(snapshot.read_allowed(
+            PublicationReadClass::AnchoredSession,
+            &PublicationReadScope::session("session-a")
+        ));
+        // A non-overlapping session is allowed for either class.
+        assert!(snapshot.read_allowed(
+            PublicationReadClass::AnchoredSession,
+            &PublicationReadScope::session("session-b")
+        ));
+    }
+
+    #[test]
+    fn anchored_session_reads_bounce_a_replacement_fence_like_strict() {
+        // A non-insert-only (replacement) fence must fence the anchored-session
+        // reader exactly like strict, so it surfaces the structured reopen
+        // rather than mixing generations.
+        for state in ["preparing", "blocked"] {
+            let replacement_fence = PublicationSnapshot::new(
+                PublicationConsistencyMode::Local,
+                vec![host_state("", 4, "heads-a")],
+                vec![control(state, 7, false)],
+            );
+            assert!(!replacement_fence.read_allowed(
+                PublicationReadClass::AnchoredSession,
+                &PublicationReadScope::session("session-b")
+            ));
+        }
+    }
+
+    #[test]
     fn unresolved_insert_only_fence_retains_the_same_manifest_scope() {
         let snapshot = PublicationSnapshot::new(
             PublicationConsistencyMode::Local,
@@ -1235,6 +1323,35 @@ mod tests {
                 let sql = repository.live_events_source();
                 assert!(sql.contains("FROM `moraine`.`events` AS e FINAL"));
                 assert!(!sql.contains("FINAL AS e"));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn scoped_live_events_source_prunes_by_session_and_none_is_byte_identical() {
+        let snapshot = PublicationSnapshot::new(
+            PublicationConsistencyMode::Local,
+            vec![host_state("", 4, "heads-a")],
+            Vec::new(),
+        );
+        let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
+            .expect("build ClickHouse client");
+        let repository = ClickHouseConversationRepository::new(client, RepoConfig::default());
+
+        ACTIVE_PUBLICATION_SNAPSHOT
+            .scope(snapshot, async {
+                // `None` is byte-identical to the historical `live_events_source`.
+                assert_eq!(
+                    repository.live_events_source(),
+                    repository.live_events_source_scoped(None)
+                );
+                // The session filter is emitted INSIDE the derived table (C2-R0):
+                // it appends to the join body, before the closing paren.
+                let scoped = repository.live_events_source_scoped(Some("session-a"));
+                assert!(scoped.contains("AS e FINAL\nALL INNER JOIN"));
+                assert!(scoped.ends_with(
+                    "AND published.source_generation = e.source_generation\nWHERE e.session_id = 'session-a')"
+                ));
             })
             .await;
     }

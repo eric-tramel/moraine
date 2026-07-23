@@ -30,6 +30,10 @@ pub use domain::{
     SessionTurn, StoreConnectionMetrics, StoreDiagnostics, StoreHealth, StoreProbe, TableColumn,
     TablePreview, TablePreviewQuery, TableSummaries, TableSummary, ToolResult, WebSearchEvent,
 };
+pub use domain::{
+    CanonicalContinuation, CanonicalPageAfter, CanonicalReadAnchor, CanonicalReadOutcome,
+    CanonicalSessionPage, CanonicalSessionSignals, CanonicalTurnPage,
+};
 pub use error::{RepoError, RepoResult};
 pub use in_memory_repo::{
     InMemoryConversationCalls, InMemoryConversationRepository, InMemoryConversationResponses,
