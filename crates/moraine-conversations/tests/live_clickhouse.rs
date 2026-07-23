@@ -21,6 +21,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+#[path = "live_clickhouse/canonical_open_benchmark.rs"]
+mod canonical_open_benchmark;
+#[path = "live_clickhouse/canonical_open_parity.rs"]
+mod canonical_open_parity;
 #[path = "live_clickhouse/envelope_gates.rs"]
 mod envelope_gates;
 #[path = "live_clickhouse/search_host_identity.rs"]
@@ -2338,6 +2342,43 @@ async fn live_envelope_shared_budget_and_statement_cap() -> Result<()> {
 #[ignore = "requires wrapper-owned live ClickHouse and destructive opt-in"]
 async fn live_envelope_spill_and_memory_ceiling() -> Result<()> {
     with_live_fixture_envelope(envelope_gates::spill_and_memory_ceiling()).await
+}
+
+// Issue #598 WI-10 exit-gate live tests (design-598-final.md LIVE TEST PLAN).
+// The bodies live in live_clickhouse/canonical_open_parity.rs; these root-level
+// wrappers keep the exact `--exact` libtest paths that
+// scripts/dev/sandbox/run-live-test dispatches on.
+
+#[tokio::test]
+#[ignore = "requires wrapper-owned live ClickHouse and destructive opt-in"]
+async fn live_canonical_open_parity() -> Result<()> {
+    with_live_fixture_envelope(canonical_open_parity::parity()).await
+}
+
+#[tokio::test]
+#[ignore = "requires wrapper-owned live ClickHouse and destructive opt-in"]
+async fn live_canonical_open_locator() -> Result<()> {
+    with_live_fixture_envelope(canonical_open_parity::locator()).await
+}
+
+#[tokio::test]
+#[ignore = "requires wrapper-owned live ClickHouse and destructive opt-in"]
+async fn live_canonical_open_continuation() -> Result<()> {
+    with_live_fixture_envelope(canonical_open_parity::continuation()).await
+}
+
+#[tokio::test]
+#[ignore = "requires wrapper-owned live ClickHouse and destructive opt-in"]
+async fn live_canonical_open_fence() -> Result<()> {
+    with_live_fixture_envelope(canonical_open_parity::fence()).await
+}
+
+// Issue #598 WI-09 boundedness benchmark (design-598-final LIVE TEST PLAN §6).
+// Wired as the pre-declared `canonical-open-bench` run-live-test mode.
+#[tokio::test]
+#[ignore = "requires wrapper-owned live ClickHouse, destructive opt-in, and ~2 GB free"]
+async fn live_canonical_open_boundedness_benchmark() -> Result<()> {
+    with_live_fixture_envelope(canonical_open_benchmark::boundedness()).await
 }
 
 #[cfg(test)]

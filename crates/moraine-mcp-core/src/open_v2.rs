@@ -23,7 +23,8 @@
 use crate::contract::{
     classify_open_cursor, encode_open_cursor_v2, CanonicalOpenV1Args, ContractError, McpEntityKind,
     McpId, OpenCursorClassified, OpenCursorV2, OpenV1Args, ToolError, ToolErrorCode,
-    OPEN_CURSOR_STALE_REOPEN_MESSAGE, OPEN_CURSOR_V2_VERSION, OPEN_MIN_LIMIT,
+    OPEN_CURSOR_MAX_CHARS, OPEN_CURSOR_STALE_REOPEN_MESSAGE, OPEN_CURSOR_V2_VERSION,
+    OPEN_MIN_LIMIT,
 };
 use crate::open_v1::{
     compact_text_content, compact_tools, contract_error_tool_response, encode_event_ref_id,
@@ -56,7 +57,9 @@ enum OpenV2Mode {
     Summary,
     Page {
         limit: u16,
-        after: Option<CanonicalContinuation>,
+        // Boxed so the carried session header (design §5.5) inside the
+        // continuation does not bloat this transient mode enum.
+        after: Option<Box<CanonicalContinuation>>,
     },
 }
 
@@ -224,7 +227,7 @@ impl AppState {
 fn repo_page_args(mode: &OpenV2Mode) -> (u16, Option<CanonicalContinuation>) {
     match mode {
         OpenV2Mode::Summary => (1, None),
-        OpenV2Mode::Page { limit, after } => (*limit, after.clone()),
+        OpenV2Mode::Page { limit, after } => (*limit, after.as_ref().map(|cont| (**cont).clone())),
     }
 }
 
@@ -276,7 +279,7 @@ fn resolve_open_v2(
                 id,
                 mode: OpenV2Mode::Page {
                     limit: decoded.limit,
-                    after: Some(decoded.continuation),
+                    after: Some(Box::new(decoded.continuation)),
                 },
                 request: json!({ "cursor": cursor }),
             })
@@ -336,14 +339,26 @@ fn mint_cursor(
 ) -> Result<Option<String>> {
     continuation
         .map(|continuation| {
-            let cursor = OpenCursorV2 {
+            let mut cursor = OpenCursorV2 {
                 version: OPEN_CURSOR_V2_VERSION,
                 target_id: target_id.to_string(),
                 limit,
                 continuation: continuation.clone(),
             };
-            encode_open_cursor_v2(&cursor)
-                .map_err(|err| anyhow::anyhow!("failed to encode continuation cursor: {err}"))
+            let token = encode_open_cursor_v2(&cursor)
+                .map_err(|err| anyhow::anyhow!("failed to encode continuation cursor: {err}"))?;
+            // The carried session header (design §5.5) can push the encoded
+            // cursor past OPEN_CURSOR_MAX_CHARS (enforced on the decode path).
+            // Drop it and re-encode: the next page recomputes the header (one
+            // session-wide pass) rather than failing the traversal (design §6
+            // carry-drop).
+            if token.len() > OPEN_CURSOR_MAX_CHARS && cursor.continuation.session_carry.is_some() {
+                cursor.continuation.session_carry = None;
+                encode_open_cursor_v2(&cursor)
+                    .map_err(|err| anyhow::anyhow!("failed to encode continuation cursor: {err}"))
+            } else {
+                Ok(token)
+            }
         })
         .transpose()
 }
@@ -646,6 +661,7 @@ mod tests {
                 event_ordinal,
             },
             after_turn_seq,
+            session_carry: None,
         }
     }
 
@@ -710,7 +726,7 @@ mod tests {
                 after: Some(after),
             } => {
                 assert_eq!(limit, 9);
-                assert_eq!(after, continuation);
+                assert_eq!(*after, continuation);
             }
             other => panic!("expected page continuation, got {other:?}"),
         }
@@ -830,6 +846,28 @@ mod tests {
     }
 
     #[test]
+    fn oversized_session_carry_is_dropped_to_fit_the_cursor() {
+        // The carried session header (design §5.5) can push the encoded cursor
+        // past OPEN_CURSOR_MAX_CHARS; mint drops it rather than failing the
+        // traversal, and the next page recomputes the header (design §6).
+        let mut continuation = sample_continuation(3, 0);
+        continuation.session_carry = Some("x".repeat(OPEN_CURSOR_MAX_CHARS * 2));
+        let token = mint_cursor(&session_id(), 25, Some(&continuation))
+            .expect("mint drops the oversized carry")
+            .expect("a continuation mints a token");
+        assert!(token.len() <= OPEN_CURSOR_MAX_CHARS);
+        match classify_open_cursor(&token).expect("classify minted cursor") {
+            OpenCursorClassified::V2(decoded) => {
+                assert!(decoded.continuation.session_carry.is_none());
+                // Everything else survives the drop.
+                assert_eq!(decoded.continuation.after, continuation.after);
+                assert_eq!(decoded.limit, 25);
+            }
+            other => panic!("expected v2 cursor, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn turn_page_event_ordinals_continue_across_pages_like_v1() {
         // v1 numbers a turn's events globally (start + index + 1). v2 slices the
         // page but continues ordinals from the anchor's within-turn ordinal, so
@@ -850,7 +888,7 @@ mod tests {
         let (v2_data, _) = shape_turn_page(
             &OpenV2Mode::Page {
                 limit: 2,
-                after: Some(sample_continuation(1, 3)),
+                after: Some(Box::new(sample_continuation(1, 3))),
             },
             &turn_id(),
             &CanonicalTurnPage {

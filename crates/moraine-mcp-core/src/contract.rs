@@ -2025,6 +2025,7 @@ mod tests {
                 event_ordinal: 4,
             },
             after_turn_seq: 12,
+            session_carry: None,
         }
     }
 
