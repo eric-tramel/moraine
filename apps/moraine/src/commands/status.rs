@@ -557,6 +557,11 @@ pub(super) async fn cmd_status(
         .http_listening
         .then(|| monitor_runtime_url(cfg));
 
+    // Canonical read-index / open-reader readiness (issue #598). Best-effort:
+    // a direct-DB read that yields "unavailable" when ClickHouse is unreachable,
+    // so it never blocks or fails the status snapshot.
+    let core_index = super::gather_core_index_report(cfg).await;
+
     Ok(StatusSnapshot {
         services,
         monitor_url,
@@ -571,6 +576,7 @@ pub(super) async fn cmd_status(
         status_notes,
         doctor: report,
         heartbeat,
+        core_index: Some(core_index),
     })
 }
 

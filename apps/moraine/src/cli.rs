@@ -154,6 +154,36 @@ pub(crate) struct DbArgs {
 pub(crate) enum DbCommand {
     Migrate,
     Doctor,
+    /// Inspect and operate the canonical read indexes (issue #598).
+    CoreIndex(CoreIndexArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct CoreIndexArgs {
+    #[command(subcommand)]
+    pub(crate) command: CoreIndexCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum CoreIndexCommand {
+    /// Print core-index/open-v2 readiness, backfill cursor age, overlap-audit
+    /// outcome, and the active open-reader mode.
+    Status,
+    /// Truncate the canonical read indexes and re-run the backfill from scratch.
+    Rebuild,
+    /// Publish the one-way open-v2 reader flag for a Shared/multi-writer backend
+    /// (or re-promote after a rebuild). Requires --force to confirm every reader
+    /// is v2-capable.
+    Promote(CoreIndexPromoteArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct CoreIndexPromoteArgs {
+    /// Confirm that every open-tool consumer of this backend is v2-capable.
+    /// Promotion switches ALL readers of a shared backend onto the canonical
+    /// reader; a downlevel reader would fail. Required to publish.
+    #[arg(long)]
+    pub(crate) force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -281,6 +311,52 @@ mod tests {
                 command: ClickhouseCommand::Supervise,
             })
         ));
+    }
+
+    #[test]
+    fn clap_parses_core_index_subcommands() {
+        let status = Cli::parse_from(["moraine", "db", "core-index", "status"]);
+        assert!(matches!(
+            status.command,
+            CliCommand::Db(DbArgs {
+                command: DbCommand::CoreIndex(CoreIndexArgs {
+                    command: CoreIndexCommand::Status,
+                }),
+            })
+        ));
+
+        let rebuild = Cli::parse_from(["moraine", "db", "core-index", "rebuild"]);
+        assert!(matches!(
+            rebuild.command,
+            CliCommand::Db(DbArgs {
+                command: DbCommand::CoreIndex(CoreIndexArgs {
+                    command: CoreIndexCommand::Rebuild,
+                }),
+            })
+        ));
+
+        // Promote defaults to unforced; --force flips the confirmation.
+        let promote = Cli::parse_from(["moraine", "db", "core-index", "promote"]);
+        match promote.command {
+            CliCommand::Db(DbArgs {
+                command:
+                    DbCommand::CoreIndex(CoreIndexArgs {
+                        command: CoreIndexCommand::Promote(args),
+                    }),
+            }) => assert!(!args.force),
+            _ => panic!("expected core-index promote command"),
+        }
+
+        let promote_forced = Cli::parse_from(["moraine", "db", "core-index", "promote", "--force"]);
+        match promote_forced.command {
+            CliCommand::Db(DbArgs {
+                command:
+                    DbCommand::CoreIndex(CoreIndexArgs {
+                        command: CoreIndexCommand::Promote(args),
+                    }),
+            }) => assert!(args.force),
+            _ => panic!("expected forced core-index promote command"),
+        }
     }
 
     #[test]

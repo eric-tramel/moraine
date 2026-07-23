@@ -13,6 +13,11 @@ use moraine_conversations::{
 use serde_json::{json, Map, Value};
 use std::time::Instant;
 
+// issue-598 WI-07 dispatch hook: the v2 canonical `open` module
+// (`open_v2.rs`) reuses this module's byte-identical response-shaping and
+// id/text formatters so both readers emit the same tool JSON. The reused items
+// carry `pub(crate)` visibility for that reuse ONLY; v1 paging, cursor, and
+// snapshot logic below are untouched (design D2).
 const SUMMARY_PREVIEW_CHARS: usize = 240;
 const ENCRYPTED_REASONING_SUMMARY: &str = "[encrypted reasoning omitted]";
 const SUMMARY_MAX_TOOLS: usize = 25;
@@ -37,10 +42,10 @@ enum OpenMode {
 }
 
 #[derive(Debug)]
-struct PageSelection {
-    start: usize,
-    end: usize,
-    next_cursor: Option<String>,
+pub(crate) struct PageSelection {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) next_cursor: Option<String>,
 }
 
 impl AppState {
@@ -360,7 +365,7 @@ fn turn_page(
     }))
 }
 
-fn request_from_arguments(arguments: &Value) -> Value {
+pub(crate) fn request_from_arguments(arguments: &Value) -> Value {
     match arguments {
         Value::Object(object) => {
             let mut request = Map::new();
@@ -383,7 +388,7 @@ fn request_from_arguments(arguments: &Value) -> Value {
     }
 }
 
-fn success_tool_response(
+pub(crate) fn success_tool_response(
     request: Value,
     data: Value,
     warnings: Vec<String>,
@@ -396,7 +401,7 @@ fn success_tool_response(
     Ok(tool_success_result(open_result_text(&payload), payload))
 }
 
-fn contract_error_tool_response(
+pub(crate) fn contract_error_tool_response(
     request: Value,
     error: ContractError,
     started_at: Instant,
@@ -416,7 +421,7 @@ fn contract_error_tool_response(
     )
 }
 
-fn not_found_tool_response(
+pub(crate) fn not_found_tool_response(
     request: Value,
     kind: McpEntityKind,
     id: &str,
@@ -433,7 +438,7 @@ fn not_found_tool_response(
     )
 }
 
-fn repo_error_tool_response(
+pub(crate) fn repo_error_tool_response(
     request: Value,
     error: moraine_conversations::RepoError,
     started_at: Instant,
@@ -468,7 +473,7 @@ fn repo_error_tool_response(
     }
 }
 
-fn internal_error_tool_response(
+pub(crate) fn internal_error_tool_response(
     request: Value,
     message: String,
     started_at: Instant,
@@ -484,7 +489,11 @@ fn internal_error_tool_response(
     )
 }
 
-fn error_tool_response(request: Value, error: ToolError, started_at: Instant) -> Result<Value> {
+pub(crate) fn error_tool_response(
+    request: Value,
+    error: ToolError,
+    started_at: Instant,
+) -> Result<Value> {
     let performance = Performance::from_elapsed(started_at.elapsed());
     let envelope = ToolErrorEnvelope::error(OPEN_TOOL, request, error, performance);
     let payload = serde_json::to_value(envelope).context("failed to encode open error envelope")?;
@@ -562,7 +571,7 @@ fn open_result_text(payload: &Value) -> String {
     }
 }
 
-fn open_session_data(
+pub(crate) fn open_session_data(
     session: &McpSessionOpen,
     page: Option<&PageSelection>,
 ) -> Result<(Value, Vec<String>)> {
@@ -650,7 +659,7 @@ fn open_session_turn_summary(turn: &McpTurnCompact) -> Result<Value> {
     }))
 }
 
-fn open_turn_data(
+pub(crate) fn open_turn_data(
     turn: &McpTurnOpen,
     page: Option<&PageSelection>,
 ) -> Result<(Value, Vec<String>)> {
@@ -714,7 +723,7 @@ fn open_turn_data(
     Ok((data, warnings))
 }
 
-fn open_turn_event_summary(
+pub(crate) fn open_turn_event_summary(
     event: &McpEventSummary,
     ordinal: usize,
     terminal_event_uid: Option<&str>,
@@ -762,7 +771,7 @@ fn has_encrypted_content_field(text: &str) -> bool {
         .any(|(index, _)| text[index + FIELD.len()..].trim_start().starts_with(':'))
 }
 
-fn open_event_data(
+pub(crate) fn open_event_data(
     event: &McpEventOpen,
     turn_state: Option<&McpTurnOpen>,
 ) -> Result<(Value, Vec<String>)> {
@@ -845,7 +854,7 @@ fn session_summary(metadata: &SessionMetadata, source: Option<&str>) -> Result<V
     }))
 }
 
-fn compact_text_content(event_id: Option<&str>, text: Option<&str>) -> Value {
+pub(crate) fn compact_text_content(event_id: Option<&str>, text: Option<&str>) -> Value {
     match text.map(str::trim).filter(|text| !text.is_empty()) {
         Some(text) => {
             let text = compact_text_line(text, SUMMARY_PREVIEW_CHARS);
@@ -870,7 +879,7 @@ fn compact_optional_line(text: Option<&str>, max_chars: usize) -> Option<String>
         .map(|text| compact_text_line(text, max_chars))
 }
 
-fn compact_tools(tools: &[String]) -> (Vec<String>, bool) {
+pub(crate) fn compact_tools(tools: &[String]) -> (Vec<String>, bool) {
     let compact = tools
         .iter()
         .take(SUMMARY_MAX_TOOLS)
@@ -1015,17 +1024,17 @@ fn is_terminal_payload(payload_type: &str) -> bool {
     matches!(payload_type, "task_complete" | "turn_aborted")
 }
 
-fn format_unix_ms(unix_ms: i64) -> String {
+pub(crate) fn format_unix_ms(unix_ms: i64) -> String {
     crate::contract::format_rfc3339_utc_millis(unix_ms)
 }
 
-fn encode_session_id(raw_session_id: &str) -> Result<String> {
+pub(crate) fn encode_session_id(raw_session_id: &str) -> Result<String> {
     Ok(McpSessionId::from_raw_session_id(raw_session_id)
         .context("invalid repository session id")?
         .to_string())
 }
 
-fn encode_turn_id(raw_session_id: &str, turn_seq: u32) -> Result<String> {
+pub(crate) fn encode_turn_id(raw_session_id: &str, turn_seq: u32) -> Result<String> {
     Ok(
         McpTurnId::from_raw_session_id_and_turn_seq(raw_session_id, turn_seq)
             .context("invalid repository turn id")?
@@ -1039,16 +1048,16 @@ fn encode_event_id(raw_event_uid: &str) -> Result<String> {
         .to_string())
 }
 
-fn encode_optional_event_id(raw_event_uid: Option<&str>) -> Result<Option<String>> {
+pub(crate) fn encode_optional_event_id(raw_event_uid: Option<&str>) -> Result<Option<String>> {
     raw_event_uid.map(encode_event_id).transpose()
 }
 
-fn encode_turn_ref_id(turn: Option<&McpTurnRef>) -> Result<Option<String>> {
+pub(crate) fn encode_turn_ref_id(turn: Option<&McpTurnRef>) -> Result<Option<String>> {
     turn.map(|turn| encode_turn_id(&turn.session_id, turn.turn_seq))
         .transpose()
 }
 
-fn encode_event_ref_id(event: Option<&McpEventRef>) -> Result<Option<String>> {
+pub(crate) fn encode_event_ref_id(event: Option<&McpEventRef>) -> Result<Option<String>> {
     event
         .map(|event| encode_event_id(&event.event_uid))
         .transpose()

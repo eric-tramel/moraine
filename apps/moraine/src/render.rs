@@ -1,5 +1,5 @@
 use anyhow::Result;
-use moraine_clickhouse::DoctorReport;
+use moraine_clickhouse::{CoreIndexAuditOutcome, DoctorReport};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -102,6 +102,139 @@ pub(crate) struct StatusSnapshot {
     pub(crate) status_notes: Vec<String>,
     pub(crate) doctor: DoctorReport,
     pub(crate) heartbeat: HeartbeatSnapshot,
+    /// Canonical read-index / open-reader readiness (issue #598). `None` only
+    /// on the legacy status paths that do not gather it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) core_index: Option<CoreIndexReport>,
+}
+
+/// Canonical read-index (issue #598) readiness surfaced by `moraine status`,
+/// `moraine db doctor`, and `moraine db core-index status`. Additive JSON: a
+/// downlevel consumer ignores it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct CoreIndexReport {
+    /// Whether the migration-036 read-index state was readable (migration
+    /// applied and ClickHouse reachable). When false the readiness fields are
+    /// defaults and the surfacing shows "unavailable".
+    pub(crate) available: bool,
+    /// `core_indexes.ready == 1`: the coverage sweep completed and the overlap
+    /// audit passed.
+    pub(crate) core_indexes_ready: bool,
+    /// `open_v2.ready == 1`: the one-way `open` cutover flag consumers read.
+    pub(crate) open_v2_ready: bool,
+    /// How `open_v2` was published (`auto-local` or `operator-promote`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) open_v2_provenance: Option<String>,
+    /// Seconds since the backfill cursor / readiness row was last written
+    /// (decoded from the snowflake generation).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) backfill_cursor_age_seconds: Option<i64>,
+    /// The persisted overlap-audit outcome, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) audit: Option<CoreIndexAuditOutcome>,
+    /// The configured `[mcp] open_reader` value: `auto` | `v1` | `v2`.
+    pub(crate) configured_open_reader: String,
+    /// The effective reader after resolution: `v1` | `v2` | `error`.
+    pub(crate) effective_open_reader: String,
+    /// True when a config override (`v1`/`v2`) is forcing the effective reader.
+    pub(crate) open_reader_override: bool,
+    /// Human-readable note about the resolution (override in effect, forced-v2
+    /// while indexes are not ready, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) open_reader_note: Option<String>,
+}
+
+/// Human-readable lines for a [`CoreIndexReport`], shared by the doctor,
+/// status, and `core-index status` renderers.
+pub(crate) fn core_index_report_lines(report: &CoreIndexReport) -> Vec<String> {
+    if !report.available {
+        return vec![
+            "core indexes: unavailable (migration 036 not applied or ClickHouse unreachable)"
+                .to_string(),
+            format!(
+                "open reader: configured={}, effective=unknown",
+                report.configured_open_reader
+            ),
+        ];
+    }
+
+    let mut lines = vec![
+        format!(
+            "core indexes ready: {}",
+            state_label(report.core_indexes_ready)
+        ),
+        format!(
+            "open v2 ready: {}{}",
+            state_label(report.open_v2_ready),
+            match &report.open_v2_provenance {
+                Some(provenance) if report.open_v2_ready => format!(" ({provenance})"),
+                _ => String::new(),
+            }
+        ),
+    ];
+
+    lines.push(match report.backfill_cursor_age_seconds {
+        Some(age) => format!("backfill cursor age: {}", format_age_seconds(age)),
+        None => "backfill cursor age: not yet swept".to_string(),
+    });
+
+    lines.push(match &report.audit {
+        Some(audit) => format!(
+            "overlap audit: {} (sessions={}, events={}, nav_missing={}, loc_missing={}, dir_missing={}, cardinality_delta={})",
+            if audit.passed { "pass" } else { "fail" },
+            audit.sampled_sessions,
+            audit.sampled_events,
+            audit.navigation_missing,
+            audit.locator_missing,
+            audit.directory_missing_sessions,
+            audit.navigation_locator_cardinality_delta,
+        ),
+        None => "overlap audit: not yet run".to_string(),
+    });
+
+    let mut reader_line = format!(
+        "open reader: configured={}, effective={}",
+        report.configured_open_reader, report.effective_open_reader
+    );
+    if report.open_reader_override {
+        reader_line.push_str(" (config override)");
+    }
+    lines.push(reader_line);
+    if let Some(note) = &report.open_reader_note {
+        lines.push(format!("open reader note: {note}"));
+    }
+    lines
+}
+
+/// One concise line summarizing core-index readiness for the `moraine status`
+/// Database panel.
+pub(crate) fn status_core_index_line(report: &CoreIndexReport) -> String {
+    if !report.available {
+        return "core indexes: unavailable".to_string();
+    }
+    format!(
+        "core indexes: {}  |  open reader: {} (configured {})",
+        state_label(report.core_indexes_ready),
+        report.effective_open_reader,
+        report.configured_open_reader,
+    )
+}
+
+/// Render a signed age in seconds as a compact human string.
+fn format_age_seconds(age_seconds: i64) -> String {
+    if age_seconds < 0 {
+        return "just now".to_string();
+    }
+    let age = age_seconds;
+    if age < 60 {
+        format!("{age}s")
+    } else if age < 3600 {
+        format!("{}m{}s", age / 60, age % 60)
+    } else if age < 86_400 {
+        format!("{}h{}m", age / 3600, (age % 3600) / 60)
+    } else {
+        format!("{}d{}h", age / 86_400, (age % 86_400) / 3600)
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -475,6 +608,16 @@ pub(crate) fn render_status(output: &CliOutput, snapshot: &StatusSnapshot) -> Re
     if output.verbose && !snapshot.doctor.errors.is_empty() {
         doctor_lines.push(format!("  errors: {}", snapshot.doctor.errors.join(" | ")));
     }
+    if let Some(core_index) = &snapshot.core_index {
+        doctor_lines.push(status_core_index_line(core_index));
+        // Surface a non-silent config override prominently even in the concise
+        // view, and a forced-v2-not-ready misconfiguration.
+        if let Some(note) = &core_index.open_reader_note {
+            if core_index.open_reader_override || core_index.effective_open_reader == "error" {
+                doctor_lines.push(format!("  open reader: {note}"));
+            }
+        }
+    }
     output.section("Database", &doctor_lines);
 
     // -- Ingest activity (only show when there is something to report) --
@@ -571,9 +714,21 @@ pub(crate) fn render_db_migrate(output: &CliOutput, outcome: &MigrationOutcome) 
     Ok(())
 }
 
-pub(crate) fn render_db_doctor(output: &CliOutput, report: &DoctorReport) -> Result<()> {
+pub(crate) fn render_db_doctor(
+    output: &CliOutput,
+    report: &DoctorReport,
+    core_index: &CoreIndexReport,
+) -> Result<()> {
     if output.is_json() {
-        println!("{}", serde_json::to_string_pretty(report)?);
+        // Additive: the DoctorReport shape is unchanged; core-index readiness
+        // rides in a sibling object so downlevel JSON consumers are unaffected.
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "doctor": report,
+                "core_index": core_index,
+            }))?
+        );
         return Ok(());
     }
 
@@ -634,7 +789,18 @@ pub(crate) fn render_db_doctor(output: &CliOutput, report: &DoctorReport) -> Res
     if !report.errors.is_empty() {
         lines.push(format!("errors: {}", report.errors.join(" | ")));
     }
+    lines.extend(core_index_report_lines(core_index));
     output.section("DB Doctor", &lines);
+    Ok(())
+}
+
+/// Render the `moraine db core-index status` report.
+pub(crate) fn render_core_index_status(output: &CliOutput, report: &CoreIndexReport) -> Result<()> {
+    if output.is_json() {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    output.section("Canonical Read Indexes", &core_index_report_lines(report));
     Ok(())
 }
 
@@ -775,5 +941,87 @@ mod tests {
         assert!(panel.contains("abcdefghij"));
         assert!(panel.contains("klmnopqrst"));
         assert!(panel.contains("uvwxyz"));
+    }
+
+    fn ready_report() -> CoreIndexReport {
+        CoreIndexReport {
+            available: true,
+            core_indexes_ready: true,
+            open_v2_ready: true,
+            open_v2_provenance: Some("auto-local".to_string()),
+            backfill_cursor_age_seconds: Some(3725),
+            audit: Some(CoreIndexAuditOutcome {
+                passed: true,
+                sampled_sessions: 12,
+                sampled_events: 3072,
+                ..CoreIndexAuditOutcome::default()
+            }),
+            configured_open_reader: "auto".to_string(),
+            effective_open_reader: "v2".to_string(),
+            open_reader_override: false,
+            open_reader_note: None,
+        }
+    }
+
+    #[test]
+    fn core_index_lines_surface_readiness_age_audit_and_reader() {
+        let lines = core_index_report_lines(&ready_report());
+        let joined = lines.join("\n");
+        assert!(joined.contains("core indexes ready: yes"), "{joined}");
+        assert!(
+            joined.contains("open v2 ready: yes (auto-local)"),
+            "{joined}"
+        );
+        // 3725s renders as compact hours/minutes.
+        assert!(joined.contains("backfill cursor age: 1h2m"), "{joined}");
+        assert!(joined.contains("overlap audit: pass"), "{joined}");
+        assert!(
+            joined.contains("open reader: configured=auto, effective=v2"),
+            "{joined}"
+        );
+        assert!(!joined.contains("config override"), "{joined}");
+    }
+
+    #[test]
+    fn core_index_lines_flag_v1_override() {
+        let mut report = ready_report();
+        report.configured_open_reader = "v1".to_string();
+        report.effective_open_reader = "v1".to_string();
+        report.open_reader_override = true;
+        report.open_reader_note = Some("v1 forced by [mcp] open_reader".to_string());
+        let joined = core_index_report_lines(&report).join("\n");
+        assert!(
+            joined.contains("open reader: configured=v1, effective=v1 (config override)"),
+            "{joined}"
+        );
+        assert!(joined.contains("open reader note: v1 forced"), "{joined}");
+    }
+
+    #[test]
+    fn core_index_lines_report_unavailable() {
+        let report = CoreIndexReport {
+            available: false,
+            core_indexes_ready: false,
+            open_v2_ready: false,
+            open_v2_provenance: None,
+            backfill_cursor_age_seconds: None,
+            audit: None,
+            configured_open_reader: "auto".to_string(),
+            effective_open_reader: "unknown".to_string(),
+            open_reader_override: false,
+            open_reader_note: None,
+        };
+        let joined = core_index_report_lines(&report).join("\n");
+        assert!(joined.contains("core indexes: unavailable"), "{joined}");
+        assert!(joined.contains("configured=auto"), "{joined}");
+    }
+
+    #[test]
+    fn age_formatting_covers_every_bucket() {
+        assert_eq!(format_age_seconds(-5), "just now");
+        assert_eq!(format_age_seconds(42), "42s");
+        assert_eq!(format_age_seconds(125), "2m5s");
+        assert_eq!(format_age_seconds(3725), "1h2m");
+        assert_eq!(format_age_seconds(90_061), "1d1h");
     }
 }

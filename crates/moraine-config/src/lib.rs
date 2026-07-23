@@ -255,6 +255,153 @@ pub struct IngestConfig {
     pub ack_observation: bool,
 }
 
+/// The configured `[mcp] open_reader` selector for the `open` tool family
+/// (issue #598 BINDING D6). It decides which repository reader backs
+/// `open(session|turn|event)`:
+///
+/// - [`OpenReaderMode::Auto`] (the default): use the canonical v2 reader only
+///   once its read indexes are published (`open_v2.ready == 1`) AND the backend
+///   is the default single-owner Local backend; otherwise stay on the legacy v1
+///   projected reader. Readiness is cached monotonically after the first
+///   positive, so a mid-run demotion never happens.
+/// - [`OpenReaderMode::V1`]: force the legacy v1 reader regardless of published
+///   readiness — the non-silent operational kill-switch. `moraine status` and
+///   `moraine db doctor` must surface that an override is in effect.
+/// - [`OpenReaderMode::V2`]: force the canonical v2 reader (for testing or a
+///   promoted Shared backend). When the indexes are not ready the reader fails
+///   with a typed error rather than silently falling back to v1.
+///
+/// The value is validated at config load (an unknown string is rejected with a
+/// friendly error listing the valid selectors), and a config override beats the
+/// process-cached readiness at process start.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OpenReaderMode {
+    /// Readiness- and Local-gated selection (the default).
+    #[default]
+    Auto,
+    /// Force the legacy v1 projected reader (the kill-switch).
+    V1,
+    /// Force the canonical v2 reader.
+    V2,
+}
+
+pub const OPEN_READER_MODE_AUTO: &str = "auto";
+pub const OPEN_READER_MODE_V1: &str = "v1";
+pub const OPEN_READER_MODE_V2: &str = "v2";
+
+impl OpenReaderMode {
+    /// The canonical lowercase string for this mode (its config value).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Auto => OPEN_READER_MODE_AUTO,
+            Self::V1 => OPEN_READER_MODE_V1,
+            Self::V2 => OPEN_READER_MODE_V2,
+        }
+    }
+
+    /// Case-insensitive, whitespace-trimmed parse of a config value.
+    fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case(OPEN_READER_MODE_AUTO) {
+            Some(Self::Auto)
+        } else if value.eq_ignore_ascii_case(OPEN_READER_MODE_V1) {
+            Some(Self::V1)
+        } else if value.eq_ignore_ascii_case(OPEN_READER_MODE_V2) {
+            Some(Self::V2)
+        } else {
+            None
+        }
+    }
+
+    /// Resolve the configured selector against the published `open_v2` readiness
+    /// and the backend's Local status (BINDING D6/D3). This is the single
+    /// authority for turning config + readiness into an effective reader and is
+    /// consumed by status/doctor surfacing and repository dispatch alike.
+    ///
+    /// `open_v2_ready` is `mcp_read_index_state('open_v2').ready == 1`;
+    /// `publication_mode_is_local` is whether the backend is the default
+    /// single-owner Local backend (only the Local backend auto-selects v2).
+    pub fn resolve(
+        self,
+        open_v2_ready: bool,
+        publication_mode_is_local: bool,
+    ) -> OpenReaderResolution {
+        match self {
+            // Non-silent kill-switch: always v1, flagged as an override.
+            Self::V1 => OpenReaderResolution::V1 {
+                config_override: true,
+            },
+            // Forced v2 (testing / promoted Shared backend). Does NOT require
+            // Local — that is the point of promotion — but does require the
+            // indexes to be ready; otherwise the reader must fail typed rather
+            // than silently fall back.
+            Self::V2 => {
+                if open_v2_ready {
+                    OpenReaderResolution::V2 {
+                        config_override: true,
+                    }
+                } else {
+                    OpenReaderResolution::ForcedV2Unready
+                }
+            }
+            // Default: v2 only when published AND Local.
+            Self::Auto => {
+                if open_v2_ready && publication_mode_is_local {
+                    OpenReaderResolution::V2 {
+                        config_override: false,
+                    }
+                } else {
+                    OpenReaderResolution::V1 {
+                        config_override: false,
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl fmt::Display for OpenReaderMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for OpenReaderMode {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).ok_or_else(|| {
+            serde::de::Error::unknown_variant(
+                value.trim(),
+                &[
+                    OPEN_READER_MODE_AUTO,
+                    OPEN_READER_MODE_V1,
+                    OPEN_READER_MODE_V2,
+                ],
+            )
+        })
+    }
+}
+
+/// The effective reader after resolving [`OpenReaderMode`] against published
+/// readiness (see [`OpenReaderMode::resolve`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenReaderResolution {
+    /// The legacy v1 projected reader is in effect. `config_override` is true
+    /// only when `open_reader = "v1"` forced it (the kill-switch), false when
+    /// auto simply has not selected v2 yet.
+    V1 { config_override: bool },
+    /// The canonical v2 reader is in effect. `config_override` is true when
+    /// `open_reader = "v2"` forced it, false when auto selected it.
+    V2 { config_override: bool },
+    /// `open_reader = "v2"` was forced but the read indexes are not ready:
+    /// `open` must fail with a typed error rather than fall back to v1.
+    ForcedV2Unready,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpConfig {
@@ -304,6 +451,13 @@ pub struct McpConfig {
     /// an embedded server. Keeps startup fast when the daemon is absent.
     #[serde(default = "default_central_connect_timeout_ms")]
     pub central_connect_timeout_ms: u64,
+    /// Selects which repository reader backs the `open` tool family
+    /// (issue #598). `"auto"` (the default) uses the canonical v2 reader once
+    /// its indexes are published on a Local backend; `"v1"` forces the legacy
+    /// projected reader (the non-silent kill-switch); `"v2"` forces the
+    /// canonical reader. Validated at config load; see [`OpenReaderMode`].
+    #[serde(default)]
+    pub open_reader: OpenReaderMode,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -981,6 +1135,7 @@ impl Default for McpConfig {
             central_socket_path: default_mcp_socket(),
             start_central_on_up: true,
             central_connect_timeout_ms: default_central_connect_timeout_ms(),
+            open_reader: OpenReaderMode::default(),
         }
     }
 }
@@ -2932,6 +3087,101 @@ max_parallel_requests = 0
         assert!(cfg.start_central_on_up);
         assert_eq!(cfg.central_connect_timeout_ms, 250);
         assert_eq!(cfg.central_socket_path, "mcp.sock");
+    }
+
+    #[test]
+    fn open_reader_defaults_to_auto() {
+        assert_eq!(McpConfig::default().open_reader, OpenReaderMode::Auto);
+        assert_eq!(OpenReaderMode::default(), OpenReaderMode::Auto);
+    }
+
+    #[test]
+    fn load_config_accepts_every_open_reader_selector() {
+        for (value, expected) in [
+            ("auto", OpenReaderMode::Auto),
+            ("v1", OpenReaderMode::V1),
+            ("v2", OpenReaderMode::V2),
+            // Case-insensitive and whitespace-trimmed.
+            ("\"V2\"", OpenReaderMode::V2),
+        ] {
+            let literal = if value.starts_with('"') {
+                value.to_string()
+            } else {
+                format!("\"{value}\"")
+            };
+            let path = write_temp_config(
+                &format!("[mcp]\nopen_reader = {literal}\n"),
+                &format!("mcp-open-reader-{}", expected.as_str()),
+            );
+            let cfg = load_config(&path).expect("valid open_reader must load");
+            std::fs::remove_file(&path).ok();
+            assert_eq!(cfg.mcp.open_reader, expected, "value {value}");
+        }
+    }
+
+    #[test]
+    fn load_config_rejects_unknown_open_reader_value() {
+        let path = write_temp_config("[mcp]\nopen_reader = \"v3\"\n", "mcp-open-reader-invalid");
+        let error = load_config(&path).expect_err("unknown open_reader must fail");
+        std::fs::remove_file(&path).ok();
+        let message = error.to_string();
+        // Friendly unknown-variant error lists the valid selectors.
+        assert!(message.contains("v3"), "message: {message}");
+        assert!(message.contains("auto"), "message: {message}");
+        assert!(message.contains("v1"), "message: {message}");
+        assert!(message.contains("v2"), "message: {message}");
+    }
+
+    #[test]
+    fn open_reader_v1_override_beats_published_readiness() {
+        // The kill-switch forces v1 even when the indexes are ready and Local,
+        // and is flagged as an override so status/doctor can surface it.
+        assert_eq!(
+            OpenReaderMode::V1.resolve(true, true),
+            OpenReaderResolution::V1 {
+                config_override: true
+            }
+        );
+    }
+
+    #[test]
+    fn open_reader_auto_selects_v2_only_when_ready_and_local() {
+        assert_eq!(
+            OpenReaderMode::Auto.resolve(true, true),
+            OpenReaderResolution::V2 {
+                config_override: false
+            }
+        );
+        // Not ready: stay on v1 (not an override).
+        assert_eq!(
+            OpenReaderMode::Auto.resolve(false, true),
+            OpenReaderResolution::V1 {
+                config_override: false
+            }
+        );
+        // Ready but Shared (not Local): auto never auto-selects v2 there.
+        assert_eq!(
+            OpenReaderMode::Auto.resolve(true, false),
+            OpenReaderResolution::V1 {
+                config_override: false
+            }
+        );
+    }
+
+    #[test]
+    fn open_reader_v2_forces_v2_without_requiring_local_but_fails_when_unready() {
+        // Forced v2 does not require Local (that is the promoted-Shared case).
+        assert_eq!(
+            OpenReaderMode::V2.resolve(true, false),
+            OpenReaderResolution::V2 {
+                config_override: true
+            }
+        );
+        // Forced v2 with unready indexes yields the typed no-fallback outcome.
+        assert_eq!(
+            OpenReaderMode::V2.resolve(false, true),
+            OpenReaderResolution::ForcedV2Unready
+        );
     }
 
     fn assert_backend_defaults(backend: &BackendConfig) {
