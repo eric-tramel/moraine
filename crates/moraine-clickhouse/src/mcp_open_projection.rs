@@ -8,8 +8,6 @@ use std::collections::{BTreeMap, BTreeSet};
 const BACKFILL_PAGE_SIZE: usize = 64;
 const REFRESH_CONCURRENCY: usize = 4;
 const MAX_UNSTABLE_REFRESH_ATTEMPTS: usize = 8;
-const MAX_PROJECTED_TEXT_SUMMARY_CHARS: usize = 65_536;
-const MAX_PROJECTED_PAYLOAD_SUMMARY_CHARS: usize = 131_071;
 
 /// One exact source head required by a prepared MCP compatibility candidate.
 ///
@@ -1418,21 +1416,11 @@ impl ClickHouseClient {
             required_heads,
             false,
         );
-        let statement = format!(
-            "INSERT INTO {database}.mcp_open_events\n\
-             (event_uid, source_host, slot, candidate_generation, generation, session_id, event_order, turn_seq,\n\
-              event_time, actor_role, event_class, payload_type, event_type, event_ordinal,\n\
-              call_id, name, phase, item_id, source_ref, text_content, payload_json,\n\
-              token_usage_json, endpoint_kind, token_usage_buckets, token_usage_native_units,\n\
-              previous_event_uid, next_event_uid)\n\
-             {ctes}\n\
-             SELECT\n\
-               event_uid, source_host, {slot}, {generation}, {generation}, session_id, event_order, turn_seq,\n\
-               event_time, actor_role, event_class, payload_type, event_type, event_ordinal,\n\
-               call_id, name, phase, item_id, source_ref, text_content, payload_json,\n\
-               token_usage_json, endpoint_kind, token_usage_buckets, token_usage_native_units,\n\
-               previous_event_uid, next_event_uid\n\
-             FROM enriched",
+        let statement = single_projected_events_sql(
+            &database,
+            &ctes,
+            &slot.to_string(),
+            &generation.to_string(),
         );
         self.mutation_request_text_with_params_and_timeout(
             &statement,
@@ -1461,85 +1449,11 @@ impl ClickHouseClient {
             required_heads,
             false,
         );
-        let message = "(event_class = 'message' OR (event_class = 'event_msg' AND payload_type IN ('user_message', 'agent_message', 'message', 'text')))";
-        let user_message = format!("(lowerUTF8(actor_role) = 'user' AND {message})");
-        let assistant_message = format!("(lowerUTF8(actor_role) = 'assistant' AND {message})");
-        let final_response_message =
-            format!("({assistant_message} AND lowerUTF8(phase) != 'commentary')");
-        let statement = format!(
-            "INSERT INTO {database}.mcp_open_turns\n\
-             (session_id, slot, candidate_generation, generation, turn_seq, turn_id, started_at, ended_at,\n\
-              total_events, user_messages, assistant_messages, tool_calls, tool_results, reasoning_items,\n\
-              user_input_summary_source, final_response_summary_source, user_input_summary_is_payload, final_response_summary_is_payload,\n\
-              user_input_event_uid, user_input_event_order, user_input_event_time, user_input_event_type,\n\
-              final_response_event_uid, final_response_event_order, final_response_event_time, final_response_event_type,\n\
-              tools_called, normalized_event_types, completed, terminal_event_uid,\n\
-              first_event_uid, first_event_order, first_event_time, first_event_type,\n\
-              last_event_uid, last_event_order, last_event_time, last_event_type,\n\
-              previous_turn_seq, previous_turn_id, previous_turn_started_at, previous_turn_ended_at,\n\
-              next_turn_seq, next_turn_id, next_turn_started_at, next_turn_ended_at, event_summaries_json)\n\
-             {ctes},\n\
-             turn_rows AS (\n\
-               SELECT\n\
-                 session_id, turn_seq, anyIf(turn_id, turn_id != '') AS turn_id,\n\
-                 min(event_time) AS started_at, max(event_time) AS ended_at, count() AS total_events,\n\
-                 countIf(actor_role = 'user' AND event_class = 'message') AS user_messages,\n\
-                 countIf(actor_role = 'assistant' AND event_class = 'message') AS assistant_messages,\n\
-                 countIf(event_class = 'tool_call') AS tool_calls, countIf(event_class = 'tool_result') AS tool_results,\n\
-                 countIf(event_class = 'reasoning') AS reasoning_items,\n\
-                 argMinIf(summary_source, tuple(event_order, event_uid), {user_message}) AS user_input_summary_source,\n\
-                 argMaxIf(summary_source, tuple(event_order, event_uid), {final_response_message}) AS final_response_summary_source,\n\
-                 argMinIf(toUInt8(summary_is_payload), tuple(event_order, event_uid), {user_message}) AS user_input_summary_is_payload,\n\
-                 argMaxIf(toUInt8(summary_is_payload), tuple(event_order, event_uid), {final_response_message}) AS final_response_summary_is_payload,\n\
-                 argMinIf(event_uid, tuple(event_order, event_uid), {user_message}) AS user_input_event_uid,\n\
-                 argMinIf(event_order, tuple(event_order, event_uid), {user_message}) AS user_input_event_order,\n\
-                 argMinIf(event_time, tuple(event_order, event_uid), {user_message}) AS user_input_event_time,\n\
-                 argMinIf(event_type, tuple(event_order, event_uid), {user_message}) AS user_input_event_type,\n\
-                 argMaxIf(event_uid, tuple(event_order, event_uid), {final_response_message}) AS final_response_event_uid,\n\
-                 argMaxIf(event_order, tuple(event_order, event_uid), {final_response_message}) AS final_response_event_order,\n\
-                 argMaxIf(event_time, tuple(event_order, event_uid), {final_response_message}) AS final_response_event_time,\n\
-                 argMaxIf(event_type, tuple(event_order, event_uid), {final_response_message}) AS final_response_event_type,\n\
-                 arrayDistinct(arrayMap(x -> x.2, arraySort(groupArrayIf(tuple(event_order, tool_label), event_type = 'tool_call' AND tool_label != '')))) AS tools_called,\n\
-                 arrayDistinct(arrayMap(x -> x.2, arraySort(groupArray(tuple(event_order, event_type))))) AS normalized_event_types,\n\
-                 argMaxIf(toUInt8(payload_type = 'task_complete'), tuple(event_order, event_uid), payload_type IN ('task_complete', 'turn_aborted')) AS completed,\n\
-                 argMaxIf(event_uid, tuple(event_order, event_uid), payload_type IN ('task_complete', 'turn_aborted')) AS terminal_event_uid,\n\
-                 argMin(event_uid, tuple(event_order, event_uid)) AS first_event_uid,\n\
-                 argMin(event_order, tuple(event_order, event_uid)) AS first_event_order,\n\
-                 argMin(event_time, tuple(event_order, event_uid)) AS first_event_time,\n\
-                 argMin(event_type, tuple(event_order, event_uid)) AS first_event_type,\n\
-                 argMax(event_uid, tuple(event_order, event_uid)) AS last_event_uid,\n\
-                 argMax(event_order, tuple(event_order, event_uid)) AS last_event_order,\n\
-                 argMax(event_time, tuple(event_order, event_uid)) AS last_event_time,\n\
-                 argMax(event_type, tuple(event_order, event_uid)) AS last_event_type,\n\
-                 toJSONString(arrayMap(x -> x.2, arraySort(groupArray(tuple(event_order, event_summary))))) AS event_summaries_json\n\
-               FROM summarized\n\
-               GROUP BY session_id, turn_seq\n\
-             ),\n\
-             turn_neighbors AS (\n\
-               SELECT *,\n\
-                 lagInFrame(turn_seq, 1, toUInt32(0)) OVER turn_window AS previous_turn_seq,\n\
-                 lagInFrame(turn_id, 1, '') OVER turn_window AS previous_turn_id,\n\
-                 lagInFrame(started_at, 1, toDateTime64(0, 3)) OVER turn_window AS previous_turn_started_at,\n\
-                 lagInFrame(ended_at, 1, toDateTime64(0, 3)) OVER turn_window AS previous_turn_ended_at,\n\
-                 leadInFrame(turn_seq, 1, toUInt32(0)) OVER turn_window AS next_turn_seq,\n\
-                 leadInFrame(turn_id, 1, '') OVER turn_window AS next_turn_id,\n\
-                 leadInFrame(started_at, 1, toDateTime64(0, 3)) OVER turn_window AS next_turn_started_at,\n\
-                 leadInFrame(ended_at, 1, toDateTime64(0, 3)) OVER turn_window AS next_turn_ended_at\n\
-               FROM turn_rows\n\
-               WINDOW turn_window AS (PARTITION BY session_id ORDER BY turn_seq ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)\n\
-             )\n\
-             SELECT\n\
-               session_id, {slot}, {generation}, {generation}, turn_seq, turn_id, started_at, ended_at,\n\
-               total_events, user_messages, assistant_messages, tool_calls, tool_results, reasoning_items,\n\
-               user_input_summary_source, final_response_summary_source, user_input_summary_is_payload, final_response_summary_is_payload,\n\
-               user_input_event_uid, user_input_event_order, user_input_event_time, user_input_event_type,\n\
-               final_response_event_uid, final_response_event_order, final_response_event_time, final_response_event_type,\n\
-               tools_called, normalized_event_types, completed, terminal_event_uid,\n\
-               first_event_uid, first_event_order, first_event_time, first_event_type,\n\
-               last_event_uid, last_event_order, last_event_time, last_event_type,\n\
-               previous_turn_seq, previous_turn_id, previous_turn_started_at, previous_turn_ended_at,\n\
-               next_turn_seq, next_turn_id, next_turn_started_at, next_turn_ended_at, event_summaries_json\n\
-             FROM turn_neighbors",
+        let statement = single_projected_turns_sql(
+            &database,
+            &ctes,
+            &slot.to_string(),
+            &generation.to_string(),
         );
         self.mutation_request_text_with_params_and_timeout(
             &statement,
@@ -1575,92 +1489,20 @@ impl ClickHouseClient {
             required_heads,
             true,
         );
-        let mcp_name_predicate = crate::mcp_tool_names::sql_predicate("name");
-        let required_heads_sql = source_heads_sql(required_heads);
         let required_heads_fingerprint = source_heads_fingerprint(required_heads);
-        let statement = format!(
-            "INSERT INTO {database}.mcp_open_publication_headers\n\
-             (session_id, candidate_publication_id, slot, generation, source_revision, dirty_revision, first_event_time,\n\
-              last_event_time, total_turns, total_events, user_messages, assistant_messages,\n\
-              tool_calls, tool_results, mode, first_event_uid, last_event_uid, last_actor_role,\n\
-              title, source, harness, inference_provider, session_slug, session_summary,\n\
-              list_title, list_session_summary, completed, terminal_event_uid, origin_cwd,\n\
-              tombstone, required_source_heads, required_heads_fingerprint, header_revision,\n\
-              publisher_id, operation_id)\n\
-             {ctes},\n\
-             header AS (\n\
-               SELECT\n\
-                 session_id, max(projected.source_revision) AS source_revision, min(event_time) AS first_event_time,\n\
-                 max(event_time) AS last_event_time, toUInt32(max(turn_seq)) AS total_turns, count() AS total_events,\n\
-                 countIf(actor_role = 'user' AND event_class = 'message') AS user_messages,\n\
-                 countIf(actor_role = 'assistant' AND event_class = 'message') AS assistant_messages,\n\
-                 countIf(event_class = 'tool_call') AS tool_calls, countIf(event_class = 'tool_result') AS tool_results,\n\
-                 multiIf(\n\
-                   countIf(payload_type = 'web_search_call' OR payload_type = 'search_results_received' OR (payload_type = 'tool_use' AND name IN ('WebSearch', 'WebFetch'))) > 0, 'web_search',\n\
-                   countIf(source_name = 'codex-mcp' OR {mcp_name_predicate}) > 0, 'mcp_internal',\n\
-                   countIf(event_class IN ('tool_call', 'tool_result') OR payload_type = 'tool_use') > 0, 'tool_calling', 'chat') AS mode,\n\
-                 argMin(event_uid, tuple(event_time, event_order, event_uid)) AS first_event_uid,\n\
-                 argMax(event_uid, tuple(event_time, event_order, event_uid)) AS last_event_uid,\n\
-                 argMax(actor_role, tuple(event_time, event_order, event_uid)) AS last_actor_role,\n\
-                 ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'title'), ''),\n\
-                   tuple(event_ts, event_uid), event_class = 'session_meta'\n\
-                     OR (source_name = 'omp' AND JSONExtractString(payload_json, 'type') IN ('title', 'title_change'))), '') AS latest_metadata_title,\n\
-                 ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'name'), ''),\n\
-                   tuple(event_ts, event_uid), event_class = 'session_meta'), '') AS latest_metadata_name,\n\
-                 ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'summary'), ''),\n\
-                   tuple(event_ts, event_uid), event_class = 'session_meta'), '') AS latest_metadata_summary,\n\
-                 ifNull(argMaxIf(coalesce(nullIf(JSONExtractString(payload_json, 'title'), ''), nullIf(JSONExtractString(payload_json, 'name'), ''), nullIf(JSONExtractString(payload_json, 'summary'), '')),\n\
-                   tuple(event_ts, event_uid), event_class = 'session_meta'), '') AS latest_session_meta_title,\n\
-                 ifNull(argMaxIf(coalesce(nullIf(JSONExtractString(payload_json, 'summary'), ''), nullIf(JSONExtractString(payload_json, 'title'), ''), nullIf(JSONExtractString(payload_json, 'name'), '')),\n\
-                   tuple(event_ts, event_uid), event_class = 'session_meta'), '') AS latest_session_meta_summary,\n\
-                 ifNull(argMinIf(nullIf(trimBoth(replaceRegexpOne(arrayElement(splitByChar('/', replaceAll(source_file, '\\\\', '/')), -1), '[.]jsonl$', '')), ''),\n\
-                   tuple(event_ts, event_uid), source_name = 'omp' AND notEmpty(session_id)\n\
-                     AND endsWith(source_file, '.jsonl')\n\
-                     AND NOT endsWith(source_file, concat(session_id, '.jsonl'))), '') AS omp_dispatch_title,\n\
-                 ifNull(argMax(nullIf(source_name, ''), tuple(event_ts, event_uid)), '') AS source,\n\
-                 ifNull(argMax(nullIf(harness, ''), tuple(event_ts, event_uid)), '') AS harness,\n\
-                 ifNull(argMax(nullIf(inference_provider, ''), tuple(event_ts, event_uid)), '') AS inference_provider,\n\
-                 ifNull(argMaxIf(nullIf(JSONExtractString(payload_json, 'slug'), ''), tuple(event_ts, event_uid), event_class = 'session_meta'), '') AS session_slug,\n\
-                 ifNull(argMinIf(cwd, tuple(event_ts, event_uid), cwd != ''), '') AS origin_cwd\n\
-               FROM enriched AS projected\n\
-               GROUP BY session_id\n\
-               HAVING source_revision = {expected_source_revision}\n\
-             ),\n\
-             current_dirty AS (\n\
-               SELECT if(count() = 0, toUInt64(0), toUInt64(max(dirty.dirty_revision))) AS dirty_revision\n\
-               FROM {database}.mcp_open_dirty_sessions AS dirty FINAL\n\
-               WHERE dirty.session_id = {session_sql}\n\
-             ),\n\
-             terminal AS (\n\
-               SELECT\n\
-                 session_id, argMax(completed, turn_seq) AS completed, argMax(terminal_event_uid, turn_seq) AS terminal_event_uid\n\
-               FROM {database}.mcp_open_turns FINAL\n\
-               WHERE session_id = {session_sql} AND slot = {slot} AND generation = {generation} AND turn_seq > 0\n\
-               GROUP BY session_id\n\
-             )\n\
-             SELECT\n\
-               h.session_id, {candidate_publication_id}, {slot}, {generation}, h.source_revision, {dirty_revision},\n\
-               h.first_event_time, h.last_event_time, h.total_turns, h.total_events,\n\
-               h.user_messages, h.assistant_messages, h.tool_calls, h.tool_results, h.mode,\n\
-               h.first_event_uid, h.last_event_uid, h.last_actor_role,\n\
-               if(h.source = 'omp', coalesce(nullIf(h.latest_metadata_title, ''), nullIf(h.latest_metadata_name, ''), nullIf(h.latest_metadata_summary, ''), nullIf(h.omp_dispatch_title, ''), ''), coalesce(nullIf(h.latest_metadata_title, ''), nullIf(h.latest_metadata_name, ''), '')), h.source,\n\
-               h.harness, h.inference_provider, h.session_slug,\n\
-               if(h.source = 'omp', coalesce(nullIf(h.latest_metadata_summary, ''), nullIf(h.latest_metadata_title, ''), nullIf(h.latest_metadata_name, ''), nullIf(h.omp_dispatch_title, ''), ''), coalesce(nullIf(h.latest_metadata_summary, ''), nullIf(h.latest_metadata_title, ''), nullIf(h.latest_metadata_name, ''), '')),\n\
-               if(h.source = 'omp', coalesce(nullIf(h.latest_metadata_title, ''), nullIf(h.latest_metadata_name, ''), nullIf(h.latest_metadata_summary, ''), nullIf(h.omp_dispatch_title, ''), ''), h.latest_session_meta_title),\n\
-               if(h.source = 'omp', coalesce(nullIf(h.latest_metadata_summary, ''), nullIf(h.latest_metadata_title, ''), nullIf(h.latest_metadata_name, ''), nullIf(h.omp_dispatch_title, ''), ''), h.latest_session_meta_summary),\n\
-               ifNull(t.completed, 0), ifNull(t.terminal_event_uid, ''), h.origin_cwd,\n\
-               toUInt8(0), {required_heads_sql}, {required_heads_fingerprint}, {generation},\n\
-               {publisher_id}, {operation_id}\n\
-             FROM header AS h\n\
-             CROSS JOIN current_dirty AS d\n\
-             LEFT JOIN terminal AS t ON t.session_id = h.session_id\n\
-             WHERE d.dirty_revision = {dirty_revision}",
-            session_sql = escape_literal(session_id),
-            candidate_publication_id = escape_literal(candidate_publication_id),
-            required_heads_fingerprint = escape_literal(&required_heads_fingerprint),
-            publisher_id = escape_literal(publisher_id),
-            operation_id = escape_literal(operation_id),
-        );
+        let statement = projected_publication_header_sql(ProjectedPublicationHeaderSql {
+            database: &database,
+            ctes: &ctes,
+            session_id,
+            candidate_publication_id,
+            operation_id,
+            publisher_id,
+            slot: &slot.to_string(),
+            generation: &generation.to_string(),
+            expected_source_revision: &expected_source_revision.to_string(),
+            dirty_revision: &dirty_revision.to_string(),
+            required_heads,
+        });
         self.mutation_request_text_with_params_and_timeout(
             &statement,
             None,
@@ -1681,6 +1523,173 @@ impl ClickHouseClient {
                 && head.required_heads_fingerprint == required_heads_fingerprint
         }))
     }
+}
+
+/// Single-session projected-events INSERT for one candidate slot/generation.
+///
+/// Column lists are the durable `mcp_open_events` protocol; the derivation
+/// expressions live in the `{ctes}` pipeline (see [`projection_ctes`]).
+fn single_projected_events_sql(database: &str, ctes: &str, slot: &str, generation: &str) -> String {
+    format!(
+        "INSERT INTO {database}.mcp_open_events\n\
+         (event_uid, source_host, slot, candidate_generation, generation, session_id, event_order, turn_seq,\n\
+          event_time, actor_role, event_class, payload_type, event_type, event_ordinal,\n\
+          call_id, name, phase, item_id, source_ref, text_content, payload_json,\n\
+          token_usage_json, endpoint_kind, token_usage_buckets, token_usage_native_units,\n\
+          previous_event_uid, next_event_uid)\n\
+         {ctes}\n\
+         SELECT\n\
+           event_uid, source_host, {slot}, {generation}, {generation}, session_id, event_order, turn_seq,\n\
+           event_time, actor_role, event_class, payload_type, event_type, event_ordinal,\n\
+           call_id, name, phase, item_id, source_ref, text_content, payload_json,\n\
+           token_usage_json, endpoint_kind, token_usage_buckets, token_usage_native_units,\n\
+           previous_event_uid, next_event_uid\n\
+         FROM enriched",
+    )
+}
+
+/// Single-session projected-turns INSERT for one candidate slot/generation.
+///
+/// The turn-fold aggregates, summary-selection predicates, and neighbor window
+/// come from the shared [`canonical_derivations`](crate::canonical_derivations)
+/// fragments so the projector, the 036 MVs, and the v2 reader agree on turn
+/// semantics.
+fn single_projected_turns_sql(database: &str, ctes: &str, slot: &str, generation: &str) -> String {
+    use crate::canonical_derivations::{self as cd, DerivationColumns, TurnSummaryPredicates};
+    let cols = DerivationColumns::PROJECTOR;
+    let predicates = TurnSummaryPredicates::new(cols);
+    let turn_folds = cd::turn_fold_columns(cols, &predicates);
+    let turn_neighbors = cd::turn_neighbors_cte();
+    format!(
+        "INSERT INTO {database}.mcp_open_turns\n\
+         (session_id, slot, candidate_generation, generation, turn_seq, turn_id, started_at, ended_at,\n\
+          total_events, user_messages, assistant_messages, tool_calls, tool_results, reasoning_items,\n\
+          user_input_summary_source, final_response_summary_source, user_input_summary_is_payload, final_response_summary_is_payload,\n\
+          user_input_event_uid, user_input_event_order, user_input_event_time, user_input_event_type,\n\
+          final_response_event_uid, final_response_event_order, final_response_event_time, final_response_event_type,\n\
+          tools_called, normalized_event_types, completed, terminal_event_uid,\n\
+          first_event_uid, first_event_order, first_event_time, first_event_type,\n\
+          last_event_uid, last_event_order, last_event_time, last_event_type,\n\
+          previous_turn_seq, previous_turn_id, previous_turn_started_at, previous_turn_ended_at,\n\
+          next_turn_seq, next_turn_id, next_turn_started_at, next_turn_ended_at, event_summaries_json)\n\
+         {ctes},\n\
+         turn_rows AS (\n\
+           SELECT\n\
+             session_id, {turn_folds}\n\
+           FROM summarized\n\
+           GROUP BY session_id, turn_seq\n\
+         ),\n\
+         {turn_neighbors}\n\
+         SELECT\n\
+           session_id, {slot}, {generation}, {generation}, turn_seq, turn_id, started_at, ended_at,\n\
+           total_events, user_messages, assistant_messages, tool_calls, tool_results, reasoning_items,\n\
+           user_input_summary_source, final_response_summary_source, user_input_summary_is_payload, final_response_summary_is_payload,\n\
+           user_input_event_uid, user_input_event_order, user_input_event_time, user_input_event_type,\n\
+           final_response_event_uid, final_response_event_order, final_response_event_time, final_response_event_type,\n\
+           tools_called, normalized_event_types, completed, terminal_event_uid,\n\
+           first_event_uid, first_event_order, first_event_time, first_event_type,\n\
+           last_event_uid, last_event_order, last_event_time, last_event_type,\n\
+           previous_turn_seq, previous_turn_id, previous_turn_started_at, previous_turn_ended_at,\n\
+           next_turn_seq, next_turn_id, next_turn_started_at, next_turn_ended_at, event_summaries_json\n\
+         FROM turn_neighbors",
+    )
+}
+
+/// Parameters for [`projected_publication_header_sql`]. Grouped into a struct
+/// because the session-header INSERT threads a dozen literals into its
+/// generated SQL and a positional signature would be error-prone.
+struct ProjectedPublicationHeaderSql<'a> {
+    database: &'a str,
+    ctes: &'a str,
+    session_id: &'a str,
+    candidate_publication_id: &'a str,
+    operation_id: &'a str,
+    publisher_id: &'a str,
+    slot: &'a str,
+    generation: &'a str,
+    expected_source_revision: &'a str,
+    dirty_revision: &'a str,
+    required_heads: &'a [McpOpenSourceHead],
+}
+
+/// Session-header INSERT: the session-scalar rollup (counts, mode, first/last,
+/// metadata-precedence title/summary/slug, terminal) over the projected events.
+///
+/// The mode multiIf, first/last precedence key, metadata precedence, and
+/// terminal selection are shared
+/// [`canonical_derivations`](crate::canonical_derivations) fragments.
+fn projected_publication_header_sql(args: ProjectedPublicationHeaderSql<'_>) -> String {
+    let ProjectedPublicationHeaderSql {
+        database,
+        ctes,
+        session_id,
+        candidate_publication_id,
+        operation_id,
+        publisher_id,
+        slot,
+        generation,
+        expected_source_revision,
+        dirty_revision,
+        required_heads,
+    } = args;
+    let session_rollup = crate::canonical_derivations::session_header_rollup_columns(
+        crate::canonical_derivations::DerivationColumns::PROJECTOR,
+    );
+    let terminal_cols = crate::canonical_derivations::session_terminal_selection_columns();
+    let required_heads_sql = source_heads_sql(required_heads);
+    let required_heads_fingerprint = source_heads_fingerprint(required_heads);
+    format!(
+        "INSERT INTO {database}.mcp_open_publication_headers\n\
+         (session_id, candidate_publication_id, slot, generation, source_revision, dirty_revision, first_event_time,\n\
+          last_event_time, total_turns, total_events, user_messages, assistant_messages,\n\
+          tool_calls, tool_results, mode, first_event_uid, last_event_uid, last_actor_role,\n\
+          title, source, harness, inference_provider, session_slug, session_summary,\n\
+          list_title, list_session_summary, completed, terminal_event_uid, origin_cwd,\n\
+          tombstone, required_source_heads, required_heads_fingerprint, header_revision,\n\
+          publisher_id, operation_id)\n\
+         {ctes},\n\
+         header AS (\n\
+           SELECT\n\
+             session_id, max(projected.source_revision) AS source_revision, {session_rollup}\n\
+           FROM enriched AS projected\n\
+           GROUP BY session_id\n\
+           HAVING source_revision = {expected_source_revision}\n\
+         ),\n\
+         current_dirty AS (\n\
+           SELECT if(count() = 0, toUInt64(0), toUInt64(max(dirty.dirty_revision))) AS dirty_revision\n\
+           FROM {database}.mcp_open_dirty_sessions AS dirty FINAL\n\
+           WHERE dirty.session_id = {session_sql}\n\
+         ),\n\
+         terminal AS (\n\
+           SELECT\n\
+             session_id, {terminal_cols}\n\
+           FROM {database}.mcp_open_turns FINAL\n\
+           WHERE session_id = {session_sql} AND slot = {slot} AND generation = {generation} AND turn_seq > 0\n\
+           GROUP BY session_id\n\
+         )\n\
+         SELECT\n\
+           h.session_id, {candidate_publication_id}, {slot}, {generation}, h.source_revision, {dirty_revision},\n\
+           h.first_event_time, h.last_event_time, h.total_turns, h.total_events,\n\
+           h.user_messages, h.assistant_messages, h.tool_calls, h.tool_results, h.mode,\n\
+           h.first_event_uid, h.last_event_uid, h.last_actor_role,\n\
+           if(h.source = 'omp', coalesce(nullIf(h.latest_metadata_title, ''), nullIf(h.latest_metadata_name, ''), nullIf(h.latest_metadata_summary, ''), nullIf(h.omp_dispatch_title, ''), ''), coalesce(nullIf(h.latest_metadata_title, ''), nullIf(h.latest_metadata_name, ''), '')), h.source,\n\
+           h.harness, h.inference_provider, h.session_slug,\n\
+           if(h.source = 'omp', coalesce(nullIf(h.latest_metadata_summary, ''), nullIf(h.latest_metadata_title, ''), nullIf(h.latest_metadata_name, ''), nullIf(h.omp_dispatch_title, ''), ''), coalesce(nullIf(h.latest_metadata_summary, ''), nullIf(h.latest_metadata_title, ''), nullIf(h.latest_metadata_name, ''), '')),\n\
+           if(h.source = 'omp', coalesce(nullIf(h.latest_metadata_title, ''), nullIf(h.latest_metadata_name, ''), nullIf(h.latest_metadata_summary, ''), nullIf(h.omp_dispatch_title, ''), ''), h.latest_session_meta_title),\n\
+           if(h.source = 'omp', coalesce(nullIf(h.latest_metadata_summary, ''), nullIf(h.latest_metadata_title, ''), nullIf(h.latest_metadata_name, ''), nullIf(h.omp_dispatch_title, ''), ''), h.latest_session_meta_summary),\n\
+           ifNull(t.completed, 0), ifNull(t.terminal_event_uid, ''), h.origin_cwd,\n\
+           toUInt8(0), {required_heads_sql}, {required_heads_fingerprint}, {generation},\n\
+           {publisher_id}, {operation_id}\n\
+         FROM header AS h\n\
+         CROSS JOIN current_dirty AS d\n\
+         LEFT JOIN terminal AS t ON t.session_id = h.session_id\n\
+         WHERE d.dirty_revision = {dirty_revision}",
+        session_sql = escape_literal(session_id),
+        candidate_publication_id = escape_literal(candidate_publication_id),
+        required_heads_fingerprint = escape_literal(&required_heads_fingerprint),
+        publisher_id = escape_literal(publisher_id),
+        operation_id = escape_literal(operation_id),
+    )
 }
 
 fn publish_legacy_candidate_heads_sql(
@@ -2046,11 +2055,11 @@ fn projected_turns_insert_sql(
     generation: &str,
     session_ids: &BTreeSet<String>,
 ) -> String {
-    let message = "(event_class = 'message' OR (event_class = 'event_msg' AND payload_type IN ('user_message', 'agent_message', 'message', 'text')))";
-    let user_message = format!("(lowerUTF8(actor_role) = 'user' AND {message})");
-    let assistant_message = format!("(lowerUTF8(actor_role) = 'assistant' AND {message})");
-    let final_response_message =
-        format!("({assistant_message} AND lowerUTF8(phase) != 'commentary')");
+    use crate::canonical_derivations::{self as cd, DerivationColumns, TurnSummaryPredicates};
+    let cols = DerivationColumns::PROJECTOR;
+    let predicates = TurnSummaryPredicates::new(cols);
+    let turn_folds = cd::turn_fold_columns(cols, &predicates);
+    let turn_neighbors = cd::turn_neighbors_cte();
     format!(
         "INSERT INTO {database}.mcp_open_turns\n\
          (session_id, slot, candidate_generation, generation, turn_seq, turn_id, started_at, ended_at,\n\
@@ -2067,53 +2076,11 @@ fn projected_turns_insert_sql(
          turn_rows AS (\n\
            SELECT\n\
              session_id, any(candidate_slot) AS candidate_slot, any(candidate_generation) AS candidate_generation,\n\
-             turn_seq, anyIf(turn_id, turn_id != '') AS turn_id,\n\
-             min(event_time) AS started_at, max(event_time) AS ended_at, count() AS total_events,\n\
-             countIf(actor_role = 'user' AND event_class = 'message') AS user_messages,\n\
-             countIf(actor_role = 'assistant' AND event_class = 'message') AS assistant_messages,\n\
-             countIf(event_class = 'tool_call') AS tool_calls, countIf(event_class = 'tool_result') AS tool_results,\n\
-             countIf(event_class = 'reasoning') AS reasoning_items,\n\
-             argMinIf(summary_source, tuple(event_order, event_uid), {user_message}) AS user_input_summary_source,\n\
-             argMaxIf(summary_source, tuple(event_order, event_uid), {final_response_message}) AS final_response_summary_source,\n\
-             argMinIf(toUInt8(summary_is_payload), tuple(event_order, event_uid), {user_message}) AS user_input_summary_is_payload,\n\
-             argMaxIf(toUInt8(summary_is_payload), tuple(event_order, event_uid), {final_response_message}) AS final_response_summary_is_payload,\n\
-             argMinIf(event_uid, tuple(event_order, event_uid), {user_message}) AS user_input_event_uid,\n\
-             argMinIf(event_order, tuple(event_order, event_uid), {user_message}) AS user_input_event_order,\n\
-             argMinIf(event_time, tuple(event_order, event_uid), {user_message}) AS user_input_event_time,\n\
-             argMinIf(event_type, tuple(event_order, event_uid), {user_message}) AS user_input_event_type,\n\
-             argMaxIf(event_uid, tuple(event_order, event_uid), {final_response_message}) AS final_response_event_uid,\n\
-             argMaxIf(event_order, tuple(event_order, event_uid), {final_response_message}) AS final_response_event_order,\n\
-             argMaxIf(event_time, tuple(event_order, event_uid), {final_response_message}) AS final_response_event_time,\n\
-             argMaxIf(event_type, tuple(event_order, event_uid), {final_response_message}) AS final_response_event_type,\n\
-             arrayDistinct(arrayMap(x -> x.2, arraySort(groupArrayIf(tuple(event_order, tool_label), event_type = 'tool_call' AND tool_label != '')))) AS tools_called,\n\
-             arrayDistinct(arrayMap(x -> x.2, arraySort(groupArray(tuple(event_order, event_type))))) AS normalized_event_types,\n\
-             argMaxIf(toUInt8(payload_type = 'task_complete'), tuple(event_order, event_uid), payload_type IN ('task_complete', 'turn_aborted')) AS completed,\n\
-             argMaxIf(event_uid, tuple(event_order, event_uid), payload_type IN ('task_complete', 'turn_aborted')) AS terminal_event_uid,\n\
-             argMin(event_uid, tuple(event_order, event_uid)) AS first_event_uid,\n\
-             argMin(event_order, tuple(event_order, event_uid)) AS first_event_order,\n\
-             argMin(event_time, tuple(event_order, event_uid)) AS first_event_time,\n\
-             argMin(event_type, tuple(event_order, event_uid)) AS first_event_type,\n\
-             argMax(event_uid, tuple(event_order, event_uid)) AS last_event_uid,\n\
-             argMax(event_order, tuple(event_order, event_uid)) AS last_event_order,\n\
-             argMax(event_time, tuple(event_order, event_uid)) AS last_event_time,\n\
-             argMax(event_type, tuple(event_order, event_uid)) AS last_event_type,\n\
-             toJSONString(arrayMap(x -> x.2, arraySort(groupArray(tuple(event_order, event_summary))))) AS event_summaries_json\n\
+             {turn_folds}\n\
            FROM summarized\n\
            GROUP BY session_id, turn_seq\n\
          ),\n\
-         turn_neighbors AS (\n\
-           SELECT *,\n\
-             lagInFrame(turn_seq, 1, toUInt32(0)) OVER turn_window AS previous_turn_seq,\n\
-             lagInFrame(turn_id, 1, '') OVER turn_window AS previous_turn_id,\n\
-             lagInFrame(started_at, 1, toDateTime64(0, 3)) OVER turn_window AS previous_turn_started_at,\n\
-             lagInFrame(ended_at, 1, toDateTime64(0, 3)) OVER turn_window AS previous_turn_ended_at,\n\
-             leadInFrame(turn_seq, 1, toUInt32(0)) OVER turn_window AS next_turn_seq,\n\
-             leadInFrame(turn_id, 1, '') OVER turn_window AS next_turn_id,\n\
-             leadInFrame(started_at, 1, toDateTime64(0, 3)) OVER turn_window AS next_turn_started_at,\n\
-             leadInFrame(ended_at, 1, toDateTime64(0, 3)) OVER turn_window AS next_turn_ended_at\n\
-           FROM turn_rows\n\
-           WINDOW turn_window AS (PARTITION BY session_id ORDER BY turn_seq ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)\n\
-         )\n\
+         {turn_neighbors}\n\
          SELECT\n\
            session_id, {slot}, {generation}, {generation}, turn_seq, turn_id, started_at, ended_at,\n\
            total_events, user_messages, assistant_messages, tool_calls, tool_results, reasoning_items,\n\
@@ -2212,19 +2179,24 @@ fn backfill_complete_sql(database: &str, session_ids: &BTreeSet<String>) -> Stri
 }
 
 fn projection_pipeline_ctes(projected_source_revision: &str, source_revision_gate: &str) -> String {
-    let event_type = event_type_sql();
+    use crate::canonical_derivations::{self as cd, DerivationColumns};
+    let cols = DerivationColumns::PROJECTOR;
+    let event_type = cd::event_type_expr(cols);
+    let event_time = cd::DISPLAY_TIME_EXPR;
+    let turn_seq = cd::turn_seq_windowed_expr(cols, "canonical_rows");
+    let order_key = cd::event_order_window_key();
     format!(
         "ordered AS (\n\
            SELECT canonical.*,\n\
-             ifNull(parseDateTime64BestEffortOrNull(record_ts), ingested_at) AS event_time,\n\
+             {event_time} AS event_time,\n\
              row_number() OVER canonical_window AS event_order,\n\
-             if(toUInt32(turn_index) > 0, toUInt32(turn_index), greatest(toUInt32(1), toUInt32(sum(if(actor_role = 'user' AND event_class = 'message', 1, 0)) OVER canonical_rows))) AS turn_seq,\n\
+             {turn_seq} AS turn_seq,\n\
              {projected_source_revision} AS source_revision\n\
            FROM canonical\n\
            {source_revision_gate}\n\
            WINDOW\n\
-             canonical_window AS (PARTITION BY session_id ORDER BY ifNull(parseDateTime64BestEffortOrNull(record_ts), ingested_at), source_host, source_file, source_generation, source_offset, source_line_no, event_uid),\n\
-             canonical_rows AS (PARTITION BY session_id ORDER BY ifNull(parseDateTime64BestEffortOrNull(record_ts), ingested_at), source_host, source_file, source_generation, source_offset, source_line_no, event_uid ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)\n\
+             canonical_window AS (PARTITION BY session_id ORDER BY {order_key}),\n\
+             canonical_rows AS (PARTITION BY session_id ORDER BY {order_key} ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)\n\
          ),\n\
          typed AS (\n\
            SELECT *, {event_type} AS event_type,\n\
@@ -2251,8 +2223,8 @@ fn projection_pipeline_ctes(projected_source_revision: &str, source_revision_gat
            ), 'Tuple(event_uid String, event_order UInt64, event_time String, event_unix_ms Int64, actor_role String, event_class String, payload_type String, event_type String, call_id String, name String, phase String, summary_source String, summary_is_payload UInt8)') AS event_summary\n\
            FROM enriched\n\
          )",
-        payload_summary_chars = MAX_PROJECTED_PAYLOAD_SUMMARY_CHARS,
-        text_summary_chars = MAX_PROJECTED_TEXT_SUMMARY_CHARS,
+        payload_summary_chars = crate::canonical_derivations::MAX_PROJECTED_PAYLOAD_SUMMARY_CHARS,
+        text_summary_chars = crate::canonical_derivations::MAX_PROJECTED_TEXT_SUMMARY_CHARS,
     )
 }
 
@@ -2301,19 +2273,6 @@ fn projection_ctes(
          {pipeline}",
         source_head_filter = source_head_filter(required_heads, "e"),
     )
-}
-
-fn event_type_sql() -> &'static str {
-    "multiIf(\
-      lowerUTF8(actor_role) = 'user' AND (event_class = 'message' OR (event_class = 'event_msg' AND payload_type IN ('user_message', 'agent_message', 'message', 'text', 'event_msg'))), 'user_input',\
-      lowerUTF8(actor_role) = 'assistant' AND (event_class = 'message' OR (event_class = 'event_msg' AND payload_type IN ('user_message', 'agent_message', 'message', 'text', 'event_msg'))), 'assistant_response',\
-      lowerUTF8(actor_role) != 'system' AND (event_class = 'reasoning' OR payload_type IN ('agent_reasoning', 'reasoning', 'thinking')), 'reasoning',\
-      lowerUTF8(actor_role) != 'system' AND (event_class = 'tool_call' OR payload_type IN ('tool_use', 'function_call', 'custom_tool_call', 'web_search_call')), 'tool_call',\
-      lowerUTF8(actor_role) != 'system' AND (event_class = 'tool_result' OR payload_type IN ('tool_result', 'function_call_output', 'custom_tool_call_output', 'search_results_received')), 'tool_response',\
-      event_class IN ('compacted_raw', 'summary') OR payload_type IN ('compacted', 'summary'), 'compaction',\
-      event_class = 'queue_operation' OR payload_type IN ('task_started', 'task_complete', 'turn_aborted', 'item_completed', 'queue-operation'), 'runtime',\
-      lowerUTF8(actor_role) = 'system' OR event_class IN ('system', 'progress', 'file_history_snapshot') OR payload_type IN ('system', 'progress', 'file-history-snapshot', 'file_history_snapshot'), 'system',\
-      'unknown')"
 }
 
 #[cfg(test)]
@@ -2544,6 +2503,93 @@ mod tests {
         let replacement = publish_legacy_candidate_heads_sql("moraine", "replacement:42", None);
         assert!(replacement.contains("candidate_publication_id = 'replacement:42'"));
         assert!(!replacement.contains("session_id ="));
+    }
+
+    /// Byte-identity snapshot pin for WI-01's zero-diff projector refactor.
+    ///
+    /// The golden `.sql` files under `testdata/projector_golden/` were captured
+    /// from the pre-refactor projector (each verified byte-identical to git HEAD
+    /// modulo the `\n\` continuation stripping). After extracting the derivation
+    /// expressions into [`crate::canonical_derivations`], every representative
+    /// generated statement must still match its golden exactly — any diff is a
+    /// behavioral change and a bug. Regenerate goldens ONLY via a deliberate,
+    /// reviewed projection change.
+    #[test]
+    fn projector_generated_sql_is_byte_identical_after_fragment_extraction() {
+        use std::collections::BTreeSet;
+        let db = super::escape_identifier("moraine");
+        let heads = canonical_source_heads(&[
+            head("host-a", "/sessions/a.jsonl", 3, 10),
+            head("host-b", "/sessions/b.jsonl", 7, 11),
+        ])
+        .unwrap();
+        let ctes_reval = projection_ctes(&db, "session-a", 42, &heads, true);
+        let ctes_child = projection_ctes(&db, "session-a", 42, &heads, false);
+        let sessions = BTreeSet::from(["session-a".to_string(), "session-b".to_string()]);
+        let header =
+            super::projected_publication_header_sql(super::ProjectedPublicationHeaderSql {
+                database: &db,
+                ctes: &ctes_reval,
+                session_id: "session-a",
+                candidate_publication_id: "append:session-a:1000",
+                operation_id: "op-1",
+                publisher_id: "pub-1",
+                slot: "1",
+                generation: "1000",
+                expected_source_revision: "42",
+                dirty_revision: "7",
+                required_heads: &heads,
+            });
+        let cases: [(&str, String, &str); 8] = [
+            (
+                "projection_ctes_reval",
+                ctes_reval.clone(),
+                include_str!("testdata/projector_golden/projection_ctes_reval.sql"),
+            ),
+            (
+                "projection_ctes_child",
+                ctes_child.clone(),
+                include_str!("testdata/projector_golden/projection_ctes_child.sql"),
+            ),
+            (
+                "single_projected_events",
+                super::single_projected_events_sql(&db, &ctes_child, "1", "1000"),
+                include_str!("testdata/projector_golden/single_projected_events.sql"),
+            ),
+            (
+                "single_projected_turns",
+                super::single_projected_turns_sql(&db, &ctes_child, "1", "1000"),
+                include_str!("testdata/projector_golden/single_projected_turns.sql"),
+            ),
+            (
+                "projected_publication_header",
+                header,
+                include_str!("testdata/projector_golden/projected_publication_header.sql"),
+            ),
+            (
+                "batch_projected_events",
+                batch_projected_events_sql("moraine", &sessions),
+                include_str!("testdata/projector_golden/batch_projected_events.sql"),
+            ),
+            (
+                "batch_projected_turns",
+                batch_projected_turns_sql("moraine", &sessions),
+                include_str!("testdata/projector_golden/batch_projected_turns.sql"),
+            ),
+            (
+                "event_type",
+                crate::canonical_derivations::event_type_expr(
+                    crate::canonical_derivations::DerivationColumns::PROJECTOR,
+                ),
+                include_str!("testdata/projector_golden/event_type.sql"),
+            ),
+        ];
+        for (name, generated, golden) in cases {
+            assert_eq!(
+                generated, golden,
+                "generated projector SQL for `{name}` diverged from its byte-identity golden"
+            );
+        }
     }
 
     #[test]
