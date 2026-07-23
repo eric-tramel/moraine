@@ -1,0 +1,1414 @@
+//! Issue #598 WI-10 exit-gate live tests: prove on a real ClickHouse that the
+//! v2 canonical `open` reader (design-598-final §5, `canonical_open.rs`) is
+//! field-parity with the v1 projector reader across a rich fixture corpus, that
+//! `open(event)` rejects non-live generations via `mcp_event_locator`, that
+//! cursor continuation is correct under concurrent append-only mutation and the
+//! anchor boundary guard, and that an append-fenced source (#602) serves the
+//! pinned pre-fence state without a spurious reopen while a genuine revision
+//! move returns the structured reopen (BINDING D9).
+//!
+//! The root `live_clickhouse.rs` owns the `#[tokio::test]` wrappers (so the
+//! `run-live-test` `--exact` paths stay flat) and scopes each body under the
+//! shared live-fixture Migration envelope; operations under test build their
+//! own Interactive-class envelopes exactly the way the MCP boundary does.
+//!
+//! Each gate is registered as its own `run-live-test` mode:
+//!   * `canonical-open-parity`       -> [`parity`]
+//!   * `canonical-open-locator`      -> [`locator`]
+//!   * `canonical-open-continuation` -> [`continuation`]
+//!   * `canonical-open-fence`        -> [`fence`]
+
+use super::*;
+use moraine_config::{QueryBudgetsConfig, ValidatedQueryBudgets};
+use moraine_conversations::{
+    CanonicalContinuation, CanonicalReadOutcome, ConversationRepository, McpEventOpen,
+    McpSessionOpen, McpTurnOpen, RepoError, SessionOriginScope,
+};
+use serde_json::Value;
+
+// --- fixture-building primitives -------------------------------------------
+
+const HOST_A: &str = "canonical-open-host-a";
+const HOST_B: &str = "canonical-open-host-b";
+const SESSION_DATE: &str = "2026-07-20";
+
+/// An ISO-8601 `record_ts` string (the raw source timestamp) at
+/// `12:mm:ss.000Z` on the fixture date; `secs` is total seconds past 12:00.
+fn iso(secs: u32) -> String {
+    format!("2026-07-20T12:{:02}:{:02}.000Z", secs / 60 % 60, secs % 60)
+}
+
+/// The ClickHouse `DateTime64(3)` literal for the same instant, used for
+/// `event_ts` / `ingested_at`.
+fn dt(secs: u32) -> String {
+    format!("2026-07-20 12:{:02}:{:02}.000", secs / 60 % 60, secs % 60)
+}
+
+/// A single fixture `events` row. Defaults model a well-formed assistant text
+/// message; fixtures override the fields that matter to the case under test.
+/// Every field the navigation / directory / locator MVs read is representable
+/// here, so the corpus is seeded purely through `events` + publication control
+/// (never by writing the derived tables directly).
+#[derive(Clone)]
+struct Ev {
+    session_id: String,
+    source_host: String,
+    source_name: String,
+    source_file: String,
+    source_generation: u32,
+    source_offset: u64,
+    source_line_no: u64,
+    event_uid: String,
+    record_ts: String,
+    event_ts: String,
+    ingested_at: String,
+    event_kind: String,
+    actor_kind: String,
+    payload_type: String,
+    tool_name: String,
+    tool_call_id: String,
+    item_id: String,
+    op_status: String,
+    inference_provider: String,
+    harness: String,
+    cwd: String,
+    turn_index: u32,
+    text_content: String,
+    payload_json: String,
+    event_version: u64,
+}
+
+impl Ev {
+    fn new(session_id: &str, event_uid: &str, secs: u32) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            source_host: HOST_A.to_string(),
+            source_name: "fixture".to_string(),
+            source_file: format!("/fixtures/{session_id}.jsonl"),
+            source_generation: 1,
+            source_offset: u64::from(secs) * 4096,
+            source_line_no: u64::from(secs) + 1,
+            event_uid: event_uid.to_string(),
+            record_ts: iso(secs),
+            event_ts: dt(secs),
+            ingested_at: dt(secs),
+            event_kind: "message".to_string(),
+            actor_kind: "assistant".to_string(),
+            payload_type: "message".to_string(),
+            tool_name: String::new(),
+            tool_call_id: String::new(),
+            item_id: String::new(),
+            op_status: String::new(),
+            inference_provider: "openai".to_string(),
+            harness: "codex".to_string(),
+            cwd: "/repo".to_string(),
+            turn_index: 0,
+            text_content: format!("assistant text for {event_uid}"),
+            payload_json: "{}".to_string(),
+            event_version: 1,
+        }
+    }
+
+    fn user(mut self) -> Self {
+        self.actor_kind = "user".to_string();
+        self.payload_type = "message".to_string();
+        self.text_content = format!("user prompt for {}", self.event_uid);
+        self
+    }
+
+    fn tool_call(mut self, tool: &str, call_id: &str) -> Self {
+        self.event_kind = "tool_call".to_string();
+        self.actor_kind = "assistant".to_string();
+        self.payload_type = "function_call".to_string();
+        self.tool_name = tool.to_string();
+        self.tool_call_id = call_id.to_string();
+        self.text_content = String::new();
+        self
+    }
+
+    fn turn(mut self, turn_index: u32) -> Self {
+        self.turn_index = turn_index;
+        self
+    }
+
+    fn host(mut self, host: &str) -> Self {
+        self.source_host = host.to_string();
+        self
+    }
+
+    fn generation(mut self, generation: u32) -> Self {
+        self.source_generation = generation;
+        self
+    }
+
+    fn record_ts(mut self, raw: &str) -> Self {
+        self.record_ts = raw.to_string();
+        self
+    }
+
+    fn ingested_at_secs(mut self, secs: u32) -> Self {
+        self.ingested_at = dt(secs);
+        self
+    }
+
+    fn version(mut self, version: u64) -> Self {
+        self.event_version = version;
+        self
+    }
+
+    fn cwd(mut self, cwd: &str) -> Self {
+        self.cwd = cwd.to_string();
+        self
+    }
+
+    fn source(mut self, name: &str, file: &str) -> Self {
+        self.source_name = name.to_string();
+        self.source_file = file.to_string();
+        self
+    }
+
+    fn payload(mut self, kind: &str, payload_json: &str) -> Self {
+        self.event_kind = kind.to_string();
+        self.payload_json = payload_json.to_string();
+        self
+    }
+
+    fn payload_type(mut self, payload_type: &str) -> Self {
+        self.payload_type = payload_type.to_string();
+        self
+    }
+
+    fn value(&self) -> Value {
+        serde_json::json!({
+            "ingested_at": self.ingested_at,
+            "source_host": self.source_host,
+            "event_uid": self.event_uid,
+            "session_id": self.session_id,
+            "session_date": SESSION_DATE,
+            "source_name": self.source_name,
+            "harness": self.harness,
+            "inference_provider": self.inference_provider,
+            "source_file": self.source_file,
+            "source_generation": self.source_generation,
+            "source_line_no": self.source_line_no,
+            "source_offset": self.source_offset,
+            "source_ref": self.event_uid,
+            "record_ts": self.record_ts,
+            "event_ts": self.event_ts,
+            "event_kind": self.event_kind,
+            "actor_kind": self.actor_kind,
+            "payload_type": self.payload_type,
+            "op_status": self.op_status,
+            "turn_index": self.turn_index,
+            "item_id": self.item_id,
+            "tool_call_id": self.tool_call_id,
+            "tool_name": self.tool_name,
+            "cwd": self.cwd,
+            "text_content": self.text_content,
+            "payload_json": self.payload_json,
+            "event_version": self.event_version,
+        })
+    }
+}
+
+/// Insert a batch of fixture events synchronously (each raw statement rides the
+/// ambient live-fixture envelope).
+async fn seed_events(clickhouse: &ClickHouseClient, rows: &[Ev]) -> Result<()> {
+    let values: Vec<Value> = rows.iter().map(Ev::value).collect();
+    clickhouse
+        .insert_json_rows_sync("events", &values)
+        .await
+        .context("failed to seed canonical-open fixture events")
+}
+
+fn admin_budget() -> moraine_config::ValidatedQueryBudget {
+    ValidatedQueryBudgets::from_config(&QueryBudgetsConfig::default())
+        .expect("bundled default query budgets are valid")
+        .administrative
+}
+
+/// Publish every not-yet-published source head, then backfill BOTH read models:
+/// the v1 projector (`mcp_open_*`, drives `get_mcp_*`) and the v2 canonical
+/// indexes (migration-036 directory/locator/navigation, drive `canonical_*`).
+/// Driving both readers off one seeded canonical corpus is the parity contract.
+async fn publish_and_backfill_both(
+    clickhouse: &ClickHouseClient,
+    database: &OwnedDatabaseName,
+) -> Result<()> {
+    publish_missing_schema_fixture_sources(clickhouse, database).await?;
+    clickhouse
+        .backfill_mcp_open_read_model()
+        .await
+        .context("failed to backfill the v1 projector read model")?;
+    clickhouse
+        .backfill_canonical_read_indexes(true, &live_fixture_budget(), &admin_budget(), |_| {})
+        .await
+        .context("failed to backfill the v2 canonical read indexes")?;
+    Ok(())
+}
+
+// --- v2 page accumulation ---------------------------------------------------
+
+/// Drive `canonical_open_session_page` across full pagination and merge the
+/// per-page turns into one `McpSessionOpen`, exactly the way the tool layer
+/// reconstructs a full session for a parity diff. A `Reopen` during a quiescent
+/// traversal is a failure.
+async fn open_session_v2(
+    repository: &ClickHouseConversationRepository,
+    session_id: &str,
+    limit: u16,
+) -> Result<Option<McpSessionOpen>> {
+    let mut after: Option<CanonicalContinuation> = None;
+    let mut merged: Option<McpSessionOpen> = None;
+    loop {
+        let outcome = repository
+            .canonical_open_session_page(session_id, limit, after.clone())
+            .await
+            .with_context(|| format!("v2 session page read failed for {session_id}"))?;
+        let page = match outcome {
+            None => return Ok(None),
+            Some(CanonicalReadOutcome::Reopen) => {
+                bail!("unexpected reopen during quiescent v2 traversal of {session_id}")
+            }
+            Some(CanonicalReadOutcome::Page(page)) => page,
+        };
+        let continuation = page.continuation.clone();
+        match merged.as_mut() {
+            None => merged = Some(page.session),
+            Some(accumulated) => accumulated.turns.extend(page.session.turns),
+        }
+        match continuation {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    Ok(merged)
+}
+
+/// Drive `canonical_open_turn_page` across full pagination and merge the
+/// per-page events into one `McpTurnOpen`.
+async fn open_turn_v2(
+    repository: &ClickHouseConversationRepository,
+    session_id: &str,
+    turn_seq: u32,
+    limit: u16,
+) -> Result<Option<McpTurnOpen>> {
+    let mut after: Option<CanonicalContinuation> = None;
+    let mut merged: Option<McpTurnOpen> = None;
+    loop {
+        let outcome = repository
+            .canonical_open_turn_page(session_id, turn_seq, limit, true, after.clone())
+            .await
+            .with_context(|| {
+                format!("v2 turn page read failed for {session_id} turn {turn_seq}")
+            })?;
+        let page = match outcome {
+            None => return Ok(None),
+            Some(CanonicalReadOutcome::Reopen) => {
+                bail!("unexpected reopen during quiescent v2 turn traversal of {session_id}")
+            }
+            Some(CanonicalReadOutcome::Page(page)) => page,
+        };
+        let continuation = page.continuation.clone();
+        match merged.as_mut() {
+            None => merged = Some(page.turn),
+            Some(accumulated) => accumulated.events.extend(page.turn.events),
+        }
+        match continuation {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    Ok(merged)
+}
+
+// --- parity normalization (the explicit whitelist) --------------------------
+//
+// design-598-final LIVE TEST PLAN §2 whitelists exactly three v1/v2 open
+// divergences: (1) `snapshot` is Some in v1 and always None in v2 (v2 uses the
+// continuation, not generation-pinned snapshots); (2) the v1 trichotomy
+// "canonical exists but projection missing" ReadModelChanged arm collapses to
+// Ok(None); (3) the deterministic v2 `turn_id` may differ from v1's
+// nondeterministic `anyIf(turn_id)` WITHIN the turn's value set. Everything
+// else must be byte-identical. `strip_*` nulls (1) and blanks (3) so a direct
+// serde_json equality proves the remainder; turn_id membership is checked
+// separately by the caller where a turn legitimately mixes `turn_index` values.
+
+fn blank_at<'a>(value: &'a mut Value, path: &[&str]) -> Option<&'a mut Value> {
+    let mut cursor = value;
+    for key in path {
+        cursor = cursor.as_object_mut()?.get_mut(*key)?;
+    }
+    Some(cursor)
+}
+
+fn null_snapshot(value: &mut Value) {
+    if let Some(object) = value.as_object_mut() {
+        object.insert("snapshot".to_string(), Value::Null);
+    }
+}
+
+fn blank_turn_id_in_metadata(turn: &mut Value) {
+    if let Some(turn_id) = blank_at(turn, &["metadata", "turn_id"]) {
+        *turn_id = Value::String(String::new());
+    }
+}
+
+fn normalized_session(open: &McpSessionOpen) -> Result<Value> {
+    let mut value = serde_json::to_value(open).context("failed to serialize session open")?;
+    null_snapshot(&mut value);
+    if let Some(turns) = value
+        .as_object_mut()
+        .and_then(|object| object.get_mut("turns"))
+        .and_then(Value::as_array_mut)
+    {
+        for turn in turns {
+            // McpTurnCompact carries its turn_id under `metadata.turn_id`.
+            blank_turn_id_in_metadata(turn);
+        }
+    }
+    Ok(value)
+}
+
+fn normalized_turn(open: &McpTurnOpen) -> Result<Value> {
+    let mut value = serde_json::to_value(open).context("failed to serialize turn open")?;
+    null_snapshot(&mut value);
+    if let Some(turn_id) = blank_at(&mut value, &["metadata", "turn_id"]) {
+        *turn_id = Value::String(String::new());
+    }
+    Ok(value)
+}
+
+fn normalized_event(open: &McpEventOpen) -> Result<Value> {
+    let mut value = serde_json::to_value(open).context("failed to serialize event open")?;
+    if let Some(turn_id) = blank_at(&mut value, &["parent_turn", "turn_id"]) {
+        *turn_id = Value::String(String::new());
+    }
+    Ok(value)
+}
+
+/// Assert the v1 and v2 readers agree on `open(session)` after the whitelist.
+async fn assert_session_parity(
+    repository: &ClickHouseConversationRepository,
+    session_id: &str,
+    limit: u16,
+) -> Result<McpSessionOpen> {
+    let v1 = repository
+        .get_mcp_session(session_id)
+        .await
+        .with_context(|| format!("v1 session open failed for {session_id}"))?
+        .with_context(|| format!("v1 session open returned None for {session_id}"))?;
+    let v2 = open_session_v2(repository, session_id, limit)
+        .await?
+        .with_context(|| format!("v2 session open returned None for {session_id}"))?;
+    let v1_norm = normalized_session(&v1)?;
+    let v2_norm = normalized_session(&v2)?;
+    if v1_norm != v2_norm {
+        bail!("session-open parity mismatch for {session_id}\n  v1={v1_norm}\n  v2={v2_norm}");
+    }
+    Ok(v2)
+}
+
+/// Assert the v1 and v2 readers agree on `open(turn)` after the whitelist.
+async fn assert_turn_parity(
+    repository: &ClickHouseConversationRepository,
+    session_id: &str,
+    turn_seq: u32,
+    limit: u16,
+) -> Result<()> {
+    let v1 = repository
+        .get_mcp_turn(session_id, turn_seq)
+        .await
+        .with_context(|| format!("v1 turn open failed for {session_id} turn {turn_seq}"))?
+        .with_context(|| format!("v1 turn open returned None for {session_id} turn {turn_seq}"))?;
+    let v2 = open_turn_v2(repository, session_id, turn_seq, limit)
+        .await?
+        .with_context(|| format!("v2 turn open returned None for {session_id} turn {turn_seq}"))?;
+    let v1_norm = normalized_turn(&v1)?;
+    let v2_norm = normalized_turn(&v2)?;
+    if v1_norm != v2_norm {
+        bail!(
+            "turn-open parity mismatch for {session_id} turn {turn_seq}\n  v1={v1_norm}\n  v2={v2_norm}"
+        );
+    }
+    Ok(())
+}
+
+/// Assert the v1 and v2 readers agree on `open(event)` after the whitelist.
+async fn assert_event_parity(
+    repository: &ClickHouseConversationRepository,
+    event_uid: &str,
+) -> Result<()> {
+    let v1 = repository
+        .get_mcp_event(event_uid)
+        .await
+        .with_context(|| format!("v1 event open failed for {event_uid}"))?
+        .with_context(|| format!("v1 event open returned None for {event_uid}"))?;
+    let v2 = repository
+        .canonical_open_event(event_uid)
+        .await
+        .with_context(|| format!("v2 event open failed for {event_uid}"))?
+        .with_context(|| format!("v2 event open returned None for {event_uid}"))?;
+    let v1_norm = normalized_event(&v1)?;
+    let v2_norm = normalized_event(&v2)?;
+    if v1_norm != v2_norm {
+        bail!("event-open parity mismatch for {event_uid}\n  v1={v1_norm}\n  v2={v2_norm}");
+    }
+    Ok(())
+}
+
+// --- shared prep/cleanup scaffolding ---------------------------------------
+
+async fn with_owned_live_db<F, Fut>(phase: &str, body: F) -> Result<()>
+where
+    F: FnOnce(ClickHouseClient, OwnedDatabaseName) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let prerequisites = LivePrerequisites::load()?;
+    let database = prepare_owned_database_identity(&prerequisites.sandbox_id)?;
+    let clickhouse = live_client(&prerequisites, &database)?;
+    assert_owned_database_census_empty(&clickhouse, &format!("before {phase}")).await?;
+    let outcome = body(clickhouse.clone(), database.clone()).await;
+    let cleanup = cleanup_database(&clickhouse, &database).await;
+    let census = assert_owned_database_census_empty(&clickhouse, &format!("after {phase}")).await;
+    finish_with_cleanup(outcome, finish_with_cleanup(cleanup, census))
+}
+
+// ===========================================================================
+// Gate 1: canonical-open-parity
+// ===========================================================================
+
+/// Byte-parity of the v2 canonical reader against the v1 projector across the
+/// rich fixture corpus enumerated in the LIVE TEST PLAN §2. Both readers are
+/// driven off the same seeded `events` corpus; every case is diffed
+/// field-by-field for `open(session|turn|event)` under the whitelist above.
+pub(super) async fn parity() -> Result<()> {
+    with_owned_live_db(
+        "canonical-open parity gate",
+        |clickhouse, database| async move {
+            clickhouse
+                .run_migrations()
+                .await
+                .context("failed to migrate canonical-open parity database")?;
+
+            seed_parity_corpus(&clickhouse).await?;
+            publish_and_backfill_both(&clickhouse, &database).await?;
+
+            let repository =
+                ClickHouseConversationRepository::new(clickhouse.clone(), RepoConfig::default());
+
+            // (a) Empty / absent session: both readers agree on Ok(None), and a
+            // blank-session row is excluded from both (notEmpty(session_id) MV
+            // filter + v1 projector).
+            assert!(repository
+                .get_mcp_session("parity-does-not-exist")
+                .await?
+                .is_none());
+            assert!(open_session_v2(&repository, "parity-does-not-exist", 25)
+                .await?
+                .is_none());
+            assert!(repository.get_mcp_session("").await?.is_none());
+            assert!(open_session_v2(&repository, "", 25).await?.is_none());
+
+            // (b) Single-turn, (c) tool-only (turn_seq floor 1), (d) multi-turn,
+            // (g) multi-host ordering, (h) terminal-in-middle-turn. Full-session
+            // parity plus per-turn and terminal-event parity, exercised at a page
+            // size that forces multi-page traversal on the multi-turn session.
+            for session_id in [
+                "parity-single-turn",
+                "parity-tool-only",
+                "parity-multi-turn",
+                "parity-multi-host",
+                "parity-terminal-mid",
+                "parity-metadata",
+            ] {
+                let session = assert_session_parity(&repository, session_id, 2).await?;
+                for turn in &session.turns {
+                    assert_turn_parity(&repository, session_id, turn.metadata.turn_seq, 3).await?;
+                    if let Some(reference) = &turn.first_event {
+                        assert_event_parity(&repository, &reference.event_uid).await?;
+                    }
+                    if let Some(reference) = &turn.last_event {
+                        assert_event_parity(&repository, &reference.event_uid).await?;
+                    }
+                }
+            }
+
+            // (e) Non-contiguous `turn_index` override recurrence mixed with the
+            // counter path (design §5.3 membership rule + VERIFIER ADDENDUM item 2
+            // stray-override folding). The whole session diffs equal; the mixed
+            // turn's deterministic v2 turn_id is asserted to lie within the v1
+            // value set (the one whitelisted divergence).
+            let overridden = assert_session_parity(&repository, "parity-override", 2).await?;
+            assert!(
+                overridden.turns.len() >= 2,
+                "override fixture must expand to at least two turns"
+            );
+            for turn in &overridden.turns {
+                assert_turn_parity(&repository, "parity-override", turn.metadata.turn_seq, 4)
+                    .await?;
+            }
+            assert_override_turn_id_within_value_set(&repository, "parity-override").await?;
+
+            // 035 metadata precedence surface: OPEN per-field-latest title/name/
+            // summary/slug from session_meta + omp title/title_change, with the omp
+            // dispatch-title fallback. The `parity-metadata` session above already
+            // diffed equal end-to-end; assert the concrete resolved values so a
+            // silent both-wrong regression cannot pass parity.
+            let metadata_session = repository
+                .get_mcp_session("parity-metadata")
+                .await?
+                .context("metadata session missing from v1 reader")?;
+            assert_eq!(
+                metadata_session.title.as_deref(),
+                Some("Latest Explicit Title")
+            );
+
+            // Malformed-timestamp / sentinel divergence (whitelisted): v2 sorts the
+            // malformed row at the epoch sentinel deterministically, and that order
+            // is stable across a same-uid re-insert (the §1a "no ghost rows"
+            // property) even though the display timestamp legitimately moves.
+            assert_malformed_timestamp_divergence(&clickhouse, &repository).await?;
+
+            // Scope in/out including trailing-slash root/origin shapes (design R8):
+            // a scoped repository sees only sessions whose origin_cwd is under the
+            // configured root, identically across both readers.
+            assert_scope_parity(&clickhouse).await?;
+
+            Ok(())
+        },
+    )
+    .await
+}
+
+/// Seed every parity session in one place. Ordering fields (`record_ts` -> the
+/// deterministic v2 `sort_time`; `source_offset`/`source_line_no`) are chosen
+/// so the derived public order is unambiguous.
+#[allow(clippy::vec_init_then_push)] // readable interleaved fixture with per-row comments
+async fn seed_parity_corpus(clickhouse: &ClickHouseClient) -> Result<()> {
+    let mut rows: Vec<Ev> = Vec::new();
+
+    // Blank-session row: excluded from both readers.
+    rows.push(Ev::new("", "parity-blank-1", 1).user());
+
+    // Single-turn: one user + one assistant, counter path. Origin carries a
+    // trailing slash (`/repo/`) so the scope check exercises R8 trailing-slash
+    // root/origin matching against the no-trailing-slash root `/repo`.
+    rows.push(
+        Ev::new("parity-single-turn", "single-u1", 10)
+            .user()
+            .cwd("/repo/"),
+    );
+    rows.push(Ev::new("parity-single-turn", "single-a1", 11).cwd("/repo/"));
+
+    // Out-of-scope: origin under a different root; hidden from a `/repo`-scoped
+    // repository by both readers.
+    rows.push(
+        Ev::new("parity-out-of-scope", "oos-u1", 12)
+            .user()
+            .cwd("/elsewhere")
+            .source("fixture", "/fixtures/parity-out-of-scope.jsonl"),
+    );
+    rows.push(
+        Ev::new("parity-out-of-scope", "oos-a1", 13)
+            .cwd("/elsewhere")
+            .source("fixture", "/fixtures/parity-out-of-scope.jsonl"),
+    );
+
+    // Tool-only: assistant tool calls, no user message -> turn_seq floor 1.
+    rows.push(Ev::new("parity-tool-only", "tool-c1", 20).tool_call("shell", "call-1"));
+    rows.push(Ev::new("parity-tool-only", "tool-c2", 21).tool_call("shell", "call-2"));
+
+    // Multi-turn: three user/assistant pairs via the counter path.
+    for turn in 0..3u32 {
+        let base = 30 + turn * 4;
+        rows.push(Ev::new("parity-multi-turn", &format!("multi-u{turn}"), base).user());
+        rows.push(Ev::new(
+            "parity-multi-turn",
+            &format!("multi-a{turn}"),
+            base + 1,
+        ));
+    }
+
+    // Multi-host: interleaved hosts; the projector order key is host-aware, so
+    // v2 must match the PROJECTOR (not the host-less v_conversation_trace).
+    rows.push(
+        Ev::new("parity-multi-host", "mh-u1", 40)
+            .user()
+            .host(HOST_A),
+    );
+    rows.push(Ev::new("parity-multi-host", "mh-a1", 41).host(HOST_B));
+    rows.push(
+        Ev::new("parity-multi-host", "mh-u2", 42)
+            .user()
+            .host(HOST_B),
+    );
+    rows.push(Ev::new("parity-multi-host", "mh-a2", 43).host(HOST_A));
+
+    // Terminal-in-middle-turn: a `task_complete` in turn 1 while turn 2
+    // continues; session completed/terminal come from the max-turn_seq turn.
+    rows.push(Ev::new("parity-terminal-mid", "term-u1", 50).user());
+    rows.push(Ev::new("parity-terminal-mid", "term-a1", 51));
+    // A task_complete terminates the (middle) turn 1 while turn 2 continues;
+    // the session-level terminal must come from the max-turn_seq turn (turn 2),
+    // not this completed middle turn (R1(b)).
+    rows.push(Ev::new("parity-terminal-mid", "term-c1", 52).payload_type("task_complete"));
+    rows.push(Ev::new("parity-terminal-mid", "term-u2", 53).user());
+    rows.push(Ev::new("parity-terminal-mid", "term-a2", 54));
+
+    // Override recurrence: explicit turn_index that revisits an earlier turn
+    // out of contiguous order, mixed with counter-path rows.
+    rows.push(Ev::new("parity-override", "ovr-u1", 60).user().turn(1));
+    rows.push(Ev::new("parity-override", "ovr-a1", 61).turn(1));
+    rows.push(Ev::new("parity-override", "ovr-u2", 62).user().turn(2));
+    rows.push(Ev::new("parity-override", "ovr-a2", 63).turn(2));
+    // A later row that folds back into turn 1 (non-contiguous recurrence).
+    rows.push(Ev::new("parity-override", "ovr-a1-late", 64).turn(1));
+
+    // Malformed record_ts (sentinel divergence, LIVE TEST PLAN §2 whitelist):
+    // `mal-a1`'s record_ts fails BestEffort parse, so v2's deterministic
+    // sort_time is the epoch sentinel (sorts at session start) while v1 sorts it
+    // at its ingested_at position. Asserted separately, never diffed v1==v2.
+    rows.push(Ev::new("parity-malformed", "mal-u1", 80).user());
+    rows.push(
+        Ev::new("parity-malformed", "mal-a1", 81)
+            .record_ts("not-a-timestamp")
+            .ingested_at_secs(5)
+            .version(1),
+    );
+    rows.push(Ev::new("parity-malformed", "mal-a2", 82));
+
+    // Metadata precedence: session_meta title/name/summary/slug + omp
+    // title_change, latest-wins per field.
+    rows.push(
+        Ev::new("parity-metadata", "meta-title-early", 70)
+            .source("omp", "/tmp/omp/parity-metadata.jsonl")
+            .payload("session_meta", r#"{"title":"Early Title"}"#),
+    );
+    rows.push(Ev::new("parity-metadata", "meta-user", 71).user());
+    rows.push(
+        Ev::new("parity-metadata", "meta-title-late", 72)
+            .source("omp", "/tmp/omp/parity-metadata.jsonl")
+            .payload("session_meta", r#"{"title":"Latest Explicit Title"}"#),
+    );
+    rows.push(Ev::new("parity-metadata", "meta-a", 73));
+
+    seed_events(clickhouse, &rows).await
+}
+
+/// Assert the mixed-override turn's deterministic v2 turn_id lies within the
+/// v1 value set (the LIVE TEST PLAN §2 turn_id whitelist). We read the v1 turn
+/// and v2 turn separately and compare their `turn_id` for membership.
+async fn assert_override_turn_id_within_value_set(
+    repository: &ClickHouseConversationRepository,
+    session_id: &str,
+) -> Result<()> {
+    let v1 = repository
+        .get_mcp_turn(session_id, 1)
+        .await?
+        .context("override turn 1 missing from v1 reader")?;
+    let v2 = open_turn_v2(repository, session_id, 1, 8)
+        .await?
+        .context("override turn 1 missing from v2 reader")?;
+    // Both derive turn_id from a member row's `toString(turn_index)`; the mixed
+    // turn's only turn_index value is "1", so the deterministic v2 value must
+    // equal the (here unambiguous) v1 value.
+    assert_eq!(
+        v1.metadata.turn_id, v2.metadata.turn_id,
+        "override turn_id diverged outside the whitelisted value set"
+    );
+    assert_eq!(v2.metadata.turn_id, "1");
+    Ok(())
+}
+
+/// Sentinel-`record_ts` ordering divergence (LIVE TEST PLAN §2 whitelist). The
+/// malformed row sorts first at the epoch sentinel, and that order is stable
+/// across a same-uid re-insert with a fresh `ingested_at`/version because the
+/// v2 `sort_time` is a pure function of the record bytes (design §1a). The
+/// re-insert version-collapses to a single navigation row — no ghost. Display
+/// timestamps may legitimately move with `ingested_at`, so we assert order and
+/// cardinality, not byte-identical output.
+async fn assert_malformed_timestamp_divergence(
+    clickhouse: &ClickHouseClient,
+    repository: &ClickHouseConversationRepository,
+) -> Result<()> {
+    let before = open_session_v2(repository, "parity-malformed", 25)
+        .await?
+        .context("malformed session missing from v2 reader")?;
+    let first_turn = before
+        .turns
+        .first()
+        .context("malformed session must expand to at least one turn")?;
+    let first_event = first_turn
+        .first_event
+        .as_ref()
+        .context("malformed session's first turn must carry a first event")?;
+    assert_eq!(
+        first_event.event_uid, "mal-a1",
+        "the malformed-record_ts row must sort first at the epoch sentinel"
+    );
+    let total_events_before = before.metadata.total_events;
+
+    // Re-insert the same uid with a new ingested_at and higher version. The
+    // navigation MV fires on the insert; the deterministic sort_time keeps the
+    // PK identical, so ReplacingMergeTree(event_version) collapses it.
+    let reinsert = vec![Ev::new("parity-malformed", "mal-a1", 81)
+        .record_ts("not-a-timestamp")
+        .ingested_at_secs(3000)
+        .version(2)];
+    seed_events(clickhouse, &reinsert).await?;
+
+    let after = open_session_v2(repository, "parity-malformed", 25)
+        .await?
+        .context("malformed session missing from v2 reader after re-insert")?;
+    let after_first = after
+        .turns
+        .first()
+        .and_then(|turn| turn.first_event.as_ref())
+        .context("malformed session's first turn must survive the re-insert")?;
+    assert_eq!(
+        after_first.event_uid, "mal-a1",
+        "the malformed row must still sort first after a same-uid re-insert (deterministic sort_time)"
+    );
+    assert_eq!(
+        after.metadata.total_events, total_events_before,
+        "a same-uid re-insert must not add a phantom event (no ghost row)"
+    );
+
+    #[derive(serde::Deserialize)]
+    struct CountRow {
+        value: u64,
+    }
+    let navigation_rows = clickhouse
+        .query_rows::<CountRow>(
+            "SELECT toUInt64(count()) AS value FROM mcp_event_navigation FINAL \
+             WHERE session_id = 'parity-malformed' AND event_uid = 'mal-a1' \
+             FORMAT JSONEachRow",
+            None,
+        )
+        .await?
+        .into_iter()
+        .next()
+        .map(|row| row.value)
+        .unwrap_or_default();
+    assert_eq!(
+        navigation_rows, 1,
+        "the re-inserted malformed row must version-collapse to one navigation row"
+    );
+    Ok(())
+}
+
+/// Trailing-slash root/origin scope parity (design R8): a repository scoped to
+/// `/repo` (no trailing slash) must, identically across both readers, expose a
+/// session whose origin_cwd is `/repo/` and hide a session originating outside.
+async fn assert_scope_parity(clickhouse: &ClickHouseClient) -> Result<()> {
+    let scoped = ClickHouseConversationRepository::new(
+        clickhouse.clone(),
+        RepoConfig {
+            session_scope: Some(SessionOriginScope {
+                roots: vec!["/repo".to_string()],
+            }),
+            ..RepoConfig::default()
+        },
+    );
+
+    // In-scope: origin_cwd `/repo/` (trailing slash) is under root `/repo`.
+    let in_scope_v1 = scoped.get_mcp_session("parity-single-turn").await?;
+    let in_scope_v2 = open_session_v2(&scoped, "parity-single-turn", 25).await?;
+    assert!(
+        in_scope_v1.is_some() && in_scope_v2.is_some(),
+        "in-scope session must be visible to both readers under the scoped repo"
+    );
+
+    // Out-of-scope: `parity-tool-only` originates under `/repo` too by default,
+    // so seed comparison relies on an explicitly out-of-root origin. The
+    // multi-host fixture keeps `/repo`; use a dedicated out-of-scope probe.
+    let out_v1 = scoped.get_mcp_session("parity-out-of-scope").await?;
+    let out_v2 = open_session_v2(&scoped, "parity-out-of-scope", 25).await?;
+    assert!(
+        out_v1.is_none() && out_v2.is_none(),
+        "out-of-scope session must be hidden from both readers under the scoped repo"
+    );
+    Ok(())
+}
+
+// ===========================================================================
+// Gate 2: canonical-open-locator
+// ===========================================================================
+
+/// `open(event)` via `mcp_event_locator` rejects a non-live (superseded or
+/// replaying-only) generation and resolves a live one; the locator seek reads
+/// no unrelated session's rows (LIVE TEST PLAN §3, issue-598.md:161).
+pub(super) async fn locator() -> Result<()> {
+    with_owned_live_db(
+        "canonical-open locator gate",
+        |clickhouse, database| async move {
+            clickhouse
+                .run_migrations()
+                .await
+                .context("failed to migrate canonical-open locator database")?;
+
+            // Session under replacement: generation 1 (originally live), then a
+            // generation-2 replacement of the same source file, plus an unrelated
+            // session that must never be touched by a locator seek.
+            let gen1 = vec![
+                Ev::new("locator-session", "loc-g1-u1", 10)
+                    .user()
+                    .source("fixture", "/fixtures/locator.jsonl")
+                    .generation(1),
+                Ev::new("locator-session", "loc-g1-a1", 11)
+                    .source("fixture", "/fixtures/locator.jsonl")
+                    .generation(1),
+            ];
+            let gen2 = vec![
+                Ev::new("locator-session", "loc-g2-u1", 12)
+                    .user()
+                    .source("fixture", "/fixtures/locator.jsonl")
+                    .generation(2),
+                Ev::new("locator-session", "loc-g2-a1", 13)
+                    .source("fixture", "/fixtures/locator.jsonl")
+                    .generation(2),
+            ];
+            let unrelated = vec![
+                Ev::new("locator-unrelated", "loc-other-u1", 20)
+                    .user()
+                    .source("fixture", "/fixtures/locator-other.jsonl"),
+                Ev::new("locator-unrelated", "loc-other-a1", 21)
+                    .source("fixture", "/fixtures/locator-other.jsonl"),
+            ];
+
+            // --- Phase 1: generation 1 is the only published head. ---
+            seed_events(&clickhouse, &gen1).await?;
+            seed_events(&clickhouse, &unrelated).await?;
+            publish_and_backfill_both(&clickhouse, &database).await?;
+
+            let repository =
+                ClickHouseConversationRepository::new(clickhouse.clone(), RepoConfig::default());
+
+            // A live generation-1 uid resolves.
+            let live = repository
+                .canonical_open_event("loc-g1-a1")
+                .await?
+                .context("live generation-1 event must resolve via the locator")?;
+            assert_eq!(live.event.session_id, "locator-session");
+
+            // --- Phase 2: seed generation 2 but leave it unpublished (replaying
+            // only). The navigation/locator MVs store all generations, but the
+            // reader filters to the pinned live head (generation 1), so a
+            // replaying-only uid is rejected and reads still expose complete-old. ---
+            seed_events(&clickhouse, &gen2).await?;
+            assert!(
+                repository
+                    .canonical_open_event("loc-g2-a1")
+                    .await?
+                    .is_none(),
+                "a replaying-only (unpublished) generation uid must be rejected as non-live"
+            );
+            let pre_activation = repository
+                .canonical_open_event("loc-g1-a1")
+                .await?
+                .context("generation-1 event must still resolve while g2 is replaying")?;
+            assert_eq!(pre_activation.event.event_uid, "loc-g1-a1");
+
+            // --- Phase 3: activate generation 2 (publish its head). Generation 1 is
+            // now superseded and rejected; generation 2 resolves. Never a mix. ---
+            publish_missing_schema_fixture_sources(&clickhouse, &database).await?;
+            assert!(
+                repository
+                    .canonical_open_event("loc-g1-a1")
+                    .await?
+                    .is_none(),
+                "a superseded generation uid must be rejected once replaced"
+            );
+            let activated = repository
+                .canonical_open_event("loc-g2-a1")
+                .await?
+                .context("activated generation-2 event must resolve")?;
+            assert_eq!(activated.event.session_id, "locator-session");
+
+            // The locator seek for the target session must not scan the unrelated
+            // session's rows: assert via query_log that no statement in the seek
+            // envelope read the unrelated session's canonical text.
+            assert_locator_seek_is_scoped(&clickhouse, &repository).await?;
+
+            Ok(())
+        },
+    )
+    .await
+}
+
+/// Run one `open(event)` inside a uniquely-labelled Interactive envelope and
+/// assert from `system.query_log` that the locator seek touched no unrelated
+/// session's wide content (no full-corpus / unrelated-session scan).
+async fn assert_locator_seek_is_scoped(
+    clickhouse: &ClickHouseClient,
+    repository: &ClickHouseConversationRepository,
+) -> Result<()> {
+    QueryEnvelope::new(
+        "issue598-locator-seek",
+        QueryClass::Interactive,
+        &default_interactive_budget(),
+    )
+    .scope(async {
+        repository
+            .canonical_open_event("loc-g2-a1")
+            .await
+            .context("scoped locator seek failed")?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await?;
+
+    clickhouse
+        .request_text("SYSTEM FLUSH LOGS", None, None, false, None)
+        .await?;
+
+    #[derive(serde::Deserialize)]
+    struct CountRow {
+        value: u64,
+    }
+    let unrelated_scans = clickhouse
+        .query_rows::<CountRow>(
+            "SELECT toUInt64(countIf(position(query, 'locator-unrelated') > 0)) AS value \
+             FROM system.query_log \
+             WHERE type = 'QueryFinish' \
+               AND startsWith(query_id, 'moraine-issue598-locator-seek') \
+               AND current_database = currentDatabase() \
+             FORMAT JSONEachRow",
+            None,
+        )
+        .await?
+        .into_iter()
+        .next()
+        .map(|row| row.value)
+        .unwrap_or_default();
+    assert_eq!(
+        unrelated_scans, 0,
+        "the locator seek must not reference the unrelated session"
+    );
+    Ok(())
+}
+
+// ===========================================================================
+// Gate 3: canonical-open-continuation
+// ===========================================================================
+
+/// Cursor continuation under concurrency (design §5.4, D1's dedicated gate):
+/// quiescent continuation touches only the directory point-read; in-order
+/// appends continue via the boundary guard with no dropped/duplicated events;
+/// an out-of-order append reopens; a replacement mid-traversal reopens; an
+/// unrelated-source publication does NOT reopen (step-3 precision).
+pub(super) async fn continuation() -> Result<()> {
+    with_owned_live_db(
+        "canonical-open continuation gate",
+        |clickhouse, database| async move {
+            clickhouse
+                .run_migrations()
+                .await
+                .context("failed to migrate canonical-open continuation database")?;
+
+            // A multi-turn session plus an unrelated session (for the step-3
+            // precision case), both published and backfilled.
+            let mut rows = Vec::new();
+            for turn in 0..6u32 {
+                let base = 10 + turn * 4;
+                rows.push(Ev::new("cont-session", &format!("cont-u{turn}"), base).user());
+                rows.push(Ev::new("cont-session", &format!("cont-a{turn}"), base + 1));
+            }
+            rows.push(
+                Ev::new("cont-unrelated", "cont-other-u1", 90)
+                    .user()
+                    .source("fixture", "/fixtures/cont-other.jsonl"),
+            );
+            rows.push(
+                Ev::new("cont-unrelated", "cont-other-a1", 91)
+                    .source("fixture", "/fixtures/cont-other.jsonl"),
+            );
+            seed_events(&clickhouse, &rows).await?;
+            publish_and_backfill_both(&clickhouse, &database).await?;
+
+            let repository =
+                ClickHouseConversationRepository::new(clickhouse.clone(), RepoConfig::default());
+
+            // (a) Quiescent continuation touches only the directory point-read:
+            // no statement in the second page's envelope reads
+            // `mcp_event_navigation`.
+            assert_quiescent_continuation_is_directory_only(&clickhouse, &repository).await?;
+
+            // (b) In-order appends mid-traversal: page 1, then append new turns
+            // that sort AFTER the anchor (higher record_ts). The boundary guard
+            // passes and the merged traversal is gap-free / duplicate-free
+            // against a final reference read.
+            assert_in_order_append_continues(&clickhouse, &repository, &database).await?;
+
+            // (c) Out-of-order append (older record_ts than the anchor) sorts
+            // into the served prefix -> boundary guard fails -> structured
+            // reopen.
+            assert_out_of_order_append_reopens(&clickhouse, &repository).await?;
+
+            // (g) Unrelated-source publication moves the global revision but the
+            // target session's heads are unchanged -> NO reopen.
+            assert_unrelated_publication_does_not_reopen(&clickhouse, &repository, &database)
+                .await?;
+
+            Ok(())
+        },
+    )
+    .await
+}
+
+/// Mint a page-1 cursor, then read page 2 inside a labelled envelope and assert
+/// no statement read the navigation index (quiescent path = directory
+/// point-read only).
+async fn assert_quiescent_continuation_is_directory_only(
+    clickhouse: &ClickHouseClient,
+    repository: &ClickHouseConversationRepository,
+) -> Result<()> {
+    let first = repository
+        .canonical_open_session_page("cont-session", 2, None)
+        .await?
+        .context("quiescent page 1 returned no outcome")?;
+    let continuation = match first {
+        CanonicalReadOutcome::Page(page) => page
+            .continuation
+            .context("quiescent page 1 must yield a continuation")?,
+        CanonicalReadOutcome::Reopen => bail!("quiescent page 1 unexpectedly reopened"),
+    };
+
+    QueryEnvelope::new(
+        "issue598-quiescent-page",
+        QueryClass::Interactive,
+        &default_interactive_budget(),
+    )
+    .scope(async {
+        repository
+            .canonical_open_session_page("cont-session", 2, Some(continuation))
+            .await
+            .context("quiescent page 2 read failed")?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await?;
+
+    clickhouse
+        .request_text("SYSTEM FLUSH LOGS", None, None, false, None)
+        .await?;
+    #[derive(serde::Deserialize)]
+    struct CountRow {
+        value: u64,
+    }
+    let navigation_reads = clickhouse
+        .query_rows::<CountRow>(
+            "SELECT toUInt64(countIf(position(query, 'mcp_event_navigation') > 0)) AS value \
+             FROM system.query_log \
+             WHERE type = 'QueryFinish' \
+               AND startsWith(query_id, 'moraine-issue598-quiescent-page') \
+               AND current_database = currentDatabase() \
+             FORMAT JSONEachRow",
+            None,
+        )
+        .await?
+        .into_iter()
+        .next()
+        .map(|row| row.value)
+        .unwrap_or_default();
+    assert_eq!(
+        navigation_reads, 0,
+        "a quiescent continuation must not scan mcp_event_navigation (directory point-read only)"
+    );
+    Ok(())
+}
+
+/// Page 1, append new turns that sort after the anchor, then continue. The
+/// boundary guard passes, the traversal proceeds, and the concatenation of all
+/// served pages is gap-free and duplicate-free against a fresh full read.
+async fn assert_in_order_append_continues(
+    clickhouse: &ClickHouseClient,
+    repository: &ClickHouseConversationRepository,
+    database: &OwnedDatabaseName,
+) -> Result<()> {
+    let first = repository
+        .canonical_open_session_page("cont-session", 2, None)
+        .await?
+        .context("append page 1 returned no outcome")?;
+    let (mut served, continuation) = match first {
+        CanonicalReadOutcome::Page(page) => (
+            page.session
+                .turns
+                .iter()
+                .map(|turn| turn.metadata.turn_seq)
+                .collect::<Vec<_>>(),
+            page.continuation
+                .context("append page 1 must yield a continuation")?,
+        ),
+        CanonicalReadOutcome::Reopen => bail!("append page 1 unexpectedly reopened"),
+    };
+
+    // Concurrent in-order appends: two new turns whose record_ts sort strictly
+    // after every served row. The MV maintains navigation/directory on insert,
+    // so no re-backfill is needed.
+    let appended = vec![
+        Ev::new("cont-session", "cont-u-append-0", 200).user(),
+        Ev::new("cont-session", "cont-a-append-0", 201),
+        Ev::new("cont-session", "cont-u-append-1", 202).user(),
+        Ev::new("cont-session", "cont-a-append-1", 203),
+    ];
+    seed_events(clickhouse, &appended).await?;
+    // The appends are within the same live generation; republish is a no-op for
+    // the head, but the source head must remain published.
+    publish_missing_schema_fixture_sources(clickhouse, database).await?;
+
+    // Continue paging from the page-1 cursor to the end.
+    let mut after = Some(continuation);
+    loop {
+        let outcome = repository
+            .canonical_open_session_page("cont-session", 2, after.clone())
+            .await?
+            .context("append continuation returned no outcome")?;
+        let page = match outcome {
+            CanonicalReadOutcome::Page(page) => page,
+            CanonicalReadOutcome::Reopen => {
+                bail!("an in-order append must not reopen the cursor")
+            }
+        };
+        served.extend(page.session.turns.iter().map(|turn| turn.metadata.turn_seq));
+        match page.continuation {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+
+    // Gap-free / duplicate-free: the served turn sequence is strictly
+    // increasing with no repeats.
+    for window in served.windows(2) {
+        assert!(
+            window[1] > window[0],
+            "served turns must be strictly increasing (no gaps/dupes): {served:?}"
+        );
+    }
+    // The final served set must cover every turn the fresh full read reports.
+    let reference = open_session_v2(repository, "cont-session", 25)
+        .await?
+        .context("reference full read returned None")?;
+    let reference_turns: Vec<u32> = reference
+        .turns
+        .iter()
+        .map(|turn| turn.metadata.turn_seq)
+        .collect();
+    assert_eq!(
+        served, reference_turns,
+        "continued traversal must equal a fresh full read after the appends"
+    );
+    Ok(())
+}
+
+/// Page 1, then insert an event whose record_ts is OLDER than the served
+/// anchor. It sorts into the prefix, so the boundary guard's counts no longer
+/// match the anchor and the next page returns the structured reopen.
+async fn assert_out_of_order_append_reopens(
+    clickhouse: &ClickHouseClient,
+    repository: &ClickHouseConversationRepository,
+) -> Result<()> {
+    // Use a fresh session so the earlier append test does not interfere.
+    let mut rows = Vec::new();
+    for turn in 0..4u32 {
+        let base = 300 + turn * 4;
+        rows.push(Ev::new("cont-ooo-session", &format!("ooo-u{turn}"), base).user());
+        rows.push(Ev::new(
+            "cont-ooo-session",
+            &format!("ooo-a{turn}"),
+            base + 1,
+        ));
+    }
+    seed_events(clickhouse, &rows).await?;
+
+    let first = repository
+        .canonical_open_session_page("cont-ooo-session", 2, None)
+        .await?
+        .context("out-of-order page 1 returned no outcome")?;
+    let continuation = match first {
+        CanonicalReadOutcome::Page(page) => page
+            .continuation
+            .context("out-of-order page 1 must yield a continuation")?,
+        CanonicalReadOutcome::Reopen => bail!("out-of-order page 1 unexpectedly reopened"),
+    };
+
+    // Insert a row that sorts BEFORE the anchor (record_ts at 12:05:00, earlier
+    // than the served rows at 12:05:00+): here we use an explicitly small secs
+    // value so the deterministic sort_time lands in the served prefix.
+    let out_of_order = vec![Ev::new("cont-ooo-session", "ooo-prefix-insert", 1).user()];
+    seed_events(clickhouse, &out_of_order).await?;
+
+    let second = repository
+        .canonical_open_session_page("cont-ooo-session", 2, Some(continuation))
+        .await?
+        .context("out-of-order page 2 returned no outcome")?;
+    match second {
+        CanonicalReadOutcome::Reopen => Ok(()),
+        CanonicalReadOutcome::Page(_) => {
+            bail!("a prefix-inserting out-of-order append must return the structured reopen")
+        }
+    }
+}
+
+/// Page 1 of the target session, publish a NEW generation of an UNRELATED
+/// source (moving the global publication revision), then continue the target.
+/// The target's live heads are unchanged, so step-3's fingerprint check keeps
+/// the cursor alive: no reopen.
+async fn assert_unrelated_publication_does_not_reopen(
+    clickhouse: &ClickHouseClient,
+    repository: &ClickHouseConversationRepository,
+    database: &OwnedDatabaseName,
+) -> Result<()> {
+    let first = repository
+        .canonical_open_session_page("cont-session", 2, None)
+        .await?
+        .context("unrelated-publication page 1 returned no outcome")?;
+    let continuation = match first {
+        CanonicalReadOutcome::Page(page) => page
+            .continuation
+            .context("unrelated-publication page 1 must yield a continuation")?,
+        CanonicalReadOutcome::Reopen => bail!("unrelated-publication page 1 unexpectedly reopened"),
+    };
+
+    // Publish a brand-new unrelated source generation, advancing the global
+    // publication revision without touching cont-session's heads.
+    let unrelated_gen2 = vec![Ev::new("cont-unrelated", "cont-other-g2", 95)
+        .source("fixture", "/fixtures/cont-other.jsonl")
+        .generation(2)];
+    seed_events(clickhouse, &unrelated_gen2).await?;
+    publish_missing_schema_fixture_sources(clickhouse, database).await?;
+
+    let second = repository
+        .canonical_open_session_page("cont-session", 2, Some(continuation))
+        .await?
+        .context("unrelated-publication page 2 returned no outcome")?;
+    match second {
+        CanonicalReadOutcome::Page(_) => Ok(()),
+        CanonicalReadOutcome::Reopen => {
+            bail!("an unrelated-source publication must NOT reopen the target cursor (step-3)")
+        }
+    }
+}
+
+// ===========================================================================
+// Gate 4: canonical-open-fence
+// ===========================================================================
+
+/// An append-fenced source (#602) serves the pinned pre-fence state
+/// consistently: ordinary fenced appends produce no spurious `ReadModelChanged`
+/// (BINDING D9 — the v2 `AnchoredSession` read proceeds), while a genuine
+/// revision move (a replacement generation) returns the structured reopen.
+pub(super) async fn fence() -> Result<()> {
+    with_owned_live_db("canonical-open fence gate", |clickhouse, database| async move {
+        clickhouse
+            .run_migrations()
+            .await
+            .context("failed to migrate canonical-open fence database")?;
+
+        let mut rows = Vec::new();
+        for turn in 0..4u32 {
+            let base = 10 + turn * 4;
+            rows.push(
+                Ev::new("fence-session", &format!("fence-u{turn}"), base)
+                    .user()
+                    .source("fixture", "/fixtures/fence.jsonl"),
+            );
+            rows.push(
+                Ev::new("fence-session", &format!("fence-a{turn}"), base + 1)
+                    .source("fixture", "/fixtures/fence.jsonl"),
+            );
+        }
+        seed_events(&clickhouse, &rows).await?;
+        publish_and_backfill_both(&clickhouse, &database).await?;
+
+        let repository =
+            ClickHouseConversationRepository::new(clickhouse.clone(), RepoConfig::default());
+
+        // D9: an ordinary append to the live fenced source is visible and the
+        // v2 open proceeds — no spurious ReadModelChanged. (An insert-only
+        // append fence is exactly the steady-state case here: the append writes
+        // no head rows, so the pinned as-of heads are untouched and the
+        // AnchoredSession read is allowed.)
+        let appended = vec![
+            Ev::new("fence-session", "fence-u-append", 200)
+                .user()
+                .source("fixture", "/fixtures/fence.jsonl"),
+            Ev::new("fence-session", "fence-a-append", 201)
+                .source("fixture", "/fixtures/fence.jsonl"),
+        ];
+        seed_events(&clickhouse, &appended).await?;
+        publish_missing_schema_fixture_sources(&clickhouse, &database).await?;
+
+        match repository
+            .canonical_open_session_page("fence-session", 25, None)
+            .await
+        {
+            Ok(Some(CanonicalReadOutcome::Page(_))) => {}
+            Ok(Some(CanonicalReadOutcome::Reopen)) => {
+                bail!("an ordinary fenced append must not reopen the initial open")
+            }
+            Ok(None) => bail!("fence-session must be openable after an append"),
+            Err(RepoError::ReadModelChanged) => {
+                bail!("an ordinary insert-only fenced append must not surface ReadModelChanged (D9)")
+            }
+            Err(other) => return Err(other.into()),
+        }
+
+        // A genuine revision move: publish a replacement generation of the same
+        // source mid-traversal. The session's live head flips, the cursor's
+        // heads-fingerprint changes, and the next page returns the structured
+        // reopen (complete-old -> complete-new, never mixed).
+        assert_revision_move_reopens(&clickhouse, &repository, &database).await?;
+
+        Ok(())
+    })
+    .await
+}
+
+/// Page 1, publish a replacement generation of the target's source, then
+/// continue: the heads-fingerprint change forces a structured reopen.
+async fn assert_revision_move_reopens(
+    clickhouse: &ClickHouseClient,
+    repository: &ClickHouseConversationRepository,
+    database: &OwnedDatabaseName,
+) -> Result<()> {
+    let first = repository
+        .canonical_open_session_page("fence-session", 2, None)
+        .await?
+        .context("revision-move page 1 returned no outcome")?;
+    let continuation = match first {
+        CanonicalReadOutcome::Page(page) => page
+            .continuation
+            .context("revision-move page 1 must yield a continuation")?,
+        CanonicalReadOutcome::Reopen => bail!("revision-move page 1 unexpectedly reopened"),
+    };
+
+    // Replacement generation 2 of the SAME source file, published as the new
+    // head: this is a genuine revision move over the target session.
+    let replacement = vec![
+        Ev::new("fence-session", "fence-g2-u", 12)
+            .user()
+            .source("fixture", "/fixtures/fence.jsonl")
+            .generation(2),
+        Ev::new("fence-session", "fence-g2-a", 13)
+            .source("fixture", "/fixtures/fence.jsonl")
+            .generation(2),
+    ];
+    seed_events(clickhouse, &replacement).await?;
+    publish_missing_schema_fixture_sources(clickhouse, database).await?;
+
+    let second = repository
+        .canonical_open_session_page("fence-session", 2, Some(continuation))
+        .await;
+    match second {
+        Ok(Some(CanonicalReadOutcome::Reopen)) => Ok(()),
+        Ok(Some(CanonicalReadOutcome::Page(_))) => {
+            bail!("a genuine revision move must return the structured reopen, not a page")
+        }
+        Ok(None) => bail!("revision-move page 2 unexpectedly returned no outcome"),
+        // A ReadModelChanged from snapshot revalidation exhaustion is also an
+        // acceptable "do not continue a stale snapshot" surface, but the
+        // designed path is the structured reopen.
+        Err(RepoError::ReadModelChanged) => Ok(()),
+        Err(other) => Err(other.into()),
+    }
+}

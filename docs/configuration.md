@@ -743,6 +743,7 @@ prewarm_on_initialize = false
 async_log_writes = true
 protocol_version = "2024-11-05"
 # max_parallel_requests = 16 # optional; omitted defaults to 8
+open_reader = "auto"
 use_central_server = true
 central_socket_path = "mcp.sock"
 central_connect_timeout_ms = 250
@@ -760,6 +761,7 @@ central_connect_timeout_ms = 250
 | `async_log_writes` | `true` | Writes MCP observability rows asynchronously so tool calls stay responsive. |
 | `protocol_version` | `2024-11-05` | MCP protocol version advertised by the server. |
 | `max_parallel_requests` | `8` | Maximum retrieval requests executed concurrently by each MCP server process. At most 16 additional requests wait in FIFO order until capacity is available or the request is cancelled. A full queue is rejected immediately with a structured retryable error. A configured value must be greater than zero. |
+| `open_reader` | `auto` | Which repository reader backs the `open(session\|turn\|event)` tool family (issue #598). `auto` uses the canonical page-aware v2 reader once its read indexes are published on the default Local backend, otherwise the legacy v1 projected reader; `v1` forces the legacy reader (the non-silent kill-switch); `v2` forces the canonical reader and fails typed if its indexes are not ready. Validated at config load. |
 | `use_central_server` | `true` | Makes `moraine run mcp` prefer the shared central server socket, with embedded fallback. |
 | `central_socket_path` | `mcp.sock` | Unix socket path. Bare filenames resolve under `runtime.pids_dir`; absolute paths are used verbatim. |
 | `central_connect_timeout_ms` | `250` | Milliseconds a proxy client waits for the central socket before falling back to embedded mode. |
@@ -769,6 +771,16 @@ context defaults when retrieval snippets are too narrow.
 Leave `prewarm_on_initialize` disabled for harnesses that launch multiple MCP
 processes at once; enabling it trades startup CPU/database work for lower
 first-search latency.
+
+Leave `open_reader` at `auto`. It selects the canonical page-aware `open`
+reader (issue #598) once migration 036's read indexes finish backfilling on the
+default Local backend, and otherwise keeps the legacy projected reader — no
+manual action is required for a normal local install. Use `v1` as an immediate,
+non-silent kill-switch (surfaced in `moraine status` and `moraine db doctor`),
+and `v2` only for testing or a promoted shared backend. Readiness, operator
+commands (`moraine db core-index status|rebuild|promote`), and rollback are
+documented in
+[Canonical read indexes and the `open` reader](operations/canonical-read-indexes.md).
 
 The shared central server applies one parallel-request budget across every MCP
 socket connection and queues at most 16 valid retrievals in FIFO order when that

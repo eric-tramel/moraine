@@ -557,7 +557,12 @@ pub(super) struct WideRow {
 
 /// The session-level header the three open paths share: metadata scalars plus
 /// the OPEN-precedence title/summary/slug and session completed/terminal.
-#[derive(Debug, Clone)]
+///
+/// Serializable so an `open(session)` continuation can carry it across pages
+/// (design §5.5 `SessionCarry`): the header is session-level state that does not
+/// change while a session is quiescent, so page k+1 reuses it instead of
+/// re-running the page-1 totals/metadata/terminal scans.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct CanonicalSessionHeader {
     pub(super) metadata: SessionMetadata,
     pub(super) title: Option<String>,
@@ -568,6 +573,32 @@ pub(super) struct CanonicalSessionHeader {
     pub(super) session_summary: Option<String>,
     pub(super) completed: bool,
     pub(super) terminal_event_uid: Option<String>,
+    /// The session's `max(turn_index)` (design §5.2.4 override-path input). When
+    /// it is `0` the session has no explicit turn overrides, so `turn_seq` is
+    /// monotonic in navigation-tuple order and the session page reader can
+    /// early-stop after `K + 1` turns rather than sweeping the whole session.
+    pub(super) max_override: u32,
+}
+
+/// The outcome of resolving a continuation cursor into a resumable page start.
+pub(super) struct ResolvedContinuation {
+    pub(super) start_after: Option<CanonicalReadAnchor>,
+    pub(super) start_derived: ForwardDerived,
+    pub(super) signals: CanonicalSessionSignals,
+    /// The page-1 session header, reused verbatim when the session is quiescent
+    /// (design §5.5). `None` on a first page or after inserts landed, in which
+    /// case the page recomputes the header.
+    pub(super) carried_header: Option<CanonicalSessionHeader>,
+}
+
+/// Serialize a session header for the continuation cursor's `session_carry`.
+fn encode_session_carry(header: &CanonicalSessionHeader) -> Option<String> {
+    serde_json::to_string(header).ok()
+}
+
+/// Decode a carried session header; a malformed carry falls back to recompute.
+fn decode_session_carry(carry: Option<&str>) -> Option<CanonicalSessionHeader> {
+    carry.and_then(|json| serde_json::from_str(json).ok())
 }
 
 /// A synthetic pre-session anchor: the zero state a first-page forward
@@ -834,6 +865,7 @@ impl ClickHouseConversationRepository {
         };
         Ok(Some(CanonicalSessionHeader {
             metadata,
+            max_override: totals.max_override,
             title: non_empty_string(title),
             source: non_empty_string(totals.source),
             harness: non_empty_string(totals.harness),
@@ -889,6 +921,78 @@ impl ClickHouseConversationRepository {
                 after = Some(nav_row_to_anchor(last_row, last_der));
             }
             if !has_more {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Output-sized `open(session)` page collection (design §5.2.3/§5.5): stream
+    /// navigation windows forward from `start_after`, early-stopping as soon as
+    /// `limit + 1` distinct `turn_seq`s beyond `after_turn_seq` have begun — so
+    /// one page reads `O(page events)` rows, never the whole session.
+    ///
+    /// SAFETY (parity): this is only equal to the full-session bucketing when
+    /// `turn_seq` is monotonic in navigation-tuple order, which holds exactly
+    /// when the session has no explicit turn overrides (`max_override == 0`): all
+    /// rows then carry `turn_index = 0`, so `turn_seq = max(1, U)` and `U` is
+    /// non-decreasing in tuple order. The caller keeps the full-session sweep for
+    /// override-bearing sessions, whose non-contiguous stray recurrences the
+    /// early stop cannot see. The per-query chunk is `max(1024, 8 * limit)`
+    /// (design §5.2.3 chunk target), so read-rows per page are bounded by the
+    /// page's own turns plus one chunk of granularity, independent of session
+    /// size.
+    async fn canonical_stream_session_page(
+        &self,
+        session_id: &str,
+        start_after: Option<CanonicalReadAnchor>,
+        start_derived: ForwardDerived,
+        after_turn_seq: u32,
+        limit: usize,
+    ) -> RepoResult<Vec<(NavWindowRow, ForwardDerived)>> {
+        let chunk: u16 = u16::try_from(std::cmp::max(1024, limit.saturating_mul(8)))
+            .unwrap_or(u16::MAX)
+            .saturating_sub(1)
+            .max(1);
+        let mut out: Vec<(NavWindowRow, ForwardDerived)> = Vec::new();
+        let mut anchor_state = start_derived;
+        let mut after = start_after;
+        let mut distinct_new: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        'outer: loop {
+            let sql = self.build_navigation_window_sql(session_id, after.as_ref(), None, chunk);
+            let rows = self.map_backend(self.query_rows::<NavWindowRow>(&sql, None).await)?;
+            if rows.is_empty() {
+                break;
+            }
+            let take = rows.len().min(usize::from(chunk));
+            let has_more_chunk = rows.len() > usize::from(chunk);
+            let inputs: Vec<ForwardInput> = rows
+                .iter()
+                .take(take)
+                .map(|row| ForwardInput {
+                    turn_index: row.turn_index,
+                    is_user_message: row.is_user_message != 0,
+                })
+                .collect();
+            let derived = derive_forward(anchor_state, &inputs);
+            for (row, der) in rows.into_iter().take(take).zip(derived.iter().copied()) {
+                if der.turn_seq > after_turn_seq {
+                    distinct_new.insert(der.turn_seq);
+                }
+                out.push((row, der));
+                // Once the `(limit + 1)`-th new turn has begun, every earlier new
+                // turn is complete (monotonic ordering); stop with that turn's
+                // first row present so `bucket_turns` still sees `limit + 1`
+                // buckets (has-more detection + the page's continuation anchor).
+                if distinct_new.len() > limit {
+                    break 'outer;
+                }
+            }
+            if let Some((last_row, last_der)) = out.last() {
+                anchor_state = *last_der;
+                after = Some(nav_row_to_anchor(last_row, last_der));
+            }
+            if !has_more_chunk {
                 break;
             }
         }
@@ -1047,7 +1151,12 @@ impl ClickHouseConversationRepository {
         }
         let limit = usize::from(limit.max(1));
 
-        let (start_after, start_derived, signals) = match self
+        let ResolvedContinuation {
+            start_after,
+            start_derived,
+            signals,
+            carried_header,
+        } = match self
             .canonical_resolve_continuation(session_id, after)
             .await?
         {
@@ -1056,13 +1165,34 @@ impl ClickHouseConversationRepository {
         };
         let after_turn_seq = start_derived.turn_seq;
 
-        let Some(header) = self.canonical_session_header(session_id).await? else {
-            return Ok(None);
+        // Page 1 (and any post-insert continuation) runs the single allowed
+        // session-wide header pass; a quiescent continuation reuses the carried
+        // page-1 header, so later pages do no session-sized scan (design §5.5).
+        let header = match carried_header {
+            Some(header) => header,
+            None => match self.canonical_session_header(session_id).await? {
+                Some(header) => header,
+                None => return Ok(None),
+            },
         };
 
-        let rows = self
-            .canonical_stream_navigation(session_id, start_after, start_derived)
-            .await?;
+        // Override-free sessions have `turn_seq` monotonic in tuple order, so the
+        // page reader early-stops after `K + 1` turns instead of sweeping the
+        // whole session; override-bearing sessions keep the full sweep so their
+        // non-contiguous stray recurrences still fold correctly (design §5.2.3).
+        let rows = if header.max_override == 0 {
+            self.canonical_stream_session_page(
+                session_id,
+                start_after,
+                start_derived,
+                after_turn_seq,
+                limit,
+            )
+            .await?
+        } else {
+            self.canonical_stream_navigation(session_id, start_after, start_derived)
+                .await?
+        };
         let turns = bucket_turns(rows, after_turn_seq);
 
         let has_more = turns.len() > limit;
@@ -1084,6 +1214,11 @@ impl ClickHouseConversationRepository {
             .map(|(_, bucket)| self.assemble_turn_compact(session_id, bucket, &summaries))
             .collect();
 
+        // Carry the header verbatim so the next quiescent page skips the
+        // session-wide header pass (design §5.5). The tool layer drops it if the
+        // encoded cursor would exceed OPEN_CURSOR_MAX_CHARS; the reader then
+        // recomputes.
+        let session_carry = has_more.then(|| encode_session_carry(&header)).flatten();
         let continuation = if has_more {
             page_turns
                 .last()
@@ -1092,6 +1227,7 @@ impl ClickHouseConversationRepository {
                     signals: signals.clone(),
                     after: nav_row_to_anchor(row, der),
                     after_turn_seq: der.turn_seq,
+                    session_carry: session_carry.clone(),
                 })
         } else {
             None
@@ -1131,11 +1267,11 @@ impl ClickHouseConversationRepository {
         }
         let limit = usize::from(limit.max(1));
 
-        let (_start_after, _start_derived, signals) = match self
+        let signals = match self
             .canonical_resolve_continuation(session_id, after.clone())
             .await?
         {
-            Some(resolved) => resolved,
+            Some(resolved) => resolved.signals,
             None => return Ok(Some(CanonicalReadOutcome::Reopen)),
         };
 
@@ -1206,6 +1342,7 @@ impl ClickHouseConversationRepository {
                 signals: signals.clone(),
                 after: nav_row_to_anchor(row, der),
                 after_turn_seq: turn_seq,
+                session_carry: None,
             })
         } else {
             None
@@ -1378,17 +1515,16 @@ impl ClickHouseConversationRepository {
         &self,
         session_id: &str,
         after: Option<CanonicalContinuation>,
-    ) -> RepoResult<
-        Option<(
-            Option<CanonicalReadAnchor>,
-            ForwardDerived,
-            CanonicalSessionSignals,
-        )>,
-    > {
+    ) -> RepoResult<Option<ResolvedContinuation>> {
         match after {
             None => {
                 let signals = self.canonical_read_signals(session_id).await?;
-                Ok(Some((None, zero_derived(), signals)))
+                Ok(Some(ResolvedContinuation {
+                    start_after: None,
+                    start_derived: zero_derived(),
+                    signals,
+                    carried_header: None,
+                }))
             }
             Some(cont) => {
                 let fresh = self.canonical_read_signals(session_id).await?;
@@ -1396,24 +1532,32 @@ impl ClickHouseConversationRepository {
                 match plan_continuation(&cont.signals, &fresh, fingerprint_matches) {
                     ContinuationStep::Reopen => Ok(None),
                     ContinuationStep::RunBoundaryGuard => {
+                        // Inserts landed: the header may have grown, so the
+                        // carried copy is NOT reused — the page recomputes it.
                         if self
                             .canonical_boundary_intact(session_id, &cont.after)
                             .await?
                         {
-                            Ok(Some((
-                                Some(cont.after.clone()),
-                                forward_from_anchor(&cont.after),
-                                fresh,
-                            )))
+                            Ok(Some(ResolvedContinuation {
+                                start_after: Some(cont.after.clone()),
+                                start_derived: forward_from_anchor(&cont.after),
+                                signals: fresh,
+                                carried_header: None,
+                            }))
                         } else {
                             Ok(None)
                         }
                     }
-                    ContinuationStep::Proceed => Ok(Some((
-                        Some(cont.after.clone()),
-                        forward_from_anchor(&cont.after),
-                        fresh,
-                    ))),
+                    // Quiescent (or unrelated global-revision move): the session
+                    // content is unchanged, so the page-1 header carried on the
+                    // cursor is reused verbatim — the reader runs no session-wide
+                    // totals/metadata/terminal scan on this page.
+                    ContinuationStep::Proceed => Ok(Some(ResolvedContinuation {
+                        start_after: Some(cont.after.clone()),
+                        start_derived: forward_from_anchor(&cont.after),
+                        signals: fresh,
+                        carried_header: decode_session_carry(cont.session_carry.as_deref()),
+                    })),
                 }
             }
         }
@@ -1716,6 +1860,85 @@ mod tests {
             plan_continuation(&cursor, &signals(7, 100, 1000, 2100, "fp-a"), true),
             ContinuationStep::Reopen
         );
+    }
+
+    // --- session carry / early-stop (design §5.5, WI-09 bound) -------------
+
+    fn sample_header(max_override: u32) -> CanonicalSessionHeader {
+        CanonicalSessionHeader {
+            metadata: SessionMetadata {
+                session_id: "session-a".to_string(),
+                first_event_time: "2026-07-20 12:00:00.000".to_string(),
+                first_event_unix_ms: 1_777_000_000_000,
+                last_event_time: "2026-07-20 12:30:00.000".to_string(),
+                last_event_unix_ms: 1_777_001_800_000,
+                total_turns: 5000,
+                total_events: 50_000,
+                user_messages: 5000,
+                assistant_messages: 5000,
+                tool_calls: 0,
+                tool_results: 0,
+                mode: ConversationMode::Chat,
+                first_event_uid: "e-0001".to_string(),
+                last_event_uid: "e-50000".to_string(),
+                last_actor_role: "assistant".to_string(),
+            },
+            max_override,
+            title: Some("Monster session".to_string()),
+            source: Some("fixture".to_string()),
+            harness: Some("codex".to_string()),
+            inference_provider: Some("openai".to_string()),
+            session_slug: None,
+            session_summary: Some("Monster session".to_string()),
+            completed: true,
+            terminal_event_uid: Some("e-50000".to_string()),
+        }
+    }
+
+    #[test]
+    fn session_carry_round_trips_through_the_cursor_string() {
+        let header = sample_header(0);
+        let encoded = encode_session_carry(&header).expect("carry encodes");
+        let decoded = decode_session_carry(Some(encoded.as_str())).expect("carry decodes");
+        // The reused header is byte-identical: page k+1 renders the same session
+        // fields as page 1 without a session-wide scan.
+        assert_eq!(decoded.metadata.session_id, header.metadata.session_id);
+        assert_eq!(decoded.metadata.total_turns, header.metadata.total_turns);
+        assert_eq!(decoded.max_override, header.max_override);
+        assert_eq!(decoded.title, header.title);
+        assert_eq!(decoded.completed, header.completed);
+        assert_eq!(decoded.terminal_event_uid, header.terminal_event_uid);
+    }
+
+    #[test]
+    fn malformed_or_absent_carry_falls_back_to_recompute() {
+        assert!(decode_session_carry(None).is_none());
+        assert!(decode_session_carry(Some("not json")).is_none());
+    }
+
+    #[test]
+    fn override_free_streams_keep_turn_seq_monotonic() {
+        // The early-stop path is only engaged for override-free sessions; there
+        // `turn_seq` is non-decreasing in tuple order, which is exactly what lets
+        // a `K + 1`-turn early stop equal the full-session bucketing.
+        let mut anchor = zero_derived();
+        let inputs: Vec<ForwardInput> = (0..200)
+            .map(|i| ForwardInput {
+                turn_index: 0,
+                is_user_message: i % 10 == 0,
+            })
+            .collect();
+        let mut last_turn = 0;
+        for input in &inputs {
+            let derived = derive_forward(anchor, std::slice::from_ref(input));
+            assert!(
+                derived[0].turn_seq >= last_turn,
+                "override-free turn_seq regressed: {} < {last_turn}",
+                derived[0].turn_seq
+            );
+            last_turn = derived[0].turn_seq;
+            anchor = derived[0];
+        }
     }
 
     // --- SQL shape ---------------------------------------------------------

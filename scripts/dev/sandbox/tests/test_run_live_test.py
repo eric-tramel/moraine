@@ -480,6 +480,44 @@ class RunLiveTestTests(unittest.TestCase):
             "envelope-spill", "live_envelope_spill_and_memory_ceiling"
         )
 
+    def test_canonical_open_parity_mode_runs_only_exact_ignored_function(self) -> None:
+        self.assert_exact_invocation(
+            "canonical-open-parity", "live_canonical_open_parity"
+        )
+
+    def test_canonical_open_locator_mode_runs_only_exact_ignored_function(self) -> None:
+        self.assert_exact_invocation(
+            "canonical-open-locator", "live_canonical_open_locator"
+        )
+
+    def test_canonical_open_continuation_mode_runs_only_exact_ignored_function(self) -> None:
+        self.assert_exact_invocation(
+            "canonical-open-continuation", "live_canonical_open_continuation"
+        )
+
+    def test_canonical_open_fence_mode_runs_only_exact_ignored_function(self) -> None:
+        self.assert_exact_invocation(
+            "canonical-open-fence", "live_canonical_open_fence"
+        )
+
+    def test_canonical_open_bench_mode_runs_only_exact_ignored_function(self) -> None:
+        # Pre-declared for WI-09; the test body lands later, the mode is wired now.
+        self.assert_exact_invocation(
+            "canonical-open-bench", "live_canonical_open_boundedness_benchmark"
+        )
+
+    def test_append_to_visible_mode_runs_only_exact_ignored_function(self) -> None:
+        # Pre-declared for WI-11.
+        self.assert_exact_invocation(
+            "append-to-visible", "live_canonical_open_append_to_visible"
+        )
+
+    def test_fsync_to_open_valid_mode_runs_only_exact_ignored_function(self) -> None:
+        # Pre-declared for WI-11.
+        self.assert_exact_invocation(
+            "fsync-to-open-valid", "live_canonical_open_fsync_to_open_valid"
+        )
+
     def test_missing_and_unknown_modes_fail_before_boot(self) -> None:
         missing = self.run_wrapper()
         unknown = self.run_wrapper("all-ignored")

@@ -6,6 +6,39 @@ content-free **canonical read indexes** (issue #598). This page is the operator
 reference for that reader: how to select it, how to inspect its readiness, and
 how to repair or roll it back.
 
+## Architecture overview
+
+The legacy `open` path served a full-content **projection** (`mcp_open_*`) that
+was rebuilt for every touched session after each ingest flush — turning a
+fixed-size append into work proportional to the whole prior session. The
+canonical reader retires that steady-state rebuild: canonical `events` rows are
+the content authority, and `open` reconstructs only the requested session (or
+turn, or event) on demand, one keyset page at a time.
+
+Two ideas make that cheap:
+
+- **Content-free read indexes (migration 036).** Three small index tables carry
+  only scalars — sort keys, kinds, identifiers, versions, and precomputed
+  boolean flags — never text, payloads, summaries, or turn bodies. They are
+  maintained incrementally by join-free materialized views on every `events`
+  insert block, so index maintenance is `O(new events)` and never rereads prior
+  history. `mcp_event_navigation` provides the session-ordered paging key,
+  `mcp_event_locator` provides an exact per-event seek, and
+  `mcp_session_directory` provides per-session discovery scalars.
+- **A page-aware reader.** `open` filters to the requested session and a pinned
+  live publication revision, reads narrow ordering/classification columns first,
+  derives event order, turns, summaries, and neighbors over that bounded set,
+  and only then hydrates the wide `text_content` / `payload_json` columns for the
+  events on the returned page. A fixed-size append never scans or rewrites prior
+  session content, and continuations reuse a cursor carry so a quiescent next
+  page touches only a directory point-read.
+
+The deterministic navigation sort key (`record_ts` parsed, or an epoch sentinel
+when it does not parse — never the unstable `ingested_at`) means a re-inserted
+or re-normalized event collapses to the same index row instead of producing a
+ghost, so cursor continuations can validate an anchor exactly. The full design
+rationale lives with issue #598; this page is the operator surface.
+
 ## What migration 036 installs
 
 `sql/036_canonical_read_indexes.sql` adds three content-free index tables and
@@ -33,6 +66,49 @@ Readiness lives in `mcp_read_index_state` under three keys:
 - `open_v2` — the one-way `open` cutover flag consumers read. `cursor` records
   how it was published: `auto-local` (the Local auto-gate) or `operator-promote`
   (the explicit command below).
+
+## Staged cutover status
+
+The canonical reader is landing one consumer at a time, not as a single
+cross-surface switch. As of this build:
+
+- **`open(session|turn|event)` is cut over.** When `open_reader` resolves to v2
+  (published and Local, or forced), the `open` tool family reads canonical rows
+  through the page-aware reader. This is a one-way flip per process.
+- **`list_sessions` and the monitor still read v1** (issue #599). Session
+  discovery and monitor session lists continue to authorize and read against the
+  `mcp_open_*` projection.
+- **Search still reads v1** (issue #597). Search ranking and result hydration
+  continue to use the projected read model.
+- **The v1 projector, its dirty-session materialized view, the janitor, and the
+  publication bridge keep running** as the compatibility reconciler. They keep
+  `mcp_open_*` current for the consumers still on v1 — and that is exactly what
+  makes a binary downgrade a safe full rollback for this whole change (see
+  [Rollback](#rollback)).
+
+Only after list/monitor (#599) and search (#597) have both cut over does a
+later, separate retirement change stop the projector and dirty writes and drop
+the compatibility tables. Until then, expect steady-state reads and writes
+against `mcp_open_*` from the not-yet-migrated consumers; they are not a sign
+the canonical `open` reader is inactive.
+
+## Append-to-visible latency contract
+
+For an active file-backed session on the reference host, a committed append
+becomes visible through the canonical `open` reader within **2 seconds at p95**,
+measured from ingest acknowledgement (the durable `events` insert) to the first
+valid `open` that reflects the appended event. This is the realtime contract the
+canonical reader must hold; the projector rebuild it replaces could stall this
+path under load.
+
+The gate is validated by the pre-wired live-test modes `append-to-visible`
+(`insert-ack → first-valid-open` p95 ≤ 2 s) and `fsync-to-open-valid`
+(end-to-end `fsync → first-valid-open`, reported alongside). Structured
+retry/reopen responses during an insert-only append fence count as
+not-yet-visible samples, never failures. Polled SQLite/NAC/Cursor sources retain
+their documented polling latency until their delta-scan follow-up lands. See
+[Testing and benchmarking](../development/testing.md) for how to run these
+modes.
 
 ## Selecting the reader: `[mcp] open_reader`
 

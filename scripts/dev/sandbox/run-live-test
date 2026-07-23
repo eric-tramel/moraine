@@ -35,6 +35,20 @@ Modes:
   envelope-shared-budget
                     Run live_envelope_shared_budget_and_statement_cap exactly.
   envelope-spill    Run live_envelope_spill_and_memory_ceiling exactly.
+  canonical-open-parity
+                    Run live_canonical_open_parity exactly.
+  canonical-open-locator
+                    Run live_canonical_open_locator exactly.
+  canonical-open-continuation
+                    Run live_canonical_open_continuation exactly.
+  canonical-open-fence
+                    Run live_canonical_open_fence exactly.
+  canonical-open-bench
+                    Run live_canonical_open_boundedness_benchmark exactly (WI-09).
+  append-to-visible
+                    Run live_canonical_open_append_to_visible exactly (WI-11).
+  fsync-to-open-valid
+                    Run live_canonical_open_fsync_to_open_valid exactly (WI-11).
 
 Each invocation creates and owns a fresh sandbox, enables destructive tests
 only for the in-container Cargo process, retains a diagnostic log, and tears
@@ -68,6 +82,31 @@ case "$1" in
         ;;
     envelope-spill)
         test_function="live_envelope_spill_and_memory_ceiling"
+        ;;
+    canonical-open-parity)
+        test_function="live_canonical_open_parity"
+        ;;
+    canonical-open-locator)
+        test_function="live_canonical_open_locator"
+        ;;
+    canonical-open-continuation)
+        test_function="live_canonical_open_continuation"
+        ;;
+    canonical-open-fence)
+        test_function="live_canonical_open_fence"
+        ;;
+    canonical-open-bench)
+        # WI-09 populates this test body (canonical_open_benchmark.rs); the mode
+        # arm is pre-declared here so that phase never edits this dispatcher.
+        test_function="live_canonical_open_boundedness_benchmark"
+        ;;
+    append-to-visible)
+        # WI-11 populates this test body; pre-declared mode arm.
+        test_function="live_canonical_open_append_to_visible"
+        ;;
+    fsync-to-open-valid)
+        # WI-11 populates this test body; pre-declared mode arm.
+        test_function="live_canonical_open_fsync_to_open_valid"
         ;;
     -h|--help)
         usage

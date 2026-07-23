@@ -301,6 +301,15 @@ protocol_version = "2024-11-05"
 # is rejected immediately with a structured retryable error.
 # max_parallel_requests = 16
 
+# Which repository reader backs the open(session|turn|event) tool family
+# (issue #598). "auto" (default) uses the canonical page-aware v2 reader once
+# migration 036's read indexes are published on the default Local backend, and
+# otherwise the legacy v1 projected reader. "v1" forces the legacy reader (the
+# non-silent kill-switch, shown in `moraine status`/`moraine db doctor`); "v2"
+# forces the canonical reader and fails typed when its indexes are not ready.
+# See docs/operations/canonical-read-indexes.md.
+open_reader = "auto"
+
 
 # Prefer the shared central MCP server when running "moraine run mcp". If the
 # socket is unavailable, Moraine falls back to an embedded stdio server.

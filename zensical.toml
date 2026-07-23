@@ -16,6 +16,9 @@ nav = [
   { "Monitor HTTP API" = "monitor-http-api.md" },
   { "Remote ClickHouse" = "remote-clickhouse.md" },
   { "Analytics Export" = "export.md" },
+  { "Operations" = [
+    { "Canonical Read Indexes" = "operations/canonical-read-indexes.md" },
+  ] },
   { "Agent MCP Search" = [
     { "Overview" = "agent-mcp-search/index.md" },
     { "Install by Harness" = "agent-mcp-search/install.md" },

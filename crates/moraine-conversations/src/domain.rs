@@ -527,6 +527,15 @@ pub struct CanonicalContinuation {
     /// The `turn_seq` of the last fully served turn (session pages) or the turn
     /// being paged (turn pages); `0` for event reads.
     pub after_turn_seq: u32,
+    /// The carried session header (design §5.5 / §6 `SessionCarry`), JSON-encoded
+    /// so a quiescent `open(session)` continuation reuses the page-1 header
+    /// instead of re-running the session-wide totals/metadata/terminal scans on
+    /// every page — the difference between output-sized paging and an O(E_s)
+    /// per-page rescan the WI-09 boundedness benchmark forbids. Absent on turn /
+    /// event continuations and whenever the tool layer drops it to keep the
+    /// encoded cursor under `OPEN_CURSOR_MAX_CHARS` (the reader then recomputes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_carry: Option<String>,
 }
 
 /// The page-in continuation a caller passes to resume a traversal (the decoded
