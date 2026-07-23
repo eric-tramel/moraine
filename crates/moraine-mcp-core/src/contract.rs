@@ -1,4 +1,5 @@
 use chrono::DateTime;
+use moraine_conversations::CanonicalContinuation;
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{json, Value};
 use std::fmt;
@@ -841,6 +842,94 @@ pub fn decode_open_cursor(token: &str) -> ContractResult<OpenCursor> {
     })?;
     serde_json::from_slice(&bytes)
         .map_err(|_| invalid_request_with_field("cursor", "cursor is malformed; reopen the target"))
+}
+
+// --- issue-598 v2 canonical `open` continuation cursor (WI-07) --------------
+
+/// The cursor wire version the v2 canonical `open` reader mints (design §6).
+/// Legacy tokens carry `version == 1` and are handled by the v1 paging module;
+/// the version-tolerant [`classify_open_cursor`] recognizes both.
+pub const OPEN_CURSOR_V2_VERSION: u8 = 2;
+
+/// The message a legacy v1 continuation token yields on the v2 path, and the
+/// text the v2 reader uses for a repository-signalled staleness reopen (design
+/// §6, reusing the v1 stale-cursor wording, open_v1.rs).
+pub const OPEN_CURSOR_STALE_REOPEN_MESSAGE: &str =
+    "cursor snapshot is stale; reopen the target to restart expansion";
+
+/// The tool-facing continuation cursor for the v2 canonical `open` reader.
+///
+/// It is a serialized projection of a repository [`CanonicalContinuation`] (the
+/// pinned publication revision, the session's cheap change signals, and the
+/// full ordering-tuple anchor plus derived state) alongside the target id and
+/// page size. Page `k + 1` decodes it and hands the embedded continuation
+/// straight back to the repository reader, which derives forward from the
+/// anchor with no prefix rescan (design D1, §5.3/§6). The repository never
+/// encodes or decodes this wire token — the tool layer owns the base64
+/// envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenCursorV2 {
+    pub version: u8,
+    pub target_id: String,
+    pub limit: u16,
+    pub continuation: CanonicalContinuation,
+}
+
+/// The outcome of classifying an opaque `open` continuation token by its wire
+/// version, without committing to a full v2 decode (design §6, R7). The
+/// version-tolerant decode lets a post-flip reader recognize a legacy v1 token
+/// and return deterministic stale-reopen guidance instead of a misleading
+/// "malformed" error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenCursorClassified {
+    /// A legacy v1 cursor (`version == 1`). The caller maps this to the
+    /// structured stale-reopen response.
+    V1Legacy,
+    /// A decoded v2 cursor (boxed to keep the enum small).
+    V2(Box<OpenCursorV2>),
+}
+
+#[derive(Deserialize)]
+struct CursorVersionPeek {
+    version: u8,
+}
+
+/// Encode a v2 continuation cursor as a padding-free base64url token.
+pub fn encode_open_cursor_v2(cursor: &OpenCursorV2) -> ContractResult<String> {
+    let bytes = serde_json::to_vec(cursor).map_err(|error| {
+        invalid_request_with_field("cursor", format!("failed to encode cursor: {error}"))
+    })?;
+    Ok(encode_base64_url_no_pad(&bytes))
+}
+
+/// Version-tolerant decode of an opaque `open` continuation token (design §6).
+///
+/// The token's `{version}` is read first, in isolation: `1` classifies as a
+/// legacy v1 cursor (the caller reopens deterministically), `2` fully decodes
+/// the v2 cursor, and any other version — or an undecodable envelope — is a
+/// malformed-cursor error. A foreign or truncated token never panics.
+pub fn classify_open_cursor(token: &str) -> ContractResult<OpenCursorClassified> {
+    if token.len() > OPEN_CURSOR_MAX_CHARS {
+        return Err(invalid_request_with_field(
+            "cursor",
+            format!("cursor must be at most {OPEN_CURSOR_MAX_CHARS} characters"),
+        ));
+    }
+    let bytes = decode_base64_url_no_pad(token).map_err(|_| cursor_malformed())?;
+    let peek: CursorVersionPeek = serde_json::from_slice(&bytes).map_err(|_| cursor_malformed())?;
+    match peek.version {
+        1 => Ok(OpenCursorClassified::V1Legacy),
+        v if v == OPEN_CURSOR_V2_VERSION => {
+            let cursor: OpenCursorV2 =
+                serde_json::from_slice(&bytes).map_err(|_| cursor_malformed())?;
+            Ok(OpenCursorClassified::V2(Box::new(cursor)))
+        }
+        _ => Err(cursor_malformed()),
+    }
+}
+
+fn cursor_malformed() -> ContractError {
+    invalid_request_with_field("cursor", "cursor is malformed; reopen the target")
 }
 
 /// How far `file_attention` widens its search.
@@ -1910,6 +1999,92 @@ mod tests {
         assert!(!encoded.contains('='));
         assert_eq!(decode_open_cursor(&encoded).expect("decode cursor"), cursor);
         assert!(decode_open_cursor("not+url-safe").is_err());
+    }
+
+    fn sample_continuation() -> CanonicalContinuation {
+        use moraine_conversations::{CanonicalReadAnchor, CanonicalSessionSignals};
+        CanonicalContinuation {
+            signals: CanonicalSessionSignals {
+                pinned_revision: 77,
+                heads_fingerprint: "a".repeat(64),
+                observed_sum: 128,
+                min_bound_ms: 1_777_000_000_000,
+                max_bound_ms: 1_777_000_500_000,
+            },
+            after: CanonicalReadAnchor {
+                sort_time_ms: 1_777_000_400_000,
+                source_host: "host-1".to_string(),
+                source_file: "codex/session.jsonl".to_string(),
+                source_generation: 3,
+                source_offset: 4096,
+                source_line_no: 210,
+                event_uid: "event-210".to_string(),
+                event_order: 210,
+                turn_seq: 12,
+                prefix_user_message_count: 12,
+                event_ordinal: 4,
+            },
+            after_turn_seq: 12,
+        }
+    }
+
+    #[test]
+    fn open_cursor_v2_round_trips_and_is_version_tolerant() {
+        let cursor = OpenCursorV2 {
+            version: OPEN_CURSOR_V2_VERSION,
+            target_id: McpTurnId::from_raw_session_id_and_turn_seq("sess-1", 12)
+                .unwrap()
+                .to_string(),
+            limit: 25,
+            continuation: sample_continuation(),
+        };
+        let encoded = encode_open_cursor_v2(&cursor).expect("encode v2 cursor");
+        assert!(!encoded.contains('='));
+        assert_eq!(
+            classify_open_cursor(&encoded).expect("classify v2 cursor"),
+            OpenCursorClassified::V2(Box::new(cursor))
+        );
+    }
+
+    #[test]
+    fn classify_open_cursor_reopens_legacy_v1_tokens() {
+        // A post-flip reader must recognize a legacy v1 token and route it to
+        // the deterministic stale-reopen response, never a "malformed" error.
+        let v1_token = encode_open_cursor(&OpenCursor {
+            version: 1,
+            target_id: McpTurnId::from_raw_session_id_and_turn_seq("sess-1", 7)
+                .unwrap()
+                .to_string(),
+            limit: 5,
+            snapshot_slot: 1,
+            snapshot_generation: 42,
+            after: OpenCursorAfter::Event {
+                event_order: 9,
+                event_uid: "event-9".to_string(),
+            },
+        })
+        .expect("encode v1 cursor");
+        assert_eq!(
+            classify_open_cursor(&v1_token).expect("classify v1 token"),
+            OpenCursorClassified::V1Legacy
+        );
+    }
+
+    #[test]
+    fn classify_open_cursor_rejects_unknown_versions_and_garbage() {
+        let unknown_version =
+            encode_base64_url_no_pad(&serde_json::to_vec(&json!({ "version": 9 })).unwrap());
+        let unknown = classify_open_cursor(&unknown_version).expect_err("unknown version");
+        assert_eq!(unknown.code(), ToolErrorCode::InvalidRequest);
+        assert!(unknown.message().contains("malformed"));
+
+        let garbage = classify_open_cursor("not+url-safe").expect_err("garbage token");
+        assert_eq!(garbage.code(), ToolErrorCode::InvalidRequest);
+        assert!(garbage.message().contains("malformed"));
+
+        let oversized = "A".repeat(OPEN_CURSOR_MAX_CHARS + 1);
+        let too_long = classify_open_cursor(&oversized).expect_err("oversized token");
+        assert_eq!(too_long.code(), ToolErrorCode::InvalidRequest);
     }
 
     #[test]

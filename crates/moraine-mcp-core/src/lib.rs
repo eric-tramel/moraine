@@ -4,6 +4,7 @@ pub mod contract;
 mod file_attention_v1;
 mod list_sessions_v1;
 mod open_v1;
+mod open_v2;
 mod private_proxy;
 mod search_sessions_v1;
 

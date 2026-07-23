@@ -16,8 +16,9 @@ pub mod envelope;
 mod mcp_open_projection;
 pub use canonical_indexes::{
     CoreIndexAuditOutcome, CoreIndexBackfillOutcome, CoreIndexBackfillProgress, CoreIndexCursor,
-    ReadIndexState, BACKFILL_PAGE_SIZE, OPEN_V2_PROVENANCE_AUTO_LOCAL, PAGE_STATEMENT_CAP,
-    STATE_KEY_CORE_AUDIT, STATE_KEY_CORE_INDEXES, STATE_KEY_OPEN_V2,
+    OpenV2PromotionOutcome, ReadIndexState, BACKFILL_PAGE_SIZE, OPEN_V2_PROVENANCE_AUTO_LOCAL,
+    OPEN_V2_PROVENANCE_OPERATOR_PROMOTE, PAGE_STATEMENT_CAP, STATE_KEY_CORE_AUDIT,
+    STATE_KEY_CORE_INDEXES, STATE_KEY_OPEN_V2,
 };
 pub use envelope::{
     batch_statement_cap, budget_telemetry, envelope_error_kind, kill_query_prefix,

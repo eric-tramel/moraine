@@ -54,8 +54,21 @@ pub const STATE_KEY_CORE_AUDIT: &str = "core_audit";
 pub const STATE_KEY_OPEN_V2: &str = "open_v2";
 
 /// Provenance recorded in `open_v2.cursor` when readiness is auto-published on
-/// the Local backend (contrast the operator `promote` provenance in WI-05).
+/// the Local backend (contrast the operator `promote` provenance below).
 pub const OPEN_V2_PROVENANCE_AUTO_LOCAL: &str = "auto-local";
+
+/// Provenance recorded in `open_v2.cursor` when readiness is published by the
+/// explicit operator `moraine db core-index promote` command (BINDING D3): the
+/// non-Local path for a Shared/multi-writer backend, or a re-promotion after a
+/// rebuild.
+pub const OPEN_V2_PROVENANCE_OPERATOR_PROMOTE: &str = "operator-promote";
+
+/// The three migration-036 index tables truncated by a `core-index rebuild`.
+const CANONICAL_INDEX_TABLES: [&str; 3] = [
+    "mcp_session_directory",
+    "mcp_event_locator",
+    "mcp_event_navigation",
+];
 
 /// Events swept per page. Each page reads at most `~PAGE_SIZE` rows per
 /// statement (asserted per-page in the live tests, C2-R1); the durable cursor
@@ -226,6 +239,19 @@ pub enum CoreIndexBackfillProgress {
     Published { core_indexes: bool, open_v2: bool },
     /// Nothing to do: the sweep was already complete on entry.
     AlreadyComplete,
+}
+
+/// Result of an operator `open_v2` promotion attempt (WI-05).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OpenV2PromotionOutcome {
+    /// The coverage sweep is complete (`core_indexes.ready == 1`).
+    pub core_indexes_ready: bool,
+    /// The persisted overlap audit passed.
+    pub audit_passed: bool,
+    /// `open_v2.ready` was already 1 before this call (idempotent no-op).
+    pub already_promoted: bool,
+    /// This call published `open_v2.ready = 1` with the operator provenance.
+    pub promoted: bool,
 }
 
 /// A materialized `mcp_read_index_state` row.
@@ -523,6 +549,90 @@ impl ClickHouseClient {
         let outcome = serde_json::from_str(&state.cursor)
             .context("failed to decode persisted core-index audit outcome")?;
         Ok(Some(outcome))
+    }
+
+    /// Explicit operator promotion of the one-way `open_v2` reader flag (WI-05,
+    /// BINDING D3). This is the sanctioned path for a Shared/multi-writer
+    /// backend — where the Local auto-gate deliberately withholds `open_v2` —
+    /// and for re-promotion after a `rebuild`.
+    ///
+    /// Promotion is only published when the coverage sweep is complete
+    /// (`core_indexes.ready == 1`) AND the persisted overlap audit passed; the
+    /// reader must never be switched onto an unaudited index. When those
+    /// preconditions are not met the returned outcome reports them and nothing
+    /// is written. Already-promoted is an idempotent success. The caller is
+    /// responsible for the operator confirmation that every consumer is
+    /// v2-capable before invoking this (a Shared promotion switches ALL readers).
+    ///
+    /// Assumes an active query envelope (the caller scopes it).
+    pub async fn promote_open_v2_reader(&self) -> Result<OpenV2PromotionOutcome> {
+        let mut outcome = OpenV2PromotionOutcome {
+            core_indexes_ready: self.canonical_read_indexes_ready().await?,
+            audit_passed: self
+                .core_index_audit_outcome()
+                .await?
+                .is_some_and(|audit| audit.passed),
+            already_promoted: self.open_v2_reader_ready().await?,
+            promoted: false,
+        };
+
+        if outcome.already_promoted {
+            return Ok(outcome);
+        }
+        if !outcome.core_indexes_ready || !outcome.audit_passed {
+            // Preconditions unmet: leave open_v2 at 0, report why.
+            return Ok(outcome);
+        }
+
+        self.write_index_state(STATE_KEY_OPEN_V2, true, OPEN_V2_PROVENANCE_OPERATOR_PROMOTE)
+            .await?;
+        outcome.promoted = true;
+        Ok(outcome)
+    }
+
+    /// Reset the migration-036 canonical read indexes to a pre-backfill state
+    /// (WI-05 `core-index rebuild`): truncate the three index tables and reset
+    /// the `core_indexes`, `core_audit`, and `open_v2` readiness rows to
+    /// `ready = 0` with an empty cursor. A subsequent
+    /// [`Self::backfill_canonical_read_indexes`] then re-sweeps from scratch.
+    ///
+    /// Truncation uses `IF EXISTS` so an operator can safely run it against a
+    /// database that has not applied migration 036 yet. Assumes an active query
+    /// envelope.
+    pub async fn reset_canonical_read_indexes(&self) -> Result<()> {
+        for table in CANONICAL_INDEX_TABLES {
+            self.truncate_index_table(table).await?;
+        }
+        // Zero every readiness row so the reader never sees a stale ready=1
+        // while the freshly-truncated indexes are empty. The RMT(generation)
+        // engine keeps the newest write, so these zeros win until the rerun
+        // republishes.
+        for state_key in [
+            STATE_KEY_CORE_INDEXES,
+            STATE_KEY_CORE_AUDIT,
+            STATE_KEY_OPEN_V2,
+        ] {
+            self.write_index_state(state_key, false, "").await?;
+        }
+        Ok(())
+    }
+
+    async fn truncate_index_table(&self, table: &str) -> Result<()> {
+        let statement = format!(
+            "TRUNCATE TABLE IF EXISTS {db}.{table}",
+            db = escape_identifier(&self.cfg.database),
+            table = escape_identifier(table),
+        );
+        self.mutation_request_text_with_params_and_timeout(
+            &statement,
+            None,
+            Some(&self.cfg.database),
+            &[],
+            Some(migration_request_timeout(self.cfg.timeout_seconds)),
+        )
+        .await
+        .with_context(|| format!("failed to truncate {table} during core-index rebuild"))?;
+        Ok(())
     }
 
     /// Sweep one page under the active per-page envelope. Returns `None` when no
