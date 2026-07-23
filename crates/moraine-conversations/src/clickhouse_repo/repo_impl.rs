@@ -180,6 +180,63 @@ impl ConversationRepository for ClickHouseConversationRepository {
         .await
     }
 
+    async fn canonical_open_session_page(
+        &self,
+        session_id: &str,
+        limit: u16,
+        after: Option<CanonicalContinuation>,
+    ) -> RepoResult<Option<CanonicalReadOutcome<CanonicalSessionPage>>> {
+        // The issue-598 v2 reader runs as an `AnchoredSession` read so an
+        // insert-only append fence overlapping the target session does not
+        // bounce it (design §5.1, D9).
+        self.run_publication_consistent_scoped(
+            PublicationReadClass::AnchoredSession,
+            PublicationReadScope::session(session_id),
+            || self.canonical_open_session_page_impl(session_id, limit, after.clone()),
+        )
+        .await
+    }
+
+    async fn canonical_open_turn_page(
+        &self,
+        session_id: &str,
+        turn_seq: u32,
+        limit: u16,
+        include_events: bool,
+        after: Option<CanonicalContinuation>,
+    ) -> RepoResult<Option<CanonicalReadOutcome<CanonicalTurnPage>>> {
+        self.run_publication_consistent_scoped(
+            PublicationReadClass::AnchoredSession,
+            PublicationReadScope::session(session_id),
+            || {
+                self.canonical_open_turn_page_impl(
+                    session_id,
+                    turn_seq,
+                    limit,
+                    include_events,
+                    after.clone(),
+                )
+            },
+        )
+        .await
+    }
+
+    async fn canonical_open_event(&self, event_uid: &str) -> RepoResult<Option<McpEventOpen>> {
+        // Event opens widen their scope from the event to its resolved session
+        // once the locator has identified it (mirrors `get_mcp_event`).
+        self.run_publication_consistent_scoped_with_result_scope(
+            PublicationReadClass::AnchoredSession,
+            PublicationReadScope::event(event_uid),
+            |result: &Option<McpEventOpen>| {
+                result
+                    .as_ref()
+                    .map(|event| PublicationReadScope::session(&event.event.session_id))
+            },
+            || self.canonical_open_event_impl(event_uid),
+        )
+        .await
+    }
+
     async fn get_mcp_event(&self, event_uid: &str) -> RepoResult<Option<McpEventOpen>> {
         self.run_publication_consistent_scoped_with_result_scope(
             PublicationReadClass::Strict,

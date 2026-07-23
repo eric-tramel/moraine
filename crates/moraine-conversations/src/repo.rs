@@ -6,6 +6,7 @@ use crate::domain::{
     TableSummaries, WebSearchEvent,
 };
 use crate::domain::{
+    CanonicalContinuation, CanonicalReadOutcome, CanonicalSessionPage, CanonicalTurnPage,
     Conversation, ConversationDetailOptions, ConversationListFilter, ConversationSearchQuery,
     ConversationSearchResults, FileAttentionQuery, FileAttentionTouch, McpEventOpen,
     McpSessionListFilter, McpSessionListItem, McpSessionOpen, McpTurnOpen, OpenContext,
@@ -14,7 +15,7 @@ use crate::domain::{
     SessionMetadataSearchQuery, SessionMetadataSearchResults, TraceEvent, Turn, TurnListFilter,
     TurnSummary,
 };
-use crate::error::RepoResult;
+use crate::error::{RepoError, RepoResult};
 
 #[async_trait]
 pub trait ConversationRepository: Send + Sync {
@@ -118,4 +119,50 @@ pub trait ConversationRepository: Send + Sync {
     ) -> RepoResult<Vec<FileAttentionTouch>>;
 
     async fn cancel_query(&self, query_id: &str) -> RepoResult<()>;
+
+    // --- issue-598 v2 canonical `open` reader (WI-06) ----------------------
+    //
+    // Page-in / page-out entry points the tool-facing `open_v2` module (WI-07)
+    // consumes. They are NOT yet on the `open` dispatch path — WI-08 performs
+    // the one-way flip and, for the backend router, the delegation to the inner
+    // repository. The default here fails typed so a backend that has not
+    // implemented the reader (in-memory, or an unwired router) never silently
+    // returns an empty page.
+
+    /// One keyset page of an `open(session)` traversal from live canonical rows.
+    async fn canonical_open_session_page(
+        &self,
+        session_id: &str,
+        limit: u16,
+        after: Option<CanonicalContinuation>,
+    ) -> RepoResult<Option<CanonicalReadOutcome<CanonicalSessionPage>>> {
+        let _ = (session_id, limit, after);
+        Err(RepoError::backend(
+            "canonical v2 open reader is not available on this repository",
+        ))
+    }
+
+    /// One keyset page of an `open(turn)` traversal from live canonical rows.
+    async fn canonical_open_turn_page(
+        &self,
+        session_id: &str,
+        turn_seq: u32,
+        limit: u16,
+        include_events: bool,
+        after: Option<CanonicalContinuation>,
+    ) -> RepoResult<Option<CanonicalReadOutcome<CanonicalTurnPage>>> {
+        let _ = (session_id, turn_seq, limit, include_events, after);
+        Err(RepoError::backend(
+            "canonical v2 open reader is not available on this repository",
+        ))
+    }
+
+    /// `open(event)` reconstructed from the locator seek plus the shared
+    /// session reader.
+    async fn canonical_open_event(&self, event_uid: &str) -> RepoResult<Option<McpEventOpen>> {
+        let _ = event_uid;
+        Err(RepoError::backend(
+            "canonical v2 open reader is not available on this repository",
+        ))
+    }
 }

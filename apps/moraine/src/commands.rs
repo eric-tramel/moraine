@@ -8,8 +8,8 @@ mod up;
 
 use anyhow::{bail, Context, Result};
 use moraine_clickhouse::{
-    ClickHouseClient, DoctorReport, MigrationProgress, PublicationDiagnostics, QueryClass,
-    QueryEnvelope,
+    ClickHouseClient, CoreIndexBackfillProgress, DoctorReport, MigrationProgress,
+    PublicationDiagnostics, QueryClass, QueryEnvelope,
 };
 use moraine_config::{AppConfig, QueryBudgetsConfig, ValidatedQueryBudgets};
 use moraine_conversations::{ClickHouseConversationRepository, RepoConfig};
@@ -223,9 +223,18 @@ pub(crate) fn query_budgets(cfg: &AppConfig) -> ValidatedQueryBudgets {
 pub(super) enum DatabaseProgress {
     Migration(MigrationProgress),
     ReconciliationInspecting,
-    ReconciliationStarted { historical: bool },
-    ReconciliationAdvanced { processed: usize },
-    ReconciliationFinished { processed: usize },
+    ReconciliationStarted {
+        historical: bool,
+    },
+    ReconciliationAdvanced {
+        processed: usize,
+    },
+    ReconciliationFinished {
+        processed: usize,
+    },
+    /// Canonical read-index (issue #598) backfill progress. Runs after and
+    /// outside the v1 read-model backfill.
+    CoreIndex(CoreIndexBackfillProgress),
 }
 
 async fn migrate_database_with_progress<F>(
@@ -266,9 +275,32 @@ where
             .await
             .context("failed to backfill MCP open read model")?;
             on_progress(DatabaseProgress::ReconciliationFinished { processed });
-            Ok(MigrationOutcome { applied })
+            Ok::<_, anyhow::Error>(())
         })
-        .await
+        .await?;
+
+    // Issue #598 WI-03: sweep the pre-existing corpus into the migration-036
+    // canonical read indexes, then audit + publish readiness. This is sequenced
+    // AFTER and OUTSIDE the v1 backfill envelope above (BINDING D5): the sweep
+    // scopes its OWN Migration-class batch envelope per page rather than sharing
+    // one envelope whose deadline would cap the sum of every page's time.
+    //
+    // The migrate/up path only ever targets the default single-owner local
+    // backend (config: the default backend is "the only backend moraine
+    // migrates"), so the publication mode is Local and open_v2 may auto-publish
+    // (BINDING D3). The predicate is threaded explicitly so a future
+    // shared-target migrate path cannot silently flip the consumer flag.
+    let publication_mode_is_local = true;
+    ch.backfill_canonical_read_indexes(
+        publication_mode_is_local,
+        &budgets.migration,
+        &budgets.administrative,
+        |event| on_progress(DatabaseProgress::CoreIndex(event)),
+    )
+    .await
+    .context("failed to backfill canonical read indexes")?;
+
+    Ok(MigrationOutcome { applied })
 }
 
 pub(super) async fn migrate_database_for_up<F>(
@@ -306,6 +338,39 @@ async fn cmd_db_migrate(cfg: &AppConfig) -> Result<MigrationOutcome> {
                 eprintln!("MCP open read model ready.");
             }
         }
+        DatabaseProgress::CoreIndex(event) => match event {
+            CoreIndexBackfillProgress::Starting { resuming } => {
+                eprintln!(
+                    "Building canonical read indexes (issue #598){}.",
+                    if resuming { ", resuming" } else { "" }
+                );
+            }
+            CoreIndexBackfillProgress::PageIndexed {
+                pages,
+                events_indexed,
+            } => {
+                eprintln!("  swept {pages} pages ({events_indexed} events)");
+            }
+            CoreIndexBackfillProgress::Auditing => {
+                eprintln!("  auditing canonical read-index coverage");
+            }
+            CoreIndexBackfillProgress::Published {
+                core_indexes,
+                open_v2,
+            } => {
+                if core_indexes {
+                    eprintln!(
+                        "Canonical read indexes ready (open v2 reader: {}).",
+                        if open_v2 { "published" } else { "unpublished" }
+                    );
+                } else {
+                    eprintln!(
+                        "Canonical read indexes installed but not published (overlap audit did not pass)."
+                    );
+                }
+            }
+            CoreIndexBackfillProgress::AlreadyComplete => {}
+        },
     })
     .await
 }

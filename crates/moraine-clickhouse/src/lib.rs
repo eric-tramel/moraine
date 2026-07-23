@@ -11,8 +11,14 @@ use serde_json::Value;
 use std::io::Write;
 
 pub mod canonical_derivations;
+mod canonical_indexes;
 pub mod envelope;
 mod mcp_open_projection;
+pub use canonical_indexes::{
+    CoreIndexAuditOutcome, CoreIndexBackfillOutcome, CoreIndexBackfillProgress, CoreIndexCursor,
+    ReadIndexState, BACKFILL_PAGE_SIZE, OPEN_V2_PROVENANCE_AUTO_LOCAL, PAGE_STATEMENT_CAP,
+    STATE_KEY_CORE_AUDIT, STATE_KEY_CORE_INDEXES, STATE_KEY_OPEN_V2,
+};
 pub use envelope::{
     batch_statement_cap, budget_telemetry, envelope_error_kind, kill_query_prefix,
     record_budget_rejection, record_budget_request, unenveloped_statement_count, AllowanceResource,

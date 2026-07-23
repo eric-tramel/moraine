@@ -78,17 +78,18 @@ use crate::cursor::{
 };
 use crate::domain::{
     is_user_facing_content_event, AnalyticsConcurrencyPoint, AnalyticsRange, AnalyticsSnapshot,
-    AnalyticsTokenPoint, AnalyticsTurnPoint, AnalyticsWindow, Conversation,
-    ConversationDetailOptions, ConversationListFilter, ConversationListSort, ConversationMode,
-    ConversationSearchHit, ConversationSearchQuery, ConversationSearchResults,
-    ConversationSearchStats, ConversationSummary, FileAttentionQuery, FileAttentionTouch,
-    McpEventOpen, McpEventRef, McpEventSummary, McpEventType, McpSessionListFilter,
-    McpSessionListItem, McpSessionOpen, McpTurnCompact, McpTurnOpen, McpTurnRef, OpenContext,
-    OpenEvent, OpenEventRequest, Page, PageRequest, RepoConfig, SearchEventHit, SearchEventKind,
-    SearchEventsQuery, SearchEventsResult, SearchEventsStats, SearchMcpEventHit,
-    SearchMcpEventsQuery, SearchMcpEventsResult, SearchMcpEventsStats, SearchStrategyHint,
-    SessionAnalytics, SessionAnalyticsQuery, SessionEventsDirection, SessionEventsQuery,
-    SessionMetadata, SessionMetadataSearchHit, SessionMetadataSearchQuery,
+    AnalyticsTokenPoint, AnalyticsTurnPoint, AnalyticsWindow, CanonicalContinuation,
+    CanonicalReadAnchor, CanonicalReadOutcome, CanonicalSessionPage, CanonicalSessionSignals,
+    CanonicalTurnPage, Conversation, ConversationDetailOptions, ConversationListFilter,
+    ConversationListSort, ConversationMode, ConversationSearchHit, ConversationSearchQuery,
+    ConversationSearchResults, ConversationSearchStats, ConversationSummary, FileAttentionQuery,
+    FileAttentionTouch, McpEventOpen, McpEventRef, McpEventSummary, McpEventType,
+    McpSessionListFilter, McpSessionListItem, McpSessionOpen, McpTurnCompact, McpTurnOpen,
+    McpTurnRef, OpenContext, OpenEvent, OpenEventRequest, Page, PageRequest, RepoConfig,
+    SearchEventHit, SearchEventKind, SearchEventsQuery, SearchEventsResult, SearchEventsStats,
+    SearchMcpEventHit, SearchMcpEventsQuery, SearchMcpEventsResult, SearchMcpEventsStats,
+    SearchStrategyHint, SessionAnalytics, SessionAnalyticsQuery, SessionEventsDirection,
+    SessionEventsQuery, SessionMetadata, SessionMetadataSearchHit, SessionMetadataSearchQuery,
     SessionMetadataSearchResults, SessionMetadataSearchStats, SessionOriginScope, SessionStep,
     SessionTurn, ToolResult, TraceEvent, Turn, TurnListFilter, TurnSummary, WebSearchEvent,
 };
@@ -97,6 +98,7 @@ use crate::repo::ConversationRepository;
 
 mod analytics;
 mod cache;
+mod canonical_open;
 mod consistency;
 mod file_attention;
 mod helpers;
