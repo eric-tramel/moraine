@@ -6,21 +6,13 @@ impl ClickHouseConversationRepository {
     }
 
     pub(super) fn mode_aggregate_sql() -> String {
-        let mcp_name_predicate = moraine_clickhouse::mcp_tool_names::sql_predicate("tool_name");
-        format!(
-            "multiIf(
-    countIf(
-      payload_type = 'web_search_call'
-      OR payload_type = 'search_results_received'
-      OR (payload_type = 'tool_use' AND tool_name IN ('WebSearch', 'WebFetch'))
-    ) > 0,
-    'web_search',
-    countIf(source_name = 'codex-mcp' OR {mcp_name_predicate}) > 0,
-    'mcp_internal',
-    countIf(event_kind IN ('tool_call', 'tool_result') OR payload_type = 'tool_use') > 0,
-    'tool_calling',
-    'chat'
-  )"
+        // Shared authority: the presence-ranked session-mode multiIf lives in
+        // `moraine_clickhouse::canonical_derivations` so the list/search path,
+        // the `mcp_open_*` projector header, and the 036 directory `mode_hint`
+        // agree on mode. This consumer reads the physical `events` columns
+        // (`tool_name`/`event_kind`), unlike the projector's aliased set.
+        moraine_clickhouse::canonical_derivations::mode_aggregate_expr(
+            moraine_clickhouse::canonical_derivations::DerivationColumns::EVENTS,
         )
     }
 

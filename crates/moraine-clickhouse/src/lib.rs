@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::io::Write;
 
+pub mod canonical_derivations;
 pub mod envelope;
 mod mcp_open_projection;
 pub use envelope::{
@@ -1325,50 +1326,7 @@ impl ClickHouseClient {
             escape_literal(&self.cfg.database)
         );
 
-        let required = [
-            "raw_events",
-            "events",
-            "event_links",
-            "tool_io",
-            "ingest_errors",
-            "ingest_checkpoints",
-            "ingest_heartbeats",
-            "search_documents",
-            "search_postings",
-            "search_conversation_terms",
-            "search_term_stats",
-            "search_corpus_stats",
-            "search_query_log",
-            "search_hit_log",
-            "search_interaction_log",
-            "mcp_open_sessions",
-            "mcp_open_turns",
-            "mcp_open_events",
-            "mcp_open_dirty_sessions",
-            "mcp_open_projection_state",
-            "mcp_open_publication_headers",
-            "mcp_open_generation_readiness",
-            "mcp_open_backfill_plans",
-            "published_source_generations",
-            "ingest_checkpoint_transitions",
-            "source_generation_publication_readiness",
-            "ingest_append_control",
-            "publication_diagnostic_events",
-            "v_published_source_generation_history",
-            "v_current_published_source_generations",
-            "v_current_ingest_checkpoint_transitions",
-            "v_current_source_generation_publication_readiness",
-            "v_current_ingest_append_control",
-            "v_live_events",
-            "v_live_event_links",
-            "v_live_tool_io",
-            "v_live_search_documents",
-            "v_live_search_postings",
-            "v_mcp_open_publication_headers",
-            "v_current_mcp_open_generation_readiness",
-            "v_publication_diagnostics",
-            "schema_migrations",
-        ];
+        let required = REQUIRED_SCHEMA_OBJECTS;
 
         let existing_tables = match self
             .query_json_data::<TableRow>(&table_query, Some("system"))
@@ -1480,6 +1438,63 @@ impl ClickHouseClient {
         Ok(rows.into_iter().map(|row| row.version).collect())
     }
 }
+
+/// Schema objects the `doctor_report` handshake requires to exist, checked
+/// against `system.tables` (materialized views appear there too). New
+/// migrations that add a durable table or MV register it here so a partially
+/// applied schema is reported as missing rather than silently tolerated.
+pub const REQUIRED_SCHEMA_OBJECTS: &[&str] = &[
+    "raw_events",
+    "events",
+    "event_links",
+    "tool_io",
+    "ingest_errors",
+    "ingest_checkpoints",
+    "ingest_heartbeats",
+    "search_documents",
+    "search_postings",
+    "search_conversation_terms",
+    "search_term_stats",
+    "search_corpus_stats",
+    "search_query_log",
+    "search_hit_log",
+    "search_interaction_log",
+    "mcp_open_sessions",
+    "mcp_open_turns",
+    "mcp_open_events",
+    "mcp_open_dirty_sessions",
+    "mcp_open_projection_state",
+    "mcp_open_publication_headers",
+    "mcp_open_generation_readiness",
+    "mcp_open_backfill_plans",
+    "published_source_generations",
+    "ingest_checkpoint_transitions",
+    "source_generation_publication_readiness",
+    "ingest_append_control",
+    "publication_diagnostic_events",
+    // issue-598 WI-02 canonical read indexes + their materialized views.
+    "mcp_session_directory",
+    "mcp_event_locator",
+    "mcp_event_navigation",
+    "mcp_read_index_state",
+    "mv_mcp_session_directory_from_events",
+    "mv_mcp_event_locator_from_events",
+    "mv_mcp_event_navigation_from_events",
+    "v_published_source_generation_history",
+    "v_current_published_source_generations",
+    "v_current_ingest_checkpoint_transitions",
+    "v_current_source_generation_publication_readiness",
+    "v_current_ingest_append_control",
+    "v_live_events",
+    "v_live_event_links",
+    "v_live_tool_io",
+    "v_live_search_documents",
+    "v_live_search_postings",
+    "v_mcp_open_publication_headers",
+    "v_current_mcp_open_generation_readiness",
+    "v_publication_diagnostics",
+    "schema_migrations",
+];
 
 pub fn bundled_migrations() -> Vec<Migration> {
     vec![
@@ -1657,6 +1672,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             version: "035",
             name: "035_mcp_list_metadata_projection.sql",
             sql: include_str!("../../../sql/035_mcp_list_metadata_projection.sql"),
+        },
+        Migration {
+            version: "036",
+            name: "036_canonical_read_indexes.sql",
+            sql: include_str!("../../../sql/036_canonical_read_indexes.sql"),
         },
     ]
 }
@@ -2573,6 +2593,251 @@ mod tests {
             assert!(
                 migration.sql.contains("WHERE notEmpty(session_id)"),
                 "migration {version} must not enqueue blank session IDs"
+            );
+        }
+    }
+
+    /// Fetch migration 036's bundled SQL, panicking with a clear message if the
+    /// canonical read-index migration is not registered.
+    fn migration_036_sql() -> &'static str {
+        bundled_migrations()
+            .into_iter()
+            .find(|migration| migration.version == "036")
+            .expect("migration 036 must be registered")
+            .sql
+    }
+
+    /// Isolate the region of migration 036 that defines the three materialized
+    /// views (from the first `CREATE MATERIALIZED VIEW` to the first control-row
+    /// `INSERT`), so join-free / store-all-generations assertions never trip over
+    /// the guarded-seed subqueries that follow.
+    fn migration_036_mv_region(sql: &str) -> &str {
+        let (_, after) = sql
+            .split_once("CREATE MATERIALIZED VIEW IF NOT EXISTS moraine.mv_mcp_session_directory_from_events")
+            .expect("036 must define the directory MV");
+        let (region, _) = after
+            .split_once("INSERT INTO moraine.mcp_read_index_state")
+            .expect("036 must seed control rows after the MVs");
+        region
+    }
+
+    #[test]
+    fn migration_036_is_additive_and_registered() {
+        let sql = migration_036_sql();
+        // Purely additive: no destructive statements and no reset of the legacy
+        // projector state (deliberate contrast to 029/033/034/035).
+        assert!(
+            !sql.contains("TRUNCATE TABLE"),
+            "036 must not truncate any relation"
+        );
+        assert!(
+            !sql.contains("DELETE WHERE"),
+            "036 must not delete any rows"
+        );
+        assert!(
+            !sql.contains("INTO moraine.mcp_open_projection_state")
+                && !sql.contains("TABLE moraine.mcp_open_projection_state"),
+            "036 must not reset the legacy projector state"
+        );
+        // Every table/MV is created with IF NOT EXISTS (re-run safe).
+        for object in [
+            "CREATE TABLE IF NOT EXISTS moraine.mcp_session_directory",
+            "CREATE TABLE IF NOT EXISTS moraine.mcp_event_locator",
+            "CREATE TABLE IF NOT EXISTS moraine.mcp_event_navigation",
+            "CREATE TABLE IF NOT EXISTS moraine.mcp_read_index_state",
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS moraine.mv_mcp_session_directory_from_events",
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS moraine.mv_mcp_event_locator_from_events",
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS moraine.mv_mcp_event_navigation_from_events",
+        ] {
+            assert!(sql.contains(object), "036 must contain `{object}`");
+        }
+    }
+
+    #[test]
+    fn migration_036_index_tables_use_the_designed_engines_and_keys() {
+        let sql = migration_036_sql();
+
+        // Directory: AggregatingMergeTree with aggregate-state columns; ORDER BY
+        // matches the MV GROUP BY so block inserts merge into one row per group.
+        assert!(sql.contains("mode_hint SimpleAggregateFunction(max, UInt8)"));
+        assert!(sql.contains("min_observed_event_time SimpleAggregateFunction(min, DateTime64(3))"));
+        assert!(sql.contains("max_observed_event_time SimpleAggregateFunction(max, DateTime64(3))"));
+        assert!(sql.contains("observed_events SimpleAggregateFunction(sum, UInt64)"));
+        assert!(sql.contains(
+            "origin_cwd_state AggregateFunction(argMinIf, String, Tuple(DateTime64(3), String), UInt8)"
+        ));
+        assert!(sql.contains("ENGINE = AggregatingMergeTree"));
+        assert!(sql.contains(
+            "ORDER BY (session_id, source_host, source_name, source_file, source_generation, harness)"
+        ));
+
+        // Locator: RMT(event_version), uid-leading PK for point seeks.
+        assert!(sql.contains("ENGINE = ReplacingMergeTree(event_version)"));
+        assert!(sql.contains("ORDER BY (event_uid, source_host)"));
+
+        // Navigation: RMT(event_version), session-hash partitioned, PK equal to
+        // the deterministic sort tuple.
+        assert!(sql.contains("PARTITION BY cityHash64(session_id) % 64"));
+        assert!(sql.contains(
+            "ORDER BY (session_id, sort_time, source_host, source_file, source_generation, source_offset, source_line_no, event_uid)"
+        ));
+        // Two precomputed per-row flags, no running/content columns.
+        assert!(sql.contains("is_user_message UInt8"));
+        assert!(sql.contains("is_metadata_bearing UInt8"));
+
+        // Control table: RMT(generation) keyed by state_key.
+        assert!(sql.contains("ENGINE = ReplacingMergeTree(generation)"));
+        assert!(sql.contains("ORDER BY (state_key)"));
+    }
+
+    #[test]
+    fn migration_036_mv_bodies_match_shared_canonical_derivations() {
+        use canonical_derivations::{DerivationColumns, DISPLAY_TIME_EXPR, SORT_TIME_EXPR};
+        let sql = migration_036_sql();
+        let cols = DerivationColumns::EVENTS;
+
+        let (_, after_dir) = sql
+            .split_once("TO moraine.mcp_session_directory AS")
+            .expect("directory MV");
+        let (directory_mv, _) = after_dir
+            .split_once("CREATE MATERIALIZED VIEW")
+            .expect("locator MV follows directory MV");
+        let (_, after_loc) = sql
+            .split_once("TO moraine.mcp_event_locator AS")
+            .expect("locator MV");
+        let (locator_mv, _) = after_loc
+            .split_once("CREATE MATERIALIZED VIEW")
+            .expect("navigation MV follows locator MV");
+        let (_, after_nav) = sql
+            .split_once("TO moraine.mcp_event_navigation AS")
+            .expect("navigation MV");
+        let (navigation_mv, _) = after_nav
+            .split_once("INSERT INTO moraine.mcp_read_index_state")
+            .expect("seeds follow navigation MV");
+
+        // Directory `mode_hint` is the shared per-event mode rank (EVENTS
+        // columns, per VERIFIER ADDENDUM item 3); bounds aggregate the v1 display
+        // expression; origin scope is the argMinIf state.
+        assert!(
+            directory_mv.contains(&canonical_derivations::mode_rank_expr(cols)),
+            "directory MV mode_hint must equal the shared mode rank: {directory_mv}"
+        );
+        assert!(directory_mv.contains(&format!("min({DISPLAY_TIME_EXPR})")));
+        assert!(directory_mv.contains(&format!("max({DISPLAY_TIME_EXPR})")));
+        assert!(directory_mv.contains("count() AS observed_events"));
+        assert!(directory_mv.contains(
+            "argMinIfState(cwd, tuple(event_ts, event_uid), cwd != '') AS origin_cwd_state"
+        ));
+        assert!(directory_mv.contains(
+            "GROUP BY session_id, source_host, source_name, source_file, source_generation, harness"
+        ));
+
+        // Locator + navigation carry the deterministic sort key.
+        assert!(locator_mv.contains(&format!("{SORT_TIME_EXPR} AS sort_time")));
+        assert!(navigation_mv.contains(&format!("{SORT_TIME_EXPR} AS sort_time")));
+        // Navigation keeps the v1 display expr and the two shared flags. The
+        // per-row boolean flags are `toUInt8`-wrapped (UInt8 columns; matches the
+        // `has_codex_mcp` precedent and sidesteps top-level `AND ... AS` binding).
+        assert!(navigation_mv.contains(&format!("{DISPLAY_TIME_EXPR} AS display_time")));
+        assert!(navigation_mv.contains(&format!(
+            "toUInt8({}) AS is_user_message",
+            canonical_derivations::user_message_count_predicate(cols)
+        )));
+        assert!(navigation_mv.contains(&format!(
+            "toUInt8({}) AS is_metadata_bearing",
+            canonical_derivations::is_metadata_bearing_predicate(cols)
+        )));
+    }
+
+    #[test]
+    fn migration_036_mvs_are_join_free_and_store_all_generations() {
+        let sql = migration_036_sql();
+        let region = migration_036_mv_region(sql);
+
+        assert!(
+            !region.contains("JOIN"),
+            "036 MVs must be join-free: {region}"
+        );
+        // Exactly one top-level SELECT per MV — an IN-subquery or nested SELECT
+        // would push the count above three.
+        assert_eq!(
+            region.matches("SELECT").count(),
+            3,
+            "036 MVs must have exactly one SELECT each (no subqueries): {region}"
+        );
+        // Every MV filters blank sessions and nothing else — no publication /
+        // generation gate (store all generations; gating is read-time).
+        assert_eq!(
+            region.matches("WHERE notEmpty(session_id)").count(),
+            3,
+            "each 036 MV must filter only blank session ids"
+        );
+        assert!(
+            !region.contains("publication_revision") && !region.contains("FINAL"),
+            "036 MVs must not gate on publication or read FINAL: {region}"
+        );
+    }
+
+    #[test]
+    fn migration_036_seeds_control_rows_idempotently() {
+        let sql = migration_036_sql();
+        for state_key in ["core_indexes", "core_audit", "open_v2"] {
+            let seed = format!("SELECT '{state_key}', 0, 0, ''");
+            assert!(
+                sql.contains(&seed),
+                "036 must seed the `{state_key}` control row"
+            );
+        }
+        // Each seed is guarded so a re-run cannot reset an in-progress backfill
+        // or a published readiness flag.
+        assert_eq!(
+            sql.matches("WHERE NOT EXISTS").count(),
+            3,
+            "036 must guard all three control-row seeds"
+        );
+        assert_eq!(
+            sql.matches("FROM moraine.mcp_read_index_state FINAL")
+                .count(),
+            3,
+            "each guarded seed must probe the control table with FINAL"
+        );
+    }
+
+    #[test]
+    fn migration_036_parses_into_ten_statements_without_bare_prefix() {
+        // Materialize against a non-default database to prove the `moraine.`
+        // placeholder is rewritten everywhere (no bare table names leak).
+        let materialized =
+            materialize_migration_sql(migration_036_sql(), "other_db").expect("materialize 036");
+        let statements = split_sql_statements(&materialized);
+        // 4 CREATE TABLE + 3 CREATE MATERIALIZED VIEW + 3 guarded INSERT.
+        assert_eq!(
+            statements.len(),
+            10,
+            "unexpected statement count in 036: {statements:#?}"
+        );
+        for statement in &statements {
+            assert!(
+                !statement.contains("moraine."),
+                "036 statement must not reference a bare `moraine.` after rewrite: {statement}"
+            );
+        }
+    }
+
+    #[test]
+    fn required_schema_objects_include_the_036_read_indexes() {
+        for object in [
+            "mcp_session_directory",
+            "mcp_event_locator",
+            "mcp_event_navigation",
+            "mcp_read_index_state",
+            "mv_mcp_session_directory_from_events",
+            "mv_mcp_event_locator_from_events",
+            "mv_mcp_event_navigation_from_events",
+        ] {
+            assert!(
+                REQUIRED_SCHEMA_OBJECTS.contains(&object),
+                "handshake roster must require `{object}`"
             );
         }
     }
