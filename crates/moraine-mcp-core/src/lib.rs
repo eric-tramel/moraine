@@ -9,7 +9,10 @@ mod private_proxy;
 mod search_sessions_v1;
 
 use anyhow::{anyhow, Context, Result};
-use moraine_config::{AppConfig, ValidatedQueryBudgets, KNOWN_INGEST_HARNESSES};
+use moraine_config::{
+    AppConfig, OpenReaderResolution, ValidatedQueryBudgets, DEFAULT_BACKEND_NAME,
+    KNOWN_INGEST_HARNESSES,
+};
 use moraine_conversations::{
     BackendRepositoryRouter, EnvelopeStatsSnapshot, QueryClass, QueryEnvelope, RepoError,
 };
@@ -381,6 +384,18 @@ struct AppState {
     /// request runs inside an Interactive envelope built from these, and
     /// prewarm runs under the Background class (issue #600 W7).
     query_budgets: ValidatedQueryBudgets,
+    /// Cached `open_v2` readiness for this backend (issue #598 WI-08 / BINDING
+    /// D6). Read once at backend construction (`moraine-clickhouse`
+    /// `open_v2_reader_ready`) and threaded in here, so the one-way `open`
+    /// cutover is stable for the process lifetime: a config `v1` override still
+    /// beats it (see [`AppState::open`]), but a not-ready backend never flips
+    /// mid-process, and a ready backend never silently falls back.
+    open_v2_ready: bool,
+    /// Whether this backend is the default single-owner Local backend (issue
+    /// #598 BINDING D3). Only Local backends auto-select the v2 reader; named
+    /// Shared backends stay on v1 under `auto` and require an explicit
+    /// `open_reader = "v2"` to force the canonical reader.
+    publication_mode_is_local: bool,
 }
 
 fn tool_output_schema(tool: &str, data_schema: Value) -> Value {
@@ -805,10 +820,59 @@ impl AppState {
         match params.name.as_str() {
             contract::SEARCH_SESSIONS_TOOL => self.search_sessions_v1(params.arguments).await,
             contract::LIST_SESSIONS_TOOL => self.list_sessions_v1(params.arguments).await,
-            contract::OPEN_TOOL => self.open_v1(params.arguments).await,
+            contract::OPEN_TOOL => self.open(params.arguments).await,
             contract::FILE_ATTENTION_TOOL => self.file_attention_v1(params.arguments).await,
             other => Err(anyhow!("unknown tool: {other}")),
         }
+    }
+
+    /// The one-way `open` reader dispatch (issue #598 WI-08, BINDING D2/D3/D6).
+    ///
+    /// The configured `[mcp] open_reader` selector is resolved against this
+    /// backend's cached `open_v2` readiness and Local status through the single
+    /// mode-resolution authority ([`moraine_config::OpenReaderMode::resolve`]),
+    /// so the dispatch and the status/doctor surface (WI-05) always agree on the
+    /// effective reader. Resolution is intentionally recomputed per request over
+    /// process-constant inputs (config read at process start; readiness read
+    /// once at backend construction and cached): a `v1` override always wins,
+    /// and the readiness input never regresses within a process.
+    ///
+    /// Routing is strictly one-way per request: the v2 branch never falls back
+    /// to v1 on a canonical read failure (it returns the typed error), and the
+    /// v1 branch is byte-identical to today.
+    async fn open(&self, arguments: Value) -> Result<Value> {
+        match self
+            .cfg
+            .mcp
+            .open_reader
+            .resolve(self.open_v2_ready, self.publication_mode_is_local)
+        {
+            OpenReaderResolution::V2 { .. } => self.open_v2(arguments).await,
+            OpenReaderResolution::V1 { .. } => self.open_v1(arguments).await,
+            // `open_reader = "v2"` forced but the read indexes are not ready:
+            // fail typed rather than silently serve v1 (issue-598.md:117,339).
+            OpenReaderResolution::ForcedV2Unready => self.open_forced_v2_unready(arguments),
+        }
+    }
+
+    /// The typed failure for a forced-v2 reader on a backend whose canonical
+    /// read indexes are not ready. It never falls back to v1 (that would defeat
+    /// the operator's explicit `open_reader = "v2"`); the message points at the
+    /// migration that publishes readiness, matching the v1 gate wording.
+    fn open_forced_v2_unready(&self, arguments: Value) -> Result<Value> {
+        let started_at = request_started_at();
+        let request = open_v1::request_from_arguments(&arguments);
+        open_v1::error_tool_response(
+            request,
+            contract::ToolError {
+                code: contract::ToolErrorCode::InternalError,
+                message: "MCP open v2 read indexes are not ready; run `moraine db migrate` \
+                     (or set [mcp] open_reader = \"auto\")"
+                    .to_string(),
+                details: None,
+            },
+            started_at,
+        )
     }
 }
 
@@ -927,6 +991,7 @@ fn validated_query_budgets(cfg: &AppConfig) -> Result<ValidatedQueryBudgets> {
 }
 
 impl AppState {
+    #[allow(clippy::too_many_arguments)]
     fn with_repository(
         cfg: Arc<AppConfig>,
         repo: Arc<dyn ConversationRepository>,
@@ -934,6 +999,8 @@ impl AppState {
         launch_dir: Option<PathBuf>,
         request_admission: Arc<RequestAdmission>,
         query_budgets: ValidatedQueryBudgets,
+        open_v2_ready: bool,
+        publication_mode_is_local: bool,
     ) -> Arc<AppState> {
         Arc::new(AppState {
             cfg,
@@ -942,10 +1009,26 @@ impl AppState {
             prewarm_started,
             request_admission,
             query_budgets,
+            open_v2_ready,
+            publication_mode_is_local,
         })
     }
 
+    /// Embedded composition root for tests: the default single-owner Local
+    /// backend with the v2 reader not yet published, so `open` resolves to the
+    /// byte-identical v1 reader unless a test opts into v2. Production stdio uses
+    /// [`AppState::embedded_with_readiness`] with the real cached readiness.
+    #[cfg(test)]
     fn embedded(cfg: AppConfig, repo: Arc<dyn ConversationRepository>) -> Arc<AppState> {
+        Self::embedded_with_readiness(cfg, repo, false, true)
+    }
+
+    fn embedded_with_readiness(
+        cfg: AppConfig,
+        repo: Arc<dyn ConversationRepository>,
+        open_v2_ready: bool,
+        publication_mode_is_local: bool,
+    ) -> Arc<AppState> {
         let request_admission = build_request_admission(&cfg);
         let query_budgets = validated_query_budgets(&cfg)
             .expect("query budgets are validated at configuration load");
@@ -956,6 +1039,8 @@ impl AppState {
             std::env::current_dir().ok(),
             request_admission,
             query_budgets,
+            open_v2_ready,
+            publication_mode_is_local,
         )
     }
 }
@@ -1480,13 +1565,27 @@ where
 /// Repository construction, project routing, schema policy, and scoped
 /// fallback all live outside mcp-core. The injected repository remains fixed
 /// for the lifetime of this stdio connection.
+///
+/// `open_v2_ready`/`publication_mode_is_local` are the resolved-open inputs the
+/// caller read once at backend construction (issue #598 WI-08): the readiness
+/// probe (`moraine-clickhouse` `open_v2_reader_ready`) against the routed
+/// backend, and whether that backend is the default single-owner Local backend.
+/// They stay fixed for the connection lifetime, so the one-way flip never
+/// regresses mid-process.
 pub async fn run_stdio_with_repository(
     cfg: AppConfig,
     repository: Arc<dyn ConversationRepository>,
+    open_v2_ready: bool,
+    publication_mode_is_local: bool,
 ) -> Result<()> {
     // Fail closed on an unbounded [query_budgets] before serving anything.
     validated_query_budgets(&cfg)?;
-    let state = AppState::embedded(cfg, repository);
+    let state = AppState::embedded_with_readiness(
+        cfg,
+        repository,
+        open_v2_ready,
+        publication_mode_is_local,
+    );
     serve_connection(
         state,
         BufReader::new(tokio::io::stdin()),
@@ -1530,6 +1629,15 @@ struct SocketState {
     prewarm_gates: BackendPrewarmGates,
     request_admission: Arc<RequestAdmission>,
     query_budgets: ValidatedQueryBudgets,
+    /// The default single-owner Local backend's cached `open_v2` readiness,
+    /// read once at backend construction and threaded in by the caller (issue
+    /// #598 WI-08). Only the Local backend auto-selects the v2 reader, and this
+    /// server hosts exactly one Local backend (the default), so this single
+    /// cached bool is authoritative for every `auto`-mode connection. A named
+    /// Shared backend resolves to v1 under `auto` regardless of this value; a
+    /// forced `open_reader = "v2"` on such a backend uses it as a best-effort
+    /// readiness proxy and still fails typed rather than falling back.
+    open_v2_ready: bool,
     shutdown: watch::Receiver<bool>,
 }
 
@@ -1547,6 +1655,7 @@ pub async fn run_socket_with_router<S>(
     cfg: Arc<AppConfig>,
     router: Arc<BackendRepositoryRouter>,
     socket_path: PathBuf,
+    open_v2_ready: bool,
     shutdown: S,
 ) -> Result<()>
 where
@@ -1562,6 +1671,7 @@ where
         prewarm_gates: BackendPrewarmGates::new(&cfg),
         request_admission,
         query_budgets,
+        open_v2_ready,
         shutdown: connection_shutdown_rx,
         cfg,
         router,
@@ -1919,6 +2029,12 @@ async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStr
         }
         Err(error) => return Err(error),
     };
+    // Only the default single-owner backend is Local (issue #598 BINDING D3);
+    // named backends are Shared and never auto-select the v2 reader. The cached
+    // `open_v2_ready` is the default backend's readiness, which is exactly what
+    // the `auto` resolution consults for this Local backend and is short-
+    // circuited by `publication_mode_is_local = false` for Shared backends.
+    let publication_mode_is_local = backend.backend_name() == DEFAULT_BACKEND_NAME;
     let app_state = AppState::with_repository(
         state.cfg,
         backend.repository().clone(),
@@ -1926,6 +2042,8 @@ async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStr
         launch_dir,
         state.request_admission,
         state.query_budgets,
+        state.open_v2_ready,
+        publication_mode_is_local,
     );
     if negotiated {
         private_proxy::write_ack(&mut write_half).await?;
@@ -2060,6 +2178,7 @@ pub async fn run_socket_with_router<S>(
     _cfg: Arc<AppConfig>,
     _router: Arc<BackendRepositoryRouter>,
     _socket_path: PathBuf,
+    _open_v2_ready: bool,
     _shutdown: S,
 ) -> Result<()>
 where
@@ -2121,7 +2240,12 @@ mod tests {
         assert_eq!(state.request_admission.slots.available_permits(), 24);
     }
 
-    fn successful_test_state() -> Arc<AppState> {
+    /// An in-memory repository whose v1 `get_mcp_session` returns a session, and
+    /// whose v2 `canonical_open_*` methods are the trait defaults (a typed
+    /// "canonical v2 open reader is not available" backend error). This lets a
+    /// dispatch test tell which reader a resolved `open` routed to: a v1 route
+    /// succeeds; a v2 route surfaces the canonical-unavailable internal error.
+    fn successful_session_repository() -> Arc<dyn ConversationRepository> {
         let session = McpSessionOpen {
             metadata: SessionMetadata {
                 session_id: "session-success".to_string(),
@@ -2151,14 +2275,17 @@ mod tests {
             terminal_event_uid: None,
             snapshot: None,
         };
-        let repository = Arc::new(InMemoryConversationRepository::with_responses(
+        Arc::new(InMemoryConversationRepository::with_responses(
             RepoConfig::default(),
             InMemoryConversationResponses {
                 get_mcp_session: Some(Ok(Some(session))),
                 ..InMemoryConversationResponses::default()
             },
-        ));
-        AppState::embedded(AppConfig::default(), repository)
+        ))
+    }
+
+    fn successful_test_state() -> Arc<AppState> {
+        AppState::embedded(AppConfig::default(), successful_session_repository())
     }
 
     fn repository_error_test_state() -> Arc<AppState> {
@@ -2796,6 +2923,138 @@ mod tests {
         assert_eq!(error["details"]["retryable"], json!(true));
     }
 
+    // --- issue-598 WI-08: one-way open reader dispatch -----------------------
+
+    /// Build an `open`-dispatch state with an explicit `[mcp] open_reader`
+    /// selector and the two cached resolution inputs. The repository routes v1
+    /// to a successful session and v2 to the canonical-unavailable error, so
+    /// each test can assert the reader the dispatch chose.
+    fn open_dispatch_state(
+        open_reader: moraine_config::OpenReaderMode,
+        open_v2_ready: bool,
+        publication_mode_is_local: bool,
+    ) -> Arc<AppState> {
+        let mut cfg = AppConfig::default();
+        cfg.mcp.open_reader = open_reader;
+        AppState::embedded_with_readiness(
+            cfg,
+            successful_session_repository(),
+            open_v2_ready,
+            publication_mode_is_local,
+        )
+    }
+
+    async fn open_success_session(state: &AppState) -> Value {
+        let open_id = contract::McpSessionId::from_raw_session_id("session-success")
+            .expect("valid session id")
+            .to_string();
+        call_tool_rpc(state, 1, contract::OPEN_TOOL, json!({ "id": open_id })).await
+    }
+
+    fn open_error_message(response: &Value) -> String {
+        response["result"]["structuredContent"]["error"]["message"]
+            .as_str()
+            .expect("open error carries a message")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn open_dispatch_selects_v2_when_ready_local_and_auto() {
+        // auto + ready + Local ⇒ the canonical v2 reader. The in-memory backend
+        // has no v2 reader, so a v2 route surfaces the typed canonical error —
+        // proof the dispatch reached open_v2 rather than the v1 projected read.
+        let state = open_dispatch_state(moraine_config::OpenReaderMode::Auto, true, true);
+        let response = open_success_session(&state).await;
+        assert_handled_tool_error_exchange(&response, contract::OPEN_TOOL, "internal_error");
+        assert!(
+            open_error_message(&response).contains("canonical v2 open reader is not available"),
+            "auto+ready+local must route to v2: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_dispatch_uses_v1_when_config_overrides_to_v1() {
+        // The `v1` kill-switch beats a ready+Local backend (BINDING D6): v1
+        // serves the session successfully and never touches the v2 reader.
+        let state = open_dispatch_state(moraine_config::OpenReaderMode::V1, true, true);
+        let response = open_success_session(&state).await;
+        assert_successful_tool_exchange(&response, contract::OPEN_TOOL);
+    }
+
+    #[tokio::test]
+    async fn open_dispatch_uses_v1_when_indexes_not_ready() {
+        // auto + Local but the v2 indexes are not published ⇒ stay on v1.
+        let state = open_dispatch_state(moraine_config::OpenReaderMode::Auto, false, true);
+        let response = open_success_session(&state).await;
+        assert_successful_tool_exchange(&response, contract::OPEN_TOOL);
+    }
+
+    #[tokio::test]
+    async fn open_dispatch_uses_v1_for_shared_backend_under_auto() {
+        // auto + ready but a named Shared backend (not Local) ⇒ stay on v1
+        // (BINDING D3): only the default single-owner Local backend auto-flips.
+        let state = open_dispatch_state(moraine_config::OpenReaderMode::Auto, true, false);
+        let response = open_success_session(&state).await;
+        assert_successful_tool_exchange(&response, contract::OPEN_TOOL);
+    }
+
+    #[tokio::test]
+    async fn open_dispatch_forced_v2_ignores_local_but_fails_when_unready() {
+        // `v2` forces the canonical reader without requiring Local, but a
+        // not-ready backend fails typed rather than silently serving v1
+        // (issue-598.md:117,339): no fallback.
+        let state = open_dispatch_state(moraine_config::OpenReaderMode::V2, false, false);
+        let response = open_success_session(&state).await;
+        assert_handled_tool_error_exchange(&response, contract::OPEN_TOOL, "internal_error");
+        assert!(
+            open_error_message(&response).contains("not ready"),
+            "forced v2 on a not-ready backend must fail typed: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_dispatch_forced_v2_selects_v2_when_ready_even_if_not_local() {
+        // `v2` + ready on a Shared backend routes to the canonical reader.
+        let state = open_dispatch_state(moraine_config::OpenReaderMode::V2, true, false);
+        let response = open_success_session(&state).await;
+        assert_handled_tool_error_exchange(&response, contract::OPEN_TOOL, "internal_error");
+        assert!(
+            open_error_message(&response).contains("canonical v2 open reader is not available"),
+            "forced v2 must route to v2 regardless of Local: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_dispatch_v1_cursor_under_v2_yields_structured_reopen() {
+        // A legacy v1 continuation token arriving on the v2 dispatch decodes to
+        // the deterministic stale-reopen response, never "malformed" and never a
+        // v1 retry (design §6, R7 / classify_open_cursor).
+        let state = open_dispatch_state(moraine_config::OpenReaderMode::V2, true, true);
+        let v1_cursor = contract::encode_open_cursor(&contract::OpenCursor {
+            version: 1,
+            target_id: contract::McpSessionId::from_raw_session_id("session-success")
+                .expect("valid session id")
+                .to_string(),
+            limit: 5,
+            snapshot_slot: 1,
+            snapshot_generation: 7,
+            after: contract::OpenCursorAfter::Turn { turn_seq: 3 },
+        })
+        .expect("encode v1 cursor");
+        let response = call_tool_rpc(
+            &state,
+            1,
+            contract::OPEN_TOOL,
+            json!({ "cursor": v1_cursor }),
+        )
+        .await;
+        assert_handled_tool_error_exchange(&response, contract::OPEN_TOOL, "invalid_request");
+        assert!(
+            open_error_message(&response).contains("reopen the target to restart expansion"),
+            "a v1 cursor under v2 dispatch must reopen: {response}"
+        );
+    }
+
     #[tokio::test]
     async fn serve_connection_frames_one_response_per_request() {
         let state = test_state();
@@ -2921,7 +3180,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let server_sock = sock.clone();
         let server = tokio::spawn(async move {
-            run_socket_with_router(cfg, router, server_sock, async {
+            run_socket_with_router(cfg, router, server_sock, false, async {
                 let _ = shutdown_rx.await;
             })
             .await
@@ -3010,7 +3269,7 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
         let owner = UnixListener::bind(&sock).expect("bind existing owner");
         let (cfg, router) = default_test_router();
-        let error = run_socket_with_router(cfg, router, sock.clone(), pending())
+        let error = run_socket_with_router(cfg, router, sock.clone(), false, pending())
             .await
             .expect_err("second backend must fail");
         assert!(

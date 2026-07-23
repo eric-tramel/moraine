@@ -25,10 +25,11 @@ pub use domain::{
 };
 pub use domain::{
     AnalyticsConcurrencyPoint, AnalyticsRange, AnalyticsSnapshot, AnalyticsTokenPoint,
-    AnalyticsTurnPoint, AnalyticsWindow, IngestHeartbeat, IngestHeartbeatRead,
-    PublicationDiagnostics, SessionAnalytics, SessionAnalyticsQuery, SessionLookback, SessionStep,
-    SessionTurn, StoreConnectionMetrics, StoreDiagnostics, StoreHealth, StoreProbe, TableColumn,
-    TablePreview, TablePreviewQuery, TableSummaries, TableSummary, ToolResult, WebSearchEvent,
+    AnalyticsTurnPoint, AnalyticsWindow, CoreIndexAuditOutcome, CoreIndexHealth, IngestHeartbeat,
+    IngestHeartbeatRead, PublicationDiagnostics, SessionAnalytics, SessionAnalyticsQuery,
+    SessionLookback, SessionStep, SessionTurn, StoreConnectionMetrics, StoreDiagnostics,
+    StoreHealth, StoreProbe, TableColumn, TablePreview, TablePreviewQuery, TableSummaries,
+    TableSummary, ToolResult, WebSearchEvent,
 };
 pub use domain::{
     CanonicalContinuation, CanonicalPageAfter, CanonicalReadAnchor, CanonicalReadOutcome,

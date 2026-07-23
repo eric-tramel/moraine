@@ -46,6 +46,22 @@ async fn store_health_maps_all_successful_probe_facts() {
                     "issues": ["mirror host-b catching up"]
                 }]),
             ),
+            // Core-index probe (issue #598): each of the three read_index_state
+            // accessors first checks whether mcp_read_index_state exists. On a
+            // reachable-but-not-yet-migrated database every check reports absent,
+            // so the probe maps to Available with all flags false.
+            ScriptedResponse::rows(
+                &["FROM system.tables", "mcp_read_index_state"],
+                json!([{"value": "0"}]),
+            ),
+            ScriptedResponse::rows(
+                &["FROM system.tables", "mcp_read_index_state"],
+                json!([{"value": "0"}]),
+            ),
+            ScriptedResponse::rows(
+                &["FROM system.tables", "mcp_read_index_state"],
+                json!([{"value": "0"}]),
+            ),
         ];
         let (repo, state) = build_scripted_repo(responses).await;
 
@@ -80,7 +96,17 @@ async fn store_health_maps_all_successful_probe_facts() {
             }
             other => panic!("expected publication diagnostics, got {other:?}"),
         }
-        assert_script_consumed(&state, 5);
+        assert!(
+            matches!(&health.core_index, StoreProbe::Available(ci)
+                if !ci.core_indexes_ready
+                    && !ci.open_v2_ready
+                    && ci.open_v2_provenance.is_none()
+                    && ci.backfill_cursor_age_ms.is_none()
+                    && ci.audit_outcome.is_none()),
+            "unmigrated core-index probe maps to Available/all-false, got {:?}",
+            health.core_index
+        );
+        assert_script_consumed(&state, 8);
     })
     .await;
 }
@@ -95,6 +121,12 @@ async fn store_health_keeps_each_probe_failure_independent() {
             ScriptedResponse::failure(
                 &["FROM `moraine`.v_publication_diagnostics"],
                 "health publication failed",
+            ),
+            // Core-index probe: the first read_index_state existence check
+            // fails, so the whole probe short-circuits to Failed (one request).
+            ScriptedResponse::failure(
+                &["FROM system.tables", "mcp_read_index_state"],
+                "health core-index failed",
             ),
         ];
         let (repo, state) = build_scripted_repo(responses).await;
@@ -124,7 +156,11 @@ async fn store_health_keeps_each_probe_failure_independent() {
             health.publication,
             StoreProbe::Failed { ref message } if message.contains("health publication failed")
         ));
-        assert_script_consumed(&state, 5);
+        assert!(matches!(
+            health.core_index,
+            StoreProbe::Failed { ref message } if message.contains("health core-index failed")
+        ));
+        assert_script_consumed(&state, 6);
     })
     .await;
 }

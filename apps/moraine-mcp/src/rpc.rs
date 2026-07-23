@@ -1,6 +1,9 @@
 use crate::cli::ServeMode;
 use anyhow::{anyhow, bail, Context, Result};
-use moraine_config::{AppConfig, QueryBudgetsConfig, ValidatedQueryBudgets};
+use moraine_clickhouse::{ClickHouseClient, QueryClass, QueryEnvelope};
+use moraine_config::{
+    AppConfig, ClickHouseConfig, QueryBudgetsConfig, ValidatedQueryBudgets, DEFAULT_BACKEND_NAME,
+};
 use moraine_conversations::{BackendRepositoryRouter, RepoConfig};
 #[cfg(unix)]
 use moraine_mcp_core::PrivateRouteNegotiation;
@@ -133,6 +136,43 @@ fn backend_query_budgets(cfg: &AppConfig) -> ValidatedQueryBudgets {
     })
 }
 
+/// The ClickHouse config for a named backend, falling back to the top-level
+/// `[clickhouse]` (the default single-owner backend's config).
+fn backend_clickhouse_config(cfg: &AppConfig, backend_name: &str) -> ClickHouseConfig {
+    cfg.backends
+        .get(backend_name)
+        .cloned()
+        .unwrap_or_else(|| cfg.clickhouse.clone())
+}
+
+/// Read the `open_v2` reader readiness once at backend construction (issue #598
+/// WI-08, BINDING D6). This is the sole DB read that seeds the one-way `open`
+/// cutover for the served process: the MCP dispatch caches the result for the
+/// process lifetime, so a not-ready backend stays on v1 and a ready one never
+/// falls back (a config `v1` override still wins regardless).
+///
+/// Best-effort by design: an unreachable or un-migrated backend yields `false`
+/// (stay on v1) rather than failing startup — matching the `auto` contract that
+/// v2 activates only once its indexes are published.
+async fn read_open_v2_ready(cfg: &AppConfig, backend_name: &str) -> bool {
+    let clickhouse = backend_clickhouse_config(cfg, backend_name);
+    let Ok(client) = ClickHouseClient::new(clickhouse) else {
+        return false;
+    };
+    let budgets = backend_query_budgets(cfg);
+    // The probe runs at startup with no ambient request envelope; give its one
+    // statement an Administrative-class envelope so it carries a query id and a
+    // finite deadline (issue #600 amendment A10), like the backend handshake.
+    QueryEnvelope::new(
+        "open-v2-readiness-probe",
+        QueryClass::Administrative,
+        &budgets.administrative,
+    )
+    .scope(async { client.open_v2_reader_ready().await })
+    .await
+    .unwrap_or(false)
+}
+
 fn backend_router(
     cfg: Arc<AppConfig>,
     session_scope: Option<SessionOriginScope>,
@@ -218,9 +258,21 @@ async fn run_stdio_entry(cfg: AppConfig, session_scope: Option<SessionOriginScop
         .await
         .context("failed to construct embedded conversation repository")?;
     let repository = backend.repository().clone();
+    // Resolve the open-reader inputs once for the routed backend (issue #598
+    // WI-08): whether it is the default single-owner Local backend, and its
+    // published `open_v2` readiness. Only Local backends auto-select v2.
+    let backend_name = backend.backend_name().to_string();
+    let publication_mode_is_local = backend_name == DEFAULT_BACKEND_NAME;
+    let open_v2_ready = read_open_v2_ready(&cfg, &backend_name).await;
     drop(backend);
     drop(router);
-    moraine_mcp_core::run_stdio_with_repository(Arc::unwrap_or_clone(cfg), repository).await
+    moraine_mcp_core::run_stdio_with_repository(
+        Arc::unwrap_or_clone(cfg),
+        repository,
+        open_v2_ready,
+        publication_mode_is_local,
+    )
+    .await
 }
 
 async fn run_backend(
@@ -243,6 +295,13 @@ async fn run_backend(
         .await
         .context("failed to build default backend conversation repository")?;
 
+    // Read the default (single-owner Local) backend's `open_v2` readiness once,
+    // now that its repository is built (issue #598 WI-08). This is the only
+    // Local backend the socket server hosts, so this cached bool is what the
+    // `auto` open-reader resolution consults for every default-backend
+    // connection; named Shared backends stay on v1 under `auto` regardless.
+    let open_v2_ready = read_open_v2_ready(&cfg, DEFAULT_BACKEND_NAME).await;
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut services = JoinSet::new();
 
@@ -254,6 +313,7 @@ async fn run_backend(
             socket_cfg,
             socket_router,
             socket_path,
+            open_v2_ready,
             wait_for_shutdown(socket_shutdown),
         )
         .await;

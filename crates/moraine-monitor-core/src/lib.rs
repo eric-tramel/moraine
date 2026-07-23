@@ -13,10 +13,10 @@ use moraine_config::AppConfig;
 use moraine_config::{QueryBudgetsConfig, ValidatedQueryBudgets};
 use moraine_conversations::{
     budget_telemetry, record_budget_rejection, record_budget_request, AnalyticsRange,
-    BackendRepository, BackendRepositoryRouter, IngestHeartbeat, IngestHeartbeatRead,
-    PublicationDiagnostics, QueryClass, QueryEnvelope, RepoError, SessionAnalytics,
-    SessionAnalyticsQuery, SessionLookback, SessionStep, SessionTurn, StoreConnectionMetrics,
-    StoreHealth, StoreProbe, TablePreviewQuery, TableSummaries,
+    BackendRepository, BackendRepositoryRouter, CoreIndexHealth, IngestHeartbeat,
+    IngestHeartbeatRead, PublicationDiagnostics, QueryClass, QueryEnvelope, RepoError,
+    SessionAnalytics, SessionAnalyticsQuery, SessionLookback, SessionStep, SessionTurn,
+    StoreConnectionMetrics, StoreHealth, StoreProbe, TablePreviewQuery, TableSummaries,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -552,6 +552,10 @@ async fn api_health(Extension(backend): Extension<Arc<BackendRepository>>) -> Re
                     "healthy": false,
                     "error": "publication readiness unavailable while store health is unavailable",
                 },
+                "core_index": {
+                    "available": false,
+                    "error": "canonical read-index readiness unavailable while store health is unavailable",
+                },
                 "query_budgets": query_budgets_payload(),
             });
             if let Some(code) = code {
@@ -562,17 +566,30 @@ async fn api_health(Extension(backend): Extension<Arc<BackendRepository>>) -> Re
     };
     let connections = connection_payload(&health.connections);
     let publication = publication_payload(&health.publication);
+    let core_index = core_index_payload(&health.core_index);
 
     let ping_ms = match &health.ping {
         StoreProbe::Available(value) => *value,
         StoreProbe::Failed { message } => {
-            return health_failure_response(&backend, message, connections, publication);
+            return health_failure_response(
+                &backend,
+                message,
+                connections,
+                publication,
+                core_index,
+            );
         }
     };
     let version = match &health.version {
         StoreProbe::Available(value) => value,
         StoreProbe::Failed { message } => {
-            return health_failure_response(&backend, message, connections, publication);
+            return health_failure_response(
+                &backend,
+                message,
+                connections,
+                publication,
+                core_index,
+            );
         }
     };
     let heartbeat = heartbeat.map(monitor_heartbeat_status).unwrap_or_default();
@@ -586,6 +603,7 @@ async fn api_health(Extension(backend): Extension<Arc<BackendRepository>>) -> Re
             "ping_ms": ping_ms,
             "connections": connections,
             "publication": publication,
+            "core_index": core_index,
             "query_budgets": query_budgets_payload(),
             "ingestor": health_heartbeat_payload(&heartbeat),
         }),
@@ -598,6 +616,7 @@ fn health_failure_response(
     message: &str,
     connections: Value,
     publication: Value,
+    core_index: Value,
 ) -> Response {
     json_response(
         json!({
@@ -607,6 +626,7 @@ fn health_failure_response(
             "error": message,
             "connections": connections,
             "publication": publication,
+            "core_index": core_index,
             "query_budgets": query_budgets_payload(),
         }),
         StatusCode::SERVICE_UNAVAILABLE,
@@ -641,12 +661,14 @@ async fn api_status(Extension(backend): Extension<Arc<BackendRepository>>) -> Re
     let estimated_total_rows = tables.iter().map(|table| table.rows).sum::<u64>();
     let clickhouse = status_clickhouse_payload(&backend, &health, database_exists);
     let publication = publication_payload(&health.publication);
+    let core_index = core_index_payload(&health.core_index);
 
     json_response(
         json!({
             "ok": true,
             "clickhouse": clickhouse,
             "publication": publication,
+            "core_index": core_index,
             "query_budgets": query_budgets_payload(),
             "database": {
                 "exists": database_exists,
@@ -674,6 +696,10 @@ fn unavailable_store_health(message: String) -> StoreHealth {
         connections: StoreProbe::Failed { message },
         publication: StoreProbe::Failed {
             message: "publication readiness unavailable while store health is unavailable"
+                .to_string(),
+        },
+        core_index: StoreProbe::Failed {
+            message: "canonical read-index readiness unavailable while store health is unavailable"
                 .to_string(),
         },
     }
@@ -748,6 +774,29 @@ fn publication_payload(probe: &StoreProbe<PublicationDiagnostics>) -> Value {
         StoreProbe::Failed { message } => json!({
             "available": false,
             "healthy": false,
+            "error": message,
+        }),
+    }
+}
+
+/// Serialize the additive canonical read-index (issue #598) readiness probe for
+/// the `/api/v1/health` and `/api/v1/status` payloads. Additive and fail-soft:
+/// a store that cannot report readiness yields `{"available": false, ...}` and
+/// never fails the surrounding response. Field names mirror the CLI
+/// `CoreIndexReport` (issue #598 WI-05) so operators read the same shape across
+/// HTTP and CLI.
+fn core_index_payload(probe: &StoreProbe<CoreIndexHealth>) -> Value {
+    match probe {
+        StoreProbe::Available(health) => json!({
+            "available": true,
+            "core_indexes_ready": health.core_indexes_ready,
+            "open_v2_ready": health.open_v2_ready,
+            "open_v2_provenance": health.open_v2_provenance,
+            "backfill_cursor_age_ms": health.backfill_cursor_age_ms,
+            "audit": health.audit_outcome,
+        }),
+        StoreProbe::Failed { message } => json!({
+            "available": false,
             "error": message,
         }),
     }
@@ -1512,6 +1561,13 @@ mod tests {
                 interserver: 1,
             }),
             publication: StoreProbe::Available(PublicationDiagnostics::default()),
+            core_index: StoreProbe::Available(CoreIndexHealth {
+                core_indexes_ready: true,
+                open_v2_ready: true,
+                open_v2_provenance: Some("auto-local".to_string()),
+                backfill_cursor_age_ms: Some(4_200),
+                audit_outcome: None,
+            }),
         }
     }
 
@@ -2050,6 +2106,66 @@ mod tests {
 
         let status = response_json(api_status(Extension(backend)).await).await;
         assert_eq!(status["publication"], health["publication"]);
+    }
+
+    #[tokio::test]
+    async fn health_and_status_expose_core_index_readiness() {
+        let (backend, _) = fake_backend(InMemoryConversationResponses {
+            read_store_health: Some(Ok(StoreHealth {
+                core_index: StoreProbe::Available(CoreIndexHealth {
+                    core_indexes_ready: true,
+                    open_v2_ready: true,
+                    open_v2_provenance: Some("operator-promote".to_string()),
+                    backfill_cursor_age_ms: Some(9_000),
+                    audit_outcome: None,
+                }),
+                ..sample_health()
+            })),
+            latest_ingest_heartbeat: Some(Ok(sample_heartbeat())),
+            list_table_summaries: Some(Ok(TableSummaries::default())),
+            ..Default::default()
+        })
+        .await;
+
+        let health = response_json(api_health(Extension(backend.clone())).await).await;
+        assert_eq!(health["ok"], json!(true));
+        assert_eq!(health["core_index"]["available"], json!(true));
+        assert_eq!(health["core_index"]["core_indexes_ready"], json!(true));
+        assert_eq!(health["core_index"]["open_v2_ready"], json!(true));
+        assert_eq!(
+            health["core_index"]["open_v2_provenance"],
+            json!("operator-promote")
+        );
+        assert_eq!(health["core_index"]["backfill_cursor_age_ms"], json!(9_000));
+
+        // The additive block is present on `/status` with the same shape.
+        let status = response_json(api_status(Extension(backend)).await).await;
+        assert_eq!(status["core_index"], health["core_index"]);
+    }
+
+    #[tokio::test]
+    async fn core_index_probe_failure_is_diagnostic_without_hiding_store_liveness() {
+        let (backend, _) = fake_backend(InMemoryConversationResponses {
+            read_store_health: Some(Ok(StoreHealth {
+                core_index: StoreProbe::Failed {
+                    message: "core read indexes unavailable".to_string(),
+                },
+                ..sample_health()
+            })),
+            latest_ingest_heartbeat: Some(Ok(sample_heartbeat())),
+            ..Default::default()
+        })
+        .await;
+
+        let response = api_health(Extension(backend)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let health = response_json(response).await;
+        assert_eq!(health["ok"], json!(true));
+        assert_eq!(health["core_index"]["available"], json!(false));
+        assert_eq!(
+            health["core_index"]["error"],
+            json!("core read indexes unavailable")
+        );
     }
 
     #[tokio::test]
