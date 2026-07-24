@@ -246,7 +246,7 @@ fn spawn_projection_worker(
                     .map(|error| format!("{error:#}"));
                 completed
                     .lock()
-                    .expect("projection outcome mutex poisoned")
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(ProjectionOutcome {
                         session_id,
                         cost: started.elapsed(),
@@ -360,7 +360,7 @@ fn spawn_projection_maintenance(
                     Ok(sessions) if !sessions.is_empty() => {
                         discovered
                             .lock()
-                            .expect("discovered projection debt mutex poisoned")
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .extend(sessions);
                     }
                     Ok(_) => {}
@@ -479,14 +479,14 @@ fn drain_pending_projection(
         &mut *worker
             .discovered
             .lock()
-            .expect("discovered projection debt mutex poisoned"),
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
     );
     pending_ack.projection_session_ids.extend(discovered);
     let outcomes = std::mem::take(
         &mut *worker
             .outcomes
             .lock()
-            .expect("projection outcome mutex poisoned"),
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
     );
     let now = Instant::now();
     for outcome in outcomes {
