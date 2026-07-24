@@ -1288,7 +1288,6 @@ name = "moraine-mcp"
 version = "0.7.1"
 dependencies = [
  "anyhow",
- "moraine-clickhouse",
  "moraine-config",
  "moraine-conversations",
  "moraine-mcp-core",

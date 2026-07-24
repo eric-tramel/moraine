@@ -79,6 +79,32 @@ pub fn build_clickhouse_repository_with_user_agent(
     )))
 }
 
+/// Probe `open_v2` reader readiness for a backend (issue #598 WI-08).
+///
+/// Composition-root helper so binaries do not need a direct
+/// `moraine-clickhouse` edge (epic #451 phase-1 dependency policy): builds a
+/// client for the given backend config and runs the single readiness read
+/// under an Administrative-class envelope (issue #600 amendment A10 — startup
+/// probes carry a query id and finite deadline). Best-effort by design: an
+/// unreachable or un-migrated backend reports `false` (stay on v1) rather
+/// than failing startup.
+pub async fn probe_open_v2_ready(
+    clickhouse: moraine_config::ClickHouseConfig,
+    budgets: &moraine_config::ValidatedQueryBudgets,
+) -> bool {
+    let Ok(client) = moraine_clickhouse::ClickHouseClient::new(clickhouse) else {
+        return false;
+    };
+    QueryEnvelope::new(
+        "open-v2-readiness-probe",
+        QueryClass::Administrative,
+        &budgets.administrative,
+    )
+    .scope(async { client.open_v2_reader_ready().await })
+    .await
+    .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod construction_tests {
     use super::{
