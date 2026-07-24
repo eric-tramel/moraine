@@ -276,8 +276,13 @@ struct PkBoundaryRow {
     source_name: String,
     source_file: String,
     source_generation: u32,
-    source_offset: String,
-    source_line_no: String,
+    // Suffixed aliases: bare `source_offset`/`source_line_no` SELECT aliases
+    // would shadow the physical PK columns inside the same statement's
+    // WHERE/ORDER BY, silently turning the keyset tuple comparison and the
+    // boundary ordering into STRING comparisons (caught live by the
+    // canonical-open-bench multi-page backfill).
+    source_offset_str: String,
+    source_line_no_str: String,
     event_uid: String,
 }
 
@@ -293,11 +298,11 @@ impl PkBoundaryRow {
             source_file: self.source_file,
             source_generation: self.source_generation,
             source_offset: self
-                .source_offset
+                .source_offset_str
                 .parse()
                 .context("failed to parse core-index cursor source_offset")?,
             source_line_no: self
-                .source_line_no
+                .source_line_no_str
                 .parse()
                 .context("failed to parse core-index cursor source_line_no")?,
             event_uid: self.event_uid,
@@ -750,8 +755,8 @@ impl ClickHouseClient {
              source_name,\n\
              source_file,\n\
              source_generation,\n\
-             toString(source_offset) AS source_offset,\n\
-             toString(source_line_no) AS source_line_no,\n\
+             toString(source_offset) AS source_offset_str,\n\
+             toString(source_line_no) AS source_line_no_str,\n\
              event_uid\n\
              FROM {db}.events",
             db = escape_identifier(&self.cfg.database),
