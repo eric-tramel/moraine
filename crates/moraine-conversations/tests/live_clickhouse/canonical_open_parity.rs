@@ -507,8 +507,20 @@ pub(super) async fn parity() -> Result<()> {
             assert!(open_session_v2(&repository, "parity-does-not-exist", 25)
                 .await?
                 .is_none());
-            assert!(repository.get_mcp_session("").await?.is_none());
-            assert!(open_session_v2(&repository, "", 25).await?.is_none());
+            // Blank ids are rejected identically by BOTH readers at the shared
+            // validation layer (`validate_session_id`), before any SQL runs —
+            // that rejection parity, not Ok(None), is the contract. The blank
+            // ROW seeded above is excluded from listings by the MV/projector
+            // `notEmpty(session_id)` filters, which the directory census in
+            // later cases exercises.
+            assert!(matches!(
+                repository.get_mcp_session("").await,
+                Err(RepoError::InvalidArgument(_))
+            ));
+            assert!(matches!(
+                repository.canonical_open_session_page("", 25, None).await,
+                Err(RepoError::InvalidArgument(_))
+            ));
 
             // (b) Single-turn, (c) tool-only (turn_seq floor 1), (d) multi-turn,
             // (g) multi-host ordering, (h) terminal-in-middle-turn. Full-session
