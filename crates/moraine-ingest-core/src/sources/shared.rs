@@ -1158,12 +1158,15 @@ fn strip_root(path: &str, root: &str) -> Option<String> {
         .map(|tail| tail.to_string())
 }
 
+/// Per-record normalization context. It deliberately carries the RESOLVED
+/// `session_id` and not the file-level hint it came from: a normalizer able to
+/// branch on "was identity already established?" would emit different rows for
+/// the same line depending on where the pass started.
 pub(crate) struct RecordContext<'a> {
     pub(crate) source_name: &'a str,
     pub(crate) harness: &'a str,
     pub(crate) inference_provider: &'a str,
     pub(crate) session_id: &'a str,
-    pub(crate) session_hint: &'a str,
     pub(crate) session_date: &'a str,
     pub(crate) cwd: &'a str,
     pub(crate) source_file: &'a str,
@@ -1455,7 +1458,6 @@ mod tests {
             harness: "codex",
             inference_provider: "openai",
             session_id: "s1",
-            session_hint: "",
             session_date: "2026-02-15",
             cwd,
             source_file: "/tmp/s1.jsonl",

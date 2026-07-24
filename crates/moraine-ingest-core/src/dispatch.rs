@@ -610,11 +610,14 @@ struct InitialSourceHints {
     cwd: String,
 }
 
-/// Best-effort session-level identity recovered from the bounded file head.
-/// Resumed files restart after their session header, while OMP subagent files
-/// use descriptive filenames and begin with a title record before the session
-/// header. Priming both hints prevents resumed rows from losing cwd and leading
-/// OMP rows from creating an empty-ID pseudo-session.
+/// File-level identity recovered from the bounded file head, used for every
+/// pass over the file so a resume starting past the session header and a read
+/// starting at byte zero agree on who the file belongs to. The first non-empty
+/// id wins, which is the file's own header — a forked or sub-agent transcript
+/// that replays its parent's header further down never reaches this scan.
+/// Priming cwd from the same head keeps resumed rows from losing it and keeps
+/// leading OMP rows (a title record precedes the session header) out of an
+/// empty-ID pseudo-session.
 fn infer_initial_source_hints(
     source_file: &str,
     source_name: &str,
@@ -1206,12 +1209,15 @@ pub(crate) async fn process_file(
     let mut reader = BufReader::new(file.take(remaining));
     let mut offset = checkpoint.last_offset;
     let mut line_no = checkpoint.last_line_no;
-    let initial_hints = if checkpoint.last_offset > 0 || work.harness == "pi-coding-agent" {
-        infer_initial_source_hints(source_file, &work.source_name, &work.harness)
-    } else {
-        InitialSourceHints::default()
-    };
-    let mut session_hint = kiro_metadata
+    // Priming is unconditional: a resume that primed and a full read that did
+    // not would start the same line from different state, and the resolvers
+    // that fall back to it would attribute that line two different ways.
+    let initial_hints = infer_initial_source_hints(source_file, &work.source_name, &work.harness);
+    // Session identity is fixed for the whole file before the first record is
+    // normalized and never reassigned from a record, so `session_id` is a pure
+    // function of (file, line). A record that names its own session still wins
+    // — this is only what an unnamed record falls back to.
+    let session_identity = kiro_metadata
         .as_ref()
         .map(KiroSessionMetadata::session_id)
         .filter(|value| !value.trim().is_empty())
@@ -1322,13 +1328,12 @@ pub(crate) async fn process_file(
                 checkpoint.source_generation,
                 0,
                 0,
-                &session_hint,
+                &session_identity,
                 &model_hint,
                 &cwd_hint,
                 &record_ts_hint,
             ) {
                 Ok(normalized) => {
-                    session_hint = normalized.session_hint.clone();
                     model_hint = normalized.model_hint.clone();
                     cwd_hint = normalized.cwd_hint.clone();
                     batch.extend_normalized(normalized);
@@ -1474,7 +1479,7 @@ pub(crate) async fn process_file(
             checkpoint.source_generation,
             line_no,
             start_offset,
-            &session_hint,
+            &session_identity,
             &model_hint,
             &cwd_hint,
             &record_ts_hint,
@@ -1563,7 +1568,9 @@ pub(crate) async fn process_file(
             &mut session_cursors,
         );
 
-        session_hint = normalized.session_hint.clone();
+        // `session_identity` is deliberately not reassigned here: chaining it
+        // would carry a record's resolved session forward, and a resume that
+        // began below that record would carry something else.
         model_hint = normalized.model_hint.clone();
         cwd_hint = normalized.cwd_hint.clone();
         // A null `raw_row` means the normalizer deliberately skipped the
@@ -1805,7 +1812,11 @@ async fn process_session_json_file(
     }
 
     let mut batch = RowBatch::default();
-    let mut session_hint = String::new();
+    // Only messages after `already_emitted` are synthesized on a resume, so a
+    // chained identity would start from a different record than a full pass.
+    // Every session-doc record carries its own session, so nothing falls back
+    // to this and it stays empty for the whole file.
+    let session_identity = String::new();
     let mut model_hint = String::new();
     let mut cwd_hint = String::new();
 
@@ -1820,12 +1831,11 @@ async fn process_session_json_file(
             SESSION_JSON_GENERATION,
             line_no,
             0,
-            &session_hint,
+            &session_identity,
             &model_hint,
             &cwd_hint,
         ) {
             Ok(normalized) => {
-                session_hint = normalized.session_hint;
                 model_hint = normalized.model_hint;
                 cwd_hint = normalized.cwd_hint;
                 // A null `raw_row` is the normalizer's "skip this record"
@@ -2237,6 +2247,200 @@ mod tests {
         assert!(error.to_string().contains("shrank"));
 
         let _ = fs::remove_file(&path);
+    }
+
+    /// Own thread of the sub-agent rollout below; also the id in its filename.
+    const CODEX_OWN_THREAD: &str = "019f81a9-8226-7c71-a7de-5a0992207ab6";
+    /// Thread that spawned it, whose `session_meta` Codex replays into the
+    /// child rollout as part of the forked context.
+    const CODEX_PARENT_THREAD: &str = "019f7fe1-3b94-7fa2-856c-79946cb89dd2";
+
+    /// Real Codex sub-agent rollout shape: the file's own header, then the
+    /// PARENT thread's replayed header, then ordinary records, then the parent
+    /// header again further down.
+    fn codex_subagent_rollout_lines() -> Vec<String> {
+        let own_header = json!({
+            "type": "session_meta",
+            "timestamp": "2026-07-20T18:33:17.019Z",
+            "payload": {
+                "id": CODEX_OWN_THREAD,
+                "session_id": CODEX_PARENT_THREAD,
+                "forked_from_id": CODEX_PARENT_THREAD,
+                "parent_thread_id": CODEX_PARENT_THREAD,
+                "thread_source": "subagent",
+                "agent_nickname": "Beauvoir",
+                "cwd": "/repo",
+            }
+        });
+        let replayed_parent_header = json!({
+            "type": "session_meta",
+            "timestamp": "2026-07-20T18:33:18.019Z",
+            "payload": {
+                "id": CODEX_PARENT_THREAD,
+                "session_id": CODEX_PARENT_THREAD,
+                "thread_source": "user",
+                "cwd": "/repo",
+            }
+        });
+        let message = |seq: u64| {
+            json!({
+                "type": "event_msg",
+                "timestamp": format!("2026-07-20T18:33:{:02}.019Z", 20 + seq),
+                "payload": {"type": "agent_message", "message": format!("delegated step {seq}")}
+            })
+        };
+
+        [
+            own_header,
+            replayed_parent_header.clone(),
+            message(1),
+            message(2),
+            replayed_parent_header,
+            message(3),
+        ]
+        .iter()
+        .map(|record| record.to_string() + "\n")
+        .collect()
+    }
+
+    fn unique_rollout_path(name: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("moraine-codex-{name}-{suffix}"));
+        fs::create_dir_all(&dir).expect("create rollout directory");
+        dir.join(format!(
+            "rollout-2026-07-20T18-33-17-{CODEX_OWN_THREAD}.jsonl"
+        ))
+    }
+
+    /// One `process_file` pass. Returns the session each source line was
+    /// attributed to, the sub-agent lineage links emitted, and the durable
+    /// checkpoint a following pass would resume from.
+    async fn codex_attribution_pass(
+        path: &Path,
+        resume_from: Option<Checkpoint>,
+    ) -> (
+        std::collections::BTreeMap<u64, String>,
+        Vec<Value>,
+        Option<Checkpoint>,
+    ) {
+        let config = moraine_config::AppConfig::default();
+        let work = WorkItem {
+            source_name: "codex".to_string(),
+            harness: "codex".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: String::new(),
+            path: path.to_string_lossy().to_string(),
+        };
+        let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+        if let Some(resume_from) = resume_from {
+            checkpoints.write().await.insert(
+                crate::checkpoint::checkpoint_key(&work.source_name, &work.path),
+                resume_from,
+            );
+        }
+        let metrics = Arc::new(Metrics::default());
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(64);
+
+        let (result, messages) = drive_with_barrier_acks(
+            process_file(
+                &config,
+                &work,
+                checkpoints,
+                &VolatilePollMap::new(),
+                sink_tx,
+                &metrics,
+            ),
+            &mut sink_rx,
+        )
+        .await;
+        result.expect("codex rollout ingests");
+
+        let mut by_line = std::collections::BTreeMap::new();
+        let mut links = Vec::new();
+        let mut checkpoint = None;
+        for batch in observed_batches(&messages) {
+            for row in &batch.event_rows {
+                let line = row
+                    .get("source_line_no")
+                    .and_then(Value::as_u64)
+                    .expect("event carries its source line");
+                let session = row
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .expect("event carries a session")
+                    .to_string();
+                by_line.insert(line, session);
+            }
+            links.extend(batch.link_rows.iter().cloned());
+            if let Some(batch_checkpoint) = batch.checkpoint.clone() {
+                checkpoint = Some(batch_checkpoint);
+            }
+        }
+
+        (by_line, links, checkpoint)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn codex_subagent_rollout_attribution_is_independent_of_where_the_pass_started() {
+        let lines = codex_subagent_rollout_lines();
+
+        let whole = unique_rollout_path("whole");
+        fs::write(&whole, lines.concat()).expect("write whole rollout");
+        let (fresh, fresh_links, _) = codex_attribution_pass(&whole, None).await;
+
+        // Same bytes, but consumed as a head pass plus an append pass — the
+        // shape that produced one source line under two session ids.
+        let appended = unique_rollout_path("appended");
+        fs::write(&appended, lines[..2].concat()).expect("write rollout head");
+        let (head, head_links, checkpoint) = codex_attribution_pass(&appended, None).await;
+        let checkpoint = checkpoint.expect("head pass persists a checkpoint");
+        assert!(
+            checkpoint.last_offset > 0,
+            "the append must resume mid-file"
+        );
+        fs::write(&appended, lines.concat()).expect("append the rest of the rollout");
+        let (tail, tail_links, _) = codex_attribution_pass(&appended, Some(checkpoint)).await;
+
+        let mut resumed = head;
+        resumed.extend(tail);
+        assert_eq!(
+            fresh, resumed,
+            "a line must resolve to the same session whether the pass started above it or at it"
+        );
+        assert_eq!(fresh.len(), lines.len(), "every line is attributed");
+        for (line, session) in &fresh {
+            assert_eq!(
+                session, CODEX_OWN_THREAD,
+                "line {line} must stay on the rollout's own thread"
+            );
+        }
+
+        let mut resumed_links = head_links;
+        resumed_links.extend(tail_links);
+        for links in [&fresh_links, &resumed_links] {
+            let lineage: Vec<&Value> = links
+                .iter()
+                .filter(|link| {
+                    link.get("link_type").and_then(Value::as_str) == Some("subagent_parent")
+                })
+                .collect();
+            assert_eq!(lineage.len(), 1, "one lineage edge per sub-agent rollout");
+            assert_eq!(
+                lineage[0].get("linked_external_id").and_then(Value::as_str),
+                Some(CODEX_PARENT_THREAD),
+                "the parent thread is preserved as a link, not as the session"
+            );
+            assert_eq!(
+                lineage[0].get("session_id").and_then(Value::as_str),
+                Some(CODEX_OWN_THREAD)
+            );
+        }
+
+        let _ = fs::remove_file(&whole);
+        let _ = fs::remove_file(&appended);
     }
 
     #[tokio::test(flavor = "multi_thread")]

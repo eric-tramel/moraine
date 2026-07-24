@@ -77,7 +77,13 @@ impl IngestSource for Opencode {
 
     fn session_id(&self, record: &Value, ctx: &SourceRecordContext<'_>) -> String {
         let mut session_id = first_text([record.get("session_id"), record.get("sessionID")]);
-        if session_id.is_empty() && ctx.top_type == "opencode_session" {
+        // `opencode_session.id` names a session only while none is
+        // established; a second header inside one stream would otherwise
+        // rebind every following record, and differently per scan start.
+        if session_id.is_empty()
+            && ctx.top_type == "opencode_session"
+            && ctx.session_hint.is_empty()
+        {
             session_id = to_str(record.get("id"));
         }
         if !session_id.is_empty() {

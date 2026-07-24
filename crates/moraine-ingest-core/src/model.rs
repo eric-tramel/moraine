@@ -152,12 +152,17 @@ pub struct NormalizedRecord {
     pub link_rows: Vec<Value>,
     pub tool_rows: Vec<Value>,
     pub error_rows: Vec<Value>,
+    /// Session this record resolved to. Read it, but never chain it back in as
+    /// the next record's hint: identity is fixed per file from the head so one
+    /// line resolves the same way whatever offset the pass started at, and
+    /// chaining reintroduces exactly the read-position dependence that let a
+    /// replayed parent header rebind a whole sub-agent transcript.
     pub session_hint: String,
     pub model_hint: String,
     /// Resolved working directory for this record (record-level cwd where the
     /// harness carries one, otherwise the caller-supplied session-level hint).
-    /// Callers chain it back in like `session_hint`/`model_hint` so records
-    /// after a harness's session header inherit the session cwd.
+    /// Callers chain it back in like `model_hint` so records after a harness's
+    /// session header inherit the session cwd.
     pub cwd_hint: String,
 }
 

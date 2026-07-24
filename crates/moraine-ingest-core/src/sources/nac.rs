@@ -45,11 +45,17 @@ impl IngestSource for NacSource {
 
     fn session_id(&self, record: &Value, ctx: &SourceRecordContext<'_>) -> String {
         let id = to_str(record.get("session_id"));
-        if id.is_empty() {
-            ctx.session_hint.to_string()
-        } else {
-            id
+        if !id.is_empty() {
+            return id;
         }
+        if !ctx.session_hint.is_empty() {
+            return ctx.session_hint.to_string();
+        }
+        // The poller always supplies an empty hint and the source file is a
+        // SQLite database with no session in its name, so an id-less record
+        // would otherwise land in the empty pseudo-session that migration 020
+        // had to purge. Fall back to the record's own stable UID instead.
+        format!("nac:{}", ctx.base_uid)
     }
 
     fn normalize(

@@ -810,7 +810,8 @@ mod tests {
         assert_eq!(metadata.model(), "claude-sonnet-4");
         assert_eq!(metadata.created_at(), "2026-05-28T20:26:40Z");
 
-        let mut session_hint = metadata.session_id().to_string();
+        // Sidecar identity is fixed for the file, exactly as dispatch fixes it.
+        let session_identity = metadata.session_id().to_string();
         let mut model_hint = metadata.model().to_string();
         let mut cwd_hint = metadata.cwd().to_string();
         let mut record_ts_hint = metadata.created_at().to_string();
@@ -825,13 +826,12 @@ mod tests {
             1,
             0,
             0,
-            &session_hint,
+            &session_identity,
             &model_hint,
             &cwd_hint,
             &record_ts_hint,
         )
         .expect("normalize Kiro session metadata");
-        session_hint = session_meta.session_hint.clone();
         model_hint = session_meta.model_hint.clone();
         cwd_hint = session_meta.cwd_hint.clone();
         records.push(session_meta);
@@ -852,7 +852,7 @@ mod tests {
                 1,
                 index as u64 + 1,
                 start_offset,
-                &session_hint,
+                &session_identity,
                 &model_hint,
                 &cwd_hint,
                 &record_ts_hint,
@@ -863,7 +863,6 @@ mod tests {
                     record_ts_hint = record_ts.to_string();
                 }
             }
-            session_hint = normalized.session_hint.clone();
             model_hint = normalized.model_hint.clone();
             cwd_hint = normalized.cwd_hint.clone();
             records.push(normalized);

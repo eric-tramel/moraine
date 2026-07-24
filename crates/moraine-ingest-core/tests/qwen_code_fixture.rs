@@ -18,7 +18,10 @@ fn normalize_fixture() -> Vec<NormalizedRecord> {
     let path = fixture_path();
     let body = std::fs::read_to_string(&path).expect("read Qwen fixture");
     let mut offset = 0_u64;
-    let mut session_hint = String::new();
+    // Dispatch fixes session identity from the file head and never chains it
+    // forward; every fixture record carries its own `sessionId`, so the frozen
+    // fallback stays empty.
+    let session_identity = String::new();
     let mut model_hint = String::new();
     let mut cwd_hint = String::new();
     let mut rows = Vec::new();
@@ -40,12 +43,11 @@ fn normalize_fixture() -> Vec<NormalizedRecord> {
             1,
             index as u64 + 1,
             source_offset,
-            &session_hint,
+            &session_identity,
             &model_hint,
             &cwd_hint,
         )
         .expect("Qwen fixture record normalizes");
-        session_hint = normalized.session_hint.clone();
         model_hint = normalized.model_hint.clone();
         cwd_hint = normalized.cwd_hint.clone();
         rows.push(normalized);
