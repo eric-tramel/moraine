@@ -1,10 +1,9 @@
 use crate::cli::ServeMode;
 use anyhow::{anyhow, bail, Context, Result};
-use moraine_clickhouse::{ClickHouseClient, QueryClass, QueryEnvelope};
 use moraine_config::{
     AppConfig, ClickHouseConfig, QueryBudgetsConfig, ValidatedQueryBudgets, DEFAULT_BACKEND_NAME,
 };
-use moraine_conversations::{BackendRepositoryRouter, RepoConfig};
+use moraine_conversations::{probe_open_v2_ready, BackendRepositoryRouter, RepoConfig};
 #[cfg(unix)]
 use moraine_mcp_core::PrivateRouteNegotiation;
 use moraine_mcp_core::SessionOriginScope;
@@ -156,21 +155,8 @@ fn backend_clickhouse_config(cfg: &AppConfig, backend_name: &str) -> ClickHouseC
 /// v2 activates only once its indexes are published.
 async fn read_open_v2_ready(cfg: &AppConfig, backend_name: &str) -> bool {
     let clickhouse = backend_clickhouse_config(cfg, backend_name);
-    let Ok(client) = ClickHouseClient::new(clickhouse) else {
-        return false;
-    };
     let budgets = backend_query_budgets(cfg);
-    // The probe runs at startup with no ambient request envelope; give its one
-    // statement an Administrative-class envelope so it carries a query id and a
-    // finite deadline (issue #600 amendment A10), like the backend handshake.
-    QueryEnvelope::new(
-        "open-v2-readiness-probe",
-        QueryClass::Administrative,
-        &budgets.administrative,
-    )
-    .scope(async { client.open_v2_reader_ready().await })
-    .await
-    .unwrap_or(false)
+    probe_open_v2_ready(clickhouse, &budgets).await
 }
 
 fn backend_router(
