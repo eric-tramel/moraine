@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use moraine_clickhouse::{
     ClickHouseClient, CoreIndexAuditOutcome, CoreIndexBackfillProgress, DoctorReport,
     MigrationProgress, OpenV2PromotionOutcome, PublicationDiagnostics, QueryClass, QueryEnvelope,
-    ReadIndexState, STATE_KEY_CORE_INDEXES, STATE_KEY_OPEN_V2,
+    ReadIndexState, OPEN_V2_PROVENANCE_OPERATOR_PROMOTE, STATE_KEY_CORE_INDEXES, STATE_KEY_OPEN_V2,
 };
 use moraine_config::{
     AppConfig, OpenReaderMode, OpenReaderResolution, QueryBudgetsConfig, ValidatedQueryBudgets,
@@ -539,12 +539,47 @@ fn snowflake_age_seconds(generation: u64) -> Option<i64> {
     Some((now_ms - write_ms) / 1000)
 }
 
+/// The rebuild's `publication_mode_is_local` (BINDING D3). The CLI targets the
+/// config's default backend, which is Local — except that an `open_v2` row
+/// published with the operator-promote provenance marks the backend as operated
+/// through the Shared promote ceremony, and a rebuild must not bypass that
+/// ceremony by silently republishing with `auto-local` provenance: the doc's
+/// rebuild-then-re-promote step is the operator's verification gate.
+fn rebuild_publication_mode_is_local(prior_open_v2: Option<&ReadIndexState>) -> bool {
+    CLI_PUBLICATION_MODE_IS_LOCAL
+        && !prior_open_v2
+            .is_some_and(|row| row.ready == 1 && row.cursor == OPEN_V2_PROVENANCE_OPERATOR_PROMOTE)
+}
+
 async fn cmd_db_core_index_rebuild(cfg: &AppConfig, output: &CliOutput) -> Result<ExitCode> {
     let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
     let budgets = query_budgets(cfg);
 
-    eprintln!("Resetting canonical read indexes (truncate + clear readiness).");
-    // The reset is a handful of quick TRUNCATE/INSERT statements — one Migration
+    // Readiness revocation only reaches processes started AFTER it: running
+    // backend/MCP processes cache open_v2 readiness for their process lifetime
+    // (WI-08) and would keep serving v2 against the truncated indexes.
+    eprintln!("WARNING: already-running backend/MCP processes cache the open v2 reader for their");
+    eprintln!("         process lifetime and will keep serving it against the truncated indexes.");
+    eprintln!(
+        "         Restart them now (`moraine down && moraine up`) so they serve v1 until this"
+    );
+    eprintln!("         rebuild republishes readiness.");
+
+    let prior_open_v2 = ch
+        .migration_envelope(&budgets.migration)
+        .scope(ch.read_index_state(STATE_KEY_OPEN_V2))
+        .await
+        .context("failed to read open_v2 state before the core-index rebuild")?;
+    let publication_mode_is_local = rebuild_publication_mode_is_local(prior_open_v2.as_ref());
+    if !publication_mode_is_local {
+        eprintln!("open_v2 was published via `core-index promote`; this rebuild will not auto-publish it.");
+        eprintln!(
+            "Verify the rebuilt indexes, then re-run `moraine db core-index promote --force`."
+        );
+    }
+
+    eprintln!("Resetting canonical read indexes (readiness revoked, then truncate).");
+    // The reset is a handful of quick INSERT/TRUNCATE statements — one Migration
     // envelope over the batch is fine (contrast the backfill, whose per-page
     // envelopes below are required so a page deadline caps one page, not the
     // sum of all pages, BINDING D5).
@@ -558,7 +593,7 @@ async fn cmd_db_core_index_rebuild(cfg: &AppConfig, output: &CliOutput) -> Resul
     // it must NOT be wrapped in an additional envelope here.
     let outcome = ch
         .backfill_canonical_read_indexes(
-            CLI_PUBLICATION_MODE_IS_LOCAL,
+            publication_mode_is_local,
             &budgets.migration,
             &budgets.administrative,
             render_core_index_progress,
@@ -655,6 +690,7 @@ async fn cmd_db_core_index_promote(
                 "already_promoted": outcome.already_promoted,
                 "core_indexes_ready": outcome.core_indexes_ready,
                 "audit_passed": outcome.audit_passed,
+                "backfill_in_flight": outcome.backfill_in_flight,
                 "core_index": report,
             }))?
         );
@@ -671,7 +707,15 @@ async fn cmd_db_core_index_promote(
                 state_label(outcome.core_indexes_ready),
                 if outcome.audit_passed { "pass" } else { "fail" },
             ));
-            lines.push("  Run `moraine db core-index rebuild` first.".to_string());
+            if outcome.backfill_in_flight {
+                lines.push(
+                    "  A backfill/rebuild sweep is in flight (page cursor persisted); \
+                     let it finish, then re-run promote."
+                        .to_string(),
+                );
+            } else {
+                lines.push("  Run `moraine db core-index rebuild` first.".to_string());
+            }
         }
         output.section("Canonical Read Indexes: Promote", &lines);
     }
@@ -869,6 +913,36 @@ mod tests {
     /// A real ClickHouse snowflake for `write_ms` (top 41 bits = ms since epoch).
     fn snowflake_for(write_ms: u64) -> u64 {
         write_ms << 22
+    }
+
+    #[test]
+    fn rebuild_withholds_auto_publish_for_operator_promoted_backends() {
+        // An open_v2 row published via the promote ceremony marks the backend
+        // as Shared-operated: the rebuild must not republish it as auto-local.
+        let promoted = state_row(
+            STATE_KEY_OPEN_V2,
+            1,
+            snowflake_for(1),
+            OPEN_V2_PROVENANCE_OPERATOR_PROMOTE,
+        );
+        assert!(!rebuild_publication_mode_is_local(Some(&promoted)));
+
+        // Auto-local publications and unpublished/absent rows keep the CLI's
+        // Local auto-publish.
+        let auto_local = state_row(STATE_KEY_OPEN_V2, 1, snowflake_for(1), "auto-local");
+        assert!(rebuild_publication_mode_is_local(Some(&auto_local)));
+        let unpublished = state_row(STATE_KEY_OPEN_V2, 0, 0, "");
+        assert!(rebuild_publication_mode_is_local(Some(&unpublished)));
+        // A zeroed row that still carries the promote provenance is not
+        // published (ready = 0): the Local gate stays on.
+        let revoked = state_row(
+            STATE_KEY_OPEN_V2,
+            0,
+            snowflake_for(2),
+            OPEN_V2_PROVENANCE_OPERATOR_PROMOTE,
+        );
+        assert!(rebuild_publication_mode_is_local(Some(&revoked)));
+        assert!(rebuild_publication_mode_is_local(None));
     }
 
     #[test]

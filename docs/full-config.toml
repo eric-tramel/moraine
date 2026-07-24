@@ -308,7 +308,12 @@ protocol_version = "2024-11-05"
 # non-silent kill-switch, shown in `moraine status`/`moraine db doctor`); "v2"
 # forces the canonical reader and fails typed when its indexes are not ready.
 # See docs/operations/canonical-read-indexes.md.
-open_reader = "auto"
+#
+# Leave this commented out unless you need to pin a reader: binaries older
+# than the #598 PR window reject unknown [mcp] keys, so a moraine.toml that
+# carries this key must have it removed BEFORE any binary-downgrade rollback
+# or every service will refuse to start.
+# open_reader = "auto"
 
 
 # Prefer the shared central MCP server when running "moraine run mcp". If the

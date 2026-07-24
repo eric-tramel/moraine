@@ -743,7 +743,7 @@ prewarm_on_initialize = false
 async_log_writes = true
 protocol_version = "2024-11-05"
 # max_parallel_requests = 16 # optional; omitted defaults to 8
-open_reader = "auto"
+# open_reader = "auto" # optional; leave unset unless pinning a reader
 use_central_server = true
 central_socket_path = "mcp.sock"
 central_connect_timeout_ms = 250
@@ -772,14 +772,17 @@ Leave `prewarm_on_initialize` disabled for harnesses that launch multiple MCP
 processes at once; enabling it trades startup CPU/database work for lower
 first-search latency.
 
-Leave `open_reader` at `auto`. It selects the canonical page-aware `open`
-reader (issue #598) once migration 036's read indexes finish backfilling on the
-default Local backend, and otherwise keeps the legacy projected reader — no
-manual action is required for a normal local install. Use `v1` as an immediate,
-non-silent kill-switch (surfaced in `moraine status` and `moraine db doctor`),
-and `v2` only for testing or a promoted shared backend. Readiness, operator
-commands (`moraine db core-index status|rebuild|promote`), and rollback are
-documented in
+Leave `open_reader` unset (equivalent to `auto`). It selects the canonical
+page-aware `open` reader (issue #598) once migration 036's read indexes finish
+backfilling on the default Local backend, and otherwise keeps the legacy
+projected reader — no manual action is required for a normal local install.
+Use `v1` as an immediate, non-silent kill-switch (surfaced in `moraine status`
+and `moraine db doctor`), and `v2` only for testing or a promoted shared
+backend. Binaries older than the #598 PR window reject unknown `[mcp]` keys,
+so remove the key from `moraine.toml` before any binary-downgrade rollback.
+Readiness, operator commands
+(`moraine db core-index status|rebuild|promote`), and rollback are documented
+in
 [Canonical read indexes and the `open` reader](operations/canonical-read-indexes.md).
 
 The shared central server applies one parallel-request budget across every MCP

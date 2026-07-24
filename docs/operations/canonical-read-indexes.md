@@ -160,6 +160,16 @@ The same fields are additive JSON under `--output json`, and are surfaced by:
 Core-index readiness is a normal transient state (like publication replaying);
 it does **not** fail the doctor exit code.
 
+> **Status/doctor read live state; serving processes do not.** Each backend or
+> MCP process samples `open_v2` readiness once at construction and keeps that
+> answer for its lifetime. After an in-place `moraine db migrate` publishes
+> readiness under a running backend daemon, `status`/`doctor` report the v2
+> reader as active while the daemon keeps dispatching v1 until it is restarted
+> (`moraine down && moraine up`). This divergence is safe in direction (v1
+> serves correctly) but means doctor output describes the state a *newly
+> started* process would adopt, not necessarily what a long-running daemon is
+> doing right now.
+
 > **Monitor `/api/v1/health`** is intended to expose the same readiness fields.
 > Wiring that endpoint requires an additive `StoreHealth` field in the
 > repository crate (`moraine-conversations`); see the deviation note at the end
@@ -176,17 +186,40 @@ unreachable or migration 036 has not been applied.
 
 ### `moraine db core-index rebuild`
 
-Truncates the three index tables, resets the `core_indexes` / `core_audit` /
-`open_v2` readiness rows to `ready = 0`, then re-runs the backfill from scratch
-(the same engine `moraine db migrate` uses, with one Migration-class query
-envelope per page). Use it when the indexes are suspected stale or corrupt, or
-after a schema change that invalidated them.
+Resets the `open_v2` / `core_audit` / `core_indexes` readiness rows to
+`ready = 0` (in that order — readiness is revoked before anything destructive
+runs), truncates the three index tables, then re-runs the backfill from
+scratch (the same engine `moraine db migrate` uses, with one Migration-class
+query envelope per page). Use it when the indexes are suspected stale or
+corrupt, or after a schema change that invalidated them.
 
-Rebuild is safe while serving traffic **on the default Local backend**: readers
-resolving `auto` fall back to v1 while `open_v2.ready` is 0, and flip back to v2
-only after the rebuild republishes readiness. On a Shared backend, set
-`open_reader = "v1"` on all reader processes first (they will not otherwise
-demote once they have cached v2), run the rebuild, then re-`promote`.
+**Rebuild is not transparent to already-running readers.** Every process reads
+`open_v2` readiness once at backend construction and caches it for its
+lifetime (that monotonic cache is what makes the v2 flip one-way). Revoking
+readiness therefore only reaches processes started afterwards: a backend
+daemon or stdio MCP process that already cached v2 keeps resolving v2 against
+the truncated indexes for the whole re-sweep — serving "not found" and
+silently truncated sessions — and indefinitely if the rebuild fails midway.
+Before (or immediately after) starting a rebuild, restart the running stack:
+
+```
+moraine down && moraine up
+```
+
+Processes started while `open_v2.ready` is 0 resolve `auto` to v1 and adopt v2
+at their next start after the rebuild republishes readiness. The `rebuild`
+command prints this warning before touching anything.
+
+On a Shared backend, additionally set `open_reader = "v1"` on all reader
+processes first (a restart alone re-probes readiness, and mid-rebuild that
+yields v1 anyway — the explicit kill-switch makes it deterministic), run the
+rebuild, then re-`promote`.
+
+A rebuild also honors the promote ceremony: when the pre-rebuild `open_v2` row
+was published with `operator-promote` provenance, the rebuild withholds the
+auto-publication (recording a `withheld-non-local` marker) and the explicit
+`moraine db core-index promote --force` remains the only way to re-publish —
+the rebuild never silently re-flips a promoted backend as `auto-local`.
 
 ### `moraine db core-index promote`
 
@@ -230,6 +263,12 @@ reports "no change" and succeeds.
   reads it exactly as before. (This holds until the separate step-6 retirement
   PR removes the v1 writers.)
 
+  **Remove `open_reader` from `moraine.toml` before downgrading.** Downlevel
+  binaries reject unknown `[mcp]` keys at config load, so a config still
+  carrying `open_reader` (for example after applying the kill-switch above)
+  makes every service — `up`, the backend daemon, ingest, MCP — refuse to
+  start on the old binary. Delete the line, then downgrade.
+
 ## DB-level reset recipe (CLI unavailable)
 
 `moraine db core-index rebuild` performs exactly the statements below. Run them
@@ -239,15 +278,18 @@ subsequent `moraine up` / `moraine db migrate` re-runs the backfill and
 republishes.
 
 ```sql
+-- Revoke readiness FIRST (ReplacingMergeTree(generation): a fresh snowflake
+-- makes each zero win). Statements are not transactional, so this ordering is
+-- the crash-safety guarantee: an interruption at any point leaves the state
+-- reporting not-ready over intact-or-empty tables, never ready-but-empty.
+INSERT INTO moraine.mcp_read_index_state (state_key, ready, generation, cursor)
+VALUES ('open_v2',      0, generateSnowflakeID(), ''),
+       ('core_audit',   0, generateSnowflakeID(), ''),
+       ('core_indexes', 0, generateSnowflakeID(), '');
+
 TRUNCATE TABLE IF EXISTS moraine.mcp_session_directory;
 TRUNCATE TABLE IF EXISTS moraine.mcp_event_locator;
 TRUNCATE TABLE IF EXISTS moraine.mcp_event_navigation;
-
--- ReplacingMergeTree(generation): a fresh snowflake makes each zero win.
-INSERT INTO moraine.mcp_read_index_state (state_key, ready, generation, cursor)
-VALUES ('core_indexes', 0, generateSnowflakeID(), ''),
-       ('core_audit',   0, generateSnowflakeID(), ''),
-       ('open_v2',      0, generateSnowflakeID(), '');
 ```
 
 To publish `open_v2` by hand (the DB-level equivalent of `promote --force`,
