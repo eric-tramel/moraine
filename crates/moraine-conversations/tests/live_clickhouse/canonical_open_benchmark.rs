@@ -585,8 +585,17 @@ pub(super) async fn boundedness() -> Result<()> {
         );
 
         // Adding a 1M-event / 100k-session unrelated corpus does not grow a
-        // small session's open cost (directory/navigation are session-pruned).
-        if unrelated.read_rows > smallsession.read_rows.saturating_mul(2) + 4_096 {
+        // small session's open cost beyond fixed granule floors. The open
+        // issues 6 session-scoped data statements; once the shared tables hold
+        // real data, each statement's pruned read pays up to 2 boundary
+        // granules of 8192 (measured: 2+2+2+1+1 granules across the header,
+        // locator, directory, hydration, and terminal statements, with the
+        // events read literally unchanged at ~4.7k rows). That allowance is
+        // CONSTANT in corpus size — the anti-scaling property — while a real
+        // pruning regression reads some fraction of the 1M-row navigation
+        // table and overshoots it by an order of magnitude.
+        const INDEPENDENCE_GRANULE_ALLOWANCE: u64 = 6 * 2 * 8_192;
+        if unrelated.read_rows > smallsession.read_rows + INDEPENDENCE_GRANULE_ALLOWANCE {
             // Per-statement breakdown for both phases so the failure names the
             // exact statement whose reads grew with the corpus.
             #[derive(serde::Deserialize)]
