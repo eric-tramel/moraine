@@ -146,6 +146,11 @@ impl Ev {
         self
     }
 
+    fn event_ts(mut self, raw: &str) -> Self {
+        self.event_ts = raw.to_string();
+        self
+    }
+
     fn ingested_at_secs(mut self, secs: u32) -> Self {
         self.ingested_at = dt(secs);
         self
@@ -541,6 +546,50 @@ pub(super) async fn parity() -> Result<()> {
             // (first member row's turn_index), never turn_seq's "2"/"3".
             assert_counter_turn_id_pins_turn_index(&repository).await?;
 
+            // Review-finding regression trio (issue-598 adversarial review):
+            // (f1) epoch-sentinel event_ts rows survive hydration end-to-end;
+            // (f2) an early high-override stray is served complete across
+            // limit-1 pagination (the from-anchor window can never re-read
+            // it); (f3) continuation anchors on float-lossy 2038 sort_times
+            // resume exactly. All three sessions diff v1 == v2 byte-for-byte
+            // across full pagination.
+            for (session_id, page_limit) in [
+                ("parity-epoch", 2u16),
+                ("parity-override-early", 1),
+                ("parity-2038", 1),
+            ] {
+                let session = assert_session_parity(&repository, session_id, page_limit).await?;
+                for turn in &session.turns {
+                    assert_turn_parity(&repository, session_id, turn.metadata.turn_seq, 2).await?;
+                    if let Some(reference) = &turn.first_event {
+                        assert_event_parity(&repository, &reference.event_uid).await?;
+                    }
+                    if let Some(reference) = &turn.last_event {
+                        assert_event_parity(&repository, &reference.event_uid).await?;
+                    }
+                }
+            }
+            let early_override =
+                assert_session_parity(&repository, "parity-override-early", 1).await?;
+            assert_eq!(
+                early_override
+                    .turns
+                    .iter()
+                    .map(|turn| turn.metadata.turn_seq)
+                    .collect::<Vec<_>>(),
+                vec![1, 7],
+                "early stray override must produce turns 1 and 7"
+            );
+            let stray_turn = early_override
+                .turns
+                .iter()
+                .find(|turn| turn.metadata.turn_seq == 7)
+                .context("turn 7 missing from early-override session")?;
+            assert_eq!(
+                stray_turn.metadata.total_events, 1,
+                "turn 7 is exactly the pre-anchor stray row"
+            );
+
             // 035 metadata precedence surface: OPEN per-field-latest title/name/
             // summary/slug from session_meta + omp title/title_change, with the omp
             // dispatch-title fallback. The `parity-metadata` session above already
@@ -683,6 +732,54 @@ async fn seed_parity_corpus(clickhouse: &ClickHouseClient) -> Result<()> {
             .payload("session_meta", r#"{"title":"Latest Explicit Title"}"#),
     );
     rows.push(Ev::new("parity-metadata", "meta-a", 73));
+
+    // Real-ingest malformed shape (issue-598 review finding 1): when the Rust
+    // normalizer cannot parse record_ts it stores the EPOCH SENTINEL in
+    // events.event_ts (never a well-formed time), while the navigation MV's
+    // display_time falls back to ingested_at. Hydration must still return the
+    // row (the temporal bound carries an epoch-sentinel branch); both readers
+    // sort an epoch event_ts first, so the session diffs v1 == v2.
+    rows.push(Ev::new("parity-epoch", "epoch-u1", 90).user());
+    rows.push(
+        Ev::new("parity-epoch", "epoch-a1", 91)
+            .record_ts("not-a-timestamp")
+            .event_ts("1970-01-01 00:00:00.000")
+            .ingested_at_secs(92),
+    );
+    rows.push(Ev::new("parity-epoch", "epoch-a2", 93));
+
+    // Early stray override (review finding 2): an assistant row stamped with a
+    // HIGH explicit turn_index whose ordering tuple PRECEDES the counter-path
+    // turn. A from-anchor continuation window can never see it again after
+    // page 1, so paged reads (limit 1) must still serve turn 7 complete.
+    rows.push(Ev::new("parity-override-early", "oe-stray7", 100).turn(7));
+    rows.push(Ev::new("parity-override-early", "oe-u1", 101).user());
+    rows.push(Ev::new("parity-override-early", "oe-a1", 102));
+
+    // Float-lossy keyset window (review finding 3): sort_time values in
+    // [1000*2^k, 1024*2^k] ms lose their millisecond under a
+    // toDateTime64(ms/1000.0, 3) reconstruction (verified: 2147483847595 ->
+    // ...:27.594). Anchors landing on these instants must resume exactly —
+    // no re-served event, no spurious reopen — which only holds with exact
+    // fromUnixTimestamp64Milli reconstruction.
+    for (uid, ms, user) in [
+        ("y38-u1", 595u32, true),
+        ("y38-a1", 596, false),
+        ("y38-u2", 597, true),
+        ("y38-a2", 598, false),
+        ("y38-u3", 599, true),
+        ("y38-a3", 600, false),
+    ] {
+        let record = format!("2038-01-18T22:17:27.{ms:03}Z");
+        let event = format!("2038-01-18 22:17:27.{ms:03}");
+        let mut row = Ev::new("parity-2038", uid, 110 + (ms - 595))
+            .record_ts(&record)
+            .event_ts(&event);
+        if user {
+            row = row.user();
+        }
+        rows.push(row);
+    }
 
     seed_events(clickhouse, &rows).await
 }
