@@ -553,11 +553,15 @@ pub(super) async fn parity() -> Result<()> {
             // it); (f3) continuation anchors on float-lossy 2038 sort_times
             // resume exactly. All three sessions diff v1 == v2 byte-for-byte
             // across full pagination.
-            for (session_id, page_limit) in [
-                ("parity-epoch", 2u16),
-                ("parity-override-early", 1),
-                ("parity-2038", 1),
-            ] {
+            // parity-epoch is deliberately NOT byte-diffed: a malformed
+            // record_ts row's ORDER legitimately diverges (v2 sorts it at the
+            // deterministic epoch sentinel, v1 at its ingested_at fallback) —
+            // the same whitelisted class as parity-malformed. What must hold
+            // is that v2 still HYDRATES the row: the finding's failure mode
+            // was the temporal bound silently excluding it, so open(event)
+            // returned None and turn membership lost its content.
+            assert_epoch_sentinel_rows_hydrate(&repository).await?;
+            for (session_id, page_limit) in [("parity-override-early", 1u16), ("parity-2038", 1)] {
                 let session = assert_session_parity(&repository, session_id, page_limit).await?;
                 for turn in &session.turns {
                     assert_turn_parity(&repository, session_id, turn.metadata.turn_seq, 2).await?;
@@ -782,6 +786,55 @@ async fn seed_parity_corpus(clickhouse: &ClickHouseClient) -> Result<()> {
     }
 
     seed_events(clickhouse, &rows).await
+}
+
+/// The epoch-sentinel hydration contract (issue-598 review finding 1). Real
+/// ingest stores `event_ts = 1970-01-01` whenever the normalizer cannot parse
+/// `record_ts`, while the navigation index's `display_time` falls back to
+/// `ingested_at` — decades apart. A hydration bound derived from display time
+/// (with any finite slack) drops the row, so `open(event)` reports it missing
+/// and its turn loses the row's content. Both hydration branches are pinned:
+/// the pure epoch-equality bound (`open(event)`, a single sentinel row) and
+/// the mixed range-plus-sentinel bound (`open(turn)`, sentinel row alongside
+/// well-formed ones).
+async fn assert_epoch_sentinel_rows_hydrate(
+    repository: &ClickHouseConversationRepository,
+) -> Result<()> {
+    let event = repository
+        .canonical_open_event("epoch-a1")
+        .await
+        .context("v2 event open failed for the epoch-sentinel row")?
+        .context("v2 open(event) dropped the epoch-sentinel row — hydration excluded it")?;
+    assert_eq!(
+        event.event.text_content.as_str(),
+        "assistant text for epoch-a1",
+        "the epoch-sentinel row must hydrate its wide content, not just its reference"
+    );
+
+    let turn = open_turn_v2(repository, "parity-epoch", 1, 4)
+        .await?
+        .context("v2 turn open returned None for the epoch-sentinel session")?;
+    let uids: Vec<&str> = turn
+        .events
+        .iter()
+        .map(|event| event.event_uid.as_str())
+        .collect();
+    assert_eq!(
+        uids,
+        vec!["epoch-a1", "epoch-u1", "epoch-a2"],
+        "the sentinel row sorts first deterministically and stays a turn member"
+    );
+    let sentinel = turn
+        .events
+        .iter()
+        .find(|event| event.event_uid == "epoch-a1")
+        .context("sentinel row missing from its own turn")?;
+    assert_eq!(
+        sentinel.text_preview.as_deref(),
+        Some("assistant text for epoch-a1"),
+        "mixed range+sentinel hydration must return the sentinel row's content"
+    );
+    Ok(())
 }
 
 /// Assert the override turn's deterministic v2 turn_id lies within the v1
