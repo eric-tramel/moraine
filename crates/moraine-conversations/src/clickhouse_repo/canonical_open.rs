@@ -30,29 +30,13 @@
 //! verified by the WI-10 live parity fixtures; the folds here are structured to
 //! that contract and unit-tested for their SQL shape and forward arithmetic.
 
+use super::consistency::EventTsBounds;
 use super::*;
 use moraine_clickhouse::canonical_derivations::{self as cd, DerivationColumns};
 
 /// The `events`-column derivation set the reader always uses (the migration-036
 /// indexes carry the physical `actor_kind`/`event_kind`/`tool_name` names).
 const COLS: DerivationColumns = DerivationColumns::EVENTS;
-
-/// Temporal-pruning slack around a hydration page's display-time bounds. A
-/// page's events are temporally contiguous, so their canonical `events` rows
-/// fall inside the page's `[min(display_time), max(display_time)]` window —
-/// with two ingest-reality exceptions the emitted predicate must admit. A
-/// `record_ts` the Rust normalizer cannot parse stores the epoch sentinel
-/// (`events.event_ts = 1970-01-01`) while `display_time` falls back to
-/// `ingested_at`; no finite slack bridges that, so the bound carries an
-/// explicit epoch-sentinel branch (see `live_events_source_bounded`). A
-/// timezone-naive `record_ts` parses as UTC in Rust but as the server
-/// timezone in ClickHouse BestEffort, skewing `event_ts` from `display_time`
-/// by up to ±14 h — 26 h of slack covers every real UTC offset plus drift.
-/// The hydration statement keeps the uid list as its exact filter; the
-/// widened `BETWEEN` exists only for granule pruning, and `session_id` leads
-/// the events primary key, so slack width costs at most the session's own
-/// granules.
-const HYDRATION_TEMPORAL_SLACK_MS: i64 = 26 * 3_600_000;
 
 // ---------------------------------------------------------------------------
 // Forward derivation arithmetic (design §5.3) — pure, unit-tested.
@@ -239,6 +223,7 @@ pub(super) struct NavWindowRow {
     pub(super) sort_time_ms: i64,
     pub(super) display_time: String,
     pub(super) display_time_ms: i64,
+    pub(super) event_ts_ms: i64,
     pub(super) turn_index: u32,
     pub(super) is_user_message: u8,
     pub(super) actor_kind: String,
@@ -417,7 +402,7 @@ impl ClickHouseConversationRepository {
         let event_type = cd::event_type_expr(COLS);
         let predicates = cd::TurnSummaryPredicates::new(COLS);
         format!(
-            "SELECT\n  ev.event_uid AS event_uid,\n  ev.source_host AS source_host,\n  ev.source_file AS source_file,\n  ev.source_generation AS source_generation,\n  ev.source_offset AS source_offset,\n  ev.source_line_no AS source_line_no,\n  toUInt64(ev.event_version) AS event_version,\n  toInt64(toUnixTimestamp64Milli(ev.sort_time)) AS sort_time_ms,\n  toString(ev.display_time) AS display_time,\n  toInt64(toUnixTimestamp64Milli(ev.display_time)) AS display_time_ms,\n  toUInt32(ev.turn_index) AS turn_index,\n  toUInt8(ev.is_user_message) AS is_user_message,\n  ev.actor_kind AS actor_kind,\n  ev.event_kind AS event_kind,\n  ev.payload_type AS payload_type,\n  ev.tool_name AS tool_name,\n  {event_type} AS event_type,\n  toUInt8({user_input}) AS is_user_input,\n  toUInt8({final_response}) AS is_final_response,\n  toUInt8(ev.payload_type IN ('task_complete', 'turn_aborted')) AS is_terminal,\n  toUInt8(ev.payload_type = 'task_complete') AS is_completed\nFROM (\n  {inner}\n) AS ev\nORDER BY {inner_tuple} ASC\nFORMAT JSONEachRow",
+            "SELECT\n  ev.event_uid AS event_uid,\n  ev.source_host AS source_host,\n  ev.source_file AS source_file,\n  ev.source_generation AS source_generation,\n  ev.source_offset AS source_offset,\n  ev.source_line_no AS source_line_no,\n  toUInt64(ev.event_version) AS event_version,\n  toInt64(toUnixTimestamp64Milli(ev.sort_time)) AS sort_time_ms,\n  toString(ev.display_time) AS display_time,\n  toInt64(toUnixTimestamp64Milli(ev.display_time)) AS display_time_ms,\n  toInt64(toUnixTimestamp64Milli(ev.event_ts)) AS event_ts_ms,\n  toUInt32(ev.turn_index) AS turn_index,\n  toUInt8(ev.is_user_message) AS is_user_message,\n  ev.actor_kind AS actor_kind,\n  ev.event_kind AS event_kind,\n  ev.payload_type AS payload_type,\n  ev.tool_name AS tool_name,\n  {event_type} AS event_type,\n  toUInt8({user_input}) AS is_user_input,\n  toUInt8({final_response}) AS is_final_response,\n  toUInt8(ev.payload_type IN ('task_complete', 'turn_aborted')) AS is_terminal,\n  toUInt8(ev.payload_type = 'task_complete') AS is_completed\nFROM (\n  {inner}\n) AS ev\nORDER BY {inner_tuple} ASC\nFORMAT JSONEachRow",
             user_input = predicates.user_input,
             final_response = predicates.final_response,
             inner_tuple = Self::navigation_sort_tuple("ev"),
@@ -495,25 +480,20 @@ impl ClickHouseConversationRepository {
     /// are reader-derived.
     ///
     /// The uid list cannot prune the `events` primary key `(session_id,
-    /// event_ts, …)`, so the caller passes the page's `[min, max]`
-    /// `display_time` bounds: a page's events are temporally contiguous, and
-    /// the bounds — widened by [`HYDRATION_TEMPORAL_SLACK_MS`] — become a
-    /// closed `event_ts BETWEEN` emitted INSIDE the live-events derived table
-    /// (C2-R0), pruning the `FINAL` scan by granule. The uid `IN` list remains
-    /// the exact filter; the `BETWEEN` exists only for pruning.
+    /// event_ts, …)`, so the caller passes [`EventTsBounds`] computed from the
+    /// page rows' OWN `event_ts` values (the navigation index stores the
+    /// identical instant, so the range is exact — no slack): a closed
+    /// `event_ts BETWEEN`, plus an epoch-sentinel equality branch when the
+    /// page holds malformed-`record_ts` rows, emitted INSIDE the live-events
+    /// derived table (C2-R0), pruning the `FINAL` scan by granule. The uid
+    /// `IN` list remains the exact filter; the bound exists only for pruning.
     pub(super) fn build_wide_hydration_sql(
         &self,
         session_id: &str,
         event_uids: &[String],
-        display_bounds_ms: Option<(i64, i64)>,
+        bounds: Option<EventTsBounds>,
     ) -> String {
-        let event_ts_bounds_ms = display_bounds_ms.map(|(min_ms, max_ms)| {
-            (
-                min_ms.saturating_sub(HYDRATION_TEMPORAL_SLACK_MS),
-                max_ms.saturating_add(HYDRATION_TEMPORAL_SLACK_MS),
-            )
-        });
-        let events = self.live_events_source_bounded(Some(session_id), event_ts_bounds_ms);
+        let events = self.live_events_source_bounded(Some(session_id), bounds);
         let uid_list = sql_array_strings(event_uids);
         let text_cap = cd::MAX_PROJECTED_TEXT_SUMMARY_CHARS;
         let payload_cap = cd::MAX_PROJECTED_PAYLOAD_SUMMARY_CHARS;
@@ -743,15 +723,28 @@ fn dedup_adjacent_navigation_versions(rows: Vec<NavWindowRow>) -> Vec<NavWindowR
 /// The `[min, max]` display-time bounds (ms) of a hydration candidate row set,
 /// passed to the wide hydration statement for temporal granule pruning (raw
 /// bounds — the SQL builder applies [`HYDRATION_TEMPORAL_SLACK_MS`]).
-fn display_bounds_ms(rows: &[(NavWindowRow, ForwardDerived)]) -> Option<(i64, i64)> {
-    rows.iter()
-        .map(|(row, _)| row.display_time_ms)
-        .fold(None, |bounds, ms| {
-            Some(match bounds {
-                None => (ms, ms),
-                Some((lo, hi)) => (lo.min(ms), hi.max(ms)),
-            })
-        })
+/// Exact hydration bounds over the rows' own `event_ts` values: closed range
+/// for well-formed rows, epoch-equality branch for sentinel rows.
+fn hydration_bounds(rows: &[(NavWindowRow, ForwardDerived)]) -> Option<EventTsBounds> {
+    let mut range: Option<(i64, i64)> = None;
+    let mut include_epoch = false;
+    for (row, _) in rows {
+        if row.event_ts_ms == 0 {
+            include_epoch = true;
+            continue;
+        }
+        range = Some(match range {
+            None => (row.event_ts_ms, row.event_ts_ms),
+            Some((lo, hi)) => (lo.min(row.event_ts_ms), hi.max(row.event_ts_ms)),
+        });
+    }
+    if range.is_none() && !include_epoch {
+        return None;
+    }
+    Some(EventTsBounds {
+        range,
+        include_epoch,
+    })
 }
 
 fn nav_row_to_anchor(row: &NavWindowRow, der: &ForwardDerived) -> CanonicalReadAnchor {
@@ -1136,19 +1129,19 @@ impl ClickHouseConversationRepository {
     }
 
     /// Hydrate the wide content columns for exactly `event_uids`.
-    /// `display_bounds_ms` is the covering rows' `[min, max]` display time,
+    /// `bounds` is the covering rows' exact `event_ts` window,
     /// used purely for temporal granule pruning of the `events` scan
     /// ([`Self::build_wide_hydration_sql`]).
     async fn canonical_hydrate(
         &self,
         session_id: &str,
         event_uids: &[String],
-        display_bounds_ms: Option<(i64, i64)>,
+        bounds: Option<EventTsBounds>,
     ) -> RepoResult<HashMap<String, WideRow>> {
         if event_uids.is_empty() {
             return Ok(HashMap::default());
         }
-        let sql = self.build_wide_hydration_sql(session_id, event_uids, display_bounds_ms);
+        let sql = self.build_wide_hydration_sql(session_id, event_uids, bounds);
         let rows = self.map_backend(self.query_rows::<WideRow>(&sql, None).await)?;
         Ok(rows
             .into_iter()
@@ -1345,23 +1338,20 @@ impl ClickHouseConversationRepository {
         let has_more = turns.len() > limit;
         let page_turns = &turns[..turns.len().min(limit)];
 
-        // Hydrate the page's per-turn summary events only, temporally pruned to
-        // the page's own display-time window.
+        // Hydrate the page's per-turn summary events only, temporally pruned
+        // to the page rows' own exact event_ts window.
         let mut summary_uids: Vec<String> = Vec::new();
-        let mut page_bounds: Option<(i64, i64)> = None;
+        let mut page_rows: Vec<(NavWindowRow, ForwardDerived)> = Vec::new();
         for (_, bucket) in page_turns {
-            for (row, _) in bucket {
-                page_bounds = Some(match page_bounds {
-                    None => (row.display_time_ms, row.display_time_ms),
-                    Some((lo, hi)) => (lo.min(row.display_time_ms), hi.max(row.display_time_ms)),
-                });
+            for (row, der) in bucket {
+                page_rows.push((row.clone(), *der));
                 if row.is_user_input != 0 || row.is_final_response != 0 {
                     summary_uids.push(row.event_uid.clone());
                 }
             }
         }
         let summaries = self
-            .canonical_hydrate(session_id, &summary_uids, page_bounds)
+            .canonical_hydrate(session_id, &summary_uids, hydration_bounds(&page_rows))
             .await?;
 
         let compact_turns: Vec<McpTurnCompact> = page_turns
@@ -1475,7 +1465,7 @@ impl ClickHouseConversationRepository {
         // Every hydrated uid is a member of this turn, so the turn's own
         // display-time window bounds the temporal pruning.
         let hydrated = self
-            .canonical_hydrate(session_id, &hydrate_uids, display_bounds_ms(&turn_rows))
+            .canonical_hydrate(session_id, &hydrate_uids, hydration_bounds(&turn_rows))
             .await?;
 
         let compact = self.assemble_turn_compact(session_id, &turn_rows, &hydrated);
@@ -1616,19 +1606,19 @@ impl ClickHouseConversationRepository {
             .canonical_hydrate(
                 &locator.session_id,
                 &summary_uids,
-                display_bounds_ms(&turn_rows),
+                hydration_bounds(&turn_rows),
             )
             .await?;
         let parent_turn = self.assemble_turn_compact(&locator.session_id, &turn_rows, &summaries);
 
         // Hydrate the target event's full content only, pruned to its own
-        // display instant.
-        let target_display_ms = rows[target_index].0.display_time_ms;
+        // exact event_ts instant (epoch-sentinel rows hit the equality branch).
+        let target_row = std::slice::from_ref(&rows[target_index]);
         let hydrated = self
             .canonical_hydrate(
                 &locator.session_id,
                 &[event_uid.to_string()],
-                Some((target_display_ms, target_display_ms)),
+                hydration_bounds(target_row),
             )
             .await?;
         let Some(wide) = hydrated.get(event_uid) else {
@@ -1892,6 +1882,7 @@ mod tests {
             sort_time_ms,
             display_time: "2026-07-20 12:00:00.000".to_string(),
             display_time_ms: sort_time_ms,
+            event_ts_ms: sort_time_ms,
             turn_index: 0,
             is_user_message: 0,
             actor_kind: "assistant".to_string(),
@@ -2300,7 +2291,10 @@ mod tests {
             r.build_wide_hydration_sql(
                 "session-a",
                 &uids,
-                Some((1_700_000_000_000, 1_700_000_600_000)),
+                Some(EventTsBounds {
+                    range: Some((1_700_000_000_000, 1_700_000_600_000)),
+                    include_epoch: false,
+                }),
             )
         })
         .await;
@@ -2310,14 +2304,15 @@ mod tests {
         assert!(sql.contains("token_usage_buckets"));
         // Bounded to the explicit uid set — never the whole session.
         assert!(sql.contains("WHERE e.event_uid IN ['uid-1','uid-2']"));
-        // Temporal pruning: the page's display-time bounds, widened by the
-        // one-hour slack, land INSIDE the live-events derived table as a
-        // closed `event_ts BETWEEN` so the events primary key
-        // `(session_id, event_ts, …)` prunes the FINAL scan by granule. The
-        // uid list above stays the exact filter.
+        // Temporal pruning: the page rows' exact event_ts bounds land INSIDE
+        // the live-events derived table as a closed `event_ts BETWEEN` so the
+        // events primary key `(session_id, event_ts, …)` prunes the FINAL
+        // scan by granule — no slack, the navigation index stores the same
+        // instant. The uid list above stays the exact filter.
         assert!(sql.contains(
-            "(e.event_ts BETWEEN fromUnixTimestamp64Milli(1699906400000) AND fromUnixTimestamp64Milli(1700094200000) OR e.event_ts = fromUnixTimestamp64Milli(0))"
+            "e.event_ts BETWEEN fromUnixTimestamp64Milli(1700000000000) AND fromUnixTimestamp64Milli(1700000600000)"
         ));
+        assert!(!sql.contains("OR e.event_ts = fromUnixTimestamp64Milli(0)"));
         // event_order / turn_seq are reader-derived, never hydrated.
         assert!(!sql.contains("event_order"));
         assert!(!sql.contains("turn_seq"));
@@ -2336,6 +2331,42 @@ mod tests {
         let sql = build(|r| r.build_wide_hydration_sql("session-a", &uids, None)).await;
         assert!(!sql.contains("BETWEEN"));
         assert!(sql.contains("WHERE e.event_uid IN ['uid-1']"));
+    }
+
+    #[tokio::test]
+    async fn wide_hydration_admits_epoch_sentinel_rows() {
+        let uids = vec!["uid-1".to_string()];
+        // Mixed page: well-formed range plus a malformed-record_ts row.
+        let sql = build(|r| {
+            r.build_wide_hydration_sql(
+                "session-a",
+                &uids,
+                Some(EventTsBounds {
+                    range: Some((1_700_000_000_000, 1_700_000_600_000)),
+                    include_epoch: true,
+                }),
+            )
+        })
+        .await;
+        assert!(sql.contains(
+            "(e.event_ts BETWEEN fromUnixTimestamp64Milli(1700000000000) AND fromUnixTimestamp64Milli(1700000600000) OR e.event_ts = fromUnixTimestamp64Milli(0))"
+        ));
+        // All-epoch page: pure equality, no range.
+        let sql = build(|r| {
+            r.build_wide_hydration_sql(
+                "session-a",
+                &uids,
+                Some(EventTsBounds {
+                    range: None,
+                    include_epoch: true,
+                }),
+            )
+        })
+        .await;
+        assert!(sql.contains(
+            "WHERE e.session_id = 'session-a' AND e.event_ts = fromUnixTimestamp64Milli(0)"
+        ));
+        assert!(!sql.contains("BETWEEN"));
     }
 
     #[tokio::test]
