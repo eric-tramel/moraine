@@ -376,7 +376,7 @@ async fn assert_session_parity(
     let v1 = repository
         .get_mcp_session(session_id)
         .await
-        .with_context(|| format!("v1 session open failed for {session_id}"))?
+        .map_err(|error| anyhow!("v1 session open failed for {session_id}: {error:#}"))?
         .with_context(|| format!("v1 session open returned None for {session_id}"))?;
     let v2 = open_session_v2(repository, session_id, limit)
         .await?
@@ -399,7 +399,9 @@ async fn assert_turn_parity(
     let v1 = repository
         .get_mcp_turn(session_id, turn_seq)
         .await
-        .with_context(|| format!("v1 turn open failed for {session_id} turn {turn_seq}"))?
+        .map_err(|error| {
+            anyhow!("v1 turn open failed for {session_id} turn {turn_seq}: {error:#}")
+        })?
         .with_context(|| format!("v1 turn open returned None for {session_id} turn {turn_seq}"))?;
     let v2 = open_turn_v2(repository, session_id, turn_seq, limit)
         .await?
@@ -422,7 +424,7 @@ async fn assert_event_parity(
     let v1 = repository
         .get_mcp_event(event_uid)
         .await
-        .with_context(|| format!("v1 event open failed for {event_uid}"))?
+        .map_err(|error| anyhow!("v1 event open failed for {event_uid}: {error:#}"))?
         .with_context(|| format!("v1 event open returned None for {event_uid}"))?;
     let v2 = repository
         .canonical_open_event(event_uid)
@@ -581,8 +583,8 @@ pub(super) async fn parity() -> Result<()> {
                     .iter()
                     .map(|turn| turn.metadata.turn_seq)
                     .collect::<Vec<_>>(),
-                vec![1, 7],
-                "early stray override must produce turns 1 and 7"
+                vec![2, 7],
+                "the counter turn derives seq 2 behind the override's user message"
             );
             let stray_turn = early_override
                 .turns
@@ -590,8 +592,8 @@ pub(super) async fn parity() -> Result<()> {
                 .find(|turn| turn.metadata.turn_seq == 7)
                 .context("turn 7 missing from early-override session")?;
             assert_eq!(
-                stray_turn.metadata.total_events, 1,
-                "turn 7 is exactly the pre-anchor stray row"
+                stray_turn.metadata.total_events, 2,
+                "turn 7 keeps both pre-anchor rows across pagination"
             );
 
             // 035 metadata precedence surface: OPEN per-field-latest title/name/
@@ -752,13 +754,21 @@ async fn seed_parity_corpus(clickhouse: &ClickHouseClient) -> Result<()> {
     );
     rows.push(Ev::new("parity-epoch", "epoch-a2", 93));
 
-    // Early stray override (review finding 2): an assistant row stamped with a
-    // HIGH explicit turn_index whose ordering tuple PRECEDES the counter-path
-    // turn. A from-anchor continuation window can never see it again after
-    // page 1, so paged reads (limit 1) must still serve turn 7 complete.
-    rows.push(Ev::new("parity-override-early", "oe-stray7", 100).turn(7));
-    rows.push(Ev::new("parity-override-early", "oe-u1", 101).user());
-    rows.push(Ev::new("parity-override-early", "oe-a1", 102));
+    // Early stray override (review finding 2): an explicit turn_index 7 turn
+    // whose rows sort FIRST by ordering tuple, followed by a counter-path turn
+    // that derives turn_seq 2 (the override's user message advances the
+    // counter). Served page order is by turn_seq — so page 1 (limit 1) serves
+    // turn 2, whose rows are the session's LAST, and the anchor lands past
+    // every row of turn 7. A from-anchor continuation window can never see
+    // turn 7 again, so paged reads must re-fold to serve it.
+    rows.push(
+        Ev::new("parity-override-early", "oe-u7", 100)
+            .user()
+            .turn(7),
+    );
+    rows.push(Ev::new("parity-override-early", "oe-a7", 101).turn(7));
+    rows.push(Ev::new("parity-override-early", "oe-u1", 102).user());
+    rows.push(Ev::new("parity-override-early", "oe-a1", 103));
 
     // Float-lossy keyset window (review finding 3): sort_time values in
     // [1000*2^k, 1024*2^k] ms lose their millisecond under a
