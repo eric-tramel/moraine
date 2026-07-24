@@ -282,10 +282,10 @@ async fn run_backend(
         .context("failed to build default backend conversation repository")?;
 
     // Read the default (single-owner Local) backend's `open_v2` readiness once,
-    // now that its repository is built (issue #598 WI-08). This is the only
-    // Local backend the socket server hosts, so this cached bool is what the
-    // `auto` open-reader resolution consults for every default-backend
-    // connection; named Shared backends stay on v1 under `auto` regardless.
+    // now that its repository is built (issue #598 WI-08). It seeds only the
+    // default backend's readiness cell inside the socket server; named backends
+    // are probed against their own ClickHouse config on their first connection,
+    // so a forced `open_reader = "v2"` gates on the routed backend's readiness.
     let open_v2_ready = read_open_v2_ready(&cfg, DEFAULT_BACKEND_NAME).await;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

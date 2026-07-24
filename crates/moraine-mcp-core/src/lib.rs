@@ -13,6 +13,8 @@ use moraine_config::{
     AppConfig, OpenReaderResolution, ValidatedQueryBudgets, DEFAULT_BACKEND_NAME,
     KNOWN_INGEST_HARNESSES,
 };
+#[cfg(unix)]
+use moraine_conversations::probe_open_v2_ready;
 use moraine_conversations::{
     BackendRepositoryRouter, EnvelopeStatsSnapshot, QueryClass, QueryEnvelope, RepoError,
 };
@@ -1621,6 +1623,117 @@ impl BackendPrewarmGates {
     }
 }
 
+/// Per-backend `open_v2` readiness cells for the socket daemon (issue #598
+/// WI-08 applied per backend). The default Local backend's cell is seeded from
+/// the caller's startup probe; a named backend is probed against its OWN
+/// ClickHouse config on its first connection and the result is cached for the
+/// process lifetime — the same construction-time-read contract, keyed by the
+/// backend that actually serves the reads. `[mcp] open_reader` is
+/// daemon-global, so a forced `"v2"` resolves EVERY backend's opens: the
+/// ForcedV2Unready typed gate must test the routed backend's readiness, not
+/// the default backend's.
+#[cfg(unix)]
+#[derive(Clone)]
+struct BackendOpenV2Readiness {
+    by_backend: Arc<std::collections::HashMap<String, Arc<tokio::sync::OnceCell<bool>>>>,
+}
+
+#[cfg(unix)]
+impl BackendOpenV2Readiness {
+    fn new(cfg: &AppConfig, default_backend_ready: bool) -> Self {
+        let by_backend = cfg
+            .backends
+            .keys()
+            .map(|name| {
+                let seed = (name == DEFAULT_BACKEND_NAME).then_some(default_backend_ready);
+                (
+                    name.clone(),
+                    Arc::new(tokio::sync::OnceCell::new_with(seed)),
+                )
+            })
+            .collect();
+        Self {
+            by_backend: Arc::new(by_backend),
+        }
+    }
+
+    /// The routed backend's cached readiness, probing it once on first use.
+    /// The probe is best-effort by design (an unreachable or un-migrated
+    /// backend yields `false`, staying on v1), matching the startup probe's
+    /// contract for the default backend.
+    async fn for_backend(
+        &self,
+        cfg: &AppConfig,
+        budgets: &ValidatedQueryBudgets,
+        backend_name: &str,
+    ) -> Result<bool> {
+        let cell = self.by_backend.get(backend_name).cloned().ok_or_else(|| {
+            anyhow!("selected backend '{backend_name}' has no open_v2 readiness cell")
+        })?;
+        let clickhouse = cfg
+            .backends
+            .get(backend_name)
+            .cloned()
+            .unwrap_or_else(|| cfg.clickhouse.clone());
+        Ok(*cell
+            .get_or_init(|| probe_open_v2_ready(clickhouse, budgets))
+            .await)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod open_v2_readiness_tests {
+    use super::*;
+
+    /// Config with an unreachable ClickHouse for both the default and a named
+    /// backend, so any real probe resolves to `false` (stay on v1).
+    fn cfg_with_named_backend() -> AppConfig {
+        let mut cfg = AppConfig::default();
+        cfg.clickhouse.url = "http://127.0.0.1:9".to_string();
+        cfg.backends
+            .insert(DEFAULT_BACKEND_NAME.to_string(), cfg.clickhouse.clone());
+        cfg.backends
+            .insert("team-a".to_string(), cfg.clickhouse.clone());
+        cfg
+    }
+
+    #[tokio::test]
+    async fn named_backend_never_inherits_the_default_backends_readiness() {
+        let cfg = cfg_with_named_backend();
+        let budgets = validated_query_budgets(&cfg).expect("budgets");
+        let readiness = BackendOpenV2Readiness::new(&cfg, true);
+
+        // The default backend's cell is seeded from the startup probe (true
+        // here — returned without probing the unreachable URL)...
+        assert!(readiness
+            .for_backend(&cfg, &budgets, DEFAULT_BACKEND_NAME)
+            .await
+            .expect("default backend readiness"));
+
+        // ...but a named backend probes its OWN ClickHouse config: unreachable
+        // resolves to false (v1), never the default backend's cached true. The
+        // ForcedV2Unready gate therefore tests the backend that serves the
+        // reads.
+        assert!(!readiness
+            .for_backend(&cfg, &budgets, "team-a")
+            .await
+            .expect("named backend readiness"));
+    }
+
+    #[tokio::test]
+    async fn unknown_backend_name_is_a_readiness_error() {
+        let cfg = cfg_with_named_backend();
+        let budgets = validated_query_budgets(&cfg).expect("budgets");
+        let readiness = BackendOpenV2Readiness::new(&cfg, false);
+
+        let error = readiness
+            .for_backend(&cfg, &budgets, "ghost")
+            .await
+            .expect_err("unknown backend must not silently resolve");
+        assert!(error.to_string().contains("ghost"));
+    }
+}
+
 #[cfg(unix)]
 #[derive(Clone)]
 struct SocketState {
@@ -1629,15 +1742,12 @@ struct SocketState {
     prewarm_gates: BackendPrewarmGates,
     request_admission: Arc<RequestAdmission>,
     query_budgets: ValidatedQueryBudgets,
-    /// The default single-owner Local backend's cached `open_v2` readiness,
-    /// read once at backend construction and threaded in by the caller (issue
-    /// #598 WI-08). Only the Local backend auto-selects the v2 reader, and this
-    /// server hosts exactly one Local backend (the default), so this single
-    /// cached bool is authoritative for every `auto`-mode connection. A named
-    /// Shared backend resolves to v1 under `auto` regardless of this value; a
-    /// forced `open_reader = "v2"` on such a backend uses it as a best-effort
-    /// readiness proxy and still fails typed rather than falling back.
-    open_v2_ready: bool,
+    /// Per-backend cached `open_v2` readiness (issue #598 WI-08): the default
+    /// Local backend's value is read once at backend construction and threaded
+    /// in by the caller; named backends are probed on first connection. Every
+    /// connection's `open` dispatch consults the readiness of the backend it
+    /// was routed to.
+    open_v2_readiness: BackendOpenV2Readiness,
     shutdown: watch::Receiver<bool>,
 }
 
@@ -1650,6 +1760,12 @@ struct SocketState {
 /// the same backend share both its repository and its MCP prewarm gate. When
 /// shutdown resolves, accepting stops, connection and request cancellation is
 /// drained within a fixed bound, and the public socket path is unlinked.
+///
+/// `open_v2_ready` is the DEFAULT backend's `open_v2` readiness, probed by the
+/// caller at backend construction (issue #598 WI-08); it seeds only the
+/// default backend's readiness cell. Named backends are probed against their
+/// own ClickHouse config on their first connection (see
+/// [`BackendOpenV2Readiness`]).
 #[cfg(unix)]
 pub async fn run_socket_with_router<S>(
     cfg: Arc<AppConfig>,
@@ -1671,7 +1787,7 @@ where
         prewarm_gates: BackendPrewarmGates::new(&cfg),
         request_admission,
         query_budgets,
-        open_v2_ready,
+        open_v2_readiness: BackendOpenV2Readiness::new(&cfg, open_v2_ready),
         shutdown: connection_shutdown_rx,
         cfg,
         router,
@@ -2030,11 +2146,24 @@ async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStr
         Err(error) => return Err(error),
     };
     // Only the default single-owner backend is Local (issue #598 BINDING D3);
-    // named backends are Shared and never auto-select the v2 reader. The cached
-    // `open_v2_ready` is the default backend's readiness, which is exactly what
-    // the `auto` resolution consults for this Local backend and is short-
-    // circuited by `publication_mode_is_local = false` for Shared backends.
+    // named backends are Shared and never auto-select the v2 reader. The
+    // readiness threaded into the connection is the ROUTED backend's: `[mcp]
+    // open_reader` is daemon-global, so a forced `"v2"` (the promoted-Shared
+    // path) resolves every backend's opens, and the ForcedV2Unready typed gate
+    // must test the backend that actually serves the reads — not the default.
     let publication_mode_is_local = backend.backend_name() == DEFAULT_BACKEND_NAME;
+    let open_v2_ready = match state
+        .open_v2_readiness
+        .for_backend(&state.cfg, &state.query_budgets, backend.backend_name())
+        .await
+    {
+        Ok(ready) => ready,
+        Err(error) if negotiated => {
+            private_proxy::write_route_error(&mut write_half, &error.to_string()).await?;
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     let app_state = AppState::with_repository(
         state.cfg,
         backend.repository().clone(),
@@ -2042,7 +2171,7 @@ async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStr
         launch_dir,
         state.request_admission,
         state.query_budgets,
-        state.open_v2_ready,
+        open_v2_ready,
         publication_mode_is_local,
     );
     if negotiated {

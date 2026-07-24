@@ -63,6 +63,15 @@ pub const OPEN_V2_PROVENANCE_AUTO_LOCAL: &str = "auto-local";
 /// rebuild.
 pub const OPEN_V2_PROVENANCE_OPERATOR_PROMOTE: &str = "operator-promote";
 
+/// Provenance recorded in `open_v2.cursor` (with `ready = 0`) when a passing
+/// publish deliberately withholds `open_v2` because the backend is not the
+/// default single-owner Local backend (BINDING D3). The marker distinguishes
+/// "promotion is the operator's explicit next step" from a crash between the
+/// `core_indexes` and `open_v2` readiness writes, so the idempotent
+/// resume-gate re-evaluation completes only genuinely stranded Local
+/// publications and never bypasses the Shared promote ceremony.
+pub const OPEN_V2_PROVENANCE_WITHHELD_NON_LOCAL: &str = "withheld-non-local";
+
 /// The three migration-036 index tables truncated by a `core-index rebuild`.
 const CANONICAL_INDEX_TABLES: [&str; 3] = [
     "mcp_session_directory",
@@ -97,20 +106,27 @@ pub const PAGE_STATEMENT_CAP: u32 = PAGE_STMT_BOUNDARY_PROBE
     + PAGE_STMT_CURSOR_PERSIST
     + PAGE_STMT_MARGIN;
 
-/// Statement cap for the resume-state read phase (a table-existence probe plus
-/// one state read).
-const RESUME_STATEMENT_CAP: u32 = 4;
+/// Statement cap for the resume-state read phase: up to three
+/// existence-probe + state-read pairs (`core_indexes`, `core_audit`,
+/// `open_v2`) plus the stranded-publication completing write, with margin.
+const RESUME_STATEMENT_CAP: u32 = 8;
 /// Statement cap for the audit phase (sample fetch + coverage/cardinality
 /// probes + audit persist).
 const AUDIT_STATEMENT_CAP: u32 = 16;
 /// Statement cap for the readiness-publication phase: a `core_indexes` state
-/// read (existence probe + read = 2) plus the `core_indexes` and `open_v2`
-/// writes, with margin.
-const PUBLISH_STATEMENT_CAP: u32 = 6;
+/// read (existence probe + read = 2), an `open_v2` state read guarding the
+/// non-local withhold marker, and the `core_indexes` and `open_v2` writes,
+/// with margin.
+const PUBLISH_STATEMENT_CAP: u32 = 8;
 
-/// Sessions sampled by the overlap audit.
+/// Sessions sampled by the overlap audit (randomly, so repeated audits do not
+/// re-check the same fixed alphabetical prefix of the corpus).
 const AUDIT_SESSION_SAMPLE: u64 = 128;
-/// Most-recent events per sampled session checked for index coverage.
+/// Events per coverage slice per sampled session. The audit checks TWO slices
+/// of each session — its newest and its oldest events — because post-036 the
+/// newest rows are exactly what the live MVs wrote: a newest-only sample could
+/// pass without ever touching the range the backfill swept. The oldest slice
+/// is the backfilled range for any session predating the migration.
 const AUDIT_EVENTS_PER_SESSION: u64 = 256;
 /// Memory ceiling for the audit anti-join probes (spills instead of blowing the
 /// server memory cap; precedent `sql/032`).
@@ -250,6 +266,10 @@ pub struct OpenV2PromotionOutcome {
     pub audit_passed: bool,
     /// `open_v2.ready` was already 1 before this call (idempotent no-op).
     pub already_promoted: bool,
+    /// A coverage sweep is in flight (or crashed mid-sweep): `core_indexes`
+    /// is not ready but its durable page cursor is persisted. Promotion is
+    /// refused until the sweep (or a rerun of it) completes.
+    pub backfill_in_flight: bool,
     /// This call published `open_v2.ready = 1` with the operator provenance.
     pub promoted: bool,
 }
@@ -374,28 +394,36 @@ impl ClickHouseClient {
     {
         let mut outcome = CoreIndexBackfillOutcome::default();
 
-        // Resume state: short-circuit when the sweep already completed.
-        let existing = QueryEnvelope::new_batch(
+        // Resume state: short-circuit when the sweep already completed, but
+        // first re-evaluate the publication gate idempotently (a crash between
+        // the `core_indexes` and `open_v2` readiness writes must not strand
+        // the Local cutover forever behind this short-circuit).
+        let action = QueryEnvelope::new_batch(
             "core-index-resume",
             QueryClass::Migration,
             migration_budget,
             admin_budget,
             RESUME_STATEMENT_CAP,
         )
-        .scope(self.read_index_state(STATE_KEY_CORE_INDEXES))
+        .scope(self.resume_action(publication_mode_is_local))
         .await?;
-        if existing.as_ref().is_some_and(|state| state.ready == 1) {
-            outcome.already_complete = true;
-            on_progress(CoreIndexBackfillProgress::AlreadyComplete);
-            return Ok(outcome);
-        }
-
-        let mut cursor: Option<CoreIndexCursor> = match existing {
-            Some(state) if !state.cursor.is_empty() => Some(
-                serde_json::from_str(&state.cursor)
-                    .context("failed to decode persisted core-index backfill cursor")?,
-            ),
-            _ => None,
+        let mut cursor: Option<CoreIndexCursor> = match action {
+            ResumeAction::AlreadyComplete {
+                open_v2_republished,
+            } => {
+                outcome.already_complete = true;
+                outcome.open_v2_published = open_v2_republished;
+                if open_v2_republished {
+                    on_progress(CoreIndexBackfillProgress::Published {
+                        core_indexes: true,
+                        open_v2: true,
+                    });
+                } else {
+                    on_progress(CoreIndexBackfillProgress::AlreadyComplete);
+                }
+                return Ok(outcome);
+            }
+            ResumeAction::Sweep { cursor } => cursor,
         };
         on_progress(CoreIndexBackfillProgress::Starting {
             resuming: cursor.is_some(),
@@ -460,6 +488,61 @@ impl ClickHouseClient {
         });
 
         Ok(outcome)
+    }
+
+    /// Read the durable resume state and decide this invocation's course.
+    ///
+    /// On the already-complete path the readiness publication gate is
+    /// re-derived from the persisted audit (idempotent re-evaluation, BINDING
+    /// D3): `core_indexes.ready` and the Local `open_v2` auto-publish are two
+    /// separate statements, so a crash between them leaves the sweep complete
+    /// with `open_v2` stranded at 0. That stranded publication is completed
+    /// here. The explicit non-local withhold marker
+    /// ([`OPEN_V2_PROVENANCE_WITHHELD_NON_LOCAL`]) is respected: for a
+    /// Shared-ceremony backend, promotion stays the operator's explicit step.
+    ///
+    /// Assumes an active query envelope ([`RESUME_STATEMENT_CAP`]).
+    async fn resume_action(&self, publication_mode_is_local: bool) -> Result<ResumeAction> {
+        let Some(state) = self.read_index_state(STATE_KEY_CORE_INDEXES).await? else {
+            return Ok(ResumeAction::Sweep { cursor: None });
+        };
+        if state.ready != 1 {
+            let cursor = if state.cursor.is_empty() {
+                None
+            } else {
+                Some(
+                    serde_json::from_str(&state.cursor)
+                        .context("failed to decode persisted core-index backfill cursor")?,
+                )
+            };
+            return Ok(ResumeAction::Sweep { cursor });
+        }
+
+        let audit_passed = self
+            .core_index_audit_outcome()
+            .await?
+            .is_some_and(|audit| audit.passed);
+        let plan = readiness_publication_plan(audit_passed, publication_mode_is_local);
+        if !plan.publish_open_v2 {
+            return Ok(ResumeAction::AlreadyComplete {
+                open_v2_republished: false,
+            });
+        }
+        let stranded = match self.read_index_state(STATE_KEY_OPEN_V2).await? {
+            None => true,
+            Some(row) if row.ready == 1 => false,
+            Some(row) => row.cursor != OPEN_V2_PROVENANCE_WITHHELD_NON_LOCAL,
+        };
+        if !stranded {
+            return Ok(ResumeAction::AlreadyComplete {
+                open_v2_republished: false,
+            });
+        }
+        self.write_index_state(STATE_KEY_OPEN_V2, true, OPEN_V2_PROVENANCE_AUTO_LOCAL)
+            .await?;
+        Ok(ResumeAction::AlreadyComplete {
+            open_v2_republished: true,
+        })
     }
 
     /// Read the latest `mcp_read_index_state` row for `state_key`, or `None`
@@ -565,19 +648,32 @@ impl ClickHouseClient {
     /// (`core_indexes.ready == 1`) AND the persisted overlap audit passed; the
     /// reader must never be switched onto an unaudited index. When those
     /// preconditions are not met the returned outcome reports them and nothing
-    /// is written. Already-promoted is an idempotent success. The caller is
-    /// responsible for the operator confirmation that every consumer is
-    /// v2-capable before invoking this (a Shared promotion switches ALL readers).
+    /// is written — including while a backfill sweep is in flight
+    /// (`core_indexes.ready == 0` with a persisted page cursor).
+    /// Already-promoted is an idempotent success. The caller is responsible
+    /// for the operator confirmation that every consumer is v2-capable before
+    /// invoking this (a Shared promotion switches ALL readers).
+    ///
+    /// ClickHouse offers no transactions, so the preconditions are re-verified
+    /// immediately AFTER the publish write: a concurrent `rebuild` reset zeroes
+    /// the readiness rows around this write, and the freshly published row's
+    /// newer snowflake generation would otherwise survive that reset and keep
+    /// `open_v2 = 1` over truncated, unaudited indexes. When the re-check fails
+    /// the published row is revoked and the call errors.
     ///
     /// Assumes an active query envelope (the caller scopes it).
     pub async fn promote_open_v2_reader(&self) -> Result<OpenV2PromotionOutcome> {
+        let core_indexes = self.read_index_state(STATE_KEY_CORE_INDEXES).await?;
         let mut outcome = OpenV2PromotionOutcome {
-            core_indexes_ready: self.canonical_read_indexes_ready().await?,
+            core_indexes_ready: core_indexes.as_ref().is_some_and(|state| state.ready == 1),
             audit_passed: self
                 .core_index_audit_outcome()
                 .await?
                 .is_some_and(|audit| audit.passed),
             already_promoted: self.open_v2_reader_ready().await?,
+            backfill_in_flight: core_indexes
+                .as_ref()
+                .is_some_and(|state| state.ready == 0 && !state.cursor.is_empty()),
             promoted: false,
         };
 
@@ -591,33 +687,57 @@ impl ClickHouseClient {
 
         self.write_index_state(STATE_KEY_OPEN_V2, true, OPEN_V2_PROVENANCE_OPERATOR_PROMOTE)
             .await?;
+
+        // Post-write re-verification (see the doc comment). Also confirm the
+        // published row itself is still visible: a concurrent non-local publish
+        // withhold could have overwritten it with the marker row.
+        let still_ready = self.canonical_read_indexes_ready().await?;
+        let still_audited = self
+            .core_index_audit_outcome()
+            .await?
+            .is_some_and(|audit| audit.passed);
+        let still_published = self.open_v2_reader_ready().await?;
+        if !still_ready || !still_audited || !still_published {
+            self.write_index_state(STATE_KEY_OPEN_V2, false, "").await?;
+            anyhow::bail!(
+                "open_v2 promotion aborted: core-index readiness changed while promoting \
+                 (a `core-index rebuild` reset is likely in flight); the published row was \
+                 revoked — re-run `moraine db core-index promote --force` after the rebuild \
+                 completes"
+            );
+        }
         outcome.promoted = true;
         Ok(outcome)
     }
 
     /// Reset the migration-036 canonical read indexes to a pre-backfill state
-    /// (WI-05 `core-index rebuild`): truncate the three index tables and reset
-    /// the `core_indexes`, `core_audit`, and `open_v2` readiness rows to
-    /// `ready = 0` with an empty cursor. A subsequent
+    /// (WI-05 `core-index rebuild`): reset the `open_v2`, `core_audit`, and
+    /// `core_indexes` readiness rows to `ready = 0` with an empty cursor, then
+    /// truncate the three index tables. A subsequent
     /// [`Self::backfill_canonical_read_indexes`] then re-sweeps from scratch.
+    ///
+    /// Every statement here is a separate HTTP request with no transaction, so
+    /// crash safety comes from the write ordering: readiness is revoked BEFORE
+    /// any destructive statement, `open_v2` (the consumer cutover flag) first.
+    /// A crash at any boundary leaves the state reporting not-ready over
+    /// intact-or-empty tables — never ready-but-empty — and the next backfill
+    /// re-sweeps (replays are idempotent by this module's overlap argument).
+    /// The RMT(generation) engine keeps the newest write, so the zeros win
+    /// until the rerun republishes.
     ///
     /// Truncation uses `IF EXISTS` so an operator can safely run it against a
     /// database that has not applied migration 036 yet. Assumes an active query
     /// envelope.
     pub async fn reset_canonical_read_indexes(&self) -> Result<()> {
-        for table in CANONICAL_INDEX_TABLES {
-            self.truncate_index_table(table).await?;
-        }
-        // Zero every readiness row so the reader never sees a stale ready=1
-        // while the freshly-truncated indexes are empty. The RMT(generation)
-        // engine keeps the newest write, so these zeros win until the rerun
-        // republishes.
         for state_key in [
-            STATE_KEY_CORE_INDEXES,
-            STATE_KEY_CORE_AUDIT,
             STATE_KEY_OPEN_V2,
+            STATE_KEY_CORE_AUDIT,
+            STATE_KEY_CORE_INDEXES,
         ] {
             self.write_index_state(state_key, false, "").await?;
+        }
+        for table in CANONICAL_INDEX_TABLES {
+            self.truncate_index_table(table).await?;
         }
         Ok(())
     }
@@ -885,9 +1005,13 @@ impl ClickHouseClient {
         Ok(())
     }
 
-    /// Bounded overlap audit: samples recent events across sampled sessions and
-    /// confirms the locator, navigation, and directory indexes cover them, plus
-    /// per-session navigation-vs-locator cardinality agreement.
+    /// Bounded overlap audit: samples each sampled session's newest AND oldest
+    /// events (the oldest slice covers the backfilled range, which post-036 MV
+    /// writes never touch) and confirms the locator, navigation, and directory
+    /// indexes cover them, plus per-session navigation-vs-locator cardinality
+    /// agreement. Sessions with fewer than two slices of events contribute the
+    /// same rows to both slices; the missing counters gate on zero-vs-nonzero,
+    /// so the double count is harmless.
     async fn run_overlap_audit(&self) -> Result<CoreIndexAuditOutcome> {
         let mut outcome = CoreIndexAuditOutcome::default();
 
@@ -907,10 +1031,15 @@ impl ClickHouseClient {
             .collect::<Vec<_>>()
             .join(", ");
 
-        let coverage = self.audit_coverage(&session_list).await?;
-        outcome.sampled_events = coverage.0;
-        outcome.navigation_missing = coverage.1;
-        outcome.locator_missing = coverage.2;
+        let newest = self
+            .audit_coverage(&session_list, AuditSlice::Newest)
+            .await?;
+        let oldest = self
+            .audit_coverage(&session_list, AuditSlice::Oldest)
+            .await?;
+        outcome.sampled_events = newest.0 + oldest.0;
+        outcome.navigation_missing = newest.1 + oldest.1;
+        outcome.locator_missing = newest.2 + oldest.2;
         outcome.directory_missing_sessions = self
             .audit_directory_missing(&sessions, &session_list)
             .await?;
@@ -927,14 +1056,7 @@ impl ClickHouseClient {
     }
 
     async fn audit_sample_sessions(&self) -> Result<Vec<String>> {
-        let query = format!(
-            "SELECT session_id\n\
-             FROM (SELECT DISTINCT session_id FROM {db}.events WHERE notEmpty(session_id)\n\
-                   ORDER BY session_id LIMIT {sample})\n\
-             FORMAT JSONEachRow",
-            db = escape_identifier(&self.cfg.database),
-            sample = AUDIT_SESSION_SAMPLE,
-        );
+        let query = audit_sample_sessions_sql(&escape_identifier(&self.cfg.database));
         let rows: Vec<SessionIdRow> = self
             .query_json_each_row(&query, Some(&self.cfg.database))
             .await
@@ -942,33 +1064,14 @@ impl ClickHouseClient {
         Ok(rows.into_iter().map(|row| row.session_id).collect())
     }
 
-    /// Returns `(sampled_events, navigation_missing, locator_missing)` over the
-    /// most-recent events of the sampled sessions.
-    async fn audit_coverage(&self, session_list: &str) -> Result<(u64, u64, u64)> {
-        let db = escape_identifier(&self.cfg.database);
-        let query = format!(
-            "SELECT\n\
-             toString(count()) AS sampled_events,\n\
-             toString(countIf(NOT nav_present)) AS navigation_missing,\n\
-             toString(countIf(NOT loc_present)) AS locator_missing\n\
-             FROM (\n\
-               SELECT event_uid, source_host,\n\
-                 (event_uid, source_host) IN (\n\
-                   SELECT event_uid, source_host FROM {db}.mcp_event_navigation\n\
-                   WHERE session_id IN ({session_list})) AS nav_present,\n\
-                 event_uid IN (\n\
-                   SELECT event_uid FROM {db}.mcp_event_locator\n\
-                   WHERE session_id IN ({session_list})) AS loc_present\n\
-               FROM {db}.events\n\
-               WHERE notEmpty(session_id) AND session_id IN ({session_list})\n\
-               ORDER BY session_id, event_ts DESC, source_offset DESC, source_line_no DESC, event_uid DESC\n\
-               LIMIT {per_session} BY session_id\n\
-             )\n\
-             SETTINGS max_bytes_in_join = {join_bytes}\n\
-             FORMAT JSONEachRow",
-            per_session = AUDIT_EVENTS_PER_SESSION,
-            join_bytes = AUDIT_MAX_BYTES_IN_JOIN,
-        );
+    /// Returns `(sampled_events, navigation_missing, locator_missing)` over one
+    /// coverage slice (newest or oldest events) of the sampled sessions.
+    async fn audit_coverage(
+        &self,
+        session_list: &str,
+        slice: AuditSlice,
+    ) -> Result<(u64, u64, u64)> {
+        let query = audit_coverage_sql(&escape_identifier(&self.cfg.database), session_list, slice);
         let rows: Vec<AuditCoverageRow> = self
             .query_json_each_row(&query, Some(&self.cfg.database))
             .await
@@ -1082,6 +1185,18 @@ impl ClickHouseClient {
         if plan.publish_open_v2 {
             self.write_index_state(STATE_KEY_OPEN_V2, true, OPEN_V2_PROVENANCE_AUTO_LOCAL)
                 .await?;
+        } else if !self.open_v2_reader_ready().await? {
+            // Non-local withhold marker: distinguishes "promotion is the
+            // operator's explicit step" from a crash-stranded Local
+            // auto-publish, so the resume-gate re-evaluation never completes
+            // a publication the Shared ceremony deliberately withheld. Never
+            // written over a published row (a concurrent promote wins).
+            self.write_index_state(
+                STATE_KEY_OPEN_V2,
+                false,
+                OPEN_V2_PROVENANCE_WITHHELD_NON_LOCAL,
+            )
+            .await?;
         }
         Ok((plan.publish_core_indexes, plan.publish_open_v2))
     }
@@ -1106,6 +1221,75 @@ fn readiness_publication_plan(
         publish_core_indexes: audit_passed,
         publish_open_v2: audit_passed && publication_mode_is_local,
     }
+}
+
+/// Which end of a sampled session the coverage probe reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuditSlice {
+    /// The most-recent events: post-036 these are the live-MV-written rows.
+    Newest,
+    /// The oldest events: the backfilled range for sessions predating 036.
+    Oldest,
+}
+
+impl AuditSlice {
+    fn order_direction(self) -> &'static str {
+        match self {
+            Self::Newest => "DESC",
+            Self::Oldest => "ASC",
+        }
+    }
+}
+
+/// The overlap-audit session sample query. Random sampling: a deterministic
+/// (e.g. alphabetical) prefix would re-audit the same fixed corpus subset on
+/// every run and could structurally miss defects confined to the rest.
+fn audit_sample_sessions_sql(db: &str) -> String {
+    format!(
+        "SELECT session_id\n\
+         FROM (SELECT DISTINCT session_id FROM {db}.events WHERE notEmpty(session_id)\n\
+               ORDER BY rand() LIMIT {sample})\n\
+         FORMAT JSONEachRow",
+        sample = AUDIT_SESSION_SAMPLE,
+    )
+}
+
+/// The overlap-audit coverage probe for one slice of the sampled sessions.
+fn audit_coverage_sql(db: &str, session_list: &str, slice: AuditSlice) -> String {
+    let dir = slice.order_direction();
+    format!(
+        "SELECT\n\
+         toString(count()) AS sampled_events,\n\
+         toString(countIf(NOT nav_present)) AS navigation_missing,\n\
+         toString(countIf(NOT loc_present)) AS locator_missing\n\
+         FROM (\n\
+           SELECT event_uid, source_host,\n\
+             (event_uid, source_host) IN (\n\
+               SELECT event_uid, source_host FROM {db}.mcp_event_navigation\n\
+               WHERE session_id IN ({session_list})) AS nav_present,\n\
+             event_uid IN (\n\
+               SELECT event_uid FROM {db}.mcp_event_locator\n\
+               WHERE session_id IN ({session_list})) AS loc_present\n\
+           FROM {db}.events\n\
+           WHERE notEmpty(session_id) AND session_id IN ({session_list})\n\
+           ORDER BY session_id, event_ts {dir}, source_offset {dir}, source_line_no {dir}, event_uid {dir}\n\
+           LIMIT {per_session} BY session_id\n\
+         )\n\
+         SETTINGS max_bytes_in_join = {join_bytes}\n\
+         FORMAT JSONEachRow",
+        per_session = AUDIT_EVENTS_PER_SESSION,
+        join_bytes = AUDIT_MAX_BYTES_IN_JOIN,
+    )
+}
+
+/// Decision for a backfill invocation after reading the durable resume state.
+enum ResumeAction {
+    /// Sweep already complete. `open_v2_republished` reports whether this
+    /// invocation completed a stranded Local auto-publish (a previous run
+    /// crashed between the `core_indexes` and `open_v2` readiness writes).
+    AlreadyComplete { open_v2_republished: bool },
+    /// Sweep from `cursor` (`None` sweeps from the corpus start).
+    Sweep { cursor: Option<CoreIndexCursor> },
 }
 
 /// One swept page's result.
@@ -1281,5 +1465,332 @@ mod tests {
         let encoded = serde_json::to_string(&outcome).expect("encode");
         let decoded: CoreIndexAuditOutcome = serde_json::from_str(&encoded).expect("decode");
         assert_eq!(outcome, decoded);
+    }
+
+    #[test]
+    fn audit_samples_randomly_and_covers_both_session_ends() {
+        // Random session sampling: a deterministic alphabetical prefix would
+        // re-audit the same fixed subset on every run.
+        assert!(audit_sample_sessions_sql("moraine").contains("ORDER BY rand()"));
+
+        // Post-036 the newest rows per session are exactly what the live MVs
+        // wrote; only the oldest slice exercises the backfilled range. Both
+        // slices must be probed.
+        let newest = audit_coverage_sql("moraine", "'s1'", AuditSlice::Newest);
+        assert!(newest.contains("event_ts DESC"));
+        assert!(newest.contains("event_uid DESC"));
+        let oldest = audit_coverage_sql("moraine", "'s1'", AuditSlice::Oldest);
+        assert!(oldest.contains("event_ts ASC"));
+        assert!(oldest.contains("event_uid ASC"));
+    }
+
+    // --- scripted-transport tests (state-machine crash ordering) ------------
+
+    use crate::envelope::{test_budget, with_test_envelope};
+    use axum::extract::{Query as AxumQuery, State as AxumState};
+    use axum::http::StatusCode;
+    use axum::routing::post;
+    use axum::Router;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    /// Scripted `mcp_read_index_state` transport double: serves state reads
+    /// from an in-memory row map, applies state INSERTs back onto that map,
+    /// and records every mutation statement in arrival order (the crash-safety
+    /// contract under test is exactly that ordering).
+    #[derive(Clone, Default)]
+    struct StateMock {
+        rows: Arc<Mutex<HashMap<String, (u8, String)>>>,
+        statements: Arc<Mutex<Vec<String>>>,
+        /// Simulate a concurrent `rebuild` reset racing a promote: as soon as
+        /// the `open_v2` publish INSERT lands, `core_indexes` reads flip to
+        /// `ready = 0`.
+        zero_core_after_open_v2_publish: bool,
+    }
+
+    impl StateMock {
+        fn set_row(&self, state_key: &str, ready: u8, cursor: &str) {
+            self.rows
+                .lock()
+                .expect("row mutex")
+                .insert(state_key.to_string(), (ready, cursor.to_string()));
+        }
+
+        fn statements(&self) -> Vec<String> {
+            self.statements.lock().expect("statement mutex").clone()
+        }
+    }
+
+    /// `('key', ready, generateSnowflakeID(), 'cursor')` from a state INSERT.
+    fn parse_state_write(statement: &str) -> Option<(String, u8, String)> {
+        let values = statement.split("VALUES (").nth(1)?;
+        let mut parts = values.splitn(4, ", ");
+        let key = parts.next()?.trim_matches('\'').to_string();
+        let ready = parts.next()?.parse().ok()?;
+        let _generation = parts.next()?;
+        let cursor = parts
+            .next()?
+            .trim_end_matches(')')
+            .trim_matches('\'')
+            .to_string();
+        Some((key, ready, cursor))
+    }
+
+    async fn state_mock_handler(
+        AxumState(mock): AxumState<StateMock>,
+        AxumQuery(params): AxumQuery<HashMap<String, String>>,
+    ) -> (StatusCode, String) {
+        let query = params.get("query").cloned().unwrap_or_default();
+
+        if query.starts_with("INSERT INTO") || query.starts_with("TRUNCATE") {
+            mock.statements
+                .lock()
+                .expect("statement mutex")
+                .push(query.clone());
+            if let Some((key, ready, cursor)) = parse_state_write(&query) {
+                let publish_landed = key == STATE_KEY_OPEN_V2 && ready == 1;
+                mock.rows
+                    .lock()
+                    .expect("row mutex")
+                    .insert(key, (ready, cursor));
+                if publish_landed && mock.zero_core_after_open_v2_publish {
+                    mock.rows
+                        .lock()
+                        .expect("row mutex")
+                        .insert(STATE_KEY_CORE_INDEXES.to_string(), (0, String::new()));
+                }
+            }
+            return (StatusCode::OK, String::new());
+        }
+        if query.contains("FROM system.tables") {
+            return (StatusCode::OK, "{\"value\":\"1\"}\n".to_string());
+        }
+        if query.contains("mcp_read_index_state") {
+            let Some(key) = query
+                .split("state_key = '")
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+            else {
+                return (StatusCode::OK, String::new());
+            };
+            let row = mock.rows.lock().expect("row mutex").get(key).cloned();
+            return match row {
+                Some((ready, cursor)) => (
+                    StatusCode::OK,
+                    format!(
+                        "{}\n",
+                        serde_json::json!({
+                            "state_key": key,
+                            "ready": ready,
+                            "generation": "123",
+                            "cursor": cursor,
+                        })
+                    ),
+                ),
+                None => (StatusCode::OK, String::new()),
+            };
+        }
+        (StatusCode::OK, String::new())
+    }
+
+    async fn spawn_state_mock(mock: StateMock) -> String {
+        let app = Router::new()
+            .route("/", post(state_mock_handler).get(state_mock_handler))
+            .with_state(mock);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind state mock listener");
+        let addr = listener.local_addr().expect("state mock listener addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    fn mock_client(url: String) -> ClickHouseClient {
+        ClickHouseClient::new(moraine_config::ClickHouseConfig {
+            url,
+            database: "moraine".to_string(),
+            username: "default".to_string(),
+            password: String::new(),
+            timeout_seconds: 5.0,
+            request_compression: moraine_config::ClickHouseRequestCompression::None,
+            async_insert: true,
+            wait_for_async_insert: true,
+            allow_newer_server: false,
+        })
+        .expect("mock client")
+    }
+
+    fn passed_audit_json() -> String {
+        serde_json::to_string(&CoreIndexAuditOutcome {
+            passed: true,
+            ..CoreIndexAuditOutcome::default()
+        })
+        .expect("encode audit")
+    }
+
+    #[tokio::test]
+    async fn reset_revokes_readiness_before_truncating() {
+        let mock = StateMock::default();
+        let client = mock_client(spawn_state_mock(mock.clone()).await);
+
+        with_test_envelope(client.reset_canonical_read_indexes())
+            .await
+            .expect("reset");
+
+        // Crash ordering: all three ready=0 rows land BEFORE the first
+        // destructive statement, and open_v2 (the consumer flag) lands first.
+        let statements = mock.statements();
+        assert_eq!(statements.len(), 6, "statements: {statements:#?}");
+        assert!(statements[0].contains("'open_v2', 0"));
+        assert!(statements[1].contains("'core_audit', 0"));
+        assert!(statements[2].contains("'core_indexes', 0"));
+        for statement in &statements[3..] {
+            assert!(
+                statement.starts_with("TRUNCATE TABLE"),
+                "expected truncate after the readiness zeros: {statement}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn backfill_completes_a_stranded_local_open_v2_publication() {
+        // A previous run crashed between the core_indexes publish and the
+        // Local open_v2 auto-publish: sweep complete, audit passed, open_v2
+        // stranded at 0 with no withhold marker.
+        let mock = StateMock::default();
+        mock.set_row(STATE_KEY_CORE_INDEXES, 1, "{}");
+        mock.set_row(STATE_KEY_CORE_AUDIT, 1, &passed_audit_json());
+        mock.set_row(STATE_KEY_OPEN_V2, 0, "");
+        let client = mock_client(spawn_state_mock(mock.clone()).await);
+
+        let budget = test_budget(30.0, 64, 1_000_000, 1_000_000_000);
+        let mut events = Vec::new();
+        let outcome = client
+            .backfill_canonical_read_indexes(true, &budget, &budget, |event| events.push(event))
+            .await
+            .expect("backfill");
+
+        assert!(outcome.already_complete);
+        assert!(outcome.open_v2_published, "stranded publication completed");
+        let statements = mock.statements();
+        assert_eq!(statements.len(), 1, "statements: {statements:#?}");
+        assert!(statements[0].contains("'open_v2', 1"));
+        assert!(statements[0].contains(OPEN_V2_PROVENANCE_AUTO_LOCAL));
+        assert!(events.contains(&CoreIndexBackfillProgress::Published {
+            core_indexes: true,
+            open_v2: true,
+        }));
+    }
+
+    #[tokio::test]
+    async fn backfill_already_complete_respects_the_non_local_withhold_marker() {
+        // The open_v2 row carries the deliberate Shared-ceremony withhold
+        // marker: the resume gate must NOT complete the publication even when
+        // invoked with the Local publication mode.
+        let mock = StateMock::default();
+        mock.set_row(STATE_KEY_CORE_INDEXES, 1, "{}");
+        mock.set_row(STATE_KEY_CORE_AUDIT, 1, &passed_audit_json());
+        mock.set_row(STATE_KEY_OPEN_V2, 0, OPEN_V2_PROVENANCE_WITHHELD_NON_LOCAL);
+        let client = mock_client(spawn_state_mock(mock.clone()).await);
+
+        let budget = test_budget(30.0, 64, 1_000_000, 1_000_000_000);
+        let outcome = client
+            .backfill_canonical_read_indexes(true, &budget, &budget, |_| {})
+            .await
+            .expect("backfill");
+
+        assert!(outcome.already_complete);
+        assert!(!outcome.open_v2_published);
+        assert!(mock.statements().is_empty(), "no writes on withheld state");
+    }
+
+    #[tokio::test]
+    async fn backfill_already_complete_is_a_noop_when_open_v2_is_published() {
+        let mock = StateMock::default();
+        mock.set_row(STATE_KEY_CORE_INDEXES, 1, "{}");
+        mock.set_row(STATE_KEY_CORE_AUDIT, 1, &passed_audit_json());
+        mock.set_row(STATE_KEY_OPEN_V2, 1, OPEN_V2_PROVENANCE_AUTO_LOCAL);
+        let client = mock_client(spawn_state_mock(mock.clone()).await);
+
+        let budget = test_budget(30.0, 64, 1_000_000, 1_000_000_000);
+        let outcome = client
+            .backfill_canonical_read_indexes(true, &budget, &budget, |_| {})
+            .await
+            .expect("backfill");
+
+        assert!(outcome.already_complete);
+        assert!(!outcome.open_v2_published);
+        assert!(mock.statements().is_empty());
+    }
+
+    #[tokio::test]
+    async fn promote_refuses_while_a_backfill_sweep_is_in_flight() {
+        // ready = 0 with a persisted page cursor: a sweep is mid-flight (or
+        // crashed mid-flight); promotion must refuse and say so.
+        let mock = StateMock::default();
+        mock.set_row(STATE_KEY_CORE_INDEXES, 0, "{\"session_id\":\"s\"}");
+        let client = mock_client(spawn_state_mock(mock.clone()).await);
+
+        let outcome = with_test_envelope(client.promote_open_v2_reader())
+            .await
+            .expect("promote");
+
+        assert!(!outcome.promoted);
+        assert!(!outcome.core_indexes_ready);
+        assert!(outcome.backfill_in_flight);
+        assert!(mock.statements().is_empty(), "refusal writes nothing");
+    }
+
+    #[tokio::test]
+    async fn promote_revokes_its_publish_when_a_reset_races_it() {
+        // Preconditions read clean, but a concurrent rebuild reset zeroes
+        // core_indexes around the publish write. The post-write re-check must
+        // revoke the freshly published row (whose newer snowflake would
+        // otherwise survive the reset) and fail loudly.
+        let mock = StateMock {
+            zero_core_after_open_v2_publish: true,
+            ..StateMock::default()
+        };
+        mock.set_row(STATE_KEY_CORE_INDEXES, 1, "{}");
+        mock.set_row(STATE_KEY_CORE_AUDIT, 1, &passed_audit_json());
+        mock.set_row(STATE_KEY_OPEN_V2, 0, "");
+        let client = mock_client(spawn_state_mock(mock.clone()).await);
+
+        let error = with_test_envelope(client.promote_open_v2_reader())
+            .await
+            .expect_err("racing reset must abort the promotion");
+        assert!(
+            error.to_string().contains("promotion aborted"),
+            "unexpected error: {error:#}"
+        );
+
+        let statements = mock.statements();
+        assert_eq!(statements.len(), 2, "statements: {statements:#?}");
+        assert!(statements[0].contains("'open_v2', 1"));
+        assert!(statements[0].contains(OPEN_V2_PROVENANCE_OPERATOR_PROMOTE));
+        assert!(statements[1].contains("'open_v2', 0"));
+    }
+
+    #[tokio::test]
+    async fn promote_publishes_when_preconditions_hold_through_the_write() {
+        let mock = StateMock::default();
+        mock.set_row(STATE_KEY_CORE_INDEXES, 1, "{}");
+        mock.set_row(STATE_KEY_CORE_AUDIT, 1, &passed_audit_json());
+        mock.set_row(STATE_KEY_OPEN_V2, 0, "");
+        let client = mock_client(spawn_state_mock(mock.clone()).await);
+
+        let outcome = with_test_envelope(client.promote_open_v2_reader())
+            .await
+            .expect("promote");
+
+        assert!(outcome.promoted);
+        assert!(!outcome.already_promoted);
+        assert!(!outcome.backfill_in_flight);
+        let statements = mock.statements();
+        assert_eq!(statements.len(), 1, "statements: {statements:#?}");
+        assert!(statements[0].contains("'open_v2', 1"));
+        assert!(statements[0].contains(OPEN_V2_PROVENANCE_OPERATOR_PROMOTE));
     }
 }
