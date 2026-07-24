@@ -775,25 +775,59 @@ async fn seed_parity_corpus(clickhouse: &ClickHouseClient) -> Result<()> {
     );
     rows.push(Ev::new("parity-override-early", "oe-a1", 103).turn(1));
 
-    // Float-lossy keyset window (review finding 3): sort_time values in
-    // [1000*2^k, 1024*2^k] ms lose their millisecond under a
-    // toDateTime64(ms/1000.0, 3) reconstruction (verified: 2147483847595 ->
-    // ...:27.594). Anchors landing on these instants must resume exactly —
-    // no re-served event, no spurious reopen — which only holds with exact
-    // fromUnixTimestamp64Milli reconstruction.
-    for (uid, ms, user) in [
-        ("y38-u1", 595u32, true),
-        ("y38-a1", 596, false),
-        ("y38-u2", 597, true),
-        ("y38-a2", 598, false),
-        ("y38-u3", 599, true),
-        ("y38-a3", 600, false),
-    ] {
-        let record = format!("2038-01-18T22:17:27.{ms:03}Z");
-        let event = format!("2038-01-18 22:17:27.{ms:03}");
-        let mut row = Ev::new("parity-2038", uid, 110 + (ms - 595))
-            .record_ts(&record)
-            .event_ts(&event);
+    // Float-lossy keyset window (review finding 3). Every instant below is
+    // VERIFIED lossy: `toDateTime64(ms/1000.0, 3)` reconstructs each one 1 ms
+    // LOW (e.g. …27.595 -> …27.594), because ulp(ms/1000)·1000 exceeds ulp(ms)
+    // once ms >= 1000·2^31 and the float->Decimal cast truncates. An anchor on
+    // such an instant must still resume exactly — no re-served event, no
+    // spurious reopen — which holds only with exact fromUnixTimestamp64Milli
+    // reconstruction. Picking merely "a 2038 timestamp" is not enough: most
+    // instants in the window round-trip fine, so a careless fixture passes
+    // with or without the fix.
+    for (index, (uid, record, event, user)) in [
+        (
+            "y38-u1",
+            "2038-01-19T03:17:27.595Z",
+            "2038-01-19 03:17:27.595",
+            true,
+        ),
+        (
+            "y38-a1",
+            "2038-01-19T03:17:27.601Z",
+            "2038-01-19 03:17:27.601",
+            false,
+        ),
+        (
+            "y38-u2",
+            "2038-01-19T03:17:27.607Z",
+            "2038-01-19 03:17:27.607",
+            true,
+        ),
+        (
+            "y38-a2",
+            "2038-01-19T03:17:27.608Z",
+            "2038-01-19 03:17:27.608",
+            false,
+        ),
+        (
+            "y38-u3",
+            "2038-01-19T03:17:27.614Z",
+            "2038-01-19 03:17:27.614",
+            true,
+        ),
+        (
+            "y38-a3",
+            "2038-01-19T03:17:27.615Z",
+            "2038-01-19 03:17:27.615",
+            false,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut row = Ev::new("parity-2038", uid, 110 + index as u32)
+            .record_ts(record)
+            .event_ts(event);
         if user {
             row = row.user();
         }
