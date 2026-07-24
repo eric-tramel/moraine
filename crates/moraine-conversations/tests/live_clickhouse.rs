@@ -569,15 +569,57 @@ async fn publish_replaced_schema_fixture_sources(
     clickhouse: &ClickHouseClient,
     database: &OwnedDatabaseName,
 ) -> Result<()> {
-    match publish_missing_schema_fixture_sources(clickhouse, database).await {
-        Ok(()) => return Ok(()),
-        Err(error)
-            if error
-                .to_string()
-                .contains("unpublished source generation(s)") => {}
-        Err(error) => return Err(error),
-    }
     let database = database.as_str();
+    // Unlike `publish_missing_schema_fixture_sources` (which only covers
+    // never-published sources), a replacement must ADVANCE an existing head:
+    // publish the latest events generation for every source whose current
+    // published generation is behind it. A plain LEFT JOIN yields default
+    // values (generation 0) for never-published sources, so one predicate
+    // covers both never-published and superseded heads.
+    let publish = format!(
+        r#"INSERT INTO `{database}`.`published_source_generations`
+(
+  source_host, source_name, source_file, source_generation, publication_revision,
+  publisher_id, operation_id, published_at
+)
+WITH
+  (
+    SELECT ifNull(max(publication_revision), toUInt64(0))
+    FROM `{database}`.`v_published_source_generation_history`
+  ) AS base_revision
+SELECT
+  latest.source_host,
+  latest.source_name,
+  latest.source_file,
+  latest.source_generation,
+  base_revision + toUInt64(row_number() OVER (
+    ORDER BY latest.source_host, latest.source_name, latest.source_file
+  )) AS publication_revision,
+  'live-schema-fixture' AS publisher_id,
+  concat('live-schema-fixture:', hex(cityHash64(
+    latest.source_host, latest.source_name, latest.source_file, latest.source_generation
+  ))) AS operation_id,
+  now64(3) AS published_at
+FROM
+(
+  SELECT
+    source_host,
+    source_name,
+    source_file,
+    max(source_generation) AS source_generation
+  FROM `{database}`.`events` FINAL
+  GROUP BY source_host, source_name, source_file
+) AS latest
+LEFT JOIN `{database}`.`v_current_published_source_generations` AS heads
+  ON heads.source_host = latest.source_host
+ AND toString(heads.source_name) = toString(latest.source_name)
+ AND heads.source_file = latest.source_file
+WHERE heads.source_generation < latest.source_generation"#
+    );
+    clickhouse
+        .request_text(&publish, None, Some(database), false, None)
+        .await
+        .context("failed to publish replaced-fixture source heads")?;
     #[derive(Deserialize)]
     struct MissingHeadCount {
         value: u64,
