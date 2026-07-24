@@ -28,7 +28,7 @@ use crate::tee::{
     spawn_tee_router, RedactionContext, RouteResolver, SharedRouteResolver, StatusRegistry,
 };
 use crate::watch::{enumerate_tracked_files, spawn_watcher_threads};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use moraine_clickhouse::{ClickHouseClient, QueryClass, QueryEnvelope};
 use moraine_config::{
     AppConfig, ClickHouseConfig, IngestSource, QueryBudgetsConfig, SourceFormat,
@@ -571,10 +571,25 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
     }
 
     info!("rust ingestor running; waiting for shutdown signal");
-    tokio::signal::ctrl_c()
-        .await
-        .context("signal handler failed")?;
-    info!("shutdown signal received");
+    // Fail loud if the default sink task dies: a dead sink leaves every
+    // poller and dispatcher spamming "sink channel closed" forever while no
+    // events are ingested (observed as a 35-hour zombie after an ENOSPC
+    // panic). Exiting nonzero makes the failure visible and restartable.
+    let mut sink_handle = sink_handle;
+    tokio::select! {
+        signal = tokio::signal::ctrl_c() => {
+            signal.context("signal handler failed")?;
+            info!("shutdown signal received");
+        }
+        exited = &mut sink_handle => {
+            match exited {
+                Ok(()) => bail!("default sink task exited unexpectedly; shutting down ingest"),
+                Err(join_error) => bail!(
+                    "default sink task aborted unexpectedly ({join_error}); shutting down ingest"
+                ),
+            }
+        }
+    }
 
     drop(process_tx);
     drop(sink_tx);
