@@ -492,11 +492,34 @@ pub(super) async fn boundedness() -> Result<()> {
 
         // A mid-traversal page reads work bounded by the page size, NOT the
         // session size: at least an order of magnitude below the monster.
-        assert!(
-            midpage.read_rows < MONSTER_EVENTS / 10,
-            "continuation page read {} rows — not output-sized against a {MONSTER_EVENTS}-event session",
-            midpage.read_rows
-        );
+        if midpage.read_rows >= MONSTER_EVENTS / 10 {
+            // Per-statement breakdown so a failure names the offender.
+            #[derive(serde::Deserialize)]
+            struct StmtRow {
+                q: String,
+                rows: u64,
+            }
+            let stmts = clickhouse
+                .query_rows::<StmtRow>(
+                    "SELECT substring(query, 1, 160) AS q, toUInt64(read_rows) AS rows \
+                     FROM system.query_log \
+                     WHERE type = 'QueryFinish' \
+                       AND startsWith(query_id, 'moraine-issue598-midpage-') \
+                       AND NOT startsWith(query_id, 'moraine-issue598-midpage-mint') \
+                       AND current_database = currentDatabase() \
+                     ORDER BY read_rows DESC LIMIT 12 FORMAT JSONEachRow",
+                    None,
+                )
+                .await
+                .unwrap_or_default();
+            for stmt in &stmts {
+                eprintln!("midpage stmt rows={} q={}", stmt.rows, stmt.q.replace('\n', " "));
+            }
+            panic!(
+                "continuation page read {} rows — not output-sized against a {MONSTER_EVENTS}-event session",
+                midpage.read_rows
+            );
+        }
         // The full traversal rereads at most 10× one reference narrow scan
         // (page 1's session-wide header pass), i.e. no per-page full rescan.
         let reference = firstpage.read_rows.max(1);
