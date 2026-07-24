@@ -586,12 +586,35 @@ pub(super) async fn boundedness() -> Result<()> {
 
         // Adding a 1M-event / 100k-session unrelated corpus does not grow a
         // small session's open cost (directory/navigation are session-pruned).
-        assert!(
-            unrelated.read_rows <= smallsession.read_rows.saturating_mul(2) + 4_096,
-            "unrelated corpus grew a small open's read cost: before={} after={}",
-            smallsession.read_rows,
-            unrelated.read_rows
-        );
+        if unrelated.read_rows > smallsession.read_rows.saturating_mul(2) + 4_096 {
+            // Per-statement breakdown for both phases so the failure names the
+            // exact statement whose reads grew with the corpus.
+            #[derive(serde::Deserialize)]
+            struct StmtRow {
+                id: String,
+                q: String,
+                rows: u64,
+            }
+            let stmts = clickhouse
+                .query_rows::<StmtRow>(
+                    "SELECT query_id AS id, substring(query, 1, 200) AS q,                             toUInt64(read_rows) AS rows                      FROM system.query_log                      WHERE type = 'QueryFinish'                        AND (startsWith(query_id, 'moraine-issue598-smallsession-')                             OR startsWith(query_id, 'moraine-issue598-unrelated-'))                        AND current_database = currentDatabase()                      ORDER BY read_rows DESC LIMIT 24 FORMAT JSONEachRow",
+                    None,
+                )
+                .await
+                .unwrap_or_default();
+            for stmt in &stmts {
+                eprintln!(
+                    "independence stmt rows={} id={} q={}",
+                    stmt.rows,
+                    stmt.id,
+                    stmt.q.replace('\n', " ")
+                );
+            }
+            panic!(
+                "unrelated corpus grew a small open's read cost: before={} after={}",
+                smallsession.read_rows, unrelated.read_rows
+            );
+        }
 
         // E / 2E / 4E: a fixed page-1 open is work-independent of prior length.
         let scale_e = cost("scalee")?.read_rows;
