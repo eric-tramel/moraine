@@ -2373,6 +2373,21 @@ async fn live_canonical_open_fence() -> Result<()> {
     with_live_fixture_envelope(canonical_open_parity::fence()).await
 }
 
+// Issue #598 WI-11 append-to-visible probe (design-598-final LIVE TEST PLAN,
+// BINDING D8: the clock starts at durable canonical insert acknowledgment).
+// Wired as the pre-declared `append-to-visible` / `fsync-to-open-valid` modes.
+#[tokio::test]
+#[ignore = "requires wrapper-owned live ClickHouse and destructive opt-in"]
+async fn live_canonical_open_append_to_visible() -> Result<()> {
+    with_live_fixture_envelope(canonical_open_parity::append_to_visible()).await
+}
+
+#[tokio::test]
+#[ignore = "requires wrapper-owned live ClickHouse and destructive opt-in"]
+async fn live_canonical_open_fsync_to_open_valid() -> Result<()> {
+    with_live_fixture_envelope(canonical_open_parity::fsync_to_open_valid()).await
+}
+
 // Issue #598 WI-09 boundedness benchmark (design-598-final LIVE TEST PLAN §6).
 // Wired as the pre-declared `canonical-open-bench` run-live-test mode.
 #[tokio::test]
