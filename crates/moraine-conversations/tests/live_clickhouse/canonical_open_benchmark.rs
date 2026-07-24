@@ -5,21 +5,38 @@
 //!
 //! The corpus is seeded ONLY through `events` + publication control and the
 //! migration-036 read indexes (never the retired `mcp_open_*` projection), so
-//! every measured statement exercises the exact production v2 path. Fixtures
-//! (design-598-final LIVE TEST PLAN §6, WI-09):
+//! every measured statement exercises the exact production v2 path.
 //!
-//! - a 50-turn session: session-page warm p95 ≤ 1000 ms.
-//! - a 1000-event single turn: turn-open warm p95 ≤ 750 ms.
-//! - a single event target: event-open warm p95 ≤ 500 ms.
-//! - a 50k-event monster (~5000 turns × 10 events, PR-604 profile scaled): full
-//!   traversal ≤ 30 s; peak query memory ≤ 512 MiB (BINDING D10); one page-1
-//!   session-wide pass plus output-sized pages (≤ 10× narrow-byte reread; a
-//!   continuation page's read-rows bounded by page size, not session size, at
-//!   default `max_results = 25`).
-//! - an E / 2E / 4E trio: a fixed append opens with work independent of prior
-//!   session length.
-//! - a 1M-event / 100k-session unrelated corpus: it does not grow any open's
-//!   read cost.
+//! The contracts this module ACTUALLY ASSERTS (each a single warmed
+//! measurement, not a p95; fixtures from design-598-final LIVE TEST PLAN §6):
+//!
+//! - a 50-turn session: warm page-1 session open ≤ 1000 ms.
+//! - a 1000-event single turn: warm turn open ≤ 750 ms.
+//! - a single event target: warm event open ≤ 500 ms.
+//! - the 50k-event monster (5000 turns × 10 events, PR-604 profile scaled):
+//!   * the traversal returns exactly `MONSTER_EVENTS / EVENTS_PER_TURN` turns
+//!     in exactly `ceil(turns / PAGE_LIMIT)` pages (the page count is pinned,
+//!     so the per-page budgets below cannot inflate via fragmentation);
+//!   * full-traversal wall ≤ pages × 750 ms (a per-page round-trip budget —
+//!     150 s at the pinned 200 pages, NOT a 30 s total);
+//!   * full-traversal `read_rows` ≤ pages × 5 granules (5 × 8192 rows/page —
+//!     per-page reads independent of session size);
+//!   * one mid-traversal continuation page reads ≤ [`MIDPAGE_READ_ROWS_CEILING`]
+//!     rows (8 granules, session-size-independent);
+//!   * peak per-query memory over EVERY measured phase ≤ 512 MiB (BINDING D10).
+//! - an E / 2E / 4E trio (5k / 10k / 20k events): each page-1 open's
+//!   `read_rows` stays under 2× the monster's page-1 header pass. This is a
+//!   coarse anti-scan ceiling only — the 2E/E and 4E/2E ratios are NOT
+//!   asserted; per-page session-size independence is what the midpage gate
+//!   pins.
+//! - a 1M-event / 100k-session unrelated corpus: re-opening the 50-turn
+//!   session may grow `read_rows` by at most a constant boundary-granule
+//!   allowance (6 statements × 2 granules), constant in corpus size.
+//! - no measured statement references the retired `mcp_open_*` projection.
+//!
+//! NOT asserted (reported in the evidence JSON for trend-watching only): the
+//! traversal-reads-to-narrow-scan multiple (`reread_multiple` vs the
+//! [`REREAD_MULTIPLE`] budget).
 //!
 //! Per-phase Interactive envelopes tag the query-log ids `moraine-issue598-*`,
 //! which [`read_issue598_cost_metrics`] aggregates from `system.query_log`.
@@ -46,8 +63,12 @@ const MEMORY_CEILING_BYTES: u64 = 512 * 1024 * 1024;
 /// fixed-append work-independence, so this gate never needs to scale with the
 /// fixture.
 const MIDPAGE_READ_ROWS_CEILING: u64 = 65_536;
-/// One full traversal may reread at most this multiple of the fixture's narrow
-/// bytes (issue-598.md:160). The denominator is one measured reference scan.
+/// The issue-598.md:160 reread aspiration (traversal reads ≤ this multiple of
+/// one narrow reference scan). NOT an asserted gate: small pages pay granule
+/// floors that make a fixed multiple of one narrow scan unsatisfiable physics
+/// (see the per-page read budget below, which is the asserted contract).
+/// Emitted in the evidence JSON as `reread_budget` next to the measured
+/// `reread_multiple` for trend-watching.
 const REREAD_MULTIPLE: u64 = 10;
 /// The unrelated corpus (design §5.6 residual, 1M events / 100k sessions).
 const UNRELATED_EVENTS: u64 = 1_000_000;
@@ -417,10 +438,24 @@ pub(super) async fn boundedness() -> Result<()> {
             traversed_turns, expected_turns,
             "monster traversal returned {traversed_turns} turns, expected {expected_turns}"
         );
+        // Pin the page count itself: the monster is override-free, so the
+        // reader fills every page to exactly PAGE_LIMIT turns (early-stop
+        // paging) and the correct count is a fixture constant. The wall and
+        // read budgets below are denominated per page; without this pin a
+        // limit-handling regression that fragments output (e.g. 1 turn/page)
+        // would inflate those budgets in lockstep with the cost blowup it
+        // causes, and the traversal would still "pass".
+        let expected_pages = expected_turns.div_ceil(usize::from(PAGE_LIMIT));
+        assert_eq!(
+            pages, expected_pages,
+            "monster traversal produced {pages} pages, expected {expected_pages} \
+             ({expected_turns} turns at {PAGE_LIMIT} turns/page)"
+        );
         // Per-page wall budget: each page pays a fixed number of round trips
         // (publication capture/revalidate, signal, window, hydration), so the
         // honest wall gate is per page — a quadratic reader blows this up
-        // immediately, while sandbox CPU contention does not.
+        // immediately, while sandbox CPU contention does not. With `pages`
+        // pinned above, this budget is a fixed 200 x 750 ms = 150 s.
         let wall_budget_ms = (pages as u64) * 750;
         assert!(
             traverse_ms <= wall_budget_ms,
@@ -543,11 +578,13 @@ pub(super) async fn boundedness() -> Result<()> {
             }
             let stmts = clickhouse
                 .query_rows::<StmtRow>(
+                    // The cursor mint runs under the separate
+                    // 'moraine-issue598-mintcursor-…' envelope, so the midpage
+                    // prefix alone isolates the measured continuation page.
                     "SELECT substring(query, 1, 160) AS q, toUInt64(read_rows) AS rows \
                      FROM system.query_log \
                      WHERE type = 'QueryFinish' \
                        AND startsWith(query_id, 'moraine-issue598-midpage-') \
-                       AND NOT startsWith(query_id, 'moraine-issue598-midpage-mint') \
                        AND current_database = currentDatabase() \
                      ORDER BY read_rows DESC LIMIT 12 FORMAT JSONEachRow",
                     None,
@@ -562,8 +599,8 @@ pub(super) async fn boundedness() -> Result<()> {
                 midpage.read_rows
             );
         }
-        // The full traversal rereads at most 10× one reference narrow scan
-        // (page 1's session-wide header pass), i.e. no per-page full rescan.
+        // One reference narrow scan (page 1's session-wide header pass): the
+        // denominator for the evidence JSON's unasserted `reread_multiple`.
         let reference = firstpage.read_rows.max(1);
         // Per-page read budget: a 25-event page cannot read fewer rows than
         // its granule floors (measured ~4.15 granules of 8192 per page: 2 for

@@ -328,19 +328,17 @@ async fn open_turn_v2(
 // divergences: (1) `snapshot` is Some in v1 and always None in v2 (v2 uses the
 // continuation, not generation-pinned snapshots); (2) the v1 trichotomy
 // "canonical exists but projection missing" ReadModelChanged arm collapses to
-// Ok(None); (3) the deterministic v2 `turn_id` may differ from v1's
-// nondeterministic `anyIf(turn_id)` WITHIN the turn's value set. Everything
-// else must be byte-identical. `strip_*` nulls (1) and blanks (3) so a direct
-// serde_json equality proves the remainder; turn_id membership is checked
-// separately by the caller where a turn legitimately mixes `turn_index` values.
-
-fn blank_at<'a>(value: &'a mut Value, path: &[&str]) -> Option<&'a mut Value> {
-    let mut cursor = value;
-    for key in path {
-        cursor = cursor.as_object_mut()?.get_mut(*key)?;
-    }
-    Some(cursor)
-}
+// Ok(None); (3) the deterministic v2 `turn_id` (the first member row's
+// `turn_index`, canonical_derivations `deterministic_turn_id_expr`) may differ
+// from v1's nondeterministic `anyIf(turn_id, turn_id != '')` ONLY within a
+// turn that mixes `turn_index` values. No turn in this corpus mixes values
+// (counter-path turns are all-`turn_index = 0`; each `parity-override` turn
+// carries a single explicit index), so (3) never applies here and `turn_id`
+// is byte-diffed like every other field. Blanking it corpus-wide would mask a
+// v2 regression to the `turn_seq` fallback, which diverges from v1's "0" on
+// every counter-path turn with `turn_seq >= 2` — that derivation is pinned
+// explicitly by [`assert_counter_turn_id_pins_turn_index`]. `null_snapshot`
+// nulls (1) so a direct serde_json equality proves everything else.
 
 fn null_snapshot(value: &mut Value) {
     if let Some(object) = value.as_object_mut() {
@@ -348,43 +346,20 @@ fn null_snapshot(value: &mut Value) {
     }
 }
 
-fn blank_turn_id_in_metadata(turn: &mut Value) {
-    if let Some(turn_id) = blank_at(turn, &["metadata", "turn_id"]) {
-        *turn_id = Value::String(String::new());
-    }
-}
-
 fn normalized_session(open: &McpSessionOpen) -> Result<Value> {
     let mut value = serde_json::to_value(open).context("failed to serialize session open")?;
     null_snapshot(&mut value);
-    if let Some(turns) = value
-        .as_object_mut()
-        .and_then(|object| object.get_mut("turns"))
-        .and_then(Value::as_array_mut)
-    {
-        for turn in turns {
-            // McpTurnCompact carries its turn_id under `metadata.turn_id`.
-            blank_turn_id_in_metadata(turn);
-        }
-    }
     Ok(value)
 }
 
 fn normalized_turn(open: &McpTurnOpen) -> Result<Value> {
     let mut value = serde_json::to_value(open).context("failed to serialize turn open")?;
     null_snapshot(&mut value);
-    if let Some(turn_id) = blank_at(&mut value, &["metadata", "turn_id"]) {
-        *turn_id = Value::String(String::new());
-    }
     Ok(value)
 }
 
 fn normalized_event(open: &McpEventOpen) -> Result<Value> {
-    let mut value = serde_json::to_value(open).context("failed to serialize event open")?;
-    if let Some(turn_id) = blank_at(&mut value, &["parent_turn", "turn_id"]) {
-        *turn_id = Value::String(String::new());
-    }
-    Ok(value)
+    serde_json::to_value(open).context("failed to serialize event open")
 }
 
 /// Assert the v1 and v2 readers agree on `open(session)` after the whitelist.
@@ -548,9 +523,9 @@ pub(super) async fn parity() -> Result<()> {
 
             // (e) Non-contiguous `turn_index` override recurrence mixed with the
             // counter path (design §5.3 membership rule + VERIFIER ADDENDUM item 2
-            // stray-override folding). The whole session diffs equal; the mixed
-            // turn's deterministic v2 turn_id is asserted to lie within the v1
-            // value set (the one whitelisted divergence).
+            // stray-override folding). The whole session diffs equal — including
+            // `turn_id`, since every turn here carries a single `turn_index`
+            // value — and the override turn's concrete turn_id value is pinned.
             let overridden = assert_session_parity(&repository, "parity-override", 2).await?;
             assert!(
                 overridden.turns.len() >= 2,
@@ -561,6 +536,10 @@ pub(super) async fn parity() -> Result<()> {
                     .await?;
             }
             assert_override_turn_id_within_value_set(&repository, "parity-override").await?;
+            // Pin the turn_id DERIVATION where the two candidate rules diverge:
+            // a counter-path turn with turn_seq >= 2 must report turn_id "0"
+            // (first member row's turn_index), never turn_seq's "2"/"3".
+            assert_counter_turn_id_pins_turn_index(&repository).await?;
 
             // 035 metadata precedence surface: OPEN per-field-latest title/name/
             // summary/slug from session_meta + omp title/title_change, with the omp
@@ -708,9 +687,12 @@ async fn seed_parity_corpus(clickhouse: &ClickHouseClient) -> Result<()> {
     seed_events(clickhouse, &rows).await
 }
 
-/// Assert the mixed-override turn's deterministic v2 turn_id lies within the
-/// v1 value set (the LIVE TEST PLAN §2 turn_id whitelist). We read the v1 turn
-/// and v2 turn separately and compare their `turn_id` for membership.
+/// Assert the override turn's deterministic v2 turn_id lies within the v1
+/// value set (the LIVE TEST PLAN §2 turn_id membership rule). The turn's only
+/// `turn_index` value is 1 — and there `turn_index == turn_seq`, so this
+/// checkpoint alone cannot distinguish the correct derivation (first row's
+/// turn_index) from the turn_seq fallback; that distinction is pinned by
+/// [`assert_counter_turn_id_pins_turn_index`].
 async fn assert_override_turn_id_within_value_set(
     repository: &ClickHouseConversationRepository,
     session_id: &str,
@@ -722,7 +704,7 @@ async fn assert_override_turn_id_within_value_set(
     let v2 = open_turn_v2(repository, session_id, 1, 8)
         .await?
         .context("override turn 1 missing from v2 reader")?;
-    // Both derive turn_id from a member row's `toString(turn_index)`; the mixed
+    // Both derive turn_id from a member row's `toString(turn_index)`; the
     // turn's only turn_index value is "1", so the deterministic v2 value must
     // equal the (here unambiguous) v1 value.
     assert_eq!(
@@ -730,6 +712,35 @@ async fn assert_override_turn_id_within_value_set(
         "override turn_id diverged outside the whitelisted value set"
     );
     assert_eq!(v2.metadata.turn_id, "1");
+    Ok(())
+}
+
+/// Pin the turn_id derivation on a case where the two candidate rules actually
+/// diverge: `parity-multi-turn` turn 3 is counter-path (`turn_index = 0` on
+/// every row) with `turn_seq = 3`, so the correct turn_id — v1's
+/// `anyIf(toString(turn_index))` and v2's first-member-row `turn_index`
+/// (design R1(d)) — is "0", while a v2 regression to the `turn_seq` fallback
+/// (canonical_open.rs `assemble_turn_compact`) would report "3". The parity
+/// diffs above already byte-compare turn_id; this assert additionally pins the
+/// concrete value so a both-readers-wrong drift cannot pass unnoticed.
+async fn assert_counter_turn_id_pins_turn_index(
+    repository: &ClickHouseConversationRepository,
+) -> Result<()> {
+    let v1 = repository
+        .get_mcp_turn("parity-multi-turn", 3)
+        .await?
+        .context("counter turn 3 missing from v1 reader")?;
+    let v2 = open_turn_v2(repository, "parity-multi-turn", 3, 8)
+        .await?
+        .context("counter turn 3 missing from v2 reader")?;
+    assert_eq!(
+        v1.metadata.turn_id, "0",
+        "v1 counter-path turn_id must derive from turn_index, not turn_seq"
+    );
+    assert_eq!(
+        v2.metadata.turn_id, "0",
+        "v2 counter-path turn_id must derive from the first member row's turn_index, not the turn_seq fallback"
+    );
     Ok(())
 }
 
@@ -939,9 +950,9 @@ pub(super) async fn locator() -> Result<()> {
                 .context("activated generation-2 event must resolve")?;
             assert_eq!(activated.event.session_id, "locator-session");
 
-            // The locator seek for the target session must not scan the unrelated
-            // session's rows: assert via query_log that no statement in the seek
-            // envelope read the unrelated session's canonical text.
+            // The locator seek must not scan unrelated sessions' rows: assert
+            // via query_log that every statement over a session-holding table
+            // in the seek envelope carried its uid/session scoping predicate.
             assert_locator_seek_is_scoped(&clickhouse, &repository).await?;
 
             Ok(())
@@ -951,8 +962,22 @@ pub(super) async fn locator() -> Result<()> {
 }
 
 /// Run one `open(event)` inside a uniquely-labelled Interactive envelope and
-/// assert from `system.query_log` that the locator seek touched no unrelated
-/// session's wide content (no full-corpus / unrelated-session scan).
+/// assert from `system.query_log` that every statement over a session-holding
+/// table carried its scoping predicate — the structural property whose loss IS
+/// the unrelated-session/full-corpus scan regression.
+///
+/// Why structural: an UNSCOPED statement's SQL text never mentions the
+/// unrelated session by name (grepping for 'locator-unrelated' is tautologically
+/// zero), and at this fixture's size (six rows) `read_rows` cannot separate a
+/// point-read from a full scan because both sit under one granule. What a
+/// scoping regression in `canonical_open.rs` MUST change is the statement text
+/// itself: the locator point-read loses its `event_uid = 'loc-g2-a1'`
+/// predicate, or a navigation/directory/hydration statement loses its
+/// `session_id = 'locator-session'` predicate. So the census requires every
+/// statement referencing `mcp_event_locator`, `mcp_event_navigation`,
+/// `mcp_session_directory`, or the wide `events` read to contain the target
+/// uid or the resolved session id, and requires the census to be non-empty so
+/// it cannot pass vacuously.
 async fn assert_locator_seek_is_scoped(
     clickhouse: &ClickHouseClient,
     repository: &ClickHouseConversationRepository,
@@ -976,12 +1001,25 @@ async fn assert_locator_seek_is_scoped(
         .await?;
 
     #[derive(serde::Deserialize)]
-    struct CountRow {
-        value: u64,
+    struct CensusRow {
+        session_table_statements: u64,
+        unscoped_statements: u64,
     }
-    let unrelated_scans = clickhouse
-        .query_rows::<CountRow>(
-            "SELECT toUInt64(countIf(position(query, 'locator-unrelated') > 0)) AS value \
+    let census = clickhouse
+        .query_rows::<CensusRow>(
+            "SELECT \
+               toUInt64(countIf( \
+                 position(query, 'mcp_event_locator') > 0 \
+                 OR position(query, 'mcp_event_navigation') > 0 \
+                 OR position(query, 'mcp_session_directory') > 0 \
+                 OR position(query, '`events` AS e FINAL') > 0)) AS session_table_statements, \
+               toUInt64(countIf( \
+                 (position(query, 'mcp_event_locator') > 0 \
+                  OR position(query, 'mcp_event_navigation') > 0 \
+                  OR position(query, 'mcp_session_directory') > 0 \
+                  OR position(query, '`events` AS e FINAL') > 0) \
+                 AND position(query, 'loc-g2-a1') = 0 \
+                 AND position(query, 'locator-session') = 0)) AS unscoped_statements \
              FROM system.query_log \
              WHERE type = 'QueryFinish' \
                AND startsWith(query_id, 'moraine-issue598-locator-seek') \
@@ -992,11 +1030,17 @@ async fn assert_locator_seek_is_scoped(
         .await?
         .into_iter()
         .next()
-        .map(|row| row.value)
-        .unwrap_or_default();
+        .context("locator-seek scoping census returned no row")?;
+    assert!(
+        census.session_table_statements > 0,
+        "locator-seek census saw no statements over the session-holding tables — \
+         the scoping gate would pass vacuously (query-id prefix or table names drifted?)"
+    );
     assert_eq!(
-        unrelated_scans, 0,
-        "the locator seek must not reference the unrelated session"
+        census.unscoped_statements, 0,
+        "every locator-seek statement over a session-holding table must be scoped \
+         by the target event uid or the resolved session id ({} of {} were not)",
+        census.unscoped_statements, census.session_table_statements
     );
     Ok(())
 }
@@ -1155,7 +1199,13 @@ async fn assert_quiescent_continuation_is_directory_only(
 
 /// Page 1, append new turns that sort after the anchor, then continue. The
 /// boundary guard passes, the traversal proceeds, and the concatenation of all
-/// served pages is gap-free and duplicate-free against a fresh full read.
+/// served pages is gap-free and duplicate-free at EVENT identity — every
+/// turn's `(turn_seq, first/last event uid, total_events)` is pinned against
+/// the fixture, and the full served turn content byte-equals a fresh full
+/// read. Comparing turn_seq sequences alone would let a continuation that
+/// drops or duplicates a non-user event (the chunk-boundary-resume /
+/// `dedup_adjacent_navigation_versions` bug class) pass, because only user
+/// messages shift turn derivation.
 async fn assert_in_order_append_continues(
     clickhouse: &ClickHouseClient,
     repository: &ClickHouseConversationRepository,
@@ -1167,11 +1217,7 @@ async fn assert_in_order_append_continues(
         .context("append page 1 returned no outcome")?;
     let (mut served, continuation) = match first {
         CanonicalReadOutcome::Page(page) => (
-            page.session
-                .turns
-                .iter()
-                .map(|turn| turn.metadata.turn_seq)
-                .collect::<Vec<_>>(),
+            page.session.turns,
             page.continuation
                 .context("append page 1 must yield a continuation")?,
         ),
@@ -1205,34 +1251,74 @@ async fn assert_in_order_append_continues(
                 bail!("an in-order append must not reopen the cursor")
             }
         };
-        served.extend(page.session.turns.iter().map(|turn| turn.metadata.turn_seq));
+        served.extend(page.session.turns);
         match page.continuation {
             Some(next) => after = Some(next),
             None => break,
         }
     }
 
-    // Gap-free / duplicate-free: the served turn sequence is strictly
-    // increasing with no repeats.
-    for window in served.windows(2) {
+    // Turn-level ordering: the served turn_seq stream is strictly increasing.
+    let served_seqs: Vec<u32> = served.iter().map(|turn| turn.metadata.turn_seq).collect();
+    for window in served_seqs.windows(2) {
         assert!(
             window[1] > window[0],
-            "served turns must be strictly increasing (no gaps/dupes): {served:?}"
+            "served turns must be strictly increasing (no gaps/dupes): {served_seqs:?}"
         );
     }
-    // The final served set must cover every turn the fresh full read reports.
+
+    // Event identity, pinned to the fixture: six seeded turns plus the two
+    // appended ones, each exactly (user, assistant). A dropped or duplicated
+    // event anywhere changes a turn's first/last uid or its event count.
+    let expected_identity: Vec<(u32, String, String, u64)> = (0..6u32)
+        .map(|t| (t + 1, format!("cont-u{t}"), format!("cont-a{t}"), 2))
+        .chain((0..2u32).map(|a| {
+            (
+                7 + a,
+                format!("cont-u-append-{a}"),
+                format!("cont-a-append-{a}"),
+                2,
+            )
+        }))
+        .collect();
+    let served_identity: Vec<(u32, String, String, u64)> = served
+        .iter()
+        .map(|turn| {
+            Ok((
+                turn.metadata.turn_seq,
+                turn.first_event
+                    .as_ref()
+                    .context("served turn missing its first event ref")?
+                    .event_uid
+                    .clone(),
+                turn.last_event
+                    .as_ref()
+                    .context("served turn missing its last event ref")?
+                    .event_uid
+                    .clone(),
+                turn.metadata.total_events,
+            ))
+        })
+        .collect::<Result<_>>()?;
+    assert_eq!(
+        served_identity, expected_identity,
+        "merged traversal must serve every fixture event exactly once across the append boundary"
+    );
+
+    // And the full served turn content must byte-equal a fresh full read, so
+    // any divergence the identity triples cannot see (summaries, per-class
+    // counts, event refs) fails loudly too.
     let reference = open_session_v2(repository, "cont-session", 25)
         .await?
         .context("reference full read returned None")?;
-    let reference_turns: Vec<u32> = reference
-        .turns
-        .iter()
-        .map(|turn| turn.metadata.turn_seq)
-        .collect();
-    assert_eq!(
-        served, reference_turns,
-        "continued traversal must equal a fresh full read after the appends"
-    );
+    let served_json = serde_json::to_value(&served).context("failed to serialize served turns")?;
+    let reference_json =
+        serde_json::to_value(&reference.turns).context("failed to serialize reference turns")?;
+    if served_json != reference_json {
+        bail!(
+            "continued traversal diverged from a fresh full read after the appends\n  served={served_json}\n  reference={reference_json}"
+        );
+    }
     Ok(())
 }
 
