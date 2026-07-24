@@ -40,13 +40,19 @@ const COLS: DerivationColumns = DerivationColumns::EVENTS;
 /// Temporal-pruning slack around a hydration page's display-time bounds. A
 /// page's events are temporally contiguous, so their canonical `events` rows
 /// fall inside the page's `[min(display_time), max(display_time)]` window —
-/// except rows whose `record_ts` failed BestEffort parsing: their
-/// `events.event_ts` falls back near ingestion time, which is the same
-/// fallback `display_time` uses, so one hour of slack absorbs the residual
-/// drift between the two fallbacks (the malformed-record_ts parity fixture
-/// pins this). The hydration statement keeps the uid list as its exact
-/// filter; the widened `BETWEEN` exists only for granule pruning.
-const HYDRATION_TEMPORAL_SLACK_MS: i64 = 3_600_000;
+/// with two ingest-reality exceptions the emitted predicate must admit. A
+/// `record_ts` the Rust normalizer cannot parse stores the epoch sentinel
+/// (`events.event_ts = 1970-01-01`) while `display_time` falls back to
+/// `ingested_at`; no finite slack bridges that, so the bound carries an
+/// explicit epoch-sentinel branch (see `live_events_source_bounded`). A
+/// timezone-naive `record_ts` parses as UTC in Rust but as the server
+/// timezone in ClickHouse BestEffort, skewing `event_ts` from `display_time`
+/// by up to ±14 h — 26 h of slack covers every real UTC offset plus drift.
+/// The hydration statement keeps the uid list as its exact filter; the
+/// widened `BETWEEN` exists only for granule pruning, and `session_id` leads
+/// the events primary key, so slack width costs at most the session's own
+/// granules.
+const HYDRATION_TEMPORAL_SLACK_MS: i64 = 26 * 3_600_000;
 
 // ---------------------------------------------------------------------------
 // Forward derivation arithmetic (design §5.3) — pure, unit-tested.
@@ -322,7 +328,7 @@ impl ClickHouseConversationRepository {
         let tuple = Self::navigation_sort_tuple("n");
         let anchor_tuple = self.anchor_tuple_literal(anchor);
         format!(
-            "SELECT\n  toUInt64(countIf({tuple} <= {anchor_tuple})) AS count_le_anchor,\n  toUInt64(countIf(n.is_user_message = 1 AND {tuple} <= {anchor_tuple})) AS user_messages_le_anchor\n{from}\nWHERE n.session_id = {sid}\n  AND n.sort_time <= toDateTime64({sort_ms} / 1000.0, 3)\nFORMAT JSONEachRow",
+            "SELECT\n  toUInt64(countIf({tuple} <= {anchor_tuple})) AS count_le_anchor,\n  toUInt64(countIf(n.is_user_message = 1 AND {tuple} <= {anchor_tuple})) AS user_messages_le_anchor\n{from}\nWHERE n.session_id = {sid}\n  AND n.sort_time <= fromUnixTimestamp64Milli({sort_ms})\nFORMAT JSONEachRow",
             sid = sql_quote(session_id),
             sort_ms = anchor.sort_time_ms,
         )
@@ -332,7 +338,7 @@ impl ClickHouseConversationRepository {
     /// boundary comparisons.
     fn anchor_tuple_literal(&self, anchor: &CanonicalReadAnchor) -> String {
         format!(
-            "tuple(toDateTime64({sort_ms} / 1000.0, 3), {host}, {file}, {gen}, {offset}, {line}, {uid})",
+            "tuple(fromUnixTimestamp64Milli({sort_ms}), {host}, {file}, {gen}, {offset}, {line}, {uid})",
             sort_ms = anchor.sort_time_ms,
             host = sql_quote(&anchor.source_host),
             file = sql_quote(&anchor.source_file),
@@ -388,14 +394,14 @@ impl ClickHouseConversationRepository {
         ];
         if let Some(after) = after {
             predicates.push(format!(
-                "n.sort_time >= toDateTime64({} / 1000.0, 3)",
+                "n.sort_time >= fromUnixTimestamp64Milli({})",
                 after.sort_time_ms
             ));
             predicates.push(format!("{tuple} > {}", self.anchor_tuple_literal(after)));
         }
         if let Some(upper_ms) = window_upper_ms {
             predicates.push(format!(
-                "n.sort_time < toDateTime64({upper_ms} / 1000.0, 3)"
+                "n.sort_time < fromUnixTimestamp64Milli({upper_ms})"
             ));
         }
         let where_clause = predicates.join("\n  AND ");
@@ -442,7 +448,7 @@ impl ClickHouseConversationRepository {
         );
         let event_ts_tuple = "tuple(n.event_ts, n.event_uid)";
         format!(
-            "SELECT\n  toUInt64(count()) AS total_events,\n  toUInt64(countIf({umsg})) AS user_messages,\n  toUInt64(countIf({assistant_msg})) AS assistant_messages,\n  toUInt64(countIf(n.event_kind = 'tool_call')) AS tool_calls,\n  toUInt64(countIf(n.event_kind = 'tool_result')) AS tool_results,\n  toUInt32(max(n.turn_index)) AS max_override,\n  {counter_user_messages} AS counter_user_messages,\n  toString(min(n.display_time)) AS first_event_time,\n  toInt64(toUnixTimestamp64Milli(min(n.display_time))) AS first_event_unix_ms,\n  toString(max(n.display_time)) AS last_event_time,\n  toInt64(toUnixTimestamp64Milli(max(n.display_time))) AS last_event_unix_ms,\n  ifNull(argMin(nullIf(n.event_uid, ''), {display_tuple}), '') AS first_event_uid,\n  ifNull(argMax(nullIf(n.event_uid, ''), {display_tuple}), '') AS last_event_uid,\n  ifNull(argMax(nullIf(n.actor_kind, ''), {display_tuple}), '') AS last_actor_role,\n  ifNull(argMax(nullIf(n.source_name, ''), {event_ts_tuple}), '') AS source,\n  ifNull(argMax(nullIf(n.harness, ''), {event_ts_tuple}), '') AS harness,\n  ifNull(argMax(nullIf(n.inference_provider, ''), {event_ts_tuple}), '') AS inference_provider,\n  {mode} AS mode\n{from}\nWHERE n.session_id = {sid}\nFORMAT JSONEachRow"
+            "SELECT\n  toUInt64(count()) AS total_events,\n  toUInt64(countIf({umsg})) AS user_messages,\n  toUInt64(countIf({assistant_msg})) AS assistant_messages,\n  toUInt64(countIf(n.event_kind = 'tool_call')) AS tool_calls,\n  toUInt64(countIf(n.event_kind = 'tool_result')) AS tool_results,\n  toUInt32(max(n.turn_index)) AS max_override,\n  {counter_user_messages} AS counter_user_messages,\n  toString(min(n.display_time)) AS first_event_time,\n  toInt64(toUnixTimestamp64Milli(min(n.display_time))) AS first_event_unix_ms,\n  toString(max(n.display_time)) AS last_event_time,\n  toInt64(toUnixTimestamp64Milli(max(n.display_time))) AS last_event_unix_ms,\n  ifNull(argMin(nullIf(n.event_uid, ''), {display_tuple}), '') AS first_event_uid,\n  ifNull(argMax(nullIf(n.event_uid, ''), {display_tuple}), '') AS last_event_uid,\n  argMax(n.actor_kind, {display_tuple}) AS last_actor_role,\n  ifNull(argMax(nullIf(n.source_name, ''), {event_ts_tuple}), '') AS source,\n  ifNull(argMax(nullIf(n.harness, ''), {event_ts_tuple}), '') AS harness,\n  ifNull(argMax(nullIf(n.inference_provider, ''), {event_ts_tuple}), '') AS inference_provider,\n  ifNull(argMinIf(nullIf(trimBoth(replaceRegexpOne(arrayElement(splitByChar('/', replaceAll(n.source_file, '\\\\', '/')), -1), '[.]jsonl$', '')), ''), {event_ts_tuple}, n.source_name = 'omp' AND notEmpty(n.session_id) AND endsWith(n.source_file, '.jsonl') AND NOT endsWith(n.source_file, concat(n.session_id, '.jsonl'))), '') AS omp_dispatch_title,\n  {mode} AS mode\n{from}\nWHERE n.session_id = {sid}\nFORMAT JSONEachRow"
         )
     }
 
@@ -455,7 +461,7 @@ impl ClickHouseConversationRepository {
         let published = self.published_generations_subquery();
         let sid = sql_quote(session_id);
         format!(
-            "SELECT\n  toString(e.event_ts) AS event_ts,\n  e.event_uid AS event_uid,\n  e.event_kind AS event_kind,\n  e.payload_json AS payload_json,\n  e.source_name AS source_name,\n  e.source_file AS source_file,\n  e.session_id AS session_id\nFROM {events} AS e\nWHERE e.event_uid IN (\n  SELECT n.event_uid\n  FROM {nav} AS n FINAL\n  ALL INNER JOIN {published} AS published\n    ON published.source_host = n.source_host AND published.source_name = n.source_name AND published.source_file = n.source_file AND published.source_generation = n.source_generation\n  WHERE n.session_id = {sid} AND n.is_metadata_bearing = 1\n)\nFORMAT JSONEachRow"
+            "SELECT\n  toString(e.event_ts) AS event_ts,\n  e.event_uid AS event_uid,\n  e.event_kind AS event_kind,\n  e.payload_json AS payload_json\nFROM {events} AS e\nWHERE e.event_uid IN (\n  SELECT n.event_uid\n  FROM {nav} AS n FINAL\n  ALL INNER JOIN {published} AS published\n    ON published.source_host = n.source_host AND published.source_name = n.source_name AND published.source_file = n.source_file AND published.source_generation = n.source_generation\n  WHERE n.session_id = {sid} AND n.is_metadata_bearing = 1\n)\nFORMAT JSONEachRow"
         )
     }
 
@@ -536,7 +542,7 @@ impl ClickHouseConversationRepository {
         let from = self.navigation_live_from();
         let tuple = Self::navigation_sort_tuple("n");
         let target = format!(
-            "tuple(toDateTime64({sort_ms} / 1000.0, 3), {host}, {file}, {gen}, {offset}, {line}, {uid})",
+            "tuple(fromUnixTimestamp64Milli({sort_ms}), {host}, {file}, {gen}, {offset}, {line}, {uid})",
             sort_ms = locator.sort_time_ms,
             host = sql_quote(&locator.source_host),
             file = sql_quote(&locator.source_file),
@@ -549,7 +555,7 @@ impl ClickHouseConversationRepository {
         // target) unless overridden. The reader recomputes turn membership for
         // the ordinal via the same forward rule; here we surface the raw counts.
         format!(
-            "SELECT\n  toUInt64(countIf({tuple} <= {target})) AS event_order,\n  toUInt64(countIf(n.is_user_message = 1 AND {tuple} <= {target})) AS prefix_user_message_count,\n  toUInt32(anyIf(n.turn_index, {tuple} = {target})) AS target_turn_index\n{from}\nWHERE n.session_id = {sid}\n  AND n.sort_time <= toDateTime64({sort_ms} / 1000.0, 3)\nFORMAT JSONEachRow",
+            "SELECT\n  toUInt64(countIf({tuple} <= {target})) AS event_order,\n  toUInt64(countIf(n.is_user_message = 1 AND {tuple} <= {target})) AS prefix_user_message_count,\n  toUInt32(anyIf(n.turn_index, {tuple} = {target})) AS target_turn_index\n{from}\nWHERE n.session_id = {sid}\n  AND n.sort_time <= fromUnixTimestamp64Milli({sort_ms})\nFORMAT JSONEachRow",
             sid = sql_quote(&locator.session_id),
             sort_ms = locator.sort_time_ms,
         )
@@ -579,6 +585,7 @@ pub(super) struct TotalsRow {
     pub(super) source: String,
     pub(super) harness: String,
     pub(super) inference_provider: String,
+    pub(super) omp_dispatch_title: String,
     pub(super) mode: String,
 }
 
@@ -588,9 +595,6 @@ pub(super) struct MetaRow {
     pub(super) event_uid: String,
     pub(super) event_kind: String,
     pub(super) payload_json: String,
-    pub(super) source_name: String,
-    pub(super) source_file: String,
-    pub(super) session_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -773,18 +777,6 @@ fn json_field(payload_json: &str, key: &str) -> String {
         .unwrap_or_default()
 }
 
-/// The projector's omp dispatch-title basename (`projection.rs`): backslashes to
-/// `/`, last path segment, strip a trailing `.jsonl`, trimmed.
-fn omp_dispatch_basename(source_file: &str) -> String {
-    let normalized = source_file.replace('\\', "/");
-    let basename = normalized.rsplit('/').next().unwrap_or(&normalized);
-    basename
-        .strip_suffix(".jsonl")
-        .unwrap_or(basename)
-        .trim()
-        .to_string()
-}
-
 #[derive(Debug, Clone, Default)]
 struct MetadataPrecedence {
     latest_metadata_title: String,
@@ -797,7 +789,9 @@ struct MetadataPrecedence {
 /// Reproduce the projector's OPEN metadata-precedence inputs
 /// (`projection.rs`) in Rust over the bounded metadata-bearing rows: latest
 /// non-empty per field by `(event_ts, event_uid)`, session-meta-only for
-/// name/summary/slug, and the first omp non-session-file dispatch basename.
+/// name/summary/slug. The omp dispatch-title fallback is NOT derived here —
+/// v1 computes it over all canonical rows, so the caller seeds it from the
+/// session-totals pass (which scans every navigation row).
 fn metadata_precedence(rows: &[MetaRow]) -> MetadataPrecedence {
     let mut ordered: Vec<&MetaRow> = rows.iter().collect();
     ordered.sort_by(|a, b| {
@@ -805,7 +799,6 @@ fn metadata_precedence(rows: &[MetaRow]) -> MetadataPrecedence {
             .cmp(&(b.event_ts.as_str(), b.event_uid.as_str()))
     });
     let mut precedence = MetadataPrecedence::default();
-    let mut dispatch_seen = false;
     for row in ordered {
         let title = json_field(&row.payload_json, "title");
         if !title.is_empty() {
@@ -823,18 +816,6 @@ fn metadata_precedence(rows: &[MetaRow]) -> MetadataPrecedence {
             let slug = json_field(&row.payload_json, "slug");
             if !slug.is_empty() {
                 precedence.session_slug = slug;
-            }
-        }
-        let session_file = format!("{}.jsonl", row.session_id);
-        if !dispatch_seen
-            && row.source_name == "omp"
-            && row.source_file.ends_with(".jsonl")
-            && !row.source_file.ends_with(&session_file)
-        {
-            let basename = omp_dispatch_basename(&row.source_file);
-            if !basename.is_empty() {
-                precedence.omp_dispatch_title = basename;
-                dispatch_seen = true;
             }
         }
     }
@@ -968,7 +949,12 @@ impl ClickHouseConversationRepository {
             .into_iter()
             .next();
 
-        let precedence = metadata_precedence(&metadata_rows);
+        let mut precedence = metadata_precedence(&metadata_rows);
+        // The dispatch-title fallback is v1's argMinIf over ALL canonical rows
+        // (shared fragment), not just metadata-bearing ones — a title-less omp
+        // dispatch session has zero metadata rows yet still gets its dispatch
+        // basename. The totals pass computes it; the fold cannot.
+        precedence.omp_dispatch_title = totals.omp_dispatch_title.clone();
         let (title, summary) = open_title_and_summary(&totals.source, &precedence);
         let total_turns = total_turns_from_parts(
             totals.total_events,
@@ -1023,7 +1009,11 @@ impl ClickHouseConversationRepository {
         start_after: Option<CanonicalReadAnchor>,
         start_derived: ForwardDerived,
     ) -> RepoResult<Vec<(NavWindowRow, ForwardDerived)>> {
-        const CHUNK: u16 = 4096;
+        // Navigation rows are narrow scalars, so a large chunk costs little
+        // memory while bounding the statement count a full override sweep
+        // spends from its Interactive envelope (256-statement cap): even a
+        // 1M-event session folds in ~62 window statements at this size.
+        const CHUNK: u16 = 16_384;
         let mut out: Vec<(NavWindowRow, ForwardDerived)> = Vec::new();
         let mut anchor_state = start_derived;
         let mut after = start_after;
@@ -1328,8 +1318,15 @@ impl ClickHouseConversationRepository {
 
         // Override-free sessions have `turn_seq` monotonic in tuple order, so the
         // page reader early-stops after `K + 1` turns instead of sweeping the
-        // whole session; override-bearing sessions keep the full sweep so their
-        // non-contiguous stray recurrences still fold correctly (design §5.2.3).
+        // whole session. Override-bearing sessions must re-fold from the
+        // SESSION START on every page — not from the anchor — because an
+        // override recurrence can stamp a high explicit `turn_index` on a row
+        // whose ordering tuple precedes the anchor; a from-anchor window would
+        // serve that turn incomplete or never serve it at all. The from-start
+        // fold is exactly page 1's (v1's whole-session fold), and
+        // `bucket_turns` drops the already-served `turn_seq`s (design
+        // §5.2.3). Bounded override paging (targeted turn_index pickup) is a
+        // #598 follow-up.
         let rows = if header.max_override == 0 {
             self.canonical_stream_session_page(
                 session_id,
@@ -1340,7 +1337,7 @@ impl ClickHouseConversationRepository {
             )
             .await?
         } else {
-            self.canonical_stream_navigation(session_id, start_after, start_derived)
+            self.canonical_stream_navigation(session_id, None, zero_derived())
                 .await?
         };
         let turns = bucket_turns(rows, after_turn_seq);
@@ -2190,7 +2187,7 @@ mod tests {
         assert!(sql.contains("`moraine`.`mcp_event_navigation` AS n FINAL"));
         // PK-pruned to the session and the closed upper bound.
         assert!(sql.contains("WHERE n.session_id = 'session-a'"));
-        assert!(sql.contains("n.sort_time <= toDateTime64"));
+        assert!(sql.contains("n.sort_time <= fromUnixTimestamp64Milli"));
     }
 
     #[tokio::test]
@@ -2235,12 +2232,12 @@ mod tests {
         .await;
         assert_payload_free(&sql);
         // keyset: strictly after the anchor tuple …
-        assert!(sql.contains(") > tuple(toDateTime64"));
+        assert!(sql.contains(") > tuple(fromUnixTimestamp64Milli"));
         // … with an explicit closed lower bound on `sort_time` (PK column 2)
         // so granule pruning never depends on tuple-comparison support.
-        assert!(sql.contains("n.sort_time >= toDateTime64(1700000000000 / 1000.0, 3)"));
+        assert!(sql.contains("n.sort_time >= fromUnixTimestamp64Milli(1700000000000)"));
         // closed upper window bound.
-        assert!(sql.contains("n.sort_time < toDateTime64(1700000100000 / 1000.0, 3)"));
+        assert!(sql.contains("n.sort_time < fromUnixTimestamp64Milli(1700000100000)"));
         assert!(sql.contains("LIMIT 11"));
     }
 
@@ -2319,7 +2316,7 @@ mod tests {
         // `(session_id, event_ts, …)` prunes the FINAL scan by granule. The
         // uid list above stays the exact filter.
         assert!(sql.contains(
-            "e.event_ts BETWEEN toDateTime64(1699996400000 / 1000.0, 3) AND toDateTime64(1700004200000 / 1000.0, 3)"
+            "(e.event_ts BETWEEN fromUnixTimestamp64Milli(1699906400000) AND fromUnixTimestamp64Milli(1700094200000) OR e.event_ts = fromUnixTimestamp64Milli(0))"
         ));
         // event_order / turn_seq are reader-derived, never hydrated.
         assert!(!sql.contains("event_order"));
@@ -2383,7 +2380,7 @@ mod tests {
         assert!(sql.contains("AS event_order"));
         assert!(sql.contains("prefix_user_message_count"));
         assert!(sql.contains("WHERE n.session_id = 'session-a'"));
-        assert!(sql.contains("n.sort_time <= toDateTime64"));
+        assert!(sql.contains("n.sort_time <= fromUnixTimestamp64Milli"));
     }
 
     #[test]

@@ -599,7 +599,16 @@ impl ClickHouseConversationRepository {
     /// (issue-598 C2-R0 "no optimizer trust"). `(_, None)` reproduces the
     /// scoped SQL byte-for-byte. Used by the canonical reader's wide hydration
     /// (`canonical_open.rs`), where the bound is pruning-only slack around the
-    /// page's display-time window — never a correctness filter.
+    /// page's display-time window — never a correctness filter. Two ingest
+    /// realities make a bare window a correctness filter, so the emitted
+    /// predicate also admits the epoch sentinel: a record_ts the Rust
+    /// normalizer cannot parse stores `event_ts = 1970-01-01T00:00:00.000`
+    /// while the navigation index falls back to `ingested_at` (decades away),
+    /// and a timezone-naive record_ts parses as UTC in Rust but as the server
+    /// timezone in `parseDateTime64BestEffortOrNull` (hours of skew, covered
+    /// by the caller's slack width). `session_id` leads the events primary
+    /// key, so the sentinel branch reads at most the session's own malformed
+    /// rows.
     pub(super) fn live_events_source_bounded(
         &self,
         session_id: Option<&str>,
@@ -616,7 +625,7 @@ impl ClickHouseConversationRepository {
         }
         if let Some((min_ms, max_ms)) = event_ts_bounds_ms {
             inner_predicates.push(format!(
-                "e.event_ts BETWEEN toDateTime64({min_ms} / 1000.0, 3) AND toDateTime64({max_ms} / 1000.0, 3)"
+                "(e.event_ts BETWEEN fromUnixTimestamp64Milli({min_ms}) AND fromUnixTimestamp64Milli({max_ms}) OR e.event_ts = fromUnixTimestamp64Milli(0))"
             ));
         }
         let session_filter = if inner_predicates.is_empty() {
@@ -1391,7 +1400,7 @@ mod tests {
                 let bounded =
                     repository.live_events_source_bounded(Some("session-a"), Some((1_000, 2_000)));
                 assert!(bounded.ends_with(
-                    "AND published.source_generation = e.source_generation\nWHERE e.session_id = 'session-a' AND e.event_ts BETWEEN toDateTime64(1000 / 1000.0, 3) AND toDateTime64(2000 / 1000.0, 3))"
+                    "AND published.source_generation = e.source_generation\nWHERE e.session_id = 'session-a' AND (e.event_ts BETWEEN fromUnixTimestamp64Milli(1000) AND fromUnixTimestamp64Milli(2000) OR e.event_ts = fromUnixTimestamp64Milli(0)))"
                 ));
             })
             .await;
