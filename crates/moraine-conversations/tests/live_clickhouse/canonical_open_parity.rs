@@ -583,17 +583,17 @@ pub(super) async fn parity() -> Result<()> {
                     .iter()
                     .map(|turn| turn.metadata.turn_seq)
                     .collect::<Vec<_>>(),
-                vec![2, 7],
-                "the counter turn derives seq 2 behind the override's user message"
+                vec![1, 2],
+                "both turns survive pagination despite inverted tuple order"
             );
             let stray_turn = early_override
                 .turns
                 .iter()
-                .find(|turn| turn.metadata.turn_seq == 7)
-                .context("turn 7 missing from early-override session")?;
+                .find(|turn| turn.metadata.turn_seq == 2)
+                .context("turn 2 missing from early-override session")?;
             assert_eq!(
                 stray_turn.metadata.total_events, 2,
-                "turn 7 keeps both pre-anchor rows across pagination"
+                "turn 2 keeps both pre-anchor rows across pagination"
             );
 
             // 035 metadata precedence surface: OPEN per-field-latest title/name/
@@ -754,21 +754,26 @@ async fn seed_parity_corpus(clickhouse: &ClickHouseClient) -> Result<()> {
     );
     rows.push(Ev::new("parity-epoch", "epoch-a2", 93));
 
-    // Early stray override (review finding 2): an explicit turn_index 7 turn
-    // whose rows sort FIRST by ordering tuple, followed by a counter-path turn
-    // that derives turn_seq 2 (the override's user message advances the
-    // counter). Served page order is by turn_seq — so page 1 (limit 1) serves
-    // turn 2, whose rows are the session's LAST, and the anchor lands past
-    // every row of turn 7. A from-anchor continuation window can never see
-    // turn 7 again, so paged reads must re-fold to serve it.
+    // Override turn served AFTER rows that sort BEFORE it (review finding 2).
+    // Turn 2's rows come FIRST in ordering-tuple order, turn 1's come last, so
+    // page 1 (limit 1) serves turn 1 — the session's LAST rows — and its
+    // anchor lands past every row of turn 2. A from-anchor continuation window
+    // can never see turn 2 again, so the page reader must re-fold from the
+    // session start to serve it. Overrides stay dense (max turn_index equals
+    // the turn count) because the projector's total_turns identity makes a
+    // sparse high override unrepresentable in the v1 read model.
     rows.push(
-        Ev::new("parity-override-early", "oe-u7", 100)
+        Ev::new("parity-override-early", "oe-u2", 100)
             .user()
-            .turn(7),
+            .turn(2),
     );
-    rows.push(Ev::new("parity-override-early", "oe-a7", 101).turn(7));
-    rows.push(Ev::new("parity-override-early", "oe-u1", 102).user());
-    rows.push(Ev::new("parity-override-early", "oe-a1", 103));
+    rows.push(Ev::new("parity-override-early", "oe-a2", 101).turn(2));
+    rows.push(
+        Ev::new("parity-override-early", "oe-u1", 102)
+            .user()
+            .turn(1),
+    );
+    rows.push(Ev::new("parity-override-early", "oe-a1", 103).turn(1));
 
     // Float-lossy keyset window (review finding 3): sort_time values in
     // [1000*2^k, 1024*2^k] ms lose their millisecond under a
