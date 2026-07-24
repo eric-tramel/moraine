@@ -1056,7 +1056,7 @@ pub(super) async fn continuation() -> Result<()> {
             // (c) Out-of-order append (older record_ts than the anchor) sorts
             // into the served prefix -> boundary guard fails -> structured
             // reopen.
-            assert_out_of_order_append_reopens(&clickhouse, &repository).await?;
+            assert_out_of_order_append_reopens(&clickhouse, &repository, &database).await?;
 
             // (g) Unrelated-source publication moves the global revision but the
             // target session's heads are unchanged -> NO reopen.
@@ -1242,6 +1242,7 @@ async fn assert_in_order_append_continues(
 async fn assert_out_of_order_append_reopens(
     clickhouse: &ClickHouseClient,
     repository: &ClickHouseConversationRepository,
+    database: &OwnedDatabaseName,
 ) -> Result<()> {
     // Use a fresh session so the earlier append test does not interfere.
     let mut rows = Vec::new();
@@ -1255,6 +1256,9 @@ async fn assert_out_of_order_append_reopens(
         ));
     }
     seed_events(clickhouse, &rows).await?;
+    // The fresh source file is new to this helper; publish its head so the
+    // pinned-heads reader sees the session as live.
+    publish_missing_schema_fixture_sources(clickhouse, database).await?;
 
     let first = repository
         .canonical_open_session_page("cont-ooo-session", 2, None)
