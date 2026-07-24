@@ -190,6 +190,7 @@ where
 /// the number of pages fetched. A reopen during a quiescent traversal fails.
 async fn traverse_session(
     repository: &ClickHouseConversationRepository,
+    envelope_kind: &str,
     session_id: &str,
     limit: u16,
 ) -> Result<(usize, usize)> {
@@ -197,10 +198,20 @@ async fn traverse_session(
     let mut turns = 0_usize;
     let mut pages = 0_usize;
     loop {
-        let outcome = repository
-            .canonical_open_session_page(session_id, limit, after.clone())
-            .await
-            .with_context(|| format!("session page read failed for {session_id}"))?;
+        // Production scoping: every open() request is its own Interactive
+        // envelope (one MCP tools/call per page). Running thousands of pages
+        // under a single envelope trips the per-request statement cap — that
+        // cap is the #600 contract, not a reader defect. Fresh per-page
+        // envelopes share the phase kind, so the query_id prefix aggregation
+        // over the phase is unaffected.
+        let outcome = QueryEnvelope::new(
+            envelope_kind,
+            QueryClass::Interactive,
+            &default_interactive_budget(),
+        )
+        .scope(repository.canonical_open_session_page(session_id, limit, after.clone()))
+        .await
+        .with_context(|| format!("session page read failed for {session_id}"))?;
         let page = match outcome {
             None => bail!("session {session_id} unexpectedly missing during traversal"),
             Some(moraine_conversations::CanonicalReadOutcome::Reopen) => {
@@ -368,7 +379,7 @@ pub(super) async fn boundedness() -> Result<()> {
         .await?;
         // --- monster: full traversal at the default page size -------------
         let ((traversed_turns, pages), traverse_ms) = phase("traverse", async {
-            traverse_session(&repository, MONSTER_SESSION, PAGE_LIMIT).await
+            traverse_session(&repository, "issue598-traverse", MONSTER_SESSION, PAGE_LIMIT).await
         })
         .await?;
         let expected_turns = (MONSTER_EVENTS / EVENTS_PER_TURN) as usize;
