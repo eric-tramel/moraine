@@ -478,6 +478,31 @@ pub(super) async fn boundedness() -> Result<()> {
         // publication head is missing. It is one (host,name,file) source, so the
         // pinned-heads join grows by a single row.
         publish_missing_schema_fixture_sources(&clickhouse, &database).await?;
+        // Consolidate the fresh corpus parts before measuring. Each batched
+        // INSERT above flushed one new part per table, and a point-read pays a
+        // boundary-granule floor (~8192 rows) in EVERY part that could contain
+        // its key until background merges consolidate — ~8 batches showed up
+        // as ~60k phantom rows on an otherwise perfectly pruned open. That is
+        // transient merge state, not the asymptotic independence this gate
+        // protects (production merges run continuously), so make the
+        // measurement deterministic instead of racing the merge scheduler.
+        for table in [
+            "events",
+            "mcp_event_navigation",
+            "mcp_event_locator",
+            "mcp_session_directory",
+        ] {
+            clickhouse
+                .request_text(
+                    &format!("OPTIMIZE TABLE `{database_name}`.`{table}` FINAL"),
+                    None,
+                    Some(database_name),
+                    false,
+                    None,
+                )
+                .await
+                .with_context(|| format!("failed to consolidate {table} after corpus seed"))?;
+        }
         let ((), unrelated_ms) = phase("unrelated", async {
             repository
                 .canonical_open_session_page("issue598-session-50", PAGE_LIMIT, None)
