@@ -70,7 +70,18 @@ pub(crate) fn normalize_record_with_ts_hint(
 
     let record = match source.preflight(record) {
         Preflight::Keep(record) => record,
-        Preflight::Skip => return Ok(NormalizedRecord::default()),
+        // A skipped record emits nothing (the null `raw_row` is the caller's
+        // skip signal) but must not mutate carried state: returning a default
+        // would blank the session/model/cwd hints mid-file and make every
+        // following record resolve against a cleared chain.
+        Preflight::Skip => {
+            return Ok(NormalizedRecord {
+                session_hint: session_hint.to_string(),
+                model_hint: model_hint.to_string(),
+                cwd_hint: cwd_hint.to_string(),
+                ..Default::default()
+            })
+        }
     };
 
     let harness_name = source.harness();
@@ -144,7 +155,6 @@ pub(crate) fn normalize_record_with_ts_hint(
         harness: harness_name,
         inference_provider: &metadata.inference_provider,
         session_id: &session_id,
-        session_hint,
         session_date: &session_date,
         cwd: &cwd,
         source_file,

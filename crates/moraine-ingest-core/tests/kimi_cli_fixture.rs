@@ -44,7 +44,10 @@ fn fixture_records(name: &str) -> (PathBuf, Vec<(u64, u64, Value)>) {
 
 fn normalize_lines(name: &str) -> Vec<moraine_ingest_core::model::NormalizedRecord> {
     let (path, records) = fixture_records(name);
-    let mut session_hint = String::new();
+    // Dispatch fixes session identity from the file head and never chains it
+    // forward; Kimi derives its session from the path, so the frozen fallback
+    // is never consulted.
+    let session_identity = String::new();
     let mut model_hint = String::new();
     let mut cwd_hint = String::new();
 
@@ -60,12 +63,11 @@ fn normalize_lines(name: &str) -> Vec<moraine_ingest_core::model::NormalizedReco
                 1,
                 line_no,
                 source_offset,
-                &session_hint,
+                &session_identity,
                 &model_hint,
                 &cwd_hint,
             )
             .expect("kimi fixture normalizes");
-            session_hint = normalized.session_hint.clone();
             model_hint = normalized.model_hint.clone();
             cwd_hint = normalized.cwd_hint.clone();
             normalized

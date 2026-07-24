@@ -56,6 +56,46 @@ the JSONL entry format as internal and unstable. Windows local storage is not
 enabled because no path is verified across installer modes, and remote Cowork
 OpenTelemetry is a separate source surface.
 
+### Session attribution is a function of the line, not of the pass
+
+Every ingest pass over a source line must resolve the same `session_id`. This is
+load-bearing rather than cosmetic: `event_uid` excludes `session_id`, and
+`moraine.events` is a `ReplacingMergeTree` whose sort key LEADS with
+`session_id`, so two passes that disagree write two rows that can never
+collapse — one event with two identities.
+
+Dispatch enforces it structurally. `infer_initial_source_hints` reads the file
+head on EVERY pass (not only on a resume) and takes the first non-empty session
+a record resolves to; that value is the file's identity for the whole pass and
+is never reassigned from a record. A record that names its own session still
+wins — the file identity is only what an unnamed record falls back to. A skipped
+record (`Preflight::Skip`) returns the caller's hints untouched rather than
+blanking them.
+
+`session_id()` implementations must respect the same rule: a header record may
+name the file's thread only while no identity is established, and never a thread
+that is not this file's. `RecordContext` deliberately carries the RESOLVED
+`session_id` and not the hint it came from, so a normalizer cannot branch on
+"was identity already established?" and emit different rows per pass start.
+
+### Codex forks and sub-agent threads
+
+A Codex rollout records exactly one thread, and its filename carries that
+thread's id (`rollout-<ts>-<uuid>.jsonl`). Codex replays the SPAWNING thread's
+`session_meta` into a forked or sub-agent rollout as part of the forked context,
+so such a file contains several `session_meta` records naming different threads.
+`Codex::session_id` therefore trusts the filename first; a header names the
+thread only for a rollout whose name carries none, and only while no identity is
+established.
+
+The child keeps its own session. The relationship is preserved as a
+`subagent_parent` external link on the file's own `session_meta` event — the
+`kimi-cli` precedent — whose `linked_external_id` is the parent thread id
+(`parent_thread_id`, else `forked_from_id`, else the header's `session_id`) and
+whose `metadata_json` carries `thread_source`, `parent_thread_id`, and
+`forked_from_id`. A replayed parent header names another thread and contributes
+no link. A plain session, whose header names only itself, has no parent.
+
 ### Kimi parent and sub-agent streams
 
 Kimi treats every `wire.jsonl` as its own session boundary. A parent stream at
@@ -119,7 +159,7 @@ Each adapter implements `IngestSource` from `sources/mod.rs`:
 | `source_metadata()` | Per-record provider and model hint discovery. Hermes splits `vendor/model` here. |
 | `record_ts()` | Timestamp string consumed by the shared parser. Kimi converts Unix-second wire timestamps here. |
 | `top_type()` | Source-level discriminator used for dispatch inside the adapter. |
-| `session_id()` | Stable session id derived from record fields, file path, prior session hint, or raw UID. |
+| `session_id()` | Stable session id derived from record fields, file path, the file-level session identity, or raw UID. Must resolve one line the same way on every pass. |
 | `normalize()` | Emit `NormalizedPartials`: event rows, event link rows, and tool IO rows. |
 
 `normalize()` receives a `RecordContext`. That context has already been stamped
@@ -207,6 +247,9 @@ Adapters must emit rows that already satisfy the normalized schema domain:
 - `model`, `inference_provider`, and `session_id` must preserve source-specific
   semantics. Hermes model strings are split from provider/model input and are
   not blindly canonicalized through generic helpers.
+- Every column an adapter derives per line must be a pure function of the record
+  and its file. `session_id` in particular must not depend on where the pass
+  started; see "Session attribution is a function of the line, not of the pass".
 - Synthetic timestamp sequencing should only advance for rows that are actually
   emitted. This matters for Hermes trajectory segment parsing.
 

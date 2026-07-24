@@ -19,19 +19,26 @@ impl IngestSource for Codex {
     }
 
     fn session_id(&self, record: &Value, ctx: &SourceRecordContext<'_>) -> String {
-        if ctx.top_type == "session_meta" {
-            let payload = record.get("payload").cloned().unwrap_or(Value::Null);
-            let payload_id = to_str(payload.get("id"));
+        // A rollout file records exactly one thread and its name carries that
+        // thread's id. Forked and sub-agent rollouts replay the PARENT
+        // thread's `session_meta` further down the same file, so honoring
+        // every header's `payload.id` rebinds the file to its parent from that
+        // line on — and only for a scan that reached it, which makes the same
+        // line resolve differently on a resume than on a full read. Attribution
+        // must be a function of (file, line) alone: the filename wins, and a
+        // header may name the thread only while no identity is established and
+        // the filename carries none.
+        let own_thread_id = infer_session_id_from_file(ctx.source_file);
+        if !own_thread_id.is_empty() {
+            return own_thread_id;
+        }
+        if ctx.session_hint.is_empty() && ctx.top_type == "session_meta" {
+            let payload_id = to_str(record.pointer("/payload/id"));
             if !payload_id.is_empty() {
                 return payload_id;
             }
         }
-
-        if ctx.session_hint.is_empty() {
-            infer_session_id_from_file(ctx.source_file)
-        } else {
-            ctx.session_hint.to_string()
-        }
+        ctx.session_hint.to_string()
     }
 
     fn jsonl_carries_cwd(&self) -> bool {
@@ -72,6 +79,7 @@ fn normalize_codex_event(
     let mut partials = emitter.finish();
     stamp_codex_model_fallbacks(&codex_record, &mut partials.event_rows);
     append_codex_parent_link(&codex_record, ctx, &mut partials);
+    append_codex_thread_lineage(&codex_record, ctx, &mut partials);
     partials
 }
 
@@ -702,7 +710,222 @@ fn append_codex_parent_link(
     }
 }
 
+/// Codex writes a forked or sub-agent thread to its own rollout file, so the
+/// child keeps its own session and the parent relationship travels as an
+/// explicit `subagent_parent` external link (the `kimi-cli` precedent) rather
+/// than by folding the child's records into the parent's transcript. Only the
+/// file's own header describes this file's lineage: a replayed parent header
+/// names a different thread and contributes nothing.
+fn append_codex_thread_lineage(
+    record: &CodexRecord<'_>,
+    ctx: &RecordContext<'_>,
+    partials: &mut NormalizedPartials,
+) {
+    if record.top_type != "session_meta" {
+        return;
+    }
+
+    let own_thread_id = to_str(record.payload_field("id"));
+    if own_thread_id.is_empty() || own_thread_id != ctx.session_id {
+        return;
+    }
+
+    let parent_thread_id = codex_parent_thread_id(record);
+    if parent_thread_id.is_empty() || parent_thread_id == own_thread_id {
+        return;
+    }
+
+    let Some(uid) = partials
+        .event_rows
+        .first()
+        .and_then(|row| row.get("event_uid"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return;
+    };
+
+    let metadata_json = compact_json(&json!({
+        "thread_source": to_str(record.payload_field("thread_source")),
+        "parent_thread_id": to_str(record.payload_field("parent_thread_id")),
+        "forked_from_id": to_str(record.payload_field("forked_from_id")),
+    }));
+    partials.push_link(build_external_link_row(
+        ctx,
+        &uid,
+        &parent_thread_id,
+        "subagent_parent",
+        &metadata_json,
+    ));
+}
+
+/// `parent_thread_id` is the sub-agent spawn edge and `forked_from_id` the
+/// fork edge; `payload.session_id` names the originating thread on older
+/// rollouts that carry neither, and equals `payload.id` on a plain session.
+fn codex_parent_thread_id(record: &CodexRecord<'_>) -> String {
+    let parent_thread_id = to_str(record.payload_field("parent_thread_id"));
+    if !parent_thread_id.is_empty() {
+        return parent_thread_id;
+    }
+
+    let forked_from_id = to_str(record.payload_field("forked_from_id"));
+    if !forked_from_id.is_empty() {
+        return forked_from_id;
+    }
+
+    to_str(record.payload_field("session_id"))
+}
+
 fn null_value<'a>() -> &'a Value {
     static NULL_VALUE: Value = Value::Null;
     &NULL_VALUE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::normalize::normalize_record;
+
+    const OWN_THREAD: &str = "019f81a9-8226-7c71-a7de-5a0992207ab6";
+    const PARENT_THREAD: &str = "019f7fe1-3b94-7fa2-856c-79946cb89dd2";
+    const ROLLOUT: &str =
+        "/sessions/2026/07/20/rollout-2026-07-20T18-33-17-019f81a9-8226-7c71-a7de-5a0992207ab6.jsonl";
+    /// Older layouts (and hand-copied rollouts) whose name carries no thread id.
+    const UNNAMED_ROLLOUT: &str = "/sessions/2026/07/20/rollout.jsonl";
+
+    fn own_header() -> Value {
+        json!({
+            "type": "session_meta",
+            "timestamp": "2026-07-20T18:33:17.019Z",
+            "payload": {
+                "id": OWN_THREAD,
+                "session_id": PARENT_THREAD,
+                "forked_from_id": PARENT_THREAD,
+                "parent_thread_id": PARENT_THREAD,
+                "thread_source": "subagent",
+                "cwd": "/repo",
+            }
+        })
+    }
+
+    /// Codex replays the spawning thread's own header into the child rollout.
+    fn replayed_parent_header() -> Value {
+        json!({
+            "type": "session_meta",
+            "timestamp": "2026-07-20T18:33:18.019Z",
+            "payload": {
+                "id": PARENT_THREAD,
+                "session_id": PARENT_THREAD,
+                "thread_source": "user",
+                "cwd": "/repo",
+            }
+        })
+    }
+
+    fn normalize(
+        record: &Value,
+        source_file: &str,
+        line_no: u64,
+        session_hint: &str,
+    ) -> crate::model::NormalizedRecord {
+        normalize_record(
+            record,
+            "test-codex",
+            "codex",
+            source_file,
+            1,
+            1,
+            line_no,
+            line_no * 100,
+            session_hint,
+            "",
+            "",
+        )
+        .expect("codex record should normalize")
+    }
+
+    fn lineage_links(record: &crate::model::NormalizedRecord) -> Vec<&Value> {
+        record
+            .link_rows
+            .iter()
+            .filter(|link| link["link_type"] == "subagent_parent")
+            .collect()
+    }
+
+    #[test]
+    fn replayed_parent_header_never_rebinds_the_rollout() {
+        // Whatever identity the pass carried, the answer is the file's own
+        // thread — the property the duplicate-uid defect violated.
+        for hint in ["", OWN_THREAD, PARENT_THREAD] {
+            assert_eq!(
+                normalize(&replayed_parent_header(), ROLLOUT, 2, hint).session_hint,
+                OWN_THREAD
+            );
+        }
+        assert_eq!(
+            normalize(&own_header(), ROLLOUT, 1, "").session_hint,
+            OWN_THREAD
+        );
+        assert_eq!(
+            normalize(
+                &json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-07-20T18:33:21.019Z",
+                    "payload": {"type": "agent_message", "message": "delegated step"}
+                }),
+                ROLLOUT,
+                3,
+                PARENT_THREAD,
+            )
+            .session_hint,
+            OWN_THREAD
+        );
+    }
+
+    #[test]
+    fn an_unnamed_rollout_is_named_by_its_first_header_only() {
+        assert_eq!(
+            normalize(&own_header(), UNNAMED_ROLLOUT, 1, "").session_hint,
+            OWN_THREAD
+        );
+        // Identity established: a later header naming another thread loses.
+        assert_eq!(
+            normalize(&replayed_parent_header(), UNNAMED_ROLLOUT, 2, OWN_THREAD).session_hint,
+            OWN_THREAD
+        );
+    }
+
+    #[test]
+    fn the_own_header_carries_the_parent_relationship() {
+        let normalized = normalize(&own_header(), ROLLOUT, 1, "");
+        let links = lineage_links(&normalized);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0]["linked_external_id"], PARENT_THREAD);
+        assert_eq!(links[0]["session_id"], OWN_THREAD);
+        assert_eq!(links[0]["event_uid"], normalized.event_rows[0]["event_uid"]);
+
+        let metadata: Value = serde_json::from_str(links[0]["metadata_json"].as_str().unwrap())
+            .expect("lineage metadata is JSON");
+        assert_eq!(metadata["thread_source"], "subagent");
+        assert_eq!(metadata["parent_thread_id"], PARENT_THREAD);
+        assert_eq!(metadata["forked_from_id"], PARENT_THREAD);
+    }
+
+    #[test]
+    fn a_replayed_parent_header_contributes_no_lineage() {
+        let normalized = normalize(&replayed_parent_header(), ROLLOUT, 2, OWN_THREAD);
+        assert!(lineage_links(&normalized).is_empty());
+    }
+
+    #[test]
+    fn a_plain_session_has_no_parent() {
+        let plain = json!({
+            "type": "session_meta",
+            "timestamp": "2026-07-20T18:33:17.019Z",
+            "payload": {"id": OWN_THREAD, "session_id": OWN_THREAD, "cwd": "/repo"}
+        });
+        let normalized = normalize(&plain, ROLLOUT, 1, "");
+        assert_eq!(normalized.session_hint, OWN_THREAD);
+        assert!(lineage_links(&normalized).is_empty());
+    }
 }

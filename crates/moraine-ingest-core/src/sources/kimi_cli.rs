@@ -95,6 +95,9 @@ fn kimi_subagent_parent_session_id(source_file: &str) -> Option<String> {
     Some(format!("kimi-cli:{parent_session_id}"))
 }
 
+/// Whether a TurnBegin already appeared in the bytes before `source_offset`.
+/// Answered from the file itself, so it is a function of (file, offset) alone
+/// and a resume starting mid-file reaches the same verdict as a full pass.
 fn has_prior_kimi_turn_begin(source_file: &str, source_offset: u64) -> bool {
     let Ok(file) = std::fs::File::open(source_file) else {
         return false;
@@ -122,8 +125,10 @@ fn link_kimi_subagent_to_parent(
     // A Kimi wire file can contain multiple turns. Inspect only the already
     // consumed prefix so this relationship is attached to the stream's first
     // TurnBegin across blank lines, skipped records, and incremental resumes.
+    // The prefix scan is the whole gate: session identity is now established
+    // for the file before its first record is normalized, so an emptiness
+    // check on the hint would never hold and would drop the link outright.
     if wire.msg_type() != "TurnBegin"
-        || !ctx.session_hint.is_empty()
         || has_prior_kimi_turn_begin(ctx.source_file, ctx.source_offset)
     {
         return;

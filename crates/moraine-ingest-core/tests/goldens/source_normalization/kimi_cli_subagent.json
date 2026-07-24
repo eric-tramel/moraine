@@ -9,7 +9,7 @@
       "link_rows": [],
       "model_hint": "",
       "raw_rows": [],
-      "session_hint": "",
+      "session_hint": "kimi-cli:agent-abcdef01",
       "tool_rows": []
     },
     {
@@ -331,7 +331,21 @@
           "worktree_root": ""
         }
       ],
-      "link_rows": [],
+      "link_rows": [
+        {
+          "event_uid": "f9b588af4094c8a880317e5da1e93d8ad9f683ac0deea498c9eb88570d873ff1",
+          "event_version": "<event_version>",
+          "harness": "kimi-cli",
+          "inference_provider": "moonshot",
+          "link_type": "subagent_parent",
+          "linked_event_uid": "",
+          "linked_external_id": "kimi-cli:11111111-2222-4333-8444-555555555555",
+          "metadata_json": "{}",
+          "session_id": "kimi-cli:agent-abcdef01",
+          "source_event_version": "<event_version>",
+          "source_name": "golden-kimi-cli-subagent"
+        }
+      ],
       "model_hint": "kimi-cli",
       "raw_rows": [
         {

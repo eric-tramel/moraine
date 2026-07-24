@@ -23,18 +23,21 @@ impl IngestSource for PiCodingAgent {
     }
 
     fn session_id(&self, record: &Value, ctx: &SourceRecordContext<'_>) -> String {
-        if ctx.top_type == "session" {
-            let session_id = to_str(record.get("id"));
-            if !session_id.is_empty() {
-                return session_id;
+        // Same contract as Codex: the `session` header names this file's
+        // thread once, and a later header naming another thread must not
+        // rebind the file — that resolves one line two ways depending on where
+        // the scan began. Established identity therefore outranks any header.
+        if ctx.session_hint.is_empty() {
+            if ctx.top_type == "session" {
+                let session_id = to_str(record.get("id"));
+                if !session_id.is_empty() {
+                    return session_id;
+                }
             }
+            return infer_session_id_from_file(ctx.source_file);
         }
 
-        if ctx.session_hint.is_empty() {
-            infer_session_id_from_file(ctx.source_file)
-        } else {
-            ctx.session_hint.to_string()
-        }
+        ctx.session_hint.to_string()
     }
 
     fn jsonl_carries_cwd(&self) -> bool {
@@ -815,4 +818,71 @@ fn append_pi_parent_links(
 fn null_value<'a>() -> &'a Value {
     static NULL_VALUE: Value = Value::Null;
     &NULL_VALUE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::normalize::normalize_record;
+
+    const SOURCE_FILE: &str = "/sessions/omp-review.jsonl";
+
+    fn normalize(
+        record: Value,
+        line_no: u64,
+        session_hint: &str,
+    ) -> crate::model::NormalizedRecord {
+        normalize_record(
+            &record,
+            "test-pi",
+            "pi-coding-agent",
+            SOURCE_FILE,
+            1,
+            1,
+            line_no,
+            line_no * 100,
+            session_hint,
+            "",
+            "",
+        )
+        .expect("pi record should normalize")
+    }
+
+    fn session_record(id: &str) -> Value {
+        json!({
+            "type": "session",
+            "id": id,
+            "timestamp": "2026-07-20T18:33:17.019Z",
+            "cwd": "/repo",
+        })
+    }
+
+    #[test]
+    fn a_later_session_header_never_rebinds_the_file() {
+        // The head scan names the file; a second `session` record — a forked
+        // or replayed context — must not move the rest of the file onto it,
+        // which would attribute one line two ways across a resume.
+        assert_eq!(
+            normalize(session_record("omp-first"), 2, "").session_hint,
+            "omp-first"
+        );
+        assert_eq!(
+            normalize(session_record("omp-second"), 9, "omp-first").session_hint,
+            "omp-first"
+        );
+        assert_eq!(
+            normalize(
+                json!({
+                    "type": "message",
+                    "timestamp": "2026-07-20T18:33:21.019Z",
+                    "role": "assistant",
+                    "content": "step",
+                }),
+                10,
+                "omp-first",
+            )
+            .session_hint,
+            "omp-first"
+        );
+    }
 }

@@ -167,6 +167,11 @@ fn golden_cases() -> [GoldenCase; 13] {
             source_file: "/fixtures/kiro/11111111-2222-4333-8444-555555555555.jsonl",
             format: GoldenFormat::Jsonl,
         },
+        // `source_file` is synthetic so recorded UIDs stay host-independent,
+        // which means it cannot be opened: the sub-agent link's "is this the
+        // stream's first turn" prefix scan finds nothing and every TurnBegin
+        // anchors a link here. Production reads the real file and links once —
+        // that is pinned by tests/kimi_cli_fixture.rs, not by this snapshot.
         GoldenCase {
             name: "kimi_cli_subagent",
             harness: "kimi-cli",
@@ -257,7 +262,10 @@ fn normalize_jsonl(case: &GoldenCase) -> Vec<NormalizedRecord> {
     let body = std::fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("read fixture {}: {err}", path.display()));
     let mut offset = 0_u64;
-    let mut session_hint = String::new();
+    // Dispatch fixes session identity from the file head and never reassigns
+    // it from a record, so every pass over a line resolves it the same way.
+    // Mirror that here or the goldens would pin a contract production dropped.
+    let session_identity = prime_session_identity(case, &body);
     let mut model_hint = String::new();
     let mut cwd_hint = String::new();
     let mut records = Vec::new();
@@ -282,18 +290,53 @@ fn normalize_jsonl(case: &GoldenCase) -> Vec<NormalizedRecord> {
             1,
             line_no,
             start_offset,
-            &session_hint,
+            &session_identity,
             &model_hint,
             &cwd_hint,
         )
         .unwrap_or_else(|err| panic!("normalize {} line {line_no}: {err:#}", case.name));
-        session_hint = normalized.session_hint.clone();
         model_hint = normalized.model_hint.clone();
         cwd_hint = normalized.cwd_hint.clone();
         records.push(normalized);
     }
 
     records
+}
+
+/// Stand-in for dispatch's bounded head scan: the first non-empty session a
+/// record resolves to on its own becomes the file's identity for every pass.
+fn prime_session_identity(case: &GoldenCase, body: &str) -> String {
+    const MAX_HEAD_LINES: usize = 25;
+
+    for (idx, raw_line) in body.split_inclusive('\n').take(MAX_HEAD_LINES).enumerate() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        let Ok(normalized) = normalize_record(
+            &record,
+            case.source_name,
+            case.harness,
+            case.source_file,
+            1,
+            1,
+            idx as u64 + 1,
+            0,
+            "",
+            "",
+            "",
+        ) else {
+            continue;
+        };
+        if !normalized.session_hint.trim().is_empty() {
+            return normalized.session_hint;
+        }
+    }
+
+    String::new()
 }
 
 fn normalize_hermes_session_json(case: &GoldenCase) -> Vec<NormalizedRecord> {
