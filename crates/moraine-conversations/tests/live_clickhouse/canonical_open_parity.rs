@@ -1412,3 +1412,167 @@ async fn assert_revision_move_reopens(
         Err(other) => Err(other.into()),
     }
 }
+
+// ===========================================================================
+// Gate 5: append-to-visible (WI-11, BINDING D8 / R5)
+// ===========================================================================
+//
+// The spec realtime contract (issue-598.md §Realtime): a committed append to a
+// live file-backed session must become visible through `open` within 2s p95 on
+// the reference host. Per BINDING D8 the clock STARTS at durable canonical
+// insert acknowledgment (`insert_json_rows_sync` returning) and STOPS at the
+// first `open` that returns the appended event as visible/valid through the v2
+// canonical reader. Two run-live-test modes exercise the gate with two distinct
+// oracles, both against the same D8 clock:
+//   * `append-to-visible`  -> [`append_to_visible`]  (open(session) turn presence)
+//   * `fsync-to-open-valid` -> [`fsync_to_open_valid`] (open(event) via locator)
+
+const APPEND_PROBE_SAMPLES: usize = 40;
+const APPEND_PROBE_P95_BUDGET_MS: u128 = 2000;
+const APPEND_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(15);
+const APPEND_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Seed a published + backfilled single-turn base session and return a
+/// repository. Every later append reuses this already-published source head, so
+/// the append is live the instant its `events` insert is durable.
+async fn append_probe_setup(
+    clickhouse: &ClickHouseClient,
+    database: &OwnedDatabaseName,
+) -> Result<ClickHouseConversationRepository> {
+    let base = vec![
+        Ev::new("probe-session", "probe-base-u0", 10).user(),
+        Ev::new("probe-session", "probe-base-a0", 11),
+    ];
+    seed_events(clickhouse, &base).await?;
+    publish_and_backfill_both(clickhouse, database).await?;
+    Ok(ClickHouseConversationRepository::new(
+        clickhouse.clone(),
+        RepoConfig::default(),
+    ))
+}
+
+/// The `i`-th append: a counter-path user+assistant turn whose `record_ts`
+/// sorts strictly after every prior row (append-only, the live-ingest shape).
+/// Returns the assistant event uid whose visibility ends the timed window.
+fn append_probe_turn(i: usize) -> (Vec<Ev>, String) {
+    let secs = 1000 + (i as u32) * 2;
+    let user_uid = format!("probe-append-u{i}");
+    let asst_uid = format!("probe-append-a{i}");
+    let rows = vec![
+        Ev::new("probe-session", &user_uid, secs).user(),
+        Ev::new("probe-session", &asst_uid, secs + 1),
+    ];
+    (rows, asst_uid)
+}
+
+/// p95 in whole milliseconds by nearest-rank over the collected samples.
+fn append_probe_p95_millis(mut samples: Vec<Duration>) -> u128 {
+    assert!(
+        !samples.is_empty(),
+        "no append-to-visible samples collected"
+    );
+    samples.sort_unstable();
+    let rank = ((samples.len() as f64) * 0.95).ceil() as usize;
+    let idx = rank.saturating_sub(1).min(samples.len() - 1);
+    samples[idx].as_millis()
+}
+
+/// Gate: open(session) turn-presence oracle. For each of `APPEND_PROBE_SAMPLES`
+/// appends, start the clock at the durable insert ack and stop it when a full
+/// v2 session traversal first reflects the new turn. Assert p95 <= 2000ms.
+pub(super) async fn append_to_visible() -> Result<()> {
+    with_owned_live_db(
+        "canonical-open append-to-visible gate",
+        |clickhouse, database| async move {
+            clickhouse.run_migrations().await.context(
+                "failed to migrate canonical-open append-to-visible database",
+            )?;
+            let repository = append_probe_setup(&clickhouse, &database).await?;
+
+            // Baseline turn count (the single base turn), read outside the
+            // timed window.
+            let mut expected_turns = open_session_v2(&repository, "probe-session", 64)
+                .await?
+                .context("base session must open")?
+                .turns
+                .len();
+
+            let mut samples = Vec::with_capacity(APPEND_PROBE_SAMPLES);
+            for i in 0..APPEND_PROBE_SAMPLES {
+                let (rows, _asst_uid) = append_probe_turn(i);
+                // Durable insert; its acknowledgment is the D8 clock start.
+                seed_events(&clickhouse, &rows).await?;
+                let started = Instant::now();
+                expected_turns += 1;
+                loop {
+                    let visible = open_session_v2(&repository, "probe-session", 64)
+                        .await?
+                        .map(|session| session.turns.len() >= expected_turns)
+                        .unwrap_or(false);
+                    if visible {
+                        break;
+                    }
+                    if started.elapsed() > APPEND_PROBE_TIMEOUT {
+                        bail!(
+                            "append {i} not visible via open(session) within {:?}",
+                            APPEND_PROBE_TIMEOUT
+                        );
+                    }
+                    tokio::time::sleep(APPEND_PROBE_POLL_INTERVAL).await;
+                }
+                samples.push(started.elapsed());
+            }
+
+            let p95 = append_probe_p95_millis(samples);
+            assert!(
+                p95 <= APPEND_PROBE_P95_BUDGET_MS,
+                "insert-ack -> open(session)-visible p95 {p95}ms exceeds the {APPEND_PROBE_P95_BUDGET_MS}ms budget"
+            );
+            Ok(())
+        },
+    )
+    .await
+}
+
+/// Gate: open(event)-via-locator oracle. Same D8 clock, but the timed window
+/// ends when `canonical_open_event` first resolves the appended event through
+/// `mcp_event_locator`. Assert p95 <= 2000ms.
+pub(super) async fn fsync_to_open_valid() -> Result<()> {
+    with_owned_live_db(
+        "canonical-open fsync-to-open-valid gate",
+        |clickhouse, database| async move {
+            clickhouse.run_migrations().await.context(
+                "failed to migrate canonical-open fsync-to-open-valid database",
+            )?;
+            let repository = append_probe_setup(&clickhouse, &database).await?;
+
+            let mut samples = Vec::with_capacity(APPEND_PROBE_SAMPLES);
+            for i in 0..APPEND_PROBE_SAMPLES {
+                let (rows, asst_uid) = append_probe_turn(i);
+                seed_events(&clickhouse, &rows).await?;
+                let started = Instant::now();
+                loop {
+                    if repository.canonical_open_event(&asst_uid).await?.is_some() {
+                        break;
+                    }
+                    if started.elapsed() > APPEND_PROBE_TIMEOUT {
+                        bail!(
+                            "append {i} ({asst_uid}) not visible via open(event) within {:?}",
+                            APPEND_PROBE_TIMEOUT
+                        );
+                    }
+                    tokio::time::sleep(APPEND_PROBE_POLL_INTERVAL).await;
+                }
+                samples.push(started.elapsed());
+            }
+
+            let p95 = append_probe_p95_millis(samples);
+            assert!(
+                p95 <= APPEND_PROBE_P95_BUDGET_MS,
+                "insert-ack -> open(event)-valid p95 {p95}ms exceeds the {APPEND_PROBE_P95_BUDGET_MS}ms budget"
+            );
+            Ok(())
+        },
+    )
+    .await
+}
