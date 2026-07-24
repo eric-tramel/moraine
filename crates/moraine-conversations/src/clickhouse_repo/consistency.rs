@@ -588,14 +588,42 @@ impl ClickHouseConversationRepository {
     /// `live_events_source` SQL byte-for-byte (the filter fragment is empty), so
     /// every existing caller is untouched.
     pub(super) fn live_events_source_scoped(&self, session_id: Option<&str>) -> String {
+        self.live_events_source_bounded(session_id, None)
+    }
+
+    /// [`Self::live_events_source_scoped`] with an additional optional closed
+    /// `event_ts` window, likewise emitted **inside** the derived table: the
+    /// `events` primary key is `(session_id, event_ts, …)`, so the inner
+    /// `BETWEEN` prunes the `FINAL` scan by granule rather than relying on the
+    /// optimizer pushing an outer predicate through the publication join
+    /// (issue-598 C2-R0 "no optimizer trust"). `(_, None)` reproduces the
+    /// scoped SQL byte-for-byte. Used by the canonical reader's wide hydration
+    /// (`canonical_open.rs`), where the bound is pruning-only slack around the
+    /// page's display-time window — never a correctness filter.
+    pub(super) fn live_events_source_bounded(
+        &self,
+        session_id: Option<&str>,
+        event_ts_bounds_ms: Option<(i64, i64)>,
+    ) -> String {
         let snapshot = require_active_publication_snapshot("live event reads");
 
         let history = self.table_ref("v_published_source_generation_history");
         let revision_predicate = snapshot.publication_revision_predicate("history");
         let events = self.table_ref("events");
-        let session_filter = session_id
-            .map(|session_id| format!("\nWHERE e.session_id = {}", sql_quote(session_id)))
-            .unwrap_or_default();
+        let mut inner_predicates: Vec<String> = Vec::new();
+        if let Some(session_id) = session_id {
+            inner_predicates.push(format!("e.session_id = {}", sql_quote(session_id)));
+        }
+        if let Some((min_ms, max_ms)) = event_ts_bounds_ms {
+            inner_predicates.push(format!(
+                "e.event_ts BETWEEN toDateTime64({min_ms} / 1000.0, 3) AND toDateTime64({max_ms} / 1000.0, 3)"
+            ));
+        }
+        let session_filter = if inner_predicates.is_empty() {
+            String::new()
+        } else {
+            format!("\nWHERE {}", inner_predicates.join(" AND "))
+        };
         format!(
             "(SELECT e.*\nFROM {events} AS e FINAL\nALL INNER JOIN (\n  SELECT\n    history.source_host AS source_host,\n    history.source_name AS source_name,\n    history.source_file AS source_file,\n    tupleElement(argMax(tuple(history.source_generation, history.publication_revision), history.publication_revision), 1) AS source_generation\n  FROM {history} AS history\n  WHERE {revision_predicate}\n  GROUP BY history.source_host, history.source_name, history.source_file\n) AS published\n  ON published.source_host = e.source_host\n AND published.source_name = e.source_name\n AND published.source_file = e.source_file\n AND published.source_generation = e.source_generation{session_filter})"
         )
@@ -1351,6 +1379,19 @@ mod tests {
                 assert!(scoped.contains("AS e FINAL\nALL INNER JOIN"));
                 assert!(scoped.ends_with(
                     "AND published.source_generation = e.source_generation\nWHERE e.session_id = 'session-a')"
+                ));
+                // The bounded variant with no bounds is byte-identical to the
+                // scoped SQL; with bounds, the closed `event_ts BETWEEN` also
+                // lands INSIDE the derived table so the `(session_id, event_ts)`
+                // primary-key prefix prunes the FINAL scan (issue-598 C2-R0).
+                assert_eq!(
+                    scoped,
+                    repository.live_events_source_bounded(Some("session-a"), None)
+                );
+                let bounded =
+                    repository.live_events_source_bounded(Some("session-a"), Some((1_000, 2_000)));
+                assert!(bounded.ends_with(
+                    "AND published.source_generation = e.source_generation\nWHERE e.session_id = 'session-a' AND e.event_ts BETWEEN toDateTime64(1000 / 1000.0, 3) AND toDateTime64(2000 / 1000.0, 3))"
                 ));
             })
             .await;

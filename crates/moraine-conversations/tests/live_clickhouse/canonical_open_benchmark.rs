@@ -37,6 +37,15 @@ const MONSTER_EVENTS: u64 = 50_000;
 const EVENTS_PER_TURN: u64 = 10;
 /// The interactive memory ceiling (issue-598.md:160, BINDING D10).
 const MEMORY_CEILING_BYTES: u64 = 512 * 1024 * 1024;
+/// A continuation page's `read_rows` ceiling: 8 granules at the default
+/// `index_granularity` of 8192. Any point read costs at least one full granule
+/// of `read_rows`, so a bound expressed as a fraction of the session (the old
+/// `MONSTER_EVENTS / 10`) sits below storage physics; 8 granules stays an
+/// order of magnitude under the 50k monster while being
+/// session-size-INDEPENDENT — the E / 2E / 4E trio phase separately asserts
+/// fixed-append work-independence, so this gate never needs to scale with the
+/// fixture.
+const MIDPAGE_READ_ROWS_CEILING: u64 = 65_536;
 /// One full traversal may reread at most this multiple of the fixture's narrow
 /// bytes (issue-598.md:160). The denominator is one measured reference scan.
 const REREAD_MULTIPLE: u64 = 10;
@@ -490,9 +499,9 @@ pub(super) async fn boundedness() -> Result<()> {
             "interactive query memory exceeded 512 MiB on the monster: {peak_memory} bytes"
         );
 
-        // A mid-traversal page reads work bounded by the page size, NOT the
-        // session size: at least an order of magnitude below the monster.
-        if midpage.read_rows >= MONSTER_EVENTS / 10 {
+        // A mid-traversal page reads work bounded by the page size and granule
+        // geometry, NOT the session size (see MIDPAGE_READ_ROWS_CEILING).
+        if midpage.read_rows >= MIDPAGE_READ_ROWS_CEILING {
             // Per-statement breakdown so a failure names the offender.
             #[derive(serde::Deserialize)]
             struct StmtRow {
@@ -516,7 +525,7 @@ pub(super) async fn boundedness() -> Result<()> {
                 eprintln!("midpage stmt rows={} q={}", stmt.rows, stmt.q.replace('\n', " "));
             }
             panic!(
-                "continuation page read {} rows — not output-sized against a {MONSTER_EVENTS}-event session",
+                "continuation page read {} rows — exceeds the granule-aware ceiling of {MIDPAGE_READ_ROWS_CEILING} rows (8 x 8192) against a {MONSTER_EVENTS}-event session",
                 midpage.read_rows
             );
         }
