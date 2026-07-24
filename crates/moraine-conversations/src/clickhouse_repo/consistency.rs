@@ -612,7 +612,7 @@ impl ClickHouseConversationRepository {
     pub(super) fn live_events_source_bounded(
         &self,
         session_id: Option<&str>,
-        event_ts_bounds_ms: Option<(i64, i64)>,
+        event_ts_bounds_ms: Option<EventTsBounds>,
     ) -> String {
         let snapshot = require_active_publication_snapshot("live event reads");
 
@@ -623,10 +623,18 @@ impl ClickHouseConversationRepository {
         if let Some(session_id) = session_id {
             inner_predicates.push(format!("e.session_id = {}", sql_quote(session_id)));
         }
-        if let Some((min_ms, max_ms)) = event_ts_bounds_ms {
-            inner_predicates.push(format!(
-                "(e.event_ts BETWEEN fromUnixTimestamp64Milli({min_ms}) AND fromUnixTimestamp64Milli({max_ms}) OR e.event_ts = fromUnixTimestamp64Milli(0))"
-            ));
+        if let Some(bounds) = event_ts_bounds_ms {
+            match (bounds.range, bounds.include_epoch) {
+                (Some((min_ms, max_ms)), false) => inner_predicates.push(format!(
+                    "e.event_ts BETWEEN fromUnixTimestamp64Milli({min_ms}) AND fromUnixTimestamp64Milli({max_ms})"
+                )),
+                (Some((min_ms, max_ms)), true) => inner_predicates.push(format!(
+                    "(e.event_ts BETWEEN fromUnixTimestamp64Milli({min_ms}) AND fromUnixTimestamp64Milli({max_ms}) OR e.event_ts = fromUnixTimestamp64Milli(0))"
+                )),
+                (None, true) => inner_predicates
+                    .push("e.event_ts = fromUnixTimestamp64Milli(0)".to_string()),
+                (None, false) => {}
+            }
         }
         let session_filter = if inner_predicates.is_empty() {
             String::new()
@@ -1398,9 +1406,15 @@ mod tests {
                     repository.live_events_source_bounded(Some("session-a"), None)
                 );
                 let bounded =
-                    repository.live_events_source_bounded(Some("session-a"), Some((1_000, 2_000)));
+                    repository.live_events_source_bounded(
+                        Some("session-a"),
+                        Some(EventTsBounds {
+                            range: Some((1_000, 2_000)),
+                            include_epoch: false,
+                        }),
+                    );
                 assert!(bounded.ends_with(
-                    "AND published.source_generation = e.source_generation\nWHERE e.session_id = 'session-a' AND (e.event_ts BETWEEN fromUnixTimestamp64Milli(1000) AND fromUnixTimestamp64Milli(2000) OR e.event_ts = fromUnixTimestamp64Milli(0)))"
+                    "AND published.source_generation = e.source_generation\nWHERE e.session_id = 'session-a' AND e.event_ts BETWEEN fromUnixTimestamp64Milli(1000) AND fromUnixTimestamp64Milli(2000))"
                 ));
             })
             .await;
@@ -1610,4 +1624,17 @@ mod tests {
         drop(effects);
         assert!(repository.scoped_session_cache.read().await.is_empty());
     }
+}
+
+/// Exact hydration pruning bounds for [`live event reads`]: `range` is the
+/// closed `[min, max]` of the target rows' own `event_ts` values (the
+/// navigation index stores the identical instant the canonical row carries,
+/// so no slack is needed), and `include_epoch` adds an equality branch for
+/// epoch-sentinel rows (a `record_ts` the ingest normalizer could not
+/// parse). `session_id` leads the events primary key, so either branch reads
+/// at most the session's own granules.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct EventTsBounds {
+    pub(super) range: Option<(i64, i64)>,
+    pub(super) include_epoch: bool,
 }
