@@ -437,7 +437,7 @@ impl ClickHouseConversationRepository {
         let text_cap = cd::MAX_PROJECTED_TEXT_SUMMARY_CHARS;
         let payload_cap = cd::MAX_PROJECTED_PAYLOAD_SUMMARY_CHARS;
         format!(
-            "SELECT\n  e.session_id AS session_id,\n  e.event_uid AS event_uid,\n  toString(e.event_ts) AS event_time,\n  toInt64(toUnixTimestamp64Milli(e.event_ts)) AS event_unix_ms,\n  e.actor_kind AS actor_role,\n  e.event_kind AS event_class,\n  e.payload_type AS payload_type,\n  e.call_id AS call_id,\n  e.tool_name AS name,\n  e.tool_phase AS phase,\n  e.item_id AS item_id,\n  e.source_ref AS source_ref,\n  substring(e.text_content, 1, {text_cap}) AS text_content,\n  substring(e.payload_json, 1, {payload_cap}) AS payload_json,\n  e.token_usage_json AS token_usage_json,\n  e.endpoint_kind AS endpoint_kind,\n  e.token_usage_buckets AS token_usage_buckets,\n  e.token_usage_native_units AS token_usage_native_units\nFROM {events} AS e\nWHERE e.event_uid IN {uid_list}\nFORMAT JSONEachRow"
+            "SELECT\n  e.session_id AS session_id,\n  e.event_uid AS event_uid,\n  toString(e.event_ts) AS event_time,\n  toInt64(toUnixTimestamp64Milli(e.event_ts)) AS event_unix_ms,\n  e.actor_kind AS actor_role,\n  e.event_kind AS event_class,\n  e.payload_type AS payload_type,\n  e.tool_call_id AS call_id,\n  e.tool_name AS name,\n  e.tool_phase AS phase,\n  e.item_id AS item_id,\n  e.source_ref AS source_ref,\n  substring(e.text_content, 1, {text_cap}) AS text_content,\n  substring(e.payload_json, 1, {payload_cap}) AS payload_json,\n  e.token_usage_json AS token_usage_json,\n  e.endpoint_kind AS endpoint_kind,\n  e.token_usage_buckets AS token_usage_buckets,\n  e.token_usage_native_units AS token_usage_native_units\nFROM {events} AS e\nWHERE e.event_uid IN {uid_list}\nFORMAT JSONEachRow"
         )
     }
 
@@ -2060,6 +2060,13 @@ mod tests {
         // event_order / turn_seq are reader-derived, never hydrated.
         assert!(!sql.contains("event_order"));
         assert!(!sql.contains("turn_seq"));
+        // Raw events columns, aliased to the projector's public names — the
+        // physical table has tool_call_id/tool_name/tool_phase, not the
+        // aliases (caught live by the parity gate).
+        assert!(sql.contains("e.tool_call_id AS call_id"));
+        assert!(sql.contains("e.tool_name AS name"));
+        assert!(sql.contains("e.tool_phase AS phase"));
+        assert!(!sql.contains("e.call_id AS"));
     }
 
     #[tokio::test]
